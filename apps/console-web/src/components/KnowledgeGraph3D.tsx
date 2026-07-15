@@ -62,12 +62,18 @@ const EDGE_BASE: Record<string, (w?: number) => string> = {
   source: () => dim(COLOR.file, 0.35),
   resource: () => dim(COLOR.resource, 0.35),
   evidence: () => dim(COLOR.episode, 0.35),
+  observed: () => dim(COLOR.episode, 0.5),
+  artifact: () => dim(COLOR.file, 0.5),
   governs: () => dim(COLOR.policy, 0.5),
 };
 
 function nodeVal(n: GNode): number {
   if (n.type === 'kind') return 42;
-  if (n.type === 'entity') return 6 + Math.min(18, (n.data?.mention_count as number) || 0) * 0.5;
+  if (n.type === 'entity') {
+    const exactObservations = (n.data?.observationCount as number) || 0;
+    const legacyMentions = (n.data?.mention_count as number) || 0;
+    return 6 + Math.min(18, exactObservations > 0 ? exactObservations : legacyMentions) * 0.5;
+  }
   if (n.type === 'file') return 5;
   if (n.type === 'goal') return 14;
   if (n.type === 'workflow') return 9;
@@ -107,6 +113,18 @@ const ALL_TYPES = [
 
 interface Sel { label: string; type: string; content?: string; data?: Record<string, unknown>; connected: number }
 
+interface RelationshipEvidence {
+  episodeId: string;
+  excerpt: string;
+  sourceUri?: string | null;
+  confidence?: number;
+  observedAt?: string;
+  validFrom?: string | null;
+  validTo?: string | null;
+  extractionMethod?: string;
+  episodeStatus?: string;
+}
+
 export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) {
   const wrap = useRef<HTMLDivElement>(null);
   const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined);
@@ -116,7 +134,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
 
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
   const [data, setData] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
-  const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0, stored: 0, inferred: 0, semantic: 0 });
+  const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0, relationships: 0, totalRelationships: 0, stored: 0, inferred: 0, semantic: 0 });
   const [dims, setDims] = useState({ w: 0, h: height });
 
   // view state
@@ -167,6 +185,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           facts: nodes.filter((n) => n.type === 'fact').length,
           links: links.filter((l) => l.type === 'similar').length,
           totalFacts: res.meta?.totalFacts ?? 0,
+          relationships: links.filter((l) => l.type === 'related').length,
+          totalRelationships: res.meta?.coverage?.edgeTypeTotals?.related ?? links.filter((l) => l.type === 'related').length,
           stored: res.meta?.coverage?.edges?.stored ?? links.filter((link) => link.truth === 'stored').length,
           inferred: res.meta?.coverage?.edges?.inferred ?? links.filter((link) => link.truth === 'inferred').length,
           semantic: res.meta?.coverage?.edges?.semantic ?? links.filter((link) => link.truth === 'semantic').length,
@@ -293,6 +313,22 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
       data: node.data, connected: hi.current.nodes.size - 1,
     });
   };
+  const onLinkClick = (link: GLink) => {
+    stopOrbit();
+    const source = typeof link.source === 'object' ? link.source : nodeById.get(link.source);
+    const target = typeof link.target === 'object' ? link.target : nodeById.get(link.target);
+    const sourceId = source?.id ?? String(link.source);
+    const targetId = target?.id ?? String(link.target);
+    setSelected(`edge:${link.id}`);
+    hi.current = { nodes: new Set([sourceId, targetId]), links: new Set([link]) };
+    setSel({
+      label: link.label ?? link.type,
+      type: 'relationship',
+      content: `${source?.label ?? sourceId} → ${target?.label ?? targetId}`,
+      data: { ...link.data, truth: link.truth, edgeType: link.type, weight: link.weight },
+      connected: 2,
+    });
+  };
   const clearFocus = () => { setSelected(null); hi.current = { nodes: new Set(), links: new Set() }; setSel(null); };
 
   // search → fly to first match
@@ -366,12 +402,17 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           }}
           linkWidth={(l) => (hi.current.links.has(l) ? 1.4 : l.type === 'similar' ? 0.5 : 0.25)}
           linkCurvature={(l) => (l.type === 'similar' ? 0.12 : 0)}
+          linkLabel={(l) => l.label ?? l.type}
+          linkDirectionalArrowLength={(l) => (l.type === 'related' ? 3.5 : 0)}
+          linkDirectionalArrowRelPos={0.72}
+          linkDirectionalArrowColor={(l) => (l.type === 'related' ? dim(COLOR.entity, 0.85) : 'rgba(255,255,255,0)')}
           linkDirectionalParticles={(l) => (!reduceMotion() && hi.current.links.has(l) && l.type === 'similar' ? 3 : 0)}
           linkDirectionalParticleWidth={1.4}
           linkDirectionalParticleSpeed={0.01}
           linkDirectionalParticleColor={() => COLOR.similar}
           onNodeHover={onHover}
           onNodeClick={onNodeClick}
+          onLinkClick={onLinkClick}
           onBackgroundClick={clearFocus}
           warmupTicks={reduceMotion() ? 60 : 20}
           cooldownTime={reduceMotion() ? 0 : 4000}
@@ -413,10 +454,6 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
 
           {/* controls (top-right) */}
           <div className="absolute right-3 top-3 flex items-center gap-2">
-            <span className="rounded-md bg-black/50 px-2 py-1 text-caption text-white/60 backdrop-blur"
-              title={counts.totalFacts > counts.facts ? `Showing the ${counts.facts} most relevant of ${counts.totalFacts} facts` : undefined}>
-              {counts.totalFacts > counts.facts ? `${counts.facts} of ${counts.totalFacts}` : counts.facts} facts · {counts.stored} stored{showOverlays ? ` · ${counts.inferred} inferred · ${counts.semantic} semantic` : ''}
-            </span>
             <button type="button" onClick={() => setBloomOn((v) => !v)} aria-label="Toggle glow" title="Toggle glow"
               className={cn('rounded-md border p-1.5 backdrop-blur cursor-pointer', bloomOn ? 'border-amber-300/50 bg-amber-400/20 text-amber-200' : 'border-white/15 bg-black/50 text-white/70 hover:text-white')}>
               <Sparkles className="h-4 w-4" aria-hidden />
@@ -428,9 +465,17 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           </div>
 
           {!sel && (
-            <div className="pointer-events-none absolute bottom-3 left-3 max-w-[55%] text-caption text-white/45">
-              Drag to orbit · scroll to zoom · click a star to dive in
-            </div>
+            <>
+              <div className="pointer-events-none absolute bottom-3 left-3 max-w-[45%] text-caption text-white/45">
+                Drag to orbit · scroll to zoom · click a star to dive in
+              </div>
+              <div className="pointer-events-none absolute bottom-3 right-3 max-w-[52%] rounded-md bg-black/50 px-2 py-1 text-right text-caption text-white/60 backdrop-blur"
+                title={counts.totalFacts > counts.facts ? `Showing the ${counts.facts} most relevant of ${counts.totalFacts} facts` : undefined}>
+                {counts.totalFacts > counts.facts ? `${counts.facts} of ${counts.totalFacts}` : counts.facts} facts
+                {' · '}{counts.totalRelationships > counts.relationships ? `${counts.relationships} of ${counts.totalRelationships}` : counts.relationships} entity relations
+                {' · '}{counts.stored} stored edges{showOverlays ? ` · ${counts.inferred} inferred · ${counts.semantic} semantic` : ''}
+              </div>
+            </>
           )}
         </>
       )}
@@ -443,13 +488,53 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
       {sel && (
         <div className="absolute bottom-3 right-3 w-72 rounded-lg border border-white/15 bg-black/70 p-3 text-white shadow-lg backdrop-blur">
           <div className="mb-1 flex items-start justify-between gap-2">
-            <span className="text-caption font-semibold uppercase tracking-wide" style={{ color: sel.type === 'fact' ? KIND_COLOR[(sel.data?.kind as string)] || '#FBE9D6' : (COLOR as Record<string, string>)[sel.type] }}>
-              {sel.type === 'fact' ? (KIND_LABEL[(sel.data?.kind as string)] || 'Fact') : (NODE_TYPE_LABEL[sel.type] ?? 'Topic')}
+            <span className="text-caption font-semibold uppercase tracking-wide" style={{ color: sel.type === 'fact' ? KIND_COLOR[(sel.data?.kind as string)] || '#FBE9D6' : sel.type === 'relationship' ? COLOR.entity : (COLOR as Record<string, string>)[sel.type] }}>
+              {sel.type === 'fact' ? (KIND_LABEL[(sel.data?.kind as string)] || 'Fact') : sel.type === 'relationship' ? 'Stored relationship' : (NODE_TYPE_LABEL[sel.type] ?? 'Topic')}
             </span>
             <button type="button" onClick={clearFocus} aria-label="Close" className="cursor-pointer text-white/50 hover:text-white"><X className="h-4 w-4" aria-hidden /></button>
           </div>
           <div className="text-body font-medium">{sel.label}</div>
+          {sel.type === 'entity' && Array.isArray(sel.data?.aliases) && (sel.data.aliases as string[]).length > 0 && (
+            <p className="mt-1 line-clamp-2 text-caption text-white/55">aka {(sel.data.aliases as string[]).join(', ')}</p>
+          )}
           {sel.content && <p className="mt-1 max-h-40 overflow-auto text-small text-white/70">{sel.content}</p>}
+          {sel.type === 'relationship' && (
+            <div className="mt-2 space-y-2">
+              <div className="flex flex-wrap gap-1.5">
+                <span className="rounded-full border border-emerald-300/30 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-100">{String(sel.data?.truth ?? 'stored')} truth</span>
+                {typeof sel.data?.confidence === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{Math.round((sel.data.confidence as number) * 100)}% confidence</span>}
+                {typeof sel.data?.evidenceCount === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.evidenceCount as number} evidence {sel.data.evidenceCount === 1 ? 'source' : 'sources'}</span>}
+              </div>
+              {(typeof sel.data?.validFrom === 'string' || typeof sel.data?.validTo === 'string') && (
+                <p className="text-caption text-white/50">
+                  Valid {typeof sel.data.validFrom === 'string' ? `from ${new Date(sel.data.validFrom).toLocaleDateString()}` : ''}{typeof sel.data.validTo === 'string' ? ` until ${new Date(sel.data.validTo).toLocaleDateString()}` : ' · current'}
+                </p>
+              )}
+              {sel.data?.edgeType === 'observed' ? (
+                <div className="rounded-md border border-violet-300/20 bg-violet-400/10 p-2 text-caption text-violet-100">
+                  Exact source observation{typeof sel.data?.sourceKind === 'string' ? ` · ${(sel.data.sourceKind as string).replace(/_/g, ' ')}` : ''}
+                  {typeof sel.data?.observedAt === 'string' ? ` · ${new Date(sel.data.observedAt as string).toLocaleDateString()}` : ''}
+                  {typeof sel.data?.sourceUri === 'string' && <p className="mt-1 truncate text-[10px] text-violet-100/60" title={sel.data.sourceUri as string}>{sel.data.sourceUri as string}</p>}
+                </div>
+              ) : Array.isArray(sel.data?.evidence) && (sel.data.evidence as RelationshipEvidence[]).length > 0 ? (
+                <div className="max-h-44 space-y-2 overflow-auto border-t border-white/10 pt-2">
+                  {(sel.data.evidence as RelationshipEvidence[]).map((evidence, index) => (
+                    <div key={`${evidence.episodeId}:${index}`} className="rounded-md border border-white/10 bg-white/5 p-2">
+                      <p className="text-caption leading-relaxed text-white/75">“{evidence.excerpt}”</p>
+                      <p className="mt-1 text-[10px] text-white/40">
+                        {evidence.extractionMethod?.replace(/_/g, ' ') ?? 'source evidence'}
+                        {evidence.episodeStatus ? ` · ${evidence.episodeStatus}` : ''}
+                        {evidence.observedAt ? ` · ${new Date(evidence.observedAt).toLocaleDateString()}` : ''}
+                      </p>
+                      {evidence.sourceUri && <p className="mt-0.5 truncate text-[10px] text-white/35" title={evidence.sourceUri}>{evidence.sourceUri}</p>}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-md border border-amber-300/20 bg-amber-400/10 p-2 text-caption text-amber-100">Legacy stored edge — no grounded excerpt is available yet.</p>
+              )}
+            </div>
+          )}
           <div className="mt-2 flex flex-wrap gap-1.5">
             {sel.data?.pinned === true && <span className="rounded-full bg-amber-400/90 px-2 py-0.5 text-[10px] font-semibold text-amber-950">pinned</span>}
             {typeof sel.data?.importance === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">importance {sel.data.importance as number}/10</span>}
@@ -458,12 +543,16 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
             {sel.type === 'skill' && typeof sel.data?.tier === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.tier as string}</span>}
             {(sel.type === 'goal' || sel.type === 'focus') && typeof sel.data?.status === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.status as string}</span>}
             {sel.type === 'workflow' && typeof sel.data?.steps === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.steps as number} steps</span>}
+            {sel.type === 'entity' && typeof sel.data?.factCount === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.factCount as number} facts</span>}
+            {sel.type === 'entity' && typeof sel.data?.mention_count === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.mention_count as number} mentions</span>}
+            {sel.type === 'entity' && typeof sel.data?.observationCount === 'number' && (sel.data.observationCount as number) > 0 && <span className="rounded-full border border-violet-300/30 bg-violet-400/10 px-2 py-0.5 text-[10px] text-violet-100">{sel.data.observationCount as number} source episodes</span>}
+            {sel.type === 'entity' && typeof sel.data?.identifierCount === 'number' && (sel.data.identifierCount as number) > 0 && <span className="rounded-full border border-emerald-300/30 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-100">{sel.data.identifierCount as number} stable IDs</span>}
             {sel.connected > 0 && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.connected} connected</span>}
           </div>
-          <button type="button" onClick={() => void expandNeighborhood()} disabled={expanding}
+          {sel.type !== 'relationship' && <button type="button" onClick={() => void expandNeighborhood()} disabled={expanding}
             className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-white/20 px-2.5 py-1.5 text-caption text-white/80 hover:bg-white/10 disabled:opacity-50">
             <Layers3 className="h-3.5 w-3.5" aria-hidden /> {expanding ? 'Expanding…' : 'Expand stored neighborhood'}
-          </button>
+          </button>}
         </div>
       )}
     </div>

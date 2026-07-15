@@ -41,11 +41,15 @@ import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js'
 import { FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
-import { openMemoryDb } from '../memory/db.js';
+import { MEMORY_DB_PATH, openMemoryDb } from '../memory/db.js';
+import { auditMemoryReadiness } from '../memory/readiness.js';
 import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
 import { recallMemory } from '../memory/recall-memory.js';
 import { readRecallShadowSummary, scheduleRecallShadow } from '../memory/recall-shadow.js';
+import { readRecallUsageHealth } from '../memory/recall-usage.js';
+import { readPromptContextHealth } from '../memory/prompt-context-health.js';
 import { listMemoryPolicies, readTemporalEvidenceHealth, reconcileTemporalEvidence } from '../memory/temporal-memory.js';
+import { applyMemoryFix, detectMemoryHealCandidates, dismissMemoryFix } from '../memory/self-heal.js';
 import {
   getFocusSnapshot,
   activateFocus as activateFocusRow,
@@ -55,6 +59,11 @@ import {
   extractResourceIdFromApprovalArgs,
 } from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
+import { readEntityRelationshipHealth, reconcileMemoryRelationships } from '../memory/relations.js';
+import { listEntityIdentityConflicts } from '../memory/entity-identity.js';
+import { consolidateFact, readReflectionReplayHealth } from '../memory/reflection.js';
+import { readReflectionCandidateHealth } from '../memory/reflection-candidates.js';
+import { promoteReflectionCandidateById, rejectReflectionCandidateClusterById } from '../memory/candidate-review.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
@@ -565,7 +574,7 @@ const CONTEXT_FILES: ContextFileDefinition[] = [
   {
     key: 'memory',
     title: 'Long-Term Memory',
-    description: 'Standing context Clementine should keep visible across chat, Discord, voice, and autonomous runs.',
+    description: 'Curated standing context above the generated marker stays visible on every surface. The generated fact projection remains searchable and is recalled on demand instead of duplicated into every prompt.',
     filePath: MEMORY_FILE,
     minUsefulChars: 120,
   },
@@ -2507,6 +2516,179 @@ export function registerConsoleRoutes(
     }
   });
 
+  /** Durable source-event timeline. Episodes are the evidence layer beneath
+   * claims: user turns, tool results, meetings, imports, manual memories, and
+   * reflections. Counts are exact and independent of the visible page so the
+   * desktop never presents a bounded slice as the whole history. */
+  app.get('/api/console/memory/episodes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const limit = Math.max(1, Math.min(200, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '80', 10) || 80));
+    const offset = Math.max(0, Math.min(100_000, parseInt(typeof req.query.offset === 'string' ? req.query.offset : '0', 10) || 0));
+    const query = typeof req.query.q === 'string' ? req.query.q.replace(/\s+/g, ' ').trim().slice(0, 240) : '';
+    const kindRaw = typeof req.query.kind === 'string' ? req.query.kind.trim() : '';
+    const statusRaw = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    const reviewRaw = typeof req.query.review === 'string' ? req.query.review.trim() : '';
+    const candidateSourceRaw = typeof req.query.candidateSource === 'string' ? req.query.candidateSource.trim() : '';
+    const kinds = new Set(['user_turn', 'tool_result', 'import', 'manual', 'reflection']);
+    const statuses = new Set(['available', 'partial', 'missing', 'pending', 'expired']);
+    const candidateSources = new Set(['tool_reflection', 'recursive_reflection', 'auto_capture', 'meeting_analysis', 'manual', 'import']);
+    const where: string[] = ['1 = 1'];
+    const params: unknown[] = [];
+    if (kindRaw === 'meeting') {
+      where.push("me.subtype = 'meeting'");
+    } else if (kinds.has(kindRaw)) {
+      where.push('me.kind = ?');
+      params.push(kindRaw);
+    }
+    if (statuses.has(statusRaw)) {
+      where.push('me.status = ?');
+      params.push(statusRaw);
+    }
+    if (reviewRaw === 'pending' || candidateSources.has(candidateSourceRaw)) {
+      const sourceClause = candidateSources.has(candidateSourceRaw) ? ' AND pending_review.source_type = ?' : '';
+      where.push(`EXISTS (
+        SELECT 1 FROM memory_reflection_candidates pending_review
+        WHERE pending_review.episode_id = me.id AND pending_review.status = 'pending'${sourceClause}
+      )`);
+      if (sourceClause) params.push(candidateSourceRaw);
+    }
+    if (query) {
+      const like = `%${query.toLowerCase()}%`;
+      where.push(`(
+        LOWER(COALESCE(me.title, '')) LIKE ?
+        OR LOWER(COALESCE(me.evidence_excerpt, '')) LIKE ?
+        OR LOWER(COALESCE(me.source_app, '')) LIKE ?
+        OR LOWER(COALESCE(me.source_uri, '')) LIKE ?
+      )`);
+      params.push(like, like, like, like);
+    }
+    try {
+      const db = openMemoryDb();
+      const predicate = where.join(' AND ');
+      const total = (db.prepare(`SELECT COUNT(*) AS count FROM memory_episodes me WHERE ${predicate}`).get(...params) as { count: number }).count;
+      const allTotal = (db.prepare('SELECT COUNT(*) AS count FROM memory_episodes').get() as { count: number }).count;
+      const rows = db.prepare(`
+        SELECT me.id, me.kind, me.subtype, me.title, me.source_app, me.source_uri,
+               me.occurred_at, me.ingested_at, me.status, me.evidence_excerpt,
+               me.metadata_json,
+               (SELECT COUNT(DISTINCT fe.fact_id) FROM fact_evidence fe WHERE fe.episode_id = me.id) AS claim_count,
+               (SELECT COUNT(DISTINCT eo.entity_id) FROM entity_observations eo WHERE eo.episode_id = me.id) AS entity_count
+        FROM memory_episodes me
+        WHERE ${predicate}
+        ORDER BY julianday(me.occurred_at) DESC, me.occurred_at DESC, me.id DESC
+        LIMIT ? OFFSET ?
+      `).all(...params, limit, offset) as Array<{
+        id: string; kind: string; subtype: string | null; title: string | null;
+        source_app: string | null; source_uri: string | null; occurred_at: string;
+        ingested_at: string; status: string; evidence_excerpt: string | null;
+        metadata_json: string; claim_count: number; entity_count: number;
+      }>;
+      const byKindRows = db.prepare('SELECT kind, COUNT(*) AS count FROM memory_episodes GROUP BY kind').all() as Array<{ kind: string; count: number }>;
+      const byStatusRows = db.prepare('SELECT status, COUNT(*) AS count FROM memory_episodes GROUP BY status').all() as Array<{ status: string; count: number }>;
+      const meetings = (db.prepare("SELECT COUNT(*) AS count FROM memory_episodes WHERE subtype = 'meeting'").get() as { count: number }).count;
+      const pendingCandidates = (db.prepare(
+        "SELECT COUNT(*) AS count FROM memory_reflection_candidates WHERE status = 'pending'",
+      ).get() as { count: number }).count;
+      const pendingUniqueClaims = (db.prepare(`
+        SELECT COUNT(*) AS count FROM (
+          SELECT kind, candidate_hash
+          FROM memory_reflection_candidates
+          WHERE status = 'pending'
+          GROUP BY kind, candidate_hash
+        )
+      `).get() as { count: number }).count;
+      const pendingCandidateSourceRows = db.prepare(`
+        SELECT source_type, COUNT(*) AS count,
+               COUNT(DISTINCT kind || char(31) || candidate_hash) AS unique_count
+        FROM memory_reflection_candidates
+        WHERE status = 'pending'
+        GROUP BY source_type
+      `).all() as Array<{ source_type: string; count: number; unique_count: number }>;
+      const candidateRows = rows.length > 0 ? db.prepare(`
+        SELECT id, episode_id, kind, text, importance, status, reason,
+               source_type, intake_reason, resulting_fact_id,
+               CASE WHEN status = 'pending' THEN (
+                 SELECT COUNT(*) FROM memory_reflection_candidates duplicate
+                 WHERE duplicate.status = 'pending'
+                   AND duplicate.kind = candidate.kind
+                   AND duplicate.candidate_hash = candidate.candidate_hash
+               ) ELSE 0 END AS pending_equivalent_count
+        FROM memory_reflection_candidates candidate
+        WHERE episode_id IN (${rows.map(() => '?').join(',')})
+        ORDER BY created_at ASC, id ASC
+      `).all(...rows.map((row) => row.id)) as Array<{
+        id: number; episode_id: string; kind: string; text: string; importance: number;
+        status: string; reason: string | null; source_type: string;
+        intake_reason: string | null; resulting_fact_id: number | null;
+        pending_equivalent_count: number;
+      }> : [];
+      const candidatesByEpisode = new Map<string, typeof candidateRows>();
+      for (const candidate of candidateRows) {
+        const group = candidatesByEpisode.get(candidate.episode_id) ?? [];
+        group.push(candidate);
+        candidatesByEpisode.set(candidate.episode_id, group);
+      }
+      res.json({
+        total,
+        allTotal,
+        visible: rows.length,
+        offset,
+        hasMore: offset + rows.length < total,
+        summary: {
+          byKind: Object.fromEntries(byKindRows.map((row) => [row.kind, row.count])),
+          byStatus: Object.fromEntries(byStatusRows.map((row) => [row.status, row.count])),
+          meetings,
+          pendingCandidates,
+          pendingUniqueClaims,
+          pendingCandidatesBySource: Object.fromEntries(
+            pendingCandidateSourceRows.map((row) => [row.source_type, row.count]),
+          ),
+          pendingUniqueClaimsBySource: Object.fromEntries(
+            pendingCandidateSourceRows.map((row) => [row.source_type, row.unique_count]),
+          ),
+        },
+        episodes: rows.map((row) => {
+          let metadata: Record<string, unknown> = {};
+          try { metadata = JSON.parse(row.metadata_json || '{}') as Record<string, unknown>; } catch { /* preserve empty metadata */ }
+          const excerpt = row.evidence_excerpt ?? '';
+          const candidates = candidatesByEpisode.get(row.id) ?? [];
+          return {
+            id: row.id,
+            kind: row.kind,
+            subtype: row.subtype,
+            title: row.title,
+            sourceApp: row.source_app,
+            sourceUri: row.source_uri,
+            occurredAt: row.occurred_at,
+            ingestedAt: row.ingested_at,
+            status: row.status,
+            excerpt: excerpt.slice(0, 2_400),
+            excerptTruncated: excerpt.length > 2_400,
+            metadata,
+            claimCount: row.claim_count,
+            entityCount: row.entity_count,
+            candidateCount: candidates.length,
+            pendingCandidateCount: candidates.filter((candidate) => candidate.status === 'pending').length,
+            candidates: candidates.map((candidate) => ({
+              id: candidate.id,
+              kind: candidate.kind,
+              text: candidate.text,
+              importance: candidate.importance,
+              status: candidate.status,
+              reason: candidate.reason,
+              sourceType: candidate.source_type,
+              intakeReason: candidate.intake_reason,
+              resultingFactId: candidate.resulting_fact_id,
+              pendingEquivalentCount: candidate.pending_equivalent_count,
+            })),
+          };
+        }),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * List durable facts. ?kind=user|project|feedback|reference filters.
    * Defaults to active only; ?includeInactive=1 includes soft-deleted.
@@ -2520,10 +2702,106 @@ export function registerConsoleRoutes(
     const limit = Math.max(1, Math.min(200, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '60', 10) || 60));
     try {
       const facts = includeInactive
-        ? listAllFacts(limit).filter((f) => !kind || f.kind === kind)
+        ? listAllFacts(limit, kind)
         : listActiveFacts({ kind, limit });
+      const db = openMemoryDb();
+      const total = kind
+        ? (db.prepare(`SELECT COUNT(*) AS count FROM consolidated_facts WHERE ${includeInactive ? '1 = 1' : 'active = 1'} AND kind = ?`).get(kind) as { count: number }).count
+        : (db.prepare(`SELECT COUNT(*) AS count FROM consolidated_facts WHERE ${includeInactive ? '1 = 1' : 'active = 1'}`).get() as { count: number }).count;
       const policies = new Map(listMemoryPolicies().map((policy) => [policy.fact_id, policy]));
-      res.json({ facts: facts.map((fact) => ({ ...fact, evidence: getFactWithEvidence(fact.id)?.evidence ?? [], policy: policies.get(fact.id) ?? null })) });
+      res.json({ total, visible: facts.length, facts: facts.map((fact) => {
+        const enriched = getFactWithEvidence(fact.id);
+        return {
+          ...fact,
+          evidence: enriched?.evidence ?? [],
+          validityIntervals: enriched?.validityIntervals ?? [],
+          policy: policies.get(fact.id) ?? null,
+        };
+      }) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Human review queue for conservative legacy cleanup and semantic duplicate
+   * convergence. Detection may persist a proposal, but no fact changes until
+   * the exact request or fact pair is explicitly resolved by the owner. */
+  const detectMemoryReviewCandidates = () => {
+    const pending = (fix: ReturnType<typeof detectMemoryHealCandidates>[number]) =>
+      !fix.status || fix.status === 'pending';
+    // Detect each human-review family under its own cap. A large legacy-noise
+    // backlog must never crowd semantic duplicates out of the desktop queue
+    // (or vice versa). Interleave the two families for the same reason.
+    const duplicate = detectMemoryHealCandidates({
+      kinds: ['merge_duplicate'],
+      maxCandidates: 200,
+      persistProposals: true,
+    }).filter(pending);
+    const transient = detectMemoryHealCandidates({
+      kinds: ['retire_transient_request'],
+      maxCandidates: 200,
+      persistProposals: true,
+    }).filter(pending);
+    const interleaved: Array<(typeof duplicate)[number]> = [];
+    const max = Math.max(duplicate.length, transient.length);
+    for (let index = 0; index < max; index += 1) {
+      if (duplicate[index]) interleaved.push(duplicate[index]);
+      if (transient[index]) interleaved.push(transient[index]);
+    }
+    return interleaved;
+  };
+
+  app.get('/api/console/memory/review-candidates', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const limit = Math.max(1, Math.min(100, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '25', 10) || 25));
+    try {
+      const reviewCandidates = detectMemoryReviewCandidates();
+      const candidates = reviewCandidates.slice(0, limit)
+        .map((fix) => ({
+          ...fix,
+          targetFacts: fix.targetIds.map((id) => getFactWithEvidence(id)).filter(Boolean),
+        }));
+      res.json({
+        candidates,
+        total: reviewCandidates.length,
+        visible: candidates.length,
+        byKind: {
+          merge_duplicate: reviewCandidates.filter((candidate) => candidate.kind === 'merge_duplicate').length,
+          retire_transient_request: reviewCandidates.filter((candidate) => candidate.kind === 'retire_transient_request').length,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/memory/review-candidates/:id/apply', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const candidates = detectMemoryReviewCandidates();
+      const fix = candidates.find((candidate) => candidate.id === req.params.id
+        && (candidate.kind === 'retire_transient_request' || candidate.kind === 'merge_duplicate')
+        && (!candidate.status || candidate.status === 'pending'));
+      if (!fix) { res.status(404).json({ error: 'review candidate not found or already resolved' }); return; }
+      // The exact candidate (including both facts for a merge) was rendered in
+      // the desktop review card. Keep deterministic server probes and backup,
+      // but do not require an online LLM veto after explicit owner approval.
+      const result = await applyMemoryFix(fix, { humanApproved: true });
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/memory/review-candidates/:id/dismiss', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      // Ensure a deterministic proposal exists before resolving it.
+      const candidates = detectMemoryReviewCandidates();
+      const fix = candidates.find((candidate) => candidate.id === req.params.id
+        && (candidate.kind === 'retire_transient_request' || candidate.kind === 'merge_duplicate'));
+      if (!fix || !dismissMemoryFix(fix.id)) { res.status(404).json({ error: 'review candidate not found' }); return; }
+      res.json({ ok: true, id: fix.id, status: 'skipped' });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2959,6 +3237,22 @@ export function registerConsoleRoutes(
     }
   });
 
+  /** Backup-first graph reconciliation. Strong identifiers may converge an
+   * identity; inferred joins are refreshed but remain inferred; only exact
+   * source excerpts can create stored entity relationships. */
+  app.post('/api/console/memory/reconcile-relationships', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as { maxFacts?: unknown };
+    const maxFacts = typeof body.maxFacts === 'number' && Number.isFinite(body.maxFacts)
+      ? Math.max(1, Math.min(50_000, Math.floor(body.maxFacts)))
+      : 5_000;
+    try {
+      res.json(reconcileMemoryRelationships({ factLimit: maxFacts, requireBackup: true }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Tier D2 — memory health/observability: fact counts, embedding coverage
    * + freshness, recall hit-rate, and the hidden layers (pinned / episodic /
@@ -2977,13 +3271,48 @@ export function registerConsoleRoutes(
       const chunkEmbeds = one('SELECT COUNT(*) AS c FROM embeddings');
       const pinned = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND pinned = 1');
       const episodic = one('SELECT COUNT(*) AS c FROM episodic_pointers');
-      const entities = one('SELECT COUNT(*) AS c FROM entities');
+      const entities = one(`SELECT COUNT(*) AS c FROM entities e
+        WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)`);
+      const entityRedirects = one('SELECT COUNT(*) AS c FROM entity_redirects');
+      const entityIdentityConflicts = listEntityIdentityConflicts(10_000).length;
       const focusActive = one("SELECT COUNT(*) AS c FROM current_focus WHERE status = 'active'");
       const evidenceHealth = readTemporalEvidenceHealth();
       const pendingReflections = one("SELECT COUNT(*) AS c FROM reflection_pending_extractions WHERE status = 'pending'");
       const unreachableFacts = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND utility_count = 0');
-      const policyRows = db.prepare('SELECT policy_type, COUNT(*) AS c FROM memory_policies GROUP BY policy_type').all() as Array<{ policy_type: string; c: number }>;
+      const policyRows = db.prepare(`
+        SELECT mp.policy_type, COUNT(*) AS c
+        FROM memory_policies mp
+        JOIN consolidated_facts f ON f.id = mp.fact_id
+        WHERE f.active = 1
+        GROUP BY mp.policy_type
+      `).all() as Array<{ policy_type: string; c: number }>;
       const policies = Object.fromEntries(policyRows.map((row) => [row.policy_type, row.c]));
+      const policyCoverage = {
+        compiledHard: one(`
+          SELECT COUNT(*) AS c FROM memory_policies mp
+          JOIN consolidated_facts f ON f.id = mp.fact_id
+          WHERE f.active = 1 AND mp.policy_type = 'hard_constraint'
+            AND mp.enforcement = 'dispatch'
+            AND json_valid(mp.applies_to_json) = 1
+            AND json_extract(mp.applies_to_json, '$.deterministic') = 1
+        `),
+        promptOnlyConstraintFacts: one(`
+          SELECT COUNT(*) AS c FROM memory_policies mp
+          JOIN consolidated_facts f ON f.id = mp.fact_id
+          WHERE f.active = 1 AND f.kind = 'constraint' AND mp.enforcement = 'prompt'
+        `),
+        overstatedDispatch: one(`
+          SELECT COUNT(*) AS c FROM memory_policies mp
+          JOIN consolidated_facts f ON f.id = mp.fact_id
+          WHERE f.active = 1 AND mp.enforcement = 'dispatch'
+            AND (
+              mp.policy_type <> 'hard_constraint'
+              OR CASE WHEN json_valid(mp.applies_to_json) = 1
+                THEN COALESCE(json_extract(mp.applies_to_json, '$.deterministic'), 0)
+                ELSE 0 END <> 1
+            )
+        `),
+      };
       const usage = db.prepare(`
         SELECT COALESCE(SUM(impression_count), 0) AS impressions,
                COALESCE(SUM(utility_count), 0) AS utility
@@ -2993,16 +3322,25 @@ export function registerConsoleRoutes(
         SELECT MIN(created_at) AS at FROM reflection_pending_extractions WHERE status = 'pending'
       `).get() as { at: string | null }).at;
       const relationshipCounts = {
-        factEntity: one('SELECT COUNT(*) AS c FROM fact_entities'),
-        factResource: one('SELECT COUNT(*) AS c FROM fact_resources'),
-        entityEntity: one('SELECT COUNT(*) AS c FROM entity_edges WHERE invalidated_at IS NULL'),
+        factEntity: one("SELECT COUNT(*) AS c FROM fact_entities WHERE link_type <> 'inferred_text'"),
+        factEntityInferred: one("SELECT COUNT(*) AS c FROM fact_entities WHERE link_type = 'inferred_text'"),
+        factResource: one("SELECT COUNT(*) AS c FROM fact_resources WHERE link_type <> 'inferred_text'"),
+        factResourceInferred: one("SELECT COUNT(*) AS c FROM fact_resources WHERE link_type = 'inferred_text'"),
         factEvidence: one('SELECT COUNT(*) AS c FROM fact_evidence'),
+        ...readEntityRelationshipHealth(),
       };
       const embStats = readEmbeddingStats();
       const embHealth = getEmbeddingHealth();
+      const recallUsage = readRecallUsageHealth(30);
+      const reflectionReplay = readReflectionReplayHealth();
+      const reflectionCandidates = readReflectionCandidateHealth();
+      const promptContext = (() => {
+        try { return readPromptContextHealth(30); } catch { return undefined; }
+      })();
       res.json({
         facts: { active: facts, inactive: factsInactive, total: factsTotal, pinned },
         entities,
+        entityIdentity: { canonical: entities, redirects: entityRedirects, conflicts: entityIdentityConflicts },
         episodicPointers: episodic,
         focusActive,
         embeddings: {
@@ -3031,10 +3369,127 @@ export function registerConsoleRoutes(
           impressions: usage.impressions,
           utility: usage.utility,
           policies,
+          policyCoverage,
           relationships: relationshipCounts,
           shadow: readRecallShadowSummary(500),
+          recallUsage,
+          reflectionReplay,
+          reflectionCandidates,
+          promptContext,
         },
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Auditable claim-intake ledger. This answers what the reflection layer
+   * proposed, what entered canonical memory, what reinforced an existing fact,
+   * and what was rejected or expired—without exposing raw tool payloads. */
+  app.get('/api/console/memory/reflection-candidates', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const requestedStatus = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+      const status = ['pending', 'promoted', 'rejected', 'expired'].includes(requestedStatus)
+        ? requestedStatus
+        : null;
+      const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit ?? '50'), 10) || 50));
+      const rows = openMemoryDb().prepare(`
+        SELECT mrc.id, mrc.episode_id, mrc.session_id, mrc.call_id,
+               mrc.kind, mrc.text, mrc.importance, mrc.status, mrc.reason,
+               mrc.source_type, mrc.intake_reason, mrc.source_uri AS candidate_source_uri, mrc.attempt_count,
+               mrc.next_attempt_at, mrc.last_error,
+               mrc.resulting_fact_id, mrc.created_at, mrc.resolved_at,
+               me.source_app, me.source_uri AS episode_source_uri, me.occurred_at,
+               cf.content AS resulting_fact_content
+        FROM memory_reflection_candidates mrc
+        LEFT JOIN memory_episodes me ON me.id = mrc.episode_id
+        LEFT JOIN consolidated_facts cf ON cf.id = mrc.resulting_fact_id
+        WHERE (? IS NULL OR mrc.status = ?)
+        ORDER BY mrc.created_at DESC, mrc.id DESC
+        LIMIT ?
+      `).all(status, status, limit) as Array<{
+        id: number; episode_id: string | null; session_id: string; call_id: string;
+        kind: string; text: string; importance: number; status: string; reason: string | null;
+        source_type: string; intake_reason: string | null; candidate_source_uri: string | null; attempt_count: number;
+        next_attempt_at: string | null; last_error: string | null;
+        resulting_fact_id: number | null; created_at: string; resolved_at: string | null;
+        source_app: string | null; episode_source_uri: string | null; occurred_at: string | null;
+        resulting_fact_content: string | null;
+      }>;
+      res.json({
+        candidates: rows.map((row) => ({
+          id: row.id,
+          episodeId: row.episode_id,
+          sessionId: row.session_id,
+          callId: row.call_id,
+          kind: row.kind,
+          text: row.text,
+          importance: row.importance,
+          status: row.status,
+          reason: row.reason,
+          sourceType: row.source_type,
+          intakeReason: row.intake_reason,
+          attemptCount: row.attempt_count,
+          nextAttemptAt: row.next_attempt_at,
+          lastError: row.last_error,
+          resultingFactId: row.resulting_fact_id,
+          resultingFactContent: row.resulting_fact_content,
+          sourceApp: row.source_app,
+          sourceUri: row.candidate_source_uri ?? row.episode_source_uri,
+          occurredAt: row.occurred_at,
+          createdAt: row.created_at,
+          resolvedAt: row.resolved_at,
+        })),
+        health: readReflectionCandidateHealth(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/memory/reflection-candidates/:id/promote', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'invalid candidate id' }); return; }
+    try {
+      const result = await promoteReflectionCandidateById(id);
+      if (!result) { res.status(409).json({ error: 'candidate is missing, already resolved, or currently processing' }); return; }
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/memory/reflection-candidates/:id/reject', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'invalid candidate id' }); return; }
+    try {
+      const result = rejectReflectionCandidateClusterById(id);
+      if (!result) {
+        res.status(409).json({ error: 'candidate is missing, already resolved, or currently processing' });
+        return;
+      }
+      res.json({
+        ok: true,
+        candidateId: id,
+        status: 'rejected',
+        rejectedCandidateIds: result.rejectedCandidateIds,
+        rejectedCount: result.rejectedCandidateIds.length,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** Truthful, non-mutating assurance report for the desktop Memory screen.
+   * Uses a separate query-only handle so rendering diagnostics can never run a
+   * migration, reconciliation, checkpoint, or repair. */
+  app.get('/api/console/memory/readiness', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(auditMemoryReadiness(MEMORY_DB_PATH));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -5904,7 +6359,7 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/context/facts', (req, res) => {
+  app.post('/api/console/context/facts', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const kind = typeof req.body?.kind === 'string' ? req.body.kind : 'user';
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
@@ -5917,8 +6372,23 @@ export function registerConsoleRoutes(
       return;
     }
     try {
-      const fact = rememberFact({ kind: kind as (typeof FACT_KINDS)[number], content, sessionId: 'console:context' });
-      res.json({ fact, facts: listActiveFacts({ limit: 18 }) });
+      const outcome = await consolidateFact({
+        kind: kind as (typeof FACT_KINDS)[number],
+        text: content,
+        trustLevel: 1,
+        authority: 'user',
+        sourceApp: 'Clementine Desktop',
+        sourceUri: 'clementine://desktop/context/facts',
+      }, { sessionId: 'console:context' });
+      const fact = outcome.factId ? getFact(outcome.factId) : null;
+      res.json({
+        fact,
+        consolidation: {
+          action: outcome.action,
+          supersededFactId: outcome.supersededFactId ?? null,
+        },
+        facts: listActiveFacts({ limit: 18 }),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -8149,13 +8619,37 @@ export function registerConsoleRoutes(
     try {
       const { openMemoryDb } = await import('../memory/db.js');
       const db = openMemoryDb();
-      const typeParam = typeof req.query.type === 'string' ? req.query.type : '';
+      const rawType = typeof req.query.type === 'string' ? req.query.type : '';
+      const query = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+      const requestedLimit = Math.max(1, Math.min(1_000, Number(req.query.limit) || 400));
       const allowed = new Set(['person', 'company', 'project', 'place', 'thing']);
-      const rows = (allowed.has(typeParam)
-        ? db.prepare('SELECT * FROM entities WHERE entity_type = ? ORDER BY mention_count DESC, last_seen_at DESC LIMIT 200')
-            .all(typeParam)
-        : db.prepare('SELECT * FROM entities ORDER BY mention_count DESC, last_seen_at DESC LIMIT 200')
-            .all()) as Array<{
+      const typeParam = allowed.has(rawType) ? rawType : '';
+      const where = `
+        NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
+        AND (? = '' OR e.entity_type = ?)
+        AND (
+          ? = ''
+          OR instr(e.canonical_name_lc, ?) > 0
+          OR EXISTS (
+            SELECT 1 FROM entity_aliases ea
+            WHERE ea.entity_id = e.id AND instr(ea.alias_lc, ?) > 0
+          )
+        )`;
+      const filterArgs = [typeParam, typeParam, query, query, query];
+      const rows = db.prepare(`SELECT e.*,
+            (SELECT COUNT(*) FROM fact_entities fe WHERE fe.entity_id = e.id) AS fact_count,
+            (SELECT COUNT(*) FROM fact_entities fe
+              WHERE fe.entity_id = e.id AND fe.link_type <> 'inferred_text') AS grounded_fact_count,
+            (SELECT COUNT(*) FROM fact_entities fe
+              WHERE fe.entity_id = e.id AND fe.link_type = 'inferred_text') AS inferred_fact_count,
+            (SELECT COUNT(*) FROM entity_identifiers ei WHERE ei.entity_id = e.id) AS identifier_count,
+            (SELECT COUNT(*) FROM entity_observations eo WHERE eo.entity_id = e.id) AS observation_count
+          FROM entities e
+          WHERE ${where}
+          ORDER BY grounded_fact_count DESC, observation_count DESC,
+            e.mention_count DESC, e.last_seen_at DESC
+          LIMIT ?`)
+        .all(...filterArgs, requestedLimit) as Array<{
         id: number;
         entity_type: string;
         canonical_name: string;
@@ -8164,6 +8658,11 @@ export function registerConsoleRoutes(
         first_seen_at: string;
         last_seen_at: string;
         mention_count: number;
+        fact_count: number;
+        grounded_fact_count: number;
+        inferred_fact_count: number;
+        identifier_count: number;
+        observation_count: number;
       }>;
       const entities = rows.map((r) => {
         let aliases: string[] = [];
@@ -8179,12 +8678,112 @@ export function registerConsoleRoutes(
           firstSeenAt: r.first_seen_at,
           lastSeenAt: r.last_seen_at,
           mentionCount: r.mention_count,
+          factCount: r.fact_count,
+          groundedFactCount: r.grounded_fact_count,
+          inferredFactCount: r.inferred_fact_count,
+          identifierCount: r.identifier_count,
+          observationCount: r.observation_count,
         };
       });
-      const totalRow = db.prepare('SELECT COUNT(*) AS c FROM entities').get() as { c: number };
-      res.json({ entities, total: totalRow?.c ?? 0 });
+      const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM entities e WHERE ${where}`)
+        .get(...filterArgs) as { c: number };
+      const allTotalRow = db.prepare(`SELECT COUNT(*) AS c FROM entities e
+        WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)`).get() as { c: number };
+      const redirectedRow = db.prepare('SELECT COUNT(*) AS c FROM entity_redirects').get() as { c: number };
+      res.json({
+        entities,
+        total: totalRow?.c ?? 0,
+        allTotal: allTotalRow?.c ?? 0,
+        redirectedTotal: redirectedRow?.c ?? 0,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/brain/entities/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'entity id must be a positive integer' }); return; }
+    try {
+      const { getEntityMemoryDetail } = await import('../memory/entity-memory.js');
+      const asOf = typeof req.query.asOf === 'string' ? req.query.asOf : undefined;
+      res.json(getEntityMemoryDetail(id, { asOf }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(message === 'entity not found' ? 404 : 500).json({ error: message });
+    }
+  });
+
+  app.get('/api/console/brain/entity-identity/conflicts', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listEntityIdentityConflicts } = await import('../memory/entity-identity.js');
+      const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+      const conflicts = listEntityIdentityConflicts(limit);
+      res.json({ conflicts, total: conflicts.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/brain/entity-identity/candidates', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listEntityDuplicateCandidates } = await import('../memory/entity-review.js');
+      const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+      const rawType = typeof req.query.type === 'string' ? req.query.type : '';
+      const allowed = new Set(['person', 'company', 'project', 'place', 'thing']);
+      const type = allowed.has(rawType) ? rawType as 'person' | 'company' | 'project' | 'place' | 'thing' : undefined;
+      res.json(listEntityDuplicateCandidates({ limit, type }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/brain/entity-identity/candidates/dismiss', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { dismissEntityDuplicateCandidate } = await import('../memory/entity-review.js');
+      const entityIds = Array.isArray(req.body?.entityIds) ? req.body.entityIds.map(Number) : [];
+      const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+      const pairsDismissed = dismissEntityDuplicateCandidate(entityIds, reason);
+      res.json({ ok: true, pairsDismissed });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(/requires|missing|redirected|same type/i.test(message) ? 400 : 500).json({ error: message });
+    }
+  });
+
+  app.post('/api/console/brain/entity-identity/candidates/restore-dismissed', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { restoreDismissedEntityDuplicateCandidates } = await import('../memory/entity-review.js');
+      res.json({ ok: true, restored: restoreDismissedEntityDuplicateCandidates() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/brain/entities/merge', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const sourceEntityId = Number(req.body?.sourceEntityId);
+      const canonicalEntityId = Number(req.body?.canonicalEntityId);
+      if (!Number.isInteger(sourceEntityId) || sourceEntityId <= 0 || !Number.isInteger(canonicalEntityId) || canonicalEntityId <= 0) {
+        res.status(400).json({ error: 'sourceEntityId and canonicalEntityId must be positive integers' });
+        return;
+      }
+      const { mergeEntities } = await import('../memory/entity-identity.js');
+      const canonicalId = mergeEntities({
+        sourceEntityId,
+        canonicalEntityId,
+        reason: typeof req.body?.reason === 'string' ? req.body.reason : 'desktop identity review',
+        confidence: 1,
+      });
+      res.json({ ok: true, canonicalEntityId: canonicalId });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -8236,7 +8835,9 @@ export function registerConsoleRoutes(
       `).get() as { active_total: number; derived: number; avg_importance: number | null };
 
       const entityTotals = db.prepare(`
-        SELECT entity_type, COUNT(*) AS c FROM entities GROUP BY entity_type
+        SELECT e.entity_type, COUNT(*) AS c FROM entities e
+        WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
+        GROUP BY e.entity_type
       `).all() as Array<{ entity_type: string; c: number }>;
       const entityMap: Record<string, number> = {};
       for (const row of entityTotals) entityMap[row.entity_type] = row.c;
@@ -8244,6 +8845,12 @@ export function registerConsoleRoutes(
 
       const pointersTotal = (db.prepare('SELECT COUNT(*) AS c FROM episodic_pointers').get() as { c: number })?.c ?? 0;
       const pointersRecent = (db.prepare('SELECT COUNT(*) AS c FROM episodic_pointers WHERE created_at >= ?').get(since7d) as { c: number })?.c ?? 0;
+      const episodeCounts = db.prepare(`
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN occurred_at >= ? THEN 1 ELSE 0 END) AS recent,
+               SUM(CASE WHEN subtype = 'meeting' THEN 1 ELSE 0 END) AS meetings
+        FROM memory_episodes
+      `).get(since7d) as { total: number; recent: number | null; meetings: number | null };
 
       // Reflection health is in the per-day tool-events ndjson + the
       // harness.db condenser_applied / fact-conflict events we'd emit.
@@ -8298,6 +8905,9 @@ export function registerConsoleRoutes(
         entitiesThing: entityMap.thing ?? 0,
         pointersTotal,
         pointersRecent,
+        memoryEpisodesTotal: episodeCounts.total,
+        memoryEpisodesRecent: episodeCounts.recent ?? 0,
+        recordedMeetingsTotal: episodeCounts.meetings ?? 0,
         reflections24h,
         reflectionsSuccess,
         reflectionsSkipped,

@@ -19,6 +19,7 @@ const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
 const { checkpointWorkingMemory } = await import('../memory/working-memory.js');
 const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+const { MEMORY_AUTO_SECTION_MARKER, MEMORY_FILE } = await import('../memory/vault.js');
 
 test('query-driven recall: a request-relevant fact is surfaced UP FRONT for a matching message (never knowledge-starve the brain)', () => {
   resetMemoryDb();
@@ -203,21 +204,64 @@ test('partition: stable EXCLUDES the volatile tail (Now / query recall / Current
   assert.doesNotMatch(volatile, /# Persistent Context/);
 });
 
+test('policy memory is rendered once without the legacy all-constraints duplicate', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'constraint', content: 'Always send Outlook email from legal@example.com.' });
+  rememberFact({ kind: 'constraint', content: 'Always pause and ask a human before discussing sensitive legal requests.' });
+  const ctx = renderHarnessMemoryContext({ sessionId: 's', partition: 'all' });
+  assert.match(ctx, /## Persistent Facts/);
+  assert.match(ctx, /Dispatch-enforced constraints/);
+  assert.match(ctx, /Prompt-only instructions \(context, not deterministic enforcement\)/);
+  assert.match(ctx, /1 dispatch-enforced, 1 prompt-only/);
+  assert.doesNotMatch(ctx, /## Standing Constraints/);
+  assert.equal(ctx.match(/Always send Outlook email from legal@example\.com\./g)?.length, 1);
+  assert.equal(ctx.match(/Always pause and ask a human before discussing sensitive legal requests\./g)?.length, 1);
+});
+
+test('assembled prompt ignores the generated MEMORY.md projection but preserves curated memory', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'Canonical project fact remains available from SQLite.' });
+  mkdirSync(path.dirname(MEMORY_FILE), { recursive: true });
+  writeFileSync(
+    MEMORY_FILE,
+    `# Memory\n\n${MEMORY_AUTO_SECTION_MARKER}\n\n## Projects\n- ${'generated duplicate '.repeat(400)}\n`,
+    'utf-8',
+  );
+  const withGeneratedProjection = renderHarnessMemoryContext({ partition: 'stable' });
+
+  writeFileSync(MEMORY_FILE, '# Memory\n', 'utf-8');
+  const withScaffoldOnly = renderHarnessMemoryContext({ partition: 'stable' });
+  assert.equal(withGeneratedProjection, withScaffoldOnly, 'generated projection must add zero prompt bytes');
+  assert.doesNotMatch(withGeneratedProjection, /generated duplicate/);
+  assert.match(withGeneratedProjection, /Canonical project fact remains available from SQLite/);
+
+  writeFileSync(
+    MEMORY_FILE,
+    `# Memory\n\n## Curated context\n- Keep this compact standing note.\n\n${MEMORY_AUTO_SECTION_MARKER}\n\n- generated duplicate\n`,
+    'utf-8',
+  );
+  const curated = renderHarnessMemoryContext({ partition: 'stable' });
+  assert.match(curated, /## Long-Term Memory/);
+  assert.match(curated, /Keep this compact standing note/);
+  assert.doesNotMatch(curated, /generated duplicate/);
+});
+
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-test('recall + constraint lines are bounded: a runaway fact cannot blow the volatile context', () => {
+test('query-recall lines are bounded: a runaway fact cannot blow the volatile context', () => {
   resetMemoryDb();
   const runaway = `Salesforce market leader schema notes: ${'z'.repeat(5_000)}`;
   rememberFact({ kind: 'project', content: runaway });
   rememberFact({ kind: 'constraint', content: `Always send from the approved sender. ${'c'.repeat(5_000)}` });
   const ctx = renderHarnessMemoryContext({ query: 'salesforce market leader schema notes' });
-  // Only the sections A4 bounds per-line: query recall + standing constraints.
+  // Query recall has its own per-line bound. Policy memory is bounded by the
+  // Persistent Facts tier budgets and is not duplicated into another section.
   // (The Persistent Facts primer has its own TOTAL bound and allows longer lines.)
   for (const section of ctx.split(/\n(?=## )/)) {
     const title = section.split('\n', 1)[0] ?? '';
-    if (!/Relevant To Your Request|Standing Constraints/.test(title)) continue;
+    if (!/Relevant To Your Request/.test(title)) continue;
     for (const line of section.split('\n').filter((l) => l.startsWith('- '))) {
       assert.ok(line.length <= 1060, `injected line bounded (got ${line.length} chars in "${title}")`);
     }

@@ -100,6 +100,7 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   assert.match(scripts, /npm run test:release-assets/);
   assert.match(scripts, /npm run typecheck/);
   assert.match(scripts, /npm run bench:gates/);
+  assert.match(scripts, /npm run eval:memory/);
   assert.match(scripts, /npm run eval:passk/);
   assert.match(scripts, /npm run eval:jobs/);
   assert.match(scripts, /refs\/remotes\/origin\/main/);

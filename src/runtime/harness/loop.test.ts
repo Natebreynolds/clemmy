@@ -904,6 +904,10 @@ test('previousResponseId is NOT passed to the SDK (codex requires full history e
 
 test('runTurn injects a transient memory primer before the first model response', async () => {
   resetEventLog();
+  rememberFact({
+    kind: 'project',
+    content: 'Salesforce prospecting should prioritize stale untouched accounts before enrichment.',
+  });
   const sess = HarnessSession.create({ kind: 'chat' });
   let filteredInput: AgentInputItem[] = [];
 
@@ -937,7 +941,7 @@ test('runTurn injects a transient memory primer before the first model response'
     && ((item as { content: string }).content.includes('[MEMORY PRIMER]')),
   ) as { content: string } | undefined;
   assert.ok(primer, 'expected memory primer to be appended to model input');
-  assert.match(primer.content, /memory search ran/i);
+  assert.match(primer.content, /Use relevant hits/i);
   assert.match(primer.content, /Salesforce prospecting/i);
   assert.match(primer.content, /stale untouched accounts/i);
 
@@ -945,6 +949,10 @@ test('runTurn injects a transient memory primer before the first model response'
   assert.equal(primerEvents.length, 1);
   assert.equal(primerEvents[0].data.injected, true);
   assert.ok((primerEvents[0].data.hitCount as number) > 0);
+  assert.equal(primerEvents[0].data.source, 'unified');
+  assert.match(String(primerEvents[0].data.recallId), /^mr-/);
+  assert.equal(typeof primerEvents[0].data.omittedCount, 'number');
+  assert.equal(primerEvents[0].data.includedCount, primerEvents[0].data.hitCount);
 });
 
 test('turn numbers monotonically increment across runs', async () => {

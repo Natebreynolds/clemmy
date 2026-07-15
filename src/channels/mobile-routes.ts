@@ -61,7 +61,7 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { lookupIdempotent, rememberIdempotent } from '../runtime/idempotency.js';
 import { randomBytes } from 'node:crypto';
 import { readdirSync } from 'node:fs';
-import { recallHybrid } from '../memory/recall.js';
+import { recallMemory } from '../memory/recall-memory.js';
 import { listActiveFacts } from '../memory/facts.js';
 type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -1133,18 +1133,36 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.get('/api/memory/search', requireMobileSession, async (req, res) => {
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-    if (!q) { res.json({ query: '', hits: [] }); return; }
+    if (!q) {
+      res.json({
+        query: '',
+        hits: [],
+        answerability: 'insufficient',
+        diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+      });
+      return;
+    }
     const limit = clampInt(req.query.limit, 20, 1, 50);
     try {
-      const hits = await recallHybrid(q, { limit });
+      // Keep the original mobile hit contract while sourcing it from the same
+      // evidence-backed, temporal, graph-assisted pipeline used by the agent
+      // and desktop console. A fact/episode/person/resource must not become
+      // invisible merely because the user searched from their phone.
+      const result = await recallMemory(q, { limit, graphDepth: 1 });
       res.json({
         query: q,
-        hits: hits.map((hit) => ({
-          path: hit.filePath,
-          title: hit.title,
-          snippet: typeof hit.snippet === 'string' ? hit.snippet.slice(0, 280) : '',
+        hits: result.hits.map((hit) => ({
+          path: hit.ref.type === 'note' ? hit.ref.id : `${hit.ref.type}:${hit.ref.id}`,
+          title: hit.title ?? `${hit.ref.type} memory`,
+          snippet: hit.text.slice(0, 280),
           score: Number(hit.score.toFixed(3)),
+          ref: hit.ref,
+          confidence: Number(hit.confidence.toFixed(3)),
+          evidenceCount: hit.evidence.length,
+          whyRecalled: hit.whyRecalled,
         })),
+        answerability: result.answerability,
+        diagnostics: result.diagnostics,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

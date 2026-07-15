@@ -18,9 +18,11 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { reviewForgetRequest, registerMemoryTools } = await import('./memory-tools.js');
 const { LOCAL_MCP_TOOL_NAMES } = await import('./catalog.js');
-const { resetMemoryDb } = await import('../memory/db.js');
+const { openMemoryDb, resetMemoryDb } = await import('../memory/db.js');
 const { rememberFact, getFact } = await import('../memory/facts.js');
+const { loadFactEntityEdges } = await import('../memory/relations.js');
 const { appendFactRecallTrace } = await import('../memory/recall-trace.js');
+const { recordRecallRun } = await import('../memory/recall-usage.js');
 const { listProposedMemoryFixes } = await import('../memory/self-heal.js');
 const { loadFactEmbeddings, _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
 
@@ -72,6 +74,10 @@ test('memory_self_heal is exposed in the local MCP catalog', () => {
   assert.ok(LOCAL_MCP_TOOL_NAMES.includes('memory_self_heal'));
 });
 
+test('memory_mark_used is exposed in the local MCP catalog', () => {
+  assert.ok(LOCAL_MCP_TOOL_NAMES.includes('memory_mark_used'));
+});
+
 test('convert_to_markdown is exposed in the local MCP catalog', () => {
   assert.ok(LOCAL_MCP_TOOL_NAMES.includes('convert_to_markdown'));
 });
@@ -88,6 +94,171 @@ function registeredToolHandlers(): Map<string, (args: Record<string, unknown>) =
   registerMemoryTools(server as never);
   return handlers;
 }
+
+test('memory_remember rejects one-off task requests but accepts explicit standing rules', async () => {
+  const previous = process.env.CLEMMY_REMEMBER_RECONCILE;
+  process.env.CLEMMY_REMEMBER_RECONCILE = 'off';
+  try {
+    const handler = registeredToolHandlers().get('memory_remember');
+    assert.ok(handler);
+    const rejected = await handler!({
+      kind: 'user',
+      content: 'Quick task: briefly analyze one client and email me the result.',
+    });
+    assert.match(rejected.content[0].text, /Not remembered.*one-time command/i);
+    assert.equal((openMemoryDb().prepare('SELECT COUNT(*) AS count FROM consolidated_facts').get() as { count: number }).count, 0);
+
+    const accepted = await handler!({
+      kind: 'feedback',
+      content: 'Send the pipeline report every Monday to the sales list.',
+    });
+    assert.match(accepted.content[0].text, /Remembered/);
+    assert.equal((openMemoryDb().prepare('SELECT COUNT(*) AS count FROM consolidated_facts').get() as { count: number }).count, 1);
+
+    const repeated = await handler!({
+      kind: 'feedback',
+      content: '  Send the pipeline report every Monday to the sales list.  ',
+    });
+    assert.match(repeated.content[0].text, /Reinforced an existing fact/);
+    assert.equal((openMemoryDb().prepare('SELECT COUNT(*) AS count FROM consolidated_facts').get() as { count: number }).count, 1,
+      'the old reconcile=off setting must not restore the direct-write bypass');
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_REMEMBER_RECONCILE;
+    else process.env.CLEMMY_REMEMBER_RECONCILE = previous;
+  }
+});
+
+test('memory_remember creates evidence-backed entities and reuses a person by exact personal email', async () => {
+  const previous = process.env.CLEMMY_REMEMBER_RECONCILE;
+  process.env.CLEMMY_REMEMBER_RECONCILE = 'off';
+  try {
+    const handler = registeredToolHandlers().get('memory_remember');
+    assert.ok(handler, 'memory_remember should be registered');
+
+    const first = await handler!({
+      kind: 'project',
+      content: 'Dana Smith (dana@acme.com) works at Acme.',
+      sessionId: 'remember-entity-session-1',
+      entities: [
+        { type: 'person', name: 'Dana Smith', aliases: ['Dana'], identifiers: [{ scheme: 'email', value: 'dana@acme.com' }] },
+        { type: 'company', name: 'Acme' },
+      ],
+      relationships: [{ subject: 'Dana Smith', predicate: 'works at', object: 'Acme' }],
+    });
+    assert.match(first.content[0].text, /linked 2 canonical entities/);
+    assert.match(first.content[0].text, /grounded 1 relationship/);
+
+    const second = await handler!({
+      kind: 'project',
+      content: 'D. Smith (dana@acme.com) leads Project Kite.',
+      sessionId: 'remember-entity-session-2',
+      entities: [
+        { type: 'person', name: 'D. Smith', aliases: ['Dana Smith'], identifiers: [{ scheme: 'email', value: 'dana@acme.com' }] },
+        { type: 'project', name: 'Project Kite' },
+      ],
+      relationships: [{ subject: 'D. Smith', predicate: 'leads', object: 'Project Kite', validFrom: '2026-07-01T00:00:00.000Z' }],
+    });
+    assert.match(second.content[0].text, /linked 2 canonical entities/);
+    assert.match(second.content[0].text, /grounded 1 relationship/);
+
+    const db = openMemoryDb();
+    const people = db.prepare("SELECT id, canonical_name FROM entities WHERE entity_type = 'person'").all() as Array<{ id: number; canonical_name: string }>;
+    assert.equal(people.length, 1, 'the stable email must converge the name variant into one person');
+    assert.equal(people[0].canonical_name, 'Dana Smith');
+    assert.equal((db.prepare("SELECT COUNT(*) AS c FROM entity_identifiers WHERE entity_id = ? AND scheme = 'email' AND value_norm = 'dana@acme.com'").get(people[0].id) as { c: number }).c, 1);
+    assert.equal((db.prepare("SELECT COUNT(*) AS c FROM entity_aliases WHERE entity_id = ? AND alias_lc = 'd. smith'").get(people[0].id) as { c: number }).c, 1);
+
+    const facts = db.prepare("SELECT id FROM consolidated_facts WHERE content IN (?, ?) ORDER BY id")
+      .all('Dana Smith (dana@acme.com) works at Acme.', 'D. Smith (dana@acme.com) leads Project Kite.') as Array<{ id: number }>;
+    assert.equal(facts.length, 2);
+    const edges = loadFactEntityEdges(facts.map((fact) => fact.id));
+    assert.equal(edges.length, 4);
+    assert.ok(edges.every((edge) => edge.truth === 'stored' && edge.evidenceEpisodeId && edge.evidenceExcerpt));
+    assert.equal(edges.filter((edge) => edge.entityId === people[0].id).length, 2, 'both facts should replay through the same canonical person');
+    const relationships = db.prepare(`
+      SELECT ee.predicate, ee.subject_id, ee.object_id, eee.excerpt, eee.source_fact_id, eee.extraction_method
+      FROM entity_edges ee
+      JOIN entity_edge_evidence eee
+        ON eee.subject_id = ee.subject_id AND eee.predicate = ee.predicate AND eee.object_id = ee.object_id
+      ORDER BY ee.predicate
+    `).all() as Array<{ predicate: string; subject_id: number; object_id: number; excerpt: string; source_fact_id: number; extraction_method: string }>;
+    assert.deepEqual(relationships.map((row) => row.predicate), ['leads', 'works at']);
+    assert.ok(relationships.every((row) => row.subject_id === people[0].id));
+    assert.ok(relationships.every((row) => row.excerpt.length > 0 && facts.some((fact) => fact.id === row.source_fact_id)));
+    assert.ok(relationships.every((row) => row.extraction_method === 'manual'));
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_REMEMBER_RECONCILE;
+    else process.env.CLEMMY_REMEMBER_RECONCILE = previous;
+  }
+});
+
+test('memory_remember rejects unnamed entities and drops identifiers absent from evidence', async () => {
+  const previous = process.env.CLEMMY_REMEMBER_RECONCILE;
+  process.env.CLEMMY_REMEMBER_RECONCILE = 'off';
+  try {
+    const handler = registeredToolHandlers().get('memory_remember');
+    assert.ok(handler);
+    const response = await handler!({
+      kind: 'user',
+      content: 'Nathan Reynolds met Alex at the memory review.',
+      entities: [
+        { type: 'person', name: 'Nathan Reynolds', identifiers: [{ scheme: 'email', value: 'invented@example.com' }] },
+        { type: 'person', name: 'Morgan Jones', identifiers: [{ scheme: 'email', value: 'morgan@example.com' }] },
+      ],
+      relationships: [{ subject: 'Nathan Reynolds', predicate: 'knows', object: 'Morgan Jones' }],
+    });
+    assert.match(response.content[0].text, /linked 1 canonical entity/);
+    assert.match(response.content[0].text, /rejected 2 unsupported annotation/);
+
+    const db = openMemoryDb();
+    assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entities').get() as { c: number }).c, 1);
+    assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entity_identifiers').get() as { c: number }).c, 0);
+    assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entity_edges').get() as { c: number }).c, 0);
+    const row = db.prepare("SELECT id FROM entities WHERE canonical_name = 'Nathan Reynolds'").get() as { id: number } | undefined;
+    assert.ok(row);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_REMEMBER_RECONCILE;
+    else process.env.CLEMMY_REMEMBER_RECONCILE = previous;
+  }
+});
+
+test('memory_mark_used credits an exact recalled fact once', async () => {
+  const fact = rememberFact({ kind: 'project', content: 'The live review is about the Atlas partnership.' });
+  const run = recordRecallRun({
+    objective: 'what was the live review about?',
+    surface: 'test',
+    answerability: 'supported',
+    candidateRefs: [{ type: 'fact', id: String(fact.id) }],
+  });
+  const handler = registeredToolHandlers().get('memory_mark_used');
+  assert.ok(handler, 'memory_mark_used should be registered');
+
+  const result = await handler!({ recall_id: run.id, refs: [`fact:${fact.id}`], detail: 'Supplied the meeting topic.' });
+  assert.match(result.content[0].text, /Recorded 1 material-use ref/);
+  assert.match(result.content[0].text, new RegExp(`Credited fact #${fact.id}\\b`));
+  assert.equal(getFact(fact.id)?.utilityCount, 1);
+
+  const retry = await handler!({ recall_id: run.id, refs: [`fact:${fact.id}`] });
+  assert.match(retry.content[0].text, /duplicate ignored/);
+  assert.equal(getFact(fact.id)?.utilityCount, 1);
+});
+
+test('memory_search_facts returns attributable refs instead of uncreditable fact rows', async () => {
+  const fact = rememberFact({ kind: 'project', content: 'The Atlas partnership review is scheduled for Thursday.' });
+  const handlers = registeredToolHandlers();
+  const search = handlers.get('memory_search_facts');
+  const mark = handlers.get('memory_mark_used');
+  assert.ok(search && mark);
+
+  const result = await search!({ query: 'Atlas partnership review Thursday', limit: 8 });
+  const text = result.content[0].text;
+  assert.match(text, new RegExp(`\\[fact:${fact.id}\\]`));
+  const recallId = text.match(/recall_id\s+(mr-[a-f0-9-]+)/i)?.[1];
+  assert.ok(recallId, 'scoped fact search should create an attribution run');
+
+  await mark!({ recall_id: recallId!, refs: [`fact:${fact.id}`], detail: 'Supplied the review date.' });
+  assert.equal(getFact(fact.id)?.utilityCount, 1);
+});
 
 test('memory_self_heal tool lists, applies, and reverts audited memory fixes', async () => {
   const overexposed = rememberFact({

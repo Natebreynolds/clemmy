@@ -2,21 +2,29 @@ import { openMemoryDb, type MemoryEpisodeStatus } from './db.js';
 import {
   findSimilarFactsScored,
   getFact,
+  getFactAt,
   lexicalRelevance,
   searchFactsByText,
   searchFactsByTextAt,
   type ConsolidatedFact,
 } from './facts.js';
-import { recallHybrid, resolveTemporalMeetingDate } from './recall.js';
+import { recallHybrid, resolveRecallTimeZone, resolveTemporalMeetingDate } from './recall.js';
 import {
   getFactIdsForEntity,
   getFactIdsForResource,
   getNeighborEntityIds,
+  loadFactEntityEdges,
+  loadFactResourceEdges,
   resolveEntityIdsForText,
 } from './relations.js';
-import { listResourcePointers } from './source-map.js';
+import { getResourcePointersByIds, listAllResourcePointers, type ResourcePointer } from './source-map.js';
 import { matchToolChoicesForStep } from './tool-choice-store.js';
 import { getFactEvidence, listMemoryPolicies } from './temporal-memory.js';
+import {
+  readRecallRefUtilitySignals,
+  serializeRecallRef,
+  type RecallRefUtilitySignal,
+} from './recall-usage.js';
 
 export type MemoryRef =
   | { type: 'fact'; id: string }
@@ -40,7 +48,7 @@ export interface MemoryEvidenceHit {
 export interface MemoryRecallResult {
   hits: MemoryEvidenceHit[];
   answerability: 'supported' | 'partial' | 'insufficient';
-  diagnostics: { candidates: number; stores: string[]; elapsedMs: number };
+  diagnostics: { candidates: number; stores: string[]; elapsedMs: number; utilityAdjusted?: number };
 }
 
 export interface MemoryRecallContext {
@@ -58,6 +66,8 @@ export interface MemoryRecallContext {
 
 const STOP = new Set(['the', 'and', 'for', 'with', 'from', 'this', 'that', 'what', 'when', 'where', 'how', 'your']);
 const IN_PERSON_RE = /\b(?:in\s*-?\s*person|inperson)(?=$|[^a-z0-9])/i;
+const INSUFFICIENT_MEETING_CONTENT_RE = /\b(?:transcript too short|untranscribed|contained no discussion|no (?:usable )?(?:discussion|transcript)|recording (?:was )?empty)\b/i;
+const MEETING_TOPIC_INTENT_RE = /\b(?:about|discuss(?:ed|ion)?|cover(?:ed|age)?|summar(?:y|ize|ise)|topics?|decisions?|action items?|takeaways?|what happened)\b/i;
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 
 function tokens(text: string): Set<string> {
@@ -70,6 +80,126 @@ function overlapScore(queryTokens: Set<string>, text: string): number {
   let matched = 0;
   for (const token of queryTokens) if (hay.has(token)) matched += 1;
   return matched / queryTokens.size;
+}
+
+function meetingContentSupportsTopicAnswer(text: string): boolean {
+  if (INSUFFICIENT_MEETING_CONTENT_RE.test(text)) return false;
+  const summary = text.match(/\bSummary:\s*([\s\S]*?)(?=\n(?:Topics|Participants|Decisions|Action items|Notes|Transcript):|$)/i)?.[1]?.trim();
+  if (summary && summary.length >= 40) return true;
+  const transcript = text.match(/\bTranscript:\s*([\s\S]*)$/i)?.[1]?.trim();
+  if (transcript && transcript.length >= 40) return true;
+  // Vault meeting snippets omit the literal `Summary:` label after rendering.
+  return text.length >= 100 && tokens(text).size >= 12;
+}
+
+function localDateKey(iso: string, timeZone?: string): string {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return iso.slice(0, 10);
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const value = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+    return `${value('year')}-${value('month')}-${value('day')}`;
+  } catch {
+    return iso.slice(0, 10);
+  }
+}
+
+export interface TemporalQueryWindow {
+  startMs: number;
+  endMs: number;
+  startDate: string;
+  endDate: string;
+  label: string;
+}
+
+function shiftDateKey(dateKey: string, days: number): string {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
+function monthDateRange(dateKey: string, monthOffset: number): { start: string; end: string } {
+  const [year, month] = dateKey.split('-').map(Number);
+  const start = new Date(Date.UTC(year, month - 1 + monthOffset, 1));
+  const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0));
+  return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+}
+
+function yearDateRange(dateKey: string, yearOffset: number): { start: string; end: string } {
+  const year = Number(dateKey.slice(0, 4)) + yearOffset;
+  return { start: `${year}-01-01`, end: `${year}-12-31` };
+}
+
+/** Convert a wall-clock instant in an IANA zone to UTC. Iterating the observed
+ * offset avoids hard-coded DST assumptions and keeps relative dates stable at
+ * midnight boundaries. */
+function zonedWallClockMs(dateKey: string, timeZone: string): number {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const desired = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+  let guess = desired;
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23',
+  });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = formatter.formatToParts(new Date(guess));
+    const value = (type: Intl.DateTimeFormatPartTypes): number => Number(parts.find((part) => part.type === type)?.value);
+    const observed = Date.UTC(value('year'), value('month') - 1, value('day'), value('hour'), value('minute'), value('second'));
+    const delta = desired - observed;
+    guess += delta;
+    if (delta === 0) break;
+  }
+  return guess;
+}
+
+/** Resolve common event-time expressions to an exact user-local window. This
+ * is intentionally deterministic and bounded; unsupported prose leaves the
+ * query unfiltered instead of guessing. */
+export function resolveTemporalQueryWindow(
+  query: string,
+  options: { nowMs?: number; timeZone?: string } = {},
+): TemporalQueryWindow | null {
+  const timeZone = resolveRecallTimeZone(options.timeZone);
+  const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+  const today = localDateKey(new Date(nowMs).toISOString(), timeZone);
+  let range: { start: string; end: string; label: string } | null = null;
+  const explicitDate = query.match(/\b(20\d{2}-\d{2}-\d{2})\b/)?.[1];
+  if (explicitDate) range = { start: explicitDate, end: explicitDate, label: explicitDate };
+  else if (/\byesterday\b/i.test(query)) {
+    const date = shiftDateKey(today, -1);
+    range = { start: date, end: date, label: 'yesterday' };
+  } else if (/\b(?:today|tonight|this\s+(?:morning|afternoon|evening))\b/i.test(query)) {
+    range = { start: today, end: today, label: 'today' };
+  } else if (/\blast\s+week\b/i.test(query) || /\bthis\s+week\b/i.test(query)) {
+    const [year, month, day] = today.split('-').map(Number);
+    const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+    const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
+    const thisMonday = shiftDateKey(today, mondayOffset);
+    const last = /\blast\s+week\b/i.test(query);
+    const start = shiftDateKey(thisMonday, last ? -7 : 0);
+    range = { start, end: last ? shiftDateKey(start, 6) : today, label: last ? 'last week' : 'this week' };
+  } else if (/\blast\s+month\b/i.test(query) || /\bthis\s+month\b/i.test(query)) {
+    const last = /\blast\s+month\b/i.test(query);
+    const dates = monthDateRange(today, last ? -1 : 0);
+    range = { ...dates, end: last ? dates.end : today, label: last ? 'last month' : 'this month' };
+  } else if (/\blast\s+year\b/i.test(query) || /\bthis\s+year\b/i.test(query)) {
+    const last = /\blast\s+year\b/i.test(query);
+    const dates = yearDateRange(today, last ? -1 : 0);
+    range = { ...dates, end: last ? dates.end : today, label: last ? 'last year' : 'this year' };
+  } else {
+    const year = query.match(/\b(?:in|during)\s+(20\d{2})\b/i)?.[1];
+    if (year) range = { start: `${year}-01-01`, end: `${year}-12-31`, label: year };
+  }
+  if (!range) return null;
+  const startMs = zonedWallClockMs(range.start, timeZone);
+  const endMs = zonedWallClockMs(shiftDateKey(range.end, 1), timeZone) - 1;
+  return { startMs, endMs, startDate: range.start, endDate: range.end, label: range.label };
 }
 
 function factHit(fact: ConsolidatedFact, score: number, why: string[]): MemoryEvidenceHit {
@@ -104,6 +234,154 @@ function mergeHit(target: Map<string, MemoryEvidenceHit>, hit: MemoryEvidenceHit
   existing.evidence = Array.from(evidence.values());
 }
 
+function memoryRefKey(ref: MemoryRef): string {
+  return `${ref.type}:${ref.id}`;
+}
+
+/**
+ * A small, bounded rerank signal from explicit material-use attribution.
+ * Relevance, temporal validity, and evidence remain dominant: even a ref used
+ * hundreds of times can gain at most 0.08. Explicit not-useful outcomes dampen
+ * the bonus, but never push a candidate below its evidence-derived score.
+ */
+export function recallUtilityBonus(
+  signal: RecallRefUtilitySignal | undefined,
+  nowMs = Date.now(),
+): number {
+  if (!signal || signal.used <= 0) return 0;
+  const total = Math.max(signal.used, signal.used + Math.max(0, signal.notUseful));
+  const reliability = clamp(signal.used / total, 0, 1);
+  const frequency = clamp(Math.log1p(signal.used) / Math.log1p(20), 0, 1);
+  let recency = 0;
+  const lastUsedMs = signal.lastUsedAt ? Date.parse(signal.lastUsedAt) : Number.NaN;
+  if (Number.isFinite(lastUsedMs)) {
+    const ageDays = Math.max(0, (nowMs - lastUsedMs) / (24 * 60 * 60 * 1_000));
+    recency = 0.02 * Math.exp(-ageDays / 90);
+  }
+  return clamp(reliability * (0.06 * frequency + recency), 0, 0.08);
+}
+
+function applyUtilityRerank(
+  hits: MemoryEvidenceHit[],
+  nowMs: number,
+): { hits: MemoryEvidenceHit[]; adjusted: number } {
+  const signals = readRecallRefUtilitySignals(hits.map((hit) => ({
+    type: hit.ref.type,
+    id: String(hit.ref.id),
+  })));
+  let adjusted = 0;
+  const reranked = hits.map((hit) => {
+    const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
+    const bonus = recallUtilityBonus(signal, nowMs);
+    if (bonus <= 0 || !signal) return hit;
+    adjusted += 1;
+    const outcomes = signal.used + signal.notUseful;
+    return {
+      ...hit,
+      score: clamp(hit.score + bonus, 0, 1),
+      whyRecalled: Array.from(new Set([
+        ...hit.whyRecalled,
+        `proven useful in ${signal.used} attributed recall${signal.used === 1 ? '' : 's'}`,
+        ...(signal.notUseful > 0 ? [`material-use evidence ${signal.used}/${outcomes}`] : []),
+      ])),
+    };
+  });
+  return { hits: reranked, adjusted };
+}
+
+function normalizedMeetingSourceUri(sourceUri?: string | null): string | null {
+  const trimmed = sourceUri?.trim();
+  if (!trimmed || !/^meeting:\/\//i.test(trimmed)) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const provider = parsed.hostname.toLowerCase();
+    const meetingId = decodeURIComponent(parsed.pathname.replace(/^\/+|\/+$/g, ''));
+    if (!provider || !meetingId) return null;
+    return `meeting://${provider}/${encodeURIComponent(meetingId)}`;
+  } catch {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+interface MeetingNoteIdentity {
+  logicalKey: string;
+  sourceUri: string;
+}
+
+/** Resolve the stable recording identity embedded in a meeting artifact. This
+ * is exact metadata matching, not title/date similarity: if the artifact does
+ * not carry a meeting id, it remains an independent note. */
+function meetingNoteIdentity(filePath: string): MeetingNoteIdentity | null {
+  if (!filePath.replace(/\\/g, '/').includes('/04-Meetings/')) return null;
+  const db = openMemoryDb();
+  const row = db.prepare(`
+    SELECT content FROM vault_chunks
+    WHERE path = ? AND content LIKE '%type: meeting-transcript%'
+    ORDER BY chunk_index ASC LIMIT 1
+  `).get(filePath) as { content: string } | undefined;
+  if (!row) return null;
+  const value = (key: string) => row.content.match(new RegExp(`^${key}:\\s*(.+)$`, 'im'))?.[1]?.trim();
+  const meetingId = value('meeting_id');
+  if (!meetingId) return null;
+  const provider = value('provider')?.toLowerCase()
+    || (IN_PERSON_RE.test(`${value('source') ?? ''} ${filePath}`) ? 'local' : 'recall');
+  const derivedSourceUri = normalizedMeetingSourceUri(`meeting://${provider}/${encodeURIComponent(meetingId)}`);
+  if (!derivedSourceUri) return null;
+  const episode = db.prepare(`
+    SELECT source_uri FROM memory_episodes
+    WHERE subtype = 'meeting'
+      AND (source_uri = ? OR (call_id = ? AND (session_id = ? OR session_id IS NULL)))
+    ORDER BY CASE WHEN source_uri = ? THEN 0 ELSE 1 END, occurred_at DESC
+    LIMIT 1
+  `).get(derivedSourceUri, meetingId, `meeting:${provider}`, derivedSourceUri) as { source_uri: string | null } | undefined;
+  const sourceUri = normalizedMeetingSourceUri(episode?.source_uri) ?? derivedSourceUri;
+  return { logicalKey: `meeting:${sourceUri}`, sourceUri };
+}
+
+function collapseMeetingRepresentations(
+  hits: MemoryEvidenceHit[],
+  logicalKeys: Map<string, string>,
+): MemoryEvidenceHit[] {
+  const groups = new Map<string, MemoryEvidenceHit[]>();
+  const standalone: MemoryEvidenceHit[] = [];
+  for (const hit of hits) {
+    const key = logicalKeys.get(memoryRefKey(hit.ref));
+    if (!key) { standalone.push(hit); continue; }
+    const group = groups.get(key) ?? [];
+    group.push(hit);
+    groups.set(key, group);
+  }
+
+  const collapsed = Array.from(groups.values()).map((group) => {
+    if (group.length === 1) return group[0];
+    const canonical = group.find((hit) => hit.ref.type === 'episode')
+      ?? group.reduce((best, hit) => hit.score > best.score ? hit : best);
+    const richest = [...group].sort((a, b) =>
+      Number(meetingContentSupportsTopicAnswer(b.text)) - Number(meetingContentSupportsTopicAnswer(a.text))
+      || b.text.length - a.text.length
+      || Number(b.ref.type === 'episode') - Number(a.ref.type === 'episode'))[0];
+    const evidence = new Map<string, MemoryEvidenceHit['evidence'][number]>();
+    for (const hit of group) for (const item of hit.evidence) {
+      evidence.set(`${item.episodeId}:${item.sourceUri ?? ''}:${item.excerpt}`, item);
+    }
+    return {
+      ...canonical,
+      title: canonical.title ?? richest.title,
+      text: richest.text,
+      score: Math.max(...group.map((hit) => hit.score)),
+      confidence: Math.max(...group.map((hit) => hit.confidence)),
+      validFrom: canonical.validFrom ?? richest.validFrom,
+      validTo: canonical.validTo ?? richest.validTo,
+      evidence: Array.from(evidence.values()),
+      whyRecalled: Array.from(new Set([
+        ...group.flatMap((hit) => hit.whyRecalled),
+        'cross-store meeting representations collapsed',
+      ])),
+    } satisfies MemoryEvidenceHit;
+  });
+  return [...standalone, ...collapsed];
+}
+
 function isValidAt(fact: ConsolidatedFact, asOfMs: number): boolean {
   const from = Date.parse(fact.validFrom ?? fact.createdAt);
   const to = fact.validTo ? Date.parse(fact.validTo) : Number.POSITIVE_INFINITY;
@@ -131,11 +409,17 @@ function diversify(hits: MemoryEvidenceHit[], limit: number): MemoryEvidenceHit[
   return selected;
 }
 
-function resolveAsOf(query: string, explicit?: string, nowMs = Date.now()): { iso?: string; ms: number } {
+function resolveAsOf(query: string, explicit?: string, nowMs = Date.now(), timeZone?: string): { iso?: string; ms: number } {
   const raw = explicit?.trim()
     || query.match(/\b(?:as of|on)\s+(\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]+)?)/i)?.[1]
     || query.match(/\b(?:as of|in)\s+(\d{4})\b/i)?.[1];
-  if (!raw) return { ms: nowMs };
+  if (!raw) {
+    const relative = /\b(?:as\s+of|by|before)\s+(?:today|yesterday|this\s+(?:week|month|year)|last\s+(?:week|month|year))\b/i.test(query)
+      ? resolveTemporalQueryWindow(query, { nowMs, timeZone })
+      : null;
+    if (!relative) return { ms: nowMs };
+    return { iso: new Date(relative.endMs).toISOString(), ms: relative.endMs };
+  }
   const normalized = /^\d{4}$/.test(raw) ? `${raw}-12-31T23:59:59.999Z`
     : /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T23:59:59.999Z`
       : raw.replace(' ', 'T');
@@ -154,23 +438,28 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const wanted = new Set(context.stores ?? ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure']);
   const usedStores = new Set<string>();
   const merged = new Map<string, MemoryEvidenceHit>();
+  const logicalMeetingKeys = new Map<string, string>();
   if (!objective) return { hits: [], answerability: 'insufficient', diagnostics: { candidates: 0, stores: [], elapsedMs: 0 } };
   const queryTokens = tokens(objective);
   const contextNowMs = context.now ? Date.parse(context.now) : Date.now();
   const nowMs = Number.isFinite(contextNowMs) ? contextNowMs : Date.now();
-  const recallTime = resolveAsOf(objective, context.asOf, nowMs);
+  const timeZone = resolveRecallTimeZone(context.timeZone);
+  const recallTime = resolveAsOf(objective, context.asOf, nowMs, timeZone);
   const asOfMs = recallTime.ms;
   const historicalAsOf = recallTime.iso;
-  const temporalMeetingDate = resolveTemporalMeetingDate(objective, { nowMs, timeZone: context.timeZone });
+  const temporalMeetingDate = resolveTemporalMeetingDate(objective, { nowMs, timeZone });
+  const temporalMeetingTopicQuery = Boolean(temporalMeetingDate && MEETING_TOPIC_INTENT_RE.test(objective));
+  const temporalWindow = resolveTemporalQueryWindow(objective, { nowMs, timeZone });
+  const searchFactsAsGraphBridge = wanted.has('fact') || depth > 0;
 
   const [semanticFacts, notes] = await Promise.all([
-    wanted.has('fact') ? findSimilarFactsScored(objective, { topK: perStore }).catch(() => []) : Promise.resolve([]),
-    wanted.has('note') ? recallHybrid(objective, { limit: perStore, nowMs, timeZone: context.timeZone }).catch(() => []) : Promise.resolve([]),
+    searchFactsAsGraphBridge ? findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }).catch(() => []) : Promise.resolve([]),
+    wanted.has('note') ? recallHybrid(objective, { limit: perStore, nowMs, timeZone }).catch(() => []) : Promise.resolve([]),
   ]);
 
   const factIds = new Set<number>();
-  if (wanted.has('fact')) {
-    usedStores.add('fact');
+  if (searchFactsAsGraphBridge) {
+    if (wanted.has('fact')) usedStores.add('fact');
     const lexical = historicalAsOf
       ? searchFactsByTextAt(objective, historicalAsOf, perStore)
       : searchFactsByText(objective, perStore);
@@ -190,7 +479,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
         lexicalScore > 0 ? `lexical relevance ${lexicalScore.toFixed(2)}` : '',
         hit.evidence.length > 0 ? 'source-backed' : '',
       ].filter(Boolean);
-      mergeHit(merged, hit);
+      if (wanted.has('fact')) mergeHit(merged, hit);
     }
   }
 
@@ -205,7 +494,8 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
         && normalizedPath.includes('/04-Meetings/')
         && (normalizedPath.includes(temporalMeetingDate) || note.snippet.includes(temporalMeetingDate)),
       );
-      mergeHit(merged, {
+      const identity = meetingNoteIdentity(note.filePath);
+      const hit: MemoryEvidenceHit = {
         ref: { type: 'note', id: note.filePath },
         title: note.title,
         text: note.snippet,
@@ -218,92 +508,244 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
         whyRecalled: exactTemporalMeeting
           ? ['exact temporal match', inPersonMatch ? 'in-person capture match' : '', 'recorded meeting source', 'vault type meeting-transcript'].filter(Boolean)
           : ['vault lexical/vector retrieval'],
-      });
+      };
+      mergeHit(merged, hit);
+      if (identity) logicalMeetingKeys.set(memoryRefKey(hit.ref), identity.logicalKey);
     });
   }
 
-  let entityIds: number[] = [];
+  const directEntityIdSet = new Set<number>();
+  const factLinkedEntityIdSet = new Set<number>();
+  const neighborEntityIdSet = new Set<number>();
+  const entityIds = new Set<number>();
   if (wanted.has('entity') || depth > 0) {
     const directEntityIds = resolveEntityIdsForText(objective, perStore);
-    const directEntityIdSet = new Set(directEntityIds);
-    entityIds = directEntityIds;
-    if (directEntityIds.length > 0) usedStores.add('entity');
-    if (depth === 2) entityIds = Array.from(new Set([
-      ...entityIds,
-      ...getNeighborEntityIds(entityIds, perStore, historicalAsOf ?? new Date(asOfMs).toISOString()),
-    ]));
-    if (entityIds.length > 0) {
-      const db = openMemoryDb();
-      const ph = entityIds.map(() => '?').join(',');
-      const rows = db.prepare(`
-        SELECT id, entity_type, canonical_name, mention_count FROM entities WHERE id IN (${ph})
-      `).all(...entityIds) as Array<{ id: number; entity_type: string; canonical_name: string; mention_count: number }>;
-      for (const row of rows) {
-        if (wanted.has('entity')) mergeHit(merged, {
-          ref: { type: 'entity', id: row.id },
-          title: row.canonical_name,
-          text: `${row.entity_type} · mentioned ${row.mention_count}×`,
-          score: directEntityIdSet.has(row.id) ? 0.72 : 0.48,
-          confidence: 0.75,
-          evidence: [],
-          whyRecalled: [directEntityIdSet.has(row.id) ? 'entity name or alias matched' : 'stored entity relation'],
-        });
-        if (depth > 0) for (const id of getFactIdsForEntity(row.id, perStore, historicalAsOf)) factIds.add(id);
-      }
+    for (const id of directEntityIds) {
+      directEntityIdSet.add(id);
+      entityIds.add(id);
+      if (depth > 0) for (const factId of getFactIdsForEntity(id, perStore, historicalAsOf)) factIds.add(factId);
     }
   }
 
-  const resources = listResourcePointers({ limit: 2_000 })
+  const directResources = (wanted.has('resource') || depth > 0 ? listAllResourcePointers() : [])
     .map((resource) => ({ resource, overlap: overlapScore(queryTokens, `${resource.name} ${resource.whatsHere ?? ''} ${resource.whenToUse ?? ''}`) }))
     .filter((item) => item.overlap * Math.max(1, queryTokens.size) >= (context.resourceMinOverlap ?? 1))
     .sort((a, b) => b.overlap - a.overlap)
     .slice(0, perStore);
-  if (wanted.has('resource') && resources.length > 0) usedStores.add('resource');
-  for (const { resource, overlap } of resources) {
-    if (wanted.has('resource')) mergeHit(merged, {
-      ref: { type: 'resource', id: resource.id },
-      title: resource.name,
-      text: `${resource.app}${resource.whatsHere ? ` · ${resource.whatsHere}` : ''}`,
-      score: 0.38 + 0.42 * overlap,
-      confidence: resource.trust ?? 0.7,
-      evidence: [],
-      whyRecalled: [`resource overlap ${overlap.toFixed(2)}`],
-    });
+  const directResourceOverlap = new Map<number, number>();
+  const resourceById = new Map<number, ResourcePointer>();
+  const resourceIds = new Set<number>();
+  const factLinkedResourceIdSet = new Set<number>();
+  for (const { resource, overlap } of directResources) {
+    directResourceOverlap.set(resource.id, overlap);
+    resourceById.set(resource.id, resource);
+    resourceIds.add(resource.id);
     if (depth > 0) for (const id of getFactIdsForResource(resource.id, perStore, historicalAsOf)) factIds.add(id);
+  }
+
+  // Bidirectional stored-graph expansion. Previous recall could travel from a
+  // directly named entity/resource into facts, but a semantic fact hit was a
+  // dead end. Traverse the exact persisted joins in the opposite direction so
+  // a recalled claim can surface its people, resources, and source episodes.
+  // Explicitly inferred text matches remain excluded from recall.
+  const graphFactIds = Array.from(factIds).slice(0, perStore * 4);
+  const factEntityEdges = depth > 0
+    ? loadFactEntityEdges(graphFactIds).filter((edge) => edge.truth === 'stored')
+    : [];
+  const factResourceEdges = depth > 0
+    ? loadFactResourceEdges(graphFactIds).filter((edge) => edge.truth === 'stored')
+    : [];
+  for (const edge of factEntityEdges) {
+    entityIds.add(edge.entityId);
+    factLinkedEntityIdSet.add(edge.entityId);
+  }
+  for (const edge of factResourceEdges) {
+    resourceIds.add(edge.resourceId);
+    factLinkedResourceIdSet.add(edge.resourceId);
+  }
+
+  if (depth === 2 && entityIds.size > 0) {
+    const neighbors = getNeighborEntityIds(
+      Array.from(entityIds),
+      perStore,
+      historicalAsOf ?? new Date(asOfMs).toISOString(),
+    );
+    for (const id of neighbors) {
+      entityIds.add(id);
+      neighborEntityIdSet.add(id);
+    }
+    // Second hop: every stored entity/resource reached from a fact can lead to
+    // other temporally valid claims. Keep the fan-out bounded per store.
+    for (const id of Array.from(entityIds).slice(0, perStore * 2)) {
+      for (const factId of getFactIdsForEntity(id, perStore, historicalAsOf)) factIds.add(factId);
+    }
+    for (const id of Array.from(resourceIds).slice(0, perStore * 2)) {
+      for (const factId of getFactIdsForResource(id, perStore, historicalAsOf)) factIds.add(factId);
+    }
+  }
+
+  if (entityIds.size > 0 && wanted.has('entity')) {
+    const ids = Array.from(entityIds).slice(0, perStore * 3);
+    const ph = ids.map(() => '?').join(',');
+    const rows = openMemoryDb().prepare(`
+      SELECT id, entity_type, canonical_name, mention_count FROM entities WHERE id IN (${ph})
+    `).all(...ids) as Array<{ id: number; entity_type: string; canonical_name: string; mention_count: number }>;
+    for (const row of rows) {
+      const supportingEdges = factEntityEdges.filter((edge) => edge.entityId === row.id);
+      const evidence = supportingEdges
+        .filter((edge) => edge.evidenceEpisodeId && edge.evidenceExcerpt?.trim())
+        .map((edge) => ({
+          episodeId: edge.evidenceEpisodeId!,
+          excerpt: edge.evidenceExcerpt!,
+        }));
+      const direct = directEntityIdSet.has(row.id);
+      const factLinked = factLinkedEntityIdSet.has(row.id);
+      mergeHit(merged, {
+        ref: { type: 'entity', id: row.id },
+        title: row.canonical_name,
+        text: `${row.entity_type} · mentioned ${row.mention_count}×`,
+        score: direct ? 0.72 : factLinked ? 0.58 : 0.48,
+        confidence: supportingEdges.length > 0
+          ? Math.max(...supportingEdges.map((edge) => edge.confidence))
+          : 0.75,
+        evidence,
+        whyRecalled: [
+          direct ? 'entity name or alias matched' : '',
+          factLinked ? 'stored fact-to-entity relationship' : '',
+          neighborEntityIdSet.has(row.id) ? 'stored entity relationship' : '',
+        ].filter(Boolean),
+      });
+    }
+    usedStores.add('entity');
+  }
+
+  for (const resource of getResourcePointersByIds(Array.from(resourceIds))) resourceById.set(resource.id, resource);
+  if (wanted.has('resource')) {
+    for (const resource of Array.from(resourceById.values()).slice(0, perStore * 3)) {
+      const supportingEdges = factResourceEdges.filter((edge) => edge.resourceId === resource.id);
+      const evidence = supportingEdges
+        .filter((edge) => edge.evidenceEpisodeId && edge.evidenceExcerpt?.trim())
+        .map((edge) => ({ episodeId: edge.evidenceEpisodeId!, excerpt: edge.evidenceExcerpt! }));
+      const overlap = directResourceOverlap.get(resource.id);
+      const factLinked = factLinkedResourceIdSet.has(resource.id);
+      mergeHit(merged, {
+        ref: { type: 'resource', id: resource.id },
+        title: resource.name,
+        text: `${resource.app}${resource.whatsHere ? ` · ${resource.whatsHere}` : ''}`,
+        score: overlap !== undefined ? 0.38 + 0.42 * overlap : factLinked ? 0.56 : 0.42,
+        confidence: supportingEdges.length > 0
+          ? Math.max(resource.trust ?? 0.7, ...supportingEdges.map((edge) => edge.confidence))
+          : resource.trust ?? 0.7,
+        evidence,
+        whyRecalled: [
+          overlap !== undefined ? `resource overlap ${overlap.toFixed(2)}` : '',
+          factLinked ? 'stored fact-to-resource relationship' : '',
+        ].filter(Boolean),
+      });
+    }
+    if (resourceById.size > 0) usedStores.add('resource');
   }
 
   // Graph-expanded facts are evidence-bearing context, not merely breadcrumbs.
   if (wanted.has('fact')) for (const id of factIds) {
-    const fact = getFact(id);
+    const fact = historicalAsOf ? getFactAt(id, historicalAsOf) : getFact(id);
     if (!fact || (!historicalAsOf && !fact.active) || !isValidAt(fact, asOfMs)) continue;
     mergeHit(merged, factHit(fact, 0.58 + 0.2 * lexicalRelevance(objective, fact.content), ['stored graph traversal']));
+  }
+
+  if (wanted.has('episode') && depth > 0) {
+    let linkedEpisodes = 0;
+    for (const factId of Array.from(factIds).slice(0, perStore * 4)) {
+      for (const evidence of getFactEvidence(factId)) {
+        if (linkedEpisodes >= perStore * 3) break;
+        if ((evidence.status !== 'available' && evidence.status !== 'partial') || !evidence.excerpt.trim()) continue;
+        const occurredAtMs = Date.parse(evidence.occurredAt);
+        if (Number.isFinite(occurredAtMs) && occurredAtMs > asOfMs) continue;
+        mergeHit(merged, {
+          ref: { type: 'episode', id: evidence.episodeId },
+          title: 'supporting memory episode',
+          text: evidence.excerpt,
+          score: 0.56,
+          confidence: evidence.status === 'available' ? 0.85 : 0.65,
+          validFrom: evidence.occurredAt,
+          evidence: [{ episodeId: evidence.episodeId, excerpt: evidence.excerpt, sourceUri: evidence.sourceUri }],
+          whyRecalled: ['stored fact-to-evidence relationship', `supports fact:${factId}`],
+        });
+        linkedEpisodes += 1;
+      }
+    }
+    if (linkedEpisodes > 0) usedStores.add('episode');
   }
 
   if (wanted.has('episode')) {
     const db = openMemoryDb();
     const tokenList = Array.from(queryTokens).slice(0, 8);
-    const rows = tokenList.length === 0 ? [] : db.prepare(`
-      SELECT id, kind, source_app, source_uri, occurred_at, evidence_excerpt, status
+    const lexicalClauses = tokenList.map(() => `LOWER(COALESCE(title, '') || ' ' || COALESCE(source_app, '') || ' ' || evidence_excerpt) LIKE ?`);
+    // A temporal meeting query is type-constrained. The previous `1 = 1`
+    // temporal widening admitted every episode from that day, allowing an
+    // unrelated manual memory to answer "what was my meeting about?" with
+    // false confidence when no meeting existed.
+    const candidateClauses = temporalMeetingDate
+      ? ["subtype = 'meeting'"]
+      : [
+          ...(lexicalClauses.length > 0 ? [`(${lexicalClauses.join(' OR ')})`] : []),
+          ...(temporalWindow ? ['1 = 1'] : []),
+        ];
+    const baseEpisodeSql = `
+      SELECT id, kind, subtype, title, source_app, source_uri, occurred_at, evidence_excerpt, status
       FROM memory_episodes
       WHERE evidence_excerpt IS NOT NULL
-        AND (${tokenList.map(() => 'LOWER(evidence_excerpt) LIKE ?').join(' OR ')})
+        AND status IN ('available','partial')
+        AND (${candidateClauses.join(' OR ')})
       ORDER BY occurred_at DESC
-      LIMIT ?
-    `).all(...tokenList.map((token) => `%${token}%`), perStore) as Array<{
-      id: string; kind: string; source_app: string | null; source_uri: string | null;
+    `;
+    const episodeQueryTokens = temporalMeetingDate ? [] : tokenList;
+    const rows = candidateClauses.length === 0 ? [] : (temporalWindow
+      ? db.prepare(baseEpisodeSql).all(...episodeQueryTokens.map((token) => `%${token}%`))
+      : db.prepare(`${baseEpisodeSql} LIMIT ?`).all(...episodeQueryTokens.map((token) => `%${token}%`), temporalMeetingDate ? 200 : perStore)) as Array<{
+      id: string; kind: string; subtype: string | null; title: string | null; source_app: string | null; source_uri: string | null;
       occurred_at: string; evidence_excerpt: string; status: MemoryEpisodeStatus;
     }>;
-    if (rows.length > 0) usedStores.add('episode');
-    for (const row of rows) mergeHit(merged, {
+    const rankedEpisodes = rows.map((row) => {
+      const lexical = overlapScore(queryTokens, `${row.title ?? ''} ${row.source_app ?? ''} ${row.evidence_excerpt}`);
+      const occurredAtMs = Date.parse(row.occurred_at);
+      const temporalMatch = Boolean(temporalWindow && Number.isFinite(occurredAtMs)
+        && occurredAtMs >= temporalWindow.startMs && occurredAtMs <= temporalWindow.endMs);
+      const exactTemporalMeeting = Boolean(temporalMeetingDate
+        && row.subtype === 'meeting'
+        && localDateKey(row.occurred_at, timeZone) === temporalMeetingDate);
+      return { row, lexical, temporalMatch, exactTemporalMeeting };
+    }).filter((item) => temporalMeetingDate
+      ? item.exactTemporalMeeting
+      : temporalWindow ? item.temporalMatch : item.lexical > 0)
+      .sort((a, b) => Number(b.exactTemporalMeeting) - Number(a.exactTemporalMeeting)
+        || Number(b.temporalMatch) - Number(a.temporalMatch) || b.lexical - a.lexical)
+      .slice(0, perStore);
+    if (rankedEpisodes.length > 0) usedStores.add('episode');
+    for (const { row, lexical, temporalMatch, exactTemporalMeeting } of rankedEpisodes) {
+      const hit: MemoryEvidenceHit = {
       ref: { type: 'episode', id: row.id },
-      title: row.source_app ?? row.kind,
+      title: row.title ?? row.source_app ?? row.kind,
       text: row.evidence_excerpt,
-      score: 0.35 + 0.4 * overlapScore(queryTokens, row.evidence_excerpt),
-      confidence: row.status === 'available' ? 0.85 : 0.55,
+      score: exactTemporalMeeting ? 0.97 : temporalMatch ? 0.88 + 0.08 * lexical : 0.35 + 0.45 * lexical,
+      confidence: row.status === 'available' ? 0.9 : row.status === 'partial' ? 0.65 : 0.4,
       validFrom: row.occurred_at,
       evidence: [{ episodeId: row.id, excerpt: row.evidence_excerpt, sourceUri: row.source_uri ?? undefined }],
-      whyRecalled: ['durable episode evidence'],
-    });
+      whyRecalled: exactTemporalMeeting
+        ? ['exact temporal match', 'first-class recorded meeting episode', row.source_app?.includes('In-person') ? 'in-person capture match' : '']
+          .filter(Boolean)
+        : [
+            temporalMatch && temporalWindow ? `temporal window match: ${temporalWindow.label}` : '',
+            'durable episode evidence',
+            row.subtype ? `${row.subtype} episode` : '',
+          ].filter(Boolean),
+      };
+      mergeHit(merged, hit);
+      const sourceIdentity = normalizedMeetingSourceUri(row.source_uri);
+      if (row.subtype === 'meeting' && sourceIdentity) {
+        logicalMeetingKeys.set(memoryRefKey(hit.ref), `meeting:${sourceIdentity}`);
+      }
+    }
   }
 
   if (wanted.has('policy')) {
@@ -336,11 +778,33 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     }));
   }
 
-  const hits = diversify(Array.from(merged.values()), limit);
-  const supported = hits.some((hit) => hit.evidence.length > 0 && hit.score >= 0.45);
+  const utilityRerank = applyUtilityRerank(Array.from(merged.values()), nowMs);
+  const logicalCandidates = collapseMeetingRepresentations(utilityRerank.hits, logicalMeetingKeys)
+    .map((hit) => temporalMeetingTopicQuery && hit.whyRecalled.includes('exact temporal match')
+      && !meetingContentSupportsTopicAnswer(hit.text)
+      ? {
+          ...hit,
+          score: Math.min(hit.score, 0.62),
+          whyRecalled: Array.from(new Set([...hit.whyRecalled, 'recording exists; topic unavailable'])),
+        }
+      : hit);
+  const intentCandidates = temporalMeetingDate
+    ? logicalCandidates.filter((hit) => hit.whyRecalled.includes('exact temporal match'))
+    : logicalCandidates;
+  const hits = diversify(intentCandidates, limit);
+  const supported = temporalMeetingDate
+    ? hits.some((hit) => hit.evidence.length > 0
+      && hit.score >= 0.45
+      && (!temporalMeetingTopicQuery || meetingContentSupportsTopicAnswer(hit.text)))
+    : hits.some((hit) => hit.evidence.length > 0 && hit.score >= 0.45);
   return {
     hits,
     answerability: supported ? 'supported' : hits.length > 0 ? 'partial' : 'insufficient',
-    diagnostics: { candidates: merged.size, stores: Array.from(usedStores), elapsedMs: Date.now() - started },
+    diagnostics: {
+      candidates: merged.size,
+      stores: Array.from(usedStores),
+      elapsedMs: Date.now() - started,
+      utilityAdjusted: utilityRerank.adjusted,
+    },
   };
 }

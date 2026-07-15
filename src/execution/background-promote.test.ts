@@ -68,6 +68,17 @@ test('hasDurableExecutionIntent fires on explicit durable intent and broad data 
   assert.equal(hasDurableExecutionIntent('build me a site'), false);
   assert.equal(hasDurableExecutionIntent('what is the weather today?'), false);
   assert.equal(hasDurableExecutionIntent('summarize this email'), false);
+  assert.equal(hasDurableExecutionIntent('Please summarize this transcript in the background.'), true);
+  assert.equal(
+    hasDurableExecutionIntent([
+      'Please summarize this captured meeting for me, then ask what I want you to act on from it.',
+      'Important rules: read the full transcript end-to-end before summarizing.',
+      'Existing machine summary for context only:',
+      'The firm has several large, long-running matters and needs stronger online visibility.',
+    ].join('\n')),
+    false,
+    'embedded meeting content must not be mistaken for a long-running-task directive',
+  );
   assert.equal(hasDurableExecutionIntent('end to end encryption — how does it work?'), false); // no build verb
   assert.equal(hasDurableExecutionIntent('research Salesforce and Airtable integration options'), false);
   assert.equal(hasDurableExecutionIntent('pull 5 salesforce accounts for me please just as a test'), false);
@@ -98,6 +109,10 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
   );
   // No intent → never promote.
   assert.equal(shouldPromoteToDurable('build me a site'), false);
+  assert.equal(
+    shouldPromoteToDurable('Please discuss this transcript. The client described several long-running matters.'),
+    false,
+  );
 });
 
 test('stripBackgroundPrefix removes a leading background command only', () => {

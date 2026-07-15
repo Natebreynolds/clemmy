@@ -27,7 +27,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resetMemoryDb, openMemoryDb } = await import('./db.js');
+const { resetMemoryDb, openMemoryDb, closeMemoryDb } = await import('./db.js');
 const {
   upsertEntity,
   storeEpisodicPointer,
@@ -43,6 +43,7 @@ const {
   consolidateActiveFacts,
   consolidateFact,
   getResolverStats,
+  readReflectionReplayHealth,
   _resetResolverStatsForTest,
   _testOnly_peekSessionImportance,
   _testOnly_resetAllSessionImportance,
@@ -53,7 +54,17 @@ const {
   _testOnly_reflectorRoute,
 } = await import('./reflection.js');
 const { rememberFact, getFact, setFactPinned, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
+const { getFactEvidence, recordMemoryEpisode, reapExpiredPendingReflections } = await import('./temporal-memory.js');
+const { readReflectionCandidateHealth } = await import('./reflection-candidates.js');
 const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
+const {
+  mergeEntities, resolveCanonicalEntityId, listEntityIdentityConflicts,
+  autoReconcileStrongEntityIdentifiers, isStrongPersonalEmail,
+} = await import('./entity-identity.js');
+const {
+  setFactEntityLinks, getFactIdsForEntity, resolveEntityIdsForText,
+  loadEntityEdges, loadFactEntityEdges, loadFactResourceEdges,
+} = await import('./relations.js');
 
 function factContentHash(id: number): string {
   const row = openMemoryDb().prepare('SELECT content_hash FROM consolidated_facts WHERE id = ?').get(id) as { content_hash: string };
@@ -136,6 +147,188 @@ test('entities: case-insensitive matching on canonical name', () => {
   const id1 = upsertEntity({ type: 'person', name: 'Marlow Smith' });
   const id2 = upsertEntity({ type: 'person', name: 'MARLOW SMITH' });
   assert.equal(id1, id2);
+});
+
+test('entities: one durable episode increments identity observation only once', () => {
+  resetMemoryDb();
+  const episode = recordMemoryEpisode({
+    kind: 'tool_result',
+    sessionId: 'entity-observation-session',
+    callId: 'entity-observation-call',
+    occurredAt: '2026-07-01T10:00:00.000Z',
+    sourceUri: 'meeting://entity-observation',
+    content: 'Dana Smith joined the meeting.',
+  });
+  const first = upsertEntity({
+    type: 'person', name: 'Dana Smith', evidenceEpisodeId: episode.id,
+    sourceUri: 'meeting://entity-observation',
+  });
+  const replay = upsertEntity({
+    type: 'person', name: 'Dana Smith', aliases: ['Dana'], evidenceEpisodeId: episode.id,
+    sourceUri: 'meeting://entity-observation',
+  });
+  assert.equal(replay, first);
+  const row = openMemoryDb().prepare(`
+    SELECT mention_count, first_seen_at, last_seen_at,
+      (SELECT COUNT(*) FROM entity_observations eo WHERE eo.entity_id = entities.id) AS observations
+    FROM entities WHERE id = ?
+  `).get(first) as { mention_count: number; first_seen_at: string; last_seen_at: string; observations: number };
+  assert.deepEqual(row, {
+    mention_count: 1,
+    first_seen_at: '2026-07-01T10:00:00.000Z',
+    last_seen_at: '2026-07-01T10:00:00.000Z',
+    observations: 1,
+  });
+});
+
+test('entities: observation time follows source occurrence and does not move backward on replay', () => {
+  resetMemoryDb();
+  const older = recordMemoryEpisode({
+    kind: 'tool_result', sessionId: 'entity-time-session', callId: 'older',
+    occurredAt: '2026-06-01T10:00:00.000Z', content: 'Dana Smith attended.',
+  });
+  const newer = recordMemoryEpisode({
+    kind: 'tool_result', sessionId: 'entity-time-session', callId: 'newer',
+    occurredAt: '2026-07-01T10:00:00.000Z', content: 'Dana Smith attended again.',
+  });
+  const id = upsertEntity({ type: 'person', name: 'Dana Smith', evidenceEpisodeId: newer.id });
+  upsertEntity({ type: 'person', name: 'Dana Smith', evidenceEpisodeId: older.id });
+  upsertEntity({ type: 'person', name: 'Dana Smith', evidenceEpisodeId: older.id });
+  const row = openMemoryDb().prepare(`
+    SELECT mention_count, first_seen_at, last_seen_at,
+      (SELECT COUNT(*) FROM entity_observations eo WHERE eo.entity_id = entities.id) AS observations
+    FROM entities WHERE id = ?
+  `).get(id) as { mention_count: number; first_seen_at: string; last_seen_at: string; observations: number };
+  assert.deepEqual(row, {
+    mention_count: 2,
+    first_seen_at: '2026-06-01T10:00:00.000Z',
+    last_seen_at: '2026-07-01T10:00:00.000Z',
+    observations: 2,
+  });
+});
+
+test('entities: a stable email converges different names into one canonical person', () => {
+  resetMemoryDb();
+  const id1 = upsertEntity({
+    type: 'person',
+    name: 'Nathan Reynolds',
+    aliases: ['nathan@example.com'],
+    evidenceEpisodeId: undefined,
+  });
+  const id2 = upsertEntity({
+    type: 'person',
+    name: 'Nate Reynolds',
+    aliases: ['nathan@example.com'],
+  });
+  assert.equal(id2, id1, 'the shared stable identifier prevents a duplicate person row');
+
+  const row = openMemoryDb().prepare('SELECT aliases_json FROM entities WHERE id = ?').get(id1) as { aliases_json: string };
+  assert.ok(JSON.parse(row.aliases_json).includes('Nate Reynolds'), 'the alternate display name is retained as an alias');
+});
+
+test('entities: historical exact personal-email duplicates reconcile to the strongest canonical person', () => {
+  resetMemoryDb();
+  const canonical = upsertEntity({
+    type: 'person', name: 'Nathan Reynolds', aliases: ['nathan@example.com'],
+  });
+  const db = openMemoryDb();
+  const now = '2026-01-01T00:00:00.000Z';
+  const duplicate = Number(db.prepare(`
+    INSERT INTO entities
+      (entity_type, canonical_name, canonical_name_lc, aliases_json, first_seen_at, last_seen_at, mention_count)
+    VALUES ('person', 'Nate', 'nate', '[]', ?, ?, 1)
+  `).run(now, now).lastInsertRowid);
+  db.prepare(`
+    INSERT INTO entity_identifiers
+      (entity_id, scheme, value, value_norm, confidence, evidence_episode_id, source_uri, first_seen_at, last_seen_at)
+    VALUES (?, 'email', 'nathan@example.com', 'nathan@example.com', 0.99, NULL, NULL, ?, ?)
+  `).run(duplicate, now, now);
+
+  const result = autoReconcileStrongEntityIdentifiers();
+  assert.equal(result.groupsMerged, 1);
+  assert.equal(result.entitiesRedirected, 1);
+  assert.equal(resolveCanonicalEntityId(duplicate), canonical);
+  assert.equal(upsertEntity({ type: 'person', name: 'Nate Reynolds', aliases: ['nathan@example.com'] }), canonical);
+});
+
+test('entities: shared inboxes and cross-type email reuse never auto-merge identities', () => {
+  resetMemoryDb();
+  const amy = upsertEntity({ type: 'person', name: 'Amy Adams', aliases: ['sales@example.com'] });
+  const alex = upsertEntity({ type: 'person', name: 'Alex Alvarez', aliases: ['sales@example.com'] });
+  const company = upsertEntity({ type: 'company', name: 'Example Co', aliases: ['amy@example.com'] });
+  const person = upsertEntity({ type: 'person', name: 'Amy Person', aliases: ['amy@example.com'] });
+  assert.notEqual(amy, alex, 'a generic shared inbox is review-only evidence');
+  assert.notEqual(company, person, 'identifiers never merge across entity types');
+  assert.deepEqual(listEntityIdentityConflicts(), [], 'neither case is presented as a safe duplicate-person merge');
+  assert.equal(isStrongPersonalEmail('no-reply@example.com'), false);
+  assert.equal(isStrongPersonalEmail('customer.service@example.com'), false);
+  assert.equal(isStrongPersonalEmail('operations@example.com'), false);
+});
+
+test('entities: low-confidence personal email remains review evidence and cannot authorize a merge', () => {
+  resetMemoryDb();
+  const first = upsertEntity({
+    type: 'person', name: 'Jordan North',
+    identifiers: [{ scheme: 'email', value: 'jordan@example.com', confidence: 0.5 }],
+  });
+  const second = upsertEntity({
+    type: 'person', name: 'J. North',
+    identifiers: [{ scheme: 'email', value: 'jordan@example.com', confidence: 0.5 }],
+  });
+  assert.notEqual(first, second);
+  assert.deepEqual(autoReconcileStrongEntityIdentifiers(), {
+    groupsScanned: 0,
+    groupsMerged: 0,
+    entitiesRedirected: 0,
+  });
+  assert.equal(listEntityIdentityConflicts().length, 1, 'uncertain identifier collision stays reviewable');
+});
+
+test('entities: identical names with conflicting personal emails remain distinct', () => {
+  resetMemoryDb();
+  const first = upsertEntity({ type: 'person', name: 'Jordan Lee', aliases: ['jordan.one@example.com'] });
+  const second = upsertEntity({ type: 'person', name: 'Jordan Lee', aliases: ['jordan.two@example.com'] });
+  assert.notEqual(first, second, 'a name collision must not combine two strongly distinct people');
+
+  const replay = upsertEntity({ type: 'person', name: 'J. Lee', aliases: ['jordan.two@example.com'] });
+  assert.equal(replay, second, 'the stable identifier must select the correct same-name person');
+});
+
+test('entities: a shared phone is evidence but never an automatic person merge key', () => {
+  resetMemoryDb();
+  const first = upsertEntity({
+    type: 'person', name: 'Avery North', identifiers: [{ scheme: 'phone', value: '+1 555 010 2200' }],
+  });
+  const second = upsertEntity({
+    type: 'person', name: 'Blake North', identifiers: [{ scheme: 'phone', value: '+1 555 010 2200' }],
+  });
+  assert.notEqual(first, second, 'family or office phone reuse cannot authorize an identity merge');
+});
+
+test('entities: a shared single-token nickname is not enough to auto-merge people', () => {
+  resetMemoryDb();
+  const first = upsertEntity({ type: 'person', name: 'Amy Adams', aliases: ['Amy'] });
+  const second = upsertEntity({ type: 'person', name: 'Amy Alvarez', aliases: ['Amy'] });
+  assert.notEqual(first, second, 'ambiguous nicknames remain distinct');
+});
+
+test('entities: reviewed merge redirects history and retrieval without deleting the source row', () => {
+  resetMemoryDb();
+  const canonical = upsertEntity({ type: 'person', name: 'Nathan Reynolds', aliases: ['Nathan'] });
+  const duplicate = upsertEntity({ type: 'person', name: 'Nate' });
+  const fact = rememberFact({ kind: 'user', content: 'Nate owns the weekly client review.' });
+  setFactEntityLinks(fact.id, [duplicate]);
+
+  assert.equal(mergeEntities({
+    sourceEntityId: duplicate,
+    canonicalEntityId: canonical,
+    reason: 'user-reviewed duplicate',
+  }), canonical);
+  assert.equal(resolveCanonicalEntityId(duplicate), canonical);
+  assert.ok(getFactIdsForEntity(duplicate).includes(fact.id), 'old ids replay through the canonical identity');
+  assert.deepEqual(resolveEntityIdsForText('What did Nate own?'), [canonical], 'the old name resolves once, to the canonical person');
+  assert.ok(openMemoryDb().prepare('SELECT id FROM entities WHERE id = ?').get(duplicate), 'the historical source entity remains queryable');
+  assert.deepEqual(listEntityIdentityConflicts(), []);
 });
 
 test('episodic_pointers: round-trip per session', () => {
@@ -344,6 +537,11 @@ test('reflectOnToolReturn: low-importance extractions persist and commit togethe
     assert.equal(first.factsWritten, 0);
     assert.equal(first.pointersStored, 1, 'pointer is stored even while fact commit is delayed');
     assert.equal(_testOnly_peekSessionImportance(sessionId), 4);
+    const bufferedHealth = readReflectionCandidateHealth();
+    assert.equal(bufferedHealth.total, 1);
+    assert.equal(bufferedHealth.pending, 1);
+    assert.equal(bufferedHealth.orphanedPending, 0);
+    assert.ok(bufferedHealth.oldestPending);
     assert.equal(
       (openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get() as { n: number }).n,
       0,
@@ -364,6 +562,10 @@ test('reflectOnToolReturn: low-importance extractions persist and commit togethe
     assert.equal(second.entitiesUpserted, 1, 'pending entities commit with their delayed batch');
     assert.equal(second.sumImportance, 10);
     assert.equal(_testOnly_peekSessionImportance(sessionId), 0, 'pending threshold window resets after commit');
+    const promotedHealth = readReflectionCandidateHealth();
+    assert.equal(promotedHealth.pending, 0);
+    assert.equal(promotedHealth.promoted, 2);
+    assert.equal(promotedHealth.promotionRate, 1);
 
     const rows = openMemoryDb().prepare(`
       SELECT content, derived_from_call_id
@@ -388,6 +590,136 @@ test('reflectOnToolReturn: low-importance extractions persist and commit togethe
   }
 });
 
+test('reflectOnToolReturn: task-shaped extractor noise is rejected before canonical fact memory', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  const priorEmbed = process.env.CLEMMY_EMBED_AT_WRITE;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  process.env.CLEMMY_EMBED_AT_WRITE = 'off';
+  try {
+    _testOnly_setReflectionExtractor(async () => ({
+      facts: [
+        { kind: 'reference', text: 'Clementine searched the CRM for Dana.', importance: 4 },
+        { kind: 'reference', text: 'Dana Smith is the billing contact for Acme.', importance: 6 },
+      ],
+      entities: [{ type: 'person', name: 'Dana Smith' }, { type: 'company', name: 'Acme' }],
+      pointers: [],
+    }));
+    const result = await reflectOnToolReturn({
+      sessionId: 'sess-quality-filter',
+      callId: 'call-quality-filter',
+      tool: 'crm_lookup',
+      output: `CRM directory record: Dana Smith is the billing contact for Acme. ${'authoritative directory context '.repeat(50)}`,
+    });
+    assert.equal(result.factsWritten, 1);
+    const facts = openMemoryDb().prepare('SELECT content FROM consolidated_facts').all() as Array<{ content: string }>;
+    assert.deepEqual(facts.map((row) => row.content), ['Dana Smith is the billing contact for Acme.']);
+    const candidates = openMemoryDb().prepare(`
+      SELECT text, status, reason, resulting_fact_id
+      FROM memory_reflection_candidates ORDER BY text
+    `).all() as Array<{ text: string; status: string; reason: string; resulting_fact_id: number | null }>;
+    assert.deepEqual(candidates.map((row) => [row.text, row.status, row.reason, row.resulting_fact_id != null]), [
+      ['Clementine searched the CRM for Dana.', 'rejected', 'assistant_action_history', false],
+      ['Dana Smith is the billing contact for Acme.', 'promoted', 'consolidation:add', true],
+    ]);
+    const health = readReflectionCandidateHealth();
+    assert.equal(health.promoted, 1);
+    assert.equal(health.rejected, 1);
+    assert.equal(health.rejectionReasons.assistant_action_history, 1);
+  } finally {
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+    if (priorEmbed === undefined) delete process.env.CLEMMY_EMBED_AT_WRITE; else process.env.CLEMMY_EMBED_AT_WRITE = priorEmbed;
+  }
+});
+
+test('the same person fact from a later episode reinforces one canonical memory with both sources', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  const priorEmbed = process.env.CLEMMY_EMBED_AT_WRITE;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  process.env.CLEMMY_EMBED_AT_WRITE = 'off';
+  try {
+    _testOnly_setReflectionExtractor(async () => ({
+      facts: [{ kind: 'reference', text: 'Dana Smith is the billing contact for Acme.', importance: 6 }],
+      entities: [{ type: 'person', name: 'Dana Smith' }, { type: 'company', name: 'Acme' }],
+      pointers: [],
+    }));
+    const first = await reflectOnToolReturn({
+      sessionId: 'sess-person-reinforcement', callId: 'call-directory', tool: 'crm_lookup',
+      output: `CRM directory: Dana Smith is the billing contact for Acme. ${'directory context '.repeat(80)}`,
+    });
+    const second = await reflectOnToolReturn({
+      sessionId: 'sess-person-reinforcement', callId: 'call-meeting', tool: 'meeting_transcript',
+      output: `Meeting transcript: Dana Smith is the billing contact for Acme. ${'meeting context '.repeat(80)}`,
+    });
+    assert.equal(first.factsWritten, 1);
+    assert.equal(second.factsWritten, 0);
+    assert.equal(second.factsNoop, 1);
+    const db = openMemoryDb();
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get() as { n: number }).n, 1);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM entities').get() as { n: number }).n, 2);
+    assert.equal((db.prepare('SELECT SUM(mention_count) AS n FROM entities').get() as { n: number }).n, 4);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM fact_evidence').get() as { n: number }).n, 2);
+    const candidates = db.prepare(`
+      SELECT status, reason FROM memory_reflection_candidates ORDER BY call_id
+    `).all() as Array<{ status: string; reason: string }>;
+    assert.deepEqual(candidates, [
+      { status: 'promoted', reason: 'consolidation:add' },
+      { status: 'promoted', reason: 'consolidation:reinforce' },
+    ]);
+  } finally {
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+    if (priorEmbed === undefined) delete process.env.CLEMMY_EMBED_AT_WRITE; else process.env.CLEMMY_EMBED_AT_WRITE = priorEmbed;
+  }
+});
+
+test('expired reflection candidates settle their buffered receipts instead of remaining pending forever', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '10';
+  try {
+    _testOnly_setReflectionExtractor(async () => ({
+      facts: [{ kind: 'reference', text: 'The amber archive belongs to Project Quorvex.', importance: 4 }],
+      entities: [],
+      pointers: [],
+    }));
+    const input = {
+      sessionId: 'sess-expired-candidate',
+      callId: 'call-expired-candidate',
+      tool: 'read_file',
+      output: `Project record: the amber archive belongs to Project Quorvex. ${'archive context '.repeat(80)}`,
+    };
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'low_importance');
+    const db = openMemoryDb();
+    db.prepare(`
+      UPDATE reflection_pending_extractions SET expires_at = '2026-07-01T00:00:00.000Z'
+      WHERE session_id = ? AND call_id = ?
+    `).run(input.sessionId, input.callId);
+    assert.equal(reapExpiredPendingReflections('2026-07-02T00:00:00.000Z'), 1);
+    const candidate = db.prepare(`
+      SELECT status, reason FROM memory_reflection_candidates
+      WHERE session_id = ? AND call_id = ?
+    `).get(input.sessionId, input.callId) as { status: string; reason: string };
+    assert.deepEqual(candidate, { status: 'expired', reason: 'threshold_expired' });
+    const receipt = db.prepare(`
+      SELECT status, completed_at, result_json FROM memory_reflection_receipts
+      WHERE session_id = ? AND call_id = ?
+    `).get(input.sessionId, input.callId) as { status: string; completed_at: string | null; result_json: string | null };
+    assert.equal(receipt.status, 'completed');
+    assert.equal(receipt.completed_at, '2026-07-02T00:00:00.000Z');
+    assert.deepEqual(JSON.parse(receipt.result_json ?? '{}'), { lifecycle: 'expired', reason: 'threshold_expired' });
+    const health = readReflectionCandidateHealth('2026-07-02T00:00:00.000Z');
+    assert.equal(health.pending, 0);
+    assert.equal(health.expired, 1);
+    assert.equal(health.orphanedPending, 0);
+  } finally {
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+  }
+});
+
 test('reflectOnToolReturn: extractor failure still leaves a recallable pointer', async () => {
   resetMemoryDb();
   _testOnly_resetAllSessionImportance();
@@ -409,6 +741,121 @@ test('reflectOnToolReturn: extractor failure still leaves a recallable pointer',
     assert.match(pointers[0].label, /extractor_failed/);
   } finally {
     if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+  }
+});
+
+test('reflection receipts suppress identical replay after a database reopen', async () => {
+  resetMemoryDb();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  const priorEmbed = process.env.CLEMMY_EMBED_AT_WRITE;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  process.env.CLEMMY_EMBED_AT_WRITE = 'off';
+  let extractorCalls = 0;
+  const input = {
+    sessionId: 'sess-durable-replay',
+    callId: 'call-durable-replay',
+    tool: 'directory_lookup',
+    output: `Dana works at Acme. ${'durable directory evidence '.repeat(50)}`,
+  };
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return {
+        facts: [{ kind: 'reference', text: 'Dana works at Acme', importance: 4 }],
+        entities: [{ type: 'person', name: 'Dana' }, { type: 'company', name: 'Acme' }],
+        pointers: [{ label: 'Dana directory record' }],
+        relationships: [{
+          subject: 'Dana', predicate: 'works at', object: 'Acme',
+          evidence_excerpt: 'Dana works at Acme', confidence: 0.95,
+        }],
+      };
+    });
+    const first = await reflectOnToolReturn(input);
+    assert.equal(first.skipped, undefined);
+    closeMemoryDb();
+    openMemoryDb();
+    const replay = await reflectOnToolReturn(input);
+    assert.equal(replay.skipped, 'already_reflected');
+    assert.equal(extractorCalls, 1, 'the replay never reaches the extractor');
+    const db = openMemoryDb();
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get() as { n: number }).n, 1);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM entities').get() as { n: number }).n, 2);
+    assert.equal((db.prepare('SELECT SUM(mention_count) AS n FROM entities').get() as { n: number }).n, 2);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM entity_edge_evidence').get() as { n: number }).n, 1);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM episodic_pointers').get() as { n: number }).n, 1);
+    assert.deepEqual(readReflectionReplayHealth(), {
+      total: 1, processing: 0, buffered: 0, completed: 1, failed: 0, retried: 0, staleProcessing: 0,
+    });
+  } finally {
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+    if (priorEmbed === undefined) delete process.env.CLEMMY_EMBED_AT_WRITE; else process.env.CLEMMY_EMBED_AT_WRITE = priorEmbed;
+  }
+});
+
+test('failed reflection receipts are retryable without duplicating fallback pointers', async () => {
+  resetMemoryDb();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  let extractorCalls = 0;
+  const input = {
+    sessionId: 'sess-retryable-reflection',
+    callId: 'call-retryable-reflection',
+    tool: 'composio_execute_tool',
+    output: 'retryable connector output '.repeat(80),
+  };
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      if (extractorCalls === 1) return null;
+      return { facts: [], entities: [], pointers: [] };
+    });
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'extractor_failed');
+    assert.equal((await reflectOnToolReturn(input)).skipped, undefined);
+    assert.equal(extractorCalls, 2, 'a failed receipt grants a new processing attempt');
+    assert.equal(
+      (openMemoryDb().prepare('SELECT COUNT(*) AS n FROM episodic_pointers').get() as { n: number }).n,
+      1,
+      'the retry reuses the same deterministic fallback pointer',
+    );
+    assert.deepEqual(readReflectionReplayHealth(), {
+      total: 1, processing: 0, buffered: 0, completed: 1, failed: 0, retried: 1, staleProcessing: 0,
+    });
+  } finally {
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+  }
+});
+
+test('buffered low-importance reflection is not extracted twice after restart', async () => {
+  resetMemoryDb();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '10';
+  let extractorCalls = 0;
+  const input = {
+    sessionId: 'sess-buffered-replay',
+    callId: 'call-buffered-replay',
+    tool: 'read_file',
+    output: 'low importance durable content '.repeat(80),
+  };
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return {
+        facts: [{ kind: 'reference', text: 'The amber replay fixture remains pending', importance: 4 }],
+        entities: [{ type: 'project', name: 'Amber Replay' }],
+        pointers: [],
+      };
+    });
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'low_importance');
+    closeMemoryDb();
+    openMemoryDb();
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'already_reflected');
+    assert.equal(extractorCalls, 1);
+    const db = openMemoryDb();
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reflection_pending_extractions').get() as { n: number }).n, 1);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get() as { n: number }).n, 0);
+    assert.equal(readReflectionReplayHealth().buffered, 1);
+  } finally {
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
   }
 });
 
@@ -438,6 +885,110 @@ test('reflection extractor sanitizer preserves signal from schema-drifted JSON',
   assert.deepEqual(extraction.resources, [
     { kind: 'sheet', name: 'Q3 pipeline sheet', whats_here: 'renewal outreach rows' },
   ]);
+});
+
+test('reflection relationship sanitizer requires a bounded evidence quote', () => {
+  const extraction = _testOnly_sanitizeExtractionOutput({
+    facts: [],
+    entities: [
+      { type: 'person', name: 'Dana' },
+      { type: 'company', name: 'Acme' },
+    ],
+    pointers: [],
+    relationships: [
+      { subject: 'Dana', predicate: 'works at', object: 'Acme' },
+      { subject: 'Dana', relation: 'works at', object: 'Acme', quote: 'Dana works at Acme', confidence: 3 },
+    ],
+  }, { withRelationships: true });
+  assert.equal(extraction?.relationships?.length, 1, 'an ungrounded relationship is dropped at the contract boundary');
+  assert.deepEqual(extraction?.relationships?.[0], {
+    subject: 'Dana', predicate: 'works at', object: 'Acme',
+    evidence_excerpt: 'Dana works at Acme', confidence: 1,
+  });
+});
+
+test('reflection stores only source-grounded relationships from the same extraction episode', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  const priorEdges = process.env.CLEMMY_ENTITY_EDGES;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  delete process.env.CLEMMY_ENTITY_EDGES;
+  const output = `Directory record: Dana works at Acme. ${'durable directory context '.repeat(50)}`;
+  try {
+    _testOnly_setReflectionExtractor(async () => ({
+      facts: [{ kind: 'reference', text: 'Dana works at Acme', importance: 4 }],
+      entities: [{ type: 'person', name: 'Dana' }, { type: 'company', name: 'Acme' }],
+      pointers: [],
+      relationships: [{
+        subject: 'Dana', predicate: 'employed by', object: 'Acme',
+        evidence_excerpt: 'Dana works at Acme', confidence: 0.92,
+      }],
+    }));
+    await reflectOnToolReturn({
+      sessionId: 'relationship-session', callId: 'relationship-call', tool: 'directory_lookup', output,
+    });
+    const edge = loadEntityEdges()[0];
+    assert.equal(edge.predicate, 'works at');
+    assert.equal(edge.evidenceCount, 1);
+    assert.equal(edge.evidence[0].excerpt, 'Dana works at Acme');
+    assert.equal(edge.evidence[0].episodeId, edge.evidenceEpisodeId);
+    const factRow = openMemoryDb().prepare("SELECT id FROM consolidated_facts WHERE content = 'Dana works at Acme'").get() as { id: number };
+    const factLinks = loadFactEntityEdges([factRow.id]);
+    assert.equal(factLinks.length, 2);
+    assert.ok(factLinks.every((link) => link.truth === 'stored' && link.evidenceEpisodeId === edge.evidenceEpisodeId));
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+    if (priorEdges === undefined) delete process.env.CLEMMY_ENTITY_EDGES; else process.env.CLEMMY_ENTITY_EDGES = priorEdges;
+  }
+});
+
+test('reflection grounds a uniquely named source-map resource from the same durable episode', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  const priorSourceMap = process.env.CLEMMY_SOURCE_MAP;
+  const priorSourceTrust = process.env.CLEMMY_SOURCE_TRUST;
+  const priorEmbed = process.env.CLEMMY_EMBED_AT_WRITE;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  process.env.CLEMMY_SOURCE_MAP = 'on';
+  process.env.CLEMMY_SOURCE_TRUST = 'on';
+  process.env.CLEMMY_EMBED_AT_WRITE = 'off';
+  const output = `Drive result: The Northstar launch plan is stored in the Q3 Planning folder. ${'durable source context '.repeat(50)}`;
+  try {
+    _testOnly_setReflectionExtractor(async () => ({
+      facts: [{ kind: 'reference', text: 'The Northstar launch plan is stored in the Q3 Planning folder.', importance: 7 }],
+      entities: [],
+      pointers: [],
+      resources: [{
+        kind: 'folder', name: 'Q3 Planning', ref: 'folder-q3-planning',
+        whats_here: 'Northstar launch plans', when_to_use: 'launch planning',
+      }],
+    }));
+    const result = await reflectOnToolReturn({
+      sessionId: 'resource-reflection-session',
+      callId: 'resource-reflection-call',
+      tool: 'google_drive_search',
+      output,
+    });
+    assert.equal(result.factsWritten, 1);
+    const fact = openMemoryDb().prepare(`
+      SELECT id FROM consolidated_facts
+      WHERE content = 'The Northstar launch plan is stored in the Q3 Planning folder.'
+    `).get() as { id: number };
+    const edges = loadFactResourceEdges([fact.id]);
+    assert.equal(edges.length, 1);
+    assert.equal(edges[0].truth, 'stored');
+    assert.ok(edges[0].evidenceEpisodeId);
+    assert.match(edges[0].evidenceExcerpt ?? '', /Q3 Planning/);
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+    if (priorSourceMap === undefined) delete process.env.CLEMMY_SOURCE_MAP; else process.env.CLEMMY_SOURCE_MAP = priorSourceMap;
+    if (priorSourceTrust === undefined) delete process.env.CLEMMY_SOURCE_TRUST; else process.env.CLEMMY_SOURCE_TRUST = priorSourceTrust;
+    if (priorEmbed === undefined) delete process.env.CLEMMY_EMBED_AT_WRITE; else process.env.CLEMMY_EMBED_AT_WRITE = priorEmbed;
+  }
 });
 
 test('recursive reflection sanitizer accepts schema-drifted pattern output', () => {
@@ -548,9 +1099,63 @@ test('recursive reflection CONSOLIDATES: rolled-up depth-0 sources are demoted (
     for (const f of derived) assert.equal(getFact(f.id)?.importance, 3, 'derived source clamped down to 3');
     assert.equal(getFact(userStated.id)?.importance, 5, 'user-stated (trust 1.0) source untouched');
     assert.equal(getFact(pinnedSrc.id)?.importance, 5, 'pinned source untouched');
+    const rollup = openMemoryDb().prepare("SELECT id, derivation_depth, derived_from_fact_ids FROM consolidated_facts WHERE content = 'ZZZ QQQ XYZZY consolidated rollup token'")
+      .get() as { id: number; derivation_depth: number; derived_from_fact_ids: string } | undefined;
+    assert.ok(rollup);
+    assert.equal(rollup!.derivation_depth, 1);
+    assert.deepEqual(
+      (JSON.parse(rollup!.derived_from_fact_ids) as number[]).sort((a, b) => a - b),
+      [...derived.map((fact) => fact.id), userStated.id, pinnedSrc.id].sort((a, b) => a - b),
+    );
+    const evidence = getFactEvidence(rollup!.id);
+    assert.equal(evidence.length, 1);
+    assert.match(evidence[0].excerpt, new RegExp(`\\[fact:${derived[0].id}\\] Derived signal number 0`));
+    assert.doesNotMatch(evidence[0].excerpt, /ZZZ QQQ XYZZY/, 'the generated pattern is never used as its own evidence');
+    const lifecycle = openMemoryDb().prepare(`
+      SELECT status, reason, resulting_fact_id FROM memory_reflection_candidates
+      WHERE text = 'ZZZ QQQ XYZZY consolidated rollup token'
+    `).get() as { status: string; reason: string; resulting_fact_id: number } | undefined;
+    assert.deepEqual(lifecycle, { status: 'promoted', reason: 'consolidation:add', resulting_fact_id: rollup!.id });
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
   }
+});
+
+test('consolidateFact: semantic NOOP keeps one canonical fact and attaches the new source episode', async () => {
+  resetMemoryDb();
+  const originalEpisode = recordMemoryEpisode({
+    kind: 'tool_result', sessionId: 'noop-evidence', callId: 'crm', sourceUri: 'crm://contact/dana',
+    content: 'Dana Smith is the billing contact for Acme.',
+  });
+  const original = rememberFact({
+    kind: 'project', content: 'Dana Smith is Acme’s billing contact.',
+    derivedFrom: { sessionId: 'noop-evidence', callId: 'crm', tool: 'crm_lookup' },
+  });
+  assert.equal(getFactEvidence(original.id)[0]?.episodeId, originalEpisode.id);
+
+  const meetingEpisode = recordMemoryEpisode({
+    kind: 'tool_result', sessionId: 'noop-evidence', callId: 'meeting', sourceUri: 'recording://local/acme-review',
+    content: 'In today’s meeting, Dana Smith was confirmed as the Acme billing contact.',
+  });
+  const outcome = await consolidateFact({
+    kind: 'project', text: 'The billing contact at Acme is Dana Smith.', trustLevel: 0.8, authority: 'derived',
+  }, {
+    sessionId: 'noop-evidence',
+    derivedFrom: { sessionId: 'noop-evidence', callId: 'meeting', tool: 'meeting_transcript' },
+  }, {
+    resolver: async () => ({ decision: 'NOOP', target_id: original.id }),
+  });
+
+  assert.equal(outcome.action, 'ignore');
+  assert.equal(outcome.factId, original.id);
+  assert.equal((openMemoryDb().prepare('SELECT COUNT(*) AS count FROM consolidated_facts WHERE active = 1').get() as { count: number }).count, 1);
+  const evidence = getFactEvidence(original.id);
+  assert.deepEqual(new Set(evidence.map((item) => item.episodeId)), new Set([
+    originalEpisode.id, meetingEpisode.id,
+  ]));
+  assert.ok(evidence.some((item) => /today’s meeting/.test(item.excerpt)));
+  assert.ok(evidence.some((item) => item.episodeId === meetingEpisode.id && item.sourceUri === 'recording://local/acme-review'));
+  assert.equal(getFact(original.id)?.trustLevel, 0.8);
 });
 
 test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-data tools', () => {
@@ -812,6 +1417,46 @@ test('consolidateFact: resolver UPDATE on a pinned fact is blocked — content u
   assert.equal(getFact(prot.id)?.content, content, 'pinned content is untouched');
   assert.equal(out.updated, 0, 'no update tallied');
   assert.equal(out.written, 1, 'candidate falls through to the conservative ADD');
+});
+
+test('consolidateFact: an explicit user correction supersedes pinned policy and preserves history', async () => {
+  resetMemoryDb();
+  const original = rememberFact({
+    kind: 'constraint',
+    content: 'Always send Atlas updates from the legacy@example.com Outlook mailbox.',
+    occurredAt: '2026-01-01T00:00:00.000Z',
+  });
+  assert.equal(getFact(original.id)?.pinned, true);
+
+  const out = await consolidateFact(
+    {
+      kind: 'constraint',
+      text: 'Always send Atlas updates from the operations@example.com Outlook mailbox.',
+      trustLevel: 1,
+      authority: 'user',
+      occurredAt: '2026-07-15T00:00:00.000Z',
+      pin: true,
+    },
+    { sessionId: 'user-correction' },
+    {
+      resolver: async () => ({
+        decision: 'UPDATE',
+        target_id: original.id,
+        rewrite: 'Always send Atlas updates from the operations@example.com Outlook mailbox.',
+      }),
+    },
+  );
+
+  assert.equal(out.action, 'supersede');
+  assert.equal(out.supersededFactId, original.id);
+  assert.equal(getFact(original.id)?.active, false, 'the stale policy remains historical');
+  assert.equal(getFact(original.id)?.supersededByFactId, out.factId);
+  const replacement = getFact(out.factId!);
+  assert.equal(replacement?.active, true);
+  assert.equal(replacement?.pinned, true, 'standing protection transfers to the corrected policy');
+  const policy = openMemoryDb().prepare('SELECT policy_type, enforcement FROM memory_policies WHERE fact_id = ?')
+    .get(out.factId!) as { policy_type: string; enforcement: string };
+  assert.deepEqual(policy, { policy_type: 'hard_constraint', enforcement: 'dispatch' });
 });
 
 test('consolidateFact: oversized resolver rewrite falls back to candidate text', async () => {

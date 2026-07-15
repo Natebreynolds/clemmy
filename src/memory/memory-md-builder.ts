@@ -2,8 +2,10 @@
  * Auto-generated MEMORY.md builder.
  *
  * Background: MEMORY.md sits at ~/.clementine-next/vault/00-System/MEMORY.md
- * and is one of the files the agent reads on every turn (loadMemoryContext
- * in vault.ts). On a fresh install it's just "# Memory\n\n" and stays
+ * and provides a human-readable projection of durable memory. Only the
+ * user-curated section above the marker is read on every turn; generated facts
+ * are recalled from their canonical typed SQLite store. On a fresh install the
+ * file is just "# Memory\n\n" and stays
  * that way forever unless the USER manually edits it — the agent writes
  * durable signals to the consolidated_facts SQLite table instead, which
  * is fine for retrieval but means the human-readable file looks broken.
@@ -41,7 +43,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from '
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
-import { MEMORY_FILE, MEMORY_PROMPT_READ_CHARS } from './vault.js';
+import { MEMORY_AUTO_SECTION_MARKER, MEMORY_FILE, MEMORY_PROMPT_READ_CHARS } from './vault.js';
 import { listActiveFacts, countActiveFacts, type ConsolidatedFact } from './facts.js';
 
 const logger = pino({ name: 'clementine-next.memory.md-builder' });
@@ -51,11 +53,9 @@ const logger = pino({ name: 'clementine-next.memory.md-builder' });
  * auto-generated section (below). Stable across versions so existing
  * files keep splitting correctly after upgrades.
  */
-const AUTO_MARKER = '<!-- AUTO-GENERATED · do not edit below this line — overwritten on next refresh -->';
-
-/** Maximum facts to include in each kind's section. The file is read
- *  into the agent's instructions on every turn — a 200-fact dump
- *  would blow the prompt window. 10/kind = 40 max, well under budget. */
+/** Maximum facts to include in each kind's section. The file is read by humans
+ *  and indexed for on-demand recall. 10/kind = 40 max keeps the projection
+ *  useful without turning it into an unreadable dump. */
 const MAX_FACTS_PER_KIND = 10;
 
 /** Hard cap on the auto section's length in characters. Belt-and-
@@ -83,7 +83,8 @@ const SECTIONS: FactSection[] = [
  * re-emits the same separator without us needing to inject it.
  */
 function splitAtMarker(existing: string): { userPart: string; hadMarker: boolean } {
-  const idx = existing.indexOf(AUTO_MARKER);
+  const exactIdx = existing.indexOf(MEMORY_AUTO_SECTION_MARKER);
+  const idx = exactIdx >= 0 ? exactIdx : existing.indexOf('<!-- AUTO-GENERATED');
   if (idx === -1) {
     // No marker — preserve everything, the writer will append the marker
     // + auto section below.
@@ -172,20 +173,13 @@ export interface RegenerateMemoryMdResult {
   factCount: number;
   autoSectionChars: number;
   hadMarker: boolean;
-  /** Tier C1: total assembled file length in chars. */
+  /** Total assembled human-readable file length in chars. */
   totalChars: number;
-  /** Tier C1: true when the assembled file exceeds the prompt read budget
-   *  (MEMORY_PROMPT_READ_CHARS), so its tail is clipped from the per-turn
-   *  injection. NOT data loss — facts are independently injected via
-   *  renderFactsForInstructions (the SQLite stream) — but the human-readable
-   *  MEMORY.md view in the prompt is truncated. Surfaced so the owner/doctor
-   *  can see it instead of silent clipping. */
+  /** True when the user-curated prefix exceeds its prompt budget. Generated
+   *  facts are never prompt-injected from this projection, so their size does
+   *  not count as prompt truncation. */
   promptTruncated: boolean;
-  /** True only when the USER-curated section (above the AUTO marker) alone
-   *  exceeds the prompt read budget — the one ACTIONABLE clip (the user wrote
-   *  >budget chars of their own content that won't fully inject). The AUTO
-   *  section overflowing is by-design and non-destructive (facts inject via the
-   *  SQLite stream), so we no longer warn on that. Gates the log warning. */
+  /** Backward-compatible explicit alias used by the maintenance warning. */
   userOverflow: boolean;
 }
 
@@ -217,7 +211,7 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
   // the title; otherwise preserve verbatim.
   const userTrimmed = userPart.trim();
   const userBlock = userTrimmed.length > 0 ? userTrimmed + '\n\n' : '# Memory\n\n';
-  const next = `${userBlock}${AUTO_MARKER}\n${autoBody}`;
+  const next = `${userBlock}${MEMORY_AUTO_SECTION_MARKER}\n${autoBody}`;
 
   // The auto-section header includes a regen timestamp for the user's
   // benefit. Strip it from BOTH sides before comparing so a no-op call
@@ -226,12 +220,10 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
   // happened to pass because consecutive calls fired in the same
   // millisecond, but the maintenance loop has 30-min gaps.
   const totalChars = next.length;
-  const promptTruncated = totalChars > MEMORY_PROMPT_READ_CHARS;
-  // Only the USER block clipping is actionable; the AUTO section overflowing is
-  // by-design (facts inject via the SQLite stream). The injected view is the
-  // whole file sliced to the budget, so user content is lost ONLY when the user
-  // block alone exceeds it.
+  // Only the USER block is prompt-eligible. Generated facts stay visible in the
+  // vault and are injected through their canonical typed/retrieved paths.
   const userOverflow = userBlock.length > MEMORY_PROMPT_READ_CHARS;
+  const promptTruncated = userOverflow;
 
   const normalizeForDiff = (s: string) => s.replace(/_Auto-regenerated [^_]+_/g, '_Auto-regenerated <ts>_');
   if (normalizeForDiff(next) === normalizeForDiff(existing)) {

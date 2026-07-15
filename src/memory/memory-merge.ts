@@ -32,6 +32,8 @@ interface MergeStats {
   clustersFound: number;
   factsMerged: number;
   accessCountFolded: number;
+  impressionCountFolded: number;
+  utilityCountFolded: number;
   importanceFolded: number;
   blockedByPinned: number;
   blockedByEntity: number;
@@ -140,14 +142,16 @@ function bufferToFloat32Array(buf: Buffer): Float32Array {
   return new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
 }
 
-/**
- * Compute Stanford-style importance score: importance × log(1 + accessCount).
- * Higher score = more important + more frequently accessed.
- */
-function getStanfordScore(fact: Fact): number {
-  const imp = fact.importance ?? 5;
-  const acc = fact.access_count ?? 0;
-  return imp * Math.log(1 + acc);
+/** Canonical selection must only reward material use. `access_count` is kept
+ * as legacy telemetry and may include passive prompt exposure, while
+ * `impression_count` explicitly measures exposure. Neither is evidence that a
+ * fact helped. This mirrors the reviewed duplicate path in self-heal.ts. */
+export function mergeCanonicalQuality(fact: Pick<ConsolidatedFactRow,
+  'score' | 'importance' | 'trust_level' | 'utility_count'>): number {
+  return (fact.score ?? 0)
+    + (fact.importance ?? 5) / 10
+    + Math.log1p(Math.max(0, fact.utility_count ?? 0)) / 10
+    + (fact.trust_level ?? 0.6);
 }
 
 /**
@@ -195,11 +199,12 @@ function findClustersInKind(
     }
 
     if (cluster.length >= 2) {
-      // Pick canonical by Stanford score
+      // Pick canonical by durable quality and material utility. Passive
+      // exposure must never decide which duplicate survives.
       let canonical = seedFact;
-      let bestScore = getStanfordScore(seedFact);
+      let bestScore = mergeCanonicalQuality(seedFact);
       for (const f of cluster.slice(1)) {
-        const score = getStanfordScore(f);
+        const score = mergeCanonicalQuality(f);
         if (score > bestScore) {
           canonical = f;
           bestScore = score;
@@ -225,19 +230,31 @@ function findClustersInKind(
 
 /**
  * Consolidate metadata when merging a cluster of paraphrases.
- * Uses MAX semantics for importance and trust (facts reinforce each other),
- * and SUM for access_count (cumulative reinforcement).
+ * Uses MAX semantics for importance and trust. Usage and exposure telemetry
+ * are folded into their own columns; only utility can reinforce later recall.
  */
 function consolidateCluster(canonical: Fact, others: Fact[]) {
   let maxImportance = canonical.importance ?? 5;
   let totalAccessCount = canonical.access_count ?? 0;
+  let totalImpressionCount = canonical.impression_count ?? 0;
+  let totalUtilityCount = canonical.utility_count ?? 0;
   let maxTrust = canonical.trust_level ?? 1.0;
+  let lastAccessedAt = canonical.last_accessed_at ?? null;
+  let lastUsedAt = canonical.last_used_at ?? null;
   let sourceApp = canonical.source_app;
 
   for (const fact of others) {
     maxImportance = Math.max(maxImportance, fact.importance ?? 5);
     totalAccessCount += fact.access_count ?? 0;
+    totalImpressionCount += fact.impression_count ?? 0;
+    totalUtilityCount += fact.utility_count ?? 0;
     maxTrust = Math.max(maxTrust, fact.trust_level ?? 1.0);
+    if (fact.last_accessed_at && (!lastAccessedAt || fact.last_accessed_at > lastAccessedAt)) {
+      lastAccessedAt = fact.last_accessed_at;
+    }
+    if (fact.last_used_at && (!lastUsedAt || fact.last_used_at > lastUsedAt)) {
+      lastUsedAt = fact.last_used_at;
+    }
     if (!sourceApp && fact.source_app) {
       sourceApp = fact.source_app;
     }
@@ -246,27 +263,36 @@ function consolidateCluster(canonical: Fact, others: Fact[]) {
   return {
     importance: Math.min(10, Math.max(1, maxImportance)),
     accessCount: totalAccessCount,
+    impressionCount: totalImpressionCount,
+    utilityCount: totalUtilityCount,
     trustLevel: Math.min(1, Math.max(0, maxTrust)),
+    lastAccessedAt,
+    lastUsedAt,
     sourceApp,
   };
 }
 
 /**
- * Main paraphrase merge job. Runs nightly to consolidate semantic duplicates.
+ * Main paraphrase merge job. Available as an explicit operator action to
+ * consolidate reviewed semantic duplicates. It is disabled by default because
+ * embedding similarity is candidate evidence, not proof of identity: production
+ * merges previously collapsed distinct phone numbers, dates, and legal topics.
  * Reversible via unmergeCluster + audit log. New merge entries retain the
  * canonical fact's pre-merge metadata so a reversal can restore it exactly.
  */
 export async function mergeParaphrases(): Promise<MergeStats> {
   // Read this at dispatch time so console/runtime feature-flag changes take
   // effect without restarting the daemon.
-  if (getRuntimeEnv('CLEMMY_MERGE_ENABLED', 'true') !== 'true') {
-    return { clustersFound: 0, factsMerged: 0, accessCountFolded: 0, importanceFolded: 0, blockedByPinned: 0, blockedByEntity: 0, errors: 0 };
+  if (getRuntimeEnv('CLEMMY_MERGE_ENABLED', 'false') !== 'true') {
+    return { clustersFound: 0, factsMerged: 0, accessCountFolded: 0, impressionCountFolded: 0, utilityCountFolded: 0, importanceFolded: 0, blockedByPinned: 0, blockedByEntity: 0, errors: 0 };
   }
 
   const stats: MergeStats = {
     clustersFound: 0,
     factsMerged: 0,
     accessCountFolded: 0,
+    impressionCountFolded: 0,
+    utilityCountFolded: 0,
     importanceFolded: 0,
     blockedByPinned: 0,
     blockedByEntity: 0,
@@ -297,12 +323,13 @@ export async function mergeParaphrases(): Promise<MergeStats> {
         f.trust_level, f.extracted_at,
         f.importance, f.last_accessed_at,
         f.derivation_depth, f.derived_from_fact_ids,
-        f.pinned, f.source_app, f.access_count,
+        f.pinned, f.source_app, f.access_count, f.impression_count,
+        f.utility_count, f.last_used_at,
         fe.vector
       FROM consolidated_facts f
       LEFT JOIN fact_embeddings fe ON f.id = fe.fact_id
       WHERE f.active = 1
-      ORDER BY f.importance DESC, f.access_count DESC
+      ORDER BY f.importance DESC, f.utility_count DESC, f.id ASC
     `).all() as any[];
 
     const factsWithEmbedding = rows
@@ -369,8 +396,11 @@ export async function mergeParaphrases(): Promise<MergeStats> {
         const canonicalBefore = {
           importance: canonical.importance ?? 5,
           accessCount: canonical.access_count ?? 0,
+          impressionCount: canonical.impression_count ?? 0,
+          utilityCount: canonical.utility_count ?? 0,
           trustLevel: canonical.trust_level ?? 1.0,
           lastAccessedAt: canonical.last_accessed_at ?? null,
+          lastUsedAt: canonical.last_used_at ?? null,
           sourceApp: canonical.source_app ?? null,
         };
         const folded = consolidateCluster(canonical, merged);
@@ -378,9 +408,20 @@ export async function mergeParaphrases(): Promise<MergeStats> {
         // Update canonical fact
         db.prepare(`
           UPDATE consolidated_facts
-          SET importance = ?, access_count = ?, trust_level = ?, last_accessed_at = ?, source_app = ?
+          SET importance = ?, access_count = ?, impression_count = ?, utility_count = ?,
+              trust_level = ?, last_accessed_at = ?, last_used_at = ?, source_app = ?
           WHERE id = ?
-        `).run(folded.importance, folded.accessCount, folded.trustLevel, new Date().toISOString(), folded.sourceApp, canonical.id);
+        `).run(
+          folded.importance,
+          folded.accessCount,
+          folded.impressionCount,
+          folded.utilityCount,
+          folded.trustLevel,
+          folded.lastAccessedAt,
+          folded.lastUsedAt,
+          folded.sourceApp,
+          canonical.id,
+        );
 
         // Soft-delete merged facts
         const now = new Date().toISOString();
@@ -402,6 +443,8 @@ export async function mergeParaphrases(): Promise<MergeStats> {
               reason: 'paraphrase',
             })),
             accessCountFolded: folded.accessCount,
+            impressionCountFolded: folded.impressionCount,
+            utilityCountFolded: folded.utilityCount,
             importanceFolded: folded.importance,
             trustFolded: folded.trustLevel,
           },
@@ -410,6 +453,8 @@ export async function mergeParaphrases(): Promise<MergeStats> {
         stats.clustersFound++;
         stats.factsMerged += merged.length;
         stats.accessCountFolded += folded.accessCount;
+        stats.impressionCountFolded += folded.impressionCount;
+        stats.utilityCountFolded += folded.utilityCount;
         stats.importanceFolded += folded.importance;
       }
     }
@@ -493,8 +538,11 @@ export function unmergeCluster(
     const canonicalBefore = mergeEntry.detail?.canonicalBefore as {
       importance?: unknown;
       accessCount?: unknown;
+      impressionCount?: unknown;
+      utilityCount?: unknown;
       trustLevel?: unknown;
       lastAccessedAt?: unknown;
+      lastUsedAt?: unknown;
       sourceApp?: unknown;
     } | undefined;
     const canRestoreCanonical = canonicalBefore !== undefined
@@ -514,13 +562,17 @@ export function unmergeCluster(
       if (canRestoreCanonical) {
         db.prepare(`
           UPDATE consolidated_facts
-          SET importance = ?, access_count = ?, trust_level = ?, last_accessed_at = ?, source_app = ?
+          SET importance = ?, access_count = ?, impression_count = ?, utility_count = ?,
+              trust_level = ?, last_accessed_at = ?, last_used_at = ?, source_app = ?
           WHERE id = ?
         `).run(
           Number(canonicalBefore!.importance),
           Number(canonicalBefore!.accessCount),
+          Number.isFinite(Number(canonicalBefore!.impressionCount)) ? Number(canonicalBefore!.impressionCount) : 0,
+          Number.isFinite(Number(canonicalBefore!.utilityCount)) ? Number(canonicalBefore!.utilityCount) : 0,
           Number(canonicalBefore!.trustLevel),
           typeof canonicalBefore!.lastAccessedAt === 'string' ? canonicalBefore!.lastAccessedAt : null,
+          typeof canonicalBefore!.lastUsedAt === 'string' ? canonicalBefore!.lastUsedAt : null,
           typeof canonicalBefore!.sourceApp === 'string' ? canonicalBefore!.sourceApp : null,
           canonicalId,
         );

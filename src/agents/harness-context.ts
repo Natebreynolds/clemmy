@@ -26,7 +26,7 @@
  * snapshot.
  */
 import { loadMemoryContext } from '../memory/vault.js';
-import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, listConstraints, searchFactsByText } from '../memory/facts.js';
+import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
@@ -161,7 +161,6 @@ export function renderFocusForInstructions(): string {
   return focus;
 }
 
-const CONSTRAINTS_SHOWN = 20;
 // Per-line bound for injected memory content (recall bullets, constraint
 // bodies). A single runaway fact must not blow the volatile context tail —
 // but the cut is MARKED so the model knows to fetch the full fact rather
@@ -174,26 +173,6 @@ function clipContextLine(text: string): string {
     ? t
     : `${t.slice(0, CONTEXT_LINE_MAX_CHARS)} …[truncated — search memory for the full fact]`;
 }
-function renderActiveConstraints(): string {
-  try {
-    // listConstraints() (no arg) returns ALL active constraints — the same set
-    // the dispatch gate enforces. We DISPLAY the most important CONSTRAINTS_SHOWN
-    // (importance-ranked), but never silently hide the rest: a count note makes
-    // clear they're still ACTIVE and ENFORCED, so the model never assumes a
-    // constraint it doesn't see has lapsed.
-    const all = listConstraints();
-    if (all.length === 0) return '';
-    const shown = all.slice(0, CONSTRAINTS_SHOWN);
-    let out = shown.map((c) => `- ${clipContextLine(String(c.content ?? ''))}`).join('\n');
-    if (all.length > shown.length) {
-      out += `\n_(+${all.length - shown.length} more standing constraints are ACTIVE and ENFORCED on tool dispatch, not all shown here.)_`;
-    }
-    return out;
-  } catch {
-    return '';
-  }
-}
-
 function renderActiveGoals(): string {
   const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
   if (goals.length === 0) return '';
@@ -228,7 +207,10 @@ function renderActiveGoals(): string {
 export function renderLearnedBlocks(objective?: string): { recentlyLearned: string; toolChoices: string; establishedDestinations: string } {
   let recentlyLearned = '';
   try {
-    recentlyLearned = section('Recently Learned (last 24h)', renderRecentlyLearnedForInstructions(24, 15));
+    // Keep only a compact recency bridge here. Durable detail already lives in
+    // the typed fact/episode stores and is retrieved by the unified primer; the
+    // call ids are retained so the model can still reopen exact raw evidence.
+    recentlyLearned = section('Recently Learned (last 24h)', renderRecentlyLearnedForInstructions(24, 8, 1000));
   } catch {
     recentlyLearned = '';
   }
@@ -368,8 +350,6 @@ export function renderHarnessMemoryContext(opts?: {
   // state and does not need an immediate focus_get round-trip.
   const focus = renderFocusForInstructions();
 
-  const constraints = renderActiveConstraints();
-
   // Query-driven recall (parity with the main harness loop's buildTurnMemoryPrimer):
   // surface the consolidated facts MOST RELEVANT to the user's CURRENT message. A
   // brain that runs on this self-assembled context (the Claude Agent SDK lane) only
@@ -404,7 +384,6 @@ export function renderHarnessMemoryContext(opts?: {
     // cutoff for date math, which is months stale.
     { title: 'Now', text: section('Now', nowLine) },
     { title: 'Autonomy', text: section('Autonomy', renderAutonomy()) },
-    { title: 'Standing Constraints', text: section('Standing Constraints', constraints) },
     { title: 'Relevant To Your Request', text: section('Relevant To Your Request', requestRecall) },
     { title: 'Completed Actions This Conversation', text: section('Completed Actions This Conversation', sessionActions) },
     { title: 'User Preferences', text: section('User Preferences', profile) },

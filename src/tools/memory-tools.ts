@@ -4,18 +4,24 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, embedMissingFacts, readEmbeddingStats, readFactEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned, touchFactAccess } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, reviewStandingInstructions, searchFacts, setFactPinned, recordFactImpression } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
-import { recallEverything, formatUnifiedRecall } from '../memory/unified-recall.js';
+import { recallEverything, formatUnifiedRecall, unifiedHitRecallRef, visibleUnifiedRecallHits } from '../memory/unified-recall.js';
+import { createRecallRunId, recordRecallRun, recordRecallUse } from '../memory/recall-usage.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
 import { scheduleRecallShadow } from '../memory/recall-shadow.js';
 import { applyMemoryFix, detectMemoryHealCandidates, listProposedMemoryFixes, revertMemoryHeal, runMemorySelfHeal, type ProposedMemoryFix } from '../memory/self-heal.js';
-import { getRuntimeEnv } from '../config.js';
+import { looksLikeHighConfidenceTransientRequest } from '../memory/memory-quality.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { addNotification } from '../runtime/notifications.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
 import type { ConsolidatedFact } from '../memory/facts.js';
+import { openMemoryDb, type EntityType } from '../memory/db.js';
+import { upsertEntity, type EntityIdentifierInput } from '../memory/entity-identity.js';
+import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelationshipOutcome } from '../memory/relations.js';
+import { getFactEvidence } from '../memory/temporal-memory.js';
+import { compileWordMatcher } from '../memory/word-match.js';
 
 /**
  * Standing-instruction protection for the DIRECT memory tools.
@@ -81,6 +87,237 @@ function notifyStandingRuleChange(
 // duplicate. Below this cosine bar a candidate is treated as clearly novel
 // and ADDed without an LLM resolver call (cost fast-path).
 const REMEMBER_NOVELTY_FAST_PATH_SIM = 0.6;
+const MEMORY_ENTITY_TYPES = ['person', 'company', 'project', 'place', 'thing'] as const;
+
+export interface RememberedEntityAnnotation {
+  type: EntityType;
+  name: string;
+  aliases?: string[];
+  identifiers?: EntityIdentifierInput[];
+  confidence?: number;
+}
+
+export interface RememberedEntityAttachmentResult {
+  linkedEntityIds: number[];
+  identifiersStored: number;
+  skipped: Array<{ name: string; reason: string }>;
+  resolved: Array<{ name: string; aliases: string[]; entityId: number }>;
+}
+
+export interface RememberedRelationshipAnnotation {
+  subject: string;
+  predicate: string;
+  object: string;
+  confidence?: number;
+  validFrom?: string;
+  validTo?: string;
+}
+
+export interface RememberedRelationshipAttachmentResult {
+  outcomes: Record<EntityRelationshipOutcome, number>;
+  skipped: Array<{ relationship: string; reason: string }>;
+}
+
+function textMentionsName(text: string, value: string): boolean {
+  return compileWordMatcher(value.trim().toLowerCase(), 2)?.test(text.toLowerCase()) ?? false;
+}
+
+function textContainsIdentifier(text: string, identifier: EntityIdentifierInput): boolean {
+  const value = identifier.value.trim();
+  if (!value) return false;
+  const scheme = identifier.scheme.trim().toLowerCase();
+  if (scheme === 'phone') {
+    const wanted = value.replace(/\D/g, '');
+    return wanted.length >= 7 && text.replace(/\D/g, '').includes(wanted);
+  }
+  if (scheme === 'domain') {
+    const wanted = value
+      .replace(/^https?:\/\//i, '')
+      .replace(/^www\./i, '')
+      .split(/[/?#]/, 1)[0]
+      .toLowerCase();
+    return wanted.length >= 4 && text.toLowerCase().includes(wanted);
+  }
+  return text.toLowerCase().includes(value.toLowerCase());
+}
+
+/**
+ * Attach structured entity annotations to an already-durable direct fact.
+ * Every accepted identity must be named in both the canonical fact and one
+ * surviving evidence excerpt. Identifiers and aliases are retained only when
+ * they literally occur in that same excerpt, preventing a model annotation
+ * from becoming unsupported identity evidence.
+ */
+export function attachRememberedEntities(
+  factId: number,
+  annotations: RememberedEntityAnnotation[],
+): RememberedEntityAttachmentResult {
+  const fact = getFact(factId);
+  const result: RememberedEntityAttachmentResult = { linkedEntityIds: [], identifiersStored: 0, skipped: [], resolved: [] };
+  if (!fact?.active) {
+    for (const annotation of annotations) result.skipped.push({ name: annotation.name, reason: 'fact_unavailable' });
+    return result;
+  }
+  const evidence = getFactEvidence(factId).filter(
+    (item) => item.excerpt.trim().length > 0 && (item.status === 'available' || item.status === 'partial'),
+  );
+  if (evidence.length === 0) {
+    for (const annotation of annotations) result.skipped.push({ name: annotation.name, reason: 'durable_evidence_unavailable' });
+    return result;
+  }
+
+  const linked = new Set<number>();
+  for (const annotation of annotations.slice(0, 12)) {
+    const name = annotation.name.replace(/\s+/g, ' ').trim();
+    const aliases = Array.from(new Set((annotation.aliases ?? [])
+      .map((alias) => alias.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)))
+      .slice(0, 12);
+    const mentionedNames = [name, ...aliases].filter((candidate) => textMentionsName(fact.content, candidate));
+    if (!name || mentionedNames.length === 0) {
+      result.skipped.push({ name: name || '(blank)', reason: 'not_named_in_fact' });
+      continue;
+    }
+    const supporting = evidence.find((item) => mentionedNames.some((candidate) => textMentionsName(item.excerpt, candidate)));
+    if (!supporting) {
+      result.skipped.push({ name, reason: 'not_named_in_evidence' });
+      continue;
+    }
+    const groundedAliases = aliases.filter((alias) => textMentionsName(supporting.excerpt, alias));
+    const groundedIdentifiers = (annotation.identifiers ?? [])
+      .filter((identifier) => textContainsIdentifier(supporting.excerpt, identifier))
+      .slice(0, 12);
+    const confidence = Math.max(0, Math.min(1, annotation.confidence ?? 0.95));
+
+    try {
+      const entityId = openMemoryDb().transaction(() => {
+        const id = upsertEntity({
+          type: annotation.type,
+          name,
+          aliases: groundedAliases,
+          identifiers: groundedIdentifiers,
+          confidence,
+          evidenceEpisodeId: supporting.episodeId,
+          sourceUri: supporting.sourceUri,
+          sourceFactId: factId,
+          sourceKind: 'fact_link',
+        });
+        addFactEntityLinks(factId, [id], {
+          linkType: 'extracted',
+          confidence,
+          evidenceEpisodeId: supporting.episodeId,
+          evidenceExcerpt: supporting.excerpt,
+        });
+        return id;
+      })();
+      linked.add(entityId);
+      result.resolved.push({ name, aliases: groundedAliases, entityId });
+      result.identifiersStored += groundedIdentifiers.length;
+    } catch (error) {
+      result.skipped.push({
+        name,
+        reason: `write_failed:${error instanceof Error ? error.message : String(error)}`.slice(0, 180),
+      });
+    }
+  }
+  result.linkedEntityIds = Array.from(linked);
+  return result;
+}
+
+function normalizedEntityReference(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Persist direct entity relationships only when both endpoints were grounded
+ * by this fact and the same durable excerpt explicitly supports the edge. */
+export function attachRememberedRelationships(
+  factId: number,
+  annotations: RememberedRelationshipAnnotation[],
+  entities: RememberedEntityAttachmentResult,
+): RememberedRelationshipAttachmentResult {
+  const result: RememberedRelationshipAttachmentResult = {
+    outcomes: { add: 0, reinforce: 0, supersede: 0, ignore: 0 },
+    skipped: [],
+  };
+  const evidence = getFactEvidence(factId).filter(
+    (item) => item.excerpt.trim().length > 0 && (item.status === 'available' || item.status === 'partial'),
+  );
+  const refs = new Map<string, Set<number>>();
+  for (const entity of entities.resolved) {
+    for (const value of [entity.name, ...entity.aliases]) {
+      const key = normalizedEntityReference(value);
+      if (!key) continue;
+      const ids = refs.get(key) ?? new Set<number>();
+      ids.add(entity.entityId);
+      refs.set(key, ids);
+    }
+  }
+  const resolve = (value: string): number | undefined => {
+    const ids = refs.get(normalizedEntityReference(value));
+    return ids?.size === 1 ? ids.values().next().value : undefined;
+  };
+
+  for (const annotation of annotations.slice(0, 12)) {
+    const label = `${annotation.subject} -${annotation.predicate}-> ${annotation.object}`;
+    const subjectId = resolve(annotation.subject);
+    const objectId = resolve(annotation.object);
+    if (!subjectId || !objectId) {
+      result.skipped.push({ relationship: label, reason: 'endpoint_not_uniquely_grounded_in_entities' });
+      continue;
+    }
+    let recorded = false;
+    let lastReason = 'durable_evidence_unavailable';
+    for (const item of evidence) {
+      const outcome = recordGroundedEntityRelationship({
+        subjectId,
+        predicate: annotation.predicate,
+        objectId,
+        evidenceEpisodeId: item.episodeId,
+        evidenceExcerpt: item.excerpt,
+        sourceText: item.excerpt,
+        sourceUri: item.sourceUri,
+        sourceFactId: factId,
+        confidence: Math.max(0, Math.min(1, annotation.confidence ?? 0.95)),
+        validFrom: annotation.validFrom,
+        validTo: annotation.validTo,
+        extractionMethod: 'manual',
+      });
+      lastReason = outcome.reason;
+      if (outcome.outcome !== 'ignore' || outcome.reason === 'duplicate_evidence') {
+        result.outcomes[outcome.outcome] += 1;
+        recorded = true;
+        break;
+      }
+    }
+    if (!recorded) result.skipped.push({ relationship: label, reason: lastReason });
+  }
+  return result;
+}
+
+function enrichRememberedFact(
+  factId: number,
+  entities: RememberedEntityAnnotation[] | undefined,
+  relationships: RememberedRelationshipAnnotation[] | undefined,
+): string {
+  if (!entities?.length && !relationships?.length) return '';
+  const attached = entities?.length
+    ? attachRememberedEntities(factId, entities)
+    : { linkedEntityIds: [], identifiersStored: 0, skipped: [], resolved: [] } satisfies RememberedEntityAttachmentResult;
+  const relationResult = relationships?.length
+    ? attachRememberedRelationships(factId, relationships, attached)
+    : null;
+  const parts = [
+    `linked ${attached.linkedEntityIds.length} canonical entit${attached.linkedEntityIds.length === 1 ? 'y' : 'ies'}`,
+  ];
+  if (relationResult) {
+    const stored = relationResult.outcomes.add + relationResult.outcomes.reinforce
+      + relationResult.outcomes.supersede + relationResult.outcomes.ignore;
+    parts.push(`grounded ${stored} relationship${stored === 1 ? '' : 's'}`);
+  }
+  const rejected = attached.skipped.length + (relationResult?.skipped.length ?? 0);
+  if (rejected > 0) parts.push(`rejected ${rejected} unsupported annotation(s)`);
+  return ` · ${parts.join(' · ')}`;
+}
 
 function formatMemoryFix(fix: ProposedMemoryFix): string {
   const status = fix.status ?? 'pending';
@@ -227,45 +464,70 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_remember',
-    'Record a durable fact in long-term memory. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Use kind=constraint for an ENFORCEABLE standing rule that must HARD-GATE tool dispatch — a sender/account/destination routing rule ("always send Outlook mail from billing@acme.co", "only write Salesforce in the sandbox org") or a never-do guardrail ("never post to the prod channel"). A constraint is auto-pinned and is checked by the dispatch gate on every matching tool call, so reserve it for rules that should BLOCK a wrong action, not general preferences. Idempotent — re-recording the same fact bumps its score.',
+    'Record a durable fact in long-term memory. One-off commands, questions, and task requests are rejected; put those in task/focus/working memory instead. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). When the fact explicitly names people, companies, projects, places, or things, include structured entities so Clementine creates or reuses their canonical identity and grounds the graph link in this fact\'s durable evidence. If the content explicitly states a relationship between two included entities, add subject/predicate/object under relationships; only controlled predicates and relationships supported verbatim by the durable fact are accepted. Include an alias or identifier only when it is literally present in content; unsupported annotations are rejected. Use kind=constraint for an ENFORCEABLE standing rule that must HARD-GATE tool dispatch — a sender/account/destination routing rule ("always send Outlook mail from billing@acme.co", "only write Salesforce in the sandbox org") or a never-do guardrail ("never post to the prod channel"). A constraint is auto-pinned and is checked by the dispatch gate on every matching tool call, so reserve it for rules that should BLOCK a wrong action, not general preferences. Idempotent — re-recording the same fact bumps its score.',
     {
       kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]),
       content: z.string().min(3).max(800),
       sessionId: z.string().optional(),
       sourcePath: z.string().optional(),
+      entities: z.array(z.object({
+        type: z.enum(MEMORY_ENTITY_TYPES),
+        name: z.string().min(2).max(120),
+        aliases: z.array(z.string().min(2).max(120)).max(12).optional(),
+        identifiers: z.array(z.object({
+          scheme: z.enum(['email', 'phone', 'domain', 'url', 'handle']),
+          value: z.string().min(2).max(240),
+          confidence: z.number().min(0).max(1).optional(),
+        })).max(12).optional(),
+        confidence: z.number().min(0).max(1).optional(),
+      })).max(12).optional(),
+      relationships: z.array(z.object({
+        subject: z.string().min(2).max(120),
+        predicate: z.string().min(2).max(80),
+        object: z.string().min(2).max(120),
+        confidence: z.number().min(0).max(1).optional(),
+        validFrom: z.string().max(64).optional(),
+        validTo: z.string().max(64).optional(),
+      })).max(12).optional(),
     },
-    async ({ kind, content, sessionId, sourcePath }) => {
+    async ({ kind, content, sessionId, sourcePath, entities, relationships }) => {
       try {
-        const reconcile = (getRuntimeEnv('CLEMMY_REMEMBER_RECONCILE', 'on') || 'on').toLowerCase() !== 'off';
-        if (reconcile) {
-          // Route through the Mem0 resolver. User-stated facts pass trust
-          // 1.0 so they win conflicts against derived (0.6) facts.
-          const outcome = await consolidateFact(
-            {
-              kind: kind as (typeof FACT_KINDS)[number],
-              text: content,
-              trustLevel: 1.0,
-              sourceUri: sourcePath,
-            },
-            { sessionId },
-            { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
+        if (looksLikeHighConfidenceTransientRequest(content)) {
+          return textResult(
+            'Not remembered: this reads like a one-time command, question, or task request rather than durable memory. '
+            + 'Keep it in the active task/focus or create a task; rewrite only the stable fact or recurring rule if one was actually stated.',
           );
-          const verb = outcome.action === 'supersede'
-            ? 'Superseded the prior fact with'
-            : outcome.action === 'reinforce'
-              ? 'Reinforced an existing fact'
-              : outcome.action === 'ignore'
-                ? 'Already known — no change'
-                : 'Remembered';
-          return textResult(`${verb} (${kind}): ${content}`);
         }
-        const fact = rememberFact({
-          kind: kind as (typeof FACT_KINDS)[number],
-          content,
-          sessionId,
-          path: sourcePath,
-        });
-        return textResult(`Remembered #${fact.id} (${fact.kind}, score ${fact.score.toFixed(2)}): ${fact.content}`);
+        // There is intentionally no legacy direct-write switch here. Every
+        // public remember operation must pass through the same semantic
+        // duplicate/conflict resolver, evidence capture, and temporal history
+        // path or reliability depends on deployment configuration.
+        const outcome = await consolidateFact(
+          {
+            kind: kind as (typeof FACT_KINDS)[number],
+            text: content,
+            trustLevel: 1.0,
+            authority: 'user',
+            sourceUri: sourcePath,
+          },
+          { sessionId },
+          { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
+        );
+        const verb = outcome.action === 'supersede'
+          ? 'Superseded the prior fact with'
+          : outcome.action === 'reinforce'
+            ? 'Reinforced an existing fact'
+            : outcome.action === 'ignore'
+              ? 'Already known — no change'
+              : 'Remembered';
+        const graphSummary = outcome.factId
+          ? enrichRememberedFact(
+              outcome.factId,
+              entities as RememberedEntityAnnotation[] | undefined,
+              relationships as RememberedRelationshipAnnotation[] | undefined,
+            )
+          : '';
+        return textResult(`${verb} (${kind}): ${content}${graphSummary}`);
       } catch (err) {
         return textResult(`memory_remember failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -339,17 +601,34 @@ export function registerMemoryTools(server: McpServer): void {
         kind: kind as (typeof FACT_KINDS)[number] | undefined,
         topK: limit ?? 8,
       });
-      // Refresh the recency anchor for surfaced facts: an on-demand recall is an
-      // ACCESS, so bumping last_accessed_at keeps frequently-recalled facts warm
-      // for the Stanford recall score (best-effort, never throws).
-      for (const fact of facts) touchFactAccess(fact.id);
+      // A returned candidate is an impression, not proof the agent materially
+      // used it. Utility is reserved for an applied/cited memory signal so a
+      // broad search cannot make every displayed row rank higher next time.
+      for (const fact of facts) recordFactImpression(fact.id);
       appendFactRecallTrace({
         surface: 'memory_search_facts',
         query,
         facts: facts.map((fact) => ({ fact, reason: 'agent-tool-semantic-search' })),
       });
-      if (facts.length === 0) return textResult('No relevant facts found.');
-      const lines = facts.map((fact) => `- #${fact.id} ${fact.kind}: ${fact.content}`);
+      let recallId: string | undefined;
+      try {
+        const run = recordRecallRun({
+          objective: query,
+          surface: 'memory_search_facts',
+          answerability: facts.length > 0 ? 'partial' : 'insufficient',
+          candidateRefs: facts.map((fact) => ({ type: 'fact', id: String(fact.id) })),
+        });
+        recallId = run.id;
+      } catch {
+        // Attribution must never make a scoped recall unavailable.
+      }
+      if (facts.length === 0) {
+        return textResult(`No relevant facts found.${recallId ? ` Recall ${recallId}.` : ''}`);
+      }
+      const lines = facts.map((fact) => `- [fact:${fact.id}] ${fact.kind}: ${fact.content}`);
+      if (recallId) {
+        lines.push(`[USE FEEDBACK] If an exact fact materially changes your answer, plan, or tool choice, call memory_mark_used once with recall_id ${recallId} and only the exact fact:<id> ref(s) used.`);
+      }
       return textResult(lines.join('\n'));
     },
   );
@@ -364,15 +643,34 @@ export function registerMemoryTools(server: McpServer): void {
     async ({ objective, limit }) => {
       const result = await recallEverything(objective, { limit: limit ?? 12 });
       scheduleRecallShadow({ query: objective, surface: 'memory_recall_all', limit: limit ?? 12 });
-      if (result.hits.length === 0) return textResult('No relevant memory found across facts, notes, entities, resources, or tool-recall.');
+      try {
+        const recallId = createRecallRunId();
+        result.recallId = recallId;
+        result.hits = visibleUnifiedRecallHits(result, 4000);
+        const run = recordRecallRun({
+          id: recallId,
+          objective,
+          surface: 'memory_recall_all',
+          answerability: result.answerability ?? 'partial',
+          candidateRefs: result.hits.map(unifiedHitRecallRef),
+        });
+        result.recallId = run.id;
+      } catch {
+        delete result.recallId;
+        // Attribution must never make recall unavailable.
+      }
+      if (result.hits.length === 0) {
+        const recall = result.recallId ? ` Recall ${result.recallId}.` : '';
+        return textResult(`No relevant memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}`);
+      }
       const block = formatUnifiedRecall(result, 4000);
-      // Reinforce surfaced claims selected by the agent. Policy hits reference
-      // their canonical fact id too, so they count as useful recall as well.
+      // Record exposure only. Unified recall deliberately returns alternatives;
+      // simply appearing in that pack does not establish material usefulness.
       const recalledFactIds = new Set(result.hits
         .filter((h) => h.type === 'fact' || h.type === 'policy')
         .map((h) => Number(h.ref))
         .filter(Number.isFinite));
-      for (const id of recalledFactIds) touchFactAccess(id);
+      for (const id of recalledFactIds) recordFactImpression(id);
       const facts = result.hits
         .filter((h) => h.type === 'fact' || h.type === 'policy')
         .map((h) => getFact(Number(h.ref)))
@@ -382,7 +680,37 @@ export function registerMemoryTools(server: McpServer): void {
         query: objective,
         facts: facts.map((fact) => ({ fact, reason: 'agent-tool-unified-recall' })),
       });
-      return textResult(block);
+      const attribution = result.recallId
+        ? `\n[USE FEEDBACK] If a returned memory materially changes your answer, plan, or tool choice, call memory_mark_used once with recall_id ${result.recallId} and only the exact ref(s) you used. Do not credit merely displayed alternatives.`
+        : '';
+      return textResult(block + attribution);
+    },
+  );
+
+  server.tool(
+    'memory_mark_used',
+    'Attribute material use of an exact memory_recall_all result. Call this once after one or more returned refs actually change your answer, plan, scope, or tool choice; never mark every displayed candidate. The recall id and refs must be copied exactly from that recall result. Retries are idempotent.',
+    {
+      recall_id: z.string().min(1),
+      refs: z.array(z.string().min(3)).min(1).max(20),
+      outcome: z.enum(['used', 'not_useful']).optional(),
+      detail: z.string().max(500).optional(),
+    },
+    async ({ recall_id, refs, outcome, detail }) => {
+      const result = recordRecallUse({ recallId: recall_id, refs, outcome, detail });
+      if (!result.ok) {
+        const reason = result.reason === 'expired'
+          ? 'That recall attribution window has expired.'
+          : 'No recall run exists with that id.';
+        return textResult(`${reason} No utility was recorded.`);
+      }
+      const parts = [
+        `Recorded ${result.recorded.length} ${outcome === 'not_useful' ? 'not-useful' : 'material-use'} ref${result.recorded.length === 1 ? '' : 's'}.`,
+      ];
+      if (result.utilityFactIds.length > 0) parts.push(`Credited fact${result.utilityFactIds.length === 1 ? '' : 's'} #${result.utilityFactIds.join(', #')}.`);
+      if (result.duplicates.length > 0) parts.push(`${result.duplicates.length} duplicate${result.duplicates.length === 1 ? '' : 's'} ignored.`);
+      if (result.rejected.length > 0) parts.push(`${result.rejected.length} ref${result.rejected.length === 1 ? '' : 's'} rejected because it was not returned by that recall.`);
+      return textResult(parts.join(' '));
     },
   );
 

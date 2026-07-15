@@ -39,6 +39,10 @@ export interface FactRecallTraceEntry {
   mode?: string;
   sessionId?: string;
   facts: FactRecallTraceFact[];
+  includedCount?: number;
+  omittedCount?: number;
+  candidateCount?: number;
+  enforcementBackedCount?: number;
 }
 
 function truncate(s: string | undefined, max = 500): string | undefined {
@@ -55,6 +59,10 @@ export function appendFactRecallTrace(input: {
   mode?: string;
   sessionId?: string;
   nowIso?: string;
+  includedCount?: number;
+  omittedCount?: number;
+  candidateCount?: number;
+  enforcementBackedCount?: number;
 }): void {
   try {
     const facts = input.facts
@@ -68,12 +76,19 @@ export function appendFactRecallTrace(input: {
         accessCount: fact.accessCount ?? 0,
         trustLevel: fact.trustLevel ?? null,
       }));
-    if (facts.length === 0) return;
+    const hasPromptCounts = typeof input.includedCount === 'number'
+      || typeof input.omittedCount === 'number'
+      || typeof input.candidateCount === 'number';
+    if (facts.length === 0 && !hasPromptCounts) return;
     const entry: FactRecallTraceEntry = {
       at: input.nowIso ?? new Date().toISOString(),
       surface: input.surface,
       facts,
     };
+    if (typeof input.includedCount === 'number') entry.includedCount = Math.max(0, Math.floor(input.includedCount));
+    if (typeof input.omittedCount === 'number') entry.omittedCount = Math.max(0, Math.floor(input.omittedCount));
+    if (typeof input.candidateCount === 'number') entry.candidateCount = Math.max(0, Math.floor(input.candidateCount));
+    if (typeof input.enforcementBackedCount === 'number') entry.enforcementBackedCount = Math.max(0, Math.floor(input.enforcementBackedCount));
     const query = truncate(input.query);
     const objective = truncate(input.objective);
     if (query) entry.query = query;

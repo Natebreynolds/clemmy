@@ -27,6 +27,8 @@ const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
 const { appendEvent, createSession: createHarnessSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { resetMemoryDb } = await import('../memory/db.js');
+const { rememberFact } = await import('../memory/facts.js');
 
 interface Harness {
   url: string;
@@ -443,6 +445,39 @@ test('chat/send rejects without a cookie', async () => {
     });
     assert.equal(res.status, 401);
   } finally { await h.close(); }
+});
+
+test('mobile memory search uses unified recall and returns facts absent from the vault', async () => {
+  resetMemoryDb();
+  const fact = rememberFact({
+    kind: 'project',
+    content: 'The Quorvex live in-person meeting covered the amber renewal proposal.',
+    sourceUri: 'recording://local/quorvex-review',
+    occurredAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+  });
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h);
+    const response = await fetch(`${h.url}/m/api/memory/search?q=${encodeURIComponent('Quorvex amber renewal')}&limit=10`, {
+      headers: { cookie },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      answerability: string;
+      diagnostics: { stores: string[]; candidates: number };
+      hits: Array<{ path: string; snippet: string; ref?: { type: string; id: string | number }; evidenceCount?: number; whyRecalled?: string[] }>;
+    };
+    const hit = body.hits.find((candidate) => candidate.ref?.type === 'fact' && Number(candidate.ref.id) === fact.id);
+    assert.ok(hit, 'the unified endpoint should expose the canonical fact');
+    assert.equal(hit.path, `fact:${fact.id}`);
+    assert.match(hit.snippet, /live in-person meeting/i);
+    assert.ok((hit.evidenceCount ?? 0) >= 1, 'mobile results should expose surviving evidence');
+    assert.ok((hit.whyRecalled?.length ?? 0) > 0);
+    assert.ok(body.diagnostics.stores.includes('fact'));
+  } finally {
+    await h.close();
+    resetMemoryDb();
+  }
 });
 
 test('chat/send returns 503 when no assistant is wired', async () => {

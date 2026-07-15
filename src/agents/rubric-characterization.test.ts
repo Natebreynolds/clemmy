@@ -38,11 +38,15 @@ const GOLDEN = {
   // manufactures a closing question.
   // 2026-07-15 memory reliability replay: unified recall is the default agent
   // lookup; legacy vault-only recall remains available only for explicit scope.
-  instructions: { len: 35295, sha16: '034fc90fb17cd60a' },
-  native: { len: 34398, sha16: 'b8903bad1dac892b' },
-  claudeBrain: { len: 5171, sha16: 'f9b0c036405ae0cb' },
+  // 2026-07-15 recall utility loop: exact returned refs receive reinforcement
+  // only after materially affecting an answer, plan, scope, or tool choice.
+  // 2026-07-15 structured entity capture: both provider lanes annotate only
+  // literal identities/relationships so memory writes populate grounded graph.
+  instructions: { len: 35977, sha16: '9acafd60a2beb6bf' },
+  native: { len: 35080, sha16: 'acfc047e5d80c1e3' },
+  claudeBrain: { len: 5589, sha16: 'eaf07b47ae5ca924' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8430, sha16: 'c606d1a28a993b1e' },
+  lean: { len: 8848, sha16: '8bb076e57bdea9bf' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

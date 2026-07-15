@@ -50,7 +50,13 @@ import { tickAuthKeepalive, isAuthKeepaliveEnabled } from '../runtime/auth-keepa
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
-import { processMemoryMaintenance } from '../memory/maintenance.js';
+import {
+  finalizeGroundedEntityLinksOnBoot,
+  finalizeGroundedResourceLinksOnBoot,
+  finalizeLegacyReflectionCandidatesOnBoot,
+  finalizeMemoryIdentityOnBoot,
+  processMemoryMaintenance,
+} from '../memory/maintenance.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
@@ -494,25 +500,24 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
 }
 
 // Tier A2/A3 — nightly memory hygiene: forgetting (decay/eviction of the
-// stale, low-value, unpinned tail) + retroactive semantic dedup of
-// near-identical facts. Without this the consolidated_facts store only
-// grows (~100/day with ~zero deactivation). Both halves are flag-gated
-// (default off) and conservative + bounded; the owner flips them on after
-// tuning thresholds from observed counts. Same once-per-local-day,
+// stale, low-value, unpinned tail) + optional retroactive semantic dedup of
+// near-identical facts. Semantic similarity only proposes identity; it cannot
+// safely prove it, so dedup is explicitly opt-in. Same once-per-local-day,
 // survives-restart contract as recursive reflection (offset one hour so
 // the two brain jobs don't pile onto the same tick).
 const MEMORY_HYGIENE_LOCAL_HOUR = 4;
 
 async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
-  // Default-ON now (per feedback_no_rollout_flags: validated behavior becomes
-  // the default path). Both halves are conservative + SOFT (active=0,
+  // Decay remains default-on. Semantic dedup is default-off after production
+  // evidence showed it collapsing distinct phone numbers, dates, and topics.
+  // Both halves are SOFT (active=0,
   // pinned-exempt, importance<=4, idle>=60d, score-floored, capped) and every
   // retirement is recoverable (reactivateFact / restore route) AND reviewable
   // (the hygiene audit log below + the inactive-facts view). The env vars
   // survive ONLY as an operator kill-switch (set to 'off' to disable), not as a
   // rollout gate.
   const decayOn = (getRuntimeEnv('CLEMMY_MEMORY_DECAY', 'on') || 'on').toLowerCase() !== 'off';
-  const dedupOn = (getRuntimeEnv('CLEMMY_MEMORY_DEDUP', 'on') || 'on').toLowerCase() !== 'off';
+  const dedupOn = (getRuntimeEnv('CLEMMY_MEMORY_DEDUP', 'off') || 'off').toLowerCase() === 'on';
   if (!decayOn && !dedupOn) return;
 
   const now = new Date();
@@ -1068,6 +1073,58 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // missing auth / broken config when they open the dashboard, not
   // when they go looking for a missing notification.
   reportBootSetupIssues();
+  // Migration-safe identity finalization: the schema upgrade preserves every
+  // historical row, then this backup-first step redirects only people sharing
+  // an exact non-generic personal email. This makes identity readiness true on
+  // first boot instead of waiting for the 4:40 AM maintenance window.
+  try {
+    const identityFinalization = finalizeMemoryIdentityOnBoot();
+    if (identityFinalization.reason === 'backup_failed') {
+      logger.warn(identityFinalization, 'Withheld boot identity reconciliation because the safety backup failed');
+    } else if (identityFinalization.ran) {
+      logger.info(identityFinalization, 'Finalized stable person identities on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot identity finalization failed');
+  }
+  // v26 introduced a per-claim reflection ledger, but older threshold buffers
+  // contain only exact extractor JSON. Project those stored claims into the
+  // ledger before expiry cleanup so upgrade history says what was proposed and
+  // why it expired instead of silently deleting the last auditable payload.
+  try {
+    const reflectionFinalization = finalizeLegacyReflectionCandidatesOnBoot();
+    if (reflectionFinalization.reason === 'backup_failed') {
+      logger.warn(reflectionFinalization, 'Withheld legacy reflection-ledger finalization because the safety backup failed');
+    } else if (reflectionFinalization.ran) {
+      logger.info(reflectionFinalization, 'Finalized legacy reflection candidates on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot reflection-ledger finalization failed');
+  }
+  // The migration labels every legacy text match as inferred. Promote only
+  // links whose canonical fact and surviving source excerpt name the same
+  // unique identity, so stored-truth graph mode is useful on the first boot
+  // without ever converting co-occurrence into evidence.
+  try {
+    const graphFinalization = finalizeGroundedEntityLinksOnBoot();
+    if (graphFinalization.reason === 'backup_failed') {
+      logger.warn(graphFinalization, 'Withheld grounded graph reconciliation because the safety backup failed');
+    } else if (graphFinalization.ran) {
+      logger.info(graphFinalization, 'Grounded recoverable legacy entity links on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot grounded graph finalization failed');
+  }
+  try {
+    const resourceFinalization = finalizeGroundedResourceLinksOnBoot();
+    if (resourceFinalization.reason === 'backup_failed') {
+      logger.warn(resourceFinalization, 'Withheld grounded resource reconciliation because the safety backup failed');
+    } else if (resourceFinalization.ran) {
+      logger.info(resourceFinalization, 'Grounded recoverable legacy resource links on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot grounded resource finalization failed');
+  }
   const interrupted = interruptStaleRunningBackgroundTasks();
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');

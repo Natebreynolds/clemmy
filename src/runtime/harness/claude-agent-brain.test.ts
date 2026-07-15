@@ -18,6 +18,7 @@ const {
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainJudgeForTest,
   setClaudeAgentSdkBrainSearchFactsHybridForTest,
+  setClaudeAgentSdkBrainUnifiedPrimerForTest,
   looksLikeToolNarration,
   looksLikeStreamingNarration,
   looksLikeReasoningLeak,
@@ -44,6 +45,10 @@ beforeEach(() => {
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
+    objective: query, hits: [], perStore: {}, answerability: 'insufficient',
+    diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
+  }));
   _resetClaudeAgentSdkAdvertisableLocalToolsForTest();
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
@@ -55,6 +60,8 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY;
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
   delete process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS;
+  delete process.env.CLEMMY_UNIFIED_RECALL;
+  delete process.env.CLEMMY_UNIFIED_TURN_PRIMER;
   process.env.AUTH_MODE = 'api_key';
 });
 
@@ -62,6 +69,7 @@ after(() => {
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -472,9 +480,11 @@ test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/mode
   assert.doesNotMatch(prompt, /READ-ONLY\/local-context/);
 });
 
-test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back open', async () => {
+test('renderClaudeAgentBrainTurnContext bounds slow unified recall and falls back open', async () => {
   process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS = '5';
-  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => await new Promise(() => { /* intentionally stalled */ }));
+  process.env.CLEMMY_UNIFIED_RECALL = 'off'; // keep degraded breadcrumbs synchronous in this timeout test
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async () => await new Promise(() => { /* intentionally stalled */ }));
+  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => []);
   const start = Date.now();
   const ctx = await renderClaudeAgentBrainTurnContext({ message: 'market leader accounts', sessionId: 'brain-recall-timeout' });
   const elapsedMs = Date.now() - start;
@@ -484,7 +494,7 @@ test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back
 
 test('Claude brain primer surfaces an exact-date recorded meeting before external calendar lookup', async () => {
   process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
-  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => []);
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
   const db = openMemoryDb();
   const meetingPath = '/vault/04-Meetings/2026-07-14-in-person_meeting-local-review-primer.md';
   const insert = db.prepare(`
@@ -506,7 +516,8 @@ started_at: 2026-07-14T20:24:09.442Z
       message: 'What was my recorded meeting on 2026-07-14 about?',
       sessionId: 'brain-recorded-meeting-primer',
     });
-    assert.match(ctx, /RECORDED MEETING · exact temporal match/);
+    assert.match(ctx, /\[NOTE\]/);
+    assert.doesNotMatch(ctx, /\[why:/, 'automatic primer keeps ranking explanations out of the prompt');
     assert.match(ctx, /Scorpion Partnership Revenue and Legal Data Integration Review/);
     assert.match(ctx, /partnership revenue/);
     assert.ok(ctx.includes(meetingPath), 'primer carries the local source path for memory_read');
@@ -589,6 +600,33 @@ test('Claude brain carries same-session external-write ledger in system append w
   assert.equal(prompt.match(/ALREADY DONE in THIS conversation/g)?.length, 1);
 });
 
+test('Claude brain keeps unified recall enabled when context split is off', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'off';
+  const sourceUri = 'meeting://local/no-split-review';
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
+    objective: query,
+    answerability: 'supported',
+    diagnostics: { candidates: 6, stores: ['episode'], elapsedMs: 2 },
+    perStore: { episode: 1 },
+    hits: [{
+      type: 'episode', ref: 'no-split-review', title: 'In-person no-split review',
+      snippet: 'Reviewed the temporal memory rollout.', score: 0.98, confidence: 0.95,
+      whyRecalled: ['exact temporal match'],
+      evidence: [{ episodeId: 'no-split-review', excerpt: 'Reviewed the rollout.', sourceUri }],
+    }],
+  }));
+
+  const ctx = await renderClaudeAgentBrainTurnContext({
+    message: 'What was my in-person meeting today about?',
+    sessionId: 'brain-no-split-unified-memory',
+  });
+
+  assert.match(ctx, /\[MEMORY PRIMER\]/);
+  assert.match(ctx, /\[EPISODE\].*In-person no-split review/);
+  assert.match(ctx, /meeting:\/\/local\/no-split-review/);
+  assert.doesNotMatch(ctx, /# Current State/, 'persistent and volatile blocks stay in the system append');
+});
+
 test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors excludes, creates a session, and streams final text', async () => {
   const chunks: string[] = [];
   let captured: any;
@@ -634,6 +672,45 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   const effort = listEvents('brain-run', { types: ['reasoning_effort'] })[0]?.data as { transport?: string; effort?: string } | undefined;
   assert.equal(effort?.transport, 'claude_agent_sdk_brain');
   assert.equal(effort?.effort, 'provider_default');
+});
+
+test('Claude dispatch telemetry carries exact unified-primer refs and recall id', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const sourceUri = '/vault/04-Meetings/2026-07-15-live-review.md';
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
+    objective: query,
+    answerability: 'supported',
+    diagnostics: { candidates: 3, stores: ['note', 'episode'], elapsedMs: 7 },
+    perStore: { vault: 1 },
+    hits: [{
+      type: 'vault', ref: sourceUri, title: 'Live review', snippet: 'Reviewed memory reliability.',
+      score: 0.97, confidence: 0.95, whyRecalled: ['exact temporal match'],
+      evidence: [{ episodeId: `note:${sourceUri}`, excerpt: 'Reviewed memory reliability.', sourceUri }],
+    }],
+  }));
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'The meeting reviewed memory reliability.', sessionId: 'sdk', model: 'claude', toolUses: [],
+  }));
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'What was my meeting today about?', sessionId: 'brain-unified-primer-telemetry',
+  });
+
+  const event = listEvents('brain-unified-primer-telemetry', { types: ['turn_memory_primer'] })[0];
+  assert.ok(event);
+  assert.equal(event.data.source, 'unified');
+  assert.equal(event.data.hitCount, 1);
+  assert.equal(event.data.includedCount, 1);
+  assert.equal(event.data.omittedCount, 0);
+  assert.equal(event.data.candidateCount, 3);
+  assert.deepEqual(event.data.stores, ['note', 'episode']);
+  assert.equal(event.data.answerability, 'supported');
+  assert.match(String(event.data.recallId), /^mr-/);
+  const run = openMemoryDb().prepare('SELECT surface, candidate_refs_json FROM memory_recall_runs WHERE id = ?')
+    .get(event.data.recallId) as { surface: string; candidate_refs_json: string };
+  assert.equal(run.surface, 'claude_primer');
+  assert.deepEqual(JSON.parse(run.candidate_refs_json), [{ type: 'note', id: sourceUri }]);
 });
 
 test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
@@ -1505,6 +1582,7 @@ test('overflow A2: an UNCOMMITTED context overflow retries ONCE with reduced con
   const retry = seen[1];
   assert.ok((retry.priorTurns?.length ?? 0) <= 2, 'prior turns halved to the last 2');
   assert.ok(!(retry.turnContext ?? '').includes('## Relevant To Your Request'), 'recall section dropped on the retry');
+  assert.ok(!(retry.turnContext ?? '').includes('[MEMORY PRIMER]'), 'unified recall section dropped on the retry');
 });
 
 test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds for tool_output_query)', async () => {

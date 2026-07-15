@@ -3,6 +3,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { VAULT_DIR } from '../../memory/vault.js';
+import { recordMemoryEpisode } from '../../memory/temporal-memory.js';
+import { openMemoryDb, type MemoryEpisodeRow } from '../../memory/db.js';
+import { upsertEntity } from '../../memory/entity-identity.js';
+import { recordReflectionCandidate, reflectionCandidateHash } from '../../memory/reflection-candidates.js';
 import { readSecret } from '../../runtime/secrets/index.js';
 
 export type RecallRegion = 'us-west-2' | 'us-east-1' | 'eu-central-1' | 'ap-northeast-1';
@@ -438,6 +442,285 @@ function loadMeetingRecord(windowId: string, recordingId?: string, sdkUploadId?:
   return null;
 }
 
+function meetingEpisodeContent(record: RecallMeetingRecord, analysis: RecallMeetingAnalysis | null): string {
+  const provider = record.provider === 'local' ? 'In-person recording' : `Recall recording${record.platform ? ` (${record.platform})` : ''}`;
+  const lines = [
+    `Meeting: ${record.title || (record.provider === 'local' ? 'In-person meeting' : record.platform || 'Recorded meeting')}`,
+    `Capture: ${provider}`,
+    `Started: ${record.startedAt}`,
+    record.endedAt ? `Ended: ${record.endedAt}` : '',
+    analysis?.summary ? `Summary: ${analysis.summary}` : '',
+    analysis?.topics?.length ? `Topics: ${analysis.topics.join(', ')}` : '',
+    analysis?.participants?.length ? `Participants: ${analysis.participants.join(', ')}` : '',
+    analysis?.decisions?.length ? `Decisions: ${analysis.decisions.join(' | ')}` : '',
+    analysis?.actionItems?.length
+      ? `Action items: ${analysis.actionItems.map((item) => `${item.text}${item.owner ? ` [${item.owner}]` : ''}${item.dueDate ? ` [due ${item.dueDate}]` : ''}`).join(' | ')}`
+      : '',
+    record.notes?.length ? `Notes: ${record.notes.map((note) => note.text).join(' | ')}` : '',
+    record.segments.length
+      ? `Transcript: ${record.segments.map((segment) => `${segment.speaker ? `${segment.speaker}: ` : ''}${segment.text}`).join(' ')}`
+      : '',
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+const GENERIC_MEETING_PARTICIPANT_RE = /^(?:host|guest|speaker(?:\s*\d+)?|participant(?:\s*\d+)?|attendee(?:\s*\d+)?|caller(?:\s*\d+)?|unknown|unidentified|anonymous|user|me|system|assistant|clementine)$/i;
+
+/** Analyzer participant names are structured evidence, but provider role
+ * labels are not identities. Normalize simple role wrappers and retain only
+ * bounded human-looking names/emails; never create a person called "Speaker
+ * 2" just because diarization could not identify them. */
+export function groundedMeetingParticipantNames(analysis: RecallMeetingAnalysis | null): string[] {
+  const names = new Map<string, string>();
+  for (const raw of analysis?.participants ?? []) {
+    const value = String(raw ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^(?:host|guest|speaker\s*\d*)\s*[:—-]\s*/i, '')
+      .replace(/\s+\((?:host|guest|speaker\s*\d*)\)$/i, '')
+      .trim();
+    if (!value || value.length < 2 || value.length > 120) continue;
+    if (GENERIC_MEETING_PARTICIPANT_RE.test(value)) continue;
+    if (!/[a-z]/i.test(value) || value.split(/\s+/).length > 12) continue;
+    const key = value.toLowerCase();
+    if (!names.has(key)) names.set(key, value);
+  }
+  return [...names.values()];
+}
+
+/** Synchronize one meeting's exact structured participants into the canonical
+ * identity ledger. Entity upsert resolves stable identifiers/name duplicates;
+ * the (entity, episode) primary key makes repeated filing harmless. A corrected
+ * participant list removes only prior meeting-participant observations from
+ * this same episode, never facts/relationships that independently observed the
+ * identity. */
+function syncMeetingParticipantObservations(
+  episode: MemoryEpisodeRow,
+  analysis: RecallMeetingAnalysis | null,
+): void {
+  if (!analysis) return;
+  const sourceUri = episode.source_uri ?? undefined;
+  const confidence = analysis.source === 'manual' ? 0.95 : 0.82;
+  const entityIds = groundedMeetingParticipantNames(analysis).map((name) => upsertEntity({
+    type: 'person',
+    name,
+    confidence,
+    evidenceEpisodeId: episode.id,
+    sourceUri,
+    sourceKind: 'meeting_participant',
+  }));
+  const db = openMemoryDb();
+  if (entityIds.length === 0) {
+    db.prepare(`
+      DELETE FROM entity_observations
+      WHERE episode_id = ? AND source_kind = 'meeting_participant'
+    `).run(episode.id);
+    return;
+  }
+  const placeholders = entityIds.map(() => '?').join(',');
+  db.prepare(`
+    DELETE FROM entity_observations
+    WHERE episode_id = ? AND source_kind = 'meeting_participant'
+      AND entity_id NOT IN (${placeholders})
+  `).run(episode.id, ...entityIds);
+}
+
+export interface MeetingMemoryProposal {
+  kind: 'project';
+  text: string;
+  importance: number;
+  intakeReason: 'structured meeting decision' | 'structured meeting action item' | 'user-marked meeting action' | 'user-marked meeting follow-up';
+  trustLevel: number;
+  authority: 'derived' | 'user';
+}
+
+const EMPTY_MEETING_CLAIM_RE = /^(?:none|none noted|no decisions?|no action items?|n\/?a|not applicable|unknown|tbd|transcript too short to analyze)[.!]?$/i;
+
+function boundedMeetingClaim(value: unknown, maxChars = 320): string {
+  if (typeof value !== 'string') return '';
+  const text = value.replace(/\s+/g, ' ').trim().replace(/^[-*•]\s*/, '');
+  if (text.length < 4 || EMPTY_MEETING_CLAIM_RE.test(text)) return '';
+  return text.slice(0, maxChars).trim();
+}
+
+const GENERIC_MEETING_TITLE_RE = /^(?:zoom|google meet|meet|microsoft teams|teams|manual desktop audio recording|in-person meeting|recorded meeting|meeting)$/i;
+
+function meetingClaimContext(record: RecallMeetingRecord, analysis: RecallMeetingAnalysis | null): string {
+  const namedTitle = [analysis?.title, record.title]
+    .map((value) => boundedMeetingClaim(value, 120))
+    .find((value) => value && !GENERIC_MEETING_TITLE_RE.test(value));
+  const topicTitle = (analysis?.topics ?? [])
+    .map((value) => boundedMeetingClaim(value, 50))
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(' / ');
+  const title = namedTitle || (topicTitle ? `${topicTitle} review` : 'Recorded meeting');
+  const date = /^\d{4}-\d{2}-\d{2}/.test(record.startedAt) ? record.startedAt.slice(0, 10) : '';
+  return `${title}${date ? ` (${date})` : ''}`;
+}
+
+function groundedMeetingOwner(value: unknown): string {
+  const owner = boundedMeetingClaim(value, 100);
+  if (!owner) return '';
+  const parts = owner.split(/\s+(?:and|&)\s+|\s*,\s*/i).map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return '';
+  const grounded = parts.filter((part) => !GENERIC_MEETING_PARTICIPANT_RE.test(part));
+  return grounded.join(' and ');
+}
+
+/** Convert only decision/action-shaped structured fields into reviewable
+ * claim proposals. Summaries and topic tags remain episode context: promoting
+ * them as facts would create broad, repetitive memory that competes with the
+ * exact recording. User-marked live actions/follow-ups are included even
+ * before analyzer output exists. */
+export function meetingMemoryProposals(
+  record: RecallMeetingRecord,
+  analysis: RecallMeetingAnalysis | null,
+): MeetingMemoryProposal[] {
+  const context = meetingClaimContext(record, analysis);
+  const proposals: MeetingMemoryProposal[] = [];
+  const seen = new Set<string>();
+  const add = (proposal: MeetingMemoryProposal) => {
+    const text = proposal.text.replace(/\s+/g, ' ').trim().slice(0, 500).trim();
+    if (!text || EMPTY_MEETING_CLAIM_RE.test(text)) return;
+    const hash = reflectionCandidateHash(text);
+    if (seen.has(hash)) return;
+    seen.add(hash);
+    proposals.push({ ...proposal, text });
+  };
+
+  const derivedTrust = analysis?.source === 'manual' ? 0.95 : 0.82;
+  for (const raw of analysis?.decisions ?? []) {
+    const decision = boundedMeetingClaim(raw);
+    if (!decision) continue;
+    add({
+      kind: 'project',
+      text: `Decision from ${context}: ${decision}`,
+      importance: 7,
+      intakeReason: 'structured meeting decision',
+      trustLevel: derivedTrust,
+      authority: analysis?.source === 'manual' ? 'user' : 'derived',
+    });
+  }
+  for (const item of analysis?.actionItems ?? []) {
+    const action = boundedMeetingClaim(item?.text);
+    if (!action) continue;
+    const owner = groundedMeetingOwner(item?.owner);
+    const dueDate = boundedMeetingClaim(item?.dueDate, 40);
+    const detail = [owner ? `Owner: ${owner}` : '', dueDate ? `Due: ${dueDate}` : ''].filter(Boolean).join(' · ');
+    add({
+      kind: 'project',
+      text: `Action item from ${context}: ${action}${detail ? ` (${detail})` : ''}`,
+      importance: 8,
+      intakeReason: 'structured meeting action item',
+      trustLevel: derivedTrust,
+      authority: analysis?.source === 'manual' ? 'user' : 'derived',
+    });
+  }
+  for (const note of record.notes ?? []) {
+    if (note.kind !== 'action' && note.kind !== 'followup') continue;
+    const noteText = boundedMeetingClaim(note.text);
+    if (!noteText) continue;
+    const action = note.kind === 'action';
+    add({
+      kind: 'project',
+      text: `${action ? 'User-marked action' : 'User-marked follow-up'} from ${context}: ${noteText}`,
+      importance: action ? 9 : 8,
+      intakeReason: action ? 'user-marked meeting action' : 'user-marked meeting follow-up',
+      trustLevel: 1,
+      authority: 'user',
+    });
+  }
+  return proposals;
+}
+
+/** Synchronize reviewable claims for one stable meeting episode. Replaying the
+ * same analysis is idempotent. When a corrected analysis removes a decision or
+ * action, only its still-pending proposal is rejected; an owner-approved fact
+ * is never silently withdrawn. */
+export function syncMeetingMemoryProposals(
+  episode: MemoryEpisodeRow,
+  record: RecallMeetingRecord,
+  analysis: RecallMeetingAnalysis | null,
+): { proposed: number; retired: number } {
+  const proposals = meetingMemoryProposals(record, analysis);
+  if (!analysis && proposals.length === 0) return { proposed: 0, retired: 0 };
+  const sourceUri = episode.source_uri ?? `meeting://${record.provider === 'local' ? 'local' : 'recall'}/${encodeURIComponent(record.id)}`;
+  const now = analysis?.generatedAt && Number.isFinite(Date.parse(analysis.generatedAt))
+    ? analysis.generatedAt
+    : new Date().toISOString();
+  const db = openMemoryDb();
+  let retired = 0;
+  const tx = db.transaction(() => {
+    for (const proposal of proposals) {
+      recordReflectionCandidate({
+        episodeId: episode.id,
+        sessionId: episode.session_id ?? `meeting:${record.provider === 'local' ? 'local' : 'recall'}`,
+        callId: episode.call_id ?? record.id,
+        kind: proposal.kind,
+        text: proposal.text,
+        importance: proposal.importance,
+        sourceType: 'meeting_analysis',
+        intakeReason: proposal.intakeReason,
+        trustLevel: proposal.trustLevel,
+        authority: proposal.authority,
+        sourceUri,
+        now,
+      });
+    }
+    // A missing analysis can be a transient write/read race. Add user notes in
+    // that state, but never infer that previously extracted claims vanished.
+    if (!analysis) return;
+    const hashes = proposals.map((proposal) => reflectionCandidateHash(proposal.text));
+    const hashClause = hashes.length > 0 ? `AND candidate_hash NOT IN (${hashes.map(() => '?').join(',')})` : '';
+    const info = db.prepare(`
+      UPDATE memory_reflection_candidates
+      SET status = 'rejected', reason = 'analysis_revision_removed', resolved_at = ?
+      WHERE episode_id = ? AND source_type = 'meeting_analysis' AND status = 'pending'
+        ${hashClause}
+    `).run(now, episode.id, ...hashes);
+    retired = Number(info.changes ?? 0);
+  });
+  tx();
+  return { proposed: proposals.length, retired };
+}
+
+/** Project a completed recording into the canonical episode store. The stable
+ * (session, call) identity means transcript, title, and analysis upgrades amend
+ * one episode instead of creating duplicate memories. */
+export function recordMeetingMemoryEpisode(record: RecallMeetingRecord): MemoryEpisodeRow | null {
+  if (record.status !== 'completed' || isSyntheticRecallCapture(record)) return null;
+  const provider = record.provider === 'local' ? 'local' : 'recall';
+  const analysis = loadRecallMeetingAnalysis(record.id);
+  const episode = recordMemoryEpisode({
+    kind: 'tool_result',
+    subtype: 'meeting',
+    title: record.title || (provider === 'local' ? 'In-person meeting' : record.platform || 'Recorded meeting'),
+    sourceApp: provider === 'local' ? 'Clementine Meetings (In-person)' : 'Clementine Meetings (Recall)',
+    sessionId: `meeting:${provider}`,
+    callId: record.id,
+    sourceUri: `meeting://${provider}/${encodeURIComponent(record.id)}`,
+    occurredAt: record.startedAt,
+    content: meetingEpisodeContent(record, analysis),
+    status: record.segments.length > 0 || Boolean(analysis?.summary) ? 'available' : 'partial',
+    metadata: {
+      meetingId: record.id,
+      provider,
+      platform: record.platform ?? null,
+      endedAt: record.endedAt ?? null,
+      artifactPath: record.artifactPath ?? null,
+      analysisPath: record.analysisPath ?? (analysis ? analysisPathFor(record.id) : null),
+      segmentCount: record.segments.length,
+      notesCount: record.notes?.length ?? 0,
+      canonicalStatus: record.canonicalStatus ?? null,
+      transcriptionStatus: record.transcriptionStatus ?? null,
+    },
+  });
+  syncMeetingParticipantObservations(episode, analysis);
+  syncMeetingMemoryProposals(episode, record, analysis);
+  return episode;
+}
+
 function saveMeetingRecord(record: RecallMeetingRecord): RecallMeetingRecord {
   const targetPath = recordPath(record.recordingId || record.sdkUploadId || record.windowId);
   writeJsonAtomic(targetPath, record);
@@ -448,6 +731,9 @@ function saveMeetingRecord(record: RecallMeetingRecord): RecallMeetingRecord {
     if (stored.filePath === targetPath || stored.record.id !== record.id) continue;
     try { unlinkSync(stored.filePath); } catch { /* best-effort alias cleanup */ }
   }
+  // Meeting persistence owns the canonical projection. A memory-DB failure
+  // must not corrupt the already-durable recording; maintenance can replay it.
+  try { recordMeetingMemoryEpisode(record); } catch { /* replayed by meeting filing/maintenance */ }
   return record;
 }
 

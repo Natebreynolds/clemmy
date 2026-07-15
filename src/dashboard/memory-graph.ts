@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { openMemoryDb } from '../memory/db.js';
 import { listActiveFacts, countActiveFacts } from '../memory/facts.js';
-import { isEmbeddingsEnabled, loadFactEmbeddings } from '../memory/embeddings.js';
+import { activeEmbeddingSpaceKey, isEmbeddingsEnabled, loadFactEmbeddings } from '../memory/embeddings.js';
 import { getRuntimeEnv } from '../config.js';
 import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { listSkills } from '../memory/skill-store.js';
@@ -9,8 +9,15 @@ import { listWorkflows } from '../memory/workflow-store.js';
 import { listGoalRecords } from '../memory/goals-list.js';
 import { listFocuses } from '../memory/focus.js';
 import { compileWordMatcher } from '../memory/word-match.js';
-import { loadFactEntityEdges, loadEntityEdges, loadFactResourceEdges } from '../memory/relations.js';
+import {
+  countCurrentEntityEdges,
+  getNeighborEntityIds,
+  loadFactEntityEdges,
+  loadEntityEdges,
+  loadFactResourceEdges,
+} from '../memory/relations.js';
 import { getMemoryGeneration } from '../memory/temporal-memory.js';
+import { resolveCanonicalEntityId } from '../memory/entity-identity.js';
 
 /**
  * Pure builder for the Memory tab's knowledge graph.
@@ -91,12 +98,143 @@ type MemoryDb = ReturnType<typeof openMemoryDb>;
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
+interface StoredEpisodeArtifactLink {
+  episodeId: string;
+  path: string;
+  chunks: number;
+  mtime: number;
+}
+
+interface StoredEntityObservationLink {
+  entityId: number;
+  episodeId: string;
+  sourceFactId: number | null;
+  sourceUri: string | null;
+  sourceKind: string;
+  confidence: number;
+  observedAt: string;
+}
+
+/** Exact entity→episode observations. These rows are the idempotent source
+ * ledger for "where did Clementine see this person/thing?" and therefore are
+ * stored truth, never a name-match or semantic overlay. Redirects are resolved
+ * at read time so historical duplicate identities cannot reappear on-canvas. */
+function loadStoredEntityObservationLinks(
+  db: MemoryDb,
+  options: { entityIds?: number[]; episodeIds?: string[]; limit?: number } = {},
+): StoredEntityObservationLink[] {
+  const params: unknown[] = [];
+  const clauses: string[] = [];
+  const canonicalEntityId = 'COALESCE(er.canonical_entity_id, eo.entity_id)';
+  if (options.entityIds?.length) {
+    clauses.push(`${canonicalEntityId} IN (${options.entityIds.map(() => '?').join(',')})`);
+    params.push(...options.entityIds);
+  }
+  if (options.episodeIds?.length) {
+    clauses.push(`eo.episode_id IN (${options.episodeIds.map(() => '?').join(',')})`);
+    params.push(...options.episodeIds);
+  }
+  const limit = clamp(options.limit ?? 600, 1, 2_000);
+  params.push(limit);
+  return db.prepare(`
+    SELECT ${canonicalEntityId} AS entity_id, eo.episode_id,
+           eo.source_fact_id, eo.source_uri, eo.source_kind,
+           eo.confidence, eo.observed_at
+    FROM entity_observations eo
+    LEFT JOIN entity_redirects er ON er.source_entity_id = eo.entity_id
+    JOIN entities e ON e.id = ${canonicalEntityId}
+    JOIN memory_episodes me ON me.id = eo.episode_id
+    ${clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''}
+    ORDER BY eo.observed_at DESC, entity_id, eo.episode_id
+    LIMIT ?
+  `).all(...params).map((row) => {
+    const item = row as {
+      entity_id: number; episode_id: string; source_fact_id: number | null;
+      source_uri: string | null; source_kind: string; confidence: number; observed_at: string;
+    };
+    return {
+      entityId: item.entity_id,
+      episodeId: item.episode_id,
+      sourceFactId: item.source_fact_id,
+      sourceUri: item.source_uri,
+      sourceKind: item.source_kind,
+      confidence: item.confidence,
+      observedAt: item.observed_at,
+    };
+  });
+}
+
+function countStoredEntityObservationLinks(db: MemoryDb): number {
+  return Number((db.prepare(`
+    SELECT COUNT(*) AS count FROM (
+      SELECT COALESCE(er.canonical_entity_id, eo.entity_id) AS entity_id, eo.episode_id
+      FROM entity_observations eo
+      LEFT JOIN entity_redirects er ON er.source_entity_id = eo.entity_id
+      JOIN entities e ON e.id = COALESCE(er.canonical_entity_id, eo.entity_id)
+      JOIN memory_episodes me ON me.id = eo.episode_id
+      GROUP BY entity_id, eo.episode_id
+    )
+  `).get() as { count: number }).count);
+}
+
+/** Exact episode→vault-artifact pointers already persisted by meeting capture.
+ * The relationship is stored truth because it comes from metadata.artifactPath
+ * and an exact vault path join; no title, date, or text similarity participates. */
+function loadStoredEpisodeArtifactLinks(
+  db: MemoryDb,
+  options: { episodeIds?: string[]; paths?: string[]; limit?: number } = {},
+): StoredEpisodeArtifactLink[] {
+  const params: unknown[] = [];
+  const clauses: string[] = [];
+  const artifactPath = "json_extract(CASE WHEN json_valid(me.metadata_json) THEN me.metadata_json ELSE '{}' END, '$.artifactPath')";
+  if (options.episodeIds?.length) {
+    clauses.push(`me.id IN (${options.episodeIds.map(() => '?').join(',')})`);
+    params.push(...options.episodeIds);
+  }
+  if (options.paths?.length) {
+    clauses.push(`${artifactPath} IN (${options.paths.map(() => '?').join(',')})`);
+    params.push(...options.paths);
+  }
+  const limit = clamp(options.limit ?? 300, 1, 2_000);
+  params.push(limit);
+  return db.prepare(`
+    SELECT me.id AS episode_id, ${artifactPath} AS artifact_path,
+           COUNT(vc.id) AS chunks, MAX(vc.mtime) AS mtime
+    FROM memory_episodes me
+    JOIN vault_chunks vc ON vc.path = ${artifactPath}
+    WHERE typeof(${artifactPath}) = 'text'
+      ${clauses.length > 0 ? `AND ${clauses.join(' AND ')}` : ''}
+    GROUP BY me.id, artifact_path
+    ORDER BY me.occurred_at DESC
+    LIMIT ?
+  `).all(...params).map((row) => {
+    const item = row as { episode_id: string; artifact_path: string; chunks: number; mtime: number };
+    return { episodeId: item.episode_id, path: item.artifact_path, chunks: item.chunks, mtime: item.mtime };
+  });
+}
+
+function countStoredEpisodeArtifactLinks(db: MemoryDb): number {
+  const artifactPath = "json_extract(CASE WHEN json_valid(me.metadata_json) THEN me.metadata_json ELSE '{}' END, '$.artifactPath')";
+  return Number((db.prepare(`
+    SELECT COUNT(DISTINCT me.id) AS count
+    FROM memory_episodes me
+    WHERE typeof(${artifactPath}) = 'text'
+      AND EXISTS (SELECT 1 FROM vault_chunks vc WHERE vc.path = ${artifactPath})
+  `).get() as { count: number }).count);
+}
+
 /**
  * Canonical signature for a fact set — sorted ids joined. Shared by the
  * position cache and the semantic-edge cache so both describe the SAME set.
  */
 function factSignature(ids: number[]): string {
-  return `${getMemoryGeneration()}:${ids.slice().sort((a, b) => a - b).join(',')}`;
+  // The DB generation covers fact content/hash and embedding row mutations.
+  // The active space is deliberately separate: provider selection can switch
+  // synchronously before the replacement vectors are backfilled, in which
+  // case no SQLite trigger has fired yet. Without this component the graph
+  // could briefly return PCA coordinates and semantic edges computed from a
+  // model that is no longer active.
+  return `${getMemoryGeneration()}:${activeEmbeddingSpaceKey()}:${ids.slice().sort((a, b) => a - b).join(',')}`;
 }
 
 // ── Semantic 3D layout (PCA) ────────────────────────────────────────────
@@ -580,21 +718,40 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
   // edges from the stored entity_edges relation.
   if (entitiesLimit > 0) {
     const entityRows = db.prepare(`
-      SELECT id, entity_type, canonical_name, canonical_name_lc, aliases_json, mention_count
-      FROM entities
+      SELECT e.id, e.entity_type, e.canonical_name, e.canonical_name_lc, e.aliases_json, e.mention_count,
+             (SELECT COUNT(*) FROM fact_entities fe WHERE fe.entity_id = e.id) AS fact_count,
+             (SELECT COUNT(*) FROM entity_identifiers ei WHERE ei.entity_id = e.id) AS identifier_count,
+             (SELECT COUNT(*) FROM entity_observations eo WHERE eo.entity_id = e.id) AS observation_count
+      FROM entities e
+      WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
       ORDER BY mention_count DESC, last_seen_at DESC
       LIMIT ?
-    `).all(entitiesLimit) as Array<{ id: number; entity_type: string; canonical_name: string; canonical_name_lc: string; aliases_json: string | null; mention_count: number }>;
+    `).all(entitiesLimit) as Array<{ id: number; entity_type: string; canonical_name: string; canonical_name_lc: string; aliases_json: string | null; mention_count: number; fact_count: number; identifier_count: number; observation_count: number }>;
     const entityById = new Map(entityRows.map((e) => [e.id, e]));
 
     const referencedEntityIds = new Set<number>();
-    // 1. STORED fact→entity edges (only to entities we'll render).
-    const factsWithStoredLink = new Set<number>();
+    // 1. Persisted fact→entity links retain their epistemic origin. A nightly
+    // text match is useful in augmented mode, but persistence alone does not
+    // graduate it to stored truth.
+    const factsWithPersistedLink = new Set<number>();
     for (const link of loadFactEntityEdges(factIds)) {
       if (!entityById.has(link.entityId)) continue;
+      if (link.truth === 'inferred' && truthMode === 'stored') continue;
       referencedEntityIds.add(link.entityId);
-      factsWithStoredLink.add(link.factId);
-      edges.push({ id: `fact:${link.factId}->entity:${link.entityId}`, source: `fact:${link.factId}`, target: `entity:${link.entityId}`, type: 'entity', truth: 'stored' });
+      factsWithPersistedLink.add(link.factId);
+      edges.push({
+        id: `fact:${link.factId}->entity:${link.entityId}`,
+        source: `fact:${link.factId}`,
+        target: `entity:${link.entityId}`,
+        type: 'entity',
+        inferred: link.truth === 'inferred',
+        truth: link.truth,
+        data: {
+          confidence: link.confidence,
+          evidenceEpisodeId: link.evidenceEpisodeId,
+          evidenceExcerpt: link.evidenceExcerpt,
+        },
+      });
     }
 
     // 2. INFERRED fallback — only for facts the stored layer hasn't covered yet.
@@ -612,7 +769,7 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
       return { row: e, res };
     });
     for (const fact of truthMode === 'augmented' ? facts : []) {
-      if (factsWithStoredLink.has(fact.id)) continue;
+      if (factsWithPersistedLink.has(fact.id)) continue;
       const lower = (fact.content || '').toLowerCase();
       if (!lower) continue;
       for (const m of entityMatchers) {
@@ -639,7 +796,20 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
         id: `entity:${e.id}`,
         label: e.canonical_name,
         type: 'entity',
-        data: { entity_type: e.entity_type, mention_count: e.mention_count },
+        data: {
+          entity_type: e.entity_type,
+          mention_count: e.mention_count,
+          factCount: e.fact_count,
+          identifierCount: e.identifier_count,
+          observationCount: e.observation_count,
+          aliases: (() => {
+            try {
+              const parsed = JSON.parse(e.aliases_json ?? '[]');
+              return Array.isArray(parsed) ? parsed.filter((alias) => typeof alias === 'string').slice(0, 12) : [];
+            } catch { return []; }
+          })(),
+          canonical: true,
+        },
       });
     }
 
@@ -659,6 +829,8 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
           data: {
             confidence: ee.confidence,
             evidenceEpisodeId: ee.evidenceEpisodeId,
+            evidenceCount: ee.evidenceCount,
+            evidence: ee.evidence,
             validFrom: ee.validFrom,
             validTo: ee.validTo,
           },
@@ -668,7 +840,8 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
   }
 
   // Stored fact→resource pointers.
-  const resourceLinks = loadFactResourceEdges(factIds);
+  const resourceLinks = loadFactResourceEdges(factIds)
+    .filter((link) => truthMode === 'augmented' || link.truth === 'stored');
   if (resourceLinks.length > 0) {
     const resourceIds = Array.from(new Set(resourceLinks.map((link) => link.resourceId)));
     const placeholders = resourceIds.map(() => '?').join(',');
@@ -691,15 +864,22 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
       source: `fact:${link.factId}`,
       target: `resource:${link.resourceId}`,
       type: 'resource',
-      truth: 'stored',
+      inferred: link.truth === 'inferred',
+      truth: link.truth,
+      data: {
+        confidence: link.confidence,
+        evidenceEpisodeId: link.evidenceEpisodeId,
+        evidenceExcerpt: link.evidenceExcerpt,
+      },
     });
   }
 
   // Durable episode/evidence provenance for rendered facts.
+  const visibleEpisodeIds = new Set<string>();
   if (factIds.length > 0) {
     const placeholders = factIds.map(() => '?').join(',');
     const episodeRows = db.prepare(`
-      SELECT DISTINCT me.id, me.kind, me.source_app, me.source_uri, me.occurred_at,
+      SELECT DISTINCT me.id, me.kind, me.subtype, me.title, me.source_app, me.source_uri, me.occurred_at,
              me.status, me.evidence_excerpt, fe.fact_id
       FROM fact_evidence fe
       JOIN memory_episodes me ON me.id = fe.episode_id
@@ -707,18 +887,17 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
       ORDER BY me.occurred_at DESC
       LIMIT 300
     `).all(...factIds) as Array<{
-      id: string; kind: string; source_app: string | null; source_uri: string | null;
+      id: string; kind: string; subtype: string | null; title: string | null; source_app: string | null; source_uri: string | null;
       occurred_at: string; status: string; evidence_excerpt: string | null; fact_id: number;
     }>;
-    const episodeIds = new Set<string>();
     for (const episode of episodeRows) {
-      if (!episodeIds.has(episode.id)) {
-        episodeIds.add(episode.id);
+      if (!visibleEpisodeIds.has(episode.id)) {
+        visibleEpisodeIds.add(episode.id);
         nodes.push({
           id: `episode:${episode.id}`,
-          label: episode.source_app ?? `${episode.kind} ${episode.occurred_at.slice(0, 10)}`,
+          label: episode.title ?? episode.source_app ?? `${episode.kind} ${episode.occurred_at.slice(0, 10)}`,
           type: 'episode',
-          data: { kind: episode.kind, sourceUri: episode.source_uri, occurredAt: episode.occurred_at, status: episode.status, excerpt: episode.evidence_excerpt },
+          data: { kind: episode.kind, subtype: episode.subtype, sourceUri: episode.source_uri, occurredAt: episode.occurred_at, status: episode.status, excerpt: episode.evidence_excerpt },
         });
       }
       edges.push({
@@ -729,6 +908,134 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
         truth: 'stored',
       });
     }
+  }
+
+  // Meetings are useful event memories even before the analyzer promotes any
+  // claims from them. Show recent persisted meeting episodes as standalone
+  // stored nodes instead of hiding them until a fact→evidence edge exists.
+  const recentMeetings = db.prepare(`
+    SELECT id, kind, subtype, title, source_app, source_uri, occurred_at, status, evidence_excerpt, metadata_json
+    FROM memory_episodes
+    WHERE subtype = 'meeting'
+    ORDER BY occurred_at DESC
+    LIMIT 50
+  `).all() as Array<{
+    id: string; kind: string; subtype: string | null; title: string | null; source_app: string | null;
+    source_uri: string | null; occurred_at: string; status: string; evidence_excerpt: string | null; metadata_json: string;
+  }>;
+  for (const episode of recentMeetings) {
+    if (visibleEpisodeIds.has(episode.id)) continue;
+    visibleEpisodeIds.add(episode.id);
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(episode.metadata_json || '{}') as Record<string, unknown>; } catch { /* keep empty */ }
+    nodes.push({
+      id: `episode:${episode.id}`,
+      label: episode.title ?? episode.source_app ?? `meeting ${episode.occurred_at.slice(0, 10)}`,
+      type: 'episode',
+      data: {
+        kind: episode.kind,
+        subtype: episode.subtype,
+        sourceUri: episode.source_uri,
+        occurredAt: episode.occurred_at,
+        status: episode.status,
+        excerpt: episode.evidence_excerpt,
+        ...metadata,
+      },
+    });
+  }
+
+  // A canonical identity's observation ledger records the exact durable
+  // episodes in which Clementine saw that person/thing. Project those rows as
+  // stored edges and load their episode endpoints on demand; this makes a
+  // person's source timeline visible without guessing from matching names.
+  const visibleEntityIds = nodes
+    .filter((node) => node.type === 'entity')
+    .map((node) => Number(node.id.slice('entity:'.length)))
+    .filter(Number.isFinite);
+  const observationLinks = visibleEntityIds.length > 0
+    ? loadStoredEntityObservationLinks(db, { entityIds: visibleEntityIds, limit: 600 })
+    : [];
+  const missingObservationEpisodeIds = [...new Set(observationLinks
+    .map((link) => link.episodeId)
+    .filter((episodeId) => !visibleEpisodeIds.has(episodeId)))];
+  if (missingObservationEpisodeIds.length > 0) {
+    const placeholders = missingObservationEpisodeIds.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT id, kind, subtype, title, source_app, source_uri, occurred_at,
+             status, evidence_excerpt, metadata_json
+      FROM memory_episodes WHERE id IN (${placeholders})
+    `).all(...missingObservationEpisodeIds) as Array<{
+      id: string; kind: string; subtype: string | null; title: string | null;
+      source_app: string | null; source_uri: string | null; occurred_at: string;
+      status: string; evidence_excerpt: string | null; metadata_json: string;
+    }>;
+    for (const episode of rows) {
+      let metadata: Record<string, unknown> = {};
+      try { metadata = JSON.parse(episode.metadata_json || '{}') as Record<string, unknown>; } catch { /* keep empty */ }
+      visibleEpisodeIds.add(episode.id);
+      nodes.push({
+        id: `episode:${episode.id}`,
+        label: episode.title ?? episode.source_app ?? `${episode.kind} ${episode.occurred_at.slice(0, 10)}`,
+        type: 'episode',
+        data: {
+          kind: episode.kind,
+          subtype: episode.subtype,
+          sourceUri: episode.source_uri,
+          occurredAt: episode.occurred_at,
+          status: episode.status,
+          excerpt: episode.evidence_excerpt,
+          ...metadata,
+        },
+      });
+    }
+  }
+  const visibleObservationEpisodes = new Set(visibleEpisodeIds);
+  for (const link of observationLinks) {
+    if (!visibleObservationEpisodes.has(link.episodeId)) continue;
+    edges.push({
+      id: `entity:${link.entityId}->episode:${link.episodeId}`,
+      source: `entity:${link.entityId}`,
+      target: `episode:${link.episodeId}`,
+      type: 'observed',
+      label: 'observed in',
+      truth: 'stored',
+      data: {
+        confidence: link.confidence,
+        sourceFactId: link.sourceFactId,
+        sourceUri: link.sourceUri,
+        sourceKind: link.sourceKind,
+        observedAt: link.observedAt,
+      },
+    });
+  }
+
+  // A recorded meeting and its transcript are two projections of one durable
+  // event. Connect them through the exact artifactPath persisted on the
+  // episode so stored-truth mode shows provenance without relying on filenames.
+  const artifactLinks = loadStoredEpisodeArtifactLinks(db, {
+    episodeIds: Array.from(visibleEpisodeIds),
+    limit: 300,
+  });
+  const visibleNodeIds = new Set(nodes.map((node) => node.id));
+  for (const link of artifactLinks) {
+    const fileId = `file:${link.path}`;
+    if (!visibleNodeIds.has(fileId)) {
+      visibleNodeIds.add(fileId);
+      nodes.push({
+        id: fileId,
+        label: link.path.split('/').slice(-2).join('/'),
+        type: 'file',
+        data: { chunks: link.chunks, mtime: link.mtime, exactArtifact: true },
+      });
+    }
+    edges.push({
+      id: `episode:${link.episodeId}->${fileId}`,
+      source: `episode:${link.episodeId}`,
+      target: fileId,
+      type: 'artifact',
+      truth: 'stored',
+      data: { pointer: 'episode.metadata.artifactPath' },
+    });
   }
 
   // Typed policy nodes make enforcement semantics visible instead of treating
@@ -795,13 +1102,29 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
   const totals = {
     facts: countActiveFacts(),
     files: (db.prepare('SELECT COUNT(DISTINCT path) AS c FROM vault_chunks').get() as { c: number }).c,
-    entities: (db.prepare('SELECT COUNT(*) AS c FROM entities').get() as { c: number }).c,
+    entities: (db.prepare(`
+      SELECT COUNT(*) AS c FROM entities e
+      WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
+    `).get() as { c: number }).c,
     resources: (db.prepare('SELECT COUNT(*) AS c FROM resource_pointers').get() as { c: number }).c,
     episodes: (db.prepare('SELECT COUNT(*) AS c FROM memory_episodes').get() as { c: number }).c,
     policies: (db.prepare('SELECT COUNT(*) AS c FROM memory_policies').get() as { c: number }).c,
   };
+  const edgeTypeTotals: Record<string, number> = {
+    entity: (db.prepare("SELECT COUNT(*) AS c FROM fact_entities WHERE link_type <> 'inferred_text'").get() as { c: number }).c,
+    entityInferred: (db.prepare("SELECT COUNT(*) AS c FROM fact_entities WHERE link_type = 'inferred_text'").get() as { c: number }).c,
+    resource: (db.prepare("SELECT COUNT(*) AS c FROM fact_resources WHERE link_type <> 'inferred_text'").get() as { c: number }).c,
+    resourceInferred: (db.prepare("SELECT COUNT(*) AS c FROM fact_resources WHERE link_type = 'inferred_text'").get() as { c: number }).c,
+    evidence: (db.prepare('SELECT COUNT(*) AS c FROM fact_evidence').get() as { c: number }).c,
+    observed: countStoredEntityObservationLinks(db),
+    artifact: countStoredEpisodeArtifactLinks(db),
+    governs: (db.prepare('SELECT COUNT(*) AS c FROM memory_policies').get() as { c: number }).c,
+    related: countCurrentEntityEdges(),
+  };
   const visibleByType: Record<string, number> = {};
   for (const node of nodes) visibleByType[node.type] = (visibleByType[node.type] ?? 0) + 1;
+  const visibleEdgeTypes: Record<string, number> = {};
+  for (const edge of edges) visibleEdgeTypes[edge.type] = (visibleEdgeTypes[edge.type] ?? 0) + 1;
   const edgeTruth = { stored: 0, inferred: 0, semantic: 0 };
   for (const edge of edges) edgeTruth[edge.truth] += 1;
 
@@ -822,7 +1145,7 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
       // additive meta — non-fact store presence (WS1 graph completeness).
       graphFull: isGraphFullEnabled(),
       truthMode,
-      coverage: { totals, visible: visibleByType, edges: edgeTruth },
+      coverage: { totals, visible: visibleByType, edges: edgeTruth, edgeTypeTotals, visibleEdgeTypes },
       stores: nonFact.counts,
       // additive meta
       semanticEdges: {
@@ -847,26 +1170,48 @@ export function buildMemoryNeighborhood(db: MemoryDb, nodeId: string, depth: 1 |
   const entities = new Set<number>();
   const resources = new Set<number>();
   const episodes = new Set<string>();
+  const files = new Set<string>();
   const policies = new Set<number>();
   const separator = nodeId.indexOf(':');
   const type = separator >= 0 ? nodeId.slice(0, separator) : nodeId;
   const rawId = separator >= 0 ? nodeId.slice(separator + 1) : '';
   if (type === 'fact' && Number.isInteger(Number(rawId))) facts.add(Number(rawId));
-  else if (type === 'entity' && Number.isInteger(Number(rawId))) entities.add(Number(rawId));
+  else if (type === 'entity' && Number.isInteger(Number(rawId))) entities.add(resolveCanonicalEntityId(Number(rawId)));
   else if (type === 'resource' && Number.isInteger(Number(rawId))) resources.add(Number(rawId));
   else if (type === 'episode' && rawId) episodes.add(rawId);
+  else if (type === 'file' && rawId) files.add(rawId);
   else if (type === 'policy' && Number.isInteger(Number(rawId))) policies.add(Number(rawId));
   else return { nodes: [], edges: [], meta: { truthMode: 'stored', seed: nodeId, depth, error: 'unsupported node id' } };
 
   const idsSql = (values: Array<number | string>) => values.map(() => '?').join(',');
+  const expandArtifacts = (): void => {
+    const links = [
+      ...(episodes.size > 0 ? loadStoredEpisodeArtifactLinks(db, { episodeIds: Array.from(episodes), limit: 300 }) : []),
+      ...(files.size > 0 ? loadStoredEpisodeArtifactLinks(db, { paths: Array.from(files), limit: 300 }) : []),
+    ];
+    for (const link of links) {
+      episodes.add(link.episodeId);
+      files.add(link.path);
+    }
+  };
+  const expandObservations = (): void => {
+    const links = [
+      ...(entities.size > 0 ? loadStoredEntityObservationLinks(db, { entityIds: Array.from(entities), limit: 600 }) : []),
+      ...(episodes.size > 0 ? loadStoredEntityObservationLinks(db, { episodeIds: Array.from(episodes), limit: 600 }) : []),
+    ];
+    for (const link of links) {
+      entities.add(resolveCanonicalEntityId(link.entityId));
+      episodes.add(link.episodeId);
+    }
+  };
   const expandEndpointFacts = (): void => {
     if (entities.size > 0) {
       const ids = Array.from(entities);
-      for (const row of db.prepare(`SELECT fact_id FROM fact_entities WHERE entity_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ fact_id: number }>) facts.add(row.fact_id);
+      for (const row of db.prepare(`SELECT fact_id FROM fact_entities WHERE link_type <> 'inferred_text' AND entity_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ fact_id: number }>) facts.add(row.fact_id);
     }
     if (resources.size > 0) {
       const ids = Array.from(resources);
-      for (const row of db.prepare(`SELECT fact_id FROM fact_resources WHERE resource_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ fact_id: number }>) facts.add(row.fact_id);
+      for (const row of db.prepare(`SELECT fact_id FROM fact_resources WHERE link_type <> 'inferred_text' AND resource_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ fact_id: number }>) facts.add(row.fact_id);
     }
     if (episodes.size > 0) {
       const ids = Array.from(episodes);
@@ -877,27 +1222,28 @@ export function buildMemoryNeighborhood(db: MemoryDb, nodeId: string, depth: 1 |
   const expandFacts = (): void => {
     if (facts.size === 0) return;
     const ids = Array.from(facts);
-    for (const row of db.prepare(`SELECT entity_id FROM fact_entities WHERE fact_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ entity_id: number }>) entities.add(row.entity_id);
-    for (const row of db.prepare(`SELECT resource_id FROM fact_resources WHERE fact_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ resource_id: number }>) resources.add(row.resource_id);
+    for (const row of db.prepare(`SELECT entity_id FROM fact_entities WHERE link_type <> 'inferred_text' AND fact_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ entity_id: number }>) entities.add(resolveCanonicalEntityId(row.entity_id));
+    for (const row of db.prepare(`SELECT resource_id FROM fact_resources WHERE link_type <> 'inferred_text' AND fact_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ resource_id: number }>) resources.add(row.resource_id);
     for (const row of db.prepare(`SELECT episode_id FROM fact_evidence WHERE fact_id IN (${idsSql(ids)}) LIMIT 300`).all(...ids) as Array<{ episode_id: string }>) episodes.add(row.episode_id);
     for (const row of db.prepare(`SELECT fact_id FROM memory_policies WHERE fact_id IN (${idsSql(ids)})`).all(...ids) as Array<{ fact_id: number }>) policies.add(row.fact_id);
   };
 
   for (let hop = 0; hop < depth; hop++) {
+    expandArtifacts();
+    expandObservations();
     expandEndpointFacts();
     expandFacts();
-    if (entities.size > 0 && hop + 1 < depth) {
+    if (entities.size > 0) {
       const ids = Array.from(entities);
       const now = new Date().toISOString();
-      const rows = db.prepare(`
-        SELECT subject_id, object_id FROM entity_edges
-        WHERE (invalidated_at IS NULL OR invalidated_at > ?)
-          AND (valid_from IS NULL OR valid_from <= ?)
-          AND (valid_to IS NULL OR valid_to > ?)
-          AND (subject_id IN (${idsSql(ids)}) OR object_id IN (${idsSql(ids)}))
-        LIMIT 200
-      `).all(now, now, now, ...ids, ...ids) as Array<{ subject_id: number; object_id: number }>;
-      for (const row of rows) { entities.add(row.subject_id); entities.add(row.object_id); }
+      for (const neighborId of getNeighborEntityIds(ids, 200, now)) entities.add(neighborId);
+      const seedIds = new Set(ids);
+      for (const edge of loadEntityEdges(2_000, now)) {
+        if (!seedIds.has(edge.subjectId) && !seedIds.has(edge.objectId)) continue;
+        entities.add(resolveCanonicalEntityId(edge.subjectId));
+        entities.add(resolveCanonicalEntityId(edge.objectId));
+        for (const evidence of edge.evidence) episodes.add(evidence.episodeId);
+      }
     }
   }
 
@@ -907,6 +1253,7 @@ export function buildMemoryNeighborhood(db: MemoryDb, nodeId: string, depth: 1 |
   const entityIds = Array.from(entities).slice(0, 300);
   const resourceIds = Array.from(resources).slice(0, 300);
   const episodeIds = Array.from(episodes).slice(0, 300);
+  const fileIds = Array.from(files).slice(0, 300);
   const policyIds = Array.from(policies).filter((id) => factIds.includes(id));
 
   if (factIds.length > 0) {
@@ -921,16 +1268,44 @@ export function buildMemoryNeighborhood(db: MemoryDb, nodeId: string, depth: 1 |
     }
   }
   if (entityIds.length > 0) {
-    const rows = db.prepare(`SELECT id, canonical_name, entity_type, mention_count FROM entities WHERE id IN (${idsSql(entityIds)})`).all(...entityIds) as Array<{ id: number; canonical_name: string; entity_type: string; mention_count: number }>;
-    for (const row of rows) nodes.push({ id: `entity:${row.id}`, label: row.canonical_name, type: 'entity', data: { entity_type: row.entity_type, mention_count: row.mention_count } });
+    const rows = db.prepare(`SELECT e.id, e.canonical_name, e.entity_type, e.mention_count, e.aliases_json,
+      (SELECT COUNT(*) FROM fact_entities fe WHERE fe.entity_id = e.id) AS fact_count,
+      (SELECT COUNT(*) FROM entity_identifiers ei WHERE ei.entity_id = e.id) AS identifier_count,
+      (SELECT COUNT(*) FROM entity_observations eo WHERE eo.entity_id = e.id) AS observation_count
+      FROM entities e WHERE e.id IN (${idsSql(entityIds)})`).all(...entityIds) as Array<{ id: number; canonical_name: string; entity_type: string; mention_count: number; aliases_json: string | null; fact_count: number; identifier_count: number; observation_count: number }>;
+    for (const row of rows) {
+      let aliases: string[] = [];
+      try {
+        const parsed = JSON.parse(row.aliases_json ?? '[]');
+        if (Array.isArray(parsed)) aliases = parsed.filter((alias): alias is string => typeof alias === 'string').slice(0, 12);
+      } catch { /* malformed legacy aliases */ }
+      nodes.push({ id: `entity:${row.id}`, label: row.canonical_name, type: 'entity', data: { entity_type: row.entity_type, mention_count: row.mention_count, factCount: row.fact_count, identifierCount: row.identifier_count, observationCount: row.observation_count, aliases, canonical: true } });
+    }
   }
   if (resourceIds.length > 0) {
     const rows = db.prepare(`SELECT id, name, app, kind, ref, whats_here, trust FROM resource_pointers WHERE id IN (${idsSql(resourceIds)})`).all(...resourceIds) as Array<{ id: number; name: string; app: string; kind: string; ref: string; whats_here: string | null; trust: number | null }>;
     for (const row of rows) nodes.push({ id: `resource:${row.id}`, label: row.name, type: 'resource', data: { app: row.app, kind: row.kind, ref: row.ref, whatsHere: row.whats_here, trust: row.trust } });
   }
   if (episodeIds.length > 0) {
-    const rows = db.prepare(`SELECT id, kind, source_app, source_uri, occurred_at, status, evidence_excerpt FROM memory_episodes WHERE id IN (${idsSql(episodeIds)})`).all(...episodeIds) as Array<{ id: string; kind: string; source_app: string | null; source_uri: string | null; occurred_at: string; status: string; evidence_excerpt: string | null }>;
-    for (const row of rows) nodes.push({ id: `episode:${row.id}`, label: row.source_app ?? row.kind, type: 'episode', data: { sourceUri: row.source_uri, occurredAt: row.occurred_at, status: row.status, excerpt: row.evidence_excerpt } });
+    const rows = db.prepare(`SELECT id, kind, subtype, title, source_app, source_uri, occurred_at, status, evidence_excerpt, metadata_json FROM memory_episodes WHERE id IN (${idsSql(episodeIds)})`).all(...episodeIds) as Array<{ id: string; kind: string; subtype: string | null; title: string | null; source_app: string | null; source_uri: string | null; occurred_at: string; status: string; evidence_excerpt: string | null; metadata_json: string }>;
+    for (const row of rows) {
+      let metadata: Record<string, unknown> = {};
+      try { metadata = JSON.parse(row.metadata_json || '{}') as Record<string, unknown>; } catch { /* keep empty */ }
+      nodes.push({ id: `episode:${row.id}`, label: row.title ?? row.source_app ?? row.kind, type: 'episode', data: { kind: row.kind, subtype: row.subtype, sourceUri: row.source_uri, occurredAt: row.occurred_at, status: row.status, excerpt: row.evidence_excerpt, ...metadata } });
+    }
+  }
+  if (fileIds.length > 0) {
+    const rows = db.prepare(`
+      SELECT path, COUNT(*) AS chunks, MAX(mtime) AS mtime
+      FROM vault_chunks WHERE path IN (${idsSql(fileIds)})
+      GROUP BY path
+    `).all(...fileIds) as Array<{ path: string; chunks: number; mtime: number }>;
+    for (const row of rows) nodes.push({
+      id: `file:${row.path}`,
+      label: row.path.split('/').slice(-2).join('/'),
+      type: 'file',
+      data: { chunks: row.chunks, mtime: row.mtime, exactArtifact: true },
+    });
   }
   if (policyIds.length > 0) {
     const rows = db.prepare(`SELECT fact_id, policy_type, enforcement, priority FROM memory_policies WHERE fact_id IN (${idsSql(policyIds)})`).all(...policyIds) as Array<{ fact_id: number; policy_type: string; enforcement: string; priority: number }>;
@@ -942,36 +1317,77 @@ export function buildMemoryNeighborhood(db: MemoryDb, nodeId: string, depth: 1 |
 
   const factSet = new Set(factIds), entitySet = new Set(entityIds), resourceSet = new Set(resourceIds), episodeSet = new Set(episodeIds);
   if (factIds.length > 0) {
-    for (const row of db.prepare(`SELECT fact_id, entity_id FROM fact_entities WHERE fact_id IN (${idsSql(factIds)})`).all(...factIds) as Array<{ fact_id: number; entity_id: number }>) if (entitySet.has(row.entity_id)) edges.push({ id: `fact:${row.fact_id}->entity:${row.entity_id}`, source: `fact:${row.fact_id}`, target: `entity:${row.entity_id}`, type: 'entity', truth: 'stored' });
-    for (const row of db.prepare(`SELECT fact_id, resource_id FROM fact_resources WHERE fact_id IN (${idsSql(factIds)})`).all(...factIds) as Array<{ fact_id: number; resource_id: number }>) if (resourceSet.has(row.resource_id)) edges.push({ id: `fact:${row.fact_id}->resource:${row.resource_id}`, source: `fact:${row.fact_id}`, target: `resource:${row.resource_id}`, type: 'resource', truth: 'stored' });
+    for (const row of db.prepare(`
+      SELECT fact_id, entity_id, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_entities WHERE link_type <> 'inferred_text' AND fact_id IN (${idsSql(factIds)})
+    `).all(...factIds) as Array<{ fact_id: number; entity_id: number; confidence: number; evidence_episode_id: string | null; evidence_excerpt: string | null }>) if (entitySet.has(row.entity_id)) edges.push({
+      id: `fact:${row.fact_id}->entity:${row.entity_id}`, source: `fact:${row.fact_id}`, target: `entity:${row.entity_id}`,
+      type: 'entity', truth: 'stored', data: { confidence: row.confidence, evidenceEpisodeId: row.evidence_episode_id, evidenceExcerpt: row.evidence_excerpt },
+    });
+    for (const row of db.prepare(`
+      SELECT fact_id, resource_id, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_resources WHERE link_type <> 'inferred_text' AND fact_id IN (${idsSql(factIds)})
+    `).all(...factIds) as Array<{ fact_id: number; resource_id: number; confidence: number; evidence_episode_id: string | null; evidence_excerpt: string | null }>) if (resourceSet.has(row.resource_id)) edges.push({
+      id: `fact:${row.fact_id}->resource:${row.resource_id}`, source: `fact:${row.fact_id}`, target: `resource:${row.resource_id}`,
+      type: 'resource', truth: 'stored', data: { confidence: row.confidence, evidenceEpisodeId: row.evidence_episode_id, evidenceExcerpt: row.evidence_excerpt },
+    });
     for (const row of db.prepare(`SELECT fact_id, episode_id FROM fact_evidence WHERE fact_id IN (${idsSql(factIds)})`).all(...factIds) as Array<{ fact_id: number; episode_id: string }>) if (episodeSet.has(row.episode_id)) edges.push({ id: `fact:${row.fact_id}->episode:${row.episode_id}`, source: `fact:${row.fact_id}`, target: `episode:${row.episode_id}`, type: 'evidence', truth: 'stored' });
   }
   if (entityIds.length > 0) {
     const now = new Date().toISOString();
-    const rows = db.prepare(`
-      SELECT subject_id, predicate, object_id, recurrence_count, confidence,
-             evidence_episode_id, valid_from, valid_to
-      FROM entity_edges
-      WHERE (invalidated_at IS NULL OR invalidated_at > ?)
-        AND (valid_from IS NULL OR valid_from <= ?)
-        AND (valid_to IS NULL OR valid_to > ?)
-        AND subject_id IN (${idsSql(entityIds)})
-        AND object_id IN (${idsSql(entityIds)})
-    `).all(now, now, now, ...entityIds, ...entityIds) as Array<{
-      subject_id: number; predicate: string; object_id: number; recurrence_count: number;
-      confidence: number; evidence_episode_id: string | null; valid_from: string | null; valid_to: string | null;
-    }>;
-    for (const row of rows) if (entitySet.has(row.subject_id) && entitySet.has(row.object_id)) edges.push({
-      id: `related:${row.subject_id}-${row.predicate}-${row.object_id}`,
-      source: `entity:${row.subject_id}`,
-      target: `entity:${row.object_id}`,
+    const rows = loadEntityEdges(2_000, now);
+    for (const row of rows) if (entitySet.has(row.subjectId) && entitySet.has(row.objectId)) edges.push({
+      id: `related:${row.subjectId}-${row.predicate}-${row.objectId}`,
+      source: `entity:${row.subjectId}`,
+      target: `entity:${row.objectId}`,
       type: 'related',
       label: row.predicate,
-      weight: row.recurrence_count,
+      weight: row.recurrenceCount,
       truth: 'stored',
-      data: { confidence: row.confidence, evidenceEpisodeId: row.evidence_episode_id, validFrom: row.valid_from, validTo: row.valid_to },
+      data: {
+        confidence: row.confidence,
+        evidenceEpisodeId: row.evidenceEpisodeId,
+        evidenceCount: row.evidenceCount,
+        evidence: row.evidence,
+        validFrom: row.validFrom,
+        validTo: row.validTo,
+      },
     });
   }
+
+  for (const link of loadStoredEntityObservationLinks(db, {
+    entityIds,
+    episodeIds,
+    limit: 600,
+  })) if (entitySet.has(link.entityId) && episodeSet.has(link.episodeId)) edges.push({
+    id: `entity:${link.entityId}->episode:${link.episodeId}`,
+    source: `entity:${link.entityId}`,
+    target: `episode:${link.episodeId}`,
+    type: 'observed',
+    label: 'observed in',
+    truth: 'stored',
+    data: {
+      confidence: link.confidence,
+      sourceFactId: link.sourceFactId,
+      sourceUri: link.sourceUri,
+      sourceKind: link.sourceKind,
+      observedAt: link.observedAt,
+    },
+  });
+
+  const fileSet = new Set(fileIds);
+  for (const link of loadStoredEpisodeArtifactLinks(db, {
+    episodeIds,
+    paths: fileIds,
+    limit: 300,
+  })) if (episodeSet.has(link.episodeId) && fileSet.has(link.path)) edges.push({
+    id: `episode:${link.episodeId}->file:${link.path}`,
+    source: `episode:${link.episodeId}`,
+    target: `file:${link.path}`,
+    type: 'artifact',
+    truth: 'stored',
+    data: { pointer: 'episode.metadata.artifactPath' },
+  });
 
   return { nodes, edges, meta: { truthMode: 'stored', seed: nodeId, depth, factCount: factSet.size, edgeCount: edges.length } };
 }

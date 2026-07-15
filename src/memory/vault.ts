@@ -18,18 +18,47 @@ export const CRON_FILE = path.join(SYSTEM_DIR, 'CRON.md');
 export const WORKFLOWS_DIR = path.join(SYSTEM_DIR, 'workflows');
 export const WORKING_MEMORY_FILE = path.join(BASE_DIR, 'working-memory.md');
 
-/** Char budget MEMORY.md gets when injected into the prompt every turn.
- *  The auto-section builder caps its output at 6000 chars, but the
- *  authoritative fact carrier in the prompt is renderFactsForInstructions
- *  (the SQLite stream), so MEMORY.md is a secondary human-readable surface
- *  and stays at a tight budget. Exported so the builder (Tier C1) can warn
- *  when the assembled file exceeds what the prompt actually reads. */
-export const MEMORY_PROMPT_READ_CHARS = 4000;
+/** Stable separator shared with memory-md-builder.ts. Content below this marker
+ *  is a human-readable projection of consolidated_facts, not a second source of
+ *  prompt truth. Keep the exact marker stable so existing vaults continue to
+ *  split correctly after upgrades. */
+export const MEMORY_AUTO_SECTION_MARKER = '<!-- AUTO-GENERATED · do not edit below this line — overwritten on next refresh -->';
+
+/** Char budget for USER-CURATED MEMORY.md content injected every turn. The
+ *  generated section is intentionally excluded: renderFactsForInstructions is
+ *  the canonical, typed policy/fact carrier and query recall supplies archival
+ *  detail on demand. */
+export const MEMORY_PROMPT_READ_CHARS = 1600;
 
 function readMaybe(filePath: string, maxChars = 4000): string | undefined {
   if (!existsSync(filePath)) return undefined;
   try {
     return readFileSync(filePath, 'utf-8').trim().slice(0, maxChars);
+  } catch {
+    return undefined;
+  }
+}
+
+function readCuratedMemoryMaybe(filePath: string, maxChars: number): string | undefined {
+  if (!existsSync(filePath)) return undefined;
+  try {
+    const raw = readFileSync(filePath, 'utf-8');
+    // Match the stable marker exactly first, then tolerate older/future marker
+    // wording that retains the AUTO-GENERATED prefix.
+    const exactMarkerIndex = raw.indexOf(MEMORY_AUTO_SECTION_MARKER);
+    const compatibleMarkerIndex = exactMarkerIndex >= 0
+      ? exactMarkerIndex
+      : raw.indexOf('<!-- AUTO-GENERATED');
+    const curated = raw.slice(0, compatibleMarkerIndex >= 0 ? compatibleMarkerIndex : raw.length).trim();
+    // A scaffold-only heading carries no memory and should not consume a prompt
+    // section. Any content beneath it remains eligible for injection.
+    const meaningful = curated.replace(/^#\s+Memory\s*/i, '').trim();
+    if (!meaningful) return undefined;
+    if (curated.length <= maxChars) return curated;
+
+    const clipNotice = '\n\n_[Curated MEMORY.md clipped; full text remains in the vault.]_';
+    const contentBudget = Math.max(0, maxChars - clipNotice.length);
+    return `${curated.slice(0, contentBudget).trimEnd()}${clipNotice}`;
   } catch {
     return undefined;
   }
@@ -52,7 +81,7 @@ export function loadMemoryContext(): MemoryContext {
   ensureVaultScaffold();
   return {
     soul: readMaybe(SOUL_FILE),
-    memory: readMaybe(MEMORY_FILE, MEMORY_PROMPT_READ_CHARS),
+    memory: readCuratedMemoryMaybe(MEMORY_FILE, MEMORY_PROMPT_READ_CHARS),
     identity: readMaybe(IDENTITY_FILE),
     workingMemory: readMaybe(WORKING_MEMORY_FILE, 3000),
   };

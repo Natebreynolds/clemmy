@@ -515,6 +515,19 @@ function activeProviderSync(): EmbeddingProvider | null {
 export function activeEmbeddingModel(): string | null { return activeProviderSync()?.model ?? null; }
 export function activeEmbeddingDim(): number | null { return activeProviderSync()?.dim ?? null; }
 
+/**
+ * Stable identity for the vector space currently allowed to participate in
+ * recall/graph computations. Consumers that cache derived geometry or
+ * similarity must include this key: a provider/model/dimension switch can
+ * happen before the replacement backfill writes any rows (and therefore
+ * before SQLite's memory generation changes).
+ */
+export function activeEmbeddingSpaceKey(): string {
+  const provider = activeProviderSync();
+  if (!provider?.model || !Number.isFinite(provider.dim)) return 'disabled';
+  return `${provider.name || 'unknown'}:${provider.model}:${provider.dim}`;
+}
+
 function activeEmbeddingSelector(): { model: string; dim: number } | null {
   const provider = activeProviderSync();
   if (!provider?.model || !Number.isFinite(provider.dim)) return null;

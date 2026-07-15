@@ -309,11 +309,22 @@ export interface MemoryHit {
   title: string;
   snippet: string;
   score: number;
+  ref?: { type: 'fact' | 'entity' | 'resource' | 'episode' | 'note' | 'procedure' | 'policy'; id: string | number };
+  confidence?: number;
+  evidenceCount?: number;
+  whyRecalled?: string[];
 }
 
-export async function searchMemory(query: string, limit = 20): Promise<{ query: string; hits: MemoryHit[] }> {
+export interface MemorySearchResult {
+  query: string;
+  hits: MemoryHit[];
+  answerability: 'supported' | 'partial' | 'insufficient';
+  diagnostics: { candidates: number; stores: string[]; elapsedMs: number };
+}
+
+export async function searchMemory(query: string, limit = 20): Promise<MemorySearchResult> {
   const url = `/m/api/memory/search?q=${encodeURIComponent(query)}&limit=${limit}`;
-  return api<{ query: string; hits: MemoryHit[] }>(url);
+  return api<MemorySearchResult>(url);
 }
 
 export interface MemoryFact {

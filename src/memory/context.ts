@@ -1,8 +1,10 @@
 import { loadMemoryContext } from './vault.js';
 import { loadSessionBrief, renderSessionContinuity } from './session-briefs.js';
 import { loadWorkingMemoryForSession } from './working-memory.js';
-import { formatSearchHits, searchVault, searchVaultAsync } from './search.js';
 import { getRecallObjective } from './focus.js';
+import { appendFactRecallTrace } from './recall-trace.js';
+import { formatSearchHits, searchVault } from './search.js';
+import { buildUnifiedTurnPrimer } from './turn-primer.js';
 import { SessionStore } from './session-store.js';
 import type { AssembledPromptContext } from '../types.js';
 import { classifyMessageIntent, memoryBudgetFor } from '../assistant/message-intent.js';
@@ -15,13 +17,6 @@ import {
   pullRecentTurnsForHarnessHistory,
   renderTranscriptTurns,
 } from '../runtime/harness/session-transcript.js';
-
-/**
- * Gentle recency half-life (days) for chat vault recall. The decay is FLOORED
- * (see recall.ts RECENCY_FLOOR) so a freshly-referenced item edges out a stale
- * one without burying strong older notes. 30 days = a soft tiebreaker.
- */
-const CHAT_RECALL_RECENCY_HALF_LIFE_DAYS = 30;
 
 /**
  * Chat cross-session seed window. The chat path has same-session continuity
@@ -139,26 +134,18 @@ function mergeContinuity(brief: string | undefined, seed: string | undefined): s
   return [brief, seed].filter(Boolean).join('\n\n') || undefined;
 }
 
-function buildSearchQuery(memoryContext: { workingMemory?: string; sessionBrief?: string }, message: string, transcript: string): string {
-  return [
-    message,
-    transcript,
-    memoryContext.workingMemory?.slice(0, 400) ?? '',
-    memoryContext.sessionBrief?.slice(0, 300) ?? '',
-  ].filter(Boolean).join(' ').slice(0, 1200);
-}
-
 /**
- * Async prompt context assembly. Adds embedding rerank to the vault
- * recall when an OpenAI API key is configured; otherwise the FTS-only
- * path runs (same cost as before). Prefer this from anywhere that
- * already has an `await` available, like `assistant/core.ts respond()`.
+ * Async prompt context assembly for the legacy/direct assistant lane. Archival
+ * recall deliberately goes through the same evidence-backed full-memory primer
+ * as the flagship harnesses; this lane is still reachable as a channel and
+ * workflow fallback, so vault-only recall here would make reliability depend on
+ * which runtime happened to answer the turn.
  *
  * The memory budget is driven by the message-intent classifier:
  * casual / meta messages skip vault search and working memory; lookup
  * and action messages get the full retrieval pass.
  */
-export async function assemblePromptContextAsync(sessionId: string, message: string, transcript: string): Promise<AssembledPromptContext> {
+export async function assemblePromptContextAsync(sessionId: string, message: string, _transcript: string): Promise<AssembledPromptContext> {
   const intent = classifyMessageIntent(message);
   const budget = memoryBudgetFor(intent.intent);
   const brief = budget.loadSessionBrief ? loadSessionBrief(sessionId) : undefined;
@@ -170,15 +157,42 @@ export async function assemblePromptContextAsync(sessionId: string, message: str
       budget.loadSessionBrief ? buildPriorSessionSeed(sessionId) : undefined,
     ),
   };
-  const hits = budget.vaultSearchTopK > 0
-    ? await searchVaultAsync(buildSearchQuery(memoryContext, message, transcript), {
+  const objective = getRecallObjective(message) ?? message;
+  const primer = budget.vaultSearchTopK > 0
+    ? await buildUnifiedTurnPrimer({
+        query: objective,
+        surface: 'legacy_assistant_primer',
         limit: budget.vaultSearchTopK,
-        objective: getRecallObjective(message),
-        recencyHalfLifeDays: CHAT_RECALL_RECENCY_HALF_LIFE_DAYS,
+        maxChars: budget.vaultFormatBytes,
+        timeoutMs: 1_500,
+        sessionId,
       })
-    : [];
+    : null;
+  let retrievalText = primer?.text ?? '';
+  if (!retrievalText && primer && ['timeout', 'error', 'disabled'].includes(primer.status)) {
+    // The shared ranker can be unavailable during cold model load, provider
+    // failure, or an operator kill-switch. Preserve a bounded lexical vault
+    // safety net so a recorded meeting is still discoverable; label it
+    // explicitly so neither the model nor health UI mistakes it for full recall.
+    const fallbackHits = searchVault(objective, budget.vaultSearchTopK);
+    const formatted = formatSearchHits(fallbackHits, budget.vaultFormatBytes);
+    const included = formatted.match(/^- /gm)?.length ?? 0;
+    retrievalText = formatted
+      ? `[MEMORY PRIMER DEGRADED — vault-only lexical fallback after unified ${primer.status}]\n${formatted}`
+      : '';
+    appendFactRecallTrace({
+      surface: 'turn_memory_primer',
+      query: objective,
+      mode: `legacy_assistant_fallback_${primer.status}`,
+      sessionId,
+      facts: [],
+      includedCount: included,
+      omittedCount: Math.max(0, fallbackHits.length - included),
+      candidateCount: fallbackHits.length,
+    });
+  }
   return {
     memoryContext,
-    retrievalText: formatSearchHits(hits, budget.vaultFormatBytes || 0),
+    retrievalText,
   };
 }

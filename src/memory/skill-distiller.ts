@@ -27,7 +27,8 @@ import {
 import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
 import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
-import { rememberFact } from './facts.js';
+import { consolidateFact } from './reflection.js';
+import { recordMemoryEpisode } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
 
@@ -509,12 +510,12 @@ export async function distillSkillFromSessions(
  * Best-effort; only touches drafts, so a session with no loaded drafts is a
  * cheap no-op.
  */
-export function reinforceDraftSkills(
+export async function reinforceDraftSkills(
   skillNames: string[],
   outcome: 'success' | 'failure',
   reason?: string,
   sessionId?: string,
-): void {
+): Promise<void> {
   if (!distillerEnabled()) return;
   // On failure, prefer a STRUCTURED recovery tip mined from the session's
   // failed-then-corrected trajectory (error signature → corrective retry) over
@@ -553,11 +554,31 @@ export function reinforceDraftSkills(
         const infraTransient = isInfraTransientFailure(reason ?? '') || (!!recoveryTip && isInfraTransientFailure(recoveryTip));
         if (quarantined && substantive && !infraTransient && failureLearningEnabled()) {
           try {
-            rememberFact({
+            const evidenceSessionId = sessionId ?? 'skill-distiller';
+            const callId = `skill-reinforce:${name}:${failureCount}`;
+            const sourceUri = `clementine://skills/${encodeURIComponent(name)}/failure/${failureCount}`;
+            // Persist the observed failure before deriving a durable lesson.
+            // The claim must replay through this source episode, never through
+            // a synthetic episode whose excerpt is merely the claim itself.
+            recordMemoryEpisode({
+              kind: 'reflection',
+              sourceApp: 'Clementine skill distiller',
+              sessionId: evidenceSessionId,
+              callId,
+              sourceUri,
+              title: `Repeated failure evidence for ${name}`,
+              content: line,
+              metadata: { skill: name, failureCount, recoveryTip: Boolean(recoveryTip) },
+            });
+            await consolidateFact({
               kind: 'feedback',
-              content: `Avoid repeating this: the "${name}" approach failed repeatedly and was retired. ${line}`.slice(0, 400),
-              ...(sessionId ? { derivedFrom: { sessionId, tool: 'skill_reinforce' } } : {}),
+              text: `Avoid repeating this: the "${name}" approach failed repeatedly and was retired. ${line}`.slice(0, 400),
               trustLevel: 0.6,
+              authority: 'derived',
+              sourceUri,
+            }, {
+              sessionId: evidenceSessionId,
+              derivedFrom: { sessionId: evidenceSessionId, callId, tool: 'skill_reinforce' },
             });
           } catch { /* best-effort */ }
         }

@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
-import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings } from './embeddings.js';
+import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
-import { captureFactEvidence, getFactEvidence, listMemoryPolicies, type FactEvidence } from './temporal-memory.js';
+import { captureFactEvidence, getFactEvidence, linkFactEvidence, listMemoryPolicies, syncMemoryPolicyForFact, type FactEvidence } from './temporal-memory.js';
+import { attachGroundedFactResources, resolveEntityIdsForText, setFactEntityLinks } from './relations.js';
 
 // ─── Per-turn semantic recall (reuse the turn's query embedding) ───────────
 // The per-turn fact ranking is SYNCHRONOUS, but embedding the query is async.
@@ -115,6 +116,16 @@ export interface ConsolidatedFact {
   supersededByFactId?: number | null;
   confidence?: number | null;
   evidence?: FactEvidence[];
+  validityIntervals?: FactValidityInterval[];
+}
+
+export interface FactValidityInterval {
+  id: number;
+  factId: number;
+  validFrom: string;
+  validTo: string | null;
+  openedReason: string;
+  closedReason: string | null;
 }
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference', 'constraint'];
@@ -211,10 +222,27 @@ export interface RememberInput {
   sourceUri?: string;
   /** The time the source event occurred; defaults to ingestion time. */
   occurredAt?: string;
+  /** Exact already-durable source for this claim. Writers that persist an
+   * episode before asynchronous consolidation use this to avoid a crash window
+   * and to keep the canonical fact attached to the original user turn. */
+  evidence?: {
+    episodeId: string;
+    excerpt: string;
+    sourceUri?: string | null;
+  };
 }
 
 function captureEvidenceBestEffort(fact: ConsolidatedFact, input: RememberInput): void {
   try {
+    if (input.evidence?.episodeId && input.evidence.excerpt.trim()) {
+      linkFactEvidence({
+        factId: fact.id,
+        episodeId: input.evidence.episodeId,
+        excerpt: input.evidence.excerpt,
+        sourceUri: input.evidence.sourceUri ?? input.sourceUri ?? input.path ?? null,
+      });
+      return;
+    }
     captureFactEvidence({
       factId: fact.id,
       factContent: fact.content,
@@ -228,6 +256,51 @@ function captureEvidenceBestEffort(fact: ConsolidatedFact, input: RememberInput)
   } catch {
     // Evidence durability is best-effort at the write boundary. The bounded
     // maintenance backfill retries and health reports any missing source.
+  }
+}
+
+/** Direct/manual claims are themselves durable evidence that the named entity
+ * belongs to the fact. Promote only entities already resolved by an exact
+ * canonical-name/alias match and only after a surviving evidence excerpt was
+ * written; derived facts are linked later by the reflection consolidation
+ * service against their original tool episode. */
+function captureDirectFactEntityLinksBestEffort(fact: ConsolidatedFact, input: RememberInput): void {
+  if (input.derivedFrom?.callId || input.derivedFrom?.sessionId) return;
+  try {
+    const entityIds = resolveEntityIdsForText(fact.content, 8);
+    if (entityIds.length === 0) return;
+    const evidence = getFactEvidence(fact.id).find((item) => item.excerpt.trim().length > 0 && (item.status === 'available' || item.status === 'partial'));
+    if (!evidence) return;
+    setFactEntityLinks(fact.id, entityIds, {
+      linkType: 'extracted',
+      confidence: fact.confidence ?? fact.trustLevel ?? 1,
+      evidenceEpisodeId: evidence.episodeId,
+      evidenceExcerpt: evidence.excerpt,
+    });
+  } catch {
+    // Relationship enrichment is fail-open; the fact and its evidence are
+    // already durable and nightly inferred matching remains an overlay.
+  }
+}
+
+/** Direct/manual claims also ground explicitly named source-map resources.
+ * The relationship helper rereads durable fact evidence and requires one
+ * unique, sufficiently specific name in both claim and excerpt, so this never
+ * upgrades a generic “Drive”/“CRM” mention or an ambiguous folder name. */
+function captureDirectFactResourceLinksBestEffort(fact: ConsolidatedFact, input: RememberInput): void {
+  if (input.derivedFrom?.callId || input.derivedFrom?.sessionId) return;
+  try {
+    const evidence = getFactEvidence(fact.id).find((item) =>
+      item.excerpt.trim().length > 0 && (item.status === 'available' || item.status === 'partial'));
+    if (!evidence) return;
+    attachGroundedFactResources({
+      factId: fact.id,
+      evidenceEpisodeId: evidence.episodeId,
+      confidence: fact.confidence ?? fact.trustLevel ?? 1,
+    });
+  } catch {
+    // Resource enrichment is fail-open; the durable fact remains canonical and
+    // nightly inferred matching remains available as a labeled overlay.
   }
 }
 
@@ -273,6 +346,8 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
   const autoPin = input.kind === 'constraint' ? 1 : 0;
 
   if (existing) {
+    const reactivating = existing.active === 0 ? 1 : 0;
+    const reactivationBoundary = input.occurredAt ?? now;
     db.prepare(`
       UPDATE consolidated_facts
       SET score = MIN(score + 0.1, 10),
@@ -297,14 +372,23 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
           source_app              = COALESCE(source_app, ?),
           -- Constraint auto-pin: MAX so a re-write never UNpins a fact a
           -- user or the safety path pinned.
-          pinned                   = MAX(pinned, ?)
+          pinned                   = MAX(pinned, ?),
+          -- Exact content can recur after supersession. Reopening the row must
+          -- start a fresh validity period instead of inheriting the old close.
+          valid_from               = CASE WHEN ? = 1 THEN ? ELSE valid_from END,
+          valid_to                 = CASE WHEN ? = 1 THEN NULL ELSE valid_to END,
+          superseded_by_fact_id    = CASE WHEN ? = 1 THEN NULL ELSE superseded_by_fact_id END
       WHERE id = ?
     `).run(now, input.sessionId ?? null, input.path ?? null,
-           dfSession, dfCall, dfTool, trust, trust, extractedAt, importance, input.sourceApp ?? null, autoPin, existing.id);
+           dfSession, dfCall, dfTool, trust, trust, extractedAt, importance, input.sourceApp ?? null, autoPin,
+           reactivating, reactivationBoundary, reactivating, reactivating, existing.id);
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
       .get(existing.id) as ConsolidatedFactRow;
     const updatedFact = rowToFact(refreshed);
+    syncMemoryPolicyForFact(updatedFact.id);
     captureEvidenceBestEffort(updatedFact, input);
+    captureDirectFactEntityLinksBestEffort(updatedFact, input);
+    captureDirectFactResourceLinksBestEffort(updatedFact, input);
     emitSemanticFactUpserted(updatedFact, 'update');
     return updatedFact;
   }
@@ -332,7 +416,10 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;
   const insertedFact = rowToFact(inserted);
+  syncMemoryPolicyForFact(insertedFact.id);
   captureEvidenceBestEffort(insertedFact, input);
+  captureDirectFactEntityLinksBestEffort(insertedFact, input);
+  captureDirectFactResourceLinksBestEffort(insertedFact, input);
   emitSemanticFactUpserted(insertedFact, 'insert');
   return insertedFact;
 }
@@ -435,6 +522,7 @@ export function updateFact(
   `).run(newContent, newHash, now, now, newTrust, newImportance, patch.sessionId ?? null, patch.sourceApp ?? null, id);
   const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(id) as ConsolidatedFactRow;
+  syncMemoryPolicyForFact(id);
   return rowToFact(refreshed);
 }
 
@@ -473,6 +561,7 @@ export function supersedeFact(
     }
   });
   tx();
+  syncMemoryPolicyForFact(replacement.id);
   return getFact(replacement.id);
 }
 
@@ -538,8 +627,12 @@ export function reactivateFact(id: number): boolean {
   const db = openMemoryDb();
   const now = new Date().toISOString();
   const info = db.prepare(
-    'UPDATE consolidated_facts SET active = 1, updated_at = ?, last_accessed_at = ?, last_used_at = ? WHERE id = ? AND active = 0',
-  ).run(now, now, now, id);
+    `UPDATE consolidated_facts
+     SET active = 1, updated_at = ?, last_accessed_at = ?, last_used_at = ?,
+         valid_from = ?, valid_to = NULL, superseded_by_fact_id = NULL
+     WHERE id = ? AND active = 0`,
+  ).run(now, now, now, now, id);
+  if (info.changes > 0) syncMemoryPolicyForFact(id);
   return info.changes > 0;
 }
 
@@ -577,7 +670,7 @@ export interface ScoredFact {
  */
 export async function findSimilarFactsScored(
   content: string,
-  options: { kind?: ConsolidatedFactKind; topK?: number } = {},
+  options: { kind?: ConsolidatedFactKind; topK?: number; asOf?: string } = {},
 ): Promise<ScoredFact[]> {
   const db = openMemoryDb();
   const topK = Math.max(1, Math.min(20, options.topK ?? 5));
@@ -590,7 +683,18 @@ export async function findSimilarFactsScored(
       // Full-pool semantic search. The vectors are generation-cached in the
       // active provider space, so tail facts are never discarded by recency
       // before cosine relevance is computed.
-      const vectors = loadActiveFactEmbeddings(options.kind);
+      const historicalAt = options.asOf && Number.isFinite(Date.parse(options.asOf))
+        ? new Date(Date.parse(options.asOf)).toISOString()
+        : undefined;
+      const vectors = historicalAt
+        ? loadFactEmbeddings((db.prepare(`
+            SELECT DISTINCT cf.id
+            FROM consolidated_facts cf
+            JOIN fact_validity_intervals fvi ON fvi.fact_id = cf.id
+            WHERE fvi.valid_from <= ? AND (fvi.valid_to IS NULL OR fvi.valid_to > ?)
+              ${options.kind ? 'AND cf.kind = ?' : ''}
+          `).all(historicalAt, historicalAt, ...(options.kind ? [options.kind] : [])) as Array<{ id: number }>).map((row) => row.id))
+        : loadActiveFactEmbeddings(options.kind);
       const ids = Array.from(vectors.keys());
       if (vectors.size > 0) {
         const queryVector = await embedQuery(normalized);
@@ -615,7 +719,7 @@ export async function findSimilarFactsScored(
             return topIds
               .map((id) => byId.get(id))
               .filter((r): r is ConsolidatedFactRow => Boolean(r))
-              .map((r) => ({ fact: rowToFact(r), sim: simById.get(r.id) ?? null }));
+              .map((r) => ({ fact: historicalAt ? (getFactAt(r.id, historicalAt) ?? rowToFact(r)) : rowToFact(r), sim: simById.get(r.id) ?? null }));
           }
         }
       }
@@ -638,12 +742,23 @@ export async function findSimilarFactsScored(
   // bm25-like ranking via fts5 if facts have an FTS index. They
   // currently don't, so we fall back to a simple LIKE-token-count
   // ranker which still gives the resolver a useful candidate pool.
-  const matches = db.prepare(`
-    SELECT * FROM consolidated_facts
-    WHERE active = 1
-      ${options.kind ? 'AND kind = ?' : ''}
-      AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
-  `).all(...(options.kind ? [options.kind] : []), ...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
+  const historicalAt = options.asOf && Number.isFinite(Date.parse(options.asOf))
+    ? new Date(Date.parse(options.asOf)).toISOString()
+    : undefined;
+  const matches = historicalAt
+    ? db.prepare(`
+        SELECT DISTINCT cf.* FROM consolidated_facts cf
+        JOIN fact_validity_intervals fvi ON fvi.fact_id = cf.id
+        WHERE fvi.valid_from <= ? AND (fvi.valid_to IS NULL OR fvi.valid_to > ?)
+          ${options.kind ? 'AND cf.kind = ?' : ''}
+          AND (${tokens.map(() => 'LOWER(cf.content) LIKE ?').join(' OR ')})
+      `).all(historicalAt, historicalAt, ...(options.kind ? [options.kind] : []), ...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[]
+    : db.prepare(`
+        SELECT * FROM consolidated_facts
+        WHERE active = 1
+          ${options.kind ? 'AND kind = ?' : ''}
+          AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
+      `).all(...(options.kind ? [options.kind] : []), ...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
 
   // Score by token-occurrence count, return top-K. No cosine available on
   // this path, so sim is null (callers must not threshold against it).
@@ -653,7 +768,10 @@ export async function findSimilarFactsScored(
     return { row, hits };
   });
   scored.sort((a, b) => b.hits - a.hits || (b.row.updated_at || '').localeCompare(a.row.updated_at || ''));
-  return scored.slice(0, topK).map((s) => ({ fact: rowToFact(s.row), sim: null }));
+  return scored.slice(0, topK).map((s) => ({
+    fact: historicalAt ? (getFactAt(s.row.id, historicalAt) ?? rowToFact(s.row)) : rowToFact(s.row),
+    sim: null,
+  }));
 }
 
 export async function findSimilarFacts(
@@ -732,19 +850,21 @@ export function searchFactsByTextAt(query: string, asOf: string, limit = 5): Con
   const at = new Date(atMs).toISOString();
   try {
     const rows = openMemoryDb().prepare(`
-      SELECT * FROM consolidated_facts
-      WHERE COALESCE(valid_from, created_at) <= ?
-        AND (valid_to IS NULL OR valid_to > ?)
-        AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
-    `).all(at, at, ...tokens.map((token) => `%${token}%`)) as ConsolidatedFactRow[];
+      SELECT cf.*, fvi.valid_from AS interval_valid_from, fvi.valid_to AS interval_valid_to
+      FROM consolidated_facts cf
+      JOIN fact_validity_intervals fvi ON fvi.fact_id = cf.id
+      WHERE fvi.valid_from <= ?
+        AND (fvi.valid_to IS NULL OR fvi.valid_to > ?)
+        AND (${tokens.map(() => 'LOWER(cf.content) LIKE ?').join(' OR ')})
+    `).all(at, at, ...tokens.map((token) => `%${token}%`)) as Array<ConsolidatedFactRow & { interval_valid_from: string; interval_valid_to: string | null }>;
     return rows
       .map((row) => ({
         row,
         hits: tokens.reduce((sum, token) => sum + (row.content.toLowerCase().includes(token) ? 1 : 0), 0),
       }))
-      .sort((a, b) => b.hits - a.hits || (b.row.valid_from ?? b.row.created_at).localeCompare(a.row.valid_from ?? a.row.created_at))
+      .sort((a, b) => b.hits - a.hits || b.row.interval_valid_from.localeCompare(a.row.interval_valid_from))
       .slice(0, Math.max(1, limit))
-      .map(({ row }) => rowToFact(row));
+      .map(({ row }) => ({ ...rowToFact(row), validFrom: row.interval_valid_from, validTo: row.interval_valid_to }));
   } catch {
     return [];
   }
@@ -1089,13 +1209,20 @@ export function listActiveFacts(options: {
   return rows.map(rowToFact);
 }
 
-export function listAllFacts(limit = 50): ConsolidatedFact[] {
+export function listAllFacts(limit = 50, kind?: ConsolidatedFactKind): ConsolidatedFact[] {
   const db = openMemoryDb();
-  const rows = db.prepare(`
-    SELECT * FROM consolidated_facts
-    ORDER BY active DESC, score DESC, updated_at DESC
-    LIMIT ?
-  `).all(limit) as ConsolidatedFactRow[];
+  const rows = kind
+    ? db.prepare(`
+        SELECT * FROM consolidated_facts
+        WHERE kind = ?
+        ORDER BY active DESC, score DESC, updated_at DESC
+        LIMIT ?
+      `).all(kind, limit) as ConsolidatedFactRow[]
+    : db.prepare(`
+        SELECT * FROM consolidated_facts
+        ORDER BY active DESC, score DESC, updated_at DESC
+        LIMIT ?
+      `).all(limit) as ConsolidatedFactRow[];
   return rows.map(rowToFact);
 }
 
@@ -1105,10 +1232,46 @@ export function getFact(id: number): ConsolidatedFact | null {
   return row ? rowToFact(row) : null;
 }
 
+/** Return the exact asserted period containing `asOf`, if any. */
+export function getFactAt(id: number, asOf: string): ConsolidatedFact | null {
+  const atMs = Date.parse(asOf);
+  if (!Number.isFinite(atMs)) return null;
+  const at = new Date(atMs).toISOString();
+  const row = openMemoryDb().prepare(`
+    SELECT cf.*, fvi.valid_from AS interval_valid_from, fvi.valid_to AS interval_valid_to
+    FROM consolidated_facts cf
+    JOIN fact_validity_intervals fvi ON fvi.fact_id = cf.id
+    WHERE cf.id = ? AND fvi.valid_from <= ? AND (fvi.valid_to IS NULL OR fvi.valid_to > ?)
+    ORDER BY fvi.valid_from DESC
+    LIMIT 1
+  `).get(id, at, at) as (ConsolidatedFactRow & { interval_valid_from: string; interval_valid_to: string | null }) | undefined;
+  return row ? { ...rowToFact(row), validFrom: row.interval_valid_from, validTo: row.interval_valid_to } : null;
+}
+
+export function getFactValidityIntervals(id: number): FactValidityInterval[] {
+  const rows = openMemoryDb().prepare(`
+    SELECT id, fact_id, valid_from, valid_to, opened_reason, closed_reason
+    FROM fact_validity_intervals
+    WHERE fact_id = ?
+    ORDER BY valid_from DESC, id DESC
+  `).all(id) as Array<{
+    id: number; fact_id: number; valid_from: string; valid_to: string | null;
+    opened_reason: string; closed_reason: string | null;
+  }>;
+  return rows.map((row) => ({
+    id: row.id,
+    factId: row.fact_id,
+    validFrom: row.valid_from,
+    validTo: row.valid_to,
+    openedReason: row.opened_reason,
+    closedReason: row.closed_reason,
+  }));
+}
+
 export function getFactWithEvidence(id: number): ConsolidatedFact | null {
   const fact = getFact(id);
   if (!fact) return null;
-  return { ...fact, evidence: getFactEvidence(id) };
+  return { ...fact, evidence: getFactEvidence(id), validityIntervals: getFactValidityIntervals(id) };
 }
 
 /**
@@ -1141,7 +1304,25 @@ export function setFactPinned(id: number, pinned: boolean): boolean {
     SET pinned = ?, updated_at = ?
     WHERE id = ?
   `).run(pinned ? 1 : 0, new Date().toISOString(), id);
-  return Number(info.changes ?? 0) > 0;
+  const changed = Number(info.changes ?? 0) > 0;
+  if (changed) syncMemoryPolicyForFact(id);
+  return changed;
+}
+
+/** Only policies with a compiled deterministic contract may enter the
+ * dispatch guard. `listConstraints()` remains the complete prompt/review set. */
+export function listDispatchConstraints(): ConsolidatedFact[] {
+  const rows = openMemoryDb().prepare(`
+    SELECT cf.* FROM consolidated_facts cf
+    JOIN memory_policies mp ON mp.fact_id = cf.id
+    WHERE cf.active = 1 AND cf.kind = 'constraint'
+      AND mp.policy_type = 'hard_constraint' AND mp.enforcement = 'dispatch'
+      AND CASE WHEN json_valid(mp.applies_to_json) = 1
+        THEN COALESCE(json_extract(mp.applies_to_json, '$.deterministic'), 0)
+        ELSE 0 END = 1
+    ORDER BY mp.priority DESC, cf.updated_at DESC
+  `).all() as ConsolidatedFactRow[];
+  return rows.map(rowToFact);
 }
 
 /** Active pinned facts (standing instructions), newest-first. Capped so
@@ -1161,22 +1342,15 @@ export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
   return rows.map(rowToFact);
 }
 
-/**
- * List active constraint facts. Constraints are hard rules that guard tool
- * dispatch, so ENFORCEMENT must see ALL of them — a recency LIMIT silently
- * stopped enforcing an old-but-critical safety rule once a user accumulated
- * more than the cap (e.g. >20 standing rules → the oldest mailbox/org rule
- * fell out and stopped gating dispatch). `limit` undefined ⇒ unbounded (the
- * enforcement callers in constraint-guard.ts pass nothing). A caller that
- * only DISPLAYS a subset (harness-context) passes an explicit cap; that
- * subset is ranked by importance first so the most critical rules show.
- */
+/** List every active legacy constraint-shaped instruction for prompt context
+ * and owner review. Only `listDispatchConstraints()` is allowed to feed the
+ * deterministic gate; unsupported natural-language rules remain visible here
+ * without being falsely advertised as machine-enforced. */
 export function listConstraints(limit?: number): ConsolidatedFact[] {
   const db = openMemoryDb();
   // Importance-first ordering so an explicit display cap keeps the most
-  // critical rules; recency breaks ties. Enforcement (no limit) gets all rows,
-  // so order is immaterial there — but consistent ordering keeps findEmail/
-  // toolkit "first match wins" deterministic (highest-importance rule wins).
+  // critical rules; recency breaks ties. The unbounded read is used for prompt
+  // and policy-review surfaces so no standing instruction silently disappears.
   const base = `SELECT * FROM consolidated_facts
     WHERE active = 1 AND kind = 'constraint'
     ORDER BY COALESCE(importance, 5) DESC, updated_at DESC`;
@@ -1245,17 +1419,29 @@ export function renderFactsForInstructions(
   // the "always apply" block by harness-synthetic auto-pins under the old 12-cap.
   let pinned: ConsolidatedFact[] = [];
   let policyTypeByFactId = new Map<number, 'hard_constraint' | 'core_profile' | 'standing_preference'>();
+  let enforcementByFactId = new Map<number, 'dispatch' | 'prompt'>();
+  let dispatchBackedFactIds = new Set<number>();
   try {
     const policies = listMemoryPolicies().slice(0, POLICY_RUNAWAY_CAP);
     policyTypeByFactId = new Map(policies.map((policy) => [policy.fact_id, policy.policy_type]));
+    enforcementByFactId = new Map(policies.map((policy) => [policy.fact_id, policy.enforcement]));
+    dispatchBackedFactIds = new Set(policies
+      .filter((policy) => {
+        if (policy.policy_type !== 'hard_constraint' || policy.enforcement !== 'dispatch') return false;
+        try { return JSON.parse(policy.applies_to_json)?.deterministic === true; } catch { return false; }
+      })
+      .map((policy) => policy.fact_id));
     pinned = policies.map((policy) => getFact(policy.fact_id)).filter((fact): fact is ConsolidatedFact => Boolean(fact));
   } catch {
-    // v14/partially migrated fallback: keep prompt assembly available.
+    // Partially migrated fallback: keep prompt assembly available, but never
+    // claim deterministic enforcement without the persisted compiled contract.
     try { pinned = listPinnedFacts(POLICY_RUNAWAY_CAP); } catch { pinned = []; }
     policyTypeByFactId = new Map(pinned.map((fact) => [
       fact.id,
       fact.kind === 'constraint' ? 'hard_constraint' : fact.kind === 'user' ? 'core_profile' : 'standing_preference',
     ]));
+    enforcementByFactId = new Map(pinned.map((fact) => [fact.id, 'prompt']));
+    dispatchBackedFactIds = new Set();
   }
   const pinnedIds = new Set(pinned.map((f) => f.id));
   const renderPinned = mode !== 'scored';
@@ -1277,18 +1463,29 @@ export function renderFactsForInstructions(
   const renderedPolicyFacts: ConsolidatedFact[] = [];
   if (renderPinned && pinned.length > 0) {
     const totalPolicyBudget = mode === 'pinned' ? maxChars : Math.min(maxChars, 1600);
-    const hardBudget = Math.min(HARD_CONSTRAINT_SUMMARY_BUDGET, Math.floor(totalPolicyBudget * 0.40));
-    const coreBudget = Math.min(CORE_PROFILE_BUDGET, Math.floor(totalPolicyBudget * 0.35));
-    const preferenceBudget = Math.min(STANDING_PREFERENCE_BUDGET, Math.max(160, totalPolicyBudget - hardBudget - coreBudget));
     const groups = {
-      hard_constraint: pinned.filter((f) => policyTypeByFactId.get(f.id) === 'hard_constraint'),
-      core_profile: pinned.filter((f) => policyTypeByFactId.get(f.id) === 'core_profile'),
+      dispatch_constraint: pinned.filter((f) => f.kind === 'constraint' && dispatchBackedFactIds.has(f.id)),
+      prompt_instruction: pinned.filter((f) => f.kind === 'constraint' && !dispatchBackedFactIds.has(f.id)),
+      core_profile: pinned.filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) === 'core_profile'),
       standing_preference: pinned
-        .filter((f) => policyTypeByFactId.get(f.id) === 'standing_preference')
+        .filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) !== 'core_profile')
         .sort((a, b) => objective
           ? lexicalRelevance(objective, b.content) - lexicalRelevance(objective, a.content)
           : (b.importance ?? 5) - (a.importance ?? 5)),
     };
+    // Allocate only among groups that exist. Reserving 75% of a small budget
+    // for empty tiers can hide the one real preference even when it fits.
+    const activeWeight = (groups.dispatch_constraint.length > 0 ? 28 : 0)
+      + (groups.prompt_instruction.length > 0 ? 25 : 0)
+      + (groups.core_profile.length > 0 ? 25 : 0)
+      + (groups.standing_preference.length > 0 ? 22 : 0);
+    const share = (present: boolean, weight: number, cap: number): number => present && activeWeight > 0
+      ? Math.min(cap, Math.floor(totalPolicyBudget * weight / activeWeight))
+      : 0;
+    const dispatchBudget = share(groups.dispatch_constraint.length > 0, 28, HARD_CONSTRAINT_SUMMARY_BUDGET);
+    const promptOnlyBudget = share(groups.prompt_instruction.length > 0, 25, totalPolicyBudget);
+    const coreBudget = share(groups.core_profile.length > 0, 25, CORE_PROFILE_BUDGET);
+    const preferenceBudget = share(groups.standing_preference.length > 0, 22, STANDING_PREFERENCE_BUDGET);
     const renderGroup = (title: string, group: ConsolidatedFact[], budget: number, suffix: (omitted: number) => string): string => {
       if (group.length === 0) return '';
       const lines: string[] = [];
@@ -1305,8 +1502,12 @@ export function renderFactsForInstructions(
     };
     pinnedSection = [
       renderGroup(
-        'Hard constraints (enforced at dispatch)', groups.hard_constraint, hardBudget,
+        'Dispatch-enforced constraints', groups.dispatch_constraint, dispatchBudget,
         (n) => `_… ${n} more constraint${n === 1 ? '' : 's'} omitted from this summary but still enforced._`,
+      ),
+      renderGroup(
+        'Prompt-only instructions (context, not deterministic enforcement)', groups.prompt_instruction, promptOnlyBudget,
+        (n) => `_… ${n} more prompt-only instruction${n === 1 ? '' : 's'} available through memory_recall_all._`,
       ),
       renderGroup(
         'Core profile', groups.core_profile, coreBudget,
@@ -1318,7 +1519,7 @@ export function renderFactsForInstructions(
         (n) => `_… ${n} more standing preference${n === 1 ? '' : 's'} available through memory_recall_all._`,
       ),
     ].filter(Boolean).join('\n\n');
-    pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; all ${groups.hard_constraint.length} hard constraints remain dispatch-enforced._`;
+    pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; ${groups.dispatch_constraint.length} dispatch-enforced, ${groups.prompt_instruction.length} prompt-only._`;
   }
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {
@@ -1365,8 +1566,19 @@ export function renderFactsForInstructions(
     surface: 'facts_for_instructions',
     objective,
     mode,
+    includedCount: renderedPolicyFacts.length + renderedScoredFacts.length,
+    candidateCount: (renderPinned ? pinned.length : 0) + scored.length,
+    omittedCount: Math.max(0,
+      ((renderPinned ? pinned.length : 0) + scored.length)
+      - renderedPolicyFacts.length
+      - renderedScoredFacts.length,
+    ),
+    enforcementBackedCount: renderPinned ? pinned.filter((fact) => dispatchBackedFactIds.has(fact.id)).length : 0,
     facts: [
-      ...(renderPinned ? renderedPolicyFacts.map((fact) => ({ fact, reason: `policy:${policyTypeByFactId.get(fact.id) ?? 'standing'}` })) : []),
+      ...(renderPinned ? renderedPolicyFacts.map((fact) => ({
+        fact,
+        reason: `policy:${policyTypeByFactId.get(fact.id) ?? 'standing'}:${enforcementByFactId.get(fact.id) ?? 'prompt'}`,
+      })) : []),
       ...renderedScoredFacts.map((fact) => ({ fact, reason: objective ? 'scored-stanford-objective' : 'scored-stanford-global' })),
     ],
   });

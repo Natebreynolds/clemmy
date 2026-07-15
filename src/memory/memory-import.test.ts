@@ -19,6 +19,8 @@ const { resetMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
 const { listActiveFacts } = await import('./facts.js');
 // eslint-disable-next-line import/first
+const { getFactEvidence } = await import('./temporal-memory.js');
+// eslint-disable-next-line import/first
 const {
   scanMemorySource,
   ingestMemorySource,
@@ -86,6 +88,20 @@ test('ingestMemorySource (distill off): structured description → typed fact; f
   assert.match(jane.content, /^\[user-jane\]/, 'headline fact carries the source name');
   assert.ok(imported.some((f) => /Postgres 16 on Railway/.test(f.content)), 'bullet harvested from freeform file');
   assert.ok(!imported.some((f) => f.content === 'noise'), 'short noise lines are not facts');
+
+  const janeEvidence = getFactEvidence(jane.id);
+  assert.ok(janeEvidence.length > 0, 'imported fact must retain durable source evidence');
+  assert.ok(janeEvidence.every((item) => item.status === 'available'));
+  assert.ok(janeEvidence.some((item) => item.excerpt.includes('Jane is a solo family-law attorney in Austin')));
+  assert.ok(janeEvidence.every((item) => item.sourceUri === path.join(SRC, 'user_jane.md')));
+  assert.ok(
+    janeEvidence.every((item) => !item.excerpt.includes('[user-jane]')),
+    'evidence must be copied from the source file, not synthesized from the normalized claim',
+  );
+
+  const postgres = imported.find((f) => /Postgres 16 on Railway/.test(f.content))!;
+  const postgresEvidence = getFactEvidence(postgres.id);
+  assert.ok(postgresEvidence.some((item) => item.excerpt.includes('The production database is Postgres 16 on Railway')));
 
   // Re-ingest: content-hash idempotency → zero NEW facts, all deduped.
   const again = await ingestMemorySource(SRC, { sourceLabel: 'test-foreign', distill: false });

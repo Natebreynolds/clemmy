@@ -197,9 +197,9 @@ export function memoryBudgetFor(
       // already describe capabilities.
       return { loadWorkingMemory: false, loadSessionBrief: true, vaultSearchTopK: 0, vaultFormatBytes: 0 };
     case 'lookup':
-      return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 6, vaultFormatBytes: 2400 };
+      return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 6, vaultFormatBytes: 1800 };
     case 'action':
-      return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 6, vaultFormatBytes: 2400 };
+      return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 6, vaultFormatBytes: 1800 };
     case 'tool_intent':
     default:
       return { loadWorkingMemory: true, loadSessionBrief: true, vaultSearchTopK: 4, vaultFormatBytes: 1800 };

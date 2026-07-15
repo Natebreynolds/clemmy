@@ -23,7 +23,12 @@ process.env.CLEMENTINE_HOME = TMP;
 
 const { regenerateMemoryMd } = await import('./memory-md-builder.js');
 const { rememberFact, forgetFact, listActiveFacts } = await import('./facts.js');
-const { MEMORY_FILE } = await import('./vault.js');
+const {
+  loadMemoryContext,
+  MEMORY_AUTO_SECTION_MARKER,
+  MEMORY_FILE,
+  MEMORY_PROMPT_READ_CHARS,
+} = await import('./vault.js');
 
 test('regenerateMemoryMd: writes a placeholder when 0 facts exist', () => {
   const result = regenerateMemoryMd();
@@ -131,9 +136,9 @@ test('regenerateMemoryMd: header reports the TRUE active-fact count, not the 160
 
 test('regenerateMemoryMd: AUTO-section overflow does NOT set userOverflow (no false-alarm warning)', () => {
   // Seed long facts across all kinds so the RENDERED auto section (10/kind)
-  // overflows the 4000-char read budget — the real-world condition (long
-  // "Clementine requirement: …" facts). With a small user block, that overflow
-  // must NOT flag userOverflow (the warning gate) — it is by-design.
+  // exceeds the curated prompt budget — the real-world condition (long
+  // "Clementine requirement: …" facts). The generated projection is not prompt
+  // content, so it must not report any prompt truncation.
   for (const kind of ['user', 'project', 'feedback', 'reference'] as const) {
     for (let i = 0; i < 12; i++) {
       rememberFact({ kind, content: `Long ${kind} standing detail entry ${i} — ${'context phrase '.repeat(10)}` });
@@ -141,15 +146,36 @@ test('regenerateMemoryMd: AUTO-section overflow does NOT set userOverflow (no fa
   }
   writeFileSync(MEMORY_FILE, '# Memory\n\n## Notes\n- short user note\n', 'utf-8');
   const result = regenerateMemoryMd();
-  assert.equal(result.promptTruncated, true, 'precondition: the assembled file exceeds the 4000-char budget');
+  assert.ok(result.totalChars > MEMORY_PROMPT_READ_CHARS, 'precondition: the assembled file exceeds the curated budget');
+  assert.equal(result.promptTruncated, false, 'generated projection size must not count as prompt truncation');
   assert.equal(result.userOverflow, false, 'AUTO-section overflow must not trip the actionable warning');
+
+  const memory = loadMemoryContext().memory ?? '';
+  assert.match(memory, /short user note/, 'curated prefix remains always visible');
+  assert.doesNotMatch(memory, /Long (user|project|feedback|reference) standing detail/, 'generated fact projection must not duplicate canonical facts in the prompt');
+  assert.doesNotMatch(memory, /AUTO-GENERATED/);
 });
 
 test('regenerateMemoryMd: userOverflow is true only when the USER block alone exceeds the budget', () => {
-  // A user-curated section larger than the 4000-char read budget IS actionable
+  // A user-curated section larger than the prompt read budget IS actionable
   // (their own content will clip from the injected view) — userOverflow=true.
   const hugeUserBlock = '# Memory\n\n## My notes\n' + '- a long curated standing note line\n'.repeat(160);
   writeFileSync(MEMORY_FILE, hugeUserBlock, 'utf-8');
   const result = regenerateMemoryMd();
-  assert.equal(result.userOverflow, true, 'a >4000-char user section must trip userOverflow');
+  assert.equal(result.userOverflow, true, 'an oversized user section must trip userOverflow');
+  assert.equal(result.promptTruncated, true);
+
+  const memory = loadMemoryContext().memory ?? '';
+  assert.ok(memory.length <= MEMORY_PROMPT_READ_CHARS, 'curated memory must stay within its prompt budget');
+  assert.match(memory, /Curated MEMORY\.md clipped/, 'prompt clipping is explicit rather than silent');
+  assert.doesNotMatch(memory, /AUTO-GENERATED/);
+});
+
+test('loadMemoryContext: an auto-only MEMORY.md does not create a redundant prompt block', () => {
+  writeFileSync(
+    MEMORY_FILE,
+    `# Memory\n\n${MEMORY_AUTO_SECTION_MARKER}\n\n## User\n- generated duplicate fact\n`,
+    'utf-8',
+  );
+  assert.equal(loadMemoryContext().memory, undefined);
 });

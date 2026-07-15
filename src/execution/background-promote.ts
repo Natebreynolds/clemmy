@@ -43,15 +43,37 @@ import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-p
 export function hasDurableExecutionIntent(message: string): boolean {
   const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
   const intentText = stripNegatedDurableIntent(lower);
-  if (/^\/?(background|bg)\b/.test(intentText)) return true;
-  if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(intentText)) return true;
-  if (/\b(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background\b/.test(intentText)) return true;
-  if (/\b(?:do|finish)\s+(?:this|it|that|the request|the task)\s+in\s+the\s+background\b/.test(intentText)) return true;
-  if (/\b(keep working|don't stop|do not stop|long-running|longer running|overnight|take your time)\b/.test(intentText)) return true;
-  if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(intentText)) {
-    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(intentText);
+  // Generated chat prompts can contain a transcript, machine summary, or other
+  // source material after the user's leading directive. Never let phrases in
+  // that embedded content (live bug: "large, long-running matters") decide the
+  // execution lane for a conversational summarize/review/discuss request.
+  // Explicit durable wording in the leading directive still wins.
+  const leadingDirective = intentText.slice(0, 400);
+  if (startsAsForegroundDiscussion(leadingDirective)) {
+    return hasDirectDurableDirective(leadingDirective);
   }
+  if (hasDirectDurableDirective(intentText)) return true;
   return hasAutomaticDataPipelineShape(lower);
+}
+
+function startsAsForegroundDiscussion(text: string): boolean {
+  return /^(?:please\s+)?(?:summarize|review|discuss|explain|tell me about|walk me through)\b/.test(text);
+}
+
+function hasDirectDurableDirective(text: string): boolean {
+  if (/^\/?(background|bg)\b/.test(text)) return true;
+  if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(text)) return true;
+  if (/\b(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background\b/.test(text)) return true;
+  if (/\b(?:do|finish)\s+(?:this|it|that|the request|the task)\s+in\s+the\s+background\b/.test(text)) return true;
+  if (/\b(?:in the background|overnight|as a job|keep working|don't stop|do not stop|longer running|take your time)\b/.test(text)) return true;
+  // "long-running" is descriptive in ordinary source material. Treat it as
+  // routing intent only when it modifies the task/work itself.
+  if (/\b(?:this|that|it|task|job|request|work|process|run)\b.{0,30}\blong[- ]running\b/.test(text)
+    || /\blong[- ]running\b.{0,30}\b(?:task|job|request|work|process|run)\b/.test(text)) return true;
+  if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(text)) {
+    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(text);
+  }
+  return false;
 }
 
 function stripNegatedDurableIntent(lower: string): string {
@@ -67,7 +89,7 @@ function stripNegatedDurableIntent(lower: string): string {
 function hasAutomaticDataPipelineShape(lower: string): boolean {
   // Skip obvious pure questions/explanations. These can mention several services
   // without asking Clementine to move data through them.
-  if (/^(what|why|how|when|who|where|explain|summarize|tell me about)\b/.test(lower)) return false;
+  if (/^(?:please\s+)?(?:what|why|how|when|who|where|explain|summarize|tell me about)\b/.test(lower)) return false;
 
   const serviceHits = countHits(lower, [
     /\bsalesforce\b/,

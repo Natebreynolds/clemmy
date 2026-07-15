@@ -116,6 +116,14 @@ test('declarative fallback ignores questions and imperative tasks', () => {
   assert.deepEqual(extractAutoMemoryCandidates('Send the quarterly report to the leadership team today.'), []);
 });
 
+test('declarative fallback rejects unpunctuated questions and requests from real capture failures', () => {
+  assert.deepEqual(extractAutoMemoryCandidates('can I have the body of the emails'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('can i have the domains for all of these please'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('can you fix the view here I am not seeing the data'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('How many Airtable bases do I have'), []);
+  assert.deepEqual(extractAutoMemoryCandidates('how do you search memory and find my saved facts'), []);
+});
+
 test('a "do you remember ..." question is not treated as a store request', () => {
   assert.deepEqual(extractAutoMemoryCandidates('Do you remember what we decided about pricing?'), []);
 });

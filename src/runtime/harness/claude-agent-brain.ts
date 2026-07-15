@@ -15,6 +15,7 @@ import { recallMemory } from '../../memory/recall-memory.js';
 import { isTemporalMeetingQuery } from '../../memory/recall.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
+import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
@@ -68,6 +69,12 @@ export function setClaudeAgentSdkBrainJudgeForTest(fn: ObjectiveJudgeFn | null):
 let searchFactsHybridImpl: typeof searchFactsHybrid = searchFactsHybrid;
 export function setClaudeAgentSdkBrainSearchFactsHybridForTest(fn: typeof searchFactsHybrid | null): void {
   searchFactsHybridImpl = fn ?? searchFactsHybrid;
+}
+
+export function setClaudeAgentSdkBrainUnifiedPrimerForTest(
+  fn: Parameters<typeof _setUnifiedTurnPrimerRecallForTest>[0],
+): void {
+  _setUnifiedTurnPrimerRecallForTest(fn);
 }
 
 /** Completion-judge kill-switch (default ON). Off ⇒ the SDK brain trusts its own
@@ -369,7 +376,7 @@ function stripRecallFromTurnContext(turnContext: string | undefined): string | u
   if (!turnContext) return turnContext;
   return turnContext
     .split('\n\n')
-    .filter((block) => !block.startsWith('## Relevant To Your Request'))
+    .filter((block) => !block.startsWith('[MEMORY PRIMER]') && !block.startsWith('## Relevant To Your Request'))
     .join('\n\n');
 }
 
@@ -700,59 +707,133 @@ function renderClaudeBrainSkillsBlock(): string {
  * turn-to-turn (current time, query recall, live focus/goals/held/working-memory)
  * plus THIS session's completed irreversible actions. Returned separately from
  * the (stable, cacheable) system append so the caller can inject it into the user
- * turn, where uncached content belongs. Empty when the context-split kill-switch
- * is off (the volatile content then lives in the system append, old behavior).
+ * turn, where uncached content belongs. When context splitting is off, the
+ * persistent/volatile blocks remain in the system append but unified recall
+ * still rides here: a prompt-placement kill-switch must not change memory.
  */
-export async function renderClaudeAgentBrainTurnContext(request: AssistantRequest): Promise<string> {
-  if (!contextSplitEnabled()) return '';
+interface ClaudeTurnMemoryPrimerTelemetry {
+  enabled: boolean;
+  hitCount: number;
+  omittedCount: number;
+  candidateCount: number;
+  source: string | null;
+  recallId: string | null;
+  answerability: 'supported' | 'partial' | 'insufficient' | null;
+  stores: string[];
+  recallElapsedMs: number | null;
+  skippedReason: string | null;
+}
+
+async function buildClaudeAgentBrainTurnContext(request: AssistantRequest): Promise<{
+  text: string;
+  memoryPrimer: ClaudeTurnMemoryPrimerTelemetry;
+}> {
+  const q = (request.message ?? '').replace(/\s+/g, ' ').trim();
+  const splitContext = contextSplitEnabled();
   // Render the volatile tail WITHOUT the query so its FTS-only recall block is
   // omitted — we replace it below with HYBRID recall (FTS ∪ semantic) so the
   // Claude lane stops knowledge-starving on paraphrased requests (Phase 4).
-  const volatile = renderCanonicalMemoryContext({
-    sessionId: request.sessionId,
-    partition: 'volatile',
-    includeSessionActions: false,
-  });
+  const volatile = splitContext
+    ? renderCanonicalMemoryContext({
+        sessionId: request.sessionId,
+        partition: 'volatile',
+        includeSessionActions: false,
+      })
+    : '';
   let recall = '';
-  const q = (request.message ?? '').replace(/\s+/g, ' ').trim();
+  let unifiedPrimerStatus: 'ok' | 'empty' | 'timeout' | 'error' | 'disabled' | null = null;
   const recallOn = (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  let memoryPrimer: ClaudeTurnMemoryPrimerTelemetry = {
+    enabled: recallOn,
+    hitCount: 0,
+    omittedCount: 0,
+    candidateCount: 0,
+    source: recallOn ? 'unified' : null,
+    recallId: null,
+    answerability: null,
+    stores: [],
+    recallElapsedMs: null,
+    skippedReason: !recallOn ? 'disabled' : !q ? 'empty_input' : 'no_hits',
+  };
   if (q && recallOn) {
     scheduleRecallShadow({ query: q, surface: 'claude_primer', limit: 6 });
     try {
       const timeoutMs = queryRecallTimeoutMs();
-      const [hits, meetingRecall] = await Promise.all([
-        withTimeout(searchFactsHybridImpl(q, 6), timeoutMs, []),
-        isTemporalMeetingQuery(q)
-          ? withTimeout(recallMemory(q, { stores: ['note'], graphDepth: 0, limit: 4 }), timeoutMs, null)
-          : Promise.resolve(null),
-      ]);
-      const meetingBullets = (meetingRecall?.hits ?? []).map((hit) => {
-        const source = hit.evidence[0]?.sourceUri;
-        const content = String(hit.text ?? '').trim();
-        const bounded = content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — load the source for the full meeting]`;
-        return `- [RECORDED MEETING · ${hit.whyRecalled.join(', ')}] ${hit.title ?? 'Meeting'}: ${bounded}${source ? ` (source: ${source})` : ''}`;
+      const unified = await buildUnifiedTurnPrimer({
+        query: q,
+        surface: 'claude_primer',
+        limit: 8,
+        maxChars: 1_800,
+        timeoutMs,
+        sessionId: request.sessionId,
       });
-      const factBullets = hits
-        // Per-bullet bound: recall content is injected every turn and was one
-        // of the last unbounded context inputs on this lane. The cut is MARKED
-        // so a fact whose operative tail (URL/id) sits past the bound reads as
-        // incomplete, not as the whole fact.
-        .map((f) => {
-          const content = String(f.content ?? '').trim();
-          return `- ${content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — search memory for the full fact]`}`;
-        })
-        .filter((l) => l.length > 2);
-      const bullets = [...meetingBullets, ...factBullets].join('\n');
-      if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
-    } catch { recall = ''; }
+      unifiedPrimerStatus = unified.status;
+      memoryPrimer = {
+        enabled: true,
+        hitCount: unified.hitCount,
+        omittedCount: unified.omittedHitCount,
+        candidateCount: unified.diagnostics?.candidates ?? unified.retrievedHitCount,
+        source: 'unified',
+        recallId: unified.recallId ?? null,
+        answerability: unified.answerability ?? null,
+        stores: unified.diagnostics?.stores ?? [],
+        recallElapsedMs: unified.diagnostics?.elapsedMs ?? null,
+        skippedReason: unified.status === 'ok' ? null : unified.status === 'empty' ? 'no_hits' : unified.status,
+      };
+      if (unified.status === 'ok') {
+        recall = unified.text ?? '';
+      } else if (unified.status !== 'empty') {
+        // Degraded fallback only: preserve the prior bounded fact/meeting path
+        // when the unified ranker is killed, times out, or fails.
+        const [hits, meetingRecall] = await Promise.all([
+          withTimeout(searchFactsHybridImpl(q, 6), timeoutMs, []),
+          isTemporalMeetingQuery(q)
+            ? withTimeout(recallMemory(q, { stores: ['note'], graphDepth: 0, limit: 4 }), timeoutMs, null)
+            : Promise.resolve(null),
+        ]);
+        const meetingBullets = (meetingRecall?.hits ?? []).map((hit) => {
+          const source = hit.evidence[0]?.sourceUri;
+          const content = String(hit.text ?? '').trim();
+          const bounded = content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — load the source for the full meeting]`;
+          return `- [RECORDED MEETING · ${hit.whyRecalled.join(', ')}] ${hit.title ?? 'Meeting'}: ${bounded}${source ? ` (source: ${source})` : ''}`;
+        });
+        const factBullets = hits
+          .map((f) => {
+            const content = String(f.content ?? '').trim();
+            return `- ${content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — search memory for the full fact]`}`;
+          })
+          .filter((line) => line.length > 2);
+        const bullets = [...meetingBullets, ...factBullets].join('\n');
+        if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
+        memoryPrimer = {
+          ...memoryPrimer,
+          hitCount: meetingBullets.length + factBullets.length,
+          omittedCount: 0,
+          candidateCount: meetingBullets.length + hits.length,
+          source: `legacy_fallback_${unified.status}`,
+          recallId: null,
+          answerability: recall ? 'partial' : 'insufficient',
+          stores: [...new Set([
+            ...(meetingBullets.length > 0 ? ['note'] : []),
+            ...(factBullets.length > 0 ? ['fact'] : []),
+          ])],
+          skippedReason: recall ? null : `unified_${unified.status}_no_fallback_hits`,
+        };
+      }
+    } catch {
+      recall = '';
+      unifiedPrimerStatus = 'error';
+      memoryPrimer = { ...memoryPrimer, source: 'legacy_fallback_error', skippedReason: 'error' };
+    }
   }
-  // Wave 2 Move A: append cross-store breadcrumbs (people/things, places, proven
-  // tools) — the entity/resource/tool stores that had no per-turn auto-recall on
-  // THIS lane either (the SDK brain's recall above covers facts plus exact-date
-  // recorded meetings). Sync stores →
-  // no first-token latency; self-gating via CLEMMY_UNIFIED_RECALL.
+  if (!splitContext) {
+    return { text: recall, memoryPrimer };
+  }
+  // Legacy cross-store breadcrumbs are retained only when the unified primer is
+  // explicitly disabled or unavailable. The primary result already contains
+  // entities, resources, episodes, policies, notes, facts, and procedures.
   let breadcrumbs = '';
-  if (q) {
+  if (q && unifiedPrimerStatus !== 'ok' && unifiedPrimerStatus !== 'empty') {
     try { breadcrumbs = await crossStoreBreadcrumbs(q); } catch { breadcrumbs = ''; }
   }
   let sessionActions = '';
@@ -791,17 +872,37 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(request.sessionId)) {
     convergenceSteer = CONVERGENCE_STEER;
   }
-  return [convergenceSteer, volatile, continuationContext, harnessHealth, recall, breadcrumbs, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
+  return {
+    text: [convergenceSteer, volatile, continuationContext, harnessHealth, recall, breadcrumbs, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n'),
+    memoryPrimer,
+  };
+}
+
+export async function renderClaudeAgentBrainTurnContext(request: AssistantRequest): Promise<string> {
+  return (await buildClaudeAgentBrainTurnContext(request)).text;
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(
   sessionId: string,
   request: AssistantRequest,
   turnContext: string,
+  primer?: ClaudeTurnMemoryPrimerTelemetry,
 ): void {
   const query = (request.message ?? '').replace(/\s+/g, ' ').trim();
-  const injectedBytes = Buffer.byteLength(turnContext, 'utf-8');
+  const recallBlocks = turnContext.split('\n\n').filter((block) =>
+    block.startsWith('[MEMORY PRIMER]')
+    || block.startsWith('## Relevant To Your Request')
+    || block.startsWith('[ALSO IN MEMORY'),
+  );
+  const recallText = recallBlocks.join('\n\n');
+  const injectedBytes = Buffer.byteLength(recallText, 'utf-8');
   const injected = injectedBytes > 0;
+  const unified = recallBlocks.some((block) => block.startsWith('[MEMORY PRIMER]'));
+  const refs = unified ? [...recallText.matchAll(/\[ref\s+(?:fact|note|entity|resource|episode|policy|procedure):[^\]]+\]/g)].length : null;
+  const recallId = recallText.match(/recall:\s*([^;\]\s]+)/i)?.[1] ?? null;
+  const answerability = recallText.match(/answerability:\s*(supported|partial|insufficient)/i)?.[1] ?? null;
+  const includedCount = primer?.hitCount ?? refs ?? 0;
+  const omittedCount = primer?.omittedCount ?? 0;
   try {
     appendEvent({
       sessionId,
@@ -809,13 +910,20 @@ function emitClaudeAgentSdkBrainContextTelemetry(
       role: 'system',
       type: 'turn_memory_primer',
       data: {
-        enabled: true,
+        enabled: primer?.enabled ?? true,
         queryPreview: query.slice(0, 160),
-        hitCount: null,
+        hitCount: includedCount,
+        includedCount,
+        omittedCount,
+        candidateCount: primer?.candidateCount ?? includedCount + omittedCount,
         injected,
         injectedBytes,
-        source: 'claude_agent_sdk_brain_context',
-        skippedReason: injected ? null : 'empty_context',
+        source: primer?.source ?? (unified ? 'unified' : injected ? 'legacy_fallback' : null),
+        recallId: primer?.recallId ?? recallId,
+        answerability: primer?.answerability ?? answerability,
+        stores: primer?.stores ?? [],
+        recallElapsedMs: primer?.recallElapsedMs ?? null,
+        skippedReason: primer?.skippedReason ?? (injected ? null : 'no_hits'),
       },
     });
   } catch { /* telemetry must never block the turn */ }
@@ -831,7 +939,7 @@ function emitClaudeAgentSdkBrainContextTelemetry(
         memory: {
           enabled: true,
           injected,
-          source: 'claude_agent_sdk_brain_context',
+          source: unified ? 'unified' : injected ? 'legacy_fallback' : null,
         },
         skills: { detected: false },
         workflows: { detected: false },
@@ -916,7 +1024,11 @@ export async function respondViaClaudeAgentSdkBrain(
     const session = getSession(sessionId);
     const shouldCapture = session?.kind === 'chat';
     const captured = shouldCapture
-      ? captureInteractionSignals({ message: request.message, sessionId })
+      ? captureInteractionSignals({
+          message: request.message,
+          sessionId,
+          sourceEventId: request.runId ? `run:${request.runId}` : undefined,
+        })
       : { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
     if (captured.candidates.length > 0 || captured.profilePatch) {
       appendEvent({
@@ -1051,8 +1163,9 @@ export async function respondViaClaudeAgentSdkBrain(
   // the reply-envelope extractor so the user sees prose, not `{"reply":"…"}` JSON.
   let rawStreamText = '';
   const replyExtractor = createReplyStreamExtractor();
-  const turnContext = await renderClaudeAgentBrainTurnContext(request);
-  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext);
+  const renderedTurnContext = await buildClaudeAgentBrainTurnContext(request);
+  const turnContext = renderedTurnContext.text;
+  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const runOptions = {
     sessionId,
     modelId,

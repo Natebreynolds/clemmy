@@ -147,11 +147,40 @@ export function upsertResourcePointer(input: UpsertResourceInput): ResourcePoint
 
 export function listResourcePointers(options: { app?: string; limit?: number } = {}): ResourcePointer[] {
   const db = openMemoryDb();
-  const limit = Math.max(1, Math.min(500, options.limit ?? 100));
+  // Unified recall deliberately searches the complete local resource pool.
+  // Keep a generous safety ceiling for accidental callers, but do not make an
+  // older resource unreachable merely because 500 newer pointers exist.
+  const limit = Math.max(1, Math.min(5_000, options.limit ?? 100));
   const rows = (options.app
     ? db.prepare('SELECT * FROM resource_pointers WHERE app = ? ORDER BY last_seen_at DESC LIMIT ?').all(options.app, limit)
     : db.prepare('SELECT * FROM resource_pointers ORDER BY last_seen_at DESC LIMIT ?').all(limit)) as ResourcePointerRow[];
   return rows.map(rowToPointer);
+}
+
+/** Complete resource pool for relevance scoring. This is intentionally a
+ * separate API from listResourcePointers so UI/context callers remain bounded
+ * while unified archival recall has no recency gate. */
+export function listAllResourcePointers(): ResourcePointer[] {
+  return (openMemoryDb().prepare(
+    'SELECT * FROM resource_pointers ORDER BY last_seen_at DESC',
+  ).all() as ResourcePointerRow[]).map(rowToPointer);
+}
+
+/** Load exact resource ids without passing through a recency-limited list.
+ * Stored graph traversal uses this so a fact can lead back to an old resource
+ * even when that resource would not be a direct lexical candidate. */
+export function getResourcePointersByIds(ids: number[]): ResourcePointer[] {
+  const unique = Array.from(new Set(ids.filter((id) => Number.isInteger(id) && id > 0)));
+  if (unique.length === 0) return [];
+  const placeholders = unique.map(() => '?').join(',');
+  const rows = openMemoryDb().prepare(`
+    SELECT * FROM resource_pointers
+    WHERE id IN (${placeholders})
+  `).all(...unique) as ResourcePointerRow[];
+  const order = new Map(unique.map((id, index) => [id, index]));
+  return rows
+    .sort((a, b) => (order.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+    .map(rowToPointer);
 }
 
 export function countResourcePointers(): number {

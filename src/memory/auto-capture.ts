@@ -1,6 +1,6 @@
 import type { ConsolidatedFactKind } from './db.js';
 import type { ConsolidatedFact } from './facts.js';
-import { consolidateFact } from './reflection.js';
+import { drainDurableConsolidationCandidates, enqueueAutoCaptureCandidates } from './durable-consolidation.js';
 import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 import { getRuntimeEnv } from '../config.js';
@@ -51,6 +51,9 @@ export interface AutoCaptureResult {
    *  so committed rows aren't known synchronously. Kept for back-compat;
    *  callers should report on `candidates` instead. */
   facts: ConsolidatedFact[];
+  /** Durable learned-claim rows written before asynchronous consolidation. */
+  queuedCandidateIds?: number[];
+  episodeId?: string | null;
   profilePatch?: Record<string, unknown>;
   profile?: UserProfile;
 }
@@ -360,6 +363,12 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
 function isDurableDeclarative(text: string): boolean {
   if (text.length < 20 || text.length > 400) return false;
   if (/[?]\s*$/.test(text)) return false; // questions aren't facts
+  // Punctuation is not a reliable question detector for chat/voice input. In
+  // production, requests such as "can I have the body of the emails" and
+  // "can you fix the view here I am not seeing the data" were stored because
+  // the embedded "I have" / "I am" matched the declarative regex below. A
+  // leading interrogative or request auxiliary keeps those turns ephemeral.
+  if (/^\s*(?:can|could|would|will|should|do|did|does|what|when|where|who|why|how|is|are|am|have|has)\b/i.test(text)) return false;
   // First-person / possessive / "the X is/are" declaratives with a
   // stative verb. e.g. "my … is", "we use …", "I work at …", "our … are".
   const declarative =
@@ -375,6 +384,8 @@ function isDurableDeclarative(text: string): boolean {
 export function captureInteractionSignals(input: {
   message: string;
   sessionId?: string;
+  sourceEventId?: string;
+  occurredAt?: string;
   maxFacts?: number;
 }): AutoCaptureResult {
   // Harness-injected re-prompts (judge/stall/parse/grounding/YOLO/outcome) are
@@ -385,32 +396,41 @@ export function captureInteractionSignals(input: {
   }
   const candidates = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
 
-  for (const candidate of candidates) {
-    // Fire-and-forget: route the user-stated fact through the SAME Mem0
-    // conflict resolver the tool-return reflection path uses, so a user
-    // restating a preference ("actually, Wednesday now") UPDATEs/DELETEs
-    // the stale fact instead of stacking a duplicate. trustLevel 1.0
-    // keeps user statements authoritative over derived (0.6) facts on
-    // conflict. The resolver makes an LLM call, so we never await it on
-    // the chat turn — memory capture must never block the conversation.
-    queueMicrotask(() => {
-      consolidateFact(
-        { kind: candidate.kind, text: candidate.content, trustLevel: 1.0, pin: candidate.pin },
-        { sessionId: input.sessionId },
-      ).then((outcome) => {
-        // The turn optimistically reports 'learned', but this write is async and
-        // can no-op or fail. Make a non-persist VISIBLE (was a silent swallow) so
-        // a dropped capture is diagnosable — never surfaced to the turn.
-        if (outcome && !outcome.written && !outcome.updated && !outcome.deleted && !outcome.noop) {
-          logger.warn({ kind: candidate.kind, reason: candidate.reason }, 'auto-capture persisted nothing (fact dropped)');
-        }
-      }).catch((err) => {
-        logger.warn(
-          { err: err instanceof Error ? err.message : String(err), kind: candidate.kind },
-          'auto-capture consolidateFact FAILED — fact not persisted despite optimistic "learned"',
-        );
+  // Persist the exact source turn + replayable claim rows synchronously, then
+  // run the semantic conflict resolver off the response path. A daemon restart
+  // after this point cannot lose the memory: maintenance drains pending rows.
+  // Re-delivery of the same sourceEventId reuses the ledger rows, so retries do
+  // not create duplicate facts or duplicate "learning decision" entries.
+  let queuedCandidateIds: number[] = [];
+  let episodeId: string | null = null;
+  if (candidates.length > 0 && input.sessionId) {
+    try {
+      const queued = enqueueAutoCaptureCandidates({
+        message: input.message,
+        sessionId: input.sessionId,
+        sourceEventId: input.sourceEventId,
+        occurredAt: input.occurredAt,
+        candidates,
       });
-    });
+      queuedCandidateIds = queued.candidateIds;
+      episodeId = queued.episodeId;
+      if (queuedCandidateIds.length > 0) {
+        queueMicrotask(() => {
+          void drainDurableConsolidationCandidates({ ids: queuedCandidateIds, limit: queuedCandidateIds.length })
+            .catch((err) => {
+              logger.warn(
+                { err: err instanceof Error ? err.message : String(err), candidateIds: queuedCandidateIds },
+                'auto-capture immediate consolidation failed; durable maintenance replay remains queued',
+              );
+            });
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), sessionId: input.sessionId },
+        'auto-capture could not persist its durable intake ledger',
+      );
+    }
   }
 
   const profilePatch = extractProfilePatchFromMessage(input.message);
@@ -426,6 +446,8 @@ export function captureInteractionSignals(input: {
   return {
     candidates,
     facts: [],
+    queuedCandidateIds,
+    episodeId,
     profilePatch,
     profile,
   };

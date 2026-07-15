@@ -118,6 +118,9 @@ export class ClementineAssistant {
       const captured = captureInteractionSignals({
         message: request.message,
         sessionId: request.sessionId,
+        sourceEventId: request.runId
+          ? `run:${request.runId}`
+          : `desktop-turn:${sessionBeforeReply.turns.length}`,
       });
       if (request.runId && (captured.candidates.length > 0 || captured.profilePatch)) {
         // Facts are consolidated asynchronously through the Mem0 resolver
@@ -183,7 +186,7 @@ export class ClementineAssistant {
     const promptParts = [
       request.channel ? `Channel: ${request.channel}` : '',
       transcriptBeforeReply ? `Recent transcript:\n${transcriptBeforeReply}` : '',
-      retrievalText ? `Relevant vault context:\n${retrievalText}` : '',
+      retrievalText ? `Relevant memory context:\n${retrievalText}` : '',
       turnContext,
       executionPrompt,
       `Latest user message:\n${request.message}`,

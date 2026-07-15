@@ -3,6 +3,7 @@ import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
 import { buildPlannerAgent, sanitizePlanOutput, type Plan } from '../../agents/planner.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
+import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
@@ -323,6 +324,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     const captured = captureInteractionSignals({
       message: input.input,
       sessionId: input.sessionId,
+      sourceEventId: 'plan-first:turn:0',
     });
     if (captured.candidates.length > 0 || captured.profilePatch) {
       appendEvent({
@@ -343,18 +345,48 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
 
   // Memory-IN: prime the planner with what Clementine already knows BEFORE
   // it drafts the plan, so it FILLS slots from memory instead of re-asking
-  // the user details memory already holds. Mirrors the main loop's
-  // buildTurnMemoryPrimer; recall must NEVER block planning.
+  // the user details memory already holds. This uses the same evidence-backed
+  // pipeline as both flagship agent lanes; the old vault-only path is retained
+  // solely as a bounded timeout/error fallback. Recall must NEVER block planning.
   let memoryContext = '';
   let memoryHitCount = 0;
+  let memoryOmittedCount = 0;
+  let memoryCandidateCount = 0;
+  let memorySource = 'unified';
+  let memoryRecallId: string | null = null;
+  let memoryAnswerability: 'supported' | 'partial' | 'insufficient' | null = null;
+  let memoryStores: string[] = [];
+  let memoryRecallElapsedMs: number | null = null;
   try {
-    const hits = await recallHybrid(input.input, { limit: 6 });
-    memoryHitCount = hits.length;
-    const lines = hits
-      .filter((h) => (h.score ?? 0) > 0)
-      .map((h) => `- ${h.title ?? 'note'}: ${h.snippet}`.slice(0, 300));
-    if (lines.length) {
-      memoryContext = `What Clementine already knows (from memory — use this to FILL slots; do NOT ask the user for anything answered here):\n${lines.join('\n')}`;
+    const unified = await buildUnifiedTurnPrimer({
+      query: input.input,
+      surface: 'automatic_primer',
+      limit: 6,
+      maxChars: 2_400,
+      timeoutMs: 1_500,
+      sessionId: input.sessionId,
+    });
+    if (unified.status === 'ok' || unified.status === 'empty') {
+      memoryContext = unified.text ?? '';
+      memoryHitCount = unified.hitCount;
+      memoryOmittedCount = unified.omittedHitCount;
+      memoryCandidateCount = unified.diagnostics?.candidates ?? unified.retrievedHitCount;
+      memoryRecallId = unified.recallId ?? null;
+      memoryAnswerability = unified.answerability ?? null;
+      memoryStores = unified.diagnostics?.stores ?? [];
+      memoryRecallElapsedMs = unified.diagnostics?.elapsedMs ?? null;
+    } else {
+      const hits = await recallHybrid(input.input, { limit: 6 });
+      const lines = hits
+        .filter((h) => (h.score ?? 0) > 0)
+        .map((h) => `- ${h.title ?? 'note'}: ${h.snippet}`.slice(0, 300));
+      memoryContext = lines.length
+        ? `What Clementine already knows (from memory — use this to FILL slots; do NOT ask the user for anything answered here):\n${lines.join('\n')}`
+        : '';
+      memoryHitCount = lines.length;
+      memoryOmittedCount = Math.max(0, hits.length - lines.length);
+      memoryCandidateCount = hits.length;
+      memorySource = `legacy_fallback_${unified.status}`;
     }
   } catch {
     // Recall must never block planning — fall through to no memoryContext.
@@ -369,8 +401,16 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         enabled: true,
         queryPreview: input.input.slice(0, 160),
         hitCount: memoryHitCount,
+        includedCount: memoryHitCount,
+        omittedCount: memoryOmittedCount,
+        candidateCount: memoryCandidateCount,
         injected: Boolean(memoryContext),
-        source: 'plan_first',
+        injectedBytes: Buffer.byteLength(memoryContext, 'utf8'),
+        source: memorySource,
+        recallId: memoryRecallId,
+        answerability: memoryAnswerability,
+        stores: memoryStores,
+        recallElapsedMs: memoryRecallElapsedMs,
       },
     });
   } catch {

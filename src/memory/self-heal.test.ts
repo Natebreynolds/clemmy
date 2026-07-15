@@ -19,13 +19,26 @@ delete process.env.CLEMMY_MEMORY_SELF_HEAL_MAX;
 // eslint-disable-next-line import/first
 const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
-const { rememberFact, getFact, setFactPinned } = await import('./facts.js');
+const { rememberFact, getFact, getFactValidityIntervals, setFactPinned } = await import('./facts.js');
 // eslint-disable-next-line import/first
 const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
 // eslint-disable-next-line import/first
 const { readHygieneAudit } = await import('./hygiene-audit.js');
 // eslint-disable-next-line import/first
 const { appendFactRecallTrace } = await import('./recall-trace.js');
+// eslint-disable-next-line import/first
+const { getFactEvidence } = await import('./temporal-memory.js');
+// eslint-disable-next-line import/first
+const { upsertEntity } = await import('./reflection.js');
+// eslint-disable-next-line import/first
+const { upsertResourcePointer } = await import('./source-map.js');
+// eslint-disable-next-line import/first
+const {
+  setFactEntityLinks,
+  setFactResourceLinks,
+  loadFactEntityEdges,
+  loadFactResourceEdges,
+} = await import('./relations.js');
 // eslint-disable-next-line import/first
 const {
   detectMemoryHealCandidates,
@@ -34,6 +47,7 @@ const {
   revertMemoryHeal,
   listProposedMemoryFixes,
   parseMemoryVetoVerdict,
+  looksLikeLegacyTransientRequest,
   _memorySelfHealTest,
 } = await import('./self-heal.js');
 
@@ -106,6 +120,101 @@ test('runMemorySelfHeal: retires internal-noise facts, keeps real facts, audits,
   const second = await runMemorySelfHeal({ maxApply: 5, nowIso: '2026-07-04T12:02:00.000Z' });
   assert.equal(second.applied, 0, 'a reverted fix signature is not auto-applied again');
   assert.ok(second.skipped.some((s) => /reverted/.test(s.reason)));
+});
+
+test('legacy conversational requests enter review but are never retired automatically', async () => {
+  const request = rememberFact({ kind: 'user', content: 'Can you fix the memory graph and show me what changed' });
+  const declarative = rememberFact({ kind: 'user', content: 'Nathan prefers concise progress updates.' });
+
+  const candidates = detectMemoryHealCandidates({ persistProposals: true, maxCandidates: 20, nowIso: '2027-07-04T12:00:00.000Z' });
+  const fix = candidates.find((candidate) => candidate.kind === 'retire_transient_request' && candidate.targetIds.includes(request.id));
+  assert.ok(fix, 'the legacy request should be proposed for review');
+  assert.equal(candidates.some((candidate) => candidate.targetIds.includes(declarative.id)), false);
+
+  const automatic = await runMemorySelfHeal({ maxApply: 20, nowIso: '2027-07-04T12:01:00.000Z' });
+  assert.equal(automatic.applied, 0);
+  assert.ok(automatic.skipped.some((item) => item.id === fix!.id && /review required/.test(item.reason)));
+  assert.equal(getFact(request.id)?.active, true, 'scheduled cleanup must leave the request untouched');
+
+  const applied = await applyMemoryFix(fix!, { nowIso: '2027-07-04T12:02:00.000Z' });
+  assert.equal(applied.ok, true);
+  assert.equal(getFact(request.id)?.active, false);
+  assert.equal(getFact(declarative.id)?.active, true);
+
+  const reverted = revertMemoryHeal(applied.auditId!, '2027-07-04T12:03:00.000Z');
+  assert.equal(reverted.ok, true);
+  assert.equal(getFact(request.id)?.active, true);
+  const intervals = getFactValidityIntervals(request.id);
+  assert.equal(intervals.length, 2, 'revert opens a new validity period instead of erasing the retirement gap');
+  assert.equal(intervals[0]?.validFrom, '2027-07-04T12:03:00.000Z');
+  assert.equal(intervals[0]?.validTo, null);
+  assert.equal(intervals[1]?.validTo, '2027-07-04T12:02:00.000Z');
+});
+
+test('legacy request shape detector excludes durable capture wrappers and proper-name declaratives', () => {
+  assert.equal(looksLikeLegacyTransientRequest('How people get replayed and added without duplicate memory?'), true);
+  assert.equal(looksLikeLegacyTransientRequest('Please search my recorded meetings'), true);
+  assert.equal(looksLikeLegacyTransientRequest('Quick task: briefly analyze one client and send me the result'), true);
+  assert.equal(looksLikeLegacyTransientRequest('Go ahead and email the summary when ready'), true);
+  assert.equal(looksLikeLegacyTransientRequest('I need you to remember this meeting'), true);
+  assert.equal(looksLikeLegacyTransientRequest('User explicitly asked Clementine to remember: How the Orchid account is billed.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('Send the pipeline report every Monday to the sales list.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('Email outreach execution chronically fails on sender identity and recipient integrity.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('When pulling Salesforce accounts, only include accounts with a real named contact.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('When recalling meetings, lead with decisions, owners, and next actions.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('When writing client updates, use concise outcome-first language.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('When meeting Sarah tomorrow, send the draft.'), true);
+  assert.equal(looksLikeLegacyTransientRequest('When reviewing this, can you fix the title?'), true);
+  assert.equal(looksLikeLegacyTransientRequest('When Nate says “scorpion email,” it refers to his main Outlook account.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('Will Smith is attached to the Acme project.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('Clementine requirement: always ask before deleting a memory.'), false);
+});
+
+test('legacy transient review scans the complete direct-fact pool beyond the former 5000-row ceiling', () => {
+  const db = openMemoryDb();
+  const now = new Date().toISOString();
+  const insert = db.prepare(`
+    INSERT INTO consolidated_facts
+      (kind, content, content_hash, score, active, created_at, updated_at, importance, pinned)
+    VALUES ('user', ?, ?, 1, 1, ?, ?, 5, 0)
+  `);
+  db.transaction(() => {
+    for (let i = 0; i < 5001; i += 1) {
+      insert.run(`Nathan has durable profile attribute number ${i}.`, `self-heal-direct-tail-${i}`, now, now);
+    }
+  })();
+  const request = rememberFact({ kind: 'user', content: 'Can you fix the view here because I am not seeing the data' });
+
+  const fix = detectMemoryHealCandidates({
+    kinds: ['retire_transient_request'], persistProposals: false, maxCandidates: 200,
+  }).find((candidate) => candidate.targetIds.includes(request.id));
+  assert.ok(fix, 'a conversational request beyond the former direct-fact scan ceiling remains reviewable');
+});
+
+test('internal-noise review scans the complete derived pool beyond the former 1000-row ceiling', () => {
+  const db = openMemoryDb();
+  const now = new Date().toISOString();
+  const insert = db.prepare(`
+    INSERT INTO consolidated_facts
+      (kind, content, content_hash, score, active, created_at, updated_at,
+       derived_from_session_id, derived_from_tool, importance, pinned)
+    VALUES ('project', ?, ?, 1, 1, ?, ?, 'tail-session', 'calendar_read', 5, 0)
+  `);
+  db.transaction(() => {
+    for (let i = 0; i < 1001; i += 1) {
+      insert.run(`Durable calendar observation number ${i}.`, `self-heal-derived-tail-${i}`, now, now);
+    }
+  })();
+  const noise = rememberFact({
+    kind: 'project',
+    content: 'Internal memory lookup result should stay out of durable knowledge.',
+    derivedFrom: { tool: 'memory_read', sessionId: 'tail-noise-session' },
+  });
+
+  const fix = detectMemoryHealCandidates({
+    kinds: ['retire_internal_noise'], persistProposals: false, maxCandidates: 200,
+  }).find((candidate) => candidate.targetIds.includes(noise.id));
+  assert.ok(fix, 'self-referential tool noise beyond the former derived-fact scan ceiling remains reviewable');
 });
 
 test('lift_recall_gap: boosts importance without changing content', async () => {
@@ -212,12 +321,44 @@ test('preview candidate detection and dry-run do not persist proposals or mutate
 test('merge_duplicate: requires judge approval, merges lower-quality duplicate, and can revert', async () => {
   const keep = rememberFact({ kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.', score: 5, importance: 8 });
   const drop = rememberFact({ kind: 'project', content: 'The Revill Law Firm SEO report is at revill-lawfirm.com/report.', score: 1, importance: 6 });
+  const companyId = upsertEntity({ type: 'company', name: 'Revill Law Firm' });
+  const report = upsertResourcePointer({
+    app: 'Google Drive', kind: 'file', name: 'Revill SEO Report', providerId: 'revill-report',
+  });
+  const [dropEvidence] = getFactEvidence(drop.id);
+  assert.ok(dropEvidence);
+  setFactEntityLinks(keep.id, [companyId], { linkType: 'inferred_text', confidence: 0.55 });
+  setFactEntityLinks(drop.id, [companyId], {
+    linkType: 'stored', confidence: 0.96,
+    evidenceEpisodeId: dropEvidence.episodeId, evidenceExcerpt: dropEvidence.excerpt,
+  });
+  setFactResourceLinks(drop.id, [report.id], {
+    linkType: 'stored', confidence: 0.95,
+    evidenceEpisodeId: dropEvidence.episodeId, evidenceExcerpt: dropEvidence.excerpt,
+  });
+  openMemoryDb().prepare(`
+    UPDATE consolidated_facts
+    SET access_count = 1, impression_count = 2, utility_count = 1,
+        last_accessed_at = '2026-07-01T10:00:00.000Z', last_used_at = '2026-07-01T10:00:00.000Z'
+    WHERE id = ?
+  `).run(keep.id);
+  openMemoryDb().prepare(`
+    UPDATE consolidated_facts
+    SET access_count = 2, impression_count = 3, utility_count = 2,
+        last_accessed_at = '2026-07-02T10:00:00.000Z', last_used_at = '2026-07-02T10:00:00.000Z'
+    WHERE id = ?
+  `).run(drop.id);
   setEmbedding(keep.id, [1, 0, 0, 0]);
   setEmbedding(drop.id, [0.999, 0.001, 0, 0]);
 
   const fixes = detectMemoryHealCandidates({ nowIso: '2026-07-04T12:00:00.000Z' });
   const fix = fixes.find((f) => f.kind === 'merge_duplicate');
   assert.ok(fix, 'expected a merge_duplicate candidate');
+
+  const automatic = await runMemorySelfHeal({ maxApply: 5, nowIso: '2026-07-04T12:00:30.000Z' });
+  assert.equal(automatic.applied, 0, 'nightly self-heal never executes a semantic merge');
+  assert.ok(automatic.skipped.some((item) => item.id === fix!.id && /review required/.test(item.reason)));
+  assert.equal(getFact(drop.id)?.active, true, 'review candidate remains active until explicit approval');
 
   const veto = await applyMemoryFix(fix!, {
     nowIso: '2026-07-04T12:00:00.000Z',
@@ -228,15 +369,33 @@ test('merge_duplicate: requires judge approval, merges lower-quality duplicate, 
 
   const applied = await applyMemoryFix(fix!, {
     nowIso: '2026-07-04T12:01:00.000Z',
-    judge: async () => ({ verdict: 'approve', reason: 'same fact' }),
+    humanApproved: true,
   });
   assert.equal(applied.ok, true);
   assert.equal(getFact(drop.id)?.active, false);
+  assert.equal(getFact(drop.id)?.supersededByFactId, keep.id, 'inactive duplicate points to its canonical fact');
+  assert.equal(getFact(drop.id)?.validTo, '2026-07-04T12:01:00.000Z');
   assert.equal(getFact(keep.id)?.active, true);
+  assert.equal(getFact(keep.id)?.impressionCount, 5, 'passive exposure history is folded without becoming utility');
+  assert.equal(getFact(keep.id)?.utilityCount, 3, 'material-use history follows the canonical claim');
+  assert.equal(getFact(keep.id)?.lastUsedAt, '2026-07-02T10:00:00.000Z');
+  assert.equal(getFactEvidence(keep.id).length, 2, 'both independent source episodes remain attached');
+  const mergedEntity = loadFactEntityEdges([keep.id]).find((edge) => edge.entityId === companyId);
+  assert.equal(mergedEntity?.truth, 'stored', 'strong grounded identity link upgrades the inferred canonical link');
+  assert.equal(mergedEntity?.evidenceEpisodeId, dropEvidence.episodeId);
+  const mergedResource = loadFactResourceEdges([keep.id]).find((edge) => edge.resourceId === report.id);
+  assert.equal(mergedResource?.truth, 'stored', 'resource provenance moves with the canonical claim');
+  assert.match(applied.message, /preserved 1 evidence source and 2 graph links/);
 
   const reverted = revertMemoryHeal(applied.auditId!, '2026-07-04T12:02:00.000Z');
   assert.equal(reverted.ok, true);
   assert.equal(getFact(drop.id)?.active, true);
+  assert.equal(getFact(drop.id)?.supersededByFactId, null);
+  assert.equal(getFact(keep.id)?.impressionCount, 2);
+  assert.equal(getFact(keep.id)?.utilityCount, 1);
+  assert.equal(getFactEvidence(keep.id).length, 1, 'revert removes only evidence copied by the merge');
+  assert.equal(loadFactEntityEdges([keep.id]).find((edge) => edge.entityId === companyId)?.truth, 'inferred');
+  assert.equal(loadFactResourceEdges([keep.id]).some((edge) => edge.resourceId === report.id), false);
 });
 
 test('merge_duplicate probe rejects entity-mismatched facts even with similar embeddings', async () => {
@@ -246,6 +405,99 @@ test('merge_duplicate probe rejects entity-mismatched facts even with similar em
   setEmbedding(b.id, [0.999, 0.001, 0, 0]);
   const fixes = detectMemoryHealCandidates();
   assert.equal(fixes.some((f) => f.kind === 'merge_duplicate'), false);
+});
+
+test('merge_duplicate canonical selection uses material utility, never passive exposure', () => {
+  const overexposed = rememberFact({
+    kind: 'project',
+    content: 'The Atlas renewal review is scheduled for Thursday morning.',
+    score: 1,
+    importance: 5,
+  });
+  const useful = rememberFact({
+    kind: 'project',
+    content: 'Atlas renewal review is scheduled Thursday morning.',
+    score: 1,
+    importance: 5,
+  });
+  openMemoryDb().prepare(`
+    UPDATE consolidated_facts
+    SET access_count = 1000, impression_count = 1000, utility_count = 0
+    WHERE id = ?
+  `).run(overexposed.id);
+  openMemoryDb().prepare(`
+    UPDATE consolidated_facts
+    SET access_count = 0, impression_count = 0, utility_count = 5
+    WHERE id = ?
+  `).run(useful.id);
+  setEmbedding(overexposed.id, [1, 0, 0, 0]);
+  setEmbedding(useful.id, [0.999, 0.001, 0, 0]);
+
+  const fix = detectMemoryHealCandidates({ persistProposals: false })
+    .find((candidate) => candidate.kind === 'merge_duplicate');
+  assert.ok(fix);
+  assert.equal((fix!.payload as { keepId: number }).keepId, useful.id,
+    'one explicit material-use history outweighs any number of passive impressions');
+  assert.equal((fix!.payload as { dropId: number }).dropId, overexposed.id);
+});
+
+test('merge_duplicate scans the complete active fact pool beyond the former 1500-row sample', () => {
+  const db = openMemoryDb();
+  const now = new Date().toISOString();
+  const insert = db.prepare(`
+    INSERT INTO consolidated_facts
+      (kind, content, content_hash, score, active, created_at, updated_at, importance, pinned)
+    VALUES ('reference', ?, ?, 1, 1, ?, ?, 10, 0)
+  `);
+  db.transaction(() => {
+    for (let i = 0; i < 1501; i += 1) {
+      insert.run(`Synthetic high-priority filler memory ${i}.`, `self-heal-tail-filler-${i}`, now, now);
+    }
+  })();
+
+  const first = rememberFact({
+    kind: 'project',
+    content: 'Tail account renewal report lives in the Atlas client folder.',
+    importance: 1,
+  });
+  const second = rememberFact({
+    kind: 'project',
+    content: 'The Tail account renewal report is in the Atlas client folder.',
+    importance: 1,
+  });
+  setEmbedding(first.id, [1, 0, 0, 0]);
+  setEmbedding(second.id, [0.999, 0.001, 0, 0]);
+
+  const fix = detectMemoryHealCandidates({ persistProposals: false, maxCandidates: 200 })
+    .find((candidate) => candidate.kind === 'merge_duplicate'
+      && candidate.targetIds.includes(first.id)
+      && candidate.targetIds.includes(second.id));
+  assert.ok(fix, 'a duplicate outside the former 1500-row recency/importance sample remains reviewable');
+});
+
+test('fix-family filtering prevents unrelated hygiene candidates from starving duplicate review', () => {
+  for (let i = 0; i < 5; i += 1) {
+    rememberFact({
+      kind: 'project',
+      content: `Internal memory tool result ${i}.`,
+      derivedFrom: { tool: 'memory_read', sessionId: `noise-${i}` },
+    });
+  }
+  const first = rememberFact({ kind: 'project', content: 'Atlas launch review happens Friday at ten.' });
+  const second = rememberFact({ kind: 'project', content: 'The Atlas launch review is Friday at ten.' });
+  setEmbedding(first.id, [1, 0, 0, 0]);
+  setEmbedding(second.id, [0.999, 0.001, 0, 0]);
+
+  const unscoped = detectMemoryHealCandidates({ persistProposals: false, maxCandidates: 1 });
+  assert.equal(unscoped[0]?.kind, 'retire_internal_noise', 'the shared legacy ordering would consume the cap');
+  const duplicateOnly = detectMemoryHealCandidates({
+    kinds: ['merge_duplicate'],
+    persistProposals: false,
+    maxCandidates: 1,
+  });
+  assert.equal(duplicateOnly[0]?.kind, 'merge_duplicate');
+  assert.ok(duplicateOnly[0]?.targetIds.includes(first.id));
+  assert.ok(duplicateOnly[0]?.targetIds.includes(second.id));
 });
 
 test('supersede_stale_fact: only lower-trust derived preference is deactivated', async () => {

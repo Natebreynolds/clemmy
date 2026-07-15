@@ -72,6 +72,26 @@ function createOldSchemaDb(): void {
     CREATE INDEX idx_facts_active ON consolidated_facts(active, kind, score DESC);
     CREATE INDEX idx_facts_pinned ON consolidated_facts(pinned, active);
 
+    CREATE TABLE vault_chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      title TEXT,
+      mtime INTEGER NOT NULL,
+      byte_size INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      UNIQUE(path, chunk_index)
+    );
+
+    CREATE TABLE embeddings (
+      chunk_id INTEGER PRIMARY KEY REFERENCES vault_chunks(id) ON DELETE CASCADE,
+      model TEXT NOT NULL,
+      dim INTEGER NOT NULL,
+      vector BLOB NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE fact_embeddings (
       fact_id      INTEGER PRIMARY KEY REFERENCES consolidated_facts(id) ON DELETE CASCADE,
       model        TEXT NOT NULL,
@@ -79,6 +99,40 @@ function createOldSchemaDb(): void {
       vector       BLOB NOT NULL,
       content_hash TEXT NOT NULL,
       created_at   TEXT NOT NULL
+    );
+
+    -- The fixture is stamped through v11, so include the v3/v10 relationship
+    -- endpoints required by later additive migrations. The original version
+    -- of this test predated v13+ and modeled only facts/embeddings; that became
+    -- an internally impossible "v11" database once relationship migrations
+    -- began running after the migration under test.
+    CREATE TABLE entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_type TEXT NOT NULL,
+      canonical_name TEXT NOT NULL,
+      canonical_name_lc TEXT NOT NULL,
+      aliases_json TEXT NOT NULL DEFAULT '[]',
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      mention_count INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(entity_type, canonical_name_lc)
+    );
+
+    CREATE TABLE resource_pointers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      app TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      ref TEXT NOT NULL,
+      name TEXT NOT NULL,
+      whats_here TEXT,
+      when_to_use TEXT,
+      parent_ref TEXT,
+      trust REAL,
+      source TEXT NOT NULL DEFAULT 'reactive',
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      mention_count INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(app, ref)
     );
 
     CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -160,6 +214,30 @@ test('rememberFact(kind=constraint) → listConstraints → gate applies to the 
   // Reads and profile lookups are NOT gated (no recursion, no read friction).
   assert.equal(findEmailSendConstraint('OUTLOOK_GET_PROFILE', { user_id: 'me' }), null);
   assert.equal(findEmailSendConstraint('OUTLOOK_OUTLOOK_LIST_MESSAGES', {}), null);
+});
+
+test('compiled Salesforce CLI-only policy blocks the forbidden Composio route', () => {
+  const saved = rememberFact({
+    kind: 'constraint',
+    content: 'Always call Salesforce via the local sf CLI, never via the Composio Salesforce toolkit because that connection is expired.',
+  });
+  const policy = openMemoryDb().prepare(`
+    SELECT policy_type, enforcement, applies_to_json FROM memory_policies WHERE fact_id = ?
+  `).get(saved.id) as { policy_type: string; enforcement: string; applies_to_json: string };
+  assert.equal(policy.policy_type, 'hard_constraint');
+  assert.equal(policy.enforcement, 'dispatch');
+  assert.equal(JSON.parse(policy.applies_to_json).family, 'salesforce_cli_only');
+
+  const violation = checkConstraintViolation('composio_execute_tool', {
+    action: 'SALESFORCE_EXECUTE_SOQL_QUERY',
+    query: 'SELECT Id FROM Account LIMIT 1',
+  });
+  assert.equal(violation?.constraint.id, saved.id);
+  assert.match(violation?.reason ?? '', /local sf CLI/i);
+
+  assert.equal(checkConstraintViolation('run_shell_command', {
+    command: 'sf data query --json --query "SELECT Id FROM Account LIMIT 1"',
+  }), null);
 });
 
 test('verifyOutlookSender blocks the wrong mailbox and passes the right one', async () => {
@@ -266,7 +344,7 @@ test('tool-bound rules: constraints ride with the toolkit they name, globally', 
 
   // Unrelated toolkits carry NO banner — zero noise where no rule binds.
   assert.equal(renderToolkitConstraintBanner('airtable'), null);
-  assert.equal(renderToolkitConstraintBanner('salesforce'), null);
+  assert.match(renderToolkitConstraintBanner('salesforce') ?? '', /local sf CLI/i);
   assert.equal(constraintsForToolkit('unknown').length, 0);
   assert.equal(constraintsForToolkit('*').length, 0);
 });

@@ -13,6 +13,8 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const local = await import('./meeting-capture.js');
 const shared = await import('../recall/meeting-capture.js');
+const { openMemoryDb } = await import('../../memory/db.js');
+const { recallMemory } = await import('../../memory/recall-memory.js');
 
 async function waitForStatus(meetingId: string, status: string): Promise<ReturnType<typeof shared.loadRecallMeetingById>> {
   const deadline = Date.now() + 3_000;
@@ -107,10 +109,37 @@ test('ingest writes a shared transcript artifact and is idempotent', async () =>
   assert.match(artifact, /^source: local whisper \(base\.en\)$/m);
   assert.match(artifact, /We agreed to ship the onboarding patch/);
 
+  const episode = openMemoryDb().prepare(`
+    SELECT id, subtype, title, source_app, evidence_excerpt, metadata_json
+    FROM memory_episodes WHERE subtype = 'meeting' AND call_id = ?
+  `).get(started.record.id) as {
+    id: string; subtype: string; title: string; source_app: string; evidence_excerpt: string; metadata_json: string;
+  } | undefined;
+  assert.ok(episode, 'completed in-person recording becomes a first-class memory episode');
+  assert.equal(episode?.title, 'Onboarding sync');
+  assert.equal(episode?.source_app, 'Clementine Meetings (In-person)');
+  assert.match(episode?.evidence_excerpt ?? '', /ship the onboarding patch/);
+  assert.equal((JSON.parse(episode?.metadata_json ?? '{}') as { provider?: string }).provider, 'local');
+
+  const recall = await recallMemory('What was the in-person meeting I had today about?', {
+    stores: ['episode'],
+    graphDepth: 0,
+    now: '2026-07-13T20:00:00.000Z',
+    timeZone: 'UTC',
+  });
+  assert.equal(recall.hits[0]?.ref.type, 'episode');
+  assert.equal(recall.hits[0]?.ref.id, episode?.id);
+  assert.match(recall.hits[0]?.text ?? '', /ship the onboarding patch/);
+  assert.ok(recall.hits[0]?.whyRecalled.includes('exact temporal match'));
+
   // A completion retry after a response/network loss must not transcribe twice.
   local.ingestLocalMeeting({ sessionId: 'happy-path', audioPath: started.audioPath });
   await delay(20);
   assert.equal(calls, 1);
+  const episodeCount = (openMemoryDb().prepare(
+    `SELECT COUNT(*) AS c FROM memory_episodes WHERE subtype = 'meeting' AND call_id = ?`,
+  ).get(started.record.id) as { c: number }).c;
+  assert.equal(episodeCount, 1, 'completion retry upgrades one stable episode instead of duplicating memory');
 });
 
 test('keepAudio=false durably records completed source-audio deletion', async () => {

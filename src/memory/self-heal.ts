@@ -15,10 +15,11 @@ import { canMergeEntitySafe, extractAnchors } from './memory-merge.js';
 import { appendHygieneAudit, readHygieneAudit, type HygieneAuditEntry } from './hygiene-audit.js';
 import { readFactRecallTrace, type FactRecallSurface } from './recall-trace.js';
 import { isSelfReferentialTool } from './reflection.js';
+import { looksLikeTransientRequest } from './memory-quality.js';
 
 const logger = pino({ name: 'clementine-next.memory.self-heal' });
 
-export type MemoryFixKind = 'merge_duplicate' | 'retire_internal_noise' | 'lift_recall_gap' | 'demote_overexposed_fact' | 'supersede_stale_fact';
+export type MemoryFixKind = 'merge_duplicate' | 'retire_internal_noise' | 'retire_transient_request' | 'lift_recall_gap' | 'demote_overexposed_fact' | 'supersede_stale_fact';
 export type MemoryFixStatus = 'pending' | 'applied' | 'skipped' | 'reverted';
 export type MemoryFixConfidence = 'high' | 'medium' | 'low';
 
@@ -104,12 +105,21 @@ interface CandidateOptions {
   maxCandidates?: number;
   nowIso?: string;
   persistProposals?: boolean;
+  /** Restrict detection to the requested fix families. Review surfaces use
+   * this to prevent unrelated automatic hygiene candidates from consuming the
+   * shared cap before human-review candidates are even considered. */
+  kinds?: MemoryFixKind[];
 }
 
 interface ApplyOptions {
   dryRun?: boolean;
   nowIso?: string;
   judge?: MemoryFixJudge;
+  /** Exact candidate pair was shown to the owner and explicitly approved.
+   * Server-side probes still revalidate every invariant; this replaces only
+   * the probabilistic model veto so an offline/local-first install can honor a
+   * deliberate review decision. Never set this from unattended maintenance. */
+  humanApproved?: boolean;
 }
 
 interface RunOptions extends CandidateOptions {
@@ -127,12 +137,56 @@ interface StoredProposalFile {
 interface FactSnapshot {
   id: number;
   active: number;
+  score: number;
   importance: number | null;
   trust_level: number | null;
+  confidence: number | null;
   access_count: number;
+  impression_count: number;
+  utility_count: number;
   source_app: string | null;
   last_accessed_at: string | null;
+  last_used_at: string | null;
   updated_at: string;
+  valid_from: string | null;
+  valid_to: string | null;
+  superseded_by_fact_id: number | null;
+}
+
+interface FactEvidenceTransferRow {
+  fact_id: number;
+  episode_id: string;
+  excerpt: string;
+  source_uri: string | null;
+  ordinal: number;
+  created_at: string;
+}
+
+interface FactLinkTransferRow {
+  fact_id: number;
+  linked_id: number;
+  created_at: string;
+  link_type: 'stored' | 'extracted' | 'inferred_text';
+  confidence: number;
+  evidence_episode_id: string | null;
+  evidence_excerpt: string | null;
+}
+
+interface FactLinkTransferDelta {
+  linkedId: number;
+  before: FactLinkTransferRow | null;
+  applied: FactLinkTransferRow;
+}
+
+/** Exact relational delta produced by a reviewed duplicate merge. Keeping the
+ * applied row beside the prior row lets revert use compare-and-swap semantics:
+ * later evidence is never overwritten merely because an old merge is undone. */
+interface DuplicateFactMergeTransfer {
+  keepId: number;
+  dropId: number;
+  evidenceAdded: FactEvidenceTransferRow[];
+  entityLinks: FactLinkTransferDelta[];
+  resourceLinks: FactLinkTransferDelta[];
 }
 
 const STORE_DIR = path.join(BASE_DIR, 'state', 'memory-self-heal');
@@ -181,7 +235,10 @@ function snapshotRows(ids: number[]): FactSnapshot[] {
   const db = openMemoryDb();
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(
-    `SELECT id, active, importance, trust_level, access_count, source_app, last_accessed_at, updated_at
+    `SELECT id, active, score, importance, trust_level, confidence,
+            access_count, impression_count, utility_count,
+            source_app, last_accessed_at, last_used_at, updated_at,
+            valid_from, valid_to, superseded_by_fact_id
      FROM consolidated_facts WHERE id IN (${placeholders})`,
   ).all(...ids) as FactSnapshot[];
   return rows;
@@ -195,7 +252,11 @@ function truncate(s: string, n = 120): string {
 function factQuality(row: ConsolidatedFactRow): number {
   return (row.score ?? 0)
     + (row.importance ?? 5) / 10
-    + Math.log(1 + (row.access_count ?? 0)) / 10
+    // Canonical selection is a ranking decision too. `access_count` is legacy
+    // exposure telemetry and includes automatic prompt impressions; using it
+    // here would let passive display decide which duplicate survives. Only an
+    // explicit material-use signal may reinforce the canonical candidate.
+    + Math.log(1 + (row.utility_count ?? 0)) / 10
     + (row.trust_level ?? 0.6);
 }
 
@@ -251,6 +312,14 @@ export function listProposedMemoryFixes(): ProposedMemoryFix[] {
   return readProposalFile().proposals;
 }
 
+/** Keep a review-only proposal from resurfacing without mutating its facts. */
+export function dismissMemoryFix(id: string, reason = 'kept as a fact by user'): boolean {
+  const proposal = loadProposedMemoryFix(id);
+  if (!proposal) return false;
+  updateStoredProposal(id, { status: 'skipped', skipReason: reason });
+  return true;
+}
+
 function loadProposedMemoryFix(id: string): ProposedMemoryFix | null {
   return readProposalFile().proposals.find((p) => p.id === id) ?? null;
 }
@@ -260,8 +329,7 @@ function detectMergeDuplicates(nowIso: string, cap: number): ProposedMemoryFix[]
   const rows = db.prepare(
     `SELECT * FROM consolidated_facts
      WHERE active = 1 AND pinned = 0
-     ORDER BY COALESCE(importance, 5) DESC, updated_at DESC
-     LIMIT 1500`,
+     ORDER BY COALESCE(importance, 5) DESC, updated_at DESC`,
   ).all() as ConsolidatedFactRow[];
   const vectors = loadFactEmbeddings(rows.map((r) => r.id));
   const embedded = rows.filter((r) => vectors.has(r.id));
@@ -316,8 +384,7 @@ function detectInternalNoise(nowIso: string, cap: number): ProposedMemoryFix[] {
   const rows = db.prepare(
     `SELECT * FROM consolidated_facts
      WHERE active = 1 AND pinned = 0 AND derived_from_tool IS NOT NULL
-     ORDER BY id ASC
-     LIMIT 1000`,
+     ORDER BY id ASC`,
   ).all() as ConsolidatedFactRow[];
   return rows
     .filter((r) => isSelfReferentialTool(r.derived_from_tool))
@@ -329,6 +396,40 @@ function detectInternalNoise(nowIso: string, cap: number): ProposedMemoryFix[] {
       confidence: 'high',
       autoApplicable: true,
       signature: `retire-internal:${row.id}:${row.derived_from_tool ?? 'unknown'}`,
+      payload: { id: row.id },
+    }, nowIso));
+}
+
+/**
+ * Conservative detector for legacy chat turns that were promoted verbatim as
+ * direct facts. It only feeds a human review queue; matching text is never
+ * retired by the scheduled self-heal runner.
+ */
+export const looksLikeLegacyTransientRequest = looksLikeTransientRequest;
+
+function detectTransientRequests(nowIso: string, cap: number): ProposedMemoryFix[] {
+  if (cap <= 0) return [];
+  const db = openMemoryDb();
+  const rows = db.prepare(
+    `SELECT * FROM consolidated_facts
+     WHERE active = 1 AND pinned = 0 AND kind != 'constraint'
+       AND derived_from_call_id IS NULL
+       AND derived_from_session_id IS NULL
+       AND derived_from_tool IS NULL
+     ORDER BY id ASC`,
+  ).all() as ConsolidatedFactRow[];
+  return rows
+    .filter((row) => looksLikeLegacyTransientRequest(row.content))
+    .slice(0, cap)
+    .map((row) => proposal({
+      kind: 'retire_transient_request',
+      targetIds: [row.id],
+      evidence: `direct fact resembles a conversational request; content="${truncate(row.content)}"`,
+      confidence: 'medium',
+      // Explicit review applies through applyMemoryFix. The scheduled runner
+      // separately refuses this kind, so text shape is never deletion authority.
+      autoApplicable: true,
+      signature: `retire-transient-request:${row.id}:${row.content_hash}`,
       payload: { id: row.id },
     }, nowIso));
 }
@@ -464,8 +565,7 @@ function detectStaleSupersessions(nowIso: string, cap: number): ProposedMemoryFi
   const rows = db.prepare(
     `SELECT * FROM consolidated_facts
      WHERE active = 1 AND pinned = 0
-     ORDER BY created_at ASC
-     LIMIT 2000`,
+     ORDER BY created_at ASC`,
   ).all() as ConsolidatedFactRow[];
   const parsed = rows
     .map((row) => ({ row, parsed: parsePreferenceFact(row.content) }))
@@ -510,6 +610,8 @@ function detectStaleSupersessions(nowIso: string, cap: number): ProposedMemoryFi
 export function detectMemoryHealCandidates(opts: CandidateOptions = {}): ProposedMemoryFix[] {
   const nowIso = opts.nowIso ?? new Date().toISOString();
   const cap = Math.max(1, Math.min(200, opts.maxCandidates ?? DEFAULT_MAX_CANDIDATES));
+  const requestedKinds = opts.kinds?.length ? new Set(opts.kinds) : null;
+  const wants = (kind: MemoryFixKind) => requestedKinds === null || requestedKinds.has(kind);
   const out: ProposedMemoryFix[] = [];
   const push = (items: ProposedMemoryFix[]) => {
     for (const item of items) {
@@ -517,11 +619,12 @@ export function detectMemoryHealCandidates(opts: CandidateOptions = {}): Propose
       out.push(item);
     }
   };
-  push(detectInternalNoise(nowIso, cap - out.length));
-  push(detectOverexposedRecallFacts(nowIso, cap - out.length));
-  push(detectRecallGaps(nowIso, cap - out.length));
-  push(detectMergeDuplicates(nowIso, cap - out.length));
-  push(detectStaleSupersessions(nowIso, cap - out.length));
+  if (wants('retire_internal_noise')) push(detectInternalNoise(nowIso, cap - out.length));
+  if (wants('retire_transient_request')) push(detectTransientRequests(nowIso, cap - out.length));
+  if (wants('demote_overexposed_fact')) push(detectOverexposedRecallFacts(nowIso, cap - out.length));
+  if (wants('lift_recall_gap')) push(detectRecallGaps(nowIso, cap - out.length));
+  if (wants('merge_duplicate')) push(detectMergeDuplicates(nowIso, cap - out.length));
+  if (wants('supersede_stale_fact')) push(detectStaleSupersessions(nowIso, cap - out.length));
   const seen = new Set<string>();
   const deduped = out.filter((p) => (seen.has(p.id) ? false : (seen.add(p.id), true)));
   return opts.persistProposals === false ? deduped : upsertProposals(deduped);
@@ -613,6 +716,17 @@ function validateFixProbe(fix: ProposedMemoryFix): { ok: true } | { ok: false; r
     if (!isSelfReferentialTool(row.derived_from_tool)) return { ok: false, reason: 'fact is no longer internal tool noise' };
     return { ok: true };
   }
+  if (fix.kind === 'retire_transient_request') {
+    const p = fix.payload as SingleFactPayload;
+    const row = requireRow(p.id);
+    if (!row) return { ok: false, reason: 'fact missing, inactive, or pinned' };
+    if (row.kind === 'constraint') return { ok: false, reason: 'constraints are never transient cleanup candidates' };
+    if (row.derived_from_call_id || row.derived_from_session_id || row.derived_from_tool) {
+      return { ok: false, reason: 'fact provenance changed since detection' };
+    }
+    if (!looksLikeLegacyTransientRequest(row.content)) return { ok: false, reason: 'fact no longer resembles a transient request' };
+    return { ok: true };
+  }
   if (fix.kind === 'lift_recall_gap') {
     const p = fix.payload as LiftRecallGapPayload;
     const row = requireRow(p.id);
@@ -690,6 +804,233 @@ function appendHealAudit(fix: ProposedMemoryFix, nowIso: string, ids: number[], 
   return id;
 }
 
+function laterIso(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return a >= b ? a : b;
+}
+
+function linkTruthRank(value: FactLinkTransferRow['link_type']): number {
+  if (value === 'stored') return 3;
+  if (value === 'extracted') return 2;
+  return 1;
+}
+
+function sameLinkRow(a: FactLinkTransferRow | null | undefined, b: FactLinkTransferRow | null | undefined): boolean {
+  return Boolean(a && b)
+    && a!.fact_id === b!.fact_id
+    && a!.linked_id === b!.linked_id
+    && a!.created_at === b!.created_at
+    && a!.link_type === b!.link_type
+    && a!.confidence === b!.confidence
+    && a!.evidence_episode_id === b!.evidence_episode_id
+    && a!.evidence_excerpt === b!.evidence_excerpt;
+}
+
+function mergedLinkRow(
+  keepId: number,
+  existing: FactLinkTransferRow | null,
+  incoming: FactLinkTransferRow,
+): FactLinkTransferRow {
+  const existingRank = existing ? linkTruthRank(existing.link_type) : 0;
+  const incomingRank = linkTruthRank(incoming.link_type);
+  const preferred = !existing
+    || incomingRank > existingRank
+    || (incomingRank === existingRank && incoming.confidence > existing.confidence)
+      ? incoming
+      : existing;
+  const fallback = preferred === incoming ? existing : incoming;
+  return {
+    fact_id: keepId,
+    linked_id: incoming.linked_id,
+    created_at: existing?.created_at ?? incoming.created_at,
+    link_type: preferred.link_type,
+    confidence: Math.max(existing?.confidence ?? 0, incoming.confidence),
+    evidence_episode_id: preferred.evidence_episode_id ?? fallback?.evidence_episode_id ?? null,
+    evidence_excerpt: preferred.evidence_excerpt ?? fallback?.evidence_excerpt ?? null,
+  };
+}
+
+function transferFactLinkRows(
+  db: ReturnType<typeof openMemoryDb>,
+  table: 'fact_entities' | 'fact_resources',
+  linkedColumn: 'entity_id' | 'resource_id',
+  keepId: number,
+  dropId: number,
+): FactLinkTransferDelta[] {
+  // `table` and `linkedColumn` are closed unions controlled by this module;
+  // values never originate from user input.
+  const select = db.prepare(`
+    SELECT fact_id, ${linkedColumn} AS linked_id, created_at, link_type, confidence,
+           evidence_episode_id, evidence_excerpt
+    FROM ${table} WHERE fact_id = ?
+  `);
+  const existingById = new Map(
+    (select.all(keepId) as FactLinkTransferRow[]).map((row) => [row.linked_id, row]),
+  );
+  const incoming = select.all(dropId) as FactLinkTransferRow[];
+  const write = db.prepare(`
+    INSERT INTO ${table}
+      (fact_id, ${linkedColumn}, created_at, link_type, confidence, evidence_episode_id, evidence_excerpt)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fact_id, ${linkedColumn}) DO UPDATE SET
+      created_at = excluded.created_at,
+      link_type = excluded.link_type,
+      confidence = excluded.confidence,
+      evidence_episode_id = excluded.evidence_episode_id,
+      evidence_excerpt = excluded.evidence_excerpt
+  `);
+  const deltas: FactLinkTransferDelta[] = [];
+  for (const row of incoming) {
+    const before = existingById.get(row.linked_id) ?? null;
+    const applied = mergedLinkRow(keepId, before, row);
+    if (sameLinkRow(before, applied)) continue;
+    write.run(
+      applied.fact_id,
+      applied.linked_id,
+      applied.created_at,
+      applied.link_type,
+      applied.confidence,
+      applied.evidence_episode_id,
+      applied.evidence_excerpt,
+    );
+    deltas.push({ linkedId: row.linked_id, before, applied });
+  }
+  return deltas;
+}
+
+function transferFactEvidenceRows(
+  db: ReturnType<typeof openMemoryDb>,
+  keepId: number,
+  dropId: number,
+): FactEvidenceTransferRow[] {
+  const incoming = db.prepare(`
+    SELECT fact_id, episode_id, excerpt, source_uri, ordinal, created_at
+    FROM fact_evidence WHERE fact_id = ?
+    ORDER BY episode_id, ordinal
+  `).all(dropId) as FactEvidenceTransferRow[];
+  const exact = db.prepare(`
+    SELECT 1 FROM fact_evidence
+    WHERE fact_id = ? AND episode_id = ? AND excerpt = ?
+      AND COALESCE(source_uri, '') = COALESCE(?, '')
+    LIMIT 1
+  `);
+  const occupied = db.prepare(`
+    SELECT 1 FROM fact_evidence WHERE fact_id = ? AND episode_id = ? AND ordinal = ?
+  `);
+  const nextOrdinal = db.prepare(`
+    SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal
+    FROM fact_evidence WHERE fact_id = ? AND episode_id = ?
+  `);
+  const insert = db.prepare(`
+    INSERT INTO fact_evidence
+      (fact_id, episode_id, excerpt, source_uri, ordinal, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const added: FactEvidenceTransferRow[] = [];
+  for (const row of incoming) {
+    if (exact.get(keepId, row.episode_id, row.excerpt, row.source_uri)) continue;
+    const ordinal = occupied.get(keepId, row.episode_id, row.ordinal)
+      ? Number((nextOrdinal.get(keepId, row.episode_id) as { ordinal: number }).ordinal)
+      : row.ordinal;
+    const applied = { ...row, fact_id: keepId, ordinal };
+    insert.run(
+      applied.fact_id,
+      applied.episode_id,
+      applied.excerpt,
+      applied.source_uri,
+      applied.ordinal,
+      applied.created_at,
+    );
+    added.push(applied);
+  }
+  return added;
+}
+
+function transferDuplicateFactProvenance(
+  db: ReturnType<typeof openMemoryDb>,
+  keepId: number,
+  dropId: number,
+): DuplicateFactMergeTransfer {
+  return {
+    keepId,
+    dropId,
+    evidenceAdded: transferFactEvidenceRows(db, keepId, dropId),
+    entityLinks: transferFactLinkRows(db, 'fact_entities', 'entity_id', keepId, dropId),
+    resourceLinks: transferFactLinkRows(db, 'fact_resources', 'resource_id', keepId, dropId),
+  };
+}
+
+function sameEvidenceRow(a: FactEvidenceTransferRow | undefined, b: FactEvidenceTransferRow): boolean {
+  return Boolean(a)
+    && a!.fact_id === b.fact_id
+    && a!.episode_id === b.episode_id
+    && a!.excerpt === b.excerpt
+    && a!.source_uri === b.source_uri
+    && a!.ordinal === b.ordinal
+    && a!.created_at === b.created_at;
+}
+
+/** Revert only the relational rows that are still byte-identical to what the
+ * merge wrote. If later learning strengthened a link or replaced an excerpt,
+ * that newer state wins and is deliberately left intact. */
+function revertDuplicateFactProvenance(transfer: DuplicateFactMergeTransfer): void {
+  const db = openMemoryDb();
+  const revertLinks = (
+    table: 'fact_entities' | 'fact_resources',
+    linkedColumn: 'entity_id' | 'resource_id',
+    deltas: FactLinkTransferDelta[],
+  ): void => {
+    const read = db.prepare(`
+      SELECT fact_id, ${linkedColumn} AS linked_id, created_at, link_type, confidence,
+             evidence_episode_id, evidence_excerpt
+      FROM ${table} WHERE fact_id = ? AND ${linkedColumn} = ?
+    `);
+    const remove = db.prepare(`DELETE FROM ${table} WHERE fact_id = ? AND ${linkedColumn} = ?`);
+    const restore = db.prepare(`
+      INSERT INTO ${table}
+        (fact_id, ${linkedColumn}, created_at, link_type, confidence, evidence_episode_id, evidence_excerpt)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(fact_id, ${linkedColumn}) DO UPDATE SET
+        created_at = excluded.created_at,
+        link_type = excluded.link_type,
+        confidence = excluded.confidence,
+        evidence_episode_id = excluded.evidence_episode_id,
+        evidence_excerpt = excluded.evidence_excerpt
+    `);
+    for (const delta of deltas) {
+      const current = read.get(transfer.keepId, delta.linkedId) as FactLinkTransferRow | undefined;
+      if (!sameLinkRow(current, delta.applied)) continue;
+      if (!delta.before) remove.run(transfer.keepId, delta.linkedId);
+      else restore.run(
+        delta.before.fact_id,
+        delta.before.linked_id,
+        delta.before.created_at,
+        delta.before.link_type,
+        delta.before.confidence,
+        delta.before.evidence_episode_id,
+        delta.before.evidence_excerpt,
+      );
+    }
+  };
+
+  db.transaction(() => {
+    const readEvidence = db.prepare(`
+      SELECT fact_id, episode_id, excerpt, source_uri, ordinal, created_at
+      FROM fact_evidence WHERE fact_id = ? AND episode_id = ? AND ordinal = ?
+    `);
+    const removeEvidence = db.prepare(`
+      DELETE FROM fact_evidence WHERE fact_id = ? AND episode_id = ? AND ordinal = ?
+    `);
+    for (const row of transfer.evidenceAdded) {
+      const current = readEvidence.get(row.fact_id, row.episode_id, row.ordinal) as FactEvidenceTransferRow | undefined;
+      if (sameEvidenceRow(current, row)) removeEvidence.run(row.fact_id, row.episode_id, row.ordinal);
+    }
+    revertLinks('fact_entities', 'entity_id', transfer.entityLinks);
+    revertLinks('fact_resources', 'resource_id', transfer.resourceLinks);
+  })();
+}
+
 function applyMergeDuplicate(fix: ProposedMemoryFix, nowIso: string, dryRun: boolean): MemoryHealResult {
   const p = fix.payload as MergeDuplicatePayload;
   const before = snapshotRows([p.keepId, p.dropId]);
@@ -697,20 +1038,62 @@ function applyMergeDuplicate(fix: ProposedMemoryFix, nowIso: string, dryRun: boo
   const db = openMemoryDb();
   const keep = rowById(p.keepId)!;
   const drop = rowById(p.dropId)!;
+  const foldedScore = Math.max(keep.score ?? 1, drop.score ?? 1);
   const foldedImportance = Math.min(10, Math.max(keep.importance ?? 5, drop.importance ?? 5));
   const foldedTrust = Math.min(1, Math.max(keep.trust_level ?? 0.6, drop.trust_level ?? 0.6));
+  const foldedConfidence = Math.min(1, Math.max(keep.confidence ?? keep.trust_level ?? 0.6, drop.confidence ?? drop.trust_level ?? 0.6));
   const foldedAccess = (keep.access_count ?? 0) + (drop.access_count ?? 0);
+  const foldedImpressions = (keep.impression_count ?? 0) + (drop.impression_count ?? 0);
+  const foldedUtility = (keep.utility_count ?? 0) + (drop.utility_count ?? 0);
   const sourceApp = keep.source_app ?? drop.source_app;
-  db.transaction(() => {
+  const transfer = db.transaction(() => {
+    const provenance = transferDuplicateFactProvenance(db, p.keepId, p.dropId);
     db.prepare(
       `UPDATE consolidated_facts
-       SET importance = ?, trust_level = ?, access_count = ?, source_app = ?, last_accessed_at = ?, updated_at = ?
+       SET score = ?, importance = ?, trust_level = ?, confidence = ?,
+           access_count = ?, impression_count = ?, utility_count = ?,
+           source_app = ?, last_accessed_at = ?, last_used_at = ?, updated_at = ?
        WHERE id = ?`,
-    ).run(foldedImportance, foldedTrust, foldedAccess, sourceApp, nowIso, nowIso, p.keepId);
-    db.prepare('UPDATE consolidated_facts SET active = 0, updated_at = ? WHERE id = ?').run(nowIso, p.dropId);
+    ).run(
+      foldedScore,
+      foldedImportance,
+      foldedTrust,
+      foldedConfidence,
+      foldedAccess,
+      foldedImpressions,
+      foldedUtility,
+      sourceApp,
+      laterIso(keep.last_accessed_at, drop.last_accessed_at),
+      laterIso(keep.last_used_at, drop.last_used_at),
+      laterIso(keep.updated_at, drop.updated_at) ?? keep.updated_at,
+      p.keepId,
+    );
+    db.prepare(`
+      UPDATE consolidated_facts
+      SET active = 0, valid_to = ?, superseded_by_fact_id = ?, updated_at = ?
+      WHERE id = ?
+    `).run(nowIso, p.keepId, nowIso, p.dropId);
+    return provenance;
   })();
-  const id = appendHealAudit(fix, nowIso, [p.dropId], { action: 'merge_duplicate', keepId: p.keepId, dropId: p.dropId, similarity: p.similarity, before });
-  return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.dropId], auditId: id, message: `Merged duplicate fact #${p.dropId} into #${p.keepId}.` };
+  const id = appendHealAudit(fix, nowIso, [p.dropId], {
+    action: 'merge_duplicate',
+    keepId: p.keepId,
+    dropId: p.dropId,
+    similarity: p.similarity,
+    before,
+    mergeTransfer: transfer,
+  });
+  const evidence = transfer.evidenceAdded.length;
+  const links = transfer.entityLinks.length + transfer.resourceLinks.length;
+  return {
+    ok: true,
+    fixId: fix.id,
+    kind: fix.kind,
+    applied: 1,
+    ids: [p.dropId],
+    auditId: id,
+    message: `Merged duplicate fact #${p.dropId} into #${p.keepId}; preserved ${evidence} evidence source${evidence === 1 ? '' : 's'} and ${links} graph link${links === 1 ? '' : 's'}.`,
+  };
 }
 
 function applyRetireInternalNoise(fix: ProposedMemoryFix, nowIso: string, dryRun: boolean): MemoryHealResult {
@@ -721,6 +1104,16 @@ function applyRetireInternalNoise(fix: ProposedMemoryFix, nowIso: string, dryRun
   db.prepare('UPDATE consolidated_facts SET active = 0, updated_at = ? WHERE id = ?').run(nowIso, p.id);
   const id = appendHealAudit(fix, nowIso, [p.id], { action: 'retire_internal_noise', before });
   return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.id], auditId: id, message: `Retired internal-noise fact #${p.id}.` };
+}
+
+function applyRetireTransientRequest(fix: ProposedMemoryFix, nowIso: string, dryRun: boolean): MemoryHealResult {
+  const p = fix.payload as SingleFactPayload;
+  const before = snapshotRows([p.id]);
+  if (dryRun) return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.id], message: `Would forget legacy request fact #${p.id}.` };
+  const db = openMemoryDb();
+  db.prepare('UPDATE consolidated_facts SET active = 0, updated_at = ? WHERE id = ?').run(nowIso, p.id);
+  const id = appendHealAudit(fix, nowIso, [p.id], { action: 'retire_transient_request', before });
+  return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.id], auditId: id, message: `Forgot legacy request fact #${p.id}. It can be restored from memory history.` };
 }
 
 function applyLiftRecallGap(fix: ProposedMemoryFix, nowIso: string, dryRun: boolean): MemoryHealResult {
@@ -771,7 +1164,9 @@ export async function applyMemoryFix(input: string | ProposedMemoryFix, opts: Ap
     return { ok: false, fixId: fix.id, kind: fix.kind, applied: 0, ids: [], message: `Skipped memory fix ${fix.id}: ${probe.reason}`, reason: probe.reason };
   }
   if (fix.kind === 'merge_duplicate' || fix.kind === 'supersede_stale_fact') {
-    const judge = await (opts.judge ?? judgeMemoryFixCrossFamily)(fix);
+    const judge = opts.humanApproved
+      ? { verdict: 'approve' as const, reason: 'owner reviewed exact candidate' }
+      : await (opts.judge ?? judgeMemoryFixCrossFamily)(fix);
     if (judge.verdict === 'veto' || (judge.verdict === 'unavailable' && memorySelfHealJudgeRequired())) {
       const reason = judge.reason ?? judge.verdict;
       if (!opts.dryRun) updateStoredProposal(fix.id, { status: 'skipped', skipReason: reason });
@@ -782,6 +1177,7 @@ export async function applyMemoryFix(input: string | ProposedMemoryFix, opts: Ap
   let result: MemoryHealResult;
   if (fix.kind === 'merge_duplicate') result = applyMergeDuplicate(fix, nowIso, opts.dryRun === true);
   else if (fix.kind === 'retire_internal_noise') result = applyRetireInternalNoise(fix, nowIso, opts.dryRun === true);
+  else if (fix.kind === 'retire_transient_request') result = applyRetireTransientRequest(fix, nowIso, opts.dryRun === true);
   else if (fix.kind === 'lift_recall_gap') result = applyLiftRecallGap(fix, nowIso, opts.dryRun === true);
   else if (fix.kind === 'demote_overexposed_fact') result = applyDemoteOverexposedFact(fix, nowIso, opts.dryRun === true);
   else result = applySupersedeStaleFact(fix, nowIso, opts.dryRun === true);
@@ -803,6 +1199,16 @@ export async function runMemorySelfHeal(opts: RunOptions = {}): Promise<MemoryHe
   const results: MemoryHealResult[] = [];
   const skipped: Array<{ id: string; kind: MemoryFixKind; reason: string }> = [];
   for (const fix of candidates.slice(0, maxApply)) {
+    // Embedding similarity is evidence for a review queue, never authority to
+    // delete a durable claim. Keep the proposal pending so the desktop/API can
+    // apply it explicitly through applyMemoryFix after human review.
+    if (fix.kind === 'merge_duplicate' || fix.kind === 'retire_transient_request') {
+      const reason = fix.kind === 'merge_duplicate'
+        ? 'review required for semantic merge'
+        : 'review required before forgetting a conversational request';
+      skipped.push({ id: fix.id, kind: fix.kind, reason });
+      continue;
+    }
     if (fix.status && fix.status !== 'pending') {
       skipped.push({ id: fix.id, kind: fix.kind, reason: `stored status is ${fix.status}` });
       continue;
@@ -815,17 +1221,75 @@ export async function runMemorySelfHeal(opts: RunOptions = {}): Promise<MemoryHe
   return { ran: true, proposed: candidates.length, applied, skipped, results, dryRun };
 }
 
-function restoreSnapshot(rows: FactSnapshot[]): void {
+function restoreSnapshot(rows: FactSnapshot[], nowIso: string): void {
   if (rows.length === 0) return;
   const db = openMemoryDb();
-  const stmt = db.prepare(
+  const restore = db.prepare(
     `UPDATE consolidated_facts
-     SET active = ?, importance = ?, trust_level = ?, access_count = ?, source_app = ?, last_accessed_at = ?, updated_at = ?
+     SET active = ?, score = ?, importance = ?, trust_level = ?, confidence = ?,
+         access_count = ?, impression_count = ?, utility_count = ?,
+         source_app = ?, last_accessed_at = ?, last_used_at = ?, updated_at = ?,
+         valid_from = ?, valid_to = ?, superseded_by_fact_id = ?
      WHERE id = ?`,
   );
+  const reactivate = db.prepare(
+    `UPDATE consolidated_facts
+     SET active = 1, score = ?, importance = ?, trust_level = ?, confidence = ?,
+         access_count = ?, impression_count = ?, utility_count = ?,
+         source_app = ?, last_accessed_at = ?, last_used_at = ?, updated_at = ?,
+         valid_from = ?, valid_to = NULL, superseded_by_fact_id = NULL
+     WHERE id = ?`,
+  );
+  const current = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?');
   db.transaction(() => {
     for (const row of rows) {
-      stmt.run(row.active, row.importance, row.trust_level, row.access_count, row.source_app, row.last_accessed_at, row.updated_at, row.id);
+      const live = current.get(row.id) as ConsolidatedFactRow | undefined;
+      // Older audit snapshots predate measured impressions/utility and do not
+      // carry these fields. Reverting one must preserve the live value instead
+      // of binding undefined into a NOT NULL column.
+      const score = row.score ?? live?.score ?? 1;
+      const confidence = row.confidence ?? live?.confidence ?? live?.trust_level ?? null;
+      const impressionCount = row.impression_count ?? live?.impression_count ?? 0;
+      const utilityCount = row.utility_count ?? live?.utility_count ?? 0;
+      const lastUsedAt = row.last_used_at ?? live?.last_used_at ?? null;
+      if (row.active === 1 && live?.active === 0) {
+        // Undoing a retirement asserts the claim again now. It must open a new
+        // validity period rather than reopening/overwriting its closed history.
+        reactivate.run(
+          score,
+          row.importance,
+          row.trust_level,
+          confidence,
+          row.access_count,
+          impressionCount,
+          utilityCount,
+          row.source_app,
+          row.last_accessed_at,
+          lastUsedAt,
+          nowIso,
+          nowIso,
+          row.id,
+        );
+      } else {
+        restore.run(
+          row.active,
+          score,
+          row.importance,
+          row.trust_level,
+          confidence,
+          row.access_count,
+          impressionCount,
+          utilityCount,
+          row.source_app,
+          row.last_accessed_at,
+          lastUsedAt,
+          row.updated_at,
+          row.valid_from,
+          row.valid_to,
+          row.superseded_by_fact_id,
+          row.id,
+        );
+      }
     }
   })();
 }
@@ -835,7 +1299,9 @@ export function revertMemoryHeal(healAuditId: string, nowIso: string = new Date(
   if (!entry) return { ok: false, message: `No memory-heal audit entry found for "${healAuditId}".`, ids: [] };
   const before = (entry.detail as { before?: FactSnapshot[] } | undefined)?.before;
   if (!Array.isArray(before) || before.length === 0) return { ok: false, message: `Memory heal "${healAuditId}" has no reversible snapshot.`, ids: [] };
-  restoreSnapshot(before);
+  restoreSnapshot(before, nowIso);
+  const mergeTransfer = (entry.detail as { mergeTransfer?: DuplicateFactMergeTransfer } | undefined)?.mergeTransfer;
+  if (mergeTransfer) revertDuplicateFactProvenance(mergeTransfer);
   const ids = before.map((r) => r.id);
   appendHygieneAudit({
     at: nowIso,

@@ -57,7 +57,10 @@ test('renderFactsForInstructions traces pinned and scored facts with their reaso
   assert.equal(entry.surface, 'facts_for_instructions');
   assert.equal(entry.objective, 'market leader accounts');
   assert.equal(entry.mode, 'all');
-  assert.ok(entry.facts.some((f) => f.id === pinned.id && f.reason === 'policy:standing_preference'));
+  assert.equal(entry.includedCount, 2);
+  assert.equal(entry.omittedCount, 0);
+  assert.equal(entry.candidateCount, 2);
+  assert.ok(entry.facts.some((f) => f.id === pinned.id && f.reason === 'policy:standing_preference:prompt'));
   assert.ok(entry.facts.some((f) => f.id === scored.id && f.reason === 'scored-stanford-objective'));
 });
 
@@ -71,4 +74,7 @@ test('renderFactsForInstructions traces only scored facts that survive clipping'
   assert.match(rendered, /Short visible market leader fact/);
   assert.ok(entry.facts.some((f) => f.id === visible.id));
   assert.ok(entry.facts.length < 2, 'clipped-away fact is not recorded as exposed');
+  assert.equal(entry.includedCount, 1);
+  assert.equal(entry.omittedCount, 1);
+  assert.equal(entry.candidateCount, 2);
 });

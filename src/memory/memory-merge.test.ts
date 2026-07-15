@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-memory-merge';
 process.env.CLEMENTINE_HOME = TEST_HOME;
-const { mergeParaphrases, selectMergeAuditToRevert } = await import('./memory-merge.js');
+const { mergeCanonicalQuality, mergeParaphrases, selectMergeAuditToRevert } = await import('./memory-merge.js');
 type HygieneAuditEntry = import('./hygiene-audit.js').HygieneAuditEntry;
 
 // Test helper: create an in-memory test database
@@ -70,10 +70,20 @@ test('canMergeEntitySafe: different table IDs should not merge', () => {
   // (The actual guard is tested via integration test)
 });
 
-test('consolidateCluster: folds importance via MAX', () => {
-  // Helper test to verify consolidation logic
-  // importance=7, importance=5 should become 7
-  // access_count=10, access_count=5 should become 15
+test('merge canonical quality rewards material utility and ignores passive exposure', () => {
+  const passive = mergeCanonicalQuality({
+    score: 1, importance: 5, trust_level: 0.8, utility_count: 0,
+  });
+  const useful = mergeCanonicalQuality({
+    score: 1, importance: 5, trust_level: 0.8, utility_count: 5,
+  });
+  assert.ok(useful > passive);
+
+  // access_count and impression_count are intentionally absent from the
+  // quality contract, so any number of automatic displays cannot change it.
+  assert.equal(passive, mergeCanonicalQuality({
+    score: 1, importance: 5, trust_level: 0.8, utility_count: 0,
+  }));
 });
 
 test('mergeParaphrases: successfully merges similar facts', async () => {

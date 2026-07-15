@@ -150,7 +150,7 @@ function datePartsAt(ms: number, timeZone: string): { year: number; month: numbe
   return { year: value('year'), month: value('month'), day: value('day') };
 }
 
-function safeTimeZone(explicit?: string): string {
+export function resolveRecallTimeZone(explicit?: string): string {
   const requested = explicit?.trim() || loadUserProfile().timezone?.trim()
     || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   try {
@@ -173,7 +173,7 @@ export function resolveTemporalMeetingDate(query: string, options: Pick<RecallOp
   if (explicit) return explicit;
   if (!RELATIVE_DATE_RE.test(query)) return null;
   const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
-  const parts = datePartsAt(nowMs, safeTimeZone(options.timeZone));
+  const parts = datePartsAt(nowMs, resolveRecallTimeZone(options.timeZone));
   return shiftCalendarDate(parts, /\byesterday\b/i.test(query) ? -1 : 0);
 }
 
@@ -210,7 +210,7 @@ function formatOccurrenceTime(iso: string, timeZone: string): string {
 function temporalMeetingHits(query: string, options: RecallOptions, limit: number): MemorySearchHit[] {
   const date = resolveTemporalMeetingDate(query, options);
   if (!date) return [];
-  const timeZone = safeTimeZone(options.timeZone);
+  const timeZone = resolveRecallTimeZone(options.timeZone);
   const db = openMemoryDb();
   const params: unknown[] = [`%${date}%`, `%${date}%`];
   let sql = `

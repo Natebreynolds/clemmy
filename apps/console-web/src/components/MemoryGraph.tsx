@@ -49,7 +49,7 @@ function saveCollapsed(set: Set<string>): void {
   try { window.localStorage.setItem(COLLAPSE_KEY, JSON.stringify(Array.from(set))); } catch { /* ignore */ }
 }
 
-interface Sel { label: string; type: string; content?: string }
+interface Sel { label: string; type: string; content?: string; data?: Record<string, unknown> }
 
 export function MemoryGraph({ height = 480 }: { height?: number }) {
   const container = useRef<HTMLDivElement>(null);
@@ -60,7 +60,7 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
   // each node's data/position/parent + connected edges).
   const stashedRef = useRef<Map<string, CollectionReturnValue>>(new Map());
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error'>('loading');
-  const [counts, setCounts] = useState({ nodes: 0, edges: 0 });
+  const [counts, setCounts] = useState({ facts: 0, context: 0, edges: 0 });
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const hiddenRef = useRef(hidden);
   const [query, setQuery] = useState('');
@@ -115,7 +115,10 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
                 },
               };
             }),
-            ...keptEdges.map((e) => ({ data: { id: e.id, source: e.source, target: e.target } })),
+            ...keptEdges.map((e) => ({ data: {
+              id: e.id, source: e.source, target: e.target, type: e.type,
+              label: e.label ?? '', truth: e.truth, details: e.data ?? {},
+            } })),
           ],
           style: [
             {
@@ -163,6 +166,17 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
               },
             },
             { selector: 'edge', style: { width: 1, 'line-color': edgeColor, 'curve-style': 'bezier', opacity: 0.4, 'z-index': 0 } },
+            { selector: 'edge[truth="inferred"]', style: { 'line-style': 'dashed', opacity: 0.25 } },
+            { selector: 'edge[truth="semantic"]', style: { 'line-style': 'dotted', opacity: 0.25 } },
+            {
+              selector: 'edge[type="related"]',
+              style: {
+                label: 'data(label)', 'font-size': 9, color: text,
+                'text-background-color': surface, 'text-background-opacity': 0.85,
+                'text-background-padding': '3px', 'target-arrow-shape': 'triangle',
+                'target-arrow-color': edgeColor, opacity: 0.7,
+              },
+            },
             { selector: '.hovered', style: { 'border-width': 4, 'border-color': primary, label: 'data(label)', color: text, 'font-size': 10, 'text-outline-color': surface, 'text-outline-width': 3, 'z-index': 99 } },
             { selector: 'edge.hl', style: { 'line-color': primary, opacity: 0.9, width: 2, 'z-index': 90 } },
             { selector: '.faded', style: { opacity: 0.08, 'text-opacity': 0 } },
@@ -207,10 +221,29 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
           hood.removeClass('faded');
           hood.edgesWith(hood).removeClass('faded').addClass('hl');
         });
+        cy.on('tap', 'edge[type="related"]', (evt) => {
+          const edge = evt.target;
+          const details = edge.data('details') as Record<string, unknown>;
+          const evidence = Array.isArray(details?.evidence) ? details.evidence as Array<{ excerpt?: string }> : [];
+          setSelected({
+            label: edge.data('label') || 'relationship',
+            type: 'stored relationship',
+            content: `${edge.source().data('label')} → ${edge.target().data('label')}${evidence[0]?.excerpt ? `\n\nEvidence: “${evidence[0].excerpt}”` : '\n\nLegacy edge — no grounded excerpt available.'}`,
+            data: details,
+          });
+          cy.elements().addClass('faded');
+          edge.removeClass('faded').addClass('hl');
+          edge.source().removeClass('faded');
+          edge.target().removeClass('faded');
+        });
         cy.on('tap', (evt) => { if (evt.target === cy) { setSelected(null); cy.elements().removeClass('faded hl'); } });
 
         cyRef.current = cy;
-        setCounts({ nodes: nodes.filter((n) => n.type !== 'kind').length, edges: keptEdges.length });
+        setCounts({
+          facts: nodes.filter((n) => n.type === 'fact').length,
+          context: nodes.filter((n) => n.type !== 'kind' && n.type !== 'fact').length,
+          edges: keptEdges.length,
+        });
         setRoomCount(cy.nodes('[type="kind"]').length);
         // Drop any persisted fold-ids for rooms that no longer exist, so
         // collapsed.size can't outrun the real room count (toggle correctness).
@@ -305,7 +338,7 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
             </div>
           </div>
           <div className="absolute right-3 top-3 flex items-center gap-2">
-            <span className="rounded-md bg-surface/90 px-2 py-1 text-caption text-faint backdrop-blur">{counts.nodes} facts · {counts.edges} links</span>
+            <span className="rounded-md bg-surface/90 px-2 py-1 text-caption text-faint backdrop-blur">{counts.facts} facts · {counts.context} context nodes · {counts.edges} stored links</span>
             <button type="button" onClick={() => setAllRooms(anyExpanded)}
               aria-label={anyExpanded ? 'Collapse all rooms' : 'Expand all rooms'}
               title={anyExpanded ? 'Fold every topic into a tidy chip' : 'Open every topic to see its facts'}
@@ -335,7 +368,7 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
             <button type="button" onClick={() => { setSelected(null); cyRef.current?.elements().removeClass('faded hl'); }} aria-label="Close" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>
           </div>
           <div className="text-body font-medium text-fg">{selected.label}</div>
-          {selected.content && <p className="mt-1 max-h-40 overflow-auto text-small text-muted">{selected.content}</p>}
+          {selected.content && <p className="mt-1 max-h-40 whitespace-pre-line overflow-auto text-small text-muted">{selected.content}</p>}
         </div>
       )}
     </div>

@@ -83,6 +83,7 @@ import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
+import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -1125,7 +1126,7 @@ const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 2);
 const STALL_RETRY_BACKOFF_MS = [250, 1000];
 const MAX_MISSING_REPLY_RETRIES = 1;
 const TURN_MEMORY_PRIMER_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_TOP_K', 6);
-const TURN_MEMORY_PRIMER_MAX_CHARS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_MAX_CHARS', 2600);
+const TURN_MEMORY_PRIMER_MAX_CHARS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_MAX_CHARS', 1800);
 const TURN_MEMORY_PRIMER_FACT_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_FACT_TOP_K', 5);
 const TURN_MEMORY_PRIMER_EPISODIC_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_EPISODIC_TOP_K', 6);
 
@@ -1331,9 +1332,15 @@ interface TurnMemoryPrimer {
   query: string;
   hitCount: number;
   injectedBytes: number;
-  source?: 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error';
+  source?: 'unified' | 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error';
   text?: string;
   skippedReason?: string;
+  recallId?: string;
+  answerability?: 'supported' | 'partial' | 'insufficient';
+  candidateCount?: number;
+  omittedCount?: number;
+  stores?: string[];
+  recallElapsedMs?: number;
 }
 
 function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = '', breadcrumbs = ''): TurnMemoryPrimer {
@@ -1386,28 +1393,63 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
 
   try {
+    // Primary path: the same complete evidence-backed retrieval used by
+    // memory_recall_all. Session-local tool pointers remain additive working
+    // memory; the archival stores no longer use four divergent rankers.
+    const episodicBlock = episodicBlockForPrimer(sessionId);
+    const unified = await buildUnifiedTurnPrimer({
+      query,
+      surface: 'automatic_primer',
+      limit: Math.max(TURN_MEMORY_PRIMER_TOP_K, TURN_MEMORY_PRIMER_FACT_TOP_K),
+      maxChars: Math.max(700, TURN_MEMORY_PRIMER_MAX_CHARS - episodicBlock.length - (episodicBlock ? 2 : 0)),
+      timeoutMs: TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS,
+      sessionId,
+    });
+    if (unified.status === 'ok' || unified.status === 'empty') {
+      const text = [unified.text, episodicBlock].filter(Boolean).join('\n\n');
+      return {
+        enabled: true,
+        query,
+        hitCount: unified.hitCount,
+        injectedBytes: Buffer.byteLength(text, 'utf8'),
+        source: 'unified',
+        text: text || undefined,
+        skippedReason: text ? undefined : 'no_hits',
+        recallId: unified.recallId,
+        answerability: unified.answerability,
+        candidateCount: unified.diagnostics?.candidates,
+        omittedCount: unified.omittedHitCount,
+        stores: unified.diagnostics?.stores,
+        recallElapsedMs: unified.diagnostics?.elapsedMs,
+      };
+    }
+
     // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to
     // the existing facts+vault+episodic primer — never replacing it. Self-gating +
     // computed once (sync stores → no latency), passed into every format path below.
     const breadcrumbs = await crossStoreBreadcrumbs(query);
     const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
-    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
+    if (!hybridEnabled) {
+      const legacy = formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
+      return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
+    }
 
     try {
       const hybridHits = await searchVaultAsyncWithTimeout(query);
       if (hybridHits && hybridHits.length > 0) {
-        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
+        const legacy = formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
+        return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
       }
       if (hybridHits === null) {
         return {
           ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId, breadcrumbs),
-          skippedReason: ftsHits.length > 0 ? 'hybrid_timeout' : 'hybrid_timeout_no_fts_hits',
+          skippedReason: ftsHits.length > 0 ? `unified_${unified.status}_hybrid_timeout` : `unified_${unified.status}_hybrid_timeout_no_fts_hits`,
         };
       }
     } catch {
       return {
         ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId, breadcrumbs),
-        skippedReason: ftsHits.length > 0 ? 'hybrid_error' : 'hybrid_error_no_fts_hits',
+        skippedReason: ftsHits.length > 0 ? `unified_${unified.status}_hybrid_error` : `unified_${unified.status}_hybrid_error_no_fts_hits`,
       };
     }
 
@@ -2842,7 +2884,7 @@ async function runConversationCore(
             void (async () => {
               try {
                 const { reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
-                reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', judgeReason, options.sessionId);
+                await reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', judgeReason, options.sessionId);
               } catch { /* best-effort */ }
             })();
           }
@@ -3579,7 +3621,7 @@ function maybeDistillSkill(sessionId: string, objective: string, evidence: strin
       // session leaned on (promotes a proven draft toward approved).
       try {
         const usedDrafts = gatherSessionSkills(sessionId).map((s) => s.name);
-        if (usedDrafts.length > 0) reinforceDraftSkills(usedDrafts, 'success');
+        if (usedDrafts.length > 0) await reinforceDraftSkills(usedDrafts, 'success');
       } catch { /* reinforcement is best-effort */ }
       await distillSkillFromSession(sessionId, {
         objective,
@@ -3726,7 +3768,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (shouldCapture) {
     queueMicrotask(() => {
       try {
-        const captured = captureInteractionSignals({ message: options.input, sessionId: options.sessionId });
+        const captured = captureInteractionSignals({
+          message: options.input,
+          sessionId: options.sessionId,
+          sourceEventId: `turn:${turn}`,
+        });
         if (captured.candidates.length > 0 || captured.profilePatch) {
           safeAppend({
             sessionId: options.sessionId,
@@ -4152,10 +4198,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       enabled: turnMemoryPrimer.enabled,
       queryPreview: clip(turnMemoryPrimer.query, 160),
       hitCount: turnMemoryPrimer.hitCount,
+      includedCount: turnMemoryPrimer.hitCount,
       injected: Boolean(turnMemoryPrimer.text),
       injectedBytes: turnMemoryPrimer.injectedBytes,
       source: turnMemoryPrimer.source ?? null,
       skippedReason: turnMemoryPrimer.skippedReason ?? null,
+      recallId: turnMemoryPrimer.recallId ?? null,
+      answerability: turnMemoryPrimer.answerability ?? null,
+      candidateCount: turnMemoryPrimer.candidateCount ?? null,
+      omittedCount: turnMemoryPrimer.omittedCount ?? null,
+      stores: turnMemoryPrimer.stores ?? [],
+      recallElapsedMs: turnMemoryPrimer.recallElapsedMs ?? null,
     },
   });
   safeAppend({

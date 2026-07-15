@@ -4,13 +4,26 @@ import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
-import { STATE_DIR, backupMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
+import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
-import { syncFactEntityLinks, syncFactResourceLinks } from './relations.js';
+import {
+  backfillGroundedFactEntityLinks,
+  backfillGroundedFactResourceLinks,
+  backfillGroundedEntityRelationships,
+  syncFactEntityLinks,
+  syncFactResourceLinks,
+  type GroundedFactEntityBackfillStats,
+  type GroundedFactResourceBackfillStats,
+} from './relations.js';
+import {
+  autoReconcileStrongEntityIdentifiers,
+  countStrongEntityIdentifierCollisionGroups,
+  type EntityIdentifierReconciliationResult,
+} from './entity-identity.js';
 import { reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
 import {
   reapStuckRecallRecordings,
@@ -19,6 +32,7 @@ import {
   listAllRecallMeetingRecords,
   analysisPathFor,
   fileMeetingFromAnalysis,
+  recordMeetingMemoryEpisode,
 } from '../integrations/recall/meeting-capture.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import { recoverPendingLocalAudioDeletions } from '../integrations/local-meetings/meeting-capture.js';
@@ -30,6 +44,14 @@ import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { previousLocalDayKey, runTaskLedgerHygiene } from '../tasks/task-ledger-hygiene.js';
 import { runReportOnlyCurator } from './curator.js';
 import { backfillTemporalEvidence, reapExpiredPendingReflections } from './temporal-memory.js';
+import { reapExpiredUnusedRecallRuns } from './recall-usage.js';
+import { drainDurableConsolidationCandidates } from './durable-consolidation.js';
+import { reconcileKnownPendingCandidates } from './candidate-review.js';
+import {
+  backfillLegacyReflectionCandidates,
+  countLegacyReflectionCandidateBatches,
+  type LegacyReflectionCandidateBackfillResult,
+} from './reflection-candidates.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -55,6 +77,7 @@ import { backfillTemporalEvidence, reapExpiredPendingReflections } from './tempo
 const logger = pino({ name: 'clementine-next.memory.maintenance' });
 
 const REINDEX_EVERY_N_TICKS = 4;     // ~60s with a 15s tick
+const CONSOLIDATION_REPLAY_EVERY_N_TICKS = 4; // ~60s; crash-safe user-statement replay
 const BACKFILL_EVERY_N_TICKS = 8;    // ~120s with a 15s tick
 const BACKFILL_BATCH = 200;          // chunks per pass — caps API spend per tick
 // MEMORY.md is read into the agent's instructions on every turn. The
@@ -117,6 +140,7 @@ interface MemoryMaintenanceState {
   lastSkillUpdateFireDay?: string;
   lastBackupDay?: string;
   lastMemorySelfHealDay?: string;
+  lastRelationshipBackfillDay?: string;
   lastMergeDay?: string;
   lastGoalReapDay?: string;
   lastTaskLedgerHygieneDay?: string;
@@ -169,10 +193,18 @@ const MEMORY_BACKUP_RETAIN = 7;
 const MEMORY_SELF_HEAL_NIGHTLY_HOUR = 4;
 const MEMORY_SELF_HEAL_NIGHTLY_MINUTE = 35;
 
-// Tier C2b — nightly paraphrase merge (default on; CLEMMY_MERGE_ENABLED=false
-// to disable). Consolidates semantically identical facts with entity-aware
-// guards to prevent merging facts about different tables/clients/accounts.
-// Runs once per local day at 4:45, after backup. Fully reversible via audit log.
+// Evidence-backed relationship/identity repair runs after the reversible DB
+// backup and before semantic merge. It only converges exact personal-email
+// duplicates and direct source-supported relationships; co-occurrence is never
+// promoted to stored graph truth.
+const RELATIONSHIP_BACKFILL_NIGHTLY_HOUR = 4;
+const RELATIONSHIP_BACKFILL_NIGHTLY_MINUTE = 40;
+
+// Tier C2b — reviewed paraphrase merge (default off;
+// CLEMMY_MERGE_ENABLED=true opts in). Embedding similarity is not sufficient
+// evidence to delete a distinct claim, so normal nightly maintenance only
+// generates review candidates. Runs at 4:45 when explicitly enabled, after
+// backup. Fully reversible via audit log.
 const MEMORY_MERGE_NIGHTLY_HOUR = 4;
 const MEMORY_MERGE_NIGHTLY_MINUTE = 45; // offset from backup's 4:30
 
@@ -263,6 +295,237 @@ export function isAtOrAfterDailyTime(now: Date, hour: number, minute: number): b
   return h > hour || (h === hour && now.getMinutes() >= minute);
 }
 
+export interface BootIdentityFinalizationResult {
+  pendingBefore: number;
+  pendingAfter: number;
+  ran: boolean;
+  backupPath: string | null;
+  reason: 'already_converged' | 'reconciled' | 'backup_failed';
+  reconciliation: EntityIdentifierReconciliationResult | null;
+}
+
+/**
+ * Finish stable-identifier convergence immediately after an upgraded daemon
+ * starts. A backup is mandatory before redirects are written; ambiguous names,
+ * shared inboxes, phones, and handles are never included in this repair.
+ */
+export function finalizeMemoryIdentityOnBoot(): BootIdentityFinalizationResult {
+  const pendingBefore = countStrongEntityIdentifierCollisionGroups();
+  if (pendingBefore === 0) {
+    return {
+      pendingBefore,
+      pendingAfter: 0,
+      ran: false,
+      backupPath: null,
+      reason: 'already_converged',
+      reconciliation: null,
+    };
+  }
+  const backup = backupMemoryDb({ retain: 14 });
+  if (!backup) {
+    return {
+      pendingBefore,
+      pendingAfter: pendingBefore,
+      ran: false,
+      backupPath: null,
+      reason: 'backup_failed',
+      reconciliation: null,
+    };
+  }
+  const reconciliation = autoReconcileStrongEntityIdentifiers(10_000);
+  const pendingAfter = countStrongEntityIdentifierCollisionGroups();
+  return {
+    pendingBefore,
+    pendingAfter,
+    ran: true,
+    backupPath: backup.backupPath,
+    reason: 'reconciled',
+    reconciliation,
+  };
+}
+
+export interface BootGroundedGraphFinalizationResult {
+  candidatesBefore: number;
+  ran: boolean;
+  backupPath: string | null;
+  reason: 'already_finalized' | 'nothing_recoverable' | 'reconciled' | 'backup_failed';
+  reconciliation: GroundedFactEntityBackfillStats | null;
+}
+
+export interface BootReflectionLedgerFinalizationResult {
+  missingBatchesBefore: number;
+  missingBatchesAfter: number;
+  expiredBatches: number;
+  ran: boolean;
+  backupPath: string | null;
+  reason: 'already_auditable' | 'reconciled' | 'backup_failed';
+  backfill: LegacyReflectionCandidateBackfillResult | null;
+}
+
+/** Project pre-v26 threshold buffers into the claim-level decision ledger on
+ * the first upgraded boot. The projection reads only exact stored extractor
+ * JSON. A backup is mandatory, missing source episodes remain missing, and
+ * expired buffers are settled only after their candidate rows exist. */
+export function finalizeLegacyReflectionCandidatesOnBoot(
+  now = new Date().toISOString(),
+): BootReflectionLedgerFinalizationResult {
+  const missingBatchesBefore = countLegacyReflectionCandidateBatches();
+  if (missingBatchesBefore === 0) {
+    return {
+      missingBatchesBefore,
+      missingBatchesAfter: 0,
+      expiredBatches: 0,
+      ran: false,
+      backupPath: null,
+      reason: 'already_auditable',
+      backfill: null,
+    };
+  }
+  const backup = backupMemoryDb({ retain: 14 });
+  if (!backup) {
+    return {
+      missingBatchesBefore,
+      missingBatchesAfter: missingBatchesBefore,
+      expiredBatches: 0,
+      ran: false,
+      backupPath: null,
+      reason: 'backup_failed',
+      backfill: null,
+    };
+  }
+  const backfill = backfillLegacyReflectionCandidates();
+  const expiredBatches = reapExpiredPendingReflections(now);
+  const missingBatchesAfter = countLegacyReflectionCandidateBatches();
+  return {
+    missingBatchesBefore,
+    missingBatchesAfter,
+    expiredBatches,
+    ran: true,
+    backupPath: backup.backupPath,
+    reason: 'reconciled',
+    backfill,
+  };
+}
+
+/**
+ * One-time, backup-first post-migration promotion for legacy fact→entity joins.
+ * A link becomes stored truth only when one unique, sufficiently specific
+ * identity is named in both the canonical fact and a surviving evidence
+ * excerpt. Ambiguous names and excerpt-free links remain inferred forever.
+ */
+export function finalizeGroundedEntityLinksOnBoot(): BootGroundedGraphFinalizationResult {
+  const db = openMemoryDb();
+  const action = 'grounded_fact_entity_boot_backfill';
+  const alreadyFinalized = Boolean(db.prepare(`
+    SELECT 1 FROM memory_migration_audit WHERE action = ? LIMIT 1
+  `).get(action));
+  if (alreadyFinalized) {
+    return { candidatesBefore: 0, ran: false, backupPath: null, reason: 'already_finalized', reconciliation: null };
+  }
+  const candidatesBefore = Number((db.prepare(`
+    SELECT COUNT(DISTINCT cf.id) AS count
+    FROM consolidated_facts cf
+    JOIN fact_entities fe ON fe.fact_id = cf.id AND fe.link_type = 'inferred_text'
+    WHERE EXISTS (
+      SELECT 1 FROM fact_evidence fve
+      JOIN memory_episodes me ON me.id = fve.episode_id
+      WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0
+        AND me.status IN ('available','partial')
+    )
+  `).get() as { count: number }).count);
+  const record = db.prepare(`
+    INSERT INTO memory_migration_audit
+      (migration_version, action, affected_rows, detail_json, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  if (candidatesBefore === 0) {
+    record.run(MEMORY_SCHEMA_VERSION, action, 0, JSON.stringify({ candidatesBefore }), new Date().toISOString());
+    return { candidatesBefore, ran: false, backupPath: null, reason: 'nothing_recoverable', reconciliation: null };
+  }
+  const backup = backupMemoryDb({ retain: 14 });
+  if (!backup) {
+    return { candidatesBefore, ran: false, backupPath: null, reason: 'backup_failed', reconciliation: null };
+  }
+  const reconciliation = backfillGroundedFactEntityLinks({ factLimit: 50_000 });
+  record.run(
+    MEMORY_SCHEMA_VERSION,
+    action,
+    reconciliation.promoted,
+    JSON.stringify({ candidatesBefore, ...reconciliation }),
+    new Date().toISOString(),
+  );
+  return {
+    candidatesBefore,
+    ran: true,
+    backupPath: backup.backupPath,
+    reason: 'reconciled',
+    reconciliation,
+  };
+}
+
+export interface BootGroundedResourceFinalizationResult {
+  candidatesBefore: number;
+  ran: boolean;
+  backupPath: string | null;
+  reason: 'already_finalized' | 'nothing_recoverable' | 'reconciled' | 'backup_failed';
+  reconciliation: GroundedFactResourceBackfillStats | null;
+}
+
+/** One-time, backup-first post-migration promotion for legacy fact→resource
+ * joins. Only unique, specific resource names repeated in the canonical claim
+ * and a surviving source excerpt become stored truth. This uses a distinct
+ * audit marker so installs that already completed entity grounding still pick
+ * up the newer resource grounding pass exactly once. */
+export function finalizeGroundedResourceLinksOnBoot(): BootGroundedResourceFinalizationResult {
+  const db = openMemoryDb();
+  const action = 'grounded_fact_resource_boot_backfill';
+  const alreadyFinalized = Boolean(db.prepare(`
+    SELECT 1 FROM memory_migration_audit WHERE action = ? LIMIT 1
+  `).get(action));
+  if (alreadyFinalized) {
+    return { candidatesBefore: 0, ran: false, backupPath: null, reason: 'already_finalized', reconciliation: null };
+  }
+  const candidatesBefore = Number((db.prepare(`
+    SELECT COUNT(DISTINCT cf.id) AS count
+    FROM consolidated_facts cf
+    JOIN fact_resources fr ON fr.fact_id = cf.id AND fr.link_type = 'inferred_text'
+    WHERE EXISTS (
+      SELECT 1 FROM fact_evidence fve
+      JOIN memory_episodes me ON me.id = fve.episode_id
+      WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0
+        AND me.status IN ('available','partial')
+    )
+  `).get() as { count: number }).count);
+  const record = db.prepare(`
+    INSERT INTO memory_migration_audit
+      (migration_version, action, affected_rows, detail_json, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  if (candidatesBefore === 0) {
+    record.run(MEMORY_SCHEMA_VERSION, action, 0, JSON.stringify({ candidatesBefore }), new Date().toISOString());
+    return { candidatesBefore, ran: false, backupPath: null, reason: 'nothing_recoverable', reconciliation: null };
+  }
+  const backup = backupMemoryDb({ retain: 14 });
+  if (!backup) {
+    return { candidatesBefore, ran: false, backupPath: null, reason: 'backup_failed', reconciliation: null };
+  }
+  const reconciliation = backfillGroundedFactResourceLinks({ factLimit: 50_000 });
+  record.run(
+    MEMORY_SCHEMA_VERSION,
+    action,
+    reconciliation.promoted,
+    JSON.stringify({ candidatesBefore, ...reconciliation }),
+    new Date().toISOString(),
+  );
+  return {
+    candidatesBefore,
+    ran: true,
+    backupPath: backup.backupPath,
+    reason: 'reconciled',
+    reconciliation,
+  };
+}
+
 export async function processMemoryMaintenance(tickCount: number): Promise<void> {
   if (tickCount % REINDEX_EVERY_N_TICKS === 0) {
     try {
@@ -273,6 +536,32 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'vault reindex tick failed');
+    }
+  }
+
+  // Automatic user-statement capture records an episode-backed candidate
+  // before launching its semantic resolver. Drain anything left by a daemon
+  // exit or transient failure; leases + candidate identity make this safe when
+  // an immediate worker is still finishing the same claim.
+  if (tickCount % CONSOLIDATION_REPLAY_EVERY_N_TICKS === 0) {
+    try {
+      const replay = await drainDurableConsolidationCandidates({ limit: 8 });
+      if (replay.promoted > 0 || replay.retried > 0 || replay.expired > 0) {
+        logger.info({ replay }, 'durable memory consolidation replay tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'durable memory consolidation replay tick failed');
+    }
+    // A proposal that exactly matches an already-active canonical fact needs
+    // no second semantic approval. Attach its independent episode as evidence
+    // and resolve only that exact claim; paraphrases/conflicts remain queued.
+    try {
+      const known = reconcileKnownPendingCandidates({ limit: 20 });
+      if (known.resolved > 0 || known.failed > 0) {
+        logger.info({ known }, 'known memory evidence reconciliation tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'known memory evidence reconciliation tick failed');
     }
   }
 
@@ -357,6 +646,12 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       if (expiredPending > 0) logger.info({ expiredPending }, 'pending reflection evidence expired');
     } catch (err) {
       logger.warn({ err }, 'pending reflection reaper tick failed');
+    }
+    try {
+      const expiredRecallRuns = reapExpiredUnusedRecallRuns();
+      if (expiredRecallRuns > 0) logger.info({ expiredRecallRuns }, 'unused recall attribution runs expired');
+    } catch (err) {
+      logger.warn({ err }, 'recall attribution reaper tick failed');
     }
   }
 
@@ -545,9 +840,30 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
-  // Tier C2b — nightly paraphrase merge at 4:45 AM local (default on).
-  // Entity-aware consolidation of semantic duplicates. Fully reversible via
-  // audit log + soft-delete. Fire-once-per-day, persisted dedupe.
+  if (isAtOrAfterDailyTime(now, RELATIONSHIP_BACKFILL_NIGHTLY_HOUR, RELATIONSHIP_BACKFILL_NIGHTLY_MINUTE)) {
+    if (maintenanceState.lastRelationshipBackfillDay !== today) {
+      maintenanceState.lastRelationshipBackfillDay = today;
+      writeMaintenanceState(maintenanceState);
+      const enabled = (getRuntimeEnv('CLEMMY_ENTITY_RELATIONSHIP_BACKFILL', 'on') || 'on').trim().toLowerCase() !== 'off';
+      if (enabled) {
+        try {
+          const identities = autoReconcileStrongEntityIdentifiers(100);
+          if (identities.entitiesRedirected > 0) {
+            logger.info(
+              { identities },
+              'strong entity identity reconciliation completed',
+            );
+          }
+        } catch (err) {
+          logger.warn({ err }, 'grounded entity relationship maintenance failed');
+        }
+      }
+    }
+  }
+
+  // Tier C2b — reviewed paraphrase merge at 4:45 AM local (default off).
+  // The detector may propose semantic duplicates, but this mutating legacy job
+  // runs only when CLEMMY_MERGE_ENABLED=true is explicitly configured.
   if (isAtOrAfterDailyTime(now, MEMORY_MERGE_NIGHTLY_HOUR, MEMORY_MERGE_NIGHTLY_MINUTE)) {
     if (maintenanceState.lastMergeDay !== today) {
       maintenanceState.lastMergeDay = today;
@@ -571,6 +887,18 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'relationship link sync failed');
+      }
+      try {
+        const enabled = (getRuntimeEnv('CLEMMY_ENTITY_RELATIONSHIP_BACKFILL', 'on') || 'on').trim().toLowerCase() !== 'off';
+        if (enabled) {
+          const groundedFactLinks = backfillGroundedFactEntityLinks({ factLimit: 5_000 });
+          const relationships = backfillGroundedEntityRelationships({ factLimit: 5_000 });
+          if (groundedFactLinks.promoted > 0 || relationships.added > 0 || relationships.reinforced > 0) {
+            logger.info({ groundedFactLinks, relationships }, 'grounded entity relationship backfill completed');
+          }
+        }
+      } catch (err) {
+        logger.warn({ err }, 'grounded entity relationship backfill failed');
       }
       // WS6 — hard-purge facts soft-deleted well beyond the recovery window so
       // consolidated_facts + fact_embeddings stop growing forever (FK CASCADE
@@ -680,6 +1008,9 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
 export function tickMeetingFiling(): number {
   let filed = 0;
   for (const record of listAllRecallMeetingRecords()) {
+    // Additive replay for recordings captured before first-class meeting
+    // episodes shipped, and an idempotent refresh for analysis/title changes.
+    try { recordMeetingMemoryEpisode(record); } catch { /* next tick retries */ }
     const artifactPath = record.artifactPath;
     if (!artifactPath) continue;
     const analysisPath = analysisPathFor(record.id);

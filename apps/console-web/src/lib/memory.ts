@@ -16,7 +16,8 @@ export interface Fact {
   impressionCount?: number;
   utilityCount?: number;
   evidence?: Array<{ episodeId: string; excerpt: string; sourceUri?: string; occurredAt?: string; status?: string }>;
-  policy?: { policy_type: 'hard_constraint' | 'core_profile' | 'standing_preference'; enforcement: 'dispatch' | 'prompt'; priority: number } | null;
+  validityIntervals?: Array<{ id: number; factId: number; validFrom: string; validTo: string | null; openedReason: string; closedReason: string | null }>;
+  policy?: { policy_type: 'hard_constraint' | 'core_profile' | 'standing_preference'; enforcement: 'dispatch' | 'prompt'; applies_to_json?: string; priority: number } | null;
 }
 
 export interface Goal {
@@ -52,7 +53,7 @@ export const FACT_KINDS: { key: Fact['kind']; label: string }[] = [
 ];
 
 export const listFacts = (kind?: Fact['kind'], limit = 80, includeInactive = false) =>
-  apiGet<{ facts: Fact[] }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}${includeInactive ? '&includeInactive=1' : ''}`);
+  apiGet<{ facts: Fact[]; total: number; visible: number }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}${includeInactive ? '&includeInactive=1' : ''}`);
 
 export const forgetFact = (id: Fact['id']) =>
   apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/forget`);
@@ -67,6 +68,28 @@ export const restoreFact = (id: Fact['id']) =>
 
 export const updateFact = (id: Fact['id'], patch: { content?: string; importance?: number }) =>
   apiPatch<{ ok: boolean; fact: Fact; supersededFactId?: number | null }>(`/api/console/memory/facts/${encodeURIComponent(String(id))}`, patch);
+
+export interface MemoryReviewCandidate {
+  id: string;
+  kind: 'retire_transient_request' | 'merge_duplicate';
+  evidence: string;
+  confidence: 'high' | 'medium' | 'low';
+  reversible: true;
+  targetIds: number[];
+  targetFacts: Fact[];
+  payload?: { keepId?: number; dropId?: number; similarity?: number };
+}
+export const listMemoryReviewCandidates = (limit = 25) =>
+  apiGet<{
+    candidates: MemoryReviewCandidate[];
+    total: number;
+    visible: number;
+    byKind: { merge_duplicate: number; retire_transient_request: number };
+  }>(`/api/console/memory/review-candidates?limit=${limit}`);
+export const applyMemoryReviewCandidate = (id: string) =>
+  apiPost<{ ok: boolean; auditId?: string; message: string }>(`/api/console/memory/review-candidates/${encodeURIComponent(id)}/apply`);
+export const dismissMemoryReviewCandidate = (id: string) =>
+  apiPost<{ ok: true; id: string; status: 'skipped' }>(`/api/console/memory/review-candidates/${encodeURIComponent(id)}/dismiss`);
 
 /** A core context file Clementine reads every turn (SOUL/IDENTITY/MEMORY/working). */
 export interface ContextFile {
@@ -95,6 +118,96 @@ export interface MemoryHit {
 export const searchMemory = (q: string) =>
   apiGet<{ query: string; hits: MemoryHit[]; answerability: 'supported' | 'partial' | 'insufficient'; diagnostics: { candidates: number; stores: string[]; elapsedMs: number } }>(`/api/console/memory/search-all?q=${encodeURIComponent(q)}`);
 
+export type MemoryEpisodeKind = 'user_turn' | 'tool_result' | 'import' | 'manual' | 'reflection';
+export type MemoryEpisodeStatus = 'available' | 'partial' | 'missing' | 'pending' | 'expired';
+export interface MemoryEpisodeCandidate {
+  id: number;
+  kind: string;
+  text: string;
+  importance: number;
+  status: 'pending' | 'promoted' | 'rejected' | 'expired';
+  reason: string | null;
+  sourceType: string;
+  intakeReason: string | null;
+  resultingFactId: number | null;
+  /** Number of pending source observations with this exact normalized claim.
+   * One owner decision resolves the available cluster while preserving every
+   * episode as independent evidence. */
+  pendingEquivalentCount: number;
+}
+export interface MemoryEpisode {
+  id: string;
+  kind: MemoryEpisodeKind;
+  subtype: string | null;
+  title: string | null;
+  sourceApp: string | null;
+  sourceUri: string | null;
+  occurredAt: string;
+  ingestedAt: string;
+  status: MemoryEpisodeStatus;
+  excerpt: string;
+  excerptTruncated: boolean;
+  metadata: Record<string, unknown>;
+  claimCount: number;
+  entityCount: number;
+  candidateCount: number;
+  pendingCandidateCount: number;
+  candidates: MemoryEpisodeCandidate[];
+}
+export interface MemoryEpisodeList {
+  total: number;
+  allTotal: number;
+  visible: number;
+  offset: number;
+  hasMore: boolean;
+  summary: {
+    byKind: Partial<Record<MemoryEpisodeKind, number>>;
+    byStatus: Partial<Record<MemoryEpisodeStatus, number>>;
+    meetings: number;
+    pendingCandidates: number;
+    pendingUniqueClaims: number;
+    pendingCandidatesBySource: Record<string, number>;
+    pendingUniqueClaimsBySource: Record<string, number>;
+  };
+  episodes: MemoryEpisode[];
+}
+export const listMemoryEpisodes = (options: {
+  kind?: MemoryEpisodeKind | 'meeting' | 'all';
+  status?: MemoryEpisodeStatus | 'all';
+  review?: 'pending' | 'all';
+  candidateSource?: 'tool_reflection' | 'recursive_reflection' | 'auto_capture' | 'meeting_analysis' | 'manual' | 'import' | 'all';
+  query?: string;
+  limit?: number;
+  offset?: number;
+} = {}) => {
+  const params = new URLSearchParams();
+  if (options.kind && options.kind !== 'all') params.set('kind', options.kind);
+  if (options.status && options.status !== 'all') params.set('status', options.status);
+  if (options.review && options.review !== 'all') params.set('review', options.review);
+  if (options.candidateSource && options.candidateSource !== 'all') params.set('candidateSource', options.candidateSource);
+  if (options.query?.trim()) params.set('q', options.query.trim());
+  params.set('limit', String(options.limit ?? 80));
+  if (options.offset) params.set('offset', String(options.offset));
+  return apiGet<MemoryEpisodeList>(`/api/console/memory/episodes?${params.toString()}`);
+};
+export const promoteMemoryEpisodeCandidate = (id: number) =>
+  apiPost<{
+    ok: true;
+    candidateId: number;
+    factId: number;
+    action: 'reinforce' | 'supersede' | 'add' | 'ignore';
+    coalescedCandidateIds: number[];
+    evidenceSourcesAdded: number;
+  }>(`/api/console/memory/reflection-candidates/${encodeURIComponent(String(id))}/promote`);
+export const rejectMemoryEpisodeCandidate = (id: number) =>
+  apiPost<{
+    ok: true;
+    candidateId: number;
+    status: 'rejected';
+    rejectedCandidateIds: number[];
+    rejectedCount: number;
+  }>(`/api/console/memory/reflection-candidates/${encodeURIComponent(String(id))}/reject`);
+
 export interface VaultFile { path: string; chunks: number; mtime: number; byteSize: number }
 export const getMemoryFiles = () =>
   apiGet<{ files: VaultFile[]; status?: unknown }>('/api/console/memory/files');
@@ -104,7 +217,11 @@ export function fileBasename(p: string): string {
 }
 
 export const addFact = (content: string, kind: Fact['kind'] = 'user') =>
-  apiPost('/api/console/context/facts', { content, kind });
+  apiPost<{
+    fact: Fact | null;
+    consolidation: { action: 'add' | 'reinforce' | 'supersede' | 'ignore'; supersededFactId: number | null };
+    facts: Fact[];
+  }>('/api/console/context/facts', { content, kind });
 
 export const addGoal = (title: string, description: string, priority: 'high' | 'medium' | 'low' = 'medium') =>
   apiPost('/api/console/context/goals', { title, description, priority });
@@ -113,6 +230,7 @@ export interface BrainHealth {
   activeFacts?: number; derivedFacts?: number; directFacts?: number; avgImportance?: number;
   entitiesTotal?: number; entitiesPerson?: number; entitiesCompany?: number; entitiesProject?: number; entitiesPlace?: number; entitiesThing?: number;
   pointersTotal?: number; pointersRecent?: number; reflections24h?: number;
+  memoryEpisodesTotal?: number; memoryEpisodesRecent?: number; recordedMeetingsTotal?: number;
 }
 export const getBrainHealth = () => apiGet<BrainHealth>('/api/console/brain/health');
 
@@ -143,15 +261,136 @@ export interface MemoryHealth {
     pendingReflections?: number; oldestPending?: string | null; unreachableFacts?: number;
     impressions?: number; utility?: number;
     policies?: Record<string, number>;
+    policyCoverage?: { compiledHard?: number; promptOnlyConstraintFacts?: number; overstatedDispatch?: number };
     relationships?: Record<string, number>;
     shadow?: {
       samples: number; averageOverlap: number; primaryOnly: number; legacyOnly: number;
       tailHits: number; evidenceBacked: number; primaryFacts: number; evidenceRate: number;
       supported: number; lastAt: string | null; bySurface: Record<string, number>;
     };
+    recallUsage?: {
+      windowDays: number; runs: number; usedRuns: number; conversionRate: number | null;
+      usedRefs: number; notUsefulRefs: number; refUtilityEvents: number;
+      refTypeUses: Partial<Record<'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure', number>>;
+      topRefShare: number | null;
+      topRef: { type: 'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure'; id: string; uses: number } | null;
+      factUtilityEvents: number;
+      topFactShare: number | null;
+      topFact: { id: number; content: string; uses: number } | null;
+    };
+    reflectionReplay?: {
+      total: number; processing: number; buffered: number; completed: number;
+      failed: number; retried: number; staleProcessing: number;
+    };
+    reflectionCandidates?: {
+      total: number; pending: number; promoted: number; rejected: number; expired: number;
+      pendingUniqueClaims: number; duplicatePendingObservations: number; knownExactPending: number;
+      overduePending: number; orphanedPending: number; retrying: number; failedPending: number;
+      oldestPending: string | null;
+      promotionRate: number | null; rejectionReasons: Record<string, number>;
+    };
+    promptContext?: {
+      windowDays: number; runs: number; injectedRuns: number;
+      telemetryCompleteRuns: number; unknownOmissionRuns: number;
+      included: number; omitted: number; candidates: number;
+      omissionRate: number | null; lastAt: string | null;
+      last: {
+        included: number; omitted: number | null; candidates: number | null;
+        source: string | null; injected: boolean;
+      } | null;
+      bySource: Record<string, number>;
+      standingContext: {
+        runs: number; telemetryCompleteRuns: number; unknownOmissionRuns: number;
+        included: number; omitted: number; lastAt: string | null;
+        last: {
+          mode: string | null; included: number; omitted: number | null;
+          candidates: number | null; enforcementBacked: number;
+        } | null;
+      };
+    };
   };
 }
 export const getMemoryHealth = () => apiGet<MemoryHealth>('/api/console/memory/health');
+
+export interface ReflectionCandidateDecision {
+  id: number;
+  episodeId: string | null;
+  sessionId: string;
+  callId: string;
+  kind: string;
+  text: string;
+  importance: number;
+  status: 'pending' | 'promoted' | 'rejected' | 'expired';
+  reason: string | null;
+  sourceType: 'tool_reflection' | 'recursive_reflection' | 'auto_capture' | 'meeting_analysis' | 'manual' | 'import';
+  intakeReason: string | null;
+  attemptCount: number;
+  nextAttemptAt: string | null;
+  lastError: string | null;
+  resultingFactId: number | null;
+  resultingFactContent: string | null;
+  sourceApp: string | null;
+  sourceUri: string | null;
+  occurredAt: string | null;
+  createdAt: string;
+  resolvedAt: string | null;
+}
+export const listReflectionCandidates = (
+  limit = 50,
+  status?: ReflectionCandidateDecision['status'],
+) => apiGet<{
+  candidates: ReflectionCandidateDecision[];
+  health: NonNullable<NonNullable<MemoryHealth['reliability']>['reflectionCandidates']>;
+}>(`/api/console/memory/reflection-candidates?limit=${limit}${status ? `&status=${status}` : ''}`);
+
+export type MemoryReadinessStatus = 'pass' | 'warn' | 'fail' | 'skip';
+export interface MemoryReadinessCheck {
+  id: string;
+  label: string;
+  status: MemoryReadinessStatus;
+  blocking: boolean;
+  summary: string;
+  metrics?: Record<string, number | string | null>;
+}
+export interface MemoryReadinessReport {
+  reportVersion: 1;
+  generatedAt: string;
+  mode: 'read-only';
+  expectedSchemaVersion: number;
+  observedSchemaVersion: number | null;
+  ready: boolean;
+  summary: Record<MemoryReadinessStatus, number>;
+  checks: MemoryReadinessCheck[];
+  inventory?: {
+    facts: { active: number; inactive: number; derivedActive: number; neverUsedActive: number };
+    policies: { hardConstraints: number; coreProfile: number; standingPreferences: number };
+    evidence: {
+      derivedWithUsableEvidence: number; unavailableHistoricalDerived: number;
+      unreconciledDerived: number; postUpgradeDerivedWithoutUsableEvidence: number;
+    };
+    graph: {
+      factEntityStored: number; factEntityInferred: number;
+      factResourceStored: number; factResourceInferred: number;
+      entityObservationStored: number; entityObservationBroken: number;
+      episodeArtifactStored: number; episodeArtifactBroken: number;
+      entityRelationships: number; groundedEntityRelationships: number;
+    };
+    identity: {
+      canonicalEntities: number; redirects: number;
+      exactEmailCollisionGroups: number; exactNameReviewSignals: number;
+    };
+    recall: {
+      runs30d: number; usedRuns30d: number; usedRefs30d: number;
+      topFactShare30d: number | null;
+    };
+    reflectionCandidates: {
+      total: number; pending: number; promoted: number; rejected: number; expired: number;
+      pendingUniqueClaims: number; duplicatePendingObservations: number; knownExactPending: number;
+      overduePending: number; orphanedPending: number; retrying: number; failedPending: number;
+    };
+  } | null;
+}
+export const getMemoryReadiness = () => apiGet<MemoryReadinessReport>('/api/console/memory/readiness');
 
 export interface EvidenceReconciliationReport {
   backupPath: string | null;
@@ -166,6 +405,21 @@ export interface EvidenceReconciliationReport {
 export const reconcileMemoryEvidence = (maxFacts = 5_000) =>
   apiPost<EvidenceReconciliationReport>('/api/console/memory/reconcile-evidence', { maxFacts, batchSize: 200 });
 
+export interface RelationshipReconciliationReport {
+  backupPath: string | null;
+  identities: { groupsScanned: number; groupsMerged: number; entitiesRedirected: number };
+  factEntityLinks: { factsScanned: number; entitiesConsidered: number; linksWritten: number };
+  groundedFactEntityLinks: { factsScanned: number; evidenceScanned: number; candidates: number; promoted: number; ambiguous: number; ignored: number };
+  factResourceLinks: { factsScanned: number; entitiesConsidered: number; linksWritten: number };
+  groundedFactResourceLinks: { factsScanned: number; evidenceScanned: number; candidates: number; promoted: number; ambiguous: number; ignored: number };
+  relationships: { factsScanned: number; evidenceScanned: number; candidates: number; added: number; reinforced: number; ignored: number };
+  before: Record<string, number>;
+  after: Record<string, number>;
+  elapsedMs: number;
+}
+export const reconcileMemoryRelationships = (maxFacts = 5_000) =>
+  apiPost<RelationshipReconciliationReport>('/api/console/memory/reconcile-relationships', { maxFacts });
+
 /** A learned tool-recall (procedural) memo — which tool proved out for an intent. */
 export interface ToolRecallRecord {
   intent: string;
@@ -175,8 +429,107 @@ export interface ToolRecallRecord {
 }
 export const getToolRecall = () => apiGet<{ count: number; records: ToolRecallRecord[] }>('/api/console/memory/tool-recall');
 
-export interface Entity { id: number | string; entityType: string; canonicalName: string; aliases?: string[]; mentionCount?: number }
-export const listEntities = (limit = 400) => apiGet<{ entities: Entity[]; total: number }>(`/api/console/brain/entities?limit=${limit}`);
+export interface Entity {
+  id: number | string;
+  entityType: string;
+  canonicalName: string;
+  aliases?: string[];
+  mentionCount?: number;
+  factCount?: number;
+  groundedFactCount?: number;
+  inferredFactCount?: number;
+  identifierCount?: number;
+  observationCount?: number;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+}
+export interface EntityMemoryDetail {
+  entity: {
+    id: number; type: string; canonicalName: string; firstSeenAt: string; lastSeenAt: string;
+    legacyMentionCount: number;
+    aliases: Array<{ value: string; confidence: number; sourceUri: string | null; evidenceEpisodeId: string | null; firstSeenAt: string; lastSeenAt: string }>;
+    identifiers: Array<{ scheme: string; value: string; confidence: number; sourceUri: string | null; evidenceEpisodeId: string | null; firstSeenAt: string; lastSeenAt: string }>;
+  };
+  identity: {
+    requestedId: number; canonicalId: number;
+    redirectedFrom: Array<{ id: number; canonicalName: string; reason: string; confidence: number; createdAt: string }>;
+  };
+  claims: Array<{
+    factId: number; kind: Fact['kind']; content: string; active: boolean; confidence: number;
+    validFrom: string | null; validTo: string | null; supersededByFactId: number | null;
+    linkType: 'stored' | 'extracted'; linkConfidence: number;
+    quality: 'accepted' | 'needs_review'; reviewReason: string | null;
+    evidence: Array<{ episodeId: string; excerpt: string; sourceUri?: string; occurredAt: string; status: string }>;
+  }>;
+  relationships: Array<{
+    direction: 'outgoing' | 'incoming'; predicate: string;
+    otherEntity: { id: number; type: string; canonicalName: string };
+    current: boolean; confidence: number; recurrenceCount: number;
+    validFrom: string | null; validTo: string | null;
+    evidence: Array<{ episodeId: string; excerpt: string; sourceUri: string | null; sourceFactId: number | null; confidence: number; observedAt: string; status: string }>;
+    validityIntervals: Array<{ validFrom: string; validTo: string | null; openedReason: string; closedReason: string | null }>;
+  }>;
+  episodes: Array<{
+    id: string; kind: string; subtype: string | null; title: string | null;
+    sourceApp: string | null; sourceUri: string | null; occurredAt: string; status: string;
+    excerpt: string | null; confidence: number; sourceKind: string; sourceFactId: number | null;
+  }>;
+  stats: {
+    groundedClaims: number; currentClaims: number; reviewClaims: number; relationships: number; currentRelationships: number;
+    sourceEpisodes: number; aliases: number; identifiers: number; redirectedIdentities: number;
+  };
+  asOf: string;
+}
+export interface EntityIdentityConflict {
+  scheme: string;
+  value: string;
+  entities: Array<{ id: number; type: string; name: string }>;
+}
+export interface EntityDuplicateCandidate {
+  id: string;
+  entityType: string;
+  confidence: 'high' | 'medium' | 'low';
+  score: number;
+  suggestedCanonicalId: number;
+  entities: Array<{
+    id: number; type: string; name: string; aliases: string[];
+    identifiers: Array<{ scheme: string; value: string }>;
+    groundedClaims: number; inferredLinks: number; observations: number; legacyMentions: number;
+    firstSeenAt: string; lastSeenAt: string;
+  }>;
+  matches: Array<{
+    entityIds: [number, number];
+    basis: 'shared_identifier' | 'canonical_equivalent' | 'canonical_alias' | 'shared_alias' | 'person_name_variant' | 'person_nickname';
+    score: number; detail: string;
+  }>;
+  reasons: string[];
+  cautions: string[];
+}
+export const listEntities = (limit = 300, type = 'all', query = '') => {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (type !== 'all') params.set('type', type);
+  if (query.trim()) params.set('q', query.trim());
+  return apiGet<{ entities: Entity[]; total: number; allTotal: number; redirectedTotal?: number }>(`/api/console/brain/entities?${params.toString()}`);
+};
+export const getEntityMemory = (id: Entity['id'], asOf?: string) =>
+  apiGet<EntityMemoryDetail>(`/api/console/brain/entities/${encodeURIComponent(String(id))}${asOf ? `?asOf=${encodeURIComponent(asOf)}` : ''}`);
+export const listEntityIdentityConflicts = (limit = 100) =>
+  apiGet<{ conflicts: EntityIdentityConflict[]; total: number }>(`/api/console/brain/entity-identity/conflicts?limit=${limit}`);
+export const listEntityDuplicateCandidates = (limit = 100, type = 'person') =>
+  apiGet<{ candidates: EntityDuplicateCandidate[]; total: number; dismissedCount: number; entitiesScanned: number }>(`/api/console/brain/entity-identity/candidates?limit=${limit}&type=${encodeURIComponent(type)}`);
+export const dismissEntityDuplicateCandidate = (entityIds: number[]) =>
+  apiPost<{ ok: true; pairsDismissed: number }>('/api/console/brain/entity-identity/candidates/dismiss', {
+    entityIds,
+    reason: 'desktop identity review: distinct people',
+  });
+export const restoreDismissedEntityDuplicateCandidates = () =>
+  apiPost<{ ok: true; restored: number }>('/api/console/brain/entity-identity/candidates/restore-dismissed');
+export const mergeEntityIdentity = (sourceEntityId: number, canonicalEntityId: number) =>
+  apiPost<{ ok: true; canonicalEntityId: number }>('/api/console/brain/entities/merge', {
+    sourceEntityId,
+    canonicalEntityId,
+    reason: 'desktop identity review',
+  });
 
 export interface SourcePointer { id: number | string; app: string; kind?: string; ref?: string; name?: string; whatsHere?: string }
 export const getSourceMap = () => apiGet<{ enabled?: boolean; count?: number; pointers?: SourcePointer[] }>('/api/console/memory/source-map');
@@ -191,7 +544,13 @@ export interface GraphMeta {
   semanticEdges?: { enabled: boolean; requested: number; threshold: number; cap: number; count: number; embeddedFacts: number; skippedNoEmbedding: number };
   clustering?: { mode: string; clusters: number };
   truthMode?: 'stored' | 'augmented';
-  coverage?: { totals?: Record<string, number>; visible?: Record<string, number>; edges?: { stored: number; inferred: number; semantic: number } };
+  coverage?: {
+    totals?: Record<string, number>;
+    visible?: Record<string, number>;
+    edges?: { stored: number; inferred: number; semantic: number };
+    edgeTypeTotals?: Record<string, number>;
+    visibleEdgeTypes?: Record<string, number>;
+  };
 }
 export interface GraphResponse { nodes: GraphNode[]; edges: GraphEdge[]; meta?: GraphMeta }
 export interface GraphParams {

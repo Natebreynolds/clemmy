@@ -1,29 +1,40 @@
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
+import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
-import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
+import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EpisodicPointerRow } from './db.js';
 import {
   rememberFact,
   supersedeFact,
   deleteFact,
   demoteRolledUpSource,
   getFact,
+  updateFact,
   setFactPinned,
-  findSimilarFacts,
   findSimilarFactsScored,
   type RememberInput,
   type ConsolidatedFact,
 } from './facts.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
-import { recordEntityEdge } from './relations.js';
+import { attachGroundedFactResources, recordGroundedEntityRelationship, setFactEntityLinks } from './relations.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
-import { recordMemoryEpisode } from './temporal-memory.js';
+import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
+import { upsertEntity } from './entity-identity.js';
+import { compileWordMatcher } from './word-match.js';
+import { derivedFactRejectionReason } from './memory-quality.js';
+import {
+  recordReflectionCandidate,
+  reflectionCandidateHash,
+  resolveReflectionCandidate,
+} from './reflection-candidates.js';
+
+export { upsertEntity } from './entity-identity.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -110,6 +121,10 @@ const ExtractedRelationshipSchema = z.object({
   subject: z.string().min(1).max(120),
   predicate: z.string().min(1).max(80),
   object: z.string().min(1).max(120),
+  evidence_excerpt: z.string().min(3).max(1_500),
+  confidence: z.number().min(0).max(1).optional(),
+  valid_from: z.string().max(40).optional(),
+  valid_to: z.string().max(40).optional(),
 });
 const ExtractionSchema = z.object({
   facts: z.array(ExtractedFactSchema).max(EXTRACTOR_MAX_FACTS),
@@ -135,6 +150,44 @@ interface PendingReflectionBatch {
   importance: number;
 }
 
+function reflectionEpisodeExcerpt(input: ReflectionInput, extraction: Extraction): string {
+  const source = input.output.trim();
+  if (!source) return '';
+  const excerpts: string[] = [];
+  const seen = new Set<string>();
+  for (const fact of extraction.facts ?? []) {
+    const excerpt = selectSupportingExcerpt(source, fact.text, 700).trim();
+    if (!excerpt) continue;
+    const key = excerpt.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    excerpts.push(excerpt);
+  }
+  return (excerpts.length > 0 ? excerpts.join('\n\n') : source).slice(0, 2_000);
+}
+
+/** Record the bounded source once, before a candidate can be buffered. The
+ * excerpt is composed only from exact source fragments selected for the
+ * proposed claims, so a delayed promotion never has to synthesize evidence. */
+function recordReflectionEpisode(
+  input: ReflectionInput,
+  extraction: Extraction,
+  status: 'pending' | 'available' | 'partial' = 'pending',
+): string {
+  const now = new Date().toISOString();
+  return recordMemoryEpisode({
+    kind: 'tool_result',
+    sourceApp: input.tool ?? null,
+    sessionId: input.sessionId,
+    callId: input.callId,
+    sourceUri: `tool://${input.sessionId}/${input.callId}`,
+    occurredAt: now,
+    content: reflectionEpisodeExcerpt(input, extraction),
+    rawRetainedUntil: new Date(Date.parse(now) + 14 * 24 * 60 * 60 * 1000).toISOString(),
+    status,
+  }).id;
+}
+
 export interface ReflectionInput {
   sessionId: string;
   callId: string;
@@ -156,12 +209,11 @@ export interface ReflectionResult {
 const PROMPT_PREAMBLE = buildExtractorPreamble(false);
 const PROMPT_PREAMBLE_WITH_RESOURCES = buildExtractorPreamble(true);
 
-/** WS2 entity↔entity edges from the extractor. Default OFF (validation-gated
- *  flip per the no-rollout-flags directive) so the extractor prompt + schema
- *  stay byte-identical until proven. The entity_edges table + graph rendering
- *  ship regardless; this only controls POPULATION from the extractor. */
+/** Evidence-grounded entity relationships are on by default. `off` remains a
+ *  kill switch, but learned edges now require an exact source excerpt and a
+ *  controlled predicate before they can enter stored-truth graph mode. */
 function entityEdgesEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_ENTITY_EDGES', 'off') || 'off').trim().toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_ENTITY_EDGES', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
 function buildExtractorPreamble(includeResources: boolean, includeRelationships = false): string {
@@ -178,7 +230,7 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
     shape.push(`  "resources": [{ "kind": "folder|file|doc|sheet|base|table|object|channel|label", "name": "<resource name>", "ref": "<optional stable id/uri>", "whats_here": "<one phrase: what this holds>", "when_to_use": "<optional: when to come back here>" }]${includeRelationships ? ',' : ''}`);
   }
   if (includeRelationships) {
-    shape.push('  "relationships": [{ "subject": "<entity name>", "predicate": "<short relation, e.g. works at / reports to / owns>", "object": "<entity name>" }]');
+    shape.push('  "relationships": [{ "subject": "<entity name>", "predicate": "works at|reports to|leads|owns|member of|founded|advises|partner at|primary contact for|manages|collaborates with|customer of|client of|vendor for|investor in|board member of|works on|created|located in|attended|spouse of|parent of|sibling of|friend of", "object": "<entity name>", "evidence_excerpt": "<exact verbatim quote from the tool output>", "confidence": <0-1>, "valid_from": "<optional ISO date/time>", "valid_to": "<optional ISO date/time>" }]');
   }
   const lines = [
     'You are the reflection layer of a long-running personal assistant.',
@@ -205,7 +257,8 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
     lines.push('- "resources" are NAMED LOCATIONS this output reveals — a Drive folder, an Airtable base/table, a CRM object, a mail label, a channel. Capture WHERE data lives + what it holds (NOT the content). Only include real, re-visitable containers; skip one-off records and the data values themselves.');
   }
   if (includeRelationships) {
-    lines.push('- "relationships" connect two entities you already listed in "entities" with a short predicate ("works at", "reports to", "owns"). Only include relations the output actually states; subject and object MUST be names present in "entities".');
+    lines.push('- "relationships" connect two entities already listed in "entities". Use ONLY a predicate from the schema vocabulary and only when the output explicitly states the relation; never infer one from co-occurrence. subject and object MUST be names present in "entities".');
+    lines.push('- Every relationship requires evidence_excerpt copied VERBATIM from the tool output. It must be the smallest exact quote that proves the subject-predicate-object relation. Do not paraphrase or repair the quote.');
   }
   const arrayCount = 3 + (includeResources ? 1 : 0) + (includeRelationships ? 1 : 0);
   const countWord = ['zero', 'one', 'two', 'three', 'four', 'five'][arrayCount] ?? String(arrayCount);
@@ -376,8 +429,19 @@ function sanitizeExtractionOutput(
         const subject = boundedString(relationship.subject, 120);
         const predicate = boundedString(relationship.predicate ?? relationship.relation ?? relationship.relationship, 80);
         const object = boundedString(relationship.object, 120);
-        if (!subject || !predicate || !object) return null;
-        return { subject, predicate, object };
+        const evidenceExcerpt = boundedString(relationship.evidence_excerpt ?? relationship.evidenceExcerpt ?? relationship.quote, 1_500);
+        const confidence = typeof relationship.confidence === 'number'
+          ? Math.max(0, Math.min(1, relationship.confidence))
+          : undefined;
+        const validFrom = boundedString(relationship.valid_from ?? relationship.validFrom, 40);
+        const validTo = boundedString(relationship.valid_to ?? relationship.validTo, 40);
+        if (!subject || !predicate || !object || !evidenceExcerpt || evidenceExcerpt.length < 3) return null;
+        return {
+          subject, predicate, object, evidence_excerpt: evidenceExcerpt,
+          ...(confidence !== undefined ? { confidence } : {}),
+          ...(validFrom ? { valid_from: validFrom } : {}),
+          ...(validTo ? { valid_to: validTo } : {}),
+        };
       })
       .filter((relationship): relationship is z.infer<typeof ExtractedRelationshipSchema> => relationship !== null)
       .slice(0, 8);
@@ -540,25 +604,127 @@ export function _testOnly_sanitizeRecursivePatternOutput(
   return sanitizeRecursivePatternOutput(value);
 }
 
-/**
- * Per-process de-dup so the same (session_id, call_id) doesn't get
- * reflected twice if the daemon's hook fires the path twice (e.g.
- * SDK retry on a tool that was marked successful then re-emitted).
- * Bounded to avoid unbounded growth on long-running daemons.
- */
-const RECENT_REFLECTED = new Set<string>();
-const RECENT_REFLECTED_MAX = 2000;
-function markReflected(key: string): void {
-  RECENT_REFLECTED.add(key);
-  if (RECENT_REFLECTED.size > RECENT_REFLECTED_MAX) {
-    // Drop the oldest ~25% in arrival order
-    const iter = RECENT_REFLECTED.values();
-    for (let i = 0; i < RECENT_REFLECTED_MAX / 4; i++) {
-      const next = iter.next();
-      if (next.done) break;
-      RECENT_REFLECTED.delete(next.value);
+/** Durable tool-reflection replay protection. A process-local Set cannot tell a
+ * legitimate retry from a replay after daemon restart. The receipt ledger uses
+ * a short processing lease: completed/buffered identical inputs are exactly
+ * once, active duplicates coalesce, and failed/crashed work remains retryable. */
+type ReflectionReceiptStatus = 'processing' | 'buffered' | 'completed' | 'failed';
+const REFLECTION_PROCESSING_LEASE_MS = 10 * 60 * 1000;
+
+function reflectionInputHash(input: ReflectionInput): string {
+  return createHash('sha256')
+    .update(input.tool ?? '')
+    .update('\0')
+    .update(input.output)
+    .digest('hex');
+}
+
+function claimReflectionReceipt(input: ReflectionInput): { claimed: boolean; inputHash: string } {
+  const db = openMemoryDb();
+  const inputHash = reflectionInputHash(input);
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const row = db.prepare(`
+      SELECT input_hash, status, last_attempt_at
+      FROM memory_reflection_receipts
+      WHERE session_id = ? AND call_id = ?
+    `).get(input.sessionId, input.callId) as {
+      input_hash: string; status: ReflectionReceiptStatus; last_attempt_at: string;
+    } | undefined;
+    if (row?.input_hash === inputHash) {
+      if (row.status === 'completed' || row.status === 'buffered') return { claimed: false, inputHash };
+      const attemptedAt = Date.parse(row.last_attempt_at);
+      if (row.status === 'processing' && Number.isFinite(attemptedAt) && Date.now() - attemptedAt < REFLECTION_PROCESSING_LEASE_MS) {
+        return { claimed: false, inputHash };
+      }
     }
-  }
+    if (!row) {
+      db.prepare(`
+        INSERT INTO memory_reflection_receipts
+          (session_id, call_id, input_hash, status, attempts, first_seen_at, last_attempt_at)
+        VALUES (?, ?, ?, 'processing', 1, ?, ?)
+      `).run(input.sessionId, input.callId, inputHash, now, now);
+    } else {
+      db.prepare(`
+        UPDATE memory_reflection_receipts
+        SET input_hash = ?, status = 'processing', attempts = attempts + 1,
+            last_attempt_at = ?, completed_at = NULL, result_json = NULL, last_error = NULL
+        WHERE session_id = ? AND call_id = ?
+      `).run(inputHash, now, input.sessionId, input.callId);
+    }
+    return { claimed: true, inputHash };
+  })();
+}
+
+function settleReflectionReceipt(
+  input: ReflectionInput,
+  inputHash: string,
+  status: Exclude<ReflectionReceiptStatus, 'processing'>,
+  result?: unknown,
+  error?: string,
+): void {
+  const now = new Date().toISOString();
+  openMemoryDb().prepare(`
+    UPDATE memory_reflection_receipts
+    SET status = ?, completed_at = ?, result_json = ?, last_error = ?
+    WHERE session_id = ? AND call_id = ? AND input_hash = ?
+  `).run(
+    status,
+    status === 'failed' ? null : now,
+    result === undefined ? null : JSON.stringify(result),
+    error?.slice(0, 1_000) ?? null,
+    input.sessionId,
+    input.callId,
+    inputHash,
+  );
+}
+
+function settleBufferedReceiptAfterCommit(input: ReflectionInput, result: unknown): void {
+  const now = new Date().toISOString();
+  openMemoryDb().prepare(`
+    UPDATE memory_reflection_receipts
+    SET status = 'completed', completed_at = ?, result_json = ?, last_error = NULL
+    WHERE session_id = ? AND call_id = ? AND status = 'buffered'
+  `).run(now, JSON.stringify(result), input.sessionId, input.callId);
+}
+
+export interface ReflectionReplayHealth {
+  total: number;
+  processing: number;
+  buffered: number;
+  completed: number;
+  failed: number;
+  retried: number;
+  staleProcessing: number;
+}
+
+export function readReflectionReplayHealth(now = new Date().toISOString()): ReflectionReplayHealth {
+  const db = openMemoryDb();
+  const rows = db.prepare(`
+    SELECT status, COUNT(*) AS count FROM memory_reflection_receipts GROUP BY status
+  `).all() as Array<{ status: ReflectionReceiptStatus; count: number }>;
+  const byStatus = new Map(rows.map((row) => [row.status, row.count]));
+  const retried = (db.prepare(`
+    SELECT COUNT(*) AS count FROM memory_reflection_receipts WHERE attempts > 1
+  `).get() as { count: number }).count;
+  const cutoff = new Date(Date.parse(now) - REFLECTION_PROCESSING_LEASE_MS).toISOString();
+  const staleProcessing = (db.prepare(`
+    SELECT COUNT(*) AS count FROM memory_reflection_receipts
+    WHERE status = 'processing' AND last_attempt_at <= ?
+  `).get(cutoff) as { count: number }).count;
+  const processing = byStatus.get('processing') ?? 0;
+  const buffered = byStatus.get('buffered') ?? 0;
+  const completed = byStatus.get('completed') ?? 0;
+  const failed = byStatus.get('failed') ?? 0;
+  return {
+    total: processing + buffered + completed + failed,
+    processing,
+    buffered,
+    completed,
+    failed,
+    retried,
+    staleProcessing,
+  };
 }
 
 async function runExtractor(serialized: string): Promise<Extraction | null> {
@@ -657,7 +823,12 @@ export function _testOnly_sanitizeConflictDecision(value: unknown): ConflictDeci
 }
 
 export async function resolveConflict(
-  candidate: { kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint'; text: string; trustLevel?: number },
+  candidate: {
+    kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint';
+    text: string;
+    trustLevel?: number;
+    authority?: ConsolidateCandidate['authority'];
+  },
   similar: ConsolidatedFact[],
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
@@ -671,8 +842,15 @@ export async function resolveConflict(
     });
     const runner = new Runner({ workflowName: 'clementine-conflict-resolver' });
     const candTrust = typeof candidate.trustLevel === 'number' ? candidate.trustLevel.toFixed(2) : '?';
-    const candAuthoritative = typeof candidate.trustLevel === 'number' && candidate.trustLevel >= AUTHORITATIVE_TRUST
-      ? ' [AUTHORITATIVE system-of-record]' : '';
+    const candAuthoritative = candidate.authority === 'user'
+      ? ' [AUTHORITATIVE user statement]'
+      : candidate.authority === 'derived'
+        ? ' [DERIVED tool observation]'
+        : candidate.authority === 'import'
+          ? ' [IMPORTED claim]'
+          : typeof candidate.trustLevel === 'number' && candidate.trustLevel >= AUTHORITATIVE_TRUST
+            ? ' [HIGH-TRUST source]'
+            : '';
     const prompt = [
       `Candidate fact (kind=${candidate.kind}, trust=${candTrust})${candAuthoritative}: "${candidate.text}"`,
       '',
@@ -702,12 +880,23 @@ export interface ConsolidateCandidate {
    *  derived facts leave this undefined → rememberFact defaults to 0.6.
    *  Systems of record pass ~0.9 (connectors-as-authoritative-writers). */
   trustLevel?: number;
+  /** Who is allowed to revise protected standing memory. Trust expresses claim
+   * quality; authority expresses write permission. Only an explicit user
+   * statement may supersede a pinned memory automatically. */
+  authority?: 'user' | 'derived' | 'import' | 'manual';
   /** v9 — friendly app name when the candidate came from a system of
    *  record (set by classifySource in the reflection loop). */
   sourceApp?: string;
   /** Durable locator/time for imports and other non-tool episodes. */
   sourceUri?: string;
   occurredAt?: string;
+  /** An exact source episode persisted before this asynchronous write. */
+  evidence?: RememberInput['evidence'];
+  /** Higher-order reflection provenance. These fields keep the canonical fact
+   * linked to the source claims it synthesizes, in addition to episode-level
+   * evidence for the exact excerpts. */
+  derivationDepth?: number;
+  derivedFromFactIds?: number[];
   /** Pin the resulting fact (always-injected, decay-exempt). Set by the
    *  auto-capture prohibition path so a safety-critical "never …" rule can
    *  never be scoped out of context at action time. Pinned INSIDE
@@ -855,6 +1044,9 @@ async function consolidateFactInner(
       sourceApp: candidate.sourceApp,
       sourceUri: candidate.sourceUri,
       occurredAt: candidate.occurredAt,
+      derivationDepth: candidate.derivationDepth,
+      derivedFromFactIds: candidate.derivedFromFactIds,
+      evidence: candidate.evidence,
     });
     maybePin(reinforced.id);
     out.action = 'reinforce';
@@ -902,6 +1094,9 @@ async function consolidateFactInner(
       sourceApp: candidate.sourceApp,
       sourceUri: candidate.sourceUri,
       occurredAt: candidate.occurredAt,
+      derivationDepth: candidate.derivationDepth,
+      derivedFromFactIds: candidate.derivedFromFactIds,
+      evidence: candidate.evidence,
     });
     if (updated) {
       out.action = 'supersede';
@@ -934,6 +1129,9 @@ async function consolidateFactInner(
       sourceApp: candidate.sourceApp,
       sourceUri: candidate.sourceUri,
       occurredAt: candidate.occurredAt,
+      derivationDepth: candidate.derivationDepth,
+      derivedFromFactIds: candidate.derivedFromFactIds,
+      evidence: candidate.evidence,
     });
     maybePin(added.id);
     out.action = 'add';
@@ -944,25 +1142,68 @@ async function consolidateFactInner(
   }
 
   const decision = await (opts.resolver ?? resolveConflict)(
-    { kind: candidate.kind, text: candidate.text, trustLevel: candidate.trustLevel },
+    {
+      kind: candidate.kind,
+      text: candidate.text,
+      trustLevel: candidate.trustLevel,
+      authority: candidate.authority,
+    },
     similar,
   );
 
   if (decision.decision === 'NOOP') {
     out.action = 'ignore';
     out.factId = typeof decision.target_id === 'number' ? decision.target_id : undefined;
+    // Semantic duplicate does not mean duplicate evidence. Preserve the new
+    // episode on the existing canonical row and lift its trust/importance
+    // metadata without minting another fact. Otherwise two different meetings
+    // can corroborate the same person/project claim, yet only the first source
+    // survives—a provenance loss disguised as successful deduplication.
+    if (out.factId) {
+      const target = getFact(out.factId);
+      if (target) {
+        updateFact(target.id, {
+          trustLevel: candidate.trustLevel,
+          importance: candidate.importance,
+          sessionId: ctx.sessionId,
+          sourceApp: candidate.sourceApp,
+        });
+        if (candidate.evidence?.episodeId && candidate.evidence.excerpt.trim()) {
+          linkFactEvidence({
+            factId: target.id,
+            episodeId: candidate.evidence.episodeId,
+            excerpt: candidate.evidence.excerpt,
+            sourceUri: candidate.evidence.sourceUri ?? candidate.sourceUri ?? null,
+          });
+        } else {
+          captureFactEvidence({
+            factId: target.id,
+            factContent: target.content,
+            sourceApp: candidate.sourceApp ?? null,
+            sourcePath: candidate.sourceUri ?? null,
+            sessionId: ctx.derivedFrom?.sessionId ?? ctx.sessionId ?? null,
+            callId: ctx.derivedFrom?.callId ?? null,
+            tool: ctx.derivedFrom?.tool ?? null,
+            occurredAt: candidate.occurredAt,
+          });
+        }
+      }
+    }
     out.noop = 1;
     return out;
   }
 
-  // Pinned facts are the always-rendered standing instructions — losing one
-  // silently removes live protection. A resolver decision is LLM output and
-  // must NEVER delete or rewrite a pinned fact; downgrade DELETE/UPDATE on a
-  // pinned target to the conservative ADD below (the candidate still lands).
+  // Pinned facts are the always-rendered standing instructions. Derived,
+  // imported, and authority-unknown candidates may never rewrite them. An
+  // explicit user statement is the one safe exception: corrections must be
+  // able to replace stale preferences/constraints, with supersedeFact keeping
+  // the original claim and validity interval for historical recall.
+  const userAuthorizedCorrection = candidate.authority === 'user';
   const pinnedTargetId =
     (decision.decision === 'DELETE' || decision.decision === 'UPDATE') &&
     typeof decision.target_id === 'number' &&
-    getFact(decision.target_id)?.pinned
+    getFact(decision.target_id)?.pinned &&
+    !userAuthorizedCorrection
       ? decision.target_id
       : null;
   if (pinnedTargetId !== null) {
@@ -979,6 +1220,9 @@ async function consolidateFactInner(
       sourceApp: candidate.sourceApp,
       sourceUri: candidate.sourceUri,
       occurredAt: candidate.occurredAt,
+      derivationDepth: candidate.derivationDepth,
+      derivedFromFactIds: candidate.derivedFromFactIds,
+      evidence: candidate.evidence,
     });
     if (replacement) {
       maybePin(replacement.id);
@@ -1008,6 +1252,9 @@ async function consolidateFactInner(
       sourceApp: candidate.sourceApp,
       sourceUri: candidate.sourceUri,
       occurredAt: candidate.occurredAt,
+      derivationDepth: candidate.derivationDepth,
+      derivedFromFactIds: candidate.derivedFromFactIds,
+      evidence: candidate.evidence,
     });
     if (updated) {
       out.action = 'supersede';
@@ -1033,6 +1280,9 @@ async function consolidateFactInner(
     sourceApp: candidate.sourceApp,
     sourceUri: candidate.sourceUri,
     occurredAt: candidate.occurredAt,
+    derivationDepth: candidate.derivationDepth,
+    derivedFromFactIds: candidate.derivedFromFactIds,
+    evidence: candidate.evidence,
   };
   const added = rememberFact(rememberInput);
   maybePin(added.id);
@@ -1041,57 +1291,6 @@ async function consolidateFactInner(
   out.written = 1;
   out.importanceAdded += candidate.importance ?? 0;
   return out;
-}
-
-/**
- * Upsert an entity row. canonical_name_lc is the dedupe key per
- * (entity_type, name). Aliases merge with existing aliases (set-union).
- * Returns the row id.
- */
-export function upsertEntity(input: {
-  type: EntityType;
-  name: string;
-  aliases?: string[];
-}): number {
-  const db = openMemoryDb();
-  const name = input.name.trim();
-  if (!name) throw new Error('upsertEntity: name required');
-  const nameLc = name.toLowerCase();
-  const now = new Date().toISOString();
-  const newAliases = (input.aliases ?? []).map((a) => a.trim()).filter((a) => a && a.toLowerCase() !== nameLc);
-
-  const existing = db.prepare(
-    'SELECT * FROM entities WHERE entity_type = ? AND canonical_name_lc = ?',
-  ).get(input.type, nameLc) as EntityRow | undefined;
-
-  if (existing) {
-    // Merge aliases (set-union, case-insensitive)
-    let merged: string[] = [];
-    try {
-      const current = JSON.parse(existing.aliases_json) as unknown;
-      if (Array.isArray(current)) merged = current.filter((a) => typeof a === 'string');
-    } catch { /* ignore */ }
-    const seen = new Set(merged.map((a) => a.toLowerCase()));
-    for (const alias of newAliases) {
-      if (!seen.has(alias.toLowerCase())) {
-        merged.push(alias);
-        seen.add(alias.toLowerCase());
-      }
-    }
-    db.prepare(`
-      UPDATE entities
-      SET aliases_json = ?, last_seen_at = ?, mention_count = mention_count + 1
-      WHERE id = ?
-    `).run(JSON.stringify(merged), now, existing.id);
-    return existing.id;
-  }
-
-  const info = db.prepare(`
-    INSERT INTO entities
-      (entity_type, canonical_name, canonical_name_lc, aliases_json, first_seen_at, last_seen_at, mention_count)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
-  `).run(input.type, name, nameLc, JSON.stringify(newAliases), now, now);
-  return Number(info.lastInsertRowid);
 }
 
 export function storeEpisodicPointer(input: {
@@ -1103,6 +1302,21 @@ export function storeEpisodicPointer(input: {
 }): number {
   const db = openMemoryDb();
   const now = new Date().toISOString();
+  const label = input.label.trim();
+  const existing = db.prepare(`
+    SELECT id FROM episodic_pointers
+    WHERE session_id = ? AND call_id = ? AND label = ?
+      AND COALESCE(tool, '') = COALESCE(?, '')
+      AND COALESCE(source_uri, '') = COALESCE(?, '')
+    ORDER BY id ASC LIMIT 1
+  `).get(
+    input.sessionId,
+    input.callId,
+    label,
+    input.tool,
+    input.sourceUri ?? null,
+  ) as { id: number } | undefined;
+  if (existing) return existing.id;
   const info = db.prepare(`
     INSERT INTO episodic_pointers
       (session_id, call_id, label, tool, source_uri, created_at)
@@ -1110,7 +1324,7 @@ export function storeEpisodicPointer(input: {
   `).run(
     input.sessionId,
     input.callId,
-    input.label.trim(),
+    label,
     input.tool,
     input.sourceUri ?? null,
     now,
@@ -1136,42 +1350,55 @@ function storePendingReflectionBatch(input: ReflectionInput, extraction: Extract
   const db = openMemoryDb();
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.parse(now) + 7 * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`
-    INSERT OR REPLACE INTO reflection_pending_extractions
-      (session_id, call_id, tool, extraction_json, importance, created_at, expires_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-  `).run(
-    input.sessionId,
-    input.callId,
-    input.tool ?? null,
-    JSON.stringify(extraction),
-    importance,
-    now,
-    expiresAt,
-  );
-  try {
-    recordMemoryEpisode({
-      kind: 'tool_result',
-      sourceApp: input.tool ?? null,
-      sessionId: input.sessionId,
-      callId: input.callId,
-      sourceUri: `tool://${input.sessionId}/${input.callId}`,
-      occurredAt: now,
-      content: input.output.slice(0, 2_000),
-      rawRetainedUntil: new Date(Date.parse(now) + 14 * 24 * 60 * 60 * 1000).toISOString(),
-      status: 'pending',
-    });
-  } catch { /* pending extraction remains durable even if episode write fails */ }
-  db.prepare(`
-    DELETE FROM reflection_pending_extractions
-    WHERE session_id = ?
-      AND id NOT IN (
-        SELECT id FROM reflection_pending_extractions
-        WHERE session_id = ?
-        ORDER BY created_at DESC, id DESC
-        LIMIT ?
-      )
-  `).run(input.sessionId, input.sessionId, PENDING_REFLECTION_MAX_PER_SESSION);
+  const tx = db.transaction(() => {
+    db.prepare(`
+      INSERT OR REPLACE INTO reflection_pending_extractions
+        (session_id, call_id, tool, extraction_json, importance, created_at, expires_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+    `).run(
+      input.sessionId,
+      input.callId,
+      input.tool ?? null,
+      JSON.stringify(extraction),
+      importance,
+      now,
+      expiresAt,
+    );
+    recordReflectionEpisode(input, extraction, 'pending');
+
+    const overflow = db.prepare(`
+      SELECT id, session_id, call_id
+      FROM reflection_pending_extractions
+      WHERE session_id = ? AND status = 'pending'
+      ORDER BY created_at DESC, id DESC
+      LIMIT -1 OFFSET ?
+    `).all(input.sessionId, PENDING_REFLECTION_MAX_PER_SESSION) as Array<{
+      id: number; session_id: string; call_id: string;
+    }>;
+    for (const row of overflow) {
+      db.prepare(`
+        UPDATE memory_reflection_candidates
+        SET status = 'expired', reason = 'threshold_buffer_capacity', resolved_at = ?
+        WHERE session_id = ? AND call_id = ? AND status = 'pending'
+      `).run(now, row.session_id, row.call_id);
+      db.prepare(`
+        UPDATE memory_episodes SET status = 'expired'
+        WHERE session_id = ? AND call_id = ? AND status = 'pending'
+      `).run(row.session_id, row.call_id);
+      db.prepare(`
+        UPDATE memory_reflection_receipts
+        SET status = 'completed', completed_at = ?, result_json = ?, last_error = NULL
+        WHERE session_id = ? AND call_id = ? AND status = 'buffered'
+      `).run(
+        now,
+        JSON.stringify({ lifecycle: 'expired', reason: 'threshold_buffer_capacity' }),
+        row.session_id,
+        row.call_id,
+      );
+      db.prepare('DELETE FROM reflection_pending_extractions WHERE id = ?').run(row.id);
+    }
+  });
+  tx();
 }
 
 function sumPendingReflectionImportance(sessionId: string): number {
@@ -1179,8 +1406,9 @@ function sumPendingReflectionImportance(sessionId: string): number {
   const row = db.prepare(`
     SELECT COALESCE(SUM(importance), 0) AS sum
     FROM reflection_pending_extractions
-    WHERE session_id = ?
-  `).get(sessionId) as { sum: number | null } | undefined;
+    WHERE session_id = ? AND status = 'pending'
+      AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
+  `).get(sessionId, new Date().toISOString()) as { sum: number | null } | undefined;
   const sum = Number(row?.sum ?? 0);
   updateSessionImportanceSnapshot(sessionId, sum);
   return sum;
@@ -1191,9 +1419,10 @@ function listPendingReflectionBatches(sessionId: string): PendingReflectionBatch
   const rows = db.prepare(`
     SELECT session_id, call_id, tool, extraction_json, importance
     FROM reflection_pending_extractions
-    WHERE session_id = ?
+    WHERE session_id = ? AND status = 'pending'
+      AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
     ORDER BY created_at ASC, id ASC
-  `).all(sessionId) as Array<{
+  `).all(sessionId, new Date().toISOString()) as Array<{
     session_id: string;
     call_id: string;
     tool: string | null;
@@ -1237,7 +1466,7 @@ function clearPendingReflectionBatches(sessionId: string): void {
             AND rpe.call_id = memory_episodes.call_id
         )
     `).run(sessionId);
-    db.prepare('DELETE FROM reflection_pending_extractions WHERE session_id = ?').run(sessionId);
+    db.prepare("DELETE FROM reflection_pending_extractions WHERE session_id = ? AND status = 'pending'").run(sessionId);
   });
   tx();
   updateSessionImportanceSnapshot(sessionId, 0);
@@ -1320,16 +1549,14 @@ function mergeCommitStats(into: ReflectionCommitStats, next: ReflectionCommitSta
 async function commitExtractionMemory(input: ReflectionInput, extraction: Extraction): Promise<ReflectionCommitStats> {
   const stats = emptyCommitStats();
   let evidenceEpisodeId: string | undefined;
+  let evidenceSourceText = input.output;
   try {
-    evidenceEpisodeId = recordMemoryEpisode({
-      kind: 'tool_result',
-      sourceApp: input.tool ?? null,
-      sessionId: input.sessionId,
-      callId: input.callId,
-      sourceUri: `tool://${input.sessionId}/${input.callId}`,
-      content: input.output.slice(0, 2_000),
-      status: input.output ? 'available' : 'partial',
-    }).id;
+    evidenceEpisodeId = recordReflectionEpisode(input, extraction, input.output ? 'available' : 'partial');
+    if (!evidenceSourceText) {
+      const episode = openMemoryDb().prepare('SELECT evidence_excerpt FROM memory_episodes WHERE id = ?')
+        .get(evidenceEpisodeId) as { evidence_excerpt: string | null } | undefined;
+      evidenceSourceText = episode?.evidence_excerpt ?? '';
+    }
   } catch { /* fact-level evidence capture still retries independently */ }
 
   // Connectors-as-authoritative-writers (Thread 1): classify the producing
@@ -1339,6 +1566,7 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
   // -> null -> unchanged default trust.
   const source = isSourceTrustEnabled() ? classifySource(input.tool) : null;
 
+  const committedFacts: Array<{ fact: Extraction['facts'][number]; factId: number }> = [];
   for (const fact of extraction.facts ?? []) {
     try {
       // Mem0-style conflict resolution (Chhikara et al §2.1) via the
@@ -1352,6 +1580,7 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
           importance: fact.importance,
           trustLevel: source?.trust,
           sourceApp: source?.app,
+          authority: 'derived',
         },
         {
           sessionId: input.sessionId,
@@ -1367,7 +1596,41 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
       stats.factsDeleted += outcome.deleted;
       stats.factsNoop += outcome.noop;
       stats.sumImportance += outcome.importanceAdded;
+      if (outcome.factId) committedFacts.push({ fact, factId: outcome.factId });
+      if (outcome.factId && evidenceEpisodeId && evidenceSourceText) {
+        try {
+          const excerpt = selectSupportingExcerpt(evidenceSourceText, fact.text, 1_500);
+          if (excerpt) linkFactEvidence({
+            factId: outcome.factId,
+            episodeId: evidenceEpisodeId,
+            excerpt,
+            sourceUri: `tool://${input.sessionId}/${input.callId}`,
+          });
+          if (excerpt) attachGroundedFactResources({
+            factId: outcome.factId,
+            evidenceEpisodeId,
+            confidence: source?.trust ?? 0.7,
+          });
+        } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err), factId: outcome.factId }, 'reflection: attach consolidation evidence or resource link failed');
+        }
+      }
+      resolveReflectionCandidate({
+        sessionId: input.sessionId,
+        callId: input.callId,
+        text: fact.text,
+        status: 'promoted',
+        reason: `consolidation:${outcome.action}`,
+        resultingFactId: outcome.factId ?? null,
+      });
     } catch (err) {
+      resolveReflectionCandidate({
+        sessionId: input.sessionId,
+        callId: input.callId,
+        text: fact.text,
+        status: 'rejected',
+        reason: `commit_error:${err instanceof Error ? err.name : 'unknown'}`,
+      });
       logger.warn({ err: err instanceof Error ? err.message : String(err), fact }, 'reflection: consolidateFact failed');
     }
   }
@@ -1376,12 +1639,50 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
   const entityIdByName = new Map<string, number>();
   for (const entity of extraction.entities ?? []) {
     try {
-      const id = upsertEntity({ type: entity.type, name: entity.name, aliases: entity.aliases });
+      const id = upsertEntity({
+        type: entity.type,
+        name: entity.name,
+        aliases: entity.aliases,
+        confidence: source?.trust ?? 0.7,
+        evidenceEpisodeId,
+        sourceUri: `tool://${input.sessionId}/${input.callId}`,
+        sourceKind: 'entity_upsert',
+      });
       entityIdByName.set(entity.name.trim().toLowerCase(), id);
       for (const a of entity.aliases ?? []) entityIdByName.set(String(a).trim().toLowerCase(), id);
       stats.entitiesUpserted += 1;
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : String(err), entity }, 'reflection: upsertEntity failed');
+    }
+  }
+
+  // Ground fact→entity links at the same consolidation boundary. The entity
+  // must be named in both the durable fact and an exact excerpt copied from
+  // its source episode; a registry name match by itself remains only an
+  // inferred overlay.
+  if (evidenceEpisodeId && evidenceSourceText) {
+    for (const committed of committedFacts) {
+      try {
+        const excerpt = selectSupportingExcerpt(evidenceSourceText, committed.fact.text, 1_500);
+        if (!excerpt) continue;
+        const entityIds = new Set<number>();
+        for (const entity of extraction.entities ?? []) {
+          const names = [entity.name, ...(entity.aliases ?? [])].map((name) => name.trim()).filter(Boolean);
+          const mentionedInFact = names.some((name) => compileWordMatcher(name)?.test(committed.fact.text.toLowerCase()));
+          const mentionedInEvidence = names.some((name) => compileWordMatcher(name)?.test(excerpt.toLowerCase()));
+          if (!mentionedInFact || !mentionedInEvidence) continue;
+          const entityId = entityIdByName.get(entity.name.trim().toLowerCase());
+          if (entityId) entityIds.add(entityId);
+        }
+        if (entityIds.size > 0) setFactEntityLinks(committed.factId, Array.from(entityIds), {
+          linkType: 'extracted',
+          confidence: source?.trust ?? 0.7,
+          evidenceEpisodeId,
+          evidenceExcerpt: excerpt,
+        });
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err), factId: committed.factId }, 'reflection: grounded fact entity link failed');
+      }
     }
   }
 
@@ -1393,15 +1694,21 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
       try {
         const subjectId = entityIdByName.get(rel.subject.trim().toLowerCase());
         const objectId = entityIdByName.get(rel.object.trim().toLowerCase());
-        if (subjectId && objectId) recordEntityEdge({
+        if (subjectId && objectId && evidenceEpisodeId) recordGroundedEntityRelationship({
           subjectId,
           predicate: rel.predicate,
           objectId,
-          confidence: source?.trust ?? 0.7,
           evidenceEpisodeId,
+          evidenceExcerpt: rel.evidence_excerpt,
+          sourceText: input.output,
+          sourceUri: `tool://${input.sessionId}/${input.callId}`,
+          confidence: rel.confidence ?? source?.trust ?? 0.7,
+          validFrom: rel.valid_from,
+          validTo: rel.valid_to,
+          extractionMethod: 'reflection',
         });
       } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : String(err), rel }, 'reflection: recordEntityEdge failed');
+        logger.warn({ err: err instanceof Error ? err.message : String(err), rel }, 'reflection: grounded relationship write failed');
       }
     }
   }
@@ -1454,11 +1761,10 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   if (!input.output || input.output.length < REFLECTION_MIN_CONTENT_CHARS) {
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'too_short' });
   }
-  const dedupKey = `${input.sessionId}::${input.callId}`;
-  if (RECENT_REFLECTED.has(dedupKey)) {
+  const receipt = claimReflectionReceipt(input);
+  if (!receipt.claimed) {
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'already_reflected' });
   }
-  markReflected(dedupKey);
 
   // Cap input size to keep the extraction call cheap.
   const serialized = input.output.length > REFLECTION_MAX_INPUT_CHARS
@@ -1468,7 +1774,54 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   const extraction = await runExtractor(`Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`);
   if (!extraction) {
     const pointersStored = storeFallbackPointer(input, 'extractor_failed');
-    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored, skipped: 'extractor_failed' });
+    const result: ReflectionResult = { factsWritten: 0, entitiesUpserted: 0, pointersStored, skipped: 'extractor_failed' };
+    settleReflectionReceipt(input, receipt.inputHash, 'failed', result, 'extractor_failed');
+    return emitObservability(result);
+  }
+
+  // Turn the extractor's opaque batch into an auditable per-claim lifecycle.
+  // Exact duplicates within one extractor response share one candidate
+  // identity; unmistakable request/runtime noise is rejected before it can
+  // contribute to the threshold or enter canonical fact memory.
+  const acceptedFacts: Extraction['facts'] = [];
+  const candidateDecisions: Array<{
+    fact: Extraction['facts'][number]; status: 'pending' | 'rejected'; reason: string | null;
+  }> = [];
+  const candidateHashes = new Set<string>();
+  for (const fact of extraction.facts ?? []) {
+    const hash = reflectionCandidateHash(fact.text);
+    if (candidateHashes.has(hash)) continue;
+    candidateHashes.add(hash);
+    const rejectionReason = derivedFactRejectionReason(fact.text);
+    if (rejectionReason) {
+      candidateDecisions.push({ fact, status: 'rejected', reason: rejectionReason });
+    } else {
+      acceptedFacts.push(fact);
+      candidateDecisions.push({ fact, status: 'pending', reason: null });
+    }
+  }
+  extraction.facts = acceptedFacts;
+  const candidateEpisodeId = recordReflectionEpisode(
+    input,
+    extraction,
+    acceptedFacts.length > 0 ? 'pending' : 'available',
+  );
+  for (const decision of candidateDecisions) {
+    recordReflectionCandidate({
+      episodeId: candidateEpisodeId,
+      sessionId: input.sessionId,
+      callId: input.callId,
+      kind: decision.fact.kind,
+      text: decision.fact.text,
+      importance: decision.fact.importance,
+      status: decision.status,
+      reason: decision.reason,
+      sourceType: 'tool_reflection',
+      intakeReason: 'durable claim extracted from a tool result',
+      trustLevel: 0.6,
+      authority: 'derived',
+      sourceUri: `tool://${input.sessionId}/${input.callId}`,
+    });
   }
 
   // Source-map / landscape memory — mint resource pointers BEFORE the
@@ -1525,13 +1878,15 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     storePendingReflectionBatch(input, extraction, extractionImportance);
     pendingImportance = sumPendingReflectionImportance(input.sessionId);
     if (pendingImportance < threshold) {
-      return emitObservability({
+      const result: ReflectionResult = {
         factsWritten: 0,
         entitiesUpserted: 0,
         pointersStored,
         sumImportance: pendingImportance,
         skipped: 'low_importance',
-      });
+      };
+      settleReflectionReceipt(input, receipt.inputHash, 'buffered', result);
+      return emitObservability(result);
     }
     batchesToCommit = listPendingReflectionBatches(input.sessionId);
     if (batchesToCommit.length === 0) batchesToCommit = [{ input, extraction, importance: extractionImportance }];
@@ -1543,9 +1898,16 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     const stats = await commitExtractionMemory(batch.input, batch.extraction);
     mergeCommitStats(totals, stats);
   }
-  if (clearPendingAfterCommit) clearPendingReflectionBatches(input.sessionId);
+  if (clearPendingAfterCommit) {
+    for (const batch of batchesToCommit) {
+      if (batch.input.callId !== input.callId) {
+        settleBufferedReceiptAfterCommit(batch.input, { committedByCallId: input.callId });
+      }
+    }
+    clearPendingReflectionBatches(input.sessionId);
+  }
 
-  return emitObservability({
+  const result: ReflectionResult = {
     factsWritten: totals.factsWritten,
     factsUpdated: totals.factsUpdated,
     factsDeleted: totals.factsDeleted,
@@ -1553,7 +1915,9 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     entitiesUpserted: totals.entitiesUpserted,
     pointersStored,
     sumImportance: clearPendingAfterCommit ? pendingImportance : totals.sumImportance,
-  });
+  };
+  settleReflectionReceipt(input, receipt.inputHash, 'completed', result);
+  return emitObservability(result);
 }
 
 /**
@@ -1791,64 +2155,86 @@ export async function runRecursiveReflection(
     // signal genuinely got rolled up.
     let groupRolledUp = false;
 
-    for (const pattern of extraction.patterns) {
+    for (const [patternIndex, pattern] of extraction.patterns.entries()) {
+      const sessionId = 'cron:recursive-reflection';
+      const callId = `recursive:${startedAt}:${kind}:${patternIndex}:${reflectionCandidateHash(pattern.text).slice(0, 12)}`;
       try {
-        const similar = await findSimilarFacts(pattern.text, { kind, topK: 5 });
-        const decision = await resolveConflict({ kind, text: pattern.text }, similar);
-
-        if (decision.decision === 'NOOP') {
+        const sourceUri = `memory://recursive-reflection/${kind}/${callId}`;
+        const episode = recordMemoryEpisode({
+          kind: 'reflection',
+          sourceApp: 'Clementine recursive reflection',
+          sessionId,
+          callId,
+          sourceUri,
+          title: `${kind} higher-order pattern sources`,
+          // This is an exact bounded projection of canonical source claims,
+          // not the generated pattern. It survives source-fact decay and lets
+          // the synthesis explain precisely what it was inferred from.
+          content: rows.map((row) => `[fact:${row.id}] ${row.content}`).join('\n'),
+          metadata: { sourceFactIds: sourceIds, derivationDepth: targetDepth },
+        });
+        const rejectionReason = derivedFactRejectionReason(pattern.text);
+        recordReflectionCandidate({
+          episodeId: episode.id,
+          sessionId,
+          callId,
+          kind,
+          text: pattern.text,
+          importance: pattern.importance,
+          sourceType: 'recursive_reflection',
+          intakeReason: 'higher-order pattern synthesized from canonical facts',
+          trustLevel: 0.5,
+          authority: 'derived',
+          sourceUri,
+          ...(rejectionReason ? { status: 'rejected' as const, reason: rejectionReason } : {}),
+        });
+        if (rejectionReason) {
           result.patternsNoop += 1;
           continue;
         }
-        // Same pinned guard as consolidateFact: this path runs NIGHTLY and
-        // unattended, on depth-2 inferences (trust 0.5) — the LAST place an
-        // LLM decision may delete/rewrite a pinned standing instruction.
-        const pinnedTarget =
-          (decision.decision === 'DELETE' || decision.decision === 'UPDATE') &&
-          typeof decision.target_id === 'number' &&
-          getFact(decision.target_id)?.pinned
-            ? decision.target_id
-            : null;
-        if (pinnedTarget !== null) {
-          console.warn(`[reflection] recursive resolver ${decision.decision} blocked: fact ${pinnedTarget} is pinned — adding pattern instead`);
-        }
-        if (pinnedTarget === null && decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
-          deleteFact(decision.target_id);
-        }
-        if (pinnedTarget === null && decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
-          const rewrite =
-            decision.rewrite && decision.rewrite.length <= CONFLICT_REWRITE_MAX_CHARS
-              ? decision.rewrite
-              : pattern.text;
-          const updated = supersedeFact(decision.target_id, {
-            content: rewrite,
-            // Recursive patterns are inferences over inferences — keep
-            // trust strictly below direct-derived (0.6) so user-stated
-            // facts always win on conflict.
-            trustLevel: 0.5,
-            importance: pattern.importance,
-            derivationDepth: targetDepth,
-            derivedFromFactIds: sourceIds,
-          });
-          if (updated) {
-            result.patternsUpdated += 1;
-            groupRolledUp = true;
-            continue;
-          }
-        }
-        const remembered = rememberFact({
+
+        const outcome = await consolidateFact({
           kind,
-          content: pattern.text,
+          text: pattern.text,
           importance: pattern.importance,
+          // Recursive patterns are inferences over inferences — keep trust
+          // strictly below direct-derived (0.6), and never grant user authority.
           trustLevel: 0.5,
+          authority: 'derived',
+          sourceUri,
           derivationDepth: targetDepth,
           derivedFromFactIds: sourceIds,
+        }, {
+          sessionId,
+          derivedFrom: { sessionId, callId, tool: 'recursive_reflection' },
         });
-        if (remembered) {
+        resolveReflectionCandidate({
+          sessionId,
+          callId,
+          text: pattern.text,
+          status: 'promoted',
+          reason: `consolidation:${outcome.action}`,
+          resultingFactId: outcome.factId,
+        });
+        if (outcome.action === 'add') {
           result.patternsWritten += 1;
           groupRolledUp = true;
+        } else if (outcome.action === 'supersede') {
+          result.patternsUpdated += 1;
+          groupRolledUp = true;
+        } else {
+          result.patternsNoop += 1;
         }
       } catch (err) {
+        try {
+          resolveReflectionCandidate({
+            sessionId,
+            callId,
+            text: pattern.text,
+            status: 'rejected',
+            reason: 'consolidation_error',
+          });
+        } catch { /* lifecycle audit is best-effort on a broken database */ }
         logger.warn({ err: err instanceof Error ? err.message : String(err), kind, pattern }, 'recursive-reflection: write failed');
       }
     }

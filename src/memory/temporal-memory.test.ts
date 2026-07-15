@@ -8,13 +8,14 @@ delete process.env.OPENAI_API_KEY;
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
-const { getFact, rememberFact, supersedeFact } = await import('./facts.js');
+const { getFact, getFactAt, getFactValidityIntervals, reactivateFact, rememberFact, supersedeFact } = await import('./facts.js');
 const {
   backfillTemporalEvidence,
   countUnreconciledFactEvidence,
   getFactEvidence,
   readTemporalEvidenceHealth,
   reconcileTemporalEvidence,
+  recordMemoryEpisode,
 } = await import('./temporal-memory.js');
 const { recallMemory } = await import('./recall-memory.js');
 const {
@@ -67,6 +68,35 @@ test('derived fact evidence survives raw tool-output expiry', () => {
   const episode = openMemoryDb().prepare('SELECT status FROM memory_episodes WHERE id = ?')
     .get(afterExpiry[0].episodeId) as { status: string };
   assert.equal(episode.status, 'available');
+});
+
+test('delayed promotion reuses a pending episode excerpt after raw output is gone', () => {
+  recordMemoryEpisode({
+    kind: 'tool_result',
+    sessionId: 'delayed-session',
+    callId: 'delayed-call',
+    sourceUri: 'tool://delayed-session/delayed-call',
+    occurredAt: '2026-07-01T10:00:00.000Z',
+    content: 'CRM record: Dana Smith is the billing contact for Acme.',
+    status: 'pending',
+  });
+  assert.equal(getToolOutput('delayed-session', 'delayed-call'), null);
+
+  const fact = rememberFact({
+    kind: 'reference',
+    content: 'Dana Smith is the billing contact for Acme.',
+    derivedFrom: { sessionId: 'delayed-session', callId: 'delayed-call', tool: 'crm_lookup' },
+  });
+  const evidence = getFactEvidence(fact.id);
+  assert.equal(evidence.length, 1);
+  assert.match(evidence[0].excerpt, /Dana Smith is the billing contact for Acme/);
+  assert.equal(evidence[0].status, 'available');
+  const episode = openMemoryDb().prepare(`
+    SELECT status, evidence_excerpt FROM memory_episodes
+    WHERE session_id = 'delayed-session' AND call_id = 'delayed-call'
+  `).get() as { status: string; evidence_excerpt: string | null };
+  assert.equal(episode.status, 'available');
+  assert.match(episode.evidence_excerpt ?? '', /Dana Smith/);
 });
 
 test('missing derived provenance is linked as unavailable without fabricating an excerpt', async () => {
@@ -186,4 +216,52 @@ test('supersession returns the current claim now and the old claim historically'
   });
   assert.equal(current.hits[0]?.ref.id, String(replacement?.id));
   assert.match(current.hits[0]?.text ?? '', /two million/);
+});
+
+test('repeatable validity preserves true → false → true without duplicate rows', async () => {
+  const dana = rememberFact({
+    kind: 'project',
+    content: 'Dana owns the Orchid launch.',
+    occurredAt: '2025-01-01T00:00:00.000Z',
+  });
+  const priya = supersedeFact(dana.id, {
+    content: 'Priya owns the Orchid launch.',
+    occurredAt: '2025-02-01T00:00:00.000Z',
+  });
+  assert.ok(priya);
+  const danaAgain = supersedeFact(priya!.id, {
+    content: 'Dana owns the Orchid launch.',
+    occurredAt: '2025-03-01T00:00:00.000Z',
+  });
+  assert.equal(danaAgain?.id, dana.id, 'exact recurring content reuses the canonical claim row');
+  assert.equal(getFact(dana.id)?.active, true);
+  assert.equal(getFact(dana.id)?.validFrom, '2025-03-01T00:00:00.000Z');
+  assert.equal(getFact(dana.id)?.validTo, null);
+  assert.equal(getFact(dana.id)?.supersededByFactId, null);
+  assert.deepEqual(
+    getFactValidityIntervals(dana.id).map((interval) => [interval.validFrom, interval.validTo]),
+    [
+      ['2025-03-01T00:00:00.000Z', null],
+      ['2025-01-01T00:00:00.000Z', '2025-02-01T00:00:00.000Z'],
+    ],
+  );
+  assert.equal(getFactAt(dana.id, '2025-02-15T00:00:00.000Z'), null, 'Dana claim is not valid during Priya period');
+
+  const january = await recallMemory('who owns the Orchid launch', { stores: ['fact'], asOf: '2025-01-15T00:00:00.000Z', graphDepth: 0 });
+  const february = await recallMemory('who owns the Orchid launch', { stores: ['fact'], asOf: '2025-02-15T00:00:00.000Z', graphDepth: 0 });
+  const march = await recallMemory('who owns the Orchid launch', { stores: ['fact'], asOf: '2025-03-15T00:00:00.000Z', graphDepth: 0 });
+  assert.match(january.hits[0]?.text ?? '', /Dana/);
+  assert.match(february.hits[0]?.text ?? '', /Priya/);
+  assert.match(march.hits[0]?.text ?? '', /Dana/);
+});
+
+test('manual restore opens a new validity interval and clears stale supersession fields', () => {
+  const old = rememberFact({ kind: 'user', content: 'Nathan prefers Tuesday reviews.', occurredAt: '2025-01-01T00:00:00.000Z' });
+  const replacement = supersedeFact(old.id, { content: 'Nathan prefers Wednesday reviews.', occurredAt: '2025-02-01T00:00:00.000Z' });
+  assert.ok(replacement);
+  assert.equal(reactivateFact(old.id), true);
+  const restored = getFact(old.id)!;
+  assert.equal(restored.validTo, null);
+  assert.equal(restored.supersededByFactId, null);
+  assert.equal(getFactValidityIntervals(old.id).length, 2);
 });

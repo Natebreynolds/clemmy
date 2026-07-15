@@ -33,6 +33,7 @@ import { deleteFact } from './facts.js';
 import type { ConsolidatedFactKind } from './db.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { consolidateFact } from './reflection.js';
+import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.memory.import' });
 
@@ -360,8 +361,26 @@ export async function ingestMemorySource(
     content: string,
     filePath: string,
     occurredAt: string,
+    sourceText: string,
     importance?: number | null,
   ): Promise<void> => {
+    // Imported claims are derived from a foreign file. Persist an excerpt
+    // copied from that file before consolidation so the durable evidence is
+    // the source passage—not the distiller's rewritten claim. One file can
+    // yield several bounded excerpt episodes; recordMemoryEpisode dedupes
+    // identical passages on re-import.
+    const excerpt = selectSupportingExcerpt(sourceText, content);
+    const episode = recordMemoryEpisode({
+      kind: 'import',
+      subtype: 'memory_import',
+      title: path.basename(filePath),
+      metadata: { batchId, sourceLabel },
+      sourceApp,
+      sourceUri: filePath,
+      occurredAt,
+      content: excerpt,
+      status: excerpt ? 'available' : 'missing',
+    });
     const outcome = await consolidateFact({
       kind,
       text: content.slice(0, FACT_MAX_CHARS),
@@ -369,7 +388,9 @@ export async function ingestMemorySource(
       occurredAt,
       sourceApp,
       trustLevel: 0.75, // imported, not user-stated in THIS conversation
+      authority: 'import',
       importance: typeof importance === 'number' ? Math.max(1, Math.min(10, importance)) : 4,
+      evidence: excerpt ? { episodeId: episode.id, excerpt, sourceUri: filePath } : undefined,
     }, {}, {
       // Imports are additive unless they exactly reinforce a canonical claim;
       // speculative semantic replacement requires an explicit later review.
@@ -387,18 +408,18 @@ export async function ingestMemorySource(
         // Deterministic: the file's own name/description is the headline fact.
         const name = fm.meta.name || path.basename(file.path, path.extname(file.path));
         const kind = kindFromForeignType(fm.meta.type ?? fm.meta.kind ?? fm.meta.category);
-        if (fm.meta.description) await remember(kind, `[${name}] ${fm.meta.description}`, file.path, file.mtime);
+        if (fm.meta.description) await remember(kind, `[${name}] ${fm.meta.description}`, file.path, file.mtime, text);
         deterministicFiles += 1;
         // Body still carries detail worth distilling when it is substantial.
         if (distillEnabled && fm.body.length > 200) {
           const facts = await distillFile(fm.body, file.path);
-          if (facts) { distilledFiles += 1; for (const f of facts) await remember(f.kind, f.content, file.path, file.mtime, f.importance); }
-          else { fallbackFiles += 1; for (const f of harvestDeterministic(fm.body)) await remember(f.kind, f.content, file.path, file.mtime); }
+          if (facts) { distilledFiles += 1; for (const f of facts) await remember(f.kind, f.content, file.path, file.mtime, text, f.importance); }
+          else { fallbackFiles += 1; for (const f of harvestDeterministic(fm.body)) await remember(f.kind, f.content, file.path, file.mtime, text); }
         }
       } else {
         const facts = distillEnabled ? await distillFile(text, file.path) : null;
-        if (facts) { distilledFiles += 1; for (const f of facts) await remember(f.kind, f.content, file.path, file.mtime, f.importance); }
-        else { fallbackFiles += 1; for (const f of harvestDeterministic(text)) await remember(f.kind, f.content, file.path, file.mtime); }
+        if (facts) { distilledFiles += 1; for (const f of facts) await remember(f.kind, f.content, file.path, file.mtime, text, f.importance); }
+        else { fallbackFiles += 1; for (const f of harvestDeterministic(text)) await remember(f.kind, f.content, file.path, file.mtime, text); }
       }
     } catch (err) {
       errors.push({ path: file.path, error: err instanceof Error ? err.message : String(err) });

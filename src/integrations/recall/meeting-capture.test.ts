@@ -17,6 +17,8 @@ const {
   fileMeetingFromAnalysis,
   buildMeetingChatPrompt,
   findRecallMeetingRecord,
+  groundedMeetingParticipantNames,
+  meetingMemoryProposals,
   listAllRecallMeetingRecords,
   loadRecallMeetingById,
   noteRecallMeetingDetected,
@@ -25,6 +27,7 @@ const {
 } = await import('./meeting-capture.js');
 const { reindexVault } = await import('../../memory/indexer.js');
 const { openMemoryDb, closeMemoryDb } = await import('../../memory/db.js');
+const { shouldPromoteToDurable } = await import('../../execution/background-promote.js');
 
 test.after(() => {
   closeMemoryDb();
@@ -73,6 +76,25 @@ test('fileMeetingFromAnalysis folds title + analysis into the note, idempotently
   // Title persisted onto the record so the dashboard list shows it.
   assert.equal(loadRecallMeetingById(record.id)?.title, 'Clementine onboarding walkthrough');
 
+  const episode = openMemoryDb().prepare(`
+    SELECT subtype, title, evidence_excerpt, metadata_json
+    FROM memory_episodes WHERE subtype = 'meeting' AND call_id = ?
+  `).get(record.id) as { subtype: string; title: string; evidence_excerpt: string; metadata_json: string } | undefined;
+  assert.ok(episode, 'Recall recording is projected into the durable episode store');
+  assert.equal(episode?.title, 'Clementine onboarding walkthrough');
+  assert.match(episode?.evidence_excerpt ?? '', /installing the desktop app and connecting Salesforce/);
+  assert.equal((JSON.parse(episode?.metadata_json ?? '{}') as { provider?: string }).provider, 'recall');
+  const episodeCount = (openMemoryDb().prepare(
+    `SELECT COUNT(*) AS c FROM memory_episodes WHERE subtype = 'meeting' AND call_id = ?`,
+  ).get(record.id) as { c: number }).c;
+  assert.equal(episodeCount, 1, 'analysis and title updates amend one stable meeting episode');
+  const genericObservationCount = (openMemoryDb().prepare(`
+    SELECT COUNT(*) AS c FROM entity_observations eo
+    JOIN memory_episodes me ON me.id = eo.episode_id
+    WHERE me.call_id = ?
+  `).get(record.id) as { c: number }).c;
+  assert.equal(genericObservationCount, 0, 'generic Host/Guest role labels never become people');
+
   // Idempotent: re-filing the same analysis is a no-op.
   assert.equal(fileMeetingFromAnalysis(record.id), false, 'second filing should be a no-op');
 
@@ -85,6 +107,123 @@ test('fileMeetingFromAnalysis folds title + analysis into the note, idempotently
   ).all(artifactPath) as Array<{ content: string }>;
   const joined = rows.map((r) => r.content).join('\n');
   assert.match(joined, /connecting Salesforce/, 'summary content should be indexed');
+});
+
+test('named meeting participants become replay-safe canonical source observations', () => {
+  assert.deepEqual(
+    groundedMeetingParticipantNames({
+      participants: ['Host', 'Speaker 2', 'Guest: Dana Rivera', 'Dana Rivera', 'Morgan Lee (speaker 3)', 'Unknown'],
+      generatedAt: new Date().toISOString(),
+      source: 'agent',
+    }),
+    ['Dana Rivera', 'Morgan Lee'],
+  );
+
+  const windowId = 'win-named-participants';
+  appendRecallTranscriptSegment({
+    windowId,
+    event: 'transcript.data',
+    speaker: 'Dana Rivera',
+    text: 'Morgan and I reviewed the launch risks.',
+  });
+  const { record } = finalizeRecallMeeting({ windowId, platform: 'in-person' });
+  saveRecallMeetingAnalysis(record.id, {
+    title: 'Launch risk review',
+    summary: 'Dana and Morgan reviewed launch risks.',
+    participants: ['Dana Rivera', 'Speaker 2', 'Morgan Lee', 'dana rivera'],
+    generatedAt: new Date().toISOString(),
+    source: 'agent',
+  });
+
+  const episode = openMemoryDb().prepare(`
+    SELECT id FROM memory_episodes WHERE subtype = 'meeting' AND call_id = ?
+  `).get(record.id) as { id: string };
+  const observations = openMemoryDb().prepare(`
+    SELECT e.canonical_name, eo.source_kind, eo.confidence
+    FROM entity_observations eo
+    JOIN entities e ON e.id = eo.entity_id
+    WHERE eo.episode_id = ?
+    ORDER BY e.canonical_name
+  `).all(episode.id) as Array<{ canonical_name: string; source_kind: string; confidence: number }>;
+  assert.deepEqual(observations, [
+    { canonical_name: 'Dana Rivera', source_kind: 'meeting_participant', confidence: 0.82 },
+    { canonical_name: 'Morgan Lee', source_kind: 'meeting_participant', confidence: 0.82 },
+  ]);
+
+  // Replaying the same analysis is exactly-once; correcting it removes only
+  // this episode's obsolete participant observation, not the identity row.
+  saveRecallMeetingAnalysis(record.id, {
+    title: 'Launch risk review',
+    summary: 'Morgan reviewed launch risks.',
+    participants: ['Morgan Lee'],
+    generatedAt: new Date().toISOString(),
+    source: 'manual',
+  });
+  const corrected = openMemoryDb().prepare(`
+    SELECT e.canonical_name, eo.confidence
+    FROM entity_observations eo
+    JOIN entities e ON e.id = eo.entity_id
+    WHERE eo.episode_id = ?
+  `).all(episode.id) as Array<{ canonical_name: string; confidence: number }>;
+  assert.deepEqual(corrected, [{ canonical_name: 'Morgan Lee', confidence: 0.95 }]);
+  assert.equal((openMemoryDb().prepare(`
+    SELECT COUNT(*) AS c FROM entities WHERE canonical_name_lc = 'dana rivera'
+  `).get() as { c: number }).c, 1, 'identity history remains even when one episode observation is corrected');
+});
+
+test('meeting decisions and actions become replay-safe review proposals, not automatic facts', () => {
+  const windowId = 'win-reviewable-meeting-memory';
+  appendRecallTranscriptSegment({
+    windowId,
+    event: 'transcript.data',
+    speaker: 'Dana Rivera',
+    text: 'We decided to launch Friday. Morgan will send the migration checklist tomorrow.',
+  });
+  const { record } = finalizeRecallMeeting({ windowId, platform: 'in-person', title: 'Orchid launch review' });
+  const firstAnalysis = {
+    title: 'Orchid launch review',
+    summary: 'The team reviewed launch readiness.',
+    decisions: ['Launch the Orchid migration on Friday'],
+    actionItems: [{ text: 'Send the migration checklist', owner: 'Morgan Lee', dueDate: '2026-07-16' }],
+    topics: ['launch', 'migration'],
+    participants: ['Dana Rivera', 'Morgan Lee'],
+    generatedAt: '2026-07-15T18:00:00.000Z',
+    source: 'agent' as const,
+  };
+  assert.equal(meetingMemoryProposals(record, firstAnalysis).length, 2);
+  saveRecallMeetingAnalysis(record.id, firstAnalysis);
+
+  const db = openMemoryDb();
+  const episode = db.prepare(`SELECT id FROM memory_episodes WHERE subtype = 'meeting' AND call_id = ?`).get(record.id) as { id: string };
+  const first = db.prepare(`
+    SELECT text, status, source_type, episode_id
+    FROM memory_reflection_candidates WHERE episode_id = ? ORDER BY text
+  `).all(episode.id) as Array<{ text: string; status: string; source_type: string; episode_id: string }>;
+  assert.equal(first.length, 2);
+  assert.ok(first.every((row) => row.status === 'pending' && row.source_type === 'meeting_analysis'));
+  assert.ok(first.every((row) => row.episode_id === episode.id));
+  assert.match(first.map((row) => row.text).join('\n'), /Decision from Orchid launch review/);
+  assert.match(first.map((row) => row.text).join('\n'), /Action item from Orchid launch review/);
+  assert.equal((db.prepare('SELECT COUNT(*) AS count FROM consolidated_facts').get() as { count: number }).count, 0,
+    'derived meeting analysis waits for owner review instead of silently becoming canonical truth');
+
+  saveRecallMeetingAnalysis(record.id, firstAnalysis);
+  assert.equal((db.prepare('SELECT COUNT(*) AS count FROM memory_reflection_candidates WHERE episode_id = ?').get(episode.id) as { count: number }).count, 2,
+    'replaying identical analyzer output creates no duplicate proposals');
+
+  saveRecallMeetingAnalysis(record.id, {
+    ...firstAnalysis,
+    decisions: [],
+    actionItems: [{ text: 'Send the final migration checklist', owner: 'Morgan Lee' }],
+    generatedAt: '2026-07-15T18:05:00.000Z',
+  });
+  const corrected = db.prepare(`
+    SELECT status, reason, text FROM memory_reflection_candidates
+    WHERE episode_id = ? ORDER BY id
+  `).all(episode.id) as Array<{ status: string; reason: string | null; text: string }>;
+  assert.equal(corrected.filter((row) => row.status === 'pending').length, 1);
+  assert.equal(corrected.filter((row) => row.status === 'rejected' && row.reason === 'analysis_revision_removed').length, 2);
+  assert.match(corrected.find((row) => row.status === 'pending')?.text ?? '', /final migration checklist/);
 });
 
 test('renameMeeting sets a user title that the analyzer cannot overwrite', () => {
@@ -164,7 +303,7 @@ test('buildMeetingChatPrompt requires the full transcript and asks for next acti
 
   saveRecallMeetingAnalysis(record.id, {
     title: 'Design Partner Onboarding',
-    summary: 'Discussed onboarding and follow-up.',
+    summary: 'Discussed onboarding, follow-up, and several large, long-running matters.',
     actionItems: [{ text: 'Follow up with the design partner', owner: 'Nate' }],
     generatedAt: new Date().toISOString(),
     source: 'agent',
@@ -177,6 +316,11 @@ test('buildMeetingChatPrompt requires the full transcript and asks for next acti
   assert.match(prompt, /likely follow-up tasks/i);
   assert.match(prompt, /Do not refer to yourself as Clementine/i);
   assert.match(prompt, /Do not send messages, schedule events, update sheets, or create tasks/);
+  assert.equal(
+    shouldPromoteToDurable(prompt),
+    false,
+    'embedded meeting-summary wording must never move Discuss in chat to the background',
+  );
 });
 
 test('two SDK uploads in one reused window remain distinct before reconciliation', () => {

@@ -24,6 +24,7 @@ const {
 } = await import('./skill-store.js');
 const { assessNovelty, reinforceDraftSkills, _testOnly_sanitizeDistilledSkillOutput } = await import('./skill-distiller.js');
 const { searchFactsByText } = await import('./facts.js');
+const { getFactEvidence } = await import('./temporal-memory.js');
 import type { TraceToolCall } from '../execution/trace-to-workflow.js';
 
 beforeEach(() => {
@@ -155,22 +156,22 @@ test('distilled skill sanitizer accepts fenced schema-drifted JSON', () => {
 
 // ─── C4: self-improvement ────────────────────────────────────────────────────
 
-test('reinforce success promotes a draft to approved after 2 validated successes', () => {
+test('reinforce success promotes a draft to approved after 2 validated successes', async () => {
   writeDistilledSkill({ name: 'rein-ok', description: 'd', body: 'steps', origin: { kind: 'chat' } });
-  reinforceDraftSkills(['rein-ok'], 'success');
+  await reinforceDraftSkills(['rein-ok'], 'success');
   assert.equal(loadSkill('rein-ok')!.frontmatter.tier, 'draft', 'one success not enough');
   assert.equal(loadSkill('rein-ok')!.frontmatter.useCount, 1);
-  reinforceDraftSkills(['rein-ok'], 'success');
+  await reinforceDraftSkills(['rein-ok'], 'success');
   assert.equal(loadSkill('rein-ok')!.frontmatter.tier, 'approved', 'promoted at 2');
 });
 
-test('reinforce failure quarantines a draft after 2 failures and appends pitfalls', () => {
+test('reinforce failure quarantines a draft after 2 failures and appends pitfalls', async () => {
   writeDistilledSkill({ name: 'rein-bad', description: 'd', body: 'steps', origin: { kind: 'chat' } });
-  reinforceDraftSkills(['rein-bad'], 'failure', 'tool 500');
+  await reinforceDraftSkills(['rein-bad'], 'failure', 'tool 500');
   assert.equal(loadSkill('rein-bad')!.frontmatter.quarantined ?? false, false, 'one failure tolerated');
   // Move B: no durable fact after a SINGLE failure (not yet proven-bad).
   assert.ok(!searchFactsByText('rein-bad', 20).some((f) => /rein-bad/.test(String(f.content))), 'no avoid-fact after one failure');
-  reinforceDraftSkills(['rein-bad'], 'failure', 'bad slug');
+  await reinforceDraftSkills(['rein-bad'], 'failure', 'bad slug');
   const s = loadSkill('rein-bad')!;
   assert.equal(s.frontmatter.quarantined, true, 'quarantined at 2');
   assert.match(s.body, /tool 500/);
@@ -179,34 +180,38 @@ test('reinforce failure quarantines a draft after 2 failures and appends pitfall
   // so the proven-bad approach doesn't repeat in an unrelated later session.
   const avoid = searchFactsByText('rein-bad', 20).find((f) => f.kind === 'feedback' && /Avoid repeating this.*rein-bad/.test(String(f.content)));
   assert.ok(avoid, 'quarantine persisted a durable avoid-fact');
+  const evidence = getFactEvidence(avoid!.id);
+  assert.equal(evidence.length, 1);
+  assert.match(evidence[0].excerpt, /bad slug/);
+  assert.doesNotMatch(evidence[0].excerpt, /Avoid repeating this/, 'evidence is the observed failure, not the derived claim');
 });
 
-test('Move B review fix: a genuine infra-TRANSIENT failure quarantines but mints NO permanent avoid-fact', () => {
+test('Move B review fix: a genuine infra-TRANSIENT failure quarantines but mints NO permanent avoid-fact', async () => {
   writeDistilledSkill({ name: 'rein-transient', description: 'd', body: 'steps', origin: { kind: 'chat' } });
-  reinforceDraftSkills(['rein-transient'], 'failure', 'the request timed out');
-  reinforceDraftSkills(['rein-transient'], 'failure', '429 rate limited by upstream');
+  await reinforceDraftSkills(['rein-transient'], 'failure', 'the request timed out');
+  await reinforceDraftSkills(['rein-transient'], 'failure', '429 rate limited by upstream');
   // Quarantine still happens (baseline) — but the PERMANENT, auto-recalled avoid-fact
   // (the harmful part) is NOT minted from flaky infra.
   assert.ok(!searchFactsByText('rein-transient', 20).some((f) => /rein-transient/.test(String(f.content))), 'no permanent avoid-fact from infra-transient failures');
 });
 
-test('Move B review fix: a real bug whose reason MENTIONS a transient word still learns (no over-skip)', () => {
+test('Move B review fix: a real bug whose reason MENTIONS a transient word still learns (no over-skip)', async () => {
   writeDistilledSkill({ name: 'rein-prose', description: 'd', body: 'steps', origin: { kind: 'chat' } });
   // "timeout" as PROSE (not an infra error) must not be mistaken for a transient blip.
-  reinforceDraftSkills(['rein-prose'], 'failure', 'the timeout config value was set incorrectly by the agent');
-  reinforceDraftSkills(['rein-prose'], 'failure', 'the timeout field was hardcoded wrong again');
+  await reinforceDraftSkills(['rein-prose'], 'failure', 'the timeout config value was set incorrectly by the agent');
+  await reinforceDraftSkills(['rein-prose'], 'failure', 'the timeout field was hardcoded wrong again');
   assert.equal(loadSkill('rein-prose')!.frontmatter.quarantined, true, 'a real repeated bug still quarantines');
   const avoid = searchFactsByText('rein-prose', 20).find((f) => f.kind === 'feedback' && /Avoid repeating this.*rein-prose/.test(String(f.content)));
   assert.ok(avoid, 'a real failure that merely mentions "timeout" STILL mints the lesson');
 });
 
-test('failure-learning kill-switch: CLEMMY_FAILURE_LEARNING=off mints no avoid-fact on quarantine', () => {
+test('failure-learning kill-switch: CLEMMY_FAILURE_LEARNING=off mints no avoid-fact on quarantine', async () => {
   const prev = process.env.CLEMMY_FAILURE_LEARNING;
   process.env.CLEMMY_FAILURE_LEARNING = 'off';
   try {
     writeDistilledSkill({ name: 'rein-off', description: 'd', body: 'steps', origin: { kind: 'chat' } });
-    reinforceDraftSkills(['rein-off'], 'failure', 'e1');
-    reinforceDraftSkills(['rein-off'], 'failure', 'e2');
+    await reinforceDraftSkills(['rein-off'], 'failure', 'e1');
+    await reinforceDraftSkills(['rein-off'], 'failure', 'e2');
     assert.equal(loadSkill('rein-off')!.frontmatter.quarantined, true, 'still quarantines');
     assert.ok(!searchFactsByText('rein-off', 20).some((f) => /rein-off/.test(String(f.content))), 'kill-switch → no avoid-fact');
   } finally {
@@ -214,11 +219,11 @@ test('failure-learning kill-switch: CLEMMY_FAILURE_LEARNING=off mints no avoid-f
   }
 });
 
-test('reinforce never demotes an APPROVED (user-blessed) skill', () => {
+test('reinforce never demotes an APPROVED (user-blessed) skill', async () => {
   writeDistilledSkill({ name: 'rein-approved', description: 'd', body: 'steps', origin: { kind: 'chat' } });
   updateSkillFrontmatter('rein-approved', { tier: 'approved' });
-  reinforceDraftSkills(['rein-approved'], 'failure', 'x');
-  reinforceDraftSkills(['rein-approved'], 'failure', 'y');
+  await reinforceDraftSkills(['rein-approved'], 'failure', 'x');
+  await reinforceDraftSkills(['rein-approved'], 'failure', 'y');
   const s = loadSkill('rein-approved')!;
   assert.equal(s.frontmatter.tier, 'approved', 'approved untouched');
   assert.notEqual(s.frontmatter.quarantined, true, 'approved never auto-quarantined');

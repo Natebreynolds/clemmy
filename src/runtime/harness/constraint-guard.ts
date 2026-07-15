@@ -9,7 +9,7 @@
  * violation is detected, it escalates to the user instead of executing.
  */
 
-import { listConstraints, type ConsolidatedFact } from '../../memory/facts.js';
+import { listConstraints, listDispatchConstraints, type ConsolidatedFact } from '../../memory/facts.js';
 import { isIrreversibleSendSlug } from './execution-gate.js';
 
 export interface ConstraintViolation {
@@ -91,7 +91,7 @@ export function findEmailSendConstraint(
     // — the pre-fix hole) and SEND_DRAFT, while correctly leaving reversible
     // CREATE_*_DRAFT ungated (a draft is not a send).
     if (!isIrreversibleSendSlug(toolSlug)) return null;
-    for (const constraint of listConstraints()) {
+    for (const constraint of listDispatchConstraints()) {
       const content = constraint.content.toLowerCase();
       if (!content.includes('email') && !content.includes('mail')) continue;
       const match = constraint.content.match(EMAIL_IN_TEXT);
@@ -114,7 +114,7 @@ export function findEmailSendConstraint(
 export function pinnedCalendarRuleLabels(): string[] {
   const labels = new Set<string>();
   try {
-    for (const constraint of listConstraints()) {
+    for (const constraint of listDispatchConstraints()) {
       const content = constraint.content.toLowerCase();
       if (!content.includes('outlook')) continue;
       if (!content.includes('calendar')) continue;
@@ -146,7 +146,7 @@ export function findOutlookCalendarReadConstraint(
     const combinedIntent = `${intentText}\n${argsIntentText(args)}`;
     if (!combinedIntent.trim()) return null;
 
-    for (const constraint of listConstraints()) {
+    for (const constraint of listDispatchConstraints()) {
       const content = constraint.content.toLowerCase();
       if (!content.includes('outlook')) continue;
       if (!content.includes('calendar')) continue;
@@ -209,7 +209,7 @@ export function checkConstraintViolation(
   opts: { emailHandledExternally?: boolean } = {},
 ): ConstraintViolation | null {
   try {
-    const constraints = listConstraints();
+    const constraints = listDispatchConstraints();
     if (constraints.length === 0) return null;
 
     for (const constraint of constraints) {
@@ -217,8 +217,27 @@ export function checkConstraintViolation(
       if (violation) return violation;
     }
   } catch (err) {
-    // Constraint checking is advisory; don't break dispatch on errors
+    // A registry outage must not turn hard policies off. Fail closed with a
+    // synthetic diagnostic constraint so the caller can explain why nothing
+    // was dispatched and the user can repair/retry deliberately.
     console.error('[constraint-guard] error checking constraints:', err);
+    const now = new Date().toISOString();
+    return {
+      constraint: {
+        id: -1,
+        kind: 'constraint',
+        content: 'Hard-constraint registry unavailable; deterministic policy compliance could not be verified.',
+        source: {},
+        score: 10,
+        active: true,
+        createdAt: now,
+        updatedAt: now,
+        pinned: true,
+      },
+      reason: 'Clementine could not verify dispatch policies, so it failed closed.',
+      toolName,
+      violatingField: 'policy registry',
+    };
   }
 
   return null;
@@ -235,6 +254,25 @@ function checkSingleConstraint(
   opts: { emailHandledExternally?: boolean } = {},
 ): ConstraintViolation | null {
   const content = constraint.content.toLowerCase();
+
+  // Explicit route prohibition: the user requires the authenticated local sf
+  // CLI and forbids the expired/dead Composio Salesforce connector. This is a
+  // dispatch-level choice and can therefore be enforced without model recall.
+  if (toolName === 'composio_execute_tool'
+      && content.includes('salesforce')
+      && content.includes('composio')
+      && /\bsf\s+cli\b/i.test(content)
+      && /\b(?:never|do not|don't|expired|dead)\b/i.test(content)) {
+    const action = String(args.action ?? '').toLowerCase();
+    if (action.includes('salesforce')) {
+      return {
+        constraint,
+        reason: 'Composio Salesforce is forbidden by this rule; use the authenticated local sf CLI.',
+        toolName,
+        violatingField: 'tool route',
+      };
+    }
+  }
 
   // Email account constraint: "use [account] for Outlook"
   if (!opts.emailHandledExternally

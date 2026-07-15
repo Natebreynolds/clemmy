@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type Database from 'better-sqlite3';
 import {
   backupMemoryDb,
   openMemoryDb,
@@ -8,11 +9,15 @@ import {
   type MemoryPolicyRow,
 } from './db.js';
 import { getToolOutput } from '../runtime/harness/eventlog.js';
+import { classifyConstraintEnforcement } from './policy-enforcement.js';
 
 const MAX_EVIDENCE_CHARS = 2_000;
 
 export interface MemoryEpisodeInput {
   kind: MemoryEpisodeKind;
+  subtype?: string | null;
+  title?: string | null;
+  metadata?: Record<string, unknown> | null;
   sourceApp?: string | null;
   sessionId?: string | null;
   callId?: string | null;
@@ -94,14 +99,25 @@ export function recordMemoryEpisode(input: MemoryEpisodeInput): MemoryEpisodeRow
   const excerpt = input.content ? normalize(input.content).slice(0, MAX_EVIDENCE_CHARS) : '';
   const id = episodeIdFor(input, excerpt);
   const status = input.status ?? (excerpt ? 'available' : 'missing');
+  const subtype = input.subtype?.trim().slice(0, 80) || null;
+  const title = input.title?.replace(/\s+/g, ' ').trim().slice(0, 240) || null;
+  const metadataJson = JSON.stringify(input.metadata ?? {});
   db.prepare(`
     INSERT INTO memory_episodes
       (id, kind, source_app, session_id, call_id, source_uri, occurred_at,
-       ingested_at, content_hash, evidence_excerpt, raw_retained_until, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ingested_at, content_hash, evidence_excerpt, raw_retained_until, status,
+       subtype, title, metadata_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       source_app = COALESCE(excluded.source_app, memory_episodes.source_app),
       source_uri = COALESCE(excluded.source_uri, memory_episodes.source_uri),
+      occurred_at = excluded.occurred_at,
+      subtype = COALESCE(excluded.subtype, memory_episodes.subtype),
+      title = COALESCE(excluded.title, memory_episodes.title),
+      metadata_json = CASE
+        WHEN excluded.metadata_json != '{}' THEN excluded.metadata_json
+        ELSE memory_episodes.metadata_json
+      END,
       evidence_excerpt = CASE
         WHEN excluded.evidence_excerpt IS NOT NULL AND length(excluded.evidence_excerpt) > 0
           THEN excluded.evidence_excerpt
@@ -131,6 +147,9 @@ export function recordMemoryEpisode(input: MemoryEpisodeInput): MemoryEpisodeRow
     excerpt || null,
     input.rawRetainedUntil ?? null,
     status,
+    subtype,
+    title,
+    metadataJson,
   );
   return db.prepare('SELECT * FROM memory_episodes WHERE id = ?').get(id) as MemoryEpisodeRow;
 }
@@ -219,7 +238,19 @@ export function captureFactEvidence(input: {
   tool?: string | null;
   occurredAt?: string;
 }): MemoryEpisodeRow {
+  // A tool:// locator is only a fallback. If the durable episode was already
+  // captured from a stronger source (recording://, crm://, file://, etc.), a
+  // later semantic-NOOP attachment must not overwrite that real locator merely
+  // because the consolidation candidate omitted sourceUri.
+  const existingSourceUri = input.sessionId && input.callId
+    ? (openMemoryDb().prepare(`
+        SELECT source_uri FROM memory_episodes
+        WHERE session_id = ? AND call_id = ?
+        ORDER BY ingested_at DESC LIMIT 1
+      `).get(input.sessionId, input.callId) as { source_uri: string | null } | undefined)?.source_uri
+    : null;
   const sourceUri = input.sourcePath
+    ?? existingSourceUri
     ?? (input.sessionId && input.callId ? `tool://${input.sessionId}/${input.callId}` : null);
   if (input.sessionId && input.callId) {
     let stored: ReturnType<typeof getToolOutput> = null;
@@ -242,8 +273,16 @@ export function captureFactEvidence(input: {
     // episode excerpt before raw tool-output expiry. Reuse that exact stored
     // excerpt for sibling facts; otherwise persist an unavailable link so this
     // fact is classified once and bounded backfill can advance.
-    const durableExcerpt = excerpt || (episode.status === 'available' ? episode.evidence_excerpt?.trim() ?? '' : '');
+    const durableExcerpt = excerpt || episode.evidence_excerpt?.trim() || '';
     if (durableExcerpt) {
+      // A pending/partial episode may already hold an exact excerpt copied at
+      // extraction time even after raw tool output has expired. Promote that
+      // durable source instead of downgrading it to missing merely because the
+      // later fact write could not reread the raw event-log row.
+      openMemoryDb().prepare(`
+        UPDATE memory_episodes SET status = 'available'
+        WHERE id = ? AND status <> 'available'
+      `).run(episode.id);
       linkFactEvidence({ factId: input.factId, episodeId: episode.id, excerpt: durableExcerpt, sourceUri: episode.source_uri ?? sourceUri });
     } else {
       linkUnavailableFactEvidence({ factId: input.factId, episodeId: episode.id, sourceUri: episode.source_uri ?? sourceUri });
@@ -297,6 +336,60 @@ export function listMemoryPolicies(): MemoryPolicyRow[] {
     ORDER BY CASE mp.policy_type WHEN 'hard_constraint' THEN 0 WHEN 'core_profile' THEN 1 ELSE 2 END,
              mp.priority DESC, mp.updated_at DESC
   `).all() as MemoryPolicyRow[];
+}
+
+/** Reconcile a fact's policy projection with what the runtime can truly
+ * enforce. Database triggers create a conservative prompt-only projection so
+ * direct/legacy writes never claim enforcement by accident; canonical write
+ * paths call this immediately afterward to promote compiled rule families. */
+export function syncMemoryPolicyForFact(factId: number): MemoryPolicyRow | null {
+  const db = openMemoryDb();
+  const fact = db.prepare(`
+    SELECT id, kind, content, active, pinned, importance, created_at, updated_at
+    FROM consolidated_facts WHERE id = ?
+  `).get(factId) as {
+    id: number; kind: string; content: string; active: number; pinned: number;
+    importance: number | null; created_at: string; updated_at: string;
+  } | undefined;
+  if (!fact || fact.active !== 1 || (fact.kind !== 'constraint' && fact.pinned !== 1)) {
+    db.prepare('DELETE FROM memory_policies WHERE fact_id = ?').run(factId);
+    return null;
+  }
+
+  const descriptor = fact.kind === 'constraint'
+    ? classifyConstraintEnforcement(fact.content)
+    : null;
+  const policyType = fact.kind === 'constraint'
+    ? descriptor!.deterministic ? 'hard_constraint' : 'standing_preference'
+    : fact.kind === 'user' ? 'core_profile' : 'standing_preference';
+  const enforcement = descriptor?.deterministic ? 'dispatch' : 'prompt';
+  const appliesTo = descriptor ?? {
+    schemaVersion: 1,
+    family: fact.kind === 'user' ? 'core_profile' : 'standing_preference',
+    deterministic: false,
+    tools: [],
+    reason: 'Prompt-context policy; not a tool-dispatch constraint.',
+  };
+  db.prepare(`
+    INSERT INTO memory_policies
+      (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fact_id) DO UPDATE SET
+      policy_type = excluded.policy_type,
+      enforcement = excluded.enforcement,
+      applies_to_json = excluded.applies_to_json,
+      priority = excluded.priority,
+      updated_at = excluded.updated_at
+  `).run(
+    fact.id,
+    policyType,
+    enforcement,
+    JSON.stringify(appliesTo),
+    Math.round((fact.importance ?? 5) * 10),
+    fact.created_at,
+    fact.updated_at,
+  );
+  return db.prepare('SELECT * FROM memory_policies WHERE fact_id = ?').get(fact.id) as MemoryPolicyRow;
 }
 
 /** Bounded incremental backfill. Existing broken sources remain marked missing;
@@ -440,24 +533,47 @@ export function reconcileTemporalEvidence(options: {
   };
 }
 
-export function reapExpiredPendingReflections(now = new Date().toISOString()): number {
-  const db = openMemoryDb();
+export function reapExpiredPendingReflectionsInDatabase(
+  db: Database.Database,
+  now = new Date().toISOString(),
+): number {
   const rows = db.prepare(`
     SELECT session_id, call_id FROM reflection_pending_extractions
-    WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?
+    WHERE status = 'pending' AND expires_at IS NOT NULL
+      AND julianday(expires_at) <= julianday(?)
   `).all(now) as Array<{ session_id: string; call_id: string }>;
   const tx = db.transaction(() => {
     for (const row of rows) {
       db.prepare(`
+        UPDATE memory_reflection_candidates
+        SET status = 'expired', reason = 'threshold_expired', resolved_at = ?
+        WHERE session_id = ? AND call_id = ? AND status = 'pending'
+      `).run(now, row.session_id, row.call_id);
+      db.prepare(`
         UPDATE memory_episodes SET status = 'expired'
         WHERE session_id = ? AND call_id = ? AND status = 'pending'
       `).run(row.session_id, row.call_id);
+      db.prepare(`
+        UPDATE memory_reflection_receipts
+        SET status = 'completed', completed_at = ?, result_json = ?, last_error = NULL
+        WHERE session_id = ? AND call_id = ? AND status = 'buffered'
+      `).run(
+        now,
+        JSON.stringify({ lifecycle: 'expired', reason: 'threshold_expired' }),
+        row.session_id,
+        row.call_id,
+      );
     }
     db.prepare(`
       DELETE FROM reflection_pending_extractions
-      WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?
+      WHERE status = 'pending' AND expires_at IS NOT NULL
+        AND julianday(expires_at) <= julianday(?)
     `).run(now);
   });
   tx();
   return rows.length;
+}
+
+export function reapExpiredPendingReflections(now = new Date().toISOString()): number {
+  return reapExpiredPendingReflectionsInDatabase(openMemoryDb(), now);
 }

@@ -133,6 +133,9 @@ jobs:
       - name: Harness gate benchmark
         run: npm run bench:gates
 
+      - name: Memory reliability gate
+        run: npm run eval:memory
+
       - name: pass^k consistency (strict)
         run: npm run eval:passk
         env:
