@@ -201,7 +201,7 @@ export function renderActionDisciplineDirective(intent?: MessageIntent, message 
   if (!actiony && !scopedLookup) return '';
   return [
     'Action discipline (this turn is editing / multi-step work):',
-    '- RESOLVE SCOPE BEFORE YOU QUERY OR MUTATE. If the request uses possessive or relative scope ("my", "our", "mine", "the usual", "again", or a bare person / account / project / list name) or is otherwise ambiguous about WHO or WHICH records it covers, do NOT guess. FIRST call memory_recall (scoped to the request) to resolve it — e.g. "my accounts" means the ones the user owns, not everyone\'s; "the usual sheet" means a specific known sheet. If recall does not resolve the scope, ask ONE concise clarifying question before running the query or mutation. Never silently drop a scope filter (like an owner filter) or invent one — resolve it, then speak the result in plain language, not the raw field expression.',
+    '- RESOLVE SCOPE BEFORE YOU QUERY OR MUTATE. If the request uses possessive or relative scope ("my", "our", "mine", "the usual", "again", or a bare person / account / project / list name) or is otherwise ambiguous about WHO or WHICH records it covers, do NOT guess. FIRST call memory_recall_all (scoped to the request) to resolve it; use memory_recall only for an explicitly vault-only lookup — e.g. "my accounts" means the ones the user owns, not everyone\'s; "the usual sheet" means a specific known sheet. If recall does not resolve the scope, ask ONE concise clarifying question before running the query or mutation. Never silently drop a scope filter (like an owner filter) or invent one — resolve it, then speak the result in plain language, not the raw field expression.',
     '- Surface tradeoffs. If two interpretations of the request lead to materially different work, name them in one sentence and pick one — don\'t silently choose. Name your load-bearing assumptions inline rather than burying them in a diff.',
     '- Touch only what the request requires. Don\'t refactor adjacent code, fix unrelated formatting, or sneak in "while-I\'m-here" cleanups. Match the existing style even when you\'d write it differently. If you notice unrelated dead code, mention it, don\'t delete it.',
   ].join('\n');
@@ -353,7 +353,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
   // working request blind to facts + proven tools — send a one-line pointer so
   // the model knows the context is one call away the moment the turn turns real.
   if (intent === 'casual' || intent === 'meta_clarify') {
-    const pointer = 'Context for this turn (private — use as needed, do not recite): any standing facts are above. If this turns into real work, pull your saved facts and proven tools first (memory_search_facts, tool_choice_recall, working_memory, goal_list) — they exist even though they are not inlined on this lightweight turn.';
+    const pointer = 'Context for this turn (private — use as needed, do not recite): any standing facts are above. If this turns into real work, pull your saved memory and proven tools first (memory_recall_all, tool_choice_recall, working_memory, goal_list) — they exist even though they are not inlined on this lightweight turn.';
     // A pinned Active Task is binding even on a casual/approval turn ("ok",
     // "go ahead") — surface it so the model never acts blind to the list it
     // was told to use. Other working-memory content stays out on light turns.

@@ -1318,7 +1318,7 @@ function buildMemoryFirstStallRetryHint(sessionId: string): string {
     return (
       ` The user's original request appears to reference existing work: ${JSON.stringify(query)}.` +
       ' Before calling ask_user_question, call focus_get. If focus_get does not identify the target,' +
-      ' call memory_search or memory_recall with that request or its key nouns. Only ask the user' +
+      ' call memory_recall_all with that request or its key nouns. Only ask the user' +
       ' after focus and memory return no useful match.'
     );
   } catch {
@@ -1352,7 +1352,7 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
   const text = [
     '[MEMORY PRIMER]',
     `A ${sourceLabel} memory search ran for the latest user message before this model call.`,
-    'Use these hits to steer the first response and tool choice. Treat snippets as candidate memory, not proof; before mutating external resources or creating source-backed artifacts, load the source with memory_read/read_file/recall_tool_result or call memory_recall for more context.',
+    'Use these hits to steer the first response and tool choice. Treat snippets as candidate memory, not proof; before mutating external resources or creating source-backed artifacts, load the source with memory_read/read_file/recall_tool_result or call memory_recall_all for evidence-backed context.',
     ...(factsBlock ? ['', factsBlock] : []),
     ...(episodicBlock ? ['', episodicBlock] : []),
     ...(formatted ? ['', formatted] : []),

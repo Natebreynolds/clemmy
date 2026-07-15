@@ -213,6 +213,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
           ? clamp(0.98 - rank * 0.01, 0.85, 0.98)
           : clamp(0.68 - rank * 0.025, 0.2, 0.68),
         confidence: exactTemporalMeeting ? 0.95 : 0.8,
+        validFrom: note.occurredAt,
         evidence: [{ episodeId: `note:${note.filePath}`, excerpt: note.snippet, sourceUri: note.filePath }],
         whyRecalled: exactTemporalMeeting
           ? ['exact temporal match', inPersonMatch ? 'in-person capture match' : '', 'recorded meeting source', 'vault type meeting-transcript'].filter(Boolean)

@@ -10,8 +10,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR, DEFAULT_TOOL_RESULT_MAX_CHARS, textResult, truncateToolText, updateEnvKey } from './shared.js';
+import { BASE_DIR, DEFAULT_TOOL_RESULT_MAX_CHARS, resolveMemoryTarget, textResult, truncateToolText, updateEnvKey } from './shared.js';
 import { getRuntimeEnv } from '../config.js';
+import { VAULT_DIR } from '../memory/vault.js';
+
+test('resolveMemoryTarget accepts absolute evidence paths inside the vault', () => {
+  const evidencePath = path.join(VAULT_DIR, '04-Meetings', 'recording.md');
+  assert.equal(resolveMemoryTarget(evidencePath), evidencePath);
+});
+
+test('resolveMemoryTarget does not let absolute paths escape the vault', () => {
+  assert.notEqual(resolveMemoryTarget('/tmp/not-memory.md'), '/tmp/not-memory.md');
+});
 
 test('truncateToolText: passes through short strings unchanged', () => {
   const s = 'hello world';

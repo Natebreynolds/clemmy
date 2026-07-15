@@ -185,6 +185,10 @@ export interface MemorySearchHit {
   title: string;
   snippet: string;
   score: number;
+  /** Occurrence time when the hit represents a temporal source such as a recording. */
+  occurredAt?: string;
+  /** IANA timezone used to render occurredAt for model-facing context. */
+  timeZone?: string;
 }
 
 export interface AssembledPromptContext {

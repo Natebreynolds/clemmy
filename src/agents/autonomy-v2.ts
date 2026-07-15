@@ -516,7 +516,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- `task_add` / `task_update` to manage the tasks file. `goal_update` to log progress or change goal status.',
       '- `note_take` to append context to today\'s daily note.',
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
-      '- `memory_recall` to look something up before deciding.',
+      '- `memory_recall_all` to look across memory before deciding; use `memory_recall` only for a vault-only lookup.',
       '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
       '- `draft_plan` BEFORE you act on complex multi-step work — it returns a structured plan (objective, steps, risks, needsUserInput, recommendsTrackedExecution) without mutating anything. Skip it for trivial actions.',
       '- `share_plan` after `draft_plan` when the plan is executable, moderate, and safe/local/read-only but the user should still see the working approach. It does not ask for approval; continue after sharing it.',

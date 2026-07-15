@@ -130,10 +130,10 @@ test('Step 2: casual turn skips the tail BUT standing/pinned facts stay in Tier-
   try {
     // pinned fact created in the previous test persists in the shared temp store.
     const casualTail = buildTurnContextBlock(ctx, 'casual', 'hey');
-    assert.match(casualTail, /memory_search_facts/, 'casual turn → lean POINTER (insurance), not the heavy blocks');
+    assert.match(casualTail, /memory_recall_all/, 'casual turn → unified-recall POINTER (insurance), not the heavy blocks');
     assert.doesNotMatch(casualTail, /## Working Memory|## Persistent Facts/, 'casual turn omits the heavy working blocks');
     assert.doesNotMatch(casualTail, /Remembered Tool Choices/, 'casual turn omits the inlined tool-choices');
-    assert.match(buildTurnContextBlock(ctx, 'meta_clarify', 'what can you do'), /memory_search_facts/, 'meta turn → pointer too');
+    assert.match(buildTurnContextBlock(ctx, 'meta_clarify', 'what can you do'), /memory_recall_all/, 'meta turn → pointer too');
 
     const casualInstr = buildAssistantInstructions(ctx, 'dashboard', 'casual', 'hey');
     assert.match(casualInstr, /Standing preferences/, 'pinned facts present even on a casual turn (never dropped)');

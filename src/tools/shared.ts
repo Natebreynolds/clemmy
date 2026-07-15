@@ -114,7 +114,21 @@ export function resolveMemoryTarget(target: string): string {
     today: ensureTodayNote(),
   };
 
-  return shortcuts[target] || path.join(VAULT_DIR, target);
+  if (shortcuts[target]) return shortcuts[target];
+
+  // Recall results intentionally expose the durable source path so an agent can
+  // load the evidence instead of trusting a snippet. Those paths are absolute,
+  // while memory_read historically accepted only vault-relative targets and
+  // silently prefixed an absolute path with VAULT_DIR. Accept absolute paths
+  // only when they remain inside the vault; never turn memory_read into an
+  // arbitrary filesystem reader.
+  if (path.isAbsolute(target)) {
+    const resolved = path.resolve(target);
+    const vaultRoot = path.resolve(VAULT_DIR);
+    if (resolved === vaultRoot || resolved.startsWith(`${vaultRoot}${path.sep}`)) return resolved;
+  }
+
+  return path.join(VAULT_DIR, target);
 }
 
 export function readText(filePath: string, fallback: string, maxChars = 12000): string {

@@ -193,9 +193,24 @@ function frontmatterValue(content: string, key: string): string | undefined {
   return content.match(new RegExp(`^${key}:\\s*(.+)$`, 'im'))?.[1]?.trim();
 }
 
+function formatOccurrenceTime(iso: string, timeZone: string): string {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  }).format(new Date(ms));
+}
+
 function temporalMeetingHits(query: string, options: RecallOptions, limit: number): MemorySearchHit[] {
   const date = resolveTemporalMeetingDate(query, options);
   if (!date) return [];
+  const timeZone = safeTimeZone(options.timeZone);
   const db = openMemoryDb();
   const params: unknown[] = [`%${date}%`, `%${date}%`];
   let sql = `
@@ -233,13 +248,18 @@ function temporalMeetingHits(query: string, options: RecallOptions, limit: numbe
     const isTranscript = /(?:^|\n)type:\s*meeting-transcript\b/i.test(metadata)
       || /(?:^|\n)(?:recording_id|meeting_id):/im.test(all);
     const label = `${isTranscript ? 'Recorded meeting' : 'Meeting note'} on ${date}`;
-    const details = [startedAt ? `started ${startedAt}` : '', source ? `source ${source}` : ''].filter(Boolean).join(' · ');
+    const details = [
+      startedAt ? `started ${formatOccurrenceTime(startedAt, timeZone)} (${startedAt})` : '',
+      source ? `source ${source}` : '',
+    ].filter(Boolean).join(' · ');
     return {
       hit: {
         filePath,
         title,
         snippet: `${label}${details ? ` (${details})` : ''}: ${summaryText}`,
         score: 10,
+        occurredAt: startedAt,
+        timeZone,
       } satisfies MemorySearchHit,
       occurredMs: Number.isFinite(Date.parse(startedAt ?? '')) ? Date.parse(startedAt!) : mtime,
       inPersonMatch: IN_PERSON_RE.test(`${filePath} ${title} ${all}`),

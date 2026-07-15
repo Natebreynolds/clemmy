@@ -3419,7 +3419,7 @@ test('runConversation: existing-work stall retry forces focus and memory before 
   assert.match(retryText, /existing work/i);
   assert.match(retryText, /gala silet acution animation post/i);
   assert.match(retryText, /focus_get/);
-  assert.match(retryText, /memory_search or memory_recall/);
+  assert.match(retryText, /memory_recall_all/);
   assert.doesNotMatch(
     retryText,
     /call ask_user_question instead of producing announcement text/,
@@ -3449,7 +3449,7 @@ test('runConversation: fresh stall retry keeps generic ask-user fallback', async
   const retryText = userInputs[1].data.text as string;
   assert.match(retryText, /call ask_user_question instead of producing announcement text/);
   assert.doesNotMatch(retryText, /existing work/i);
-  assert.doesNotMatch(retryText, /memory_search or memory_recall/);
+  assert.doesNotMatch(retryText, /memory_recall_all/);
 });
 
 test('runConversation: stall retry that ALSO stalls falls through to sub_agent_stalled', async () => {

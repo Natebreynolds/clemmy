@@ -229,6 +229,10 @@ ended_at: 2026-07-14T21:10:00.000Z
   assert.equal(firstQuery[0]?.filePath, meetingPath, 'exact-date recording beats a calendar note with stronger repeated terms');
   assert.equal(firstQuery[0]?.title, 'Scorpion Partnership Revenue and Legal Data Integration Review');
   assert.match(firstQuery[0]?.snippet ?? '', /Recorded meeting on 2026-07-14/);
+  assert.match(firstQuery[0]?.snippet ?? '', /started Jul 14, 2026, 1:24 PM PDT/);
+  assert.match(firstQuery[0]?.snippet ?? '', /2026-07-14T20:24:09\.442Z/);
+  assert.equal(firstQuery[0]?.occurredAt, '2026-07-14T20:24:09.442Z');
+  assert.equal(firstQuery[0]?.timeZone, 'America/Los_Angeles');
   assert.match(firstQuery[0]?.snippet ?? '', /partnership revenue/);
 
   const clarifiedQuery = await recallHybrid('I recorded a meeting today what was that', {

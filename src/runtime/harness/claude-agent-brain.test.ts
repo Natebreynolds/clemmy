@@ -1565,5 +1565,5 @@ test('brain runOptions demand the local-MCP sentinel so tool starvation throws i
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
   await respondViaClaudeAgentSdkBrain('home', { message: 'hi', sessionId: 'sentinel-check' });
-  assert.deepEqual(seen, ['memory_recall'], 'local-server sentinel demanded on every brain run');
+  assert.deepEqual(seen, ['memory_recall_all'], 'unified-memory sentinel demanded on every brain run');
 });

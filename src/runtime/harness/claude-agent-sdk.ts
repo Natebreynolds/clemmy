@@ -660,7 +660,7 @@ function missingRequiredLocalMcpTools(requiredTools: string[] | undefined, adver
   return required.filter((tool) => !advertised.has(normalizeToolName(tool)));
 }
 
-const BASELINE_LOCAL_MCP_TOOLS = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file', 'workspace_artifact_query']);
+const BASELINE_LOCAL_MCP_TOOLS = new Set(['ping', 'memory_recall_all', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file', 'workspace_artifact_query']);
 
 function localMcpSurfaceInitialized(advertisedTools: string[]): boolean {
   return advertisedTools.some((toolName) => BASELINE_LOCAL_MCP_TOOLS.has(mcpToolTail(toolName)));

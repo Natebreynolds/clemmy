@@ -36,11 +36,13 @@ const GOLDEN = {
   // 2026-07-09 stabilization: one beat MAXIMUM (a precise request is alignment),
   // injected focus replaces per-turn focus_get, and completed work no longer
   // manufactures a closing question.
-  instructions: { len: 35217, sha16: 'a62231446587c1a4' },
-  native: { len: 34320, sha16: '4a3c5498cb72386e' },
-  claudeBrain: { len: 5126, sha16: 'd8a6fb7b5476b40b' },
+  // 2026-07-15 memory reliability replay: unified recall is the default agent
+  // lookup; legacy vault-only recall remains available only for explicit scope.
+  instructions: { len: 35295, sha16: '034fc90fb17cd60a' },
+  native: { len: 34398, sha16: 'b8903bad1dac892b' },
+  claudeBrain: { len: 5171, sha16: 'f9b0c036405ae0cb' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8385, sha16: 'd9cde196cfc11eba' },
+  lean: { len: 8430, sha16: 'c606d1a28a993b1e' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
