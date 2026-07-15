@@ -9,6 +9,7 @@ import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { recallEverything, formatUnifiedRecall } from '../memory/unified-recall.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
+import { scheduleRecallShadow } from '../memory/recall-shadow.js';
 import { applyMemoryFix, detectMemoryHealCandidates, listProposedMemoryFixes, revertMemoryHeal, runMemorySelfHeal, type ProposedMemoryFix } from '../memory/self-heal.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
@@ -362,6 +363,7 @@ export function registerMemoryTools(server: McpServer): void {
     },
     async ({ objective, limit }) => {
       const result = await recallEverything(objective, { limit: limit ?? 12 });
+      scheduleRecallShadow({ query: objective, surface: 'memory_recall_all', limit: limit ?? 12 });
       if (result.hits.length === 0) return textResult('No relevant memory found across facts, notes, entities, resources, or tool-recall.');
       const block = formatUnifiedRecall(result, 4000);
       // Reinforce surfaced claims selected by the agent. Policy hits reference

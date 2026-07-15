@@ -145,6 +145,48 @@ test('unified recall searches every public memory store in one evidence pack', a
   }
 });
 
+test('unified recall promotes the exact recorded meeting for the two observed failed queries', async () => {
+  rememberFact({ kind: 'project', content: 'User attends recurring in-person leadership meetings and offsites.' });
+  const db = openMemoryDb();
+  const meetingPath = '/vault/04-Meetings/2026-07-14-in-person_meeting-local-review.md';
+  const insert = db.prepare(`
+    INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const mtime = Date.parse('2026-07-14T17:17:50.000Z');
+  const metadata = `---
+type: meeting-transcript
+source: local whisper (base.en)
+recording_id: recording-in-person-review
+title: Scorpion Partnership Revenue and Legal Data Integration Review
+started_at: 2026-07-14T20:24:09.442Z
+ended_at: 2026-07-14T21:10:00.000Z
+---`;
+  const summary = '## Summary\nInternal Scorpion team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.';
+  insert.run(meetingPath, 0, metadata, null, mtime, Buffer.byteLength(metadata), 'meeting-metadata');
+  insert.run(meetingPath, 1, summary, 'Summary', mtime, Buffer.byteLength(summary), 'meeting-summary');
+
+  for (const query of [
+    'What was the inperson meeting I had today about?',
+    'I recorded a meeting today what was that',
+  ]) {
+    const result = await recallMemory(query, {
+      limit: 8,
+      now: '2026-07-15T01:25:12.839Z',
+      timeZone: 'America/Los_Angeles',
+    });
+    const hit = result.hits[0];
+    assert.equal(hit?.ref.type, 'note');
+    assert.equal(hit?.ref.id, meetingPath);
+    assert.equal(hit?.title, 'Scorpion Partnership Revenue and Legal Data Integration Review');
+    assert.ok(hit?.whyRecalled.includes('exact temporal match'));
+    assert.ok(hit?.whyRecalled.includes('recorded meeting source'));
+    if (query.includes('inperson')) assert.ok(hit?.whyRecalled.includes('in-person capture match'));
+    assert.equal(hit?.evidence[0]?.sourceUri, meetingPath);
+    assert.match(hit?.text ?? '', /partnership revenue/);
+  }
+});
+
 test('stored graph traversal respects fact validity for historical entity queries', async () => {
   const acme = upsertEntity({ type: 'company', name: 'Acme' });
   const old = rememberFact({

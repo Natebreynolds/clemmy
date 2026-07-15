@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto';
-import { openMemoryDb, type MemoryEpisodeKind, type MemoryEpisodeRow, type MemoryEpisodeStatus, type MemoryPolicyRow } from './db.js';
+import {
+  backupMemoryDb,
+  openMemoryDb,
+  type MemoryEpisodeKind,
+  type MemoryEpisodeRow,
+  type MemoryEpisodeStatus,
+  type MemoryPolicyRow,
+} from './db.js';
 import { getToolOutput } from '../runtime/harness/eventlog.js';
 
 const MAX_EVIDENCE_CHARS = 2_000;
@@ -22,6 +29,38 @@ export interface FactEvidence {
   sourceUri?: string;
   occurredAt: string;
   status: MemoryEpisodeStatus;
+}
+
+export interface TemporalEvidenceBackfillResult {
+  scanned: number;
+  /** Facts linked to a real, source-derived supporting excerpt. */
+  linked: number;
+  /** Facts linked to an explicit unavailable-source episode. */
+  missing: number;
+  /** Facts not yet classified by the backfill. */
+  remaining: number;
+}
+
+export interface TemporalEvidenceReconciliationReport {
+  backupPath: string | null;
+  before: number;
+  processed: number;
+  available: number;
+  unavailable: number;
+  remaining: number;
+  complete: boolean;
+  elapsedMs: number;
+}
+
+export interface TemporalEvidenceHealth {
+  evidenceAvailable: number;
+  evidenceUnavailable: number;
+  unreconciledEvidence: number;
+  unreconciledDerivedEvidence: number;
+  unavailableDerivedEvidence: number;
+  brokenEvidence: number;
+  missingEpisodes: number;
+  evidenceCoverage: number;
 }
 
 function normalize(text: string): string {
@@ -143,6 +182,29 @@ export function linkFactEvidence(input: {
   );
 }
 
+/** Persist the fact→episode relationship when the original source is gone.
+ * The empty excerpt is an explicit sentinel, never fabricated evidence. Recall
+ * filters it out of answer-supporting evidence, while audits can still explain
+ * exactly which source episode is unavailable. */
+export function linkUnavailableFactEvidence(input: {
+  factId: number;
+  episodeId: string;
+  sourceUri?: string | null;
+  ordinal?: number;
+}): void {
+  openMemoryDb().prepare(`
+    INSERT OR IGNORE INTO fact_evidence
+      (fact_id, episode_id, excerpt, source_uri, ordinal, created_at)
+    VALUES (?, ?, '', ?, ?, ?)
+  `).run(
+    input.factId,
+    input.episodeId,
+    input.sourceUri ?? null,
+    input.ordinal ?? 0,
+    new Date().toISOString(),
+  );
+}
+
 /** Attach durable evidence to a fact at write time. Direct/manual memories use
  * the exact claim as their evidence. Derived memories copy a supporting source
  * fragment out of tool_outputs while it still exists; otherwise the episode is
@@ -176,7 +238,16 @@ export function captureFactEvidence(input: {
         : null,
       status: excerpt ? 'available' : 'missing',
     });
-    if (excerpt) linkFactEvidence({ factId: input.factId, episodeId: episode.id, excerpt, sourceUri });
+    // A prior fact from the same call may already have copied the durable
+    // episode excerpt before raw tool-output expiry. Reuse that exact stored
+    // excerpt for sibling facts; otherwise persist an unavailable link so this
+    // fact is classified once and bounded backfill can advance.
+    const durableExcerpt = excerpt || (episode.status === 'available' ? episode.evidence_excerpt?.trim() ?? '' : '');
+    if (durableExcerpt) {
+      linkFactEvidence({ factId: input.factId, episodeId: episode.id, excerpt: durableExcerpt, sourceUri: episode.source_uri ?? sourceUri });
+    } else {
+      linkUnavailableFactEvidence({ factId: input.factId, episodeId: episode.id, sourceUri: episode.source_uri ?? sourceUri });
+    }
     return episode;
   }
 
@@ -230,7 +301,71 @@ export function listMemoryPolicies(): MemoryPolicyRow[] {
 
 /** Bounded incremental backfill. Existing broken sources remain marked missing;
  * recoverable tool outputs are copied before their TTL expires. */
-export function backfillTemporalEvidence(limit = 200): { scanned: number; linked: number; missing: number } {
+export function countUnreconciledFactEvidence(): number {
+  return (openMemoryDb().prepare(`
+    SELECT COUNT(*) AS c
+    FROM consolidated_facts cf
+    WHERE NOT EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = cf.id)
+  `).get() as { c: number }).c;
+}
+
+export function readTemporalEvidenceHealth(): TemporalEvidenceHealth {
+  const db = openMemoryDb();
+  const one = (sql: string): number => (db.prepare(sql).get() as { c: number } | undefined)?.c ?? 0;
+  const factsTotal = one('SELECT COUNT(*) AS c FROM consolidated_facts');
+  const evidenceAvailable = one(`
+    SELECT COUNT(DISTINCT fe.fact_id) AS c
+    FROM fact_evidence fe
+    JOIN memory_episodes me ON me.id = fe.episode_id
+    WHERE me.status IN ('available','partial') AND length(trim(fe.excerpt)) > 0
+  `);
+  const evidenceUnavailable = one(`
+    SELECT COUNT(DISTINCT fe.fact_id) AS c
+    FROM fact_evidence fe
+    JOIN memory_episodes me ON me.id = fe.episode_id
+    WHERE (me.status IN ('missing','expired') OR length(trim(fe.excerpt)) = 0)
+      AND NOT EXISTS (
+        SELECT 1 FROM fact_evidence usable
+        JOIN memory_episodes usable_episode ON usable_episode.id = usable.episode_id
+        WHERE usable.fact_id = fe.fact_id
+          AND usable_episode.status IN ('available','partial')
+          AND length(trim(usable.excerpt)) > 0
+      )
+  `);
+  const unreconciledEvidence = countUnreconciledFactEvidence();
+  const unreconciledDerivedEvidence = one(`
+    SELECT COUNT(*) AS c FROM consolidated_facts cf
+    WHERE cf.active = 1 AND cf.derived_from_call_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = cf.id)
+  `);
+  const unavailableDerivedEvidence = one(`
+    SELECT COUNT(DISTINCT cf.id) AS c
+    FROM consolidated_facts cf
+    JOIN fact_evidence fe ON fe.fact_id = cf.id
+    JOIN memory_episodes me ON me.id = fe.episode_id
+    WHERE cf.active = 1 AND cf.derived_from_call_id IS NOT NULL
+      AND (me.status IN ('missing','expired') OR length(trim(fe.excerpt)) = 0)
+      AND NOT EXISTS (
+        SELECT 1 FROM fact_evidence usable
+        JOIN memory_episodes usable_episode ON usable_episode.id = usable.episode_id
+        WHERE usable.fact_id = cf.id
+          AND usable_episode.status IN ('available','partial')
+          AND length(trim(usable.excerpt)) > 0
+      )
+  `);
+  return {
+    evidenceAvailable,
+    evidenceUnavailable,
+    unreconciledEvidence,
+    unreconciledDerivedEvidence,
+    unavailableDerivedEvidence,
+    brokenEvidence: unreconciledDerivedEvidence + unavailableDerivedEvidence,
+    missingEpisodes: one("SELECT COUNT(*) AS c FROM memory_episodes WHERE status = 'missing'"),
+    evidenceCoverage: factsTotal > 0 ? (evidenceAvailable + evidenceUnavailable) / factsTotal : 1,
+  };
+}
+
+export function backfillTemporalEvidence(limit = 200): TemporalEvidenceBackfillResult {
   const db = openMemoryDb();
   const rows = db.prepare(`
     SELECT cf.*
@@ -253,9 +388,56 @@ export function backfillTemporalEvidence(limit = 200): { scanned: number; linked
       tool: row.derived_from_tool ? String(row.derived_from_tool) : null,
       occurredAt: row.created_at ? String(row.created_at) : undefined,
     });
-    if (episode.status === 'missing') missing += 1; else linked += 1;
+    const evidence = getFactEvidence(Number(row.id));
+    if (evidence.some((item) => item.status === 'available' && item.excerpt.trim().length > 0)) linked += 1;
+    else if (episode.status === 'missing' || evidence.some((item) => item.status === 'missing')) missing += 1;
   }
-  return { scanned: rows.length, linked, missing };
+  return { scanned: rows.length, linked, missing, remaining: countUnreconciledFactEvidence() };
+}
+
+/** Operator-triggered, backup-first reconciliation. The default cap is large
+ * enough for a personal store but still bounded; callers can resume safely
+ * because every processed fact receives either available or unavailable
+ * provenance and is never selected again. */
+export function reconcileTemporalEvidence(options: {
+  maxFacts?: number;
+  batchSize?: number;
+  requireBackup?: boolean;
+} = {}): TemporalEvidenceReconciliationReport {
+  const started = Date.now();
+  const maxFacts = Math.max(1, Math.min(50_000, options.maxFacts ?? 5_000));
+  const batchSize = Math.max(1, Math.min(1_000, options.batchSize ?? 200));
+  const before = countUnreconciledFactEvidence();
+  const backup = backupMemoryDb({ retain: 7 });
+  if ((options.requireBackup ?? true) && !backup) {
+    throw new Error('Evidence reconciliation stopped because a preflight memory backup could not be created.');
+  }
+  let processed = 0;
+  let available = 0;
+  let unavailable = 0;
+  let remaining = before;
+  while (processed < maxFacts && remaining > 0) {
+    const result = backfillTemporalEvidence(Math.min(batchSize, maxFacts - processed));
+    if (result.scanned === 0) { remaining = result.remaining; break; }
+    const classified = result.linked + result.missing;
+    processed += result.scanned;
+    available += result.linked;
+    unavailable += result.missing;
+    remaining = result.remaining;
+    if (classified !== result.scanned) {
+      throw new Error(`Evidence reconciliation classified ${classified}/${result.scanned} facts; stopped to avoid a non-advancing loop.`);
+    }
+  }
+  return {
+    backupPath: backup?.backupPath ?? null,
+    before,
+    processed,
+    available,
+    unavailable,
+    remaining,
+    complete: remaining === 0,
+    elapsedMs: Date.now() - started,
+  };
 }
 
 export function reapExpiredPendingReflections(now = new Date().toISOString()): number {

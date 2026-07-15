@@ -36,6 +36,7 @@ const {
   _resetClaudeAgentSdkAdvertisableLocalToolsForTest,
 } = await import('./claude-agent-sdk.js');
 const capabilityHealth = await import('./capability-health.js');
+const { openMemoryDb } = await import('../../memory/db.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -479,6 +480,39 @@ test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back
   const elapsedMs = Date.now() - start;
   assert.ok(elapsedMs < 1500, `slow recall must not stall turn-context assembly; elapsed ${elapsedMs}ms`);
   assert.doesNotMatch(ctx, /Relevant To Your Request\n- /, 'timed-out recall block is omitted');
+});
+
+test('Claude brain primer surfaces an exact-date recorded meeting before external calendar lookup', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => []);
+  const db = openMemoryDb();
+  const meetingPath = '/vault/04-Meetings/2026-07-14-in-person_meeting-local-review-primer.md';
+  const insert = db.prepare(`
+    INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const metadata = `---
+type: meeting-transcript
+source: local whisper (base.en)
+recording_id: recording-in-person-review-primer
+title: Scorpion Partnership Revenue and Legal Data Integration Review
+started_at: 2026-07-14T20:24:09.442Z
+---`;
+  const summary = '## Summary\nInternal Scorpion team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.';
+  try {
+    insert.run(meetingPath, 0, metadata, null, Date.now(), Buffer.byteLength(metadata), 'primer-meeting-metadata');
+    insert.run(meetingPath, 1, summary, 'Summary', Date.now(), Buffer.byteLength(summary), 'primer-meeting-summary');
+    const ctx = await renderClaudeAgentBrainTurnContext({
+      message: 'What was my recorded meeting on 2026-07-14 about?',
+      sessionId: 'brain-recorded-meeting-primer',
+    });
+    assert.match(ctx, /RECORDED MEETING · exact temporal match/);
+    assert.match(ctx, /Scorpion Partnership Revenue and Legal Data Integration Review/);
+    assert.match(ctx, /partnership revenue/);
+    assert.ok(ctx.includes(meetingPath), 'primer carries the local source path for memory_read');
+  } finally {
+    db.prepare('DELETE FROM vault_chunks WHERE path = ?').run(meetingPath);
+  }
 });
 
 test('Claude brain volatile turn context includes degraded harness capability health', async () => {

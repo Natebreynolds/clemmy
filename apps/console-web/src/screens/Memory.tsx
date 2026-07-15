@@ -19,7 +19,7 @@ import {
   listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
   getBrainHealth, getMemoryHealth, getToolRecall, listEntities, getSourceMap, fileBasename, FACT_KINDS,
   discoverImportSources, scanImportPath, runMemoryImport, listImportBatches, undoImportBatch,
-  restoreFact, updateFact,
+  restoreFact, updateFact, reconcileMemoryEvidence,
   type Fact, type ContextFile, type Entity, type ToolRecallRecord, type ImportScan, type ImportBatch, type MemoryHit,
 } from '@/lib/memory';
 
@@ -108,7 +108,7 @@ function OverviewTab() {
           </Card>
         ))}
       </div>
-      <RecallHealthStrip health={memHealth.data} />
+      <RecallHealthStrip health={memHealth.data} onReconciled={() => void memHealth.refetch()} />
       <div>
         <p className="mb-2 text-small text-muted">How everything connects — tap a topic to fold it, drag to explore, tap a node for detail.</p>
         <MemoryGraphContainer height={540} />
@@ -120,7 +120,9 @@ function OverviewTab() {
 // ─────────── Recall / embedding health ───────────
 // Surfaces the signal that was illegible before: when embeddings are off (no
 // key) or circuit-broken, semantic recall silently degrades to lexical match.
-function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryHealth }) {
+function RecallHealthStrip({ health, onReconciled }: { health?: import('@/lib/memory').MemoryHealth; onReconciled?: () => void }) {
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileMessage, setReconcileMessage] = useState('');
   const emb = health?.embeddings;
   const recall = health?.recall;
   const reliability = health?.reliability;
@@ -136,6 +138,21 @@ function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryH
     : emb.breakerOpen
       ? `Semantic recall paused (${emb.lastErrorClass ?? 'error'}) — temporarily lexical-only`
       : 'Semantic recall on';
+  const runReconciliation = async () => {
+    const remaining = reliability?.unreconciledEvidence ?? 0;
+    if (remaining <= 0 || !window.confirm(`Reconcile ${remaining.toLocaleString()} fact${remaining === 1 ? '' : 's'} now? Clementine will create a database backup first.`)) return;
+    setReconciling(true);
+    setReconcileMessage('');
+    try {
+      const report = await reconcileMemoryEvidence();
+      setReconcileMessage(`${report.processed.toLocaleString()} classified · ${report.available.toLocaleString()} source-backed · ${report.unavailable.toLocaleString()} unavailable · ${report.remaining.toLocaleString()} remaining`);
+      onReconciled?.();
+    } catch (err) {
+      setReconcileMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReconciling(false);
+    }
+  };
   return (
     <Card className="flex flex-wrap items-center gap-x-5 gap-y-2 p-3.5 text-small">
       <span className="flex items-center gap-2 font-medium text-fg">
@@ -151,11 +168,24 @@ function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryH
       {recall && (recall.calls ?? 0) > 0 && (
         <span className="text-muted">Recall hit-rate: <span className="font-medium text-fg">{pct(recall.hitRate)}</span> <span className="text-faint">({recall.hits}/{recall.calls})</span></span>
       )}
-      {reliability && <span className="basis-full text-caption text-muted">
-        Evidence: <span className="font-medium text-fg">{reliability.evidenceLinked ?? 0}</span> linked · <span className={(reliability.brokenEvidence ?? 0) > 0 ? 'font-medium text-warning' : 'font-medium text-fg'}>{reliability.brokenEvidence ?? 0} broken</span>
-        {' · '}{reliability.pendingReflections ?? 0} pending extractions · {reliability.unreachableFacts ?? 0} never used
-        {' · '}utility {reliability.utility ?? 0} / impressions {reliability.impressions ?? 0}
-      </span>}
+      {reliability && <div className="basis-full flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-muted">
+        <span>
+          Evidence: <span className="font-medium text-fg">{reliability.evidenceAvailable ?? reliability.evidenceLinked ?? 0}</span> usable
+          {' · '}<span className={(reliability.evidenceUnavailable ?? 0) > 0 ? 'font-medium text-warning' : 'font-medium text-fg'}>{reliability.evidenceUnavailable ?? 0}</span> honestly unavailable
+          {' · '}<span className={(reliability.unreconciledEvidence ?? 0) > 0 ? 'font-medium text-warning' : 'font-medium text-fg'}>{reliability.unreconciledEvidence ?? 0}</span> unreconciled
+          {' · '}{reliability.pendingReflections ?? 0} pending extractions · {reliability.unreachableFacts ?? 0} never used
+          {' · '}utility {reliability.utility ?? 0} / impressions {reliability.impressions ?? 0}
+        </span>
+        {(reliability.unreconciledEvidence ?? 0) > 0 && <Button size="sm" variant="secondary" onClick={runReconciliation} disabled={reconciling}>
+          <Database className="h-3.5 w-3.5" aria-hidden /> {reconciling ? 'Reconciling…' : 'Back up & reconcile'}
+        </Button>}
+        {reconcileMessage && <span className="basis-full text-faint">{reconcileMessage}</span>}
+        {(reliability.shadow?.samples ?? 0) > 0 && <span className="basis-full text-faint">
+          Recall shadow: {reliability.shadow?.samples} samples · {pct(reliability.shadow?.averageOverlap)} legacy overlap
+          {' · '}{reliability.shadow?.primaryOnly ?? 0} evidence-path-only hits · {reliability.shadow?.tailHits ?? 0} tail hits
+          {' · '}{pct(reliability.shadow?.evidenceRate)} source-backed
+        </span>}
+      </div>}
     </Card>
   );
 }
@@ -235,6 +265,9 @@ function FactCard({ fact, onPin, onForget, onRestore, onEdit }: { fact: Fact; on
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(fact.content);
   const long = (fact.content?.length ?? 0) > 180;
+  const usableEvidence = (fact.evidence ?? []).filter((item) =>
+    (item.status === 'available' || item.status === 'partial' || item.status === undefined) && item.excerpt.trim().length > 0);
+  const unavailableEvidence = (fact.evidence ?? []).filter((item) => !usableEvidence.includes(item));
   return (
     <Card className="flex items-start gap-3 p-3.5">
       {fact.pinned && <Pin className="mt-1 h-4 w-4 shrink-0 text-primary" aria-hidden />}
@@ -250,9 +283,9 @@ function FactCard({ fact, onPin, onForget, onRestore, onEdit }: { fact: Fact; on
         </div> : <p className={cn('text-body text-fg', !expanded && long && 'line-clamp-3')}>{fact.content}</p>}
         {long && <button type="button" onClick={() => setExpanded((v) => !v)} className="mt-1 text-caption font-semibold text-primary hover:underline cursor-pointer">{expanded ? 'Show less' : 'Show more'}</button>}
         <div className="mt-1 text-caption text-faint">
-          {typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% confidence · ` : ''}{fact.evidence?.length ?? 0} source{fact.evidence?.length === 1 ? '' : 's'} · used {fact.utilityCount ?? 0}× · shown {fact.impressionCount ?? 0}×
+          {typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% confidence · ` : ''}{usableEvidence.length} source{usableEvidence.length === 1 ? '' : 's'}{unavailableEvidence.length > 0 ? ` · ${unavailableEvidence.length} unavailable` : ''} · used {fact.utilityCount ?? 0}× · shown {fact.impressionCount ?? 0}×
         </div>
-        {(fact.evidence?.length ?? 0) > 0 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View provenance</summary><div className="mt-1 space-y-1">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-2">{item.excerpt}{item.sourceUri ? <div className="mt-1 font-mono text-faint">{item.sourceUri}</div> : null}</div>)}</div></details>}
+        {(fact.evidence?.length ?? 0) > 0 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View provenance</summary><div className="mt-1 space-y-1">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-2"><div>{item.excerpt || 'Supporting excerpt unavailable — the source expired before durable capture.'}</div><div className="mt-1 text-faint">{item.status ?? 'available'}{item.sourceUri ? ` · ${item.sourceUri}` : ''}</div></div>)}</div></details>}
       </div>
       <div className="flex shrink-0 gap-1">
         {fact.active === false ? <Button variant="ghost" size="icon" aria-label="Restore" title="Restore" onClick={onRestore}><Undo2 className="h-4 w-4" aria-hidden /></Button> : <>
