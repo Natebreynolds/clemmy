@@ -890,3 +890,32 @@ test('auto-remember fires for a BACKGROUND-lane success (lane-agnostic, just a s
   const rec = recallToolChoice(intent);
   assert.equal(rec?.choice?.identifier, 'BRIGHTDATA_SCRAPE_AS_MARKDOWN', 'a background-lane success is remembered too');
 });
+
+const { executionIntentForSession } = await import('./composio-tools.js');
+
+test('executionIntentForSession: a fresh search that surfaced the slug is the intent', () => {
+  noteComposioSearchIntent('sess-intent-1', 'pull outlook unread messages', ['OUTLOOK_LIST_MESSAGES', 'OUTLOOK_GET_MESSAGE']);
+  assert.equal(
+    executionIntentForSession('sess-intent-1', 'OUTLOOK_LIST_MESSAGES'),
+    'pull outlook unread messages',
+  );
+  // Read-only: the session entry survives for auto-remember to consume.
+  assert.equal(
+    executionIntentForSession('sess-intent-1', 'OUTLOOK_LIST_MESSAGES'),
+    'pull outlook unread messages',
+  );
+});
+
+test('executionIntentForSession: a search that did NOT surface this slug falls back to the slug seed', () => {
+  noteComposioSearchIntent('sess-intent-2', 'dataforseo ranked keywords', ['DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED']);
+  assert.equal(
+    executionIntentForSession('sess-intent-2', 'AIRTABLE_LIST_RECORDS'),
+    'airtable list records',
+  );
+});
+
+test('executionIntentForSession: no session / no search falls back to the slug seed, then the constant', () => {
+  assert.equal(executionIntentForSession(undefined, 'GMAIL_SEND_EMAIL'), 'gmail send email');
+  assert.equal(executionIntentForSession('sess-never-searched', 'GMAIL_SEND_EMAIL'), 'gmail send email');
+  assert.equal(executionIntentForSession(undefined, ''), 'composio_execute');
+});

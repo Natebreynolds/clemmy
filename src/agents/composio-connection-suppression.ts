@@ -4,7 +4,7 @@ const DAY_MS = 24 * HOUR_MS;
 const EXPIRED_BACKOFF_MS = [DAY_MS, 3 * DAY_MS, 7 * DAY_MS, 30 * DAY_MS] as const;
 const ENTITY_MISMATCH_BACKOFF_MS = [7 * DAY_MS, 14 * DAY_MS, 30 * DAY_MS] as const;
 
-export type ComposioConnectionSuppressionReason = 'expired' | 'entity-mismatch';
+export type ComposioConnectionSuppressionReason = 'expired' | 'entity-mismatch' | 'not-connected';
 
 export interface ComposioConnectionSuppression {
   reason?: string;
@@ -105,6 +105,9 @@ function classifyHardAuthFailure(err: unknown): ComposioConnectionSuppressionRea
   }
   if (/ConnectedAccountExpired|connected account .* in EXPIRED state|code['"]?\s*:?\s*1820/i.test(text)) {
     return 'expired';
+  }
+  if (/ConnectedAccountNotFound|no connected account (?:found|exists)|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|code['"]?\s*:?\s*1810/i.test(text)) {
+    return 'not-connected';
   }
   return undefined;
 }
