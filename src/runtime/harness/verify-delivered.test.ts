@@ -274,3 +274,24 @@ test('Move 3: refuters fail OPEN and never run on ordinary lanes', async () => {
     delete process.env.CLEMMY_REFUTE_COMPLETION;
   }
 });
+
+test('matchesBlockedText: a NEGATED noun-phrase blocker mention does not block (2026-07-16 live false positive)', () => {
+  // The exact line that blocked a genuinely-complete 30-item fan-out.
+  assert.equal(
+    matchesBlockedText('None — all workers computed their assigned arithmetic independently and returned in the expected format; no ambiguity or missing credentials encountered.'),
+    false,
+  );
+  assert.equal(matchesBlockedText('No approval required — the batch was pre-authorized.'), false);
+  assert.equal(matchesBlockedText('Completed without missing data.'), false);
+});
+
+test('matchesBlockedText: real blockers still fire, including verb-negation idioms and mixed sentences', () => {
+  assert.equal(matchesBlockedText('Missing credentials for Airtable — please reconnect.'), true);
+  assert.equal(matchesBlockedText("I couldn't proceed: missing credentials."), true, 'verb-negation blocker idioms keep firing');
+  assert.equal(
+    matchesBlockedText('No ambiguity in the plan, but I hit a wall: missing credentials for the CRM.'),
+    true,
+    'an un-negated mention later in the text still blocks',
+  );
+  assert.equal(matchesBlockedText("I'm blocked on the export step."), true);
+});

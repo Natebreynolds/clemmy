@@ -102,11 +102,42 @@ async function refuteHighStakesCompletion(
   return { refuted, reason: reason || 'Both adversarial lenses refuted the completion claim.' };
 }
 
+/** Negation determiners that scope over a NOUN-PHRASE blocker mention. A risk
+ *  report saying "no ambiguity or missing credentials encountered" / "None —
+ *  no approval required" is the OPPOSITE of a blocker, but the phrase patterns
+ *  (missing X, approval required, waiting on) are negation-blind and blocked a
+ *  genuinely complete live run (2026-07-16 Stage-3 validation). Deliberately
+ *  excludes verb negation (not / n't): "could not proceed" is a blocker idiom
+ *  with its own patterns, and those must keep firing. */
+const NEGATION_DETERMINERS = /\b(no|none|zero|without|never)\b/i;
+const CLAUSE_BOUNDARY = /[.!?;:\n]/;
+
+function matchIsNegated(text: string, matchIndex: number): boolean {
+  const lookbackStart = Math.max(0, matchIndex - 60);
+  let clause = text.slice(lookbackStart, matchIndex);
+  const lastBoundary = (() => {
+    for (let i = clause.length - 1; i >= 0; i--) {
+      if (CLAUSE_BOUNDARY.test(clause[i])) return i;
+    }
+    return -1;
+  })();
+  if (lastBoundary >= 0) clause = clause.slice(lastBoundary + 1);
+  return NEGATION_DETERMINERS.test(clause);
+}
+
 export function matchesBlockedText(text: string | null | undefined): boolean {
   const t = (text ?? '').trim();
   if (!t) return false;
   if (looksLikeToolUnavailableSelfReport(t)) return true;
-  return BLOCKED_TEXT_PATTERNS.some((re) => re.test(t));
+  for (const re of BLOCKED_TEXT_PATTERNS) {
+    const global = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+    let m: RegExpExecArray | null;
+    while ((m = global.exec(t)) !== null) {
+      if (!matchIsNegated(t, m.index)) return true;
+      if (m.index === global.lastIndex) global.lastIndex += 1; // zero-width safety
+    }
+  }
+  return false;
 }
 
 /**
