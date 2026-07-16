@@ -53,7 +53,6 @@ beforeEach(() => {
   _resetEmbeddingHealthForTest();
   _resetEmbedDemotionForTest();
   _setLocalProviderForTest(undefined);
-  delete process.env.CLEMMY_EMBED_LOCAL_FALLBACK;
 });
 
 afterEach(() => {
@@ -84,13 +83,6 @@ test('a single TRANSIENT breaker open does NOT demote; the second one does', () 
   _driveEmbedSuccessForTest();
   for (let i = 0; i < 3; i++) _driveEmbedFailureForTest(new Error('fetch timeout'));
   assert.notEqual(activeEmbeddingModel(), EMBEDDING_MODEL, 'second transient open: demoted to local');
-});
-
-test('kill-switch CLEMMY_EMBED_LOCAL_FALLBACK=off keeps the legacy FTS-only degradation', () => {
-  process.env.CLEMMY_EMBED_LOCAL_FALLBACK = 'off';
-  _driveEmbedFailureForTest(new Error('insufficient_quota: exceeded your current quota'));
-  assert.equal(activeEmbeddingModel(), EMBEDDING_MODEL, 'no demotion with the kill-switch off');
-  assert.equal(getEmbeddingHealth().breakerOpen, true, 'legacy breaker behavior intact');
 });
 
 test('embedQuery retries the same request on local after terminal OpenAI failure', async () => {

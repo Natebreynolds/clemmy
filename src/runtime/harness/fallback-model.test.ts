@@ -215,13 +215,6 @@ test('isFalloverError: a brain AUTH failure is recoverable → fall over to a va
   assert.equal(isFalloverError(new Error('HTTP 401 Unauthorized')), true);
   // A plain bad-request / validation error is NOT an auth fallover.
   assert.equal(isFalloverError(new Error('400 invalid schema for field x')), false);
-  // Kill-switch restores terminal behavior.
-  process.env.CLEMMY_AUTH_FALLOVER = 'off';
-  try {
-    assert.equal(isFalloverError(new ClaudeAuthError('token expired')), false, 'kill-switch → auth is terminal again');
-  } finally {
-    delete process.env.CLEMMY_AUTH_FALLOVER;
-  }
 });
 
 // ─── Sticky dead-brain registry (2026-07-08) ────────────────────────────────

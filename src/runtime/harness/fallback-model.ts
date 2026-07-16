@@ -124,10 +124,6 @@ export function isAuthRecoverableError(err: unknown): boolean {
     || /invalid_grant|refresh token not found or invalid|token (?:is invalid)|expired (?:token|credential|subscription)|(?:token|credential|subscription|session)s? (?:has |have )?expired|re-?authenticat|unauthorized|forbidden|not authenticated/i.test(msg);
 }
 
-function authFalloverEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_AUTH_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
 // ── Sticky dead-brain registry (2026-07-08) ────────────────────────────────
 // An auth-expired brain does NOT heal by itself — yet the chain re-tried the
 // dead brain on EVERY request, burning a full auth round-trip (or a 75s
@@ -398,8 +394,8 @@ export function isFalloverError(err: unknown): boolean {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
   if (kind === 'model.overloaded' || kind === 'model.http_5xx' || kind === 'model.transport_timeout') return true;
   // Auth failure on THIS brain → switch to a brain whose auth is valid rather
-  // than hard-failing the turn/run. Kill-switch CLEMMY_AUTH_FALLOVER=off.
-  if (authFalloverEnabled() && isAuthRecoverableError(err)) return true;
+  // than hard-failing the turn/run.
+  if (isAuthRecoverableError(err)) return true;
   return false;
 }
 

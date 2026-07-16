@@ -145,9 +145,6 @@ export function isProviderOverloadMessage(msg: string): boolean {
     || /\b(?:api error|http|status)\s*[:#]?\s*(?:429|500|502|503|504|529)\b/i.test(msg);
 }
 
-function overloadRetryEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_OVERLOAD_RETRY', 'on') ?? 'on').toLowerCase() !== 'off';
-}
 function maxOverloadRetries(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_OVERLOAD_RETRIES', '2') || '2', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
@@ -720,10 +717,6 @@ function recordClaudeSdkToolSurfaceError(options: ClaudeAgentSdkRunOptions, err:
     reason: err.reason,
     startupTimeoutMs: err.startupTimeoutMs,
   });
-}
-
-function toolSurfaceRetryEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRY', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 function maxToolSurfaceRetries(): number {
@@ -1551,8 +1544,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           ? maxToolSurfaceStartupRetries()
           : maxToolSurfaceRetries();
         if (
-          toolSurfaceRetryEnabled()
-          && !committed
+          !committed
           && !localMcpSurfaceInitialized(err.availableTools)
           && attempt < maxRetries
         ) {
@@ -1565,7 +1557,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
         // Safe first-byte retry: nothing committed yet and budget remains.
-        if (overloadRetryEnabled() && !committed && attempt < maxOverloadRetries()) {
+        if (!committed && attempt < maxOverloadRetries()) {
           try { stream?.close?.(); } catch { /* ignore */ }
           await sleep(overloadBackoffMs(attempt));
           continue;

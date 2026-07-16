@@ -301,23 +301,6 @@ test('attended quiet retry: a transient blip retries ONCE silently, THEN asks on
   );
 });
 
-test('attended quiet retry: CLEMMY_ATTENDED_QUIET_RETRY=off restores the immediate ask (no silent retry)', async () => {
-  resetEventLog();
-  const prev = process.env.CLEMMY_ATTENDED_QUIET_RETRY;
-  process.env.CLEMMY_ATTENDED_QUIET_RETRY = 'off';
-  try {
-    const sess = HarnessSession.create({ kind: 'chat' });
-    const runRunner: RunRunnerFn = async () => {
-      throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
-    };
-    const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do a thing', makeRunner: makeRunnerStub, runRunner });
-    assert.equal(result.status, 'awaiting_user_input');
-    assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 0, 'kill-switch off ⇒ no quiet retry, immediate ask');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_ATTENDED_QUIET_RETRY; else process.env.CLEMMY_ATTENDED_QUIET_RETRY = prev;
-  }
-});
-
 test('unattended self-heal: CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask even in a background run', async () => {
   resetEventLog();
   const prev = process.env.CLEMMY_UNATTENDED_AUTO_RECOVER;
@@ -3972,29 +3955,6 @@ test('runConversation: done:true completion reporting PRIOR tool work is NOT a z
   assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Brooke/);
 });
 
-test('runConversation: HARNESS_STALL_PRIOR_WORK=off restores the legacy zero-tool stall (kill-switch)', async () => {
-  const prev = process.env.HARNESS_STALL_PRIOR_WORK;
-  process.env.HARNESS_STALL_PRIOR_WORK = 'off';
-  try {
-    resetEventLog();
-    const sess = HarnessSession.create({ kind: 'chat' });
-    appendEvent({
-      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
-      data: { tool: 'outlook_email_search', callId: 'c0', arguments: '{}' },
-    });
-    const runRunner: RunRunnerFn = async (_r, _a, items) => ({
-      history: items, lastResponseId: undefined,
-      finalOutput: { summary: 'Searched Outlook for Brooke; no results.', reply: 'I searched and found nothing.', done: true, nextAction: 'completed', reason: null },
-    });
-    await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find Brooke email', makeRunner: makeRunnerStub, runRunner });
-    const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
-    assert.ok(stuck.length >= 1, 'with the kill-switch off, the legacy stall fires again');
-    assert.equal((stuck[0].data as { kind: string }).kind, 'structured_zero_tool_claim');
-  } finally {
-    if (prev === undefined) delete process.env.HARNESS_STALL_PRIOR_WORK; else process.env.HARNESS_STALL_PRIOR_WORK = prev;
-  }
-});
-
 // BUG 2: a coherent answer that failed the STRICT decision parse is DELIVERED,
 // not turned into the confusing "unable to make progress" prompt.
 test('runConversation: a coherent reply that failed strict parse is salvaged + delivered (not a stuck prompt)', async () => {
@@ -4298,23 +4258,6 @@ test('runConversation: a PERSISTENTLY empty response exhausts retries then compl
   assert.ok(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length >= 1, 'it retried before giving up');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.ok(completed.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'the fallback stands after retries exhaust');
-});
-
-test('runConversation: HARNESS_STALL_RETRY_EMPTY=off restores the immediate "couldn\'t be structured" (kill-switch)', async () => {
-  const prev = process.env.HARNESS_STALL_RETRY_EMPTY;
-  process.env.HARNESS_STALL_RETRY_EMPTY = 'off';
-  try {
-    resetEventLog();
-    const sess = HarnessSession.create({ kind: 'chat' });
-    const EMPTY_SENTINEL = "Clementine produced a response that couldn't be structured. Please ask again.";
-    const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: EMPTY_SENTINEL });
-    await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing', makeRunner: makeRunnerStub, runRunner });
-    // Kill-switch off → no empty-output retry → immediate no_structured_output.
-    const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).filter((e) => (e.data as { emptyOutput?: boolean }).emptyOutput === true);
-    assert.equal(retries.length, 0);
-  } finally {
-    if (prev === undefined) delete process.env.HARNESS_STALL_RETRY_EMPTY; else process.env.HARNESS_STALL_RETRY_EMPTY = prev;
-  }
 });
 
 test('runConversation: propagates run_failed status when a turn throws', async () => {

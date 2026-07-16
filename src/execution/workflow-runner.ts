@@ -2372,17 +2372,6 @@ function transientRetryFloor(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
 }
 
-/** W1b — per-item transient retry for forEach. A single item that hits a network/
- *  infra blip would otherwise fail fast and be dropped into the quality advisory
- *  (silent loss on, e.g., a 10%-of-items 5xx). Now it retries (transient-only,
- *  same `transientRetryFloor` budget as plain steps) — guarded so an item that
- *  already recorded an external_write is NEVER re-run (no double-act, reusing the
- *  crash-resume idempotency check). Default-ON (validated: guarded, transient-only,
- *  unit-tested, review-clean); CLEMMY_FOREACH_ITEM_RETRY=off is the kill-switch. */
-function forEachItemRetryEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_FOREACH_ITEM_RETRY', 'on') || 'on').toLowerCase() !== 'off';
-}
-
 /**
  * Goal-contract Phase 2: is this step eligible to loopUntil its contract?
  * The SIDE-EFFECT LAW, enforced at runtime (belt) on top of the authoring
@@ -3440,8 +3429,11 @@ export async function executeStep(
                 itemRoute = routeDiagnosticsFromResponse(response);
               }
             };
+            // W1b — per-item transient retry for forEach (same `transientRetryFloor`
+            // budget as plain steps), guarded so an item that already recorded an
+            // external_write is NEVER re-run (crash-resume idempotency check).
             await runWithStepRetry(runItemOnce, {
-              budget: forEachItemRetryEnabled() ? transientRetryFloor() : 0,
+              budget: transientRetryFloor(),
               backoffBaseMs: RETRY_BACKOFF_BASE_MS,
               isRetryable: (err) =>
                 !(err instanceof ParkRunSignal)

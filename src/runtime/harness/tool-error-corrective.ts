@@ -15,7 +15,6 @@
  * retry-once-if-transient / fix the field" for free.
  */
 import { isTransientStepError } from '../../execution/transient-error.js';
-import { getRuntimeEnv } from '../../config.js';
 
 export type ToolFailureKind =
   | 'permission_denied'
@@ -174,24 +173,3 @@ export function mcpErrorCorrectiveEnabled(): boolean {
   return (process.env.CLEMMY_MCP_ERROR_CORRECTIVE ?? 'on').toLowerCase() !== 'off';
 }
 
-/** Kill-switch. Validated-default-ON (set CLEMMY_TOOL_TIMEOUT_SELF_CORRECT=off to disable).
- *  When ON, a withTimeout kill of a long-job EXTERNAL tool (Composio / external_api / MCP)
- *  returns the async start+poll corrective (reads) or the verify-before-retry corrective
- *  (writes) as the tool RESULT — so the model self-corrects within the same run instead of
- *  the run parking on the loop's ask-user "retry/switch/stop" card. Read via getRuntimeEnv
- *  (not raw process.env) so the value applies under launchd, matching the brackets.ts
- *  kill-switch convention. */
-export function toolTimeoutSelfCorrectEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_TOOL_TIMEOUT_SELF_CORRECT', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
-/** Kill-switch. Validated-default-ON (set CLEMMY_TOOL_ABORT_ON_TIMEOUT=off to disable).
- *  When ON, a withTimeout kill of a wrapped tool call ALSO aborts the per-invocation
- *  AbortController (brackets.ts), which the Composio fetch layer merges into the live
- *  request — so a timed-out call is actually CANCELLED at the network layer instead of
- *  running on and burning provider credits. Off ⇒ no abort() call + the fetch merge is
- *  inert (no ALS signal is ever set), i.e. behavior identical to before S3. Read via
- *  getRuntimeEnv so the value applies under launchd, matching the other kill-switches. */
-export function toolAbortOnTimeoutEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_TOOL_ABORT_ON_TIMEOUT', 'on') ?? 'on').toLowerCase() !== 'off';
-}

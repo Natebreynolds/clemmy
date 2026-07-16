@@ -57,8 +57,6 @@ import { creditMatchingRecall, isTransientFailure } from '../../memory/procedura
 import {
   asyncJobTimeoutCorrective,
   writeJobTimeoutCorrective,
-  toolTimeoutSelfCorrectEnabled,
-  toolAbortOnTimeoutEnabled,
 } from './tool-error-corrective.js';
 
 /**
@@ -509,7 +507,7 @@ function recordExternalWriteOrphan(
         targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
         argsDigest: shortArgsDigest(parsedInput),
         timeoutMs,
-        aborted: toolAbortOnTimeoutEnabled(),
+        aborted: true,
       },
     });
   } catch { /* telemetry write must never block the corrective */ }
@@ -2223,18 +2221,17 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // S3 abort-on-timeout: a per-invocation controller whose signal rides the
         // ALS into the tool's fetch layer (Composio merges it via AbortSignal.any).
         // onTimeout → ac.abort() so a timed-out call is CANCELLED at the network
-        // layer instead of running on and burning provider credits. Kill-switch
-        // off ⇒ no controller, no ALS signal, no onTimeout — identical to before.
-        const ac = toolAbortOnTimeoutEnabled() ? new AbortController() : undefined;
+        // layer instead of running on and burning provider credits.
+        const ac = new AbortController();
         const start = () => originalInvoke.call(tt, runContext, input, details);
-        const work = (async () => (ac ? runWithToolAbortSignal(ac.signal, start) : start()))();
+        const work = runWithToolAbortSignal(ac.signal, start);
         return withTimeout(
           work,
           timeoutMs,
           tool.name,
           {
             isPaused: isPausedFactory(ctx?.sessionId),
-            onTimeout: ac ? () => ac.abort(new ToolTimeout(tool.name, timeoutMs)) : undefined,
+            onTimeout: () => ac.abort(new ToolTimeout(tool.name, timeoutMs)),
           },
         );
       };
@@ -2293,22 +2290,17 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // verify-before-retry corrective (writes) as the tool RESULT instead of letting
       // ToolTimeout propagate to handleRunError's ask-user "retry/switch/stop" pause —
       // so the model self-corrects within the SAME run, generalizing the run_worker
-      // precedent above to the broader class. Behind CLEMMY_TOOL_TIMEOUT_SELF_CORRECT
-      // (default on). Internal default-60s tools, shell, and draft_plan are NOT in the
-      // class: their timeout is a real hang/flake the loop's ask-user card should still
-      // surface, so they keep propagating. NOTE on the orphaned call: withTimeout
-      // rejects with ToolTimeout and the outer promise STAYS rejected, so when the
-      // underlying call finishes later its resolve() is a no-op (promises settle
-      // once). The bookkeeping .then() on invokePromise therefore does NOT run on a
-      // timeout and the late result is discarded. Consequence for a WRITE: a
-      // timed-out write that lands late is recorded NOWHERE (no recordPublish), so
-      // the verify-before-retry corrective's read-back is the ONLY dup protection —
-      // there is no ledger backstop. (A true fix is AbortController cancellation.)
-      //
-      // Ordering matters: gate on the CHEAP pure predicate, and read the
-      // kill-switch (a filesystem .env read via getRuntimeEnv) ONLY inside the
-      // catch on an actual ToolTimeout — never on the per-call success path. A
-      // class tool's normal return must not pay an fs read every invoke.
+      // precedent above to the broader class. Internal default-60s tools, shell, and
+      // draft_plan are NOT in the class: their timeout is a real hang/flake the loop's
+      // ask-user card should still surface, so they keep propagating. NOTE on the
+      // orphaned call: withTimeout rejects with ToolTimeout and the outer promise
+      // STAYS rejected, so when the underlying call finishes later its resolve() is a
+      // no-op (promises settle once). The bookkeeping .then() on invokePromise
+      // therefore does NOT run on a timeout and the late result is discarded.
+      // Consequence for a WRITE: a timed-out write that lands late is recorded NOWHERE
+      // (no recordPublish), so the verify-before-retry corrective's read-back is the
+      // ONLY dup protection — there is no ledger backstop. (A true fix is
+      // AbortController cancellation.)
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {
           const result = await invokePromise;
@@ -2321,12 +2313,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
         } catch (err) {
           if (err instanceof ToolTimeout) {
             // S3 orphan ledger: a mutating write in this long-job class timed out
-            // and may have landed — record it before self-correcting (or before it
-            // propagates when self-correct is off). No-ops for reads.
+            // and may have landed — record it before self-correcting. No-ops for reads.
             recordExternalWriteOrphan(ctx?.sessionId, tool.name, parsedInput, timeoutMs);
-            if (toolTimeoutSelfCorrectEnabled()) {
-              return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
-            }
+            return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
           }
           throw err;
         }
@@ -2361,16 +2350,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
     let result: unknown;
     try {
       // S3 abort-on-timeout (legacy execute twin — mirrors the invoke path above).
-      const ac = toolAbortOnTimeoutEnabled() ? new AbortController() : undefined;
+      const ac = new AbortController();
       const start = () => originalExecute(input, runContext);
-      const work = (async () => (ac ? runWithToolAbortSignal(ac.signal, start) : start()))();
+      const work = runWithToolAbortSignal(ac.signal, start);
       result = await withTimeout(
         work,
         timeoutMs,
         tool.name,
         {
           isPaused: isPausedFactory(ctx?.sessionId),
-          onTimeout: ac ? () => ac.abort(new ToolTimeout(tool.name, timeoutMs)) : undefined,
+          onTimeout: () => ac.abort(new ToolTimeout(tool.name, timeoutMs)),
         },
       );
     } catch (err) {
@@ -2379,12 +2368,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // (run continues) instead of propagating ToolTimeout to the ask-user pause.
       // Non-class tools (internal-60s, shell, draft_plan) keep propagating.
       if (err instanceof ToolTimeout && isTimeoutSelfCorrectTool(tool.name)) {
-        // S3 orphan ledger — mirrors the invoke path (records a maybe-landed write
-        // whether or not self-correct returns the corrective). No-ops for reads.
+        // S3 orphan ledger — mirrors the invoke path (records a maybe-landed
+        // write before self-correcting). No-ops for reads.
         recordExternalWriteOrphan(ctx?.sessionId, tool.name, input, timeoutMs);
-        if (toolTimeoutSelfCorrectEnabled()) {
-          return timeoutCorrectiveFor(tool.name, input, timeoutMs);
-        }
+        return timeoutCorrectiveFor(tool.name, input, timeoutMs);
       }
       throw err;
     }

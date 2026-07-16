@@ -1857,15 +1857,13 @@ test('forEach batching attributes item failures to their original keys across wi
   }
 });
 
-test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds BY DEFAULT (flag unset)', async () => {
+test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds', async () => {
   const prevH = process.env.WORKFLOW_USE_HARNESS;
   const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevL = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
-  delete process.env.CLEMMY_FOREACH_ITEM_RETRY; // default-ON: retry is the shipped behavior
   try {
     const attempts: Record<string, number> = {};
     const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
@@ -1901,53 +1899,6 @@ test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds BY DEFAULT
     restoreEnv('WORKFLOW_USE_HARNESS', prevH);
     restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevB);
     restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevL);
-    restoreEnv('CLEMMY_FOREACH_ITEM_RETRY', prevR);
-  }
-});
-
-test('W1b: CLEMMY_FOREACH_ITEM_RETRY=off is the kill-switch — a transient item failure is NOT retried', async () => {
-  const prevH = process.env.WORKFLOW_USE_HARNESS;
-  const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
-  const prevL = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
-  process.env.WORKFLOW_USE_HARNESS = 'off';
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
-  process.env.CLEMMY_FOREACH_ITEM_RETRY = 'off'; // explicit kill-switch
-  try {
-    const attempts: Record<string, number> = {};
-    const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
-    const ctx = {
-      workflow: { name: 'W1b Flag Off Test', steps: [] },
-      workflowSlug: 'w1b-flagoff',
-      runId: 'w1b-off-1',
-      inputs: {},
-      stepOutputs: { pull: ['a', 'd'] },
-      assistant: {
-        respond: async (req: { message?: string }) => {
-          const k = (req.message ?? '').match(/\bItem:\s*(\w+)\b/)?.[1] ?? '?';
-          attempts[k] = (attempts[k] ?? 0) + 1;
-          if (k === 'd') throw new Error('upstream 503 service unavailable');
-          return { text: 'done' };
-        },
-      },
-      completedItems: new Map(),
-      forEachFailures,
-      qualityAdvisories: [],
-    } as unknown as Parameters<typeof executeStep>[1];
-    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
-
-    const output = await executeStep(step, ctx) as Array<{ itemKey: string }>;
-
-    assert.deepEqual(output.map((i) => i.itemKey), ['a'], 'flag off → failed item is dropped, not retried');
-    assert.deepEqual(forEachFailures.map((f) => f.itemKey), ['d']);
-    assert.equal(attempts.d, 1, 'item d ran exactly once (no retry when flag off)');
-    assert.equal(readWorkflowEvents('w1b-flagoff', 'w1b-off-1').some((e) => e.kind === 'item_retry'), false, 'no item_retry when flag off');
-  } finally {
-    restoreEnv('WORKFLOW_USE_HARNESS', prevH);
-    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevB);
-    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevL);
-    restoreEnv('CLEMMY_FOREACH_ITEM_RETRY', prevR);
   }
 });
 

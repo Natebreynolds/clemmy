@@ -55,7 +55,7 @@ import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthE
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { restoreLegacyInstructionOrder, stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
+import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { recordCodexRateLimit } from './rate-limit-store.js';
 import pino from 'pino';
 
@@ -235,14 +235,8 @@ export function shouldForceSseTruncation(): boolean {
  * are the SAME class ("the model yielded no content"), so we fold the
  * former into the latter's existing retry-or-honest-error path instead of
  * special-casing it downstream. Provably safe to retry (nothing was yielded
- * to the user, so no tokens can duplicate). Kill-switch
- * CLEMMY_CODEX_RETRY_EMPTY_COMPLETION=off restores the legacy pass-through.
+ * to the user, so no tokens can duplicate).
  */
-export function retryEmptyCompletionEnabled(): boolean {
-  const v = (process.env.CLEMMY_CODEX_RETRY_EMPTY_COMPLETION ?? 'on').trim().toLowerCase();
-  return v !== 'off' && v !== '0' && v !== 'false';
-}
-
 function sizeRequestComponents(body: CodexRequestBody): RequestBodyBreakdown {
   const utf8 = (v: unknown): number => Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8');
   const instructionsBytes = Buffer.byteLength(body.instructions ?? '', 'utf8');
@@ -582,11 +576,10 @@ export class CodexResponsesModel implements Model {
       // "Empty completion" — response.completed arrived but the model
       // yielded NO content (zero output items, no text delta). Not a valid
       // answer in this harness; fold it into the same no-content retry path
-      // a truncated stream uses below (see retryEmptyCompletionEnabled).
+      // a truncated stream uses below.
       const emptyCompletion = !!completedEvent
         && seenOutputItems.length === 0
-        && !yieldedRealContent
-        && retryEmptyCompletionEnabled();
+        && !yieldedRealContent;
       if (completedEvent && !emptyCompletion) {
         // Success path — flush any deferred events (response_started +
         // metadata frames) in arrival order before the response_done.
@@ -968,27 +961,11 @@ interface CodexRequestBody {
  * docs warn a too-broad key overflows a node's ~15 RPM/prefix budget and resets
  * the cache, while a too-narrow key spreads traffic and loses reuse. Returns
  * undefined outside a harness run context (unit/contract tests) → the field is
- * omitted → byte-identical wire shape. CLEMMY_CODEX_CACHE_KEY=off disables.
+ * omitted → byte-identical wire shape.
  */
 function codexPromptCacheKey(): string | undefined {
-  if (/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CODEX_CACHE_KEY', 'on') || 'on').trim())) {
-    return undefined;
-  }
   const sessionId = harnessRunContextStorage.getStore()?.sessionId;
   return sessionId ? `clem:${sessionId}` : undefined;
-}
-
-/** When ON (default), keep the Codex `instructions` STABLE — the role rubric only —
- *  and re-home the per-turn DYNAMIC memory context after the tools block (as a
- *  trailing input system message). OpenAI's automatic cache is a single longest
- *  common prefix over `instructions + tools + input`; the legacy dynamic-first wire
- *  led with per-turn-changing context, so the prefix diverged BEFORE the large tool
- *  schema block and re-billed it nearly every turn (~26% hit rate, measured — the
- *  dominant cost driver). Keeping instructions stable makes `instructions + tools`
- *  a cacheable prefix. OFF restores the legacy dynamic-first single-string wire
- *  (byte-identical to pre-parity) for a clean rollback. */
-function codexStableInstructionsEnabled(): boolean {
-  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CODEX_STABLE_INSTRUCTIONS', 'on') || 'on').trim());
 }
 
 /** Split the assembler's `${role}${DELIM}${ctx}` into the STABLE role prefix (kept
@@ -1010,20 +987,14 @@ export function splitCodexInstructions(raw: string | undefined | null): { instru
 export function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
   const input = serializeInput(request.input);
-  let instructions: string;
-  if (codexStableInstructionsEnabled()) {
-    // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
-    // ctx moves to a trailing input system message (after tools) so `instructions +
-    // tools` caches. Placed at the input tail where the [AGENT CONTEXT PACKET]
-    // already lives — the model still sees it, it just no longer busts the prefix.
-    const split = splitCodexInstructions(request.systemInstructions);
-    instructions = split.instructions || 'You are a helpful assistant.';
-    if (split.trailingContext.trim()) {
-      input.push({ role: 'system', content: split.trailingContext.trim() });
-    }
-  } else {
-    // Legacy dynamic-first wire (kill-switch) — byte-identical to pre-parity.
-    instructions = restoreLegacyInstructionOrder(request.systemInstructions) || 'You are a helpful assistant.';
+  // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
+  // ctx moves to a trailing input system message (after tools) so `instructions +
+  // tools` caches. Placed at the input tail where the [AGENT CONTEXT PACKET]
+  // already lives — the model still sees it, it just no longer busts the prefix.
+  const split = splitCodexInstructions(request.systemInstructions);
+  const instructions = split.instructions || 'You are a helpful assistant.';
+  if (split.trailingContext.trim()) {
+    input.push({ role: 'system', content: split.trailingContext.trim() });
   }
   const body: CodexRequestBody = {
     model: resolveCodexModel(modelId),
@@ -1532,7 +1503,7 @@ function assembleModelResponse(events: AnyCodexEvent[]): ModelResponse {
   // that carried no output items is an empty completion — treat it as the
   // retryable no-content failure, not a clean (empty) ModelResponse. The
   // getResponse retry loop re-attempts it transparently (nothing yielded).
-  const emptyCompletion = !!completed && items.length === 0 && retryEmptyCompletionEnabled();
+  const emptyCompletion = !!completed && items.length === 0;
   if (!completed || emptyCompletion) {
     throw new BoundaryError({
       kind: 'codex.sse_truncated',

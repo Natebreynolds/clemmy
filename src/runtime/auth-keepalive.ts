@@ -13,8 +13,6 @@
  * process lock + skip-if-recent guards and adds no reuse-revoke risk. It also
  * announces a dead→alive recovery (e.g. after the user re-authenticates) so the
  * "expired" notification gets a matching "recovered" one.
- *
- * Kill switch: CLEMENTINE_AUTH_KEEPALIVE=off.
  */
 import pino from 'pino';
 import {
@@ -47,10 +45,6 @@ function notifyCodexAuthRecovered(): void {
     read: false,
     metadata: { errorCategory: 'auth_recovered', provider: 'codex' },
   });
-}
-
-export function isAuthKeepaliveEnabled(): boolean {
-  return (process.env.CLEMENTINE_AUTH_KEEPALIVE ?? 'on').toLowerCase() !== 'off';
 }
 
 /** One keepalive tick. Best-effort — never throws into the daemon loop. */

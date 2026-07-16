@@ -1625,15 +1625,6 @@ function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResu
   }
 }
 
-/** Gate-unification Step 2: a `done:true + awaiting_handoff_result` decision is
- *  waiting on a retired hand-off and used to fall through to a silent re-loop
- *  until a budget cap killed it (the one live dead-end the stall detectors miss).
- *  Default-on: surface the result and ask the user instead. =off reverts to the
- *  prior continue-loop behavior. */
-function handoffDeadEndFixEnabled(): boolean {
-  return (process.env.HARNESS_HANDOFF_DEADEND_FIX ?? 'on').toLowerCase() !== 'off';
-}
-
 /**
  * Pure: should a forward-progressing run auto-elevate its budget because it is
  * about to exhaust the STEP cap? Only fires on the capped `standard` preset with
@@ -2172,12 +2163,10 @@ async function runConversationCore(
       // and a convergence-steer prefix could push nextInput past the length gate), so
       // this reads the user's actual ask, not a harness directive. The EQUALITY gate is
       // the guard against re-firing: any turn whose reply is not exactly the literal
-      // (a real tool turn, an announcement) simply doesn't match. Shares the
-      // HARNESS_STALL_SALVAGE_REPLY kill-switch with the consistency salvage below.
+      // (a real tool turn, an announcement) simply doesn't match.
       if (
         (turnResult.toolCalls ?? 0) === 0 &&
         typeof turnResult.finalOutput === 'string' &&
-        (getRuntimeEnv('HARNESS_STALL_SALVAGE_REPLY', 'on') ?? 'on').toLowerCase() !== 'off' &&
         replyFulfillsVerbatimRequest(options.input, turnResult.finalOutput)
       ) {
         const verbatimReply = turnResult.finalOutput.trim();
@@ -2319,11 +2308,7 @@ async function runConversationCore(
         // "I didn't find any email from Brooke" answer this way). Only the real
         // reply is delivered — a generic ack / announcement / empty-reply
         // sentinel (hasReply:false) is excluded and still asks the user.
-        // Kill-switch HARNESS_STALL_SALVAGE_REPLY=off.
-        const salvageEnabled =
-          (getRuntimeEnv('HARNESS_STALL_SALVAGE_REPLY', 'on') ?? 'on').toLowerCase() !== 'off';
         if (
-          salvageEnabled &&
           stallInfo.signal === 'D_decision_json' &&
           (stallInfo.detail as { hasReply?: boolean }).hasReply === true &&
           stallInfo.userVisibleMessage.trim()
@@ -2363,8 +2348,7 @@ async function runConversationCore(
         // and a whitespace-normalized prefix match against the prior attempt's
         // recorded rawOutput (so an answer that CHANGED between attempts —
         // i.e. the retry actually moved something — still asks the user).
-        // Shares the HARNESS_STALL_SALVAGE_REPLY kill-switch with shape 1.
-        if (salvageEnabled && stallInfo.signal === 'A_zero_tools') {
+        if (stallInfo.signal === 'A_zero_tools') {
           const finalText = typeof turnResult.finalOutput === 'string' ? turnResult.finalOutput.trim() : '';
           const priorRaw = latestStallRetryRawOutput(options.sessionId);
           const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
@@ -2432,12 +2416,10 @@ async function runConversationCore(
       // concrete action) while we have budget. The toolCalls>0 case is already
       // retried above; this is the symmetric zero-tool case. Bounded by
       // MAX_STALL_RETRIES → after exhaustion the fallback below stands.
-      // Kill-switch HARNESS_STALL_RETRY_EMPTY=off.
       if (
         !stallInfo &&
         turnResult.finalOutput === STRUCTURED_OUTPUT_RECOVERY_FALLBACK &&
-        stallRetriesUsed < MAX_STALL_RETRIES &&
-        (getRuntimeEnv('HARNESS_STALL_RETRY_EMPTY', 'on') ?? 'on').toLowerCase() !== 'off'
+        stallRetriesUsed < MAX_STALL_RETRIES
       ) {
         stallRetriesUsed += 1;
         safeAppend({
@@ -3193,8 +3175,7 @@ async function runConversationCore(
     // path instead of a silent hang. (done:false keeps looping as before.)
     if (
       decision.done &&
-      decision.nextAction === 'awaiting_handoff_result' &&
-      handoffDeadEndFixEnabled()
+      decision.nextAction === 'awaiting_handoff_result'
     ) {
       const askedThisTurn = (() => {
         try {
@@ -5549,10 +5530,6 @@ function unattendedAutoRecoverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_UNATTENDED_AUTO_RECOVER', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-function attendedQuietRetryEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_ATTENDED_QUIET_RETRY', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
 /** An unattended run has no human to answer an infra ask. Signalled by the run
  *  session id prefix (`workflow:` / `background:`) — the robust allocation-time
  *  signal — with an execution-kind fallback. Interactive sessions are attended. */
@@ -5572,7 +5549,7 @@ type InfraRecoveryDecision = 'ask' | 'auto_retry' | 'exhausted';
  *  - UNATTENDED (workflow/background): AUTO_RETRY up to MAX_INFRA_AUTO_RECOVER,
  *    then EXHAUSTED (fail honestly — no human to ask).
  *  - ATTENDED (interactive): ONE silent AUTO_RETRY, then ASK (a human is here).
- *  Either lane's auto-retry is gated by its own kill-switch.
+ *  The unattended lane's auto-retry is gated by its own kill-switch.
  */
 function decideInfraRecovery(sessionId: string): InfraRecoveryDecision {
   if (isUnattendedSession(sessionId)) {
@@ -5580,7 +5557,6 @@ function decideInfraRecovery(sessionId: string): InfraRecoveryDecision {
     return countInfraAutoRecover(sessionId) < MAX_INFRA_AUTO_RECOVER ? 'auto_retry' : 'exhausted';
   }
   // Attended: quiet-retry once, then ask — never 'exhausted' (the user answers).
-  if (!attendedQuietRetryEnabled()) return 'ask';
   return countInfraAutoRecover(sessionId) < ATTENDED_QUIET_RETRY_BUDGET ? 'auto_retry' : 'ask';
 }
 
@@ -5603,11 +5579,6 @@ function buildInfraRetryDirective(kind: string): string {
 // register the in-flight call at death and, once it completes, fire a follow-up
 // report turn so the session self-reports — attended and unattended.
 
-/** Kill-switch (default on) for stranded-tool reunification. */
-function orphanToolReunifyEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_ORPHAN_TOOL_REUNIFY', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
 /** An orphan whose tool completed after its turn died — max age before we give up
  *  waiting (a never-completing tool must not linger forever). */
 const ORPHAN_TOOL_MAX_AGE_MS = 30 * 60_000;
@@ -5619,7 +5590,6 @@ const ORPHAN_TOOL_MAX_AGE_MS = 30 * 60_000;
  * there is no double-fire. Best-effort; never throws into the death path.
  */
 export function recordOrphanedToolInFlight(sessionId: string, turn: number): void {
-  if (!orphanToolReunifyEnabled()) return;
   try {
     const events = listEvents(sessionId);
     const returned = new Set<string>();
@@ -5686,7 +5656,6 @@ function buildOrphanReportDirective(toolName: string, resultSummary: string): st
  */
 export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolReport[] {
   const reports: OrphanedToolReport[] = [];
-  if (!orphanToolReunifyEnabled()) return reports;
   let events: EventRow[];
   try { events = listEvents(sessionId); } catch { return reports; }
   const reported = new Set(
@@ -5918,62 +5887,58 @@ function handleRunError(
     ? err.message.match(/ToolTimeout: tool (\S+) timed out after (\d+)ms/)
     : null;
   if (err instanceof ToolTimeout || wrappedToolTimeoutMatch) {
-    const askUserEnabled =
-      (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
-    if (askUserEnabled) {
-      const toolMatch = err instanceof ToolTimeout
-        ? err.message.match(/tool (\S+) timed out after (\d+)ms/)
-        : wrappedToolTimeoutMatch;
-      const toolName = toolMatch?.[1] ?? 'unknown';
-      const timeoutMs = toolMatch?.[2] ?? '?';
-      let retryContext: Record<string, unknown> | null = null;
-      try {
-        const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
-        if (recentToolCalls.length > 0) {
-          const tc = recentToolCalls[recentToolCalls.length - 1];
-          const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
-          if (tcData?.tool) {
-            retryContext = {
-              failed_tool: tcData.tool,
-              failed_args: tcData.arguments ?? null,
-              failed_call_id: tcData.callId ?? null,
-              failed_turn: tc.turn ?? turn,
-            };
-          }
+    const toolMatch = err instanceof ToolTimeout
+      ? err.message.match(/tool (\S+) timed out after (\d+)ms/)
+      : wrappedToolTimeoutMatch;
+    const toolName = toolMatch?.[1] ?? 'unknown';
+    const timeoutMs = toolMatch?.[2] ?? '?';
+    let retryContext: Record<string, unknown> | null = null;
+    try {
+      const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
+      if (recentToolCalls.length > 0) {
+        const tc = recentToolCalls[recentToolCalls.length - 1];
+        const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
+        if (tcData?.tool) {
+          retryContext = {
+            failed_tool: tcData.tool,
+            failed_args: tcData.arguments ?? null,
+            failed_call_id: tcData.callId ?? null,
+            failed_turn: tc.turn ?? turn,
+          };
         }
-      } catch { /* best-effort */ }
-      // UNATTENDED self-heal: retry the timed-out call (bounded) or fail honestly
-      // instead of asking a human who isn't there.
-      const infraDecision = decideInfraRecovery(sessionId);
-      if (infraDecision === 'auto_retry') {
-        bumpTurnNumber(sessionId, turn);
-        return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout') } };
       }
-      recordOrphanedToolInFlight(sessionId, turn);
-      if (infraDecision === 'exhausted') {
-        emitInfraUnrecovered(sessionId, turn, 'tool.timeout', normalizeError(err));
-        session.markStatus('failed');
-        bumpTurnNumber(sessionId, turn);
-        return { sessionId, turn, status: 'failed', error: normalizeError(err) };
-      }
-      safeAppend({
-        sessionId,
-        turn,
-        role: 'Clem',
-        type: 'awaiting_user_input',
-        data: {
-          question:
-            `The \`${toolName}\` tool timed out after ${timeoutMs}ms. Should I retry (the same call), switch approach, or stop here?`,
-          options: ['Retry', 'Switch approach', 'Stop'],
-          source: 'infra_error_recovery',
-          boundaryKind: 'tool.timeout',
-          operatorMessage: clip(normalizeError(err), 400),
-          retry_context: retryContext,
-        },
-      });
+    } catch { /* best-effort */ }
+    // UNATTENDED self-heal: retry the timed-out call (bounded) or fail honestly
+    // instead of asking a human who isn't there.
+    const infraDecision = decideInfraRecovery(sessionId);
+    if (infraDecision === 'auto_retry') {
       bumpTurnNumber(sessionId, turn);
-      return { sessionId, turn, status: 'awaiting_user_input', error: normalizeError(err) };
+      return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout') } };
     }
+    recordOrphanedToolInFlight(sessionId, turn);
+    if (infraDecision === 'exhausted') {
+      emitInfraUnrecovered(sessionId, turn, 'tool.timeout', normalizeError(err));
+      session.markStatus('failed');
+      bumpTurnNumber(sessionId, turn);
+      return { sessionId, turn, status: 'failed', error: normalizeError(err) };
+    }
+    safeAppend({
+      sessionId,
+      turn,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: {
+        question:
+          `The \`${toolName}\` tool timed out after ${timeoutMs}ms. Should I retry (the same call), switch approach, or stop here?`,
+        options: ['Retry', 'Switch approach', 'Stop'],
+        source: 'infra_error_recovery',
+        boundaryKind: 'tool.timeout',
+        operatorMessage: clip(normalizeError(err), 400),
+        retry_context: retryContext,
+      },
+    });
+    bumpTurnNumber(sessionId, turn);
+    return { sessionId, turn, status: 'awaiting_user_input', error: normalizeError(err) };
   }
 
   const message = normalizeError(err);
@@ -6021,7 +5986,6 @@ function handleRunError(
   // re-typing the whole prompt. F4 covers MODEL stalls (prose+no
   // tools); this is the infra-error twin: a transient backend failure
   // is exactly when "ask the user what to do" is the right answer.
-  // Honors HARNESS_INFRA_ASK_USER=off to revert.
   if (err instanceof BoundaryError) {
     const askUserKinds = new Set<string>([
       'codex.http_5xx',
@@ -6039,9 +6003,7 @@ function handleRunError(
       // dead session; brain-switch is tried first via the deferInfraAsk path below.
       'model.unknown',
     ]);
-    const askUserEnabled =
-      (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
-    if (askUserEnabled && askUserKinds.has(err.kind)) {
+    if (askUserKinds.has(err.kind)) {
       // W1a chat step-boundary fallover: if the caller can fall over to another
       // brain AND this is a transient kind that switching can fix, DEFER the ask —
       // return the kind so runConversation tries the next brain first and only

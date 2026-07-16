@@ -162,9 +162,6 @@ export function sdkStreamingEnabled(): boolean {
   const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'on') ?? 'on').trim().toLowerCase();
   return raw !== 'off' && raw !== 'false' && raw !== '0';
 }
-function narrationRetryEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
-}
 function claudeSdkSalvageEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SALVAGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
@@ -1128,15 +1125,14 @@ export async function respondViaClaudeAgentSdkBrain(
       jitAllowed = fullAllowed; jitAdvertised = advertisedUniverse; mcpToolAllowlist = undefined; jitReason = 'jit-error-fellback';
     }
   }
-  // Telemetry — emit on a real reduction OR whenever the A/B is running (so the
-  // control arm is attributable too). Tagged lane:'claude_sdk' to distinguish from
-  // the Codex orchestrator lane in the readout.
-  if (sessionId && (jitDropped > 0 || jitDecision.experiment)) {
+  // Telemetry — emit on a real reduction. Tagged lane:'claude_sdk' to distinguish
+  // from the Codex orchestrator lane in the readout.
+  if (sessionId && jitDropped > 0) {
     try {
       appendEvent({
         sessionId, turn: 0, role: 'system', type: 'tool_jit_scope',
         data: {
-          lane: 'claude_sdk', arm: jitDecision.arm, experiment: jitDecision.experiment,
+          lane: 'claude_sdk',
           jitActive: jitDecision.active,
           droppedCount: jitDropped,
           exposedCount: jitAdvertised.length,
@@ -1323,9 +1319,8 @@ export async function respondViaClaudeAgentSdkBrain(
     // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
     // most of it). If the brain made NO real tool calls but its text reproduces the
     // tool-call protocol, it described a call instead of making one — retry ONCE
-    // with a hard nudge to actually invoke the tool. Kill-switch
-    // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
+    // with a hard nudge to actually invoke the tool.
+    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && modeCanAuthorOrExecute(mode) && looksLikeToolNarration(result.text, result.toolUses)) {
       const retry = await runContinuation({
         prompt:
           `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
@@ -1342,8 +1337,7 @@ export async function respondViaClaudeAgentSdkBrain(
     // memory-context cousin of narrate-instead-of-call — it second-guessed its
     // memory instead of doing the task. Retry ONCE, telling it the context is
     // trusted and to just do the work. Any mode (a read turn can spiral too).
-    // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
+    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && looksLikeReasoningLeak(result.text, result.toolUses)) {
       const retry = await runContinuation({
         prompt:
           `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +

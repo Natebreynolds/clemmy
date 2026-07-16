@@ -65,25 +65,6 @@ test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provi
   }
 });
 
-test('embedQuery in-flight cache: kill-switch off ⇒ every call hits the provider', async () => {
-  _resetEmbeddingHealthForTest();
-  const prev = process.env.CLEMMY_EMBED_QUERY_CACHE;
-  process.env.CLEMMY_EMBED_QUERY_CACHE = 'off';
-  let calls = 0;
-  _setEmbeddingProviderForTest({
-    id: 'test-counter', dim: EMBEDDING_DIM,
-    embed: async (texts: string[]) => { calls += 1; return texts.map(() => new Float32Array(EMBEDDING_DIM)); },
-  } as any);
-  try {
-    await Promise.all([embedQuery('same query'), embedQuery('same query')]);
-    assert.equal(calls, 2, 'cache disabled → no dedup');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_EMBED_QUERY_CACHE; else process.env.CLEMMY_EMBED_QUERY_CACHE = prev;
-    _setEmbeddingProviderForTest(undefined);
-    _resetEmbeddingHealthForTest();
-  }
-});
-
 test('embedQuery cache is cleared when the embedding provider changes', async () => {
   _resetEmbeddingHealthForTest();
   let callsA = 0;
@@ -264,10 +245,10 @@ test('embedErrorIsRetryable: retries genuine transient (timeout/5xx), NOT persis
 });
 
 test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown', () => {
-  // Pin the LEGACY breaker semantics with the local-fallback demotion off —
-  // with it on (the default), a quota open demotes to the local provider and
-  // deliberately clears this cooldown (see embeddings-demotion.test.ts).
-  process.env.CLEMMY_EMBED_LOCAL_FALLBACK = 'off';
+  // Pin the LEGACY breaker semantics by disabling local embeddings — without a
+  // local provider to demote to, a quota open keeps the cooldown instead of
+  // clearing it (the demote-and-clear path is covered in embeddings-demotion.test.ts).
+  process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
   try {
     _resetEmbeddingHealthForTest();
     _driveEmbedFailureForTest(new Error('Embeddings API 429: insufficient_quota — exceeded your current quota'));
@@ -277,7 +258,7 @@ test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown'
     // ~1h cooldown, not the 5-min transient one.
     assert.ok(h.cooldownUntilMs - Date.now() > 30 * 60_000, 'terminal cooldown should be far longer than transient');
   } finally {
-    delete process.env.CLEMMY_EMBED_LOCAL_FALLBACK;
+    delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
   }
 });
 
@@ -291,9 +272,10 @@ test('breaker: a single transient error does NOT open the breaker (needs 3)', ()
 });
 
 test('breaker: success resets state and records lastSuccessAt', () => {
-  // Legacy semantics — a terminal open would otherwise demote to local and
-  // clear the breaker (embeddings-demotion.test.ts covers that path).
-  process.env.CLEMMY_EMBED_LOCAL_FALLBACK = 'off';
+  // Legacy semantics — disable local embeddings so a terminal open holds the
+  // breaker instead of demoting to local and clearing it (that path is covered
+  // in embeddings-demotion.test.ts).
+  process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
   try {
     _resetEmbeddingHealthForTest();
     _driveEmbedFailureForTest(new Error('Embeddings API 401: invalid_api_key'));
@@ -305,7 +287,7 @@ test('breaker: success resets state and records lastSuccessAt', () => {
     assert.equal(h.lastErrorClass, null);
     assert.ok(h.lastSuccessAt, 'lastSuccessAt is recorded');
   } finally {
-    delete process.env.CLEMMY_EMBED_LOCAL_FALLBACK;
+    delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
   }
 });
 

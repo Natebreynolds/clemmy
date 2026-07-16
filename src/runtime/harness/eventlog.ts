@@ -161,9 +161,9 @@ export const EVENT_TYPES = [
   'external_write_failed',
   // S3 orphan ledger: a MUTATING external write TIMED OUT. The harness stops
   // waiting but the request MAY have landed server-side (it is aborted at the
-  // network layer only when CLEMMY_TOOL_ABORT_ON_TIMEOUT is on — recorded in
-  // `aborted`). Durable audit of maybe-landed writes, and the signal the
-  // orphaned-write retry corrective consults before a blind same-shape retry.
+  // network layer — recorded in `aborted`). Durable audit of maybe-landed
+  // writes, and the signal the orphaned-write retry corrective consults before
+  // a blind same-shape retry.
   'external_write_orphaned',
   // Always-on telemetry: a run_worker sub-agent hit its turn ceiling
   // (MaxTurnsExceeded). Worker nested runs carry no harness hooks, so this is

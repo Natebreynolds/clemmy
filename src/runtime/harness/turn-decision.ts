@@ -10,7 +10,6 @@
  * unified entry point later phases adopt.
  */
 import { listEvents, type EventRow } from './eventlog.js';
-import { getRuntimeEnv } from '../../config.js';
 import { isToolSurfaceProbeTool } from './tool-evidence.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
 import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
@@ -604,10 +603,9 @@ function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boo
  * Probe tools (memory/workspace/capability lookups) are EXCLUDED, so "only
  * looked at memory then claimed an external action" is not granted suppression.
  * Fail-OPEN to false — a degraded eventlog must never hide a real "claimed done,
- * did no work" lie. Kill-switch: HARNESS_STALL_PRIOR_WORK=off.
+ * did no work" lie.
  */
 function sessionDidSubstantiveToolWork(sessionId: string, turn: number): boolean {
-  if ((getRuntimeEnv('HARNESS_STALL_PRIOR_WORK', 'on') ?? 'on').toLowerCase() === 'off') return false;
   try {
     return listEvents(sessionId, { types: ['tool_called'] }).some((event) => {
       if (typeof event.turn !== 'number' || event.turn >= turn) return false;

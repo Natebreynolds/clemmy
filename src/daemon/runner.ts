@@ -45,7 +45,7 @@ import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brac
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { getClaudeAuthSnapshot } from '../runtime/claude-oauth.js';
-import { tickAuthKeepalive, isAuthKeepaliveEnabled } from '../runtime/auth-keepalive.js';
+import { tickAuthKeepalive } from '../runtime/auth-keepalive.js';
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
@@ -1419,15 +1419,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
 
   // Proactive Codex auth keepalive: refresh a soon-to-expire token while idle and
   // surface a re-auth prompt EARLY (not mid-task). Routes through the existing
-  // single-flight + lock, so it adds no reuse-revoke risk. Kill switch:
-  // CLEMENTINE_AUTH_KEEPALIVE=off.
-  if (isAuthKeepaliveEnabled()) {
-    // Run once shortly after boot so a daemon that started with a near-expired
-    // token warms it before the first job, then every 5 min.
-    setTimeout(() => { void tickAuthKeepalive(); }, 30_000).unref?.();
-    const authKeepaliveTimer = setInterval(() => { void tickAuthKeepalive(); }, 5 * 60_000);
-    authKeepaliveTimer.unref?.();
-  }
+  // single-flight + lock, so it adds no reuse-revoke risk.
+  // Run once shortly after boot so a daemon that started with a near-expired
+  // token warms it before the first job, then every 5 min.
+  setTimeout(() => { void tickAuthKeepalive(); }, 30_000).unref?.();
+  const authKeepaliveTimer = setInterval(() => { void tickAuthKeepalive(); }, 5 * 60_000);
+  authKeepaliveTimer.unref?.();
 
   // Boot warmup: one model call + one embed ping shortly after boot so the
   // FIRST real user turn doesn't pay the cold-start tax (observed live on the

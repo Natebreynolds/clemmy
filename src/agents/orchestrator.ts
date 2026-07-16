@@ -1376,9 +1376,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       jitReason = 'jit-error-fellback';
     }
   }
-  // Telemetry. Emit when there was a real reduction (legacy behavior) OR whenever the
-  // A/B is running (so the CONTROL arm — which never reduces — is still attributable).
-  if (options.sessionId && (jitDropped > 0 || jitDecision.experiment)) {
+  // Telemetry. Emit when there was a real reduction.
+  if (options.sessionId && jitDropped > 0) {
     try {
       appendEvent({
         sessionId: options.sessionId,
@@ -1386,8 +1385,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         role: 'system',
         type: 'tool_jit_scope',
         data: {
-          arm: jitDecision.arm,
-          experiment: jitDecision.experiment,
           jitActive: jitDecision.active,
           droppedCount: jitDropped,
           exposedCount: jitDiscoveryTools.length,

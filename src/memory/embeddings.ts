@@ -272,19 +272,14 @@ function recordFailure(err: unknown): { cls: EmbedErrorClass; opened: boolean; u
 // the rest of the process lifetime (one flip max — no OpenAI↔local churn;
 // terminal/provider cooldowns survive daemon restarts). The ~1k-chunk corpus re-embeds
 // locally within a few backfill ticks; hybrid recall's FTS half covers the
-// transition. Kill-switch CLEMMY_EMBED_LOCAL_FALLBACK=off restores FTS-only
-// degradation. A quota/auth breaker demotes on the FIRST open (it will not
+// transition. A quota/auth breaker demotes on the FIRST open (it will not
 // heal by itself); a transient breaker demotes on the SECOND open in one
 // process (one bad network patch shouldn't flip providers).
 let demotedToLocal = false;
 let transientBreakerOpens = 0;
 
-function localFallbackEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_EMBED_LOCAL_FALLBACK', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
 function maybeDemoteToLocal(cls: EmbedErrorClass): void {
-  if (demotedToLocal || !localFallbackEnabled()) return;
+  if (demotedToLocal) return;
   if (providerOverride() === 'openai') return; // an explicit force is honored
   if (!localEmbeddingsAllowed()) return;
   const terminal = cls === 'quota' || cls === 'auth';
@@ -666,9 +661,8 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
     // for minutes. NOT retried: terminal (auth/quota), rate-limit (429), AND a
     // persistent CLIENT error (400 oversized-input / 404 bad-model) — those fail
     // identically on retry and just DOUBLE the synchronous JIT/recall latency on
-    // this pre-turn path (07-06 ship-review finding). Kill-switch =off.
-    if (embedErrorIsRetryable(err)
-      && (getRuntimeEnv('CLEMMY_EMBED_RETRY', 'on') || 'on').toLowerCase() !== 'off') {
+    // this pre-turn path (07-06 ship-review finding).
+    if (embedErrorIsRetryable(err)) {
       await new Promise((r) => setTimeout(r, 300));
       return await attempt();
     }
@@ -686,15 +680,10 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
 // embed `options.input`, concurrently (Promise.all). Caching the PROMISE (not just
 // the resolved value) dedupes the concurrent pair into ONE provider call, and a
 // short TTL also absorbs sequential repeats. Bounded so it never grows unbounded;
-// failures (null) are evicted so a transient miss never sticks. Kill-switch
-// CLEMMY_EMBED_QUERY_CACHE=off → byte-identical uncached behavior.
+// failures (null) are evicted so a transient miss never sticks.
 const EMBED_QUERY_CACHE_TTL_MS = 60_000;
 const EMBED_QUERY_CACHE_MAX = 256;
 const embedQueryInflight = new Map<string, { at: number; p: Promise<Float32Array | null> }>();
-
-function embedQueryCacheEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_EMBED_QUERY_CACHE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
-}
 
 function urgentFactEmbeddingBusyWaitMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_EMBED_URGENT_BUSY_WAIT_MS', '1000') || '1000', 10);
@@ -705,12 +694,8 @@ function embeddingProviderCacheKey(provider: EmbeddingProvider): string {
   return `${provider.name ?? 'unknown'}:${provider.model ?? 'unknown'}:${provider.dim}`;
 }
 
-function remoteProviderSingleFlightEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_EMBED_REMOTE_SINGLE_FLIGHT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
-}
-
 function providerUsesRemoteSingleFlight(provider: EmbeddingProvider): boolean {
-  return remoteProviderSingleFlightEnabled() && provider.name === 'openai';
+  return provider.name === 'openai';
 }
 
 function providerBusyReason(provider: EmbeddingProvider): string | null {
@@ -826,14 +811,7 @@ async function embedQueryWithProvider(provider: EmbeddingProvider, query: string
   return result?.vectors[0] ?? null;
 }
 
-async function embedQueryUncached(query: string): Promise<Float32Array | null> {
-  const provider = await getEmbeddingProvider();
-  if (!provider) return null;
-  return embedQueryWithProvider(provider, query);
-}
-
 export async function embedQuery(query: string): Promise<Float32Array | null> {
-  if (!embedQueryCacheEnabled()) return embedQueryUncached(query);
   const provider = await getEmbeddingProvider();
   if (!provider) return null;
   const now = Date.now();

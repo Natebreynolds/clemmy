@@ -12594,11 +12594,10 @@ export function registerConsoleRoutes(
     });
 
     // Client-honored feature flags (kill-switches). The renderer drives the
-    // spoken-progress, reconnect/swap, and one-loop behavior, so the server is
-    // the single source of truth and hands the resolved flags back in the
-    // session payload.
+    // spoken-progress and one-loop behavior, so the server is the single source
+    // of truth and hands the resolved flags back in the session payload.
+    // Reconnect/swap is always on.
     const voiceProgress = (getRuntimeEnv('CLEMMY_VOICE_PROGRESS', 'off') || 'off').toLowerCase() === 'on';
-    const voiceReconnect = (getRuntimeEnv('CLEMMY_VOICE_RECONNECT', 'on') || 'on').toLowerCase() !== 'off';
     // One-loop: the realtime model becomes ears+mouth only and the REAL agent
     // (the chat loop) does the thinking + talking. Off → the legacy persona.
     const voiceOneLoop = (getRuntimeEnv('CLEMMY_VOICE_ONE_LOOP', 'off') || 'off').toLowerCase() === 'on';
@@ -12649,7 +12648,7 @@ export function registerConsoleRoutes(
         model,
         voice,
         vad: { threshold: vadThreshold, silenceMs, prefixPaddingMs },
-        features: { progressUpdates: voiceProgress, reconnect: voiceReconnect, oneLoop: voiceOneLoop },
+        features: { progressUpdates: voiceProgress, reconnect: true, oneLoop: voiceOneLoop },
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

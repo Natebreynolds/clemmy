@@ -271,12 +271,7 @@ export function buildClaudeSystemBlocks(
  *  within a turn, and which the next turn re-sends as a growing prefix) was billed
  *  fresh every call. Breakpointing the last transcript message lets draft B + the
  *  judge read draft A's cached transcript and the next turn read this turn's — the
- *  fix for the fusion re-send (the sonnet-5 ~362K/turn aggregate). Kill-switch
- *  CLEMMY_CLAUDE_CACHE_TRANSCRIPT=off. */
-function claudeTranscriptCachingEnabled(): boolean {
-  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CLAUDE_CACHE_TRANSCRIPT', 'on') || 'on').trim());
-}
-
+ *  fix for the fusion re-send (the sonnet-5 ~362K/turn aggregate). */
 /** Put a cache breakpoint on the last content block of a message. String content is
  *  wrapped into a single cacheable text block (valid Anthropic shape); a block array
  *  gets the breakpoint on its last object block. No-op on an unexpected shape. */
@@ -310,7 +305,7 @@ function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapabilit
   // Gap #1 — transcript caching. Only when it's big enough to be worth a breakpoint
   // and we have budget. Caches tools+system+transcript-so-far; the next turn / the
   // sibling fusion sub-calls read it instead of re-billing.
-  if (claudeTranscriptCachingEnabled() && cap.supportsPromptCache && breakpoints < 4) {
+  if (cap.supportsPromptCache && breakpoints < 4) {
     const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : [];
     if (messages.length > 0 && estimateTokens(JSON.stringify(messages)) >= cap.cacheMinTokens) {
       const lastMsg = messages[messages.length - 1];

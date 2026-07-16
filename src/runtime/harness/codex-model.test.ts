@@ -55,17 +55,6 @@ test('buildCodexRequestBody sets a per-session prompt_cache_key inside a run con
     buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }])),
   );
   assert.equal(inside.prompt_cache_key, 'clem:sess-abc');
-
-  // Kill-switch → omitted even inside a context.
-  process.env.CLEMMY_CODEX_CACHE_KEY = 'off';
-  try {
-    const off = harnessRunContextStorage.run({ sessionId: 'sess-abc' } as never, () =>
-      buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }])),
-    );
-    assert.equal(off.prompt_cache_key, undefined);
-  } finally {
-    delete process.env.CLEMMY_CODEX_CACHE_KEY;
-  }
 });
 
 function requestWithInstructions(systemInstructions: string, input: ModelRequest['input'] = [{ role: 'user', content: 'hi' }]): ModelRequest {
@@ -95,19 +84,6 @@ test('Codex wire cache stability: two turns with the SAME role+tools but DIFFERE
   // the per-turn ctx changed — this is what lets OpenAI's prefix cache hit the tool block.
   assert.equal(a.instructions, b.instructions);
   assert.equal(a.instructions, 'ROLE');
-});
-
-test('Codex wire kill-switch (CLEMMY_CODEX_STABLE_INSTRUCTIONS=off) → legacy dynamic-first, no trailing ctx', () => {
-  process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS = 'off';
-  try {
-    const body = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`));
-    // Legacy order: dynamic ctx FIRST, role last, single string; nothing appended to input.
-    assert.equal(body.instructions, 'DYNAMIC_CTX\n\n---\n\nROLE_RUBRIC');
-    const last = (body.input as Array<Record<string, unknown>>).at(-1);
-    assert.deepEqual(last, { role: 'user', content: 'hi' }, 'no ctx re-homed into input under the kill-switch');
-  } finally {
-    delete process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS;
-  }
 });
 
 test('buildCodexRequestBody drops non-Codex function_call ids from mixed-provider history', () => {
@@ -333,25 +309,6 @@ test('CodexResponsesModel throws a retryable boundary error when every completio
   assert.equal(caught.context.emptyCompletion, true);
   // No fabricated clean response_done escaped to the SDK.
   assert.ok(!events.some((event) => event.type === 'response_done'));
-});
-
-test('CodexResponsesModel passes an empty completion through unchanged when the kill-switch is off', async () => {
-  process.env.CLEMMY_CODEX_RETRY_EMPTY_COMPLETION = 'off';
-  try {
-    const model = new ScriptedCodexModel(async function* () {
-      yield* emptyCompletion('resp_legacy_empty');
-    });
-    const events: StreamEvent[] = [];
-    for await (const event of model.getStreamedResponse(modelRequest())) {
-      events.push(event);
-    }
-    assert.equal(model.attempts, 1); // legacy: no retry
-    const done = events.at(-1) as Extract<StreamEvent, { type: 'response_done' }>;
-    assert.equal(done.type, 'response_done');
-    assert.deepEqual(done.response.output, []); // empty, as before
-  } finally {
-    delete process.env.CLEMMY_CODEX_RETRY_EMPTY_COMPLETION;
-  }
 });
 
 test('CodexResponsesModel does NOT treat a reasoning-only completion as empty (boundary with the loop layer)', async () => {

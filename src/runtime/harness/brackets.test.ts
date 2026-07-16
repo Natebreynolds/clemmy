@@ -544,19 +544,15 @@ async function runTscTimeout(opts: {
   name: string;
   path?: 'execute' | 'invoke';
   input?: unknown;            // execute: raw input; invoke: args object (JSON-stringified)
-  selfCorrect?: 'on' | 'off'; // override CLEMMY_TOOL_TIMEOUT_SELF_CORRECT (default: unset → on)
 }): Promise<{ result?: unknown; error?: unknown }> {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
     CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
     CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
-    CLEMMY_TOOL_TIMEOUT_SELF_CORRECT: process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT,
   };
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_CONFIRM_FIRST = 'off';
-  if (opts.selfCorrect) process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT = opts.selfCorrect;
-  else delete process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT;
   try {
     const counter = new ToolCallsCounter(10);
     const slow = async () => { await tscSleep(200); return 'ran'; };
@@ -606,15 +602,6 @@ test('timeout self-correct: composio WRITE timeout → verify-before-retry corre
   assert.match(result as string, /WRITE TIMED OUT/);
   assert.match(result as string, /READ THE TARGET BACK|duplicate|verify/i);
   assert.doesNotMatch(result as string, /Use the ASYNC pattern/);
-});
-
-test('timeout self-correct: kill-switch off restores ToolTimeout propagation', async () => {
-  const { error } = await runTscTimeout({
-    name: 'composio_execute_tool',
-    input: { tool_slug: 'APIFY_GET_DATASET_ITEMS' },
-    selfCorrect: 'off',
-  });
-  assert.ok(error instanceof ToolTimeout, 'kill-switch off → propagate to ask-user card');
 });
 
 test('timeout self-correct: internal + draft_plan timeouts still propagate (ask-user card preserved)', async () => {

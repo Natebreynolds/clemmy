@@ -167,21 +167,4 @@ test('transcript caching: a SMALL transcript is NOT breakpointed (below cacheMin
   assert.equal(last.content, 'hi');
 });
 
-test('transcript caching kill-switch (CLEMMY_CLAUDE_CACHE_TRANSCRIPT=off) → no transcript breakpoint', () => {
-  process.env.CLEMMY_CLAUDE_CACHE_TRANSCRIPT = 'off';
-  try {
-    const big = 'lorem ipsum dolor sit amet '.repeat(1000);
-    const parsed = envelopeBody({
-      model: 'claude-opus-4-8',
-      system: 'Be helpful.',
-      messages: [{ role: 'user', content: big }],
-      max_tokens: 100,
-    });
-    const last = (parsed.messages as Array<Record<string, unknown>>).at(-1)!;
-    assert.equal(last.content, big, 'kill-switch → transcript left untouched');
-  } finally {
-    delete process.env.CLEMMY_CLAUDE_CACHE_TRANSCRIPT;
-  }
-});
-
 void ID;

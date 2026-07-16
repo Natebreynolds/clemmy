@@ -267,9 +267,9 @@ let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
 // listComposioToolkitTools once PER connected toolkit PER search, each a
 // network round-trip (curated v3 fetch + raw SDK list). A toolkit's tool set is
 // stable within a session, so a short TTL turns the second+ search of a session
-// from multi-second into in-memory. Keyed by (slug, limit). Kill-switch
-// CLEMMY_TOOLKIT_CACHE=off. Busted whenever connections change (a new
-// connection can expose a toolkit's tools for the first time).
+// from multi-second into in-memory. Keyed by (slug, limit). Busted whenever
+// connections change (a new connection can expose a toolkit's tools for the
+// first time).
 const TOOLKIT_TOOLS_TTL_MS = 15 * 60 * 1000;
 const toolkitToolsCache = new Map<string, { at: number; data: ComposioToolkitTool[] }>();
 /** Clear the per-toolkit tool-list cache. Exported for tests + connection busts. */
@@ -1395,9 +1395,8 @@ export async function listComposioToolkitTools(
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
 
   // Only cache the default path: an explicit composioOverride (tests, special
-  // callers) must hit the live SDK. Kill-switch CLEMMY_TOOLKIT_CACHE=off.
-  const cacheable = composioOverride === undefined
-    && (process.env.CLEMMY_TOOLKIT_CACHE || 'on').toLowerCase() !== 'off';
+  // callers) must hit the live SDK.
+  const cacheable = composioOverride === undefined;
   const cacheKey = `${slug}::${limit}`;
   if (cacheable) {
     const hit = toolkitToolsCache.get(cacheKey);

@@ -2286,16 +2286,12 @@ export interface DedupResult {
  * sim=null and nothing is folded (no-op). Capped by `maxMerges` per run.
  * Soft delete only (active=0) — fully reversible, embedding + audit kept.
  */
-function dedupStoredEmbeddingsEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_DEDUP_STORED_EMBEDDINGS', 'on') || 'on').toLowerCase() !== 'off';
-}
-
 export async function consolidateActiveFacts(
   opts: { perKind?: number; maxMerges?: number; simThreshold?: number; useStoredEmbeddings?: boolean } = {},
 ): Promise<DedupResult> {
   const maxMerges = Math.max(0, opts.maxMerges ?? 100);
   const simThreshold = opts.simThreshold ?? 0.95;
-  const useStored = opts.useStoredEmbeddings ?? dedupStoredEmbeddingsEnabled();
+  const useStored = opts.useStoredEmbeddings ?? true;
   // The stored-embedding path scans the FULL active set per kind (in-memory
   // pairwise cosine over vectors we ALREADY computed — ZERO new API calls), so
   // the old 200-row window that left ~59% of project facts un-deduped is gone.
@@ -2359,7 +2355,7 @@ export async function consolidateActiveFacts(
     return result;
   }
 
-  // Legacy per-row re-embedding path (kill-switch: CLEMMY_DEDUP_STORED_EMBEDDINGS=off).
+  // Legacy per-row re-embedding path (callers may opt in with useStoredEmbeddings=false).
   for (const kind of kinds) {
     const rows = db.prepare(`
       SELECT id, content, score FROM consolidated_facts

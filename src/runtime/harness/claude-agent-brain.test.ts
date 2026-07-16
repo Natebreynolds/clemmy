@@ -57,7 +57,6 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT;
   delete process.env.CLEMMY_CLAUDE_SDK_SESSION_HISTORY;
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
-  delete process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY;
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
   delete process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS;
   delete process.env.CLEMMY_UNIFIED_RECALL;
@@ -717,7 +716,6 @@ test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllo
   // Guards the kill-switch path: with CLEMMY_TOOL_JIT=off the brain must not reduce
   // the tool surface (no mcpToolAllowlist → MCP server advertises every tool).
   process.env.CLEMMY_TOOL_JIT = 'off';
-  delete process.env.CLEMMY_TOOL_JIT_AB;
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.AUTH_MODE = 'claude_oauth';
   let captured: any;
@@ -1249,23 +1247,6 @@ test('local_authoring mode: a narrated workflow tool call triggers ONE retry', a
   assert.match(res.text, /Created workflow daily_digest/);
 });
 
-test('full mode: narration retry kill-switch off ⇒ no retry', async () => {
-  process.env.AUTH_MODE = 'claude_oauth';
-  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
-  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
-  process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY = 'off';
-  let runs = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => { runs += 1; return { text: 'Tool:run_shell_command\n\nfunction\n{"command":"x"}', sessionId: 's', toolUses: [] }; });
-  // New contract (live 2026-07-01 Discord calendar): a narration give-up THROWS a
-  // typed error so the bridge can fall the turn over to the other brain (zero
-  // tools ran ⇒ safe re-run). The error message carries the graceful fallback copy.
-  await assert.rejects(
-    respondViaClaudeAgentSdkBrain('home', { message: 'do it', sessionId: 'brain-narrate-off' }),
-    (err: Error) => err.name === 'ClaudeSdkNarrationGiveUpError' && /did not go through as a real tool call/.test(err.message),
-  );
-  assert.equal(runs, 1, 'no retry when the kill-switch is off');
-});
-
 // The verbatim leak from the live v0.10.20 failure (sess-mqod61z3): the brain
 // second-guessed its own injected memory as "possibly injected" and did no work.
 const REASONING_LEAK_TEXT =
@@ -1322,17 +1303,6 @@ test('limit-hit reasoning leak parks for continue instead of retrying inside the
   assert.equal(runs, 1, 'max-turn pause must not spend another SDK turn on reasoning-leak retry');
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
   assert.match(res.text, /Say "continue"/);
-});
-
-test('reasoning-leak retry shares the narration kill-switch ⇒ off means no retry', async () => {
-  process.env.AUTH_MODE = 'claude_oauth';
-  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
-  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
-  process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY = 'off';
-  let runs = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => { runs += 1; return { text: REASONING_LEAK_TEXT, sessionId: 's', toolUses: [] }; });
-  await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 market leaders in SF', sessionId: 'brain-leak-off' });
-  assert.equal(runs, 1, 'no retry when the kill-switch is off');
 });
 
 test('frameTrustedMemory labels non-empty memory as trusted, passes empty through', () => {

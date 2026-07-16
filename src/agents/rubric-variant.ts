@@ -48,8 +48,7 @@ function rubricAbRatio(): number {
 }
 
 /** Deterministic, stable arm for a session: same sessionId → same arm for the
- *  whole conversation (no flapping mid-session). Pure hash, no state. Mirrors
- *  assignToolJitArm so the two A/Bs bucket identically. */
+ *  whole conversation (no flapping mid-session). Pure hash, no state. */
 export function assignRubricArm(sessionId: string): RubricArm {
   const digest = createHash('sha1').update(`rubric_variant_ab::${sessionId}`).digest();
   const frac = digest.readUInt32BE(0) / 0xffffffff;
