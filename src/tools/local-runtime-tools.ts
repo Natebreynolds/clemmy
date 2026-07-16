@@ -176,8 +176,8 @@ function captureLocalTools(): CapturedLocalTool[] {
   return captured;
 }
 
-export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
-  return captureLocalTools().map((localTool) => tool({
+function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeContextValue> {
+  return tool({
     name: localTool.name,
     description: localTool.description,
     parameters: z.object(normalizeShapeForResponses(localTool.parameters)),
@@ -192,7 +192,33 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
       toolOutputContextFromSdk(localTool.name, runContext, details),
       async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
     ),
-  }));
+  });
+}
+
+export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
+  return captureLocalTools().map(localToolToRuntimeTool);
+}
+
+/** Build the Codex lane's tool_search against the exact deferred surface for
+ * this turn. The static runtime tool remains available for non-schema-on-demand
+ * lanes; this scoped instance prevents discovery from promising a tool that the
+ * active call_tool dispatcher cannot reach. */
+export function buildScopedLocalToolSearch(allowedNames: ReadonlySet<string>): Tool<RuntimeContextValue> {
+  const captured: CapturedLocalTool[] = [];
+  const fakeServer = {
+    tool(
+      name: string,
+      description: string,
+      parameters: z.ZodRawShape,
+      handler: LocalToolHandler,
+    ): void {
+      captured.push({ name, description, parameters, handler });
+    },
+  };
+  registerToolSearchTool(fakeServer as unknown as McpServer, { allowedNames });
+  const localTool = captured[0];
+  if (!localTool) throw new Error('tool_search did not register');
+  return localToolToRuntimeTool(localTool);
 }
 
 /**

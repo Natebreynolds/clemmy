@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 const { buildCallTool, _resetCallToolSchemaCacheForTest } = await import('./call-tool.js');
 const { _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await import('../runtime/harness/brackets.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
 const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
@@ -48,6 +48,35 @@ test('refuses a target that is not on the orchestrator surface (no escalation)',
   }
   // sanity: the guard is not refusing everything — an orchestrator tool is reachable.
   assert.ok(deriveOrchestratorDiscoveryNames().has('composio_execute_tool'));
+});
+
+test('turn-scoped reachability refuses a built-in that was not advertised as deferred', async () => {
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['memory_recall']),
+  }) as unknown as ToolLike;
+  const out = await withToolOutputContext({ sessionId: 'sess-scoped-auth' }, () =>
+    callTool.invoke!(
+      { context: { sessionId: 'sess-scoped-auth' } },
+      JSON.stringify({ name: 'composio_execute_tool', args_json: '{}' }),
+      { toolCall: { callId: 'scoped-call' } },
+    ) as Promise<unknown>,
+  );
+  assert.equal(JSON.parse(String(out)).error, 'not_reachable');
+});
+
+test('explicit turn denials cannot be bypassed with an external MCP name', async () => {
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(),
+    deniedNames: new Set(['fakeserver__fake_tool']),
+  }) as unknown as ToolLike;
+  const out = await withToolOutputContext({ sessionId: 'sess-denied-mcp' }, () =>
+    callTool.invoke!(
+      { context: { sessionId: 'sess-denied-mcp' } },
+      JSON.stringify({ name: 'fakeserver__fake_tool', args_json: '{}' }),
+      { toolCall: { callId: 'denied-mcp-call' } },
+    ) as Promise<unknown>,
+  );
+  assert.equal(JSON.parse(String(out)).error, 'not_reachable');
 });
 
 test('bad args return the schema with error=arg_validation and NO dispatch', async () => {
@@ -170,6 +199,38 @@ test('production run context attributes the inner dispatch without a tool-output
   }
 });
 
+test('nested call_tool dispatch reuses the ambient run counter', async () => {
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
+  );
+  const counter = new ToolCallsCounter(1);
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['composio_execute_tool']),
+  }) as unknown as ToolLike;
+  const invoke = () => callTool.invoke!(
+    { context: { sessionId: 'sess-shared-counter' } },
+    JSON.stringify({
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: '{}' }),
+    }),
+    { toolCall: { callId: `shared-counter-${counter.calls}` } },
+  ) as Promise<unknown>;
+  try {
+    await withHarnessRunContext(
+      { sessionId: 'sess-shared-counter', counter },
+      async () => {
+        assert.equal(String(await invoke()), 'rows');
+        assert.equal(counter.calls, 1, 'the inner call consumes the ambient budget');
+        const refused = String(await invoke());
+        assert.match(refused, /tool call refused by harness|tool.call limit|exceeded/i);
+        assert.equal(counter.calls, 1, 'a refused nested call cannot reset or consume past the shared limit');
+      },
+    );
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
 test('an external MCP name (<server>__<tool>) passes authority and reaches MCP resolution (2026-07-08 live gap)', async () => {
   // The model tried call_tool→dataforseo__kw_data_google_ads_search_volume live
   // and got not_reachable, then fell back to hand-rolling the provider REST API
@@ -179,4 +240,65 @@ test('an external MCP name (<server>__<tool>) passes authority and reaches MCP r
   // authority refusal.
   const out = String(await invokeCallTool('sess-mcp', 'fakeserver__fake_tool', '{"q":1}'));
   assert.ok(!out.includes('not_reachable'), 'MCP names must not be refused by the built-in authority check');
+});
+
+test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per deferred action', async () => {
+  // Live shape: the orchestrator wraps call_tool with wrapToolForHarness, and
+  // the inner dispatch charges the SAME ambient counter. Without the wrapper
+  // exemption every deferred action costs 2, halving the effective per-turn
+  // budget on the schema-on-demand lane.
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
+  );
+  const counter = new ToolCallsCounter(10);
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as ToolLike;
+  try {
+    await withHarnessRunContext(
+      { sessionId: 'sess-single-charge', counter },
+      async () => {
+        const out = await wrapped.invoke!(
+          { context: { sessionId: 'sess-single-charge' } },
+          JSON.stringify({
+            name: 'composio_execute_tool',
+            args_json: JSON.stringify({ tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: '{}' }),
+          }),
+          { toolCall: { callId: 'single-charge-1' } },
+        );
+        assert.equal(String(out), 'rows');
+        assert.equal(counter.calls, 1, 'outer dispatcher wrapper must not double-charge the inner action');
+      },
+    );
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
+test('a FAILING call_tool dispatch still charges the budget — no zero-cost retry loop', async () => {
+  // Round-2 regression: the wrapper exemption must not exempt the failure
+  // paths (refusals return before the inner dispatch, which is what normally
+  // charges). Each refused invocation costs exactly 1, and the ceiling still
+  // throws once exhausted.
+  const counter = new ToolCallsCounter(2);
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set() }) as never,
+  ) as unknown as ToolLike;
+  const invoke = () => wrapped.invoke!(
+    { context: { sessionId: 'sess-fail-charge' } },
+    JSON.stringify({ name: 'not_a_real_tool', args_json: '{}' }),
+    { toolCall: { callId: `fail-charge-${counter.calls}` } },
+  ) as Promise<unknown>;
+  await withHarnessRunContext(
+    { sessionId: 'sess-fail-charge', counter },
+    async () => {
+      assert.equal(JSON.parse(String(await invoke())).error, 'not_reachable');
+      assert.equal(counter.calls, 1, 'a refused dispatch costs exactly one call');
+      assert.equal(JSON.parse(String(await invoke())).error, 'not_reachable');
+      assert.equal(counter.calls, 2);
+      const third = String(await invoke());
+      assert.match(third, /tool call refused by harness|tool.call limit|exceeded/i, 'the ceiling still bounds a failing loop');
+      assert.equal(counter.calls, 2, 'the ceiling refuses without further spend');
+    },
+  );
 });

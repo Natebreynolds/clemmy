@@ -30,9 +30,10 @@ import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSet, buildToolCatalog, allRegistryNames } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSet, buildToolCatalog } from './tool-catalog.js';
 import { deriveOrchestratorDiscoveryNames } from '../tools/tool-registry.js';
 import { buildCallTool } from '../tools/call-tool.js';
+import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
@@ -53,6 +54,7 @@ import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime
 import { ClaudeSdkProviderOverloadError } from '../runtime/harness/claude-agent-sdk.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
+import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import {
   bareTerminalToolName,
   formatAutoResolvedAskUserQuestionOutput,
@@ -1417,14 +1419,37 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   if (searchDecision.active) {
     try {
       const excludes = new Set(options.excludeToolNames ?? []);
-      const policyAllowed = new Set([...allRegistryNames()].filter((n) => !excludes.has(n)));
+      const availableNames = new Set(
+        dedupedDiscoveryTools
+          .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+          .filter(Boolean),
+      );
+      const policyAllowed = new Set([...availableNames].filter((name) => !excludes.has(name)));
       const searchQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
         .join('\n');
       const hot = resolveHotSet(options.sessionId, searchQuery, { allowedNames: policyAllowed });
-      firstClassDiscovery = dedupedDiscoveryTools.filter((t) => hot.has((t as { name?: string }).name ?? ''));
-      callTool = buildCallTool();
-      const catalogText = buildToolCatalog({ allowedNames: policyAllowed });
+      const surface = resolveToolSurface({
+        surface: 'orchestrator',
+        lane: 'chat',
+        availableNames,
+        excludeNames: excludes,
+        promotedNames: hot,
+        deferralEnabled: true,
+        reason: 'Codex schema-on-demand surface',
+      });
+      const firstClassNames = new Set(surface.firstClass);
+      const deferredNames = new Set(surface.deferred);
+      firstClassDiscovery = dedupedDiscoveryTools
+        .filter((t) => firstClassNames.has((t as { name?: string }).name ?? ''))
+        // The static tool_search instance searches the entire registry. On the
+        // schema-on-demand lane replace it with a turn-scoped instance so every
+        // result is guaranteed to be reachable through THIS call_tool.
+        .map((t) => (t as { name?: string }).name === 'tool_search'
+          ? buildScopedLocalToolSearch(deferredNames)
+          : t);
+      callTool = buildCallTool({ reachableBuiltinNames: deferredNames, deniedNames: excludes });
+      const catalogText = buildToolCatalog({ allowedNames: deferredNames });
       searchCatalogCount = catalogText ? catalogText.split('\n').length : 0;
       searchCatalogTokens = Math.round(catalogText.length / 4);
       catalogBlock = [
@@ -1432,7 +1457,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // read the name-only listing as evidence it had NO tool access and
         // refused the task outright (A_zero_tools stall). The catalog must be
         // impossible to misread as a capability restriction.
-        '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: your first-class tools (loaded above — call them directly), every built-in below, and your connected external MCP/composio tools. NEVER claim you lack tool access. The tools below are simply not schema-loaded yet (to save context): invoke one with `call_tool(name, args_json)` using its exact name and a JSON args string — or `tool_search(query)` first if unsure of the name or arguments. External MCP tools are callable the same way: `call_tool("<server>__<tool>", args_json)`. call_tool never prompts on its own: a read runs immediately, a write/send target gates for approval exactly as a direct call would.',
+        '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: your first-class tools (loaded above — call them directly), every deferred built-in below, and your connected external MCP/composio tools. NEVER claim you lack tool access. The tools below are not schema-loaded yet (to save context), but every listed name is callable THIS turn: invoke one with `call_tool(name, args_json)` using its exact name and a JSON args string — or `tool_search(query)` first if unsure of the name or arguments. External MCP tools are callable the same way: `call_tool("<server>__<tool>", args_json)`. call_tool never prompts on its own: a read runs immediately, a write/send target gates for approval exactly as a direct call would.',
         catalogText,
       ].join('\n');
     } catch {

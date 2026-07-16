@@ -104,6 +104,9 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   const instr = await renderInstructions(onAgent);
   assert.ok(instr.includes('[tool-catalog]'), 'catalog block injected when on');
   assert.ok(instr.includes(CATALOG_ONLY_WHEN_ON), 'the catalog lists the tools it moved off first-class');
+  const catalog = instr.split('[tool-catalog]')[1] ?? '';
+  assert.ok(!catalog.includes('\nmemory_recall —'), 'a first-class tool is not duplicated in the deferred catalog');
+  assert.ok(!catalog.includes('\ncron_list —'), 'a CLI-only tool is never advertised on the chat catalog');
 
   // Telemetry records the split.
   const scope = listEvents(onSess.id, { types: ['tool_search_scope'] });
@@ -113,4 +116,18 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok((data.firstClassCount ?? 0) > 0, 'firstClassCount recorded');
   assert.ok((data.catalogCount ?? 0) > 0, 'catalogCount recorded');
   assert.ok((data.estCatalogTokens ?? 0) > 0, 'estCatalogTokens recorded');
+});
+
+test('ON: an excluded tool is absent from both first-class and deferred reachability', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const agent = await withFlag('on', () => buildOrchestratorAgent({
+    sessionId: sess.id,
+    userInput: USER_INPUT,
+    allowToolJit: true,
+    excludeToolNames: [CATALOG_ONLY_WHEN_ON],
+  }));
+  assert.equal(namesOf(agent).has(CATALOG_ONLY_WHEN_ON), false);
+  const instr = await renderInstructions(agent);
+  const catalog = instr.split('[tool-catalog]')[1] ?? '';
+  assert.ok(!catalog.includes(`\n${CATALOG_ONLY_WHEN_ON} —`));
 });

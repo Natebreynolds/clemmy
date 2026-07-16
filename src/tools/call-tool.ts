@@ -28,8 +28,8 @@ import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { harnessRunContextStorage, ToolCallsCounter } from '../runtime/harness/brackets.js';
-import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
+import { harnessRunContextStorage, ToolCallsCounter, ToolCallsLimitExceeded } from '../runtime/harness/brackets.js';
+import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
@@ -61,7 +61,24 @@ function jsonResult(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
 }
 
-export function buildCallTool(): Tool<RuntimeContextValue> {
+export interface BuildCallToolOptions {
+  /** Exact built-in names advertised as deferred on this turn. Omit for the
+   * legacy full orchestrator surface (tests and non-scoped callers). */
+  reachableBuiltinNames?: ReadonlySet<string>;
+  /** Explicit per-turn denials also apply to external MCP names. */
+  deniedNames?: ReadonlySet<string>;
+}
+
+export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeContextValue> {
+  const defaultSurface = resolveToolSurface({
+    surface: 'orchestrator_call_tool',
+    lane: 'chat',
+    availableNames: deriveOrchestratorDiscoveryNames(),
+    deferralEnabled: false,
+    reason: 'call_tool default built-in reachability',
+  });
+  const reachableBuiltinNames = options.reachableBuiltinNames ?? new Set(defaultSurface.firstClass);
+  const deniedNames = options.deniedNames ?? new Set<string>();
   return tool({
     name: 'call_tool',
     description: DESCRIPTION,
@@ -75,8 +92,29 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
       { name, args_json }: { name: string; args_json: string },
       runContext: unknown,
     ): Promise<string> => {
+      // Exactly-once budget contract: the harness wrapper exempts call_tool
+      // from the per-turn counter (the INNER tool's wrapper charges it on the
+      // dispatch path). Every early return below therefore charges the
+      // ambient counter itself — otherwise a model looping on failing
+      // call_tool invocations would burn ZERO tool budget and lose the
+      // deterministic runaway ceiling.
+      const refuse = (payload: Record<string, unknown>): string => {
+        const counter = harnessRunContextStorage.getStore()?.counter;
+        if (counter) {
+          if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
+          counter.increment();
+        }
+        return JSON.stringify(payload);
+      };
       const target = (name ?? '').trim();
-      if (!target) return JSON.stringify({ error: 'bad_request', detail: 'name is required' });
+      if (!target) return refuse({ error: 'bad_request', detail: 'name is required' });
+
+      if (deniedNames.has(target)) {
+        return refuse({
+          error: 'not_reachable',
+          detail: `"${target}" is excluded from this turn's effective tool policy.`,
+        });
+      }
 
       // 1. Authority — never escalate past the curated orchestrator surface.
       // External MCP names (<server>__<tool>) are admitted here and enforced
@@ -87,18 +125,10 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
       // live Phase-1 gap (2026-07-08): the model fell back to hand-rolling the
       // provider's REST API through shell calls, slower and less gated.
       if (!isMcpNamespacedTool(target)) {
-        const allowed = deriveOrchestratorDiscoveryNames();
-        const policy = resolveEffectiveToolPolicy({
-          surface: 'orchestrator',
-          lane: 'chat',
-          tools: [{ name: target }],
-          allowedToolNames: [...allowed],
-          reason: 'call_tool generic dispatch',
-        });
-        if (policy.tools.length === 0) {
-          return JSON.stringify({
+        if (!reachableBuiltinNames.has(target)) {
+          return refuse({
             error: 'not_reachable',
-            detail: `"${target}" is not a callable tool on this surface. Use tool_search to find the right tool, or a connected external MCP tool as <server>__<tool>.`,
+            detail: `"${target}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.`,
           });
         }
       }
@@ -110,7 +140,7 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
         try {
           args = JSON.parse(raw);
         } catch {
-          return JSON.stringify({ error: 'arg_validation', detail: 'args_json is not valid JSON' });
+          return refuse({ error: 'arg_validation', detail: 'args_json is not valid JSON' });
         }
       }
 
@@ -119,7 +149,7 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
       if (schema) {
         const parsed = schema.safeParse(args);
         if (!parsed.success) {
-          return JSON.stringify({
+          return refuse({
             error: 'arg_validation',
             schema: z.toJSONSchema(schema),
             detail: parsed.error.issues
@@ -135,12 +165,16 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
         ?? harnessRunContextStorage.getStore()?.sessionId
         ?? '';
       if (!sessionId) {
-        return JSON.stringify({
+        return refuse({
           error: 'missing_session_context',
           detail: 'call_tool requires an active harness session before it can dispatch an inner tool.',
         });
       }
-      const counter = new ToolCallsCounter(1000);
+      // Nested dispatch is part of the SAME run. Reusing the ambient counter
+      // prevents call_tool from resetting the safety budget on every wrapper
+      // invocation; the fallback only serves direct/unit invocations without a
+      // harness run context.
+      const counter = harnessRunContextStorage.getStore()?.counter ?? new ToolCallsCounter(1000);
       const out = await dispatchBatchItemTool(target, args, sessionId, counter);
 
       // 5. Promote the reached tool into the session hot-set.

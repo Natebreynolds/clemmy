@@ -53,13 +53,17 @@ export interface ClementineMcpServerOptions {
   runScopeId?: string;
   gatedMutations?: boolean;
   allowedTools?: string[];
+  /** Tools that must remain first-class when the client supports MCP tool
+   * deferral. Every unmarked registered tool remains available for native
+   * same-turn ToolSearch acquisition. */
+  alwaysLoadTools?: string[];
   /** Set for a workflow-step MCP surface so a fan-out spawned here (run_worker) is
    *  attributed to the workflow RUN in the subagent-runs store, not just the session. */
   workflowRunId?: string;
   workflowName?: string;
   stepId?: string;
-  /** Internal surface introspection. Called for every tool this server build
-   * attempts to register, after feature gates have been evaluated. */
+  /** Internal surface introspection. Called only for tools this server actually
+   * registers after feature gates and allowlists have been evaluated. */
   onToolRegistered?: (name: string) => void;
 }
 
@@ -116,6 +120,16 @@ function resolvedToolAllowlist(opts: ClementineMcpServerOptions = {}): string[] 
       : [];
 }
 
+function resolvedAlwaysLoadTools(opts: ClementineMcpServerOptions = {}): string[] {
+  const fromOptions = opts.alwaysLoadTools?.map((s) => s.trim()).filter(Boolean);
+  const raw = process.env.CLEMENTINE_MCP_ALWAYS_LOAD_TOOLS?.trim();
+  return fromOptions && fromOptions.length > 0
+    ? fromOptions
+    : raw
+      ? raw.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+}
+
 function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
   const allowlist = resolvedToolAllowlist(opts);
   if (allowlist.length === 0) return;
@@ -136,18 +150,44 @@ function installToolRegistrationObserver(server: McpServer, observer?: (name: st
   if (!observer) return;
   const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
-    if (typeof args[0] === 'string') observer(args[0]);
-    return wrapped(...args);
+    const result = wrapped(...args);
+    if (result !== undefined && typeof args[0] === 'string') observer(args[0]);
+    return result;
+  };
+}
+
+/** Mark only the recovery/hot subset as first-class for Claude's native MCP
+ * ToolSearch. Unmarked tools remain registered and callable; the client defers
+ * their schemas until it acquires them. Metadata is additive and preserves any
+ * MCP metadata a tool already registered. */
+function installAlwaysLoadMetadata(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
+  const alwaysLoad = new Set(resolvedAlwaysLoadTools(opts));
+  if (alwaysLoad.size === 0) return;
+  const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
+  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+    const toolName = typeof args[0] === 'string' ? args[0] : undefined;
+    const result = wrapped(...args) as { _meta?: Record<string, unknown>; update?: (value: { _meta?: Record<string, unknown> }) => void } | undefined;
+    if (result && toolName && alwaysLoad.has(toolName) && typeof result.update === 'function') {
+      result.update({ _meta: { ...(result._meta ?? {}), 'anthropic/alwaysLoad': true } });
+    }
+    return result;
   };
 }
 
 export function createClementineMcpServer(opts: ClementineMcpServerOptions = {}): McpServer {
   ensureToolDirectories();
   const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
+  const registeredNames = new Set<string>();
 
   installAmbientToolContext(server, opts);
+  installToolRegistrationObserver(server, (name) => {
+    registeredNames.add(name);
+    opts.onToolRegistered?.(name);
+  });
+  installAlwaysLoadMetadata(server, opts);
+  // Install last so it is the outermost registration boundary: filtered tools
+  // never reach metadata or registration observers.
   installToolAllowlistFilter(server, opts);
-  installToolRegistrationObserver(server, opts.onToolRegistered);
 
   registerMemoryTools(server);
   registerFocusTools(server);
@@ -183,12 +223,6 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerRecallTools(server);
   // Exact JSON slices from run-workspace artifacts/offloaded step context.
   registerWorkspaceArtifactTools(server);
-  // Schema-on-demand discovery entry — read-only search over the built-in tool
-  // catalog (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
-  const scopedToolNames = resolvedToolAllowlist(opts);
-  registerToolSearchTool(server, {
-    allowedNames: scopedToolNames.length > 0 ? new Set(scopedToolNames) : undefined,
-  });
   registerDynamicTools(server);
   // Agent SDK lane only: expose the mutating tools (shell/composio/write) through
   // the full harness gate chain so the Claude Agent SDK can execute them safely.
@@ -219,6 +253,13 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   }
 
   server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
+
+  // Register discovery LAST, scoped to what this exact feature-gated server
+  // actually registered. This prevents tool_search from promising registry
+  // entries that are absent from the active MCP server or filtered by JIT.
+  // The Set is intentionally live: registering tool_search adds itself after
+  // the handler captures the set.
+  registerToolSearchTool(server, { allowedNames: registeredNames });
   return server;
 }
 

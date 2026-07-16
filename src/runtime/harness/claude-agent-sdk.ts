@@ -40,6 +40,7 @@ import {
 import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-evidence.js';
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
+import { resolveToolSurface } from './tool-surface.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -355,6 +356,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   gatedMutations = false,
   mcpToolAllowlist?: string[],
   attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string; runScopeId?: string },
+  loading?: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
@@ -376,6 +378,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
           runScopeId: attribution?.runScopeId,
           gatedMutations,
           allowedTools: allowlist,
+          alwaysLoadTools: loading?.alwaysLoadTools,
           workflowRunId: attribution?.workflowRunId,
           workflowName: attribution?.workflowName,
           stepId: attribution?.stepId,
@@ -389,6 +392,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
     ...(attribution?.runScopeId?.trim() ? { CLEMENTINE_MCP_RUN_SCOPE_ID: attribution.runScopeId.trim() } : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
+    ...((loading?.alwaysLoadTools?.length ?? 0) > 0
+      ? { CLEMENTINE_MCP_ALWAYS_LOAD_TOOLS: loading!.alwaysLoadTools!.join(',') }
+      : {}),
     ...(attribution?.workflowRunId?.trim() ? { CLEMENTINE_MCP_WORKFLOW_RUN_ID: attribution.workflowRunId.trim() } : {}),
     ...(attribution?.workflowName?.trim() ? { CLEMENTINE_MCP_WORKFLOW_NAME: attribution.workflowName.trim() } : {}),
     ...(attribution?.stepId?.trim() ? { CLEMENTINE_MCP_STEP_ID: attribution.stepId.trim() } : {}),
@@ -401,7 +407,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
         args: [distEntry],
         env,
         timeout: 10 * 60 * 1000,
-        alwaysLoad: true,
+        alwaysLoad: loading?.deferUnlistedTools ? false : true,
       },
     };
   }
@@ -412,7 +418,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
       args: ['tsx', srcEntry],
       env,
       timeout: 10 * 60 * 1000,
-      alwaysLoad: true,
+      alwaysLoad: loading?.deferUnlistedTools ? false : true,
     },
   };
 }
@@ -1211,7 +1217,37 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ? withReadFanoutGuard(ceilingGated, options.sessionId)
     : ceilingGated;
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
-  const localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
+  // When Claude's native ToolSearch is active, a reduced JIT surface should not
+  // make every other local capability disappear. Register the full agentic MCP
+  // surface, mark the exact former JIT subset first-class, and leave the rest
+  // registered-but-deferred for same-turn acquisition. If JIT did not reduce the
+  // surface (or this is a deny-only worker/read lane), preserve prior behavior.
+  const useLocalDeferredAcquisition = Boolean(
+    agentic
+    && claudeToolSearchEnabled()
+    && options.mcpToolAllowlist
+    && options.mcpToolAllowlist.length > 0,
+  );
+  let localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
+  let localMcpLoading: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean } | undefined;
+  if (useLocalDeferredAcquisition) {
+    const localSurface = resolveToolSurface({
+      surface: 'claude_agent_sdk_local_mcp',
+      lane: 'brain',
+      availableNames: claudeAgentSdkAdvertisableLocalTools(),
+      alwaysLoadedNames: [
+        ...(options.mcpToolAllowlist ?? []),
+        ...(options.requiredLocalMcpTools ?? []),
+      ],
+      deferralEnabled: true,
+      reason: 'Claude native local ToolSearch acquisition',
+    });
+    localMcpToolAllowlist = undefined;
+    localMcpLoading = {
+      alwaysLoadTools: localSurface.firstClass,
+      deferUnlistedTools: true,
+    };
+  }
   const runScopeId = options.sessionId?.trim()
     ? `${options.sessionId.trim()}::claude:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
     : undefined;
@@ -1230,7 +1266,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         workflowName: options.workflowName,
         stepId: options.stepId,
         runScopeId,
-      }),
+      }, localMcpLoading),
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
       // with the Codex lane instead of being blind to native MCPs.

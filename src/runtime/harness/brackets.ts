@@ -1245,11 +1245,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
     // 1. Kill check
     assertNotKilled(ctx.sessionId);
-    // 2. Counter cap (pre-increment)
-    if (ctx.counter.willExceed()) {
-      throw new ToolCallsLimitExceeded(ctx.counter.limit);
+    // 2. Counter cap (pre-increment). The call_tool dispatcher is exempt:
+    // it delegates to dispatchBatchItemTool, whose INNER tool rides this
+    // same ambient counter (call-tool.ts) — charging the wrapper too would
+    // bill every deferred action twice, halving the effective budget on the
+    // schema-on-demand lane. The inner charge is the real one; loop
+    // detection below still evaluates the outer call.
+    if (tool.name !== 'call_tool') {
+      if (ctx.counter.willExceed()) {
+        throw new ToolCallsLimitExceeded(ctx.counter.limit);
+      }
+      ctx.counter.increment();
     }
-    ctx.counter.increment();
     // 2b. Tool-call guardrail (loop detection). Keyed by guardrailScopeId
     // when set (a worker run isolates its own window) else sessionId.
     let fanoutNudge: string | undefined;

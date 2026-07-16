@@ -111,6 +111,21 @@ test('buildClaudeAgentSdkLocalMcpServers exposes the local Clementine MCP in-pro
   assert.ok(local.instance, 'in-process MCP server instance should be present');
 });
 
+test('buildClaudeAgentSdkLocalMcpServers marks only the selected local tools always-load for native deferral', () => {
+  const servers = buildClaudeAgentSdkLocalMcpServers(
+    'brain-session-deferred',
+    true,
+    undefined,
+    undefined,
+    { alwaysLoadTools: ['memory_recall_all', 'tool_search'], deferUnlistedTools: true },
+  );
+  const local = servers['clementine-local'] as any;
+  const registered = local.instance?._registeredTools as Record<string, { _meta?: Record<string, unknown> }>;
+  assert.equal(registered.memory_recall_all?._meta?.['anthropic/alwaysLoad'], true);
+  assert.equal(registered.tool_search?._meta?.['anthropic/alwaysLoad'], true);
+  assert.equal(registered.workflow_update?._meta?.['anthropic/alwaysLoad'], undefined);
+});
+
 test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine MCP stdio server', () => {
   const original = process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
   try {
@@ -124,6 +139,16 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
     assert.equal(local.env.CLEMENTINE_MCP_SESSION_ID, 'brain-session-1');
     assert.ok(Array.isArray(local.args));
     assert.ok(local.args.some((arg: string) => arg.includes('mcp-server')));
+
+    const deferred = buildClaudeAgentSdkLocalMcpServers(
+      'brain-session-deferred-stdio',
+      true,
+      undefined,
+      undefined,
+      { alwaysLoadTools: ['memory_recall_all'], deferUnlistedTools: true },
+    )['clementine-local'] as any;
+    assert.equal(deferred.alwaysLoad, false);
+    assert.equal(deferred.env.CLEMENTINE_MCP_ALWAYS_LOAD_TOOLS, 'memory_recall_all');
   } finally {
     if (original === undefined) delete process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
     else process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = original;
@@ -248,6 +273,45 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(result.text, 'ok');
   assert.deepEqual(result.structuredOutput, { ok: true });
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
+});
+
+test('agentic JIT keeps its selected local tools first-class while registering the rest for same-turn acquisition', async () => {
+  const capture: { call?: any } = {};
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    capture.call = params;
+    return queryFromMessages([
+      {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6',
+        session_id: 'sdk-deferred-local', uuid: 'deferred-init', apiKeySource: 'none',
+        claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: ['mcp__clementine-local__memory_recall_all', 'mcp__clementine-local__tool_search'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any,
+      {
+        type: 'result', subtype: 'success', session_id: 'sdk-deferred-local', uuid: 'deferred-result',
+        result: 'ok', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+        stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any,
+    ], {});
+  }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Recall, then continue.',
+    sessionId: 'sdk-deferred-local-clem',
+    agentic: true,
+    allowedLocalMcpTools: ['memory_recall_all', 'tool_search'],
+    mcpToolAllowlist: ['memory_recall_all', 'tool_search'],
+    requiredLocalMcpTools: ['memory_recall_all'],
+  });
+
+  const local = capture.call.options.mcpServers['clementine-local'] as any;
+  const registered = local.instance._registeredTools as Record<string, { _meta?: Record<string, unknown> }>;
+  assert.equal(registered.memory_recall_all?._meta?.['anthropic/alwaysLoad'], true);
+  assert.equal(registered.tool_search?._meta?.['anthropic/alwaysLoad'], true);
+  assert.ok(registered.workflow_update, 'a non-JIT tool stays registered for native acquisition');
+  assert.equal(registered.workflow_update?._meta?.['anthropic/alwaysLoad'], undefined);
 });
 
 test('runClaudeAgentSdk fails before model work when required local MCP tools are absent from SDK init', async () => {
