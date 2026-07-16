@@ -84,6 +84,32 @@ test('C2: served view injects the window.clem bridge (slug baked in) + keeps the
   assert.ok(html.indexOf('window.clem') < html.indexOf('</body>'));
 });
 
+test('C2b: bridge is DEFINED before the view\'s own script that calls clem.data()', async () => {
+  // Regression: a top-of-body author script that calls clem.data() at load
+  // must see window.clem already defined. Before the fix, the bridge was
+  // injected at </body> — AFTER this script — so clem was undefined and the
+  // surface rendered empty on first load (forcing hand-rolled waitForClem).
+  const slug = 'bridge-order';
+  store.spaceStore.save({ id: slug, title: 'Bridge Order' });
+  const viewFile = store.resolveInSpace(slug, 'view/index.html');
+  mkdirSync(path.dirname(viewFile), { recursive: true });
+  writeFileSync(
+    viewFile,
+    '<!doctype html><html><head><meta charset="utf-8"></head>'
+      + '<body><h1>Board</h1><script>async function load(){const d=await clem.data();}load();</script></body></html>',
+    'utf-8',
+  );
+  const html = await (await fetch(`${base}/console/spaces/${slug}/view`)).text();
+  const bridgeAt = html.indexOf('window.clem=');
+  const authorCallAt = html.indexOf('clem.data()');
+  assert.ok(bridgeAt >= 0, 'bridge injected');
+  assert.ok(authorCallAt >= 0, 'author script preserved');
+  // The bridge definition must precede the author call in document order.
+  assert.ok(bridgeAt < authorCallAt, `bridge (@${bridgeAt}) must be defined before author clem.data() (@${authorCallAt})`);
+  // And it lands inside <head>, ahead of <body>.
+  assert.ok(bridgeAt < html.indexOf('<body'), 'bridge injected into <head>, before <body>');
+});
+
 test('PUT/GET data round-trips; size cap rejects with 413', async () => {
   const slug = 'data-rt';
   store.spaceStore.save({ id: slug, title: 'Data RT' });

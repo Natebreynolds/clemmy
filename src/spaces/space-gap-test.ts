@@ -101,11 +101,24 @@ export function analyzeSpaceGaps(
     });
   }
 
-  // 1: the view never fetches its data at all.
-  if (sources.length > 0 && !/\/data\b/.test(html) && !/\/refresh\b/.test(html)) {
+  // 1: the view never consumes its data at all. GENEROUS by design — a
+  // workspace can be anything the user dreams up, so EVERY legitimate
+  // consumption pattern counts: the injected clem bridge (clem.data() /
+  // clem.refresh() — the pattern our own tool guidance tells the model to
+  // PREFER), a hand-rolled fetch of the /data or /refresh routes, or data
+  // embedded/inlined into the HTML at build time. Before this, a correct
+  // clem.data() view failed the check (no '/data' literal), and models
+  // "fixed" working views for hours by bolting on redundant raw fetches
+  // (2026-07-16 james-english-pipeline incident).
+  const consumesDataPlane = /\/data\b/.test(html)
+    || /\/refresh\b/.test(html)
+    || /\bclem\s*\.\s*(data|refresh)\s*\(/.test(html)
+    || /<script[^>]*\btype\s*=\s*["']?application\/json/i.test(html) // inlined dataset
+    || /\bwindow\.__[A-Z_]*DATA/i.test(html); // embedded seed convention
+  if (sources.length > 0 && !consumesDataPlane) {
     gaps.push({
       severity: 'clarify',
-      question: `The view declares ${sources.length} data source${sources.length === 1 ? '' : 's'} but its HTML never calls GET …/data — how does the surface get populated?`,
+      question: `The view declares ${sources.length} data source${sources.length === 1 ? '' : 's'} but its HTML never reads them — no clem.data()/clem.refresh(), no GET …/data, and no embedded dataset. How does the surface get populated?`,
       why: 'The Workspace will render empty on load — the data is fetched, not embedded.',
     });
   }
