@@ -4646,3 +4646,86 @@ test('E2E memory-credit loop: a primed fact reproduced in the reply earns recall
   );
   assert.equal(getFact(fact.id)?.utilityCount, 1, 'the credit reached the utility counter');
 });
+
+test('Stage 4 E2E: a run that exhausts its token budget parks with the paired continue prompt', async () => {
+  resetEventLog();
+  const prevCeiling = process.env.HARNESS_MAX_RUN_TOKENS;
+  process.env.HARNESS_MAX_RUN_TOKENS = '1000';
+  try {
+    const { accrueSessionTokens } = await import('./eventlog.js');
+    const sess = HarnessSession.create({ kind: 'chat' });
+    let calls = 0;
+    const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+      calls += 1;
+      // Simulate real spend landing during the turn (what recordModelUsage does).
+      accrueSessionTokens(sess.id, 600);
+      return {
+        history: items,
+        lastResponseId: undefined,
+        // toolCalls > 0 keeps the zero-tool stall machinery out of the way —
+        // this test exercises the budget boundary, not stall detection.
+        toolCalls: 3,
+        // Plain-text marker contract: CONTINUE: keeps the loop going.
+        finalOutput: `CONTINUE: enriched batch ${calls} of 40, more to do`,
+      } as never;
+    };
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'do a long thing',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+    assert.equal(result.status, 'limit_exceeded');
+    assert.equal(result.limitKind, 'token_budget');
+    assert.ok(calls >= 2, 'the ceiling parked the run at a boundary, not mid-first-turn');
+    const limitEvents = listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] });
+    assert.ok(limitEvents.some((e) => (e.data as { reason?: string }).reason === 'token_budget'));
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    const park = completed.find((e) => (e.data as { reason?: string }).reason === 'awaiting_continue');
+    assert.ok(park, 'the paired awaiting_continue completion fires (surfaces treat a bare limit event as non-terminal)');
+    assert.match(String((park!.data as { reply?: string }).reply ?? ''), /token budget/i);
+  } finally {
+    if (prevCeiling === undefined) delete process.env.HARNESS_MAX_RUN_TOKENS;
+    else process.env.HARNESS_MAX_RUN_TOKENS = prevCeiling;
+  }
+});
+
+test('Stage 4 E2E: kill-switch off — the same over-budget run finishes without a park', async () => {
+  resetEventLog();
+  const prevCeiling = process.env.HARNESS_MAX_RUN_TOKENS;
+  const prevSwitch = process.env.CLEMMY_RUN_TOKEN_BUDGET;
+  process.env.HARNESS_MAX_RUN_TOKENS = '1000';
+  process.env.CLEMMY_RUN_TOKEN_BUDGET = 'off';
+  try {
+    const { accrueSessionTokens } = await import('./eventlog.js');
+    const sess = HarnessSession.create({ kind: 'chat' });
+    let calls = 0;
+    const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+      calls += 1;
+      accrueSessionTokens(sess.id, 600);
+      return {
+        history: items,
+        lastResponseId: undefined,
+        toolCalls: 3,
+        finalOutput: calls >= 3
+          ? 'Finished the thing.'
+          : `CONTINUE: batch ${calls} done, more to do`,
+      } as never;
+    };
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'do a long thing',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+    assert.equal(result.status, 'completed', 'enforcement off ⇒ no budget park');
+    assert.equal(listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] }).length, 0);
+  } finally {
+    if (prevCeiling === undefined) delete process.env.HARNESS_MAX_RUN_TOKENS;
+    else process.env.HARNESS_MAX_RUN_TOKENS = prevCeiling;
+    if (prevSwitch === undefined) delete process.env.CLEMMY_RUN_TOKEN_BUDGET;
+    else process.env.CLEMMY_RUN_TOKEN_BUDGET = prevSwitch;
+  }
+});

@@ -1505,3 +1505,14 @@ test('decideHeartbeat: cancelling emits a QUIET dashboard ping (never loud)', ()
   const d = decideHeartbeat({ status: 'cancelling', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
   assert.deepEqual(d, { emit: true, loud: false }, 'cancelling is dashboard-only');
 });
+
+test('selfResumeDecision (Stage 4): budgetExhausted parks unconditionally — before hard cap and judge', () => {
+  const base = { enabled: true, autoContinueAttempts: 0, hardCap: 24, cycleToolCalls: 10 };
+  const parked = selfResumeDecision({ ...base, budgetExhausted: true });
+  assert.equal(parked.resume, false);
+  assert.match(parked.reason, /token budget exhausted/);
+  // Budget beats every other gate, including a healthy progressing cycle.
+  assert.equal(selfResumeDecision({ ...base, autoContinueAttempts: 0, budgetExhausted: true }).needJudge, undefined);
+  // Absent/false ⇒ unchanged Wave-3 behavior.
+  assert.deepEqual(selfResumeDecision({ ...base, budgetExhausted: false }), { needJudge: true, reason: 'progress check required' });
+});

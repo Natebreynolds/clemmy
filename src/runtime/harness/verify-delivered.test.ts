@@ -295,3 +295,13 @@ test('matchesBlockedText: real blockers still fire, including verb-negation idio
   );
   assert.equal(matchesBlockedText("I'm blocked on the export step."), true);
 });
+
+test('verifyDelivered: a token-budget park is blocked (budget), never a clean delivery (Stage-4 review F1)', async () => {
+  const verdict = await verifyDelivered('finish the audit', 'Partial progress: 60 of 100 accounts enriched.', {
+    stoppedReason: 'token-budget',
+    judgeFn: async () => ({ done: true, reason: 'looks complete' }), // even a credulous judge cannot bank it
+  });
+  assert.equal(verdict.delivered, false);
+  assert.equal(verdict.blockerType, 'budget');
+  assert.match(verdict.reason ?? '', /token budget/i);
+});

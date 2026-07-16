@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
+import { accrueSessionTokens } from './harness/eventlog.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -161,6 +162,16 @@ export function recordModelUsage(args: {
     ...parseWorkflowSource(source),
   };
   recordUsage(event);
+  // Stage 4 (aggregate run budget): durable, restart/midnight-proof per-session
+  // accumulator (fills the previously-dead sessions.tokens_used column). The
+  // unit is UNCACHED tokens — counting the full prompt every turn would let
+  // cache reads eat a run's ceiling (a 200k-context brain over 50 turns is
+  // ~10M mostly-cached "tokens"). Silent no-op for rowless sources (warmup,
+  // 'unknown'); atomic under parallel worker completions.
+  try {
+    const uncached = Math.max(0, (event.totalTokens ?? 0) - (event.cachedInputTokens ?? 0));
+    accrueSessionTokens(source, uncached);
+  } catch { /* the meter must never break the model-call path */ }
   recordOperationalEvent({
     source: 'model',
     type: 'model_call_completed',

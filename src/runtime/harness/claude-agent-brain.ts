@@ -17,6 +17,8 @@ import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
+import { runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
+import { getSessionTokensUsed } from './eventlog.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
@@ -1221,6 +1223,19 @@ export async function respondViaClaudeAgentSdkBrain(
   // would double-act, e.g. re-send emails); (B) if nothing committed → ONE fresh
   // retry (a fresh query() usually re-derives a clean tool call). Kill-switch
   // CLEMMY_CLAUDE_SDK_SALVAGE. Healthy turns are byte-identical.
+  // Stage 4 — the SDK-brain lane's slice of the run token budget: when the
+  // caller (the background drain) threads a ceiling+baseline, exhaustion
+  // stops the INTERNAL auto-continue chain and surfaces as a budget park
+  // instead of silently burning past the window (review F2).
+  const budgetWindowExhausted = (): boolean => {
+    try {
+      if (!runTokenBudgetEnforcementEnabled()) return false;
+      const ceiling = typeof request.maxRunTokens === 'number' ? request.maxRunTokens : 0;
+      if (ceiling <= 0) return false;
+      const baseline = typeof request.runTokenBaseline === 'number' ? request.runTokenBaseline : 0;
+      return getSessionTokensUsed(sessionId) - baseline >= ceiling;
+    } catch { return false; }
+  };
   const runWithSalvage = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult> => {
     try {
       return await runClaudeAgentSdkImpl(opts);
@@ -1480,6 +1495,7 @@ export async function respondViaClaudeAgentSdkBrain(
         && result.toolUses.length > 0
         && autoContinues < maxSdkAutoContinues()
         && (Date.now() - autoStart) < sdkAutoContinueWallMs()
+        && !budgetWindowExhausted() // Stage 4: never auto-continue past the token window
       ) {
         const progress = (result.text || '').trim().slice(0, 1500);
         const cont = await runContinuation({
@@ -1540,7 +1556,10 @@ export async function respondViaClaudeAgentSdkBrain(
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
   const stoppedReason: AssistantResponse['stoppedReason'] =
-    result.stoppedReason ?? (result.limitHit ? 'max-turns-with-grace' : 'success');
+    result.stoppedReason
+    ?? (result.limitHit
+      ? (budgetWindowExhausted() ? 'token-budget' : 'max-turns-with-grace')
+      : 'success');
   const awaitingInput = stoppedReason === 'awaiting-input';
   // Report-back / observability parity (gap analysis): the harness loop emits
   // conversation_completed + runtime.completed on a clean terminal so the Tasks

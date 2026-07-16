@@ -1355,6 +1355,9 @@ function renderGatewayTail(response: GatewayResponse): string {
     const turns = response.turnsUsed ? ` (${response.turnsUsed} turns used)` : '';
     parts.push(`⏸ Paused at tool-call budget${turns}. Tap **Continue** below or reply \`continue\` to resume.`);
   }
+  if (response.stoppedReason === 'token-budget') {
+    parts.push('⏸ Paused at this run\'s token budget. Tap **Continue** below or reply `continue` to authorize another budget window.');
+  }
   return parts.filter(Boolean).join('\n\n');
 }
 
@@ -2529,7 +2532,7 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
             await interaction.channel.send(chunk);
           }
         }
-        if (response.stoppedReason === 'max-turns-with-grace'
+        if ((response.stoppedReason === 'max-turns-with-grace' || response.stoppedReason === 'token-budget')
             && interaction.channel && 'send' in interaction.channel) {
           await sendComponentMessage(interaction.channel, {
             content: '_resume when ready_',
@@ -2839,7 +2842,7 @@ async function handleMessage(message: Message<boolean>, assistant: ClementineAss
     // so the user has a one-tap resume affordance instead of having to type
     // "continue" by hand. Falls back gracefully when the channel doesn't
     // accept components.
-    if (response.stoppedReason === 'max-turns-with-grace'
+    if ((response.stoppedReason === 'max-turns-with-grace' || response.stoppedReason === 'token-budget')
         && 'send' in message.channel) {
       try {
         await sendComponentMessage(message.channel, {

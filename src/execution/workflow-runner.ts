@@ -54,6 +54,9 @@ import {
   writeWorkspaceCheckerReport,
 } from './workflow-run-workspace.js';
 import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprint } from '../runtime/harness/fanout-reduce.js';
+import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
+import { sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
+import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
@@ -1887,6 +1890,10 @@ async function runStepViaHarness(
         // chat budget, so a hung/runaway step wasn't bounded at the intended
         // 15 min. Env-tunable via CLEMENTINE_WORKFLOW_STEP_WALL_MS.
         maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+        // Stage 4: the WORKFLOW lane's token budget is the RUN-level advisory
+        // — a per-step park here has no continue affordance and would fail the
+        // step hard (a legit heavy fan-out step can exceed the chat preset).
+        maxRunTokens: 0,
       });
     }
 
@@ -3420,6 +3427,7 @@ export async function executeStep(
                 const response = await respondPreferHarness('workflow', {
                   sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
                   channel: 'workflow',
+                  maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
                   message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
                   // ONE model resolution for every run/lane: explicit step.model →
                   // intent-routed worker → codex-safe brain. Resolving here (not raw
@@ -3624,6 +3632,7 @@ export async function executeStep(
     const response = await respondPreferHarness('workflow', {
       sessionId: `workflow:${ctx.runId}:${step.id}`,
       channel: 'workflow',
+      maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
       message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
       // ONE model resolution for every run/lane: explicit step.model →
       // intent-routed worker → codex-safe brain. Resolving here (not raw
@@ -4622,8 +4631,38 @@ async function executeWorkflow(
   } else {
     let completedStepIds = new Set(Object.keys(stepOutputs));
     let executionRound = 0;
+    // Stage 4 — aggregate run token budget, WORKFLOW lane: advisory-only in
+    // v1 (a park here has no approval for the reaper to watch — a forever-
+    // strand would be a worse lie than a warning; see the Stage-4 design
+    // spike). One durable advisory per run when the summed per-step spend
+    // crosses the ceiling; per-step wall-clocks still bound runaway time.
+    let runBudgetWarned = false;
+    const runTokenCeiling = resolveRunTokenCeiling({ budget: getHarnessBudgetSettings() });
+    const workflowRunHasBudgetAdvisory = (wf: string, run: string): boolean =>
+      readWorkflowEvents(wf, run).some((e) =>
+        e.kind === 'step_advisory'
+        && (e as { meta?: { reason?: string } }).meta?.reason === 'run_token_budget_exceeded');
+    const maybeWarnRunBudget = (): void => {
+      if (runBudgetWarned || !runTokenBudgetEnforcementEnabled() || runTokenCeiling <= 0) return;
+      try {
+        const spent = sumSessionTokensUsedByPrefix(`workflow:${runId}:`);
+        if (spent < runTokenCeiling) return;
+        runBudgetWarned = true;
+        // Durable idempotency: a resumed run must not re-emit the advisory
+        // (the in-memory flag dies with the process).
+        try {
+          if (workflowRunHasBudgetAdvisory(workflowSlug, runId)) return;
+        } catch { /* fall through — a duplicate advisory beats a missing one */ }
+        appendWorkflowEvent(workflowSlug, runId, {
+          kind: 'step_advisory',
+          stepId: '(budget)',
+          meta: { reason: 'run_token_budget_exceeded', tokensUsed: spent, tokenCeiling: runTokenCeiling, advisoryOnly: true },
+        });
+      } catch { /* the advisory must never fail a run */ }
+    };
     while (completedStepIds.size < steps.length) {
       executionRound += 1;
+      maybeWarnRunBudget();
       const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
       const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
       const batch = readyBatch.slice(0, concurrencyCap);
@@ -4711,6 +4750,9 @@ async function executeWorkflow(
         } catch { /* the watcher is silent on any failure */ }
       }
     }
+    // Stage 4 — final-batch coverage: a ceiling crossed during the LAST round
+    // would exit the while before the next round-start check (review F6).
+    maybeWarnRunBudget();
   }
   // Clear the step tracker before the synthesis pass + final cleanup
   // so the heartbeat doesn't keep showing the LAST step name after

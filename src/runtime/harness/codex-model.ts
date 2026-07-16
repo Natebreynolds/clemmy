@@ -57,6 +57,7 @@ import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutErro
 import { estimateInputTokens } from './token-estimator.js';
 import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { recordCodexRateLimit } from './rate-limit-store.js';
+import { recordModelUsage } from '../usage-log.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-model' });
@@ -431,7 +432,10 @@ export class CodexResponsesModel implements Model {
         for await (const evt of this.streamCodex(request)) {
           events.push(evt);
         }
-        return assembleModelResponse(events);
+        const response = assembleModelResponse(events);
+        const completed = events.find((e) => e.type === 'response.completed' || e.type === 'response.done');
+        recordCodexHarnessUsage(completed?.response?.usage, this.modelId, response.responseId);
+        return response;
       } catch (err) {
         const yieldedRealContent = events.some(isRealContentCodexEvent);
         if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
@@ -595,6 +599,7 @@ export class CodexResponsesModel implements Model {
         // details fields). Mirror the OpenAIResponsesModel's streaming
         // shape: snake_case detail spreads, camelCase token counts.
         const u = completedEvent?.response?.usage ?? {};
+        recordCodexHarnessUsage(u, this.modelId, responseId ?? completedEvent?.response?.id);
         yield {
           type: 'response_done',
           response: {
@@ -1540,6 +1545,37 @@ function extractUsage(event: AnyCodexEvent | undefined): Usage {
     input_tokens_details: u.input_tokens_details ?? {},
     output_tokens_details: u.output_tokens_details ?? {},
   });
+}
+
+/** Stage 4 (aggregate run budget): the HARNESS Codex lane never recorded
+ *  usage — only the legacy codex-native-runtime did — so a Codex-OAuth
+ *  harness run (a primary production config) was invisible to the token
+ *  meter AND the dashboard usage panel. Record at both finalization sites
+ *  (streamed + non-streamed) under the ALS run session. Fail-silent:
+ *  observability must never break the model path. */
+export function recordCodexHarnessUsage(
+  usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number; input_tokens_details?: Record<string, unknown>; output_tokens_details?: Record<string, unknown> } | undefined,
+  modelId: string,
+  responseId?: string,
+): void {
+  try {
+    if (!usage) return;
+    const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+    const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+    if (inputTokens + outputTokens <= 0) return;
+    const cached = usage.input_tokens_details?.cached_tokens;
+    const reasoning = usage.output_tokens_details?.reasoning_tokens;
+    recordModelUsage({
+      sessionId: harnessRunContextStorage.getStore()?.sessionId ?? 'unknown',
+      model: modelId,
+      inputTokens,
+      cachedInputTokens: typeof cached === 'number' ? cached : undefined,
+      outputTokens,
+      reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
+      totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : inputTokens + outputTokens,
+      responseId,
+    });
+  } catch { /* fail-silent */ }
 }
 
 async function safeReadErrorBody(res: Response): Promise<string | undefined> {
