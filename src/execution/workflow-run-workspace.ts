@@ -245,6 +245,52 @@ export function runWorkspaceOffloadEnabled(): boolean {
   return (process.env.CLEMMY_RUN_WORKSPACE_OFFLOAD ?? 'on').trim().toLowerCase() !== 'off';
 }
 
+export function reduceDigestArtifactRelPath(stepId: string): string {
+  return path.join('artifacts', `reduce-${safeSegment(stepId, 'step')}.json`);
+}
+
+export interface StepReduceDigest {
+  stepId: string;
+  /** Content fingerprint of the aggregate the digest was reduced from —
+   *  a re-pursuit with unchanged items skips re-reducing. */
+  fingerprint: string;
+  shards: Array<{ shardIndex: number; degraded: boolean; items: Array<{ itemKey: string; gist: string }> }>;
+  /** Assembled text the synthesis envelope inlines. Failure lines are appended
+   *  by the runner from its own failure accumulator, never by the reducer. */
+  digest: string;
+  createdAt: string;
+}
+
+/** Stage 3 (reduce tier): persist a forEach step's shard-reduced digest as a
+ *  durable workspace artifact next to the step output. Overwrite-idempotent. */
+export function recordReduceDigest(args: {
+  workflowName: string;
+  runId: string;
+  digest: StepReduceDigest;
+}): void {
+  ensureRunWorkspace(args.workflowName, args.runId);
+  const rel = reduceDigestArtifactRelPath(args.digest.stepId);
+  const serialized = safeStringify(args.digest);
+  writeFileSync(path.join(runWorkspaceDir(args.workflowName, args.runId), rel), serialized, 'utf-8');
+  recordArtifact(args.workflowName, args.runId, {
+    path: rel,
+    tool: 'reduce-digest',
+    agent: args.digest.stepId,
+    bytes: Buffer.byteLength(serialized, 'utf-8'),
+    summary: `shard-reduced digest: ${args.digest.shards.length} shard${args.digest.shards.length === 1 ? '' : 's'}`,
+    producedAt: args.digest.createdAt,
+  });
+}
+
+export function readReduceDigest(workflowName: string, runId: string, stepId: string): StepReduceDigest | null {
+  try {
+    const abs = path.join(runWorkspaceDir(workflowName, runId), reduceDigestArtifactRelPath(stepId));
+    return JSON.parse(readFileSync(abs, 'utf-8')) as StepReduceDigest;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Offload a large cross-step CONTEXT value to the shared workspace under a
  * DETERMINISTIC per-key path, so every downstream step that depends on the same

@@ -49,11 +49,16 @@ const GOLDEN = {
   // 2026-07-16 memory_mark_used subtraction: both mark-used prompt rules removed
   // from the rubric — usage credit is now attributed in code post-turn
   // (recall-auto-credit.ts), so the model owes no bookkeeping call.
+  // 2026-07-16 Stage 3 reduce tier: the FAN OUT clause's "stalls after ~15"
+  // concession retired — large fan-outs may return compact digests and shard
+  // summaries; the rubric teaches synthesize-from-shards CONDITIONALLY (the
+  // review's F8: the behavior is kill-switchable, so the prompt must not
+  // promise it unconditionally).
   instructions: { len: 35397, sha16: '3ecaedce880db18d' },
   native: { len: 34500, sha16: 'a5c6b24cdd80de3e' },
-  claudeBrain: { len: 5411, sha16: 'cb2e4d6d1ef97277' },
+  claudeBrain: { len: 5599, sha16: '1a9c5be79e55335c' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8670, sha16: 'e136b924c1b5a209' },
+  lean: { len: 8858, sha16: '451032e10277d848' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

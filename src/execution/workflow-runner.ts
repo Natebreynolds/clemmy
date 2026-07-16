@@ -43,13 +43,17 @@ import { loadSkill } from '../memory/skill-store.js';
 import {
   anchorRunGoal,
   offloadContextValue,
+  readReduceDigest,
+  recordReduceDigest,
   recordStepOutput,
+  reduceDigestArtifactRelPath,
   runWorkspaceDir,
   runWorkspaceOffloadEnabled,
   stepOutputArtifactRelPath,
   summarizeToolOutput,
   writeWorkspaceCheckerReport,
 } from './workflow-run-workspace.js';
+import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprint } from '../runtime/harness/fanout-reduce.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
@@ -3546,6 +3550,11 @@ export async function executeStep(
       ctx.forEachFailures.push({ stepId: step.id, itemKey: r.itemKey, error: r.error });
     }
     clearWorkflowRunItemProgress(ctx.runId, step.id);
+    // Stage 3 (reduce tier): shard-reduce a LARGE aggregate into a durable
+    // digest artifact so the synthesis brain reads compressed content instead
+    // of a content-free ref. Additive only — the step output passed downstream
+    // is the full aggregate, unchanged. Best-effort: never fails the step.
+    await maybeReduceForEachAggregate(ctx, step.id, aggregate);
     return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, aggregate, {
       mode: 'forEach',
       completed: aggregate.length,
@@ -3874,6 +3883,106 @@ function stringifyForPrompt(value: unknown): string {
   }
 }
 
+/**
+ * Stage 3 (reduce tier) — shard-reduce a LARGE forEach aggregate into a
+ * durable digest artifact the synthesis envelope inlines, so the one
+ * synthesis brain call reads compressed content instead of a bare ref.
+ *
+ * Honesty is code-owned: the reducer only ever sees successful item outputs;
+ * this step's failures are appended deterministically from the runner's own
+ * accumulator. Fingerprint-idempotent (a resumed/re-pursued step with an
+ * unchanged aggregate skips re-reducing). Best-effort: any failure inside
+ * degrades per-shard (reduceShardMembers never throws) and a write failure
+ * simply leaves synthesis with today's behavior.
+ */
+/** The member projection shared by the digest WRITE (maybeReduceForEachAggregate)
+ *  and the staleness check at READ (stepOutputArtifactRefForPrompt) — both must
+ *  fingerprint the aggregate identically or a stale digest slips through. */
+function reduceMembersForAggregate(value: unknown): Array<{ itemKey: string; callId: string; text: string }> | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const members: Array<{ itemKey: string; callId: string; text: string }> = [];
+  for (const entry of value) {
+    const itemKey = (entry as { itemKey?: unknown } | null)?.itemKey;
+    if (typeof itemKey !== 'string') return null; // not a forEach aggregate shape
+    members.push({
+      itemKey,
+      callId: `item:${itemKey}`,
+      text: stringifyForPrompt((entry as { output?: unknown }).output),
+    });
+  }
+  return members;
+}
+
+async function maybeReduceForEachAggregate(
+  ctx: { workflowSlug: string; runId: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> },
+  stepId: string,
+  aggregate: Array<{ itemKey: string; output: unknown }>,
+): Promise<void> {
+  try {
+    if (!reduceTierEnabled() || !runWorkspaceOffloadEnabled()) return;
+    if (aggregate.length < 20 || serializedContextLength(aggregate) <= STEP_CONTEXT_VALUE_CLIP) return;
+    const members = reduceMembersForAggregate(aggregate);
+    if (!members) return;
+    const fingerprint = shardFingerprint(members);
+    const prior = readReduceDigest(ctx.workflowSlug, ctx.runId, stepId);
+    if (prior && prior.fingerprint === fingerprint) return; // unchanged aggregate — reuse
+
+    const shardSize = reduceShardSize();
+    const slices: Array<Array<{ itemKey: string; callId: string; text: string }>> = [];
+    for (let offset = 0; offset < members.length; offset += shardSize) {
+      slices.push(members.slice(offset, offset + shardSize));
+    }
+    // Bounded parallelism: shard reduces are independent cheap calls; running
+    // them 3-wide keeps a 100-item step from serializing ~9 model round-trips
+    // in its completion path (review F10). Each call is timeout-bounded.
+    const REDUCE_CONCURRENCY = 3;
+    const reducedSlices: Array<{ degraded: boolean; items: Array<{ itemKey: string; gist: string }> }> = [];
+    for (let at = 0; at < slices.length; at += REDUCE_CONCURRENCY) {
+      const batch = await Promise.all(slices.slice(at, at + REDUCE_CONCURRENCY).map((s) => reduceShardMembers(s)));
+      for (const reduced of batch) {
+        reducedSlices.push({
+          degraded: reduced.degraded,
+          items: reduced.items.map(({ itemKey, gist }) => ({ itemKey, gist })),
+        });
+      }
+    }
+    const shards = reducedSlices.map((s, i) => ({ shardIndex: i, ...s }));
+    const failures = ctx.forEachFailures.filter((f) => f.stepId === stepId);
+    const digestLines = [
+      `SHARD-REDUCED DIGEST of step "${stepId}" (${aggregate.length} items, ${shards.length} shards; machine-generated — exact rows via workspace_artifact_query on the step output artifact):`,
+      ...shards.map((s) => s.items.map((i) => `- ${i.itemKey}: ${i.gist}`).join('\n')),
+      // Deterministic, code-owned failure lines — the reducer never saw these.
+      ...(failures.length > 0
+        ? [`FAILED ITEMS (authoritative, from the runner): ${failures.map((f) => `${f.itemKey} (${f.error.split('\n')[0].slice(0, 120)})`).join('; ')}`]
+        : []),
+    ];
+    recordReduceDigest({
+      workflowName: ctx.workflowSlug,
+      runId: ctx.runId,
+      digest: {
+        stepId,
+        fingerprint,
+        shards,
+        digest: digestLines.join('\n'),
+        createdAt: new Date().toISOString(),
+      },
+    });
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_advisory',
+      stepId,
+      meta: {
+        reason: 'shard_reduce',
+        items: aggregate.length,
+        shards: shards.length,
+        degradedShards: shards.filter((s) => s.degraded).length,
+        failed: failures.length,
+      },
+    });
+  } catch {
+    // The reduce tier is additive; synthesis falls back to today's behavior.
+  }
+}
+
 function stepOutputArtifactRefForPrompt(
   stepId: string,
   value: unknown,
@@ -3886,6 +3995,17 @@ function stepOutputArtifactRefForPrompt(
   const workspacePath = stepOutputArtifactRelPath(stepId);
   const absolutePath = path.join(runWorkspaceDir(opts.workflowName, opts.runId), workspacePath);
   if (existsSync(absolutePath)) {
+    // Stage 3: when a shard-reduced digest exists for this step, inline it so
+    // the consumer (synthesis especially) reads real compressed content
+    // instead of flying blind on a shape summary + path. Bounded; the exact
+    // rows remain one workspace_artifact_query away. STALENESS GUARD (review
+    // F2): a digest from a prior pursuit only inlines when its fingerprint
+    // matches the CURRENT value — a re-pursued step whose aggregate changed
+    // (or fell under the reduce trigger) must never present the old digest.
+    const reduce = readReduceDigest(opts.workflowName, opts.runId, stepId);
+    const currentMembers = reduce ? reduceMembersForAggregate(value) : null;
+    const digestFresh = Boolean(reduce && currentMembers && reduce.fingerprint === shardFingerprint(currentMembers));
+    const reduceDigest = digestFresh && reduce?.digest ? reduce.digest.slice(0, 14_000) : undefined;
     return {
       __clementine_context_ref: true,
       present: true,
@@ -3893,8 +4013,10 @@ function stepOutputArtifactRefForPrompt(
       bytes: Buffer.byteLength(stringifyForPrompt(value), 'utf-8'),
       path: absolutePath,
       workspacePath,
-      instruction:
-        'This completed step output is present but too large to inline. Call workspace_artifact_query on this path for exact rows/fields/pages, or read_file for raw JSON.',
+      ...(reduceDigest ? { reduceDigest, reducePath: reduceDigestArtifactRelPath(stepId) } : {}),
+      instruction: reduceDigest
+        ? 'This completed step output is too large to inline; a shard-reduced digest is in reduceDigest. Synthesize from it, and call workspace_artifact_query on this path only for exact rows/fields/pages.'
+        : 'This completed step output is present but too large to inline. Call workspace_artifact_query on this path for exact rows/fields/pages, or read_file for raw JSON.',
     };
   }
 

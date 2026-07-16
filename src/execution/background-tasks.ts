@@ -32,6 +32,7 @@ import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
+import { resetFanoutWindow, sweepFanoutReduce } from '../runtime/harness/fanout-reduce.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered, type BlockerType } from '../runtime/harness/verify-delivered.js';
 import { verifyFanoutItems, fanoutItemVerifyEnabled } from '../runtime/harness/fanout-item-verify.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
@@ -1194,6 +1195,9 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     // boundary, so a prior run's (or continue's) failures don't leak into THIS run's
     // authoritative coverage gate and permanently block a re-completed task.
     appendEvent({ sessionId: runSessionId, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { taskId: id } });
+    // Stage 3: a new run boundary also resets the in-process fan-out reduce
+    // window, so a prior run's digest-mode state never leaks into this run.
+    resetFanoutWindow(runSessionId);
   } catch { /* trace pre-registration is best-effort; the worker creates it anyway */ }
   if (updated) emitBackgroundTaskOperational('background_task_started', updated);
   return updated;
@@ -1634,6 +1638,14 @@ async function verifyBackgroundTaskDelivery(
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType }> {
   const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
+
+  // Stage 3: close out the reduce tier before verification — reduce any
+  // full-but-unstarted shard a crash left behind and let in-flight shard
+  // reduces land, so every shard artifact is on disk for synthesis/readers.
+  // Best-effort; a sweep failure never blocks delivery.
+  try {
+    await sweepFanoutReduce(task.runSessionId);
+  } catch { /* sweep is best-effort */ }
 
   // Wave 4 Stage 2 — per-item verification of the fan-out worker OUTPUTS (anti-
   // silent-success). A zero-LLM tripwire flags hollow / blocked / off-objective /
