@@ -19,71 +19,70 @@ function writeGoal(goal: GoalRecord): void {
 
 export function registerGoalTools(server: McpServer): void {
   server.tool(
-    'goal_create',
-    'Create a persistent goal that survives across sessions and can drive proactive work.',
+    'goal_upsert',
+    'Create or update a persistent goal (one that survives across sessions and can drive proactive work). Omit `id` to CREATE a new goal (title + description required). Pass an existing `id` to UPDATE that goal — only the fields you provide change; `progressNote` is appended to the goal\'s progress log, while nextActions/blockers/linkedCronJobs replace.',
     {
-      title: z.string().min(1),
-      description: z.string().min(1),
+      id: z.string().min(1).optional().describe('Existing goal id to UPDATE. Omit to create a new goal.'),
+      title: z.string().min(1).optional().describe('Required when creating (no id). On update, renames the goal.'),
+      description: z.string().min(1).optional().describe('Required when creating (no id). On update, replaces the description.'),
       owner: z.string().optional(),
       priority: z.enum(['high', 'medium', 'low']).optional(),
+      status: z.enum(['active', 'paused', 'completed', 'blocked']).optional().describe('Update-only: goal lifecycle status. New goals start active.'),
       targetDate: z.string().optional(),
-      nextActions: z.array(z.string()).optional(),
+      nextActions: z.array(z.string()).optional().describe('Replaces the goal\'s next-actions list.'),
+      progressNote: z.string().optional().describe('Update-only: appended (timestamped) to the goal\'s progress log.'),
+      blockers: z.array(z.string()).optional().describe('Replaces the goal\'s blockers list.'),
       reviewFrequency: z.enum(['daily', 'weekly', 'on-demand']).optional(),
-      linkedCronJobs: z.array(z.string()).optional(),
+      linkedCronJobs: z.array(z.string()).optional().describe('Replaces the goal\'s linked cron jobs.'),
       autoSchedule: z.boolean().optional(),
     },
-    async ({ title, description, owner, priority, targetDate, nextActions, reviewFrequency, linkedCronJobs, autoSchedule }) => {
+    async ({ id, title, description, owner, priority, status, targetDate, nextActions, progressNote, blockers, reviewFrequency, linkedCronJobs, autoSchedule }) => {
       const now = new Date().toISOString();
+
+      // UPDATE path — an id was supplied.
+      if (id) {
+        const goal = readGoal(id);
+        if (!goal) return textResult(`Goal not found: ${id}. Omit id to create a new goal.`);
+        if (title) goal.title = title;
+        if (description) goal.description = description;
+        if (owner) goal.owner = owner;
+        if (priority) goal.priority = priority;
+        if (status) goal.status = status;
+        if (targetDate !== undefined) goal.targetDate = targetDate;
+        if (progressNote) goal.progressNotes.push(`[${now.slice(0, 16)}] ${progressNote}`);
+        if (nextActions) goal.nextActions = nextActions;
+        if (blockers) goal.blockers = blockers;
+        if (reviewFrequency) goal.reviewFrequency = reviewFrequency;
+        if (linkedCronJobs) goal.linkedCronJobs = linkedCronJobs;
+        if (autoSchedule !== undefined) goal.autoSchedule = autoSchedule;
+        goal.updatedAt = now;
+        writeGoal(goal);
+        return textResult(`Goal "${goal.title}" updated (status: ${goal.status}).`);
+      }
+
+      // CREATE path — no id.
+      if (!title || !description) {
+        return textResult('To create a goal, provide both `title` and `description` (or pass an `id` to update an existing goal).');
+      }
       const goal: GoalRecord = {
         id: randomBytes(4).toString('hex'),
         title,
         description,
         owner: owner || 'clementine',
         priority: priority || 'medium',
-        status: 'active',
+        status: status || 'active',
         createdAt: now,
         updatedAt: now,
         targetDate,
         reviewFrequency: reviewFrequency || 'weekly',
-        progressNotes: [],
+        progressNotes: progressNote ? [`[${now.slice(0, 16)}] ${progressNote}`] : [],
         nextActions: nextActions || [],
-        blockers: [],
+        blockers: blockers || [],
         linkedCronJobs: linkedCronJobs || [],
         autoSchedule,
       };
       writeGoal(goal);
       return textResult(`Goal created: "${goal.title}" (ID: ${goal.id})`);
-    },
-  );
-
-  server.tool(
-    'goal_update',
-    'Update an existing goal: status, progress, next actions, blockers, or linked cron jobs.',
-    {
-      id: z.string().min(1),
-      status: z.enum(['active', 'paused', 'completed', 'blocked']).optional(),
-      progressNote: z.string().optional(),
-      nextActions: z.array(z.string()).optional(),
-      blockers: z.array(z.string()).optional(),
-      linkedCronJobs: z.array(z.string()).optional(),
-      priority: z.enum(['high', 'medium', 'low']).optional(),
-      autoSchedule: z.boolean().optional(),
-    },
-    async ({ id, status, progressNote, nextActions, blockers, linkedCronJobs, priority, autoSchedule }) => {
-      const goal = readGoal(id);
-      if (!goal) return textResult(`Goal not found: ${id}`);
-
-      if (status) goal.status = status;
-      if (progressNote) goal.progressNotes.push(`[${new Date().toISOString().slice(0, 16)}] ${progressNote}`);
-      if (nextActions) goal.nextActions = nextActions;
-      if (blockers) goal.blockers = blockers;
-      if (linkedCronJobs) goal.linkedCronJobs = linkedCronJobs;
-      if (priority) goal.priority = priority;
-      if (autoSchedule !== undefined) goal.autoSchedule = autoSchedule;
-      goal.updatedAt = new Date().toISOString();
-      writeGoal(goal);
-
-      return textResult(`Goal "${goal.title}" updated (status: ${goal.status}).`);
     },
   );
 
@@ -114,42 +113,6 @@ export function registerGoalTools(server: McpServer): void {
           })
           .join('\n'),
       );
-    },
-  );
-
-  server.tool(
-    'goal_get',
-    'Get a single goal with description, progress notes, next actions, blockers, and linked cron jobs.',
-    {
-      id: z.string().min(1),
-    },
-    async ({ id }) => {
-      const goal = readGoal(id);
-      if (!goal) return textResult(`Goal not found: ${id}`);
-
-      const sections = [
-        `# ${goal.title}`,
-        `ID: ${goal.id} | Status: ${goal.status} | Priority: ${goal.priority} | Owner: ${goal.owner}`,
-        `Created: ${goal.createdAt} | Updated: ${goal.updatedAt}${goal.targetDate ? ` | Target: ${goal.targetDate}` : ''}`,
-        '',
-        '## Description',
-        goal.description,
-      ];
-
-      if (goal.progressNotes.length > 0) {
-        sections.push('', '## Progress Notes', ...goal.progressNotes.map((note) => `- ${note}`));
-      }
-      if (goal.nextActions.length > 0) {
-        sections.push('', '## Next Actions', ...goal.nextActions.map((action) => `- [ ] ${action}`));
-      }
-      if (goal.blockers.length > 0) {
-        sections.push('', '## Blockers', ...goal.blockers.map((blocker) => `- ${blocker}`));
-      }
-      if (goal.linkedCronJobs.length > 0) {
-        sections.push('', '## Linked Cron Jobs', ...goal.linkedCronJobs.map((job) => `- ${job}`));
-      }
-
-      return textResult(sections.join('\n'));
     },
   );
 }

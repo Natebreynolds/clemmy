@@ -72,9 +72,6 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   'update_agent',
   'delete_agent',
   'delegate_task',
-  // scheduling / cron: a step doesn't schedule or trigger future work
-  'add_cron_job',
-  'trigger_cron_job',
   // tool authoring
   'create_tool',
   // unbounded fan-out
@@ -82,7 +79,6 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // planning surface: a deterministic step does work, it doesn't plan/re-plan
   'surface_plan',
   'propose_plan',
-  'create_plan',
   // conversational question: cannot be answered inside a background run
   // (would hang the run) — block cleanly via workflow_step_result instead
   'ask_user_question',

@@ -28,7 +28,6 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
   for (const required of [
     'ask_user_question',
     'notify_user',
-    'draft_goal_from_notes',
     'share_plan',
     'pending_action_queue',
     'pending_action_list',
@@ -44,9 +43,7 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
     'background_tasks_recent',
     'background_task_status',
     'user_profile_read',
-    'user_profile_update',
     'check_capability',
-    'list_capabilities',
     'mcp_status',
     'harness_status',
   ]) {

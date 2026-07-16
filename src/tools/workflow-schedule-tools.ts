@@ -1,10 +1,7 @@
-import { existsSync, readFileSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import matter from 'gray-matter';
 import { z } from 'zod';
-import { listWorkflows, readWorkflow } from '../memory/workflow-store.js';
+import { readWorkflow } from '../memory/workflow-store.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
-import { CRON_FILE } from '../memory/vault.js';
 import { textResult } from './shared.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
 import { describeCron } from '../execution/workflow-describe.js';
@@ -77,7 +74,7 @@ const scheduleParams = {
     .string()
     .min(8)
     .max(240)
-    .describe('One-sentence description of what this scheduled workflow does. Surfaced in dashboards and the agent\'s schedule_list output.'),
+    .describe('One-sentence description of what this scheduled workflow does. Surfaced in dashboards and schedule listings.'),
   cron: z
     .string()
     .min(9)
@@ -258,59 +255,6 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       const updated: WorkflowDefinition = { ...entry.data, enabled: false };
       writeWorkflowAndSyncTriggers(name, updated);
       return textResult(`Workflow "${name}" disabled. The definition remains on disk — re-enable any time via workflow_schedule with the same name.`);
-    },
-  );
-
-  server.tool(
-    'schedule_list',
-    [
-      'List every active schedule in one place — scheduled workflows AND legacy cron jobs.',
-      'Use this when the user asks "what\'s scheduled?" or before authoring a new schedule (to avoid duplicates / conflicts).',
-      'Returns one line per schedule: source · name · cron · description. Workflows are the canonical authoring path; cron entries are legacy but still fire.',
-    ].join('\n'),
-    {},
-    async () => {
-      const lines: string[] = [];
-
-      // Scheduled workflows
-      let scheduledWorkflows = 0;
-      try {
-        for (const entry of listWorkflows()) {
-          const cron = entry.data.trigger?.schedule;
-          if (!cron) continue;
-          scheduledWorkflows += 1;
-          const state = entry.data.enabled ? 'active' : 'DISABLED';
-          lines.push(`- workflow · ${entry.data.name} · "${cron}" · ${state} · ${entry.data.description}`);
-        }
-      } catch {
-        // ignore — list still shows cron section
-      }
-
-      // Legacy cron jobs from CRON.md
-      let cronJobs = 0;
-      if (existsSync(CRON_FILE)) {
-        try {
-          const parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
-          const jobs = Array.isArray(parsed.data.jobs) ? parsed.data.jobs as Array<Record<string, unknown>> : [];
-          for (const job of jobs) {
-            const name = typeof job.name === 'string' ? job.name : '(unnamed)';
-            const cron = typeof job.schedule === 'string' ? job.schedule : '(no schedule)';
-            const enabled = job.enabled !== false;
-            const promptPreview = typeof job.prompt === 'string' ? job.prompt.slice(0, 80) : '';
-            cronJobs += 1;
-            lines.push(`- cron · ${name} · "${cron}" · ${enabled ? 'active' : 'DISABLED'} · ${promptPreview}`);
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      if (lines.length === 0) {
-        return textResult('No schedules active. Use workflow_schedule to create one.');
-      }
-
-      const header = `${scheduledWorkflows} scheduled workflow${scheduledWorkflows === 1 ? '' : 's'} + ${cronJobs} legacy cron job${cronJobs === 1 ? '' : 's'}:`;
-      return textResult(`${header}\n${lines.join('\n')}`);
     },
   );
 }

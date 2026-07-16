@@ -42,8 +42,12 @@ const GOLDEN = {
   // only after materially affecting an answer, plan, scope, or tool choice.
   // 2026-07-15 structured entity capture: both provider lanes annotate only
   // literal identities/relationships so memory writes populate grounded graph.
-  instructions: { len: 35977, sha16: '9acafd60a2beb6bf' },
-  native: { len: 35080, sha16: 'acfc047e5d80c1e3' },
+  // 2026-07-16 tool subtraction: plan-lifecycle tools (create_plan/list_plans/
+  // update_plan_step) killed → "PLAN vs EXECUTION COHERENCE" rewritten as
+  // "EXECUTION IS THE SOURCE OF TRUTH"; goal_create/goal_update/goal_get merged
+  // into goal_upsert (goal_list unchanged).
+  instructions: { len: 35636, sha16: '0de68f07b2a66e64' },
+  native: { len: 34739, sha16: 'ad85a4b466b91b79' },
   claudeBrain: { len: 5589, sha16: 'eaf07b47ae5ca924' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
   lean: { len: 8848, sha16: '8bb076e57bdea9bf' },

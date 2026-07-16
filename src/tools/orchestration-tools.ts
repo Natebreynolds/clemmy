@@ -756,64 +756,12 @@ const WorkflowVisualContractFixKindSchema = z.enum(WORKFLOW_VISUAL_CONTRACT_FIX_
 const LOOP_UNTIL_DESC =
   'Step-level loop. Exit condition = the step\'s own output contract (retry-until-contract-passes, ≤5 attempts), OR probe+until (loop until EXTERNAL STATE satisfies the until contract — poll-until-done / paginate-until-drained, ≤10 attempts). Plain LLM read steps; write needs loopSafe; send never loops.';
 
-interface CronJobRecord {
-  name: string;
-  schedule: string;
-  prompt: string;
-  tier?: number;
-  enabled?: boolean;
-  work_dir?: string;
-  mode?: 'standard' | 'unleashed';
-  max_hours?: number;
-}
-
-// Workflow schema lives in the shared workflow-store module so the MCP
-// tools, the daemon's workflow runner, and the dashboard REST routes
-// all parse identical shapes. Importing the types instead of redefining
-// them keeps the three surfaces in lock-step on field defaults.
-
-
-// Cron → human recurrence. Canonical implementation lives in
-// workflow-describe.ts (describeCron); this local alias keeps the cron_list
-// call site readable while removing the duplicate humanizer.
-const describeCronSchedule = describeCron;
-
-function loadCronJobs(): CronJobRecord[] {
-  if (!existsSync(CRON_FILE)) return [];
-  try {
-    const parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
-    return Array.isArray(parsed.data.jobs) ? (parsed.data.jobs as CronJobRecord[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveCronJobs(jobs: CronJobRecord[]): void {
-  ensureDir(path.dirname(CRON_FILE));
-  const current = existsSync(CRON_FILE) ? matter(readFileSync(CRON_FILE, 'utf-8')) : matter('');
-  current.data = { ...(current.data ?? {}), jobs };
-  writeFileSync(CRON_FILE, matter.stringify(current.content || '# Cron Jobs\n', current.data), 'utf-8');
-}
-
+// The cron TOOL surfaces (add_cron_job / cron_list / cron_run_history /
+// trigger_cron_job / cron_progress_write) were retired; only cron_progress_read
+// remains for the daemon's own CRON.md runner, which reads/writes CRON.md
+// directly and is unaffected by this subtraction. safeName is kept for it.
 function safeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
-function readRunHistory(jobName: string, limit = 10): Array<{ status?: string; startedAt?: string; finishedAt?: string; durationMs?: number; error?: string }> {
-  const filePath = path.join(CRON_RUNS_DIR, `${safeName(jobName)}.jsonl`);
-  if (!existsSync(filePath)) return [];
-  return readFileSync(filePath, 'utf-8')
-    .split('\n')
-    .filter(Boolean)
-    .slice(-limit)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as { status?: string; startedAt?: string; finishedAt?: string; durationMs?: number; error?: string };
-      } catch {
-        return {};
-      }
-    })
-    .reverse();
 }
 
 // Thin alias so existing callsites that wanted `entry.file` keep working.
@@ -824,109 +772,6 @@ function listWorkflowFiles(): WorkflowEntry[] {
 }
 
 export function registerOrchestrationTools(server: McpServer): void {
-  server.tool(
-    'cron_run_history',
-    'Query recent execution history for a cron job.',
-    {
-      job_name: z.string().min(1),
-      limit: z.number().int().min(1).max(50).optional(),
-    },
-    async ({ job_name, limit }) => {
-      const runs = readRunHistory(job_name, limit ?? 10);
-      if (runs.length === 0) return textResult(`No execution history found for job '${job_name}'.`);
-      return textResult(
-        [
-          `## Run History: ${job_name}`,
-          ...runs.map((run) => {
-            const duration = run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : '?';
-            return `- [${run.status ?? 'unknown'}] ${run.startedAt ?? 'unknown start'} (${duration})${run.error ? ` | ${run.error}` : ''}`;
-          }),
-        ].join('\n'),
-      );
-    },
-  );
-
-  server.tool(
-    'cron_list',
-    'List all scheduled cron jobs with schedules, next run times, and recent status.',
-    {},
-    async () => {
-      const jobs = loadCronJobs();
-      if (jobs.length === 0) return textResult('No cron jobs configured.');
-      return textResult(
-        jobs
-          .map((job) => {
-            const nextRun = job.enabled === false ? null : getNextRun(job.schedule);
-            const lastRun = readRunHistory(job.name, 1)[0];
-            return [
-              `**${job.name}** [${job.enabled === false ? 'disabled' : 'enabled'}]${job.mode === 'unleashed' ? ' [unleashed]' : ''}`,
-              `  Schedule: ${describeCronSchedule(job.schedule)} (\`${job.schedule}\`)`,
-              nextRun ? `  Next run: ${nextRun}` : '',
-              lastRun ? `  Last run: ${lastRun.status ?? 'unknown'}${lastRun.finishedAt ? ` at ${lastRun.finishedAt}` : ''}` : '',
-              job.work_dir ? `  Work dir: ${job.work_dir}` : '',
-              `  Prompt: ${job.prompt.slice(0, 120)}${job.prompt.length > 120 ? '...' : ''}`,
-            ].filter(Boolean).join('\n');
-          })
-          .join('\n\n'),
-      );
-    },
-  );
-
-  server.tool(
-    'add_cron_job',
-    'Add a scheduled cron job to CRON.md.',
-    {
-      name: z.string().min(1),
-      schedule: z.string().min(1),
-      prompt: z.string().min(1),
-      tier: z.number().optional(),
-      enabled: z.boolean().optional(),
-      work_dir: z.string().optional(),
-      mode: z.enum(['standard', 'unleashed']).optional(),
-      max_hours: z.number().optional(),
-    },
-    async ({ name, schedule, prompt, tier, enabled, work_dir, mode, max_hours }) => {
-      if (!validateCronExpression(schedule)) {
-        return textResult(`Invalid cron expression: "${schedule}"`);
-      }
-
-      const jobs = loadCronJobs();
-      if (jobs.some((job) => job.name.toLowerCase() === name.toLowerCase())) {
-        return textResult(`A job named "${name}" already exists.`);
-      }
-
-      jobs.push({
-        name,
-        schedule,
-        prompt,
-        tier: tier ?? 1,
-        enabled: enabled ?? true,
-        work_dir,
-        mode: mode ?? 'standard',
-        max_hours,
-      });
-      saveCronJobs(jobs);
-
-      return textResult(`Added cron job "${name}".`);
-    },
-  );
-
-  server.tool(
-    'trigger_cron_job',
-    'Trigger an existing cron job to run immediately by writing a trigger file.',
-    {
-      job_name: z.string().min(1),
-    },
-    async ({ job_name }) => {
-      const job = loadCronJobs().find((entry) => entry.name === job_name);
-      if (!job) return textResult(`Job "${job_name}" not found.`);
-      ensureDir(CRON_TRIGGERS_DIR);
-      const filePath = path.join(CRON_TRIGGERS_DIR, `${Date.now()}-${safeName(job_name)}.trigger.json`);
-      writeFileSync(filePath, JSON.stringify({ jobName: job_name, triggeredAt: new Date().toISOString() }, null, 2), 'utf-8');
-      return textResult(`Triggered "${job_name}".`);
-    },
-  );
-
   server.tool(
     'workflow_list',
     'List all workflows with description, steps, and trigger metadata.',
@@ -2296,36 +2141,6 @@ export function registerOrchestrationTools(server: McpServer): void {
       const filePath = path.join(CRON_PROGRESS_DIR, `${safeName(job_name)}.json`);
       if (!existsSync(filePath)) return textResult(`No previous progress found for job "${job_name}".`);
       return textResult(readFileSync(filePath, 'utf-8'));
-    },
-  );
-
-  server.tool(
-    'cron_progress_write',
-    'Persist progress state for a cron job.',
-    {
-      job_name: z.string().min(1),
-      completedItems: z.array(z.string()).optional(),
-      pendingItems: z.array(z.string()).optional(),
-      notes: z.string().optional(),
-      state: z.record(z.string(), z.unknown()).optional(),
-    },
-    async ({ job_name, completedItems, pendingItems, notes, state }) => {
-      ensureDir(CRON_PROGRESS_DIR);
-      const filePath = path.join(CRON_PROGRESS_DIR, `${safeName(job_name)}.json`);
-      const current = existsSync(filePath)
-        ? JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>
-        : {};
-      const next = {
-        ...current,
-        jobName: job_name,
-        lastRunAt: new Date().toISOString(),
-        completedItems: completedItems ?? current.completedItems ?? [],
-        pendingItems: pendingItems ?? current.pendingItems ?? [],
-        notes: notes ?? current.notes ?? '',
-        state: state ?? current.state ?? {},
-      };
-      writeFileSync(filePath, JSON.stringify(next, null, 2), 'utf-8');
-      return textResult(`Progress saved for "${job_name}".`);
     },
   );
 

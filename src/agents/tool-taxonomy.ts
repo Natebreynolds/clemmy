@@ -97,7 +97,6 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // external surface). "use DeepSeek for the workers" shouldn't pause for
   // approval; it's a local setting the user just asked for in chat.
   'set_model_role',
-  'clear_model_role',
   // Durable facts + working memory.
   'memory_remember',
   'memory_mark_used',
@@ -106,13 +105,11 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'memory_embed_backfill',
   'working_memory',
   'note_create',
-  'note_take',
   // Task + goal bookkeeping — local JSON, no external surface.
   'task_add',
   'task_update',
   'task_hygiene',
-  'goal_create',
-  'goal_update',
+  'goal_upsert',
   // Current focus — local SQLite attention pointer. Pure local writes,
   // no external surface. Pausing for approval on these would force the
   // user to confirm every "let's pin this as the current focus" — that's
@@ -133,12 +130,8 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'execution_update_step',
   'execution_complete',
   'execution_mark_blocked',
-  // Cron progress writes — local progress file.
-  'cron_progress_write',
-  // Plan + autonomy authoring — local writes, the user approves the
-  // plan as a whole via the plan-surface flow, not per-step.
-  'create_plan',
-  'update_plan_step',
+  // Plan surfacing — local write, the user approves the plan as a whole
+  // via the plan-surface flow, not per-step.
   'surface_plan',
   // Session bookkeeping
   'session_pause',
@@ -239,9 +232,7 @@ const ALWAYS_READ = new Set<string>([
   'execution_list',
   'execution_get',
   'execution_create',
-  'goal_get',
   'goal_list',
-  'list_plans',
   'tool_choice_recall',
   'user_profile_read',
   'desktop_status',
@@ -279,7 +270,6 @@ const ALWAYS_READ = new Set<string>([
   // draft_plan / share_plan / propose_check_in_template / surface_plan — planning
   // surfaces, agent-internal. Not network mutations.
   'draft_plan',
-  'draft_goal_from_notes',
   'share_plan',
   'surface_plan',
   'propose_check_in_template',
@@ -442,16 +432,6 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
   const rawLower = name.toLowerCase();
   if (rawLower.startsWith('dataforseo__') || rawLower.startsWith('dataforseo-mcp-server__')) {
     return 'read';
-  }
-
-  // workspace_config is mixed-mode: listing is a read, while adding or
-  // removing workspace roots changes Clementine's trust boundary.
-  if (name === 'workspace_config') {
-    const action = options.args && typeof options.args === 'object'
-      ? (options.args as { action?: unknown }).action
-      : undefined;
-    if (action === 'list') return 'read';
-    return 'admin';
   }
 
   // memory_self_heal is mixed-mode: list/dry_run only inspect proposed

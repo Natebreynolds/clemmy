@@ -118,7 +118,7 @@ function readOptInSlugs(): Set<string> {
 // -------- Decision schema --------
 //
 // Phase 2: actions are NO LONGER a structured array. The agent calls
-// real tools during its run (notify_user, task_add, goal_update,
+// real tools during its run (notify_user, task_add, goal_upsert,
 // memory_remember, etc.) and the SDK orchestrates those tool calls
 // natively. The decision output is metadata only — what did you do,
 // what are you on the hook for next time, when should you wake again.
@@ -513,8 +513,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- `notify_user` for meaningful updates the user should see, but does NOT need to respond to.',
       '- `ask_user_question` ONLY when you genuinely cannot proceed without information the user has and you do not. Never re-ask something already open — open check-ins are listed in your input.',
       '- `execution_mark_blocked` when something external blocks you. If a user answer would unblock it, ALSO call `ask_user_question` with the contextExecutionId so the cycle resumes when they answer.',
-      '- `task_add` / `task_update` to manage the tasks file. `goal_update` to log progress or change goal status.',
-      '- `note_take` to append context to today\'s daily note.',
+      '- `task_add` / `task_update` to manage the tasks file. `goal_upsert` to create a goal (omit id) or log progress / change status on one (pass its id).',
       '- `memory_remember` for durable preferences, project context, or standing feedback that should carry across sessions.',
       '- `memory_recall_all` to look across memory before deciding; use `memory_recall` only for a vault-only lookup.',
       '- `propose_check_in_template` when you notice a recurring rhythm in the user\'s work (weekly deploys, daily standups, monthly reviews) or a condition that should trigger a future nudge. DO NOT auto-install — the user approves from Settings → Proactive Check-Ins. Always include a clear `rationale` referencing the specific pattern you observed.',
@@ -634,7 +633,6 @@ export function categorizeToolForPolicy(name: string): 'composio' | 'computer' |
     'read_file',
     'list_files',
     'git_status',
-    'workspace_config',
     'workspace_list',
     'workspace_info',
     'workspace_roots',

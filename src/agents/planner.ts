@@ -57,9 +57,7 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   'git_status',
   'session_history',
   'goal_list',
-  'goal_get',
   'task_list',
-  'list_plans',
   'agent_runs_recent',
   'agent_run_get',
   'background_tasks_recent',
@@ -68,7 +66,6 @@ const PLANNER_TOOL_NAMES = new Set<string>([
   // Pre-flight capability detection so the planner can verify a CLI
   // exists before writing steps that depend on it.
   'check_capability',
-  'list_capabilities',
   // Lossless read-back for the planner's own clipped/digested reads.
   // `read_file` / `session_history` can return payloads big enough to be
   // clipped by the tool-output digest; the footer then names these two

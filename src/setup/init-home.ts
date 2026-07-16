@@ -148,7 +148,7 @@ async function main(): Promise<void> {
     JSON.stringify({
       id: 'example',
       title: 'Example: Replace this with your first real goal',
-      description: 'This is a placeholder goal. Edit or delete this file and create your own goals using the goal_create tool or by adding JSON files to ~/.clementine-next/goals/.',
+      description: 'This is a placeholder goal. Edit or delete this file and create your own goals using the goal_upsert tool or by adding JSON files to ~/.clementine-next/goals/.',
       owner: 'clementine',
       priority: 'low',
       status: 'paused',

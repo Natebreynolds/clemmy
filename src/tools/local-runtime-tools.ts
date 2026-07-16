@@ -88,18 +88,6 @@ import {
 } from '../runtime/schema-normalizer.js';
 export { normalizeZodForResponses, normalizeShapeForResponses };
 
-/**
- * Per-call destructive-hint override for the handful of local tools
- * where the kind depends on the args (e.g. `workspace_config` is admin
- * only on `add` / `remove`, but `list` is a plain read).
- */
-function localDestructiveHint(toolName: string, input: unknown): boolean {
-  if (toolName === 'workspace_config') {
-    const action = (input && typeof input === 'object' ? (input as Record<string, unknown>).action : undefined);
-    return action === 'add' || action === 'remove';
-  }
-  return false;
-}
 
 function captureLocalTools(): CapturedLocalTool[] {
   ensureToolDirectories();
@@ -185,7 +173,7 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
     // marks as "always ask" still pause regardless of policy scope.
     needsApproval: needsApprovalFromTaxonomy(localTool.name, {
       isDestructive: (input) =>
-        Boolean(localTool.approvalRequired) || localDestructiveHint(localTool.name, input),
+        Boolean(localTool.approvalRequired),
     }),
     execute: async (input, runContext, details) => withToolOutputContext(
       toolOutputContextFromSdk(localTool.name, runContext, details),

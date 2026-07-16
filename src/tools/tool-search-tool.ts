@@ -19,6 +19,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { textResult } from './shared.js';
+import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { rankCatalog } from '../agents/tool-catalog.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
@@ -86,24 +87,35 @@ export function registerToolSearchTool(
         if (schema !== undefined) schemas[name] = schema;
       }
 
-      // Promote the schema'd hits into the session hot-set (first-class next turn).
-      const sessionId = getToolOutputContext()?.sessionId;
-      for (const name of schemaNames) recordToolHit(sessionId, name);
-
-      return textResult(
-        JSON.stringify(
-          {
-            query,
-            results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
-            schemas,
-            hint: opts.allowedNames
-              ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-              : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
-          },
-          null,
-          2,
-        ),
+      // Bound our OWN payload: the generic tool-result cap would otherwise slice
+      // the JSON mid-escape and hand the model (and tests) an unparseable blob.
+      // Dropping the largest trailing schema keeps the ranked names intact — a
+      // dropped schema is re-acquirable with a tighter query, per the hint.
+      const render = (): string => JSON.stringify(
+        {
+          query,
+          results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
+          schemas,
+          hint: opts.allowedNames
+            ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
+            : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
+        },
+        null,
+        2,
       );
+      let text = render();
+      const shownSchemaNames = [...schemaNames];
+      while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
+        const dropped = shownSchemaNames.pop()!;
+        delete schemas[dropped];
+        text = render();
+      }
+
+      // Promote the schema-bearing hits into the session hot-set (first-class next turn).
+      const sessionId = getToolOutputContext()?.sessionId;
+      for (const name of shownSchemaNames) recordToolHit(sessionId, name);
+
+      return textResult(text);
     },
   );
 }

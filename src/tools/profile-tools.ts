@@ -1,22 +1,16 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { z } from 'zod';
-import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
+import { loadUserProfile } from '../runtime/user-profile.js';
 import { textResult } from './shared.js';
 
 /**
- * User-profile MCP tools. The agent uses these to adapt to the user
- * over time. Examples of legitimate use:
- *
- *   - User says "call me Alex, not by my last name" → `user_profile_update({ preferredName: 'Alex' })`
- *   - User says "skip the recap, just answer" → `user_profile_update({ communicationTone: 'terse' })`
- *   - User says "I'm in Pacific time, working 9–6 weekdays" → set timezone + working hours
+ * User-profile MCP tool (read). The agent reads the profile to adapt how
+ * it addresses the user and tunes its tone. Communication preferences the
+ * user states in chat ("call me Alex", "skip the recap", "I'm in Pacific
+ * time") are now persisted via memory_remember rather than a dedicated
+ * profile-write tool.
  *
  * Reads are cheap (file read on every call) so the agent can pull the
- * current state any time it's unsure. Writes are idempotent — same
- * patch can be applied twice without effect.
- *
- * This is the customization layer for the goal piece "customizable
- * based on the user who installed this".
+ * current state any time it's unsure.
  */
 
 export function registerProfileTools(server: McpServer): void {
@@ -41,29 +35,6 @@ export function registerProfileTools(server: McpServer): void {
         profile.notes ? `Notes: ${profile.notes}` : '',
       ].filter(Boolean);
       return textResult(lines.join('\n'));
-    },
-  );
-
-  server.tool(
-    'user_profile_update',
-    'Update the user profile. Only set fields the user has explicitly told you about — do NOT guess values. The profile is read on every conversation; changes take effect on the next turn.',
-    {
-      displayName: z.string().min(1).max(120).optional(),
-      preferredName: z.string().min(1).max(80).optional(),
-      role: z.string().min(2).max(200).optional(),
-      timezone: z.string().min(2).max(80).optional(),
-      workingHoursStart: z.string().regex(/^\d{1,2}:\d{2}$/).optional(),
-      workingHoursEnd: z.string().regex(/^\d{1,2}:\d{2}$/).optional(),
-      workingDays: z.array(z.string()).max(7).optional(),
-      communicationTone: z.enum(['terse', 'balanced', 'verbose']).optional(),
-      formality: z.enum(['casual', 'professional', 'formal']).optional(),
-      urgencyTolerance: z.enum(['low', 'normal', 'high']).optional(),
-      preferredChannels: z.array(z.string()).max(8).optional(),
-      notes: z.string().max(1200).optional(),
-    },
-    async (patch) => {
-      const updated = saveUserProfile(patch);
-      return textResult(`Profile updated. Address: ${updated.preferredName ?? updated.displayName} | tone: ${updated.communicationTone} | formality: ${updated.formality}`);
     },
   );
 }

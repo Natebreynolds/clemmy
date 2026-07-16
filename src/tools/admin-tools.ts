@@ -9,11 +9,8 @@ import {
   BASE_DIR,
   TIMERS_FILE,
   ensureDir,
-  getWorkspaceDirs,
   listWorkspaceProjects,
-  readBaseEnv,
   textResult,
-  updateEnvKey,
 } from './shared.js';
 
 interface TimerEntry {
@@ -64,10 +61,6 @@ function desktopBundleCandidates(): string[] {
     '/Applications/Clementine.app',
     path.join(os.homedir(), 'Applications', 'Clementine.app'),
   ];
-}
-
-function formatWorkspaceDir(resolved: string): string {
-  return resolved.startsWith(os.homedir()) ? resolved.replace(os.homedir(), '~') : resolved;
 }
 
 export function registerAdminTools(server: McpServer): void {
@@ -121,46 +114,6 @@ export function registerAdminTools(server: McpServer): void {
       writeTimers(timers);
 
       return textResult(`Timer set for ${minutes} minute${minutes === 1 ? '' : 's'} from now: "${message}"`);
-    },
-  );
-
-  server.tool(
-    'workspace_config',
-    'View or modify workspace directories used for project discovery.',
-    {
-      action: z.enum(['list', 'add', 'remove']),
-      directory: z.string().optional(),
-    },
-    async ({ action, directory }) => {
-      if (action === 'list') {
-        const current = getWorkspaceDirs();
-        if (current.length === 0) {
-          return textResult('No workspace directories configured or auto-detected.');
-        }
-        return textResult(current.map((dir, index) => `${index + 1}. ${dir}`).join('\n'));
-      }
-
-      if (!directory) {
-        return textResult('directory is required for add/remove.');
-      }
-
-      const resolved = resolveHomePath(directory);
-      const env = readBaseEnv();
-      const currentRaw = (env.WORKSPACE_DIRS ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
-
-      if (action === 'add') {
-        if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
-          return textResult(`Not a directory: ${resolved}`);
-        }
-        const display = formatWorkspaceDir(resolved);
-        const next = [...new Set([...currentRaw, display])];
-        updateEnvKey('WORKSPACE_DIRS', next.join(','));
-        return textResult(`Added ${display} to workspace directories.`);
-      }
-
-      const filtered = currentRaw.filter((entry) => resolveHomePath(entry) !== resolved);
-      updateEnvKey('WORKSPACE_DIRS', filtered.join(','));
-      return textResult(`Removed ${formatWorkspaceDir(resolved)} from workspace directories.`);
     },
   );
 

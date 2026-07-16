@@ -46,7 +46,7 @@ test('ensureBuiltInWorkflows seeds the generic objective execution loop once', (
 
   const byId = new Map(entry!.data.steps.map((step) => [step.id, step]));
   assert.equal(byId.get('persist_operating_record')?.dependsOn?.includes('operating_plan'), true);
-  assert.ok(byId.get('persist_operating_record')?.allowedTools?.includes('goal_create'));
+  assert.ok(byId.get('persist_operating_record')?.allowedTools?.includes('goal_upsert'));
   assert.equal(byId.get('execute_work_item')?.forEach, 'operating_plan');
   assert.equal(byId.get('execute_work_item')?.sideEffect, 'write');
 

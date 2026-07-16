@@ -94,9 +94,6 @@ const EXEMPT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'execution_list',
   // Planning primitives — pre-execution scaffolding.
   'draft_plan',
-  'create_plan',
-  'list_plans',
-  'update_plan_step',
   // Approval + user-input — must always be callable.
   'request_approval',
   'ask_user_question',

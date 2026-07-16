@@ -41,7 +41,7 @@ const SAMPLE_TOOLS = [
   { name: 'run_worker' },
   { name: 'surface_plan' },
   { name: 'ask_user_question' },
-  { name: 'add_cron_job' },
+  { name: 'create_tool' },
 ];
 
 test('step surface KEEPS the work tools real workflows need (triage regression)', () => {
@@ -75,7 +75,7 @@ test('step surface REMOVES recursion / fan-out / authoring / planning vectors', 
     'run_worker',
     'surface_plan',
     'ask_user_question',
-    'add_cron_job',
+    'create_tool',
   ]) {
     assert.equal(kept.has(name), false, `step surface must REMOVE ${name}`);
     assert.ok(WORKFLOW_STEP_BLOCKED_TOOL_NAMES.has(name), `${name} must be in the blocklist`);

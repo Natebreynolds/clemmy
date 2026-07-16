@@ -101,7 +101,7 @@ function assertReadMutatorsEqual(
 
 test('catalog surface contains its known-critical members', () => {
   const catalog = asSet(LOCAL_MCP_TOOL_NAMES);
-  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_create']) {
+  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
     assert.ok(catalog.has(n), `catalog (LOCAL_MCP_TOOL_NAMES) must include ${n}`);
   }
 });
@@ -115,7 +115,7 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
   const surface = deriveOrchestratorDiscoveryNames();
   for (const n of [
     'composio_execute_tool', 'memory_forget', 'memory_pin', 'space_save', 'workflow_create',
-    'workflow_from_session', 'goal_create', 'run_batch', 'run_tool_program', 'recall_tool_result',
+    'workflow_from_session', 'goal_upsert', 'run_batch', 'run_tool_program', 'recall_tool_result',
     'tool_output_query', 'workspace_artifact_query', 'focus_get', 'browser_harness_run', 'pending_action_queue', 'tool_search',
   ]) {
     assert.ok(surface.has(n), `orchestrator discovery surface must include ${n}`);
@@ -141,7 +141,7 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   for (const n of ro) assert.ok(auth.has(n), `authoring must be a superset of read-only (missing ${n})`);
-  for (const n of ['workflow_create', 'goal_create', 'space_save', 'pending_action_queue', 'set_model_role']) {
+  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'set_model_role']) {
     assert.ok(auth.has(n), `authoring must include ${n}`);
   }
 });
@@ -183,7 +183,7 @@ test('JIT core surface: mandated members present, JIT-able tools absent', () => 
   // always-loaded CORE must keep the tools whose JIT-pruning caused a live incident,
   // and must NOT swallow the intent-evident JIT-able tools (which retrieval brings back).
   const core = asSet(TOOL_JIT_MANDATED);
-  for (const n of ['focus_get', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'notify_user', 'browser_harness_run', 'goal_create']) {
+  for (const n of ['focus_get', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
     assert.ok(core.has(n), `JIT core must include mandated ${n}`);
   }
   // These are intent-evident / discoverable — they must stay JIT-able, not core.

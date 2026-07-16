@@ -246,7 +246,7 @@ test('Orchestrator is now the single agent — carries the union of all action t
     // Shell + filesystem
     'run_shell_command', 'write_file', 'read_file', 'list_files',
     // Workspace
-    'workspace_config', 'workspace_info', 'workspace_list', 'workspace_roots',
+    'workspace_info', 'workspace_list', 'workspace_roots',
     // Workspaces (Spaces) authoring — must be on the orchestrator surface so the
     // workspace dock / re-engage turn can actually edit + refresh a space
     // (regression guard: these were registered but omitted from discoveryTools,
@@ -261,14 +261,14 @@ test('Orchestrator is now the single agent — carries the union of all action t
     'pending_action_queue', 'pending_action_list', 'pending_action_get', 'pending_action_record_result',
     // Tasks + goals + executions
     'task_list', 'task_add', 'task_update',
-    'goal_get', 'goal_update',
+    'goal_upsert', 'goal_list',
     'execution_list', 'execution_get', 'execution_update_step', 'execution_complete', 'execution_mark_blocked',
     // CLI discovery + probes
     'local_cli_list', 'local_cli_probe',
     // Tool-choice memoization
     'tool_choice_recall', 'tool_choice_remember', 'tool_choice_invalidate',
-    // User profile (read + write)
-    'user_profile_read', 'user_profile_update',
+    // User profile (read)
+    'user_profile_read',
     // Conversation tools
     'ask_user_question', 'request_approval', 'notify_user',
     // Planning
@@ -348,8 +348,7 @@ test('JIT classification guard: every rubric-named built-in is consciously CORE 
     // hold/resume are intent-evident ("hold it for later" / "pick up X") and held
     // tasks are named in the persistent context, so semantic retrieval surfaces them.
     'hold_task_for_later', 'resume_held_task',
-    'workspace_config', 'workspace_list', 'workspace_info',
-    'goal_update',
+    'workspace_list', 'workspace_info',
     'create_agent', 'update_agent', 'team_request', 'delegate_task',
   ]);
   const mentioned = new Set<string>();

@@ -261,7 +261,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const clarify = 'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.';
   const executeDirective = EXECUTE_DIRECTIVE;
   const agentCreation = AGENT_CREATION_DIRECTIVE;
-  const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.';
+  const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions (including how-to-communicate preferences like tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.';
   const handoffs = [
     'You orchestrate sub-agents. Hand off when the work fits a specialist:',
     '- Researcher: gather information, read-only.',

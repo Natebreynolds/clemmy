@@ -49,8 +49,7 @@ export function summarizeApprovalAction(approval: PendingApproval): string {
       const subject = pickString(args, ['subject', 'title']);
       return `email \`${trim(to, 80)}\`: ${trim(subject, 160)}`;
     }
-    case 'goal_create':
-    case 'goal_update':
+    case 'goal_upsert':
     case 'task_add':
     case 'task_update': {
       const title = pickString(args, ['title', 'description', 'text', 'name']);
@@ -483,8 +482,7 @@ export function previewToolCall(toolName: string, argsRaw: unknown): string {
       const subject = pickString(args, ['subject', 'reason']);
       return subject ? `requesting approval · ${trim(subject, MAX - 22)}` : toolName;
     }
-    case 'goal_create':
-    case 'goal_update':
+    case 'goal_upsert':
     case 'task_add':
     case 'task_update': {
       const title = pickString(args, ['title', 'description', 'text', 'name']);

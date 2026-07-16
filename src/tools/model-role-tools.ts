@@ -76,20 +76,30 @@ export function registerModelRoleTools(server: McpServer): void {
   server.tool(
     'set_model_role',
     [
-      'Route a model ROLE to a specific model, when the user asks in chat (e.g. "use DeepSeek for the workers", "make the judge Opus", "run the checker on Sonnet").',
+      'Route a model ROLE to a specific model, or revert it to the default, when the user asks in chat (e.g. "use DeepSeek for the workers", "make the judge Opus", "put the workers back to normal").',
       'role = worker (delegated run_worker/grunt labor) or judge (the fusion verify checker). The BRAIN is a provider login switch — do NOT set it here; point the user to Settings → Models.',
       'modelId is an exact id the user is logged into, e.g. claude-opus-4-8, claude-sonnet-4-6, gpt-5.4, gpt-5.5, deepseek-chat, minimax-01. Takes effect on the next turn, no restart.',
-      'whenIntent (optional) scopes the rule to ONE kind of work in the user\'s OWN words: "use Claude Opus for design" → role:"worker", modelId:"claude-opus-4-8", whenIntent:"design". Omit it for a role-wide rule. When you later fan a sub-task of that kind out to a worker, tag the worker with the same intent word and it routes to this model.',
-      'This persists as a durable rule and shows in the Models panel. To revert, use clear_model_role.',
+      'reset=true reverts the role to its provider-derived default instead of setting a model ("put the workers back to normal", "stop using Opus for the judge"). Pass EITHER modelId OR reset:true, not both.',
+      'whenIntent (optional) scopes the rule to ONE kind of work in the user\'s OWN words: "use Claude Opus for design" → role:"worker", modelId:"claude-opus-4-8", whenIntent:"design". With reset it clears only that one intent-scoped rule; omit it for the role-wide rule. When you later fan a sub-task of that kind out to a worker, tag the worker with the same intent word and it routes to this model.',
+      'This persists as a durable rule and shows in the Models panel.',
     ].join('\n'),
     {
       role: z.enum(['worker', 'judge']).describe('worker = delegated labor model; judge = fusion checker model.'),
-      modelId: z.string().min(1).max(60).describe('Exact model id the user has access to (e.g. claude-opus-4-8, gpt-5.4, deepseek-chat).'),
+      modelId: z.string().min(1).max(60).optional().describe('Exact model id the user has access to (e.g. claude-opus-4-8, gpt-5.4, deepseek-chat). Omit when reset=true.'),
+      reset: z.boolean().optional().describe('Revert the role (or the named intent rule) to its provider-derived default. Mutually exclusive with modelId.'),
       whenIntent: z.string().min(1).max(80).optional().describe('Optional free-form category, in the user\'s OWN words, to scope this rule to one kind of work ("design", "legal", "research"). Omit for a role-wide rule.'),
     },
-    async ({ role, modelId, whenIntent }) => {
+    async ({ role, modelId, reset, whenIntent }) => {
       if (!chatModelRoutingEnabled()) return textResult('Chat model routing is disabled (CLEMMY_CHAT_MODEL_ROUTING=off).');
-      const clean = modelId.trim();
+      const clean = modelId?.trim();
+      if (reset && clean) return textResult('Pass either modelId (to set a model) or reset:true (to revert to default), not both.');
+      if (reset) {
+        applyRoleBinding(role as ModelRole, '', true, whenIntent);
+        const scope = whenIntent ? ` "${whenIntent.trim()}" rule` : '';
+        const r = resolveRoleModel(role as ModelRole, whenIntent);
+        return textResult(`Cleared the ${role}${scope}. ${role} now resolves to ${r.modelId} (${r.provider}).`);
+      }
+      if (!clean) return textResult('Provide a modelId to set the role, or reset:true to revert it to the default.');
       const validation = validateRoleModelBinding(role as ModelRole, clean);
       if (!validation.ok) return textResult(`I can't set that model role: ${validation.reason}`);
       applyRoleBinding(role as ModelRole, clean, false, whenIntent);
@@ -98,26 +108,6 @@ export function registerModelRoleTools(server: McpServer): void {
         `Done — ${role}${scope} now routes to ${clean}.` +
           (whenIntent ? ` I'll send "${whenIntent.trim()}" sub-tasks to ${clean}; everything else stays on the default.` : ''),
       );
-    },
-  );
-
-  server.tool(
-    'clear_model_role',
-    [
-      'Revert a model ROLE to its default (the model derived from whichever provider the user is on).',
-      'Use when the user says e.g. "put the workers back to normal" or "stop using Opus for the judge".',
-      'Pass whenIntent to remove only ONE intent-scoped rule ("stop using Opus for design" → role:"worker", whenIntent:"design") without touching the role-wide default. Omit it to clear the role-wide rule.',
-    ].join('\n'),
-    {
-      role: z.enum(['worker', 'judge']).describe('The role to reset to its provider-derived default.'),
-      whenIntent: z.string().min(1).max(80).optional().describe('Optional — clear only the rule for this category word; omit to clear the role-wide rule.'),
-    },
-    async ({ role, whenIntent }) => {
-      if (!chatModelRoutingEnabled()) return textResult('Chat model routing is disabled (CLEMMY_CHAT_MODEL_ROUTING=off).');
-      applyRoleBinding(role as ModelRole, '', true, whenIntent);
-      const scope = whenIntent ? ` "${whenIntent.trim()}" rule` : '';
-      const r = resolveRoleModel(role as ModelRole, whenIntent);
-      return textResult(`Cleared the ${role}${scope}. ${role} now resolves to ${r.modelId} (${r.provider}).`);
     },
   );
 }

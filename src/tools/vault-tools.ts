@@ -4,7 +4,6 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   TASKS_FILE,
-  appendTodayNote,
   ensureTasksFile,
   noteFolderForType,
   nextTaskId,
@@ -116,16 +115,6 @@ export function registerVaultTools(server: McpServer): void {
       const body = content?.trim() || `# ${cleanedTitle}\n`;
       replaceFile(notePath, body);
       return textResult(`Created ${path.relative(VAULT_DIR, notePath)}`);
-    },
-  );
-
-  server.tool(
-    'note_take',
-    'Append a quick capture to today’s daily note.',
-    { content: z.string().min(1) },
-    async ({ content }) => {
-      const noteName = appendTodayNote(content);
-      return textResult(`Appended to ${noteName}`);
     },
   );
 
