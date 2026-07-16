@@ -26,7 +26,6 @@ import { registerCliTools } from './cli-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerSpaceTools } from './space-tools.js';
-import { isSpacesEnabled } from '../spaces/store.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
@@ -211,7 +210,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerCliTools(server);
   registerSkillTools(server);
   registerWorkflowScheduleTools(server);
-  if (isSpacesEnabled()) registerSpaceTools(server);
+  registerSpaceTools(server);
   registerMcpStatusTools(server);
   registerMcpServerTools(server);
   registerToolChoiceTools(server);

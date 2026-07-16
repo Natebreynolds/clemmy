@@ -16,8 +16,8 @@
 // BOTH the composio execute path (composio-tools.ts, flag-independent of
 // HARNESS_TOOL_BRACKETS) AND the MCP namespace shim (mcp-namespace-shim.ts) so
 // native MCP reads (dataforseo__*/firecrawl__* — the literal read-heavy path in
-// the sess-mpxpl2l9 incident) are finally covered. Gated ONLY by
-// CLEMMY_FANOUT_DIRECTIVE (no new flag, no HARNESS_TOOL_BRACKETS dependency).
+// the sess-mpxpl2l9 incident) are finally covered. No HARNESS_TOOL_BRACKETS
+// dependency.
 //
 // Independence guard (see looksDependentOnPrior): a pure shape counter would
 // also fire on a DEPENDENT chain (parent -> contact -> cases) where each call's
@@ -28,7 +28,7 @@
 // item for a real batch, but a true chain (every link matches) never fires.
 
 const FANOUT_ADVICE_THRESHOLD = 3;
-const FANOUT_ADVICE_MAX_EMITS = 2; // re-arm cap per bucket (flag on)
+const FANOUT_ADVICE_MAX_EMITS = 2; // re-arm cap per bucket
 
 interface FanoutBucket {
   items: Set<string>;
@@ -37,13 +37,9 @@ interface FanoutBucket {
    *  data-flow independence check on the NEXT call. */
   priorResult?: string;
 }
-interface SessionTracker { buckets: Map<string, FanoutBucket>; legacyAdvised: boolean; }
+interface SessionTracker { buckets: Map<string, FanoutBucket>; }
 
 const trackerBySession = new Map<string, SessionTracker>();
-
-export function fanoutDirectiveEnabled(): boolean {
-  return (process.env.CLEMMY_FANOUT_DIRECTIVE ?? 'on').toLowerCase() !== 'off';
-}
 
 // Coarse arg shape = sorted set of top-level arg keys. Distinct enough to keep
 // genuinely different job types in separate buckets, coarse enough that the
@@ -119,18 +115,14 @@ export function appendFanoutAdvisory(params: FanoutAdvisoryParams): string | nul
   const { toolName, args, sessionId, resultText } = params;
   try {
     if (!sessionId || !toolName) return null;
-    const flagOn = fanoutDirectiveEnabled();
     let t = trackerBySession.get(sessionId);
     if (!t) {
       if (trackerBySession.size > 500) trackerBySession.clear(); // crude bound for a long-lived daemon
-      t = { buckets: new Map(), legacyAdvised: false };
+      t = { buckets: new Map() };
       trackerBySession.set(sessionId, t);
     }
-    // Flag ON: per toolName+arg-shape bucket with capped re-emit.
-    // Flag OFF: one bucket per toolName + a session-wide fire-once latch (the
-    // prior shipped behavior).
-    if (!flagOn && t.legacyAdvised) return null;
-    const bucketKey = flagOn ? `${toolName}::${coarseArgShape(args)}` : toolName;
+    // Per toolName+arg-shape bucket with capped re-emit.
+    const bucketKey = `${toolName}::${coarseArgShape(args)}`;
     let bucket = t.buckets.get(bucketKey);
     if (!bucket) { bucket = { items: new Set(), emits: 0 }; t.buckets.set(bucketKey, bucket); }
 
@@ -146,13 +138,11 @@ export function appendFanoutAdvisory(params: FanoutAdvisoryParams): string | nul
     bucket.items.add(argHash);
     const size = bucket.items.size;
 
-    const cap = flagOn ? FANOUT_ADVICE_MAX_EMITS : 1;
     // Emit on threshold crossings, spaced by THRESHOLD distinct items (3, 6),
     // capped. Spacing keeps the re-emit from firing on every call after 3.
-    const shouldEmit = size >= FANOUT_ADVICE_THRESHOLD * (bucket.emits + 1) && bucket.emits < cap;
+    const shouldEmit = size >= FANOUT_ADVICE_THRESHOLD * (bucket.emits + 1) && bucket.emits < FANOUT_ADVICE_MAX_EMITS;
     if (!shouldEmit) return null;
     bucket.emits += 1;
-    if (!flagOn) t.legacyAdvised = true;
 
     // Inside a workflow STEP (session id is `workflow:<runId>:<stepId>`),
     // run_worker is blocklisted by construction — recommending it would be

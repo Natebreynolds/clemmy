@@ -37,7 +37,6 @@ import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js'
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
-import { isSpacesEnabled } from '../spaces/store.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
@@ -1596,8 +1595,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       }
     });
     // Workspaces: silently refresh any scheduled data sources (no LLM).
-    // Flag-gated (CLEMENTINE_SPACES, default off) — no-op when disabled.
-    if (isSpacesEnabled()) {
+    {
       await withDaemonRuntimePhase('daemon.loop.space_schedules', { tickCount }, () => processSpaceSchedules()).catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'processSpaceSchedules tick failed');
       });
@@ -1637,13 +1635,13 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       await withDaemonRuntimePhase('daemon.loop.monitors', { tickCount }, async () => {
         processMonitors();
       });
-      // C2 ambient inbox watch (general, read-only, default ON; kill-switch
-      // CLEMMY_INBOX_MONITOR=off). Self-rate-limited (own cadence) + surface-only;
-      // fire-and-forget so its mailbox reads never block the tick. Best-effort.
+      // C2 ambient inbox watch (general, read-only). Self-rate-limited (own
+      // cadence) + surface-only; fire-and-forget so its mailbox reads never block
+      // the tick. Best-effort.
       void withDaemonRuntimePhase('daemon.fire_and_forget.inbox_monitor', { tickCount }, () => processInboxMonitor())
         .catch((err) => logger.warn({ err }, 'inbox monitor tick failed'));
-      // C2 ambient calendar watch — same pattern (general, read-only, default ON;
-      // kill-switch CLEMMY_CALENDAR_MONITOR=off). Self-rate-limited; fire-and-forget.
+      // C2 ambient calendar watch — same pattern (general, read-only).
+      // Self-rate-limited; fire-and-forget.
       void withDaemonRuntimePhase('daemon.fire_and_forget.calendar_monitor', { tickCount }, () => processCalendarMonitor())
         .catch((err) => logger.warn({ err }, 'calendar monitor tick failed'));
     }

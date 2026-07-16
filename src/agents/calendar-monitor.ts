@@ -12,8 +12,7 @@
  *    (OUTLOOK_GET_CALENDAR_VIEW / GOOGLECALENDAR_EVENTS_LIST) + addNotification —
  *    it can never create/cancel/respond to an event.
  *  - Gated: proactivity policy (enabled + quiet hours) + own cadence + per-scan
- *    cap + dedup. Default ON; kill-switch CLEMMY_CALENDAR_MONITOR=off. Surfaces
- *    dashboard-only (silent).
+ *    cap + dedup. Surfaces dashboard-only (silent).
  *
  * v2 (deferred): external-attendee detection (needs the account domain), prep
  * summaries, configurable look-ahead, digest mode.
@@ -95,10 +94,9 @@ export interface CalendarMonitorDeps {
 // ── config (user-editable via the proactivity policy) ────────────────────────
 function realConfig(): CalendarMonitorConfig {
   const policy = loadProactivityPolicy();
-  const killed = (getRuntimeEnv('CLEMMY_CALENDAR_MONITOR', 'on') || 'on').toLowerCase() === 'off';
   const fetchOverride = Number.parseInt(getRuntimeEnv('CLEMMY_CALENDAR_MONITOR_FETCH', '50') || '50', 10);
   return {
-    enabled: policy.calendarWatchEnabled !== false && !killed,
+    enabled: policy.calendarWatchEnabled !== false,
     intervalMs: Math.max(1, policy.calendarWatchMinutes) * 60_000,
     maxPerScan: Math.max(1, policy.calendarWatchMax),
     fetchTop: Number.isFinite(fetchOverride) && fetchOverride >= 1 ? fetchOverride : 50,

@@ -24,7 +24,6 @@ test.after(() => {
 });
 
 const base = {
-  enabled: true,
   alreadyElevated: false,
   preset: 'standard',
   autoContinueOnLimit: false,
@@ -47,10 +46,6 @@ test('NO-OP when autoContinue already on (long/unlimited — Nathan’s config)'
 test('NO-OP on a non-standard preset', () => {
   assert.equal(shouldElevateOnStepProgress({ ...base, preset: 'long' }), false);
   assert.equal(shouldElevateOnStepProgress({ ...base, preset: 'unlimited' }), false);
-});
-
-test('NO-OP when the kill-switch is off', () => {
-  assert.equal(shouldElevateOnStepProgress({ ...base, enabled: false }), false);
 });
 
 test('NO-OP when already elevated (one-way ratchet)', () => {

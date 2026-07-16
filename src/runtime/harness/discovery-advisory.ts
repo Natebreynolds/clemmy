@@ -52,10 +52,6 @@ interface DiscoverySessionTracker { buckets: Map<string, DiscoveryBucket>; }
 
 const trackerBySession = new Map<string, DiscoverySessionTracker>();
 
-export function discoveryDirectiveEnabled(): boolean {
-  return (process.env.CLEMMY_DISCOVERY_DIRECTIVE ?? 'on').toLowerCase() !== 'off';
-}
-
 function tokenize(value: string): Set<string> {
   return new Set(
     value.toLowerCase().split(/[^a-z0-9]+/g).map((t) => t.trim()).filter((t) => t.length >= 2),
@@ -90,7 +86,6 @@ export interface DiscoveryAdvisoryParams {
 export function maybeDiscoveryAdvisory(params: DiscoveryAdvisoryParams): string | null {
   const { kind, toolkit, signature, sessionId } = params;
   try {
-    if (!discoveryDirectiveEnabled()) return null;
     if (!sessionId || !toolkit || !signature) return null;
 
     let t = trackerBySession.get(sessionId);

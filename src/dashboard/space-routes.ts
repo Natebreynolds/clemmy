@@ -1,6 +1,5 @@
 /**
- * Workspaces ("Spaces") daemon routes. Additive, mounted only when the
- * CLEMENTINE_SPACES flag is on (gated by the caller in webhook.ts).
+ * Workspaces ("Spaces") daemon routes. Mounted by the caller in webhook.ts.
  *
  *  - View serving (same-origin so the agent-authored view inherits the console
  *    session cookie + CSP): GET /console/spaces/:id/view[/*] — path-safe,

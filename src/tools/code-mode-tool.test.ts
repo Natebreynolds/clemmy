@@ -157,18 +157,12 @@ test('codeModeMandateDirective: mentions composio_execute_tool only when writes 
   }
 });
 
-test('codeModeMandateDirective: kill-switches respect CODE_MODE_MANDATE and CODE_MODE', () => {
-  const prevM = process.env.CLEMMY_CODE_MODE_MANDATE;
+test('codeModeMandateDirective: no mandate when code mode itself is off', () => {
   const prevC = process.env.CLEMMY_CODE_MODE;
   try {
-    process.env.CLEMMY_CODE_MODE = 'on';
-    process.env.CLEMMY_CODE_MODE_MANDATE = 'off';
-    assert.equal(codeModeMandateDirective({ mcpServersInScope: 3 }), '', 'mandate kill-switch silences it');
-    process.env.CLEMMY_CODE_MODE_MANDATE = 'on';
     process.env.CLEMMY_CODE_MODE = 'off';
     assert.equal(codeModeMandateDirective({ mcpServersInScope: 3 }), '', 'no mandate when code mode itself is off');
   } finally {
-    if (prevM === undefined) delete process.env.CLEMMY_CODE_MODE_MANDATE; else process.env.CLEMMY_CODE_MODE_MANDATE = prevM;
     if (prevC === undefined) delete process.env.CLEMMY_CODE_MODE; else process.env.CLEMMY_CODE_MODE = prevC;
   }
 });

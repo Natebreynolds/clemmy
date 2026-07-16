@@ -28,22 +28,10 @@ import {
   existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { BASE_DIR } from '../config.js';
 import { deleteWorkspaceIndex, indexWorkspaceRecord, reindexWorkspaceRecords } from './workspace-db.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
-
-/**
- * Workspaces feature flag. DEFAULT ON (beta) — Clem can build interactive
- * Workspaces out of the box. This is a kill-switch: set CLEMENTINE_SPACES to
- * 0 / false / off / no (in ~/.clementine-next/.env or the process env) to
- * disable the tools/routes/UI. Reads process env AND the .env via getRuntimeEnv
- * so it works however the daemon was launched. Mirrors isConsoleNextEnabled.
- */
-export function isSpacesEnabled(): boolean {
-  const raw = getRuntimeEnv('CLEMENTINE_SPACES', '').trim().toLowerCase();
-  return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
-}
 
 /** Slug rules: lowercase kebab, 2–63 chars, no traversal. Path-safe by design. */
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;

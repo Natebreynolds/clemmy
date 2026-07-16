@@ -8,7 +8,7 @@
  * the same substrate: an executed tool sequence read via readSessionTrace.
  *
  * Fire-and-forget: never a loop driver, never blocks the path that triggers it.
- * Kill-switch CLEMMY_SKILL_DISTILLER=off (and the master CLEMMY_GOAL_CONTRACT).
+ * Gated by the master CLEMMY_GOAL_CONTRACT.
  *
  * Novelty gate (deterministic, BEFORE any LLM call): a routine execution — one
  * that purely ran an existing skill or a fully-specified workflow — distills
@@ -33,8 +33,7 @@ import { recordMemoryEpisode } from './temporal-memory.js';
 const logger = pino({ name: 'clementine-next.skill-distiller' });
 
 function distillerEnabled(): boolean {
-  if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
-  return (getRuntimeEnv('CLEMMY_SKILL_DISTILLER', 'on') ?? 'on').toLowerCase() !== 'off';
+  return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 /** Wave 2 Move B: on a quarantine (a proven-repeated failure), persist the lesson

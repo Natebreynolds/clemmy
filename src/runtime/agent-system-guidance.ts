@@ -1,4 +1,3 @@
-import { getRuntimeEnv } from '../config.js';
 import {
   collectAgentSystemMetrics,
   type AgentSystemRecommendation,
@@ -26,10 +25,6 @@ export function __resetAgentSystemGuidanceCacheForTests(): void {
   cachedRecommendations = [];
   cachedPolicy = null;
   cachedSummary = '';
-}
-
-function guidanceEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_AGENT_SYSTEM_GUIDANCE', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
 function guidanceAllowedForSession(kind?: string): boolean {
@@ -99,7 +94,7 @@ function clip(text: string, max: number): string {
 }
 
 export function renderAgentSystemGuidance(input: string, sessionKind?: string): AgentSystemGuidance {
-  if (!guidanceEnabled() || !guidanceAllowedForSession(sessionKind)) {
+  if (!guidanceAllowedForSession(sessionKind)) {
     return { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' };
   }
 

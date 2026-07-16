@@ -22,11 +22,6 @@ export function getBootstrap(): Bootstrap {
   return cached;
 }
 
-/** Opt-in 3D Memory Constellation (server flag CLEMENTINE_MEMORY_3D, default off). */
-export function isMemory3dEnabled(): boolean {
-  return getBootstrap().flags.memory3d;
-}
-
 /**
  * The auth token to append to requests, if any. In the packaged app the
  * session cookie does the work and this is usually empty; in dev it

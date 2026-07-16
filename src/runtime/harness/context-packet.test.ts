@@ -369,24 +369,6 @@ test('packet keeps the static line (no directive) for NON-chat sessions even whe
   }
 });
 
-test('packet keeps the static line when the kill-switch is set', () => {
-  const prev = process.env.CLEMMY_FANOUT_DIRECTIVE;
-  process.env.CLEMMY_FANOUT_DIRECTIVE = 'off';
-  try {
-    const packet = buildAgentContextPacket(
-      'Research these 10 prospects.',
-      NO_MEMORY,
-      { sessionKind: 'chat', sessionId: 'sess-chat-off' },
-    );
-    assert.equal(packet.multiItem.detected, false, 'detection skipped when off');
-    assert.equal(packet.multiItem.offered, false);
-    assert.match(packet.text, /Parallelism reminder:/, 'static line restored when off');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_FANOUT_DIRECTIVE;
-    else process.env.CLEMMY_FANOUT_DIRECTIVE = prev;
-  }
-});
-
 test('packet keeps the static line for a single-item / no-count request', () => {
   const packet = buildAgentContextPacket(
     'Audit this law firm’s website and summarize the findings.',

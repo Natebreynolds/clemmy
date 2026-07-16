@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
-import { isSpacesEnabled, spaceStore } from './store.js';
+import { spaceStore } from './store.js';
 import { addNotification } from '../runtime/notifications.js';
 
 export interface WorkspaceStarterRecipe {
@@ -112,7 +112,6 @@ const PROBE_INTERVAL_MS = 30 * 60 * 1000;
 
 export async function maybeOfferStarterWorkspace(deps: StarterOfferDeps): Promise<boolean> {
   try {
-    if (!isSpacesEnabled()) return false;
     if (existsSync(OFFER_MARKER)) return false;
     if (spaceStore.list(true).length > 0) {
       // The user already has workspaces — never nudge; mark so we never rescan.

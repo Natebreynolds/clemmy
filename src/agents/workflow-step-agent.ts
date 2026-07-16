@@ -8,15 +8,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
 import { harnessInstructions } from './harness-context.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
-import { getRuntimeEnv } from '../config.js';
 import { externalMcpScopeForAllowedToolLock } from './external-mcp-scope-lock.js';
-
-/** DEFAULT ON. Inject the "Remembered Tool Choices" recall into an UNBOUND workflow
- *  step so it uses the proven tool for its intent — the same learned recall chat
- *  gets. Off (CLEMMY_WORKFLOW_STEP_RECALL=off) ⇒ static step instructions only. */
-function workflowStepRecallEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKFLOW_STEP_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
-}
 
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
 
@@ -228,7 +220,7 @@ export async function buildWorkflowStepAgent(
   // recall block would be noise; an unbound / composio step is where the model picks
   // a tool and benefits from "for this intent, X worked before" (parity with chat).
   const surfaceLocked = stepAllowedToolsLock(options.lockTools);
-  const learnedRecall = (!surfaceLocked && options.userInput && workflowStepRecallEnabled())
+  const learnedRecall = (!surfaceLocked && options.userInput)
     ? renderToolChoicesForContext(8, undefined, options.userInput)
     : '';
   const baseInstructions = harnessInstructions(STEP_INSTRUCTIONS, { includeRememberedToolChoices: false });

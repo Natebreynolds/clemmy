@@ -20,8 +20,7 @@
  *    addNotification(). It never sends/replies/mutates — so it cannot act on the
  *    user's mail no matter what.
  *  - Gated: proactivity policy (enabled + quiet hours) + cadence + per-scan cap +
- *    dedup by message id. Default ON (validated behavior is the default); kill
- *    with CLEMMY_INBOX_MONITOR=off. Surfaces dashboard-only (silent) for v1 — no
+ *    dedup by message id. Surfaces dashboard-only (silent) for v1 — no
  *    Discord/push of mail flags, so even a marginal card stays quiet.
  *
  * v2 (deferred): smarter scoring via recall (the user's known priorities) + an
@@ -103,16 +102,14 @@ export interface InboxMonitorConfig {
 /**
  * Read the live settings from the proactivity policy (what the user edits in the
  * dashboard: on/off, how often, how many per check). Active hours come from the
- * policy's quiet-hours window via proactiveWorkAllowed. CLEMMY_INBOX_MONITOR=off
- * is a hard kill-switch over the user's toggle. Default ON
- * (feedback_no_rollout_flags) — safe because surface-only + dashboard-only.
+ * policy's quiet-hours window via proactiveWorkAllowed. Surface-only +
+ * dashboard-only.
  */
 function realConfig(): InboxMonitorConfig {
   const policy = loadProactivityPolicy();
-  const killed = (getRuntimeEnv('CLEMMY_INBOX_MONITOR', 'on') || 'on').toLowerCase() === 'off';
   const fetchOverride = Number.parseInt(getRuntimeEnv('CLEMMY_INBOX_MONITOR_FETCH', '25') || '25', 10);
   return {
-    enabled: policy.inboxWatchEnabled !== false && !killed,
+    enabled: policy.inboxWatchEnabled !== false,
     intervalMs: Math.max(1, policy.inboxWatchMinutes) * 60_000,
     maxPerScan: Math.max(1, policy.inboxWatchMax),
     fetchTop: Number.isFinite(fetchOverride) && fetchOverride >= 1 ? fetchOverride : 25,

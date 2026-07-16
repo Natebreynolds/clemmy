@@ -95,7 +95,7 @@ type GLink = Omit<GraphEdge, 'source' | 'target'> & { source: string | GNode; ta
 
 // All possible legend chips, in display order. The component renders only the
 // ones actually present in the loaded graph so the legend stays honest (e.g.
-// no "Workflows" chip when there are none, or when CLEMMY_GRAPH_FULL is off).
+// no "Workflows" chip when there are none).
 const ALL_TYPES = [
   { type: 'kind', label: 'Topics', color: COLOR.kind },
   { type: 'fact', label: 'Facts', color: '#FFB98A' },

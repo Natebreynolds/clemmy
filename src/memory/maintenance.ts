@@ -1016,8 +1016,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // It produces a small daily JSON report that can later back an approval-gated
   // cleanup UI. No memory, skill, workflow, or tool-choice mutation happens here.
   if (isAtOrAfterDailyTime(now, CURATOR_REPORT_DAILY_HOUR, CURATOR_REPORT_DAILY_MINUTE)) {
-    const curatorEnabled = (getRuntimeEnv('CLEMMY_CURATOR_REPORT', 'on') || 'on').toLowerCase() !== 'off';
-    if (curatorEnabled && maintenanceState.lastCuratorReportDay !== today) {
+    if (maintenanceState.lastCuratorReportDay !== today) {
       maintenanceState.lastCuratorReportDay = today;
       writeMaintenanceState(maintenanceState);
       try {

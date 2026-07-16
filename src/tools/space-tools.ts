@@ -7,8 +7,8 @@
  * source is wired in a later phase; the manifest already records it.
  *
  * Registered in BOTH local-runtime-tools.ts (the harness's in-process tool
- * surface) and mcp-server.ts (the standalone MCP server), gated by the
- * CLEMENTINE_SPACES flag — mirrors registerWorkflowScheduleTools.
+ * surface) and mcp-server.ts (the standalone MCP server) — mirrors
+ * registerWorkflowScheduleTools.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import os from 'node:os';

@@ -17,13 +17,12 @@
  * construction the derived contract can only require things that have always
  * been true — so it cannot fail a run that looks like the runs we learned from.
  *
- * Kill-switch CLEMMY_WORKFLOW_AUTO_TIGHTEN (default on). Persistence mirrors
- * workflow-watermark-store: one JSON file per workflow, atomic write.
+ * Persistence mirrors workflow-watermark-store: one JSON file per workflow,
+ * atomic write.
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
-import { getRuntimeEnv } from '../config.js';
 import type { WorkflowDefinition, WorkflowStepInput, WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 /** Clean runs required before ANY tightening is derived — one lucky run must
@@ -33,10 +32,6 @@ export const MIN_RUNS_TO_TIGHTEN = 3;
 const MAX_OBSERVATIONS = 12;
 const MAX_REQUIRED_KEYS = 6;
 const IDENTIFIER_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-export function autoTightenEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKFLOW_AUTO_TIGHTEN', 'on') ?? 'on').trim().toLowerCase() !== 'off';
-}
 
 export interface ShapeObservation {
   at?: string;
@@ -161,7 +156,7 @@ export interface StableTightening {
  * Record this clean run's step shapes, then return the tightenings now supported
  * by ≥ MIN_RUNS_TO_TIGHTEN invariant observations. Only touches steps with NO
  * author-declared contract and skips forEach wrappers. This is the single entry
- * the runner calls on a clean run. Returns [] when the kill-switch is off.
+ * the runner calls on a clean run.
  */
 export function recordAndDeriveStableTightenings(
   workflowSlug: string,
@@ -169,7 +164,6 @@ export function recordAndDeriveStableTightenings(
   stepOutputs: Record<string, unknown>,
   nowIso: string,
 ): StableTightening[] {
-  if (!autoTightenEnabled()) return [];
   const out: StableTightening[] = [];
   for (const step of def.steps ?? []) {
     if (contractAlreadyDeclared(step)) continue; // author-declared wins, always

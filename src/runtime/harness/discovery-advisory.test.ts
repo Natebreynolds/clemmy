@@ -136,22 +136,6 @@ test('re-emits at the 3rd and 6th, hard-capped at 2 per cluster', () => {
   assert.deepEqual(fires, [3, 6], 'fires at 3 and 6, then capped');
 });
 
-test('CLEMMY_DISCOVERY_DIRECTIVE=off suppresses the advisory entirely', () => {
-  const prev = process.env.CLEMMY_DISCOVERY_DIRECTIVE;
-  process.env.CLEMMY_DISCOVERY_DIRECTIVE = 'off';
-  try {
-    const sessionId = 'sess-da-off';
-    const fires: number[] = [];
-    for (let i = 1; i <= 6; i++) {
-      if (maybeDiscoveryAdvisory({ kind: 'search', toolkit: 'slack', signature: `post message item${i}`, sessionId })) fires.push(i);
-    }
-    assert.deepEqual(fires, [], 'flag off → never fires');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_DISCOVERY_DIRECTIVE;
-    else process.env.CLEMMY_DISCOVERY_DIRECTIVE = prev;
-  }
-});
-
 test('no sessionId / empty toolkit / empty signature are no-ops and it never throws', () => {
   assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit: 'x', signature: 'q', sessionId: undefined }), null, 'no sessionId → null');
   assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit: '', signature: 'q', sessionId: 'sess-da-empty' }), null, 'empty toolkit → null');

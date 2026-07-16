@@ -309,10 +309,6 @@ function fanoutPolicyLine(intent: MultiItemIntent, guidance: AgentSystemGuidance
 const STATIC_PARALLELISM_LINE =
   'Parallelism reminder: for independent batches, resolve shared tools/context once, then call run_worker with one structured packet per item in parallel or use an existing workflow forEach.';
 
-function fanoutDirectiveEnabled(): boolean {
-  return (process.env.CLEMMY_FANOUT_DIRECTIVE ?? 'on').toLowerCase() !== 'off';
-}
-
 /** Lighten pure-Q&A turns (skip health probes + fan-out detection). Validated
  *  behavior is the default; CLEMMY_LIGHT_QA_TURNS=off restores the full preflight. */
 function lightQaTurnsEnabled(): boolean {
@@ -555,12 +551,11 @@ export function buildAgentContextPacket(
   // Turn-start fan-out directive (P0). Fires only for CHAT sessions: workflow
   // steps can't restructure their own pipeline (forEach is an authoring-time
   // decision) and workers are already a fanned-out unit, so non-chat kinds keep
-  // the static line byte-identical (zero-regression). Honors the kill-switch.
+  // the static line byte-identical (zero-regression).
   // Fan-out detection always runs — a multi-item request ("research these 8
   // companies") has no action verb but is NOT light; dropping it would lose the
   // parallelism directive. Only the health probes (below) are safe to skip on qa.
-  const fanoutEnabled = fanoutDirectiveEnabled();
-  const multiItem = fanoutEnabled ? detectMultiItemIntent(input) : NO_MULTI_ITEM;
+  const multiItem = detectMultiItemIntent(input);
   const agentSystem = renderAgentSystemGuidance(input, opts?.sessionKind);
   const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
   const recommendedWorkerWaveSize = agentSystem.policy?.recommendedWorkerWaveSize ?? 8;
@@ -570,7 +565,7 @@ export function buildAgentContextPacket(
     agentSystem.policy &&
     (agentSystem.policy.fanoutPosture === 'block' || agentSystem.policy.fanoutPosture === 'constrain'),
   );
-  const offerFanout = fanoutEnabled && multiItem.isMultiItem && opts?.sessionKind === 'chat' && !fanoutBlockedByPolicy;
+  const offerFanout = multiItem.isMultiItem && opts?.sessionKind === 'chat' && !fanoutBlockedByPolicy;
   const parallelismLine = offerFanout
     ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize)
     : fanoutBlockedByPolicy

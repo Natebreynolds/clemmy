@@ -2896,8 +2896,7 @@ export function registerConsoleRoutes(
    * Autoresearch — force-regenerate the report NOW (the "Run autoresearch
    * now" button on the EVOLUTION panel). Returns the rebuilt content +
    * a written: true|false flag so the UI can say "no-op, content unchanged."
-   * Mirrors the nightly tick's improvement-proposer pass: drafts by default
-   * (CLEMMY_IMPROVEMENT_PROPOSER default-on; =off no-op), and still only drafts
+   * Mirrors the nightly tick's improvement-proposer pass: always drafts
    * human-reviewed items — apply is always a separate explicit click.
    */
   app.post('/api/console/autoresearch/run', async (req, res) => {
@@ -2992,8 +2991,8 @@ export function registerConsoleRoutes(
   });
 
   /**
-   * Phase C — improvement proposals. GET lists pending proposals (drafted nightly
-   * by default; CLEMMY_IMPROVEMENT_PROPOSER=off disables); POST approve applies ONE proposal through
+   * Phase C — improvement proposals. GET lists pending proposals (drafted
+   * nightly, always on); POST approve applies ONE proposal through
    * the same gated, journaled, reversible flow as the memory-approve actions.
    * ?dry=1 previews. Nothing here ever auto-mutates; apply is a human click.
    */

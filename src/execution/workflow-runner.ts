@@ -355,10 +355,8 @@ function startWorkflowHeartbeat(
     //    report);
     //  - NOT silent and titled "Workflow update:" so the bot delivery gate
     //    treats it as a real update, unlike the suppressed heartbeat noise.
-    // Kill-switch CLEMMY_WORKFLOW_LOUD_UPDATES (default on).
-    const loudUpdatesEnabled = (getRuntimeEnv('CLEMMY_WORKFLOW_LOUD_UPDATES', 'on') ?? 'on').trim().toLowerCase() !== 'off';
     const loudBeat = count === 2 || (count > 2 && (count - 2) % 3 === 0);
-    if (loudUpdatesEnabled && loudBeat) {
+    if (loudBeat) {
       addNotification({
         id: `workflow-heartbeat-loud-${runId}-${count}`,
         kind: 'workflow',
@@ -2019,7 +2017,7 @@ async function runStepViaHarness(
     // proven composio call of a step that emitted a real (non-blocked) result,
     // keyed workflow:<name>:<stepId> in the tool-choice store — the next run
     // of this step starts with the pin injected instead of re-discovering.
-    if (workflowToolPinsEnabled() && !isItemInvocation && captured.found
+    if (!isItemInvocation && captured.found
       && !(captured.value && typeof captured.value === 'object' && (captured.value as { blocked?: unknown }).blocked === true)) {
       try {
         const returned = listHarnessEvents(realSessionId, { types: ['tool_returned'] })
@@ -2531,19 +2529,13 @@ function workflowBrainFalloverEnabled(): boolean {
  *  zero new storage. A successful step's last proven composio call is
  *  remembered with provenance; future runs get it INJECTED into the step
  *  prompt ("try this first"), like auto-brief's author-time pinning without
- *  the hand-authoring. Never mutates the user's SKILL.md. Kill-switch:
- *  CLEMMY_WORKFLOW_TOOL_PINS=off. */
-function workflowToolPinsEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKFLOW_TOOL_PINS', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
+ *  the hand-authoring. Never mutates the user's SKILL.md. */
 function workflowStepPinIntent(workflowName: string, stepId: string): string {
   return `workflow:${workflowName}:${stepId}`;
 }
 
 /** Render the learned pin for prompt injection, or '' when none/unhealthy. */
 function renderWorkflowToolPin(workflowName: string, stepId: string): string {
-  if (!workflowToolPinsEnabled()) return '';
   try {
     // EXACT lookup only (review: the fuzzy fallback matched unrelated generic
     // records and injected them with fabricated 'proven in a prior run' provenance).
@@ -3101,8 +3093,8 @@ export function findContractViolationStep(
 /** T3.1: apply clean-run contract tightenings — additive-only, validated,
  *  backed up. CONSERVATIVE: only requires shape that has been INVARIANT across
  *  ≥3 clean runs (see workflow-contract-evidence-store), so a tightening can
- *  never fail a run that looks like the runs it learned from. Kill-switch
- *  CLEMMY_WORKFLOW_AUTO_TIGHTEN. Exported for tests. Returns applied step ids. */
+ *  never fail a run that looks like the runs it learned from. Exported for
+ *  tests. Returns applied step ids. */
 export function tightenWorkflowContractsFromCleanRun(
   workflowSlug: string,
   def: WorkflowDefinition,

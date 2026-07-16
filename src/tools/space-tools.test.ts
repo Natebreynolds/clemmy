@@ -2,8 +2,8 @@
  * Run: npx tsx --test src/tools/space-tools.test.ts
  *
  * Exercises the space_save / space_list / space_get tool handlers directly
- * (no LLM, no MCP transport) via a fake capturing server, plus the
- * CLEMENTINE_SPACES flag gate. Temp CLEMENTINE_HOME so the real home is safe.
+ * (no LLM, no MCP transport) via a fake capturing server. Temp CLEMENTINE_HOME
+ * so the real home is safe.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -524,17 +524,3 @@ test('space_get_runner errors cleanly for a missing runner + lists what IS decla
   assert.match(out, /deepwhy\.mjs/);
 });
 
-test('isSpacesEnabled defaults ON (beta) and honors the kill-switch', () => {
-  const prev = process.env.CLEMENTINE_SPACES;
-  delete process.env.CLEMENTINE_SPACES;
-  assert.equal(store.isSpacesEnabled(), true); // default ON
-  for (const off of ['0', 'false', 'off', 'no', 'OFF', 'False']) {
-    process.env.CLEMENTINE_SPACES = off;
-    assert.equal(store.isSpacesEnabled(), false, `kill-switch "${off}" should disable`);
-  }
-  for (const on of ['', '1', 'true', 'on', 'yes', 'anything']) {
-    process.env.CLEMENTINE_SPACES = on;
-    assert.equal(store.isSpacesEnabled(), true, `"${on}" should stay enabled`);
-  }
-  if (prev === undefined) delete process.env.CLEMENTINE_SPACES; else process.env.CLEMENTINE_SPACES = prev;
-});

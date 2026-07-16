@@ -367,10 +367,7 @@ test('stored neighborhood can load a fact omitted from the overview sample', () 
   assert.ok(neighborhood.edges.every((edge) => edge.truth === 'stored'));
 });
 
-const NON_FACT_TYPES = new Set(['tool-recall', 'skill', 'workflow', 'goal', 'focus']);
-
-test('WS1: non-fact stores (tool-recall, focus) appear as first-class nodes when graph-full is on', () => {
-  delete process.env.CLEMMY_GRAPH_FULL; // default = on
+test('WS1: non-fact stores (tool-recall, focus) appear as first-class nodes', () => {
   rememberToolChoice({ intent: 'pull stale salesforce accounts', choice: { kind: 'cli', identifier: 'sf', testedAt: new Date().toISOString() } });
   createFocus({ resourceRef: 'deal-board', title: 'D’Amore renewal', summary: 'tracking the renewal' });
 
@@ -380,20 +377,6 @@ test('WS1: non-fact stores (tool-recall, focus) appear as first-class nodes when
   assert.ok(nodes.some((n) => n.type === 'focus'), 'focus node should be present');
   assert.equal(meta.graphFull, true);
   assert.ok((meta.stores as { toolRecall: number }).toolRecall >= 1, 'meta.stores.toolRecall counted');
-});
-
-test('WS1: CLEMMY_GRAPH_FULL=off restores the legacy fact-only graph (byte-compatible)', () => {
-  process.env.CLEMMY_GRAPH_FULL = 'off';
-  try {
-    rememberToolChoice({ intent: 'list dormant opportunities', choice: { kind: 'cli', identifier: 'sf', testedAt: new Date().toISOString() } });
-    createFocus({ resourceRef: 'board-2', title: 'Q3 board', summary: 'q3' });
-    const db = openMemoryDb();
-    const { nodes, meta } = buildMemoryGraph(db);
-    assert.ok(!nodes.some((n) => NON_FACT_TYPES.has(n.type)), 'no non-fact node types when flag off');
-    assert.equal(meta.graphFull, false);
-  } finally {
-    delete process.env.CLEMMY_GRAPH_FULL;
-  }
 });
 
 test('WS1: collectNonFactStoreNodes is independently callable and counts each store', () => {

@@ -2,7 +2,6 @@ import path from 'node:path';
 import { openMemoryDb } from '../memory/db.js';
 import { listActiveFacts, countActiveFacts } from '../memory/facts.js';
 import { activeEmbeddingSpaceKey, isEmbeddingsEnabled, loadFactEmbeddings } from '../memory/embeddings.js';
-import { getRuntimeEnv } from '../config.js';
 import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { listSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -467,13 +466,7 @@ function semanticEdgesCached(
 // "I don't see the entire picture" complaint. This collector adds them as
 // first-class node types with the ownership/usage edges that already exist as
 // data (workflow→skill, goal→focus). Each store read is independently guarded
-// so one bad store never blanks the graph. Gated by isGraphFullEnabled() so the
-// legacy response stays byte-identical when off.
-
-/** Default-ON; `CLEMMY_GRAPH_FULL=off` restores the legacy fact-only graph. */
-export function isGraphFullEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_GRAPH_FULL', 'on') || 'on').trim().toLowerCase() !== 'off';
-}
+// so one bad store never blanks the graph.
 
 interface NonFactStoreResult {
   nodes: GraphNode[];
@@ -1058,14 +1051,10 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
     }
   }
 
-  // Non-fact stores (tool-recall · skills · workflows · goals · focus). Additive;
-  // gated so the legacy fact-only response is byte-identical when disabled.
-  let nonFact: NonFactStoreResult = { nodes: [], edges: [], counts: { toolRecall: 0, skills: 0, workflows: 0, goals: 0, focus: 0 } };
-  if (isGraphFullEnabled()) {
-    nonFact = collectNonFactStoreNodes();
-    for (const n of nonFact.nodes) nodes.push(n);
-    for (const e of nonFact.edges) edges.push(e);
-  }
+  // Non-fact stores (tool-recall · skills · workflows · goals · focus).
+  const nonFact: NonFactStoreResult = collectNonFactStoreNodes();
+  for (const n of nonFact.nodes) nodes.push(n);
+  for (const e of nonFact.edges) edges.push(e);
 
   // Semantic fact↔fact edges (opt-in via simEdges).
   let semantic: SemanticEdgeResult = { edges: [], embeddedFacts: 0 };
@@ -1148,7 +1137,7 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
       edgeCount: edges.length,
       semantic: semanticLayout,
       // additive meta — non-fact store presence (WS1 graph completeness).
-      graphFull: isGraphFullEnabled(),
+      graphFull: true,
       truthMode,
       coverage: { totals, visible: visibleByType, edges: edgeTruth, edgeTypeTotals, visibleEdgeTypes },
       stores: nonFact.counts,

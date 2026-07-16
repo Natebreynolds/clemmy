@@ -9,9 +9,7 @@
  * SAME journaled, reversible primitives the memory-approve flow already uses.
  *
  * Two safety walls, deliberately separate:
- *   - PROPOSE is gated by CLEMMY_IMPROVEMENT_PROPOSER (DEFAULT ON kill-switch,
- *     graduated 2026-06-28 after live validation). `=off` reverts to never
- *     drafting (the nightly tick becomes byte-identical). Drafting is read-only.
+ *   - PROPOSE is always on. Drafting is read-only.
  *   - APPLY is gated by approveEnabled() (CLEMMY_MEMORY_APPROVE) AND requires an
  *     explicit human approve call. The proposer's own logic NEVER applies its own
  *     drafts — a separate human gate is the framework's "never self-grade". This
@@ -35,7 +33,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { BASE_DIR } from '../config.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { approveEnabled, retireInternalNoise } from './memory-approve.js';
 import { appendSkillPitfall, listSkills } from '../memory/skill-store.js';
@@ -86,14 +84,13 @@ export interface ImprovementProposal {
 const STORE_DIR = path.join(BASE_DIR, 'state', 'autoresearch');
 const STORE_FILE = path.join(STORE_DIR, 'improvement-proposals.json');
 
-/** Phase-C PROPOSE gate — DEFAULT ON (kill-switch). Graduated 2026-06-28 after
- *  live validation on real run history (sane, deduped, useful proposals; zero
- *  auto-apply). `=off` reverts to never drafting. Drafting is read-only +
+/** Phase-C PROPOSE is always on. Drafting is read-only +
  *  reversible-by-construction; APPLY remains a separate explicit human gate
- *  (approveEnabled + an approve call), so default-on only populates a review
- *  queue — it never changes anything on its own. */
+ *  (approveEnabled + an approve call), so drafting only populates a review
+ *  queue — it never changes anything on its own. Retained (returns true) so the
+ *  dashboard can surface the proposer's live state. */
 export function proposerEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_IMPROVEMENT_PROPOSER', 'on') || 'on').toLowerCase() !== 'off';
+  return true;
 }
 
 function proposalId(kind: ImprovementKind, target: string, proposedText: string): string {
@@ -668,10 +665,9 @@ export function listPendingProposals(): ImprovementProposal[] {
 
 /**
  * Draft proposals from a report and persist them — the nightly tick's entry point.
- * No-op (and no model/skill reads) unless proposerEnabled(). Best-effort.
+ * Best-effort.
  */
 export function proposeFromReport(report: ObservatoryReport, deps: ProposerDeps = {}): { ran: boolean; added: number; total: number } {
-  if (!proposerEnabled()) return { ran: false, added: 0, total: 0 };
   try {
     // Four sources: report-based (tools/skills/memory), run-history contract
     // failures (workflow_step), run-history cost/latency outliers

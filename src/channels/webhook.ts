@@ -38,7 +38,6 @@ import { fireWorkflowWebhook, syncWorkflowTriggerRegistry } from '../execution/w
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
-import { isSpacesEnabled } from '../spaces/store.js';
 import { createMobileRouter } from './mobile-routes.js';
 import { readMobileAccess } from '../runtime/mobile-access-state.js';
 import {
@@ -1082,12 +1081,11 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   // so its /console handler wins. If the flag is off — or the bundle
   // isn't built — /console falls through to the legacy renderer.
   const consoleNext = isConsoleNextEnabled();
-  // Workspaces ("Spaces") — agent-authored interactive surfaces. Additive,
-  // flag-gated (CLEMENTINE_SPACES, default off). MUST register BEFORE the
-  // console SPA: its /console/* deep-link fallback would otherwise intercept
-  // GET /console/spaces/:id/view and serve the React index instead of the
-  // agent-authored view.
-  if (isSpacesEnabled()) registerSpaceRoutes(app, isAuthorized);
+  // Workspaces ("Spaces") — agent-authored interactive surfaces. MUST register
+  // BEFORE the console SPA: its /console/* deep-link fallback would otherwise
+  // intercept GET /console/spaces/:id/view and serve the React index instead
+  // of the agent-authored view.
+  registerSpaceRoutes(app, isAuthorized);
   const consoleSpaServed = consoleNext && registerConsoleSpaRoutes(app, isAuthorized);
   registerConsoleRoutes(app, isAuthorized, assistant, { serveLegacyAtRoot: !consoleSpaServed });
   app.use('/m', createMobileRouter({ isAdminAuthorized: isAuthorized, assistant }));

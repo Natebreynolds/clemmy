@@ -198,7 +198,7 @@ export function registerSkillTools(server: McpServer): void {
         case 'skipped_duplicate':
           return textResult(`This already matches an existing skill (\`${result.name}\`), so I didn't create a duplicate.`);
         case 'skipped_disabled':
-          return textResult('Skill distillation is turned off (CLEMMY_SKILL_DISTILLER=off).');
+          return textResult('Skill distillation is turned off (CLEMMY_GOAL_CONTRACT=off).');
         default:
           return textResult(`I couldn't distill a skill from this session (${result.detail ?? result.status}).`);
       }

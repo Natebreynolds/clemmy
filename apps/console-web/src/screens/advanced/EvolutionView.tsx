@@ -807,12 +807,6 @@ function ImprovementProposalsCard({
         Clementine drafts changes from recurring tool, memory, and workflow patterns. Auto proposals still wait for your approval; manual proposals are acknowledged for source edits.
       </p>
 
-      {!data.enabled && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3 text-small text-muted">
-          Set CLEMMY_IMPROVEMENT_PROPOSER=on to draft new proposals during autoresearch. Existing pending proposals remain reviewable here.
-        </div>
-      )}
-
       {items.length === 0 ? (
         <p className="text-small text-muted">No pending proposals.</p>
       ) : (

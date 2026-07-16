@@ -47,14 +47,6 @@ export function codeModeWritesEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CODE_MODE_WRITES', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
-/** JIT adoption mandate (default ON; requires code mode). The tool DESCRIPTION
- *  nudge alone didn't move adoption (live: 0 run_tool_program on a textbook
- *  multi-fetch SEO turn), so on a clearly data-heavy turn we inject a per-turn
- *  DIRECTIVE that steers multi-fetch work to Code Mode. Soft by construction — a
- *  prompt steer, not a hard gate (the model still controls execution).
- *  DELETE-WHEN-VALIDATED: once telemetry shows the mandate lifts the
- *  run_tool_program rate on mandate-fired turns without false-firing on non-data
- *  turns, fold it in unconditionally. Kill-switch: CLEMMY_CODE_MODE_MANDATE=off. */
 /** Kill-switch for the code-mode irreversible-send guard (default ON). */
 export function codeModeSendGuardEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CODE_MODE_SEND_GUARD', 'on') || 'on').trim().toLowerCase() !== 'off';
@@ -77,11 +69,6 @@ const programWorkerCounts = new WeakMap<ToolCallsCounter, number>();
  *  (one ToolCallsCounter spans one program). WeakMap → no cleanup needed. */
 const programMutationCounts = new WeakMap<ToolCallsCounter, number>();
 
-export function codeModeMandateEnabled(): boolean {
-  if (!codeModeEnabled()) return false;
-  return (getRuntimeEnv('CLEMMY_CODE_MODE_MANDATE', 'on') || 'on').trim().toLowerCase() !== 'off';
-}
-
 /**
  * Per-turn Code Mode steering directive, or '' when not applicable (so the prompt
  * is byte-identical on non-data turns). Fires only when the turn already has
@@ -102,7 +89,8 @@ export function codeModeMandateDirective(opts: {
   fanoutPreferred?: boolean;
   multiItem?: { count: number; kind: string | null; carried?: boolean };
 }): string {
-  if (!codeModeMandateEnabled()) return '';
+  // Requires code mode itself; the directive is a soft per-turn steer, not a gate.
+  if (!codeModeEnabled()) return '';
   const hasMcpData = !!opts.allowAllMcp || (opts.mcpServersInScope ?? 0) >= 1 || !!opts.composioInScope;
   if (!hasMcpData) return '';
   const fetchTools = codeModeWritesEnabled()

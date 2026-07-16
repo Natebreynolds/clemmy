@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { BASE_DIR } from '../config.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { slugifyIntent } from './tool-choice-store.js';
 import type { WorkflowAllowedTool, WorkflowDefinition, WorkflowStepInput } from './workflow-store.js';
@@ -44,14 +44,6 @@ export interface WorkflowPatternRecord {
 export interface WorkflowPatternMatch {
   record: WorkflowPatternRecord;
   score: number;
-}
-
-function learningEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKFLOW_PATTERN_LEARNING', 'on') || 'on').trim().toLowerCase() !== 'off';
-}
-
-function recallEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKFLOW_PATTERN_RECALL', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
 function ensurePatternRoot(): void {
@@ -199,7 +191,6 @@ export function recordSuccessfulWorkflowPattern(input: {
   runId: string;
   finalOutput: string;
 }): WorkflowPatternRecord | null {
-  if (!learningEnabled()) return null;
   const objective = compactText(input.workflow.description || input.workflow.name, 160);
   if (!objective) return null;
   const filePath = patternPathFor(objective);
@@ -242,7 +233,6 @@ export function recordSuccessfulWorkflowPattern(input: {
  * for workflows that have at least one learned success). Best-effort.
  */
 export function recordFailedWorkflowPattern(input: { workflow: WorkflowDefinition; workflowSlug: string }): WorkflowPatternRecord | null {
-  if (!learningEnabled()) return null;
   const objective = compactText(input.workflow.description || input.workflow.name, 160);
   if (!objective) return null;
   const existing = parsePattern(patternPathFor(objective));
@@ -282,7 +272,6 @@ export function listWorkflowPatterns(): WorkflowPatternRecord[] {
 }
 
 export function recallWorkflowPatterns(query: string, limit = 3): WorkflowPatternMatch[] {
-  if (!recallEnabled()) return [];
   const queryTokens = tokens(query);
   const matches = listWorkflowPatterns()
     .filter(isPatternHealthy) // quality gate: never recall a since-degraded pattern

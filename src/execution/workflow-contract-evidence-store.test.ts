@@ -101,11 +101,3 @@ test('recordAndDeriveStableTightenings: an empty run inside the window prevents 
   assert.deepEqual(third, []);
 });
 
-test('recordAndDeriveStableTightenings: kill-switch off → never tightens', () => {
-  process.env.CLEMMY_WORKFLOW_AUTO_TIGHTEN = 'off';
-  const def = { name: 'k', description: 'd', enabled: true, trigger: { manual: true }, steps: [{ id: 's', prompt: 'p' }] };
-  for (const d of ['2026-07-01', '2026-07-02', '2026-07-03', '2026-07-04']) {
-    assert.deepEqual(recordAndDeriveStableTightenings('k', def, { s: [{ id: 1 }] }, `${d}T00:00:00Z`), []);
-  }
-  delete process.env.CLEMMY_WORKFLOW_AUTO_TIGHTEN;
-});

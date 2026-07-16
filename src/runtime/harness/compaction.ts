@@ -786,13 +786,11 @@ export async function compactSessionIfNeeded(
   // window.
   // Age/idle trigger (Phase 4a): a long-idle thread with real weight proactively
   // summarizes so the return turn isn't dragged by the full stale transcript.
-  // Disabled by CLEMMY_IDLE_COMPACT=off. Default threshold 30 min idle, 6k tokens.
-  const idleDisabled = (process.env.CLEMMY_IDLE_COMPACT ?? 'on').toLowerCase() === 'off';
+  // Default threshold 30 min idle, 6k tokens.
   const idleThresholdMs = opts.idleCompactionThresholdMs ?? 30 * 60 * 1000;
   const idleMinTokens = opts.idleCompactionMinTokens ?? 6000;
   const idleTrigger =
-    !idleDisabled
-    && typeof opts.idleMs === 'number'
+    typeof opts.idleMs === 'number'
     && opts.idleMs > idleThresholdMs
     && beforeTokens > idleMinTokens;
 

@@ -645,12 +645,6 @@ function emitBackgroundTaskCheckIn(
 // is delivered to the task's report-back channel — the same destination a
 // terminal notification uses — so a long-running task's "still working"
 // signal actually reaches the user instead of dying in the dashboard feed.
-// Default ON. Kill-switch CLEMMY_LOUD_PROGRESS_CHECKINS=0/false/off reverts to
-// today's silent, dashboard-only behavior for every heartbeat.
-function loudProgressCheckInsEnabled(): boolean {
-  const raw = (process.env.CLEMMY_LOUD_PROGRESS_CHECKINS ?? '').trim().toLowerCase();
-  return raw !== '0' && raw !== 'false' && raw !== 'off';
-}
 
 /** Human-readable elapsed duration for a heartbeat body: "45s", "12m",
  *  "1h 5m". Kept intentionally terse so the channel line stays scannable. */
@@ -676,8 +670,7 @@ function formatElapsedDuration(ms: number): string {
  *     most one heartbeat per checkInMinutes interval per task).
  *   - cancelling → quiet dashboard ping only (the loud signal is the imminent
  *     abort notification; don't double-message the channel).
- *   - running → loud when the kill-switch is on, otherwise silent (revert to
- *     the legacy dashboard-only behavior).
+ *   - running → loud (channel-delivered).
  */
 function decideHeartbeat(input: {
   status: BackgroundTaskStatus;
@@ -688,7 +681,7 @@ function decideHeartbeat(input: {
   if (input.status !== 'running' && input.status !== 'cancelling') return { emit: false, loud: false };
   if (input.nowMs - input.lastHeartbeatAtMs < input.intervalMs) return { emit: false, loud: false };
   if (input.status === 'cancelling') return { emit: true, loud: false };
-  return { emit: true, loud: loudProgressCheckInsEnabled() };
+  return { emit: true, loud: true };
 }
 
 /** Build the substance of a running-task heartbeat: elapsed time, tool-call
@@ -756,7 +749,6 @@ function emitBackgroundTaskProgressUpdate(
 }
 
 export const backgroundHeartbeatInternalsForTest = {
-  loudProgressCheckInsEnabled,
   formatElapsedDuration,
   decideHeartbeat,
   buildProgressCheckInBody,
@@ -2178,9 +2170,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        `Task ${task.id} is now running.`,
 	        `Run: ${run.id}`,
 	        `Soft max runtime: ${task.maxMinutes} minutes`,
-	        loudProgressCheckInsEnabled()
-	          ? `I'll check in here about every ${policy.checkInMinutes} minute${policy.checkInMinutes === 1 ? '' : 's'} with progress, and report back here as soon as it's done.`
-	          : 'I will report back here as soon as it is done.',
+	        `I'll check in here about every ${policy.checkInMinutes} minute${policy.checkInMinutes === 1 ? '' : 's'} with progress, and report back here as soon as it's done.`,
 	      ].join('\n'),
 	      runId: run.id,
 	      metadata: { status: 'running' },

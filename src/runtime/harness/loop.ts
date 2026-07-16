@@ -1625,15 +1625,6 @@ function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResu
   }
 }
 
-// Kill-switch (default ON). When a PROGRESSING run is about to hit the step
-// cap, auto-elevate the budget instead of pausing for a manual `continue`, so a
-// genuinely long task ("work through all of these") finishes within its time
-// budget. No-op on an instance already configured for long runs (autoContinue
-// on → maxSteps is already 1,000,000, so the cap is never approached).
-function stepProgressElevateEnabled(): boolean {
-  return (process.env.CLEMMY_STEP_PROGRESS_ELEVATE ?? 'on').toLowerCase() !== 'off';
-}
-
 /** Gate-unification Step 2: a `done:true + awaiting_handoff_result` decision is
  *  waiting on a retired hand-off and used to fall through to a silent re-loop
  *  until a budget cap killed it (the one live dead-end the stall detectors miss).
@@ -1650,7 +1641,6 @@ function handoffDeadEndFixEnabled(): boolean {
  * install that would otherwise pause at 40 steps. Exported for tests.
  */
 export function shouldElevateOnStepProgress(opts: {
-  enabled: boolean;
   alreadyElevated: boolean;
   preset: string;
   autoContinueOnLimit: boolean;
@@ -1658,7 +1648,6 @@ export function shouldElevateOnStepProgress(opts: {
   stepIndex: number;
   maxSteps: number;
 }): boolean {
-  if (!opts.enabled) return false;
   if (opts.alreadyElevated) return false;
   if (opts.explicitMaxSteps) return false; // caller pinned the cap — respect it
   if (opts.autoContinueOnLimit) return false; // already long-run capable (no-op for long/unlimited)
@@ -3286,7 +3275,6 @@ async function runConversationCore(
     // No-op when autoContinue is already on (maxSteps is 1,000,000, so the cap
     // is never approached) → cannot regress a long/unlimited instance.
     if (shouldElevateOnStepProgress({
-      enabled: stepProgressElevateEnabled(),
       alreadyElevated: elevated,
       preset: budget.preset,
       autoContinueOnLimit: budget.autoContinueOnLimit,

@@ -38,17 +38,6 @@ test('an UNBOUND step surfaces the remembered tool; a LOCKED step does not', asy
   assert.doesNotMatch(await instr(locked), /FIRECRAWL_SCRAPE/, 'a surface-locked step is not given the recall noise');
 });
 
-test('kill-switch CLEMMY_WORKFLOW_STEP_RECALL=off ⇒ no recall injected', async () => {
-  const prev = process.env.CLEMMY_WORKFLOW_STEP_RECALL;
-  process.env.CLEMMY_WORKFLOW_STEP_RECALL = 'off';
-  try {
-    const a = await buildWorkflowStepAgent({ userInput: INTENT, lockTools: ['*'] });
-    assert.doesNotMatch(await instr(a), /FIRECRAWL_SCRAPE/);
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_WORKFLOW_STEP_RECALL; else process.env.CLEMMY_WORKFLOW_STEP_RECALL = prev;
-  }
-});
-
 test('a step with NO userInput gets the plain static instructions (no store read)', async () => {
   const a = await buildWorkflowStepAgent({ lockTools: ['*'] });
   assert.doesNotMatch(await instr(a), /FIRECRAWL_SCRAPE/);

@@ -5,8 +5,8 @@
  *   - buildImprovementProposals: deterministic detectors map observatory
  *     tool-health → structured proposals (skill_pitfall / tool_desc / retire_fact)
  *   - stable ids dedup re-proposals across nightly runs
- *   - proposerEnabled / approveEnabled gating (PROPOSE off by default; APPLY needs
- *     an explicit human call and never self-applies)
+ *   - approveEnabled gating (APPLY needs an explicit human call and never
+ *     self-applies; PROPOSE is always on)
  *   - approveProposal: manual = acknowledge only; auto skill_pitfall applies via
  *     appendSkillPitfall and is journaled; dryRun never mutates
  */
@@ -16,7 +16,6 @@ import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-improve-proposer';
 process.env.CLEMENTINE_HOME = TEST_HOME;
-delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
 delete process.env.CLEMMY_MEMORY_APPROVE;
 
 const {
@@ -132,50 +131,35 @@ test('proposal ids are stable across runs (dedup substrate)', () => {
 
 // ── gating ─────────────────────────────────────────────────────────────────
 
-test('proposerEnabled: ON by default (graduated); only CLEMMY_IMPROVEMENT_PROPOSER=off disables', () => {
-  delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
-  assert.equal(proposerEnabled(), true, 'default ON');
-  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'off';
-  assert.equal(proposerEnabled(), false, '=off kill-switch');
-  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
+test('proposerEnabled: always ON (graduated)', () => {
   assert.equal(proposerEnabled(), true);
-  delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
 });
 
-test('proposeFromReport drafts by default, no-op only with the =off kill-switch', () => {
+test('proposeFromReport drafts by default', () => {
   const r = report([{ toolName: 'flaky_tool', calls: 10, successes: 4, errors: 6, emptyResults: 0, wrongPickHints: 0 }]);
   rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
-  delete process.env.CLEMMY_IMPROVEMENT_PROPOSER; // unset = default ON now
   const onByDefault = proposeFromReport(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE });
   assert.equal(onByDefault.ran, true, 'drafts by default');
   assert.ok(onByDefault.added >= 1);
-  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'off';
-  assert.equal(proposeFromReport(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE }).ran, false, '=off no-op');
-  delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
 });
 
 test('proposeFromReport uses injected workflow-step failure evidence', () => {
   rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
-  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
-  try {
-    const res = proposeFromReport(report([]), {
-      listSkills: NO_SKILLS,
-      countRetirableNoise: NO_NOISE,
-      collectStepFailures: () => [
-        obs('wf', 'scrape', 'run-1', ['min_items: got 2, needs 10']),
-        obs('wf', 'scrape', 'run-2', ['min_items: got 3, needs 10']),
-      ],
-      nowIso: NOW,
-    });
+  const res = proposeFromReport(report([]), {
+    listSkills: NO_SKILLS,
+    countRetirableNoise: NO_NOISE,
+    collectStepFailures: () => [
+      obs('wf', 'scrape', 'run-1', ['min_items: got 2, needs 10']),
+      obs('wf', 'scrape', 'run-2', ['min_items: got 3, needs 10']),
+    ],
+    nowIso: NOW,
+  });
 
-    assert.equal(res.ran, true);
-    assert.equal(res.added, 1);
-    const [pending] = listPendingProposals();
-    assert.equal(pending.kind, 'workflow_step');
-    assert.equal(pending.target, 'wf::scrape');
-  } finally {
-    delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
-  }
+  assert.equal(res.ran, true);
+  assert.equal(res.added, 1);
+  const [pending] = listPendingProposals();
+  assert.equal(pending.kind, 'workflow_step');
+  assert.equal(pending.target, 'wf::scrape');
 });
 
 // ── persistence ──────────────────────────────────────────────────────────────
@@ -588,26 +572,21 @@ test('buildDoctorFixProposals: an APPLIED Doctor fix is skipped (only the unappl
 
 test('proposeFromReport: an unapplied Doctor fix drafts exactly once, deduped on the second tick', () => {
   rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
-  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
-  try {
-    const deps = {
-      listSkills: NO_SKILLS,
-      countRetirableNoise: NO_NOISE,
-      listDoctorFixes: () => [proposedFix('wf', 'scrape', NOW)],
-      nowIso: NOW,
-    };
-    const first = proposeFromReport(report([]), deps);
-    assert.equal(first.ran, true);
-    assert.equal(first.added, 1);
-    const [pending] = listPendingProposals();
-    assert.equal(pending.kind, 'doctor_fix');
-    assert.equal(pending.target, 'wf::scrape');
+  const deps = {
+    listSkills: NO_SKILLS,
+    countRetirableNoise: NO_NOISE,
+    listDoctorFixes: () => [proposedFix('wf', 'scrape', NOW)],
+    nowIso: NOW,
+  };
+  const first = proposeFromReport(report([]), deps);
+  assert.equal(first.ran, true);
+  assert.equal(first.added, 1);
+  const [pending] = listPendingProposals();
+  assert.equal(pending.kind, 'doctor_fix');
+  assert.equal(pending.target, 'wf::scrape');
 
-    // Second tick, same unapplied fix → no new draft.
-    const second = proposeFromReport(report([]), deps);
-    assert.equal(second.added, 0, 'same Doctor fix does not re-draft');
-    assert.equal(listPendingProposals().filter((p) => p.kind === 'doctor_fix').length, 1);
-  } finally {
-    delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
-  }
+  // Second tick, same unapplied fix → no new draft.
+  const second = proposeFromReport(report([]), deps);
+  assert.equal(second.added, 0, 'same Doctor fix does not re-draft');
+  assert.equal(listPendingProposals().filter((p) => p.kind === 'doctor_fix').length, 1);
 });

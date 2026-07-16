@@ -430,7 +430,7 @@ test('compactSessionIfNeeded — idle gap + real weight triggers L1+L2 below tok
   assert.equal(forkRequest, undefined);
 });
 
-test('compactSessionIfNeeded — idle does NOT fire on a short gap, a tiny session, or with the kill-switch off', async () => {
+test('compactSessionIfNeeded — idle does NOT fire on a short gap or a tiny session', async () => {
   resetEventLog();
   const big = (title: string) => {
     const s = HarnessSession.create({ kind: 'chat', title });
@@ -459,16 +459,6 @@ test('compactSessionIfNeeded — idle does NOT fire on a short gap, a tiny sessi
   tiny.updateConversationSnapshot(tinyItems);
   const rt = await compactSessionIfNeeded(tiny, tinyItems, { ...base, idleMs: 60 * 60 * 1000 });
   assert.equal(rt.result.layer1.applied, false, 'idle but tiny → nothing to summarize');
-
-  // Kill-switch off → no idle trigger even on a big, long-idle session.
-  const k = big('idle-killswitch');
-  process.env.CLEMMY_IDLE_COMPACT = 'off';
-  try {
-    const rk = await compactSessionIfNeeded(k.s, k.items, { ...base, idleMs: 60 * 60 * 1000 });
-    assert.equal(rk.result.layer1.applied, false, 'kill-switch makes idle compaction inert');
-  } finally {
-    delete process.env.CLEMMY_IDLE_COMPACT;
-  }
 });
 
 test('checkpointGoalStage no-ops on a tiny session and when the kill-switch is off', async () => {

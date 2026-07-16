@@ -80,8 +80,7 @@ export const POST_EXPIRY_CHECKIN_MS = 5 * 60_000;
  * v0.5.19 F8 — exported predicate so the verify-long-running smoke
  * can exercise the throttle logic without spinning up the full Discord
  * harness closure. Returns true iff we should post a "still working"
- * follow-up RIGHT NOW. Knob `CLEMMY_DISCORD_POST_EXPIRY_CHECKINS=off`
- * forces false.
+ * follow-up RIGHT NOW.
  */
 export function shouldPostExpiryCheckIn(input: {
   tokenExpired: boolean;
@@ -93,7 +92,6 @@ export function shouldPostExpiryCheckIn(input: {
   if (!input.tokenExpired) return false;
   if (input.stateDone) return false;
   if (!input.hasSendFollowup) return false;
-  if ((process.env.CLEMMY_DISCORD_POST_EXPIRY_CHECKINS ?? 'on').toLowerCase() === 'off') return false;
   return input.now - input.lastCheckInAt >= POST_EXPIRY_CHECKIN_MS;
 }
 
@@ -2056,8 +2054,7 @@ export async function runDiscordHarnessConversation(opts: {
     // edits are silently dropped — the user wouldn't see them. But
     // v0.5.19 F8 keeps the user informed by posting one "still working"
     // follow-up per POST_EXPIRY_CHECKIN_MS window so an 80-call run
-    // doesn't go dark past minute 15. Revert via
-    // CLEMMY_DISCORD_POST_EXPIRY_CHECKINS=off.
+    // doesn't go dark past minute 15.
     if (tokenExpired) {
       if (shouldPostExpiryCheckIn({
         tokenExpired,

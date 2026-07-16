@@ -1441,10 +1441,8 @@ test('truncateResultBody: prefers a paragraph boundary when one is available', (
 
 // ── Loud progress heartbeats ──────────────────────────────────────────────────
 // Time-based check-ins now reach the report-back channel with substance
-// (elapsed + tool count + current activity), rate-limited to one per interval,
-// default ON, revertible via CLEMMY_LOUD_PROGRESS_CHECKINS.
+// (elapsed + tool count + current activity), rate-limited to one per interval.
 const {
-  loudProgressCheckInsEnabled,
   formatElapsedDuration,
   decideHeartbeat,
   buildProgressCheckInBody,
@@ -1486,48 +1484,14 @@ test('progress heartbeat body falls back to the task label when no activity seen
   assert.match(body, /Currently: the quarterly SEO analysis/, 'falls back to the label as the activity');
 });
 
-test('decideHeartbeat: running past the interval emits a LOUD heartbeat by default', () => {
-  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-  delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-  try {
-    assert.equal(loudProgressCheckInsEnabled(), true, 'default ON');
-    const d = decideHeartbeat({ status: 'running', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
-    assert.deepEqual(d, { emit: true, loud: true });
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
-  }
+test('decideHeartbeat: running past the interval emits a LOUD heartbeat', () => {
+  const d = decideHeartbeat({ status: 'running', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+  assert.deepEqual(d, { emit: true, loud: true });
 });
 
 test('decideHeartbeat: within the interval is rate-limited (no second loud message)', () => {
   const d = decideHeartbeat({ status: 'running', nowMs: 100_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
   assert.deepEqual(d, { emit: false, loud: false });
-});
-
-test('decideHeartbeat: kill-switch reverts to a silent, dashboard-only ping', () => {
-  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-  process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = '0';
-  try {
-    assert.equal(loudProgressCheckInsEnabled(), false);
-    const d = decideHeartbeat({ status: 'running', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
-    assert.deepEqual(d, { emit: true, loud: false }, 'still recorded on the dashboard, just not loud');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
-  }
-});
-
-test('decideHeartbeat: "false"/"off" also disable loud heartbeats', () => {
-  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-  try {
-    for (const val of ['false', 'OFF', 'False']) {
-      process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = val;
-      assert.equal(loudProgressCheckInsEnabled(), false, `"${val}" disables`);
-    }
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
-  }
 });
 
 test('decideHeartbeat: terminal and awaiting states stop heartbeats entirely', () => {
@@ -1538,13 +1502,6 @@ test('decideHeartbeat: terminal and awaiting states stop heartbeats entirely', (
 });
 
 test('decideHeartbeat: cancelling emits a QUIET dashboard ping (never loud)', () => {
-  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-  delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-  try {
-    const d = decideHeartbeat({ status: 'cancelling', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
-    assert.deepEqual(d, { emit: true, loud: false }, 'cancelling is dashboard-only even with the kill-switch ON');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
-    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
-  }
+  const d = decideHeartbeat({ status: 'cancelling', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+  assert.deepEqual(d, { emit: true, loud: false }, 'cancelling is dashboard-only');
 });

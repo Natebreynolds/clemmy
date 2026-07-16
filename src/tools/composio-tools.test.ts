@@ -665,23 +665,6 @@ test('fan-out advisory keeps SEPARATE buckets per slug+arg-shape', async () => {
   assert.ok(bAdvice, 'bucket B fires independently of bucket A');
 });
 
-test('fan-out advisory reverts to fire-once when CLEMMY_FANOUT_DIRECTIVE=off', async () => {
-  const { maybeFanoutAdvisory } = await import('./composio-tools.js');
-  const prev = process.env.CLEMMY_FANOUT_DIRECTIVE;
-  process.env.CLEMMY_FANOUT_DIRECTIVE = 'off';
-  try {
-    const sid = 'sess-fanout-off';
-    const fires: number[] = [];
-    for (let i = 1; i <= 12; i++) {
-      if (maybeFanoutAdvisory('DATAFORSEO_SERP', { q: `item${i}` }, sid)) fires.push(i);
-    }
-    assert.deepEqual(fires, [3], 'off: legacy fire-once-per-session latch');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_FANOUT_DIRECTIVE;
-    else process.env.CLEMMY_FANOUT_DIRECTIVE = prev;
-  }
-});
-
 test('fan-out advisory never throws on malformed / unserializable args', async () => {
   const { maybeFanoutAdvisory } = await import('./composio-tools.js');
   const sid = 'sess-fanout-malformed';

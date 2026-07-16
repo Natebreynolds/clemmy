@@ -4,8 +4,8 @@
  * The GLOBAL fan-out trigger. Verifies the behavioral serial-batch detector
  * fires on observed runtime shape-repetition (any tool name, language- and
  * domain-independent), the data-flow independence guard suppresses dependent
- * chains in CODE (not advisory prose), the workflow-step variant, the
- * CLEMMY_FANOUT_DIRECTIVE kill-switch, and robustness.
+ * chains in CODE (not advisory prose), the workflow-step variant, and
+ * robustness.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -92,22 +92,6 @@ test('workflow-step session uses the forEach variant, never run_worker', () => {
   // legitimately names run_worker only to say it is NOT available here.)
   assert.ok(advice && !/FAN-OUT NOW/.test(advice), 'not the run_worker imperative variant');
   assert.ok(advice && /not run_worker/.test(advice), 'explicitly steers away from run_worker in workflows');
-});
-
-test('CLEMMY_FANOUT_DIRECTIVE=off reverts to fire-once-per-session (legacy latch)', () => {
-  const prev = process.env.CLEMMY_FANOUT_DIRECTIVE;
-  process.env.CLEMMY_FANOUT_DIRECTIVE = 'off';
-  try {
-    const sessionId = 'sess-fa-off';
-    const fires: number[] = [];
-    for (let i = 1; i <= 12; i++) {
-      if (appendFanoutAdvisory({ toolName: 'T', args: { q: `item${i}` }, sessionId })) fires.push(i);
-    }
-    assert.deepEqual(fires, [3], 'flag off: fires exactly once across the whole session');
-  } finally {
-    if (prev === undefined) delete process.env.CLEMMY_FANOUT_DIRECTIVE;
-    else process.env.CLEMMY_FANOUT_DIRECTIVE = prev;
-  }
 });
 
 test('never throws on null / circular / missing args, and no sessionId is a no-op', () => {
