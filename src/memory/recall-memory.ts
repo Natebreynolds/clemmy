@@ -768,7 +768,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     const procedures = matchToolChoicesForStep(objective, { limit: perStore });
     if (procedures.length > 0) usedStores.add('procedure');
     procedures.forEach((procedure, rank) => mergeHit(merged, {
-      ref: { type: 'procedure', id: procedure.intent },
+      ref: { type: 'procedure', id: procedure.procedureId ?? procedure.intent },
       title: procedure.intent,
       text: `proven tool → ${procedure.kind}:${procedure.identifier}`,
       score: clamp(0.62 - rank * 0.025, 0.25, 0.62),

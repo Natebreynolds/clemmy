@@ -27,7 +27,17 @@ import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, runScopeIdFromRunContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier, recallComposioForSearch } from '../memory/tool-choice-store.js';
+import {
+  beginToolProcedureUseById,
+  cancelToolProcedureUse,
+  completeToolProcedureUse,
+  recordToolProcedureImpression,
+  rememberToolChoice,
+  peekToolChoice,
+  stripBakedConnectionId,
+  updateToolChoiceOutcomeForIdentifier,
+  recallComposioForSearch,
+} from '../memory/tool-choice-store.js';
 import { harnessRunContextStorage, workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
@@ -478,7 +488,13 @@ export function composioThrownErrorOutput(
 // FIRST discovery of an intent: once remembered, the choice is injected, the
 // model stops re-searching it, and the hint goes quiet.
 const AUTO_REMEMBER_WINDOW_MS = 5 * 60 * 1000;
-const lastComposioSearchBySession = new Map<string, { query: string; at: number; slugs?: string[] }>();
+const lastComposioSearchBySession = new Map<string, {
+  query: string;
+  at: number;
+  slugs?: string[];
+  fromMemory?: boolean;
+  useIdsBySlug?: Record<string, string>;
+}>();
 
 // F2 — cross-call reconnect breaker. 90870d8c stops the WITHIN-call retry, but the
 // 15-call thrash was the MODEL re-calling composio_execute_tool for the same dead
@@ -521,7 +537,12 @@ export const __gatewayTest__ = {
 /** Record the discovery query (and, when known, the candidate slugs the search
  *  surfaced) so a following successful execute can learn from it — and only
  *  learn a slug the search actually returned. Exported for tests. */
-export function noteComposioSearchIntent(sessionId: string | undefined, query: string, slugs?: string[]): void {
+export function noteComposioSearchIntent(
+  sessionId: string | undefined,
+  query: string,
+  slugs?: string[],
+  options: { fromMemory?: boolean; useIdsBySlug?: Record<string, string> } = {},
+): void {
   if (!sessionId || !query.trim()) return;
   // Bound the map — tiny entries, but don't leak across a long-lived daemon.
   if (lastComposioSearchBySession.size > 500) {
@@ -530,10 +551,16 @@ export function noteComposioSearchIntent(sessionId: string | undefined, query: s
       if (v.at < cutoff) lastComposioSearchBySession.delete(k);
     }
   }
+  const replaced = lastComposioSearchBySession.get(sessionId);
+  if (replaced?.useIdsBySlug) {
+    for (const useId of Object.values(replaced.useIdsBySlug)) cancelToolProcedureUse(useId);
+  }
   lastComposioSearchBySession.set(sessionId, {
     query: query.trim(),
     at: Date.now(),
     slugs: slugs && slugs.length > 0 ? slugs.slice(0, 60) : undefined,
+    fromMemory: options.fromMemory,
+    useIdsBySlug: options.useIdsBySlug,
   });
 }
 
@@ -576,19 +603,31 @@ export async function maybeAutoRememberComposioChoice(
     // (that would teach "task_post = the answer" when it only QUEUES). The real
     // outcome is decided when the result is fetched. Guarded by the same kill-switch.
     if (!failed && composioAsyncResolveEnabled() && detectJobReceipt(toolSlug, result)) return;
-    // Thread 2 — close the outcome loop: credit (success) or blame (failure)
-    // whatever proven choice points at this slug on EVERY execute, not just
-    // discovery-followed ones. Flag-gated no-op when off; best-effort.
-    updateToolChoiceOutcomeForIdentifier(toolSlug, failed ? 'failure' : 'success');
-    if (failed) return; // only LEARN a new choice from successes
     const sid = sessionId;
+    const pending = sid ? lastComposioSearchBySession.get(sid) : undefined;
+    const pendingFresh = Boolean(pending && Date.now() - pending.at <= AUTO_REMEMBER_WINDOW_MS);
+    if (sid && pending) lastComposioSearchBySession.delete(sid);
+    const selectedUseId = pendingFresh ? pending?.useIdsBySlug?.[toolSlug] : undefined;
+    if (pending?.useIdsBySlug) {
+      for (const useId of Object.values(pending.useIdsBySlug)) {
+        if (useId !== selectedUseId) cancelToolProcedureUse(useId);
+      }
+    }
+    if (selectedUseId) {
+      // Exact one-shot attribution from remembered search → execute.
+      completeToolProcedureUse(selectedUseId, failed ? 'failure' : 'success');
+    } else {
+      // Compatibility fallback: credit only when the identifier resolves to ONE
+      // canonical procedure. Ambiguous account/operation matches credit nothing.
+      updateToolChoiceOutcomeForIdentifier(toolSlug, failed ? 'failure' : 'success');
+    }
+    if (failed) return; // only LEARN a new choice from successes
     if (!sid) return;
-    const pending = lastComposioSearchBySession.get(sid);
     if (!pending) return; // slug wasn't just discovered — nothing new to learn
-    // Single-use + freshness: a search only teaches the execute that closely
-    // follows it, so a much-later unrelated execute can't be mis-keyed.
-    lastComposioSearchBySession.delete(sid);
-    if (Date.now() - pending.at > AUTO_REMEMBER_WINDOW_MS) return;
+    if (!pendingFresh) return;
+    // A memory hit is an impression/use of an existing procedure, not a new
+    // search-query alias. Do not fragment it with another phrasing.
+    if (pending.fromMemory) return;
     // (A) v0.5.64 — semantic gate: only auto-remember a slug the SEARCH actually
     // surfaced for this intent. Before this, ANY successful execute keyed to the
     // last search query got cached — so a fallback the model reached for (a
@@ -651,6 +690,7 @@ export async function maybeAutoRememberComposioChoice(
     rememberToolChoice({
       intent,
       description: 'Auto-remembered: this Composio slug satisfied the searched intent.',
+      aliasSource: 'composio_search',
       choice: {
         kind: 'composio',
         identifier: toolSlug,
@@ -1767,21 +1807,10 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     description: 'Search Composio for the right action slug. Use this BEFORE concluding an action is unavailable — Composio exposes hundreds of actions per toolkit and Clementine intentionally does not inject every action schema into every call. Query with plain English ("outlook list unread messages today", "drive search by name", "gmail mark as read"). Returns slugs to pass to `composio_execute_tool`.',
     parameters: z.object(COMPOSIO_SEARCH_TOOLS_PARAMS),
     execute: async ({ query, toolkit_slug, limit }, context, details) => {
-      // (B) v0.5.64 — a re-search REFRESHES the cache. If this exact intent
-      // already has an ACTIVE cached choice, a deliberate re-search is a
-      // contradiction signal (the model is told to skip rediscovery when a
-      // choice is injected, so searching anyway means the cached slug didn't
-      // satisfy it) — invalidate it so the fresh result wins next turn instead
-      // of the stale slug. Conservative: EXACT-intent match only, so a related
-      // search can't nuke an unrelated choice. CLEMMY_TOOLCHOICE_RESEARCH_REFRESH=off reverts.
-      if ((process.env.CLEMMY_TOOLCHOICE_RESEARCH_REFRESH ?? 'on').toLowerCase() !== 'off') {
-        try {
-          const cached = peekToolChoice(query);
-          if (cached?.choice) {
-            invalidateToolChoice(query, 'agent re-searched this intent — refreshing a stale tool-choice', { automatic: true });
-          }
-        } catch { /* best-effort — a refresh failure must never break search */ }
-      }
+      // Searching is exposure/uncertainty, never evidence of failure. The old
+      // path auto-invalidated an exact memo simply because the model searched
+      // again, creating churn and relearning loops. Only a real execute outcome
+      // may change confidence or invalidate a procedure.
       // DISCOVERY-TAX short-circuit (2026-07-08): a task family that has run many
       // times (facebook scrape → sheets) re-ran composio_search_tools 4-5× across
       // toolkits (~2 min) even though tool-choice memory already held the proven
@@ -1796,9 +1825,22 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         try {
           const remembered = recallComposioForSearch(query);
           if (remembered.length > 0) {
-            // Deliberately do NOT noteComposioSearchIntent here: that would key a
-            // NEW intent fragment off this phrasing on the next execute (more
-            // fragmentation), and outcomes already credit by slug on every execute.
+            const sid = sessionIdFromRunContext(context);
+            const useIdsBySlug: Record<string, string> = {};
+            for (const match of remembered) {
+              if (!match.procedureId) continue;
+              recordToolProcedureImpression(match.procedureId);
+              const use = beginToolProcedureUseById(match.procedureId, match.intent, sid);
+              if (use) useIdsBySlug[match.slug] = use.useId;
+            }
+            // Carry exact procedure-use IDs to the following execute without
+            // teaching this query as another physical procedure/alias.
+            noteComposioSearchIntent(
+              sid,
+              query,
+              remembered.map((match) => match.slug),
+              { fromMemory: true, useIdsBySlug },
+            );
             return formatComposioToolOutput({
               configured: true,
               query,

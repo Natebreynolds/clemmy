@@ -48,6 +48,12 @@ const {
   evidenceLooksFailedOrBlocked,
   recallComposioForSearch,
   recallComposioAccountIdentity,
+  listToolChoiceAliases,
+  listToolProcedures,
+  migrateToolChoicesToCanonicalProcedures,
+  recordToolProcedureImpression,
+  beginToolProcedureUseById,
+  completeToolProcedureUse,
 } = await import('./tool-choice-store.js');
 
 test('accountIdentity: persists a valid email, rejects a ca_ id and non-email; recalls by slug', () => {
@@ -513,13 +519,13 @@ test('counts carry forward on re-remember of the same identifier, reset on a dif
   }
 });
 
-test('updateToolChoiceOutcomeForIdentifier credits every active choice on that slug', () => {
+test('updateToolChoiceOutcomeForIdentifier credits one canonical procedure, not every intent alias', () => {
   process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
   try {
     rememberToolChoice({ intent: 't2 slug one', choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY' } });
     rememberToolChoice({ intent: 't2 slug two', choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY' } });
     const n = updateToolChoiceOutcomeForIdentifier('SALESFORCE_QUERY', 'success');
-    assert.equal(n, 2, 'both intents pointing at the slug are credited');
+    assert.equal(n, 1, 'one canonical procedure is credited exactly once');
     assert.equal(peekToolChoice('t2 slug one')?.choice?.successCount, 1);
     assert.equal(peekToolChoice('t2 slug two')?.choice?.successCount, 1);
   } finally {
@@ -744,4 +750,145 @@ test('recallComposioForSearch: excludes a net-negative (broken) remembered path'
   rememberToolChoice({ intent: 'brokenapp export the widgets report', choice: { kind: 'composio', identifier: 'BROKENAPP_EXPORT_WIDGETS' } });
   for (let i = 0; i < 5; i += 1) updateToolChoiceOutcomeForIdentifier('BROKENAPP_EXPORT_WIDGETS', 'failure');
   assert.deepEqual(recallComposioForSearch('brokenapp export widgets report'), [], 'a net-negative path is never short-circuited onto');
+});
+
+// ─── Canonical procedural memory ────────────────────────────────────────────
+
+function switchTestMachine(machineId: string): void {
+  writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), `${machineId}\n`);
+  resetMachineIdCacheForTests();
+}
+
+test('canonical procedures collapse intent aliases without multiplying historical broadcast counters', () => {
+  switchTestMachine('machine-canonical-migration');
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', 'machine-canonical-migration');
+  mkdirSync(legacyDir, { recursive: true });
+  const legacy = (intent: string) => [
+    '---',
+    `intent: ${intent}`,
+    'choice:',
+    '  kind: composio',
+    '  identifier: GOOGLESHEETS_BATCH_UPDATE',
+    '  testedAt: 2026-07-01T00:00:00.000Z',
+    '  successCount: 7',
+    'fallbacks: []',
+    '---',
+    '# legacy alias',
+    '',
+  ].join('\n');
+  writeFileSync(path.join(legacyDir, 'update-weekly-sheet.md'), legacy('update weekly sheet'));
+  writeFileSync(path.join(legacyDir, 'write-campaign-rows.md'), legacy('write campaign rows'));
+
+  const report = migrateToolChoicesToCanonicalProcedures();
+  assert.equal(report.aliasesLinked, 2);
+  assert.equal(report.proceduresCreated, 1);
+  assert.equal(listToolChoiceAliases().length, 2, 'both original evidence files remain');
+  const procedures = listToolProcedures();
+  assert.equal(procedures.length, 1, 'one reusable physical procedure');
+  assert.equal(procedures[0].aliases.length, 2);
+  assert.equal(procedures[0].evidence.length, 2);
+  assert.equal(procedures[0].choice?.successCount, 7, 'duplicate broadcast counters are max-merged, not summed to 14');
+});
+
+test('legacy native-MCP objective prose is quarantined while a compact operation alias remains recallable', () => {
+  switchTestMachine('machine-native-objective-quarantine');
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', 'machine-native-objective-quarantine');
+  mkdirSync(legacyDir, { recursive: true });
+  const identifier = 'notion__search_pages';
+  const objective = `Prepare the Q3 client audit summary — ${identifier}`;
+  writeFileSync(path.join(legacyDir, 'objective.md'), [
+    '---',
+    `intent: ${objective}`,
+    'description: "Auto-remembered: this native MCP tool satisfied the active objective."',
+    'choice:',
+    '  kind: mcp',
+    `  identifier: ${identifier}`,
+    '  testedAt: 2026-07-01T00:00:00.000Z',
+    'fallbacks: []',
+    '---',
+    '# legacy objective',
+    '',
+  ].join('\n'));
+
+  const report = migrateToolChoicesToCanonicalProcedures();
+  assert.equal(report.quarantinedAliases, 1);
+  const procedure = listToolProcedures()[0];
+  assert.ok(procedure.aliases.some((alias) => alias.intent === objective && alias.status === 'quarantined'));
+  assert.ok(procedure.aliases.some((alias) => alias.intent === 'notion.search_pages' && alias.status === 'active'));
+  assert.equal(recallToolChoice(objective), null, 'broad project prose cannot be replayed as a procedure key');
+  assert.equal(recallToolChoice('notion search pages')?.choice?.identifier, identifier, 'the operation remains recallable');
+  assert.deepEqual(matchToolChoicesForStep('Prepare the Q3 client audit summary.'), [], 'quarantined prose cannot auto-bind a workflow');
+});
+
+test('impressions are diagnostic only and never improve procedure score', () => {
+  switchTestMachine('machine-procedure-impressions');
+  const record = rememberToolChoice({
+    intent: 'outlook.list.messages',
+    choice: { kind: 'composio', identifier: 'OUTLOOK_LIST_MESSAGES' },
+  });
+  assert.ok(record.procedureId);
+  const before = computeChoiceScore(record.choice);
+  for (let i = 0; i < 12; i += 1) recordToolProcedureImpression(record.procedureId!);
+  const procedure = listToolProcedures()[0];
+  assert.equal(procedure.impressionCount, 12);
+  assert.equal(computeChoiceScore(procedure.choice), before, 'exposure does not masquerade as utility');
+});
+
+test('identifier-only outcomes abstain when two canonical operations share a CLI binary', () => {
+  switchTestMachine('machine-ambiguous-cli-outcomes');
+  rememberToolChoice({
+    intent: 'netlify.deploy.site',
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod' },
+  });
+  rememberToolChoice({
+    intent: 'netlify.status.site',
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify status' },
+  });
+  assert.equal(updateToolChoiceOutcomeForIdentifier('netlify', 'success'), 0, 'ambiguous bare identifier credits nothing');
+  assert.ok(listToolProcedures().every((procedure) => (procedure.choice?.successCount ?? 0) === 0));
+});
+
+test('one-shot procedure use IDs credit only the selected procedure and cannot be replayed', () => {
+  switchTestMachine('machine-procedure-use-id');
+  const selected = rememberToolChoice({
+    intent: 'salesforce.query.accounts',
+    choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY_RECORDS' },
+  });
+  assert.ok(selected.procedureId);
+  const use = beginToolProcedureUseById(selected.procedureId!, selected.intent, 'session-use-id');
+  assert.ok(use);
+  assert.ok(completeToolProcedureUse(use!.useId, 'success'));
+  assert.equal(completeToolProcedureUse(use!.useId, 'success'), null, 'the same execution cannot be credited twice');
+  assert.equal(peekToolChoice(selected.intent)?.choice?.successCount, 1);
+});
+
+test('a corrupt legacy alias file is skipped — migration and recall of healthy intents survive', () => {
+  switchTestMachine('machine-corrupt-legacy-alias');
+  const legacyDir = path.join(TMP_HOME, 'memory', 'tool-choices', 'machine-corrupt-legacy-alias');
+  mkdirSync(legacyDir, { recursive: true });
+  // Torn write / hand-edit: frontmatter YAML that gray-matter cannot parse.
+  writeFileSync(path.join(legacyDir, 'broken-intent.md'), '---\nintent: [unclosed\nchoice: {{{\n---\nbody\n');
+  writeFileSync(
+    path.join(legacyDir, 'healthy-intent.md'),
+    [
+      '---',
+      'intent: healthy intent',
+      'choice:',
+      '  kind: composio',
+      '  identifier: GMAIL_SEND_EMAIL',
+      '  successCount: 2',
+      'fallbacks: []',
+      '---',
+      '# legacy alias',
+      '',
+    ].join('\n'),
+  );
+
+  assert.doesNotThrow(() => migrateToolChoicesToCanonicalProcedures());
+  const recalled = recallToolChoice('healthy intent');
+  assert.equal(recalled?.choice?.identifier, 'GMAIL_SEND_EMAIL', 'healthy intents stay recallable');
+  assert.ok(
+    listToolProcedures().some((procedure) => procedure.choice?.identifier === 'GMAIL_SEND_EMAIL'),
+    'migration completed for the healthy file',
+  );
 });

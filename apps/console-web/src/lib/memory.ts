@@ -422,12 +422,23 @@ export const reconcileMemoryRelationships = (maxFacts = 5_000) =>
 
 /** A learned tool-recall (procedural) memo — which tool proved out for an intent. */
 export interface ToolRecallRecord {
+  procedureId?: string | null;
   intent: string;
   description?: string | null;
+  aliases?: Array<{ intent: string; status: 'active' | 'quarantined' | 'superseded'; source: string; firstSeenAt?: string; lastSeenAt?: string }>;
+  impressionCount?: number;
+  lastImpressedAt?: string | null;
+  evidenceCount?: number;
   choice: { kind: string; identifier: string; testedAt?: string; successCount?: number; failureCount?: number; lastSuccessAt?: string | null; lastFailureAt?: string | null; score?: number } | null;
   fallbacks: { kind: string; identifier: string; reason?: string; failedAt?: string }[];
 }
-export const getToolRecall = () => apiGet<{ count: number; records: ToolRecallRecord[] }>('/api/console/memory/tool-recall');
+export const getToolRecall = () => apiGet<{
+  count: number;
+  aliasCount?: number;
+  collapsedAliases?: number;
+  quarantinedAliases?: number;
+  records: ToolRecallRecord[];
+}>('/api/console/memory/tool-recall');
 
 export interface Entity {
   id: number | string;

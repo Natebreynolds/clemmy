@@ -871,6 +871,10 @@ test('composio_search_tools: a confident memory match returns the remembered slu
     'apify facebook posts scraper actor search',
   ]) rememberTC({ intent, description: 'Auto-remembered: this Composio slug satisfied the searched intent.', choice: { kind: 'composio', identifier: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', invocationTemplate: '{"actorId":"apify/facebook-posts-scraper"}' } });
   for (let i = 0; i < 40; i += 1) bumpTC('APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', 'success');
+  const { listToolProcedures, peekToolChoice } = await import('../memory/tool-choice-store.js');
+  const beforeProcedure = listToolProcedures().find((procedure) => procedure.choice?.identifier === 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS');
+  assert.ok(beforeProcedure);
+  const beforeImpressions = beforeProcedure!.impressionCount;
 
   // COMPOSIO_API_KEY is NOT set in this test home. If the short-circuit did NOT
   // fire, the search would fall through to the credentials guard and return
@@ -880,6 +884,12 @@ test('composio_search_tools: a confident memory match returns the remembered slu
   assert.match(text, /APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS/, 'returns the remembered slug');
   assert.match(text, /memory|remembered/i, 'labels it as recalled from memory');
   assert.doesNotMatch(text, /not configured/i, 'never reached the credentials/discovery path');
+  assert.ok(peekToolChoice('apify run actor facebook page posts scraper public page url')?.choice,
+    'search exposure does not invalidate the remembered procedure');
+  const afterProcedure = listToolProcedures().find((procedure) => procedure.procedureId === beforeProcedure!.procedureId);
+  assert.equal(afterProcedure?.impressionCount, beforeImpressions + 1, 'memory-backed search records an impression only');
+  assert.equal(afterProcedure?.choice?.failureCount ?? 0, beforeProcedure?.choice?.failureCount ?? 0,
+    'searching again is not a negative outcome');
 });
 
 test('composio_search_tools: a query with NO confident memory falls through to normal discovery', async () => {

@@ -38,11 +38,21 @@
  * perturbs a tool call. Gated by CLEMMY_PROCEDURAL_OUTCOMES (the store fallback
  * checks it up front; the updateToolChoiceOutcome it calls is also a no-op off).
  */
-import { updateToolChoiceOutcome, listToolChoices, isProceduralOutcomesEnabled, type ToolChoiceRecord } from './tool-choice-store.js';
+import {
+  beginToolProcedureUse,
+  completeToolProcedureUse,
+  _resetToolProcedureUsesForTests,
+  updateToolProcedureOutcome,
+  listToolChoices,
+  isProceduralOutcomesEnabled,
+  type ToolChoiceRecord,
+} from './tool-choice-store.js';
 
 interface PendingRecall {
   intent: string;
   identifier: string;
+  procedureId?: string;
+  useId?: string;
   atMs: number;
 }
 
@@ -61,6 +71,7 @@ export function isTransientFailure(text: string): boolean {
 
 export function _resetProceduralRecallLinkForTests(): void {
   pending.clear();
+  _resetToolProcedureUsesForTests();
 }
 
 function prune(list: PendingRecall[], nowMs: number): PendingRecall[] {
@@ -141,7 +152,14 @@ export function noteRecalledIntent(
     if (!sessionId || !intent || !identifier) return;
     if (kind !== 'cli' && kind !== 'mcp') return; // composio handled by its own slug path
     const list = prune(pending.get(sessionId) ?? [], nowMs);
-    list.push({ intent, identifier: identifier.toLowerCase(), atMs: nowMs });
+    const use = beginToolProcedureUse(intent, sessionId);
+    list.push({
+      intent,
+      identifier: identifier.toLowerCase(),
+      procedureId: use?.procedureId,
+      useId: use?.useId,
+      atMs: nowMs,
+    });
     storeSession(sessionId, prune(list, nowMs));
   } catch { /* best-effort */ }
 }
@@ -190,16 +208,17 @@ function creditFromStore(executed: string, succeeded: boolean): string | null {
   try {
     if (!isProceduralOutcomesEnabled()) return null;
     const haystack = executed.toLowerCase();
-    let best: { intent: string; score: number } | null = null;
+    let best: { intent: string; procedureId?: string; score: number } | null = null;
     let tied = false;
     for (const rec of listToolChoices()) {
       const score = scoreStoreCandidate(rec, haystack);
       if (score <= 0) continue;
-      if (!best || score > best.score) { best = { intent: rec.intent, score }; tied = false; }
+      if (!best || score > best.score) { best = { intent: rec.intent, procedureId: rec.procedureId, score }; tied = false; }
       else if (score === best.score) { tied = true; }
     }
     if (!best || tied) return null; // nothing precise, or ambiguous → never mis-credit
-    updateToolChoiceOutcome(best.intent, succeeded ? 'success' : 'failure');
+    if (!best.procedureId) return null;
+    updateToolProcedureOutcome(best.procedureId, succeeded ? 'success' : 'failure', best.intent);
     return best.intent;
   } catch {
     return null;
@@ -247,7 +266,13 @@ export function creditMatchingRecall(
 
     const [credited] = list.splice(chosen, 1);
     storeSession(sessionId, list);
-    updateToolChoiceOutcome(credited.intent, succeeded ? 'success' : 'failure');
+    if (credited.useId) {
+      completeToolProcedureUse(credited.useId, succeeded ? 'success' : 'failure');
+    } else if (credited.procedureId) {
+      updateToolProcedureOutcome(credited.procedureId, succeeded ? 'success' : 'failure', credited.intent);
+    } else {
+      return null;
+    }
     return credited.intent;
   } catch {
     return null;

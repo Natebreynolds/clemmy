@@ -498,18 +498,23 @@ export function collectNonFactStoreNodes(opts: {
   try {
     const choices = listToolChoices().slice(0, toolRecallLimit);
     for (const c of choices) {
-      const id = `toolrecall:${c.intent}`;
+      const id = `toolrecall:${c.procedureId ?? c.intent}`;
       nodes.push({
         id,
         label: c.intent.length > 60 ? `${c.intent.slice(0, 57)}…` : c.intent,
         type: 'tool-recall',
         data: {
           chosenTool: c.choice?.identifier ?? null,
+          procedureId: c.procedureId ?? null,
           kind: c.choice?.kind ?? null,
           score: c.choice ? computeChoiceScore(c.choice) : 0,
           successCount: c.choice?.successCount ?? 0,
           failureCount: c.choice?.failureCount ?? 0,
           fallbacks: c.fallbacks.length,
+          aliases: c.aliases?.length ?? 1,
+          quarantinedAliases: c.aliases?.filter((alias) => alias.status === 'quarantined').length ?? 0,
+          impressionCount: c.impressionCount ?? 0,
+          evidenceCount: c.evidenceCount ?? 0,
           invalidated: c.choice === null,
         },
       });

@@ -18,7 +18,6 @@
  */
 
 import { recordFallbackSuccess, recordFallbackFailure } from './fallback-chain-store.js';
-import { updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
 
 /**
  * Tool outcome tracking — what happened when we used a tool.
@@ -116,12 +115,10 @@ export function recordToolOutcome(outcome: ToolOutcome): void {
     recordFallbackSuccess(outcome.intent, 'unknown', outcome.toolName);
   }
 
-  // Persist to tool-choice-store for per-tool learning
-  try {
-    updateToolChoiceOutcomeForIdentifier(outcome.toolName, outcome.succeeded ? 'success' : 'failure');
-  } catch (err) {
-    // Silently ignore if tool-choice-store not available
-  }
+  // Canonical procedural-memory outcomes are attributed at the shared tool
+  // result boundary (or through a one-shot procedure-use id). This global
+  // reliability profile deliberately does not credit by bare tool name: doing
+  // so duplicated Composio outcomes and blamed every operation sharing a CLI.
 }
 
 /**

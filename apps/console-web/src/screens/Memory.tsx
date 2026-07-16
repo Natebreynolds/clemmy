@@ -1373,10 +1373,18 @@ function ProceduresTab() {
   const rows = recall.data?.records ?? [];
   return (
     <>
-      <p className="mb-3 text-small text-muted">Tools Clementine learned to reach for, per intent — she skips rediscovery and goes straight to a proven path. Sorted by what's working.</p>
+      <p className="mb-3 text-small text-muted">Reusable tool procedures, with every phrasing kept as an alias instead of a duplicate memory. Outcomes belong to the procedure actually used; impressions are shown separately.</p>
+      {recall.data && rows.length > 0 && (
+        <div className="mb-3 flex flex-wrap gap-2 text-caption text-muted">
+          <span className="rounded-full border border-border bg-surface px-2.5 py-1">{recall.data.count} canonical procedures</span>
+          <span className="rounded-full border border-border bg-surface px-2.5 py-1">{recall.data.aliasCount ?? rows.length} intent aliases</span>
+          {(recall.data.collapsedAliases ?? 0) > 0 && <span className="rounded-full border border-success/30 bg-success/10 px-2.5 py-1 text-success">{recall.data.collapsedAliases} duplicates collapsed</span>}
+          {(recall.data.quarantinedAliases ?? 0) > 0 && <span className="rounded-full border border-warning/30 bg-warning/10 px-2.5 py-1 text-warning">{recall.data.quarantinedAliases} noisy aliases quarantined</span>}
+        </div>
+      )}
       {recall.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
         : rows.length === 0 ? <Card><EmptyState title="No learned procedures yet" description="As Clementine proves out which tool handles a kind of task, it lands here so she doesn't rediscover it next time." /></Card>
-          : <div className="space-y-2">{rows.map((r) => <ProcedureCard key={r.intent} rec={r} />)}</div>}
+          : <div className="space-y-2">{rows.map((r) => <ProcedureCard key={r.procedureId ?? r.intent} rec={r} />)}</div>}
     </>
   );
 }
@@ -1386,6 +1394,8 @@ function ProcedureCard({ rec }: { rec: ToolRecallRecord }) {
   const score = typeof c?.score === 'number' ? Math.round(c.score * 100) : null;
   const success = c?.successCount ?? 0;
   const failure = c?.failureCount ?? 0;
+  const aliases = rec.aliases ?? [];
+  const quarantined = aliases.filter((alias) => alias.status === 'quarantined').length;
   return (
     <Card className="p-3.5">
       <div className="flex items-start gap-3">
@@ -1406,7 +1416,25 @@ function ProcedureCard({ rec }: { rec: ToolRecallRecord }) {
               </span>
             )}
             {rec.fallbacks.length > 0 && <span>{rec.fallbacks.length} fallback{rec.fallbacks.length === 1 ? '' : 's'} tried</span>}
+            {aliases.length > 0 && <span>{aliases.length} intent alias{aliases.length === 1 ? '' : 'es'}</span>}
+            {(rec.evidenceCount ?? 0) > 0 && <span>{rec.evidenceCount} evidence event{rec.evidenceCount === 1 ? '' : 's'}</span>}
+            {(rec.impressionCount ?? 0) > 0 && <span>{rec.impressionCount} impression{rec.impressionCount === 1 ? '' : 's'} (not rank)</span>}
+            {quarantined > 0 && <span className="text-warning">{quarantined} quarantined alias{quarantined === 1 ? '' : 'es'}</span>}
           </div>
+          {aliases.length > 1 && (
+            <details className="mt-2 text-caption text-muted">
+              <summary className="cursor-pointer select-none">Show intent aliases</summary>
+              <div className="mt-1.5 space-y-1 rounded-md bg-subtle p-2">
+                {aliases.map((alias) => (
+                  <div key={`${alias.status}:${alias.intent}`} className="flex items-start gap-2">
+                    <StatusPill tone={alias.status === 'active' ? 'success' : alias.status === 'quarantined' ? 'warning' : 'neutral'}>{alias.status}</StatusPill>
+                    <span className="min-w-0 break-words">{alias.intent}</span>
+                    <span className="ml-auto shrink-0 text-faint">{alias.source.replace(/_/g, ' ')}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
         </div>
       </div>
     </Card>

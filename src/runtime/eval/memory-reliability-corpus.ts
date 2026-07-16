@@ -716,6 +716,10 @@ export function buildMemoryIntegrityEvalCases(reset: () => void): EvalCase[] {
         const text = 'The Orchid migration is approved for Friday.';
         const canonical = rememberFact({
           kind: 'project', content: text, importance: 5, trustLevel: 1,
+          // Keep the fixture's claim inside its fixed evaluation clock. Using
+          // ingestion time here made this deterministic corpus begin failing
+          // once wall-clock time passed 23:00Z on the fixture date.
+          occurredAt: '2026-07-15T18:00:00.000Z',
         });
         const source = recordMemoryEpisode({
           kind: 'tool_result', subtype: 'meeting',

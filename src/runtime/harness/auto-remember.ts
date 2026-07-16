@@ -6,8 +6,9 @@
  * successes were NEVER recorded — meaning recall could never compound for the
  * dominant tool family (Airtable/Slack/Notion/Gmail/…). This is the missing
  * commit half: on a CLEAN native-MCP success during a known objective, record
- * `objective → mcp tool` so the recall-aware scoper (resolveMcpToolScopeWithRecall)
- * can re-surface that server next time WITHOUT a keyword branch.
+ * one canonical MCP operation plus the objective as a contextual alias, so the
+ * recall-aware scoper can re-surface that server without turning project prose
+ * into the physical procedure key.
  *
  * Pairs with the recall-aware scope behind ONE flag (CLEMMY_SCOPE_FROM_RECALL):
  * remember and recall ship together or neither compounds.
@@ -17,7 +18,7 @@
  *   - NATIVE MCP ONLY. CLI auto-remember is intentionally skipped — shell
  *     builtins (ls/cat/git) would poison the store, and the user's CLIs are
  *     already $PATH-discoverable. (MCP is the family the scoper actually gated.)
- *   - Needs an ACTIVE OBJECTIVE (focus) as a stable key. No focus → skip.
+ *   - Needs an ACTIVE OBJECTIVE (focus) as retrieval context. No focus → skip.
  *   - NEVER clobbers an active memo (peek-dedup), mirroring the Composio half.
  *   - Skips error/approval/unavailable results.
  * Best-effort + silent: learning is additive and must never break a tool call.
@@ -51,7 +52,7 @@ export function detectNativeMcpSuccess(
 
 /**
  * Best-effort: on a clean native-MCP success during an active objective, record
- * `objective → mcp tool` (once). Never throws.
+ * one canonical MCP procedure (once), with the objective retained as context.
  */
 export function autoRememberOnSuccess(input: {
   toolName?: string | null;
@@ -63,14 +64,18 @@ export function autoRememberOnSuccess(input: {
     if (!success) return;
     const objective = getActiveObjective();
     if (!objective || !objective.trim()) return; // need a stable key
-    // Granular key (objective + tool) so multiple tools used for one objective
-    // are each learnable, and re-running the same tool is a no-op.
-    const intent = `${objective.trim()} — ${success.identifier}`;
+    // The operation is the stable key. Objective prose is a contextual alias:
+    // useful for semantic recall, but never allowed to define/bloat procedure
+    // identity or auto-bind a workflow by itself.
+    const [server = 'mcp', operation = 'tool'] = success.identifier.split('__', 2);
+    const intent = `${server}.${operation}`.toLowerCase().replace(/[^a-z0-9._-]+/g, '.');
     const existing = peekToolChoice(intent);
     if (existing?.choice) return; // never clobber an active memo
     rememberToolChoice({
       intent,
       description: 'Auto-remembered: this native MCP tool satisfied the active objective.',
+      aliasSource: 'synthetic',
+      aliases: [{ intent: objective.trim(), source: 'native_mcp' }],
       choice: {
         kind: 'mcp',
         identifier: success.identifier,

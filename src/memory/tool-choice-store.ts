@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -8,22 +9,20 @@ import { recordToolEvent } from '../agents/tool-observability.js';
 /**
  * Tool-choice memory store.
  *
- * Phase A of the intent-based tool dispatch plan. Stores, per-machine,
- * which concrete tool (CLI, Composio action, MCP tool) the agent
- * picked the last time it served a given intent — so future runs of
- * the same intent skip discovery and go straight to the proven path.
+ * Stores reusable per-machine tool procedures. Intent prose is an alias used
+ * for retrieval; the physical procedure is keyed by tool/provider, account,
+ * and operation fingerprint so paraphrases do not create duplicate memory.
  *
  * Layout:
  *   ~/.clementine-next/memory/tool-choices/<machine-id>/<intent-slug>.md
+ *   ~/.clementine-next/memory/tool-procedures/<machine-id>/<procedure-id>.md
  *
- * Each file is a YAML-frontmatter markdown doc (same format as the
- * rest of the vault). The frontmatter holds the choice and the
- * fallbacks (what didn't work); the body is free-form for any human
- * notes / context.
+ * Legacy tool-choice files remain additive alias/evidence records. Canonical
+ * procedure files own the active choice, outcome counters, evidence, aliases,
+ * and impressions. No migration deletes historical intent files.
  *
- * Free-form intent slugs by design (decision 2026-05-19). To defend
- * against paraphrase fragmentation, `recallToolChoice` does a fuzzy
- * lookup when there's no exact slug match.
+ * `recallToolChoice` scores aliases within each procedure, so paraphrases
+ * reinforce one candidate rather than tying duplicate physical records.
  *
  * Re-validation is event-driven only (decision 2026-05-19). A choice
  * stays valid until `invalidateToolChoice(intent, reason)` is called,
@@ -86,6 +85,58 @@ export interface ToolChoiceRecord {
   body: string;
   /** Absolute path of the underlying file. Useful for debugging. */
   filePath: string;
+  /** Stable reusable procedure identity. Legacy records omit this until the
+   * additive migration links them; the original intent file is retained. */
+  procedureId?: string;
+  procedureKey?: string;
+  /** Status of this intent alias. Quarantined historical objective prose stays
+   * inspectable but cannot drive recall or workflow binding. */
+  aliasStatus?: ToolProcedureAliasStatus;
+  /** All known aliases when this record is a canonical procedure projection. */
+  aliases?: ToolProcedureAlias[];
+  impressionCount?: number;
+  lastImpressedAt?: string;
+  evidenceCount?: number;
+}
+
+export type ToolProcedureAliasStatus = 'active' | 'quarantined' | 'superseded';
+export type ToolProcedureAliasSource = 'manual' | 'composio_search' | 'native_mcp' | 'migration' | 'synthetic';
+
+export interface ToolProcedureAlias {
+  intent: string;
+  description?: string;
+  status: ToolProcedureAliasStatus;
+  source: ToolProcedureAliasSource;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  /** Historical alias file, when one exists. Synthetic canonical aliases do
+   * not invent a legacy record. */
+  legacyFilePath?: string;
+}
+
+export interface ToolProcedureEvidence {
+  evidenceId: string;
+  at: string;
+  type: 'remember' | 'migration' | 'outcome' | 'supersession';
+  intent?: string;
+  text?: string;
+}
+
+export interface ToolProcedureRecord {
+  procedureId: string;
+  procedureKey: string;
+  provider: string;
+  operationHash: string;
+  choice: ToolChoiceRecordChoice | null;
+  aliases: ToolProcedureAlias[];
+  fallbacks: ToolChoiceRecordFallback[];
+  evidence: ToolProcedureEvidence[];
+  /** Exposure is diagnostic only and never boosts ranking. */
+  impressionCount: number;
+  lastImpressedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  filePath: string;
 }
 
 export interface RememberToolChoiceInput {
@@ -96,9 +147,19 @@ export interface RememberToolChoiceInput {
   fallbacks?: ToolChoiceRecordFallback[];
   /** Optional body text. When omitted, preserves the existing body on update. */
   body?: string;
+  /** Origin of this intent alias. It affects retrieval trust, not the canonical
+   * procedure identity. */
+  aliasSource?: ToolProcedureAliasSource;
+  /** Additional contextual aliases. These enrich retrieval but never become
+   * separate procedure records. */
+  aliases?: Array<string | { intent: string; source?: ToolProcedureAliasSource; status?: ToolProcedureAliasStatus }>;
+  /** Optional operation/schema fingerprint supplied by a discovery surface.
+   * When absent, a stable conservative fingerprint is derived. */
+  operationHash?: string;
 }
 
 const TOOL_CHOICES_ROOT = path.join(BASE_DIR, 'memory', 'tool-choices');
+const TOOL_PROCEDURES_ROOT = path.join(BASE_DIR, 'memory', 'tool-procedures');
 
 function machineDir(): string {
   return path.join(TOOL_CHOICES_ROOT, getMachineId());
@@ -106,6 +167,16 @@ function machineDir(): string {
 
 function ensureMachineDir(): string {
   const dir = machineDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function procedureMachineDir(): string {
+  return path.join(TOOL_PROCEDURES_ROOT, getMachineId());
+}
+
+function ensureProcedureMachineDir(): string {
+  const dir = procedureMachineDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -126,16 +197,43 @@ function filePathFor(intent: string): string {
   return path.join(machineDir(), `${slug}.md`);
 }
 
-function parseRecord(filePath: string): ToolChoiceRecord | null {
+function parseRecordRaw(filePath: string): ToolChoiceRecord | null {
   if (!existsSync(filePath)) return null;
-  const raw = readFileSync(filePath, 'utf-8');
-  const parsed = matter(raw);
-  const fm = parsed.data as Record<string, unknown>;
-  const intent = typeof fm.intent === 'string' ? fm.intent : path.basename(filePath, '.md');
-  const description = typeof fm.description === 'string' ? fm.description : undefined;
-  const choice = parseChoice(fm.choice);
-  const fallbacks = Array.isArray(fm.fallbacks) ? fm.fallbacks.map(parseFallback).filter(isFallback) : [];
-  return { intent, description, choice, fallbacks, body: parsed.content ?? '', filePath };
+  try {
+    const raw = readFileSync(filePath, 'utf-8');
+    const parsed = matter(raw);
+    const fm = parsed.data as Record<string, unknown>;
+    const intent = typeof fm.intent === 'string' ? fm.intent : path.basename(filePath, '.md');
+    const description = typeof fm.description === 'string' ? fm.description : undefined;
+    const choice = parseChoice(fm.choice);
+    const fallbacks = Array.isArray(fm.fallbacks) ? fm.fallbacks.map(parseFallback).filter(isFallback) : [];
+    const procedureId = typeof fm.procedureId === 'string' ? fm.procedureId : undefined;
+    const procedureKey = typeof fm.procedureKey === 'string' ? fm.procedureKey : undefined;
+    const status = fm.aliasStatus;
+    const aliasStatus = status === 'active' || status === 'quarantined' || status === 'superseded' ? status : undefined;
+    return { intent, description, choice, fallbacks, body: parsed.content ?? '', filePath, procedureId, procedureKey, aliasStatus };
+  } catch {
+    // A torn write or hand-edited file must degrade to "no record", never
+    // poison migration/recall for every other intent on this machine.
+    return null;
+  }
+}
+
+function parseRecord(filePath: string): ToolChoiceRecord | null {
+  const raw = parseRecordRaw(filePath);
+  if (!raw?.procedureId) return raw;
+  const procedure = parseProcedure(procedureFilePath(raw.procedureId));
+  if (!procedure) return raw;
+  return {
+    ...raw,
+    procedureKey: procedure.procedureKey,
+    choice: procedure.choice,
+    fallbacks: mergeFallbacks(raw.fallbacks, procedure.fallbacks),
+    aliases: procedure.aliases,
+    impressionCount: procedure.impressionCount,
+    lastImpressedAt: procedure.lastImpressedAt,
+    evidenceCount: procedure.evidence.length,
+  };
 }
 
 function placeholderChoiceString(value: unknown): boolean {
@@ -229,6 +327,9 @@ function writeRecord(record: Omit<ToolChoiceRecord, 'filePath'> & { filePath?: s
   const fm: Record<string, unknown> = {
     intent: record.intent,
     ...(record.description ? { description: record.description } : {}),
+    ...(record.procedureId ? { procedureId: record.procedureId } : {}),
+    ...(record.procedureKey ? { procedureKey: record.procedureKey } : {}),
+    ...(record.aliasStatus ? { aliasStatus: record.aliasStatus } : {}),
     choice: record.choice ?? null,
     fallbacks: record.fallbacks,
   };
@@ -269,6 +370,424 @@ function defaultBodyFor(intent: string, description?: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Canonical procedures — one reusable operation, many intent aliases
+// ─────────────────────────────────────────────────────────────────
+
+function procedureFilePath(procedureId: string): string {
+  return path.join(procedureMachineDir(), `${procedureId}.md`);
+}
+
+function parseAlias(raw: unknown): ToolProcedureAlias | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const intent = typeof value.intent === 'string' ? value.intent.trim() : '';
+  if (!intent) return null;
+  const status = value.status;
+  const source = value.source;
+  return {
+    intent,
+    description: typeof value.description === 'string' ? value.description : undefined,
+    status: status === 'quarantined' || status === 'superseded' ? status : 'active',
+    source: source === 'composio_search' || source === 'native_mcp' || source === 'migration' || source === 'synthetic'
+      ? source
+      : 'manual',
+    firstSeenAt: typeof value.firstSeenAt === 'string' ? value.firstSeenAt : new Date(0).toISOString(),
+    lastSeenAt: typeof value.lastSeenAt === 'string' ? value.lastSeenAt : new Date(0).toISOString(),
+    legacyFilePath: typeof value.legacyFilePath === 'string' ? value.legacyFilePath : undefined,
+  };
+}
+
+function parseEvidence(raw: unknown): ToolProcedureEvidence | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const evidenceId = typeof value.evidenceId === 'string' ? value.evidenceId : '';
+  const type = value.type;
+  if (!evidenceId || (type !== 'remember' && type !== 'migration' && type !== 'outcome' && type !== 'supersession')) return null;
+  return {
+    evidenceId,
+    at: typeof value.at === 'string' ? value.at : new Date(0).toISOString(),
+    type,
+    intent: typeof value.intent === 'string' ? value.intent : undefined,
+    text: typeof value.text === 'string' ? value.text : undefined,
+  };
+}
+
+function parseProcedure(filePath: string): ToolProcedureRecord | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    const parsed = matter(readFileSync(filePath, 'utf-8'));
+    const fm = parsed.data as Record<string, unknown>;
+    const procedureId = typeof fm.procedureId === 'string' ? fm.procedureId : path.basename(filePath, '.md');
+    const procedureKey = typeof fm.procedureKey === 'string' ? fm.procedureKey : '';
+    const provider = typeof fm.provider === 'string' ? fm.provider : '';
+    const operationHash = typeof fm.operationHash === 'string' ? fm.operationHash : '';
+    if (!procedureId || !procedureKey || !provider || !operationHash) return null;
+    return {
+      procedureId,
+      procedureKey,
+      provider,
+      operationHash,
+      choice: parseChoice(fm.choice),
+      aliases: Array.isArray(fm.aliases) ? fm.aliases.map(parseAlias).filter((x): x is ToolProcedureAlias => x !== null) : [],
+      fallbacks: Array.isArray(fm.fallbacks) ? fm.fallbacks.map(parseFallback).filter(isFallback) : [],
+      evidence: Array.isArray(fm.evidence) ? fm.evidence.map(parseEvidence).filter((x): x is ToolProcedureEvidence => x !== null) : [],
+      impressionCount: numOrUndef(fm.impressionCount) ?? 0,
+      lastImpressedAt: typeof fm.lastImpressedAt === 'string' ? fm.lastImpressedAt : undefined,
+      createdAt: typeof fm.createdAt === 'string' ? fm.createdAt : new Date(0).toISOString(),
+      updatedAt: typeof fm.updatedAt === 'string' ? fm.updatedAt : new Date(0).toISOString(),
+      filePath,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeProcedure(procedure: ToolProcedureRecord): ToolProcedureRecord {
+  ensureProcedureMachineDir();
+  const filePath = procedureFilePath(procedure.procedureId);
+  const fm = stripUndefined({
+    schemaVersion: 1,
+    procedureId: procedure.procedureId,
+    procedureKey: procedure.procedureKey,
+    provider: procedure.provider,
+    operationHash: procedure.operationHash,
+    choice: procedure.choice,
+    aliases: procedure.aliases,
+    fallbacks: procedure.fallbacks,
+    evidence: procedure.evidence,
+    impressionCount: procedure.impressionCount,
+    lastImpressedAt: procedure.lastImpressedAt,
+    createdAt: procedure.createdAt,
+    updatedAt: procedure.updatedAt,
+  });
+  const label = procedure.choice ? `${procedure.choice.kind}:${procedure.choice.identifier}` : procedure.procedureId;
+  writeFileSync(filePath, matter.stringify(
+    `# Canonical tool procedure — \`${label}\`\n\nThis file owns reusable procedure identity and outcome evidence. Intent-specific legacy files are retained as aliases.\n`,
+    fm as object,
+  ), 'utf-8');
+  return { ...procedure, filePath };
+}
+
+function shortHash(value: string, length = 20): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, length);
+}
+
+function normalizeIdentityPart(value: string | undefined): string {
+  return (value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function providerForChoice(choice: Pick<ToolChoiceRecordChoice, 'kind' | 'identifier'>): string {
+  const identifier = normalizeIdentityPart(choice.identifier);
+  if (choice.kind === 'mcp') return identifier.split('__')[0] || identifier;
+  if (choice.kind === 'composio') return identifier.split('_')[0] || identifier;
+  return identifier.split(/\s+/)[0] || identifier;
+}
+
+function cliOperationSignature(intent: string, choice: Pick<ToolChoiceRecordChoice, 'identifier' | 'invocationTemplate'>): string {
+  const template = cleanInvocationTemplate(choice.invocationTemplate);
+  const head = template ? normalizeIdentityPart(cliCommandHead(template)) : '';
+  const identifier = normalizeIdentityPart(choice.identifier);
+  // A concrete command head is the most truthful operation/schema proxy. If a
+  // legacy CLI memo only knows the binary, retain a conservative intent hash so
+  // unrelated subcommands are never collapsed merely because they share `sf`,
+  // `gh`, or `netlify`.
+  const meaningfulHead = head
+    .split(/\s+/)
+    .filter((token) => token && token !== '...' && !/^<.*>$/.test(token))
+    .join(' ');
+  if (meaningfulHead && meaningfulHead !== identifier) return meaningfulHead;
+  return `legacy-intent:${slugifyIntent(intent)}`;
+}
+
+export interface CanonicalToolProcedureIdentity {
+  procedureId: string;
+  procedureKey: string;
+  provider: string;
+  operationHash: string;
+}
+
+/** Stable physical identity for a reusable operation. Intent prose is an alias,
+ * not the primary key. Composio/MCP identifiers already encode an operation;
+ * CLI paths use the command head or a conservative legacy-intent fallback. */
+export function canonicalToolProcedureIdentity(input: {
+  intent: string;
+  choice: Pick<ToolChoiceRecordChoice, 'kind' | 'identifier' | 'invocationTemplate' | 'accountIdentity'>;
+  operationHash?: string;
+}): CanonicalToolProcedureIdentity {
+  const kind = input.choice.kind;
+  const identifier = normalizeIdentityPart(input.choice.identifier);
+  const provider = providerForChoice(input.choice);
+  const accountIdentity = parseAccountIdentity(input.choice.accountIdentity) ?? '';
+  const operationSignature = input.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX)
+    ? `workflow-pin:${slugifyIntent(input.intent)}:${identifier}`
+    : kind === 'cli'
+      ? cliOperationSignature(input.intent, input.choice)
+      : identifier;
+  const operationHash = normalizeIdentityPart(input.operationHash) || shortHash(operationSignature, 24);
+  const procedureKey = ['v1', kind, provider, identifier, accountIdentity, operationHash].join('|');
+  return {
+    procedureId: `tp_${shortHash(procedureKey, 24)}`,
+    procedureKey,
+    provider,
+    operationHash,
+  };
+}
+
+function laterIso(a: string | undefined, b: string | undefined): string | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return a >= b ? a : b;
+}
+
+/** Duplicate legacy records often carry the SAME broadcast outcome. Taking the
+ * maximum counter preserves the evidence without multiplying one real use by
+ * the number of aliases. */
+function mergeProcedureChoice(
+  current: ToolChoiceRecordChoice | null,
+  incoming: ToolChoiceRecordChoice,
+): ToolChoiceRecordChoice {
+  if (!current) return { ...incoming };
+  const incomingIsNewer = (incoming.testedAt ?? '') >= (current.testedAt ?? '');
+  const preferred = incomingIsNewer ? incoming : current;
+  return {
+    ...preferred,
+    invocationTemplate: preferred.invocationTemplate ?? current.invocationTemplate ?? incoming.invocationTemplate,
+    accountIdentity: preferred.accountIdentity ?? current.accountIdentity ?? incoming.accountIdentity,
+    testEvidence: preferred.testEvidence ?? current.testEvidence ?? incoming.testEvidence,
+    successCount: Math.max(current.successCount ?? 0, incoming.successCount ?? 0) || undefined,
+    failureCount: Math.max(current.failureCount ?? 0, incoming.failureCount ?? 0) || undefined,
+    approvalCount: Math.max(current.approvalCount ?? 0, incoming.approvalCount ?? 0) || undefined,
+    rejectionCount: Math.max(current.rejectionCount ?? 0, incoming.rejectionCount ?? 0) || undefined,
+    lastSuccessAt: laterIso(current.lastSuccessAt, incoming.lastSuccessAt),
+    lastFailureAt: laterIso(current.lastFailureAt, incoming.lastFailureAt),
+  };
+}
+
+function mergeProcedureAliases(existing: ToolProcedureAlias[], incoming: ToolProcedureAlias[]): ToolProcedureAlias[] {
+  const byIntent = new Map<string, ToolProcedureAlias>();
+  for (const alias of [...existing, ...incoming]) {
+    const key = slugifyIntent(alias.intent) || alias.intent.toLowerCase();
+    const prior = byIntent.get(key);
+    if (!prior) { byIntent.set(key, alias); continue; }
+    byIntent.set(key, {
+      ...prior,
+      ...alias,
+      description: alias.description ?? prior.description,
+      firstSeenAt: prior.firstSeenAt <= alias.firstSeenAt ? prior.firstSeenAt : alias.firstSeenAt,
+      lastSeenAt: prior.lastSeenAt >= alias.lastSeenAt ? prior.lastSeenAt : alias.lastSeenAt,
+      // Never let a later migration silently reactivate a quarantined alias.
+      status: prior.status === 'quarantined' || alias.status === 'quarantined'
+        ? 'quarantined'
+        : alias.status,
+      legacyFilePath: alias.legacyFilePath ?? prior.legacyFilePath,
+    });
+  }
+  return [...byIntent.values()];
+}
+
+function mergeProcedureEvidence(existing: ToolProcedureEvidence[], incoming: ToolProcedureEvidence[]): ToolProcedureEvidence[] {
+  const seen = new Set<string>();
+  const out: ToolProcedureEvidence[] = [];
+  for (const evidence of [...existing, ...incoming]) {
+    if (seen.has(evidence.evidenceId)) continue;
+    seen.add(evidence.evidenceId);
+    out.push(evidence);
+  }
+  return out.slice(-200);
+}
+
+function nativeMcpCanonicalIntent(identifier: string): string {
+  const [server = 'mcp', tool = 'tool'] = identifier.trim().split('__', 2);
+  return `${server}.${tool}`.toLowerCase().replace(/[^a-z0-9._-]+/g, '.');
+}
+
+function looksLikeLegacyObjectiveAlias(rec: ToolChoiceRecord): boolean {
+  const choice = rec.choice;
+  if (!choice || choice.kind !== 'mcp') return false;
+  if (
+    rec.description?.startsWith('Auto-remembered: this native MCP tool satisfied the active objective.')
+    && slugifyIntent(rec.intent) !== slugifyIntent(nativeMcpCanonicalIntent(choice.identifier))
+  ) return true;
+  const escaped = choice.identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\s[—-]\\s${escaped}$`, 'i').test(rec.intent.trim());
+}
+
+function inferredAliasSource(rec: ToolChoiceRecord): ToolProcedureAliasSource {
+  if (looksLikeLegacyObjectiveAlias(rec)) return 'native_mcp';
+  if (rec.description?.startsWith('Auto-remembered: this Composio slug satisfied')) return 'composio_search';
+  return rec.procedureId ? 'manual' : 'migration';
+}
+
+function migrationEvidenceId(rec: ToolChoiceRecord, identity: CanonicalToolProcedureIdentity): string {
+  return `ev_${shortHash(`${identity.procedureId}|${rec.intent}|${rec.choice?.testedAt ?? ''}|migration`, 24)}`;
+}
+
+function upsertCanonicalProcedure(input: {
+  identity: CanonicalToolProcedureIdentity;
+  choice: ToolChoiceRecordChoice;
+  aliases: ToolProcedureAlias[];
+  fallbacks?: ToolChoiceRecordFallback[];
+  evidence?: ToolProcedureEvidence[];
+  now: string;
+}): ToolProcedureRecord {
+  const current = parseProcedure(procedureFilePath(input.identity.procedureId));
+  return writeProcedure({
+    procedureId: input.identity.procedureId,
+    procedureKey: input.identity.procedureKey,
+    provider: input.identity.provider,
+    operationHash: input.identity.operationHash,
+    choice: mergeProcedureChoice(current?.choice ?? null, input.choice),
+    aliases: mergeProcedureAliases(current?.aliases ?? [], input.aliases),
+    fallbacks: mergeFallbacks(current?.fallbacks ?? [], input.fallbacks ?? []),
+    evidence: mergeProcedureEvidence(current?.evidence ?? [], input.evidence ?? []),
+    impressionCount: current?.impressionCount ?? 0,
+    lastImpressedAt: current?.lastImpressedAt,
+    createdAt: current?.createdAt ?? input.now,
+    updatedAt: input.now,
+    filePath: procedureFilePath(input.identity.procedureId),
+  });
+}
+
+function markCanonicalAliasStatus(
+  procedureId: string | undefined,
+  intent: string,
+  status: ToolProcedureAliasStatus,
+  evidenceText?: string,
+): void {
+  if (!procedureId) return;
+  const current = parseProcedure(procedureFilePath(procedureId));
+  if (!current) return;
+  const now = new Date().toISOString();
+  const aliases = current.aliases.map((alias) => (
+    slugifyIntent(alias.intent) === slugifyIntent(intent)
+      ? { ...alias, status, lastSeenAt: now }
+      : alias
+  ));
+  writeProcedure({
+    ...current,
+    aliases,
+    evidence: mergeProcedureEvidence(current.evidence, [{
+      evidenceId: `ev_${randomUUID()}`,
+      at: now,
+      type: 'supersession',
+      intent,
+      text: evidenceText,
+    }]),
+    updatedAt: now,
+  });
+}
+
+export interface ToolProcedureMigrationReport {
+  aliasesScanned: number;
+  aliasesLinked: number;
+  proceduresCreated: number;
+  quarantinedAliases: number;
+}
+
+const migratedMachines = new Set<string>();
+
+/** Additive, idempotent migration. Original intent files remain in place and
+ * gain only procedure-link metadata; canonical files own shared counters.
+ * Existing duplicated broadcast counters are merged with max(), never summed. */
+export function migrateToolChoicesToCanonicalProcedures(): ToolProcedureMigrationReport {
+  const machineId = getMachineId();
+  const report: ToolProcedureMigrationReport = { aliasesScanned: 0, aliasesLinked: 0, proceduresCreated: 0, quarantinedAliases: 0 };
+  const dir = machineDir();
+  if (!existsSync(dir)) { migratedMachines.add(machineId); return report; }
+  const records = readdirSync(dir)
+    .filter((name) => name.endsWith('.md'))
+    .map((name) => parseRecordRaw(path.join(dir, name)))
+    .filter((record): record is ToolChoiceRecord => record !== null);
+  report.aliasesScanned = records.length;
+  const existed = new Set<string>();
+  const pdir = procedureMachineDir();
+  if (existsSync(pdir)) {
+    for (const name of readdirSync(pdir)) if (name.endsWith('.md')) existed.add(name.slice(0, -3));
+  }
+  for (const rec of records) {
+    if (!rec.choice) continue;
+    const linkedProcedure = rec.procedureId ? parseProcedure(procedureFilePath(rec.procedureId)) : null;
+    const linkedChoice = linkedProcedure?.choice;
+    const sameLinkedPath = Boolean(
+      linkedProcedure
+      && linkedChoice
+      && linkedChoice.kind === rec.choice.kind
+      && linkedChoice.identifier === rec.choice.identifier
+      && (linkedChoice.accountIdentity ?? '') === (rec.choice.accountIdentity ?? ''),
+    );
+    // Trust an existing canonical link when the physical path still matches.
+    // This preserves an explicit schema/operation hash that legacy alias files
+    // intentionally do not duplicate.
+    const identity: CanonicalToolProcedureIdentity = sameLinkedPath && linkedProcedure
+      ? {
+          procedureId: linkedProcedure.procedureId,
+          procedureKey: linkedProcedure.procedureKey,
+          provider: linkedProcedure.provider,
+          operationHash: linkedProcedure.operationHash,
+        }
+      : canonicalToolProcedureIdentity({ intent: rec.intent, choice: rec.choice });
+    const now = new Date().toISOString();
+    const quarantined = looksLikeLegacyObjectiveAlias(rec);
+    const status: ToolProcedureAliasStatus = quarantined ? 'quarantined' : 'active';
+    if (quarantined) report.quarantinedAliases += 1;
+    const aliases: ToolProcedureAlias[] = [{
+      intent: rec.intent,
+      description: rec.description,
+      status,
+      source: inferredAliasSource(rec),
+      firstSeenAt: rec.choice.testedAt || now,
+      lastSeenAt: rec.choice.testedAt || now,
+      legacyFilePath: rec.filePath,
+    }];
+    // Historical native-MCP objective prose is retained but cannot be the
+    // binding key. Add a compact operation-derived alias so the capability is
+    // still recallable without the project prose.
+    if (quarantined) {
+      aliases.push({
+        intent: nativeMcpCanonicalIntent(rec.choice.identifier),
+        status: 'active',
+        source: 'synthetic',
+        firstSeenAt: now,
+        lastSeenAt: now,
+      });
+    }
+    upsertCanonicalProcedure({
+      identity,
+      choice: rec.choice,
+      aliases,
+      fallbacks: rec.fallbacks,
+      evidence: [{
+        evidenceId: migrationEvidenceId(rec, identity),
+        at: rec.choice.testedAt || now,
+        type: 'migration',
+        intent: rec.intent,
+        text: rec.choice.testEvidence,
+      }],
+      now,
+    });
+    if (!existed.has(identity.procedureId)) {
+      existed.add(identity.procedureId);
+      report.proceduresCreated += 1;
+    }
+    writeRecord({
+      ...rec,
+      procedureId: identity.procedureId,
+      procedureKey: identity.procedureKey,
+      aliasStatus: status,
+      filePath: rec.filePath,
+    });
+    report.aliasesLinked += 1;
+  }
+  migratedMachines.add(machineId);
+  return report;
+}
+
+function ensureCanonicalMigration(): void {
+  const machineId = getMachineId();
+  if (!migratedMachines.has(machineId)) migrateToolChoicesToCanonicalProcedures();
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────
 
@@ -289,39 +808,44 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const slug = slugifyIntent(intent);
   if (!slug) return null;
 
+  ensureCanonicalMigration();
+
   const exactPath = path.join(machineDir(), `${slug}.md`);
   const exact = parseRecord(exactPath);
-  if (exact) {
+  if (exact && exact.aliasStatus !== 'quarantined' && exact.aliasStatus !== 'superseded') {
     emitToolChoiceEvent('recall_hit', intent, exact.choice?.identifier);
     return exact;
   }
 
-  // Fuzzy fallback
-  const dir = machineDir();
-  if (!existsSync(dir)) { emitToolChoiceEvent('recall_miss', intent); return null; }
-  const slugs = readdirSync(dir)
-    .filter((f) => f.endsWith('.md'))
-    .map((f) => f.slice(0, -3));
-  if (slugs.length === 0) { emitToolChoiceEvent('recall_miss', intent); return null; }
-
+  // Canonical fallback: score aliases WITHIN each procedure, then rank one
+  // candidate per procedure. Near-duplicate intent files now reinforce a single
+  // procedure instead of tying each other and causing a miss.
   const queryTokens = tokenize(slug);
-  const scored = slugs.map((existing) => ({
-    slug: existing,
-    score: jaccardOverlap(queryTokens, tokenize(existing)),
-  })).sort((a, b) => b.score - a.score);
+  const scored = listToolChoices()
+    .filter((record) => !record.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX))
+    .map((record) => {
+      const aliases = (record.aliases?.length ? record.aliases : [{
+        intent: record.intent,
+        status: record.aliasStatus ?? 'active',
+        source: 'manual' as const,
+        firstSeenAt: '',
+        lastSeenAt: '',
+      }])
+        .filter((alias) => alias.status === 'active' && alias.source !== 'native_mcp');
+      const bestAlias = aliases
+        .map((alias) => ({ alias, score: jaccardOverlap(queryTokens, tokenize(slugifyIntent(alias.intent))) }))
+        .sort((a, b) => b.score - a.score)[0];
+      return { record, alias: bestAlias?.alias, score: bestAlias?.score ?? 0 };
+    })
+    .filter((entry) => entry.alias)
+    .sort((a, b) => b.score - a.score);
 
   const best = scored[0];
   const runnerUp = scored[1];
   if (!best || best.score < 0.5) { emitToolChoiceEvent('recall_miss', intent); return null; }
   if (runnerUp && runnerUp.score >= best.score) { emitToolChoiceEvent('recall_miss', intent); return null; }
-  const fuzzy = parseRecord(path.join(dir, `${best.slug}.md`));
-  // Workflow pins are exact-key records — a paraphrased chat intent must never
-  // fuzzy-surface a pin (wrong tool + fabricated provenance + arg leak).
-  if (fuzzy?.intent?.startsWith(WORKFLOW_PIN_INTENT_PREFIX)) {
-    emitToolChoiceEvent('recall_miss', intent);
-    return null;
-  }
-  emitToolChoiceEvent(fuzzy ? 'recall_hit_fuzzy' : 'recall_miss', intent, fuzzy?.choice?.identifier);
+  const fuzzy = best.record;
+  emitToolChoiceEvent('recall_hit_fuzzy', intent, fuzzy.choice?.identifier);
   return fuzzy;
 }
 
@@ -407,6 +931,7 @@ export function evidenceLooksFailedOrBlocked(text: string | undefined): boolean 
 }
 
 export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRecord {
+  ensureCanonicalMigration();
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
   if (placeholderChoiceString(input.choice.identifier)) {
@@ -417,6 +942,9 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
       fallbacks: existing?.fallbacks ?? [],
       body: input.body ?? existing?.body ?? defaultBodyFor(input.intent, input.description ?? existing?.description),
       filePath: existing?.filePath,
+      procedureId: existing?.procedureId,
+      procedureKey: existing?.procedureKey,
+      aliasStatus: existing?.aliasStatus,
     });
     emitToolChoiceEvent('remember_rejected_failed', input.intent, 'placeholder');
     return saved;
@@ -444,6 +972,9 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
       fallbacks: mergeFallbacks(existing?.fallbacks ?? [], [failedFallback]),
       body: input.body ?? existing?.body ?? defaultBodyFor(input.intent, input.description ?? existing?.description),
       filePath: existing?.filePath,
+      procedureId: existing?.procedureId,
+      procedureKey: existing?.procedureKey,
+      aliasStatus: existing?.aliasStatus,
     });
     emitToolChoiceEvent('remember_rejected_failed', input.intent, input.choice.identifier);
     return saved;
@@ -472,12 +1003,68 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
       lastFailureAt: prev.lastFailureAt,
     } : {}),
   };
+  const identity = canonicalToolProcedureIdentity({
+    intent: input.intent,
+    choice,
+    operationHash: input.operationHash,
+  });
+  if (existing?.procedureId && existing.procedureId !== identity.procedureId) {
+    markCanonicalAliasStatus(
+      existing.procedureId,
+      input.intent,
+      'superseded',
+      `Intent now resolves to ${identity.procedureId} (${choice.kind}:${choice.identifier}).`,
+    );
+  }
+  const source = input.aliasSource ?? 'manual';
+  const aliases: ToolProcedureAlias[] = [{
+    intent: input.intent,
+    description: input.description ?? existing?.description,
+    status: 'active',
+    source,
+    firstSeenAt: existing?.choice?.testedAt ?? now,
+    lastSeenAt: now,
+    legacyFilePath: existing?.filePath ?? filePathFor(input.intent),
+  }];
+  for (const aliasInput of input.aliases ?? []) {
+    const aliasIntent = typeof aliasInput === 'string' ? aliasInput : aliasInput.intent;
+    const trimmed = aliasIntent.trim();
+    if (!trimmed || slugifyIntent(trimmed) === slugifyIntent(input.intent)) continue;
+    aliases.push({
+      intent: trimmed,
+      status: typeof aliasInput === 'string' ? 'active' : (aliasInput.status ?? 'active'),
+      source: typeof aliasInput === 'string' ? source : (aliasInput.source ?? source),
+      firstSeenAt: now,
+      lastSeenAt: now,
+    });
+  }
+  const procedure = upsertCanonicalProcedure({
+    identity,
+    choice,
+    aliases,
+    fallbacks: merged,
+    evidence: [{
+      evidenceId: `ev_${randomUUID()}`,
+      at: now,
+      type: 'remember',
+      intent: input.intent,
+      text: input.choice.testEvidence ?? input.description,
+    }],
+    now,
+  });
   const saved = writeRecord({
     intent: input.intent,
     description: input.description ?? existing?.description,
-    choice,
+    // Retain the choice in the legacy alias file for backwards compatibility;
+    // canonical reads overlay it from the procedure file.
+    choice: procedure.choice,
     fallbacks: merged,
     body: input.body ?? existing?.body ?? defaultBodyFor(input.intent, input.description ?? existing?.description),
+    filePath: existing?.filePath,
+    procedureId: identity.procedureId,
+    procedureKey: identity.procedureKey,
+    aliasStatus: 'active',
+    aliases: procedure.aliases,
   });
   emitToolChoiceEvent('remember', input.intent, choice.identifier);
   return saved;
@@ -517,6 +1104,7 @@ export function invalidateToolChoice(
   reason: string,
   opts: { automatic?: boolean } = {},
 ): ToolChoiceRecord | null {
+  ensureCanonicalMigration();
   const existing = parseRecord(filePathFor(intent));
   if (!existing) return null;
   // Idempotent: already invalidated (choice null) → no-op success, no re-emit.
@@ -534,6 +1122,43 @@ export function invalidateToolChoice(
     } as ToolChoiceRecordFallback,
   ];
   const invalidatedIdentifier = existing.choice.identifier;
+  if (existing.procedureId) {
+    const procedure = parseProcedure(procedureFilePath(existing.procedureId));
+    if (procedure?.choice) {
+      const updatedAt = new Date().toISOString();
+      const updatedProcedure = writeProcedure({
+        ...procedure,
+        choice: null,
+        fallbacks: mergeFallbacks(procedure.fallbacks, newFallbacks),
+        evidence: mergeProcedureEvidence(procedure.evidence, [{
+          evidenceId: `ev_${randomUUID()}`,
+          at: updatedAt,
+          type: 'outcome',
+          intent,
+          text: reason,
+        }]),
+        updatedAt,
+      });
+      // Mirror inactivity into every linked legacy alias so a future process
+      // cannot re-promote stale embedded choices during migration.
+      const dir = machineDir();
+      if (existsSync(dir)) {
+        for (const name of readdirSync(dir)) {
+          if (!name.endsWith('.md')) continue;
+          const raw = parseRecordRaw(path.join(dir, name));
+          if (!raw || raw.procedureId !== existing.procedureId) continue;
+          writeRecord({
+            ...raw,
+            choice: null,
+            fallbacks: mergeFallbacks(raw.fallbacks, newFallbacks),
+            filePath: raw.filePath,
+          });
+        }
+      }
+      emitToolChoiceEvent(opts.automatic ? 'auto_invalidate' : 'invalidate', intent, invalidatedIdentifier);
+      return { ...existing, choice: null, fallbacks: updatedProcedure.fallbacks };
+    }
+  }
   const updated = writeRecord({
     intent: existing.intent,
     description: existing.description,
@@ -556,6 +1181,7 @@ export function invalidateToolChoice(
  * north-star recall-hit-rate metric.
  */
 export function peekToolChoice(intent: string): ToolChoiceRecord | null {
+  ensureCanonicalMigration();
   return parseRecord(filePathFor(intent));
 }
 
@@ -571,9 +1197,35 @@ export function peekToolChoice(intent: string): ToolChoiceRecord | null {
  */
 export function deleteToolChoice(intent: string): boolean {
   try {
+    ensureCanonicalMigration();
     const fp = filePathFor(intent);
-    if (!existsSync(fp)) return false;
-    unlinkSync(fp);
+    const raw = parseRecordRaw(fp);
+    let procedureId = raw?.procedureId;
+    let removed = false;
+    if (existsSync(fp)) {
+      unlinkSync(fp);
+      removed = true;
+    }
+    if (!procedureId) {
+      const procedure = listToolProcedures().find((candidate) => candidate.aliases.some(
+        (alias) => slugifyIntent(alias.intent) === slugifyIntent(intent),
+      ));
+      procedureId = procedure?.procedureId;
+    }
+    if (procedureId) {
+      const procedure = parseProcedure(procedureFilePath(procedureId));
+      if (procedure) {
+        const aliases = procedure.aliases.filter((alias) => slugifyIntent(alias.intent) !== slugifyIntent(intent));
+        const hasRoutableAlias = aliases.some((alias) => alias.status === 'active' && alias.source !== 'native_mcp');
+        if (!hasRoutableAlias) {
+          if (existsSync(procedure.filePath)) unlinkSync(procedure.filePath);
+        } else {
+          writeProcedure({ ...procedure, aliases, updatedAt: new Date().toISOString() });
+        }
+        removed = true;
+      }
+    }
+    if (!removed) return false;
     emitToolChoiceEvent('forget', intent);
     return true;
   } catch {
@@ -592,16 +1244,22 @@ export function forgetMatching(pattern: string): string[] {
   if (!needle) return [];
   const needleSlug = slugifyIntent(needle);
   const forgotten: string[] = [];
-  for (const rec of listToolChoices()) {
-    const matches = rec.intent.toLowerCase().includes(needle)
-      || (needleSlug.length > 0 && slugifyIntent(rec.intent).includes(needleSlug));
-    if (matches && deleteToolChoice(rec.intent)) forgotten.push(rec.intent);
+  const intents = new Set<string>();
+  for (const rec of listToolChoiceAliases()) intents.add(rec.intent);
+  for (const procedure of listToolProcedures()) for (const alias of procedure.aliases) intents.add(alias.intent);
+  for (const intent of intents) {
+    const matches = intent.toLowerCase().includes(needle)
+      || (needleSlug.length > 0 && slugifyIntent(intent).includes(needleSlug));
+    if (matches && deleteToolChoice(intent)) forgotten.push(intent);
   }
   return forgotten;
 }
 
-/** List all recorded tool choices on this machine. Test/debug helper. */
-export function listToolChoices(): ToolChoiceRecord[] {
+/** Every historical intent-alias file, including duplicates and inactive rows.
+ * Most production consumers should use listToolChoices(), which projects one
+ * record per canonical procedure. */
+export function listToolChoiceAliases(): ToolChoiceRecord[] {
+  ensureCanonicalMigration();
   const dir = machineDir();
   if (!existsSync(dir)) return [];
   const out: ToolChoiceRecord[] = [];
@@ -611,6 +1269,71 @@ export function listToolChoices(): ToolChoiceRecord[] {
     if (rec) out.push(rec);
   }
   return out;
+}
+
+export function listToolProcedures(): ToolProcedureRecord[] {
+  ensureCanonicalMigration();
+  const dir = procedureMachineDir();
+  if (!existsSync(dir)) return [];
+  const out: ToolProcedureRecord[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.md')) continue;
+    const procedure = parseProcedure(path.join(dir, name));
+    if (procedure) out.push(procedure);
+  }
+  return out;
+}
+
+function preferredProcedureAlias(procedure: ToolProcedureRecord): ToolProcedureAlias | undefined {
+  const rank: Record<ToolProcedureAliasSource, number> = {
+    manual: 0,
+    composio_search: 1,
+    synthetic: 2,
+    migration: 3,
+    native_mcp: 4,
+  };
+  const active = procedure.aliases.filter((alias) => alias.status === 'active');
+  const nonWorkflow = active.filter((alias) => !alias.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
+  return [...(nonWorkflow.length > 0 ? nonWorkflow : active)]
+    .sort((a, b) => rank[a.source] - rank[b.source] || b.lastSeenAt.localeCompare(a.lastSeenAt))[0]
+    ?? procedure.aliases[0];
+}
+
+function projectProcedure(procedure: ToolProcedureRecord): ToolChoiceRecord {
+  const alias = preferredProcedureAlias(procedure);
+  const intent = alias?.intent ?? `${procedure.provider}.${procedure.operationHash}`;
+  const hasActiveAlias = procedure.aliases.some((candidate) => candidate.status === 'active');
+  return {
+    intent,
+    description: alias?.description,
+    // A superseded-only procedure remains inspectable as history but is not an
+    // active retrieval/ranking candidate.
+    choice: hasActiveAlias ? procedure.choice : null,
+    fallbacks: procedure.fallbacks,
+    body: `# Canonical procedure — \`${intent}\`\n`,
+    filePath: procedure.filePath,
+    procedureId: procedure.procedureId,
+    procedureKey: procedure.procedureKey,
+    aliasStatus: alias?.status,
+    aliases: procedure.aliases,
+  };
+}
+
+/** Semantic list: one row per reusable procedure, plus truly inactive legacy
+ * records that have no procedure yet. This is the default for recall, prompts,
+ * graph projection, curation, and workflow binding, so aliases do not inflate
+ * rankings, counts, or prompt space. */
+export function listToolChoices(): ToolChoiceRecord[] {
+  const procedures = listToolProcedures().map(projectProcedure);
+  const linked = new Set(procedures.map((record) => record.procedureId));
+  const inactiveOrphans = listToolChoiceAliases()
+    .filter((record) => !record.procedureId || !linked.has(record.procedureId))
+    .map((record) => (
+      record.aliasStatus === 'quarantined' || record.aliasStatus === 'superseded'
+        ? { ...record, choice: null }
+        : record
+    ));
+  return [...procedures, ...inactiveOrphans];
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -819,9 +1542,19 @@ function identityChoiceTokens(rec: ToolChoiceRecord): Set<string> {
 }
 
 function intentChoiceTokens(rec: ToolChoiceRecord): Set<string> {
-  const raw = tokenize(slugifyIntent(rec.intent));
   const out = new Set<string>();
-  for (const t of raw) if (t.length >= 3 && !STEP_MATCH_STOPWORDS.has(t)) out.add(t);
+  const intents = rec.aliases?.length
+    ? rec.aliases
+      .filter((alias) => alias.status === 'active'
+        && alias.source !== 'native_mcp'
+        && !alias.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX))
+      .map((alias) => alias.intent)
+    : [rec.intent];
+  for (const intent of intents) {
+    for (const t of tokenize(slugifyIntent(intent))) {
+      if (t.length >= 3 && !STEP_MATCH_STOPWORDS.has(t)) out.add(t);
+    }
+  }
   return out;
 }
 
@@ -840,7 +1573,11 @@ function coreChoiceTokens(rec: ToolChoiceRecord): Set<string> {
 /** CONTEXT tokens of a choice: its description words, minus generics. Used to
  *  raise confidence but never sufficient alone to anchor a match. */
 function contextChoiceTokens(rec: ToolChoiceRecord): Set<string> {
-  const raw = wordTokens(rec.description ?? '');
+  const aliasContext = rec.aliases
+    ?.filter((alias) => alias.status === 'active' && alias.source === 'native_mcp')
+    .map((alias) => alias.intent)
+    .join(' ') ?? '';
+  const raw = wordTokens(`${rec.description ?? ''} ${aliasContext}`);
   const out = new Set<string>();
   for (const t of raw) if (t.length >= 3 && !STEP_MATCH_GENERIC_TOKENS.has(t)) out.add(t);
   return out;
@@ -850,6 +1587,7 @@ export type StepToolChoiceTier = 'high' | 'medium';
 
 export interface StepToolChoiceMatch {
   intent: string;
+  procedureId?: string;
   kind: ToolChoiceKind;
   identifier: string;
   invocationTemplate?: string;
@@ -979,6 +1717,7 @@ export function matchToolChoicesForStep(
 
     out.push({
       intent: rec.intent,
+      procedureId: rec.procedureId,
       kind: rec.choice.kind,
       identifier: rec.choice.identifier,
       invocationTemplate: rec.choice.invocationTemplate,
@@ -1015,6 +1754,8 @@ export interface RememberedComposioMatch {
    *  fragment for the slug agrees. Dropped (undefined) on disagreement so the
    *  consumer treats it as ambiguous → ASK rather than picking a stale mailbox. */
   accountIdentity?: string;
+  /** Exact canonical procedure selected by memory. */
+  procedureId?: string;
 }
 
 /**
@@ -1052,7 +1793,13 @@ export function recallComposioForSearch(
   }
   const outcomesOn = isProceduralOutcomesEnabled();
 
-  type Agg = { best: RememberedComposioMatch; totalSuccess: number; bestMatched: number; identities: Set<string> };
+  type Agg = {
+    best: RememberedComposioMatch;
+    totalSuccess: number;
+    bestMatched: number;
+    identities: Set<string>;
+    procedureIds: Set<string>;
+  };
   const bySlug = new Map<string, Agg>();
   for (const rec of records) {
     const c = rec.choice;
@@ -1061,14 +1808,26 @@ export function recallComposioForSearch(
     // Never short-circuit onto a net-negative (broken) remembered path.
     if (outcomesOn && computeChoiceScore(c) < TOOL_CHOICE_SCORE_FLOOR) continue;
 
-    // Distinctive tokens live in the INTENT (the search query it was learned from),
-    // not the slug. Drop generic verbs/stopwords so a shared "search"/"get" can't anchor.
-    const choiceTokens = new Set<string>();
-    for (const t of wordTokens(rec.intent)) {
-      if (t.length >= 3 && !STEP_MATCH_GENERIC_TOKENS.has(t)) choiceTokens.add(t);
+    // Distinctive tokens live in intent ALIASES (the search phrasings), not the
+    // slug. Score every alias but count the canonical procedure only once.
+    const aliasIntents = rec.aliases?.length
+      ? rec.aliases
+        .filter((alias) => alias.status === 'active' && !alias.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX))
+        .map((alias) => alias.intent)
+      : [rec.intent];
+    let bestAliasIntent = rec.intent;
+    let matched: string[] = [];
+    for (const aliasIntent of aliasIntents) {
+      const choiceTokens = new Set<string>();
+      for (const t of wordTokens(aliasIntent)) {
+        if (t.length >= 3 && !STEP_MATCH_GENERIC_TOKENS.has(t)) choiceTokens.add(t);
+      }
+      const aliasMatched = [...choiceTokens].filter((t) => q.has(t));
+      if (aliasMatched.length > matched.length) {
+        matched = aliasMatched;
+        bestAliasIntent = aliasIntent;
+      }
     }
-    if (choiceTokens.size === 0) continue;
-    const matched = [...choiceTokens].filter((t) => q.has(t));
     if (matched.length === 0) continue;
     const hasStrong = matched.some((t) => !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
     const toolkit = c.identifier.split('_')[0]?.toLowerCase() ?? '';
@@ -1080,10 +1839,11 @@ export function recallComposioForSearch(
     const successCount = (c.successCount ?? 0);
     const cand: RememberedComposioMatch = {
       slug: c.identifier,
-      intent: rec.intent,
+      intent: bestAliasIntent,
       invocationTemplate: c.invocationTemplate,
       successCount,
       matched,
+      procedureId: rec.procedureId,
     };
     const prev = bySlug.get(c.identifier);
     if (!prev) {
@@ -1092,11 +1852,13 @@ export function recallComposioForSearch(
         totalSuccess: successCount,
         bestMatched: matched.length,
         identities: new Set(c.accountIdentity ? [c.accountIdentity] : []),
+        procedureIds: new Set(rec.procedureId ? [rec.procedureId] : []),
       });
     } else {
       prev.totalSuccess += successCount;
       if (matched.length > prev.bestMatched) { prev.best = cand; prev.bestMatched = matched.length; }
       if (c.accountIdentity) prev.identities.add(c.accountIdentity);
+      if (rec.procedureId) prev.procedureIds.add(rec.procedureId);
     }
   }
 
@@ -1106,6 +1868,7 @@ export function recallComposioForSearch(
     ...a.best,
     successCount: a.totalSuccess,
     accountIdentity: a.identities.size === 1 ? [...a.identities][0] : undefined,
+    procedureId: a.procedureIds.size === 1 ? [...a.procedureIds][0] : undefined,
   }));
   results.sort((x, y) => (y.matched.length - x.matched.length) || (y.successCount - x.successCount));
   return results.slice(0, opts.limit ?? 3);
@@ -1256,19 +2019,45 @@ function applyOutcome(choice: ToolChoiceRecordChoice, outcome: ProceduralOutcome
   return next;
 }
 
-function recordOutcomeOn(rec: ToolChoiceRecord, outcome: ProceduralOutcome): ToolChoiceRecord | null {
-  if (!rec.choice) return null;
+function mirrorProcedureToLegacyAliases(procedure: ToolProcedureRecord): void {
+  const dir = machineDir();
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.md')) continue;
+    const raw = parseRecordRaw(path.join(dir, name));
+    if (!raw || raw.procedureId !== procedure.procedureId) continue;
+    writeRecord({
+      ...raw,
+      choice: procedure.choice,
+      fallbacks: mergeFallbacks(raw.fallbacks, procedure.fallbacks),
+      filePath: raw.filePath,
+    });
+  }
+}
+
+function recordOutcomeOnProcedure(
+  procedure: ToolProcedureRecord,
+  outcome: ProceduralOutcome,
+  intent?: string,
+): ToolProcedureRecord | null {
+  if (!procedure.choice) return null;
   const now = new Date().toISOString();
-  const nextChoice = applyOutcome(rec.choice, outcome, now);
-  const saved = writeRecord({
-    intent: rec.intent,
-    description: rec.description,
+  const nextChoice = applyOutcome(procedure.choice, outcome, now);
+  const saved = writeProcedure({
+    ...procedure,
     choice: nextChoice,
-    fallbacks: rec.fallbacks,
-    body: rec.body,
-    filePath: rec.filePath,
+    evidence: mergeProcedureEvidence(procedure.evidence, [{
+      evidenceId: `ev_${randomUUID()}`,
+      at: now,
+      type: 'outcome',
+      intent,
+      text: outcome,
+    }]),
+    updatedAt: now,
   });
-  emitToolChoiceEvent(outcome === 'failure' || outcome === 'rejected' ? 'outcome_neg' : 'outcome_pos', rec.intent, nextChoice.identifier);
+  mirrorProcedureToLegacyAliases(saved);
+  const eventIntent = intent ?? preferredProcedureAlias(saved)?.intent ?? saved.procedureId;
+  emitToolChoiceEvent(outcome === 'failure' || outcome === 'rejected' ? 'outcome_neg' : 'outcome_pos', eventIntent, nextChoice.identifier);
 
   // Auto-invalidate a path that's failing repeatedly with no later win, so the
   // next run rediscovers instead of re-treading a broken procedure.
@@ -1278,14 +2067,136 @@ function recordOutcomeOn(rec: ToolChoiceRecord, outcome: ProceduralOutcome): Too
       ? nextChoice.lastSuccessAt > nextChoice.lastFailureAt
       : Boolean(nextChoice.lastSuccessAt);
     if (failures >= AUTO_INVALIDATE_FAILURE_STREAK && !winAfterLoss) {
-      return invalidateToolChoice(
-        rec.intent,
-        `auto-invalidated after ${failures} failures with no later success`,
+      const aliasIntent = preferredProcedureAlias(saved)?.intent;
+      const reason = `auto-invalidated after ${failures} failures with no later success`;
+      const invalidated = aliasIntent ? invalidateToolChoice(
+        aliasIntent,
+        reason,
         { automatic: true },
-      ) ?? saved;
+      ) : null;
+      if (invalidated) return parseProcedure(saved.filePath) ?? saved;
+      // Synthetic-only canonical aliases have no legacy file to invalidate by
+      // intent. Retire the physical procedure directly and retain the fallback.
+      const fallback: ToolChoiceRecordFallback = {
+        kind: nextChoice.kind,
+        identifier: nextChoice.identifier,
+        failedAt: now,
+        reason,
+      };
+      const retired = writeProcedure({
+        ...saved,
+        choice: null,
+        fallbacks: mergeFallbacks(saved.fallbacks, [fallback]),
+        updatedAt: now,
+      });
+      mirrorProcedureToLegacyAliases(retired);
+      emitToolChoiceEvent('auto_invalidate', eventIntent, nextChoice.identifier);
+      return retired;
     }
   }
   return saved;
+}
+
+export function updateToolProcedureOutcome(
+  procedureId: string,
+  outcome: ProceduralOutcome,
+  intent?: string,
+): ToolProcedureRecord | null {
+  if (!isProceduralOutcomesEnabled() || !procedureId) return null;
+  ensureCanonicalMigration();
+  const procedure = parseProcedure(procedureFilePath(procedureId));
+  if (!procedure?.choice) return null;
+  return recordOutcomeOnProcedure(procedure, outcome, intent);
+}
+
+/** Record exposure separately from usefulness. This field is intentionally not
+ * consumed by computeChoiceScore or any ranking path. */
+export function recordToolProcedureImpression(procedureId: string): ToolProcedureRecord | null {
+  if (!procedureId) return null;
+  ensureCanonicalMigration();
+  const procedure = parseProcedure(procedureFilePath(procedureId));
+  if (!procedure) return null;
+  const now = new Date().toISOString();
+  return writeProcedure({
+    ...procedure,
+    impressionCount: procedure.impressionCount + 1,
+    lastImpressedAt: now,
+    updatedAt: now,
+  });
+}
+
+interface PendingToolProcedureUse {
+  useId: string;
+  procedureId: string;
+  intent: string;
+  sessionId?: string;
+  createdAtMs: number;
+}
+
+const pendingProcedureUses = new Map<string, PendingToolProcedureUse>();
+const PROCEDURE_USE_TTL_MS = 10 * 60 * 1000;
+const MAX_PENDING_PROCEDURE_USES = 1_000;
+
+function pruneProcedureUses(nowMs = Date.now()): void {
+  for (const [useId, use] of pendingProcedureUses) {
+    if (nowMs - use.createdAtMs > PROCEDURE_USE_TTL_MS) pendingProcedureUses.delete(useId);
+  }
+  while (pendingProcedureUses.size > MAX_PENDING_PROCEDURE_USES) {
+    const oldest = pendingProcedureUses.keys().next().value as string | undefined;
+    if (!oldest) break;
+    pendingProcedureUses.delete(oldest);
+  }
+}
+
+/** Create a one-shot attribution handle for the exact procedure selected by
+ * recall. Completing the handle credits only that procedure. */
+export function beginToolProcedureUse(
+  intent: string,
+  sessionId?: string,
+): { useId: string; procedureId: string } | null {
+  ensureCanonicalMigration();
+  const record = peekToolChoice(intent) ?? recallToolChoice(intent);
+  if (!record?.choice || !record.procedureId) return null;
+  return beginToolProcedureUseById(record.procedureId, record.intent, sessionId);
+}
+
+export function beginToolProcedureUseById(
+  procedureId: string,
+  intent: string,
+  sessionId?: string,
+): { useId: string; procedureId: string } | null {
+  ensureCanonicalMigration();
+  const procedure = parseProcedure(procedureFilePath(procedureId));
+  if (!procedure?.choice) return null;
+  pruneProcedureUses();
+  const use: PendingToolProcedureUse = {
+    useId: `tpu_${randomUUID()}`,
+    procedureId,
+    intent,
+    sessionId,
+    createdAtMs: Date.now(),
+  };
+  pendingProcedureUses.set(use.useId, use);
+  return { useId: use.useId, procedureId: use.procedureId };
+}
+
+export function completeToolProcedureUse(
+  useId: string,
+  outcome: ProceduralOutcome,
+): ToolProcedureRecord | null {
+  pruneProcedureUses();
+  const use = pendingProcedureUses.get(useId);
+  if (!use) return null;
+  pendingProcedureUses.delete(useId);
+  return updateToolProcedureOutcome(use.procedureId, outcome, use.intent);
+}
+
+export function cancelToolProcedureUse(useId: string): boolean {
+  return pendingProcedureUses.delete(useId);
+}
+
+export function _resetToolProcedureUsesForTests(): void {
+  pendingProcedureUses.clear();
 }
 
 /**
@@ -1294,27 +2205,43 @@ function recordOutcomeOn(rec: ToolChoiceRecord, outcome: ProceduralOutcome): Too
  */
 export function updateToolChoiceOutcome(intent: string, outcome: ProceduralOutcome): ToolChoiceRecord | null {
   if (!isProceduralOutcomesEnabled()) return null;
+  ensureCanonicalMigration();
   const existing = parseRecord(filePathFor(intent));
   if (!existing || !existing.choice) return null;
-  return recordOutcomeOn(existing, outcome);
+  if (existing.procedureId) {
+    const updated = updateToolProcedureOutcome(existing.procedureId, outcome, existing.intent);
+    return updated ? projectProcedure(updated) : null;
+  }
+  return null;
 }
 
 /**
- * Record an outcome against every active choice whose identifier matches (e.g.
- * a Composio slug). The composio execute path knows the slug on every call —
- * regardless of whether a search preceded it — so this is the primary loop-
- * closing seam. Returns the number of choice records updated.
+ * Resolve an execution identifier only when it maps to ONE canonical procedure.
+ * Account/operation ambiguity returns null rather than broadcasting credit.
  */
+export function resolveToolProcedureForIdentifier(
+  identifier: string,
+  opts: { kind?: ToolChoiceKind; accountIdentity?: string } = {},
+): ToolProcedureRecord | null {
+  if (!identifier) return null;
+  const account = parseAccountIdentity(opts.accountIdentity);
+  const candidates = listToolProcedures().filter((procedure) => {
+    const choice = procedure.choice;
+    if (!choice || choice.identifier !== identifier) return false;
+    if (opts.kind && choice.kind !== opts.kind) return false;
+    if (account && choice.accountIdentity !== account) return false;
+    return procedure.aliases.some((alias) => alias.status === 'active');
+  });
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+/** Compatibility seam for callers that only know an identifier. It now credits
+ * at most one unambiguous canonical procedure instead of every intent alias. */
 export function updateToolChoiceOutcomeForIdentifier(identifier: string, outcome: ProceduralOutcome): number {
   if (!isProceduralOutcomesEnabled()) return 0;
-  if (!identifier) return 0;
-  let updated = 0;
-  for (const rec of listToolChoices()) {
-    if (rec.choice && rec.choice.identifier === identifier) {
-      if (recordOutcomeOn(rec, outcome)) updated += 1;
-    }
-  }
-  return updated;
+  const procedure = resolveToolProcedureForIdentifier(identifier);
+  if (!procedure) return 0;
+  return recordOutcomeOnProcedure(procedure, outcome) ? 1 : 0;
 }
 
 /**
