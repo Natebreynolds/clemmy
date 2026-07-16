@@ -32,12 +32,12 @@ test('a clean Workspace emits zero questions (byte-identical save)', () => {
   assert.equal(renderSpaceGapQuestions(gaps), '');
 });
 
-test('view that never fetches /data → a question', () => {
+test('view that never consumes its data (no bridge, no fetch, no embed) → a question', () => {
   const gaps = analyzeSpaceGaps(
     rec({ dataSources: [{ id: 'contacts', runner: 'r.mjs' }] }),
     '<html><body>static, no fetch</body></html>',
   );
-  assert.ok(gaps.some((g) => /never calls GET …\/data|never calls GET .*\/data/.test(g.question)));
+  assert.ok(gaps.some((g) => g.question.includes('never reads them')));
 });
 
 test('view that never references a declared source → a question (the nesting class)', () => {
@@ -110,4 +110,25 @@ test('C1: an action the view never wires → a question', () => {
     "<html><script>fetch('/api/console/spaces/x/data').then(r=>r.json()).then(j=>render(j.data.contacts));</script></html>",
   );
   assert.ok(gaps.some((g) => /never fires one|never references "send_email"/.test(g.question)));
+});
+
+test('check 1 is GENEROUS: every legitimate consumption pattern passes (workspaces are unlimited)', () => {
+  const record = { dataSources: [{ id: 'pipeline' }], actions: [] } as never;
+  const shapes: Array<[string, string]> = [
+    ['clem bridge data()', '<script>async function load(){ const d = await clem.data(); render(d.pipeline); }</script>'],
+    ['clem bridge refresh()', '<script>document.getElementById("r").onclick = () => clem.refresh("pipeline");</script>'],
+    ['hand-rolled /data fetch', '<script>fetch("/api/console/spaces/x/data").then(r=>r.json()).then(d=>render(d.pipeline));</script>'],
+    ['inlined JSON dataset', '<script type="application/json" id="dataset">{"pipeline":[]}</script><script>render(JSON.parse(document.getElementById("dataset").textContent).pipeline)</script>'],
+    ['embedded window seed', '<script>window.__PIPELINE_DATA = {"pipeline":[]}; render(window.__PIPELINE_DATA.pipeline);</script>'],
+  ];
+  for (const [label, html] of shapes) {
+    const gaps = analyzeSpaceGaps(record, `<html><body>${html}</body></html>`, []);
+    assert.ok(!gaps.some((g) => g.question.includes('never reads them')), `${label} must not trip check 1`);
+  }
+});
+
+test('check 1 still fires on a view that demonstrably consumes nothing', () => {
+  const record = { dataSources: [{ id: 'pipeline' }], actions: [] } as never;
+  const gaps = analyzeSpaceGaps(record, '<html><body><h1>pipeline dashboard</h1><script>document.title="x";</script></body></html>', []);
+  assert.ok(gaps.some((g) => g.question.includes('never reads them')), 'a truly data-blind view is still flagged');
 });

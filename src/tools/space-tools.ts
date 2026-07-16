@@ -450,7 +450,24 @@ export function registerSpaceTools(server: McpServer): void {
       spaceStore.recordRevision(slug); // snapshot the prior view + bump version (revertible)
       writeFileSync(viewFile, html, 'utf-8');
       const after = spaceStore.get(slug);
-      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" view (now v${after?.version}). The open Workspace auto-refreshes — no need to space_save.${detail}`);
+      // Re-run the gap test on EVERY edit and record the fresh verdict — the
+      // gap note is what the desktop banner renders, and before this it was
+      // only ever re-evaluated by space_save. A model that fixed the view with
+      // this tool (the recommended one!) left a STALE note as the newest — the
+      // banner could never clear and models re-"fixed" working views for hours
+      // (2026-07-16 james-english-pipeline incident). Advisory only; a note
+      // failure never fails the edit.
+      let gapNote = '';
+      try {
+        const gaps = analyzeSpaceGaps(after ?? rec, html, []);
+        appendNote(slug, {
+          text: gaps.length > 0 ? `Gap test flagged ${gaps.length} item${gaps.length === 1 ? '' : 's'} to confirm.` : 'Gap test: clean.',
+          kind: 'gap',
+          meta: { gaps: gaps.map((g) => ({ question: g.question, why: g.why })) },
+        });
+        gapNote = gaps.length > 0 ? renderSpaceGapQuestions(gaps) : '\n\nGap test: clean — the confirm banner clears on next load.';
+      } catch { /* the verdict is best-effort; the edit already landed */ }
+      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" view (now v${after?.version}). The open Workspace auto-refreshes — no need to space_save.${detail}${gapNote}`);
     },
   );
 
