@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer } from '@openai/agents';
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR, getRuntimeEnv } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
@@ -79,10 +79,23 @@ function stdioLaunchEnv(server: ManagedMcpServer): Record<string, string> {
   if (!server.command || !isNpxCommand(server.command)) return env;
   if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return env;
 
+  const ownedCacheDir = mcpNpxCacheDir(server.name);
   const cacheDir = explicitServerEnvValue(server, ['npm_config_cache', 'NPM_CONFIG_CACHE'])
-    ?? mcpNpxCacheDir(server.name);
+    ?? ownedCacheDir;
   try {
     mkdirSync(cacheDir, { recursive: true });
+    // Runtime hygiene can safely age out caches for removed/disabled servers
+    // only if it knows when npx last used them. Active configured servers are
+    // always preserved; this marker protects recently disabled ones too. Only
+    // stamp Clementine-owned cache dirs — an operator-specified external npm
+    // cache is never reaped, so the marker there would be pure pollution.
+    if (cacheDir === ownedCacheDir) {
+      writeFileSync(
+        path.join(cacheDir, '.last-used.json'),
+        JSON.stringify({ at: new Date().toISOString(), server: server.name }),
+        'utf8',
+      );
+    }
   } catch {
     // npm will report the real launch failure if the cache path is unusable.
   }

@@ -4,7 +4,7 @@
  * Scoped external MCP bases: a named scope must not construct the all-external
  * base first and filter afterward, because that cold-starts unrelated servers.
  */
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
@@ -314,6 +314,9 @@ test('npx stdio external servers launch with isolated npm cache defaults', () =>
   assert.equal(dataforseo.env.npm_config_yes, 'true');
   assert.equal(existsSync(dataforseo.env.npm_config_cache), true);
   assert.equal(existsSync(supabase.env.npm_config_cache), true);
+  const marker = JSON.parse(readFileSync(path.join(dataforseo.env.npm_config_cache, '.last-used.json'), 'utf8')) as { server: string; at: string };
+  assert.equal(marker.server, 'dataforseo');
+  assert.ok(Number.isFinite(Date.parse(marker.at)), 'cache last-used marker is timestamped for safe retention');
   assert.notEqual(direct.env.npm_config_cache, dataforseo.env.npm_config_cache);
   assert.notEqual(direct.env.npm_config_cache, supabase.env.npm_config_cache);
 });

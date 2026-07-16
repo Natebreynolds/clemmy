@@ -47,6 +47,8 @@ import { backfillTemporalEvidence, reapExpiredPendingReflections } from './tempo
 import { reapExpiredUnusedRecallRuns } from './recall-usage.js';
 import { drainDurableConsolidationCandidates } from './durable-consolidation.js';
 import { reconcileKnownPendingCandidates } from './candidate-review.js';
+import { reapDisposableRuntimeArtifacts } from '../runtime/storage-hygiene.js';
+import { discoverMcpServers } from '../runtime/mcp-config.js';
 import {
   backfillLegacyReflectionCandidates,
   countLegacyReflectionCandidateBatches,
@@ -145,6 +147,7 @@ interface MemoryMaintenanceState {
   lastGoalReapDay?: string;
   lastTaskLedgerHygieneDay?: string;
   lastNotificationReapDay?: string;
+  lastStorageHygieneDay?: string;
   lastCuratorReportDay?: string;
 }
 const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
@@ -227,6 +230,11 @@ const TASK_LEDGER_HYGIENE_DAILY_MINUTE = 55;
 // offset from the goal reaper's 5:00.
 const NOTIFICATION_REAP_NIGHTLY_HOUR = 5;
 const NOTIFICATION_REAP_NIGHTLY_MINUTE = 15;
+
+// Rebuildable runtime caches + bounded diagnostics only. Canonical/user state
+// is outside this policy. Runs after notification hygiene, before the curator.
+const STORAGE_HYGIENE_NIGHTLY_HOUR = 5;
+const STORAGE_HYGIENE_NIGHTLY_MINUTE = 20;
 
 // Report-only curator. Reads memory/skills/workflows/procedural tool choices and
 // writes a daily drift report; it never mutates those stores.
@@ -972,6 +980,34 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'check-in reaper nightly job failed');
+      }
+    }
+  }
+
+  // Global storage hygiene follows notification cleanup. It is deliberately
+  // limited to rebuildable caches and aged diagnostics: canonical memory,
+  // recordings, attachments, conversations, workflows, and outputs are never
+  // candidates. Persisted daily dedupe prevents repeated filesystem walks.
+  if (isAtOrAfterDailyTime(now, STORAGE_HYGIENE_NIGHTLY_HOUR, STORAGE_HYGIENE_NIGHTLY_MINUTE)) {
+    const enabled = !/^(0|false|off|no)$/i.test(
+      (getRuntimeEnv('CLEMMY_STORAGE_HYGIENE', 'on') || 'on').trim(),
+    );
+    if (enabled && maintenanceState.lastStorageHygieneDay !== today) {
+      maintenanceState.lastStorageHygieneDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const activeMcpServerNames = discoverMcpServers()
+          .filter((server) => server.enabled)
+          .map((server) => server.name);
+        const stats = reapDisposableRuntimeArtifacts({ activeMcpServerNames });
+        if (stats.removed > 0) {
+          logger.info(
+            { removed: stats.removed, bytesFreed: stats.bytesFreed, byKind: stats.byKind },
+            'disposable runtime storage hygiene completed',
+          );
+        }
+      } catch (err) {
+        logger.warn({ err }, 'disposable runtime storage hygiene failed');
       }
     }
   }
