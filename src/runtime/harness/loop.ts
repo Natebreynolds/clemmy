@@ -86,6 +86,14 @@ import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/se
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { autoCreditRecallRuns, extractFunctionCallArgTexts } from '../../memory/recall-auto-credit.js';
+import {
+  budgetLine,
+  checkRunTokenWindow,
+  formatTokens,
+  openRunTokenWindow,
+  resolveRunTokenCeiling,
+  runTokenBudgetEnforcementEnabled,
+} from './run-token-budget.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -953,6 +961,15 @@ export interface RunConversationOptions {
    */
   falloverModelIds?: string[];
   rebuildAgentForBrain?: (modelId: string) => Promise<Agent<any, any>>;
+  /** Stage 4 — aggregate run token budget. Explicit ceiling override in
+   *  UNCACHED tokens (0 = unlimited); absent ⇒ preset/env default. */
+  maxRunTokens?: number;
+  /** Stage 4 — durable window baseline captured by the caller (the background
+   *  drain passes the counter value at its iteration start so the budget
+   *  aggregates across the whole auto-continue chain); absent ⇒ the loop
+   *  self-baselines at entry (fresh window per user turn — a long-lived chat
+   *  session never parks on its own history). */
+  runTokenBaseline?: number;
 }
 
 export interface RunConversationResult {
@@ -966,6 +983,10 @@ export interface RunConversationResult {
    *  exhausted / stall give-up) — the respond bridge uses it to re-run the
    *  turn ONCE on the next brain instead of shipping the apology. */
   completedReason?: 'no_structured_output' | 'sub_agent_stalled';
+  /** Which ceiling produced a 'limit_exceeded' status — the bridge maps
+   *  'token_budget' to its own distinct stoppedReason so the background
+   *  drain parks instead of misclassifying the run (Stage 4). */
+  limitKind?: 'wall_clock' | 'max_steps' | 'token_budget';
 }
 
 function positiveIntEnv(key: string, fallback: number): number {
@@ -1721,6 +1742,16 @@ async function runConversationCore(
   let checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
   let lastCheckInAt = startedAt;
+  // Stage 4 — aggregate run token budget: window opened at loop entry (or at
+  // the caller's durable baseline), checked at the same boundary the
+  // wall-clock uses. Enforcement is kill-switched; independent of maxSteps,
+  // so autoContinueOnLimit's 1,000,000-step lift cannot bypass it.
+  const tokenBudgetOn = runTokenBudgetEnforcementEnabled();
+  const tokenWindow = openRunTokenWindow({
+    sessionId: options.sessionId,
+    ceiling: resolveRunTokenCeiling({ override: options.maxRunTokens, budget }),
+    baseline: options.runTokenBaseline,
+  });
 
   // A parked self-driving goal stops self-resumption; any turn that reaches
   // here is external re-engagement (a user reply or an outcome relay), which
@@ -3252,8 +3283,10 @@ async function runConversationCore(
     }
 
     // Wall-clock check before we kick off another turn.
+    const tokenStatus = tokenBudgetOn ? checkRunTokenWindow(tokenWindow) : null;
     if (Date.now() - lastCheckInAt >= checkInMs) {
       lastCheckInAt = Date.now();
+      const budgetNote = tokenStatus ? budgetLine(tokenStatus) : null;
       safeAppend({
         sessionId: options.sessionId,
         turn: lastTurn,
@@ -3265,7 +3298,27 @@ async function runConversationCore(
           preset: budget.preset,
           unlimited: budget.unlimited,
           summary: lastDecision?.summary ?? null,
-          message: `Still working (${stepIndex} step${stepIndex === 1 ? '' : 's'} completed).`,
+          ...(tokenStatus && tokenStatus.ceiling > 0
+            ? { tokensUsedWindow: tokenStatus.usedWindow, tokenCeiling: tokenStatus.ceiling, budgetFraction: tokenStatus.fraction }
+            : {}),
+          message: `Still working (${stepIndex} step${stepIndex === 1 ? '' : 's'} completed${budgetNote ? `; ${budgetNote}` : ''}).`,
+        },
+      });
+    }
+    // Single-shot 50%/80% budget warnings — the "no silent ceiling" guarantee:
+    // a budget park is always preceded by a durable warning event.
+    if (tokenStatus?.crossedThreshold) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'heartbeat',
+        data: {
+          kind: 'budget_threshold',
+          threshold: tokenStatus.crossedThreshold,
+          tokensUsedWindow: tokenStatus.usedWindow,
+          tokensUsedLifetime: tokenStatus.usedLifetime,
+          tokenCeiling: tokenStatus.ceiling,
         },
       });
     }
@@ -3282,6 +3335,34 @@ async function runConversationCore(
       return {
         sessionId: options.sessionId,
         status: 'limit_exceeded',
+        limitKind: 'wall_clock',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    // Stage 4 — aggregate run token budget: checked AFTER wall-clock (a dual
+    // breach reports wall_clock exactly as today; zero behavior change when
+    // the budget is off or unlimited). Same honest-park template.
+    if (tokenStatus?.exceeded) {
+      emitLimitExceededWithContinuePrompt({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        reason: 'token_budget',
+        limitDetail: {
+          tokensUsedWindow: tokenStatus.usedWindow,
+          tokensUsedLifetime: tokenStatus.usedLifetime,
+          tokenCeiling: tokenStatus.ceiling,
+          baseline: tokenWindow.baseline,
+        },
+        lastDecision: decision ?? lastDecision,
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'limit_exceeded',
+        limitKind: 'token_budget',
         steps: stepIndex,
         lastDecision: decision,
         lastTurn,
@@ -3408,6 +3489,7 @@ async function runConversationCore(
   return {
     sessionId: options.sessionId,
     status: 'limit_exceeded',
+    limitKind: 'max_steps',
     steps: stepIndex,
     lastDecision,
     lastTurn,
@@ -3437,7 +3519,7 @@ function emitLimitExceededWithContinuePrompt(opts: {
   sessionId: string;
   turn: number;
   steps: number;
-  reason: 'wall_clock' | 'max_steps';
+  reason: 'wall_clock' | 'max_steps' | 'token_budget';
   limitDetail: Record<string, unknown>;
   lastDecision: OrchestratorDecisionShape | undefined;
 }): void {
@@ -3451,8 +3533,11 @@ function emitLimitExceededWithContinuePrompt(opts: {
 
   const continueReply = opts.reason === 'wall_clock'
     ? `I hit the time budget on this conversation after ${opts.steps} step${opts.steps === 1 ? '' : 's'} and there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`
-    : `I've been working on this for ${opts.steps} step${opts.steps === 1 ? '' : 's'} and hit the step budget — there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`;
-  const internalSummary = `Hit ${opts.reason === 'wall_clock' ? 'wall-clock' : 'max-steps'} limit at step ${opts.steps}; offered the user a \`continue\` prompt instead of silently failing.`;
+    : opts.reason === 'token_budget'
+      ? `This run has used its token budget (${formatTokens(Number(opts.limitDetail.tokensUsedWindow ?? 0))} of ${formatTokens(Number(opts.limitDetail.tokenCeiling ?? 0))}) after ${opts.steps} step${opts.steps === 1 ? '' : 's'}, with more to do. Reply \`continue\` to authorize another budget window, or break it into a smaller piece.`
+      : `I've been working on this for ${opts.steps} step${opts.steps === 1 ? '' : 's'} and hit the step budget — there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`;
+  const limitLabel = opts.reason === 'wall_clock' ? 'wall-clock' : opts.reason === 'token_budget' ? 'run token budget' : 'max-steps';
+  const internalSummary = `Hit ${limitLabel} limit at step ${opts.steps}; offered the user a \`continue\` prompt instead of silently failing.`;
   safeAppend({
     sessionId: opts.sessionId,
     turn: opts.turn,
@@ -5024,6 +5109,13 @@ async function runConversationFromResumeCore(opts: {
   const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
   let lastCheckInAt = startedAt;
+  // Stage 4 — resume-path twin of the primary loop's token-budget window
+  // (self-baselined: an approval resume is a fresh user-consented window).
+  const tokenBudgetOn = runTokenBudgetEnforcementEnabled();
+  const tokenWindow = openRunTokenWindow({
+    sessionId: opts.sessionId,
+    ceiling: resolveRunTokenCeiling({ budget }),
+  });
 
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
@@ -5309,8 +5401,10 @@ async function runConversationFromResumeCore(opts: {
         lastTurn,
       };
     }
+    const tokenStatus = tokenBudgetOn ? checkRunTokenWindow(tokenWindow) : null;
     if (Date.now() - lastCheckInAt >= checkInMs) {
       lastCheckInAt = Date.now();
+      const budgetNote = tokenStatus ? budgetLine(tokenStatus) : null;
       safeAppend({
         sessionId: opts.sessionId,
         turn: lastTurn,
@@ -5322,7 +5416,10 @@ async function runConversationFromResumeCore(opts: {
           preset: budget.preset,
           unlimited: budget.unlimited,
           summary: lastDecision?.summary ?? null,
-          message: `Still working (${stepIndex} step${stepIndex === 1 ? '' : 's'} completed).`,
+          ...(tokenStatus && tokenStatus.ceiling > 0
+            ? { tokensUsedWindow: tokenStatus.usedWindow, tokenCeiling: tokenStatus.ceiling, budgetFraction: tokenStatus.fraction }
+            : {}),
+          message: `Still working (${stepIndex} step${stepIndex === 1 ? '' : 's'} completed${budgetNote ? `; ${budgetNote}` : ''}).`,
         },
       });
     }
@@ -5345,6 +5442,33 @@ async function runConversationFromResumeCore(opts: {
       return {
         sessionId: opts.sessionId,
         status: 'limit_exceeded',
+        limitKind: 'wall_clock',
+        steps: stepIndex,
+        lastDecision: decision,
+        lastTurn,
+      };
+    }
+
+    // Stage 4 — token-budget twin (after wall-clock, same precedence as the
+    // primary loop; same paired-event park template).
+    if (tokenStatus?.exceeded) {
+      emitLimitExceededWithContinuePrompt({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        steps: stepIndex,
+        reason: 'token_budget',
+        limitDetail: {
+          tokensUsedWindow: tokenStatus.usedWindow,
+          tokensUsedLifetime: tokenStatus.usedLifetime,
+          tokenCeiling: tokenStatus.ceiling,
+          baseline: tokenWindow.baseline,
+        },
+        lastDecision: decision,
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'limit_exceeded',
+        limitKind: 'token_budget',
         steps: stepIndex,
         lastDecision: decision,
         lastTurn,
@@ -5490,6 +5614,7 @@ async function runConversationFromResumeCore(opts: {
   return {
     sessionId: opts.sessionId,
     status: 'limit_exceeded',
+    limitKind: 'max_steps',
     steps: stepIndex,
     lastDecision,
     lastTurn,

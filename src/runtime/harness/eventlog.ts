@@ -845,9 +845,16 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
     metadata: patch.metadata ?? current.metadata,
     updatedAt: nowIso(),
   };
+  // Stage 4: tokens_used is a CONCURRENT counter written by
+  // accrueSessionTokens on every model completion. A read-modify-write here
+  // (status/title patches racing worker increments) would write back a stale
+  // snapshot and silently erase spend — so the blanket UPDATE never touches
+  // it; only an explicit patch.tokensUsed does.
+  const patchesTokensUsed = Object.prototype.hasOwnProperty.call(patch, 'tokensUsed');
   db.prepare(
     `UPDATE sessions SET
-       status = ?, title = ?, objective = ?, token_budget = ?, tokens_used = ?,
+       status = ?, title = ?, objective = ?, token_budget = ?,
+       tokens_used = CASE WHEN ? THEN ? ELSE tokens_used END,
        current_plan_id = ?, metadata_json = ?, updated_at = ?
      WHERE id = ?`,
   ).run(
@@ -855,13 +862,57 @@ export function updateSession(sessionId: string, patch: SessionPatch): SessionRo
     next.title,
     next.objective,
     next.tokenBudget,
+    patchesTokensUsed ? 1 : 0,
     next.tokensUsed,
     next.currentPlanId,
     JSON.stringify(next.metadata),
     next.updatedAt,
     sessionId,
   );
-  return next;
+  return patchesTokensUsed ? next : { ...next, tokensUsed: getSessionTokensUsed(sessionId) };
+}
+
+/** Stage 4 (aggregate run budget): atomic, race-safe token accrual — never a
+ *  read-modify-write. Missing session ⇒ silent no-op (warmup/'unknown' sources
+ *  have no row and must not create one). Returns whether a row was updated. */
+export function accrueSessionTokens(sessionId: string, tokens: number): boolean {
+  if (!sessionId || !Number.isFinite(tokens) || tokens <= 0) return false;
+  try {
+    const db = openEventLog();
+    const res = db.prepare(
+      'UPDATE sessions SET tokens_used = tokens_used + ? WHERE id = ?',
+    ).run(Math.trunc(tokens), sessionId);
+    return res.changes > 0;
+  } catch {
+    return false; // the meter must never break a model-call path
+  }
+}
+
+/** Stage 4 (workflow lane): run-level spend = the SUM over the run's per-step
+ *  sessions (workflow:<runId>:%). Cheap indexed prefix scan; used only at
+ *  between-batch boundaries. */
+export function sumSessionTokensUsedByPrefix(prefix: string): number {
+  if (!prefix) return 0;
+  try {
+    const row = openEventLog().prepare(
+      "SELECT COALESCE(SUM(tokens_used), 0) AS total FROM sessions WHERE id LIKE ? ESCAPE '\\'",
+    ).get(`${prefix.replace(/[%_\\]/g, (c) => `\\${c}`)}%`) as { total: number } | undefined;
+    return typeof row?.total === 'number' ? row.total : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Cheap point read of the lifetime token counter (0 when the row is absent). */
+export function getSessionTokensUsed(sessionId: string): number {
+  try {
+    const row = openEventLog().prepare(
+      'SELECT tokens_used FROM sessions WHERE id = ?',
+    ).get(sessionId) as { tokens_used: number } | undefined;
+    return typeof row?.tokens_used === 'number' ? row.tokens_used : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export function appendEvent(input: AppendEventInput): EventRow {

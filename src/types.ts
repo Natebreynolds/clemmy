@@ -66,6 +66,11 @@ export type RunStoppedReason =
   // know this member treat it as success (the prior behavior).
   | 'awaiting-input'
   | 'max-turns-with-grace'
+  // Stage 4 — the run's aggregate TOKEN budget window is exhausted. DISTINCT
+  // from 'max-turns-with-grace' so the background drain parks it as
+  // awaiting_continue WITHOUT burning free auto-continues (auto-continue must
+  // never tunnel past a budget park; only a user continue opens a new window).
+  | 'token-budget'
   | 'cancelled'
   | 'error';
 
@@ -218,6 +223,12 @@ export interface AssistantRequest {
   shouldCancel?: () => boolean | Promise<boolean>;
   /** Wall-clock budget passed through to the runtime. See RunRequest. */
   maxWallClockMs?: number;
+  /** Stage 4 — aggregate run token budget: ceiling override in UNCACHED
+   *  tokens (0 = unlimited) + the durable window baseline. The background
+   *  drain passes both so the budget aggregates across the whole
+   *  auto-continue chain of one task run. */
+  maxRunTokens?: number;
+  runTokenBaseline?: number;
   /** Tool names to hide from the model for this single call. See
    *  RunRequest.excludeToolNames for the contract. */
   excludeToolNames?: string[];

@@ -40,7 +40,9 @@ import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
-import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute } from '../runtime/harness/eventlog.js';
+import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
+import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled, formatTokens } from '../runtime/harness/run-token-budget.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
@@ -103,6 +105,10 @@ export interface BackgroundTaskRecord {
   modelTransport?: string;
   modelRouteFalloverFrom?: string;
   maxMinutes: number;
+  /** Stage 4 — optional per-task run token budget (UNCACHED tokens, soft
+   *  ceiling; parks awaiting_continue when the window is exhausted). Absent
+   *  ⇒ the preset/env default applies. */
+  maxTokens?: number;
   source: 'discord' | 'slack' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile' | 'workflow' | 'desktop';
   createdAt: string;
   updatedAt: string;
@@ -167,6 +173,8 @@ export interface CreateBackgroundTaskInput {
   reportBackTarget?: BackgroundReportBackTarget;
   model?: string;
   maxMinutes?: number;
+  /** Stage 4 — per-task run token budget override (UNCACHED tokens). */
+  maxTokens?: number;
   source?: BackgroundTaskRecord['source'];
   resumedFromTaskId?: string;
   resumeCount?: number;
@@ -220,11 +228,17 @@ function backgroundSelfResumeEnabled(): boolean {
  *  progress judge can decide. Fail-safe by construction: disabled, at the hard
  *  ceiling, or a cycle with no new tool activity all → park. Exported + tested. */
 export function selfResumeDecision(p: {
+  /** Stage 4 — the run's aggregate token window is exhausted: park
+   *  unconditionally (a user continue is the only re-arm; checked FIRST so
+   *  neither the hard cap nor the progress judge can override it). */
+  budgetExhausted?: boolean;
+} & {
   enabled: boolean;
   autoContinueAttempts: number;
   hardCap: number;
   cycleToolCalls: number;
 }): { resume?: boolean; needJudge?: boolean; reason: string } {
+  if (p.budgetExhausted) return { resume: false, reason: 'run token budget exhausted — user continue required' };
   if (!p.enabled) return { resume: false, reason: 'self-resume disabled' };
   if (p.autoContinueAttempts >= p.hardCap) return { resume: false, reason: `hard self-resume ceiling reached (${p.hardCap})` };
   if (p.cycleToolCalls <= 0) return { resume: false, reason: 'no new tool activity this cycle' };
@@ -945,6 +959,9 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     requestedModel: input.model,
     model: input.model,
     maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
+    ...(typeof input.maxTokens === 'number' && Number.isFinite(input.maxTokens) && input.maxTokens > 0
+      ? { maxTokens: Math.max(100_000, Math.min(1_000_000_000, Math.trunc(input.maxTokens))) }
+      : {}),
     source: input.source ?? 'gateway',
     createdAt,
     updatedAt: createdAt,
@@ -1187,7 +1204,14 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
   try {
     const runSessionId = updated?.runSessionId ?? `background:${id}`;
     if (!getHarnessSessionRow(runSessionId)) {
-      createHarnessSession({ id: runSessionId, kind: 'execution', title: updated?.title ?? task.title ?? 'Background task' });
+      createHarnessSession({
+        id: runSessionId,
+        kind: 'execution',
+        title: updated?.title ?? task.title ?? 'Background task',
+        // Stage 4 — informational only (console display); the enforcement
+        // ceiling is resolved from task/options/settings, never this column.
+        tokenBudget: resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() }) || undefined,
+      });
     }
     // Wave 4 Stage 2: mark a run/continue boundary. A background task's runSessionId
     // is STABLE for its whole life, so worker_result events accumulate across every
@@ -2088,6 +2112,24 @@ async function finishWorkerRun(
     logger.info({ taskId: task.id, questionId }, 'Background task paused for clarifying input');
     return;
   }
+  if (response.stoppedReason === 'token-budget') {
+    // Stage 4 — the run's aggregate TOKEN budget window is exhausted. Park
+    // awaiting_continue (the docstring's "internal run budget" state) —
+    // NEVER fall through to verify/classify, which could mark it done, and
+    // never burn auto-continues on it (only a user continue re-arms via a
+    // fresh drain-iteration baseline). Distinct reason string: "run token
+    // budget" ≠ "turn budget".
+    const reason = 'Run token budget reached before finishing. Reply continue to authorize another budget window.';
+    clearLedger(task.runSessionId);
+    markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
+    finishRun(run.id, {
+      status: 'awaiting_approval',
+      message: `Background task ${task.id} paused at its run token budget and can be continued.`,
+      outputPreview: response.text,
+    });
+    logger.warn({ taskId: task.id, reason }, 'Background task paused at run token budget (awaiting continue, not done)');
+    return;
+  }
   if (response.stoppedReason === 'max-turns-with-grace') {
     const reason = (response.text || 'The run hit its turn budget before finishing; continue is required.').trim().slice(0, 400);
     clearLedger(task.runSessionId);
@@ -2331,6 +2373,17 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        }) ?? task;
 	      }
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
+	      // Stage 4 — aggregate run token budget: one durable window per drain
+	      // iteration. The baseline is captured HERE (not per auto-continue), so
+	      // the ceiling genuinely aggregates across the whole unattended chain;
+	      // a user continue re-queues the task and a NEW drain iteration opens a
+	      // fresh window structurally (no counter reset, no re-park loop).
+	      const runTokenCeiling = resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() });
+	      const runTokenBaseline = getSessionTokensUsed(task.runSessionId);
+	      const runTokenWindowExhausted = (): boolean =>
+	        runTokenBudgetEnforcementEnabled()
+	        && runTokenCeiling > 0
+	        && (getSessionTokensUsed(task.runSessionId) - runTokenBaseline) >= runTokenCeiling;
 	      let autoContinueAttempts = 0;
 	      let toolCountAtLastCap = 0; // Wave 3: tool activity at each budget cycle
 	      let response: AssistantResponse;
@@ -2355,6 +2408,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	            Math.floor((task.maxMinutes * 60_000) / 2),
 	            remainingWallMs,
 	          ),
+	          maxRunTokens: runTokenCeiling,
+	          runTokenBaseline,
 	          message: workerMessage,
 	          runId: run.id,
 	          shouldCancel: () => {
@@ -2390,6 +2445,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	                `Run: ${run.id}`,
 	                `Latest tool: ${activity.toolName}`,
 	                `Tool calls observed: ${toolCount}`,
+	                // Stage 4 — surfaced only when enforcement is on (conditional-surface rule).
+	                ...(runTokenBudgetEnforcementEnabled() && runTokenCeiling > 0
+	                  ? [(() => { const w = Math.max(0, getSessionTokensUsed(task.runSessionId) - runTokenBaseline); return `Token budget: ${formatTokens(w)} of ${formatTokens(runTokenCeiling)} used (${Math.min(999, Math.round((w / runTokenCeiling) * 100))}%).`; })()]
+	                  : []),
 	              ].join('\n'),
 	              runId: run.id,
 	              metadata: {
@@ -2403,6 +2462,18 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
 
 	        if (response.stoppedReason !== 'max-turns-with-grace') break;
+	        // Stage 4 — a turn-budget stop whose token WINDOW is also exhausted
+	        // must park as a budget park, not burn free auto-continues + judge
+	        // cycles tunneling past it. Coerce and fall to finishWorkerRun.
+	        if (runTokenWindowExhausted()) {
+	          response = { ...response, stoppedReason: 'token-budget' };
+	          addRunEvent(run.id, {
+	            type: 'status',
+	            message: 'Run token budget window exhausted at a turn-budget boundary — parking for a user continue.',
+	            data: { tokensUsedWindow: getSessionTokensUsed(task.runSessionId) - runTokenBaseline, tokenCeiling: runTokenCeiling },
+	          });
+	          break;
+	        }
 	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) {
 	          // Wave 3 Move A: past the free auto-continue cap, SELF-RESUME only if an
 	          // independent cross-family judge confirms genuine PROGRESS, under the hard
@@ -2410,7 +2481,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          // (selfResumeDecision, pure/tested); the judge fails CLOSED (park). The
 	          // 240-min wall clock bounds everything regardless.
 	          const cycleToolCalls = toolCount - toolCountAtLastCap;
-	          const dec = selfResumeDecision({ enabled: backgroundSelfResumeEnabled(), autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls });
+	          const dec = selfResumeDecision({ enabled: backgroundSelfResumeEnabled(), autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls, budgetExhausted: runTokenWindowExhausted() });
 	          let selfResumeOk = dec.resume === true;
 	          let progressReason = dec.reason;
 	          if (dec.needJudge) {

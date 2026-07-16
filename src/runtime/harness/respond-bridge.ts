@@ -462,6 +462,8 @@ export async function respondViaHarness(
       sessionId,
       input: request.message,
       maxWallClockMs: request.maxWallClockMs,
+      maxRunTokens: request.maxRunTokens,
+      runTokenBaseline: request.runTokenBaseline,
       judgeCompletion: config.judgeCompletion,
       onChunk: request.onChunk,
       reuseRecordedUserInput: opts.reuseRecordedUserInput,
@@ -565,10 +567,14 @@ export async function respondViaHarness(
         }, routeForHarness(surface, request, opts.modelOverride));
       }
       case 'limit_exceeded':
+        // Stage 4: a token-budget park is DISTINCT from turn/step budgets —
+        // the drain must park it awaiting_continue instead of auto-continuing.
         return withRouteDiagnostics({
-          text: replyText || 'I hit the run budget before finishing — say "continue" to keep going.',
+          text: replyText || (result.limitKind === 'token_budget'
+            ? 'I hit this run\'s token budget before finishing — say "continue" to authorize another budget window.'
+            : 'I hit the run budget before finishing — say "continue" to keep going.'),
           sessionId,
-          stoppedReason: 'max-turns-with-grace',
+          stoppedReason: result.limitKind === 'token_budget' ? 'token-budget' : 'max-turns-with-grace',
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));
       case 'killed':

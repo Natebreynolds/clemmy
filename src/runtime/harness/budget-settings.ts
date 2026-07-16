@@ -14,6 +14,12 @@ export interface HarnessBudgetSettings {
   maxParallelWorkers: number;
   checkInMinutes: number;
   autoContinueOnLimit: boolean;
+  /** Stage 4 — aggregate run token budget (soft ceiling, UNCACHED tokens per
+   *  run window). Catches RUNAWAY spend, never legit scale: a heavy worker
+   *  turn is ~50-150k uncached tokens, a legit 100-worker 60-min run burns
+   *  3-8M. 0 = no ceiling. Enforcement is kill-switched (CLEMMY_RUN_TOKEN_BUDGET);
+   *  metering always runs. */
+  maxRunTokens: number;
 }
 
 export interface HarnessBudgetRuntime extends HarnessBudgetSettings {
@@ -39,6 +45,7 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxParallelWorkers: 6,
     checkInMinutes: 10,
     autoContinueOnLimit: false,
+    maxRunTokens: 10_000_000,
   },
   long: {
     preset: 'long',
@@ -49,6 +56,7 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxParallelWorkers: 8,
     checkInMinutes: 5,
     autoContinueOnLimit: true,
+    maxRunTokens: 30_000_000,
   },
   unlimited: {
     preset: 'unlimited',
@@ -63,6 +71,8 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxParallelWorkers: 12,
     checkInMinutes: 3,
     autoContinueOnLimit: true,
+    // No token ceiling on supervised-unlimited; env override can still set one.
+    maxRunTokens: 0,
   },
 };
 
@@ -75,6 +85,7 @@ const ENV_KEYS = {
   maxParallelWorkers: 'CLEMMY_WORKER_MAX_CONCURRENCY',
   checkInMinutes: 'HARNESS_CHECK_IN_MINUTES',
   autoContinueOnLimit: 'HARNESS_AUTO_CONTINUE_ON_LIMIT',
+  maxRunTokens: 'HARNESS_MAX_RUN_TOKENS',
 } as const;
 
 export const HARNESS_BUDGET_PRESETS = Object.freeze([
@@ -119,6 +130,7 @@ export function getHarnessBudgetSettings(): HarnessBudgetRuntime {
     maxParallelWorkers: intEnv(ENV_KEYS.maxParallelWorkers, defaults.maxParallelWorkers, 1, 64),
     checkInMinutes: intEnv(ENV_KEYS.checkInMinutes, defaults.checkInMinutes, 1, 240),
     autoContinueOnLimit: boolEnv(ENV_KEYS.autoContinueOnLimit, defaults.autoContinueOnLimit),
+    maxRunTokens: intEnv(ENV_KEYS.maxRunTokens, defaults.maxRunTokens, 0, 1_000_000_000),
     unlimited: preset === 'unlimited' || maxConversationWallMinutes === 0,
   };
 }
@@ -158,6 +170,9 @@ export function getElevatedBudget(current: HarnessBudgetRuntime): HarnessBudgetR
     maxParallelWorkers: Math.max(current.maxParallelWorkers, long.maxParallelWorkers),
     checkInMinutes: Math.min(current.checkInMinutes, long.checkInMinutes),
     autoContinueOnLimit: true, // critical — the standard preset's `false` is the trap
+    maxRunTokens: current.maxRunTokens === 0 || long.maxRunTokens === 0
+      ? 0
+      : Math.max(current.maxRunTokens, long.maxRunTokens),
     unlimited: current.unlimited,
   };
 }
@@ -188,6 +203,7 @@ export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBud
     autoContinueOnLimit: typeof input.autoContinueOnLimit === 'boolean'
       ? input.autoContinueOnLimit
       : base.autoContinueOnLimit,
+    maxRunTokens: clampNumber(input.maxRunTokens, base.maxRunTokens, 0, 1_000_000_000),
   };
 
   updateEnvKey(ENV_KEYS.preset, next.preset);
@@ -198,6 +214,7 @@ export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBud
   updateEnvKey(ENV_KEYS.maxParallelWorkers, String(next.maxParallelWorkers));
   updateEnvKey(ENV_KEYS.checkInMinutes, String(next.checkInMinutes));
   updateEnvKey(ENV_KEYS.autoContinueOnLimit, next.autoContinueOnLimit ? 'true' : 'false');
+  updateEnvKey(ENV_KEYS.maxRunTokens, String(next.maxRunTokens));
   process.env[ENV_KEYS.preset] = next.preset;
   process.env[ENV_KEYS.maxConversationSteps] = String(next.maxConversationSteps);
   process.env[ENV_KEYS.maxConversationWallMinutes] = String(next.maxConversationWallMinutes);
@@ -206,6 +223,7 @@ export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBud
   process.env[ENV_KEYS.maxParallelWorkers] = String(next.maxParallelWorkers);
   process.env[ENV_KEYS.checkInMinutes] = String(next.checkInMinutes);
   process.env[ENV_KEYS.autoContinueOnLimit] = next.autoContinueOnLimit ? 'true' : 'false';
+  process.env[ENV_KEYS.maxRunTokens] = String(next.maxRunTokens);
   return getHarnessBudgetSettings();
 }
 

@@ -54,6 +54,9 @@ import {
   writeWorkspaceCheckerReport,
 } from './workflow-run-workspace.js';
 import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprint } from '../runtime/harness/fanout-reduce.js';
+import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
+import { sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
+import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
@@ -4622,8 +4625,28 @@ async function executeWorkflow(
   } else {
     let completedStepIds = new Set(Object.keys(stepOutputs));
     let executionRound = 0;
+    // Stage 4 — aggregate run token budget, WORKFLOW lane: advisory-only in
+    // v1 (a park here has no approval for the reaper to watch — a forever-
+    // strand would be a worse lie than a warning; see the Stage-4 design
+    // spike). One durable advisory per run when the summed per-step spend
+    // crosses the ceiling; per-step wall-clocks still bound runaway time.
+    let runBudgetWarned = false;
+    const runTokenCeiling = resolveRunTokenCeiling({ budget: getHarnessBudgetSettings() });
     while (completedStepIds.size < steps.length) {
       executionRound += 1;
+      if (!runBudgetWarned && runTokenBudgetEnforcementEnabled() && runTokenCeiling > 0) {
+        try {
+          const spent = sumSessionTokensUsedByPrefix(`workflow:${runId}:`);
+          if (spent >= runTokenCeiling) {
+            runBudgetWarned = true;
+            appendWorkflowEvent(workflowSlug, runId, {
+              kind: 'step_advisory',
+              stepId: '(budget)',
+              meta: { reason: 'run_token_budget_exceeded', tokensUsed: spent, tokenCeiling: runTokenCeiling, advisoryOnly: true },
+            });
+          }
+        } catch { /* the advisory must never fail a run */ }
+      }
       const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
       const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
       const batch = readyBatch.slice(0, concurrencyCap);
