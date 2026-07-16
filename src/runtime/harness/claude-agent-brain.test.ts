@@ -709,7 +709,11 @@ test('Claude dispatch telemetry carries exact unified-primer refs and recall id'
   const run = openMemoryDb().prepare('SELECT surface, candidate_refs_json FROM memory_recall_runs WHERE id = ?')
     .get(event.data.recallId) as { surface: string; candidate_refs_json: string };
   assert.equal(run.surface, 'claude_primer');
-  assert.deepEqual(JSON.parse(run.candidate_refs_json), [{ type: 'note', id: sourceUri }]);
+  assert.deepEqual(JSON.parse(run.candidate_refs_json), [
+    // The snippet carries what the model actually SAW (title + snippet) so
+    // post-turn auto-credit can match demonstrable use; identity stays type:id.
+    { type: 'note', id: sourceUri, snippet: 'Live review: Reviewed memory reliability.' },
+  ]);
 });
 
 test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
