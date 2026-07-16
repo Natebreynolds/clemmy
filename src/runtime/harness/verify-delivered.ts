@@ -277,6 +277,17 @@ export async function verifyDelivered(
       blockerType: 'budget',
     };
   }
+  if (stoppedReason === 'token-budget') {
+    // Stage 4: a budget park is a paused run, never a delivered one — banking
+    // it as done would be exactly the false-complete the ceiling exists to
+    // prevent (gateway/daemon report-back lanes call this directly).
+    return {
+      delivered: false,
+      status: 'blocked',
+      reason: 'The run reached its token budget before finishing; a user continue is required.',
+      blockerType: 'budget',
+    };
+  }
 
   // 2) The agent's own words say it's blocked / needs input.
   if (matchesBlockedText(text)) {

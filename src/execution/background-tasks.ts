@@ -42,7 +42,7 @@ import { renderSessionHistoryForModel } from '../runtime/harness/session-transcr
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
-import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled, formatTokens } from '../runtime/harness/run-token-budget.js';
+import { budgetLineFor, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
@@ -1210,7 +1210,11 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
         title: updated?.title ?? task.title ?? 'Background task',
         // Stage 4 — informational only (console display); the enforcement
         // ceiling is resolved from task/options/settings, never this column.
-        tokenBudget: resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() }) || undefined,
+        // Gated on the kill-switch: enforcement off must not display a
+        // ceiling nothing will apply (conditional-surface rule).
+        tokenBudget: runTokenBudgetEnforcementEnabled()
+          ? (resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() }) || undefined)
+          : undefined,
       });
     }
     // Wave 4 Stage 2: mark a run/continue boundary. A background task's runSessionId
@@ -2446,9 +2450,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	                `Latest tool: ${activity.toolName}`,
 	                `Tool calls observed: ${toolCount}`,
 	                // Stage 4 — surfaced only when enforcement is on (conditional-surface rule).
-	                ...(runTokenBudgetEnforcementEnabled() && runTokenCeiling > 0
-	                  ? [(() => { const w = Math.max(0, getSessionTokensUsed(task.runSessionId) - runTokenBaseline); return `Token budget: ${formatTokens(w)} of ${formatTokens(runTokenCeiling)} used (${Math.min(999, Math.round((w / runTokenCeiling) * 100))}%).`; })()]
-	                  : []),
+	                ...((): string[] => { const line = budgetLineFor(task.runSessionId, runTokenBaseline, runTokenCeiling); return line ? [line] : []; })(),
 	              ].join('\n'),
 	              runId: run.id,
 	              metadata: {

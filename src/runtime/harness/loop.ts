@@ -1746,12 +1746,17 @@ async function runConversationCore(
   // the caller's durable baseline), checked at the same boundary the
   // wall-clock uses. Enforcement is kill-switched; independent of maxSteps,
   // so autoContinueOnLimit's 1,000,000-step lift cannot bypass it.
-  const tokenBudgetOn = runTokenBudgetEnforcementEnabled();
-  const tokenWindow = openRunTokenWindow({
-    sessionId: options.sessionId,
-    ceiling: resolveRunTokenCeiling({ override: options.maxRunTokens, budget }),
-    baseline: options.runTokenBaseline,
-  });
+  const runTokenCeiling = resolveRunTokenCeiling({ override: options.maxRunTokens, budget });
+  const tokenBudgetOn = runTokenBudgetEnforcementEnabled() && runTokenCeiling > 0;
+  // Window (and its baseline SELECT) only exists when a ceiling can actually
+  // fire — the unlimited preset / kill-switch pay zero per-boundary DB reads.
+  const tokenWindow = tokenBudgetOn
+    ? openRunTokenWindow({
+        sessionId: options.sessionId,
+        ceiling: runTokenCeiling,
+        baseline: options.runTokenBaseline,
+      })
+    : null;
 
   // A parked self-driving goal stops self-resumption; any turn that reaches
   // here is external re-engagement (a user reply or an outcome relay), which
@@ -3283,7 +3288,7 @@ async function runConversationCore(
     }
 
     // Wall-clock check before we kick off another turn.
-    const tokenStatus = tokenBudgetOn ? checkRunTokenWindow(tokenWindow) : null;
+    const tokenStatus = tokenWindow ? checkRunTokenWindow(tokenWindow) : null;
     if (Date.now() - lastCheckInAt >= checkInMs) {
       lastCheckInAt = Date.now();
       const budgetNote = tokenStatus ? budgetLine(tokenStatus) : null;
@@ -3355,7 +3360,7 @@ async function runConversationCore(
           tokensUsedWindow: tokenStatus.usedWindow,
           tokensUsedLifetime: tokenStatus.usedLifetime,
           tokenCeiling: tokenStatus.ceiling,
-          baseline: tokenWindow.baseline,
+          baseline: tokenWindow?.baseline ?? 0,
         },
         lastDecision: decision ?? lastDecision,
       });
@@ -4677,6 +4682,8 @@ export interface ResumePendingApprovalOptions {
   resolver?: string;
   maxTurns?: number;
   toolCallsPerTurn?: number;
+  /** Stage 4 — run token ceiling override threaded through the resume family. */
+  maxRunTokens?: number;
   /** Test injection. */
   makeRunner?: () => Runner;
   /** Test injection: drive the resume with a pre-built outcome. */
@@ -5071,6 +5078,8 @@ export async function runConversationFromResume(opts: {
   maxWallClockMs?: number;
   maxTurns?: number;
   toolCallsPerTurn?: number;
+  /** Stage 4 — run token ceiling override threaded through the resume family. */
+  maxRunTokens?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
   /** Test injection for promise-shaped completion verification (defaults to judgeObjectiveComplete). */
@@ -5093,6 +5102,8 @@ async function runConversationFromResumeCore(opts: {
   maxWallClockMs?: number;
   maxTurns?: number;
   toolCallsPerTurn?: number;
+  /** Stage 4 — run token ceiling override threaded through the resume family. */
+  maxRunTokens?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
   judgeFn?: ObjectiveJudgeFn;
@@ -5111,11 +5122,13 @@ async function runConversationFromResumeCore(opts: {
   let lastCheckInAt = startedAt;
   // Stage 4 — resume-path twin of the primary loop's token-budget window
   // (self-baselined: an approval resume is a fresh user-consented window).
-  const tokenBudgetOn = runTokenBudgetEnforcementEnabled();
-  const tokenWindow = openRunTokenWindow({
-    sessionId: opts.sessionId,
-    ceiling: resolveRunTokenCeiling({ budget }),
-  });
+  // The per-run/per-task ceiling override is honored here too — the resume
+  // twin dropping it produced 100x false parks/passes (Stage-4 review F3).
+  const resumeTokenCeiling = resolveRunTokenCeiling({ override: opts.maxRunTokens, budget });
+  const tokenBudgetOn = runTokenBudgetEnforcementEnabled() && resumeTokenCeiling > 0;
+  const tokenWindow = tokenBudgetOn
+    ? openRunTokenWindow({ sessionId: opts.sessionId, ceiling: resumeTokenCeiling })
+    : null;
 
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
@@ -5139,6 +5152,7 @@ async function runConversationFromResumeCore(opts: {
     resolver: opts.resolver,
     maxTurns,
     toolCallsPerTurn,
+    maxRunTokens: opts.maxRunTokens,
     makeRunner: opts.makeRunner,
     runRunner: opts.runRunner,
     onChunk: opts.onChunk,
@@ -5401,7 +5415,24 @@ async function runConversationFromResumeCore(opts: {
         lastTurn,
       };
     }
-    const tokenStatus = tokenBudgetOn ? checkRunTokenWindow(tokenWindow) : null;
+    const tokenStatus = tokenWindow ? checkRunTokenWindow(tokenWindow) : null;
+    // Single-shot 50%/80% budget warnings — the resume lane keeps the
+    // "no silent ceiling" invariant too (Stage-4 review F7).
+    if (tokenStatus?.crossedThreshold) {
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'heartbeat',
+        data: {
+          kind: 'budget_threshold',
+          threshold: tokenStatus.crossedThreshold,
+          tokensUsedWindow: tokenStatus.usedWindow,
+          tokensUsedLifetime: tokenStatus.usedLifetime,
+          tokenCeiling: tokenStatus.ceiling,
+        },
+      });
+    }
     if (Date.now() - lastCheckInAt >= checkInMs) {
       lastCheckInAt = Date.now();
       const budgetNote = tokenStatus ? budgetLine(tokenStatus) : null;
@@ -5461,7 +5492,7 @@ async function runConversationFromResumeCore(opts: {
           tokensUsedWindow: tokenStatus.usedWindow,
           tokensUsedLifetime: tokenStatus.usedLifetime,
           tokenCeiling: tokenStatus.ceiling,
-          baseline: tokenWindow.baseline,
+          baseline: tokenWindow?.baseline ?? 0,
         },
         lastDecision: decision,
       });

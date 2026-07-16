@@ -21,6 +21,7 @@ const {
 } = await import('./eventlog.js');
 const {
   budgetLine,
+  budgetLineFor,
   checkRunTokenWindow,
   formatTokens,
   openRunTokenWindow,
@@ -197,4 +198,14 @@ test('formatTokens + budgetLine render the honest fraction', () => {
   accrueSessionTokens(sess, 6_200_000);
   const line = budgetLine(checkRunTokenWindow(window));
   assert.match(line ?? '', /token budget 62% used \(6\.2M\/10M\)/);
+});
+
+test('budgetLineFor: the single renderer for raw window parts (drain check-ins)', () => {
+  const sess = freshSession();
+  accrueSessionTokens(sess, 4_500_000);
+  const line = budgetLineFor(sess, 0, 10_000_000);
+  assert.match(line ?? '', /token budget 45% used \(4\.5M\/10M\)/);
+  assert.equal(budgetLineFor(sess, 0, 0), null, 'no ceiling ⇒ no line');
+  process.env.CLEMMY_RUN_TOKEN_BUDGET = 'off';
+  assert.equal(budgetLineFor(sess, 0, 10_000_000), null, 'kill-switch off ⇒ no line');
 });

@@ -24567,7 +24567,7 @@ const CONSOLE_JS = `
           // can resume with a fresh budget.
           const reason = event.stoppedReason || 'success';
           const turns = event.turnsUsed ? ' (' + event.turnsUsed + ' turns)' : '';
-          if (reason === 'max-turns-with-grace') {
+          if (reason === 'max-turns-with-grace' || reason === 'token-budget') {
             setChatTurnStatus(assistantTurn, 'paused at budget' + turns);
             // Add an inline [Continue] button under the message.
             const actions = document.createElement('div');

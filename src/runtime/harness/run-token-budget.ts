@@ -109,3 +109,12 @@ export function budgetLine(status: RunTokenStatus): string | null {
   if (!runTokenBudgetEnforcementEnabled() || status.ceiling <= 0) return null;
   return `token budget ${Math.min(999, Math.round(status.fraction * 100))}% used (${formatTokens(status.usedWindow)}/${formatTokens(status.ceiling)})`;
 }
+
+/** One-shot budget line from raw (sessionId, baseline, ceiling) — the SINGLE
+ *  renderer for callers that hold a window's parts rather than a RunTokenWindow
+ *  (the background drain's check-ins). Same gating as budgetLine. */
+export function budgetLineFor(sessionId: string, baseline: number, ceiling: number): string | null {
+  if (!runTokenBudgetEnforcementEnabled() || ceiling <= 0) return null;
+  const usedWindow = Math.max(0, getSessionTokensUsed(sessionId) - baseline);
+  return `token budget ${Math.min(999, Math.round((usedWindow / ceiling) * 100))}% used (${formatTokens(usedWindow)}/${formatTokens(ceiling)})`;
+}
