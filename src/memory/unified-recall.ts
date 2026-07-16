@@ -52,10 +52,14 @@ function recallStore(type: UnifiedHitType): 'fact' | 'note' | 'entity' | 'resour
   return type;
 }
 
-export function unifiedHitRecallRef(hit: Pick<UnifiedHit, 'type' | 'ref'>): RecallCandidateRef {
+export function unifiedHitRecallRef(hit: Pick<UnifiedHit, 'type' | 'ref'> & Partial<Pick<UnifiedHit, 'title' | 'snippet'>>): RecallCandidateRef {
+  // Carry what the model actually SAW (title + snippet) so post-turn auto-credit
+  // can match demonstrable use against it. Identity stays type:id.
+  const shown = trimSnippet([hit.title, hit.snippet].filter(Boolean).join(': '));
   return {
     type: recallStore(hit.type),
     id: hit.ref,
+    ...(shown ? { snippet: shown } : {}),
   };
 }
 

@@ -7,7 +7,13 @@ export type RecallRefType = (typeof RECALL_REF_TYPES)[number];
 export interface RecallCandidateRef {
   type: RecallRefType;
   id: string;
+  /** Short content excerpt carried for auto-credit content matching. Optional
+   *  and additive: legacy rows without it only qualify for cited-tier credit.
+   *  Never part of ref identity — serialization/validation stay `type:id`. */
+  snippet?: string;
 }
+
+const REF_SNIPPET_MAX = 240;
 
 export interface RecallRun {
   id: string;
@@ -56,7 +62,10 @@ function normalizeRef(ref: RecallCandidateRef): RecallCandidateRef | null {
   const type = String(ref.type ?? '').trim() as RecallRefType;
   const id = String(ref.id ?? '').trim();
   if (!REF_TYPE_SET.has(type) || !id) return null;
-  return { type, id };
+  const snippet = typeof ref.snippet === 'string'
+    ? ref.snippet.replace(/\s+/g, ' ').trim().slice(0, REF_SNIPPET_MAX)
+    : '';
+  return snippet ? { type, id, snippet } : { type, id };
 }
 
 export function serializeRecallRef(ref: RecallCandidateRef): string {
@@ -170,6 +179,35 @@ export function recordRecallRun(input: {
     run.expiresAt,
   );
   return run;
+}
+
+/** Load an unexpired recall run with its candidate refs (snippets included when
+ *  the producer recorded them). Returns null for unknown or expired runs. */
+export function readRecallRun(recallId: string, nowIso = new Date().toISOString()): RecallRun | null {
+  const row = openMemoryDb().prepare(`
+    SELECT id, objective, surface, answerability, candidate_refs_json, created_at, expires_at
+    FROM memory_recall_runs
+    WHERE id = ?
+  `).get(recallId) as {
+    id: string;
+    objective: string;
+    surface: string;
+    answerability: RecallRun['answerability'];
+    candidate_refs_json: string;
+    created_at: string;
+    expires_at: string;
+  } | undefined;
+  if (!row) return null;
+  if (Date.parse(row.expires_at) < Date.parse(nowIso)) return null;
+  return {
+    id: row.id,
+    objective: row.objective,
+    surface: row.surface,
+    answerability: row.answerability,
+    candidateRefs: parseCandidateRefs(row.candidate_refs_json),
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
 }
 
 function parseCandidateRefs(json: string): RecallCandidateRef[] {

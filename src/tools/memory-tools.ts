@@ -616,7 +616,7 @@ export function registerMemoryTools(server: McpServer): void {
           objective: query,
           surface: 'memory_search_facts',
           answerability: facts.length > 0 ? 'partial' : 'insufficient',
-          candidateRefs: facts.map((fact) => ({ type: 'fact', id: String(fact.id) })),
+          candidateRefs: facts.map((fact) => ({ type: 'fact', id: String(fact.id), snippet: fact.content })),
         });
         recallId = run.id;
       } catch {
