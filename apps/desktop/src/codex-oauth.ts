@@ -464,7 +464,11 @@ export async function runCodexOAuthLogin(
 // ─── Persistence ──────────────────────────────────────────────────────
 
 const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
+// Match the daemon's base-dir convention (config.ts): CLEMENTINE_HOME wins
+// when set, so the desktop writes the SAME auth store the daemon reads —
+// and tests can isolate against a temp home.
+const CLEM_BASE_DIR = process.env.CLEMENTINE_HOME || path.join(HOME, '.clementine-next');
+const STATE_DIR = path.join(CLEM_BASE_DIR, 'state');
 const LOCAL_AUTH_FILE = path.join(STATE_DIR, 'auth.json');
 const CODEX_AUTH_DIR = path.join(HOME, '.codex');
 const CODEX_AUTH_FILE = path.join(CODEX_AUTH_DIR, 'auth.json');

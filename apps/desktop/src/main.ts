@@ -54,6 +54,7 @@ import {
 } from './credentials-bridge.js';
 import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
 import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
+import { hasPersistedCodexGrant } from './auth-grant.js';
 import { redactSensitiveText } from './redaction.js';
 
 /**
@@ -1834,8 +1835,19 @@ ipcMain.handle('clemmy:setup-complete', async (evt: IpcMainInvokeEvent, record: 
   // api_key (the config.ts default) and the runtime tries to use an
   // empty OPENAI_API_KEY → every agent call fails. Skip mode leaves
   // AUTH_MODE alone so a later credential drop can set it.
+  //
+  // VERIFY, don't trust: commit codex_oauth only when the grant actually
+  // persisted to the auth store. The renderer gates its NEXT button on the
+  // login IPC, but the main process is the enforcement point — a wizard bug
+  // (or an older wizard) that finalized "codex" without tokens shipped users
+  // into a boot loop (live report 2026-07-16). Unverified → leave AUTH_MODE
+  // alone; the daemon boots and Settings → Re-authenticate completes it.
   if (record.configured.auth === 'codex') {
-    setHomeEnv({ AUTH_MODE: 'codex_oauth' });
+    if (hasPersistedCodexGrant()) {
+      setHomeEnv({ AUTH_MODE: 'codex_oauth' });
+    } else {
+      console.error('[setup] codex chosen but no persisted grant — AUTH_MODE left unchanged; user must re-authenticate');
+    }
   } else if (record.configured.auth === 'openai') {
     setHomeEnv({ AUTH_MODE: 'api_key' });
   }

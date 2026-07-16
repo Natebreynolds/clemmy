@@ -644,7 +644,7 @@ async function performCodexRequest(
   await throwIfCancelled(callbacks);
   const tokens = getStoredCodexOAuthTokens();
   if (!tokens?.accessToken) {
-    throw new CodexRuntimeError('No native Codex OAuth access token is available.');
+    throw new CodexRuntimeError('No ChatGPT/Codex sign-in is available. Open Settings → Models & routing → Re-authenticate (or run `clementine auth login-device`) to finish signing in.');
   }
 
   // `prompt_cache_key` lets Codex re-use a cached prefix across calls

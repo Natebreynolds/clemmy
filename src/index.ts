@@ -662,6 +662,28 @@ async function main(): Promise<void> {
     } else {
       logger.info('Skipping webhook (WEBHOOK_ENABLED=false)');
     }
+    // Degraded-auth boot (the factory no longer crashes on a missing grant):
+    // tell the user ONCE per condition how to finish sign-in instead of
+    // letting the first chat turn fail mysteriously. Stable id → at-most-once
+    // across restarts until the notification is read.
+    try {
+      const { getAuthStatus } = await import('./runtime/auth-store.js');
+      const authStatus = getAuthStatus();
+      if (authStatus.mode !== 'api_key' && !authStatus.configured) {
+        const { addNotification } = await import('./runtime/notifications.js');
+        addNotification({
+          id: `auth-unconfigured-${authStatus.mode}`,
+          kind: 'system',
+          title: 'Finish signing in to Clementine',
+          body: 'Your AI sign-in did not complete, so chat and agents cannot run yet. Open Settings → Models & routing → Re-authenticate to finish.',
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: { source: 'auth-degraded-boot' },
+        });
+      }
+    } catch (err) {
+      logger.warn({ err }, 'auth-degraded boot notice failed — continuing');
+    }
     if (DISCORD_ENABLED) {
       await startDiscordBot(assistant);
     } else {
