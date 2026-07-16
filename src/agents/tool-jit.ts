@@ -9,7 +9,7 @@
  * user's input, reusing the existing embedding infra (embedQuery/embedTexts/cosine).
  *
  * Design constraints (mirrors mcp-tool-rank.ts):
- *  - DEFAULT OFF (CLEMMY_TOOL_JIT). Off → expose everything, byte-identical surface.
+ *  - DEFAULT ON (CLEMMY_TOOL_JIT; =off exposes everything, byte-identical surface).
  *  - GRACEFUL: empty query, no embeddings, or no semantic signal → expose everything.
  *    A reduction only ever happens when we have a real ranking; never throws.
  *  - The CORE is always kept regardless of score, so an under-ranked essential

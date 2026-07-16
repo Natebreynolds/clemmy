@@ -1665,7 +1665,7 @@ export interface DecayOptions {
    *  (which makes the importance≥5 tail structurally immortal), scale the idle
    *  threshold by importance × access-frequency so even a high-importance fact
    *  can fade after MONTHS of total disuse, while proven-useful ones are
-   *  protected longer. Default from CLEMMY_DECAY_IMPORTANCE_AWARE (off). */
+   *  protected longer. Default from CLEMMY_DECAY_IMPORTANCE_AWARE (on). */
   importanceAware?: boolean;
   nowMs?: number;
 }

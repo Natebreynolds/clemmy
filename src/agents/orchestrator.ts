@@ -1402,8 +1402,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const baseInstructions = harnessInstructions(rubricChoice.instructions, { sessionId: options.sessionId ?? undefined });
 
   // Schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 1), behind
-  // CLEMMY_CODEX_TOOL_SEARCH (default OFF → this whole block is inert and the
-  // surface is byte-identical to before). When active on an interactive chat lane:
+  // CLEMMY_CODEX_TOOL_SEARCH (default ON since v1.3.0; =off restores the full
+  // first-class surface byte-identically). When active on an interactive chat lane:
   // first-class tools = structural + the session HOT SET (TOOL_JIT_MANDATED ∪ recall
   // pins ∪ session LRU); every other discovery tool leaves the schema surface and
   // appears only in the catalog block, reachable THIS turn via call_tool. The catalog
@@ -1488,7 +1488,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       return sum + JSON.stringify(anyT.parameters ?? {}).length + (anyT.name?.length ?? 0);
     }, 0) / 4,
   );
-  if (options.sessionId && (searchDecision.active || searchDecision.experiment)) {
+  if (options.sessionId && searchDecision.active) {
     try {
       appendEvent({
         sessionId: options.sessionId,
@@ -1496,8 +1496,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         role: 'system',
         type: 'tool_search_scope',
         data: {
-          arm: searchDecision.arm,
-          experiment: searchDecision.experiment,
           active: searchDecision.active,
           firstClassCount: searchFirstClassCount,
           catalogCount: searchCatalogCount,

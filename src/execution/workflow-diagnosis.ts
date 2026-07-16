@@ -1,5 +1,5 @@
 /**
- * Workflow self-heal (flag: WORKFLOW_SELF_HEAL, default off).
+ * Workflow self-heal (flag: WORKFLOW_SELF_HEAL, default on).
  *
  * Clem's north star includes "reports back without fail" and being
  * ever-learning / self-healing. Today a workflow step that returns
