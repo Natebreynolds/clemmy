@@ -446,6 +446,16 @@ export function claudeVaultFallbackReady(): boolean {
   return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // or currently valid
 }
 
+/** File-only presence probe for Claude Code's credentials FILE (the Linux /
+ *  fallback store). Deliberately does NOT touch the macOS keychain — a silent
+ *  status read (getAuthStatus at daemon boot) must never block on an Allow
+ *  prompt. A keychain-only Claude Code login therefore doesn't count here;
+ *  Clementine's own vault grant (written by the in-app login / brain-switch
+ *  preflight) is the reliable signal on macOS. */
+export function hasClaudeCodeCredentialFile(): boolean {
+  return existsSync(path.join(os.homedir(), '.claude', '.credentials.json'));
+}
+
 function tokenExpiryIso(tokens: ClaudeOAuthTokens | null): string | undefined {
   return tokens?.expiresAt ? new Date(tokens.expiresAt).toISOString() : undefined;
 }

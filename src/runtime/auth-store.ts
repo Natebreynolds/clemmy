@@ -6,6 +6,7 @@ import { AUTH_MODE, BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.j
 import type { AuthStatus } from '../types.js';
 import { loginWithNativeCodexOAuth, refreshNativeCodexTokens, startCodexDeviceAuth, pollCodexDeviceAuth } from './codex-native-oauth.js';
 import type { NativeCodexTokenSet } from './codex-native-oauth.js';
+import { claudeVaultFallbackReady, hasClaudeCodeCredentialFile } from './claude-oauth.js';
 
 const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
 
@@ -708,6 +709,31 @@ export function getAuthStatus(): AuthStatus {
       message: openaiApiKeyPresent
         ? 'Configured for API-key runtime.'
         : 'Missing OPENAI_API_KEY for API-key runtime.',
+      openaiApiKeyPresent,
+      codexOauthPresent,
+      codexAccountId: localCodex?.accountId,
+      codexLastRefresh: localCodex?.lastRefresh,
+      codexImportPath: codexAuthSourceFile,
+      codexSharedWithCli,
+    };
+  }
+
+  // claude_oauth previously had NO branch here, so a Claude-subscription user
+  // fell through to the CODEX token checks below and always read as
+  // unconfigured — which the old boot-time throw turned into a daemon that
+  // crash-looped on every launch (live user report 2026-07-16: Claude-only
+  // sign-in, bricked after settings). Checks are FILE-only (vault grant or
+  // Claude Code's credentials file) — never the macOS keychain, which can
+  // block on an Allow prompt and must not be touched by a silent status read.
+  if (AUTH_MODE === 'claude_oauth') {
+    const claudePresent = claudeVaultFallbackReady() || hasClaudeCodeCredentialFile();
+    return {
+      mode: AUTH_MODE,
+      configured: claudePresent,
+      source: claudePresent ? 'local_store' : 'none',
+      message: claudePresent
+        ? 'Claude subscription sign-in is stored locally.'
+        : 'AUTH_MODE=claude_oauth but no Claude sign-in was found. Open Settings → Models & routing → Re-authenticate to sign in with Claude.',
       openaiApiKeyPresent,
       codexOauthPresent,
       codexAccountId: localCodex?.accountId,
