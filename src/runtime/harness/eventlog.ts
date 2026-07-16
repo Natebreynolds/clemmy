@@ -389,7 +389,13 @@ function ensureStateDir(): void {
   }
 }
 
-const MIGRATIONS: { version: number; sql: string }[] = [
+interface EventLogMigration {
+  version: number;
+  sql: string;
+  backfill?: (db: Database.Database) => void;
+}
+
+const MIGRATIONS: EventLogMigration[] = [
   {
     version: 1,
     sql: `
@@ -542,6 +548,56 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         WHERE resume_key IS NOT NULL;
     `,
   },
+  {
+    // Guardrail trackers are keyed by an EXECUTION SCOPE, not always by a real
+    // harness session id. Code mode, certified batches, and workers append
+    // `::codeMode`, `::batch:*`, or `::w:*` to the parent session. The v4 table
+    // incorrectly made that synthetic key a direct FK to sessions(id), so every
+    // fifth scoped tool call failed to persist with FOREIGN KEY constraint
+    // errors. Keep the scope isolated while anchoring its lifecycle to the real
+    // parent session for cascade cleanup.
+    version: 6,
+    sql: `
+      CREATE TABLE IF NOT EXISTS tool_guardrail_scope_state (
+        scope_id          TEXT PRIMARY KEY,
+        parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        recent_json       TEXT NOT NULL,
+        updated_at        TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_tool_guardrail_scope_parent
+        ON tool_guardrail_scope_state(parent_session_id);
+    `,
+    backfill: (db) => {
+      // A valid v4 database has both tables, but keep the additive migration
+      // tolerant of old test fixtures and partially recovered databases. More
+      // importantly, do not copy legacy orphan rows: older processes sometimes
+      // opened SQLite without FK enforcement and left scope-looking ids in the
+      // session-keyed table. Preserve only rows whose real parent still exists.
+      const hasTable = (name: string): boolean => Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+      ).get(name));
+      if (!hasTable('sessions') || !hasTable('tool_guardrail_state')) return;
+      db.exec(`
+        INSERT OR IGNORE INTO tool_guardrail_scope_state
+          (scope_id, parent_session_id, recent_json, updated_at)
+        SELECT legacy.session_id,
+               CASE
+                 WHEN instr(legacy.session_id, '::') > 0
+                   THEN substr(legacy.session_id, 1, instr(legacy.session_id, '::') - 1)
+                 ELSE legacy.session_id
+               END,
+               legacy.recent_json,
+               legacy.updated_at
+          FROM tool_guardrail_state AS legacy
+          JOIN sessions AS parent
+            ON parent.id = CASE
+              WHEN instr(legacy.session_id, '::') > 0
+                THEN substr(legacy.session_id, 1, instr(legacy.session_id, '::') - 1)
+              ELSE legacy.session_id
+            END;
+      `);
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -558,6 +614,7 @@ function runMigrations(db: Database.Database): void {
     if (migration.version <= current) continue;
     const tx = db.transaction(() => {
       db.exec(migration.sql);
+      migration.backfill?.(db);
       apply.run(migration.version, new Date().toISOString());
     });
     tx();
@@ -1179,26 +1236,42 @@ export function getToolOutput(sessionId: string, callId: string): ToolOutputReco
 // the guardrail rebuilds derived state (signature counts, distinct
 // mutating-tool args) from it on rehydrate.
 
-export function writeGuardrailState(sessionId: string, recentJson: string): void {
-  const db = openEventLog();
-  db.prepare(
-    `INSERT INTO tool_guardrail_state (session_id, recent_json, updated_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(session_id) DO UPDATE SET
-       recent_json = excluded.recent_json,
-       updated_at  = excluded.updated_at`,
-  ).run(sessionId, recentJson, new Date().toISOString());
+function guardrailParentSessionId(scopeId: string): string {
+  const separator = scopeId.indexOf('::');
+  return separator >= 0 ? scopeId.slice(0, separator) : scopeId;
 }
 
-export function readGuardrailState(sessionId: string): string | null {
+export function writeGuardrailState(scopeId: string, recentJson: string): void {
+  const db = openEventLog();
+  const parentSessionId = guardrailParentSessionId(scopeId);
+  // Out-of-band/test-only wrappers can evaluate a guardrail without first
+  // creating a harness session. Persistence is optional in that lane; skip it
+  // cleanly instead of raising a foreign-key warning on the hot tool path.
+  const parent = db.prepare('SELECT id FROM sessions WHERE id = ?').get(parentSessionId) as { id: string } | undefined;
+  if (!parent) return;
+  db.prepare(
+    `INSERT INTO tool_guardrail_scope_state (scope_id, parent_session_id, recent_json, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(scope_id) DO UPDATE SET
+       parent_session_id = excluded.parent_session_id,
+       recent_json = excluded.recent_json,
+       updated_at  = excluded.updated_at`,
+  ).run(scopeId, parentSessionId, recentJson, new Date().toISOString());
+}
+
+export function readGuardrailState(scopeId: string): string | null {
   const db = openEventLog();
   const row = db
-    .prepare('SELECT recent_json FROM tool_guardrail_state WHERE session_id = ?')
-    .get(sessionId) as { recent_json: string } | undefined;
+    .prepare('SELECT recent_json FROM tool_guardrail_scope_state WHERE scope_id = ?')
+    .get(scopeId) as { recent_json: string } | undefined;
   return row?.recent_json ?? null;
 }
 
-export function clearGuardrailState(sessionId: string): void {
+export function clearGuardrailState(scopeId: string): void {
   const db = openEventLog();
-  db.prepare('DELETE FROM tool_guardrail_state WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM tool_guardrail_scope_state WHERE scope_id = ?').run(scopeId);
+  // Compatibility cleanup for plain-session rows created before schema v6.
+  if (scopeId === guardrailParentSessionId(scopeId)) {
+    db.prepare('DELETE FROM tool_guardrail_state WHERE session_id = ?').run(scopeId);
+  }
 }

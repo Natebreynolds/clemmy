@@ -54,7 +54,7 @@ test.after(() => {
   }
 });
 
-test('schema v5 upgrades an existing v4 approval table without losing rows', () => {
+test('latest schema upgrades an existing v4 approval table without losing rows', () => {
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
@@ -93,7 +93,44 @@ test('schema v5 upgrades an existing v4 approval table without losing rows', () 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    5,
+    6,
+  );
+  resetEventLog();
+});
+
+test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (5, '2026-07-01T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    INSERT INTO sessions (id) VALUES ('sess-valid');
+    CREATE TABLE tool_guardrail_state (
+      session_id TEXT PRIMARY KEY,
+      recent_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO tool_guardrail_state (session_id, recent_json, updated_at) VALUES
+      ('sess-valid', '[{"toolName":"plain"}]', '2026-07-01T00:00:00.000Z'),
+      ('sess-valid::codeMode', '[{"toolName":"scoped"}]', '2026-07-01T00:00:01.000Z'),
+      ('sess-missing::codeMode', '[{"toolName":"orphan"}]', '2026-07-01T00:00:02.000Z');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const rows = migrated.prepare(
+    'SELECT scope_id, parent_session_id FROM tool_guardrail_scope_state ORDER BY scope_id',
+  ).all() as Array<{ scope_id: string; parent_session_id: string }>;
+  assert.deepEqual(rows, [
+    { scope_id: 'sess-valid', parent_session_id: 'sess-valid' },
+    { scope_id: 'sess-valid::codeMode', parent_session_id: 'sess-valid' },
+  ]);
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    6,
   );
   resetEventLog();
 });

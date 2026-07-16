@@ -22,7 +22,22 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-rehydrate-tes
 process.env.CLEMMY_GUARDRAIL_PERSIST = 'on'; // this test NEEDS the persist path
 
 const { evaluateToolCall, applyMode, _simulateRestartForTests } = await import('./tool-guardrail.js');
-const { createSession, writeGuardrailState } = await import('./eventlog.js');
+const { createSession, readGuardrailState, writeGuardrailState } = await import('./eventlog.js');
+
+test('synthetic code-mode guardrail scopes persist under their real parent session', () => {
+  const sid = 'sess-scoped-persistence';
+  createSession({ id: sid, kind: 'chat' });
+  const scopeId = `${sid}::codeMode`;
+  const payload = JSON.stringify([{ signature: 'sig-1', toolName: 'read_file', firstSeenMs: 1 }]);
+
+  assert.doesNotThrow(() => writeGuardrailState(scopeId, payload));
+  assert.equal(readGuardrailState(scopeId), payload);
+
+  // A scope with no durable parent is intentionally memory-only and should not
+  // emit the foreign-key failures seen in the production log.
+  assert.doesNotThrow(() => writeGuardrailState('missing-parent::codeMode', payload));
+  assert.equal(readGuardrailState('missing-parent::codeMode'), null);
+});
 
 test('strand-hunt F: legacy persisted rows (no fanoutEntity) still arm the entity gate after restart', async () => {
   const sid = 'sess-rehydrate-F';
