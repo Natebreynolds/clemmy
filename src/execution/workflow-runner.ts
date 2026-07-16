@@ -4817,6 +4817,64 @@ export function reapResolvedParkedRuns(): void {
     const rows = watched.map((id) => approvalsById.get(id));
     if (rows.some((row) => !row)) continue; // lost registry row: never auto-approve by absence
     if (rows.some((row) => row?.status === 'pending')) continue; // still waiting on a human
+
+    // A non-approved decision is terminal for THIS workflow occurrence. The
+    // old behavior re-admitted every resolved park (including reject/expire),
+    // which restarted an agentic step. If that step rebuilt even a slightly
+    // different payload, the exact-payload resume key changed and Clementine
+    // minted a brand-new approval. One declined scheduled email could therefore
+    // come back repeatedly from the same run. Approval is the only decision
+    // that may cross the side-effect boundary; every other decision stops the
+    // occurrence without disabling its recurring schedule.
+    const stopped = rows.find((row) => row?.resolution !== 'approved');
+    if (stopped) {
+      clearWorkflowRunPausedForApproval(run.id);
+      const stoppedAt = new Date().toISOString();
+      const decision = stopped.resolution === 'rejected'
+        ? 'declined by the user'
+        : stopped.resolution === 'expired'
+          ? 'not approved before it expired'
+          : 'cancelled by the user';
+      const reason = `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
+
+      // Clear every parked SDK session for this occurrence so a later recovery
+      // scan cannot revive the interrupted model state and ask again.
+      for (const row of rows) {
+        if (!row?.sessionId) continue;
+        try {
+          const session = HarnessSession.load(row.sessionId);
+          session?.clearInterruptState();
+          session?.markStatus('cancelled');
+        } catch { /* terminal run record below remains the source of truth */ }
+      }
+
+      writeRunRecord(filePath, {
+        ...run,
+        status: 'cancelled',
+        finishedAt: stoppedAt,
+        error: reason,
+        parked: undefined,
+        // The approval surface already reports the reject/expiry. Marking the
+        // run notified prevents a second generic cancellation card.
+        notifiedAt: stoppedAt,
+      });
+      try {
+        appendWorkflowEvent(run.workflow, run.id, { kind: 'run_cancelled', error: reason });
+      } catch { /* workflow event history is best-effort */ }
+      try {
+        finishRun(run.id, {
+          status: 'cancelled',
+          message: reason,
+          outputPreview: reason,
+        });
+      } catch { /* activity mirror is best-effort */ }
+      logger.info(
+        { workflow: run.workflow, runId: run.id, approvalId: stopped.approvalId, resolution: stopped.resolution },
+        'Parked workflow occurrence stopped after non-approved decision',
+      );
+      continue;
+    }
+
     // The run is about to resume, so it is no longer "parked on approval".
     // Clear the in-memory heartbeat-suppression flag here so an in-process
     // resume (approval resolved without a daemon restart) doesn't inherit a

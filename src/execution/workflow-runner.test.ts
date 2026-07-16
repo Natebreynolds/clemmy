@@ -185,6 +185,72 @@ test('reapResolvedParkedRuns keeps a run parked while its approval is pending, r
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
 
+test('reapResolvedParkedRuns terminates a rejected occurrence instead of minting another approval', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const runId = 'park-test-rejected-terminal';
+  const sessionId = `workflow:${runId}:send_step`;
+  HarnessSession.create({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: runId,
+    metadata: { source: 'workflow', workflowName: 'daily-standup-email', workflowRunId: runId, stepId: 'send_step' },
+  });
+  const session = HarnessSession.load(sessionId)!;
+  session.saveInterruptState('{"parked":true}');
+  const row = approvalRegistry.register({
+    sessionId,
+    subject: 'Send the daily standup email?',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: '{"to_email":"nathan@example.com"}' },
+    ttlMs: 60_000,
+  });
+  const filePath = writeParkedRun(runId, [row.approvalId]);
+
+  approvalRegistry.resolve(row.approvalId, 'rejected', 'unit-test-human');
+  reapResolvedParkedRuns();
+
+  const stopped = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  assert.equal(stopped.status, 'cancelled');
+  assert.equal(stopped.parked, undefined);
+  assert.match(String(stopped.error), /declined by the user/i);
+  assert.equal(HarnessSession.load(sessionId)?.sessionRow.status, 'cancelled');
+  assert.equal(HarnessSession.load(sessionId)?.loadInterruptState(), null);
+
+  // A later scan is idempotent: the occurrence remains terminal and cannot
+  // re-enter the step to generate a slightly different approval payload.
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(filePath), 'cancelled');
+
+  rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+test('reapResolvedParkedRuns terminates an expired occurrence instead of retrying the send', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  const runId = 'park-test-expired-terminal';
+  const sessionId = `workflow:${runId}:send_step`;
+  HarnessSession.create({ id: sessionId, kind: 'workflow', channel: 'workflow', title: runId, metadata: { source: 'workflow' } });
+  const row = approvalRegistry.register({
+    sessionId,
+    subject: 'Send the daily standup email?',
+    tool: 'composio_execute_tool',
+    ttlMs: 60_000,
+  });
+  const filePath = writeParkedRun(runId, [row.approvalId]);
+
+  approvalRegistry.resolve(row.approvalId, 'expired', 'unit-test-reaper');
+  reapResolvedParkedRuns();
+
+  const stopped = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  assert.equal(stopped.status, 'cancelled');
+  assert.equal(stopped.parked, undefined);
+  assert.match(String(stopped.error), /not approved before it expired/i);
+
+  rmSync(filePath, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
 test('reapResolvedParkedRuns marks the Activity run as resumed when approval clears', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
   const runId = 'park-test-activity';
@@ -364,7 +430,7 @@ test('fresh workflow run records ready batch metadata for parallel scheduler lan
   ));
 });
 
-test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails loudly, never stuck)', () => {
+test('reapResolvedParkedRuns makes a rejected approval terminal (never stuck or re-admitted)', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
   const sid2 = 'workflow-gate:park-test-2:send_step';
   HarnessSession.create({ id: sid2, kind: 'workflow', channel: 'workflow', title: 'park-test-2', metadata: { source: 'workflow' } });
@@ -377,7 +443,7 @@ test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails lou
   const filePath = writeParkedRun('park-test-2', [row.approvalId]);
   approvalRegistry.resolve(row.approvalId, 'rejected', 'parking-test');
   reapResolvedParkedRuns();
-  assert.equal(statusOf(filePath), 'running');
+  assert.equal(statusOf(filePath), 'cancelled');
   rmSync(filePath, { force: true });
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });

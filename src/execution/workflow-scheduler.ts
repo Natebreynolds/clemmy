@@ -183,9 +183,8 @@ interface ScheduledFireResult {
  * Daemon entry point. Idempotent within a minute. Safe to call every
  * 15s — only the first match per workflow per minute writes a run.
  */
-export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
+export async function processWorkflowSchedules(now: Date = new Date()): Promise<ScheduledFireResult> {
   const result: ScheduledFireResult = { fired: [], deduped: [] };
-  const now = new Date();
   const minuteKey = currentMinuteKey(now);
 
   let workflows;
@@ -236,13 +235,32 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
     const latestKey = matchedKeys[matchedKeys.length - 1];
     const missed = matchedKeys.length - 1; // earlier fires collapsed into one
 
+    // A parked approval is already the workflow's one visible decision. Do not
+    // stack tomorrow's occurrence behind it: parked runs used to be excluded
+    // from countPendingRunsFor(), which is how one daily email accumulated
+    // several near-identical approval cards. Mark this minute seen and wait for
+    // the user to approve, skip, or pause the workflow.
+    const activeRuns = countActiveRunsFor(wf.name);
+    if (activeRuns.parked > 0) {
+      result.deduped.push(wf.name);
+      recordOperationalEvent({
+        source: 'workflow',
+        type: 'workflow_trigger_deduped',
+        severity: 'info',
+        actor: 'workflow-scheduler',
+        payload: { workflowName: wf.name, schedule, reason: 'parked_awaiting_approval', parked: activeRuns.parked },
+      });
+      state.lastRunByMinute[dedupeKey] = latestKey;
+      continue;
+    }
+
     // Pending-queue cap. If the previous run hasn't finished yet and a
     // few more are already stacked, refuse to enqueue more — otherwise a
     // `*/1 * * * *` cron + a 30-min workflow would pile 60 runs/hour
     // forever and the daemon would re-read every file every tick. The
     // user gets one daily notification telling them their workflow is
     // running long and they should investigate.
-    const pending = countPendingRunsFor(wf.name);
+    const pending = activeRuns.pending;
     if (pending >= MAX_PENDING_PER_WORKFLOW) {
       result.deduped.push(wf.name);
       emitQueueBackpressureNotice(wf.name, pending);
@@ -294,33 +312,34 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
  *  without letting a single misbehaving cron carpet the disk. */
 const MAX_PENDING_PER_WORKFLOW = 3;
 
-/** Walk WORKFLOW_RUNS_DIR and count run records for `workflowName`
- *  whose status is non-terminal (queued/running/missing). Cheap because
- *  we early-out at the cap and don't parse files we don't need to. */
-function countPendingRunsFor(workflowName: string): number {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return 0;
+/** Walk WORKFLOW_RUNS_DIR once and split active work into executable
+ *  queued/running records versus approval-parked records. A parked run is not
+ *  part of the concurrency queue, but it IS schedule backpressure. */
+function countActiveRunsFor(workflowName: string): { pending: number; parked: number } {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return { pending: 0, parked: 0 };
   let files: string[];
   try {
     files = readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json'));
   } catch {
-    return 0;
+    return { pending: 0, parked: 0 };
   }
-  let count = 0;
+  let pending = 0;
+  let parked = 0;
   for (const file of files) {
-    if (count >= MAX_PENDING_PER_WORKFLOW + 1) return count; // we just need ">= cap"
+    if (pending >= MAX_PENDING_PER_WORKFLOW + 1 && parked > 0) break;
     try {
       const raw = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
         workflow?: string;
         status?: string;
       };
       if (raw.workflow !== workflowName) continue;
-      if (raw.status && raw.status !== 'queued' && raw.status !== 'running') continue;
-      count += 1;
+      if (raw.status === 'parked') parked += 1;
+      else if (!raw.status || raw.status === 'queued' || raw.status === 'running') pending += 1;
     } catch {
       // Unreadable record — ignore. The reaper will sweep it eventually.
     }
   }
-  return count;
+  return { pending, parked };
 }
 
 /** Daily-bucketed system notification so the user knows their schedule
@@ -447,3 +466,7 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   }
   return { scanned: files.length, deleted };
 }
+
+export const workflowSchedulerInternalsForTest = {
+  countActiveRunsFor,
+};

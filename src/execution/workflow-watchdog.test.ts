@@ -10,6 +10,7 @@ import {
   findStalledRuns,
   dropReportedBackTerminalRuns,
   reportedBackRunIdsFrom,
+  workflowWatchdogAlertIdsFrom,
   recommendedRecoveryForStalledRun,
   type WatchdogRunView,
   type StalledRun,
@@ -278,6 +279,16 @@ test('reportedBackRunIdsFrom: ignores the watchdog\'s own stalled alerts', () =>
     { id: 'workflow-stalled-xyz', deliveredAt: iso(0), metadata: { runId: 'xyz' } },
   ]);
   assert.ok(!ids.has('xyz'), 'the watchdog alert is not the run reporting back');
+});
+
+test('workflowWatchdogAlertIdsFrom recognizes every stable watchdog namespace', () => {
+  const ids = workflowWatchdogAlertIdsFrom([
+    { id: 'workflow-stalled-queued-1' },
+    { id: 'workflow-stalled-terminal-done-1' },
+    { id: 'workflow-heartbeat-live-1' },
+    {},
+  ]);
+  assert.deepEqual([...ids].sort(), ['workflow-stalled-queued-1', 'workflow-stalled-terminal-done-1']);
 });
 
 test('reportedBackRunIdsFrom: a delivered HEARTBEAT does not count as report-back (no masking a lost terminal result)', () => {

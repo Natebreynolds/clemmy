@@ -257,13 +257,18 @@ export function reportedBackRunIdsFrom(
   return out;
 }
 
-function collectReportedBackRunIds(): Set<string> {
-  try {
-    return reportedBackRunIdsFrom(loadNotifications());
-  } catch {
-    // Best-effort — never let a bad notification log break the watchdog.
-    return new Set<string>();
-  }
+/** Stable watchdog ids already present in the durable notification store. The
+ * notification writer dedupes these too, but checking up front avoids parsing
+ * the same ~1 MB store again for every stalled run and avoids logging the same
+ * already-surfaced warning once per minute forever. */
+export function workflowWatchdogAlertIdsFrom(
+  notifications: Array<{ id?: string }>,
+): Set<string> {
+  return new Set(
+    notifications
+      .map((notification) => notification.id)
+      .filter((id): id is string => typeof id === 'string' && id.startsWith('workflow-stalled-')),
+  );
 }
 
 /**
@@ -366,19 +371,28 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
 
   const candidates = findStalledRuns(runs, now, { queuedStallMs: queuedStallMs(), parkedStallMs: parkedStallMs() });
 
+  let notifications: ReturnType<typeof loadNotifications> = [];
+  try { notifications = loadNotifications(); } catch { /* empty state is safe */ }
+
   // Ground-truth report-back check: a terminal run that already has a delivered
   // notification DID report back — drop it (and self-heal the marker) so the
   // backstop never fires a false "result wasn't delivered" alarm for a run that
   // finished under a prior code version or across a restart boundary.
-  const reportedBack = collectReportedBackRunIds();
+  const reportedBack = reportedBackRunIdsFrom(notifications);
+  const existingAlertIds = workflowWatchdogAlertIdsFrom(notifications);
   const stalled = dropReportedBackTerminalRuns(candidates, reportedBack);
   for (const run of candidates) {
     if (run.reason === 'terminal_unnotified' && reportedBack.has(run.id)) stampNotifiedAt(run.id, now);
   }
 
+  const surfaced: string[] = [];
   for (const run of stalled) {
     const minutes = Math.max(1, Math.round(run.ageMs / 60_000));
     const alert = watchdogAlert(run, minutes);
+    const alertId = run.reason === 'terminal_unnotified'
+      ? `workflow-stalled-terminal-${run.id}`
+      : `workflow-stalled-${run.id}`;
+    if (existingAlertIds.has(alertId)) continue;
     addNotification({
       // Stable id → dedupes to one alert per stuck run. The two pre-existing
       // reasons (queued_not_draining, parked_awaiting_approval) keep the
@@ -386,9 +400,7 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
       // alerts already delivered to deployed users. Only the NEW
       // terminal_unnotified reason gets its own namespace (a run can be parked
       // and later finish unnotified — distinct, both worth surfacing).
-      id: run.reason === 'terminal_unnotified'
-        ? `workflow-stalled-terminal-${run.id}`
-        : `workflow-stalled-${run.id}`,
+      id: alertId,
       kind: 'workflow',
       title: alert.title,
       body: alert.body,
@@ -403,10 +415,12 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
         recommendedRecovery: recommendedRecoveryForStalledRun(run),
       },
     });
+    existingAlertIds.add(alertId);
+    surfaced.push(run.id);
   }
 
-  if (stalled.length > 0) {
-    logger.warn({ stalled: stalled.length, ids: stalled.map((s) => s.id) }, 'Workflow runs stuck in queue');
+  if (surfaced.length > 0) {
+    logger.warn({ stalled: surfaced.length, repeatSuppressed: stalled.length - surfaced.length, ids: surfaced }, 'Workflow runs stuck in queue');
   }
   return { stalled: stalled.length };
 }
