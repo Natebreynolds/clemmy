@@ -13,6 +13,7 @@ import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/mo
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { textResult } from './shared.js';
+import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -108,6 +109,7 @@ export function registerWorkerTools(server: McpServer): void {
       'Each worker runs in its own isolated context — keeps YOUR context from ballooning over many items, and runs the work concurrently instead of one-at-a-time (which blows your turn budget).',
       'Pass a structured packet for ONE item: the item identifier, exact resolved tool slugs, source facts/context, instructions, and expected output shape. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
       'When to use: 3+ independent items of the same kind. Aggregate the tight results the workers return.',
+      'On LARGE fan-outs (past ~8 results) further results return as compact digests with the full output parked — shard summaries arrive automatically; synthesize from those, and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never report a batch complete if any worker returned ERROR; report exactly which items succeeded and which failed.',
     ].join(' '),
     WorkerToolInputSchema.shape,
@@ -144,7 +146,15 @@ export function registerWorkerTools(server: McpServer): void {
           const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
           if (prior && prior.trim()) {
             recordResult(true, 'resume: reused prior completed result');
-            return textResult(prior);
+            // Route replays through the reduce tier too, so a resumed 100-item
+            // fan-out doesn't re-flood the parent context with prior outputs.
+            return textResult(buildWorkerReturn({
+              sessionId,
+              parentRunId,
+              item: input.item,
+              text: prior,
+              callId: `call_w_resume_${packetKey.slice(0, 16)}`,
+            }));
           }
           // No recoverable output → do NOT claim success; re-execute below.
         }
@@ -261,6 +271,7 @@ export function registerWorkerTools(server: McpServer): void {
         // did (task + persisted work-product), OUTCOME — attributed to the workflow
         // run when spawned in a step, else the session. This ONE choke-point covers
         // all three lanes (Claude / Codex / GLM-BYO). Fail-open.
+        const subagentRunId = `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`;
         try {
           const ctx = getToolOutputContext();
           const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(result.text ?? '');
@@ -268,7 +279,7 @@ export function registerWorkerTools(server: McpServer): void {
             ? 'claude'
             : resolveEffectiveProviderForModel(result.model ?? workerModel);
           recordSubagentRun({
-            id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            id: subagentRunId,
             parentRunId: ctx?.workflowRunId || sessionId,
             parentKind: ctx?.workflowRunId ? 'workflow' : 'session',
             workflowName: ctx?.workflowName,
@@ -284,7 +295,15 @@ export function registerWorkerTools(server: McpServer): void {
             finishedAt: new Date().toISOString(),
           });
         } catch { /* visibility trace is best-effort */ }
-        return textResult(result.text);
+        // Stage 3 reduce tier: past ~8 results the return compresses to a
+        // parked digest + shard summaries; small fan-outs are byte-identical.
+        return textResult(buildWorkerReturn({
+          sessionId,
+          parentRunId: getToolOutputContext()?.workflowRunId || sessionId,
+          item: input.item,
+          text: result.text,
+          callId: `call_${subagentRunId}`,
+        }));
       } catch (err) {
         recordResult(false, firstLine(err), workerModel);
         recordModelRouteOutcome({

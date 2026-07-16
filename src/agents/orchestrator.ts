@@ -45,6 +45,7 @@ import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecis
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -952,6 +953,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'Each worker call gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
       'Input: a structured packet for ONE item. You must include the item identifier, exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the item should use a user-configured worker category such as design, writing, research, code, or analysis.',
       'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
+      'On LARGE fan-outs (past ~8 results) further results return as compact digests with the full output parked — shard summaries arrive automatically; synthesize from those, and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
       'Before fanning out N mutating workers: call `request_approval` ONCE with the batch summary ("Create 50 Salesforce tasks for these leads — review the list?") instead of letting each worker pause individually. Sticky approval then covers the fan-out.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
@@ -1076,6 +1078,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const raw = value instanceof Error ? value.message : typeof value === 'string' ? value : String(value ?? '');
         return raw.split('\n')[0].slice(0, 400);
       };
+      // Stage 3 reduce tier: what this call RETURNS to the parent brain. Past
+      // ~8 results in a fan-out window, a compact parked digest replaces the
+      // verbatim payload and shard summaries ride along in-band; small
+      // fan-outs and ERROR results are byte-identical to today.
+      const reduceReturn = (output: unknown): string => {
+        const text = typeof output === 'string' ? output : String(output ?? '');
+        return buildWorkerReturn({
+          sessionId,
+          parentRunId: getToolOutputContext()?.workflowRunId || sessionId || '',
+          item: input.item,
+          text,
+          callId: toolCallId ?? `call_w_${workerRouteStartedAt}_${packetKey.slice(0, 12)}`,
+        });
+      };
       const appendWorkerResultFromOutput = (
         output: unknown,
         data: { model?: string | null; toolUses?: string[]; tokens?: number } = {},
@@ -1147,7 +1163,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // preRun:true → durable worker_result is written but no phantom
           // route-outcome metric is recorded (this worker did not actually run).
           appendWorkerResult({ item: input.item, ok: true, model: workerModel, toolUses: [], reason: 'resume: reused prior completed result', preRun: true });
-          return prior;
+          return reduceReturn(prior);
         }
         // No recoverable output → do NOT claim success; re-execute below.
       }
@@ -1204,7 +1220,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             tokens: workerResultTokens(sdkResult.usage),
           });
           recordWorkerSubagent(sdkResult.text ?? '', sdkResult.model ?? workerModel);
-          return sdkResult.text;
+          return reduceReturn(sdkResult.text ?? '');
         } catch (err) {
           // Claude SDK worker overloaded BEFORE committing anything (no tool ran,
           // nothing streamed) → fall THIS item over to the nested worker lane on
@@ -1232,7 +1248,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             const output = await worker.clone({ model: next.modelId }).asTool(fbOptions).invoke(runContext, JSON.stringify(input), details);
             appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
-            return output;
+            return reduceReturn(output);
           } catch (fallbackErr) {
             appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr) });
             recordWorkerSubagent(`ERROR: ${workerResultReason(fallbackErr)}`, next.modelId);
@@ -1254,7 +1270,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const output = await nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
         appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), route.model ?? workerModel);
-        return output;
+        return reduceReturn(output);
       } catch (err) {
         appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });
         recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, route.model ?? workerModel);
