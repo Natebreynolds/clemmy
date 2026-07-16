@@ -39,7 +39,7 @@
     "build:mobile-web": "npm --prefix apps/mobile-web run build",
     "build:console-web": "npm --prefix apps/console-web run build",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test 'src/**/*.test.ts' 'apps/**/*.test.ts'",
+    "test": "node scripts/run-tests-isolated.mjs",
     "test:release-assets": "node --test apps/desktop/scripts/vendor-recall-native.test.mjs scripts/merge-mac-update-feeds.test.mjs scripts/refresh-notarized-dmg-metadata.test.mjs scripts/release-workflow.test.mjs scripts/vendor-whispercpp-desktop.test.mjs scripts/verify-desktop-release-assets.test.mjs",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",

@@ -12,8 +12,17 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 delete process.env.OPENAI_MODEL_FAST;
 delete process.env.OPENAI_MODEL_PRIMARY;
 delete process.env.OPENAI_MODEL_DEEP;
+delete process.env.OPENAI_AGENTS_DISABLE_TRACING;
 
 const config = await import('./config.js');
+
+test('Agents SDK tracing is quiet by default when no export API key exists', () => {
+  assert.equal(config.resolveOpenAiAgentsTracingDisabled(undefined, ''), '1');
+  assert.equal(config.resolveOpenAiAgentsTracingDisabled('', 'sk-test'), undefined);
+  assert.equal(config.resolveOpenAiAgentsTracingDisabled('true', 'sk-test'), '1');
+  assert.equal(config.resolveOpenAiAgentsTracingDisabled('false', ''), undefined, 'explicit opt-in is respected');
+  assert.equal(process.env.OPENAI_AGENTS_DISABLE_TRACING, '1');
+});
 
 test('MODELS reads model tier changes from the runtime env file', () => {
   assert.equal(config.MODELS.fast, 'gpt-5.4-mini');

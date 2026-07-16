@@ -113,6 +113,27 @@ export function getOpenAiApiKey(): string {
   return fromEnv ?? '';
 }
 
+/** The Agents SDK enables its hosted trace exporter by default, even when
+ * Clementine is running on Codex/Claude OAuth with no OpenAI API key. That
+ * exporter cannot succeed and otherwise emits one stderr error per trace batch.
+ * Respect an explicit user flag; absent one, disable only when no export-capable
+ * API key exists. Returns the process-env value the SDK understands. */
+export function resolveOpenAiAgentsTracingDisabled(
+  configuredValue: string | undefined,
+  apiKey: string,
+): '1' | undefined {
+  const configured = configuredValue?.trim().toLowerCase() ?? '';
+  if (configured === '1' || configured === 'true' || configured === 'on') return '1';
+  if (configured) return undefined;
+  return apiKey.trim() ? undefined : '1';
+}
+
+const agentsTracingDisabled = resolveOpenAiAgentsTracingDisabled(
+  getEnv('OPENAI_AGENTS_DISABLE_TRACING', ''),
+  getOpenAiApiKey(),
+);
+if (agentsTracingDisabled) process.env.OPENAI_AGENTS_DISABLE_TRACING = agentsTracingDisabled;
+
 export const ASSISTANT_NAME = getEnv('ASSISTANT_NAME', 'Clementine');
 export const OWNER_NAME = getEnv('OWNER_NAME', '');
 export const OPENAI_API_KEY = getEnv('OPENAI_API_KEY', '');
