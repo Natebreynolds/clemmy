@@ -23,7 +23,8 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
   createBackgroundTask, markBackgroundTaskRunning, markBackgroundTaskDone,
-  markBackgroundTaskAwaitingApproval, markBackgroundTaskAwaitingContinue, markBackgroundTaskBlocked, markBackgroundTaskFailed,
+  markBackgroundTaskAwaitingApproval, markBackgroundTaskAwaitingInput, markBackgroundTaskAwaitingContinue,
+  markBackgroundTaskBlocked, markBackgroundTaskFailed,
   getBackgroundTask,
   updateBackgroundTask,
 } = await import('../execution/background-tasks.js');
@@ -49,6 +50,7 @@ interface BoardCard {
   sourceKind: string;
   status: string;
   primaryAction?: string;
+  nextSafeAction?: string;
   approvalId?: string;
   failureSummary?: { failedItems: number; retryable: boolean; reason: string };
   raw?: Record<string, unknown>;
@@ -110,6 +112,10 @@ test('GET /api/console/board normalizes every background-task status into the ri
   markBackgroundTaskRunning(awaitingContinue.id);
   markBackgroundTaskAwaitingContinue(awaitingContinue.id, 'turn budget', 'partial result');
 
+  const awaitingInput = createBackgroundTask({ title: 'input task', prompt: 'p', originSessionId: 'console:input' });
+  markBackgroundTaskRunning(awaitingInput.id);
+  markBackgroundTaskAwaitingInput(awaitingInput.id, 'question-board-1', 'What should I do next?');
+
   const done = createBackgroundTask({ title: 'done task', prompt: 'p' });
   markBackgroundTaskRunning(done.id);
   markBackgroundTaskDone(done.id, 'finished');
@@ -137,12 +143,15 @@ test('GET /api/console/board normalizes every background-task status into the ri
     expect(awaiting.id, 'needs_you', ['approve', 'reject', 'cancel']);
     expect(blocked.id, 'needs_you', ['cancel']);
     expect(awaitingContinue.id, 'needs_you', ['resume', 'cancel']);
+    expect(awaitingInput.id, 'needs_you', ['cancel']);
     // Terminal tasks now also offer `archive` (declutter the Done column).
     expect(done.id, 'done', ['archive']);
     expect(interrupted.id, 'done', ['resume', 'archive']);
     assert.equal(byId.get(awaiting.id)?.primaryAction, 'approve');
     assert.equal(byId.get(awaiting.id)?.approvalId, 'appr-1');
     assert.equal(byId.get(awaitingContinue.id)?.primaryAction, 'continue');
+    assert.equal(byId.get(awaitingInput.id)?.primaryAction, 'none');
+    assert.match(byId.get(awaitingInput.id)?.nextSafeAction ?? '', /originating chat/i);
   } finally {
     await h.close();
   }

@@ -1247,9 +1247,16 @@ test('completed Slack background tasks DM the requester by default', () => {
 test('queueBackgroundTaskInputResolution re-queues with the freeform answer', () => {
   const task = createBackgroundTask({ title: 'Pull accounts', prompt: 'pull', originSessionId: 'console:home' });
   markBackgroundTaskAwaitingInput(task.id, 'q-2', 'How many?');
+  const questionCard = listNotifications(300).find((item) => item.metadata?.questionId === 'q-2');
+  assert.equal(questionCard?.read, false, 'question starts as an actionable needs-input card');
   const resumed = queueBackgroundTaskInputResolution('q-2', 'just my market-leader accounts');
   assert.equal(resumed?.status, 'pending', 're-queued for the daemon to resume');
   assert.equal(resumed?.inputResolution?.answer, 'just my market-leader accounts');
+  assert.equal(
+    listNotifications(300).find((item) => item.metadata?.questionId === 'q-2')?.read,
+    true,
+    'answering clears the stale needs-input card from Home',
+  );
   // resolving a non-parked / unknown question is a no-op
   assert.equal(queueBackgroundTaskInputResolution('q-nope', 'x'), null);
 });

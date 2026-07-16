@@ -19,7 +19,7 @@ import {
   SLACK_BOT_TOKEN,
   SLACK_ENABLED,
 } from '../config.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, markNotificationsReadByQuestionId } from '../runtime/notifications.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { humanizeReportBody } from '../runtime/report-voice.js';
 import { getGoalPinForDelegation, getActiveGoalForSession } from '../agents/plan-proposals.js';
@@ -1142,6 +1142,21 @@ export function updateBackgroundTask(id: string, patch: Partial<Omit<BackgroundT
     updatedAt: nowIso(),
   };
   writeTask(updated);
+  // A question card is actionable only while the task is actually parked on
+  // that question. Any canonical state transition away from awaiting_input
+  // clears the old Home/notification attention item, whether the user answered,
+  // cancelled, or another terminal path closed the task.
+  if (task.status === 'awaiting_input' && updated.status !== 'awaiting_input' && task.pendingQuestionId) {
+    try {
+      markNotificationsReadByQuestionId(task.pendingQuestionId, {
+        backgroundTaskStatus: updated.status,
+        backgroundTaskId: updated.id,
+      });
+    } catch {
+      // The task store is canonical; notification cleanup is best-effort and
+      // must never prevent the actual task transition.
+    }
+  }
   return updated;
 }
 
@@ -1980,7 +1995,10 @@ export function queueBackgroundTaskInputResolution(questionId: string, answer: s
       body: `Task ${updated.id} will resume in the daemon with your answer.`,
       createdAt: now,
       read: false,
-      metadata: taskNotificationMetadata(updated, { questionId, status: 'pending' }),
+      // This is an informational lifecycle event, not the still-actionable
+      // question card. Keeping questionId here made consumers (and people)
+      // treat the fresh "resuming" notice as the old unresolved request.
+      metadata: taskNotificationMetadata(updated, { resolvedQuestionId: questionId, status: 'pending' }),
     });
   }
   return updated;

@@ -1522,6 +1522,13 @@ function boardActionForStatus(sourceKind: BoardCard['sourceKind'], status: strin
       nextSafeAction: 'Continue with a fresh budget from the last saved state.',
     };
   }
+  if (sourceKind === 'background' && status === 'awaiting_input') {
+    return {
+      primaryAction: 'none',
+      continueMode: 'none',
+      nextSafeAction: 'Answer the question in the originating chat, or cancel this task to clear it.',
+    };
+  }
   return { primaryAction: 'none', continueMode: 'none' };
 }
 
@@ -3507,8 +3514,19 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const records = listToolChoices().map((r) => ({
+        procedureId: r.procedureId ?? null,
         intent: r.intent,
         description: r.description ?? null,
+        aliases: (r.aliases ?? []).map((alias) => ({
+          intent: alias.intent,
+          status: alias.status,
+          source: alias.source,
+          firstSeenAt: alias.firstSeenAt,
+          lastSeenAt: alias.lastSeenAt,
+        })),
+        impressionCount: r.impressionCount ?? 0,
+        lastImpressedAt: r.lastImpressedAt ?? null,
+        evidenceCount: r.evidenceCount ?? 0,
         choice: r.choice
           ? {
               kind: r.choice.kind,
@@ -3525,7 +3543,18 @@ export function registerConsoleRoutes(
       }));
       // Strongest, most-recently-validated first; invalidated (no active choice) sink.
       records.sort((a, b) => (b.choice?.score ?? -1) - (a.choice?.score ?? -1));
-      res.json({ count: records.length, records });
+      const aliasCount = records.reduce((sum, record) => sum + Math.max(1, record.aliases.length), 0);
+      const quarantinedAliases = records.reduce(
+        (sum, record) => sum + record.aliases.filter((alias) => alias.status === 'quarantined').length,
+        0,
+      );
+      res.json({
+        count: records.length,
+        aliasCount,
+        collapsedAliases: Math.max(0, aliasCount - records.length),
+        quarantinedAliases,
+        records,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -9268,7 +9297,8 @@ export function registerConsoleRoutes(
         const column: BoardColumnId =
           task.status === 'pending' ? 'queued'
             : task.status === 'running' || task.status === 'cancelling' ? 'running'
-              : task.status === 'awaiting_approval' || task.status === 'awaiting_continue' || task.status === 'blocked' ? 'needs_you'
+              : task.status === 'awaiting_approval' || task.status === 'awaiting_input'
+                || task.status === 'awaiting_continue' || task.status === 'blocked' ? 'needs_you'
                 : 'done';
         const actions: string[] = [];
         if (task.archived) {
@@ -9277,7 +9307,7 @@ export function registerConsoleRoutes(
           if (task.status === 'pending') actions.push('promote', 'cancel');
           else if (task.status === 'awaiting_continue') actions.push('resume', 'cancel');
           else if (task.status === 'running' || task.status === 'cancelling'
-            || task.status === 'blocked') actions.push('cancel');
+            || task.status === 'awaiting_input' || task.status === 'blocked') actions.push('cancel');
           else if (task.status === 'awaiting_approval') actions.push('approve', 'reject', 'cancel');
           else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
             if (!task.resumedIntoTaskId) actions.push('resume');

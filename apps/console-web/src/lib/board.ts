@@ -293,6 +293,7 @@ export function rejectReason(card: BoardCard, target: BoardColumnId): string {
   if (target === card.column) return '';
   if (target === 'done') return 'This card can’t be cancelled.';
   if (card.status === 'awaiting_approval') return 'Approve from the card to continue — a drag can’t grant approval.';
+  if (card.status === 'awaiting_input') return 'Answer in the originating chat, or use Cancel to clear this task.';
   if (card.status === 'awaiting_continue') return 'Move it to Running to continue the background task.';
   if (target === 'running') return 'Nothing to start or resume here.';
   return 'That move isn’t available.';
@@ -370,6 +371,8 @@ export function cardTone(card: BoardCard): { tone: Tone; label: string } {
       tone: 'warning',
       label: card.status === 'awaiting_approval'
         ? 'Approval'
+        : card.status === 'awaiting_input'
+          ? 'Input'
         : card.status === 'awaiting_continue'
           ? 'Continue'
           : card.status,

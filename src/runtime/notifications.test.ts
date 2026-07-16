@@ -35,6 +35,7 @@ const {
   listNotifications,
   markStaleApprovalNotificationsRead,
   markNotificationsReadByApprovalId,
+  markNotificationsReadByQuestionId,
   isDeliveryJobStale,
 } = await import('./notifications.js');
 
@@ -190,6 +191,36 @@ test('markNotificationsReadByApprovalId marks stable and metadata approval notif
   assert.ok(mine.every((item) => item.read));
   assert.ok(mine.every((item) => item.metadata?.approvalStatus === 'resolved'));
   assert.equal(items.find((item) => item.id === 'approval-apr-other')?.read, false);
+});
+
+test('markNotificationsReadByQuestionId clears only the resolved needs-input card', () => {
+  addNotification({
+    id: 'question-q-test',
+    kind: 'approval',
+    title: 'Background task needs your input',
+    body: 'Which segment?',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { questionId: 'q-test', backgroundTaskId: 'bg-test', needsInput: true },
+  });
+  addNotification({
+    id: 'question-q-other',
+    kind: 'approval',
+    title: 'Another task needs your input',
+    body: 'Which region?',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { questionId: 'q-other', backgroundTaskId: 'bg-other', needsInput: true },
+  });
+
+  const changed = markNotificationsReadByQuestionId('q-test', { backgroundTaskStatus: 'pending' });
+  assert.equal(changed.length, 1);
+  const items = listNotifications(50);
+  const resolved = items.find((item) => item.id === 'question-q-test');
+  assert.equal(resolved?.read, true);
+  assert.equal(resolved?.metadata?.backgroundTaskStatus, 'pending');
+  assert.ok(resolved?.metadata?.questionResolvedAt);
+  assert.equal(items.find((item) => item.id === 'question-q-other')?.read, false);
 });
 
 test('markStaleApprovalNotificationsRead leaves active approvals unread and clears stale ones', () => {

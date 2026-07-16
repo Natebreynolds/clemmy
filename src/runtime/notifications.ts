@@ -423,6 +423,41 @@ export function markNotificationsReadByApprovalId(
   return changed;
 }
 
+/** Resolve the durable "background task needs your input" card once its
+ * freeform question has been answered or the task leaves that parked state.
+ * Approval notifications already had this lifecycle cleanup; question-backed
+ * cards did not, so Home could remain stuck on "needs you" after the task had
+ * resumed and the Tasks board had moved on. */
+export function markNotificationsReadByQuestionId(
+  questionId: string,
+  metadataPatch: Record<string, unknown> = {},
+): NotificationRecord[] {
+  if (!questionId) return [];
+  const items = loadNotifications();
+  const changed: NotificationRecord[] = [];
+  const resolvedAt = new Date().toISOString();
+  for (const item of items) {
+    if (item.metadata?.questionId !== questionId) continue;
+    const nextMetadata = {
+      ...(item.metadata ?? {}),
+      questionResolvedAt: resolvedAt,
+      ...metadataPatch,
+    };
+    let didChange = false;
+    if (!item.read) {
+      item.read = true;
+      didChange = true;
+    }
+    if (JSON.stringify(item.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+      item.metadata = nextMetadata;
+      didChange = true;
+    }
+    if (didChange) changed.push(item);
+  }
+  if (changed.length > 0) saveNotifications(items);
+  return changed;
+}
+
 export function markStaleApprovalNotificationsRead(
   activeApprovalIds: Iterable<string>,
   metadataPatch: Record<string, unknown> = {},
