@@ -8,7 +8,7 @@ import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactiv
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { recallEverything, formatUnifiedRecall, unifiedHitRecallRef, visibleUnifiedRecallHits } from '../memory/unified-recall.js';
-import { createRecallRunId, recordRecallRun, recordRecallUse } from '../memory/recall-usage.js';
+import { createRecallRunId, recordRecallRun } from '../memory/recall-usage.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
 import { scheduleRecallShadow } from '../memory/recall-shadow.js';
 import { applyMemoryFix, detectMemoryHealCandidates, listProposedMemoryFixes, revertMemoryHeal, runMemorySelfHeal, type ProposedMemoryFix } from '../memory/self-heal.js';
@@ -636,9 +636,6 @@ export function registerMemoryTools(server: McpServer): void {
         return textResult(`No relevant facts found.${recallId ? ` Recall ${recallId}.` : ''}`);
       }
       const lines = facts.map((fact) => `- [fact:${fact.id}] ${fact.kind}: ${fact.content}`);
-      if (recallId) {
-        lines.push(`[USE FEEDBACK] If an exact fact materially changes your answer, plan, or tool choice, call memory_mark_used once with recall_id ${recallId} and only the exact fact:<id> ref(s) used.`);
-      }
       return textResult(lines.join('\n'));
     },
   );
@@ -691,39 +688,14 @@ export function registerMemoryTools(server: McpServer): void {
         query: objective,
         facts: facts.map((fact) => ({ fact, reason: 'agent-tool-unified-recall' })),
       });
-      const attribution = result.recallId
-        ? `\n[USE FEEDBACK] If a returned memory materially changes your answer, plan, or tool choice, call memory_mark_used once with recall_id ${result.recallId} and only the exact ref(s) you used. Do not credit merely displayed alternatives.`
-        : '';
-      return textResult(block + attribution);
+      return textResult(block);
     },
   );
 
-  server.tool(
-    'memory_mark_used',
-    'Attribute material use of an exact memory_recall_all result. Call this once after one or more returned refs actually change your answer, plan, scope, or tool choice; never mark every displayed candidate. The recall id and refs must be copied exactly from that recall result. Retries are idempotent.',
-    {
-      recall_id: z.string().min(1),
-      refs: z.array(z.string().min(3)).min(1).max(20),
-      outcome: z.enum(['used', 'not_useful']).optional(),
-      detail: z.string().max(500).optional(),
-    },
-    async ({ recall_id, refs, outcome, detail }) => {
-      const result = recordRecallUse({ recallId: recall_id, refs, outcome, detail });
-      if (!result.ok) {
-        const reason = result.reason === 'expired'
-          ? 'That recall attribution window has expired.'
-          : 'No recall run exists with that id.';
-        return textResult(`${reason} No utility was recorded.`);
-      }
-      const parts = [
-        `Recorded ${result.recorded.length} ${outcome === 'not_useful' ? 'not-useful' : 'material-use'} ref${result.recorded.length === 1 ? '' : 's'}.`,
-      ];
-      if (result.utilityFactIds.length > 0) parts.push(`Credited fact${result.utilityFactIds.length === 1 ? '' : 's'} #${result.utilityFactIds.join(', #')}.`);
-      if (result.duplicates.length > 0) parts.push(`${result.duplicates.length} duplicate${result.duplicates.length === 1 ? '' : 's'} ignored.`);
-      if (result.rejected.length > 0) parts.push(`${result.rejected.length} ref${result.rejected.length === 1 ? '' : 's'} rejected because it was not returned by that recall.`);
-      return textResult(parts.join(' '));
-    },
-  );
+  // memory_mark_used was subtracted 2026-07-16: zero lifetime invocations —
+  // the model never voluntarily files usage paperwork. Recall credit now
+  // happens in code via the post-turn auto-credit hook (recall-auto-credit.ts),
+  // which feeds the same recordRecallUse sink.
 
   server.tool(
     'memory_forget',
