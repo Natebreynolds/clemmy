@@ -46,11 +46,14 @@ const GOLDEN = {
   // update_plan_step) killed → "PLAN vs EXECUTION COHERENCE" rewritten as
   // "EXECUTION IS THE SOURCE OF TRUTH"; goal_create/goal_update/goal_get merged
   // into goal_upsert (goal_list unchanged).
-  instructions: { len: 35636, sha16: '0de68f07b2a66e64' },
-  native: { len: 34739, sha16: 'ad85a4b466b91b79' },
-  claudeBrain: { len: 5589, sha16: 'eaf07b47ae5ca924' },
+  // 2026-07-16 memory_mark_used subtraction: both mark-used prompt rules removed
+  // from the rubric — usage credit is now attributed in code post-turn
+  // (recall-auto-credit.ts), so the model owes no bookkeeping call.
+  instructions: { len: 35397, sha16: '3ecaedce880db18d' },
+  native: { len: 34500, sha16: 'a5c6b24cdd80de3e' },
+  claudeBrain: { len: 5411, sha16: 'cb2e4d6d1ef97277' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8848, sha16: '8bb076e57bdea9bf' },
+  lean: { len: 8670, sha16: 'e136b924c1b5a209' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

@@ -2352,7 +2352,10 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
     const neg = (c.failureCount ?? 0) + (c.rejectionCount ?? 0);
     const pos = (c.successCount ?? 0) + (c.approvalCount ?? 0);
     const track = outcomesOn && pos + neg > 0 ? ` (✓${pos}${neg ? `/✗${neg}` : ''})` : '';
-    const line = clip(`- ${star}${r.intent}: ${c.kind}:${c.identifier}${how}${track}`);
+    // C6: surface WHICH account a remembered choice is bound to, so the model
+    // never reuses a line against the wrong mailbox.
+    const identity = c.accountIdentity ? ` @${c.accountIdentity}` : '';
+    const line = clip(`- ${star}${r.intent}: ${c.kind}:${c.identifier}${identity}${how}${track}`);
     if (used + 1 + line.length > maxChars) break;
     lines.push(line);
     used += 1 + line.length;

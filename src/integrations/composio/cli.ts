@@ -188,7 +188,35 @@ export function parseComposioCliJson(text: string): unknown {
   }
 }
 
+// E3: status probing spawns two subprocesses (--version + whoami). On the 'auto'
+// backend that happens per execute for a CLI-installed-but-unauthenticated user,
+// so memoize briefly. TTL is short enough that a fresh `composio login` is picked
+// up within a minute; busted explicitly on backend save / client reset.
+const CLI_STATUS_TTL_MS = 45_000;
+let cliStatusCache: { key: string; at: number; value: Promise<ComposioCliStatus> } | null = null;
+
+export function invalidateComposioCliStatusCache(): void {
+  cliStatusCache = null;
+}
+
 export async function getComposioCliStatus(options: ComposioCliEnvOptions = {}): Promise<ComposioCliStatus> {
+  const key = JSON.stringify([options.apiKey ?? '', options.userId ?? '']);
+  const now = Date.now();
+  if (cliStatusCache && cliStatusCache.key === key && now - cliStatusCache.at <= CLI_STATUS_TTL_MS) {
+    return cliStatusCache.value;
+  }
+  const value = fetchComposioCliStatus(options);
+  cliStatusCache = { key, at: now, value };
+  try {
+    return await value;
+  } catch (err) {
+    // Never cache a rejection.
+    if (cliStatusCache?.value === value) cliStatusCache = null;
+    throw err;
+  }
+}
+
+async function fetchComposioCliStatus(options: ComposioCliEnvOptions = {}): Promise<ComposioCliStatus> {
   const binary = findComposioCli();
   if (!binary) {
     return {

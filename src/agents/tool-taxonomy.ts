@@ -99,7 +99,6 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'set_model_role',
   // Durable facts + working memory.
   'memory_remember',
-  'memory_mark_used',
   'source_map_upsert',
   'memory_forget',
   'memory_embed_backfill',

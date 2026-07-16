@@ -166,9 +166,11 @@ export async function buildUnifiedTurnPrimer(input: {
   result.recallId = recallId;
   const preamble = '[MEMORY PRIMER]';
   const useRule = 'Use relevant hits; treat snippets as leads and load a cited source before source-backed output or external writes.';
-  const feedback = `[USAGE] If a ref materially changes the response or action, call memory_mark_used once with recall_id ${recallId} and those refs.`;
+  // The [USAGE] mark-used trailer was subtracted 2026-07-16 — usage credit is
+  // now attributed in code post-turn (recall-auto-credit.ts). Its budget share
+  // goes to the hits themselves.
   const maxChars = Math.max(700, Math.min(12_000, input.maxChars ?? 2_600));
-  const recallBudget = Math.max(0, maxChars - preamble.length - useRule.length - feedback.length - 3);
+  const recallBudget = Math.max(0, maxChars - preamble.length - useRule.length - 2);
   const retrievedHitCount = result.hits.length;
   result.hits = visibleUnifiedPrimerHits(result, recallBudget);
   if (result.hits.length === 0) {
@@ -201,7 +203,7 @@ export async function buildUnifiedTurnPrimer(input: {
     input.sessionId,
   );
   const block = formatUnifiedPrimer(result, recallBudget);
-  const text = [preamble, useRule, block, ...(persistedRecallId ? [feedback] : [])].join('\n');
+  const text = [preamble, useRule, block].join('\n');
   return {
     status: 'ok',
     query,

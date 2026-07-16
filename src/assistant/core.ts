@@ -3,6 +3,7 @@ import { MODELS } from '../config.js';
 import { analyzeExecutionIntent, buildExecutionPromptBlock, parseExecutionResponse } from '../execution/intake.js';
 import { ExecutionStore } from '../execution/store.js';
 import { assemblePromptContextAsync } from '../memory/context.js';
+import { autoCreditRecallRuns } from '../memory/recall-auto-credit.js';
 import { refreshSessionBrief } from '../memory/session-briefs.js';
 import { SessionStore } from '../memory/session-store.js';
 import type { AssistantRequest, AssistantResponse, RunResult } from '../types.js';
@@ -176,7 +177,7 @@ export class ClementineAssistant {
       ? analyzeExecutionIntent(request.message, activeExecution)
       : undefined;
     const executionPrompt = executionIntent ? buildExecutionPromptBlock(executionIntent, activeExecution) : '';
-    const { memoryContext, retrievalText } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
+    const { memoryContext, retrievalText, recallId } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
     const instructions = buildAssistantInstructions(memoryContext, request.channel, messageIntent.intent, request.message);
     // Tiered context (flag on): the dynamic per-turn blocks (facts, tool-choices,
     // working-memory, …) ride the per-turn input tail instead of the cached
@@ -274,6 +275,16 @@ export class ClementineAssistant {
       // especially) reject empty messages, so guarantee a body.
       result = { ...result, text: ASSISTANT_PAUSED_PLACEHOLDER, stoppedReason: result.stoppedReason ?? 'error' };
     }
+
+    // Post-reply memory credit for this lane's primer recall run (code-level
+    // replacement for the never-called memory_mark_used prompt rule).
+    try {
+      autoCreditRecallRuns({
+        recallIds: [recallId],
+        replyText: result.text,
+        queryText: request.message,
+      });
+    } catch { /* crediting is bookkeeping; it must never break the reply */ }
 
     if (executionPrompt && executionIntent) {
       const parsed = parseExecutionResponse(result.text);

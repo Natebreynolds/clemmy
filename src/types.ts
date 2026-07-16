@@ -194,6 +194,8 @@ export interface MemorySearchHit {
 export interface AssembledPromptContext {
   memoryContext: MemoryContext;
   retrievalText: string;
+  /** Recall run behind retrievalText, threaded to the post-reply auto-credit hook. */
+  recallId?: string;
 }
 
 export interface AssistantRequest {

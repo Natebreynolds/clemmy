@@ -10,6 +10,7 @@ import { cachedIdentityEmail, cachedConnectionOwner, recordConnectionOwner } fro
 import {
   executeComposioCliTool,
   getComposioCliStatus,
+  invalidateComposioCliStatusCache,
   searchComposioCliTools,
   type ComposioCliStatus,
 } from './cli.js';
@@ -641,6 +642,7 @@ export function resetComposioClient(): void {
   invalidateConnectedAccountSnapshot();
   catalogCache = null;
   toolkitToolsCache.clear();
+  invalidateComposioCliStatusCache();
 }
 
 export function clearConnectedToolkitsCache(): void {

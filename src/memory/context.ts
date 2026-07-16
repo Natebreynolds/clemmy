@@ -194,5 +194,6 @@ export async function assemblePromptContextAsync(sessionId: string, message: str
   return {
     memoryContext,
     retrievalText,
+    recallId: primer?.recallId,
   };
 }

@@ -564,6 +564,21 @@ export function noteComposioSearchIntent(
   });
 }
 
+/** The honest intent behind an execute, for outcome learning: the session's
+ *  fresh search query when that search actually surfaced this slug, else a
+ *  readable seed from the slug. The surfaced-slug gate is the synchronous twin
+ *  of auto-remember's semantic gate — a stale query about a DIFFERENT toolkit
+ *  must never label this slug's outcome stats. Read-only — never consumes the
+ *  session entry (auto-remember owns deletion). */
+export function executionIntentForSession(sessionId: string | undefined, toolSlug: string): string {
+  const pending = sessionId ? lastComposioSearchBySession.get(sessionId) : undefined;
+  const fresh = Boolean(pending && Date.now() - pending.at <= AUTO_REMEMBER_WINDOW_MS);
+  const surfacedThisSlug = Boolean(pending?.slugs?.includes(toolSlug));
+  return (fresh && surfacedThisSlug ? pending?.query.trim() : undefined)
+    || intentSeedFromSlug(toolSlug)
+    || 'composio_execute';
+}
+
 /** Cross-service mis-binding guard. A (possibly stale/loose) search query about
  *  toolkit X must never be bound to a slug from a DIFFERENT toolkit Y. Observed
  *  2026-06-22: a "DataForSEO ranked keywords" search whose auto-remember window
@@ -1408,6 +1423,9 @@ async function runComposioExecute(
       if (accountRouteNote) output += `\n\n${accountRouteNote}`;
       if (constraintBanner) output += `\n${constraintBanner}`;
       const sid = runSid;
+      // Capture the intent BEFORE auto-remember consumes (deletes) the session's
+      // search entry — the fresh search query is the honest intent behind this execute.
+      const executionIntent = executionIntentForSession(sid, toolSlug);
       maybeAutoRememberComposioChoice(toolSlug, args, result, sid, effectiveConnectionId);
 
       // PHASE 5: Record outcome for adaptive tool selection & learning
@@ -1423,7 +1441,7 @@ async function runComposioExecute(
       try {
         recordExecution({
           toolName: options.toolName || toolSlug,
-          intent: 'composio_execute', // TODO: extract from context
+          intent: executionIntent,
           succeeded: !failure.failed,
           errorType: failure.failed ? (failure.notFound ? 'not_found' : 'unknown') : undefined,
           timestamp: new Date().toISOString(),

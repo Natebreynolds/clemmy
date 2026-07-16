@@ -51,6 +51,55 @@ test('suppresses expired connection errors from nested SDK payloads', () => {
   assert.equal(suppression?.reason, 'expired');
 });
 
+test('suppresses not-connected (1810) errors from nested SDK payloads', () => {
+  const state = {};
+  const suppression = suppressConnectionAfterHardAuthFailure(
+    state,
+    'ca_gone',
+    {
+      message: 'Error executing the tool OUTLOOK_LIST_MAIL_FOLDER_MESSAGES',
+      data: {
+        error: {
+          message: "ConnectedAccountNotFound: no connected account found for toolkit 'outlook'",
+          code: 1810,
+        },
+      },
+    },
+    Date.parse('2026-07-02T12:00:00Z'),
+  );
+  assert.equal(suppression?.reason, 'not-connected');
+  // Falls onto the expired backoff schedule (no dedicated schedule).
+  assert.equal(
+    suppression?.suppressUntil,
+    new Date(Date.parse('2026-07-02T12:00:00Z') + hardAuthSuppressionDurationMs('not-connected', 1)).toISOString(),
+  );
+});
+
+test('suppresses ToolRouterV2 NoActiveConnection variants', () => {
+  const state = {};
+  const suppression = suppressConnectionAfterHardAuthFailure(
+    state,
+    'ca_router',
+    new Error('ToolRouterV2_NoActiveConnection: NoActiveConnection for GMAIL'),
+    Date.parse('2026-07-02T12:00:00Z'),
+  );
+  assert.equal(suppression?.reason, 'not-connected');
+});
+
+test('a plain 404 / generic not-found does NOT quarantine (misfire has 1-30 day blast radius)', () => {
+  const state = {};
+  for (const err of [
+    new Error('404 Not Found'),
+    new Error('Tool OUTLOOK_FOO not found in catalog'),
+    { message: 'resource not found', statusCode: 404 },
+    new Error('no results found for query'),
+  ]) {
+    const suppression = suppressConnectionAfterHardAuthFailure(state, 'ca_healthy', err, Date.parse('2026-07-02T12:00:00Z'));
+    assert.equal(suppression, undefined);
+  }
+  assert.deepEqual(state, {});
+});
+
 test('hard auth suppressions use progressive long-lived quarantine windows', () => {
   const now = Date.parse('2026-07-02T12:00:00Z');
   const expiredErr = {

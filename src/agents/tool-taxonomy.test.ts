@@ -95,13 +95,6 @@ test('decideToolApproval: task_hygiene is local bookkeeping and does not ask', (
   assert.equal(decision.reason, 'read-always-auto');
 });
 
-test('decideToolApproval: memory use attribution is local bookkeeping and does not ask', () => {
-  const decision = decideToolApproval({ toolName: 'memory_mark_used' });
-  assert.equal(decision.kind, 'write');
-  assert.equal(decision.needsApproval, false);
-  assert.equal(decision.reason, 'read-always-auto');
-});
-
 test('decideToolApproval: workspace authoring tools are local bookkeeping and do not ask', () => {
   setScope('strict');
   for (const toolName of ['space_save', 'space_refresh', 'space_try_runner', 'space_edit_view', 'space_set_data']) {

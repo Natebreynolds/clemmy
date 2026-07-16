@@ -892,3 +892,33 @@ test('a corrupt legacy alias file is skipped — migration and recall of healthy
     'migration completed for the healthy file',
   );
 });
+
+test('renderToolChoicesForContext: C6 — a choice bound to an account shows @identity; one without is unchanged', () => {
+  const previous = process.env.TOOL_CHOICE_CONTEXT_INJECT;
+  process.env.TOOL_CHOICE_CONTEXT_INJECT = 'on';
+  try {
+    rememberToolChoice({
+      intent: 'c6.render.with-identity',
+      choice: {
+        kind: 'composio',
+        identifier: 'OUTLOOK_LIST_MESSAGES',
+        accountIdentity: 'nathan@breakthrough.example',
+        testedAt: '2099-05-01T00:00:00.000Z',
+      },
+    });
+    rememberToolChoice({
+      intent: 'c6.render.without-identity',
+      choice: { kind: 'composio', identifier: 'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED', testedAt: '2099-05-02T00:00:00.000Z' },
+    });
+    const rendered = renderToolChoicesForContext(4);
+    const withIdentity = rendered.split('\n').find((l) => l.includes('c6.render.with-identity'));
+    const withoutIdentity = rendered.split('\n').find((l) => l.includes('c6.render.without-identity'));
+    assert.ok(withIdentity, 'identity-bound line rendered');
+    assert.match(withIdentity!, /OUTLOOK_LIST_MESSAGES @nathan@breakthrough\.example/);
+    assert.ok(withoutIdentity, 'identity-free line rendered');
+    assert.doesNotMatch(withoutIdentity!, / @/, 'no identity marker when the choice has no accountIdentity');
+  } finally {
+    if (previous === undefined) delete process.env.TOOL_CHOICE_CONTEXT_INJECT;
+    else process.env.TOOL_CHOICE_CONTEXT_INJECT = previous;
+  }
+});

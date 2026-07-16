@@ -74,8 +74,9 @@ test('memory_self_heal is exposed in the local MCP catalog', () => {
   assert.ok(LOCAL_MCP_TOOL_NAMES.includes('memory_self_heal'));
 });
 
-test('memory_mark_used is exposed in the local MCP catalog', () => {
-  assert.ok(LOCAL_MCP_TOOL_NAMES.includes('memory_mark_used'));
+test('memory_mark_used stays subtracted — usage credit is code-level (recall-auto-credit), not a model tool', () => {
+  assert.ok(!LOCAL_MCP_TOOL_NAMES.includes('memory_mark_used'));
+  assert.equal(registeredToolHandlers().get('memory_mark_used'), undefined);
 });
 
 test('convert_to_markdown is exposed in the local MCP catalog', () => {
@@ -222,41 +223,35 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
   }
 });
 
-test('memory_mark_used credits an exact recalled fact once', async () => {
-  const fact = rememberFact({ kind: 'project', content: 'The live review is about the Atlas partnership.' });
-  const run = recordRecallRun({
-    objective: 'what was the live review about?',
-    surface: 'test',
-    answerability: 'supported',
-    candidateRefs: [{ type: 'fact', id: String(fact.id) }],
-  });
-  const handler = registeredToolHandlers().get('memory_mark_used');
-  assert.ok(handler, 'memory_mark_used should be registered');
-
-  const result = await handler!({ recall_id: run.id, refs: [`fact:${fact.id}`], detail: 'Supplied the meeting topic.' });
-  assert.match(result.content[0].text, /Recorded 1 material-use ref/);
-  assert.match(result.content[0].text, new RegExp(`Credited fact #${fact.id}\\b`));
-  assert.equal(getFact(fact.id)?.utilityCount, 1);
-
-  const retry = await handler!({ recall_id: run.id, refs: [`fact:${fact.id}`] });
-  assert.match(retry.content[0].text, /duplicate ignored/);
-  assert.equal(getFact(fact.id)?.utilityCount, 1);
-});
-
-test('memory_search_facts returns attributable refs instead of uncreditable fact rows', async () => {
+test('memory_search_facts records an attribution run with snippets for post-turn auto-credit', async () => {
   const fact = rememberFact({ kind: 'project', content: 'The Atlas partnership review is scheduled for Thursday.' });
   const handlers = registeredToolHandlers();
   const search = handlers.get('memory_search_facts');
-  const mark = handlers.get('memory_mark_used');
-  assert.ok(search && mark);
+  assert.ok(search);
 
   const result = await search!({ query: 'Atlas partnership review Thursday', limit: 8 });
   const text = result.content[0].text;
   assert.match(text, new RegExp(`\\[fact:${fact.id}\\]`));
-  const recallId = text.match(/recall_id\s+(mr-[a-f0-9-]+)/i)?.[1];
-  assert.ok(recallId, 'scoped fact search should create an attribution run');
+  assert.doesNotMatch(text, /memory_mark_used/, 'the mark-used trailer stays subtracted');
 
-  await mark!({ recall_id: recallId!, refs: [`fact:${fact.id}`], detail: 'Supplied the review date.' });
+  const run = openMemoryDb().prepare(`
+    SELECT id, candidate_refs_json FROM memory_recall_runs
+    WHERE surface = 'memory_search_facts' ORDER BY created_at DESC LIMIT 1
+  `).get() as { id: string; candidate_refs_json: string } | undefined;
+  assert.ok(run, 'scoped fact search should create an attribution run');
+  const refs = JSON.parse(run!.candidate_refs_json) as Array<{ type: string; id: string; snippet?: string }>;
+  const candidate = refs.find((r) => r.type === 'fact' && r.id === String(fact.id));
+  assert.ok(candidate, 'the returned fact is a run candidate');
+  assert.equal(candidate!.snippet, fact.content, 'the snippet carries what the model saw');
+
+  // The code-level credit path replaces the tool: a reply that reproduces the
+  // fact's distinctive content credits it against this run.
+  const { autoCreditRecallRuns } = await import('../memory/recall-auto-credit.js');
+  autoCreditRecallRuns({
+    recallIds: [run!.id],
+    replyText: 'The Atlas partnership review is on Thursday — I put it on your calendar.',
+    queryText: 'review date?',
+  });
   assert.equal(getFact(fact.id)?.utilityCount, 1);
 });
 
