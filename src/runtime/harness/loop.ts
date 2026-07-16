@@ -27,6 +27,7 @@ import {
   withHarnessRunContext,
   harnessToolBracketsEnabled,
   startGate,
+  type HarnessRunContext,
 } from './brackets.js';
 import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
 import {
@@ -84,6 +85,7 @@ import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import { autoCreditRecallRuns, extractFunctionCallArgTexts } from '../../memory/recall-auto-credit.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -174,6 +176,44 @@ function safeMaybeAutoFocus(sessionId: string, summaryHint?: unknown): void {
   } catch (err) {
     // Focus is a context aid, not a reason to fail the user's turn.
     console.warn('[harness] auto-focus failed', err instanceof Error ? err.message : err);
+  }
+}
+
+/** Post-turn memory-credit hook: match this turn's recall runs (primer +
+ *  tool-recorded) against what the turn actually produced and credit
+ *  demonstrable use. Replaces the never-called memory_mark_used prompt rule
+ *  with code. Best-effort — crediting must never fail the turn. */
+function safeAutoCreditRecall(input: {
+  sessionId: string;
+  turn: number;
+  recallIds: Array<string | null | undefined>;
+  finalOutput: unknown;
+  newHistoryItems: unknown[];
+}): void {
+  try {
+    const replyText = typeof input.finalOutput === 'string'
+      ? input.finalOutput
+      : (() => { try { return JSON.stringify(input.finalOutput) ?? ''; } catch { return ''; } })();
+    const outcomes = autoCreditRecallRuns({
+      recallIds: input.recallIds,
+      replyText,
+      toolArgTexts: extractFunctionCallArgTexts(input.newHistoryItems),
+    });
+    if (outcomes.length === 0) return;
+    safeAppend({
+      sessionId: input.sessionId,
+      turn: input.turn,
+      role: 'system',
+      type: 'recall_auto_credit',
+      data: {
+        runs: outcomes.map((o) => ({
+          recallId: o.recallId,
+          refs: o.credited.map((d) => ({ ref: `${d.ref.type}:${d.ref.id}`, evidence: d.evidence })),
+        })),
+      },
+    });
+  } catch (err) {
+    console.warn('[harness] recall auto-credit failed', err instanceof Error ? err.message : err);
   }
 }
 
@@ -4382,6 +4422,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
   try {
     const run = options.runRunner ?? defaultRunRunner;
+    // Hoisted so the post-turn auto-credit hook can read the recall runs the
+    // turn's tool handlers registered (turnRecallRunIds). Built lazily inside
+    // the heartbeat callback where recallBudget exists.
+    let harnessCtx: HarnessRunContext | undefined;
     // T2.1 — install the AsyncLocalStorage context so any wrapToolForHarness
     // wrapper inside the SDK's run() can read the per-turn counter +
     // sessionId without explicit threading. Pass-through when the
@@ -4405,29 +4449,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           recallBudgetMaxCalls(),
           recallBudgetMaxBytes(),
         );
-        if (useToolWrapper) {
-          return await withHarnessRunContext(
-            {
-              sessionId: options.sessionId,
-              counter: toolCounter,
-              behaviorScopeId: `${options.sessionId}::turn:${turn}`,
-              recallBudget,
-              suppressBackgroundOffer: options.suppressBackgroundOffer,
-            },
-            () => run(runner, options.agent, items, opts),
-          ) as RunOutcome;
-        }
-        // Even without the tool-bracket wrapper, install the AsyncLocalStorage
-        // context so recall_tool_result can resolve the session id +
-        // per-turn budget.
+        harnessCtx = {
+          sessionId: options.sessionId,
+          counter: toolCounter,
+          behaviorScopeId: `${options.sessionId}::turn:${turn}`,
+          recallBudget,
+          suppressBackgroundOffer: options.suppressBackgroundOffer,
+        };
+        // With or without the tool-bracket wrapper, install the
+        // AsyncLocalStorage context so recall_tool_result can resolve the
+        // session id + per-turn budget.
         return await withHarnessRunContext(
-          {
-            sessionId: options.sessionId,
-            counter: toolCounter,
-            behaviorScopeId: `${options.sessionId}::turn:${turn}`,
-            recallBudget,
-            suppressBackgroundOffer: options.suppressBackgroundOffer,
-          },
+          harnessCtx,
           () => run(runner, options.agent, items, opts),
         ) as RunOutcome;
       },
@@ -4483,6 +4516,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       },
     });
     safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
+    safeAutoCreditRecall({
+      sessionId: options.sessionId,
+      turn,
+      recallIds: [turnMemoryPrimer.recallId, ...(harnessCtx?.turnRecallRunIds ?? [])],
+      finalOutput: outcome.finalOutput,
+      newHistoryItems: (outcome.history ?? []).slice(items.length),
+    });
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
     // here BUT not if approvals are still pending — `markStatus('completed')`
@@ -4786,6 +4826,9 @@ export async function resumePendingApproval(
 
   try {
     const run = options.runRunner ?? defaultRunRunner;
+    // Hoisted so the post-turn auto-credit hook can read the recall runs the
+    // resumed turn's tool handlers registered (turnRecallRunIds).
+    let resumeCtx: HarnessRunContext | undefined;
     // The SDK's Runner.run accepts a RunState in place of input
     // items — it picks up the conversation from exactly where the
     // interrupt fired. We thread it through the same defaultRunRunner
@@ -4800,8 +4843,9 @@ export async function resumePendingApproval(
       },
       async () => {
         if (useToolWrapper) {
+          resumeCtx = { sessionId: options.sessionId, counter: toolCounter };
           return await withHarnessRunContext(
-            { sessionId: options.sessionId, counter: toolCounter },
+            resumeCtx,
             () => run(
               runner,
               options.agent,
@@ -4866,6 +4910,16 @@ export async function resumePendingApproval(
       },
     });
     safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
+    // A resumed turn has no memory primer; credit only tool-recorded recall
+    // runs. The resumed state's full history stands in for "this turn's"
+    // items — any run credited here was recorded during the resume itself.
+    safeAutoCreditRecall({
+      sessionId: options.sessionId,
+      turn,
+      recallIds: resumeCtx?.turnRecallRunIds ?? [],
+      finalOutput: outcome.finalOutput,
+      newHistoryItems: outcome.history ?? [],
+    });
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
     // here BUT not if approvals are still pending — `markStatus('completed')`

@@ -738,6 +738,11 @@ export interface HarnessRunContext {
    *  batched reads ARE the sanctioned execution the block steers the model toward;
    *  refusing them would break the very recovery the block demands. */
   codeMode?: boolean;
+  /** Recall runs recorded by tool handlers during this turn (memory_recall_all,
+   *  memory_search_facts). The post-turn auto-credit hook reads these so every
+   *  lane that records a run gets credit matching — the code-level replacement
+   *  for the never-called memory_mark_used tool. */
+  turnRecallRunIds?: string[];
 }
 
 /** The tracker scope a call registers under. EXEMPT lanes (code-mode programs,

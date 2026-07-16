@@ -130,6 +130,29 @@ export function detectUsedRefs(input: {
   return [...cited, ...content.map(({ ref, evidence }) => ({ ref, evidence }))].slice(0, MAX_REFS_PER_RUN);
 }
 
+/** Pull the argument payloads out of this turn's new history items (SDK
+ *  `function_call` items carry `arguments`, usually a JSON string). A memory
+ *  applied through a tool call — an id pasted into an update, an email address
+ *  routed to — is use just as much as one written into the reply. */
+export function extractFunctionCallArgTexts(items: unknown[]): string[] {
+  const texts: string[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as { type?: unknown; arguments?: unknown };
+    if (record.type !== 'function_call') continue;
+    if (typeof record.arguments === 'string' && record.arguments.trim()) {
+      texts.push(record.arguments);
+    } else if (record.arguments && typeof record.arguments === 'object') {
+      try {
+        texts.push(JSON.stringify(record.arguments));
+      } catch {
+        /* unserializable args carry no matchable text */
+      }
+    }
+  }
+  return texts;
+}
+
 export interface AutoCreditOutcome {
   recallId: string;
   credited: DetectedUse[];

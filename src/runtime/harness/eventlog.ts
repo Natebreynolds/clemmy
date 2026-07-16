@@ -128,6 +128,10 @@ export const EVENT_TYPES = [
   // The actual hits are injected transiently through callModelInputFilter
   // so they do not bloat persisted conversation history.
   'turn_memory_primer',
+  // Post-turn memory credit: recall runs whose candidates demonstrably shaped
+  // the turn's output (reply / tool args / drafted plan). Replaces the
+  // never-called memory_mark_used tool with code-level attribution.
+  'recall_auto_credit',
   // Per-turn deterministic context packet: summarizes the memory
   // primer, likely skills/workflows, MCP health, local health, and
   // complexity classification that were injected transiently before

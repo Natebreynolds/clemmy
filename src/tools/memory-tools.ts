@@ -22,6 +22,15 @@ import { upsertEntity, type EntityIdentifierInput } from '../memory/entity-ident
 import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelationshipOutcome } from '../memory/relations.js';
 import { getFactEvidence } from '../memory/temporal-memory.js';
 import { compileWordMatcher } from '../memory/word-match.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+
+/** Register a recall run with the active turn so the post-turn auto-credit
+ *  hook can match its candidates against what the turn produced. */
+function noteTurnRecallRun(runId: string): void {
+  const ctx = harnessRunContextStorage.getStore();
+  if (!ctx) return;
+  (ctx.turnRecallRunIds ??= []).push(runId);
+}
 
 /**
  * Standing-instruction protection for the DIRECT memory tools.
@@ -619,6 +628,7 @@ export function registerMemoryTools(server: McpServer): void {
           candidateRefs: facts.map((fact) => ({ type: 'fact', id: String(fact.id), snippet: fact.content })),
         });
         recallId = run.id;
+        noteTurnRecallRun(run.id);
       } catch {
         // Attribution must never make a scoped recall unavailable.
       }
@@ -655,6 +665,7 @@ export function registerMemoryTools(server: McpServer): void {
           candidateRefs: result.hits.map(unifiedHitRecallRef),
         });
         result.recallId = run.id;
+        noteTurnRecallRun(run.id);
       } catch {
         delete result.recallId;
         // Attribution must never make recall unavailable.

@@ -16,6 +16,7 @@ import { isTemporalMeetingQuery } from '../../memory/recall.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
@@ -1609,6 +1610,27 @@ export async function respondViaClaudeAgentSdkBrain(
   } catch { /* terminal telemetry is best-effort, but controls recovery marker clearing */ }
   try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   if (terminalEventRecorded) markRunInFlight(sessionId, false);
+  // Post-turn memory credit: match this turn's primer recall run against the
+  // reply + tool-use record and credit demonstrable use (code-level
+  // replacement for the never-called memory_mark_used prompt rule).
+  try {
+    const credited = autoCreditRecallRuns({
+      recallIds: [renderedTurnContext.memoryPrimer.recallId],
+      replyText: text,
+      toolArgTexts: result.toolUses,
+    });
+    if (credited.length > 0) {
+      appendEvent({
+        sessionId, turn: 0, role: 'system', type: 'recall_auto_credit',
+        data: {
+          runs: credited.map((o) => ({
+            recallId: o.recallId,
+            refs: o.credited.map((d) => ({ ref: `${d.ref.type}:${d.ref.id}`, evidence: d.evidence })),
+          })),
+        },
+      });
+    }
+  } catch { /* crediting is bookkeeping; it must never break the turn */ }
   return {
     text,
     sessionId,

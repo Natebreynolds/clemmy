@@ -68,7 +68,11 @@ test('primer persists and exposes only refs that fit the actual prompt budget', 
     SELECT surface, candidate_refs_json FROM memory_recall_runs WHERE id = ?
   `).get(primer.recallId) as { surface: string; candidate_refs_json: string };
   assert.equal(row.surface, 'automatic_primer');
-  assert.deepEqual(JSON.parse(row.candidate_refs_json), [{ type: 'fact', id: String(fact.id) }]);
+  assert.deepEqual(JSON.parse(row.candidate_refs_json), [
+    // The snippet carries what the model actually SAW so post-turn auto-credit
+    // can match demonstrable use; identity remains type:id.
+    { type: 'fact', id: String(fact.id), snippet: `project fact: ${fact.content}` },
+  ]);
   assert.equal(getFact(fact.id)?.impressionCount, 1);
   assert.equal(getFact(fact.id)?.utilityCount, 0, 'automatic exposure is never utility');
   const trace = readFactRecallTrace(20).find((entry) => entry.query === 'when is Juniper?');
