@@ -3895,6 +3895,24 @@ function stringifyForPrompt(value: unknown): string {
  * degrades per-shard (reduceShardMembers never throws) and a write failure
  * simply leaves synthesis with today's behavior.
  */
+/** The member projection shared by the digest WRITE (maybeReduceForEachAggregate)
+ *  and the staleness check at READ (stepOutputArtifactRefForPrompt) — both must
+ *  fingerprint the aggregate identically or a stale digest slips through. */
+function reduceMembersForAggregate(value: unknown): Array<{ itemKey: string; callId: string; text: string }> | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const members: Array<{ itemKey: string; callId: string; text: string }> = [];
+  for (const entry of value) {
+    const itemKey = (entry as { itemKey?: unknown } | null)?.itemKey;
+    if (typeof itemKey !== 'string') return null; // not a forEach aggregate shape
+    members.push({
+      itemKey,
+      callId: `item:${itemKey}`,
+      text: stringifyForPrompt((entry as { output?: unknown }).output),
+    });
+  }
+  return members;
+}
+
 async function maybeReduceForEachAggregate(
   ctx: { workflowSlug: string; runId: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> },
   stepId: string,
@@ -3903,25 +3921,32 @@ async function maybeReduceForEachAggregate(
   try {
     if (!reduceTierEnabled() || !runWorkspaceOffloadEnabled()) return;
     if (aggregate.length < 20 || serializedContextLength(aggregate) <= STEP_CONTEXT_VALUE_CLIP) return;
-    const members = aggregate.map((entry) => ({
-      itemKey: entry.itemKey,
-      callId: `item:${entry.itemKey}`,
-      text: stringifyForPrompt(entry.output),
-    }));
+    const members = reduceMembersForAggregate(aggregate);
+    if (!members) return;
     const fingerprint = shardFingerprint(members);
     const prior = readReduceDigest(ctx.workflowSlug, ctx.runId, stepId);
     if (prior && prior.fingerprint === fingerprint) return; // unchanged aggregate — reuse
 
     const shardSize = reduceShardSize();
-    const shards: Array<{ shardIndex: number; degraded: boolean; items: Array<{ itemKey: string; gist: string }> }> = [];
+    const slices: Array<Array<{ itemKey: string; callId: string; text: string }>> = [];
     for (let offset = 0; offset < members.length; offset += shardSize) {
-      const reduced = await reduceShardMembers(members.slice(offset, offset + shardSize));
-      shards.push({
-        shardIndex: shards.length,
-        degraded: reduced.degraded,
-        items: reduced.items.map(({ itemKey, gist }) => ({ itemKey, gist })),
-      });
+      slices.push(members.slice(offset, offset + shardSize));
     }
+    // Bounded parallelism: shard reduces are independent cheap calls; running
+    // them 3-wide keeps a 100-item step from serializing ~9 model round-trips
+    // in its completion path (review F10). Each call is timeout-bounded.
+    const REDUCE_CONCURRENCY = 3;
+    const reducedSlices: Array<{ degraded: boolean; items: Array<{ itemKey: string; gist: string }> }> = [];
+    for (let at = 0; at < slices.length; at += REDUCE_CONCURRENCY) {
+      const batch = await Promise.all(slices.slice(at, at + REDUCE_CONCURRENCY).map((s) => reduceShardMembers(s)));
+      for (const reduced of batch) {
+        reducedSlices.push({
+          degraded: reduced.degraded,
+          items: reduced.items.map(({ itemKey, gist }) => ({ itemKey, gist })),
+        });
+      }
+    }
+    const shards = reducedSlices.map((s, i) => ({ shardIndex: i, ...s }));
     const failures = ctx.forEachFailures.filter((f) => f.stepId === stepId);
     const digestLines = [
       `SHARD-REDUCED DIGEST of step "${stepId}" (${aggregate.length} items, ${shards.length} shards; machine-generated — exact rows via workspace_artifact_query on the step output artifact):`,
@@ -3973,9 +3998,14 @@ function stepOutputArtifactRefForPrompt(
     // Stage 3: when a shard-reduced digest exists for this step, inline it so
     // the consumer (synthesis especially) reads real compressed content
     // instead of flying blind on a shape summary + path. Bounded; the exact
-    // rows remain one workspace_artifact_query away.
+    // rows remain one workspace_artifact_query away. STALENESS GUARD (review
+    // F2): a digest from a prior pursuit only inlines when its fingerprint
+    // matches the CURRENT value — a re-pursued step whose aggregate changed
+    // (or fell under the reduce trigger) must never present the old digest.
     const reduce = readReduceDigest(opts.workflowName, opts.runId, stepId);
-    const reduceDigest = reduce?.digest ? reduce.digest.slice(0, 14_000) : undefined;
+    const currentMembers = reduce ? reduceMembersForAggregate(value) : null;
+    const digestFresh = Boolean(reduce && currentMembers && reduce.fingerprint === shardFingerprint(currentMembers));
+    const reduceDigest = digestFresh && reduce?.digest ? reduce.digest.slice(0, 14_000) : undefined;
     return {
       __clementine_context_ref: true,
       present: true,

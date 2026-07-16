@@ -109,7 +109,7 @@ export function registerWorkerTools(server: McpServer): void {
       'Each worker runs in its own isolated context — keeps YOUR context from ballooning over many items, and runs the work concurrently instead of one-at-a-time (which blows your turn budget).',
       'Pass a structured packet for ONE item: the item identifier, exact resolved tool slugs, source facts/context, instructions, and expected output shape. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
       'When to use: 3+ independent items of the same kind. Aggregate the tight results the workers return.',
-      'On LARGE fan-outs (past ~8 results) further results return as compact digests with the full output parked — shard summaries arrive automatically; synthesize from those, and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
+      'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never report a batch complete if any worker returned ERROR; report exactly which items succeeded and which failed.',
     ].join(' '),
     WorkerToolInputSchema.shape,
@@ -148,7 +148,7 @@ export function registerWorkerTools(server: McpServer): void {
             recordResult(true, 'resume: reused prior completed result');
             // Route replays through the reduce tier too, so a resumed 100-item
             // fan-out doesn't re-flood the parent context with prior outputs.
-            return textResult(buildWorkerReturn({
+            return textResult(await buildWorkerReturn({
               sessionId,
               parentRunId,
               item: input.item,
@@ -297,7 +297,7 @@ export function registerWorkerTools(server: McpServer): void {
         } catch { /* visibility trace is best-effort */ }
         // Stage 3 reduce tier: past ~8 results the return compresses to a
         // parked digest + shard summaries; small fan-outs are byte-identical.
-        return textResult(buildWorkerReturn({
+        return textResult(await buildWorkerReturn({
           sessionId,
           parentRunId: getToolOutputContext()?.workflowRunId || sessionId,
           item: input.item,
