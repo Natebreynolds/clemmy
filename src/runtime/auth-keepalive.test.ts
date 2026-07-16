@@ -38,6 +38,8 @@ function writeVault(expSecondsFromNow: number, lastRefreshAgoMs: number, refresh
   writeFileSync(AUTH_FILE, JSON.stringify({
     source: 'native',
     codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-auth-keepalive-test',
       accessToken: jwtWithExp(Math.floor(Date.now() / 1000) + expSecondsFromNow),
       refreshToken,
       accountId: 'acct',
@@ -82,7 +84,7 @@ test('keepalive never replays a DEAD-latched token, and announces recovery on de
   let calls = 0;
   __setRefreshTokenImplForTests(async () => { calls += 1; return { accessToken: 'x', refreshToken: 'RT2', lastRefresh: new Date().toISOString() }; });
 
-  markCodexAuthDead('refresh token revoked');
+  await markCodexAuthDead('refresh token revoked');
   await tickAuthKeepalive();
   assert.equal(calls, 0, 'a DEAD latch short-circuits — never POST the dead RT');
 

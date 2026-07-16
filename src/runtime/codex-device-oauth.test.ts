@@ -90,7 +90,7 @@ test('device-code login: begin → poll(pending) → poll(complete) persists tok
   const { beginCodexDeviceLogin, pollCodexDeviceLogin, isCodexAuthDead, markCodexAuthDead } = await import('./auth-store.js');
 
   // Pretend auth was DEAD before the re-auth — a successful login must clear it.
-  markCodexAuthDead('was revoked');
+  await markCodexAuthDead('was revoked');
   assert.equal(isCodexAuthDead(), true);
 
   const start = await beginCodexDeviceLogin();
@@ -109,6 +109,8 @@ test('device-code login: begin → poll(pending) → poll(complete) persists tok
   // Tokens landed in the OWN vault; DEAD latch cleared by the successful write.
   const vault = JSON.parse(readFileSync(path.join(TMP_HOME, 'state', 'auth.json'), 'utf-8'));
   assert.equal(vault.source, 'native', 'device login writes a native (independent) grant');
+  assert.equal(vault.codexOauth.grantProvenance, 'clementine-oauth-v1', 'device login records an independent Clementine grant');
+  assert.match(vault.codexOauth.grantId, /\S/, 'device login records a non-empty grant generation');
   assert.equal(vault.codexOauth.refreshToken, 'RT-device-1', 'refresh token persisted');
   assert.equal(isCodexAuthDead(), false, 'a successful device login lifts the DEAD latch');
 });

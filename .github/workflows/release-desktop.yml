@@ -1,7 +1,8 @@
 name: Release Desktop App
 
-# Tag pushes publish production releases. Manual runs build a signed, notarized
-# macOS candidate and keep it private as a GitHub Actions artifact.
+# Tag pushes publish production releases. Manual runs build private macOS and
+# Windows x64 candidates; macOS is signed/notarized and Windows uses the
+# configured code-signing certificate when one is available.
 #
 # Required repository secrets:
 #   APPLE_ID
@@ -9,6 +10,10 @@ name: Release Desktop App
 #   APPLE_TEAM_ID
 #   CSC_LINK
 #   CSC_KEY_PASSWORD
+# Optional Windows code-signing secrets (without them the private candidate and
+# production installer are unsigned, matching the existing Windows behavior):
+#   WINDOWS_CSC_LINK
+#   WINDOWS_CSC_KEY_PASSWORD
 
 on:
   push:
@@ -241,12 +246,16 @@ jobs:
           retention-days: 14
 
   release-windows:
-    name: Build Windows artifacts
+    name: Build Windows x64 artifacts
     needs: preflight
     runs-on: windows-latest
-    # Manual runs are macOS candidates. For a tag, [mac-only] on the tagged
-    # commit intentionally skips Windows.
-    if: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[mac-only]') }}
+    # Manual runs exercise the same Recall/Whisper x64 packaging path without
+    # publishing. Production tags retain the explicit [mac-only] escape hatch.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && !contains(github.event.head_commit.message, '[mac-only]'))
+      }}
 
     steps:
       - name: Checkout

@@ -75,8 +75,12 @@ spctl --assess --type execute --verbose release/Clementine.app
 
 ## GitHub Actions release
 
-The workflow at `.github/workflows/release-desktop.yml` builds and
-publishes desktop artifacts whenever a tag matching `v*` is pushed:
+The workflow at `.github/workflows/release-desktop.yml` builds desktop
+artifacts in two modes:
+
+- Manual dispatch builds private macOS and Windows x64 release candidates.
+  It never creates or modifies a GitHub Release.
+- A pushed tag matching `v*` builds and publishes production artifacts.
 
 - `release-mac`: signed + notarized `.dmg` and `.zip`.
 - `release-windows`: NSIS `.exe` installer. It is unsigned unless the
@@ -146,11 +150,13 @@ curl -fsSL https://raw.githubusercontent.com/Natebreynolds/clemmy/main/install.s
 The repo now has a Windows packaging path, but this machine cannot run
 the final installer locally. The practical test path is GitHub Actions:
 
-1. Push a semver tag such as `v0.12.51`, or run the release workflow
-   manually and select a semver tag as the ref.
+1. Push the release-candidate branch and manually dispatch the release
+   workflow with a prerelease version such as `1.6.0-rc.1`.
 2. Let the `release-windows` job run on `windows-latest`.
-3. Download the `.exe` from the GitHub Release and test it on a real
-   Windows machine or VM.
+3. Download the private `clementine-windows-<version>` Actions artifact
+   and test the `.exe` on a real Windows machine or VM.
+4. Push the stable tag only after the candidate passes. The tag workflow
+   rebuilds the installer and publishes it with the production release.
 
 Without Windows signing secrets, the job should still produce an
 unsigned test installer. That is good enough for internal boot testing,

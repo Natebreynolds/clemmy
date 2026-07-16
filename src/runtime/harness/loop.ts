@@ -5798,13 +5798,13 @@ function emitInfraTransientAsk(
   });
 }
 
-function handleRunError(
+async function handleRunError(
   sessionId: string,
   turn: number,
   session: HarnessSession,
   err: unknown,
   opts: { deferInfraAsk?: boolean } = {},
-): RunTurnResult {
+): Promise<RunTurnResult> {
   // A kill that lands while a tool call is in flight throws KillRequested
   // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
   // Error: "Failed to run function tools: KillRequested: session X has a
@@ -6098,8 +6098,28 @@ function handleRunError(
   // notification (so they know even if they're not watching), then end cleanly.
   if (isCodexAuthRevoked(err, message)) {
     // Latch auth DEAD so background loops (execution controller, cron, autonomy)
-    // stop replaying the revoked token and park until a re-auth clears it.
-    markCodexAuthDead(message);
+    // stop replaying the revoked token and park until a re-auth clears it. Bind
+    // the latch to the request's grant generation: a response from a grant that
+    // was replaced while in flight cannot poison the fresh login.
+    const failedGrantId = typeof (err as { codexGrantId?: unknown } | null)?.codexGrantId === 'string'
+      ? (err as { codexGrantId: string }).codexGrantId
+      : undefined;
+    const latched = failedGrantId
+      ? await markCodexAuthDead(message, failedGrantId)
+      : isCodexAuthDead();
+    if (failedGrantId && !latched && !isCodexAuthDead()) {
+      const replaced = 'Your Codex sign-in changed while this request was in flight. The new sign-in was kept; retry this turn.';
+      safeAppend({
+        sessionId,
+        turn,
+        role: 'system',
+        type: 'run_failed',
+        data: { error: replaced, reason: 'codex_auth_replaced_during_request' },
+      });
+      session.markStatus('failed');
+      bumpTurnNumber(sessionId, turn);
+      return { sessionId, turn, status: 'failed', error: replaced };
+    }
     const friendly =
       'Your Codex sign-in expired or was revoked, so I can’t reach the model right now. '
       + 'Re-authenticate in Settings → Credentials → RE-AUTHENTICATE '

@@ -73,6 +73,7 @@ export interface MeetingSummary {
   status?: string;
   startedAt?: string;
   endedAt?: string;
+  durationSeconds?: number;
   segmentCount?: number;
   notesCount?: number;
   title?: string;

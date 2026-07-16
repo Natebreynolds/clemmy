@@ -49,4 +49,5 @@ echo
 echo "Private signed candidate dispatched: $VERSION"
 echo "List:     gh run list --workflow release-desktop.yml --branch \"$BRANCH\" --event workflow_dispatch --limit 1"
 echo "Watch:    gh run watch --exit-status <run-id>"
-echo "Download: gh run download --name \"clementine-macos-$VERSION\""
+echo "macOS:    gh run download --name \"clementine-macos-$VERSION\""
+echo "Windows:  gh run download --name \"clementine-windows-$VERSION\""

@@ -35,18 +35,41 @@ function runScripts(job) {
     .join('\n');
 }
 
-test('manual desktop candidates require a prerelease version and cannot publish', () => {
+test('manual desktop candidates build private Mac and Windows artifacts but cannot publish', () => {
   const input = workflow.on?.workflow_dispatch?.inputs?.candidate_version;
   assert.equal(input?.required, true);
   assert.match(String(input?.description ?? ''), /prerelease SemVer/i);
 
   const publisher = workflow.jobs?.['publish-release'];
   assert.match(String(publisher?.if ?? ''), /github\.event_name == 'push'/);
-  assert.doesNotMatch(runScripts(workflow.jobs?.['release-mac']), /gh release (?:create|upload|edit)/);
-  assert.match(
-    (workflow.jobs?.['release-mac']?.steps ?? []).map((step) => step?.uses ?? '').join('\n'),
-    /actions\/upload-artifact@v4/,
-  );
+  const macJob = workflow.jobs?.['release-mac'];
+  const windowsJob = workflow.jobs?.['release-windows'];
+  for (const job of [macJob, windowsJob]) {
+    assert.doesNotMatch(runScripts(job), /gh release (?:create|upload|edit)/);
+    assert.match(
+      (job?.steps ?? []).map((step) => step?.uses ?? '').join('\n'),
+      /actions\/upload-artifact@v4/,
+    );
+  }
+
+  const windowsCondition = String(windowsJob?.if ?? '');
+  assert.equal(windowsJob?.['runs-on'], 'windows-latest');
+  assert.match(windowsCondition, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(windowsCondition, /github\.event_name == 'push'/);
+  assert.match(windowsCondition, /!contains\(github\.event\.head_commit\.message, '\[mac-only\]'\)/);
+  assert.match(runScripts(windowsJob), /npm run package:win/);
+  assert.match(windowsReleaseText, /\['--win', 'nsis', '--x64', '--publish', 'never'\]/);
+  assert.equal(desktopPackage.build?.win?.artifactName, '${productName}-Setup-${version}.${ext}');
+  assert.match(windowsReleaseText, /verifyWindowsUpdaterArtifacts\(\)/);
+
+  const windowsUpload = (windowsJob?.steps ?? []).find((step) => step?.uses === 'actions/upload-artifact@v4');
+  assert.equal(windowsUpload?.with?.name, 'clementine-windows-${{ needs.preflight.outputs.version }}');
+  assert.match(String(windowsUpload?.with?.path ?? ''), /apps\/desktop\/release\/\*\.exe/);
+
+  const windowsBuild = (windowsJob?.steps ?? []).find((step) => step?.name === 'Build Windows installer');
+  assert.equal(windowsBuild?.env?.CSC_LINK, '${{ secrets.WINDOWS_CSC_LINK }}');
+  assert.equal(windowsBuild?.env?.CSC_KEY_PASSWORD, '${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}');
+  assert.match(dispatcherText, /clementine-windows-\$VERSION/);
 });
 
 test('candidate dispatcher defaults to the next patch prerelease and rejects downgrade candidates', () => {
@@ -115,5 +138,5 @@ test('one tag-only publisher owns GitHub Release mutation', () => {
     .filter(([, job]) => /gh release (?:create|upload|edit)/.test(runScripts(job)))
     .map(([name]) => name);
   assert.deepEqual(mutationJobs, ['publish-release']);
-  assert.match(String(workflow.jobs?.['release-windows']?.if ?? ''), /github\.event_name == 'push'/);
+  assert.match(String(workflow.jobs?.['publish-release']?.if ?? ''), /github\.event_name == 'push'/);
 });

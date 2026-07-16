@@ -187,6 +187,16 @@ try {
     const data = JSON.parse(readFileSync(localAuthFile, 'utf-8'));
     if (data.codexOauth?.accessToken === FAKE_ACCESS_TOKEN) ok('persisted local auth.json has codexOauth.accessToken');
     else fail('persisted local auth.json missing codexOauth tokens');
+    if (
+      data.source === 'native'
+      && data.codexOauth?.grantProvenance === 'clementine-oauth-v1'
+      && typeof data.codexOauth?.grantId === 'string'
+      && data.codexOauth.grantId.length > 0
+    ) {
+      ok('persisted grant has Clementine-owned provenance and a grant generation');
+    } else {
+      fail('persisted grant is missing Clementine-owned provenance or grant generation');
+    }
   } else {
     fail(`local auth.json not written to ${localAuthFile}`);
   }

@@ -4348,7 +4348,7 @@ test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is 
 
   // …unless auth is genuinely DEAD (the refresh token itself was rejected, which
   // latches DEAD inside refreshStoredNativeOAuth) — then even a bare 401 is terminal.
-  markCodexAuthDead('refresh token revoked');
+  await markCodexAuthDead('refresh token revoked');
   assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), true, 'once DEAD-latched, surface re-auth');
 
   // 2026-07-07 regression: the DEAD latch is a fact about CODEX auth, not a

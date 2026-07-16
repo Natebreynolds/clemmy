@@ -28,7 +28,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { setDefaultModelProvider } from '@openai/agents';
-import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs } from '../auth-store.js';
+import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs, isCodexAuthDead, getCodexAuthDead } from '../auth-store.js';
 import { RouterModelProvider } from './router-model.js';
 import { reviveDeadBrains } from './fallback-model.js';
 import { maybeWrapDebate } from './debate-model.js';
@@ -81,10 +81,14 @@ export function extractAccountIdFromJwt(token: string): string | null {
 /**
  * Resolve the current access token, refreshing first if the stored
  * one is older than REFRESH_AFTER_MS. If refresh fails, returns the
- * existing token and lets the API surface a 401 — the loop will
- * record run_failed and the CLI prints the error.
+ * existing token only after a transient refresh failure. Terminal refreshes,
+ * logout races, and successful refreshes whose token disappeared all fail
+ * closed so a revoked or cleared bearer is never sent once more.
  */
 export async function loadFreshCodexAccessToken(): Promise<string> {
+  if (isCodexAuthDead()) {
+    throw new Error('Codex sign-in is revoked or expired. Re-authenticate in Settings before retrying.');
+  }
   const tokens = getStoredCodexOAuthTokens();
   if (!tokens?.accessToken) {
     throw new Error('codex OAuth tokens were cleared while the harness was running');
@@ -94,7 +98,17 @@ export async function loadFreshCodexAccessToken(): Promise<string> {
     if (result.ok) {
       const refreshed = getStoredCodexOAuthTokens();
       if (refreshed?.accessToken) return refreshed.accessToken;
+      throw new Error('Codex OAuth tokens were cleared or changed during refresh; retry after signing in.');
     }
+    if (result.terminal || isCodexAuthDead()) {
+      throw new Error('Codex sign-in is revoked or expired. Re-authenticate in Settings before retrying.');
+    }
+    // A transient refresh failure may safely use the still-current access
+    // token, but re-read after the await so a concurrent logout/re-login cannot
+    // make us return the pre-refresh snapshot.
+    const current = getStoredCodexOAuthTokens();
+    if (current?.accessToken) return current.accessToken;
+    throw new Error('Codex OAuth tokens were cleared or changed during refresh; retry after signing in.');
   }
   return tokens.accessToken;
 }
@@ -154,7 +168,7 @@ function pickAvailableBrainFallback(skip: BrainMode): BrainMode | null {
   // surface a blocking GUI prompt), byo reads env/vault file. The actual Claude
   // token refresh still happens at dispatch (claude-model uses loadFresh).
   if (skip !== 'codex_oauth') {
-    try { if (getStoredCodexOAuthTokens()?.accessToken) return 'codex_oauth'; } catch { /* none */ }
+    try { if (!isCodexAuthDead() && getStoredCodexOAuthTokens()?.accessToken) return 'codex_oauth'; } catch { /* none */ }
   }
   if (skip !== 'claude_oauth') {
     try { if (claudeVaultFallbackReady()) return 'claude_oauth'; } catch { /* none */ }
@@ -195,10 +209,26 @@ function applyBrainFallback(from: string, to: BrainMode): ConfigureResult {
  * doomed request.
  */
 export async function configureHarnessRuntime(): Promise<ConfigureResult> {
-  if (configured) return { ok: true };
-
   const mode = getModelRoutingMode();
   const byo = getByoBackendConfig();
+
+  // The DEAD latch can appear after the provider was configured (for example a
+  // background refresh discovers token_revoked). Check it before the sticky
+  // configured fast-path so no later harness request sends the revoked access
+  // token. Explicit all-in BYO remains independent of Codex auth.
+  const codexBrainSelected = !(mode === 'all_in' && byo.configured)
+    && getActiveAuthMode() === 'codex_oauth';
+  if (codexBrainSelected && isCodexAuthDead()) {
+    const fb = automaticBrainFallbackEnabled() ? pickAvailableBrainFallback('codex_oauth') : null;
+    if (fb) return applyBrainFallback('Codex', fb);
+    const dead = getCodexAuthDead();
+    return {
+      ok: false,
+      reason: `The selected Codex sign-in is revoked or expired${dead?.since ? ` (since ${dead.since})` : ''}. Reconnect Codex in Settings → Models before retrying.`,
+    };
+  }
+
+  if (configured) return { ok: true };
 
   // All-in (BYO brain) takes PRECEDENCE over the stored AUTH_MODE. When a user
   // has explicitly enabled all_in with a configured BYO backend, EVERY role —

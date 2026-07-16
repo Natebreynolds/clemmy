@@ -58,7 +58,15 @@ writeFileSync(
 );
 writeFileSync(
   path.join(TMP_HOME, 'state', 'auth.json'),
-  JSON.stringify({ codexOauth: { accessToken: 'codex-access', refreshToken: 'codex-refresh' } }),
+  JSON.stringify({
+    source: 'native',
+    codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-smoke-fusion-readiness',
+      accessToken: 'codex-access',
+      refreshToken: 'codex-refresh',
+    },
+  }),
   'utf-8',
 );
 writeFileSync(

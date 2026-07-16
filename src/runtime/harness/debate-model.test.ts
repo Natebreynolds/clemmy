@@ -34,7 +34,7 @@ const { getDebateCheckerModel } = await import('../../config.js');
 function writeCodexAuth(): void {
   const state = path.join(process.env.CLEMENTINE_HOME as string, 'state');
   mkdirSync(state, { recursive: true });
-  writeFileSync(path.join(state, 'auth.json'), JSON.stringify({ codexOauth: { accessToken: 'codex-access', refreshToken: 'codex-refresh' } }), 'utf-8');
+  writeFileSync(path.join(state, 'auth.json'), JSON.stringify({ source: 'native', codexOauth: { grantProvenance: 'clementine-oauth-v1', grantId: 'grant-debate-model-test', accessToken: 'codex-access', refreshToken: 'codex-refresh' } }), 'utf-8');
   writeFileSync(path.join(state, 'claude-auth.json'), JSON.stringify({ accessToken: 'sk-ant-api03-not-a-subscription-token' }), 'utf-8');
 }
 const fakeProvider = (m: Model): import('@openai/agents-core').ModelProvider => ({ getModel: () => m }) as import('@openai/agents-core').ModelProvider;

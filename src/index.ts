@@ -68,7 +68,7 @@ Auth
   auth login-native   OAuth browser sign-in (local machine)
   auth login-device   OAuth device-code sign-in (remote / headless — any device)
   auth refresh        Refresh stored OAuth token
-  auth import-codex   Import a token from the Codex CLI (legacy; couples to a CLI logout)
+  auth import-codex   Disabled legacy command; use login-device or login-native
   auth logout         Clear stored auth
 
 Plugins
@@ -461,7 +461,7 @@ async function main(): Promise<void> {
       return;
     }
     if (subcommand === 'logout') {
-      clearImportedAuth();
+      await clearImportedAuth();
       console.log('Cleared stored auth.');
       return;
     }

@@ -32,13 +32,21 @@ mkdirSync(AUTH_STATE_DIR, { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { configureHarnessRuntime, resetHarnessRuntimeConfig, __test__ } = await import(
+const { configureHarnessRuntime, resetHarnessRuntimeConfig, loadFreshCodexAccessToken, __test__ } = await import(
   './codex-client.js'
 );
+const { __setRefreshTokenImplForTests, isCodexAuthDead } = await import('../auth-store.js');
+
+const DEAD_STATE_FILE = path.join(AUTH_STATE_DIR, 'codex-auth-dead.json');
 
 function clearAuth(): void {
   try {
     rmSync(AUTH_STATE_FILE);
+  } catch {
+    /* not present */
+  }
+  try {
+    rmSync(DEAD_STATE_FILE);
   } catch {
     /* not present */
   }
@@ -51,6 +59,7 @@ function writeAuth(payload: Record<string, unknown>): void {
 test.beforeEach(() => {
   resetHarnessRuntimeConfig();
   clearAuth();
+  __setRefreshTokenImplForTests(null);
   delete process.env.CLEMMY_BRAIN_FALLOVER;
 });
 
@@ -82,6 +91,8 @@ test('configureHarnessRuntime returns ok:true once tokens exist', async () => {
   writeAuth({
     source: 'native',
     codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-codex-client-test',
       accessToken: 'fake-access-token-abc',
       refreshToken: 'fake-refresh-token-xyz',
       lastRefresh: new Date().toISOString(),
@@ -96,6 +107,8 @@ test('configureHarnessRuntime is idempotent within a process', async () => {
   writeAuth({
     source: 'native',
     codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-codex-client-test',
       accessToken: 'a',
       refreshToken: 'r',
       lastRefresh: new Date().toISOString(),
@@ -109,6 +122,84 @@ test('configureHarnessRuntime is idempotent within a process', async () => {
   clearAuth();
   const second = await configureHarnessRuntime();
   assert.equal(second.ok, true);
+});
+
+test('a DEAD latch overrides sticky harness configuration and blocks token loading', async () => {
+  const prevMode = process.env.AUTH_MODE;
+  const prevRouting = process.env.MODEL_ROUTING_MODE;
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  writeAuth({
+    source: 'native',
+    codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-dead-after-configure',
+      accessToken: 'revoked-access',
+      refreshToken: 'revoked-refresh',
+      lastRefresh: new Date().toISOString(),
+    },
+  });
+  try {
+    const first = await configureHarnessRuntime();
+    assert.equal(first.ok, true);
+    writeFileSync(DEAD_STATE_FILE, JSON.stringify({
+      reason: 'token_revoked',
+      since: '2026-07-14T12:00:00.000Z',
+      grantId: 'grant-dead-after-configure',
+    }), 'utf-8');
+
+    const second = await configureHarnessRuntime();
+    assert.equal(second.ok, false, 'the configured fast-path cannot bypass DEAD');
+    assert.match(second.reason ?? '', /revoked|expired/i);
+    await assert.rejects(loadFreshCodexAccessToken(), /revoked|expired/i);
+  } finally {
+    if (prevMode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prevMode;
+    if (prevRouting === undefined) delete process.env.MODEL_ROUTING_MODE; else process.env.MODEL_ROUTING_MODE = prevRouting;
+    clearAuth();
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('loadFreshCodexAccessToken never returns the old bearer after a terminal refresh', async () => {
+  writeAuth({
+    source: 'native',
+    codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-terminal-during-refresh',
+      accessToken: 'opaque-old-access',
+      refreshToken: 'revoked-refresh',
+      lastRefresh: '2020-01-01T00:00:00.000Z',
+    },
+  });
+  let refreshCalls = 0;
+  __setRefreshTokenImplForTests(async () => {
+    refreshCalls += 1;
+    throw Object.assign(new Error('invalid_grant: refresh token revoked'), { status: 401 });
+  });
+
+  await assert.rejects(loadFreshCodexAccessToken(), /revoked|expired/i);
+  assert.equal(refreshCalls, 1);
+  assert.equal(isCodexAuthDead(), true, 'terminal refresh persisted the generation-bound latch');
+});
+
+test('loadFreshCodexAccessToken does not return a snapshot cleared during a transient refresh', async () => {
+  writeAuth({
+    source: 'native',
+    codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-logout-during-refresh',
+      accessToken: 'opaque-old-access',
+      refreshToken: 'still-valid-refresh',
+      lastRefresh: '2020-01-01T00:00:00.000Z',
+    },
+  });
+  __setRefreshTokenImplForTests(async () => {
+    rmSync(AUTH_STATE_FILE, { force: true });
+    throw Object.assign(new Error('temporary backend outage'), { status: 503 });
+  });
+
+  await assert.rejects(loadFreshCodexAccessToken(), /cleared or changed/i);
+  assert.equal(isCodexAuthDead(), false, 'transient failure never creates a terminal latch');
 });
 
 // --- claude_oauth brain registration (either-flagship coverage) --------------
@@ -194,7 +285,7 @@ test('configureHarnessRuntime: dead Claude brain FALLS BACK to an available Code
   process.env.MODEL_ROUTING_MODE = 'off';
   process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' }); // Claude unusable (api03)
-  writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
+  writeAuth({ source: 'native', codexOauth: { grantProvenance: 'clementine-oauth-v1', grantId: 'grant-codex-client-test', accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
   try {
     resetHarnessRuntimeConfig();
     const result = await configureHarnessRuntime();
@@ -215,7 +306,7 @@ test('configureHarnessRuntime: unavailable Claude fails closed by default even w
   const prevMode = process.env.AUTH_MODE;
   process.env.AUTH_MODE = 'claude_oauth';
   writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' });
-  writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
+  writeAuth({ source: 'native', codexOauth: { grantProvenance: 'clementine-oauth-v1', grantId: 'grant-codex-client-test', accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
   try {
     resetHarnessRuntimeConfig();
     const result = await configureHarnessRuntime();

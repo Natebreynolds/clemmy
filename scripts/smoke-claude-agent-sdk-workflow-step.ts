@@ -23,7 +23,15 @@ mkdirSync(path.join(tmpHome, 'skills', 'claude-workflow-smoke'), { recursive: tr
 writeFileSync(path.join(tmpHome, 'state', 'claude-auth.json'), readFileSync(realClaudeAuth, 'utf-8'), 'utf-8');
 writeFileSync(
   path.join(tmpHome, 'state', 'auth.json'),
-  JSON.stringify({ codexOauth: { accessToken: 'codex-smoke-access', refreshToken: 'codex-smoke-refresh' } }),
+  JSON.stringify({
+    source: 'native',
+    codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-smoke-claude-workflow-step',
+      accessToken: 'codex-smoke-access',
+      refreshToken: 'codex-smoke-refresh',
+    },
+  }),
   'utf-8',
 );
 writeFileSync(

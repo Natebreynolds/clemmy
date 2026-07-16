@@ -27,24 +27,22 @@ const AUTH_STATE_FILE = path.join(BASE_DIR, 'state', 'auth.json');
 //
 //   1. In-process single-flight — concurrent callers share one refresh promise.
 //   2. Cross-process advisory lock — serializes refreshes across daemon
-//      instances (e.g. a restart overlap). Fail-open + stale-steal so a crashed
-//      holder can never deadlock auth.
+//      instances (e.g. a restart overlap). Bounded wait + stale-steal so a
+//      crashed holder can recover without ever writing auth outside the lock.
 //   3. Skip-if-just-refreshed — after acquiring the lock, if another holder
 //      refreshed within the last 2 min, reuse their token instead of POSTing
 //      the (now-rotated) RT again.
 //
-// Two residual reuse paths this CANNOT close (both pre-existing, both strictly
-// improved vs the old N-way retry storm):
-//   - EXTERNAL Codex CLI: writeCodexAuthFile syncs ~/.codex/auth.json and
-//     getStoredCodexOAuthTokens reads it as a fallback, so a concurrently-run
-//     `codex` binary rotates the SAME family while honoring neither this lock
-//     nor skip-if-recent. The clean decouple is a dedicated Clementine login
-//     (a separate grant), not a lock. We stop pushing rotated tokens to that
-//     file on refresh (below) to at least not feed it our rotating RT.
+// One residual reuse path this CANNOT close:
 //   - At-least-once: if the refresh POST reaches the server (RT rotated) but
 //     the ACK is lost (timeout fires post-rotation), lastRefresh is NOT
 //     advanced and the consumed RT stays on disk → the next caller replays it →
 //     revoke. No lock can close server-side consumption with a lost ack.
+//
+// External Codex CLI reuse is closed separately: the runtime only accepts a
+// token pair carrying a Clementine-owned provenance marker written by a fresh
+// loopback/device login. Legacy imported (and old mislabeled) grants fail
+// closed and require one new Clementine sign-in.
 const REFRESH_LOCK_FILE = path.join(BASE_DIR, 'state', 'codex-refresh.lock');
 
 // ─────────────────────────────────────────────────────────────────
@@ -59,8 +57,8 @@ const REFRESH_LOCK_FILE = path.join(BASE_DIR, 'state', 'codex-refresh.lock');
 //
 // We persist a small DEAD latch the moment a terminal auth failure is observed.
 // While latched: refresh short-circuits (never replays the dead RT) and runtimes
-// can skip the doomed request and park instead of hammering. ANY successful token
-// write (login / import / refresh) clears it — that's the recovery signal.
+// can skip the doomed request and park instead of hammering. Any successful,
+// verified token write (login / refresh) clears it — that's the recovery signal.
 const CODEX_AUTH_DEAD_FILE = path.join(BASE_DIR, 'state', 'codex-auth-dead.json');
 
 const TERMINAL_AUTH_PATTERNS = [
@@ -141,35 +139,90 @@ export function accessTokenExpiresSoon(accessToken: string | undefined, skewMs =
   return expMs <= Date.now() + Math.max(0, skewMs);
 }
 
-export interface CodexAuthDeadState { reason: string; since: string; }
+export interface CodexAuthDeadState { reason: string; since: string; grantId?: string; }
 
-export function getCodexAuthDead(): CodexAuthDeadState | null {
+/** Read the persisted latch without applying grant-generation semantics. */
+function readCodexAuthDeadState(): CodexAuthDeadState | null {
   try {
     if (!existsSync(CODEX_AUTH_DEAD_FILE)) return null;
     const parsed = JSON.parse(readFileSync(CODEX_AUTH_DEAD_FILE, 'utf-8')) as Partial<CodexAuthDeadState>;
-    if (parsed?.reason && parsed?.since) return { reason: parsed.reason, since: parsed.since };
+    if (parsed?.reason && parsed?.since) {
+      return {
+        reason: parsed.reason,
+        since: parsed.since,
+        grantId: typeof parsed.grantId === 'string' ? parsed.grantId : undefined,
+      };
+    }
     return null;
   } catch {
     return null;
   }
 }
 
+/**
+ * Return the terminal-auth latch only when it applies to the active grant.
+ *
+ * A process can observe an old request's latch after another process has
+ * already stored a fresh sign-in. Binding the latch to grantId prevents that
+ * stale generation from signing the new grant back out. Marker-less latches
+ * from older builds remain conservative and apply until a successful login
+ * explicitly clears them.
+ */
+export function getCodexAuthDead(): CodexAuthDeadState | null {
+  const dead = readCodexAuthDeadState();
+  if (!dead?.grantId) return dead;
+  const currentGrantId = loadLocalAuthState().codexOauth?.grantId;
+  if (currentGrantId && currentGrantId !== dead.grantId) return null;
+  return dead;
+}
+
 export function isCodexAuthDead(): boolean {
   return getCodexAuthDead() !== null;
 }
 
-/** Latch auth as dead (terminal revoke/expiry). Idempotent — keeps the FIRST
- *  reason/since so the latch reflects when auth actually went down. */
-export function markCodexAuthDead(reason: string): void {
+/** Write a terminal latch while the caller owns codex-refresh.lock. */
+function markCodexAuthDeadUnderLock(reason: string, expectedGrantId?: string): boolean {
   try {
-    if (existsSync(CODEX_AUTH_DEAD_FILE)) return; // preserve original since/reason
+    const currentGrantId = loadLocalAuthState().codexOauth?.grantId;
+    // A request from an older grant finished after a successful re-login. Never
+    // let that stale response poison the new grant's health state.
+    if (expectedGrantId && currentGrantId !== expectedGrantId) return false;
+    const existing = readCodexAuthDeadState();
+    // Preserve the first reason/since for this generation. If a stale latch for
+    // a different grant survived a crash between the fresh auth write and its
+    // cleanup, replace it while we hold the shared auth-operation lock.
+    if (!existing?.grantId || !currentGrantId || existing.grantId === currentGrantId) {
+      if (existsSync(CODEX_AUTH_DEAD_FILE)) return true;
+    }
     mkdirSync(path.dirname(CODEX_AUTH_DEAD_FILE), { recursive: true });
     writeFileSync(
       CODEX_AUTH_DEAD_FILE,
-      JSON.stringify({ reason: reason.slice(0, 300), since: new Date().toISOString() }, null, 2),
+      JSON.stringify({
+        reason: reason.slice(0, 300),
+        since: new Date().toISOString(),
+        ...(currentGrantId ? { grantId: currentGrantId } : {}),
+      }, null, 2),
       { encoding: 'utf-8', mode: 0o600 },
     );
-  } catch { /* best-effort; the latch is an optimization, never load-bearing for correctness */ }
+    return true;
+  } catch {
+    return false; // best-effort; the latch is an optimization, never load-bearing for correctness
+  }
+}
+
+/**
+ * Latch auth as dead (terminal revoke/expiry), serialized with refresh/login.
+ * When `expectedGrantId` is supplied, a stale failure from a replaced grant is
+ * ignored. Idempotent — keeps the first reason/since for the active grant.
+ */
+export async function markCodexAuthDead(reason: string, expectedGrantId?: string): Promise<boolean> {
+  const lockFd = await acquireRefreshLock();
+  if (lockFd === null) return false;
+  try {
+    return markCodexAuthDeadUnderLock(reason, expectedGrantId);
+  } finally {
+    releaseRefreshLock(lockFd);
+  }
 }
 
 export function clearCodexAuthDead(): void {
@@ -182,7 +235,7 @@ export function clearCodexAuthDead(): void {
 // run well past 30s; 90s (3× the HTTP ceiling) leaves room for that while still
 // re-admitting a genuinely crashed holder. WAIT matches STALE so a waiter never
 // fails open before a live holder is even eligible to be declared dead.
-const REFRESH_LOCK_WAIT_MS = 90_000;   // bound the wait, then fail-open
+const REFRESH_LOCK_WAIT_MS = 90_000;   // bound the wait, then fail safely
 const REFRESH_LOCK_STALE_MS = 90_000;  // steal only a crashed holder, never a slow live one
 const REFRESH_SKIP_IF_WITHIN_MS = 2 * 60 * 1000; // a sibling just refreshed → reuse it
 
@@ -197,9 +250,9 @@ export function __setRefreshTokenImplForTests(fn: typeof refreshNativeCodexToken
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
-/** Acquire the cross-process refresh lock. Returns an fd on success, or null
- *  if it couldn't be acquired within the wait budget (caller proceeds anyway —
- *  fail-open, since blocking a refresh forever guarantees a 401). */
+/** Acquire the cross-process auth-write lock. Returns an fd on success, or null
+ *  if it couldn't be acquired within the wait budget. Callers fail the current
+ *  operation rather than spend/overwrite a rotating token without ownership. */
 async function acquireRefreshLock(): Promise<number | null> {
   const deadline = Date.now() + REFRESH_LOCK_WAIT_MS;
   mkdirSync(path.dirname(REFRESH_LOCK_FILE), { recursive: true });
@@ -219,7 +272,7 @@ async function acquireRefreshLock(): Promise<number | null> {
       } catch {
         continue; // lock vanished between open and stat — retry
       }
-      if (Date.now() >= deadline) return null; // fail-open
+      if (Date.now() >= deadline) return null; // fail safely without touching auth state
       await delay(150);
     }
   }
@@ -254,6 +307,8 @@ interface LocalAuthState {
   importedAt?: string;
   source?: 'codex_cli' | 'native';
   codexOauth?: {
+    grantProvenance?: string;
+    grantId?: string;
     accessToken?: string;
     refreshToken?: string;
     idToken?: string;
@@ -262,7 +317,25 @@ interface LocalAuthState {
   };
 }
 
+/**
+ * Versioned proof that this grant was minted and persisted by Clementine's own
+ * OAuth flow. Older desktop builds could import ~/.codex/auth.json and then
+ * relabel that shared token family as `source: 'native'`, so `source` alone is
+ * not trustworthy for migration. Only new interactive/device logins write this
+ * marker; markerless grants deliberately require one fresh sign-in.
+ */
+export const CODEX_GRANT_PROVENANCE = 'clementine-oauth-v1' as const;
+
+function hasIndependentCodexGrant(state: LocalAuthState): boolean {
+  return state.source === 'native'
+    && state.codexOauth?.grantProvenance === CODEX_GRANT_PROVENANCE
+    && typeof state.codexOauth.grantId === 'string'
+    && state.codexOauth.grantId.length > 0
+    && Boolean(state.codexOauth.accessToken && state.codexOauth.refreshToken);
+}
+
 export interface StoredCodexOAuthTokens {
+  grantId?: string;
   accessToken?: string;
   refreshToken?: string;
   idToken?: string;
@@ -299,13 +372,18 @@ export function getStoredCodexOAuthTokens(): StoredCodexOAuthTokens | null {
   // the dominant "keeps getting logged out" trap. Clem owns its OWN grant
   // (native loopback or device-code login); the CLI file is no longer read.
   const local = loadLocalAuthState();
-  if (local.codexOauth?.accessToken && local.codexOauth?.refreshToken) {
+  const codexOauth = local.codexOauth;
+  // DEAD means the active family is terminally revoked/expired. Never hand its
+  // access token to any runtime (the native runtime and harness have different
+  // request paths, so this store boundary is the shared fail-closed guard).
+  if (!isCodexAuthDead() && hasIndependentCodexGrant(local) && codexOauth) {
     return {
-      accessToken: local.codexOauth.accessToken,
-      refreshToken: local.codexOauth.refreshToken,
-      idToken: local.codexOauth.idToken,
-      accountId: local.codexOauth.accountId,
-      lastRefresh: local.codexOauth.lastRefresh,
+      accessToken: codexOauth.accessToken,
+      refreshToken: codexOauth.refreshToken,
+      grantId: codexOauth.grantId,
+      idToken: codexOauth.idToken,
+      accountId: codexOauth.accountId,
+      lastRefresh: codexOauth.lastRefresh,
     };
   }
   return null;
@@ -318,10 +396,45 @@ function saveLocalAuthState(state: LocalAuthState): void {
   mkdirSync(path.dirname(AUTH_STATE_FILE), { recursive: true });
   writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
   try { chmodSync(AUTH_STATE_FILE, 0o600); } catch { /* best-effort */ }
-  // A fresh, usable token landed (login / import / successful refresh) → auth is
+  // A fresh, verified token landed (login / successful refresh) → auth is
   // healthy again, so lift any DEAD latch. This is the single recovery signal.
-  if (state.codexOauth?.accessToken && state.codexOauth?.refreshToken) {
+  if (hasIndependentCodexGrant(state)) {
     clearCodexAuthDead();
+  }
+}
+
+/**
+ * Persist a newly minted independent grant under the same cross-process lock
+ * used for refresh rotation. The browser/device authorization itself happens
+ * outside the lock; only the tiny state-file replacement is serialized. If an
+ * old-family refresh was already running, this waits for it and then makes the
+ * new grant the final write. If a refresh was queued first, that refresher will
+ * re-read this new token after the lock and skip spending the old family.
+ */
+async function persistIndependentCodexTokens(
+  tokens: NativeCodexTokenSet,
+  grantId = randomUUID(),
+): Promise<void> {
+  const lockFd = await acquireRefreshLock();
+  if (lockFd === null) {
+    throw new Error('Timed out waiting to safely store the new Codex sign-in. Please try again.');
+  }
+  try {
+    saveLocalAuthState({
+      importedAt: new Date().toISOString(),
+      source: 'native',
+      codexOauth: {
+        grantProvenance: CODEX_GRANT_PROVENANCE,
+        grantId,
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        idToken: tokens.idToken,
+        accountId: tokens.accountId,
+        lastRefresh: tokens.lastRefresh,
+      },
+    });
+  } finally {
+    releaseRefreshLock(lockFd);
   }
 }
 
@@ -338,7 +451,10 @@ function getCodexBootstrapState(sourceFile = getCodexAuthSourceFile()): CodexBoo
   const local = loadLocalAuthState();
   const codexCli = loadCodexCliAuth(sourceFile);
   return {
-    localCodex: local.codexOauth,
+    // A terminally revoked grant is still present on disk so we can explain
+    // what happened, but it is not available for bootstrap/reuse. Only a fresh
+    // interactive or device grant can clear the DEAD latch.
+    localCodex: hasIndependentCodexGrant(local) && !isCodexAuthDead() ? local.codexOauth : undefined,
     codexCli: codexCli?.tokens,
     codexCliLastRefresh: codexCli?.last_refresh,
   };
@@ -367,8 +483,8 @@ export function getCodexBootstrapAvailability(sourceFile = getCodexAuthSourceFil
 // installs the CLI, and never runs `codex login` — all of which coupled Clem to
 // the CLI's shared token family (a `codex logout` then signed Clem out). Clem
 // signs in independently via the loopback (login-native) or device-code
-// (login-device) flows. The CLI file is still READ once, on demand, ONLY by the
-// explicit `auth import-codex` migration command (importCodexCliAuth).
+// (login-device) flows. The CLI file is read only to show a migration hint; the
+// legacy `auth import-codex` command is intentionally disabled below.
 
 export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile()): Promise<{ ok: boolean; message: string }> {
   try {
@@ -378,17 +494,7 @@ export async function loginWithNativeOAuth(_sourceFile = getCodexAuthSourceFile(
     // that file lets a separate `codex` invocation rotate/consume our refresh
     // token and trip reuse-detection (token_revoked). See the notes near
     // REFRESH_LOCK_FILE; this is the "Clem holds her own auth token" decouple.
-    saveLocalAuthState({
-      importedAt: new Date().toISOString(),
-      source: 'native',
-      codexOauth: {
-        accessToken: tokens.accessToken,
-        refreshToken: tokens.refreshToken,
-        idToken: tokens.idToken,
-        accountId: tokens.accountId,
-        lastRefresh: tokens.lastRefresh,
-      },
-    });
+    await persistIndependentCodexTokens(tokens);
     return {
       ok: true,
       message: 'Signed in to ChatGPT/Codex. Clementine stored its own credentials (independent of the Codex CLI).',
@@ -418,19 +524,10 @@ function sweepPendingDeviceLogins(): void {
   }
 }
 
-function persistDeviceTokens(tokens: NativeCodexTokenSet): void {
-  // OWN vault only (source 'native') — clears the DEAD latch via saveLocalAuthState.
-  saveLocalAuthState({
-    importedAt: new Date().toISOString(),
-    source: 'native',
-    codexOauth: {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      idToken: tokens.idToken,
-      accountId: tokens.accountId,
-      lastRefresh: tokens.lastRefresh,
-    },
-  });
+async function persistDeviceTokens(tokens: NativeCodexTokenSet): Promise<void> {
+  // OWN vault only (source 'native') — serialized with refresh and clears the
+  // DEAD latch only after the verified grant lands successfully.
+  await persistIndependentCodexTokens(tokens);
 }
 
 export interface CodexDeviceLoginStart {
@@ -482,7 +579,7 @@ export async function pollCodexDeviceLogin(loginId: string): Promise<CodexDevice
     const result = await pollCodexDeviceAuth(pending.deviceAuthId, pending.userCode);
     if (result.status === 'pending') return { status: 'pending' };
     pendingDeviceLogins.delete(loginId);
-    persistDeviceTokens(result.tokens);
+    await persistDeviceTokens(result.tokens);
     return { status: 'complete', accountId: result.tokens.accountId };
   } catch (error) {
     return { status: 'error', message: error instanceof Error ? error.message : String(error) };
@@ -506,7 +603,7 @@ export async function loginWithCodexDeviceCode(
       if (Date.now() > deadline) return { ok: false, message: 'Device login timed out after 15 minutes.' };
       const result = await pollCodexDeviceAuth(start.deviceAuthId, start.userCode);
       if (result.status === 'complete') {
-        persistDeviceTokens(result.tokens);
+        await persistDeviceTokens(result.tokens);
         return { ok: true, message: 'Signed in to ChatGPT/Codex via device code. Clementine stored its own credentials.' };
       }
     }
@@ -522,6 +619,16 @@ export async function loginWithCodexDeviceCode(
  *  notes near REFRESH_LOCK_FILE for why this matters (reuse → token_revoked). */
 export async function refreshStoredNativeOAuth(options: { force?: boolean; sourceFile?: string } = {}): Promise<{ ok: boolean; message: string; terminal?: boolean }> {
   const { force = false, sourceFile = getCodexAuthSourceFile() } = options;
+  // Fail closed before touching the rotating token. Old Clementine builds could
+  // label a CLI-derived shared family as `native`; only a versioned, explicitly
+  // Clementine-owned grant is safe to refresh.
+  if (!hasIndependentCodexGrant(loadLocalAuthState())) {
+    return {
+      ok: false,
+      terminal: true,
+      message: 'The stored Codex grant is legacy or unverified and will not be used. Re-authenticate with `clementine auth login-device`, `clementine auth login-native`, or desktop → Re-authenticate.',
+    };
+  }
   // 0. DEAD latch: a prior terminal revoke means the refresh token is gone.
   // Re-POSTing it can't recover and risks tripping further family revokes —
   // short-circuit until a re-auth lands and clears the latch.
@@ -551,7 +658,16 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
   // Snapshot the RT we INTEND to spend BEFORE we queue on the lock. If a sibling
   // rotates the token while we wait, the on-disk RT will differ post-lock and we
   // reuse theirs rather than spending our now-stale one (read-before-spend).
-  const preLockRefreshToken = loadLocalAuthState().codexOauth?.refreshToken;
+  const preLockState = loadLocalAuthState();
+  if (!hasIndependentCodexGrant(preLockState)) {
+    return {
+      ok: false,
+      terminal: true,
+      message: 'The stored Codex grant is legacy or unverified; re-authenticate before refreshing it.',
+    };
+  }
+  const preLockRefreshToken = preLockState.codexOauth?.refreshToken;
+  const expectedGrantId = preLockState.codexOauth?.grantId;
   // lockFd starts null + the lock is acquired INSIDE the try, so any throw from
   // acquireRefreshLock (e.g. a state-dir mkdir EACCES) still returns ok:false
   // rather than rejecting the caller's model request.
@@ -559,10 +675,20 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
   try {
     // 2. Cross-process lock — only one process refreshes at a time.
     lockFd = await acquireRefreshLock();
+    if (lockFd === null) {
+      return { ok: false, message: 'Timed out waiting for another Codex auth operation to finish. Please retry.' };
+    }
     // Re-read AFTER acquiring the lock: another holder may have just rotated
     // the token while we waited. Using the freshest on-disk RT (never a stale
     // snapshot) is what prevents submitting an already-consumed RT.
     const local = loadLocalAuthState();
+    if (!hasIndependentCodexGrant(local)) {
+      return {
+        ok: false,
+        terminal: true,
+        message: 'The stored Codex grant changed or is unverified; re-authenticate before refreshing it.',
+      };
+    }
     const refreshToken = local.codexOauth?.refreshToken;
     if (!refreshToken) {
       return { ok: false, message: 'No locally stored native refresh token is available.' };
@@ -587,11 +713,13 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     // rotated token back to ~/.codex/auth.json (the external Codex CLI's file):
     // pushing our rotating RT there lets a separate `codex` invocation consume
     // it and trip reuse-detection. Clementine owns its grant; the codex CLI owns
-    // its own. (Initial login/import still seeds the CLI file — see those paths.)
+    // its own. Fresh Clementine login paths never seed the CLI file.
     saveLocalAuthState({
       importedAt: new Date().toISOString(),
-      source: local.source ?? 'native',
+      source: 'native',
       codexOauth: {
+        grantProvenance: CODEX_GRANT_PROVENANCE,
+        grantId: local.codexOauth?.grantId,
         accessToken: tokens.accessToken,
         refreshToken: tokens.refreshToken,
         idToken: tokens.idToken,
@@ -607,7 +735,7 @@ async function doRefreshStoredNativeOAuth(_sourceFile: string, force = false): P
     if (kind === 'terminal') {
       // The token family is gone — re-POSTing it can't recover and risks more
       // family revokes. Latch DEAD so callers stop hammering until re-auth.
-      markCodexAuthDead(message);
+      markCodexAuthDeadUnderLock(message, expectedGrantId);
       return { ok: false, terminal: true, message };
     }
     // Transient (rate-limit / backend blip / network): the token is still valid;
@@ -649,36 +777,27 @@ export async function bootstrapCodexAuth(sourceFile = getCodexAuthSourceFile()):
   });
 }
 
-export function importCodexCliAuth(sourceFile = getCodexAuthSourceFile()): { ok: boolean; message: string } {
-  const source = loadCodexCliAuth(sourceFile);
-  if (!source?.tokens?.access_token || !source.tokens.refresh_token) {
-    return {
-      ok: false,
-      message: `No reusable Codex OAuth tokens found in ${sourceFile}.`,
-    };
-  }
-
-  saveLocalAuthState({
-    importedAt: new Date().toISOString(),
-    source: 'codex_cli',
-    codexOauth: {
-      accessToken: source.tokens.access_token,
-      refreshToken: source.tokens.refresh_token,
-      idToken: source.tokens.id_token,
-      accountId: source.tokens.account_id,
-      lastRefresh: source.last_refresh,
-    },
-  });
-
+export function importCodexCliAuth(_sourceFile = getCodexAuthSourceFile()): { ok: boolean; message: string } {
   return {
-    ok: true,
-    message: `Imported Codex OAuth credentials from ${sourceFile}.`,
+    ok: false,
+    message: 'Importing Codex CLI credentials is disabled because it shares a rotating token family: a CLI logout or concurrent refresh can revoke Clementine. Use `clementine auth login-device`, `clementine auth login-native`, or desktop → Re-authenticate to create Clementine’s own grant.',
   };
 }
 
-export function clearImportedAuth(): void {
-  rmSync(AUTH_STATE_FILE, { force: true });
-  clearCodexAuthDead();
+export async function clearImportedAuth(): Promise<void> {
+  // Serialize logout with refresh/login. Otherwise a refresh that started just
+  // before logout can finish afterward and silently restore the credentials the
+  // user explicitly removed.
+  const lockFd = await acquireRefreshLock();
+  if (lockFd === null) {
+    throw new Error('Timed out waiting for another Codex auth operation to finish. Please retry logout.');
+  }
+  try {
+    rmSync(AUTH_STATE_FILE, { force: true });
+    clearCodexAuthDead();
+  } finally {
+    releaseRefreshLock(lockFd);
+  }
 }
 
 export function getAuthStatus(): AuthStatus {
@@ -687,16 +806,19 @@ export function getAuthStatus(): AuthStatus {
   const codexAuthSourceFile = getCodexAuthSourceFile();
   const localCodex = local.codexOauth;
   const openaiApiKeyPresent = Boolean(getOpenAiApiKey());
-  const codexOauthPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
+  const localTokenPairPresent = Boolean(localCodex?.accessToken && localCodex?.refreshToken);
+  const verifiedCodexGrantPresent = hasIndependentCodexGrant(local);
+  const codexAuthDead = verifiedCodexGrantPresent ? getCodexAuthDead() : null;
+  // `codexOauthPresent` is consumed by every UI as the signed-in bit. A grant
+  // that is proven but terminally revoked must display as signed out and prompt
+  // for a fresh OAuth flow, not as a healthy stored credential.
+  const codexOauthPresent = verifiedCodexGrantPresent && !codexAuthDead;
 
-  // Shared-family detection: Clem's grant is coupled to the Codex CLI's rotating
-  // refresh-token family ONLY when it was explicitly imported from the CLI
-  // (legacy `auth import-codex`, source 'codex_cli'). Clem no longer runs off
-  // ~/.codex/auth.json, so a mere present CLI file is NOT coupling. In the
-  // coupled state a `codex logout` revokes the family server-side and signs Clem
-  // out — the user should re-login to mint an independent grant.
-  const codexSharedWithCli = codexOauthPresent && local.source === 'codex_cli';
-  const sharedHint = ' ⚠ This sign-in was imported from the Codex CLI — signing out of the CLI (`codex logout`) will sign Clementine out too. Run `clementine auth login-device` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.';
+  // Any markerless pair is legacy/unverified. This includes source 'native': an
+  // older desktop import path could copy the CLI family and then mislabel it as
+  // native. Treat it as potentially shared, never run from it, and require a
+  // fresh independent grant.
+  const codexSharedWithCli = localTokenPairPresent && !verifiedCodexGrantPresent;
   // Tailored hint for someone who used to run off the CLI file before the decouple.
   const legacyCliFilePresent = Boolean(codexCli?.tokens?.access_token && codexCli.tokens.refresh_token);
 
@@ -717,15 +839,29 @@ export function getAuthStatus(): AuthStatus {
     };
   }
 
+  if (codexAuthDead) {
+    return {
+      mode: AUTH_MODE,
+      configured: false,
+      source: 'native',
+      message: `Clementine's Codex sign-in was revoked or expired (since ${codexAuthDead.since}). Re-authenticate in the desktop app or run \`clementine auth login-device\` / \`clementine auth login-native\`.`,
+      openaiApiKeyPresent,
+      codexOauthPresent: false,
+      codexAuthDead: true,
+      codexRecoveryRequired: true,
+      codexAccountId: localCodex?.accountId,
+      codexLastRefresh: localCodex?.lastRefresh,
+      codexImportPath: codexAuthSourceFile,
+      codexSharedWithCli: false,
+    };
+  }
+
   if (codexOauthPresent) {
     return {
       mode: AUTH_MODE,
       configured: true,
-      source: local.source === 'native' ? 'native' : 'local_store',
-      message: (local.source === 'native'
-        ? 'Native ChatGPT/Codex credentials are stored locally. Codex CLI is optional.'
-        : 'Codex OAuth credentials are imported locally. Codex CLI is optional.')
-        + (codexSharedWithCli ? sharedHint : ''),
+      source: 'native',
+      message: 'Native ChatGPT/Codex credentials are stored locally. Codex CLI is optional.',
       openaiApiKeyPresent,
       codexOauthPresent,
       codexAccountId: localCodex?.accountId,
@@ -735,17 +871,20 @@ export function getAuthStatus(): AuthStatus {
     };
   }
 
-  // No vault grant. A present ~/.codex/auth.json is NO LONGER usable by Clem —
-  // it must hold its own grant. Point the user at the (remote-capable) login.
+  // No verified vault grant. A markerless local pair and/or ~/.codex/auth.json
+  // is NO LONGER usable by Clem — it must hold its own independently-minted
+  // grant. Point the user at the remote-capable login.
+  const legacyGrantPresent = localTokenPairPresent || legacyCliFilePresent;
   return {
     mode: AUTH_MODE,
     configured: false,
     source: 'none',
-    message: legacyCliFilePresent
-      ? 'No Clementine Codex sign-in. A Codex CLI sign-in exists but Clementine no longer uses it (so a `codex logout` can’t sign you out). Run `clementine auth login-device` (or desktop → Re-authenticate) to give Clementine its own independent sign-in.'
+    message: legacyGrantPresent
+      ? 'No verified Clementine Codex sign-in. A legacy or CLI-linked grant exists, but Clementine no longer uses it because it may share a rotating token family. Run `clementine auth login-device`, `clementine auth login-native`, or desktop → Re-authenticate to create an independent sign-in.'
       : 'No Codex OAuth credentials found. Run `clementine auth login-device` (remote/headless), `clementine auth login-native` (local browser), or use the desktop setup flow to sign in with ChatGPT.',
     openaiApiKeyPresent,
     codexOauthPresent,
+    codexRecoveryRequired: legacyGrantPresent,
     codexImportPath: codexAuthSourceFile,
     codexSharedWithCli,
   };
@@ -758,7 +897,9 @@ export function formatAuthStatus(status = getAuthStatus()): string {
     `source: ${status.source}`,
     `api_key_present: ${status.openaiApiKeyPresent ? 'yes' : 'no'}`,
     `codex_oauth_present: ${status.codexOauthPresent ? 'yes' : 'no'}`,
-    status.codexSharedWithCli ? `codex_shared_with_cli: yes (a CLI logout will revoke this — run \`clementine auth login-device\` to decouple)` : '',
+    status.codexAuthDead ? 'codex_auth_dead: yes (daemon recovery shell remains available for re-authentication)' : '',
+    status.codexRecoveryRequired ? 'codex_recovery_required: yes' : '',
+    status.codexSharedWithCli ? 'codex_shared_with_cli: possible (legacy/unverified grant is disabled — run `clementine auth login-device` to replace it)' : '',
     status.codexAccountId ? `codex_account_id: ${status.codexAccountId}` : '',
     status.codexLastRefresh ? `codex_last_refresh: ${status.codexLastRefresh}` : '',
     status.codexImportPath ? `codex_import_path: ${status.codexImportPath}` : '',

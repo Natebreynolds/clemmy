@@ -5,7 +5,14 @@ import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRun
 import { ApprovalStore } from './approval-store.js';
 import { addNotification, getNotification } from './notifications.js';
 import { ASSISTANT_NAME, BASE_DIR, DEFAULT_CODEX_MODEL } from '../config.js';
-import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, isCodexAuthDead, getCodexAuthDead } from './auth-store.js';
+import {
+  getStoredCodexOAuthTokens,
+  refreshStoredNativeOAuth,
+  isCodexAuthDead,
+  getCodexAuthDead,
+  classifyCodexAuthError,
+  markCodexAuthDead,
+} from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
@@ -67,6 +74,7 @@ class CodexRuntimeError extends Error {
     readonly bodyText?: string,
     readonly elapsedMs?: number,
     readonly retriesAttempted?: number,
+    readonly codexGrantId?: string,
   ) {
     super(message);
     this.name = 'CodexRuntimeError';
@@ -783,6 +791,8 @@ async function performCodexRequest(
       response.status,
       errorText.slice(0, 2048),
       elapsedMs,
+      undefined,
+      tokens.grantId,
     );
   }
 
@@ -838,6 +848,35 @@ async function performCodexRequest(
 	        if (!payload) continue;
 	        const type = payload.type;
 	        responseId = extractResponseId(payload) ?? responseId;
+
+	        if (type === 'response.failed' || type === 'response.error' || type === 'error') {
+	          const responseError = (payload.response && typeof payload.response === 'object')
+	            ? (payload.response as { error?: unknown }).error
+	            : undefined;
+	          const candidate = responseError ?? payload.error;
+	          let detail = '';
+	          if (typeof candidate === 'string') {
+	            detail = candidate;
+	          } else if (candidate && typeof candidate === 'object') {
+	            const authError = candidate as { code?: unknown; message?: unknown };
+	            detail = [authError.code, authError.message]
+	              .filter((value): value is string => typeof value === 'string' && value.length > 0)
+	              .join(': ');
+	          }
+	          if (!detail && typeof payload.message === 'string') detail = payload.message;
+	          if (classifyCodexAuthError({ message: detail, source: 'model' }) === 'terminal') {
+	            // Carry the exact request generation to performWithRefresh, which
+	            // persists DEAD before any outer caller can swallow the failure.
+	            throw new CodexRuntimeError(
+	              `Codex sign-in is revoked or expired — re-authenticate to resume. ${detail}`,
+	              401,
+	              detail,
+	              Date.now() - startedAt,
+	              undefined,
+	              tokens.grantId,
+	            );
+	          }
+	        }
 
 	        if (type === 'response.output_text.delta') {
 	          const delta = payload.delta;
@@ -1021,6 +1060,24 @@ export class CodexNativeRuntime implements AgentRuntime {
       try {
         return await performCodexRequest(request, input, callbacks);
       } catch (error) {
+        const modelAuthClass = error instanceof CodexRuntimeError
+          ? classifyCodexAuthError({
+              message: error.bodyText ?? error.message,
+              status: error.status,
+              source: 'model',
+            })
+          : null;
+        // Latch explicit terminal markers at the provider boundary. This legacy
+        // lane has no fallback wrapper today, but matching the harness invariant
+        // prevents future callers from swallowing a revoke and continuing to
+        // present the grant as healthy. Never latch without the request-bound
+        // generation id: that is the re-login race where the current grant may
+        // already be different.
+        if (modelAuthClass === 'terminal' && error instanceof CodexRuntimeError && error.codexGrantId) {
+          await markCodexAuthDead(error.bodyText ?? error.message, error.codexGrantId);
+          notifyCodexAuthExpired(error.bodyText ?? error.message);
+          throw error;
+        }
         if (!refreshed && error instanceof CodexRuntimeError && error.status === 401) {
           const refreshResult = await refreshStoredNativeOAuth();
           if (refreshResult.ok) {

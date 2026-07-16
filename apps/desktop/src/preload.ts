@@ -108,14 +108,6 @@ const api = {
     | { ok: true; accountId: string; lastRefresh: string; reused?: boolean }
     | { ok: false; error: string }
   >,
-  /** Force-fresh Codex OAuth re-auth — Settings RE-AUTHENTICATE button.
-   *  Always opens the browser (unlike setupCodexLogin which short-
-   *  circuits on existing valid tokens). On cancel or failure the old
-   *  tokens are kept. */
-  codexReauth: () => ipcRenderer.invoke('clemmy:codex-reauth') as Promise<
-    | { ok: true; accountId: string; lastRefresh: string }
-    | { ok: false; error: string }
-  >,
   /** Persist a profile patch to ~/.clementine-next/state/user-profile.json. */
   setupSaveProfile: (patch: Record<string, unknown>) => ipcRenderer.invoke('clemmy:setup-save-profile', patch) as Promise<{ ok: boolean }>,
   /** Wizard finished — close setup window, signal main to boot dashboard. */

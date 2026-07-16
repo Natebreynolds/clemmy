@@ -1,22 +1,27 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type RequestListener } from 'node:http';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { shell } from 'electron';
+import {
+  extractCodexAccountId,
+  getCodexJwtExpiryMs,
+  loadClementineOwnedCodexOAuthTokens,
+  persistClementineOwnedCodexOAuthTokens,
+  resolveClementineCodexAuthPaths,
+  type CodexOAuthTokens,
+} from './codex-oauth-store.js';
+
+export type { CodexOAuthTokens } from './codex-oauth-store.js';
 
 /**
  * Codex OAuth flow — desktop-local port of src/runtime/codex-native-oauth.ts
  * so the setup wizard can complete sign-in WITHOUT the user dropping into
  * a terminal to run `clementine auth login-native`.
  *
- * The daemon's auth-store reads from two locations on boot, in order:
- *   1. ~/.clementine-next/state/auth.json   (local "native" path)
- *   2. ~/.codex/auth.json                   (codex CLI compat)
- *
- * We write both so whichever runtime path the daemon takes finds the
- * tokens. The setup flow avoids mirroring these tokens into Keychain;
- * the runtime reads this native auth store directly.
+ * Clementine owns a dedicated OAuth grant in
+ * ~/.clementine-next/state/auth.json. The external Codex CLI's
+ * ~/.codex/auth.json is neither imported nor written because sharing its
+ * rotating refresh-token family lets either program revoke the other.
  */
 
 // CODEX_OAUTH_AUTH_BASE_URL overrides the base URL for local testing
@@ -33,14 +38,6 @@ const CALLBACK_PORTS = [1455, 1441, 1444, 1449, 1452, 1457, 1460, 1466, 1467];
 const CALLBACK_PATH = '/auth/callback';
 const LEGACY_CALLBACK_PATH = '/callback';
 const LOGIN_TIMEOUT_MS = 15 * 60_000;
-
-export interface CodexOAuthTokens {
-  accessToken: string;
-  refreshToken: string;
-  idToken?: string;
-  accountId?: string;
-  lastRefresh: string;
-}
 
 interface CallbackPayload {
   code?: string;
@@ -236,96 +233,9 @@ function listenForOAuthCallback(
   });
 }
 
-function parseJwtPayload(token?: string): Record<string, unknown> | null {
-  if (!token) return null;
-  const parts = token.split('.');
-  if (parts.length < 2) return null;
-  try {
-    const normalized = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
-    return JSON.parse(Buffer.from(padded, 'base64').toString('utf-8')) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function extractAccountId(idToken?: string, accessToken?: string): string | undefined {
-  for (const payload of [parseJwtPayload(idToken), parseJwtPayload(accessToken)]) {
-    const auth = payload?.['https://api.openai.com/auth'];
-    if (auth && typeof auth === 'object' && auth !== null) {
-      const accountId = (auth as Record<string, unknown>).chatgpt_account_id;
-      if (typeof accountId === 'string' && accountId) return accountId;
-    }
-  }
-  return undefined;
-}
-
-function getJwtExpiryMs(token?: string): number | null {
-  const payload = parseJwtPayload(token);
-  const exp = payload?.exp;
-  return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : null;
-}
-
 function isAccessTokenFresh(tokens: CodexOAuthTokens, skewMs = 60_000): boolean {
-  const expiresAt = getJwtExpiryMs(tokens.accessToken);
+  const expiresAt = getCodexJwtExpiryMs(tokens.accessToken);
   return expiresAt === null || expiresAt - skewMs > Date.now();
-}
-
-function normalizeTokenSet(input: {
-  accessToken?: unknown;
-  refreshToken?: unknown;
-  idToken?: unknown;
-  accountId?: unknown;
-  lastRefresh?: unknown;
-}): CodexOAuthTokens | null {
-  if (typeof input.accessToken !== 'string' || !input.accessToken) return null;
-  if (typeof input.refreshToken !== 'string' || !input.refreshToken) return null;
-  const idToken = typeof input.idToken === 'string' ? input.idToken : undefined;
-  const accountId = typeof input.accountId === 'string' ? input.accountId : extractAccountId(idToken, input.accessToken);
-  return {
-    accessToken: input.accessToken,
-    refreshToken: input.refreshToken,
-    idToken,
-    accountId,
-    lastRefresh: typeof input.lastRefresh === 'string' ? input.lastRefresh : new Date().toISOString(),
-  };
-}
-
-function readJsonFile(filePath: string): Record<string, unknown> | null {
-  if (!existsSync(filePath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as unknown;
-    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
-  } catch {
-    return null;
-  }
-}
-
-function loadExistingCodexOAuthTokens(): CodexOAuthTokens | null {
-  const local = readJsonFile(LOCAL_AUTH_FILE);
-  const localCodex = local?.codexOauth && typeof local.codexOauth === 'object'
-    ? local.codexOauth as Record<string, unknown>
-    : null;
-  const localTokens = localCodex ? normalizeTokenSet({
-    accessToken: localCodex.accessToken,
-    refreshToken: localCodex.refreshToken,
-    idToken: localCodex.idToken,
-    accountId: localCodex.accountId,
-    lastRefresh: localCodex.lastRefresh,
-  }) : null;
-  if (localTokens) return localTokens;
-
-  const cli = readJsonFile(CODEX_AUTH_FILE);
-  const cliTokens = cli?.tokens && typeof cli.tokens === 'object'
-    ? cli.tokens as Record<string, unknown>
-    : null;
-  return cliTokens ? normalizeTokenSet({
-    accessToken: cliTokens.access_token,
-    refreshToken: cliTokens.refresh_token,
-    idToken: cliTokens.id_token,
-    accountId: cliTokens.account_id,
-    lastRefresh: cli?.last_refresh,
-  }) : null;
 }
 
 async function exchangeAuthorizationCode(code: string, redirectUri: string, codeVerifier: string): Promise<CodexOAuthTokens> {
@@ -368,58 +278,18 @@ async function exchangeAuthorizationCode(code: string, redirectUri: string, code
     accessToken,
     refreshToken,
     idToken,
-    accountId: extractAccountId(idToken, accessToken),
+    accountId: extractCodexAccountId(idToken, accessToken),
     lastRefresh: new Date().toISOString(),
   };
 }
 
-async function refreshCodexOAuthTokens(tokens: CodexOAuthTokens): Promise<CodexOAuthTokens> {
-  const response = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: CLIENT_ID,
-      refresh_token: tokens.refreshToken,
-    }),
-    signal: AbortSignal.timeout(30_000),
-  }).catch((err: Error & { name?: string }) => {
-    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
-      throw new Error('OAuth refresh timed out after 30s. Check your network connection and try again.');
-    }
-    throw err;
-  });
-
-  const text = await response.text();
-  if (!response.ok) throw new Error(`OAuth refresh failed (${response.status}): ${text.slice(0, 300)}`);
-
-  let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(text) as Record<string, unknown>; }
-  catch { throw new Error(`OAuth refresh returned invalid JSON: ${text.slice(0, 300)}`); }
-
-  const accessToken = typeof parsed.access_token === 'string' ? parsed.access_token : '';
-  const refreshToken = typeof parsed.refresh_token === 'string' ? parsed.refresh_token : tokens.refreshToken;
-  const idToken = typeof parsed.id_token === 'string' ? parsed.id_token : tokens.idToken;
-  if (!accessToken) throw new Error('OAuth refresh did not return an access token.');
-
-  return {
-    accessToken,
-    refreshToken,
-    idToken,
-    accountId: extractAccountId(idToken, accessToken) ?? tokens.accountId,
-    lastRefresh: new Date().toISOString(),
-  };
-}
-
-export async function importUsableCodexOAuthTokens(): Promise<CodexOAuthTokens | null> {
-  const existing = loadExistingCodexOAuthTokens();
+export async function loadUsableClementineCodexOAuthTokens(): Promise<CodexOAuthTokens | null> {
+  // Setup never rotates an existing grant: a separately running daemon may own
+  // that refresh token. Reuse only a fresh, non-DEAD snapshot without writing
+  // it back; stale/revoked grants go through a brand-new browser login.
+  const existing = loadClementineOwnedCodexOAuthTokens(LOCAL_AUTH_FILE, CODEX_AUTH_DEAD_FILE);
   if (!existing) return null;
-  if (isAccessTokenFresh(existing)) return existing;
-  try {
-    return await refreshCodexOAuthTokens(existing);
-  } catch {
-    return null;
-  }
+  return isAccessTokenFresh(existing) ? existing : null;
 }
 
 /**
@@ -429,7 +299,7 @@ export async function importUsableCodexOAuthTokens(): Promise<CodexOAuthTokens |
  * the callback, exchanges the code, returns tokens.
  *
  * Tokens are NOT persisted by this function — call `persistCodexOAuthTokens`
- * after to write them to the daemon's auth stores.
+ * after to write them to Clementine's private auth store.
  */
 export interface RunCodexOAuthLoginOptions {
   /** OIDC `prompt` param. Pass `select_account` to force the IdP to
@@ -463,43 +333,16 @@ export async function runCodexOAuthLogin(
 
 // ─── Persistence ──────────────────────────────────────────────────────
 
-const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
-const LOCAL_AUTH_FILE = path.join(STATE_DIR, 'auth.json');
-const CODEX_AUTH_DIR = path.join(HOME, '.codex');
-const CODEX_AUTH_FILE = path.join(CODEX_AUTH_DIR, 'auth.json');
-
-function atomicWriteJson(filePath: string, value: unknown): void {
-  // Tokens here include the OAuth refresh_token. macOS default umask
-  // lands new files at 0644 — world-readable. Lock to 0600 so other
-  // accounts on the same machine can't read the refresh token from
-  // these files. We pass mode at create time AND chmodSync after
-  // rename because rename preserves the temp file's mode, but some
-  // filesystems re-apply the umask on the destination.
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  renameSync(tmp, filePath);
-  try { chmodSync(filePath, 0o600); } catch { /* best-effort; rename usually preserves the mode */ }
-}
+const { authFile: LOCAL_AUTH_FILE, authDeadFile: CODEX_AUTH_DEAD_FILE } = resolveClementineCodexAuthPaths();
 
 /** Write the tokens to Clementine's private auth store. */
-export function persistCodexOAuthTokens(tokens: CodexOAuthTokens): void {
-  const localState = {
-    importedAt: new Date().toISOString(),
-    source: 'native' as const,
-    codexOauth: {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      idToken: tokens.idToken,
-      accountId: tokens.accountId,
-      lastRefresh: tokens.lastRefresh,
-    },
-  };
+export async function persistCodexOAuthTokens(tokens: CodexOAuthTokens): Promise<void> {
   // Clementine's OWN vault only. We intentionally no longer mirror the token
   // into ~/.codex/auth.json: sharing that file with the external `codex` CLI
   // co-mingled the rotating refresh-token family, so a separate `codex`
   // invocation could consume Clementine's token and trip reuse-detection
   // (token_revoked). Clementine owns its grant; the codex CLI owns its own.
-  atomicWriteJson(LOCAL_AUTH_FILE, localState);
+  // A successful re-auth also clears the daemon's terminal-auth latch so the
+  // new grant is usable immediately without a restart or manual file cleanup.
+  await persistClementineOwnedCodexOAuthTokens(LOCAL_AUTH_FILE, CODEX_AUTH_DEAD_FILE, tokens);
 }

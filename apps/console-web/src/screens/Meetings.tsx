@@ -11,7 +11,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
-import { statusTone, relativeTime } from '@/lib/inbox';
+import { statusTone } from '@/lib/inbox';
 import { clemmy, isDesktop } from '@/lib/clemmy';
 import {
   getRecallStatus,
@@ -33,6 +33,7 @@ import {
 } from '@/lib/meetings';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
+import { meetingTimeLabel } from '@/lib/meeting-time';
 import {
   sharedLocalMeetingCapture,
   sharedLocalMeetingCaptureState,
@@ -723,7 +724,7 @@ function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: bo
         : <Video className="h-4 w-4 shrink-0 text-muted" aria-hidden />}
       <div className="min-w-0 flex-1">
         <div className="truncate text-body text-fg">{m.title || `${m.platform ?? 'Meeting'} call`}</div>
-        <div className="text-caption text-faint">{relativeTime(m.startedAt)}{typeof m.segmentCount === 'number' ? ` · ${m.segmentCount} segment${m.segmentCount === 1 ? '' : 's'}` : ''}</div>
+        <div className="text-caption text-faint">{meetingTimeLabel(m)}{typeof m.segmentCount === 'number' ? ` · ${m.segmentCount} segment${m.segmentCount === 1 ? '' : 's'}` : ''}</div>
       </div>
       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
     </button>
@@ -783,11 +784,16 @@ function MeetingDetailView({
   const localProvider = asText(r.provider) === 'local';
   const transcriptionStatus = asText(r.transcriptionStatus);
   const transcriptionError = asText(r.transcriptionError);
+  const timeLabel = meetingTimeLabel({
+    startedAt: asText(r.startedAt) || undefined,
+    endedAt: asText(r.endedAt) || undefined,
+    durationSeconds: typeof r.durationSeconds === 'number' ? r.durationSeconds : undefined,
+  });
   return (
     <div>
       <div className="mb-2 flex items-center gap-2 text-caption text-faint">
         <span className="uppercase tracking-wide">{asText(r.platform)}</span>
-        {r.startedAt ? <span>· {relativeTime(asText(r.startedAt))}</span> : null}
+        {timeLabel ? <span>· {timeLabel}</span> : null}
       </div>
       <h3 className="mb-3 text-h2 text-fg">{asText(a.title) || 'Meeting'}</h3>
       {localProvider && (transcriptionStatus === 'queued' || transcriptionStatus === 'transcribing') && (

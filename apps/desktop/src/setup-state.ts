@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { CODEX_GRANT_PROVENANCE } from './codex-oauth-store.js';
+import { CLEMENTINE_HOME_DIR, CLEMENTINE_STATE_DIR } from './clementine-paths.js';
 
 /**
  * First-run detection + setup-complete marker.
@@ -12,23 +14,23 @@ import os from 'node:os';
  * "re-run setup" flow without losing the user's existing config.
  *
  * Detection considers a state "needs setup" when the marker file is
- * absent. Existing env/Codex/vault credentials are still valid
- * fallback inputs, but they must not silently skip the wizard on a
- * fresh desktop install. The setup-complete marker is the only source
- * of truth for "this app has been onboarded."
+ * absent. Existing env and Clementine-owned vault credentials are still
+ * valid fallback inputs, but they must not silently skip the wizard on a
+ * fresh desktop install. The external Codex CLI grant is deliberately not
+ * a Clementine credential. The setup-complete marker is the only source of
+ * truth for "this app has been onboarded."
  */
 
 const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
+const STATE_DIR = CLEMENTINE_STATE_DIR;
 const MARKER_FILE = path.join(STATE_DIR, 'setup-complete.json');
 const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
 const LOCAL_AUTH_FILE = path.join(STATE_DIR, 'auth.json');
-const HOME_ENV = path.join(HOME, '.clementine-next', '.env');
+const HOME_ENV = path.join(CLEMENTINE_HOME_DIR, '.env');
 const REPO_ENV_HINTS = [
   path.join(HOME, 'clementine-next', '.env'),
   path.join(process.cwd(), '.env'),
 ];
-const CODEX_AUTH = path.join(HOME, '.codex', 'auth.json');
 
 export interface SetupCompleteRecord {
   completedAt: string;
@@ -44,9 +46,11 @@ export interface SetupCompleteRecord {
 
 export type SetupConfiguredSummary = SetupCompleteRecord['configured'];
 
-/** True when the user already has SOME usable credential anywhere
- *  (env, file vault, or codex auth). Used for diagnostics and setup
- *  copy, not as the first-run skip gate. */
+/** True when Clementine already has a usable credential of its own
+ *  (env, file vault, or its native Codex grant). Used for diagnostics and
+ *  setup copy, not as the first-run skip gate. An external Codex CLI grant
+ *  is intentionally excluded because Clementine must mint its own rotating
+ *  refresh-token family. */
 export function hasAnyUsableCredential(): boolean {
   // Check process env
   if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 0) return true;
@@ -62,18 +66,17 @@ export function hasAnyUsableCredential(): boolean {
     } catch { /* keep looking */ }
   }
 
-  // Check codex auth
-  if (existsSync(CODEX_AUTH)) {
-    try {
-      const parsed = JSON.parse(readFileSync(CODEX_AUTH, 'utf-8'));
-      if (parsed?.tokens?.access_token && parsed.tokens.refresh_token) return true;
-    } catch { /* fall through */ }
-  }
-
   if (existsSync(LOCAL_AUTH_FILE)) {
     try {
       const parsed = JSON.parse(readFileSync(LOCAL_AUTH_FILE, 'utf-8'));
-      if (parsed?.codexOauth?.accessToken && parsed.codexOauth.refreshToken) return true;
+      if (
+        parsed?.source === 'native'
+        && parsed?.codexOauth?.grantProvenance === CODEX_GRANT_PROVENANCE
+        && typeof parsed.codexOauth.grantId === 'string'
+        && parsed.codexOauth.grantId.length > 0
+        && parsed.codexOauth.accessToken
+        && parsed.codexOauth.refreshToken
+      ) return true;
     } catch { /* fall through */ }
   }
 
