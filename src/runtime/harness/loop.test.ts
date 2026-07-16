@@ -4607,3 +4607,42 @@ test('a qualified reply still halts on a follow-up question', async () => {
   assert.equal(result.status, 'awaiting_user_input', 'a qualified reply is NOT consent — the question halts');
   assert.equal(result.steps, 1);
 });
+
+test('E2E memory-credit loop: a primed fact reproduced in the reply earns recall_auto_credit', async () => {
+  resetEventLog();
+  const { getFact } = await import('../../memory/facts.js');
+  const fact = rememberFact({
+    kind: 'project',
+    content: 'The Meridian invoice 8842 must be paid before July 30 or the discount lapses.',
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+    history: items,
+    lastResponseId: undefined,
+    finalOutput: {
+      summary: 'answered from memory',
+      reply: 'Invoice 8842 needs to be paid before July 30 to keep the discount — want me to schedule it?',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  }) as never;
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'anything urgent on the Meridian account?',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+
+  const creditEvents = listEventsForConv(sess.id, { types: ['recall_auto_credit'] });
+  assert.ok(creditEvents.length >= 1, 'the turn emits a recall_auto_credit event');
+  const runs = (creditEvents[0].data as { runs: Array<{ refs: Array<{ ref: string; evidence: string }> }> }).runs;
+  assert.ok(
+    runs.some((r) => r.refs.some((ref) => ref.ref === `fact:${fact.id}`)),
+    'the reproduced fact is the credited ref',
+  );
+  assert.equal(getFact(fact.id)?.utilityCount, 1, 'the credit reached the utility counter');
+});

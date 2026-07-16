@@ -239,3 +239,57 @@ test('kill-switch: CLEMMY_AUTO_RECALL_CREDIT=off disables crediting entirely', (
     else process.env.CLEMMY_AUTO_RECALL_CREDIT = previous;
   }
 });
+
+// ---------- ranking + decay shift (the loop actually closes) ----------
+
+test('a credited fact outranks and outlives an impression-only twin', async () => {
+  const { readRecallRefUtilitySignals } = await import('./recall-usage.js');
+  const { recallUtilityBonus } = await import('./recall-memory.js');
+  const { decayAndEvictFacts, recordFactImpression, stanfordRecallScore } = await import('./facts.js');
+
+  const credited = rememberFact({ kind: 'project', content: 'Invoice 4471 for Meridian Corp is due July 30.' });
+  const impressed = rememberFact({ kind: 'project', content: 'Meridian Corp prefers morning calls on Tuesdays generally.' });
+  recordFactImpression(credited.id);
+  recordFactImpression(impressed.id);
+
+  const run = recordRecallRun({
+    objective: 'anything due for Meridian?',
+    surface: 'automatic_primer',
+    answerability: 'supported',
+    candidateRefs: [
+      { type: 'fact', id: String(credited.id), snippet: credited.content },
+      { type: 'fact', id: String(impressed.id), snippet: impressed.content },
+    ],
+  });
+  autoCreditRecallRuns({
+    recallIds: [run.id],
+    replyText: 'Invoice 4471 is due July 30 — I drafted the reminder.',
+  });
+
+  // Ranking: only demonstrable use earns the (bounded) rerank bonus.
+  const signals = readRecallRefUtilitySignals([
+    { type: 'fact', id: String(credited.id) },
+    { type: 'fact', id: String(impressed.id) },
+  ]);
+  const creditedBonus = recallUtilityBonus(signals.get(`fact:${credited.id}`));
+  const impressedBonus = recallUtilityBonus(signals.get(`fact:${impressed.id}`));
+  assert.ok(creditedBonus > 0, 'credited fact earns a rerank bonus');
+  assert.ok(creditedBonus <= 0.08, 'the bonus stays bounded');
+  assert.equal(impressedBonus, 0, 'impressions alone never earn the bonus');
+
+  // Reinforcement term: same fact shape, utility apart → credited scores higher.
+  const creditedFact = getFact(credited.id)!;
+  assert.ok(
+    stanfordRecallScore({ ...creditedFact, utilityCount: creditedFact.utilityCount })
+      > stanfordRecallScore({ ...creditedFact, utilityCount: 0 }),
+    'utility feeds the reinforcement term',
+  );
+
+  // Decay: 70 idle days later, the impression-only fact retires; the credited
+  // fact's use-scaled threshold protects it.
+  const seventyDays = Date.now() + 70 * 24 * 60 * 60 * 1000;
+  const decay = decayAndEvictFacts({ nowMs: seventyDays, minIdleDays: 60, maxDeactivate: 50 });
+  assert.ok(decay.ids.includes(impressed.id), 'the never-used fact decays');
+  assert.ok(!decay.ids.includes(credited.id), 'the demonstrably-used fact survives');
+  assert.equal(getFact(credited.id)?.active, true);
+});

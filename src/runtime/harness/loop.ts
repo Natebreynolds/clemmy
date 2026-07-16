@@ -4521,7 +4521,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       turn,
       recallIds: [turnMemoryPrimer.recallId, ...(harnessCtx?.turnRecallRunIds ?? [])],
       finalOutput: outcome.finalOutput,
-      newHistoryItems: (outcome.history ?? []).slice(items.length),
+      // Defensive: stubbed/degraded runners can hand back a non-array history.
+      newHistoryItems: Array.isArray(outcome.history) ? outcome.history.slice(items.length) : [],
     });
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
@@ -4918,7 +4919,7 @@ export async function resumePendingApproval(
       turn,
       recallIds: resumeCtx?.turnRecallRunIds ?? [],
       finalOutput: outcome.finalOutput,
-      newHistoryItems: outcome.history ?? [],
+      newHistoryItems: Array.isArray(outcome.history) ? outcome.history : [],
     });
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
