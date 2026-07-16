@@ -31,6 +31,10 @@ import { consolidateFact } from '../memory/reflection.js';
 import { getNotification, markNotificationRead, requeueNotificationDelivery } from '../runtime/notifications.js';
 import { buildActivitySnapshot, formatElapsed, formatNextRun, type RunningNowItem } from '../shared/activity-snapshot.js';
 import { actionBus } from '../runtime/action-bus.js';
+import { presentApproval, type ApprovalPresentationContext } from '../runtime/approval-summary.js';
+import { HarnessSession } from '../runtime/harness/session.js';
+import { readWorkflow } from '../memory/workflow-store.js';
+import { writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
 
 const logger = pino({ name: 'clementine-next.slack' });
 
@@ -145,7 +149,12 @@ function buildAppHomeBlocks(): KnownBlock[] {
   // user. Approvals (from the registry) ALREADY cover awaiting_approval tasks, so
   // those tasks are intentionally NOT counted again — that double-count is the
   // accuracy bug this fixes.
-  const approvals = safe(() => approvalRegistry.listPending().map((a) => ({ approvalId: a.approvalId, subject: a.subject })), []);
+  const approvals = safe(() => approvalRegistry.listPending()
+    .filter((a) => approvalRegistry.isActionable(a))
+    .map((a) => ({
+      approvalId: a.approvalId,
+      presentation: presentApproval(a, approvalContextForRow(a)),
+    })), []);
   const checkIns = safe(() => listOpenCheckIns(), []);
   const goalDrafts = safe(() => listGoalDrafts({ status: 'pending' }), []);
   const plansNeedInput = safe(() => listPlanProposals({ status: 'all' }).filter(planProposalNeedsUserInput), []);
@@ -220,13 +229,14 @@ function buildAppHomeBlocks(): KnownBlock[] {
     blocks.push({ type: 'header', text: { type: 'plain_text', text: `Needs you (${needsYou})`, emoji: true } });
     // Approvals — actionable inline buttons (these already cover awaiting_approval tasks).
     for (const a of approvals.slice(0, 5)) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${clip(a.subject || 'Approval', 140)}*` } });
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${clip(a.presentation.title, 140)}*\n${clip(toSlackMrkdwn(a.presentation.detail), 900)}` } });
       blocks.push({
         type: 'actions',
         block_id: `clementine:approval:${a.approvalId}`,
         elements: [
-          { type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Approve' }, action_id: `clementine:approve:${a.approvalId}`, value: a.approvalId },
-          { type: 'button', style: 'danger', text: { type: 'plain_text', text: 'Reject' }, action_id: `clementine:reject:${a.approvalId}`, value: a.approvalId },
+          { type: 'button', style: 'primary', text: { type: 'plain_text', text: a.presentation.approveLabel }, action_id: `clementine:approve:${a.approvalId}`, value: a.approvalId },
+          { type: 'button', style: 'danger', text: { type: 'plain_text', text: a.presentation.rejectLabel }, action_id: `clementine:reject:${a.approvalId}`, value: a.approvalId },
+          ...(a.presentation.canPauseWorkflow ? [{ type: 'button' as const, text: { type: 'plain_text' as const, text: 'Pause workflow' }, action_id: `clementine:workflow-pause:${a.approvalId}`, value: a.approvalId }] : []),
         ],
       });
     }
@@ -353,6 +363,64 @@ export function isAssistantContainerMessage(msg: { channel_type?: string; thread
 // Strip a leading "<@BOTID>" mention from an app_mention's text.
 function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/i, '').trim();
+}
+
+function approvalContextForRow(row: approvalRegistry.PendingApprovalRow): ApprovalPresentationContext {
+  try {
+    const metadata = HarnessSession.load(row.sessionId)?.sessionRow.metadata ?? {};
+    const workflowName = typeof metadata.workflowName === 'string' ? metadata.workflowName : undefined;
+    const stepId = typeof metadata.stepId === 'string' ? metadata.stepId : undefined;
+    const workflowRunId = typeof metadata.workflowRunId === 'string' ? metadata.workflowRunId : '';
+    return {
+      workflowName,
+      stepId,
+      scheduled: workflowRunId.startsWith('sched-') || row.sessionId.includes('workflow:sched-'),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Human-readable notification copy for Slack. Approval rows are the source of
+ * truth; a stale/delayed notification gracefully falls back to its saved text. */
+export function formatSlackNotificationMessage(
+  title: string,
+  body: string,
+  metadata: Record<string, unknown> | undefined,
+): string {
+  const approvalId = typeof metadata?.approvalId === 'string' ? metadata.approvalId : '';
+  if (!approvalId) return `**${title}**\n${body}`;
+  const row = approvalRegistry.get(approvalId);
+  if (!row || !approvalRegistry.isActionable(row)) return `**${title}**\n${body}`;
+  const presentation = presentApproval(row, approvalContextForRow(row));
+  return [
+    `**Approval needed: ${presentation.title}**`,
+    presentation.detail,
+    '',
+    `_Request ${row.approvalId} · expires ${new Date(row.expiresAt).toLocaleString()}_`,
+  ].join('\n');
+}
+
+async function settleSlackApprovalCard(
+  client: WebClient,
+  channelId: string,
+  messageTs: string | undefined,
+  text: string,
+): Promise<void> {
+  if (!channelId || !messageTs) return;
+  const body = toSlackMrkdwn(text) || '…';
+  try {
+    await client.chat.update({ channel: channelId, ts: messageTs, text: body, blocks: [] });
+  } catch { /* the decision is durable even if the old Slack card cannot update */ }
+}
+
+function workflowNameForApproval(row: approvalRegistry.PendingApprovalRow): string | null {
+  const context = approvalContextForRow(row);
+  return context.workflowName?.trim() || null;
+}
+
+function pendingApprovalsForWorkflow(workflowName: string): approvalRegistry.PendingApprovalRow[] {
+  return approvalRegistry.listPending({ status: 'pending' }).filter((row) => workflowNameForApproval(row) === workflowName);
 }
 
 function approvalResultText(result: ApprovalResolutionResult): string {
@@ -490,10 +558,18 @@ export function buildSlackActionsForNotification(metadata: Record<string, unknow
   }
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) {
+    const row = approvalRegistry.get(approvalId);
+    // Delivery can lag behind a desktop/mobile decision. Never publish dead
+    // buttons for an already-rejected, expired, or otherwise-resolved request.
+    if (!row || !approvalRegistry.isActionable(row)) return undefined;
+    const presentation = presentApproval(row, approvalContextForRow(row));
     return [actionsBlock(`${SLACK_ACTION_PREFIX}:approval:${approvalId}`, [
-      btn('Approve', `${SLACK_ACTION_PREFIX}:approve:${approvalId}`, approvalId, 'primary'),
-      btn('Edit', `${SLACK_ACTION_PREFIX}:edit:${approvalId}`, approvalId),
-      btn('Reject', `${SLACK_ACTION_PREFIX}:reject:${approvalId}`, approvalId, 'danger'),
+      btn(presentation.approveLabel, `${SLACK_ACTION_PREFIX}:approve:${approvalId}`, approvalId, 'primary'),
+      btn(presentation.editLabel, `${SLACK_ACTION_PREFIX}:edit:${approvalId}`, approvalId),
+      btn(presentation.rejectLabel, `${SLACK_ACTION_PREFIX}:reject:${approvalId}`, approvalId, 'danger'),
+      ...(presentation.canPauseWorkflow
+        ? [btn('Pause workflow', `${SLACK_ACTION_PREFIX}:workflow-pause:${approvalId}`, approvalId)]
+        : []),
     ])];
   }
   const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
@@ -594,10 +670,47 @@ async function handleSlackAction(opts: {
     return;
   }
 
+  if (action === 'workflow-pause') {
+    const row = approvalRegistry.get(targetId);
+    if (!row || !approvalRegistry.isActionable(row)) {
+      await opts.respondEphemeral(row
+        ? `This approval was already ${row.status}. Open Clementine → Workflows if you still want to pause its schedule.`
+        : `Approval \`${targetId}\` was not found.`);
+      return;
+    }
+    const workflowName = workflowNameForApproval(row);
+    if (!workflowName) {
+      await opts.respondEphemeral('I could not identify the workflow that created this approval. The approval was left unchanged.');
+      return;
+    }
+    const workflow = readWorkflow(workflowName);
+    if (!workflow) {
+      await opts.respondEphemeral(`Workflow \`${workflowName}\` was not found. The approval was left unchanged.`);
+      return;
+    }
+
+    writeWorkflowAndSyncTriggers(workflowName, { ...workflow.data, enabled: false });
+    const pending = pendingApprovalsForWorkflow(workflowName);
+    let skipped = 0;
+    for (const approval of pending) {
+      const result = approvalRegistry.resolve(approval.approvalId, 'rejected', 'slack-workflow-pause');
+      if (result.ok) skipped += 1;
+    }
+    const message = [
+      `⏸️ *${workflow.data.name || workflowName} paused*`,
+      `${skipped} pending occurrence${skipped === 1 ? '' : 's'} skipped before any external action. An occurrence already mid-run finishes normally.`,
+      'The workflow definition is preserved and can be re-enabled from Clementine → Workflows.',
+    ].join('\n');
+    await settleSlackApprovalCard(opts.client, opts.channelId, opts.messageTs, message);
+    await opts.respondEphemeral(message);
+    return;
+  }
+
   if (action === 'approve' || action === 'reject') {
     const approved = action === 'approve';
+    const originalRow = targetId.startsWith('apr-') ? approvalRegistry.get(targetId) : undefined;
     if (targetId.startsWith('apr-')) {
-      const row = approvalRegistry.get(targetId);
+      const row = originalRow;
       if (row && row.status !== 'pending') {
         await opts.respondEphemeral(`Approval \`${targetId}\` was already ${row.status}.`);
         return;
@@ -611,9 +724,35 @@ async function handleSlackAction(opts: {
         allowGlobalApprovalFallback: false,
         channel: 'slack',
       });
-      if (handled) return;
+      if (handled) {
+        const workflowContext = originalRow ? approvalContextForRow(originalRow) : {};
+        const workflowName = workflowContext.workflowName?.trim() || null;
+        const settled = approved
+          ? '✅ *Approved*\nClementine is resuming the protected action and will report whether it succeeds.'
+          : `⏭️ *Skipped*\nThe protected action was not performed.${workflowName ? ` This occurrence of *${workflowName}* stops here; the workflow remains enabled${workflowContext.scheduled ? ' for its next scheduled run' : ''}.` : ''}`;
+        await settleSlackApprovalCard(opts.client, opts.channelId, opts.messageTs, settled);
+        return;
+      }
     }
-    const text = await resolveApprovalOrQueueBackgroundContinuation(opts.assistant, targetId, approved);
+    // Settle the card ONLY after the resolution actually applied — a thrown
+    // resolution (unknown id, dead runtime) must leave the card actionable
+    // instead of reading "Approved" over a decision that never happened.
+    let text: string;
+    try {
+      text = await resolveApprovalOrQueueBackgroundContinuation(opts.assistant, targetId, approved);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await opts.respondEphemeral(`Could not ${approved ? 'approve' : 'reject'} \`${targetId}\`: ${detail}\nThe approval card is still actionable.`);
+      return;
+    }
+    await settleSlackApprovalCard(
+      opts.client,
+      opts.channelId,
+      opts.messageTs,
+      approved
+        ? '✅ *Approved*\nClementine is resuming the protected action and will report whether it succeeds.'
+        : '⏭️ *Skipped*\nNo external action was performed.',
+    );
     await opts.respondEphemeral(text);
     return;
   }
@@ -998,7 +1137,7 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
         });
         // An approve/reject changes what the Home should show (the approval
         // leaves "Needs you") — refresh it for the acting user right away.
-        if (b.user?.id && /^clementine:(approve|reject):/.test(actionId)) {
+        if (b.user?.id && /^clementine:(approve|reject|workflow-pause):/.test(actionId)) {
           void republishHomeFor(b.user.id);
         }
       } catch (err) {
@@ -1178,6 +1317,7 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
 // Exposed for unit tests.
 export const __test__ = {
   buildSlackActionsForNotification,
+  formatSlackNotificationMessage,
   pickEditableField,
   userAllowedSlack,
   channelAllowedSlack,

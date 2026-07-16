@@ -78,12 +78,13 @@ test('App Home shows a meaningful memory health line (facts, not a bare count) a
 test('App Home approval buttons use the shared clementine:* action ids (gated path)', () => {
   // With no real approvals the actions block is absent; assert the SHAPE the
   // builder emits by checking the action-id convention is wired in source.
-  // (Integration: any approval row → clementine:approve:<id> / clementine:reject:<id>.)
+  // (Integration: any approval row → clementine:approve:<id> /
+  // clementine:reject:<id>; scheduled workflows may also be paused.)
   const blocks = buildAppHomeBlocks() as Array<{ type: string; elements?: Array<{ action_id?: string }> }>;
   for (const b of blocks) {
     if (b.type !== 'actions') continue;
     for (const el of b.elements ?? []) {
-      assert.match(el.action_id ?? '', /^clementine:(approve|reject):/);
+      assert.match(el.action_id ?? '', /^clementine:(approve|reject|workflow-pause):/);
     }
   }
 });

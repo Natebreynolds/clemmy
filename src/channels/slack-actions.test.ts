@@ -8,10 +8,28 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import { __test__ } from './slack.js';
+process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clementine-slack-actions-'));
 
-const { buildSlackActionsForNotification } = __test__;
+const { __test__ } = await import('./slack.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
+const { buildSlackActionsForNotification, formatSlackNotificationMessage } = __test__;
+
+const basicSession = HarnessSession.create({
+  id: 'slack-actions-basic',
+  kind: 'chat',
+  channel: 'slack',
+  title: 'Slack action test',
+});
+const basicApproval = approvalRegistry.register({
+  sessionId: basicSession.id,
+  subject: 'Approve the action',
+  tool: 'request_approval',
+});
 
 function actionIds(blocks: ReturnType<typeof buildSlackActionsForNotification>): string[] {
   if (!blocks) return [];
@@ -32,11 +50,47 @@ test('buildSlackActionsForNotification: no metadata returns undefined (plain tex
 });
 
 test('buildSlackActionsForNotification: approvalId attaches approve/edit/reject', () => {
-  const ids = actionIds(buildSlackActionsForNotification({ approvalId: 'apr-xyz789' }));
+  const ids = actionIds(buildSlackActionsForNotification({ approvalId: basicApproval.approvalId }));
   assert.equal(ids.length, 3, 'expected approve, edit, reject');
-  assert.ok(ids.includes('clementine:approve:apr-xyz789'));
-  assert.ok(ids.includes('clementine:edit:apr-xyz789'));
-  assert.ok(ids.includes('clementine:reject:apr-xyz789'));
+  assert.ok(ids.includes(`clementine:approve:${basicApproval.approvalId}`));
+  assert.ok(ids.includes(`clementine:edit:${basicApproval.approvalId}`));
+  assert.ok(ids.includes(`clementine:reject:${basicApproval.approvalId}`));
+});
+
+test('buildSlackActionsForNotification: Outlook workflow uses human labels and offers pause', () => {
+  const session = HarnessSession.create({
+    id: 'workflow:sched-test:main',
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'daily-standup-email',
+    metadata: { workflowName: 'daily-standup-email', workflowRunId: 'sched-test', stepId: 'main' },
+  });
+  const row = approvalRegistry.register({
+    sessionId: session.id,
+    subject: 'Run OUTLOOK_OUTLOOK_SEND_EMAIL?',
+    tool: 'composio_execute_tool',
+    args: {
+      tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+      arguments: JSON.stringify({ to_email: 'nathan@example.com', subject: 'Daily Standup', body: 'Meetings today' }),
+    },
+  });
+  const blocks = buildSlackActionsForNotification({ approvalId: row.approvalId, workflowName: 'daily-standup-email' });
+  const ids = actionIds(blocks);
+  const labels = ((blocks?.[0] as { elements?: Array<{ text?: { text?: string } }> })?.elements ?? [])
+    .map((element) => element.text?.text);
+
+  assert.deepEqual(labels, ['Send email', 'Review / edit', 'Skip this email', 'Pause workflow']);
+  assert.ok(ids.includes(`clementine:workflow-pause:${row.approvalId}`));
+  const message = formatSlackNotificationMessage('Approval pending', row.subject, { approvalId: row.approvalId });
+  assert.match(message, /Send an Outlook email/);
+  assert.match(message, /nathan@example\.com/);
+  assert.match(message, /Daily Standup/);
+  assert.match(message, /scheduled workflow/);
+});
+
+test('buildSlackActionsForNotification: a resolved approval never gets stale buttons', () => {
+  approvalRegistry.resolve(basicApproval.approvalId, 'rejected', 'unit-test');
+  assert.equal(buildSlackActionsForNotification({ approvalId: basicApproval.approvalId }), undefined);
 });
 
 test('buildSlackActionsForNotification: checkInId attaches answer buttons', () => {

@@ -10,6 +10,7 @@ import {
 import { toDiscordMarkdown } from '../channels/discord-harness.js';
 import {
   buildSlackActionsForNotification,
+  formatSlackNotificationMessage,
   sendSlackChannelMessage,
   sendSlackChannelMessageWithBlocks,
   sendSlackDirectMessage,
@@ -193,7 +194,7 @@ function buildSlackBlocksForNotification(notification: NotificationRecord) {
 // emphasis is applied inside the send helpers' toSlackMrkdwn pass, so here we
 // emit the same `**title**\nbody` shape the Discord path uses for symmetry.
 function buildSlackBotMessage(notification: NotificationRecord): string {
-  return `**${notification.title}**\n${notification.body}`;
+  return formatSlackNotificationMessage(notification.title, notification.body, notification.metadata);
 }
 
 export async function deliverNotificationToDestination(
@@ -386,8 +387,10 @@ export async function testNotificationDestination(destination: NotificationDesti
 
 export const notificationDeliveryInternalsForTest = {
   buildDiscordComponentsForNotification,
+  buildSlackBlocksForNotification,
   shouldDeliverDiscordNotification,
   isTerminalReportBack,
   slackThreadForDelivery,
   buildDiscordBotMessage,
+  buildSlackBotMessage,
 };

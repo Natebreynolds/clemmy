@@ -1,4 +1,5 @@
 import type { PendingApproval } from '../types.js';
+import type { PendingApprovalRow } from './harness/approval-registry.js';
 import { listEvents as listHarnessEvents } from './harness/eventlog.js';
 
 /**
@@ -192,6 +193,156 @@ const CONTENT_IMAGE_KEYS = [
 export interface ApprovalContentPreview {
   body?: string;
   imageUrl?: string;
+}
+
+export interface ApprovalPresentationContext {
+  workflowName?: string;
+  stepId?: string;
+  scheduled?: boolean;
+}
+
+export interface ApprovalPresentation {
+  title: string;
+  detail: string;
+  approveLabel: string;
+  editLabel: string;
+  rejectLabel: string;
+  canPauseWorkflow: boolean;
+}
+
+/**
+ * Turn a durable approval-registry row into the thing a human is deciding.
+ * Registry subjects intentionally stay short and stable for audit/dedupe, but
+ * they are often machine-shaped ("Run OUTLOOK_OUTLOOK_SEND_EMAIL?"). User
+ * surfaces should render the destination, content, and origin instead.
+ */
+export function presentApproval(
+  row: Pick<PendingApprovalRow, 'approvalId' | 'subject' | 'tool' | 'args'>,
+  context: ApprovalPresentationContext = {},
+): ApprovalPresentation {
+  const args = row.args ?? {};
+  const slug = pickString(args, ['tool_slug', 'slug']);
+  const inner = nestedArgs(args);
+  const normalized = `${row.tool ?? ''} ${slug}`.toUpperCase();
+  const isEmailSend = /(?:OUTLOOK|GMAIL).*SEND.*EMAIL|SEND_EMAIL|EMAIL_SEND/.test(normalized);
+  const workflow = context.workflowName?.trim();
+  const step = context.stepId?.trim();
+  const canPauseWorkflow = Boolean(workflow);
+
+  if (isEmailSend) {
+    const provider = /GMAIL/.test(normalized) ? 'Gmail' : /OUTLOOK/.test(normalized) ? 'Outlook' : 'email';
+    const title = provider === 'Outlook'
+      ? 'Send an Outlook email'
+      : provider === 'Gmail'
+        ? 'Send a Gmail email'
+        : 'Send an email';
+    const to = approvalRecipient(inner);
+    const subject = pickString(inner, ['subject', 'title']);
+    const rawBody = pickLongestString(inner, ['body', 'html', 'content', 'message', 'text']);
+    const preview = rawBody ? trim(stripHtml(rawBody), 260) : '';
+    const lines: string[] = [];
+    if (to) lines.push(`**To:** ${trim(to, 180)}`);
+    if (subject) lines.push(`**Subject:** ${trim(subject, 220)}`);
+    if (preview) lines.push(`**Preview:** ${preview}`);
+    lines.push('', approvalOriginLine(workflow, step, context.scheduled));
+    lines.push('Nothing will be sent unless you approve it.');
+    if (canPauseWorkflow) {
+      lines.push('**Skip this email** stops this occurrence. **Pause workflow** stops future automatic runs.');
+    }
+    return {
+      title,
+      detail: lines.filter((line, index, all) => line !== '' || (index > 0 && all[index - 1] !== '')).join('\n').trim(),
+      approveLabel: 'Send email',
+      editLabel: 'Review / edit',
+      rejectLabel: 'Skip this email',
+      canPauseWorkflow,
+    };
+  }
+
+  const genericSubject = row.subject.replace(/^Run\s+/i, '').replace(/\?$/, '').trim();
+  const action = humanizeIdentifier(slug || row.tool || genericSubject || 'requested action');
+  const lines = [
+    row.subject && !/^Run\s+[A-Z0-9_]+\?$/i.test(row.subject) ? row.subject : '',
+    approvalOriginLine(workflow, step, context.scheduled),
+    'This action will not run unless you approve it.',
+  ].filter(Boolean);
+  if (canPauseWorkflow) {
+    lines.push('**Reject** stops this occurrence. **Pause workflow** stops future automatic runs.');
+  }
+  return {
+    title: action ? `Approve: ${action}` : 'Approval needed',
+    detail: lines.join('\n'),
+    approveLabel: 'Approve',
+    editLabel: 'Review / edit',
+    rejectLabel: canPauseWorkflow ? 'Skip this run' : 'Reject',
+    canPauseWorkflow,
+  };
+}
+
+function nestedArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const nested = args.arguments;
+  if (typeof nested === 'string') {
+    try {
+      const parsed = JSON.parse(nested);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* fall back to the outer args */ }
+  } else if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    return nested as Record<string, unknown>;
+  }
+  return args;
+}
+
+function approvalRecipient(args: Record<string, unknown>): string {
+  const direct = pickString(args, ['to_email', 'recipient_email', 'recipient', 'to', 'email']);
+  if (direct) return direct;
+  for (const key of ['to_recipients', 'recipients', 'to']) {
+    const value = args[key];
+    if (!Array.isArray(value) || value.length === 0) continue;
+    const rendered = value.slice(0, 4).map((item) => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return '';
+      const record = item as Record<string, unknown>;
+      const email = pickString(record, ['email', 'address', 'emailAddress']);
+      const name = pickString(record, ['name', 'displayName']);
+      if (email && name) return `${name} <${email}>`;
+      return email || name;
+    }).filter(Boolean);
+    if (rendered.length > 0) return rendered.join(', ');
+  }
+  return '';
+}
+
+function stripHtml(value: string): string {
+  return value
+    .replace(/<\s*br\s*\/?>/gi, ' ')
+    .replace(/<\s*\/p\s*>/gi, ' ')
+    .replace(/<\s*\/li\s*>/gi, '; ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function approvalOriginLine(workflow: string | undefined, step: string | undefined, scheduled: boolean | undefined): string {
+  if (!workflow) return '**Why:** Clementine reached a protected external action.';
+  const label = humanizeIdentifier(workflow);
+  const source = scheduled ? 'scheduled workflow' : 'workflow';
+  return `**Why:** The ${source} **${label}** reached${step ? ` step \`${step}\`` : ' its send step'}.`;
+}
+
+function humanizeIdentifier(value: string): string {
+  const words = value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return words.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function looksLikeImageUrl(s: string): boolean {

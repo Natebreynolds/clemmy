@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractApprovalContentPreview, describeWorkflowStepAction } from './approval-summary.js';
+import { extractApprovalContentPreview, describeWorkflowStepAction, presentApproval } from './approval-summary.js';
 
 test('extractApprovalContentPreview: pulls caption + image from a social-post tool call', () => {
   const p = extractApprovalContentPreview('composio_execute_tool', {
@@ -58,4 +58,56 @@ test('describeWorkflowStepAction renders the resolved action for an approval gat
   // read step with no tools still legible
   const r = describeWorkflowStepAction({ id: 's', sideEffect: 'read', prompt: 'fetch the page' });
   assert.match(r, /^READ — fetch the page/);
+});
+
+test('presentApproval explains an Outlook send with recipient, subject, preview, and scheduled origin', () => {
+  const presentation = presentApproval({
+    approvalId: 'apr-mail',
+    subject: 'Run OUTLOOK_OUTLOOK_SEND_EMAIL?',
+    tool: 'composio_execute_tool',
+    args: {
+      tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+      arguments: JSON.stringify({
+        to_email: 'nathan@example.com',
+        subject: 'Daily Standup — July 15, 2026',
+        body: 'Meetings today\n- 8:00 AM — Kickoff\n\nTop follow-ups\n- Confirm agenda',
+      }),
+    },
+  }, {
+    workflowName: 'daily-standup-email',
+    stepId: 'main',
+    scheduled: true,
+  });
+
+  assert.equal(presentation.title, 'Send an Outlook email');
+  assert.match(presentation.detail, /nathan@example\.com/);
+  assert.match(presentation.detail, /Daily Standup/);
+  assert.match(presentation.detail, /Meetings today/);
+  assert.match(presentation.detail, /scheduled workflow \*\*Daily Standup Email\*\*/);
+  assert.match(presentation.detail, /Nothing will be sent unless you approve/);
+  assert.equal(presentation.approveLabel, 'Send email');
+  assert.equal(presentation.rejectLabel, 'Skip this email');
+  assert.equal(presentation.canPauseWorkflow, true);
+});
+
+test('presentApproval handles alternate Outlook recipient shapes and strips HTML from the preview', () => {
+  const presentation = presentApproval({
+    approvalId: 'apr-mail-html',
+    subject: 'Run OUTLOOK_OUTLOOK_SEND_EMAIL?',
+    tool: 'composio_execute_tool',
+    args: {
+      tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+      arguments: {
+        to_recipients: [{ name: 'Nathan', email: 'nathan@example.com' }],
+        subject: 'A readable subject',
+        is_html: true,
+        body: '<p><b>Meetings today</b></p><ul><li>Kickoff</li></ul>',
+      },
+    },
+  });
+
+  assert.match(presentation.detail, /Nathan <nathan@example\.com>/);
+  assert.match(presentation.detail, /Meetings today/);
+  assert.doesNotMatch(presentation.detail, /<p>|<li>/);
+  assert.equal(presentation.canPauseWorkflow, false);
 });
