@@ -79,7 +79,16 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
   const distinctEntitiesByFanoutKey = new Map<string, Set<string>>();
   for (const call of recent) {
     countBySignature.set(call.signature, (countBySignature.get(call.signature) ?? 0) + 1);
-    if (MUTATING_TOOLS.has(call.toolName)) {
+    // Same-mut seeding is NAME-based (args aren't persisted, so the slug-aware
+    // classifier can't run at rehydrate). composio_execute_tool is a gateway
+    // whose calls are MOSTLY reads — folding them in inflated the mutating
+    // distinct-count after a restart and could prematurely halt the first
+    // genuine write. Exclude the gateway name: a real composio write runaway
+    // rebuilds its count live within a few calls, and the goal-fidelity send
+    // gate remains the authoritative floor. (This was blocker (b) keeping
+    // same-mut halt enforcement opt-in; the classifier blocker (a) was fixed
+    // 2026-07-12 via isMutatingExternalWrite.)
+    if (MUTATING_TOOLS.has(call.toolName) && call.toolName !== 'composio_execute_tool') {
       let set = distinctArgsByMutTool.get(call.toolName);
       if (!set) {
         set = new Set();
@@ -991,11 +1000,14 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
  *  rehydrate seeds distinct-mutation counts by NAME (folding composio READS in).
  *  Enforcing by default would refuse legitimate read-only SEO/scrape fan-outs and
  *  mis-halt the first composio write after a restart (adversarial review 07-06).
- *  The 45-email runaway is still caught by the goal-fidelity fail-closed gate;
- *  this belt-and-suspenders stays OPT-IN until the classifier + rehydrate agree.
- *  Set CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE=on to enable. */
+ *  DEFAULT ON as of 2026-07-16 (the unkillable-run incident: 15 same-mut
+ *  advisories on a serial shell grind steered nothing). Both opt-in blockers
+ *  are resolved: (a) live classification defers to the authoritative
+ *  isMutatingExternalWrite (2026-07-12), and (b) rehydrate no longer folds
+ *  composio reads into the mutating distinct-count (see rehydrateFromSqlite).
+ *  CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE=off restores warn-only. */
 function sameMutHaltEnforcedInWarn(): boolean {
-  return (process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE ?? 'off').toLowerCase() === 'on';
+  return (process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE ?? 'on').toLowerCase() !== 'off';
 }
 
 // NOTE: A `maybeTruncateToolReturn` helper used to live here. Removed

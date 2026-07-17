@@ -18,7 +18,8 @@ import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
 import { runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
-import { getSessionTokensUsed } from './eventlog.js';
+import { getSessionTokensUsed, isKillRequested } from './eventlog.js';
+import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
@@ -1520,6 +1521,23 @@ export async function respondViaClaudeAgentSdkBrain(
     // the error. Final-delivery/report-back failures below intentionally leave the
     // marker armed until durable terminal reporting succeeds.
     markRunInFlight(sessionId, false);
+    // TURN-CONTROL SPINE: a kill-switch cancellation is a USER action, not a
+    // failure — return a clean stopped reply instead of a raw error bubbling
+    // to the chat surface. Only when the kill row is actually set (a caller's
+    // own shouldCancel keeps its existing propagation semantics).
+    if (err instanceof AgentRuntimeCancelledError && isKillRequested(sessionId)) {
+      try { clearKill(sessionId); } catch { /* one-shot latch cleanup */ }
+      try {
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'kill_requested', data: { reason: 'during run (sdk lane)' } });
+      } catch { /* telemetry best-effort */ }
+      return {
+        text: 'Stopped — you asked me to halt this run. Nothing further will execute; tell me how you\'d like to proceed.',
+        sessionId,
+        stoppedReason: 'cancelled',
+        turnsUsed: 1,
+        raw: { transport: 'claude_agent_sdk_brain', cancelled: 'kill_switch' },
+      };
+    }
     throw err;
   }
 

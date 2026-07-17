@@ -24,6 +24,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 // v0.5.20 Bug K — live presence reads pending approvals + active
 // workflow sessions to drive what shows in the Discord bot status.
 const listPendingHarnessApprovals = approvalRegistry.listPending;
+import { requestKill } from '../runtime/harness/eventlog.js';
 import { listSessions as listHarnessSessions } from '../runtime/harness/eventlog.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import {
@@ -1438,6 +1439,32 @@ export const __test__ = {
 async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
+
+  // TURN-CONTROL SPINE (2026-07-16 incident: "i couldnt even stop it from
+  // discord"): a bare stop/halt/abort with NO pending approval kills the
+  // channel's ACTIVE run. Approval vocabulary keeps priority — when an
+  // approval is pending, "stop"/"cancel" still mean reject (the
+  // resolveNaturalApproval below handles it first because we require zero
+  // pending approvals here). requestKill is a one-shot latch the run's
+  // kill-aware shouldCancel + canUseTool gate now actually observe.
+  if (/^(stop|halt|abort|kill it|stop it|cancel the run|stop the run)$/i.test(normalized)) {
+    const sessionId = getOrCreateDiscordSessionId({
+      channelId: message.channelId,
+      userId: message.author.id,
+      guildId: message.guildId ?? undefined,
+    });
+    const hasPendingApproval = listPendingHarnessApprovals({ status: 'pending' }).some((a) => a.sessionId === sessionId);
+    if (!hasPendingApproval) {
+      try {
+        requestKill(sessionId, 'stopped from Discord');
+        await sendChunks(message.channel, '⏹ Stopping the current run — it halts at the next safe boundary (a second or two).', message);
+      } catch (err) {
+        await sendChunks(message.channel, `Could not stop the run: ${err instanceof Error ? err.message : String(err)}`, message);
+      }
+      return true;
+    }
+    // fall through — the approval resolver below owns stop/cancel semantics.
+  }
 
   if (isSessionsCommand(normalized)) {
     await handleHarnessSessions({

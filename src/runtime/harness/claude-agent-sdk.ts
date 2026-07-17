@@ -30,6 +30,7 @@ import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, writeToolOutput } from './eventlog.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
+import { killGateVerdict, grindGateVerdict, composeKillAwareShouldCancel } from './turn-control.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 import { createClementineMcpServer, listClementineMcpToolNames } from '../../tools/mcp-server.js';
@@ -1191,6 +1192,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
   // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
   const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, stoppedKind: null, pausedMs: 0 };
+  // TURN-CONTROL SPINE: the SDK polls shouldCancel before start and after
+  // EVERY stream message — OR-ing the kill switch in gives the whole query
+  // message-boundary kill coverage (the incident's 33-min run was unkillable
+  // because nothing on this lane ever read the kill row).
+  const effectiveShouldCancel = options.sessionId
+    ? composeKillAwareShouldCancel(options.sessionId as string, options.shouldCancel)
+    : options.shouldCancel;
   let approvalBoundary: ClaudeAgentApprovalBoundary | null = null;
   // Agentic: the async approval gate (read/local fast-allow, everything else
   // → decideToolApproval → register/surface/await). permissionMode 'default'
@@ -1204,11 +1212,33 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // ALWAYS wrap (even with the ceiling off) so approval-wait time is metered into
   // pausedMs for the wall-clock; the ceiling COUNTING is what the flag gates.
   const ceilingGated = withToolCeiling(baseCanUseTool, allowed, ceilingState, { countCeiling: sdkToolCeilingEnabled() });
-  // Read-fanout block on the native-external-MCP lane (orchestrator only — the
-  // recovery tool run_tool_program must exist, so workers/steps opt out).
-  const canUseTool = options.readFanoutGuard
-    ? withReadFanoutGuard(ceilingGated, options.sessionId)
-    : ceilingGated;
+  // TURN-CONTROL SPINE (2026-07-16 unkillable-run incident): canUseTool is the
+  // one gate EVERY tool tier passes through and the only reliable in-loop stop.
+  //  - Kill switch: checked for ALL tools (desktop/Discord stop finally works
+  //    on the default brain lane).
+  //  - Grind ladder for NATIVE-EXTERNAL tools: block/halt/escalate were being
+  //    evaluated (by withReadFanoutGuard) then silently DISCARDED — now
+  //    enforced. This wrapper REPLACES withReadFanoutGuard so each call is
+  //    evaluated exactly once (stacking both would halve every threshold);
+  //    the fanout refuse-and-steer verdict is honored only when the caller
+  //    opted in (its recovery skeleton needs run_tool_program — workers/steps
+  //    lack it). Local gated tools already ride the full ladder via
+  //    wrapToolForHarness; local reads ride the ambient counter. No double-count.
+  const canUseTool: CanUseTool = (async (toolName, input, opts) => {
+    const kill = killGateVerdict(options.sessionId);
+    if (kill) return kill as PermissionResult;
+    if (typeof toolName === 'string' && options.sessionId) {
+      const stripped = toolName.replace(/^mcp__/, '');
+      const isNativeExternalMcp = stripped.includes('__') && !/clement/i.test(stripped);
+      if (isNativeExternalMcp) {
+        const grind = grindGateVerdict(options.sessionId, stripped, input);
+        if (grind && (grind.fanout !== true || options.readFanoutGuard)) {
+          return { behavior: 'deny', message: grind.message, interrupt: grind.interrupt } as PermissionResult;
+        }
+      }
+    }
+    return ceilingGated(toolName, input, opts);
+  }) as CanUseTool;
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   // When Claude's native ToolSearch is active, a reduced JIT surface should not
   // make every other local capability disappear. Register the full agentic MCP
@@ -1386,7 +1416,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     try {
-      if (options.shouldCancel && await options.shouldCancel()) {
+      if (effectiveShouldCancel && await effectiveShouldCancel()) {
         throw new AgentRuntimeCancelledError('Run cancelled by caller.');
       }
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
@@ -1409,7 +1439,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             } catch { /* telemetry must never break the stream */ }
           }
         }
-        if (options.shouldCancel && await options.shouldCancel()) {
+        if (effectiveShouldCancel && await effectiveShouldCancel()) {
           try { await stream?.interrupt?.(); } catch { /* best-effort */ }
           throw new AgentRuntimeCancelledError('Run cancelled by caller.');
         }

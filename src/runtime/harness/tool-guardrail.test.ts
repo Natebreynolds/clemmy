@@ -785,11 +785,12 @@ test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () 
   assert.equal(applyMode(variedHalt, 'warn').action, 'warn');
 });
 
-test('applyMode: a MUTATING same-mut-tool HALT enforces ONLY when opted in (default off pending classifier reconciliation)', () => {
-  // The 45-emails-to-distinct-addresses class carries explicit mutating:true. The
-  // enforce is OPT-IN (default off) because the guardrail's composio mutating
-  // classifier is broader than the authoritative write classifier — see the
-  // sameMutHaltEnforcedInWarn() note (adversarial review 07-06).
+test('applyMode: a MUTATING same-mut-tool HALT enforces by DEFAULT (graduated 2026-07-16 after the unkillable-run incident)', () => {
+  // The 45-emails-to-distinct-addresses class carries explicit mutating:true.
+  // Both opt-in blockers are resolved (authoritative live classifier 07-12;
+  // rehydrate no longer folds composio reads into the mutating count 07-16),
+  // so the enforce graduated to default ON — 15 ignored advisories on the
+  // 07-16 serial-shell grind is the incident this closes.
   const sendRunaway = {
     action: 'halt' as const,
     signature: 'sig',
@@ -799,14 +800,15 @@ test('applyMode: a MUTATING same-mut-tool HALT enforces ONLY when opted in (defa
     count: 8,
     mutating: true,
   };
-  // Default (unset) → demotes to warn (no false-halt on read-only DataForSEO/Firecrawl batches).
-  assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'default off → warn-only');
-  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'on';
+  assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'default ON enforces the runaway halt');
+  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'off';
   try {
-    assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'opt-in enforces the runaway halt');
+    assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'kill-switch off restores warn-only');
   } finally {
     delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
   }
+  // A READ-classified call (mutating:false / absent explicit flag) NEVER halt-enforces.
+  assert.equal(applyMode({ ...sendRunaway, mutating: undefined }, 'warn').action, 'warn', 'name-fallback (gateway) never enforces');
 });
 
 test('applyMode: strict mode passes block/halt through unchanged', () => {
