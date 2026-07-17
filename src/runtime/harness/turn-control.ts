@@ -22,9 +22,11 @@
  *    `evaluateTurnBoundary` unifies its between-step limit checks so both
  *    lanes park with identical verdicts.
  */
-import { isKillRequested, appendEvent, getSession, listEvents } from './eventlog.js';
+import { createHash } from 'node:crypto';
+import { isKillRequested, appendEvent, getSession, listEvents, type KillRequestTarget } from './eventlog.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import { checkRunTokenWindow, type RunTokenWindow, type RunTokenStatus } from './run-token-budget.js';
+import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 
 // The SDK's PermissionResult shape (structural — avoids importing SDK types here).
@@ -38,9 +40,9 @@ export interface ToolGateDeny {
 }
 
 /** Kill verdict for one tool call. Pure; never throws. */
-export function killGateVerdict(sessionId: string | undefined): ToolGateDeny | null {
+export function killGateVerdict(sessionId: string | undefined, target?: KillRequestTarget): ToolGateDeny | null {
   try {
-    if (!sessionId || !isKillRequested(sessionId)) return null;
+    if (!sessionId || !isKillRequested(sessionId, target)) return null;
     return {
       behavior: 'deny',
       // interrupt:true is the only reliable in-loop stop on the SDK lane —
@@ -62,10 +64,15 @@ export function killGateVerdict(sessionId: string | undefined): ToolGateDeny | n
  * incident's model ignored 15 advisories. Returns null to allow.
  */
 export function grindGateVerdict(
-  sessionId: string | undefined,
+  authoritySessionId: string | undefined,
   strippedToolName: string,
   input: unknown,
   opts?: {
+    /** Isolated/stable counter identity. Approval authority remains on the real
+     *  session above so workers and resumed attempts cannot lose consent. */
+    trackerScopeId?: string;
+    /** Byte-pinned run_batch execution already certified by the user. */
+    approvedBatch?: boolean;
     /** The caller's recovery skeleton has run_tool_program, so the fanout
      *  refuse-and-steer is actionable. When false the fanout branch is a
      *  silent allow — no deny AND no guardrail_tripped event (review
@@ -75,13 +82,29 @@ export function grindGateVerdict(
   },
 ): ToolGateDeny | null {
   try {
-    if (!sessionId) return null;
-    const decision = applyMode(evaluateToolCall(sessionId, strippedToolName, input));
+    if (!authoritySessionId) return null;
+    const trackerScopeId = opts?.trackerScopeId ?? authoritySessionId;
+    const decision = applyMode(evaluateToolCall(
+      trackerScopeId,
+      strippedToolName,
+      input,
+      undefined,
+      { authoritySessionId, approvedBatch: opts?.approvedBatch },
+    ));
     const emit = (kind: string, reason: string): void => {
       try {
         appendEvent({
-          sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
-          data: { kind, toolName: decision.toolName, count: decision.count, reason, sdk: true },
+          sessionId: authoritySessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+          data: {
+            kind,
+            toolName: decision.toolName,
+            count: decision.count,
+            reason,
+            effect: decision.effect ?? null,
+            dangerousWrite: decision.dangerousWrite === true,
+            trackerScopeId,
+            sdk: true,
+          },
         });
       } catch { /* telemetry never blocks */ }
     };
@@ -116,10 +139,11 @@ export function grindGateVerdict(
 export function composeKillAwareShouldCancel(
   sessionId: string,
   base?: () => boolean | Promise<boolean>,
+  target?: KillRequestTarget,
 ): () => boolean | Promise<boolean> {
   return async () => {
     try {
-      if (isKillRequested(sessionId)) return true;
+      if (isKillRequested(sessionId, target)) return true;
     } catch { /* fail-open: a kill-read error must not cancel a healthy run */ }
     return base ? await base() : false;
   };
@@ -139,6 +163,7 @@ export type TurnBoundaryVerdict =
  */
 export function evaluateTurnBoundary(input: {
   sessionId: string;
+  sourceUserSeq?: number;
   startedAt: number;
   maxWallMs: number;
   stepIndex: number;
@@ -148,7 +173,10 @@ export function evaluateTurnBoundary(input: {
 }): TurnBoundaryVerdict {
   const now = input.now ?? Date.now();
   try {
-    if (isKillRequested(input.sessionId)) return { kind: 'killed', reason: 'kill switch' };
+    if (isKillRequested(
+      input.sessionId,
+      input.sourceUserSeq ? { sourceUserSeq: input.sourceUserSeq } : undefined,
+    )) return { kind: 'killed', reason: 'kill switch' };
   } catch { /* fail-open */ }
   const tokenStatus = input.tokenWindow ? checkRunTokenWindow(input.tokenWindow) : undefined;
   if (input.maxWallMs > 0 && now - input.startedAt > input.maxWallMs) {
@@ -201,20 +229,404 @@ export function shouldOfferBackground(input: {
 // read it), NOT a formal plan card: the 2026-06-01 converse-until-aligned
 // rollback stands — the model converses, the trigger is deterministic.
 
-/** Write-VERB anchored (review wf_2ed83f94 #10: plan-first's EXTERNAL_WRITE_RE
- *  matches bare service NOUNS — "check my email" tripped the beat). Verbs only;
- *  a read-only mention of a service never confirms. Kept inline so the spine
- *  stays import-light — plan-first pulls the planner subsystem. */
-const CONFIRM_EXECUTION_SHAPE_RE =
-  /\b(?:send|sends|sending|post|posting|publish|publishing|deploy|deploying|host|hosting|notify|notifying|email|emailing|message|draft|drafting|create|creating|update|updating|upload|uploading|submit|submitting|schedule|scheduling|dispatch|dispatching|delete|deleting|remove|removing|commit|committing|push|merge|merging|migrate|migrating|import|importing|export|exporting|sync|syncing|blast)\b/i;
-/** A read-verb opener means the ask is a lookup even when write-ish words
- *  appear later ("check my email and tell me if…") — bias-to-action wins. */
-const CONFIRM_READ_LEAD_RE =
-  /^(?:check|look|read|show|summari[sz]e|tell|find|list|review|search|browse|view|explain|describe|analy[sz]e|compare|give\s+me|pull\s+up|what'?s)\b/i;
-const CONFIRM_QUESTION_LEAD_RE =
-  /^(?:who|whom|whose|what|when|where|why|how|which|is|are|was|were|do|does|did|can|could|should|would|will|has|have|had)\b/i;
-const CONFIRM_CONTROL_RE =
-  /^(?:approve|approved|yes|yep|yeah|y|ok|okay|go|go ahead|proceed|continue|resume|cancel|stop|halt|no|nope|reject)\b/i;
+// Confirmation is based on a typed turn decision, not a write-ish word anywhere
+// in the sentence. The structural patterns below are inputs to that decision,
+// alongside session state, destination shape, multi-item intent, and explicit
+// continuation controls. Persisting the typed result lets the tool boundary
+// enforce it; a model cannot bypass alignment by ignoring prompt prose.
+const REQUEST_ACTION =
+  '(send|post|publish|deploy|host|notify|email|message|draft|create|update|upload|submit|schedule|dispatch|delete|remove|commit|push|merge|migrate|import|export|sync|build|write|prepare|research|analy[sz]e|collect|pull|gather|design|make|generate|convert|turn|transform|put|save|fill|add)';
+const REQUEST_ASSIST_PREFIX = '(?:(?:try|attempt)\\s+to\\s+|help\\s+me\\s+(?:to\\s+)?)?';
+const REQUESTED_ACTION_PATTERNS = [
+  new RegExp(`^(?:please\\s+)?${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  new RegExp(`^(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  new RegExp(`^i\\s+(?:need|want|would\\s+like)(?:\\s+for)?\\s+(?:you\\s+)?to\\s+${REQUEST_ASSIST_PREFIX}${REQUEST_ACTION}\\b`, 'i'),
+  new RegExp(`^let(?:'s|\\s+us)\\s+${REQUEST_ACTION}\\b`, 'i'),
+] as const;
+const EXTERNAL_ACTION_RE =
+  /\b(?:send|post|publish|deploy|host|notify|email|upload|submit|schedule|dispatch|delete|push|merge|migrate|sync)\b|\b(?:create|update|remove|import|export|draft|write|prepare|make|generate|build|design|convert)\b[^.!?\n]{0,50}\b(?:google\s+docs?|documents?|sites?|website|calendar|event|email|message|record|crm|sheets?|drive|notion|slack|teams|outlook|github|netlify)\b/i;
+const CONFIRM_CONTROLS = new Set([
+  'approve', 'approved', 'yes', 'yep', 'yeah', 'y', 'ok', 'okay',
+  'go', 'go ahead', 'proceed', 'continue', 'resume',
+]);
+const READ_ONLY_LEAD_RE =
+  /^(?:what|why|how|when|where|who|which|tell me|show me|check|look at|find|search|summarize|review|explain|compare|inspect|read|list|get)\b/i;
+const EXTERNAL_DESTINATION_RE =
+  /\b(?:google\s+(?:docs?|documents?|sheets?|drive)|netlify|vercel|railway|website|web\s*site|calendar|outlook|gmail|emails?|messages?|salesforce|crm|notion|slack|teams|github|pull request)\b/i;
+const NOUN_SHAPED_REQUEST_RE =
+  /\b(?:google\s+(?:docs?|documents?|sheets?)|website|web\s*site|calendar\s+event|email\s+draft|pull request)\b[^.!?\n]{0,100}\b(?:would\s+be|would\s+help|sounds?|please|for\s+me|i(?:'d|\s+would)\s+like)\b/i;
+
+export type TurnPreflightPhase = 'read' | 'align' | 'execute';
+type ConfirmedMutationEffect = Extract<RuntimeToolEffect, 'local_write' | 'external_write' | 'admin'>;
+type ConfirmedActionFamily = 'create' | 'update' | 'delete' | 'send' | 'publish' | 'schedule' | 'upload' | 'commit' | 'merge' | 'import' | 'export' | 'sync' | 'configure';
+
+export interface TurnPreflightDecision {
+  phase: TurnPreflightPhase;
+  consequential: boolean;
+  destination?: string;
+  /** Digest of the concrete user request that is waiting for confirmation. */
+  intentKey?: string;
+  /** On the acknowledgement turn, the exact pending intent being authorized. */
+  confirmedIntentKey?: string;
+  /** Original consequential ask. Kept in typed state so an acknowledgement
+   *  such as "go ahead" cannot replace the artifact/task objective. */
+  objective?: string;
+  /** Exact mutation classes and service families authorized by the aligned
+   *  request. Reads remain available after approval; mutations fail closed. */
+  allowedMutationEffects?: ConfirmedMutationEffect[];
+  allowedDestinations?: string[];
+  allowedActionFamilies?: ConfirmedActionFamily[];
+  reason:
+    | 'non_chat'
+    | 'feature_disabled'
+    | 'continuation_approved'
+    | 'already_aligned_session'
+    | 'read_only_request'
+    | 'external_action'
+    | 'multi_item_action'
+    | 'noun_shaped_artifact_request'
+    | 'ordinary_execution';
+}
+
+function normalizedControl(text: string): string {
+  return text.trim().toLowerCase().replace(/[.!]+$/g, '').replace(/\s+/g, ' ');
+}
+
+function isConfirmationControl(text: string): boolean {
+  return CONFIRM_CONTROLS.has(normalizedControl(text));
+}
+
+function intentKeyFor(message: string, destination: string | undefined): string {
+  return createHash('sha256')
+    .update(`${message.trim().replace(/\s+/g, ' ').toLowerCase()}\0${destination?.toLowerCase() ?? ''}`)
+    .digest('hex')
+    .slice(0, 20);
+}
+
+const DESTINATION_RULES: ReadonlyArray<readonly [string, RegExp]> = [
+  ['google_docs', /\b(?:google\s*docs?|googledocs|google\s+document)\b/i],
+  ['google_sheets', /\b(?:google\s*sheets?|googlesheets|spreadsheet)\b/i],
+  ['google_drive', /\b(?:google\s*drive|gdrive)\b/i],
+  ['email', /\b(?:e-?mail|gmail|outlook|mail)\b/i],
+  ['calendar', /\b(?:calendar|meeting|event)\b/i],
+  ['website', /\b(?:website|web\s*site|netlify|vercel|railway|deploy|publish|host)\b/i],
+  ['github', /\b(?:github|pull\s*request|git\s+push|push\s+it)\b/i],
+  ['slack', /\bslack\b/i],
+  ['teams', /\b(?:microsoft\s+teams|teams)\b/i],
+  ['notion', /\bnotion\b/i],
+  ['crm', /\b(?:crm|salesforce|hubspot)\b/i],
+  ['messages', /\b(?:message|sms|text\s+message|discord)\b/i],
+  ['documents', /\b(?:document|\bdoc\b|word\s+file)\b/i],
+  ['local', /\b(?:local|workspace|repository|\brepo\b|source\s+file|codebase|filesystem)\b/i],
+  ['memory', /\b(?:memory|remember|profile)\b/i],
+];
+
+function destinationKeysFromText(text: string): string[] {
+  const keys = DESTINATION_RULES
+    .filter(([, pattern]) => pattern.test(text))
+    .map(([key]) => key);
+  return [...new Set(keys)];
+}
+
+const GENERIC_PROVIDER_STOPWORDS = new Set([
+  'a', 'an', 'the', 'my', 'our', 'new', 'existing', 'client', 'customer',
+  'project', 'company', 'firm', 'single', 'one', 'another',
+]);
+
+function normalizeProviderAlias(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** Capture an explicitly named provider without maintaining a closed list.
+ * Examples: "create an Airtable record", "add a card in trello", "via Linear". */
+function genericProviderAliasesFromObjective(text: string): string[] {
+  const aliases: string[] = [];
+  const patterns = [
+    /\b(?:create|update|edit|delete|remove|add|send|schedule|publish|upload)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9.-]{1,30})\s+(?:record|card|issue|task|ticket|row|page|item|contact|lead|entry|message|event)\b/gi,
+    /\b(?:in|on|via|using|through)\s+([A-Za-z][A-Za-z0-9.-]{1,30})\b/gi,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const alias = normalizeProviderAlias(match[1] ?? '');
+      if (alias && !GENERIC_PROVIDER_STOPWORDS.has(alias)) aliases.push(`provider:${alias}`);
+    }
+  }
+  return [...new Set(aliases)];
+}
+
+function providerAliasForTool(toolName: string, input: unknown): string | null {
+  const normalized = toolName.replace(/^mcp__/, '');
+  const tail = normalized.split('__').at(-1) ?? normalized;
+  let raw = normalized.includes('__') ? normalized.split('__')[0] ?? '' : '';
+  if (/composio_execute_tool$/i.test(tail) && input && typeof input === 'object') {
+    const slug = (input as Record<string, unknown>).tool_slug;
+    if (typeof slug === 'string') raw = slug.split(/[_-]+/)[0] ?? '';
+  }
+  const alias = normalizeProviderAlias(raw.replace(/(?:-?mcp|-?server)$/i, ''));
+  return alias && !/^(?:clementine|clem|local)$/.test(alias) ? `provider:${alias}` : null;
+}
+
+function mutationAuthorityForObjective(
+  text: string,
+  externalAction: boolean,
+  nounShapedArtifactRequest: boolean,
+): Pick<TurnPreflightDecision, 'allowedMutationEffects' | 'allowedDestinations' | 'allowedActionFamilies'> {
+  const allowedDestinations = destinationKeysFromText(text);
+  allowedDestinations.push(...genericProviderAliasesFromObjective(text));
+  const allowedActionFamilies = actionFamiliesFromText(text, true);
+  const allowedMutationEffects: ConfirmedMutationEffect[] = [];
+  if (externalAction || nounShapedArtifactRequest || allowedDestinations.some((key) => key !== 'local' && key !== 'memory')) {
+    allowedMutationEffects.push('external_write');
+  }
+  if (allowedDestinations.includes('local') || allowedDestinations.includes('memory')) {
+    allowedMutationEffects.push('local_write');
+  }
+  if (/\b(?:install|uninstall|configure|configuration|admin|permission|credential|secret|system setting)\b/i.test(text)) {
+    allowedMutationEffects.push('admin');
+  }
+  return {
+    allowedMutationEffects: [...new Set(allowedMutationEffects)],
+    allowedDestinations,
+    allowedActionFamilies,
+  };
+}
+
+function actionFamiliesFromText(text: string, objective: boolean): ConfirmedActionFamily[] {
+  const normalized = text.replace(/[_-]+/g, ' ');
+  const actions: ConfirmedActionFamily[] = [];
+  if (/\b(?:delete|remove|trash|archive|destroy|revoke)\b/i.test(normalized)) actions.push('delete');
+  if (
+    /\b(?:send|notify|dispatch|forward|reply|broadcast|dm)\b/i.test(normalized)
+    || (objective
+      ? /(?:^|\b(?:you|to|then|and)\s+)(?:please\s+)?(?:email|message)\b/i.test(normalized.trim())
+      : /\b(?:email|message)\b/i.test(normalized))
+  ) actions.push('send');
+  if (
+    /\b(?:deploy|publish|host|release|push)\b/i.test(normalized)
+    || (objective
+      ? /(?:^|\b(?:you|to|then|and)\s+)(?:please\s+)?post\b/i.test(normalized.trim())
+      : /\bpost\b/i.test(normalized))
+  ) actions.push('publish');
+  if (/\b(?:schedule|book|invite)\b/i.test(normalized)) actions.push('schedule');
+  if (/\b(?:upload|attach)\b/i.test(normalized)) actions.push('upload');
+  if (/\bcommit\b/i.test(normalized)) actions.push('commit');
+  if (/\bmerge\b/i.test(normalized)) actions.push('merge');
+  if (/\bimport\b/i.test(normalized)) actions.push('import');
+  if (/\bexport\b/i.test(normalized)) actions.push('export');
+  if (/\bsync\b/i.test(normalized)) actions.push('sync');
+  if (/\b(?:configure|configuration|install|uninstall|enable|disable|permission|credential|secret|setting)\b/i.test(normalized)) actions.push('configure');
+  if (/\b(?:update|edit|modify|patch|append|rename|move|set|fill|add)\b/i.test(normalized)) actions.push('update');
+  if (/\b(?:create|make|generate|build|write|prepare|draft|convert|turn|transform|save|new)\b/i.test(normalized)) actions.push('create');
+  // "Create/build/deploy a website" normally requires both provisioning and
+  // publishing; authorize that narrow pair without widening document creates.
+  if (objective && actions.includes('create') && destinationKeysFromText(text).includes('website')) actions.push('publish');
+  return [...new Set(actions)];
+}
+
+function toolIdentityText(toolName: string, input: unknown): string {
+  const normalized = toolName.replace(/^mcp__/, ' ');
+  if (!input || typeof input !== 'object') return normalized;
+  const args = input as Record<string, unknown>;
+  const identityFields = ['tool_slug', 'toolSlug', 'tool', 'toolName', 'name', 'action']
+    .map((key) => args[key])
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  // A shell's destination lives in the command rather than its generic tool
+  // name. Do not inspect arbitrary content/body fields: an email containing a
+  // Google Docs link must still classify as email, not as an authorized doc.
+  if (/run_shell_command$/i.test(normalized)) {
+    const command = args.command;
+    if (typeof command === 'string') identityFields.push(command);
+  }
+  return `${normalized} ${identityFields.join(' ')}`.replace(/[_-]+/g, ' ');
+}
+
+function toolDestinationKeys(toolName: string, input: unknown, effect: RuntimeToolEffect): string[] {
+  const keys = destinationKeysFromText(toolIdentityText(toolName, input));
+  const providerAlias = providerAliasForTool(toolName, input);
+  if (providerAlias) keys.push(providerAlias);
+  if (effect === 'local_write') keys.push('local');
+  return [...new Set(keys)];
+}
+
+function toolActionFamilies(toolName: string, input: unknown): ConfirmedActionFamily[] {
+  return actionFamiliesFromText(toolIdentityText(toolName, input), false);
+}
+
+const DELEGATING_EXECUTION_TOOLS = new Set([
+  'run_tool_program',
+  'run_batch',
+  'run_worker',
+  'call_tool',
+]);
+
+function normalizedControlToolTail(toolName: string): string {
+  const normalized = toolName.replace(/^mcp__/, '');
+  const tail = normalized.split('__').at(-1) ?? normalized;
+  return tail
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase();
+}
+
+function isDelegatingExecutionTool(toolName: string): boolean {
+  const normalized = toolName.replace(/^mcp__/, '');
+  const parts = normalized.split('__');
+  // A provider may itself expose an action named RUN_BATCH. Only Clementine's
+  // own carriers get this exemption; an unknown external namespace still fails
+  // closed and can never use a matching tail as an authority bypass.
+  if (parts.length > 1 && !/^(?:clementine(?:-local)?|clem(?:entine)?_local)$/i.test(parts[0] ?? '')) {
+    return false;
+  }
+  return DELEGATING_EXECUTION_TOOLS.has(normalizedControlToolTail(toolName));
+}
+
+function decisionAuthoritySignature(decision: TurnPreflightDecision): string {
+  return JSON.stringify({
+    phase: decision.phase,
+    consequential: decision.consequential,
+    destination: decision.destination,
+    intentKey: decision.intentKey,
+    confirmedIntentKey: decision.confirmedIntentKey,
+    objective: decision.objective,
+    reason: decision.reason,
+    allowedMutationEffects: [...(decision.allowedMutationEffects ?? [])].sort(),
+    allowedDestinations: [...(decision.allowedDestinations ?? [])].sort(),
+    allowedActionFamilies: [...(decision.allowedActionFamilies ?? [])].sort(),
+  });
+}
+
+function decisionForSource(
+  sessionId: string,
+  rows: ReturnType<typeof listEvents>,
+  sourceUserSeq: number,
+): TurnPreflightDecision | null {
+  const row = rows
+    .filter((event) => event.type === 'turn_preflight_decision')
+    .sort((a, b) => b.seq - a.seq)
+    .find((event) => (event.data as { sourceUserSeq?: number }).sourceUserSeq === sourceUserSeq);
+  return row ? row.data as unknown as TurnPreflightDecision : null;
+}
+
+function latestUserSeq(rows: ReturnType<typeof listEvents>): number {
+  return rows
+    .filter((row) => row.type === 'user_input_received')
+    .reduce((max, row) => Math.max(max, row.seq), 0);
+}
+
+function alignedDecisionForIntent(
+  rows: ReturnType<typeof listEvents>,
+  intentKey: string,
+): TurnPreflightDecision | null {
+  const row = rows
+    .filter((event) => event.type === 'turn_preflight_decision')
+    .sort((a, b) => b.seq - a.seq)
+    .find((event) => {
+      const candidate = event.data as unknown as TurnPreflightDecision;
+      return candidate.phase === 'align' && candidate.intentKey === intentKey;
+    });
+  return row ? row.data as unknown as TurnPreflightDecision : null;
+}
+
+/** Acknowledgement authority exists only for the immediately preceding user
+ * request and only when that request has a durable `align` decision. An old
+ * completed turn or an older alignment cannot grant permanent execution. */
+function pendingAlignmentForCurrentInput(
+  sessionId: string,
+  sourceUserSeq?: number,
+): TurnPreflightDecision | null {
+  try {
+    const rows = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
+    const users = rows.filter((row) => row.type === 'user_input_received');
+    const currentIndex = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+      ? users.findIndex((row) => row.seq === sourceUserSeq)
+      : users.length - 1;
+    const previousUser = currentIndex > 0 ? users[currentIndex - 1] : undefined;
+    if (!previousUser) return null;
+    const decision = decisionForSource(sessionId, rows, previousUser.seq);
+    return decision?.phase === 'align' && typeof decision.intentKey === 'string' && decision.intentKey
+      ? decision
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function destinationFromText(text: string): string | undefined {
+  return text.match(EXTERNAL_DESTINATION_RE)?.[0]?.replace(/\s+/g, ' ').trim();
+}
+
+/** Pure, typed preflight decision. Regexes contribute grammatical evidence;
+ * they are not themselves authority. Session state and the persisted phase are
+ * what the tool boundary ultimately consumes. */
+export function classifyTurnPreflight(input: {
+  message: string;
+  sessionId?: string;
+  sessionKind?: string;
+  isMultiItem?: boolean;
+  itemCount?: number;
+  /** Exact accepted user event for this attempt. Avoids session-global
+   *  "latest user" authority when a transport/fallback is racing. */
+  sourceUserSeq?: number;
+}): TurnPreflightDecision {
+  const text = (input.message ?? '').trim();
+  if (input.sessionKind !== 'chat' || !input.sessionId) {
+    return { phase: 'execute', consequential: false, reason: 'non_chat' };
+  }
+  if (!confirmBeatEnabled()) {
+    return { phase: 'execute', consequential: false, reason: 'feature_disabled' };
+  }
+  if (isConfirmationControl(text)) {
+    const pending = pendingAlignmentForCurrentInput(input.sessionId, input.sourceUserSeq);
+    if (pending) {
+      return {
+        phase: 'execute',
+        consequential: true,
+        destination: pending.destination,
+        confirmedIntentKey: pending.intentKey,
+        objective: pending.objective,
+        allowedMutationEffects: pending.allowedMutationEffects,
+        allowedDestinations: pending.allowedDestinations,
+        allowedActionFamilies: pending.allowedActionFamilies,
+        reason: 'continuation_approved',
+      };
+    }
+  }
+
+  const requestedAction = REQUESTED_ACTION_PATTERNS.some((pattern) => pattern.test(text));
+  const genericProviders = genericProviderAliasesFromObjective(text);
+  const destination = destinationFromText(text) ?? genericProviders[0]?.replace(/^provider:/, '');
+  const externalAction = requestedAction && (Boolean(destination) || EXTERNAL_ACTION_RE.test(text) || genericProviders.length > 0);
+  const multiItemAction = input.isMultiItem === true && (input.itemCount ?? 0) >= 3;
+  const nounShapedArtifactRequest = Boolean(destination) && NOUN_SHAPED_REQUEST_RE.test(text);
+  const authority = mutationAuthorityForObjective(text, externalAction, nounShapedArtifactRequest);
+
+  // Interrogative/read leads win when the user did not grammatically ask
+  // Clementine to perform an action. This keeps “what should I send?” and
+  // “can Google Docs create tables?” immediate even though they contain
+  // consequential nouns and verbs.
+  if ((READ_ONLY_LEAD_RE.test(text) || (!requestedAction && /\?\s*$/.test(text))) && !requestedAction) {
+    return { phase: 'read', consequential: false, destination, reason: 'read_only_request' };
+  }
+  if (multiItemAction) {
+    return {
+      phase: 'align', consequential: true, destination, objective: text,
+      intentKey: intentKeyFor(text, destination), ...authority, reason: 'multi_item_action',
+    };
+  }
+  if (externalAction) {
+    return {
+      phase: 'align', consequential: true, destination, objective: text,
+      intentKey: intentKeyFor(text, destination), ...authority, reason: 'external_action',
+    };
+  }
+  if (nounShapedArtifactRequest) {
+    return {
+      phase: 'align', consequential: true, destination, objective: text,
+      intentKey: intentKeyFor(text, destination), ...authority, reason: 'noun_shaped_artifact_request',
+    };
+  }
+  return { phase: 'execute', consequential: false, destination, reason: 'ordinary_execution' };
+}
 
 export function confirmBeatEnabled(): boolean {
   const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'on') ?? 'on').trim().toLowerCase();
@@ -222,13 +634,8 @@ export function confirmBeatEnabled(): boolean {
 }
 
 export const CONFIRM_BEAT_TEXT =
-  '[confirm-first] This is the FIRST turn of a session and the request is execution-shaped (external writes or many items). '
-  + 'Take ONE conversational beat before doing the work, the way a colleague would:\n'
-  + '1. Confirm the plan in 2-4 lines — what you will do, in what order, and where the results land.\n'
-  + '2. Verify you actually have the tools/connections the plan needs (the MCP scope and health warnings above; check_capability for CLIs). If something is missing, SAY so and offer to help connect it — never improvise around a missing tool.\n'
-  + '3. If the work will take more than a couple of minutes, offer to run it in the background.\n'
-  + 'Then STOP and wait for the go-ahead; once the user says go, run it to completion without re-asking. '
-  + 'EXCEPTION: if the request is actually a quick read-only task (a lookup, a summary, one small read), skip the beat and just do it now.';
+  '[confirm-first] Before executing, take one brief alignment beat: summarize the plan and destination in 2–3 lines, name the connection/capability you expect to use, and mention background execution if this may take several minutes. '
+  + 'Do not call tools yet. Wait for the user’s go-ahead; then verify the connection and execute without asking again. Skip this only if the request is actually read-only.';
 
 /** Directive for a fresh execution-shaped chat turn, or null. Pure over its
  *  inputs plus one point read (prior completed turns); never throws. */
@@ -238,23 +645,222 @@ export function confirmBeatDirective(input: {
   sessionKind?: string;
   isMultiItem?: boolean;
   itemCount?: number;
+  sourceUserSeq?: number;
 }): string | null {
   try {
-    if (!confirmBeatEnabled()) return null;
-    if (input.sessionKind !== 'chat' || !input.sessionId) return null;
-    const text = (input.message ?? '').trim();
-    if (text.length < 24) return null; // control words and quick asks never confirm-beat
-    if (CONFIRM_CONTROL_RE.test(text)) return null;
-    if (CONFIRM_READ_LEAD_RE.test(text)) return null;
-    if (CONFIRM_QUESTION_LEAD_RE.test(text) && text.endsWith('?')) return null;
-    const executionShaped = CONFIRM_EXECUTION_SHAPE_RE.test(text)
-      || (input.isMultiItem === true && (input.itemCount ?? 0) >= 3);
-    if (!executionShaped) return null;
-    // FRESH sessions only. Any completed turn means the conversation already
-    // aligned (approve-once-then-run) — the beat must never re-ask mid-thread.
-    if (listEvents(input.sessionId, { types: ['conversation_completed'] }).length > 0) return null;
-    return CONFIRM_BEAT_TEXT;
+    return classifyTurnPreflight(input).phase === 'align' ? CONFIRM_BEAT_TEXT : null;
   } catch { return null; }
+}
+
+export class TurnPreflightPersistenceError extends Error {
+  readonly sessionId: string;
+  readonly phase: TurnPreflightDecision['phase'];
+
+  constructor(sessionId: string, phase: TurnPreflightDecision['phase'], cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Could not persist the ${phase} turn-preflight decision for ${sessionId}: ${detail}`, { cause });
+    this.name = 'TurnPreflightPersistenceError';
+    this.sessionId = sessionId;
+    this.phase = phase;
+  }
+}
+
+export interface TurnPreflightPersistenceIo {
+  list: typeof listEvents;
+  append: typeof appendEvent;
+}
+
+const DEFAULT_TURN_PREFLIGHT_IO: TurnPreflightPersistenceIo = {
+  list: listEvents,
+  append: appendEvent,
+};
+
+/** Attempt-local belt behind the thrown persistence error. Production callers
+ * must not dispatch the model after the throw, but if a future caller catches it
+ * incorrectly, the exact source turn still cannot mutate in this process. Each
+ * source has its own latch so a concurrently persisted turn cannot clear an
+ * older turn's failure. An unknown source is a conservative session wildcard. */
+const UNKNOWN_PREFLIGHT_SOURCE = '*';
+type FailedPreflightSource = number | typeof UNKNOWN_PREFLIGHT_SOURCE;
+const failedPreflightPersistence = new Map<string, Set<FailedPreflightSource>>();
+
+function exactPreflightSource(sourceUserSeq: number | undefined): number | null {
+  return Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+    ? sourceUserSeq as number
+    : null;
+}
+
+function latchFailedPreflightPersistence(sessionId: string, sourceUserSeq: number | undefined): void {
+  const failedSources = failedPreflightPersistence.get(sessionId) ?? new Set<FailedPreflightSource>();
+  failedSources.add(exactPreflightSource(sourceUserSeq) ?? UNKNOWN_PREFLIGHT_SOURCE);
+  failedPreflightPersistence.set(sessionId, failedSources);
+}
+
+function clearFailedPreflightPersistence(sessionId: string, sourceUserSeq: number | undefined): void {
+  const failedSources = failedPreflightPersistence.get(sessionId);
+  if (!failedSources) return;
+  const exactSource = exactPreflightSource(sourceUserSeq);
+  // A successful exact-source write proves recovery only for that source. It
+  // must not clear either another turn or an earlier unknown-source failure.
+  if (exactSource !== null) failedSources.delete(exactSource);
+  if (failedSources.size === 0) failedPreflightPersistence.delete(sessionId);
+}
+
+function hasFailedPreflightPersistence(sessionId: string, sourceUserSeq: number | undefined): boolean {
+  const failedSources = failedPreflightPersistence.get(sessionId);
+  if (!failedSources?.size) return false;
+  if (failedSources.has(UNKNOWN_PREFLIGHT_SOURCE)) return true;
+  const exactSource = exactPreflightSource(sourceUserSeq);
+  // A tool call without source identity cannot safely exclude any outstanding
+  // failure in the session, so it is treated as matching every exact latch.
+  return exactSource === null || failedSources.has(exactSource);
+}
+
+/** Persist one preflight decision for the latest user turn. Idempotent across
+ * context builders (the Codex packet and Claude brain can both consult it). */
+export function recordTurnPreflightDecision(
+  sessionId: string | undefined,
+  decision: TurnPreflightDecision,
+  sourceUserSeq?: number,
+  io: TurnPreflightPersistenceIo = DEFAULT_TURN_PREFLIGHT_IO,
+): void {
+  if (!sessionId) return;
+  let exactSourceUserSeq = exactPreflightSource(sourceUserSeq) ?? undefined;
+  try {
+    const rows = io.list(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
+    exactSourceUserSeq ??= latestUserSeq(rows) || undefined;
+    const alreadyRecorded = rows.some((row) => {
+      if (row.type !== 'turn_preflight_decision') return false;
+      const data = row.data as unknown as TurnPreflightDecision & { sourceUserSeq?: number };
+      return data.sourceUserSeq === exactSourceUserSeq
+        && decisionAuthoritySignature(data) === decisionAuthoritySignature(decision);
+    });
+    if (!alreadyRecorded) {
+      io.append({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'turn_preflight_decision',
+        data: { ...decision, sourceUserSeq: exactSourceUserSeq },
+      });
+    }
+    clearFailedPreflightPersistence(sessionId, exactSourceUserSeq);
+  } catch (cause) {
+    latchFailedPreflightPersistence(sessionId, exactSourceUserSeq);
+    // This row is execution authority, not telemetry. Continuing context/model
+    // assembly after a failed write recreates the original fail-open hole: the
+    // tool boundary observes "no decision" and assumes ordinary execution.
+    throw new TurnPreflightPersistenceError(sessionId, decision.phase, cause);
+  }
+}
+
+function mutationDenied(message: string): ToolGateDeny {
+  return { behavior: 'deny', interrupt: false, message };
+}
+
+/** Enforce alignment and the exact mutation authority it created. The approval
+ * turn copies the original intent key/objective/effect/destination scope; the
+ * tool boundary re-loads the matching align record instead of trusting a bare
+ * acknowledgement or whichever user row happens to be latest globally. */
+export function preflightGateVerdict(
+  sessionId: string | undefined,
+  toolName?: string,
+  input?: unknown,
+  sourceUserSeq?: number,
+): ToolGateDeny | null {
+  if (!sessionId) return null;
+  let requestedEffect: RuntimeToolEffect | null = null;
+  if (toolName) {
+    try { requestedEffect = classifyRuntimeToolEffect(toolName, input).effect; } catch { requestedEffect = 'unknown'; }
+  }
+  try {
+    if (
+      hasFailedPreflightPersistence(sessionId, sourceUserSeq)
+      && requestedEffect !== 'read'
+      && requestedEffect !== 'compute'
+    ) {
+      return mutationDenied('Clementine could not persist this turn’s approval state. The mutating tool was blocked fail-closed before dispatch; retry the alignment turn after local storage recovers.');
+    }
+    const rows = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
+    const exactSourceUserSeq = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+      ? sourceUserSeq as number
+      : latestUserSeq(rows);
+    const decision = decisionForSource(sessionId, rows, exactSourceUserSeq);
+    if (decision?.phase === 'align') {
+      return mutationDenied('Alignment is still pending for this request. Do not call tools in this turn. Give the brief plan/destination beat in plain language and wait for the user’s next message.');
+    }
+    if (!toolName || decision?.phase !== 'execute' || !decision.confirmedIntentKey) return null;
+
+    const aligned = alignedDecisionForIntent(rows, decision.confirmedIntentKey);
+    if (!aligned) {
+      return mutationDenied('The approved intent could not be matched to its original alignment record. No mutating tool may run; ask the user to restate and confirm the intended action.');
+    }
+    // These tools delegate rather than perform the destination mutation. Their
+    // inner calls re-enter the same preflight boundary (code-mode/batch carry
+    // sourceUserSeq), so validate the concrete provider action there. Blocking
+    // the carrier itself would force dozens of discrete calls and defeat the
+    // tool-economy path without adding safety.
+    if (isDelegatingExecutionTool(toolName)) return null;
+    const effect = requestedEffect ?? classifyRuntimeToolEffect(toolName, input).effect;
+    if (effect === 'read' || effect === 'compute') return null;
+    if (effect === 'unknown') {
+      return mutationDenied('This tool has no trustworthy runtime effect classification, so it cannot run under a consequential approval. Use a classified read/action tool or ask the user to align on a supported action.');
+    }
+    const allowedEffects = new Set(aligned.allowedMutationEffects ?? []);
+    if (!allowedEffects.has(effect as ConfirmedMutationEffect)) {
+      return mutationDenied(`The confirmed request did not authorize a ${effect.replace(/_/g, ' ')} action. Continue with read-only work or ask for a new alignment beat for this mutation.`);
+    }
+    const allowedDestinations = new Set(aligned.allowedDestinations ?? []);
+    const actualDestinations = toolDestinationKeys(toolName, input, effect);
+    if (allowedDestinations.size === 0 || !actualDestinations.some((key) => allowedDestinations.has(key))) {
+      const expected = [...allowedDestinations].join(', ') || 'an explicitly named destination';
+      const actual = actualDestinations.join(', ') || 'an unrecognized destination';
+      return mutationDenied(`This tool targets ${actual}, but the confirmed request authorized ${expected}. Use the aligned destination or ask the user to confirm the new destination.`);
+    }
+    const allowedActions = new Set(aligned.allowedActionFamilies ?? []);
+    const actualActions = toolActionFamilies(toolName, input);
+    if (allowedActions.size === 0 || !actualActions.some((action) => allowedActions.has(action))) {
+      const expected = [...allowedActions].join(', ') || 'an explicitly named action';
+      const actual = actualActions.join(', ') || 'an unrecognized action';
+      return mutationDenied(`This tool would ${actual}, but the confirmed request authorized ${expected}. Use the aligned action or ask the user to confirm the new action.`);
+    }
+    return null;
+  } catch {
+    if (toolName && requestedEffect !== 'read' && requestedEffect !== 'compute') {
+      return mutationDenied('Clementine could not verify this turn’s persisted approval authority. The mutating tool was blocked fail-closed; retry the alignment beat rather than executing with ambiguous consent.');
+    }
+    return null;
+  }
+}
+
+/** Recover the aligned objective for an acknowledgement turn. This keeps
+ * artifact identity and completion judging anchored to "create two docs", not
+ * to the low-information control message "go ahead". */
+export function effectiveTurnObjective(
+  sessionId: string | undefined,
+  fallback: string,
+  sourceUserSeq?: number,
+): string {
+  if (!sessionId) return fallback;
+  try {
+    const rows = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
+    const exactSourceUserSeq = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+      ? sourceUserSeq as number
+      : latestUserSeq(rows);
+    const decision = decisionForSource(sessionId, rows, exactSourceUserSeq);
+    if (decision?.phase === 'execute' && decision.confirmedIntentKey) {
+      const aligned = alignedDecisionForIntent(rows, decision.confirmedIntentKey);
+      if (aligned?.objective?.trim()) return aligned.objective.trim();
+    }
+  } catch { /* fallback remains authoritative */ }
+  return fallback;
+}
+
+export class PreflightAlignmentRequiredError extends Error {
+  constructor(public readonly sessionId: string, message: string) {
+    super(`PREFLIGHT_ALIGNMENT_REQUIRED: ${message}`);
+    this.name = 'PreflightAlignmentRequiredError';
+  }
 }
 
 export const BACKGROUND_OFFER_TEXT =

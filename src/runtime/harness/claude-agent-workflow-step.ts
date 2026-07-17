@@ -3,6 +3,7 @@ import { getRuntimeEnv } from '../../config.js';
 import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { recordSubagentRun } from '../../agents/subagent-runs.js';
+import { AgentRuntimeCancelledError } from '../provider.js';
 import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -220,6 +221,11 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   /** The workflow RUN id — so a fan-out (run_worker) spawned inside this step is
    *  attributed to the run in the subagent-runs visibility store. */
   runId?: string;
+  /** Exact accepted child-step user event. Keeps kill/preflight authority on
+   * this physical attempt even if the stable workflow session is reused. */
+  sourceUserSeq?: number;
+  /** Durable workflow-run cancellation (dashboard or generic Tasks board). */
+  shouldCancel?: () => boolean | Promise<boolean>;
   /** Tool-capable gated lane (read + write/send through the harness gate chain)
    *  rather than the read-only profile. */
   fullLane?: boolean;
@@ -271,6 +277,8 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   const stepRunOptions = {
     modelId: args.modelId,
     sessionId: args.sessionId,
+    sourceUserSeq: args.sourceUserSeq,
+    shouldCancel: args.shouldCancel,
     workflowRunId: args.runId,
     workflowName: args.workflowName,
     stepId: args.step.id,
@@ -319,7 +327,11 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
               + `Continue and FINISH the step — do NOT redo completed work. When done, call workflow_step_result exactly once.`,
             ...stepRunOptions,
           });
-        } catch {
+        } catch (err) {
+          // Cancellation is control flow, never a recoverable provider blip.
+          // Swallowing it here resurrected the previous partial result and let
+          // the workflow advance after the user pressed Stop.
+          if (err instanceof AgentRuntimeCancelledError) throw err;
           break; // a continuation error → keep the prior partial (it blocks honestly below)
         }
         autos += 1;

@@ -100,6 +100,386 @@ export interface ShellWriteShape {
   isProd: boolean;
 }
 
+/**
+ * A shell may hide the command that actually executes behind a literal
+ * `sh|bash|zsh -c/-lc '...'` payload. The older classifiers removed every
+ * quoted region before inspection, which made the executable payload disappear
+ * along with harmless commit messages. Keep the distinction structural: only a
+ * quoted token in the command-string position of a real shell executable is
+ * unwrapped. Quoted text passed to echo/git/etc. is never treated as code.
+ */
+export const MAX_LITERAL_SHELL_UNWRAP_DEPTH = 3;
+
+interface ShellLexWord {
+  value: string;
+  fullyQuoted: boolean;
+  dynamic: boolean;
+}
+
+export interface LiteralShellCommandExpansion {
+  /** Root command followed by each statically-known nested command. */
+  commands: string[];
+  /** A real shell -c wrapper had a dynamic/unparseable payload, or exceeded the
+   * strict recursion bound. Callers should conservatively require approval. */
+  hasOpaqueShellWrapper: boolean;
+}
+
+/** Minimal shell lexer for command-position analysis. It is intentionally not
+ * an executor/parser: it only preserves top-level segment boundaries and tells
+ * us whether one word consisted entirely of one static quoted literal. */
+function lexShellSegments(command: string): ShellLexWord[][] {
+  const segments: ShellLexWord[][] = [];
+  let words: ShellLexWord[] = [];
+  let value = '';
+  let started = false;
+  let quote: "'" | '"' | null = null;
+  let quoteParts = 0;
+  let unquotedPart = false;
+  let dynamic = false;
+
+  const pushWord = (): void => {
+    if (!started) return;
+    words.push({ value, fullyQuoted: quote === null && quoteParts === 1 && !unquotedPart, dynamic });
+    value = '';
+    started = false;
+    quote = null;
+    quoteParts = 0;
+    unquotedPart = false;
+    dynamic = false;
+  };
+  const pushSegment = (): void => {
+    pushWord();
+    if (words.length > 0) segments.push(words);
+    words = [];
+  };
+
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else value += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      if (ch === '\\' && i + 1 < command.length && /[\\$`"\n]/.test(command[i + 1])) {
+        value += command[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === '$' || ch === '`') dynamic = true;
+      value += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      started = true;
+      quote = ch;
+      quoteParts += 1;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < command.length) {
+      started = true;
+      unquotedPart = true;
+      value += command[i + 1];
+      i += 1;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (ch === '\n' || ch === '\r') pushSegment();
+      else pushWord();
+      continue;
+    }
+    if (ch === ';' || ch === '|' || ch === '&') {
+      pushSegment();
+      if (command[i + 1] === ch) i += 1;
+      continue;
+    }
+    started = true;
+    unquotedPart = true;
+    value += ch;
+  }
+  // An unterminated quote is never a safe literal command payload.
+  if (quote !== null) dynamic = true;
+  pushSegment();
+  return segments;
+}
+
+interface ShellExecutableResolution {
+  index: number | undefined;
+  opaque: boolean;
+}
+
+function isShellAssignment(word: ShellLexWord | undefined): boolean {
+  return !!word && /^[A-Za-z_][A-Za-z0-9_]*=/.test(word.value);
+}
+
+/** Locate the executable after known launchers that commonly precede a literal
+ * shell. This remains positional parsing—not a scan—so launcher-shaped text
+ * passed to echo/git/etc. stays inert data. Options whose semantics synthesize
+ * argv (`env -S`) or whose grammar is unknown are opaque instead of guessed. */
+function resolveShellExecutable(words: ShellLexWord[]): ShellExecutableResolution {
+  let idx = 0;
+  while (idx < words.length && isShellAssignment(words[idx])) idx += 1;
+
+  while (idx < words.length) {
+    const launcher = normalizedBinaryName(words[idx]?.value);
+    if (launcher === 'command') {
+      idx += 1;
+      while (idx < words.length && words[idx].value.startsWith('-')) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        // `command -v/-V` inspects a name; it does not execute that name.
+        if (option === '-v' || option === '-V') return { index: undefined, opaque: false };
+        if (option === '-p') {
+          idx += 1;
+          continue;
+        }
+        return { index: undefined, opaque: true };
+      }
+      continue;
+    }
+
+    if (launcher === 'env') {
+      idx += 1;
+      while (idx < words.length) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        if (option === '--help' || option === '--version') {
+          return { index: undefined, opaque: false };
+        }
+        if (option === '-S' || option === '--split-string' || option.startsWith('--split-string=')) {
+          return { index: undefined, opaque: true };
+        }
+        if (option === '-i' || option === '--ignore-environment' || option === '-0' || option === '--null') {
+          idx += 1;
+          continue;
+        }
+        if (option === '-u' || option === '--unset' || option === '-C' || option === '--chdir') {
+          if (!words[idx + 1]) return { index: undefined, opaque: false };
+          idx += 2;
+          continue;
+        }
+        if (/^(?:--unset|--chdir)=/.test(option) || /^-[uC].+/.test(option)) {
+          idx += 1;
+          continue;
+        }
+        if (option.startsWith('-')) return { index: undefined, opaque: true };
+        break;
+      }
+      while (idx < words.length && isShellAssignment(words[idx])) idx += 1;
+      continue;
+    }
+
+    if (launcher === 'exec') {
+      idx += 1;
+      while (idx < words.length && words[idx].value.startsWith('-')) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        if (option === '-a') {
+          if (!words[idx + 1]) return { index: undefined, opaque: false };
+          idx += 2;
+          continue;
+        }
+        if (/^-a.+/.test(option) || /^-[cl]+$/.test(option)) {
+          idx += 1;
+          continue;
+        }
+        return { index: undefined, opaque: true };
+      }
+      continue;
+    }
+
+    if (launcher === 'nohup') {
+      idx += 1;
+      const option = words[idx]?.value;
+      if (option === '--help' || option === '--version') return { index: undefined, opaque: false };
+      if (option === '--') idx += 1;
+      else if (option?.startsWith('-')) return { index: undefined, opaque: true };
+      continue;
+    }
+
+    if (launcher === 'nice') {
+      idx += 1;
+      while (idx < words.length && words[idx].value.startsWith('-')) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        if (option === '--help' || option === '--version') return { index: undefined, opaque: false };
+        if (option === '-n' || option === '--adjustment') {
+          if (!words[idx + 1]) return { index: undefined, opaque: false };
+          idx += 2;
+          continue;
+        }
+        if (/^--adjustment=/.test(option) || /^-\d+$/.test(option)) {
+          idx += 1;
+          continue;
+        }
+        return { index: undefined, opaque: true };
+      }
+      continue;
+    }
+
+    if (launcher === 'time') {
+      idx += 1;
+      while (idx < words.length && words[idx].value.startsWith('-')) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        if (option === '--help' || option === '--version') return { index: undefined, opaque: false };
+        if (option === '-p' || option === '--portability') {
+          idx += 1;
+          continue;
+        }
+        return { index: undefined, opaque: true };
+      }
+      continue;
+    }
+
+    if (launcher === 'timeout' || launcher === 'gtimeout') {
+      idx += 1;
+      while (idx < words.length && words[idx].value.startsWith('-')) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        if (option === '--help' || option === '--version') return { index: undefined, opaque: false };
+        if (option === '--foreground' || option === '--preserve-status' || option === '--verbose' || option === '-v') {
+          idx += 1;
+          continue;
+        }
+        if (option === '-k' || option === '--kill-after' || option === '-s' || option === '--signal') {
+          if (!words[idx + 1]) return { index: undefined, opaque: false };
+          idx += 2;
+          continue;
+        }
+        if (/^(?:--kill-after|--signal)=/.test(option) || /^-[ks].+/.test(option)) {
+          idx += 1;
+          continue;
+        }
+        return { index: undefined, opaque: true };
+      }
+      // timeout consumes one mandatory duration word before the executable.
+      if (!words[idx]) return { index: undefined, opaque: false };
+      idx += 1;
+      continue;
+    }
+
+    if (launcher === 'sudo') {
+      idx += 1;
+      while (idx < words.length && words[idx].value.startsWith('-')) {
+        const option = words[idx].value;
+        if (option === '--') {
+          idx += 1;
+          break;
+        }
+        if (option === '--help' || option === '--version' || option === '-V' || option === '-l' || option === '-v') {
+          return { index: undefined, opaque: false };
+        }
+        if (/^-[EHnSbPkK]$/.test(option) || option === '--preserve-env' || option === '--login') {
+          idx += 1;
+          continue;
+        }
+        if (/^(?:-u|-g|-h|-p|-C|-T|-r|-t|-D|-R|-U|--user|--group|--host|--prompt|--close-from|--command-timeout|--role|--type|--chdir|--chroot|--other-user)$/.test(option)) {
+          if (!words[idx + 1]) return { index: undefined, opaque: false };
+          idx += 2;
+          continue;
+        }
+        if (/^--(?:user|group|host|prompt|close-from|command-timeout|role|type|chdir|chroot|other-user)=/.test(option)) {
+          idx += 1;
+          continue;
+        }
+        return { index: undefined, opaque: true };
+      }
+      while (idx < words.length && isShellAssignment(words[idx])) idx += 1;
+      continue;
+    }
+
+    return { index: idx, opaque: false };
+  }
+  return { index: undefined, opaque: false };
+}
+
+function shellPayloads(command: string): { literal: string[]; opaque: boolean } {
+  const literal: string[] = [];
+  let opaque = false;
+  for (const words of lexShellSegments(command)) {
+    const resolved = resolveShellExecutable(words);
+    opaque ||= resolved.opaque;
+    const idx = resolved.index;
+    if (idx === undefined) continue;
+    const binary = normalizedBinaryName(words[idx]?.value);
+    if (binary !== 'sh' && binary !== 'bash' && binary !== 'zsh') continue;
+
+    let commandFlag = -1;
+    for (let i = idx + 1; i < words.length; i += 1) {
+      const token = words[i].value;
+      if (!token.startsWith('-')) break;
+      if (/^-[A-Za-z]*c[A-Za-z]*$/.test(token)) {
+        commandFlag = i;
+        break;
+      }
+    }
+    if (commandFlag < 0) continue;
+    const payload = words[commandFlag + 1];
+    if (!payload || payload.dynamic || (!payload.fullyQuoted && /[$`]/.test(payload.value))) {
+      opaque = true;
+      continue;
+    }
+    const body = payload.value.trim();
+    if (!body) {
+      opaque = true;
+      continue;
+    }
+    literal.push(body);
+  }
+  return { literal, opaque };
+}
+
+/** Expand only literal shell command-string payloads. Recursion is bounded even
+ * for adversarial input; a shell wrapper at the final depth is marked opaque so
+ * approval callers fail closed instead of silently trusting uninspected code. */
+export function expandLiteralShellCommands(
+  command: string,
+  maxDepth = MAX_LITERAL_SHELL_UNWRAP_DEPTH,
+): LiteralShellCommandExpansion {
+  const depthLimit = Math.max(0, Math.min(Math.trunc(maxDepth), MAX_LITERAL_SHELL_UNWRAP_DEPTH));
+  const commands: string[] = [];
+  const seen = new Set<string>();
+  const queue: Array<{ command: string; depth: number }> = [{ command, depth: 0 }];
+  let hasOpaqueShellWrapper = false;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (seen.has(current.command)) continue;
+    seen.add(current.command);
+    commands.push(current.command);
+    const nested = shellPayloads(current.command);
+    hasOpaqueShellWrapper ||= nested.opaque;
+    if (current.depth >= depthLimit) {
+      if (nested.literal.length > 0) hasOpaqueShellWrapper = true;
+      continue;
+    }
+    for (const literal of nested.literal) queue.push({ command: literal, depth: current.depth + 1 });
+  }
+  return { commands, hasOpaqueShellWrapper };
+}
+
 /** Tokenize a command segment on whitespace, stripping surrounding quotes. */
 function tokenize(segment: string): string[] {
   return segment
@@ -154,7 +534,7 @@ function effectiveCommand(tokens: string[], idx: number): { binary: string | und
  * Explicit-destination detection runs against the RAW command (a
  * `--site` inside quotes is still an explicit target).
  */
-export function classifyShellCommand(command: string): ShellWriteShape {
+function classifyOneShellCommand(command: string): ShellWriteShape {
   if (!command || typeof command !== 'string') {
     return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
   }
@@ -200,6 +580,17 @@ export function classifyShellCommand(command: string): ShellWriteShape {
   // an unrelated quoted string can't trip this (isPublish would be false).
   const isProdRaw = isProd || /(?:^|[\s"'=])--(prod|production)\b/i.test(command);
   return { isPublish: true, verb, binary, hasExplicitDestination, isProd: isProdRaw };
+}
+
+export function classifyShellCommand(command: string): ShellWriteShape {
+  if (!command || typeof command !== 'string') {
+    return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
+  }
+  for (const candidate of expandLiteralShellCommands(command).commands) {
+    const shape = classifyOneShellCommand(candidate);
+    if (shape.isPublish) return shape;
+  }
+  return { isPublish: false, verb: undefined, binary: undefined, hasExplicitDestination: false, isProd: false };
 }
 
 export interface DestinationGateResult {
@@ -283,8 +674,22 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
     case 'gh':
       return /^\s*api\b[\s\S]*\s(-x|--method)\s*(post|put|patch|delete)\b/i.test(rest)
         || /^\s*(pr|issue|release|gist|repo|secret|workflow)\s+(create|edit|delete|merge|close|comment|upload|set|run|dispatch)\b/i.test(rest);
+    case 'git':
+      return /^\s*push\b/i.test(rest);
+    case 'netlify':
+      return /^\s*deploy\b/i.test(rest)
+        || /^\s*sites?:(create|delete|update)\b/i.test(rest)
+        || /^\s*api\s+(create|update|delete)/i.test(rest);
+    case 'vercel':
+      return /^\s*(deploy|remove|alias|domains?)\b/i.test(rest) || /\s--prod(?:uction)?\b/i.test(rest);
+    case 'firebase':
+      return /^\s*(deploy|hosting:(clone|disable)|functions:delete)\b/i.test(rest);
+    case 'npm':
+    case 'pnpm':
+    case 'yarn':
+      return /^\s*(publish|unpublish|deprecate|dist-tag\s+(add|rm))\b/i.test(rest);
     case 'sf':
-      return /^\s*data\s+(update|insert|delete|upsert|import|tree)\b/i.test(rest);
+      return /^\s*data\s+(create|update|insert|delete|upsert|import|tree)\b/i.test(rest);
     case 'sfdx':
       return /force:data:/i.test(rest);
     case 'sendmail':
@@ -296,7 +701,15 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
       return rest.trim().length > 0; // `mail -s … addr` (a bare interactive `mail` has no args)
     case 'aws':
       return /^\s*s3\s+(cp|sync|mv)\b[\s\S]*\ss3:\/\//i.test(rest)
-        || /^\s*s3api\s+(put|delete|copy)-/i.test(rest);
+        || /^\s*s3api\s+(put|delete|copy)-/i.test(rest)
+        || /^\s*\S+\s+(create|update|put|delete|terminate|deregister|associate|disassociate|enable|disable|attach|detach|start|stop|reboot|run-instances|publish|send)\b/i.test(rest);
+    case 'docker':
+      return /^\s*push\b/i.test(rest);
+    case 'kubectl':
+      return /^\s*(apply|create|delete|edit|patch|replace|rollout|scale|cordon|drain|run)\b/i.test(rest);
+    case 'terraform':
+    case 'tofu':
+      return /^\s*(apply|destroy|import)\b/i.test(rest) || /^\s*state\s+(rm|mv|push)\b/i.test(rest);
     case 'stripe':
       return /\b(create|charge|payments?|refund)\b/i.test(rest);
     case 'twilio':
@@ -314,7 +727,7 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
  * anchored, quote-stripped: scans each `&&`/`||`/`;`/`|` segment, finds the
  * command binary (skipping env-assigns / sudo / `npx` wrappers), and tests it + its args.
  */
-export function classifyShellNetworkMutation(command: string): ShellNetworkMutation {
+function classifyOneShellNetworkMutation(command: string): ShellNetworkMutation {
   if (!command || typeof command !== 'string') return { isNetworkMutation: false };
   const unquoted = command.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
   for (const segment of shellSegments(unquoted)) {
@@ -329,6 +742,15 @@ export function classifyShellNetworkMutation(command: string): ShellNetworkMutat
     if (binaryIsNetworkMutation(binary, rest)) {
       return { isNetworkMutation: true, shapeKey: `shell:${binary}` };
     }
+  }
+  return { isNetworkMutation: false };
+}
+
+export function classifyShellNetworkMutation(command: string): ShellNetworkMutation {
+  if (!command || typeof command !== 'string') return { isNetworkMutation: false };
+  for (const candidate of expandLiteralShellCommands(command).commands) {
+    const mutation = classifyOneShellNetworkMutation(candidate);
+    if (mutation.isNetworkMutation) return mutation;
   }
   return { isNetworkMutation: false };
 }

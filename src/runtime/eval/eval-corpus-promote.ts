@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { listEvents, type EventRow } from '../harness/eventlog.js';
+import { projectCanonicalTopLevelToolEvents } from '../harness/tool-effect.js';
 import { toGenAiSpans, type GenAiSpan } from './otel-spans.js';
 
 export interface PendingEvalCase {
@@ -63,7 +64,7 @@ export function buildFailureCase(sessionId: string, events: EventRow[]): Pending
     capturedAt: last?.createdAt ?? '',
     failureKinds: [...kinds],
     spans: toGenAiSpans(events),
-    toolCount: events.filter((e) => e.type === 'tool_called').length,
+    toolCount: projectCanonicalTopLevelToolEvents(events, 'tool_called').length,
     promoted: false,
   };
 }

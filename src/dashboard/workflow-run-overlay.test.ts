@@ -104,7 +104,8 @@ test('buildWorkflowRunGraphOverlay joins harness evidence for tools, models, wor
       status: 'completed',
       events: [
         { type: 'worker_model_routed', data: { modelId: 'claude-opus-4-8', provider: 'claude', routeKind: 'intent' } },
-        { type: 'tool_called', data: { tool: 'GITHUB_CREATE_PULL_REQUEST' } },
+        { type: 'tool_called', data: { tool: 'GITHUB_CREATE_PULL_REQUEST', callId: 'toolu-pr', accounting: 'top_level' } },
+        { type: 'tool_called', data: { tool: 'GITHUB_CREATE_PULL_REQUEST', callId: 'mcp-pr', accounting: 'transport_mirror' } },
         { type: 'worker_result', data: { ok: true, model: 'claude-opus-4-8', toolUses: 3 } },
         { type: 'worker_result', data: { ok: false, model: 'gpt-5-codex', toolUses: 1 } },
         { type: 'worker_capped', data: { maxTurns: 12 } },

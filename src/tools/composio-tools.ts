@@ -5,7 +5,7 @@ import { tool, type Tool } from '@openai/agents';
 import { BASE_DIR } from '../config.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
-import { classifyTool, needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
+import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
   getComposioCredentialStatus,
@@ -52,6 +52,7 @@ import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { sessionHasBackgroundOffer } from '../runtime/harness/convergence-steer.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
+import { composioSlugIsReadOnly } from '../integrations/composio/slug-effect.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
 import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
 import { recordExecution } from '../runtime/graceful-degradation-engine.js';
@@ -59,6 +60,7 @@ import {
   suppressConnectionAfterHardAuthFailure,
   type ComposioConnectionSuppressionState,
 } from '../agents/composio-connection-suppression.js';
+import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -100,9 +102,9 @@ export const COMPOSIO_EXECUTE_TOOL_PARAMS = {
 
 type SuppressedConnectedToolkit = ConnectedToolkit & { suppression: { reason?: string; suppressUntil: string } };
 
-// Composio slug → ToolKind classification lives in agents/tool-taxonomy.ts
-// (classifyComposioSlug). The previous ad-hoc READ_ONLY_PREFIXES /
-// MUTATING_WORDS heuristic was deleted along with composioToolNeedsApproval.
+// Composio slug effects live in integrations/composio/slug-effect.ts. Approval,
+// retries, connection repair, and runtime guardrails all consume that one pure
+// classifier so a provider action cannot change meaning between layers.
 
 export interface FormatComposioToolOutputOptions {
   context?: unknown;
@@ -471,6 +473,30 @@ export function composioThrownErrorOutput(
   return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, notConnected, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
 }
 
+/** A remote mutation that threw after dispatch may already have committed.
+ * Retrying it on a timeout/5xx can duplicate a document, message, event, or
+ * record. Keep this corrective distinct from the read-safe transient copy: the
+ * next action is verification/read-back, never blind replay. */
+export function composioUncertainMutationOutput(
+  err: unknown,
+  options: FormatComposioToolOutputOptions = {},
+): string {
+  const rawMessage = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
+  const message = enrichComposioErrorMessage(err, rawMessage).replace(/\s+/g, ' ').trim();
+  const label = options.toolSlug || options.toolName || 'Composio mutation';
+  const body = formatComposioToolOutput({
+    error: message || 'unknown provider error',
+    toolSlug: options.toolSlug ?? null,
+    dispatch: 'uncertain',
+  }, options);
+  return [
+    '[provider-dispatch:uncertain]',
+    `⚠️ ${label} returned an ambiguous error after dispatch may have started. The external change MAY already exist.`,
+    'Do NOT repeat this mutation. Verify with the matching list/get/search action and reuse or repair the existing resource. If verification is impossible, tell the user the outcome is uncertain.',
+    body,
+  ].join('\n\n');
+}
+
 /** Run a Composio execution and format BOTH outcomes through the corrective
  *  path: returned error envelopes and thrown errors. */
 // ─── Ever-learning: tool choices memorize THEMSELVES (north-star contract) ──
@@ -814,6 +840,15 @@ export function normalizeInlineConnectedAccountId(
   }
   delete args.connected_account_id;
   delete args.connectedAccountId;
+  // Clementine-only artifact transaction keys select an intentional output
+  // slot (for example `proposal` and `appendix`) but are not provider fields.
+  // The harness reads them before dispatch; never leak them into a Composio
+  // schema where they would turn a legitimate multi-document request into an
+  // invalid-arguments failure.
+  delete args.artifact_key;
+  delete args.artifactKey;
+  delete args.output_key;
+  delete args.outputKey;
   return { args, connectedAccountId: effectiveConnectionId };
 }
 
@@ -831,7 +866,7 @@ export function applySuppressedComposioConnectionPolicy(
 
   const reason = suppression.reason ?? 'suppressed';
   const toolkit = toolkitOfSlug(toolSlug).toUpperCase();
-  const mutating = classifyTool('composio_execute_tool', { args: { tool_slug: toolSlug } }) !== 'read';
+  const mutating = classifyComposioSlugEffect(toolSlug) !== 'read';
   if (mutating) {
     return {
       connectedAccountId,
@@ -1389,16 +1424,32 @@ async function runComposioExecute(
   args: Record<string, unknown>,
   connectedAccountId: string | undefined,
   options: FormatComposioToolOutputOptions,
+  hooks: {
+    execute?: typeof executeComposioTool;
+    delay?: (ms: number) => Promise<void>;
+    skipGateway?: boolean;
+  } = {},
 ): Promise<string> {
   const runSid = sessionIdFromRunContext(options.context);
+  const dispatch = hooks.execute ?? executeComposioTool;
+  const wait = hooks.delay ?? delayMs;
 
   // THE gateway: owner-first resolution + typed blocks (ledgered). A block is
   // returned verbatim as the tool output — deterministic, zero dispatch.
-  const resolved = await resolveComposioDispatch(toolSlug, args, connectedAccountId, {
-    sessionId: runSid,
-    userInput: latestUserInputForContext(options.context),
-  });
-  if (!resolved.ok) return resolved.message;
+  const resolved: ComposioGatewayResolution = hooks.skipGateway
+    ? { ok: true, args, connectionId: connectedAccountId, senderVerified: false, notes: [] }
+    : await resolveComposioDispatch(toolSlug, args, connectedAccountId, {
+      sessionId: runSid,
+      userInput: latestUserInputForContext(options.context),
+    });
+  if (!resolved.ok) {
+    // Machine-readable proof for the artifact transaction wrapper: every
+    // gateway block above happens before executeComposioTool, so a pending
+    // create claim may be safely released and retried with corrected input.
+    // Do not use this marker for provider errors/timeouts; those may have
+    // crossed the write boundary and must remain uncertain.
+    return `[provider-dispatch:not-started:${resolved.reason}]\n${resolved.message}`;
+  }
   args = resolved.args;
   const effectiveConnectionId = resolved.connectionId;
   let accountRouteNote = resolved.notes.join('\n');
@@ -1411,11 +1462,14 @@ async function runComposioExecute(
 
   const recentErrors: string[] = [];
   let lastError: unknown;
+  // Reads are safe to retry after ambiguous transport failures. Mutations are
+  // not: a timeout/5xx can arrive after the provider committed the change.
+  const maxDispatchAttempts = composioSlugIsReadOnly(toolSlug) ? 3 : 1;
 
   // Retry loop with exponential backoff for transient errors
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= maxDispatchAttempts; attempt++) {
     try {
-      const result = await executeComposioTool(toolSlug, args, effectiveConnectionId);
+      const result = await dispatch(toolSlug, args, effectiveConnectionId);
       let output = formatComposioExecuteOutput(result, { ...options, toolSlug });
       if (gate.routeConnectedAccountId) {
         output += `\n\n[sender-verify] Routed to connection ${gate.routeConnectedAccountId} — its mailbox verified against the standing sender rule.`;
@@ -1467,7 +1521,7 @@ async function runComposioExecute(
           // moving); when false it blocks the full budget (better than losing the result).
           const poll = await autoPollJob(
             receipt,
-            (slug, a) => executeComposioTool(slug, a, effectiveConnectionId),
+            (slug, a) => dispatch(slug, a, effectiveConnectionId),
             { parkAvailable: Boolean(sid) },
           );
           const reason = poll.reason ?? '';
@@ -1508,7 +1562,7 @@ async function runComposioExecute(
                 // would otherwise sit in the watcher heartbeating for 60min
                 // before blocking — the banner is more honest). The resolved
                 // slug rides into the record so the watcher never re-discovers.
-                const plan = await resolveJobGetter(receipt, (slug, a) => executeComposioTool(slug, a, effectiveConnectionId));
+                const plan = await resolveJobGetter(receipt, (slug, a) => dispatch(slug, a, effectiveConnectionId));
                 if (plan) {
                   parked = parkComposioJob(
                     {
@@ -1594,6 +1648,10 @@ async function runComposioExecute(
           + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
       }
 
+      if (!composioSlugIsReadOnly(toolSlug)) {
+        return composioUncertainMutationOutput(err, { ...options, toolSlug });
+      }
+
       // Check if we should retry
       const decision = shouldRetryToolCall(err, attempt, recentErrors);
       if (!decision.shouldRetry) {
@@ -1603,14 +1661,29 @@ async function runComposioExecute(
       }
 
       // Transient error: wait and retry
-      if (attempt < 3) {
-        await delayMs(decision.delayMs);
+      if (attempt < maxDispatchAttempts) {
+        await wait(decision.delayMs);
       }
     }
   }
 
   // Max retries exhausted: return last error
   return composioThrownErrorOutput(lastError, { ...options, toolSlug });
+}
+
+/** Narrow dispatch harness for the ambiguity regression test. It deliberately
+ * bypasses account resolution (which is proven pre-dispatch) and exercises the
+ * same production retry loop with an injected provider executor. */
+export function runComposioExecuteForTest(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  execute: typeof executeComposioTool,
+): Promise<string> {
+  return runComposioExecute(toolSlug, args, undefined, { toolName: 'composio_execute_tool', toolSlug }, {
+    execute,
+    delay: async () => {},
+    skipGateway: true,
+  });
 }
 
 function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {

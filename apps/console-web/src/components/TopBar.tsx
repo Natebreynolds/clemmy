@@ -1,4 +1,4 @@
-import { PanelLeftClose, PanelLeft, Search, Mic } from 'lucide-react';
+import { Activity, PanelLeftClose, PanelLeft, Search, Mic } from 'lucide-react';
 import { Button } from './ui/Button';
 import { ThemeToggle } from './ThemeToggle';
 import { HealthIndicator } from './HealthIndicator';
@@ -11,10 +11,16 @@ export function TopBar({
   title,
   onToggleSidebar,
   sidebarCollapsed,
+  runEnvironmentOpen,
+  liveRunCount,
+  onToggleRunEnvironment,
 }: {
   title: string;
   onToggleSidebar: () => void;
   sidebarCollapsed: boolean;
+  runEnvironmentOpen: boolean;
+  liveRunCount: number;
+  onToggleRunEnvironment: () => void;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
   const openVoice = () => window.dispatchEvent(new Event('clem:open-voice'));
@@ -53,6 +59,26 @@ export function TopBar({
 
         <HealthIndicator />
         <ThemeToggle />
+
+        <Button
+          variant={runEnvironmentOpen ? 'secondary' : 'ghost'}
+          size="sm"
+          onClick={onToggleRunEnvironment}
+          aria-pressed={runEnvironmentOpen}
+          aria-expanded={runEnvironmentOpen}
+          aria-controls="run-environment-panel"
+          aria-label={liveRunCount > 0 ? `Run environment, ${liveRunCount} active` : 'Run environment'}
+          title="Plan, helpers, tools, and verified outputs"
+          className="relative gap-2"
+        >
+          <Activity className="h-4 w-4" aria-hidden />
+          <span className="hidden lg:inline">Run</span>
+          {liveRunCount > 0 && (
+            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
+              {liveRunCount > 99 ? '99+' : liveRunCount}
+            </span>
+          )}
+        </Button>
 
         <Button size="sm" onClick={openVoice} className="gap-2">
           <Mic className="h-4 w-4" aria-hidden />

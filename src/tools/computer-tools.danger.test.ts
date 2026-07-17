@@ -58,3 +58,38 @@ test('G6: Salesforce data/org MUTATIONS still require approval (no under-gating)
     assert.equal(shellCommandNeedsApproval(cmd), true, `should gate: ${cmd}`);
   }
 });
+
+test('literal nested shell mutations require approval while nested reads/builds stay productive', () => {
+  for (const cmd of [
+    "bash -lc 'curl -X POST https://api.example.com/send -d x=1'",
+    `sh -c "git push origin main"`,
+    `zsh -lc "bash -c 'rm -rf dist'"`,
+    `bash -lc "$RUNTIME_COMMAND"`,
+    `env FOO=x bash -lc "curl -X POST https://api.example.com/send -d x=1"`,
+    `/usr/bin/env -i sh -c "git push origin main"`,
+    `command bash -c "rm -rf dist"`,
+    `env -S "bash -lc 'curl -X POST https://api.example.com/send -d x=1'"`,
+    `exec bash -c "curl -X POST https://api.example.com/send -d x=1"`,
+    `nohup bash -c "curl -X POST https://api.example.com/send -d x=1"`,
+    `nice sh -c "git push origin main"`,
+    `timeout 30s bash -c "rm -rf dist"`,
+    `time bash -c "curl -X POST https://api.example.com/send -d x=1"`,
+    `sudo bash -c "curl -X POST https://api.example.com/send -d x=1"`,
+  ]) {
+    assert.equal(shellCommandNeedsApproval(cmd), true, `should gate nested/opaque execution: ${cmd}`);
+  }
+  for (const cmd of [
+    "bash -lc 'npm test -- --runInBand'",
+    `zsh -c "npx tsc --noEmit"`,
+    `sh -lc "ffmpeg -i a.mov b.mp4"`,
+    `env NODE_ENV=test bash -lc "npm test -- --runInBand"`,
+    `command zsh -c "npx tsc --noEmit"`,
+    `timeout 30s bash -c "npx tsc --noEmit"`,
+    `time -p bash -c "npm test -- --runInBand"`,
+    `nice bash -c "ffmpeg -i a.mov b.mp4"`,
+    `echo "bash -lc 'curl -X POST https://example.com -d x=1'"`,
+    `echo "env FOO=x bash -lc 'curl -X POST https://example.com -d x=1'"`,
+  ]) {
+    assert.equal(shellCommandNeedsApproval(cmd), false, `should preserve nested productive work/data: ${cmd}`);
+  }
+});

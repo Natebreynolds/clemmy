@@ -1,8 +1,18 @@
 import { useCallback, useRef, useState } from 'react';
-import { postChat, runHarnessStream, watchForLateCompletion, cancelSession, humanHarnessText, type StreamHandle } from './chat';
-import { apiPost, type ApiError } from './api';
+import {
+  createChatClientRequestId,
+  postChat,
+  runHarnessStream,
+  watchForLateCompletion,
+  cancelSession,
+  cancelPendingChatRequest,
+  moveSessionToBackground,
+  humanHarnessText,
+  type StreamHandle,
+} from './chat';
+import { type ApiError } from './api';
 import { humanToolLabel, salientArgDetail } from './toolLabels';
-import type { HarnessEvent, PendingActionApprovalView } from './types';
+import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
 // Re-exported for callers that historically imported it from here.
 export { salientArgDetail };
@@ -69,6 +79,121 @@ function providerFor(d: Record<string, unknown>, model: string): ActivityItem['p
 }
 
 const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
+
+export interface PendingChatPost {
+  fingerprint: string;
+  clientRequestId: string;
+  input: string;
+  sessionId: string | null;
+  attachments: string[];
+}
+
+export class ChatPostCancelledError extends Error {
+  constructor(readonly acceptedLate = false) {
+    super(acceptedLate ? 'Chat request was accepted after it was stopped.' : 'Chat request was stopped.');
+    this.name = 'AbortError';
+  }
+}
+
+function isChatPostCancelledError(error: unknown): error is ChatPostCancelledError {
+  return error instanceof ChatPostCancelledError
+    || (error instanceof Error && error.name === 'AbortError');
+}
+
+function throwIfChatPostCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ChatPostCancelledError();
+}
+
+/** Keep one request identity until its 202 is observed. If the daemon accepted
+ * the first POST but the browser lost that response, an automatic or explicit
+ * resend of the same turn replays the durable receipt instead of starting a
+ * second model/tool run. */
+export function retainPendingChatPost(
+  previous: PendingChatPost | null,
+  payload: { input: string; sessionId: string | null; attachments: string[] },
+  createId: () => string = createChatClientRequestId,
+): PendingChatPost {
+  const fingerprint = JSON.stringify([payload.sessionId ?? '', payload.input, payload.attachments]);
+  if (previous?.fingerprint === fingerprint) return previous;
+  return {
+    fingerprint,
+    clientRequestId: createId(),
+    input: payload.input,
+    sessionId: payload.sessionId,
+    attachments: [...payload.attachments],
+  };
+}
+
+function isRetryableChatPostError(error: unknown): boolean {
+  const status = Number((error as Partial<ApiError> | null)?.status);
+  return status === 0 || status >= 500 || (!Number.isFinite(status) && error instanceof TypeError);
+}
+
+/** Bounded transport recovery only. Every attempt carries the exact same
+ * request id; the server's durable receipt makes these retries side-effect
+ * free. The retained ref also survives beyond this budget for a manual resend. */
+export async function postPendingChatWithRetry(
+  pending: PendingChatPost,
+  options: {
+    retryDelaysMs?: number[];
+    transport?: typeof postChat;
+    wait?: (ms: number) => Promise<void>;
+    signal?: AbortSignal;
+    /** A POST can cross the server boundary just before Stop wins locally.
+     * The acknowledgement still carries the authoritative session id, so
+     * cancel it before rejecting and never return a streamable result. */
+    onLateAccepted?: (result: ChatPostResult) => Promise<void> | void;
+  } = {},
+): Promise<ChatPostResult> {
+  const retryDelaysMs = options.retryDelaysMs ?? [500, 1_500, 3_500, 7_500];
+  const transport = options.transport ?? postChat;
+  const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const waitForRetry = async (ms: number): Promise<void> => {
+    throwIfChatPostCancelled(options.signal);
+    if (!options.signal) {
+      await wait(ms);
+      return;
+    }
+    const signal = options.signal;
+    let onAbort: (() => void) | null = null;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new ChatPostCancelledError());
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      await Promise.race([wait(ms), aborted]);
+      throwIfChatPostCancelled(signal);
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+    }
+  };
+  let attempt = 0;
+  while (true) {
+    throwIfChatPostCancelled(options.signal);
+    try {
+      const result = await transport(
+        pending.input,
+        pending.sessionId,
+        pending.attachments,
+        pending.clientRequestId,
+      );
+      if (options.signal?.aborted) {
+        try {
+          await options.onLateAccepted?.(result);
+        } finally {
+          throw new ChatPostCancelledError(true);
+        }
+      }
+      return result;
+    } catch (error) {
+      if (isChatPostCancelledError(error)) throw error;
+      throwIfChatPostCancelled(options.signal);
+      if (!isRetryableChatPostError(error) || attempt >= retryDelaysMs.length) throw error;
+      await waitForRetry(retryDelaysMs[attempt]);
+      attempt += 1;
+    }
+  }
+}
 
 /** A backend error string is unsafe to show raw when it's a stack trace, a
  *  transport code, embedded JSON, or just very long — swap those for a calm line. */
@@ -274,6 +399,11 @@ export function useChat(options?: UseChatOptions) {
   const streamRef = useRef<StreamHandle | null>(null);
   const activeAssistantId = useRef<string | null>(null);
   const lateWatchRef = useRef<{ cancel: () => void } | null>(null);
+  const pendingPostRef = useRef<PendingChatPost | null>(null);
+  const postAbortRef = useRef<AbortController | null>(null);
+  const activeRunRef = useRef<ChatPostResult | null>(null);
+  const pendingBackgroundRef = useRef<{ assistantId: string } | null>(null);
+  const backgroundInFlightRef = useRef(false);
 
   const patch = useCallback((id: string, fields: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
@@ -340,6 +470,37 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
+  const handoffAcceptedRun = useCallback(async (
+    accepted: ChatPostResult,
+    assistantId: string,
+  ): Promise<boolean> => {
+    if (backgroundInFlightRef.current) return false;
+    backgroundInFlightRef.current = true;
+    patch(assistantId, { progress: 'Moving this exact run to the background…' });
+    try {
+      const out = await moveSessionToBackground(accepted);
+      // End only this foreground view after the server durably confirms the
+      // replacement task. A failed/stale handoff leaves the stream attached.
+      streamRef.current?.stop();
+      streamRef.current = null;
+      if (activeRunRef.current === accepted) activeRunRef.current = null;
+      patch(assistantId, {
+        status: 'complete',
+        progress: undefined,
+        text: out.text || 'Moved to the background — it will report back here.',
+      });
+      setBusy(false);
+      return true;
+    } catch {
+      patch(assistantId, {
+        progress: 'The background handoff was not confirmed, so this run is still working here.',
+      });
+      return false;
+    } finally {
+      backgroundInFlightRef.current = false;
+    }
+  }, [patch]);
+
   const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[] }) => {
     const text = input.text.trim();
     const attachmentIds = input.attachmentIds ?? [];
@@ -352,6 +513,11 @@ export function useChat(options?: UseChatOptions) {
     // from a previous stopped turn would misattribute this turn's events.
     lateWatchRef.current?.cancel();
     lateWatchRef.current = null;
+    // Do not carry a reusable session's prior attempt into this turn. If Stop
+    // wins before the new 202 arrives, onLateAccepted will cancel the exact
+    // attempt from that acknowledgement instead of guessing by session id.
+    activeRunRef.current = null;
+    pendingBackgroundRef.current = null;
     activeAssistantId.current = assistantId;
     setMessages((prev) => [
       ...prev,
@@ -360,9 +526,40 @@ export function useChat(options?: UseChatOptions) {
     ]);
     setBusy(true);
 
+    const postAbort = new AbortController();
+    postAbortRef.current = postAbort;
+
     try {
-      const body = await postChat(text, sessionIdRef.current, attachmentIds);
+      const pending = retainPendingChatPost(pendingPostRef.current, {
+        input: text,
+        sessionId: sessionIdRef.current,
+        attachments: attachmentIds,
+      });
+      pendingPostRef.current = pending;
+      const body = await postPendingChatWithRetry(pending, {
+        signal: postAbort.signal,
+        onLateAccepted: async (accepted) => {
+          // Stop won locally while the POST was crossing the daemon boundary.
+          // Use the late acknowledgement to kill that exact durable session,
+          // but never attach its stream or revive the stopped chat bubble.
+          if (postAbortRef.current === postAbort) sessionIdRef.current = accepted.sessionId;
+          const confirmed = await cancelSession(accepted);
+          if (confirmed && pendingPostRef.current === pending) pendingPostRef.current = null;
+        },
+      });
+      // Only observing the server's 202 proves this turn identity is safely
+      // bound. Until then it remains reusable for an explicit resend.
+      if (pendingPostRef.current === pending) pendingPostRef.current = null;
       sessionIdRef.current = body.sessionId;
+      activeRunRef.current = body;
+      // The background button is available immediately for responsiveness,
+      // but authority arrives only in the 202. Queue an early click and apply
+      // it to THIS acknowledgement rather than guessing from the session id.
+      const pendingBackground = pendingBackgroundRef.current as { assistantId: string } | null;
+      if (pendingBackground?.assistantId === assistantId) {
+        pendingBackgroundRef.current = null;
+        if (await handoffAcceptedRun(body, assistantId)) return;
+      }
       const handle = runHarnessStream(body.sessionId, {
         sinceSeq: body.sinceSeq ?? 0,
         onEvent: (ev) => applyEvent(assistantId, ev),
@@ -384,27 +581,70 @@ export function useChat(options?: UseChatOptions) {
         lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev));
       }
     } catch (err) {
+      if (isChatPostCancelledError(err)) return;
       const e = err as ApiError;
+      // Validation/conflict errors prove the server did not accept this exact
+      // request. Transport/restart failures retain it for a safe replay.
+      if (!isRetryableChatPostError(e) && postAbortRef.current === postAbort) pendingPostRef.current = null;
       if (e.status === 404) sessionIdRef.current = null;
       const msg = (e.message || '').trim();
       const text = !msg || looksRawError(msg) ? GENERIC_TURN_ERROR : `Couldn't send: ${msg}`;
       patch(assistantId, { text, status: 'failed', progress: undefined });
     } finally {
-      activeAssistantId.current = null;
-      setBusy(false);
+      // A stopped POST can finish after the user has already started another
+      // turn. Never let the stale promise clear the newer turn's controller,
+      // active bubble, or busy state.
+      if (postAbortRef.current === postAbort) {
+        postAbortRef.current = null;
+        if (activeAssistantId.current === assistantId) activeAssistantId.current = null;
+        setBusy(false);
+      }
+      const pendingBackground = pendingBackgroundRef.current as { assistantId: string } | null;
+      if (pendingBackground?.assistantId === assistantId) pendingBackgroundRef.current = null;
     }
-  }, [busy, applyEvent, patch]);
+  }, [busy, applyEvent, handoffAcceptedRun, patch]);
 
   const stop = useCallback(() => {
-    const sid = sessionIdRef.current;
     const aid = activeAssistantId.current;
+    const accepted = activeRunRef.current;
+    const pending = pendingPostRef.current;
+    pendingBackgroundRef.current = null;
+    postAbortRef.current?.abort();
     streamRef.current?.stop();
     streamRef.current = null;
     // Stopping before any text streamed in otherwise leaves an empty bubble.
     if (aid) setMessages((prev) => prev.map((m) => (m.id === aid
       ? { ...m, status: 'stopped', progress: undefined, text: m.text.trim() ? m.text : 'Stopped.' }
       : m)));
-    if (sid) void cancelSession(sid);
+    if (accepted) {
+      void cancelSession(accepted).then((confirmed) => {
+        if (confirmed || !aid) return;
+        setMessages((prev) => prev.map((m) => (m.id === aid
+          ? {
+              ...m,
+              status: 'failed',
+              progress: undefined,
+              text: 'Stop closed this view, but the server did not confirm that the exact run attempt was cancelled. Open Run Environment to check it before retrying.',
+            }
+          : m)));
+      });
+    } else if (pending) {
+      // Stop may win before the 202 carries an attempt id. Persist a negative
+      // receipt under the client request id; do not discard that identity until
+      // the server confirms it can never execute later.
+      void cancelPendingChatRequest(pending.clientRequestId).then((confirmed) => {
+        if (confirmed && pendingPostRef.current === pending) pendingPostRef.current = null;
+        if (confirmed || !aid) return;
+        setMessages((prev) => prev.map((m) => (m.id === aid
+          ? {
+              ...m,
+              status: 'failed',
+              progress: undefined,
+              text: 'Stop closed this view, but Clementine could not record the server-side cancellation. Open Run Environment to check it before retrying.',
+            }
+          : m)));
+      });
+    }
     setBusy(false);
   }, []);
 
@@ -413,28 +653,31 @@ export function useChat(options?: UseChatOptions) {
    *  foreground left off and reports back to this chat. The foreground bubble
    *  closes honestly with the handoff message instead of "Stopped." */
   const background = useCallback(async () => {
-    const sid = sessionIdRef.current;
     const aid = activeAssistantId.current;
-    if (!sid) return;
-    try {
-      const out = await apiPost<{ ok: boolean; taskId: string; text: string }>(
-        `/api/console/harness-sessions/${encodeURIComponent(sid)}/background`, {});
-      streamRef.current?.stop();
-      streamRef.current = null;
-      if (aid) setMessages((prev) => prev.map((m) => (m.id === aid
-        ? { ...m, status: 'complete', progress: undefined, text: out.text || 'Moved to the background — it will report back here.' }
-        : m)));
-      setBusy(false);
-    } catch {
-      // Nothing detachable (turn already finishing) — leave the run alone.
+    if (!aid || backgroundInFlightRef.current) return;
+    const accepted = activeRunRef.current;
+    if (accepted) {
+      await handoffAcceptedRun(accepted, aid);
+      return;
     }
-  }, []);
+    // The POST has not returned its exact attempt yet. Remember intent and let
+    // send() execute it against that acknowledgement before attaching SSE.
+    if (postAbortRef.current) {
+      pendingBackgroundRef.current = { assistantId: aid };
+      patch(aid, { progress: 'Waiting for this run’s identity, then moving it to the background…' });
+    }
+  }, [handoffAcceptedRun, patch]);
 
   const reset = useCallback(() => {
+    postAbortRef.current?.abort();
+    postAbortRef.current = null;
     streamRef.current?.stop();
     streamRef.current = null;
     activeAssistantId.current = null;
     sessionIdRef.current = null;
+    pendingPostRef.current = null;
+    pendingBackgroundRef.current = null;
+    activeRunRef.current = null;
     setMessages([]);
     setBusy(false);
   }, []);

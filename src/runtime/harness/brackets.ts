@@ -1,7 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput } from './eventlog.js';
-import { backgroundOfferEnabled as spineBackgroundOfferEnabled } from './turn-control.js';
+import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput, type KillRequestTarget } from './eventlog.js';
+import {
+  backgroundOfferEnabled as spineBackgroundOfferEnabled,
+  effectiveTurnObjective,
+  preflightGateVerdict,
+  PreflightAlignmentRequiredError,
+} from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
@@ -59,6 +64,22 @@ import {
   asyncJobTimeoutCorrective,
   writeJobTimeoutCorrective,
 } from './tool-error-corrective.js';
+import {
+  artifactIntentForTool,
+  artifactObjectiveForRunScope,
+  artifactOutputProvesNoDispatch,
+  artifactReuseMessage,
+  artifactVerificationIntentForTool,
+  bindClaimedArtifact,
+  claimArtifactSlot,
+  extractArtifactResource,
+  markClaimedArtifactUncertain,
+  releaseClaimedArtifact,
+  resolveArtifactRunScopeId,
+  scopeArtifactIntentForObjective,
+  verifyArtifactBindingFromToolResult,
+  type ArtifactIntent,
+} from './artifact-ledger.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -119,8 +140,8 @@ export class TokenBudgetExceeded extends Error {
 }
 
 /** Throws `KillRequested` if the kill_switches table has a row for sessionId. */
-export function assertNotKilled(sessionId: string): void {
-  if (isKillRequested(sessionId)) {
+export function assertNotKilled(sessionId: string, target?: KillRequestTarget): void {
+  if (isKillRequested(sessionId, target)) {
     throw new KillRequested(sessionId);
   }
 }
@@ -702,6 +723,9 @@ export class RecallBudget {
 export interface HarnessRunContext {
   sessionId: string;
   counter: ToolCallsCounter;
+  /** Exact accepted user event for this attempt. Deterministic preflight gates
+   * must not consult whichever session input happens to be newest. */
+  sourceUserSeq?: number;
   /** One active model/tool run; loop/discovery counters key here so a long-lived
    * chat session does not accumulate unrelated calls across user turns. */
   behaviorScopeId?: string;
@@ -1236,6 +1260,26 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const hasExecute = typeof tool.execute === 'function';
   if (!hasInvoke && !hasExecute) return tool; // pure declaration; nothing to wrap
 
+  type ArtifactDispatch = {
+    sessionId: string;
+    runScopeId: string;
+    artifactId: string;
+    intent: ArtifactIntent;
+    callId?: string;
+  };
+  type ArtifactAdmission = { dispatch?: ArtifactDispatch; deny?: string };
+
+  /** Internal control flow for a durable duplicate-artifact refusal. It stays
+   *  separate from the generic soft-error rail so callers receive the existing
+   *  reuse instruction byte-for-byte, while the claim check can run before any
+   *  accounting or external-write telemetry. */
+  class ArtifactReuseDenied extends Error {
+    constructor(public readonly reuseMessage: string) {
+      super(reuseMessage);
+      this.name = 'ArtifactReuseDenied';
+    }
+  }
+
   // Returns an advisory fan-out nudge string when the guardrail detects
   // serial per-item batch work (same composio slug, N distinct args). The
   // caller APPENDS it to the tool's result so the model reads it mid-stride —
@@ -1245,11 +1289,29 @@ export function wrapToolForHarness<T extends WrappableTool>(
     sessionId: string,
     parsedInput: unknown,
     callId?: string,
+    claimBeforeAccounting?: () => ArtifactAdmission,
   ): Promise<string | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
     // 1. Kill check
-    assertNotKilled(ctx.sessionId);
+    assertNotKilled(
+      ctx.sessionId,
+      ctx.sourceUserSeq ? { sourceUserSeq: ctx.sourceUserSeq } : undefined,
+    );
+    // 1b. Typed turn preflight. Prompt prose asks for the conversational beat;
+    // this boundary makes it authoritative for every local/code-mode tool. It
+    // runs before accounting, so a refused preflight attempt does not inflate
+    // the user's tool count or burn the execution budget.
+    const preflight = preflightGateVerdict(ctx.sessionId, tool.name, parsedInput, ctx.sourceUserSeq);
+    if (preflight) throw new PreflightAlignmentRequiredError(ctx.sessionId, preflight.message);
+    // Artifact idempotency is an admission decision, not a tool attempt. Claim
+    // immediately after kill/preflight authority but BEFORE counters, loop
+    // tracking, batch accounting, and the external_write ledger. A durable
+    // existing slot therefore refuses a duplicate without pretending another
+    // provider mutation was attempted. If a later bracket refuses this newly
+    // acquired claim, the wrapper releases it before surfacing the refusal.
+    const artifactAdmission = claimBeforeAccounting?.();
+    if (artifactAdmission?.deny) throw new ArtifactReuseDenied(artifactAdmission.deny);
     // 2. Counter cap (pre-increment). The call_tool dispatcher is exempt:
     // it delegates to dispatchBatchItemTool, whose INNER tool rides this
     // same ambient counter (call-tool.ts) — charging the wrapper too would
@@ -1272,6 +1334,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
         tool.name,
         parsedInput,
         callId,
+        {
+          authoritySessionId: ctx.sessionId,
+          approvedBatch: Boolean(ctx.certifiedBatch),
+        },
       );
       const decision = applyMode(rawDecision);
       // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
@@ -2185,6 +2251,83 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       : undefined;
 
+  const claimArtifact = (
+    ctx: HarnessRunContext | undefined,
+    parsedInput: unknown,
+    callId?: string,
+  ): { dispatch?: ArtifactDispatch; deny?: string } => {
+    const sessionId = ctx?.sessionId;
+    if (!sessionId) return {};
+    const rawIntent = artifactIntentForTool(tool.name, parsedInput);
+    if (!rawIntent) return {};
+    const attemptScopeId = guardrailScopeKey(ctx);
+    const runScopeId = resolveArtifactRunScopeId(sessionId, attemptScopeId, ctx.sourceUserSeq);
+    const recordedObjective = artifactObjectiveForRunScope(sessionId, runScopeId);
+    const intent = scopeArtifactIntentForObjective(
+      rawIntent,
+      effectiveTurnObjective(sessionId, recordedObjective, ctx.sourceUserSeq),
+      parsedInput,
+    );
+    const claim = claimArtifactSlot(sessionId, intent, callId, runScopeId);
+    if (!claim.acquired) return { deny: artifactReuseMessage(claim.artifact) };
+    return { dispatch: { sessionId, runScopeId, artifactId: claim.artifact.id, intent, callId } };
+  };
+  const settleArtifact = (dispatch: ArtifactDispatch | undefined, result: unknown): void => {
+    if (!dispatch) return;
+    try {
+      if (artifactOutputProvesNoDispatch(result)) {
+        releaseClaimedArtifact(dispatch.artifactId, dispatch.callId);
+        return;
+      }
+      const resource = extractArtifactResource(dispatch.intent, result);
+      if (resource) {
+        bindClaimedArtifact(dispatch.artifactId, dispatch.callId, resource);
+      } else {
+        markClaimedArtifactUncertain(dispatch.artifactId, dispatch.callId);
+      }
+    } catch {
+      // The provider may already have created the resource. A ledger failure can
+      // never make a blind retry safe, so leave/mark the slot uncertain.
+      try { markClaimedArtifactUncertain(dispatch.artifactId, dispatch.callId); } catch { /* fail closed via durable pending claim */ }
+    }
+  };
+  const failArtifact = (dispatch: ArtifactDispatch | undefined): void => {
+    if (!dispatch) return;
+    try { markClaimedArtifactUncertain(dispatch.artifactId, dispatch.callId); } catch { /* pending claim still blocks retries */ }
+  };
+  const releaseUndispatchedArtifact = (dispatch: ArtifactDispatch | undefined): void => {
+    if (!dispatch) return;
+    try { releaseClaimedArtifact(dispatch.artifactId, dispatch.callId); } catch { /* keep the pending claim fail-closed */ }
+  };
+  const settleArtifactReadback = (
+    ctx: HarnessRunContext | undefined,
+    parsedInput: unknown,
+    result: unknown,
+    callId?: string,
+  ): void => {
+    if (!ctx?.sessionId) return;
+    // Most tool results are unrelated to durable artifacts. Classify before
+    // resolving lineage: resolveArtifactRunScopeId persists a root mapping, so
+    // calling it unconditionally made every ordinary read/build/tool result
+    // appear to participate in artifact history. Real exact-provider readbacks
+    // still resolve the root and run the strict ID-matching verifier below.
+    if (!artifactVerificationIntentForTool(tool.name, parsedInput)) return;
+    try {
+      verifyArtifactBindingFromToolResult(
+        ctx.sessionId,
+        resolveArtifactRunScopeId(ctx.sessionId, guardrailScopeKey(ctx), ctx.sourceUserSeq),
+        tool.name,
+        parsedInput,
+        result,
+        callId,
+      );
+    } catch {
+      // Verification bookkeeping is fail-closed for completion (the row stays
+      // unverified) but must never turn a successful provider read into a tool
+      // failure for the model/user.
+    }
+  };
+
   if (hasInvoke) {
     // PRODUCTION PATH — wrap SDK invoke.
     const originalInvoke = tt.invoke!;
@@ -2209,9 +2352,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
       const invokeCallId = invokeCall?.callId ?? invokeCall?.id;
       let fanoutNudge: string | undefined;
+      let artifact: ArtifactAdmission = {};
       try {
-        fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput, invokeCallId);
+        fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput, invokeCallId, () => {
+          artifact = claimArtifact(ctx, parsedInput, invokeCallId);
+          return artifact;
+        });
       } catch (err) {
+        // No provider code has run yet. A bracket refusal after acquisition is
+        // proven non-dispatch, so the slot is safe to release; a duplicate
+        // refusal acquired nothing and leaves the authoritative row untouched.
+        releaseUndispatchedArtifact(artifact.dispatch);
+        if (err instanceof ArtifactReuseDenied) return err.reuseMessage;
         // A recoverable gate throw lands as a SOFT tool error — the model sees
         // it as the tool's output and self-corrects. Throwing here would abort
         // the run because our wrap is OUTSIDE the SDK's _invoke catch. The exact
@@ -2255,10 +2407,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
             ) as Promise<unknown>)
           : invokeOnce();
       invokePromise = invokePromise.then((result) => {
+        settleArtifact(artifact.dispatch, result);
+        settleArtifactReadback(ctx, parsedInput, result, invokeCallId);
         compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result);
         recordPublishIfSucceeded(tool.name, parsedInput, result);
         creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result);
         return result;
+      }, (err) => {
+        failArtifact(artifact.dispatch);
+        throw err;
       });
       // run_worker (Agent.asTool fan-out leaf) MUST return something into the
       // orchestrator's context even on timeout. withTimeout sits OUTSIDE the
@@ -2344,9 +2501,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
     let fanoutNudge: string | undefined;
+    let artifact: ArtifactAdmission = {};
     try {
-      fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input);
+      fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input, undefined, () => {
+        artifact = claimArtifact(ctx, input);
+        return artifact;
+      });
     } catch (err) {
+      releaseUndispatchedArtifact(artifact.dispatch);
+      if (err instanceof ArtifactReuseDenied) return err.reuseMessage;
       // SAME disposition as wrappedInvoke above: a recoverable gate throw becomes
       // a soft tool error here too (this path had NO try/catch, so a typed gate
       // throw aborted the run purely because the tool used `execute` not `invoke`).
@@ -2370,6 +2533,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         },
       );
     } catch (err) {
+      failArtifact(artifact.dispatch);
       // Same general self-correction as the invoke path: a long-job timeout on an
       // external-API / MCP tool returns the async/verify corrective as the result
       // (run continues) instead of propagating ToolTimeout to the ask-user pause.
@@ -2382,6 +2546,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       }
       throw err;
     }
+    settleArtifact(artifact.dispatch, result);
+    settleArtifactReadback(ctx, input, result);
     compensateFailedExternalWrite(ctx?.sessionId, tool.name, input, result);
     recordPublishIfSucceeded(tool.name, input, result);
     creditRecallFromToolResult(ctx?.sessionId, tool.name, input, result);
@@ -2407,6 +2573,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
 export function softToolError(err: unknown): string | null {
   if (
     err instanceof MissingExecutionWrapError ||
+    err instanceof PreflightAlignmentRequiredError ||
     err instanceof ConfirmFirstRequiredError ||
     err instanceof ToolGuardrailBlocked ||
     err instanceof ToolCallsLimitExceeded ||

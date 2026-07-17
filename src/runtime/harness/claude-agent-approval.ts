@@ -200,11 +200,9 @@ export function buildGatedToolPermission(
   const fastAllow = new Set(fastAllowTools.map(normalizeToolName).filter(Boolean));
   return (async (toolName, input, options) => {
     const bare = bareToolName(toolName);
-    // Clean live progress (parity with the Codex lane): emit a tool_called event
-    // so the dock shows "Using read_file…" — instead of streaming the model's raw
-    // text, which dumped its tool-call XML into the bubble. Fires for EVERY tool
-    // (fast-allow reads included). Best-effort: progress never blocks a tool.
-    try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: bare, callId: options.toolUseID } }); } catch { /* progress only */ }
+    // Permission is a decision boundary, not the canonical execution record.
+    // The shared SDK stream emits exactly one top-level tool_called row from the
+    // actual tool_use id for agentic, workflow, and allow-only lanes alike.
     // The CLI's control-protocol schema requires `updatedInput` on EVERY allow
     // (a bare {behavior:'allow'} fails its Zod parse with "updatedInput expected
     // record, received undefined" and the tool call dies — 2026-07-02 end-of-day

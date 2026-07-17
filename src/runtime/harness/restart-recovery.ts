@@ -19,7 +19,17 @@
  * agent/execution sessions have their own resume paths and are never touched.
  * Entirely best-effort and flag-gated (CLEMMY_CHAT_RESTART_RECOVERY).
  */
-import { listSessions, listEvents, appendEvent, type SessionRow } from './eventlog.js';
+import {
+  appendEvent,
+  clearKill,
+  finishRunAttempt,
+  getLatestRunAttempt,
+  isKillRequested,
+  listEvents,
+  listSessions,
+  type RunAttemptRecord,
+  type SessionRow,
+} from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { addNotification } from '../notifications.js';
 
@@ -95,6 +105,8 @@ export function markRunInFlight(sessionId: string, on: boolean): void {
 
 const INTERRUPTED_REPLY =
   'This run was interrupted by a restart before it finished. Reply `continue` to pick up where it left off.';
+const STOPPED_REPLY =
+  'This run was stopped as requested. A restart happened before it could finish shutting down, but it will not resume.';
 const REPLAY_PRIMER_PREFIX = '[restart-recovery]';
 const MAX_NOTIFICATIONS = 10;
 const CHAT_SCAN_PAGE_SIZE = 500;
@@ -116,7 +128,7 @@ export interface RestartRecoveryRecord {
   /** True when this run met the safety bar and a resume was dispatched. */
   autoResumed: boolean;
   /** Why auto-resume did NOT run (for the boot log / forensics). */
-  autoResumeSkipped?: 'disabled' | 'no_dispatcher' | 'external_write' | 'too_old' | 'boot_cap';
+  autoResumeSkipped?: 'disabled' | 'no_dispatcher' | 'external_write' | 'too_old' | 'boot_cap' | 'user_stopped';
   errors: string[];
 }
 
@@ -225,24 +237,37 @@ export function recoverInterruptedChatRuns(
       errors: [],
     };
 
+    let interruptedAttempt: RunAttemptRecord | null = null;
+    let userStopped = false;
+    try {
+      interruptedAttempt = getLatestRunAttempt(row.id);
+      userStopped = isKillRequested(row.id, interruptedAttempt ?? undefined);
+    } catch {
+      // A failed kill read must not invent a stop. The ordinary conservative
+      // external-write/age checks still decide whether resume is safe.
+    }
+
     // Auto-resume decision (see the safety bar above). Decided up front so the
     // in-session notice tells the truth about what happens next.
     const ageMs = now() - Date.parse(since);
     const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
-    if (!autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
+    if (userStopped) record.autoResumeSkipped = 'user_stopped';
+    else if (!autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
     else if (!dispatchResume) record.autoResumeSkipped = 'no_dispatcher';
     else if (autoResumes >= AUTO_RESUME_MAX_PER_BOOT) record.autoResumeSkipped = 'boot_cap';
     else if (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS) record.autoResumeSkipped = 'too_old';
     else if (externalWritesSinceInterrupt === null || externalWritesSinceInterrupt > 0) record.autoResumeSkipped = 'external_write';
     const willAutoResume = record.autoResumeSkipped === undefined;
-    try {
-      record.snapshotItemsBefore = sess.toInputItems().length;
-      record.lastResponseIdPresent = !!sess.previousResponseId();
-      record.replayPrimerChanged = sess.setContextPrimer(REPLAY_PRIMER_PREFIX, buildReplayPrimer(row.id, since));
-      record.snapshotItemsAfter = sess.toInputItems().length;
-      record.replayPrepared = true;
-    } catch (err) {
-      record.errors.push(`replay_primer: ${err instanceof Error ? err.message : String(err)}`);
+    if (!userStopped) {
+      try {
+        record.snapshotItemsBefore = sess.toInputItems().length;
+        record.lastResponseIdPresent = !!sess.previousResponseId();
+        record.replayPrimerChanged = sess.setContextPrimer(REPLAY_PRIMER_PREFIX, buildReplayPrimer(row.id, since));
+        record.snapshotItemsAfter = sess.toInputItems().length;
+        record.replayPrepared = true;
+      } catch (err) {
+        record.errors.push(`replay_primer: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     // Durable audit of the safety decision. This is intentionally separate from
@@ -260,6 +285,9 @@ export function recoverInterruptedChatRuns(
           eligible: willAutoResume,
           autoResume: willAutoResume,
           autoResumeSkipped: record.autoResumeSkipped ?? null,
+          userStopped,
+          interruptedAttemptId: interruptedAttempt?.attemptId ?? null,
+          interruptedRunId: interruptedAttempt?.runId ?? null,
           externalWritesSinceInterrupt,
           writeCheckFailed: externalWritesSinceInterrupt === null,
           hasDispatcher: !!dispatchResume,
@@ -279,7 +307,8 @@ export function recoverInterruptedChatRuns(
 
     // Non-silent in-session notice (the dock replays it). The text tells the
     // truth about what happens next: auto-resuming, or waiting for `continue`.
-    const noticeReply = willAutoResume ? AUTO_RESUME_REPLY : INTERRUPTED_REPLY;
+    const noticeReply = userStopped ? STOPPED_REPLY : willAutoResume ? AUTO_RESUME_REPLY : INTERRUPTED_REPLY;
+    const noticeReason = userStopped ? 'stopped_before_restart' : 'interrupted_by_restart';
     try {
       appendEvent({
         sessionId: row.id,
@@ -288,11 +317,12 @@ export function recoverInterruptedChatRuns(
         type: 'conversation_completed',
         data: {
           steps: 0,
-          reason: 'interrupted_by_restart',
+          reason: noticeReason,
           summary: noticeReply,
           reply: noticeReply,
           interruptedAt: since,
           autoResume: willAutoResume,
+          userStopped,
           ...(record.autoResumeSkipped ? { autoResumeSkipped: record.autoResumeSkipped } : {}),
           replayPrepared: record.replayPrepared,
           replayPrimerChanged: record.replayPrimerChanged,
@@ -316,13 +346,13 @@ export function recoverInterruptedChatRuns(
         addNotification({
           id: `${tick}-chat-interrupted-${row.id}`,
           kind: 'system',
-          title: 'A chat task was interrupted by a restart',
-          body: `${INTERRUPTED_REPLY} (session ${row.id})`,
+          title: userStopped ? 'A stopped chat task finished shutting down' : 'A chat task was interrupted by a restart',
+          body: `${noticeReply} (session ${row.id})`,
           createdAt: new Date(tick).toISOString(),
           read: false,
           metadata: {
             sessionId: row.id,
-            reason: 'interrupted_by_restart',
+            reason: noticeReason,
             replayPrepared: record.replayPrepared,
           },
         });
@@ -338,6 +368,15 @@ export function recoverInterruptedChatRuns(
       record.markerCleared = true;
     } catch {
       record.errors.push('marker_clear: failed');
+    }
+
+    if (userStopped) {
+      try {
+        if (interruptedAttempt) finishRunAttempt(interruptedAttempt, 'cancelled');
+        else clearKill(row.id);
+      } catch (err) {
+        record.errors.push(`kill_cleanup: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     // Dispatch the resume AFTER the marker is cleared (a resume that itself gets

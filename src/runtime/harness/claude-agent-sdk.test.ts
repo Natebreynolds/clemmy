@@ -13,7 +13,10 @@ const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
 const operationalTelemetry = await import('../operational-telemetry.js');
 const eventlog = await import('./eventlog.js');
+const artifactLedger = await import('./artifact-ledger.js');
+const toolEconomy = await import('./tool-economy.js');
 const capabilityHealth = await import('./capability-health.js');
+const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { formatAutoResolvedAskUserQuestionOutput } = await import('./terminal-tool.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
@@ -25,6 +28,7 @@ const {
   buildScopedNativeMcpServers,
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
+  resolveClaudeAgentSdkTrackerScope,
   setClaudeAgentSdkQueryForTest,
   setClaudeAgentSdkReflectionForTest,
 } = mod;
@@ -103,6 +107,558 @@ test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly o
   }
 });
 
+test('SDK tracker scopes are stable across retry/resume and rotate on a new chat turn', () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'first' } });
+  const first = resolveClaudeAgentSdkTrackerScope({ sessionId: session.id });
+  assert.equal(first, resolveClaudeAgentSdkTrackerScope({ sessionId: session.id }), 'same logical turn keeps its scope');
+  eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'second' } });
+  assert.notEqual(resolveClaudeAgentSdkTrackerScope({ sessionId: session.id }), first, 'new durable user turn rotates scope');
+  assert.equal(
+    resolveClaudeAgentSdkTrackerScope({ sessionId: session.id, workflowRunId: 'wf-run-1', stepId: 'draft' }),
+    `${session.id}::workflow:wf-run-1:draft`,
+  );
+  assert.equal(
+    resolveClaudeAgentSdkTrackerScope({ sessionId: session.id, trackerScopeId: 'explicit-worker-scope' }),
+    'explicit-worker-scope',
+  );
+});
+
+test('ordinary SDK turns do not persist artifact lineage', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Summarize the current status.' },
+  });
+  const candidate = `${session.id}::brain:ordinary-read`;
+  setClaudeAgentSdkQueryForTest(((_params: any) => successQuery('Here is the status.')) as any);
+
+  const result = await runClaudeAgentSdk({
+    prompt: 'Summarize the current status.',
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    trackerScopeId: candidate,
+    artifactRunScopeId: candidate,
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['memory_search'],
+  });
+
+  assert.equal(result.artifactRunScopeId, undefined);
+  assert.equal(artifactLedger.getArtifactRunScope(session.id, candidate), null);
+  assert.equal(artifactLedger.getArtifactRootForSourceUserSeq(session.id, source.seq), null);
+});
+
+test('native artifact replay with one durable run scope binds once and blocks a restarted retry', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::brain:external-run-42`;
+  artifactLedger._resetArtifactLedgerForTests();
+  let queryCount = 0;
+  let providerDispatches = 0;
+  const permissionVerdicts: string[] = [];
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    queryCount += 1;
+    const callId = `toolu_create_${queryCount}`;
+    const gen = (async function* () {
+      yield {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: `sdk-${queryCount}`,
+        uuid: `init-${queryCount}`, apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: ['mcp__googledocs__create_document'], mcp_servers: [{ name: 'googledocs', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any;
+      const verdict = await params.options.canUseTool(
+        'mcp__googledocs__create_document',
+        { title: 'Firm brief' },
+        { signal: new AbortController().signal, toolUseID: callId },
+      );
+      permissionVerdicts.push(verdict.behavior);
+      if (verdict.behavior === 'allow') {
+        providerDispatches += 1;
+        yield {
+          type: 'assistant', session_id: `sdk-${queryCount}`, uuid: `assistant-${queryCount}`,
+          parent_tool_use_id: null,
+          message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__googledocs__create_document', input: { title: 'Firm brief' } }] },
+        } as any;
+        yield {
+          type: 'user', session_id: `sdk-${queryCount}`, uuid: `result-${queryCount}`,
+          parent_tool_use_id: null,
+          message: { content: [{ type: 'tool_result', tool_use_id: callId, content: '{"documentId":"doc_durable_123456789"}' }] },
+        } as any;
+      }
+      yield {
+        type: 'result', subtype: 'success', session_id: `sdk-${queryCount}`, uuid: `done-${queryCount}`,
+        result: verdict.behavior === 'allow' ? 'Created the document.' : 'Reused the existing document.',
+        duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn',
+        total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any;
+    })();
+    return Object.assign(gen, {
+      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
+      stopTask: async () => false, backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
+
+  const options = {
+    prompt: 'Create a Google Doc about the firm.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    trackerScopeId,
+    allowedLocalMcpTools: ['mcp__googledocs__create_document'],
+  };
+  try {
+    await runClaudeAgentSdk(options);
+    // A second SDK process/query is the replay boundary. No in-memory claim is
+    // shared; only the durable run scope + SQLite artifact row can stop it.
+    await runClaudeAgentSdk(options);
+    assert.deepEqual(permissionVerdicts, ['allow', 'deny']);
+    assert.equal(providerDispatches, 1, 'the replay never crosses the provider boundary');
+    assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId)[0]?.status, 'bound');
+    assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 1, 'native mutation is durable before dispatch');
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
+test('native duplicate admission is replay-safe and leaves economy, ceiling, approval, and grind untouched', async () => {
+  const saved = {
+    CLEMMY_SDK_TOOL_CEILING: process.env.CLEMMY_SDK_TOOL_CEILING,
+    CLEMMY_SDK_MUTATING_CALL_CEILING: process.env.CLEMMY_SDK_MUTATING_CALL_CEILING,
+    CLEMMY_CLAUDE_SDK_REFLECTION: process.env.CLEMMY_CLAUDE_SDK_REFLECTION,
+  };
+  process.env.CLEMMY_SDK_TOOL_CEILING = 'on';
+  process.env.CLEMMY_SDK_MUTATING_CALL_CEILING = '1';
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+  const approvalRegistry = await import('./approval-registry.js');
+  const toolGuardrail = await import('./tool-guardrail.js');
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::native-duplicate-admission`;
+  const intent = {
+    kind: 'google_doc',
+    provider: 'Google Docs',
+    slotKey: 'google_doc:primary',
+    title: 'Existing brief',
+    createShape: 'GOOGLEDOCS_CREATE_DOCUMENT',
+  } as const;
+  const seeded = artifactLedger.claimArtifactSlot(session.id, intent, 'seed-existing-doc', trackerScopeId);
+  artifactLedger.bindClaimedArtifact(seeded.artifact.id, 'seed-existing-doc', {
+    resourceId: 'doc_existing_provider_123456',
+    uri: 'https://docs.google.com/document/d/doc_existing_provider_123456/edit',
+  });
+  toolGuardrail._resetAllTrackersForTests();
+  const economyState = toolEconomy.createToolEconomyState({
+    kind: 'single_deliverable', softLimit: 10, hardLimit: 15,
+  });
+  const duplicateVerdicts: Array<{ behavior?: string; message?: string }> = [];
+  let sendVerdict: { behavior?: string; message?: string; interrupt?: boolean } | undefined;
+
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield initOnlyMessage();
+    const canUse = params.options.canUseTool as (
+      name: string,
+      input: unknown,
+      options: { signal: AbortSignal; toolUseID: string },
+    ) => Promise<{ behavior?: string; message?: string; interrupt?: boolean }>;
+    const duplicateInput = { title: 'Existing brief' };
+    // The SDK may replay a permission callback while the first one is still in
+    // flight, then replay it again after resolution. All three are one provider
+    // call and must share one denial without touching downstream accounting.
+    const duplicateOptions = { signal: new AbortController().signal, toolUseID: 'toolu_duplicate_existing_doc' };
+    duplicateVerdicts.push(...await Promise.all([
+      canUse('mcp__googledocs__create_document', duplicateInput, duplicateOptions),
+      canUse('mcp__googledocs__create_document', duplicateInput, duplicateOptions),
+    ]));
+    duplicateVerdicts.push(await canUse(
+      'mcp__googledocs__create_document', duplicateInput, duplicateOptions,
+    ));
+    assert.equal(
+      approvalRegistry.listPending({ sessionId: session.id, status: 'any' }).length,
+      0,
+      'artifact reuse never surfaces an approval card',
+    );
+
+    // With a mutating ceiling of one, this distinct send reaches the approval
+    // boundary only if the duplicate consumed zero ceiling slots.
+    sendVerdict = await canUse(
+      'mcp__outlook__send_email',
+      { to: 'client@example.com', subject: 'Hello', body: 'Test' },
+      { signal: new AbortController().signal, toolUseID: 'toolu_distinct_send' },
+    );
+    yield successResultMessage('permission checks complete');
+  })())) as any);
+
+  try {
+    await assert.rejects(
+      runClaudeAgentSdk({
+        prompt: 'Reuse the existing document, then send the separate approved note.',
+        sessionId: session.id,
+        modelId: 'claude-sonnet-4-6',
+        trackerScopeId,
+        artifactRunScopeId: trackerScopeId,
+        artifactObjective: 'Create one Google Doc named Existing brief.',
+        agentic: true,
+        approvalMode: 'park',
+        allowedLocalMcpTools: ['read_file', 'memory_search'],
+        readFanoutGuard: true,
+        toolEconomyState: economyState,
+      }),
+      ClaudeAgentSdkApprovalBoundaryError,
+      'the distinct send reaches its real approval boundary instead of tripping a ceiling inflated by the duplicate',
+    );
+    assert.equal(duplicateVerdicts.length, 3);
+    for (const verdict of duplicateVerdicts) {
+      assert.equal(verdict.behavior, 'deny');
+      assert.match(verdict.message ?? '', /already bound|do not create another/i);
+    }
+    assert.equal(sendVerdict?.behavior, 'deny');
+    assert.match(sendVerdict?.message ?? '', /Approval .* pending/i);
+    assert.doesNotMatch(sendVerdict?.message ?? '', /stopped myself/i);
+    assert.equal(economyState.attempts, 1, 'only the distinct send is a canonical economy attempt');
+    assert.equal(economyState.allowed, 1);
+    assert.equal(economyState.callDecisions.size, 1, 'duplicate callback/replays mint no economy decisions');
+    assert.equal(
+      toolGuardrail._peekTracker(trackerScopeId).recentCount,
+      1,
+      'only the distinct send enters grind tracking',
+    );
+    const approvals = approvalRegistry.listPending({ sessionId: session.id, status: 'any' });
+    assert.equal(approvals.length, 1, 'only the distinct send creates an approval');
+    assert.match(approvals[0]?.tool ?? '', /send_email/i);
+    assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0, 'neither denied action is recorded as dispatched');
+    assert.equal(artifactLedger.listRunArtifacts(session.id, trackerScopeId).length, 1, 'the existing artifact remains the only slot');
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('native artifact admission releases an exact pending claim when a later approval gate denies', async () => {
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::native-release-before-dispatch`;
+  const toolName = 'mcp__googledocs__create_document';
+  const input = { title: 'Approval-gated brief' };
+  let phase: 'denied' | 'allowed' = 'denied';
+  let firstVerdict: { behavior?: string; message?: string } | undefined;
+  let retryVerdict: { behavior?: string; message?: string } | undefined;
+
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield initOnlyMessage();
+    const canUse = params.options.canUseTool as (
+      name: string,
+      args: unknown,
+      options: { signal: AbortSignal; toolUseID: string },
+    ) => Promise<{ behavior?: string; message?: string }>;
+    if (phase === 'denied') {
+      firstVerdict = await canUse(toolName, input, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_create_denied_before_dispatch',
+      });
+      yield successResultMessage('approval parked');
+      return;
+    }
+    retryVerdict = await canUse(toolName, input, {
+      signal: new AbortController().signal,
+      toolUseID: 'toolu_create_authorized_retry',
+    });
+    if (retryVerdict.behavior === 'allow') {
+      yield {
+        type: 'assistant', session_id: 's', uuid: 'use-authorized-retry', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id: 'toolu_create_authorized_retry', name: toolName, input }] },
+      } as any;
+      yield {
+        type: 'user', session_id: 's', uuid: 'result-authorized-retry', parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_result', tool_use_id: 'toolu_create_authorized_retry', is_error: false,
+          content: JSON.stringify({ documentId: 'doc_authorized_retry_123456' }),
+        }] },
+      } as any;
+    }
+    yield successResultMessage('authorized retry complete');
+  })())) as any);
+
+  const shared = {
+    prompt: 'Create one Google Doc named Approval-gated brief.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    trackerScopeId,
+    artifactRunScopeId: trackerScopeId,
+    artifactObjective: 'Create one Google Doc named Approval-gated brief.',
+  };
+  try {
+    await assert.rejects(
+      runClaudeAgentSdk({
+        ...shared,
+        agentic: true,
+        approvalMode: 'park',
+        allowedLocalMcpTools: ['read_file'],
+      }),
+      ClaudeAgentSdkApprovalBoundaryError,
+    );
+    assert.equal(firstVerdict?.behavior, 'deny');
+    assert.match(firstVerdict?.message ?? '', /Approval .* pending/i);
+    assert.equal(
+      artifactLedger.listRunArtifacts(session.id, trackerScopeId).length,
+      0,
+      'a provider-denied call leaves no stranded pending artifact row',
+    );
+
+    phase = 'allowed';
+    await runClaudeAgentSdk({
+      ...shared,
+      allowedLocalMcpTools: [toolName],
+    });
+    assert.equal(retryVerdict?.behavior, 'allow', 'the authorized retry reacquires the released slot');
+    const [artifact] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
+    assert.equal(artifact?.status, 'bound');
+    assert.equal(artifact?.resourceId, 'doc_authorized_retry_123456');
+    assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 1);
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
+test('native MCP mutations emit durable failed and orphan truth keyed by provider call id', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  let run = 0;
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    run += 1;
+    const callId = run === 1 ? 'toolu_native_failed' : 'toolu_native_orphan';
+    const gen = (async function* () {
+      yield {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: `sdk-write-${run}`,
+        uuid: `init-write-${run}`, apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: ['mcp__outlook__send_email'], mcp_servers: [{ name: 'outlook', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any;
+      const input = { to: 'client@example.com', subject: 'Hello', body: 'Test' };
+      const verdict = await params.options.canUseTool(
+        'mcp__outlook__send_email', input,
+        { signal: new AbortController().signal, toolUseID: callId },
+      );
+      assert.equal(verdict.behavior, 'allow');
+      if (run === 1) {
+        yield {
+          type: 'assistant', session_id: `sdk-write-${run}`, uuid: 'use-failed', parent_tool_use_id: null,
+          message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__outlook__send_email', input }] },
+        } as any;
+        yield {
+          type: 'user', session_id: `sdk-write-${run}`, uuid: 'result-failed', parent_tool_use_id: null,
+          message: { content: [{ type: 'tool_result', tool_use_id: callId, is_error: true, content: 'provider rejected payload' }] },
+        } as any;
+      }
+      yield {
+        type: 'result', subtype: 'success', session_id: `sdk-write-${run}`, uuid: `done-write-${run}`,
+        result: 'done', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+        stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any;
+    })();
+    return Object.assign(gen, {
+      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
+      stopTask: async () => false, backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
+
+  const options = {
+    prompt: 'Send the email.', sessionId: session.id, modelId: 'claude-sonnet-4-6',
+    trackerScopeId: 'native-write-truth', allowedLocalMcpTools: ['mcp__outlook__send_email'],
+  };
+  await runClaudeAgentSdk(options);
+  await runClaudeAgentSdk(options);
+  const writes = eventlog.listEvents(session.id, { types: ['external_write'] });
+  const failed = eventlog.listEvents(session.id, { types: ['external_write_failed'] });
+  const orphaned = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
+  assert.deepEqual(writes.map((event) => (event.data as any).callId), ['toolu_native_failed', 'toolu_native_orphan']);
+  assert.equal((failed[0]?.data as any)?.callId, 'toolu_native_failed');
+  assert.equal((orphaned[0]?.data as any)?.callId, 'toolu_native_orphan');
+});
+
+test('explicit multi-document objective permits distinct native creates and settles reversed results by call id', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::multi-doc-root`;
+  const calls = [
+    { id: 'toolu_client_brief', title: 'Client brief', documentId: 'doc_client_brief_123456' },
+    { id: 'toolu_appendix', title: 'Technical appendix', documentId: 'doc_appendix_123456' },
+  ];
+  const verdicts: string[] = [];
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    const gen = (async function* () {
+      yield {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-multi-doc',
+        uuid: 'init-multi-doc', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: ['mcp__googledocs__create_document'], mcp_servers: [{ name: 'googledocs', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any;
+      for (const call of calls) {
+        const verdict = await params.options.canUseTool(
+          'mcp__googledocs__create_document', { title: call.title },
+          { signal: new AbortController().signal, toolUseID: call.id },
+        );
+        verdicts.push(verdict.behavior);
+      }
+      yield {
+        type: 'assistant', session_id: 'sdk-multi-doc', uuid: 'uses-multi-doc', parent_tool_use_id: null,
+        message: { content: calls.map((call) => ({
+          type: 'tool_use', id: call.id, name: 'mcp__googledocs__create_document', input: { title: call.title },
+        })) },
+      } as any;
+      yield {
+        type: 'user', session_id: 'sdk-multi-doc', uuid: 'results-multi-doc', parent_tool_use_id: null,
+        message: { content: [...calls].reverse().map((call) => ({
+          type: 'tool_result', tool_use_id: call.id, is_error: false,
+          content: JSON.stringify({ documentId: call.documentId }),
+        })) },
+      } as any;
+      yield {
+        type: 'result', subtype: 'success', session_id: 'sdk-multi-doc', uuid: 'done-multi-doc',
+        result: 'Created both documents.', duration_ms: 1, duration_api_ms: 1, is_error: false,
+        num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any;
+    })();
+    return Object.assign(gen, {
+      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
+      stopTask: async () => false, backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
+  await runClaudeAgentSdk({
+    prompt: 'Create two separate Google Docs: a client brief and a technical appendix.',
+    artifactObjective: 'Create two separate Google Docs: a client brief and a technical appendix.',
+    sessionId: session.id,
+    trackerScopeId,
+    artifactRunScopeId: trackerScopeId,
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['mcp__googledocs__create_document'],
+  });
+  assert.deepEqual(verdicts, ['allow', 'allow']);
+  const artifacts = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
+  assert.deepEqual(
+    artifacts.map((artifact) => [artifact.slotKey, artifact.resourceId]),
+    [
+      ['google_doc:client-brief', 'doc_client_brief_123456'],
+      ['google_doc:technical-appendix', 'doc_appendix_123456'],
+    ],
+  );
+});
+
+test('artifact verification repair gate enforces exact-id read-back and denies every mutation/exploration call', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const documentId = 'doc_enforced_verify_123456789';
+  const verdicts: string[] = [];
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    const gen = (async function* () {
+      yield {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-verify-gate',
+        uuid: 'init-verify-gate', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: [], mcp_servers: [], permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any;
+      const calls = [
+        ['mcp__googledocs__create_document', { title: 'Duplicate' }, 'create'],
+        ['mcp__googledocs__search_documents', { query: 'Firm' }, 'search'],
+        ['mcp__googledocs__get_document', { document_id: 'wrong-doc' }, 'wrong'],
+        ['mcp__googledocs__get_document', { document_id: documentId }, 'exact'],
+      ] as const;
+      for (const [name, input, id] of calls) {
+        const verdict = await params.options.canUseTool(name, input, {
+          signal: new AbortController().signal, toolUseID: `toolu_${id}`,
+        });
+        verdicts.push(verdict.behavior);
+      }
+      yield {
+        type: 'result', subtype: 'success', session_id: 'sdk-verify-gate', uuid: 'done-verify-gate',
+        result: 'checked', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+        stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any;
+    })();
+    return Object.assign(gen, {
+      close() {}, interrupt: async () => {}, setPermissionMode: async () => {}, setModel: async () => {},
+      setMcpServers: async () => ({ added: [], removed: [], errors: {} }), streamInput: async () => {},
+      stopTask: async () => false, backgroundTasks: async () => false,
+    }) as Query;
+  }) as any);
+  await runClaudeAgentSdk({
+    prompt: 'Verify only.', sessionId: session.id, modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['mcp__googledocs__get_document'],
+    artifactVerificationOnly: [{ kind: 'google_doc', resourceId: documentId }],
+  });
+  assert.deepEqual(verdicts, ['deny', 'deny', 'deny', 'allow']);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0);
+});
+
+test('native MCP getter result independently verifies the exact bound Google Doc', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const trackerScopeId = `${session.id}::brain:verify-native-doc`;
+  const documentId = 'doc_native_verify_123456789';
+  const intent = {
+    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
+    title: 'Native brief', createShape: 'GOOGLEDOCS_CREATE_DOCUMENT',
+  } as const;
+  artifactLedger.claimArtifactSlot(session.id, intent, 'native-create', trackerScopeId);
+  artifactLedger.bindArtifactSlot(session.id, intent.slotKey, {
+    resourceId: documentId,
+    uri: `https://docs.google.com/document/d/${documentId}/edit`,
+  }, 'native-create', trackerScopeId);
+
+  const messages: SDKMessage[] = [
+    {
+      type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-native-verify',
+      uuid: 'init-native-verify', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
+      tools: ['mcp__googledocs__get_document'], mcp_servers: [{ name: 'googledocs', status: 'connected' }],
+      permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+    } as any,
+    {
+      type: 'assistant', session_id: 'sdk-native-verify', uuid: 'use-native-verify', parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_use', id: 'toolu_native_readback', name: 'mcp__googledocs__get_document',
+        input: { document_id: documentId },
+      }] },
+    } as any,
+    {
+      type: 'user', session_id: 'sdk-native-verify', uuid: 'result-native-verify', parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_result', tool_use_id: 'toolu_native_readback', is_error: false,
+        content: JSON.stringify({ data: {
+          document_id: documentId,
+          display_url: `https://docs.google.com/document/d/${documentId}/edit`,
+          plain_text: 'Verified brief',
+        } }),
+      }] },
+    } as any,
+    {
+      type: 'result', subtype: 'success', session_id: 'sdk-native-verify', uuid: 'done-native-verify',
+      result: 'Verified the document.', duration_ms: 1, duration_api_ms: 1, is_error: false,
+      num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+    } as any,
+  ];
+  const previousReflection = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+  setClaudeAgentSdkQueryForTest((() => queryFromMessages(messages, {})) as any);
+  try {
+    await runClaudeAgentSdk({
+      prompt: 'Verify the document.', sessionId: session.id, trackerScopeId,
+      modelId: 'claude-sonnet-4-6', allowedLocalMcpTools: [],
+    });
+    const [verified] = artifactLedger.listRunArtifacts(session.id, trackerScopeId);
+    assert.ok(verified?.bindingVerifiedAt);
+    assert.equal(verified?.verificationCallId, 'toolu_native_readback');
+    assert.equal(verified?.verificationShape, 'GOOGLEDOCS_GET_DOCUMENT');
+  } finally {
+    if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
+  }
+});
+
 test('buildClaudeAgentSdkLocalMcpServers exposes the local Clementine MCP in-process SDK server by default', () => {
   const servers = buildClaudeAgentSdkLocalMcpServers('brain-session-1');
   const local = servers['clementine-local'] as any;
@@ -130,13 +686,19 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
   const original = process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
   try {
     process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = 'off';
-    const servers = buildClaudeAgentSdkLocalMcpServers('brain-session-1');
+    const servers = buildClaudeAgentSdkLocalMcpServers(
+      'brain-session-1',
+      false,
+      undefined,
+      { sourceUserSeq: 123 },
+    );
     const local = servers['clementine-local'] as any;
     assert.equal(local.type, 'stdio');
     assert.ok(local.command === 'npx' || local.command.length > 0);
     assert.equal(local.alwaysLoad, true);
     assert.equal(local.env.CLEMENTINE_HOME, TMP_HOME);
     assert.equal(local.env.CLEMENTINE_MCP_SESSION_ID, 'brain-session-1');
+    assert.equal(local.env.CLEMENTINE_MCP_SOURCE_USER_SEQ, '123');
     assert.ok(Array.isArray(local.args));
     assert.ok(local.args.some((arg: string) => arg.includes('mcp-server')));
 
@@ -273,6 +835,51 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(result.text, 'ok');
   assert.deepEqual(result.structuredOutput, { ok: true });
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
+});
+
+test('replayed assistant frames contribute one returned tool use per provider call id', async () => {
+  const toolUse = {
+    type: 'tool_use',
+    id: 'toolu_replayed_frame',
+    name: 'mcp__clementine-local__ping',
+    input: { probe: true },
+  };
+  setClaudeAgentSdkQueryForTest((() => queryFromMessages([
+    {
+      type: 'system', subtype: 'init', model: 'claude-sonnet-4-6',
+      session_id: 'sdk-frame-replay', uuid: 'frame-init', apiKeySource: 'none',
+      claude_code_version: '2.1.181', cwd: process.cwd(),
+      tools: ['mcp__clementine-local__ping'],
+      mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+      permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+    } as any,
+    {
+      type: 'assistant', session_id: 'sdk-frame-replay', uuid: 'frame-assistant-1',
+      parent_tool_use_id: null, message: { content: [toolUse] },
+    } as any,
+    {
+      type: 'assistant', session_id: 'sdk-frame-replay', uuid: 'frame-assistant-replay',
+      parent_tool_use_id: null,
+      message: { content: [{ ...toolUse, name: 'mcp__clementine-local__write_file', input: { path: '/tmp/altered' } }] },
+    } as any,
+    {
+      type: 'result', subtype: 'success', session_id: 'sdk-frame-replay', uuid: 'frame-done',
+      result: 'ok', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+      stop_reason: 'end_turn', total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+    } as any,
+  ], {})) as any);
+
+  const result = await runClaudeAgentSdk({
+    prompt: 'Ping once.',
+    sessionId: 'sdk-frame-replay',
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['ping'],
+  });
+
+  assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
+  assert.equal(result.toolCallLedger?.length, 1, 'canonical event/call accounting remains one row');
+  assert.equal(result.toolCallLedger?.[0]?.name, 'ping', 'a replay cannot replace canonical call metadata');
 });
 
 test('agentic JIT keeps its selected local tools first-class while registering the rest for same-turn acquisition', async () => {
@@ -754,10 +1361,15 @@ test('agentic SDK runs leave allowedTools empty so canUseTool is the permission 
 // SAME reflection pipeline the Codex loop uses, so Clementine learns from Claude
 // turns instead of going amnesiac. The Agent SDK runs its tool loop outside the
 // @openai/agents RunHooks, so this is sourced from the SDK message stream.
+const LONG_SALESFORCE_TOOL_INPUT = {
+  tool_slug: 'SALESFORCE_QUERY',
+  arguments: { query: 'private-query-fragment '.repeat(30) },
+};
+
 function streamWithToolReturn(): SDKMessage[] {
   return [
     { type: 'system', subtype: 'init', model: 'claude-opus-4-8', session_id: 'sdk-session', uuid: 'u1', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any,
-    { type: 'assistant', session_id: 'sdk-session', uuid: 'u2', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id: 'toolu_42', name: 'mcp__clementine-local__composio_execute_tool', input: { tool_slug: 'SALESFORCE_QUERY' } }] } } as any,
+    { type: 'assistant', session_id: 'sdk-session', uuid: 'u2', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id: 'toolu_42', name: 'mcp__clementine-local__composio_execute_tool', input: LONG_SALESFORCE_TOOL_INPUT }] } } as any,
     { type: 'user', session_id: 'sdk-session', uuid: 'u3', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_42', content: 'Acme Corp has 3 open opportunities worth $45,000 total.' }] } } as any,
     { type: 'result', subtype: 'success', session_id: 'sdk-session', uuid: 'u4', result: 'done', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] } as any,
   ];
@@ -780,9 +1392,72 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
   assert.match(reflected[0].output, /Acme Corp has 3 open opportunities/);
 
   const returned = eventlog.listEvents(sess.id, { types: ['tool_returned'] });
+  const called = eventlog.listEvents(sess.id, { types: ['tool_called'] });
+  assert.equal(called.length, 1);
+  assert.equal(called[0].data.callId, 'toolu_42');
+  assert.equal(called[0].data.canonicalCallId, 'toolu_42');
+  assert.equal(called[0].data.accounting, 'top_level');
+  assert.equal(
+    called[0].data.correlationFingerprint,
+    toolCallCorrelationFingerprint('composio_execute_tool', LONG_SALESFORCE_TOOL_INPUT),
+    'canonical correlation uses the full >500-char input before its event preview is bounded',
+  );
+  assert.doesNotMatch(String(called[0].data.correlationFingerprint), /private-query-fragment/);
+  assert.equal(called[0].data.toolSlug, 'SALESFORCE_QUERY');
+  assert.equal(called[0].data.effect, 'read');
   assert.equal(returned.length, 1);
   assert.equal(returned[0].data.callId, 'toolu_42');
   assert.equal(returned[0].data.tool, 'composio_execute_tool');
+  assert.equal(returned[0].data.canonicalCallId, 'toolu_42');
+  assert.equal(returned[0].data.accounting, 'top_level');
+  assert.equal(returned[0].data.toolSlug, 'SALESFORCE_QUERY');
+  assert.equal(returned[0].data.effect, 'read');
+  assert.match(String(returned[0].data.preview ?? ''), /Acme Corp has 3 open opportunities/);
+});
+
+test('shared SDK stream emits one canonical call for repeated tool_use frames on allow-only lanes', async () => {
+  const sess = eventlog.createSession({ id: 'sdk-canonical-allow-only', kind: 'workflow' });
+  const toolUse = {
+    type: 'assistant', session_id: 's', uuid: 'tool-frame', parent_tool_use_id: null,
+    message: { content: [{
+      type: 'tool_use', id: 'toolu_dedup_1', name: 'mcp__clementine-local__composio_execute_tool',
+      input: { tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}' },
+    }] },
+  } as any;
+  const toolResult = {
+    type: 'user', session_id: 's', uuid: 'result-frame', parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_dedup_1', content: '{"id":"contact-1"}' }] },
+  } as any;
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
+    toolUse,
+    toolUse,
+    toolResult,
+    toolResult,
+    {
+      type: 'result', subtype: 'success', session_id: 's', uuid: 'done', result: 'done',
+      duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+      stop_reason: 'end_turn', total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+    } as any,
+  ], {})) as any);
+  setClaudeAgentSdkReflectionForTest((() => {}) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Find or create the contact.',
+    sessionId: sess.id,
+    allowedLocalMcpTools: ['composio_execute_tool'],
+  });
+
+  const called = eventlog.listEvents(sess.id, { types: ['tool_called'] });
+  const returned = eventlog.listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 1);
+  assert.equal(returned.length, 1);
+  assert.equal(called[0].data.canonicalCallId, 'toolu_dedup_1');
+  assert.equal(called[0].data.accounting, 'top_level');
+  assert.equal(called[0].data.toolSlug, 'HUBSPOT_FIND_OR_CREATE_CONTACT');
+  assert.equal(called[0].data.effect, 'external_write');
+  assert.equal(returned[0].data.canonicalCallId, 'toolu_dedup_1');
+  assert.equal(returned[0].data.accounting, 'top_level');
 });
 
 test('learning-OUT is skipped without a session id and when kill-switched off', async () => {
@@ -1138,7 +1813,9 @@ function hammerToolQuery(p: any, cap: number): Query {
   return stubsFor((async function* () {
     yield initOnlyMessage();
     for (let i = 0; i < cap; i++) {
-      const res = await canUse('mcp__clementine-local__run_shell_command', { command: `echo ${i}` }, {});
+      const res = await canUse('mcp__clementine-local__run_shell_command', {
+        command: `curl -X POST https://example.com/items/${i} -d value=${i}`,
+      }, {});
       if (res?.behavior === 'deny' && res?.interrupt === true) {
         throw new Error('Claude Code returned an error result: turn interrupted by host');
       }
@@ -1146,6 +1823,93 @@ function hammerToolQuery(p: any, cap: number): Query {
     yield successResultMessage('done without tripping the ceiling');
   })());
 }
+
+function exploratoryHammerQuery(p: any, cap: number): Query {
+  const canUse = p.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+  return stubsFor((async function* () {
+    yield initOnlyMessage();
+    for (let i = 0; i < cap; i += 1) {
+      const res = await canUse(
+        'mcp__clementine-local__read_file',
+        { path: `/tmp/source-${i}.md` },
+        { signal: new AbortController().signal, toolUseID: `toolu_economy_${i}` },
+      );
+      if (res?.behavior === 'deny' && res?.interrupt === true) {
+        throw new Error('Claude Code returned an error result: turn interrupted by host');
+      }
+    }
+    yield successResultMessage('kept exploring');
+  })());
+}
+
+test('tool-economy replays a denied provider callback as deny without duplicate accounting', async () => {
+  eventlog.createSession({ id: 'sdk-tool-economy-deny-replay', kind: 'chat' });
+  const state = toolEconomy.createToolEconomyState({
+    kind: 'single_deliverable', softLimit: 1, hardLimit: 8,
+  });
+  const verdicts: Array<{ behavior?: string; interrupt?: boolean }> = [];
+  setClaudeAgentSdkQueryForTest(((p: any) => {
+    const canUse = p.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+    return stubsFor((async function* () {
+      yield initOnlyMessage();
+      verdicts.push(await canUse(
+        'mcp__clementine-local__read_file',
+        { path: '/tmp/allowed.md' },
+        { signal: new AbortController().signal, toolUseID: 'toolu_allowed_once' },
+      ));
+      const deniedArgs = { path: '/tmp/denied.md' };
+      for (let replay = 0; replay < 2; replay += 1) {
+        verdicts.push(await canUse(
+          'mcp__clementine-local__read_file',
+          deniedArgs,
+          { signal: new AbortController().signal, toolUseID: 'toolu_denied_replayed' },
+        ));
+      }
+      yield successResultMessage('finished from existing evidence');
+    })());
+  }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'create one document',
+    sessionId: 'sdk-tool-economy-deny-replay',
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['read_file'],
+    toolEconomyState: state,
+  });
+
+  assert.deepEqual(verdicts.map((verdict) => verdict.behavior), ['allow', 'deny', 'deny']);
+  assert.deepEqual(verdicts.map((verdict) => verdict.interrupt), [undefined, false, false]);
+  assert.equal(state.attempts, 2);
+  assert.equal(state.softRefusals, 1);
+  const trips = eventlog.listEvents('sdk-tool-economy-deny-replay', { types: ['guardrail_tripped'] });
+  assert.equal(
+    trips.filter((event) => event.data.kind === 'tool_economy_finish_phase').length,
+    1,
+    'the replay is enforced but does not create a second canonical guardrail row',
+  );
+});
+
+test('logical-run economy enters finish phase and interrupts repeated exploration', async () => {
+  eventlog.createSession({ id: 'sdk-tool-economy', kind: 'chat' });
+  const state = toolEconomy.createToolEconomyState({
+    kind: 'single_deliverable', softLimit: 2, hardLimit: 8,
+  });
+  setClaudeAgentSdkQueryForTest(((p: any) => exploratoryHammerQuery(p, 40)) as any);
+  const result = await runClaudeAgentSdk({
+    prompt: 'create one document',
+    sessionId: 'sdk-tool-economy',
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['read_file'],
+    toolEconomyState: state,
+  });
+  assert.equal(result.limitHit, true);
+  assert.equal(result.selfStopped, true, 'finish-phase refusal is terminal, never auto-continued');
+  assert.equal(state.allowed, 2);
+  assert.equal(state.attempts, 5, 'three ignored finish steers end the run');
+  assert.match(result.text, /finish-phase steer was ignored/i);
+  const trips = eventlog.listEvents('sdk-tool-economy', { types: ['guardrail_tripped'] });
+  assert.equal(trips.filter((event) => String(event.data.kind).startsWith('tool_economy_')).length, 3);
+});
 
 test('Phase 2: a mutating thrash trips the SDK tool-call ceiling and stops the turn (interrupt)', async () => {
   const prev = process.env.CLEMMY_SDK_MUTATING_CALL_CEILING;
@@ -1156,7 +1920,7 @@ test('Phase 2: a mutating thrash trips the SDK tool-call ceiling and stops the t
       prompt: 'do a thing',
       sessionId: 'sdk-ceiling-trip',
       modelId: 'claude-sonnet-4-6',
-      // read-only allowlist → run_shell_command is NOT fast-allow → counts as mutating
+      // Concrete network POST behavior counts as mutating regardless of allowlist.
       allowedLocalMcpTools: ['read_file', 'memory_search'],
     });
     assert.equal(r.limitHit, true);
@@ -1225,11 +1989,11 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       const canUse = p.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
       return stubsFor((async function* () {
         yield initOnlyMessage();
-        // run_shell_command is NOT in the allowlist below → the gate registers an
-        // approval and AWAITS a human. Resolve it ~150ms later (a "slow human").
+        // A behaviorally mutating shell command registers an approval and
+        // AWAITS a human. Resolve it ~150ms later (a "slow human").
         // That 150ms is spent INSIDE canUseTool → pausedMs, so it must NOT count
         // toward the 40ms wall clock.
-        const callP = canUse('mcp__clementine-local__run_shell_command', { command: 'echo hi' }, { signal: new AbortController().signal });
+        const callP = canUse('mcp__clementine-local__run_shell_command', { command: 'git push origin main' }, { signal: new AbortController().signal });
         setTimeout(() => {
           for (const row of approvalRegistry.listPending({ sessionId: sid })) {
             approvalRegistry.resolve(row.approvalId, 'approved', 'test');
@@ -1246,6 +2010,10 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       modelId: 'claude-sonnet-4-6',
       agentic: true,
       maxWallClockMs: 40, // far below the ~150ms approval wait
+      // Force the silent-iterator ticker to inspect the wall clock repeatedly
+      // while canUseTool is still waiting. The regression used to pass only
+      // because the default 60s heartbeat never observed the live wait.
+      livenessHeartbeatMs: 5,
       allowedLocalMcpTools: ['read_file', 'memory_search'],
     });
 
@@ -1332,6 +2100,27 @@ test('Phase 2: the wall-clock backstop ends a stuck turn as a graceful limit, no
   });
   assert.equal(r.limitHit, true);
   assert.match(r.text, /time budget/i);
+});
+
+test('silent SDK waits emit rate-limited visible heartbeats before the wall-clock stop', async () => {
+  const sid = 'sdk-silent-heartbeat';
+  eventlog.createSession({ id: sid, kind: 'chat' });
+  let closed = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => hangingQuery(() => { closed += 1; })) as any);
+  const r = await runClaudeAgentSdk({
+    prompt: 'wait on a long provider operation',
+    sessionId: sid,
+    modelId: 'claude-sonnet-4-6',
+    maxWallClockMs: 24,
+    livenessHeartbeatMs: 6,
+  });
+  assert.equal(r.limitHit, true);
+  const beats = eventlog.listEvents(sid, { types: ['heartbeat'] })
+    .filter((event) => event.data.kind === 'progress_check_in');
+  assert.ok(beats.length >= 2, 'the user/operator sees progress while iterator.next() is silent');
+  assert.ok(beats.length <= 5, 'ticks stay rate-limited to the configured cadence');
+  assert.ok(beats.every((event) => event.data.transport === 'claude_agent_sdk'));
+  assert.equal(closed, 1);
 });
 
 test('successful SDK run falls back to streamed deltas when final result text is blank', async () => {

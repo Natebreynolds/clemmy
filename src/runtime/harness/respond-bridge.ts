@@ -41,7 +41,20 @@
 import { runConversation } from './loop.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
 import { configureHarnessRuntime } from './codex-client.js';
-import { appendEvent, clearKill, createSession, getSession, listEvents, requestKill, type EventRow } from './eventlog.js';
+import {
+  appendEvent,
+  beginRunAttempt,
+  clearKill,
+  createSession,
+  finishRunAttempt,
+  getLatestRunAttemptByRunId,
+  getSession,
+  listEvents,
+  preserveCurrentKillAndClearStale,
+  recordRunAttemptUserInput,
+  requestKill,
+  type EventRow,
+} from './eventlog.js';
 import { listPending } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
@@ -57,6 +70,7 @@ import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
 import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../../types.js';
+import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
 
@@ -89,8 +103,17 @@ const REUSE_USER_INPUT_TERMINALS = new Set<string>([
   'approval_requested',
 ]);
 
-export function hasReusableRecordedUserInput(sessionId: string, text: string): boolean {
+export function hasReusableRecordedUserInput(sessionId: string, text: string, runId?: string): boolean {
   try {
+    // The attempt binding is the durable identity of this accepted turn. It
+    // remains valid when the runtime prompt is transformed (/goal,
+    // attachments, continuation) and after the first brain writes a terminal
+    // event before a safe provider fallover. Text is only a legacy fallback.
+    const boundAttempt = runId?.trim()
+      ? getLatestRunAttemptByRunId(sessionId, runId.trim())
+      : null;
+    if (boundAttempt?.sourceUserSeq) return true;
+
     const expected = text.trim();
     if (!expected) return false;
     const recent = listEvents(sessionId).slice(-12);
@@ -291,7 +314,10 @@ function toolActivityInput(value: unknown): Record<string, unknown> {
 }
 
 function toolActivityFromHarnessEvent(event: EventRow): ToolActivity | null {
-  if (event.type !== 'tool_called') return null;
+  // Native SDK calls also emit a transport-mirror row from the inner MCP
+  // wrapper. That row remains durable audit evidence, but forwarding it would
+  // double live progress counters/check-ins for one logical action.
+  if (!isCanonicalTopLevelToolEvent(event, 'tool_called')) return null;
   const data = objectRecord(event.data);
   const rawName = data.tool ?? data.toolName;
   const toolName = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : 'unknown_tool';
@@ -379,9 +405,22 @@ export async function respondViaHarness(
     });
   }
 
-  // A kill latched by a previous request on this session id must not abort
-  // this fresh run before it starts.
-  try { clearKill(sessionId); } catch { /* best effort */ }
+  // Every standard-lane request owns a durable attempt too (Claude already did
+  // this). Outer desktop/Discord callers pass the same run id, so begin is
+  // idempotent; background/workflow/cron callers gain exact cancellation rather
+  // than a session-global poll that can jump to a newer turn.
+  const requestAttempt = beginRunAttempt(sessionId, { runId: request.runId });
+  const sourceUserEvent = recordRunAttemptUserInput(requestAttempt, {
+    turn: 1,
+    role: 'user',
+    data: {
+      text: request.message,
+      ...(request.runId ? { runId: request.runId } : {}),
+      attemptId: requestAttempt.attemptId,
+      source: `bridge:${surface}`,
+    },
+  });
+  preserveCurrentKillAndClearStale(sessionId, requestAttempt);
 
   let cancelledByCaller = false;
   let cancelPoll: ReturnType<typeof setInterval> | undefined;
@@ -392,7 +431,7 @@ export async function respondViaHarness(
         try {
           if (await shouldCancel()) {
             cancelledByCaller = true;
-            requestKill(sessionId, 'cancelled by caller (shouldCancel)');
+            requestKill(sessionId, 'cancelled by caller (shouldCancel)', requestAttempt);
             if (cancelPoll) clearInterval(cancelPoll);
           }
         } catch { /* a broken predicate must not kill the run */ }
@@ -401,6 +440,7 @@ export async function respondViaHarness(
   }
 
   const detachProgressRelay = attachLegacyProgressRelay(request);
+  let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'failed';
   try {
     const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
     const agent = await buildAgentImpl({
@@ -461,15 +501,21 @@ export async function respondViaHarness(
       agent,
       sessionId,
       input: request.message,
+      sourceUserSeq: sourceUserEvent.seq,
       maxWallClockMs: request.maxWallClockMs,
       maxRunTokens: request.maxRunTokens,
       runTokenBaseline: request.runTokenBaseline,
       judgeCompletion: config.judgeCompletion,
       onChunk: request.onChunk,
-      reuseRecordedUserInput: opts.reuseRecordedUserInput,
+      reuseRecordedUserInput: true,
       falloverModelIds: fallover.falloverModelIds,
       rebuildAgentForBrain: fallover.rebuildAgentForBrain,
     });
+    requestAttemptStatus = result.status === 'killed'
+      ? 'cancelled'
+      : result.status === 'failed'
+        ? 'failed'
+        : 'completed';
 
     const replyText =
       (result.lastDecision?.reply && result.lastDecision.reply.trim())
@@ -512,7 +558,7 @@ export async function respondViaHarness(
                 appendEvent({ sessionId, turn: 0, role: 'system', type: 'conversation_superseded', data: { reason: 'no_structured_output', recoveryModel: next.modelId, supersededAt: (replyText || '').slice(0, 240) } });
               } catch { /* transcript hygiene only — never block the recovery hop */ }
               const recovered = await respondViaHarness(surface, request, {
-                reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+                reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message, request.runId),
                 modelOverride: next.modelId,
               });
               const route = routeDiagnosticsFromResponse(recovered);
@@ -594,6 +640,10 @@ export async function respondViaHarness(
   } finally {
     detachProgressRelay();
     if (cancelPoll) clearInterval(cancelPoll);
+    try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* attempt telemetry must not mask the response */ }
+    if (requestAttemptStatus === 'cancelled') {
+      try { clearKill(sessionId, requestAttempt); } catch { /* best effort */ }
+    }
   }
 }
 
@@ -767,7 +817,7 @@ export async function recoverChatBrainFailure(
   detach?.();
   try {
     const recovered = await respondViaHarness(surface, request, {
-      reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+      reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message, request.runId),
       modelOverride: recoveryModel,
     });
     const route = routeDiagnosticsFromResponse(recovered);

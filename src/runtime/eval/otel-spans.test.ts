@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { toGenAiSpans } from './otel-spans.js';
 import type { EventRow } from '../harness/eventlog.js';
+import { toolCallCorrelationFingerprint } from '../harness/tool-correlation.js';
 
 let seq = 0;
 const ev = (type: string, data: Record<string, unknown>, createdAt: string, turn = 0): EventRow => ({
@@ -38,6 +39,23 @@ test('a failed tool result → ERROR status on the execute_tool span (failure re
   ]);
   const t = spans.find((s) => s.attributes['gen_ai.tool.call.id'] === 'c2');
   assert.equal(t?.status?.code, 'ERROR');
+});
+
+test('native MCP mirror-only failure enriches one canonical OTel ERROR span', () => {
+  const longBody = 'private-email-body '.repeat(35);
+  assert.ok(longBody.length > 500);
+  const input = { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: { body: longBody } };
+  const correlationFingerprint = toolCallCorrelationFingerprint('composio_execute_tool', input);
+  const spans = toGenAiSpans([
+    ev('tool_called', { tool: 'composio_execute_tool', callId: 'toolu-1', accounting: 'top_level', arguments: JSON.stringify(input), correlationFingerprint }, '2026-06-21T00:00:00.000Z'),
+    ev('tool_called', { tool: 'composio_execute_tool', callId: 'mcp-1', accounting: 'transport_mirror', args: { tool_slug: input.tool_slug, arguments: { body: `${longBody.slice(0, 300)}…` } }, correlationFingerprint }, '2026-06-21T00:00:00.100Z'),
+    ev('tool_returned', { tool: 'composio_execute_tool', callId: 'mcp-1', accounting: 'transport_mirror', ok: false, error: 'provider failed' }, '2026-06-21T00:00:00.900Z'),
+  ]);
+  const tools = spans.filter((span) => span.name.startsWith('execute_tool'));
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].attributes['gen_ai.tool.call.id'], 'toolu-1');
+  assert.equal(tools[0].status?.code, 'ERROR');
+  assert.equal(tools[0].status?.message, 'provider failed');
 });
 
 test('guardrail_tripped → ERROR guardrail span carrying the gate kind', () => {

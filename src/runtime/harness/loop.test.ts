@@ -79,6 +79,8 @@ const approvalRegistry = await import('./approval-registry.js');
 const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
 const { rememberFact } = await import('../../memory/facts.js');
 const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
+const artifactLedger = await import('./artifact-ledger.js');
+const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 
 test.after(() => {
   try {
@@ -181,6 +183,50 @@ test('W1a characterization: a transient model error with NO fallover factory sur
     'the ask is tagged infra_error_recovery',
   );
   assert.notEqual(sess.status, 'failed', 'session stays recoverable, not failed');
+});
+
+test('infra retry context selects the canonical native MCP call, not its later sparse mirror', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let attempt = 0;
+  const runRunner: RunRunnerFn = async () => {
+    attempt += 1;
+    const canonicalId = `toolu-retry-${attempt}`;
+    appendEvent({
+      sessionId: sess.id,
+      turn: attempt,
+      role: 'Clem',
+      type: 'tool_called',
+      data: { tool: 'composio_execute_tool', callId: canonicalId, accounting: 'top_level', arguments: JSON.stringify({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: { to: 'firm@example.com' } }) },
+    });
+    // More than the old bounded tail: recovery must query past any volume of
+    // later raw transport mirrors rather than silently losing canonical args.
+    for (let mirrorIndex = 0; mirrorIndex < 520; mirrorIndex += 1) {
+      appendEvent({
+        sessionId: sess.id,
+        turn: attempt,
+        role: 'Clem',
+        type: 'tool_called',
+        data: { tool: 'composio_execute_tool', callId: `mcp-retry-${attempt}-${mirrorIndex}`, accounting: 'transport_mirror', args: { tool_slug: 'OUTLOOK_SEND_EMAIL' } },
+      });
+    }
+    throw BoundaryError.from(new Error('backend 529 overloaded'), {
+      kind: 'model.overloaded', retryable: true, userMessage: 'The model backend hit a transient error.',
+    });
+  };
+
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'send the approved email',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const ask = listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).at(-1);
+  const retry = ask?.data.retry_context as Record<string, unknown> | undefined;
+  assert.equal(retry?.failed_call_id, `toolu-retry-${attempt}`);
+  assert.match(String(retry?.failed_args ?? ''), /firm@example\.com/);
 });
 
 test('W1a: a transient error falls over to the next brain and completes (no ask)', async () => {
@@ -1619,6 +1665,145 @@ function scriptedRunner(turns: ScriptedTurn[]): RunRunnerFn {
     };
   };
 }
+
+test('standard lane parks unresolved provider artifacts and carries exact pending evidence in the typed terminal', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const documentId = 'doc_standard_pending_123456789';
+  let rootScopeId = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    rootScopeId = artifactLedger.resolveArtifactRunScopeId(
+      sess.id,
+      `${sess.id}::turn:1`,
+      source.seq,
+    );
+    const intent = {
+      kind: 'google_doc',
+      provider: 'Google Docs',
+      slotKey: 'google_doc:primary',
+      title: 'Standard lane report',
+      createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    } as const;
+    artifactLedger.claimArtifactSlot(sess.id, intent, 'create-standard-doc', rootScopeId);
+    artifactLedger.bindArtifactSlot(sess.id, intent.slotKey, {
+      resourceId: documentId,
+      uri: `https://docs.google.com/document/d/${documentId}/edit`,
+    }, 'create-standard-doc', rootScopeId);
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Created the requested report.',
+        reply: 'Done — I created the Google Doc.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create a Google Doc report for me',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input', 'unverified binding can never return a green completion');
+  const terminals = listEvents(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'the false success terminal is replaced, not followed by a corrective duplicate');
+  const terminal = terminals[0];
+  assert.equal(terminal.data.reason, 'awaiting_user_input');
+  assert.equal(terminal.data.delivered, false);
+  assert.equal(terminal.data.artifactRunScopeId, rootScopeId);
+  const verification = terminal.data.artifactVerification as {
+    status?: string;
+    pending?: number;
+    artifacts?: Array<{ resourceId?: string; status?: string }>;
+  };
+  assert.equal(verification.status, 'pending');
+  assert.equal(verification.pending, 1);
+  assert.deepEqual(verification.artifacts?.map((artifact) => ({
+    resourceId: artifact.resourceId,
+    status: artifact.status,
+  })), [{ resourceId: documentId, status: 'pending' }]);
+  const ask = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1)!;
+  assert.equal(ask.data.source, 'artifact_verification_pending');
+  assert.match(String(ask.data.question), /same resource ID/i);
+});
+
+test('standard artifact pause lineage is inherited only by the immediate reply', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const request = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create the provider report.' },
+  });
+  const rootScopeId = artifactLedger.resolveArtifactRunScopeId(sess.id, 'standard:paused', request.seq);
+  const intent = {
+    kind: 'google_doc',
+    provider: 'Google Docs',
+    slotKey: 'google_doc:primary',
+    title: 'Provider report',
+    createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+  } as const;
+  artifactLedger.claimArtifactSlot(sess.id, intent, 'create-paused-doc', rootScopeId);
+  artifactLedger.bindArtifactSlot(sess.id, intent.slotKey, {
+    resourceId: 'doc_pause_lineage_123456789',
+  }, 'create-paused-doc', rootScopeId);
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reason: 'awaiting_user_input',
+      artifactRunScopeId: rootScopeId,
+      artifactVerification: { status: 'pending' },
+      summary: 'Reply retry to verify the exact provider resource.',
+    },
+  });
+
+  const immediate = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'retry' },
+  });
+  assert.equal(
+    artifactLedger.resolveArtifactRunScopeId(sess.id, 'standard:immediate-reply', immediate.seq),
+    rootScopeId,
+    'the immediate reply inherits the exact typed pause root',
+  );
+
+  appendEvent({
+    sessionId: sess.id,
+    turn: 3,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Actually, hold that thought.' },
+  });
+  const later = appendEvent({
+    sessionId: sess.id,
+    turn: 4,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Start a separate unrelated report.' },
+  });
+  assert.notEqual(
+    artifactLedger.resolveArtifactRunScopeId(sess.id, 'standard:after-intervening-input', later.seq),
+    rootScopeId,
+    'an intervening user input breaks the typed pause lineage',
+  );
+});
 
 test('runConversation: stops on first completed decision', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -4460,6 +4645,67 @@ test('orphaned tool: a SURVIVED turn (tool returned) registers no orphan and dra
   // the returned call is not registered.
   recordOrphanedToolInFlight(sess, 1);
   assert.equal(listEvents(sess, { types: ['orphaned_tool_inflight'] }).length, 0, 'a returned call is never an orphan');
+  assert.equal(drainOrphanedToolCompletions(sess).length, 0);
+});
+
+test('orphaned native MCP call registers and reports one physical transport execution', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sess, turn: 2, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'toolu-orphan', accounting: 'top_level', arguments: '{"tool_slug":"GOOGLEDOCS_CREATE_DOCUMENT"}' } });
+  appendEvent({ sessionId: sess, turn: 2, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'mcp-orphan', accounting: 'transport_mirror', args: { tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT' } } });
+
+  recordOrphanedToolInFlight(sess, 2);
+  const markers = listEvents(sess, { types: ['orphaned_tool_inflight'] });
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].data.callId, 'mcp-orphan', 'the physical callback owns the eventual post-stream return');
+
+  appendEvent({ sessionId: sess, turn: 2, role: 'tool', type: 'tool_returned', data: { tool: 'composio_execute_tool', callId: 'mcp-orphan', accounting: 'transport_mirror', ok: true, preview: 'created document doc-123' } });
+  const reports = drainOrphanedToolCompletions(sess);
+  assert.equal(reports.length, 1);
+  assert.match(reports[0].directive, /created document doc-123/);
+  assert.equal(drainOrphanedToolCompletions(sess).length, 0);
+});
+
+test('orphan pairing skips a returned identical canonical before the later live native MCP call', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' }).id;
+  const argumentsJson = '{"tool_slug":"GOOGLEDOCS_CREATE_DOCUMENT","arguments":{"title":"Firm brief"}}';
+  appendEvent({ sessionId: sess, turn: 4, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'toolu-returned', accounting: 'top_level', arguments: argumentsJson } });
+  appendEvent({ sessionId: sess, turn: 4, role: 'tool', type: 'tool_returned', data: { tool: 'composio_execute_tool', callId: 'toolu-returned', accounting: 'top_level', ok: true } });
+  appendEvent({ sessionId: sess, turn: 4, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'toolu-live', accounting: 'top_level', arguments: argumentsJson } });
+  appendEvent({ sessionId: sess, turn: 4, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'mcp-live', accounting: 'transport_mirror', args: { tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT', arguments: { title: 'Firm brief' } } } });
+
+  recordOrphanedToolInFlight(sess, 4);
+  const markers = listEvents(sess, { types: ['orphaned_tool_inflight'] });
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].data.callId, 'mcp-live');
+});
+
+test('a transport mirror arriving after canonical orphan registration reconciles into one report', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' }).id;
+  const longBody = 'private-document-body '.repeat(30);
+  assert.ok(longBody.length > 500);
+  const fullArgs = { tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT', arguments: { title: 'Late mirror', content: longBody } };
+  const correlationFingerprint = toolCallCorrelationFingerprint('composio_execute_tool', fullArgs);
+  appendEvent({ sessionId: sess, turn: 5, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'toolu-late', accounting: 'top_level', arguments: JSON.stringify(fullArgs), correlationFingerprint } });
+
+  recordOrphanedToolInFlight(sess, 5);
+  assert.deepEqual(
+    listEvents(sess, { types: ['orphaned_tool_inflight'] }).map((event) => event.data.callId),
+    ['toolu-late'],
+  );
+
+  appendEvent({ sessionId: sess, turn: 5, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'mcp-late', accounting: 'transport_mirror', args: { tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT', arguments: { title: 'Late mirror', content: `${longBody.slice(0, 300)}…` } }, correlationFingerprint } });
+  // A second death-path pass must not add a mirror marker for the same action.
+  recordOrphanedToolInFlight(sess, 5);
+  assert.equal(listEvents(sess, { types: ['orphaned_tool_inflight'] }).length, 1);
+
+  appendEvent({ sessionId: sess, turn: 5, role: 'tool', type: 'tool_returned', data: { tool: 'composio_execute_tool', callId: 'mcp-late', accounting: 'transport_mirror', ok: true, preview: 'created document doc-late' } });
+  const reports = drainOrphanedToolCompletions(sess);
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].callId, 'toolu-late');
+  assert.match(reports[0].directive, /created document doc-late/);
   assert.equal(drainOrphanedToolCompletions(sess).length, 0);
 });
 

@@ -28,9 +28,22 @@ import {
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
-import { appendEvent, writeToolOutput } from './eventlog.js';
+import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
-import { killGateVerdict, grindGateVerdict, composeKillAwareShouldCancel } from './turn-control.js';
+import {
+  killGateVerdict,
+  grindGateVerdict,
+  composeKillAwareShouldCancel,
+  preflightGateVerdict,
+} from './turn-control.js';
+import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
+import { toolCallCorrelationFingerprint } from './tool-correlation.js';
+import { classifyExternalWrite } from './confirm-first-gate.js';
+import { extractDuplicateIdentityKeys } from './grounding-gate.js';
+import {
+  evaluateToolEconomy,
+  type ToolEconomyState,
+} from './tool-economy.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 import { createClementineMcpServer, listClementineMcpToolNames } from '../../tools/mcp-server.js';
@@ -42,6 +55,23 @@ import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-ev
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import { resolveToolSurface } from './tool-surface.js';
+import {
+  artifactIntentForTool,
+  artifactObjectiveForRunScope,
+  artifactOutputProvesNoDispatch,
+  artifactReuseMessage,
+  artifactVerificationIntentForTool,
+  bindClaimedArtifact,
+  claimArtifactSlot,
+  extractArtifactResource,
+  markClaimedArtifactUncertain,
+  releaseClaimedArtifact,
+  resolveArtifactRunScopeId,
+  scopeArtifactIntentForObjective,
+  verifyArtifactBindingFromToolResult,
+  type ArtifactIntent,
+  type ArtifactVerificationIntent,
+} from './artifact-ledger.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -199,7 +229,24 @@ function sdkWallClockMs(): number {
 // work, only the permission decision). It is subtracted from the wall clock so a
 // long confirm-first approval can't self-abort the turn the moment the user
 // approves — honoring "approve once, then run to completion".
-interface ToolCeilingState { total: number; mutating: number; stopped: string | null; stoppedKind: 'loop' | 'wallclock' | null; pausedMs: number }
+interface ToolCeilingState {
+  total: number;
+  mutating: number;
+  stopped: string | null;
+  stoppedKind: 'loop' | 'wallclock' | null;
+  /** Completed permission-wait intervals (union, not a sum of overlaps). */
+  pausedMs: number;
+  activePermissionWaits: number;
+  permissionPauseStartedAt: number | null;
+}
+
+function effectivePermissionPausedMs(state: ToolCeilingState, now: number): number {
+  return state.pausedMs + (
+    state.activePermissionWaits > 0 && state.permissionPauseStartedAt !== null
+      ? Math.max(0, now - state.permissionPauseStartedAt)
+      : 0
+  );
+}
 
 /** Wrap a base `canUseTool` to (1) ALWAYS meter approval-wait time into
  *  state.pausedMs (so the wall clock excludes it), and (2) when `countCeiling`,
@@ -218,7 +265,12 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
         return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
       }
       const tail = toolName.split('__').at(-1) ?? toolName;
-      const isRead = fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(tail));
+      const effect = classifyRuntimeToolEffect(toolName, input);
+      // Concrete behavior wins over name/allowlist membership. The allowlist is
+      // retained only as a compatibility fallback for genuinely unknown tools.
+      const isRead = effect.effect === 'read' || effect.effect === 'compute'
+        || (effect.effect === 'unknown'
+          && (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(tail))));
       state.total += 1;
       if (!isRead) state.mutating += 1;
       if (state.mutating > mutCeiling || state.total > totalCeiling) {
@@ -229,10 +281,16 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
       }
     }
     const t0 = Date.now();
+    if (state.activePermissionWaits === 0) state.permissionPauseStartedAt = t0;
+    state.activePermissionWaits += 1;
     try {
       return await base(toolName, input, options);
     } finally {
-      state.pausedMs += Date.now() - t0;
+      state.activePermissionWaits = Math.max(0, state.activePermissionWaits - 1);
+      if (state.activePermissionWaits === 0 && state.permissionPauseStartedAt !== null) {
+        state.pausedMs += Math.max(0, Date.now() - state.permissionPauseStartedAt);
+        state.permissionPauseStartedAt = null;
+      }
     }
   }) as CanUseTool;
 }
@@ -353,7 +411,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
   mcpToolAllowlist?: string[],
-  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string; runScopeId?: string },
+  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string; runScopeId?: string; sourceUserSeq?: number },
   loading?: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
@@ -374,6 +432,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
         instance: createClementineMcpServer({
           sessionId,
           runScopeId: attribution?.runScopeId,
+          sourceUserSeq: attribution?.sourceUserSeq,
           gatedMutations,
           allowedTools: allowlist,
           alwaysLoadTools: loading?.alwaysLoadTools,
@@ -388,6 +447,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
     CLEMENTINE_HOME: BASE_DIR,
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
     ...(attribution?.runScopeId?.trim() ? { CLEMENTINE_MCP_RUN_SCOPE_ID: attribution.runScopeId.trim() } : {}),
+    ...(Number.isSafeInteger(attribution?.sourceUserSeq) && (attribution?.sourceUserSeq ?? 0) > 0
+      ? { CLEMENTINE_MCP_SOURCE_USER_SEQ: String(attribution?.sourceUserSeq) }
+      : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
     ...((loading?.alwaysLoadTools?.length ?? 0) > 0
@@ -576,7 +638,12 @@ function emitSdkToolCallEvent(
       workflowNodeRunId: wf && wf.length > 2 ? wf.slice(2).join(':') : undefined,
       toolCallId: callId,
       actor: 'claude-agent-sdk',
-      payload: { tool: toolName ? mcpToolTail(toolName) : undefined, ...extra },
+      payload: {
+        tool: toolName ? mcpToolTail(toolName) : undefined,
+        canonicalCallId: callId,
+        accounting: 'top_level',
+        ...extra,
+      },
     });
   } catch { /* observability must never break the SDK run */ }
 }
@@ -640,6 +707,99 @@ function contextWindowFromResult(result: SDKResultMessage | null): number | null
 
 function mcpToolTail(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
+}
+
+function sdkToolArgumentsPreview(input: unknown): string {
+  try { return JSON.stringify(input ?? {}).slice(0, 8_000); } catch { return String(input ?? '').slice(0, 8_000); }
+}
+
+function sdkToolResultPreview(output: unknown): string {
+  if (typeof output === 'string') return output.slice(0, 400);
+  try { return JSON.stringify(output ?? '').slice(0, 400); } catch { return String(output ?? '').slice(0, 400); }
+}
+
+function appendSdkTopLevelToolEvent(
+  sessionId: string | undefined,
+  type: 'tool_called' | 'tool_returned',
+  callId: string,
+  source: { name: string; input: unknown } | undefined,
+  result?: { isError: boolean; output?: unknown },
+): void {
+  if (!sessionId) return;
+  try {
+    const name = source?.name ?? '';
+    const metadata = runtimeToolAccountingMetadata(name, source?.input);
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: type === 'tool_called' ? 'Clem' : 'tool',
+      type,
+      data: {
+        tool: name ? mcpToolTail(name) : undefined,
+        callId,
+        canonicalCallId: callId,
+        accounting: 'top_level',
+        ...(type === 'tool_called' ? {
+          correlationFingerprint: toolCallCorrelationFingerprint(name ? mcpToolTail(name) : '', source?.input),
+        } : {}),
+        effect: metadata.effect,
+        ...(metadata.toolSlug ? { toolSlug: metadata.toolSlug } : {}),
+        ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
+        ...(type === 'tool_returned' ? {
+          ok: !result?.isError,
+          // Keep the canonical row independently useful to semantic readers.
+          // The full payload still lives in tool_outputs; this matches the
+          // existing bounded transport preview without duplicating the body.
+          ...(result?.output !== undefined ? { preview: sdkToolResultPreview(result.output) } : {}),
+        } : {}),
+      },
+    });
+  } catch { /* progress/accounting must never break the stream */ }
+}
+
+interface NativeExternalWriteAttempt {
+  callId: string;
+  toolName: string;
+  shapeKey: string;
+  targets: string[];
+}
+
+function nativeExternalWriteAttempt(toolName: string, input: unknown, callId: string): NativeExternalWriteAttempt | null {
+  const effect = classifyRuntimeToolEffect(toolName, input);
+  if (effect.source !== 'native_mcp' || effect.effect !== 'external_write') return null;
+  const shape = classifyExternalWrite(toolName, input);
+  return {
+    callId,
+    toolName,
+    shapeKey: shape.shapeKey ?? toolName.replace(/^mcp__/, ''),
+    targets: extractDuplicateIdentityKeys(input).slice(0, 8),
+  };
+}
+
+function appendNativeExternalWriteEvent(
+  sessionId: string | undefined,
+  attempt: NativeExternalWriteAttempt,
+  type: 'external_write' | 'external_write_failed' | 'external_write_orphaned',
+  extra: Record<string, unknown> = {},
+): void {
+  if (!sessionId) return;
+  try {
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type,
+      data: {
+        shapeKey: attempt.shapeKey,
+        toolName: attempt.toolName,
+        targets: attempt.targets,
+        callId: attempt.callId,
+        canonicalCallId: attempt.callId,
+        nativeMcp: true,
+        ...extra,
+      },
+    });
+  } catch { /* durable safety telemetry fails conservative via artifact claim */ }
 }
 
 function sdkPreapprovedToolsForMode(tools: string[], agentic: boolean): string[] {
@@ -781,11 +941,23 @@ export interface ClaudeAgentSdkRunOptions {
    *  run_tool_program (the recovery the refusal steers to) exists; workers/steps
    *  leave it off so a refusal never strands a run with no recovery. */
   readFanoutGuard?: boolean;
-  /** Skip the session-scoped grind ladder on this run's canUseTool gate. Set by
-   *  WORKERS, which deliberately share the parent session id — pooling their
-   *  calls into the parent's tracker would poison the orchestrator's own gate
-   *  and log phantom guardrail trips. The kill gate is never skipped. */
-  skipSessionGrindGate?: boolean;
+  /** Stable, isolated loop-guard identity for this logical run/attempt. The
+   *  real sessionId remains approval/kill/event authority. Workers pass a
+   *  packet-derived scope; workflow steps derive run+step; chat derives the
+   *  durable user-input event. */
+  trackerScopeId?: string;
+  /** Exact accepted user event owned by this run attempt. Turn preflight uses
+   * this instead of session-global latest-user state. */
+  sourceUserSeq?: number;
+  /** Durable artifact root. Unlike trackerScopeId, this may intentionally span
+   * a manual continue/restart/fallback while guardrail counters start fresh. */
+  artifactRunScopeId?: string;
+  /** Original user objective used only to distinguish an explicitly requested
+   * multi-document/site deliverable from a renamed retry. */
+  artifactObjective?: string;
+  /** Enforcement mode for the bounded post-create repair query. When present,
+   * canUseTool permits only exact-id read-backs for these resources. */
+  artifactVerificationOnly?: Array<Pick<ArtifactVerificationIntent, 'kind' | 'resourceId'>>;
   /**
    * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
    * spawned advertising ONLY these tools, so the model receives only their schemas
@@ -834,6 +1006,12 @@ export interface ClaudeAgentSdkRunOptions {
   approvalMode?: 'wait' | 'park';
   /** Caller-driven cancellation hook (background task cancel/deadline). */
   shouldCancel?: () => boolean | Promise<boolean>;
+  /** Optional logical-run economy shared by every corrective/limit
+   * continuation of an interactive brain turn. Provider toolUseID values make
+   * permission replays free; background/workflow callers intentionally omit it. */
+  toolEconomyState?: ToolEconomyState;
+  /** Test/embedding override; production defaults to one visible tick/minute. */
+  livenessHeartbeatMs?: number;
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -845,6 +1023,9 @@ export interface ClaudeAgentSdkRunResult {
   successfulToolUses?: string[];
   usage?: unknown;
   modelUsage?: unknown;
+  /** Present only after a create/exact-id verification caused durable artifact
+   * lineage to exist. Ordinary SDK turns leave this absent. */
+  artifactRunScopeId?: string;
   /** True when the run stopped because it hit the turn budget (error_max_turns)
    *  rather than finishing. The caller surfaces a graceful "say continue" instead
    *  of a hard error — parity with the harness loop's auto-continue-on-limit. */
@@ -862,14 +1043,44 @@ export interface ClaudeAgentSdkRunResult {
   toolCallLedger?: Array<{ callId: string; name: string; argsPreview: string }>;
 }
 
-function extractAssistantToolUses(message: SDKMessage): string[] {
+/**
+ * Stable guardrail identity for one logical SDK run. Unlike the former
+ * Date.now()+Math.random scope, this survives safe retries and daemon resume:
+ * workflow work keys by durable run+step, workers provide a packet key, and a
+ * chat turn keys by its durable user_input_received event.
+ */
+export function resolveClaudeAgentSdkTrackerScope(
+  options: Pick<ClaudeAgentSdkRunOptions, 'sessionId' | 'trackerScopeId' | 'workflowRunId' | 'stepId'>,
+): string | undefined {
+  const explicit = options.trackerScopeId?.trim();
+  if (explicit) return explicit;
+  const sessionId = options.sessionId?.trim();
+  if (!sessionId) return undefined;
+  if (options.workflowRunId?.trim()) {
+    return `${sessionId}::workflow:${options.workflowRunId.trim()}:${options.stepId?.trim() || 'step'}`;
+  }
+  try {
+    const inputEvent = listEvents(sessionId, { types: ['user_input_received'], limit: 1, desc: true })[0];
+    if (inputEvent?.id) return `${sessionId}::claude:${inputEvent.id}`;
+  } catch { /* a missing eventlog must not prevent a run */ }
+  // Stable fallback for out-of-band SDK callers/tests. It deliberately favors
+  // surviving restart over silently resetting a runaway counter.
+  return `${sessionId}::claude`;
+}
+
+function extractAssistantToolUses(message: SDKMessage, seenCallIds?: Set<string>): string[] {
   if (message.type !== 'assistant') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
   if (!Array.isArray(content)) return [];
   const out: string[] = [];
   for (const block of content) {
-    const b = block as { type?: unknown; name?: unknown };
-    if (b.type === 'tool_use' && typeof b.name === 'string') out.push(b.name);
+    const b = block as { type?: unknown; id?: unknown; name?: unknown };
+    if (b.type !== 'tool_use' || typeof b.name !== 'string') continue;
+    if (typeof b.id === 'string' && seenCallIds) {
+      if (seenCallIds.has(b.id)) continue;
+      seenCallIds.add(b.id);
+    }
+    out.push(b.name);
   }
   return out;
 }
@@ -1131,30 +1342,52 @@ function emitToolSurfaceRetryEvent(
   } catch { /* retry telemetry must never break the SDK lane */ }
 }
 
-async function nextSdkMessageWithStartupTimeout(
+async function nextSdkMessageWithRuntimeTicks(
   iterator: AsyncIterator<SDKMessage>,
   options: ClaudeAgentSdkRunOptions,
-  timeoutMs: number,
+  startupTimeoutMs: number,
+  tickMs: number,
+  onTick: () => Promise<'continue' | 'stop'>,
 ): Promise<IteratorResult<SDKMessage>> {
   const pending = iterator.next();
   const required = requiredLocalMcpTools(options);
-  if (timeoutMs <= 0 || required.length === 0) return pending;
-
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  try {
-    return await new Promise<IteratorResult<SDKMessage>>((resolve, reject) => {
-      timer = setTimeout(() => {
-        reject(new ClaudeAgentSdkToolSurfaceError(required, [], {
-          startupTimeoutMs: timeoutMs,
-          reason: `No SDK init message arrived within ${timeoutMs}ms; local MCP startup did not advertise tools in time.`,
-        }));
-      }, timeoutMs);
-      pending.then(resolve, reject).finally(() => {
-        if (timer) clearTimeout(timer);
+  const startedAt = Date.now();
+  while (true) {
+    const startupRemaining = startupTimeoutMs > 0 && required.length > 0
+      ? Math.max(0, startupTimeoutMs - (Date.now() - startedAt))
+      : Number.POSITIVE_INFINITY;
+    if (startupRemaining === 0) {
+      throw new ClaudeAgentSdkToolSurfaceError(required, [], {
+        startupTimeoutMs,
+        reason: `No SDK init message arrived within ${startupTimeoutMs}ms; local MCP startup did not advertise tools in time.`,
       });
+    }
+    const waitMs = Math.min(
+      tickMs > 0 ? tickMs : Number.POSITIVE_INFINITY,
+      startupRemaining,
+    );
+    if (!Number.isFinite(waitMs)) return pending;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const winner = await new Promise<
+      | { kind: 'message'; value: IteratorResult<SDKMessage> }
+      | { kind: 'tick' }
+    >((resolve, reject) => {
+      timer = setTimeout(() => resolve({ kind: 'tick' }), Math.max(1, waitMs));
+      pending.then(
+        (value) => resolve({ kind: 'message', value }),
+        reject,
+      );
+    }).finally(() => {
+      if (timer) clearTimeout(timer);
     });
-  } finally {
-    if (timer) clearTimeout(timer);
+    if (winner.kind === 'message') return winner.value;
+    if (startupRemaining <= waitMs && startupTimeoutMs > 0 && required.length > 0) {
+      throw new ClaudeAgentSdkToolSurfaceError(required, [], {
+        startupTimeoutMs,
+        reason: `No SDK init message arrived within ${startupTimeoutMs}ms; local MCP startup did not advertise tools in time.`,
+      });
+    }
+    if (await onTick() === 'stop') return { done: true, value: undefined };
   }
 }
 
@@ -1186,6 +1419,33 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Agentic lane requires a session id (the gate chain + approval read/write the
   // session's event log). Without one, fall back to the read-only allowlist.
   const agentic = Boolean(options.agentic && options.sessionId?.trim());
+  const trackerScopeId = resolveClaudeAgentSdkTrackerScope(options);
+  // Artifact lineage is intentionally LAZY. Ordinary reads/chats must not mint
+  // artifact_source_roots/run_scopes merely because the SDK lane initialized.
+  // `options.artifactRunScopeId` is an attempt/candidate scope until the first
+  // create or exact-id verification proves artifact work exists.
+  let resolvedArtifactRunScopeId: string | undefined;
+  const ensureArtifactRunScopeId = (): string | undefined => {
+    if (!options.sessionId) return undefined;
+    if (!resolvedArtifactRunScopeId) {
+      resolvedArtifactRunScopeId = resolveArtifactRunScopeId(
+        options.sessionId,
+        options.artifactRunScopeId?.trim() || trackerScopeId || options.sessionId,
+        options.sourceUserSeq,
+      );
+    }
+    return resolvedArtifactRunScopeId;
+  };
+  const artifactObjective = (runScopeId: string): string => options.artifactObjective?.trim()
+    || (options.sessionId ? artifactObjectiveForRunScope(options.sessionId, runScopeId) : '')
+    || options.prompt;
+  const nativeArtifactClaims = new Map<string, { artifactId: string; intent: ArtifactIntent }>();
+  const nativeExternalWrites = new Map<string, NativeExternalWriteAttempt>();
+  const nativePermissionResults = new Map<string, { signature: string; result: PermissionResult | null }>();
+  const nativePermissionInFlight = new Map<string, {
+    signature: string;
+    promise: Promise<PermissionResult | null>;
+  }>();
   // Point the SDK at the user's installed `claude` CLI. The npm package ships the
   // native CLI as an OPTIONAL per-arch dep (@anthropic-ai/claude-agent-sdk-<plat>);
   // when packaged with --omit=optional (and/or when the daemon's arch differs from
@@ -1196,13 +1456,25 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const pathToClaudeCodeExecutable = resolveClaudeCliPath() ?? undefined;
   // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
   // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
-  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, stoppedKind: null, pausedMs: 0 };
+  const ceilingState: ToolCeilingState = {
+    total: 0,
+    mutating: 0,
+    stopped: null,
+    stoppedKind: null,
+    pausedMs: 0,
+    activePermissionWaits: 0,
+    permissionPauseStartedAt: null,
+  };
   // TURN-CONTROL SPINE: the SDK polls shouldCancel before start and after
   // EVERY stream message — OR-ing the kill switch in gives the whole query
   // message-boundary kill coverage (the incident's 33-min run was unkillable
   // because nothing on this lane ever read the kill row).
   const effectiveShouldCancel = options.sessionId
-    ? composeKillAwareShouldCancel(options.sessionId as string, options.shouldCancel)
+    ? composeKillAwareShouldCancel(
+        options.sessionId as string,
+        options.shouldCancel,
+        options.sourceUserSeq ? { sourceUserSeq: options.sourceUserSeq } : undefined,
+      )
     : options.shouldCancel;
   let approvalBoundary: ClaudeAgentApprovalBoundary | null = null;
   // Agentic: the async approval gate (read/local fast-allow, everything else
@@ -1230,24 +1502,175 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   //    lack it). Local gated tools already ride the full ladder via
   //    wrapToolForHarness; local reads ride the ambient counter. No double-count.
   const canUseTool: CanUseTool = (async (toolName, input, opts) => {
-    const kill = killGateVerdict(options.sessionId);
+    const kill = killGateVerdict(
+      options.sessionId,
+      options.sourceUserSeq ? { sourceUserSeq: options.sourceUserSeq } : undefined,
+    );
     if (kill) return kill as PermissionResult;
-    // Workers share the PARENT session id by design (one batch approval covers
-    // the fan-out) — running the session-scoped grind ladder inside each worker
-    // would pool every worker's calls into one tracker and poison the
-    // orchestrator's own gate (review wf_2ed83f94 #6). The parent's gate owns
-    // grind control; the kill gate above still covers workers.
-    if (typeof toolName === 'string' && options.sessionId && !options.skipSessionGrindGate) {
-      const stripped = toolName.replace(/^mcp__/, '');
-      const isNativeExternalMcp = stripped.includes('__') && !/clement/i.test(stripped);
-      if (isNativeExternalMcp) {
-        const grind = grindGateVerdict(options.sessionId, stripped, input, { honorFanout: Boolean(options.readFanoutGuard) });
-        if (grind) {
-          return { behavior: 'deny', message: grind.message, interrupt: grind.interrupt } as PermissionResult;
-        }
+    // Native MCP calls never enter wrapToolForHarness. Consult the same typed
+    // persisted preflight here so the SDK lane cannot execute around the
+    // conversational alignment beat.
+    const preflight = preflightGateVerdict(options.sessionId, toolName, input, options.sourceUserSeq);
+    if (preflight) return preflight as PermissionResult;
+    const providerCallId = typeof opts.toolUseID === 'string' && opts.toolUseID.trim()
+      ? opts.toolUseID.trim()
+      : '';
+    let permissionSignature = '';
+    try { permissionSignature = `${toolName}\0${JSON.stringify(input ?? {})}`; } catch { permissionSignature = `${toolName}\0${String(input)}`; }
+    if (providerCallId) {
+      const cached = nativePermissionResults.get(providerCallId);
+      if (cached) {
+        if (cached.signature === permissionSignature) return cached.result;
+        return {
+          behavior: 'deny',
+          interrupt: true,
+          message: `Provider call id ${providerCallId} was reused for a different tool action. The turn was stopped rather than mis-correlate a mutation.`,
+        } as PermissionResult;
+      }
+      const inFlight = nativePermissionInFlight.get(providerCallId);
+      if (inFlight) {
+        if (inFlight.signature === permissionSignature) return inFlight.promise;
+        return {
+          behavior: 'deny',
+          interrupt: true,
+          message: `Provider call id ${providerCallId} was reused for a different tool action. The turn was stopped rather than mis-correlate an in-flight mutation.`,
+        } as PermissionResult;
       }
     }
-    return ceilingGated(toolName, input, opts);
+    const evaluatePermission = async (): Promise<PermissionResult | null> => {
+      if (options.artifactVerificationOnly) {
+        const verification = artifactVerificationIntentForTool(toolName, input);
+        const exactAllowed = Boolean(verification && options.artifactVerificationOnly.some(
+          (allowed) => allowed.kind === verification.kind && allowed.resourceId === verification.resourceId,
+        ));
+        if (!exactAllowed) {
+          return {
+            behavior: 'deny',
+            interrupt: false,
+            message: 'This bounded repair phase permits only an exact provider read-back of the already-bound document/site id. Create, update, list, search, shell exploration, and unrelated tools are blocked.',
+          } as PermissionResult;
+        }
+      }
+
+      let nativeExternal = false;
+      let strippedToolName = typeof toolName === 'string' ? toolName.replace(/^mcp__/, '') : '';
+      if (typeof toolName === 'string' && options.sessionId) {
+        strippedToolName = toolName.replace(/^mcp__/, '');
+        nativeExternal = strippedToolName.includes('__') && !/clement/i.test(strippedToolName);
+      }
+
+      // A durable artifact slot is admission authority, not an attempted tool
+      // call. Claim it before economy/grind/ceiling/approval so an existing
+      // document/site returns its reuse pointer without consuming budgets,
+      // mutating loop state, or surfacing an approval for work we will refuse.
+      let artifactAdmission: { artifactId: string; intent: ArtifactIntent } | undefined;
+      if (nativeExternal && options.sessionId) {
+        const rawIntent = artifactIntentForTool(strippedToolName, input);
+        const artifactRunScopeId = rawIntent ? ensureArtifactRunScopeId() : undefined;
+        if (rawIntent && artifactRunScopeId) {
+          const intent = scopeArtifactIntentForObjective(rawIntent, artifactObjective(artifactRunScopeId), input);
+          const claim = claimArtifactSlot(options.sessionId, intent, providerCallId || undefined, artifactRunScopeId);
+          if (!claim.acquired) {
+            return { behavior: 'deny', message: artifactReuseMessage(claim.artifact), interrupt: false } as PermissionResult;
+          }
+          artifactAdmission = { artifactId: claim.artifact.id, intent };
+        }
+      }
+
+      let admittedForDispatch = false;
+      try {
+        if (options.toolEconomyState) {
+          const economy = evaluateToolEconomy({
+            state: options.toolEconomyState,
+            toolName,
+            args: input,
+            callId: opts.toolUseID,
+          });
+          if (economy) {
+            if (!economy.replayed) {
+              try {
+                appendEvent({
+                  sessionId: options.sessionId as string,
+                  turn: 0,
+                  role: 'system',
+                  type: 'guardrail_tripped',
+                  data: {
+                    kind: economy.kind === 'hard_stop' ? 'tool_economy_hard_stop' : 'tool_economy_finish_phase',
+                    reason: economy.message,
+                    attempt: economy.attempt,
+                    policy: economy.policy.kind,
+                    softLimit: economy.policy.softLimit,
+                    hardLimit: economy.policy.hardLimit,
+                    toolName,
+                    canonicalCallId: opts.toolUseID,
+                  },
+                });
+              } catch { /* economy enforcement must not depend on telemetry */ }
+            }
+            if (economy.interrupt) {
+              ceilingState.stopped = economy.message;
+              ceilingState.stoppedKind = 'loop';
+            }
+            return {
+              behavior: 'deny',
+              message: economy.message,
+              interrupt: economy.interrupt,
+            } as PermissionResult;
+          }
+        }
+
+        if (nativeExternal && options.sessionId) {
+          const grind = grindGateVerdict(options.sessionId, strippedToolName, input, {
+            trackerScopeId,
+            honorFanout: Boolean(options.readFanoutGuard),
+          });
+          if (grind) {
+            return { behavior: 'deny', message: grind.message, interrupt: grind.interrupt } as PermissionResult;
+          }
+        }
+
+        const permission = await ceilingGated(toolName, input, opts);
+        if (permission?.behavior !== 'allow') return permission;
+
+        if (artifactAdmission) {
+          if (providerCallId) nativeArtifactClaims.set(providerCallId, artifactAdmission);
+          else markClaimedArtifactUncertain(artifactAdmission.artifactId);
+        }
+        if (nativeExternal && options.sessionId && providerCallId) {
+          const write = nativeExternalWriteAttempt(toolName, input, providerCallId);
+          if (write && !nativeExternalWrites.has(providerCallId)) {
+            nativeExternalWrites.set(providerCallId, write);
+            appendNativeExternalWriteEvent(options.sessionId, write, 'external_write', {
+              irreversible: classifyExternalWrite(toolName, input).irreversible,
+            });
+          }
+        }
+        admittedForDispatch = true;
+        return permission;
+      } finally {
+        // Every post-admission deny/throw is provably pre-dispatch: canUseTool
+        // has not returned allow yet. Release only the exact call-owned pending
+        // row. Ledger failure keeps it pending (the conservative direction).
+        if (!admittedForDispatch && artifactAdmission) {
+          if (providerCallId) nativeArtifactClaims.delete(providerCallId);
+          try { releaseClaimedArtifact(artifactAdmission.artifactId, providerCallId || undefined); } catch { /* pending claim remains fail-closed */ }
+        }
+      }
+    };
+
+    const permissionPromise = evaluatePermission();
+    if (providerCallId) {
+      nativePermissionInFlight.set(providerCallId, { signature: permissionSignature, promise: permissionPromise });
+    }
+    try {
+      const permission = await permissionPromise;
+      if (providerCallId) nativePermissionResults.set(providerCallId, { signature: permissionSignature, result: permission });
+      return permission;
+    } finally {
+      if (providerCallId && nativePermissionInFlight.get(providerCallId)?.promise === permissionPromise) {
+        nativePermissionInFlight.delete(providerCallId);
+      }
+    }
   }) as CanUseTool;
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   // When Claude's native ToolSearch is active, a reduced JIT surface should not
@@ -1281,9 +1704,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       deferUnlistedTools: true,
     };
   }
-  const runScopeId = options.sessionId?.trim()
-    ? `${options.sessionId.trim()}::claude:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
-    : undefined;
+  const runScopeId = trackerScopeId;
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
@@ -1299,6 +1720,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         workflowName: options.workflowName,
         stepId: options.stepId,
         runScopeId,
+        sourceUserSeq: options.sourceUserSeq,
       }, localMcpLoading),
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
@@ -1401,6 +1823,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // visible output. Once tools run or deltas stream, the error propagates and
   // the caller decides (workflow step re-dispatch / chat turn-boundary switch).
   let streamedAny = false;
+  // The SDK may replay a full assistant/user message around stream boundaries.
+  // Canonical accounting is keyed by the provider's tool_use id, not message
+  // count, so every logical call has exactly one start and one completion row.
+  const seenTopLevelToolCallIds = new Set<string>();
+  const seenTopLevelToolReturnIds = new Set<string>();
+  const seenReturnedToolCallIds = new Set<string>();
   for (let attempt = 0; ; attempt++) {
     result = null;
     init = null;
@@ -1422,6 +1850,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ceilingState.stopped = null;
     ceilingState.stoppedKind = null;
     ceilingState.pausedMs = 0;
+    ceilingState.activePermissionWaits = 0;
+    ceilingState.permissionPauseStartedAt = null;
     const startedAt = Date.now();
     let lastHeartbeatAt = startedAt;
     const toolById = new Map<string, { name: string; input: unknown }>();
@@ -1433,10 +1863,48 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
       while (true) {
-        const next = await nextSdkMessageWithStartupTimeout(
+        const heartbeatIntervalMs = Math.max(1, options.livenessHeartbeatMs ?? 60_000);
+        const next = await nextSdkMessageWithRuntimeTicks(
           iterator,
           options,
           firstByteMs === null ? toolSurfaceFirstMessageMs() : 0,
+          heartbeatIntervalMs,
+          async () => {
+            if (effectiveShouldCancel && await effectiveShouldCancel()) {
+              try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+              throw new AgentRuntimeCancelledError('Run cancelled by caller.');
+            }
+            const now = Date.now();
+            if (options.sessionId && now - lastHeartbeatAt >= heartbeatIntervalMs) {
+              lastHeartbeatAt = now;
+              try {
+                appendEvent({
+                  sessionId: options.sessionId,
+                  turn: 0,
+                  role: 'system',
+                  type: 'heartbeat',
+                  data: {
+                    kind: 'progress_check_in',
+                    toolCalls: toolCallLedger.length,
+                    elapsedMs: now - startedAt,
+                    message: `Still working (${toolCallLedger.length} tool call${toolCallLedger.length === 1 ? '' : 's'} so far).`,
+                    transport: 'claude_agent_sdk',
+                  },
+                });
+              } catch { /* liveness must never break the stream */ }
+            }
+            if (
+              wallClockMs > 0
+              && ceilingState.stopped === null
+              && now - startedAt - effectivePermissionPausedMs(ceilingState, now) > wallClockMs
+            ) {
+              ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
+              ceilingState.stoppedKind = 'wallclock';
+              try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+              return 'stop';
+            }
+            return 'continue';
+          },
         );
         if (next.done) break;
         const message = next.value;
@@ -1459,7 +1927,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // long SDK run looked dead in the operator view (the 2026-07-16
         // 33-minute incident's eventlog had zero liveness rows). Same event
         // shape, message-boundary cadence.
-        if (options.sessionId && Date.now() - lastHeartbeatAt >= 60_000) {
+        if (options.sessionId && Date.now() - lastHeartbeatAt >= heartbeatIntervalMs) {
           lastHeartbeatAt = Date.now();
           try {
             appendEvent({
@@ -1472,6 +1940,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                 toolCalls: toolCallLedger.length,
                 elapsedMs: Date.now() - startedAt,
                 message: `Still working (${toolCallLedger.length} tool call${toolCallLedger.length === 1 ? '' : 's'} so far).`,
+                transport: 'claude_agent_sdk',
               },
             });
           } catch { /* telemetry must never break the stream */ }
@@ -1479,7 +1948,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // Wall-clock backstop: a genuinely stuck stream never hangs the turn. EXCLUDE
         // approval-wait (pausedMs) so a long confirm-first approval — the user may
         // take many minutes — never self-aborts the turn the instant they approve.
-        if (wallClockMs > 0 && ceilingState.stopped === null && Date.now() - startedAt - ceilingState.pausedMs > wallClockMs) {
+        const boundaryNow = Date.now();
+        if (
+          wallClockMs > 0
+          && ceilingState.stopped === null
+          && boundaryNow - startedAt - effectivePermissionPausedMs(ceilingState, boundaryNow) > wallClockMs
+        ) {
           ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
           ceilingState.stoppedKind = 'wallclock';
           try { await stream?.interrupt?.(); } catch { /* best-effort; finally closes */ }
@@ -1514,6 +1988,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // tool use/result so the Observability panel shows what Clem actually does,
         // on BOTH lanes (chat brain + workflow step share this runner). Fail-open.
         for (const use of extractToolUseIds(message)) {
+          if (seenTopLevelToolCallIds.has(use.id)) continue;
+          seenTopLevelToolCallIds.add(use.id);
+          // The first provider frame owns this canonical id. A replay must not
+          // overwrite the source name/input later used to interpret its result.
           toolById.set(use.id, { name: use.name, input: use.input });
           try {
             toolCallLedger.push({
@@ -1522,11 +2000,69 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               argsPreview: JSON.stringify(use.input ?? {}).slice(0, 120),
             });
           } catch { /* ledger is best-effort */ }
+          appendSdkTopLevelToolEvent(options.sessionId, 'tool_called', use.id, { name: use.name, input: use.input });
           emitSdkToolCallEvent(options.sessionId, 'tool_call_started', use.id, use.name);
         }
-        toolUses.push(...extractAssistantToolUses(message));
+        // The SDK can replay a complete assistant frame around stream/compact
+        // boundaries. Return one logical tool use per provider id, matching the
+        // canonical event accounting above. Legacy/id-less blocks remain
+        // visible because there is no safe identity with which to coalesce them.
+        toolUses.push(...extractAssistantToolUses(message, seenReturnedToolCallIds));
         for (const tr of extractToolResults(message)) {
           const source = toolById.get(tr.callId);
+          if (seenTopLevelToolReturnIds.has(tr.callId)) continue;
+          seenTopLevelToolReturnIds.add(tr.callId);
+          if (options.sessionId && source) {
+            // Native external MCP reads never enter wrapToolForHarness. Observe
+            // exact-id provider getters here so a Google Doc/site binding can
+            // be independently verified without coupling it to the create-only
+            // nativeArtifactClaims set. A mismatch/error is a durable no-op.
+            const verificationIntent = artifactVerificationIntentForTool(source.name, source.input);
+            if (verificationIntent) {
+              try {
+                const artifactRunScopeId = ensureArtifactRunScopeId();
+                if (artifactRunScopeId) {
+                  verifyArtifactBindingFromToolResult(
+                    options.sessionId,
+                    artifactRunScopeId,
+                    source.name,
+                    source.input,
+                    tr.output,
+                    tr.callId,
+                    !tr.isError,
+                  );
+                }
+              } catch { /* the artifact remains unverified; never break the tool stream */ }
+            }
+            const artifactClaim = nativeArtifactClaims.get(tr.callId);
+            if (artifactClaim) {
+              try {
+                if (artifactOutputProvesNoDispatch(tr.output)) {
+                  releaseClaimedArtifact(artifactClaim.artifactId, tr.callId);
+                } else {
+                  const resource = !tr.isError ? extractArtifactResource(artifactClaim.intent, tr.output) : null;
+                  if (resource) {
+                    bindClaimedArtifact(artifactClaim.artifactId, tr.callId, resource);
+                  } else {
+                    markClaimedArtifactUncertain(artifactClaim.artifactId, tr.callId);
+                  }
+                }
+              } catch {
+                try { markClaimedArtifactUncertain(artifactClaim.artifactId, tr.callId); } catch { /* pending claim blocks blind retries */ }
+              }
+              nativeArtifactClaims.delete(tr.callId);
+            }
+            const nativeWrite = nativeExternalWrites.get(tr.callId);
+            if (nativeWrite) {
+              if (tr.isError || artifactOutputProvesNoDispatch(tr.output)) {
+                appendNativeExternalWriteEvent(options.sessionId, nativeWrite, 'external_write_failed', {
+                  providerError: tr.isError,
+                  dispatchProvenAbsent: artifactOutputProvesNoDispatch(tr.output),
+                });
+              }
+              nativeExternalWrites.delete(tr.callId);
+            }
+          }
           // On failure, carry the cause into telemetry — SDK-lane failures were
           // emitted with no error detail (151/172 tool_call_failed rows had no
           // cause), making the reliability signal unusable.
@@ -1540,23 +2076,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           if (source?.name && !tr.isError && toolOutputLooksSuccessful(tr.output)) {
             successfulToolUses.push(completionEvidenceToolName(source.name, source.input));
           }
-          // Activity-strip lifecycle: claude-agent-approval emits 'tool_called' for
-          // EVERY tool on this lane, but nothing here closes the loop (the @openai/agents
-          // onToolEnd hook doesn't run on the SDK lane), so the console strip spun
-          // forever. Emit a matching 'tool_returned' (same role/shape as the
-          // 'tool_called' emit) so the client reducer flips the still-running row.
-          // Fail-open — the strip is progress-only, never blocks the run.
-          if (options.sessionId) {
-            try {
-              appendEvent({
-                sessionId: options.sessionId,
-                turn: 0,
-                role: 'Clem',
-                type: 'tool_returned',
-                data: { tool: source ? mcpToolTail(source.name) : undefined, callId: tr.callId, ok: !tr.isError },
-              });
-            } catch { /* progress only */ }
-          }
+          appendSdkTopLevelToolEvent(options.sessionId, 'tool_returned', tr.callId, source, { isError: tr.isError, output: tr.output });
           // A3 recall contract: park every result under the SDK's OWN tool_use id
           // (toolu_…) — the id the continuation ledger hands out. Without this,
           // outputs live only under harness-generated mcp-<uuid> ids (and only
@@ -1582,12 +2102,40 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         result = extractResult(message) ?? result;
       }
       const required = requiredLocalMcpTools(options);
+      if (options.sessionId && nativeArtifactClaims.size > 0) {
+        for (const [callId, claim] of nativeArtifactClaims) {
+          try { markClaimedArtifactUncertain(claim.artifactId, callId); } catch { /* pending claim remains fail-closed */ }
+        }
+        nativeArtifactClaims.clear();
+      }
+      if (options.sessionId && nativeExternalWrites.size > 0) {
+        for (const write of nativeExternalWrites.values()) {
+          appendNativeExternalWriteEvent(options.sessionId, write, 'external_write_orphaned', {
+            reason: 'sdk_stream_ended_without_tool_result',
+          });
+        }
+        nativeExternalWrites.clear();
+      }
       if (!init && required.length > 0) {
         throw new ClaudeAgentSdkToolSurfaceError(required, [], {
           reason: 'SDK stream ended before emitting an init message.',
         });
       }
     } catch (err) {
+      if (options.sessionId && nativeArtifactClaims.size > 0) {
+        for (const [callId, claim] of nativeArtifactClaims) {
+          try { markClaimedArtifactUncertain(claim.artifactId, callId); } catch { /* pending claim remains fail-closed */ }
+        }
+        nativeArtifactClaims.clear();
+      }
+      if (options.sessionId && nativeExternalWrites.size > 0) {
+        for (const write of nativeExternalWrites.values()) {
+          appendNativeExternalWriteEvent(options.sessionId, write, 'external_write_orphaned', {
+            reason: 'sdk_stream_failed_without_tool_result',
+          });
+        }
+        nativeExternalWrites.clear();
+      }
       const msg = err instanceof Error ? err.message : String(err);
       // Our OWN interrupt (tool ceiling / wall-clock) may surface as a thrown
       // stream error rather than a clean result — it's a graceful self-stop, not
@@ -1665,6 +2213,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       modelUsage: result?.modelUsage,
       limitHit: false,
       stoppedReason: terminalToolReason,
+      ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
     };
   }
 
@@ -1681,6 +2230,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       modelUsage: result?.modelUsage,
       limitHit: true,
       selfStopped: String(ceilingState.stoppedKind) === 'loop', // cast: the 'loop' set-site is a closure alias TS can't flow-narrow
+      ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
     };
   }
 
@@ -1702,6 +2252,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         usage: result.usage,
         modelUsage: result.modelUsage,
         limitHit: true,
+        ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
       };
     }
     recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
@@ -1735,5 +2286,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     toolCallLedger,
     usage: result.usage,
     modelUsage: result.modelUsage,
+    ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
   };
 }

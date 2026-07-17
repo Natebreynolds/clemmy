@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   COMPOSIO_AUTH_CONFIGS_URL,
+  ComposioDispatchUncertainError,
   __test__,
   filterSuppressedConnectedToolkits,
   getPreferredUserId,
@@ -10,9 +11,21 @@ import {
   pickToolkitConnection,
   selectToolkitConnection,
   dispatchUserIdFor,
+  composioAutoFallbackAllowed,
+  composioCliErrorProvesNoDispatch,
   toComposioDashboardConnection,
   type ConnectedToolkit,
 } from './client.js';
+
+test('AUTO fallback never replays an ambiguous CLI mutation through the SDK', () => {
+  const timeout = new Error('socket timeout after request dispatch');
+  assert.equal(composioAutoFallbackAllowed('GOOGLEDOCS_CREATE_DOCUMENT', timeout), false);
+  assert.equal(composioAutoFallbackAllowed('OUTLOOK_SEND_EMAIL', new Error('503 Service unavailable')), false);
+  assert.equal(composioAutoFallbackAllowed('OUTLOOK_LIST_MESSAGES', timeout), true, 'reads remain retry/fallback safe');
+  assert.equal(composioAutoFallbackAllowed('GOOGLEDOCS_CREATE_DOCUMENT', Object.assign(new Error('spawn failed'), { code: 'ENOENT' })), true, 'proven pre-dispatch CLI failures may fall back');
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('ECONNRESET')), false);
+  assert.match(new ComposioDispatchUncertainError('GOOGLEDOCS_CREATE_DOCUMENT', timeout).message, /Verify the remote state/);
+});
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
   const items = [

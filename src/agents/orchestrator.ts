@@ -50,7 +50,7 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { DEFAULT_MAX_TURNS, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
+import { DEFAULT_MAX_TURNS, harnessRunContextStorage, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { ClaudeSdkProviderOverloadError } from '../runtime/harness/claude-agent-sdk.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
@@ -976,6 +976,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const packetKey = workerPacketKey(input);
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
+      const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       const workerModel = route.model ?? resolveRoleModel('worker').modelId;
       const workerProvider = resolveEffectiveProviderForModel(workerModel);
       // P6: throttle concurrent worker fan-out per session so N parallel run_worker
@@ -1188,7 +1189,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // plan-scope + execution lane aggregate across the fan-out (one batch
         // approval covers all workers).
         try {
-          const sdkResult = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
+          const sdkResult = await runClaudeAgentSdkWorker(input, workerModel, sessionId, sourceUserSeq);
           appendWorkerRoute({
             ...(route.trace ?? {
               seam: 'chat',

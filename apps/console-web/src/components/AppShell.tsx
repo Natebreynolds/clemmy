@@ -8,7 +8,13 @@ import { VoiceOverlay } from './VoiceOverlay';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
+import { RunEnvironmentPanel } from './RunEnvironmentPanel';
 import { ALL_NAV } from '@/lib/nav';
+import { listRuns } from '@/lib/inbox';
+import { usePoll } from '@/lib/poll';
+import { isRunLive } from '@/lib/run-environment';
+
+const RUN_ENVIRONMENT_PREF = 'clem.run-environment.open';
 
 function titleForPath(pathname: string): string {
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
@@ -24,6 +30,28 @@ export function AppShell() {
   ));
   const location = useLocation();
   const title = titleForPath(location.pathname);
+  const [runEnvironmentOpen, setRunEnvironmentOpen] = useState(() => {
+    try { return localStorage.getItem(RUN_ENVIRONMENT_PREF) === '1'; } catch { return false; }
+  });
+  // The drawer is intentionally lazy. Tasks/Inbox already own ambient run
+  // monitoring; a closed inspection panel must not add another permanent DB
+  // poll on every desktop screen.
+  const runs = usePoll(['run-environment-runs'], () => listRuns(12), 4000, { enabled: runEnvironmentOpen });
+  const runRows = runs.data?.runs ?? [];
+  const liveRunCount = runEnvironmentOpen ? runRows.filter((run) => isRunLive(run)).length : 0;
+
+  const toggleRunEnvironment = () => {
+    setRunEnvironmentOpen((current) => {
+      const next = !current;
+      try { localStorage.setItem(RUN_ENVIRONMENT_PREF, next ? '1' : '0'); } catch { /* preference only */ }
+      return next;
+    });
+  };
+
+  const closeRunEnvironment = () => {
+    setRunEnvironmentOpen(false);
+    try { localStorage.setItem(RUN_ENVIRONMENT_PREF, '0'); } catch { /* preference only */ }
+  };
 
   // A 401 from the daemon dispatches a global `clem:needs-login` event
   // (see lib/api.ts). Nothing surfaced it before, so an expired session was a
@@ -60,6 +88,9 @@ export function AppShell() {
           title={title}
           sidebarCollapsed={collapsed}
           onToggleSidebar={() => setCollapsed((v) => !v)}
+          runEnvironmentOpen={runEnvironmentOpen}
+          liveRunCount={liveRunCount}
+          onToggleRunEnvironment={toggleRunEnvironment}
         />
         <LocalRecordingBanner />
         {needsLogin && (
@@ -85,6 +116,15 @@ export function AppShell() {
           </ErrorBoundary>
         </main>
       </div>
+
+      <RunEnvironmentPanel
+        open={runEnvironmentOpen}
+        runs={runRows}
+        runsLoading={runs.isLoading}
+        runsError={runs.isError}
+        onRetryRuns={() => { void runs.refetch(); }}
+        onClose={closeRunEnvironment}
+      />
 
       <CommandPalette />
       <VoiceOverlay />

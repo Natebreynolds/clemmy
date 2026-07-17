@@ -8,6 +8,7 @@ import {
   type SessionRow,
   type SessionStatus,
 } from './eventlog.js';
+import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 
 export type TraceNodeCategory =
   | 'user'
@@ -327,8 +328,8 @@ function computeMetrics(events: EventRow[]): TraceMetrics {
   const turns = new Set<number>();
   for (const ev of events) {
     turns.add(ev.turn);
-    if (ev.type === 'tool_called') metrics.toolCalls += 1;
-    if (ev.type === 'tool_returned') metrics.toolReturns += 1;
+    if (isCanonicalTopLevelToolEvent(ev, 'tool_called')) metrics.toolCalls += 1;
+    if (isCanonicalTopLevelToolEvent(ev, 'tool_returned')) metrics.toolReturns += 1;
     if (eventCategory(ev.type) === 'guardrail') metrics.guardrails += 1;
     if (ev.type === 'approval_requested') metrics.approvalsRequested += 1;
     if (ev.type === 'approval_resolved') metrics.approvalsResolved += 1;

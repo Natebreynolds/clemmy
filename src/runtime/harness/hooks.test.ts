@@ -150,7 +150,41 @@ test('tool_called and tool_returned correlate via callId', () => {
   assert.equal(returned.length, 1);
   assert.equal(returned[0].parentEventId, called[0].id, 'returned points at called');
   assert.equal(called[0].data.callId, callId);
+  assert.equal(called[0].data.canonicalCallId, callId);
+  assert.equal(called[0].data.accounting, 'top_level');
+  assert.equal(called[0].data.effect, 'local_write');
+  assert.equal(returned[0].data.canonicalCallId, callId);
+  assert.equal(returned[0].data.accounting, 'top_level');
+  assert.equal(returned[0].data.effect, 'local_write');
   assert.equal(returned[0].data.result, 'ok');
+});
+
+test('tool hooks expose inner provider effects and dedupe lifecycle replay by call id', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const details = {
+    toolCall: {
+      callId: 'call_provider_once',
+      arguments: JSON.stringify({ tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}' }),
+    },
+  };
+  for (let i = 0; i < 2; i++) {
+    stub.emit('agent_tool_start', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, details);
+  }
+  for (let i = 0; i < 2; i++) {
+    stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, 'ok', details);
+  }
+
+  const called = listEvents(sess.id, { types: ['tool_called'] });
+  const returned = listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(called.length, 1);
+  assert.equal(returned.length, 1);
+  assert.equal(called[0].data.toolSlug, 'HUBSPOT_FIND_OR_CREATE_CONTACT');
+  assert.equal(called[0].data.effect, 'external_write');
+  assert.equal(returned[0].data.toolSlug, 'HUBSPOT_FIND_OR_CREATE_CONTACT');
+  assert.equal(returned[0].data.effect, 'external_write');
 });
 
 test('large tool_returned result uses recall_tool_result marker when callId present', () => {

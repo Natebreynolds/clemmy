@@ -27,12 +27,19 @@ import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWork
 // in the dashboard's Live Runs feed 404s and the inspector shows
 // "Run not found".
 import {
+  countMatchingEvents as harnessCountMatchingEvents,
+  getLatestEventSeq as harnessGetLatestEventSeq,
+  getLatestRunAttempt as harnessGetLatestRunAttempt,
+  getLatestRunAttemptByRunId as harnessGetLatestRunAttemptByRunId,
   getSession as harnessGetSession,
   listEvents as harnessListEvents,
   listSessions as harnessListSessions,
   type EventRow as HarnessEventRow,
+  type ListEventsOptions as HarnessListEventsOptions,
+  type RunAttemptRecord as HarnessRunAttemptRecord,
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
+import { getArtifactRunScope, listRunArtifacts } from '../runtime/harness/artifact-ledger.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import { fireWorkflowWebhook, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
@@ -121,6 +128,17 @@ function isSlackHarnessSession(session: HarnessSessionRow): boolean {
     || session.metadata.source === 'slack';
 }
 
+/** Desktop background handoff currently knows how to report back only to the
+ * desktop origin. Discord/Slack sessions may also be `kind: chat`, but moving
+ * one from this surface would discard its external channel/thread attribution.
+ * Hide the control until that attribution is part of the exact handoff. */
+function supportsDesktopBackgroundHandoff(session: HarnessSessionRow): boolean {
+  return session.kind === 'chat'
+    && !session.id.startsWith('background:')
+    && !isDiscordHarnessSession(session)
+    && !isSlackHarnessSession(session);
+}
+
 // A workflow runs each step in its own harness session (see
 // getWorkflowHarnessSession in workflow-runner.ts: id `workflow:<suffix>`,
 // title `<workflow>::<stepId>`, metadata.workflowRunId+stepId). Those are
@@ -169,6 +187,351 @@ function completionOutputPreview(
   return (reply || summary).slice(0, limit);
 }
 
+const HARNESS_ACTIVITY_EVENT_TYPES: HarnessEventRow['type'][] = [
+  'user_input_received',
+  'turn_started',
+  'plan_drafted',
+  'step_started',
+  'step_verified',
+  'step_failed',
+  'worker_started',
+  'worker_result',
+  'handoff',
+  'awaiting_user_input',
+  'approval_requested',
+  'approval_resolved',
+  'kill_requested',
+  'run_paused',
+  'run_resumed',
+  'heartbeat',
+  'run_completed',
+  'run_failed',
+  'conversation_completed',
+];
+
+const HARNESS_STATUS_EVENT_TYPES: HarnessEventRow['type'][] = [
+  'user_input_received',
+  'turn_started',
+  'awaiting_user_input',
+  'approval_requested',
+  'approval_resolved',
+  'kill_requested',
+  'run_paused',
+  'run_resumed',
+  'heartbeat',
+  'run_completed',
+  'run_failed',
+  'conversation_completed',
+];
+
+const RUN_ENVIRONMENT_PROJECTION_TYPES: HarnessEventRow['type'][] = [
+  'plan_drafted',
+  'step_started',
+  'step_verified',
+  'step_failed',
+  'worker_started',
+  'worker_result',
+  'handoff',
+];
+
+interface HarnessCurrentScope {
+  attempt: HarnessRunAttemptRecord | null;
+  query: Pick<HarnessListEventsOptions, 'sinceSeq' | 'sinceAt'>;
+  runScopeId?: string;
+  scopeKind: 'current_attempt' | 'latest_turn' | 'session_history';
+  scopeStartedAt?: string;
+  attemptId?: string;
+  sourceUserSeq?: number;
+}
+
+function brainRunScopeId(sessionId: string, attempt: HarnessRunAttemptRecord): string {
+  return `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
+}
+
+/** Explicit ids on user-input events are the durable attempt binding. `null`
+ * means a legacy unbound event, which may still be classified by its bounded
+ * occurrence time; `false` means it explicitly belongs somewhere else. */
+function userInputAttemptBinding(
+  event: HarnessEventRow | undefined,
+  attempt: HarnessRunAttemptRecord,
+): boolean | null {
+  if (!event) return null;
+  const data = eventRecord(event.data);
+  const attemptId = firstEventText(data.attemptId, data.attempt_id);
+  const runId = firstEventText(data.runId, data.run_id);
+  if (!attemptId && !runId) return null;
+  return attemptId === attempt.attemptId
+    || Boolean(runId && attempt.runId && runId === attempt.runId);
+}
+
+function occurredAfter(left: string | undefined, right: string | null | undefined): boolean {
+  if (!left || !right) return false;
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  return Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs > rightMs;
+}
+
+function latestInputStartsNewTurn(
+  event: HarnessEventRow | undefined,
+  attempt: HarnessRunAttemptRecord,
+): boolean {
+  return Boolean(event && (
+    userInputAttemptBinding(event, attempt) === false
+    || occurredAfter(event.createdAt, attempt.finishedAt)
+  ));
+}
+
+function chooseArtifactProjectionScope(
+  attemptScopeId: string | undefined,
+  lineageRootScopeId: string | null | undefined,
+  terminalRootScopeId: string | undefined,
+): string | undefined {
+  return lineageRootScopeId || terminalRootScopeId || attemptScopeId;
+}
+
+/**
+ * A harness session is a reusable conversation, not one run. Project the
+ * latest durable attempt (or, for pre-attempt history, the latest user turn)
+ * so an old completion/plan/document cannot leak into the active run card.
+ */
+function currentHarnessScope(sessionId: string): HarnessCurrentScope {
+  const attempt = harnessGetLatestRunAttempt(sessionId);
+  const latestInput = harnessListEvents(sessionId, {
+    types: ['user_input_received'],
+    desc: true,
+    limit: 1,
+  })[0];
+  if (attempt) {
+    const binding = userInputAttemptBinding(latestInput, attempt);
+    // A completed attempt must never absorb a newer accepted turn. Future
+    // inputs carry explicit attempt/run ids; the timestamp bound preserves
+    // honest behavior for pre-upgrade rows that do not.
+    if (latestInputStartsNewTurn(latestInput, attempt)) {
+      return {
+        attempt: null,
+        query: { sinceSeq: Math.max(0, latestInput.seq - 1) },
+        scopeKind: 'latest_turn',
+        scopeStartedAt: latestInput.createdAt,
+      };
+    }
+    if (latestInput && (binding === true || !occurredAfter(attempt.startedAt, latestInput.createdAt))) {
+      return {
+        attempt,
+        query: { sinceSeq: Math.max(0, (attempt.sourceUserSeq ?? latestInput.seq) - 1) },
+        runScopeId: brainRunScopeId(sessionId, attempt),
+        scopeKind: 'current_attempt',
+        scopeStartedAt: attempt.startedAt,
+        attemptId: attempt.attemptId,
+        sourceUserSeq: attempt.sourceUserSeq ?? undefined,
+      };
+    }
+    return {
+      attempt,
+      query: { sinceAt: attempt.startedAt },
+      runScopeId: brainRunScopeId(sessionId, attempt),
+      scopeKind: 'current_attempt',
+      scopeStartedAt: attempt.startedAt,
+      attemptId: attempt.attemptId,
+      sourceUserSeq: attempt.sourceUserSeq ?? undefined,
+    };
+  }
+  if (latestInput) {
+    return {
+      attempt: null,
+      query: { sinceSeq: Math.max(0, latestInput.seq - 1) },
+      scopeKind: 'latest_turn',
+      scopeStartedAt: latestInput.createdAt,
+    };
+  }
+  return { attempt: null, query: {}, scopeKind: 'session_history' };
+}
+
+function scopedHarnessEvents(
+  sessionId: string,
+  scope: HarnessCurrentScope,
+  options: Pick<HarnessListEventsOptions, 'types' | 'limit' | 'desc'> = {},
+): HarnessEventRow[] {
+  return harnessListEvents(sessionId, { ...scope.query, ...options });
+}
+
+function harnessRunControlProjection(
+  sessionId: string,
+  scope: HarnessCurrentScope,
+  status: string,
+  allowBackground = false,
+): {
+  canCancel: boolean;
+  cancelEndpoint?: string;
+  canBackground: boolean;
+  backgroundEndpoint?: string;
+} {
+  const canCancel = scope.attempt?.status === 'active'
+    && Boolean(scope.attemptId && scope.runScopeId)
+    && ['running', 'awaiting_approval', 'awaiting_user_input'].includes(status);
+  if (!canCancel || !scope.attemptId || !scope.runScopeId) return { canCancel: false, canBackground: false };
+  const query = new URLSearchParams({
+    attemptId: scope.attemptId,
+    runScopeId: scope.runScopeId,
+  });
+  return {
+    canCancel: true,
+    cancelEndpoint: `/api/console/harness-sessions/${encodeURIComponent(sessionId)}/cancel?${query.toString()}`,
+    canBackground: allowBackground && status === 'running',
+    ...(allowBackground && status === 'running'
+      ? { backgroundEndpoint: `/api/console/harness-sessions/${encodeURIComponent(sessionId)}/background?${query.toString()}` }
+      : {}),
+  };
+}
+
+function eventRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function parsedEventRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string') return eventRecord(value);
+  try { return eventRecord(JSON.parse(value)); } catch { return {}; }
+}
+
+function firstEventText(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+interface ToolProjectionEvent {
+  id?: string;
+  type?: string;
+  createdAt?: string;
+  data?: Record<string, unknown>;
+}
+
+function projectedToolName(event: ToolProjectionEvent): string {
+  const data = eventRecord(event.data);
+  const args = parsedEventRecord(data.args ?? data.arguments ?? data.input);
+  const nested = parsedEventRecord(args.arguments);
+  return firstEventText(
+    data.slug,
+    data.toolSlug,
+    args.tool_slug,
+    args.toolSlug,
+    nested.slug,
+    data.tool,
+    data.toolName,
+    data.name,
+  ) || 'tool';
+}
+
+/** Select one bounded, canonical tool milestone for live-state projection.
+ * Transport mirrors are audit evidence, not another action. The sanitized
+ * clone keeps only the display name so a 4s UI poll never returns a second
+ * copy of potentially large tool arguments just to say "Working". */
+function latestCanonicalToolMilestone<T extends ToolProjectionEvent>(events: T[]): T | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type !== 'tool_called') continue;
+    if (eventRecord(event.data).accounting === 'transport_mirror') continue;
+    return {
+      ...event,
+      data: {
+        tool: projectedToolName(event),
+        accounting: 'top_level',
+      },
+    } as T;
+  }
+  return undefined;
+}
+
+function projectScopedToolSummary(events: ToolProjectionEvent[]) {
+  const calls = events.filter((event) => event.type === 'tool_called');
+  const mirrors = calls.filter((event) => eventRecord(event.data).accounting === 'transport_mirror');
+  const topLevel = calls.filter((event) => eventRecord(event.data).accounting !== 'transport_mirror');
+  const logical = new Map<string, ToolProjectionEvent>();
+  for (const [index, event] of topLevel.entries()) {
+    const data = eventRecord(event.data);
+    const canonical = firstEventText(
+      data.canonicalCallId,
+      data.logicalCallId,
+      data.invocationId,
+      data.callId,
+    );
+    // Missing IDs are not silently collapsed. Each durable event is one
+    // conservative logical call, which cannot under-report a runaway.
+    logical.set(canonical || `event:${event.id ?? index}`, event);
+  }
+  const counts = new Map<string, number>();
+  for (const event of logical.values()) {
+    const name = projectedToolName(event);
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const countEntries = [...counts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name));
+  return {
+    names: countEntries.map((entry) => entry.name),
+    countsByName: Object.fromEntries(countEntries.map((entry) => [entry.name, entry.count])),
+    logicalCount: logical.size,
+    recordedCalls: topLevel.length,
+    mirrorEvents: mirrors.length,
+  };
+}
+
+type ScopedToolSummary = ReturnType<typeof projectScopedToolSummary>;
+const RUN_ENVIRONMENT_TOOL_CACHE_MAX = 128;
+const runEnvironmentToolSummaryCache = new Map<string, {
+  latestSeq: number;
+  summary: ScopedToolSummary;
+}>();
+
+/** The open Environment rail polls every few seconds. Event rows are immutable,
+ * so an unchanged latest sequence means repeatedly decoding a 135-call runaway
+ * would be pure waste. Cache only the derived aggregate, scoped to the exact
+ * attempt/turn boundary; any append or scope change recomputes truthfully. */
+function cachedScopedToolSummary(
+  sessionId: string,
+  scope: HarnessCurrentScope,
+  latestSeq: number,
+): ScopedToolSummary {
+  const scopeKey = scope.runScopeId
+    ?? `${scope.scopeKind}:${scope.query.sinceSeq ?? ''}:${scope.query.sinceAt ?? ''}`;
+  const key = `${sessionId}\0${scopeKey}`;
+  const cached = runEnvironmentToolSummaryCache.get(key);
+  if (cached?.latestSeq === latestSeq) {
+    // Refresh insertion order so the cap behaves as a tiny LRU.
+    runEnvironmentToolSummaryCache.delete(key);
+    runEnvironmentToolSummaryCache.set(key, cached);
+    return cached.summary;
+  }
+  const summary = projectScopedToolSummary(scopedHarnessEvents(sessionId, scope, { types: ['tool_called'] }));
+  runEnvironmentToolSummaryCache.set(key, { latestSeq, summary });
+  while (runEnvironmentToolSummaryCache.size > RUN_ENVIRONMENT_TOOL_CACHE_MAX) {
+    const oldest = runEnvironmentToolSummaryCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    runEnvironmentToolSummaryCache.delete(oldest);
+  }
+  return summary;
+}
+
+function terminalWasCancelled(event: HarnessEventRow | undefined): boolean {
+  if (!event) return false;
+  const data = eventRecord(event.data);
+  return /cancel|reject|den(?:y|ied)|stopp?ed|abort/i.test(
+    firstEventText(data.reason, data.status, data.decision, data.resolution, data.summary),
+  );
+}
+
+function latestHarnessEvent(
+  events: HarnessEventRow[],
+  predicate: (event: HarnessEventRow) => boolean,
+): HarnessEventRow | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (predicate(events[index])) return events[index];
+  }
+  return undefined;
+}
+
 function normalizeHostHeader(value: unknown): string {
   if (typeof value !== 'string') return '';
   const first = value.split(',')[0]?.trim().toLowerCase() ?? '';
@@ -213,21 +576,43 @@ async function autoStartMobileTunnelIfConfigured(): Promise<void> {
   }
 }
 
-function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEventRow[]): string {
-  // Both callers pass events newest-first (desc), so the MOST RECENT terminal
-  // event must win — e.g. a run that requested approval and then completed is
-  // 'completed', not stuck on 'awaiting_approval'. (Previously this reversed to
-  // oldest-first under a misleading name and returned the stale state.)
-  const newestFirst = events;
-  const terminal = newestFirst.find((event) =>
-    event.type === 'conversation_completed'
-    || event.type === 'run_completed'
-    || event.type === 'run_failed'
-    || event.type === 'approval_requested',
-  );
-  if (terminal?.type === 'run_failed') return 'failed';
+function effectiveHarnessStatus(
+  session: HarnessSessionRow,
+  events: HarnessEventRow[],
+  attempt: HarnessRunAttemptRecord | null = null,
+): string {
+  // listEvents({ desc: true, limit }) selects the newest bounded window, then
+  // returns that window in chronological order. Walk backward so a completion
+  // after an approval wins and the desktop never resurrects stale state.
+  let terminal: HarnessEventRow | undefined;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (
+      event.type === 'conversation_completed'
+      || event.type === 'run_completed'
+      || event.type === 'run_failed'
+      || event.type === 'approval_requested'
+      || event.type === 'approval_resolved'
+      || event.type === 'awaiting_user_input'
+      || event.type === 'kill_requested'
+      || event.type === 'run_paused'
+      || event.type === 'run_resumed'
+    ) {
+      terminal = event;
+      break;
+    }
+  }
+  if (session.status === 'cancelled') return 'cancelled';
+  if (attempt?.status === 'cancelled' || terminalWasCancelled(terminal)) return 'cancelled';
+  if (attempt?.status === 'failed' || terminal?.type === 'run_failed') return 'failed';
+  if (terminal?.type === 'kill_requested') return 'cancelled';
+  if (terminal?.type === 'awaiting_user_input') return 'awaiting_user_input';
   if (terminal?.type === 'approval_requested') return 'awaiting_approval';
+  if (terminal?.type === 'run_paused') return 'awaiting_approval';
   if (terminal?.type === 'conversation_completed' || terminal?.type === 'run_completed') return 'completed';
+  if (attempt?.status === 'active') return 'running';
+  if (attempt?.status === 'completed') return 'completed';
+  if (attempt?.status === 'interrupted' || attempt?.status === 'superseded') return 'idle';
   if (session.status === 'paused') return 'awaiting_approval';
   if (session.status === 'active') {
     const updatedMs = Date.parse(session.updatedAt);
@@ -237,31 +622,66 @@ function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEvent
   return session.status;
 }
 
-function harnessSessionAsActivityRun(session: HarnessSessionRow) {
-  const events = harnessListEvents(session.id, { limit: 80, desc: true });
-  const status = effectiveHarnessStatus(session, events);
-  // events are newest-first (desc), so find() returns the MOST RECENT
-  // completion — i.e. the latest reply/summary, not the first one.
-  const completion = events.find((event) =>
+function computeHarnessSessionActivityRun(session: HarnessSessionRow, latestSeq: number) {
+  const scope = currentHarnessScope(session.id);
+  const activityEvents = scopedHarnessEvents(session.id, scope, {
+    types: HARNESS_ACTIVITY_EVENT_TYPES,
+    limit: 40,
+    desc: true,
+  });
+  // One latest tool milestone is enough for Planning vs Working/liveLine. Do
+  // not load up to 40 argument-heavy tool events for every row in a 4s poll.
+  const latestTool = latestCanonicalToolMilestone(scopedHarnessEvents(session.id, scope, {
+    types: ['tool_called'],
+    // A production call can be followed by its MCP transport mirror. Keep the
+    // lookup bounded while looking past that mirror to the actual action.
+    limit: 16,
+    desc: true,
+  }));
+  const events = [...activityEvents, ...(latestTool ? [latestTool] : [])]
+    .sort((left, right) => left.seq - right.seq);
+  const status = effectiveHarnessStatus(session, events, scope.attempt);
+  const completion = latestHarnessEvent(events, (event) =>
     event.type === 'conversation_completed' || event.type === 'run_completed',
   );
+  const latestInput = latestHarnessEvent(events, (event) => event.type === 'user_input_received');
+  const latestInputData = eventRecord(latestInput?.data);
+  const currentInput = firstEventText(latestInputData.displayText, latestInputData.text);
   const outputPreview = completionOutputPreview(completion);
+  const control = harnessRunControlProjection(
+    session.id,
+    scope,
+    status,
+    supportsDesktopBackgroundHandoff(session),
+  );
   return {
     id: session.id,
     sessionId: session.id,
     userId: session.userId ?? undefined,
     channel: session.channel ?? undefined,
     source: harnessSource(session),
-    title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine session'),
-    input: session.objective || session.title || '',
+    title: currentInput
+      ? (currentInput.length > 100 ? `${currentInput.slice(0, 97)}...` : currentInput)
+      : session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine session'),
+    input: currentInput || session.objective || session.title || '',
     status,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     completedAt: status === 'completed' ? session.updatedAt : undefined,
     outputPreview,
-    // Harness events are fetched newest-first; emit them oldest-first so the
-    // timeline and liveLine match legacy runs (which are appended in order).
-    events: events.slice().reverse().map((event) => ({
+    runScopeId: scope.runScopeId,
+    runEnvironmentMeta: {
+      scopeKind: scope.scopeKind,
+      runScopeId: scope.runScopeId,
+      scopeStartedAt: scope.scopeStartedAt,
+      latestSeq,
+      attemptId: scope.attemptId,
+      sourceUserSeq: scope.sourceUserSeq,
+    },
+    ...control,
+    // listEvents already emits the selected window oldest-first, matching
+    // legacy run timelines and the plan/helper state folders in the desktop.
+    events: events.map((event) => ({
       id: event.id,
       type: event.type,
       message: harnessEventMessage(event),
@@ -269,6 +689,39 @@ function harnessSessionAsActivityRun(session: HarnessSessionRow) {
       data: event.data,
     })),
   };
+}
+
+type HarnessActivityProjection = ReturnType<typeof computeHarnessSessionActivityRun>;
+const HARNESS_ACTIVITY_CACHE_MAX = 256;
+const harnessActivityProjectionCache = new Map<string, {
+  version: string;
+  run: HarnessActivityProjection;
+}>();
+
+/** `/api/runs` is polled as a safety net, but unchanged sessions should cost
+ * one indexed latest-seq read—not five queries plus repeated JSON decoding.
+ * Every append changes latestSeq; lifecycle-only session changes are covered by
+ * status/updatedAt. The small LRU-like cap prevents long-lived daemon growth. */
+function harnessSessionAsActivityRun(session: HarnessSessionRow): HarnessActivityProjection {
+  const latestSeq = harnessGetLatestEventSeq(session.id);
+  // Active sessions have a time-based idle projection even without new events.
+  // Refresh that derived state twice a minute while still caching the hot poll.
+  const freshnessBucket = session.status === 'active' ? Math.floor(Date.now() / 30_000) : 0;
+  const version = `${session.status}:${session.updatedAt}:${latestSeq}:${freshnessBucket}`;
+  const cached = harnessActivityProjectionCache.get(session.id);
+  if (cached?.version === version) {
+    harnessActivityProjectionCache.delete(session.id);
+    harnessActivityProjectionCache.set(session.id, cached);
+    return cached.run;
+  }
+  const run = computeHarnessSessionActivityRun(session, latestSeq);
+  harnessActivityProjectionCache.set(session.id, { version, run });
+  while (harnessActivityProjectionCache.size > HARNESS_ACTIVITY_CACHE_MAX) {
+    const oldest = harnessActivityProjectionCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    harnessActivityProjectionCache.delete(oldest);
+  }
+  return run;
 }
 
 /**
@@ -298,6 +751,32 @@ function enrichActivityRun<T extends ActivityRunLike>(run: T) {
   };
 }
 
+const CANCELLABLE_BACKGROUND_TASK_STATUSES = new Set([
+  'pending',
+  'running',
+  'awaiting_approval',
+  'awaiting_input',
+  'awaiting_continue',
+  'interrupted',
+]);
+
+/** `/api/runs` is a polling summary contract. Compute friendly state from the
+ * event window server-side, then remove the raw audit array from every row. */
+function compactActivityRunListRow<T extends ActivityRunLike>(run: T) {
+  const { events: _events, ...summary } = enrichActivityRun(run);
+  const existingCanCancel = (run as T & { canCancel?: unknown }).canCancel;
+  if (typeof existingCanCancel === 'boolean') return summary;
+  const ownTask = run.id?.startsWith('run-bg') ? getBackgroundTask(run.id.slice(4)) : null;
+  const taskId = run.queuedTaskId ?? ownTask?.id;
+  const task = taskId ? getBackgroundTask(taskId) : null;
+  const canCancel = Boolean(task && CANCELLABLE_BACKGROUND_TASK_STATUSES.has(task.status));
+  return {
+    ...summary,
+    canCancel,
+    ...(canCancel && run.id ? { cancelEndpoint: `/api/runs/${encodeURIComponent(run.id)}/cancel` } : {}),
+  };
+}
+
 /**
  * Detail variant — adds the clean milestone `timeline` and a `summary` block
  * (ask / result / error) for the reading pane, on top of the inbox fields. The
@@ -312,6 +791,23 @@ function enrichActivityRunDetail<T extends ActivityRunLike>(run: T) {
       result: run.outputPreview ?? '',
       error: run.error ?? '',
     },
+  };
+}
+
+/** Derive the live label from a tiny state-only milestone set while returning
+ * the intentionally compact structural event projection. This prevents the
+ * Environment view from saying "Planning" after a tool has started without
+ * re-inflating its response with raw tool arguments. */
+function enrichProjectedActivityRunDetail<T extends ActivityRunLike>(
+  run: T,
+  stateEvents: ActivityRunLike['events'],
+) {
+  const visibleEvents = run.events ?? [];
+  const enriched = enrichActivityRunDetail({ ...run, events: stateEvents });
+  return {
+    ...enriched,
+    events: visibleEvents,
+    timeline: friendlyTimeline(visibleEvents),
   };
 }
 
@@ -395,12 +891,22 @@ function deriveDashboardSessionToken(webhookSecret: string): string {
 }
 
 export const __test__ = {
+  cancelTrackedRun,
+  chooseArtifactProjectionScope,
+  compactActivityRunListRow,
   completionOutputPreview,
   deriveDashboardSessionToken,
+  effectiveHarnessStatus,
   enrichActivityRun,
   enrichActivityRunDetail,
+  enrichProjectedActivityRunDetail,
+  harnessRunControlProjection,
+  latestInputStartsNewTurn,
+  latestCanonicalToolMilestone,
+  projectScopedToolSummary,
   resolveApiMessageSession,
   serializeMessageResponse,
+  supportsDesktopBackgroundHandoff,
   workflowRunRecordAsActivityRun,
 };
 
@@ -525,6 +1031,110 @@ function queueRunRetry(run: NonNullable<ReturnType<typeof getRun>>) {
     },
   });
   return { task, retryRun };
+}
+
+interface CancelTrackedRunResult {
+  ok: boolean;
+  httpStatus: 200 | 404 | 409 | 500;
+  message: string;
+  runId: string;
+  taskId?: string;
+  taskStatus?: string;
+}
+
+/** Shared mutation behind the HTML dashboard action and the JSON desktop API. */
+function cancelTrackedRun(id: string): CancelTrackedRunResult {
+  const run = getRun(id);
+  if (!run) return { ok: false, httpStatus: 404, message: `Run not found: ${id}`, runId: id };
+
+  // The originating run may carry queuedTaskId; a background task's own run
+  // uses id `run-<taskid>` and does not need that back-link.
+  const ownTask = run.id.startsWith('run-') ? getBackgroundTask(run.id.slice(4)) : null;
+  const taskId = run.queuedTaskId ?? ownTask?.id;
+  if (!taskId) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      message: `Run ${id} is not linked to a background task.`,
+      runId: id,
+    };
+  }
+
+  const task = getBackgroundTask(taskId);
+  if (!task) {
+    return {
+      ok: false,
+      httpStatus: 404,
+      message: `Background task not found: ${taskId}`,
+      runId: id,
+      taskId,
+    };
+  }
+  if (!CANCELLABLE_BACKGROUND_TASK_STATUSES.has(task.status)) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      message: task.status === 'cancelling'
+        ? `Background task ${task.id} is already cancelling.`
+        : `Background task ${task.id} is already ${task.status}.`,
+      runId: id,
+      taskId,
+      taskStatus: task.status,
+    };
+  }
+
+  const cancelled = cancelBackgroundTask(task.id, 'Cancelled from the dashboard Run Control Center.');
+  if (!cancelled) {
+    return {
+      ok: false,
+      httpStatus: 500,
+      message: `Unable to cancel background task ${task.id}.`,
+      runId: id,
+      taskId,
+    };
+  }
+
+  const backgroundRunId = `run-${task.id}`;
+  if (cancelled.status === 'cancelling') {
+    addRunEvent(run.id, {
+      type: 'status',
+      status: 'running',
+      message: `Cancellation requested for linked background task ${task.id}.`,
+      data: { queuedTaskId: task.id },
+    });
+    if (backgroundRunId !== run.id) {
+      addRunEvent(backgroundRunId, {
+        type: 'status',
+        status: 'running',
+        message: `Cancellation requested for background task ${task.id}.`,
+        data: { queuedTaskId: task.id },
+      });
+    }
+  } else {
+    finishRun(run.id, {
+      status: 'cancelled',
+      message: `Linked background task ${task.id} cancelled from the dashboard.`,
+      queuedTaskId: task.id,
+    });
+    if (backgroundRunId !== run.id) {
+      finishRun(backgroundRunId, {
+        status: 'cancelled',
+        message: `Background task ${task.id} cancelled from the dashboard.`,
+        queuedTaskId: task.id,
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    httpStatus: 200,
+    message: cancelled.status === 'cancelling'
+      ? `Cancellation requested for running background task ${task.id}.`
+      : `Cancelled background task ${task.id}.`,
+    runId: id,
+    taskId: task.id,
+    taskStatus: cancelled.status,
+  };
 }
 
 async function resolveApprovalOrQueueBackgroundContinuation(
@@ -1504,77 +2114,21 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
     const token = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const run = getRun(id);
-    if (!run) {
-      redirectDashboard(res, token, { kind: 'error', text: `Run not found: ${id}` });
-      return;
-    }
-    // Resolve the background task either from the originating run's link, or
-    // from the run id itself when this IS a background task's own run
-    // (id `run-<taskid>`, which carries no queuedTaskId).
-    const ownTask = run.id.startsWith('run-') ? getBackgroundTask(run.id.slice(4)) : null;
-    const taskId = run.queuedTaskId ?? ownTask?.id;
-    if (!taskId) {
-      redirectDashboard(res, token, { kind: 'error', text: `Run ${id} is not linked to a background task.` });
-      return;
-    }
-
-    const task = getBackgroundTask(taskId);
-    if (!task) {
-      redirectDashboard(res, token, { kind: 'error', text: `Background task not found: ${run.queuedTaskId}` });
-      return;
-    }
-    if (!['pending', 'running', 'awaiting_approval', 'interrupted'].includes(task.status)) {
-      redirectDashboard(res, token, {
-        kind: 'error',
-        text: task.status === 'cancelling'
-          ? `Background task ${task.id} is already cancelling.`
-          : `Background task ${task.id} is already ${task.status}.`,
-      });
-      return;
-    }
-
-    const cancelled = cancelBackgroundTask(task.id, 'Cancelled from the dashboard Run Control Center.');
-    if (!cancelled) {
-      redirectDashboard(res, token, { kind: 'error', text: `Unable to cancel background task ${task.id}.` });
-      return;
-    }
-    const backgroundRunId = `run-${task.id}`;
-    if (cancelled.status === 'cancelling') {
-      addRunEvent(run.id, {
-        type: 'status',
-        status: 'running',
-        message: `Cancellation requested for linked background task ${task.id}.`,
-        data: { queuedTaskId: task.id },
-      });
-      if (backgroundRunId !== run.id) {
-        addRunEvent(backgroundRunId, {
-          type: 'status',
-          status: 'running',
-          message: `Cancellation requested for background task ${task.id}.`,
-          data: { queuedTaskId: task.id },
-        });
-      }
-    } else {
-      finishRun(run.id, {
-        status: 'cancelled',
-        message: `Linked background task ${task.id} cancelled from the dashboard.`,
-        queuedTaskId: task.id,
-      });
-    }
-    if (backgroundRunId !== run.id && cancelled.status !== 'cancelling') {
-      finishRun(backgroundRunId, {
-        status: 'cancelled',
-        message: `Background task ${task.id} cancelled from the dashboard.`,
-        queuedTaskId: task.id,
-      });
-    }
+    const result = cancelTrackedRun(id);
     redirectDashboard(res, token, {
-      kind: 'success',
-      text: cancelled.status === 'cancelling'
-        ? `Cancellation requested for running background task ${task.id}.`
-        : `Cancelled background task ${task.id}.`,
+      kind: result.ok ? 'success' : 'error',
+      text: result.message,
     });
+  });
+
+  /** JSON-native control contract for the desktop. Unlike the historical
+   * redirect action, failures remain non-2xx after fetch redirect handling. */
+  app.post('/api/runs/:id/cancel', requireAuth, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const result = cancelTrackedRun(id);
+    res.status(result.httpStatus).json(result.ok
+      ? { ok: true, message: result.message, runId: result.runId, taskId: result.taskId, taskStatus: result.taskStatus }
+      : { ok: false, error: result.message, runId: result.runId, taskId: result.taskId, taskStatus: result.taskStatus });
   });
 
   app.post('/dashboard/actions/runs/:id/retry', (req, res) => {
@@ -1846,7 +2400,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const limit = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 30;
     const resolvedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(120, limit)) : 30;
     const legacyRuns = listRuns(Math.max(resolvedLimit, 40));
-    const harnessRuns = harnessListSessions({ limit: Math.max(resolvedLimit, 80) })
+    const harnessRuns = harnessListSessions({ limit: Math.max(30, Math.min(120, resolvedLimit * 2)) })
       .filter(isActivityVisibleHarnessSession)
       .map(harnessSessionAsActivityRun);
     // Dedup: a chat can produce BOTH a harness session (sess-…) and a legacy
@@ -1869,56 +2423,156 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           .localeCompare(String(left.updatedAt || left.completedAt || left.createdAt || '')),
       )
       .slice(0, resolvedLimit)
-      .map(enrichActivityRun);
+      .map(compactActivityRunListRow);
     res.json({ runs });
   });
 
   app.get('/api/runs/:id', requireAuth, (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const environmentView = req.query.view === 'environment';
     const sendHarnessRun = (): boolean => {
       const session = harnessGetSession(id);
       if (!session) return false;
-      const events = harnessListEvents(id, { limit: 500, desc: true }) ?? [];
-      const status = effectiveHarnessStatus(session, events);
-      // Most-recent reply/summary for the reading pane "Result" block
-      // (events are newest-first, so find() returns the latest).
-      const completion = events.find((event) =>
+      const scope = currentHarnessScope(id);
+      const statusEvents = scopedHarnessEvents(id, scope, {
+        types: HARNESS_STATUS_EVENT_TYPES,
+        limit: 40,
+        desc: true,
+      });
+      const status = effectiveHarnessStatus(session, statusEvents, scope.attempt);
+      const completion = latestHarnessEvent(statusEvents, (event) =>
         event.type === 'conversation_completed' || event.type === 'run_completed',
       );
+      const latestInput = latestHarnessEvent(statusEvents, (event) => event.type === 'user_input_received');
+      const latestInputData = eventRecord(latestInput?.data);
+      const currentInput = firstEventText(latestInputData.displayText, latestInputData.text);
       const outputPreview = completionOutputPreview(completion);
-      res.json({ run: enrichActivityRunDetail({
+      const auditEventsTotal = harnessCountMatchingEvents(id, scope.query);
+      const latestSeq = harnessGetLatestEventSeq(id);
+
+      let scopedArtifacts: ReturnType<typeof listRunArtifacts> = [];
+      let artifactRootScopeId: string | undefined;
+      let artifactCoverageStatus: 'available' | 'unavailable' = 'available';
+      try {
+        // Never attach another turn's documents to a reusable chat. Old
+        // pre-attempt sessions remain explicitly labelled session_history.
+        const terminalArtifactRoot = firstEventText(eventRecord(completion?.data).artifactRunScopeId);
+        artifactRootScopeId = scope.runScopeId
+          ? chooseArtifactProjectionScope(
+            scope.runScopeId,
+            getArtifactRunScope(id, scope.runScopeId)?.rootScopeId,
+            terminalArtifactRoot,
+          )
+          : undefined;
+        scopedArtifacts = artifactRootScopeId
+          ? listRunArtifacts(id, artifactRootScopeId)
+          : scope.scopeKind === 'session_history'
+            ? listRunArtifacts(id)
+            : [];
+      } catch {
+        artifactCoverageStatus = 'unavailable';
+        scopedArtifacts = [];
+      }
+      const artifacts = scopedArtifacts.slice(-24);
+
+      const projectionTotal = environmentView
+        ? harnessCountMatchingEvents(id, { ...scope.query, types: RUN_ENVIRONMENT_PROJECTION_TYPES })
+        : auditEventsTotal;
+      const events = environmentView
+        ? scopedHarnessEvents(id, scope, {
+          types: RUN_ENVIRONMENT_PROJECTION_TYPES,
+          limit: 160,
+          desc: true,
+        })
+        : scopedHarnessEvents(id, scope, { limit: 500, desc: true });
+      const latestStateTool = environmentView
+        ? latestCanonicalToolMilestone(scopedHarnessEvents(id, scope, {
+          types: ['tool_called'],
+          limit: 16,
+          desc: true,
+        }))
+        : undefined;
+      const toolSummary = environmentView
+        ? cachedScopedToolSummary(id, scope, latestSeq)
+        : undefined;
+      const control = harnessRunControlProjection(
+        id,
+        scope,
+        status,
+        supportsDesktopBackgroundHandoff(session),
+      );
+      const runEnvironmentMeta = {
+        scopeKind: scope.scopeKind,
+        runScopeId: scope.runScopeId,
+        attemptScopeId: scope.runScopeId,
+        artifactRootScopeId,
+        attemptId: scope.attemptId,
+        sourceUserSeq: scope.sourceUserSeq,
+        scopeStartedAt: scope.scopeStartedAt,
+        latestSeq,
+        auditEventsTotal,
+        projectionEventsTotal: projectionTotal,
+        projectionEventsReturned: events.length,
+        projectionEventsOmitted: Math.max(0, projectionTotal - events.length),
+        artifactsTotal: scopedArtifacts.length,
+        artifactsReturned: artifacts.length,
+        artifactsOmitted: Math.max(0, scopedArtifacts.length - artifacts.length),
+        artifactCoverageStatus,
+      };
+      const asActivityEvent = (event: HarnessEventRow) => ({
+        id: event.id,
+        type: event.type,
+        createdAt: event.createdAt,
+        data: event.data,
+        message: harnessEventMessage(event),
+      });
+      const projectedEvents = events.map(asActivityEvent);
+      const stateEvents = latestStateTool
+        ? [...events, latestStateTool]
+          .sort((left, right) => left.seq - right.seq)
+          .map(asActivityEvent)
+        : projectedEvents;
+      const runProjection = {
         id,
         sessionId: id,
         kind: ((session as { kind?: unknown }).kind ?? 'harness') as string,
         channel: ((session as { channel?: unknown }).channel ?? undefined) as string | undefined,
         source: harnessSource(session),
-        title: ((session as { title?: unknown }).title ?? '(Clementine session)') as string,
-        objective: ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
+        title: currentInput
+          ? (currentInput.length > 100 ? `${currentInput.slice(0, 97)}...` : currentInput)
+          : ((session as { title?: unknown }).title ?? '(Clementine session)') as string,
+        input: currentInput || ((session as { objective?: unknown }).objective ?? '') as string,
+        objective: currentInput || ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
         metadata: (session as { metadata?: Record<string, unknown> }).metadata,
         status,
         outputPreview,
         createdAt: (session as { createdAt?: unknown }).createdAt as string | undefined,
         updatedAt: (session as { updatedAt?: unknown }).updatedAt as string | undefined,
         completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt as string | undefined : undefined,
+        runScopeId: scope.runScopeId,
+        runEnvironmentMeta,
+        toolSummary,
+        ...control,
+        artifacts,
         // Keep `data` so the clean timeline can name tools/steps; `message`
-        // is the pre-rendered friendly line for the raw view. Reverse to
-        // oldest-first (events are fetched newest-first via desc).
-        events: events.slice().reverse().map((ev) => ({
-          id: (ev as { id?: unknown }).id as string | undefined,
-          type: (ev as { type?: unknown }).type as string | undefined,
-          createdAt: (ev as { createdAt?: unknown }).createdAt as string | undefined,
-          data: (ev as { data?: Record<string, unknown> }).data,
-          message: harnessEventMessage(ev),
-        })),
-      }) });
+        // is the pre-rendered friendly line for the raw view. The environment
+        // contract stays structural even when stateEvents contains one
+        // sanitized tool milestone used only to derive Working/liveLine.
+        events: projectedEvents,
+      };
+      res.json({
+        run: environmentView
+          ? enrichProjectedActivityRunDetail(runProjection, stateEvents)
+          : enrichActivityRunDetail(runProjection),
+      });
       return true;
     };
 
     // A chat can have both a harness session and a legacy run record with the
-    // same sess-* id. The list endpoint already prefers harness; detail must do
-    // the same or an active approval can open as a stale completed legacy row.
+    // same id. The list endpoint already prefers harness; detail must do the
+    // same for every valid id shape (sess-*, space-*, discord:*, background:*).
     try {
-      if (id.startsWith('sess-') && sendHarnessRun()) return;
+      if (sendHarnessRun()) return;
     } catch (err) {
       // Fall through to legacy/fallback lookups below.
     }
@@ -1926,13 +2580,89 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     // Legacy run-store lookup first (run-xxx IDs).
     const run = getRun(id);
     if (run) {
-      res.json({ run: enrichActivityRunDetail(run) });
+      const sessionId = run.sessionId?.trim();
+      const attempt = sessionId
+        ? harnessGetLatestRunAttemptByRunId(sessionId, run.id)
+        : null;
+      const attemptScopeId = sessionId && attempt ? brainRunScopeId(sessionId, attempt) : undefined;
+      let artifactRootScopeId: string | undefined;
+      let scopedArtifacts: ReturnType<typeof listRunArtifacts> = [];
+      let artifactCoverageStatus: 'available' | 'unavailable' = 'available';
+      try {
+        if (sessionId && attemptScopeId) {
+          artifactRootScopeId = chooseArtifactProjectionScope(
+            attemptScopeId,
+            getArtifactRunScope(sessionId, attemptScopeId)?.rootScopeId,
+            undefined,
+          );
+          scopedArtifacts = listRunArtifacts(sessionId, artifactRootScopeId);
+        }
+      } catch {
+        artifactCoverageStatus = 'unavailable';
+        scopedArtifacts = [];
+      }
+      const artifacts = scopedArtifacts.slice(-24);
+      const ownTask = run.id.startsWith('run-') ? getBackgroundTask(run.id.slice(4)) : null;
+      const linkedTaskId = run.queuedTaskId ?? ownTask?.id;
+      const linkedTask = linkedTaskId ? getBackgroundTask(linkedTaskId) : null;
+      const canCancel = Boolean(linkedTask && CANCELLABLE_BACKGROUND_TASK_STATUSES.has(linkedTask.status));
+      const control = {
+        canCancel,
+        ...(canCancel ? { cancelEndpoint: `/api/runs/${encodeURIComponent(run.id)}/cancel` } : {}),
+      };
+      if (environmentView) {
+        const rawEvents = Array.isArray(run.events) ? run.events : [];
+        const structuralEvents = rawEvents.filter((event) => [
+          'plan_drafted', 'step_started', 'step_completed', 'step_verified', 'step_failed',
+          'worker_started', 'worker_result', 'worker_completed', 'worker_failed', 'handoff',
+        ].includes(event.type));
+        const projected = structuralEvents.slice(-160);
+        const latestStateTool = latestCanonicalToolMilestone(rawEvents);
+        const stateEvents = latestStateTool
+          ? [...projected, latestStateTool].sort((left, right) =>
+            String(left.createdAt ?? '').localeCompare(String(right.createdAt ?? '')),
+          )
+          : projected;
+        const compactRun = {
+          ...run,
+          events: projected,
+          artifacts,
+          runScopeId: attemptScopeId,
+          toolSummary: projectScopedToolSummary(rawEvents),
+          ...control,
+          runEnvironmentMeta: {
+            scopeKind: attempt ? 'current_attempt' : 'session_history',
+            runScopeId: attemptScopeId,
+            attemptScopeId,
+            artifactRootScopeId,
+            attemptId: attempt?.attemptId,
+            scopeStartedAt: attempt?.startedAt,
+            latestSeq: sessionId ? harnessGetLatestEventSeq(sessionId) : 0,
+            auditEventsTotal: rawEvents.length,
+            projectionEventsTotal: structuralEvents.length,
+            projectionEventsReturned: projected.length,
+            projectionEventsOmitted: Math.max(0, structuralEvents.length - projected.length),
+            artifactsTotal: scopedArtifacts.length,
+            artifactsReturned: artifacts.length,
+            artifactsOmitted: Math.max(0, scopedArtifacts.length - artifacts.length),
+            artifactCoverageStatus,
+          },
+        };
+        res.json({ run: enrichProjectedActivityRunDetail(compactRun, stateEvents) });
+      } else {
+        res.json({ run: enrichActivityRunDetail({
+          ...run,
+          artifacts,
+          runScopeId: attemptScopeId,
+          artifactRootScopeId,
+          artifactCoverageStatus,
+          ...control,
+        }) });
+      }
       return;
     }
-    // Fallback A — harness session (sess-xxx IDs).
+    // Fallback — workflow run record at workflows/runs/<runId>.json.
     try {
-      if (id.startsWith('sess-') && sendHarnessRun()) return;
-      // Fallback B — workflow run record at workflows/runs/<runId>.json.
       const runPath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
       if (existsSync(runPath)) {
         const wfRun = JSON.parse(readFileSync(runPath, 'utf-8')) as Record<string, unknown>;

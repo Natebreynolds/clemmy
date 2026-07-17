@@ -18,11 +18,20 @@ const {
   respondPreferHarness,
   respondViaHarness,
   harnessSurfaceEnabled,
+  hasReusableRecordedUserInput,
   isChatBrainFalloverEligible,
   _setBridgeImplsForTests,
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
-const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('./eventlog.js');
+const {
+  appendEvent,
+  beginRunAttempt,
+  createSession,
+  getSession,
+  listEvents,
+  recordRunAttemptUserInput,
+  resetEventLog,
+} = await import('./eventlog.js');
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
 // eslint-disable-next-line import/first
@@ -348,7 +357,14 @@ test('respondPreferHarness: Claude SDK brain relays harness tool/progress events
         turn: 1,
         role: 'agent',
         type: 'tool_called',
-        data: { tool: 'run_shell_command', args: { command: 'npm test' } },
+        data: { tool: 'run_shell_command', callId: 'toolu-shell', accounting: 'top_level', arguments: JSON.stringify({ command: 'npm test' }) },
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { tool: 'run_shell_command', callId: 'mcp-shell', accounting: 'transport_mirror', args: { command: 'npm test' } },
       });
       return { text: 'claude sdk brain', sessionId: req.sessionId, stoppedReason: 'success' };
     }) as never,
@@ -536,6 +552,31 @@ test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', a
 
   assert.equal(res.text, 'fallback done');
   assert.equal(reuseRecordedUserInput, true, 'fallback harness turn reuses the Claude-recorded user row');
+});
+
+test('fallover reuses the attempt-bound input when the runtime prompt was transformed', () => {
+  const sessionId = 'fallover-bound-transformed-input';
+  const runId = 'desktop:goal-run';
+  createSession({ id: sessionId, kind: 'chat', title: 'goal test' });
+  const attempt = beginRunAttempt(sessionId, { runId });
+  recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: '/goal build the report', runId },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'provider_fallover' },
+  });
+
+  assert.equal(
+    hasReusableRecordedUserInput(sessionId, 'A transformed goal execution prompt', runId),
+    true,
+    'attempt identity wins over transformed text and a prior terminal marker',
+  );
 });
 
 test('Claude SDK brain overload AFTER committing surfaces the error (no double-act)', async () => {

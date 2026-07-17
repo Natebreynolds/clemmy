@@ -1,4 +1,4 @@
-import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from '../../agents/worker-job-packet.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, workerPacketKey, type WorkerToolInput } from '../../agents/worker-job-packet.js';
 import { getRuntimeEnv } from '../../config.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import {
@@ -87,6 +87,7 @@ export async function runClaudeAgentSdkWorker(
   input: WorkerToolInput,
   modelId: string,
   sessionId?: string,
+  sourceUserSeq?: number,
 ): Promise<ClaudeAgentSdkWorkerResult> {
   // Agentic only with the PARENT session id — the gates + plan-scope + execution
   // lane aggregate across the worker fan-out via the shared session (one batch
@@ -100,6 +101,7 @@ export async function runClaudeAgentSdkWorker(
   // Falls back to the base CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS when the guard
   // is off or the intent is ordinary.
   const resolvedMaxTurns = guard ? resolveWorkerMaxTurns(input.intent, maxTurns()) : maxTurns();
+  const trackerScopeId = sid ? `${sid}::worker:${workerPacketKey(input)}` : undefined;
   const result = await runClaudeAgentSdkImpl({
     prompt: buildWorkerJobPrompt(input),
     sessionId: sid,
@@ -113,11 +115,11 @@ export async function runClaudeAgentSdkWorker(
     nativeMcpScopeMode: 'resolved_tools',
     agentic,
     maxTurns: resolvedMaxTurns,
-    // Workers share the PARENT session id (one batch approval covers the
-    // fan-out) — the session-scoped grind ladder must not pool every worker's
-    // calls into the parent's tracker. The parent's own gate owns grind
-    // control; the kill gate still applies inside workers.
-    skipSessionGrindGate: true,
+    // Isolation and authority are separate: this packet-stable scope enforces
+    // the full grind ladder per worker (and survives resume), while sessionId
+    // continues to own kill, approval, execution, and event records.
+    trackerScopeId,
+    ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
   });
   // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say
   // continue" text. Returning that verbatim made the fan-out ledger record the

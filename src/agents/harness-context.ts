@@ -29,7 +29,7 @@ import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
-import { renderSkillsIndex } from '../memory/skill-store.js';
+import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderEstablishedDestinationsForContext } from '../runtime/harness/published-destinations.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
@@ -269,6 +269,7 @@ function queryRecallEnabled(): boolean {
 const VOLATILE_CONTEXT_TITLES = new Set<string>([
   'Now',
   'Relevant To Your Request',
+  'Relevant Skills',
   'Completed Actions This Conversation',
   'Working Memory',
   'Active Goals',
@@ -339,11 +340,14 @@ export function renderHarnessMemoryContext(opts?: {
     }
   }
 
-  let skills = '';
-  try {
-    skills = renderSkillsIndex();
-  } catch {
-    skills = '';
+  const partition = opts?.partition ?? 'all';
+  let skillDiscovery = '';
+  let relevantSkills = '';
+  if (partition !== 'volatile') {
+    try { skillDiscovery = renderSkillDiscoveryPrompt(); } catch { skillDiscovery = ''; }
+  }
+  if (partition !== 'stable') {
+    try { relevantSkills = renderRelevantSkillsForPrompt(opts?.query ?? ''); } catch { relevantSkills = ''; }
   }
 
   // Current Focus block — rendered once for this turn, so it is the current
@@ -399,10 +403,10 @@ export function renderHarnessMemoryContext(opts?: {
     { title: 'Active Goals', text: section('Active Goals', goals) },
     { title: 'Held For Later', text: section('Held For Later', heldTasks) },
     { title: 'Current Focus', text: section('Current Focus', focus) },
-    { title: 'Available Skills', text: section('Available Skills', skills) },
+    { title: 'Skill Discovery', text: section('Skill Discovery', skillDiscovery) },
+    { title: 'Relevant Skills', text: section('Relevant Skills', relevantSkills) },
   ];
 
-  const partition = opts?.partition ?? 'all';
   const blocks = tagged
     .filter((b) => Boolean(b.text))
     .filter((b) =>

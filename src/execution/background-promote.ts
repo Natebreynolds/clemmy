@@ -24,9 +24,19 @@
 import { MODELS } from '../config.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
-import { createBackgroundTask, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskRecord } from './background-tasks.js';
-import { requestKill, listEvents } from '../runtime/harness/eventlog.js';
+import { createBackgroundTask, listBackgroundTasks, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskRecord } from './background-tasks.js';
+import {
+  clearKill,
+  getActiveRunAttempt,
+  getLatestEventSeq,
+  getRunAttemptSourceUserEvent,
+  requestKill,
+  type RunAttemptRef,
+} from '../runtime/harness/eventlog.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
+import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
+import { HarnessSession } from '../runtime/harness/session.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
 /**
  * Explicit or high-confidence intent to run this work as a durable background job.
@@ -190,6 +200,9 @@ export interface EnqueueDurableChatTaskInput {
    * completion. Without it the result is notification-only.
    */
   sessionId: string;
+  /** Exact foreground provenance when this task is a user-requested handoff.
+   * Persisted on the task so a lost response can safely rejoin it. */
+  foregroundHandoff?: BackgroundTaskRecord['foregroundHandoff'];
   userId?: string;
   channel?: string;
   reportBackTarget?: BackgroundReportBackTarget;
@@ -218,6 +231,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     title: deriveTitle(input.message) || deriveTitle(prompt),
     prompt,
     originSessionId: input.sessionId,
+    foregroundHandoff: input.foregroundHandoff,
     userId: input.userId,
     channel: input.channel,
     reportBackTarget: input.reportBackTarget,
@@ -264,39 +278,70 @@ export function detectBackgroundItIntent(message: string): boolean {
   return /^\/?(background (?:it|this)|run (?:it|this) in the background|take (?:it|this) to the background|move (?:it|this) to the background|do (?:it|this) in the background|send (?:it|this) to the background|finish (?:it|this) in the background)$/.test(m);
 }
 
-/** Resolve the objective of the in-flight / just-run task for this session: the
- *  pinned goal if any, else the most recent real user request (never the
- *  background-it control itself). Null when there's nothing to background. */
-function resolveBackgroundableObjective(sessionId: string): string | null {
+/** Resolve only from the exact user event durably bound to this attempt. A
+ * reusable session's "latest" text is not ownership: under a stale click it
+ * may already belong to a newer turn. Confirmation turns are expanded through
+ * their persisted preflight decision so "go ahead" retains the agreed ask. */
+function resolveBackgroundableObjective(
+  sessionId: string,
+  attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
+): { objective: string; sourceUserSeq: number } | null {
+  const source = getRunAttemptSourceUserEvent(attempt);
+  if (!source) return null;
+  const data = source.data as { text?: unknown; displayText?: unknown };
+  const displayText = typeof data.displayText === 'string' ? data.displayText.trim() : '';
+  const recordedText = typeof data.text === 'string' ? data.text.trim() : '';
+  const fallback = displayText || recordedText;
+  if (!fallback) return null;
+
+  let objective = effectiveTurnObjective(sessionId, fallback, source.seq).trim();
+  // A live goal is the contract this exact attempt is executing against and is
+  // richer than a continuation/approval control. Preserve the prior behavior,
+  // but never fall back to unrelated ambient chat text.
   try {
     const goal = getActiveGoalForSession(sessionId);
     const goalObj = goal ? (goal.approvedPlan ?? goal.plan).objective?.trim() : '';
-    if (goalObj) return goalObj;
-  } catch { /* fall through to recent input */ }
-  try {
-    const inputs = listEvents(sessionId, { types: ['user_input_received'] })
-      .map((e) => String((e.data as { text?: string } | undefined)?.text ?? '').trim())
-      .filter((t) => t.length > 0 && !detectBackgroundItIntent(t))
-      // Synthetic harness inputs (stall-retry directives etc.) are not the
-      // user's ask — they'd hijack the objective the same way a short answer did.
-      .filter((t) => !/^Your previous response could not be parsed/i.test(t));
-    if (inputs.length === 0) return null;
-    // The TASK statement is almost never the LAST message — clarification
-    // answers land after it ("Facebook please" became a background task title,
-    // live 2026-07-08). Anchor on the most SUBSTANTIVE recent input (longest of
-    // the last 6) and append any later short answers as qualifiers, so the
-    // objective reads "pull the last 5 social posts… — Facebook please".
-    const recent = inputs.slice(-6);
-    let anchorIdx = 0;
-    for (let i = 1; i < recent.length; i += 1) if (recent[i].length > recent[anchorIdx].length) anchorIdx = i;
-    const qualifiers = recent.slice(anchorIdx + 1).filter((t) => t.length <= 120);
-    return qualifiers.length > 0 ? `${recent[anchorIdx]} — ${qualifiers.join('; ')}` : recent[anchorIdx];
-  } catch {
-    return null;
-  }
+    if (goalObj) objective = goalObj;
+  } catch { /* exact turn objective remains authoritative */ }
+  return objective ? { objective, sourceUserSeq: source.seq } : null;
 }
 
-export interface BackgroundItResult { handled: true; text: string; taskId: string; }
+export interface BackgroundItResult {
+  handled: true;
+  text: string;
+  taskId: string;
+  attemptId: string;
+  replayed: boolean;
+}
+
+export interface ForegroundBackgroundTarget {
+  attemptId: string;
+  runId?: string | null;
+  /** Server-projected scope proof for HTTP callers. Trusted in-process channel
+   * controls may omit it because they already hold the concrete attempt. */
+  runScopeId?: string | null;
+}
+
+function foregroundRunScopeId(
+  sessionId: string,
+  attempt: { attemptId: string; runId?: string | null },
+): string {
+  return `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
+}
+
+function backgroundItResult(
+  task: BackgroundTaskRecord,
+  attemptId: string,
+  replayed: boolean,
+): BackgroundItResult {
+  return {
+    handled: true,
+    taskId: task.id,
+    attemptId,
+    replayed,
+    text: `On it — moving "${task.title}" to the background now. It picks up where it was and reports back here when it's done. You're free to move on to something else.`,
+  };
+}
 
 /**
  * Handle the "background it" control: STOP the in-flight foreground run (so it
@@ -313,24 +358,100 @@ export interface BackgroundItResult { handled: true; text: string; taskId: strin
  * soft progress-diffing — acceptable for v1 (this is the resume-not-restart
  * tradeoff). A hard cross-session idempotency key would be the stronger fix.
  */
-export function detachRunningTurnToBackground(sessionId: string): BackgroundItResult | null {
-  const objective = resolveBackgroundableObjective(sessionId);
-  if (!objective) return null;
-  // Stop the foreground run so the same work doesn't run twice.
-  try { requestKill(sessionId, 'moved to background by user'); } catch { /* best effort */ }
+export function detachRunningTurnToBackground(
+  sessionId: string,
+  target: ForegroundBackgroundTarget,
+  options: {
+    source?: BackgroundTaskRecord['source'];
+    channel?: string;
+    userId?: string;
+  } = {},
+): BackgroundItResult | null {
+  if (!target.attemptId?.trim()) return null;
+
+  // Durable idempotency across a double-click, lost HTTP response, or daemon
+  // restart. Rejoin the task even after its foreground attempt has settled.
+  const existing = listBackgroundTasks({ includeArchived: true }).find((task) => (
+    task.originSessionId === sessionId
+    && task.foregroundHandoff?.sessionId === sessionId
+    && task.foregroundHandoff.attemptId === target.attemptId
+  ));
+  if (existing) {
+    const handoff = existing.foregroundHandoff!;
+    if (target.runId !== undefined && target.runId !== (handoff.runId ?? null)) return null;
+    if (target.runScopeId && target.runScopeId !== foregroundRunScopeId(sessionId, handoff)) return null;
+    return backgroundItResult(existing, target.attemptId, true);
+  }
+
+  // Validate ownership at the mutation boundary. The HTTP/Discord caller may
+  // also project an identity, but only this synchronous check prevents a stale
+  // attempt-A control from killing or cloning the newer attempt B.
+  const active = getActiveRunAttempt(sessionId);
+  if (
+    !active
+    || active.attemptId !== target.attemptId
+    || (target.runId !== undefined && target.runId !== active.runId)
+    || (target.runScopeId && target.runScopeId !== foregroundRunScopeId(sessionId, active))
+  ) return null;
+  // An approval pause is stateful inside the foreground executor. Spawning a
+  // fresh worker cannot safely inherit that pending decision and could bypass
+  // or duplicate it, so the user must decide/reject it before handoff.
+  if (isBackgroundHandoffApprovalBlocked(sessionId)) return null;
+  const resolved = resolveBackgroundableObjective(sessionId, active);
+  if (!resolved) return null;
+  const throughSeq = getLatestEventSeq(sessionId);
+
+  // Latch the exact foreground attempt before making its durable replacement.
+  // If persistence fails synchronously, release only this latch so foreground
+  // work is not silently lost. enqueue's drain yields after this call stack.
+  requestKill(sessionId, 'moved to background by user', active);
   const composedPrompt = [
-    `Objective: ${objective}`,
+    `Objective: ${resolved.objective}`,
     '',
     'You are CONTINUING this task in the background — the user just moved it here from a live chat.',
-    `Your progress so far is recorded in session "${sessionId}". Call session_history with that id FIRST to see what is already done, then continue from there — do NOT redo completed work.`,
+    `Your progress so far is recorded in session "${sessionId}" through event ${throughSeq}. Call session_history with session_id="${sessionId}" and through_seq=${throughSeq} FIRST to see what is already done, then continue from there — do NOT read later turns or redo completed work.`,
     'Work through to completion, then report the result back.',
   ].join('\n');
-  const task = enqueueDurableChatTask({ message: objective, composedPrompt, sessionId, source: 'desktop', goal: { objective } });
-  return {
-    handled: true,
-    taskId: task.id,
-    text: `On it — moving "${task.title}" to the background now. It picks up where it was and reports back here when it's done. You're free to move on to something else.`,
-  };
+  try {
+    const task = enqueueDurableChatTask({
+      message: resolved.objective,
+      composedPrompt,
+      sessionId,
+      source: options.source ?? 'desktop',
+      channel: options.channel,
+      userId: options.userId,
+      goal: { objective: resolved.objective },
+      foregroundHandoff: {
+        sessionId,
+        attemptId: active.attemptId,
+        ...(active.runId ? { runId: active.runId } : {}),
+        sourceUserSeq: resolved.sourceUserSeq,
+        throughSeq,
+      },
+    });
+    return backgroundItResult(task, active.attemptId, false);
+  } catch (error) {
+    try { clearKill(sessionId, active); } catch { /* preserve original error */ }
+    throw error;
+  }
+}
+
+/**
+ * A background handoff cannot safely carry an in-process approval interrupt.
+ * Keep this check shared so channel surfaces can explain the refusal before
+ * asking the mutation boundary to perform it. Any inability to read approval
+ * state fails closed: uncertainty here must never duplicate a pending action.
+ */
+export function isBackgroundHandoffApprovalBlocked(sessionId: string): boolean {
+  try {
+    const pendingApproval = approvalRegistry
+      .listPending({ sessionId, status: 'pending' })
+      .some((row) => approvalRegistry.isActionable(row));
+    if (pendingApproval) return true;
+    return Boolean(HarnessSession.load(sessionId)?.loadInterruptState());
+  } catch {
+    return true;
+  }
 }
 
 /**

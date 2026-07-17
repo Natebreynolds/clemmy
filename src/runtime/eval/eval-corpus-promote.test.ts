@@ -22,7 +22,8 @@ const ev = (type: string, data: Record<string, unknown>, createdAt = '2026-06-21
 test('a guardrail block → a pending case carrying the gate kind + a trace', () => {
   const c = buildFailureCase('sess-1', [
     ev('turn_started', {}),
-    ev('tool_called', { tool: 'composio_execute_tool', callId: 'c1' }),
+    ev('tool_called', { tool: 'composio_execute_tool', callId: 'c1', accounting: 'top_level' }),
+    ev('tool_called', { tool: 'composio_execute_tool', callId: 'mcp-c1', accounting: 'transport_mirror' }),
     ev('guardrail_tripped', { kind: 'confirm_first_required', toolName: 'composio_execute_tool' }, '2026-06-21T00:00:09.000Z'),
   ]);
   assert.ok(c);

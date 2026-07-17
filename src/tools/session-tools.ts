@@ -200,13 +200,14 @@ function sessionRecordForContinuity(sessionId: string): { session: SessionRecord
 export function registerSessionTools(server: McpServer): void {
   server.tool(
     'session_history',
-    'Read recent conversation history for a session. Falls back to harness cross-session-prefix events when the v0.2 transcript store is empty for the given session (Discord sessions live in the harness eventlog, not the v0.2 sessions store).',
+    'Read recent conversation history for a session. Use through_seq to freeze the transcript, completed-action ledger, and continuation prefixes at an inclusive harness event boundary. Falls back to harness cross-session-prefix events when the v0.2 transcript store is empty for the given session (Discord sessions live in the harness eventlog, not the v0.2 sessions store).',
     {
       session_id: z.string().min(1),
       max_turns: z.number().int().min(1).max(40).optional(),
+      through_seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
     },
-    async ({ session_id, max_turns }) => {
-      const transcript = renderSessionHistoryForModel(session_id, max_turns ?? 12, 12_000);
+    async ({ session_id, max_turns, through_seq }) => {
+      const transcript = renderSessionHistoryForModel(session_id, max_turns ?? 12, 12_000, through_seq);
       if (transcript) return textResult(transcript);
 
       // Fallback: harness sessions (Discord, workflow chat) record their
@@ -217,7 +218,8 @@ export function registerSessionTools(server: McpServer): void {
       // (Fix shipped 2026-05-24 after the "Yep, let's do the first 10"
       // incident — see [[project_session_status_semantics]].)
       try {
-        const prefixEvents = listHarnessEvents(session_id, { types: ['cross_session_prefix'] });
+        const prefixEvents = listHarnessEvents(session_id, { types: ['cross_session_prefix'] })
+          .filter((event) => through_seq === undefined || event.seq <= through_seq);
         if (prefixEvents.length > 0) {
           const lines = prefixEvents.map((e) => {
             const text = (e.data as { text?: unknown })?.text;

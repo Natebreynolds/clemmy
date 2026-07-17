@@ -5,12 +5,17 @@ import { markRunInFlight } from './restart-recovery.js';
 import {
   appendEvent,
   clearKill,
+  getActiveRunAttempt,
+  getLatestCanonicalTopLevelToolEvent,
+  getLatestRunAttempt,
   getSession,
   getToolOutput,
+  isKillRequested,
   listEvents,
   openEventLog,
   type AppendEventInput,
   type EventRow,
+  type KillRequestTarget,
   type SessionRow,
 } from './eventlog.js';
 import { destinationCardSuffix } from './destination-gate.js';
@@ -94,7 +99,14 @@ import {
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
-import { backgroundOfferEnabled } from './turn-control.js';
+import { backgroundOfferEnabled, effectiveTurnObjective } from './turn-control.js';
+import {
+  getArtifactRootForSourceUserSeq,
+  listRunArtifacts,
+  listUnverifiedRunArtifacts,
+  resolveArtifactRunScopeId,
+  type RunArtifact,
+} from './artifact-ledger.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -120,6 +132,7 @@ export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
 import { peekStepResult, recordStepResultFromTranscript } from '../../tools/step-result-tool.js';
+import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -140,6 +153,199 @@ function safeAppend(input: AppendEventInput): void {
       err: normalizeError(err),
     });
   }
+}
+
+interface StandardArtifactTerminalState {
+  rootScopeId: string;
+  artifacts: RunArtifact[];
+  pending: RunArtifact[];
+}
+
+/** Read the exact durable artifact root owned by this accepted user event.
+ * Candidate-only lineage is deliberately invisible: a normal read/chat turn
+ * must not acquire an artifactRunScopeId merely because the loop resolved an
+ * attempt scope. */
+function standardArtifactTerminalState(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+): StandardArtifactTerminalState | null {
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return null;
+  const rootScopeId = getArtifactRootForSourceUserSeq(sessionId, sourceUserSeq as number);
+  if (!rootScopeId) return null;
+  const artifacts = listRunArtifacts(sessionId, rootScopeId);
+  if (artifacts.length === 0) return null;
+  return {
+    rootScopeId,
+    artifacts,
+    pending: listUnverifiedRunArtifacts(sessionId, rootScopeId),
+  };
+}
+
+function artifactVerificationProjection(state: StandardArtifactTerminalState): Record<string, unknown> {
+  const pendingIds = new Set(state.pending.map((artifact) => artifact.id));
+  return {
+    artifactRunScopeId: state.rootScopeId,
+    artifactVerification: {
+      status: state.pending.length > 0 ? 'pending' : 'verified',
+      total: state.artifacts.length,
+      pending: state.pending.length,
+      artifacts: state.artifacts.map((artifact) => ({
+        artifactId: artifact.id,
+        kind: artifact.kind,
+        provider: artifact.provider,
+        resourceId: artifact.resourceId,
+        uri: artifact.uri,
+        status: pendingIds.has(artifact.id) ? 'pending' : 'verified',
+      })),
+    },
+  };
+}
+
+/** A standard-lane completion may not turn an unresolved provider create into
+ * a green success. The Claude lane has a permission-bound exact-ID repair run;
+ * this lane does not yet have an equally strict tool-only repair boundary, so
+ * it parks honestly and asks for a retry instead of relying on prompt wording
+ * that could accidentally create a replacement. */
+function parkForPendingStandardArtifacts(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  steps: number;
+  summary: string;
+  internalSummary?: string | null;
+  reply?: string | null;
+  lastDecision?: OrchestratorDecisionShape;
+  lastTurn: number;
+}): RunConversationResult | null {
+  const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  if (!state || state.pending.length === 0) return null;
+  const exactResources = state.pending.map((artifact) => ({
+    artifactId: artifact.id,
+    kind: artifact.kind,
+    provider: artifact.provider,
+    resourceId: artifact.resourceId,
+    uri: artifact.uri,
+    status: artifact.status,
+  }));
+  const resourceLabel = state.pending.length === 1 ? 'artifact' : `${state.pending.length} artifacts`;
+  const hasExactIds = state.pending.every((artifact) => Boolean(artifact.resourceId));
+  const question = hasExactIds
+    ? `The provider returned the ${resourceLabel}, but I could not independently read back the exact resource ID${state.pending.length === 1 ? '' : 's'} yet. Reply \"retry\" and I will verify the same resource ID${state.pending.length === 1 ? '' : 's'} without creating replacements.`
+    : `The ${resourceLabel} create attempt is unresolved, so I cannot honestly confirm whether the provider created it. I will not create a replacement while that outcome is uncertain; reply \"retry\" to re-check the existing attempt or \"stop\" to leave it parked.`;
+  const alreadyAsked = (() => {
+    try {
+      return listEvents(input.sessionId, { types: ['awaiting_user_input'] })
+        .some((event) => event.turn === input.turn
+          && (event.data as { source?: unknown }).source === 'artifact_verification_pending');
+    } catch { return false; }
+  })();
+  if (!alreadyAsked) {
+    safeAppend({
+      sessionId: input.sessionId,
+      turn: input.turn,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: {
+        question,
+        options: ['Retry verification', 'Stop'],
+        source: 'artifact_verification_pending',
+        artifactRunScopeId: state.rootScopeId,
+        pendingArtifacts: exactResources,
+      },
+    });
+  }
+  safeAppend({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      steps: input.steps,
+      reason: 'awaiting_user_input',
+      summary: question,
+      internalSummary: input.internalSummary ?? input.summary,
+      reply: question,
+      delivered: false,
+      blockedReason: 'artifact_binding_verification_pending',
+      ...artifactVerificationProjection(state),
+    },
+  });
+  return {
+    sessionId: input.sessionId,
+    status: 'awaiting_user_input',
+    steps: input.steps,
+    lastDecision: input.lastDecision,
+    lastTurn: input.lastTurn,
+  };
+}
+
+function finalizeStandardConversation(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  eventData: Record<string, unknown>;
+  result: RunConversationResult;
+}): RunConversationResult {
+  const summary = typeof input.eventData.summary === 'string'
+    ? input.eventData.summary
+    : 'The requested work is complete.';
+  const parked = parkForPendingStandardArtifacts({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    turn: input.turn,
+    steps: input.result.steps,
+    summary,
+    internalSummary: typeof input.eventData.internalSummary === 'string'
+      ? input.eventData.internalSummary
+      : null,
+    reply: typeof input.eventData.reply === 'string' ? input.eventData.reply : null,
+    lastDecision: input.result.lastDecision,
+    lastTurn: input.result.lastTurn,
+  });
+  if (parked) return parked;
+  const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  safeAppend({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      ...input.eventData,
+      ...(state ? artifactVerificationProjection(state) : {}),
+    },
+  });
+  return input.result;
+}
+
+/** Pair an ordinary awaiting-user result with durable artifact lineage when
+ * this turn owns artifacts. Calls with no artifacts remain byte-for-byte on
+ * the existing event path (no extra terminal and no fake scope id). */
+function appendStandardArtifactPauseTerminal(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  turn: number;
+  steps: number;
+  summary: string;
+  reply?: string | null;
+  delivered?: boolean;
+}): void {
+  const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  if (!state) return;
+  safeAppend({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      steps: input.steps,
+      reason: 'awaiting_user_input',
+      summary: input.summary,
+      reply: input.reply ?? input.summary,
+      delivered: input.delivered ?? true,
+      awaitingUser: true,
+      ...artifactVerificationProjection(state),
+    },
+  });
 }
 
 function toolCallInput(data: Record<string, unknown>): unknown {
@@ -315,7 +521,7 @@ function renderEventlogReplayFallback(sessionId: string, currentInput: string, s
  */
 const PRIOR_LOOKBACK_TURNS = 3;
 const PRIOR_MAX_EVENTS = 200; // safety cap on listEvents pull
-function inferTurnPriors(
+export function inferTurnPriors(
   sessionId: string,
   currentTurn: number,
   opts: { fallbackToolCount: number; fallbackAvgReturn: number; safetyFactor: number },
@@ -333,7 +539,7 @@ function inferTurnPriors(
     }
     // Bucket by turn number, then keep only the last PRIOR_LOOKBACK_TURNS.
     const minTurn = Math.max(0, currentTurn - PRIOR_LOOKBACK_TURNS);
-    const recentEvents = events
+    const recentEvents = projectCanonicalTopLevelToolEvents(events)
       .slice(-PRIOR_MAX_EVENTS)
       .filter((e) => typeof e.turn === 'number' && e.turn >= minTurn && e.turn < currentTurn);
     if (recentEvents.length === 0) {
@@ -827,6 +1033,8 @@ export interface RunTurnOptions {
   suppressMemoryCapture?: boolean;
   /** See RunConversationOptions.reuseRecordedUserInput. */
   reuseRecordedUserInput?: boolean;
+  /** Exact accepted source event owned by this logical user request. */
+  sourceUserSeq?: number;
   /** W1a: when true, a TRANSIENT model/codex error returns `infraTransientKind`
    *  WITHOUT writing the infra-recovery ask, so runConversation can attempt
    *  cross-brain fallover first. Off (default) = today's behavior verbatim. */
@@ -950,6 +1158,8 @@ export interface RunConversationOptions {
    * committed. Reuse that row instead of duplicating it on the fallback lane.
    */
   reuseRecordedUserInput?: boolean;
+  /** Exact accepted source event owned by this logical user request. */
+  sourceUserSeq?: number;
   /**
    * W1a chat step-boundary brain fallover. When BOTH are provided, a turn that
    * fails on a TRANSIENT model/codex error (and has NOT written externally this
@@ -1288,6 +1498,7 @@ function captureWorkflowStepResultTranscript(opts: {
 
 function completeCapturedWorkflowStepResult(opts: {
   sessionId: string;
+  sourceUserSeq?: number;
   turn: number;
   steps: number;
   decision?: OrchestratorDecisionShape | null;
@@ -1302,12 +1513,11 @@ function completeCapturedWorkflowStepResult(opts: {
       decision: userVisibleStepDecision(opts.decision ?? null),
     },
   });
-  safeAppend({
+  return finalizeStandardConversation({
     sessionId: opts.sessionId,
+    sourceUserSeq: opts.sourceUserSeq,
     turn: opts.turn,
-    role: 'system',
-    type: 'conversation_completed',
-    data: {
+    eventData: {
       steps: opts.steps,
       reason: 'workflow_step_result_captured',
       summary: opts.decision?.summary ?? 'Workflow step emitted a structured result.',
@@ -1315,14 +1525,14 @@ function completeCapturedWorkflowStepResult(opts: {
       reply: opts.decision?.reply ?? null,
       delivered: true,
     },
+    result: {
+      sessionId: opts.sessionId,
+      status: 'completed',
+      steps: opts.steps,
+      lastDecision: opts.decision ?? undefined,
+      lastTurn: opts.turn,
+    },
   });
-  return {
-    sessionId: opts.sessionId,
-    status: 'completed',
-    steps: opts.steps,
-    lastDecision: opts.decision ?? undefined,
-    lastTurn: opts.turn,
-  };
 }
 
 function userVisibleStepDecision(
@@ -1804,8 +2014,19 @@ async function runConversationCore(
   // suspicious no-tool action claims and promise-shaped replies.
   const objectiveJudge = options.judgeFn ?? judgeObjectiveComplete;
   const objectiveJudgeOptIn = options.judgeCompletion === true;
-  const objectiveJudgeActionIntent = classifyMessageIntent(options.input).intent === 'action';
-  const objective = options.input;
+  // On an approval/control turn ("go ahead"), keep every completion check
+  // anchored to the consequential request that was actually aligned. The
+  // objective lives in typed event state; no extra prompt block is injected.
+  let objective = options.sourceUserSeq
+    ? effectiveTurnObjective(options.sessionId, options.input, options.sourceUserSeq)
+    : options.input;
+  let objectiveJudgeActionIntent = classifyMessageIntent(objective).intent === 'action';
+  // When a legacy/direct caller did not thread the accepted source row, the
+  // first runTurn records it. Pin that exact row afterward so every synthetic
+  // continuation and the artifact terminal refer to one logical user request.
+  let activeSourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? options.sourceUserSeq
+    : undefined;
   // Each NOT-DONE continuation is a full brain re-run (expensive). 3 was wasteful
   // for the common case; default to 2 (still room for a genuine multi-step finish)
   // and make it tunable — CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS (Phase 3 token).
@@ -1896,6 +2117,24 @@ async function runConversationCore(
     const canStillFallover = falloverCapable
       && triedFalloverModelIds.size < (options.falloverModelIds?.length ?? 0);
 
+    // Legacy/direct callers historically recorded harness continuation text as
+    // a user_input_received audit row. Preserve that observability without
+    // letting the synthetic row replace the exact accepted source authority
+    // threaded into tool gates and artifact lineage.
+    if (!options.sourceUserSeq && activeSourceUserSeq && stepIndex > 1 && !falloverReattempt) {
+      try {
+        const row = getSession(options.sessionId);
+        if (row) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: nextTurnNumber(row),
+            role: 'user',
+            type: 'user_input_received',
+            data: { text: nextInput, synthetic: true, sourceUserSeq: activeSourceUserSeq },
+          });
+        }
+      } catch { /* synthetic audit compatibility must not block execution */ }
+    }
     const turnResult = await runTurn({
       agent: currentAgent,
       sessionId: options.sessionId,
@@ -1908,6 +2147,9 @@ async function runConversationCore(
       reuseRecordedUserInput: falloverReattempt
         ? true
         : (stepIndex === 1 ? options.reuseRecordedUserInput : false),
+      // The entire self-continuation/fallover chain remains authorized by the
+      // same accepted user event; a synthetic prompt never becomes authority.
+      sourceUserSeq: activeSourceUserSeq,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
@@ -1919,6 +2161,26 @@ async function runConversationCore(
     });
     falloverReattempt = false;
     lastTurn = turnResult.turn;
+    if (!activeSourceUserSeq) {
+      try {
+        activeSourceUserSeq = listEvents(options.sessionId, { types: ['user_input_received'] })
+          .filter((event) => event.turn === turnResult.turn)
+          .at(-1)?.seq;
+      } catch { /* missing event authority leaves artifact completion fail-closed */ }
+    }
+    if (activeSourceUserSeq) {
+      // Resolve the standard attempt even when this particular turn made no
+      // create/read-back call. That is what lets an immediate reply to the
+      // typed artifact-verification pause inherit the exact prior root. The
+      // public source lookup below only exposes it if durable artifacts exist.
+      resolveArtifactRunScopeId(
+        options.sessionId,
+        `${options.sessionId}::turn:${turnResult.turn}`,
+        activeSourceUserSeq,
+      );
+      objective = effectiveTurnObjective(options.sessionId, options.input, activeSourceUserSeq);
+      objectiveJudgeActionIntent = classifyMessageIntent(objective).intent === 'action';
+    }
     totalToolCalls += turnResult.toolCalls ?? 0;
     meaningfulToolEvidence = meaningfulToolEvidence
       || turnHasMeaningfulSuccessfulToolEvidence(options.sessionId, turnResult.turn, objective);
@@ -2027,6 +2289,24 @@ async function runConversationCore(
     // tripped, the brackets blew, or an error fired.
     if (turnResult.status !== 'completed') {
       const status: RunConversationStatus = turnResult.status;
+      if (status === 'awaiting_user_input') {
+        const latestQuestion = (() => {
+          try {
+            const event = listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+              .filter((candidate) => candidate.turn === turnResult.turn)
+              .at(-1);
+            return String((event?.data as { question?: unknown } | undefined)?.question ?? 'Awaiting your input.');
+          } catch { return 'Awaiting your input.'; }
+        })();
+        appendStandardArtifactPauseTerminal({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          turn: turnResult.turn,
+          steps: stepIndex,
+          summary: latestQuestion,
+          reply: latestQuestion,
+        });
+      }
       return {
         sessionId: options.sessionId,
         status,
@@ -2051,6 +2331,7 @@ async function runConversationCore(
     if (hasCapturedWorkflowStepResult(options.sessionId)) {
       return completeCapturedWorkflowStepResult({
         sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
         steps: stepIndex,
         decision,
@@ -2149,6 +2430,13 @@ async function runConversationCore(
             signal: structuredStallInfo.signal,
           },
         });
+        appendStandardArtifactPauseTerminal({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          turn: turnResult.turn,
+          steps: stepIndex,
+          summary: "I've been unable to make progress because the model claimed tools were unavailable instead of using them. Should I retry, switch approach, or stop here?",
+        });
         return {
           sessionId: options.sessionId,
           status: 'awaiting_user_input',
@@ -2174,6 +2462,15 @@ async function runConversationCore(
         }
       })();
       if (toolAskThisTurn) {
+        const question = String((toolAskThisTurn.data as { question?: unknown }).question ?? 'Awaiting your input.');
+        appendStandardArtifactPauseTerminal({
+          sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          turn: turnResult.turn,
+          steps: stepIndex,
+          summary: question,
+          reply: question,
+        });
         return {
           sessionId: options.sessionId,
           status: 'awaiting_user_input',
@@ -2196,34 +2493,33 @@ async function runConversationCore(
       if (plainTextContractTurn && (turnResult.toolCalls ?? 0) === 0 && typeof turnResult.finalOutput === 'string') {
         const contractReply = turnResult.finalOutput.trim();
         if (contractReply && (contractReply.length > 60 || !STALL_OUTPUT_PATTERN.test(contractReply))) {
-          safeAppend({
+          // Synthesize the decision for the RETURN-VALUE lane (2026-07-13): every
+          // salvage here completes with decision===null, so lastDecision was
+          // undefined and respondViaHarness (respond-bridge.ts) built its reply
+          // from lastDecision → shipped "(no reply produced)" on the API/Discord
+          // surfaces while the event lane (desktop dock) showed the real reply —
+          // a parity defect across the whole salvage CLASS. The event below stays
+          // the source of truth; this mirrors it into the return value.
+          lastDecision = { summary: contractReply, reply: contractReply, done: true, nextAction: 'completed', reason: null };
+          return finalizeStandardConversation({
             sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
             turn: turnResult.turn,
-            role: 'system',
-            type: 'conversation_completed',
-            data: {
+            eventData: {
               steps: stepIndex,
               reason: 'plain_text_contract_fulfilled',
               summary: contractReply,
               reply: contractReply,
               delivered: true,
             },
+            result: {
+              sessionId: options.sessionId,
+              status: 'completed',
+              steps: stepIndex,
+              lastDecision,
+              lastTurn,
+            },
           });
-          // Synthesize the decision for the RETURN-VALUE lane (2026-07-13): every
-          // salvage here completes with decision===null, so lastDecision was
-          // undefined and respondViaHarness (respond-bridge.ts) built its reply
-          // from lastDecision → shipped "(no reply produced)" on the API/Discord
-          // surfaces while the event lane (desktop dock) showed the real reply —
-          // a parity defect across the whole salvage CLASS. The event above stays
-          // the source of truth; this mirrors it into the return value.
-          lastDecision = { summary: contractReply, reply: contractReply, done: true, nextAction: 'completed', reason: null };
-          return {
-            sessionId: options.sessionId,
-            status: 'completed',
-            steps: stepIndex,
-            lastDecision,
-            lastTurn,
-          };
         }
       }
       // VERBATIM-ECHO FULFILLMENT (2026-07-13). The user's own directive explicitly
@@ -2247,29 +2543,28 @@ async function runConversationCore(
         replyFulfillsVerbatimRequest(options.input, turnResult.finalOutput)
       ) {
         const verbatimReply = turnResult.finalOutput.trim();
-        safeAppend({
+        // Mirror the reply into the return value for the respond-bridge lane
+        // (see the plain-text-contract salvage above — same class fix).
+        lastDecision = { summary: verbatimReply, reply: verbatimReply, done: true, nextAction: 'completed', reason: null };
+        return finalizeStandardConversation({
           sessionId: options.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
-          role: 'system',
-          type: 'conversation_completed',
-          data: {
+          eventData: {
             steps: stepIndex,
             reason: 'verbatim_reply_fulfilled',
             summary: verbatimReply,
             reply: verbatimReply,
             delivered: true,
           },
+          result: {
+            sessionId: options.sessionId,
+            status: 'completed',
+            steps: stepIndex,
+            lastDecision,
+            lastTurn,
+          },
         });
-        // Mirror the reply into the return value for the respond-bridge lane
-        // (see the plain-text-contract salvage above — same class fix).
-        lastDecision = { summary: verbatimReply, reply: verbatimReply, done: true, nextAction: 'completed', reason: null };
-        return {
-          sessionId: options.sessionId,
-          status: 'completed',
-          steps: stepIndex,
-          lastDecision,
-          lastTurn,
-        };
       }
       // Malformed/unparseable-decision RECOVERY. Sub-agents are TOOLS here (no
       // SDK handoffs — see orchestrator.ts), so a null decision means the
@@ -2390,12 +2685,14 @@ async function runConversationCore(
           (stallInfo.detail as { hasReply?: boolean }).hasReply === true &&
           stallInfo.userVisibleMessage.trim()
         ) {
-          safeAppend({
+          // Mirror the reply into the return value for the respond-bridge lane
+          // (see the plain-text-contract salvage above — same class fix).
+          lastDecision = { summary: stallInfo.userVisibleMessage, reply: stallInfo.userVisibleMessage, done: true, nextAction: 'completed', reason: null };
+          return finalizeStandardConversation({
             sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
             turn: turnResult.turn,
-            role: 'system',
-            type: 'conversation_completed',
-            data: {
+            eventData: {
               steps: stepIndex,
               reason: 'decision_json_salvaged',
               summary: stallInfo.userVisibleMessage,
@@ -2403,17 +2700,14 @@ async function runConversationCore(
               delivered: true,
               stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
             },
+            result: {
+              sessionId: options.sessionId,
+              status: 'completed',
+              steps: stepIndex,
+              lastDecision,
+              lastTurn,
+            },
           });
-          // Mirror the reply into the return value for the respond-bridge lane
-          // (see the plain-text-contract salvage above — same class fix).
-          lastDecision = { summary: stallInfo.userVisibleMessage, reply: stallInfo.userVisibleMessage, done: true, nextAction: 'completed', reason: null };
-          return {
-            sessionId: options.sessionId,
-            status: 'completed',
-            steps: stepIndex,
-            lastDecision,
-            lastTurn,
-          };
         }
         // SALVAGE, shape 2 (2026-07-08): A_zero_tools false-positive on a REAL
         // answer. If the exhausted retry produced substantively the SAME text
@@ -2431,12 +2725,14 @@ async function runConversationCore(
           const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
           const priorProbe = priorRaw ? normalize(priorRaw).slice(0, 160) : '';
           if (finalText.length >= 200 && priorProbe.length >= 80 && normalize(finalText).startsWith(priorProbe)) {
-            safeAppend({
+            // Mirror the reply into the return value for the respond-bridge lane
+            // (see the plain-text-contract salvage above — same class fix).
+            lastDecision = { summary: finalText, reply: finalText, done: true, nextAction: 'completed', reason: null };
+            return finalizeStandardConversation({
               sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
               turn: turnResult.turn,
-              role: 'system',
-              type: 'conversation_completed',
-              data: {
+              eventData: {
                 steps: stepIndex,
                 reason: 'stall_consistent_reply_salvaged',
                 summary: finalText,
@@ -2444,17 +2740,14 @@ async function runConversationCore(
                 delivered: true,
                 stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
               },
+              result: {
+                sessionId: options.sessionId,
+                status: 'completed',
+                steps: stepIndex,
+                lastDecision,
+                lastTurn,
+              },
             });
-            // Mirror the reply into the return value for the respond-bridge lane
-            // (see the plain-text-contract salvage above — same class fix).
-            lastDecision = { summary: finalText, reply: finalText, done: true, nextAction: 'completed', reason: null };
-            return {
-              sessionId: options.sessionId,
-              status: 'completed',
-              steps: stepIndex,
-              lastDecision,
-              lastTurn,
-            };
           }
         }
         const askUserEnabled =
@@ -2472,6 +2765,13 @@ async function runConversationCore(
               source: 'stall_recovery',
               signal: stallInfo?.signal ?? null,
             },
+          });
+          appendStandardArtifactPauseTerminal({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+            turn: turnResult.turn,
+            steps: stepIndex,
+            summary: "I've been unable to make progress on this — the model produced text without taking action twice in a row. Should I retry, switch approach, or stop here?",
           });
           return {
             sessionId: options.sessionId,
@@ -2512,12 +2812,11 @@ async function runConversationCore(
         continue;
       }
 
-      safeAppend({
+      return finalizeStandardConversation({
         sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
-        role: 'system',
-        type: 'conversation_completed',
-        data: {
+        eventData: {
           steps: stepIndex,
           reason: stallInfo ? 'sub_agent_stalled' : 'no_structured_output',
           summary: stallInfo ? stallInfo.userVisibleMessage : fallbackSummary,
@@ -2529,15 +2828,15 @@ async function runConversationCore(
               }
             : undefined,
         },
+        result: {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+          completedReason: stallInfo ? 'sub_agent_stalled' : 'no_structured_output',
+        },
       });
-      return {
-        sessionId: options.sessionId,
-        status: 'completed',
-        steps: stepIndex,
-        lastDecision,
-        lastTurn,
-        completedReason: stallInfo ? 'sub_agent_stalled' : 'no_structured_output',
-      };
     }
 
     // ASK-FIRST invariant (2026-07-09, sess-mrds80fu). A completed-tagged turn
@@ -2857,6 +3156,7 @@ async function runConversationCore(
         // back to a stale session-wide question (adversarial review 2026-07-09).
         if (verdict.awaitingUser && !skillGap) {
           const awaitingSummary = (decision.reply && decision.reply.trim() ? decision.reply : decision.summary) ?? '';
+          const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
           const askedThisTurn = (() => {
             try {
               return listEvents(options.sessionId, { types: ['awaiting_user_input'] })
@@ -2885,6 +3185,7 @@ async function runConversationCore(
               delivered: true,
               awaitingUser: true,
               ...(completionVerification ? { verification: completionVerification } : {}),
+              ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
             },
           });
           return {
@@ -3062,6 +3363,7 @@ async function runConversationCore(
       }
       if (delivery.verification) completionVerification = delivery.verification;
       if (!delivery.delivered) {
+        const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
         safeAppend({
           sessionId: options.sessionId,
           turn: turnResult.turn,
@@ -3076,6 +3378,7 @@ async function runConversationCore(
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
             ...(completionVerification ? { verification: completionVerification } : {}),
+            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
           },
         });
         const goalForBlocked = safeActiveGoal(options.sessionId);
@@ -3091,12 +3394,11 @@ async function runConversationCore(
         };
       }
 
-      safeAppend({
+      return finalizeStandardConversation({
         sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
-        role: 'system',
-        type: 'conversation_completed',
-        data: {
+        eventData: {
           steps: stepIndex,
           summary: userVisibleSummary,
           internalSummary: decision.summary,
@@ -3105,14 +3407,14 @@ async function runConversationCore(
           delivered: true,
           ...(completionVerification ? { verification: completionVerification } : {}),
         },
+        result: {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision: decision,
+          lastTurn,
+        },
       });
-      return {
-        sessionId: options.sessionId,
-        status: 'completed',
-        steps: stepIndex,
-        lastDecision: decision,
-        lastTurn,
-      };
     }
 
     if (decision.nextAction === 'awaiting_user_input') {
@@ -3172,6 +3474,16 @@ async function runConversationCore(
           (decision.reply?.trim() ? decision.reply : decision.summary) ?? 'awaiting user input',
         );
       }
+      const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
+        ?? 'Could you clarify how you\'d like me to proceed?';
+      appendStandardArtifactPauseTerminal({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        summary: awaitingSummary,
+        reply: decision.reply ?? awaitingSummary,
+      });
       return {
         sessionId: options.sessionId,
         status: 'awaiting_user_input',
@@ -3218,26 +3530,25 @@ async function runConversationCore(
       };
     }
     if (decision.nextAction === 'abandoned') {
-      safeAppend({
+      return finalizeStandardConversation({
         sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
-        role: 'system',
-        type: 'conversation_completed',
-        data: {
+        eventData: {
           steps: stepIndex,
           summary: decision.reply && decision.reply.trim() ? decision.reply : decision.summary,
           internalSummary: decision.summary,
           reply: decision.reply ?? null,
           reason: 'abandoned_by_orchestrator',
         },
+        result: {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision: decision,
+          lastTurn,
+        },
       });
-      return {
-        sessionId: options.sessionId,
-        status: 'completed',
-        steps: stepIndex,
-        lastDecision: decision,
-        lastTurn,
-      };
     }
 
     // NEVER DEAD-END (gate-unification Step 2): a `done:true` turn whose
@@ -3279,6 +3590,16 @@ async function runConversationCore(
           (decision.reply?.trim() ? decision.reply : decision.summary) ?? 'awaiting a hand-off that no longer exists',
         );
       }
+      const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
+        ?? 'I reached a point where I need your input to continue — how would you like me to proceed?';
+      appendStandardArtifactPauseTerminal({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        summary: awaitingSummary,
+        reply: decision.reply ?? awaitingSummary,
+      });
       return {
         sessionId: options.sessionId,
         status: 'awaiting_user_input',
@@ -3332,6 +3653,7 @@ async function runConversationCore(
     if (maxWallMs > 0 && Date.now() - startedAt > maxWallMs) {
       emitLimitExceededWithContinuePrompt({
         sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
         steps: stepIndex,
         reason: 'wall_clock',
@@ -3354,6 +3676,7 @@ async function runConversationCore(
     if (tokenStatus?.exceeded) {
       emitLimitExceededWithContinuePrompt({
         sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
         steps: stepIndex,
         reason: 'token_budget',
@@ -3486,6 +3809,7 @@ async function runConversationCore(
   // Max steps without resolution.
   emitLimitExceededWithContinuePrompt({
     sessionId: options.sessionId,
+    sourceUserSeq: activeSourceUserSeq,
     turn: lastTurn,
     steps: stepIndex,
     reason: 'max_steps',
@@ -3523,6 +3847,7 @@ async function runConversationCore(
  */
 function emitLimitExceededWithContinuePrompt(opts: {
   sessionId: string;
+  sourceUserSeq?: number;
   turn: number;
   steps: number;
   reason: 'wall_clock' | 'max_steps' | 'token_budget';
@@ -3544,6 +3869,7 @@ function emitLimitExceededWithContinuePrompt(opts: {
       : `I've been working on this for ${opts.steps} step${opts.steps === 1 ? '' : 's'} and hit the step budget — there's more to do. Reply \`continue\` to keep going, or break it into a smaller piece.`;
   const limitLabel = opts.reason === 'wall_clock' ? 'wall-clock' : opts.reason === 'token_budget' ? 'run token budget' : 'max-steps';
   const internalSummary = `Hit ${limitLabel} limit at step ${opts.steps}; offered the user a \`continue\` prompt instead of silently failing.`;
+  const artifactState = standardArtifactTerminalState(opts.sessionId, opts.sourceUserSeq);
   safeAppend({
     sessionId: opts.sessionId,
     turn: opts.turn,
@@ -3557,6 +3883,7 @@ function emitLimitExceededWithContinuePrompt(opts: {
       internalSummary,
       lastDecisionSummary: opts.lastDecision?.summary ?? null,
       limitKind: opts.reason,
+      ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
     },
   });
 }
@@ -3827,7 +4154,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
   const turn = nextTurnNumber(row);
 
-  if (isKillBeforeStart(options.sessionId, turn, session)) {
+  if (isKillBeforeStart(options.sessionId, turn, session, options.sourceUserSeq)) {
     return { sessionId: options.sessionId, turn, status: 'killed' };
   }
 
@@ -3838,8 +4165,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     type: 'turn_started',
     data: { input: clip(options.input, 200) },
   });
-  if (!options.reuseRecordedUserInput) {
-    session.recordUserInput(options.input, turn);
+  let sourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? options.sourceUserSeq
+    : undefined;
+  if (!options.reuseRecordedUserInput && !sourceUserSeq) {
+    const recorded = session.recordUserInput(options.input, turn);
+    sourceUserSeq ??= recorded.seq;
+  } else if (!sourceUserSeq) {
+    // Legacy callers can request reuse without threading attempt identity. Pin
+    // the current latest input once at turn start; downstream tool calls never
+    // re-read session-global latest-user state.
+    sourceUserSeq = listEvents(options.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
   }
 
   // Memory writeback. The harness path was previously missing this —
@@ -4286,6 +4622,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // continuation nudges (classified against the goal objective above) and
     // stall-retry boilerplate must not trip it mid-run (review wf_2ed83f94 #8).
     suppressConfirmBeat: options.input === CONTINUATION_INPUT || Boolean(syntheticRetryOriginalInput),
+    sourceUserSeq,
     memory: {
       enabled: turnMemoryPrimer.enabled,
       hitCount: turnMemoryPrimer.hitCount,
@@ -4549,6 +4886,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         harnessCtx = {
           sessionId: options.sessionId,
           counter: toolCounter,
+          sourceUserSeq,
           behaviorScopeId: `${options.sessionId}::turn:${turn}`,
           recallBudget,
           suppressBackgroundOffer: options.suppressBackgroundOffer,
@@ -4643,7 +4981,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
-    return handleRunError(options.sessionId, turn, session, err, { deferInfraAsk: options.deferInfraAsk });
+    return handleRunError(options.sessionId, turn, session, err, {
+      deferInfraAsk: options.deferInfraAsk,
+      sourceUserSeq,
+    });
   } finally {
     detachLogHooks();
     (runner as unknown as RunHooksLike).off(
@@ -4733,7 +5074,11 @@ export async function resumePendingApproval(
 
   const turn = nextTurnNumber(row);
 
-  if (isKillBeforeStart(options.sessionId, turn, session)) {
+  const resumeSourceUserSeq = (() => {
+    try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
+  })();
+
+  if (isKillBeforeStart(options.sessionId, turn, session, resumeSourceUserSeq)) {
     return { sessionId: options.sessionId, turn, status: 'killed' };
   }
 
@@ -4943,7 +5288,11 @@ export async function resumePendingApproval(
       },
       async () => {
         if (useToolWrapper) {
-          resumeCtx = { sessionId: options.sessionId, counter: toolCounter };
+          resumeCtx = {
+            sessionId: options.sessionId,
+            counter: toolCounter,
+            ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
+          };
           return await withHarnessRunContext(
             resumeCtx,
             () => run(
@@ -5042,7 +5391,7 @@ export async function resumePendingApproval(
       toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
-    return handleRunError(options.sessionId, turn, session, err);
+    return handleRunError(options.sessionId, turn, session, err, { sourceUserSeq: resumeSourceUserSeq });
   } finally {
     detachLogHooks();
     (runner as unknown as RunHooksLike).off(
@@ -5126,6 +5475,13 @@ async function runConversationFromResumeCore(opts: {
   const toolCallsPerTurn = opts.toolCallsPerTurn ?? budget.toolCallsPerTurn;
   const checkInMs = Math.max(60_000, budget.checkInMinutes * 60 * 1000);
   const startedAt = Date.now();
+  const activeSourceUserSeq = (() => {
+    try {
+      const attemptSource = getLatestRunAttempt(opts.sessionId)?.sourceUserSeq;
+      if (attemptSource && attemptSource > 0) return attemptSource;
+      return listEvents(opts.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
+    } catch { return undefined; }
+  })();
   let lastCheckInAt = startedAt;
   // Stage 4 — resume-path twin of the primary loop's token-budget window
   // (self-baselined: an approval resume is a fresh user-consented window).
@@ -5166,6 +5522,10 @@ async function runConversationFromResumeCore(opts: {
   });
   lastTurn = firstResult.turn;
 
+  if (activeSourceUserSeq) {
+    resolveArtifactRunScopeId(opts.sessionId, opts.sessionId, activeSourceUserSeq);
+  }
+
   if (firstResult.status !== 'completed') {
     return {
       sessionId: opts.sessionId,
@@ -5184,6 +5544,7 @@ async function runConversationFromResumeCore(opts: {
   // the action" regardless of what the orchestrator says next.
   if (opts.decision === 'reject') {
     const hasReply = decision?.reply && decision.reply.trim();
+    const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
     safeAppend({
       sessionId: opts.sessionId,
       turn: lastTurn,
@@ -5195,6 +5556,7 @@ async function runConversationFromResumeCore(opts: {
         summary: hasReply ? decision!.reply! : decision?.summary,
         internalSummary: decision?.summary,
         reply: decision?.reply ?? null,
+        ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
       },
     });
     return {
@@ -5214,6 +5576,7 @@ async function runConversationFromResumeCore(opts: {
   if (hasCapturedWorkflowStepResult(opts.sessionId)) {
     return completeCapturedWorkflowStepResult({
       sessionId: opts.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
       turn: lastTurn,
       steps: 1,
       decision,
@@ -5294,6 +5657,7 @@ async function runConversationFromResumeCore(opts: {
         ? await verifyDelivered(deliveryObjective, userVisibleSummary ?? '', { judgeFn: objectiveJudge })
         : { delivered: true as const, status: 'completed' as const };
       if (!delivery.delivered) {
+        const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
         safeAppend({
           sessionId: opts.sessionId,
           turn: lastTurn,
@@ -5308,6 +5672,7 @@ async function runConversationFromResumeCore(opts: {
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 400),
             ...(delivery.verification ? { verification: delivery.verification } : {}),
+            ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
           },
         });
         const goalForBlocked = safeActiveGoal(opts.sessionId);
@@ -5321,12 +5686,11 @@ async function runConversationFromResumeCore(opts: {
         };
       }
 
-      safeAppend({
+      return finalizeStandardConversation({
         sessionId: opts.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: lastTurn,
-        role: 'system',
-        type: 'conversation_completed',
-        data: {
+        eventData: {
           steps: stepIndex,
           summary: userVisibleSummary,
           internalSummary: decision?.summary,
@@ -5335,14 +5699,14 @@ async function runConversationFromResumeCore(opts: {
           delivered: true,
           ...(delivery.verification ? { verification: delivery.verification } : {}),
         },
+        result: {
+          sessionId: opts.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision: decision ?? undefined,
+          lastTurn,
+        },
       });
-      return {
-        sessionId: opts.sessionId,
-        status: 'completed',
-        steps: stepIndex,
-        lastDecision: decision ?? undefined,
-        lastTurn,
-      };
     }
     // Unreachable in practice: a null decision makes doneStands true and returns
     // above. The guard restores TS's non-null narrowing for the handlers below.
@@ -5374,6 +5738,16 @@ async function runConversationFromResumeCore(opts: {
             data: { question, source: 'decision_awaiting' },
           });
         }
+        const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
+          ?? 'Could you clarify how you\'d like me to proceed?';
+        appendStandardArtifactPauseTerminal({
+          sessionId: opts.sessionId,
+          sourceUserSeq: activeSourceUserSeq,
+          turn: lastTurn,
+          steps: stepIndex,
+          summary: awaitingSummary,
+          reply: decision.reply ?? awaitingSummary,
+        });
         return {
           sessionId: opts.sessionId,
           status: 'awaiting_user_input',
@@ -5471,6 +5845,7 @@ async function runConversationFromResumeCore(opts: {
       // safety timeout. emitLimitExceededWithContinuePrompt restores the pairing.
       emitLimitExceededWithContinuePrompt({
         sessionId: opts.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: lastTurn,
         steps: stepIndex,
         reason: 'wall_clock',
@@ -5492,6 +5867,7 @@ async function runConversationFromResumeCore(opts: {
     if (tokenStatus?.exceeded) {
       emitLimitExceededWithContinuePrompt({
         sessionId: opts.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: lastTurn,
         steps: stepIndex,
         reason: 'token_budget',
@@ -5520,6 +5896,7 @@ async function runConversationFromResumeCore(opts: {
       input: resumeContinuationInput,
       // Resume continuations are always harness-synthetic, never a user message.
       suppressMemoryCapture: true,
+      sourceUserSeq: activeSourceUserSeq,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,
@@ -5527,6 +5904,13 @@ async function runConversationFromResumeCore(opts: {
       onChunk: opts.onChunk,
     });
     lastTurn = turnResult.turn;
+    if (activeSourceUserSeq) {
+      resolveArtifactRunScopeId(
+        opts.sessionId,
+        `${opts.sessionId}::turn:${turnResult.turn}`,
+        activeSourceUserSeq,
+      );
+    }
     // UNATTENDED infra self-heal (parity with runConversation): a transient infra
     // error / tool-timeout on this resumed workflow/background step auto-retries
     // instead of asking an absent human. Budget-bounded in handleRunError.
@@ -5556,6 +5940,7 @@ async function runConversationFromResumeCore(opts: {
     if (hasCapturedWorkflowStepResult(opts.sessionId)) {
       return completeCapturedWorkflowStepResult({
         sessionId: opts.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
         steps: stepIndex,
         decision,
@@ -5643,6 +6028,7 @@ async function runConversationFromResumeCore(opts: {
   // dock / console SSE / Discord settle instead of hanging on a bare limit event.
   emitLimitExceededWithContinuePrompt({
     sessionId: opts.sessionId,
+    sourceUserSeq: activeSourceUserSeq,
     turn: lastTurn,
     steps: stepIndex,
     reason: 'max_steps',
@@ -5661,13 +6047,29 @@ async function runConversationFromResumeCore(opts: {
 
 // ---------- helpers ----------
 
+/** Consume only the stop this physical turn observed. Exact attempt/run
+ * latches are cleared first. A remaining matching latch can only be the
+ * legacy session-wide fallback (used by direct runTurn callers that do not
+ * own a run-attempt record), so consume that separately without touching
+ * another attempt's scoped stop. */
+function consumeObservedKill(sessionId: string, target?: KillRequestTarget): void {
+  try { clearKill(sessionId, target); } catch { /* best effort */ }
+  try {
+    if (isKillRequested(sessionId, target)) clearKill(sessionId);
+  } catch { /* best effort */ }
+}
+
 function isKillBeforeStart(
   sessionId: string,
   turn: number,
   session: HarnessSession,
+  sourceUserSeq?: number,
 ): boolean {
+  const target: KillRequestTarget | undefined = sourceUserSeq
+    ? { sourceUserSeq }
+    : getActiveRunAttempt(sessionId) ?? undefined;
   try {
-    assertNotKilled(sessionId);
+    assertNotKilled(sessionId, target);
     return false;
   } catch (err) {
     if (!(err instanceof KillRequested)) throw err;
@@ -5684,7 +6086,7 @@ function isKillBeforeStart(
     // surfaces cleared it before (line 104 there); on direct-runConversation
     // surfaces (desktop console, Discord harness) the stale row killed every
     // subsequent message on the session (observed live 2026-06-12).
-    try { clearKill(sessionId); } catch { /* best effort */ }
+    consumeObservedKill(sessionId, target);
     return true;
   }
 }
@@ -5811,28 +6213,59 @@ export function recordOrphanedToolInFlight(sessionId: string, turn: number): voi
   try {
     const events = listEvents(sessionId);
     const returned = new Set<string>();
-    const alreadyRegistered = new Set<string>();
+    const alreadyRepresented = new Set<string>();
     for (const e of events) {
       if (e.type === 'tool_returned') {
         const cid = String((e.data as { callId?: unknown } | undefined)?.callId ?? '');
         if (cid) returned.add(cid);
-      } else if (e.type === 'orphaned_tool_inflight') {
+      } else if (e.type === 'orphaned_tool_inflight' || e.type === 'orphaned_tool_reported') {
         const cid = String((e.data as { callId?: unknown } | undefined)?.callId ?? '');
-        if (cid) alreadyRegistered.add(cid);
+        if (cid) alreadyRepresented.add(cid);
       }
     }
-    for (const e of events) {
-      if (e.type !== 'tool_called' || e.turn !== turn) continue;
-      const data = (e.data ?? {}) as { callId?: unknown; tool?: unknown };
+    const turnCalls = events.filter((e) => e.type === 'tool_called' && e.turn === turn);
+    // For native SDK gateway calls, the provider-level event and the inner MCP
+    // transport event describe one execution but have different call IDs. If
+    // the outer stream dies, only the transport callback is guaranteed to emit
+    // its eventual return, so prefer one in-flight mirror per matching unresolved
+    // canonical call. Pairing only unresolved canonicals is important when an
+    // earlier identical call already returned before a later live call started.
+    const unresolvedPairs = pairTransportMirrorToolCalls(turnCalls, returned);
+    const allPairs = pairTransportMirrorToolCalls(turnCalls);
+    for (const e of turnCalls) {
+      const data = (e.data ?? {}) as { accounting?: unknown; callId?: unknown; tool?: unknown };
       const callId = String(data.callId ?? '');
-      if (!callId || returned.has(callId) || alreadyRegistered.has(callId)) continue;
+      const tool = String(data.tool ?? '');
+      if (!callId || returned.has(callId) || alreadyRepresented.has(callId)) continue;
+
+      if (data.accounting === 'top_level' && unresolvedPairs.canonicalToMirrorCallId.has(callId)) {
+        continue;
+      }
+      if (data.accounting === 'transport_mirror') {
+        const unresolvedCanonicalId = unresolvedPairs.mirrorToCanonicalCallId.get(callId);
+        const canonicalId = unresolvedCanonicalId ?? allPairs.mirrorToCanonicalCallId.get(callId);
+        // A late mirror must not create a second marker after the canonical was
+        // already registered/reported, nor resurrect a call the canonical return
+        // already resolved.
+        if (
+          canonicalId
+          && (alreadyRepresented.has(canonicalId) || (!unresolvedCanonicalId && returned.has(canonicalId)))
+        ) continue;
+      }
       safeAppend({
         sessionId, turn, role: 'system', type: 'orphaned_tool_inflight',
-        data: { callId, toolName: String(data.tool ?? ''), at: new Date().toISOString() },
+        data: { callId, toolName: tool, at: new Date().toISOString() },
       });
-      alreadyRegistered.add(callId);
+      alreadyRepresented.add(callId);
     }
   } catch { /* best-effort — a death path must never throw */ }
+}
+
+/** Latest logical provider-level tool call for exact retry context. The eventlog
+ * query excludes mirrors before LIMIT, so no volume of later audit rows can hide
+ * the provider arguments recovery needs. */
+function latestCanonicalToolCall(sessionId: string): EventRow | undefined {
+  return getLatestCanonicalTopLevelToolEvent(sessionId);
 }
 
 export interface OrphanedToolReport {
@@ -5849,8 +6282,14 @@ function summarizeOrphanCompletion(toolName: string, returnedData: unknown, batc
     const b = batchData as { total?: number; succeeded?: number; failed?: number; halted?: boolean; batchId?: string };
     return `${b.succeeded ?? 0}/${b.total ?? 0} succeeded${b.failed ? `, ${b.failed} failed` : ''}${b.halted ? ' (HALTED)' : ''}${b.batchId ? ` — ledger ${b.batchId}` : ''}`;
   }
-  const d = (returnedData ?? {}) as { preview?: unknown; result?: unknown };
-  const text = typeof d.preview === 'string' ? d.preview : typeof d.result === 'string' ? d.result : '';
+  const d = (returnedData ?? {}) as { preview?: unknown; result?: unknown; error?: unknown };
+  const text = typeof d.preview === 'string'
+    ? d.preview
+    : typeof d.result === 'string'
+      ? d.result
+      : typeof d.error === 'string'
+        ? d.error
+        : '';
   return text ? text.slice(0, 400) : `${toolName} completed`;
 }
 
@@ -5876,11 +6315,18 @@ export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolRep
   const reports: OrphanedToolReport[] = [];
   let events: EventRow[];
   try { events = listEvents(sessionId); } catch { return reports; }
+  const pairs = pairTransportMirrorToolCalls(events);
   const reported = new Set(
     events.filter((e) => e.type === 'orphaned_tool_reported')
       .map((e) => String((e.data as { callId?: unknown } | undefined)?.callId ?? '')),
   );
-  const orphans = events
+  const returnByCallId = new Map<string, EventRow>();
+  for (const event of events) {
+    if (event.type !== 'tool_returned') continue;
+    const callId = String((event.data as { callId?: unknown } | undefined)?.callId ?? '');
+    if (callId) returnByCallId.set(callId, event);
+  }
+  const orphanMarkers = events
     .filter((e) => e.type === 'orphaned_tool_inflight')
     .map((e) => ({
       callId: String((e.data as { callId?: unknown } | undefined)?.callId ?? ''),
@@ -5888,20 +6334,65 @@ export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolRep
       atMs: Date.parse(e.createdAt),
       turn: e.turn,
     }))
-    .filter((o) => o.callId && !reported.has(o.callId));
-  for (const orphan of orphans) {
-    const returnedEvent = events.find((e) => e.type === 'tool_returned' && String((e.data as { callId?: unknown } | undefined)?.callId ?? '') === orphan.callId);
+    .filter((o) => o.callId);
+  const groups = new Map<string, { logicalCallId: string; markers: typeof orphanMarkers }>();
+  for (const marker of orphanMarkers) {
+    const logicalCallId = pairs.mirrorToCanonicalCallId.get(marker.callId) ?? marker.callId;
+    const group = groups.get(logicalCallId) ?? { logicalCallId, markers: [] };
+    group.markers.push(marker);
+    groups.set(logicalCallId, group);
+  }
+
+  for (const group of groups.values()) {
+    const mirrorCallId = pairs.canonicalToMirrorCallId.get(group.logicalCallId);
+    const linkedCallIds = new Set([
+      group.logicalCallId,
+      ...(mirrorCallId ? [mirrorCallId] : []),
+      ...group.markers.map((marker) => marker.callId),
+    ]);
+    // A canonical marker and a late transport marker are one logical orphan.
+    // If any identity in the group was reported, never fire it again.
+    if ([...linkedCallIds].some((callId) => reported.has(callId))) continue;
+
+    const orphan = group.markers[0];
+    const atMs = Math.min(...group.markers.map((marker) => marker.atMs).filter(Number.isFinite));
+    const returnCandidates = [
+      ...(mirrorCallId ? [mirrorCallId] : []),
+      ...group.markers.map((marker) => marker.callId),
+      group.logicalCallId,
+    ];
+    const returnedEvent = returnCandidates
+      .map((callId) => returnByCallId.get(callId))
+      .find((event): event is EventRow => Boolean(event));
     const batchDone = orphan.toolName === 'run_batch'
-      ? events.filter((e) => e.type === 'batch_completed' && Date.parse(e.createdAt) >= orphan.atMs).slice(-1)[0]
+      ? events.filter((e) => e.type === 'batch_completed' && Date.parse(e.createdAt) >= atMs).slice(-1)[0]
       : undefined;
     if (returnedEvent || batchDone) {
-      safeAppend({ sessionId, turn: orphan.turn, role: 'system', type: 'orphaned_tool_reported', data: { callId: orphan.callId, toolName: orphan.toolName } });
+      for (const marker of group.markers) {
+        safeAppend({
+          sessionId,
+          turn: marker.turn,
+          role: 'system',
+          type: 'orphaned_tool_reported',
+          data: { callId: marker.callId, logicalCallId: group.logicalCallId, toolName: marker.toolName },
+        });
+        reported.add(marker.callId);
+      }
       const summary = summarizeOrphanCompletion(orphan.toolName, returnedEvent?.data, batchDone?.data);
-      reports.push({ callId: orphan.callId, toolName: orphan.toolName, directive: buildOrphanReportDirective(orphan.toolName, summary) });
+      reports.push({ callId: group.logicalCallId, toolName: orphan.toolName, directive: buildOrphanReportDirective(orphan.toolName, summary) });
       continue;
     }
-    if (Number.isFinite(orphan.atMs) && Date.now() - orphan.atMs > ORPHAN_TOOL_MAX_AGE_MS) {
-      safeAppend({ sessionId, turn: orphan.turn, role: 'system', type: 'orphaned_tool_reported', data: { callId: orphan.callId, toolName: orphan.toolName, expired: true } });
+    if (Number.isFinite(atMs) && Date.now() - atMs > ORPHAN_TOOL_MAX_AGE_MS) {
+      for (const marker of group.markers) {
+        safeAppend({
+          sessionId,
+          turn: marker.turn,
+          role: 'system',
+          type: 'orphaned_tool_reported',
+          data: { callId: marker.callId, logicalCallId: group.logicalCallId, toolName: marker.toolName, expired: true },
+        });
+        reported.add(marker.callId);
+      }
     }
   }
   return reports;
@@ -5943,9 +6434,8 @@ function emitInfraTransientAsk(
   const userMsg = userMessage || 'A backend error interrupted this turn.';
   let retryContext: Record<string, unknown> | null = null;
   try {
-    const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
-    if (recentToolCalls.length > 0) {
-      const tc = recentToolCalls[recentToolCalls.length - 1];
+    const tc = latestCanonicalToolCall(sessionId);
+    if (tc) {
       const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
       if (tcData?.tool) {
         retryContext = {
@@ -5978,7 +6468,7 @@ function handleRunError(
   turn: number,
   session: HarnessSession,
   err: unknown,
-  opts: { deferInfraAsk?: boolean } = {},
+  opts: { deferInfraAsk?: boolean; sourceUserSeq?: number } = {},
 ): RunTurnResult {
   // A kill that lands while a tool call is in flight throws KillRequested
   // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
@@ -6003,7 +6493,10 @@ function handleRunError(
     session.markStatus('cancelled');
     // One-shot: the kill stopped this run; clear the latch so the user's
     // next message on the session isn't assassinated by the stale row.
-    try { clearKill(sessionId); } catch { /* best effort */ }
+    const target: KillRequestTarget | undefined = opts.sourceUserSeq
+      ? { sourceUserSeq: opts.sourceUserSeq }
+      : getActiveRunAttempt(sessionId) ?? undefined;
+    consumeObservedKill(sessionId, target);
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'killed' };
   }
@@ -6112,9 +6605,8 @@ function handleRunError(
     const timeoutMs = toolMatch?.[2] ?? '?';
     let retryContext: Record<string, unknown> | null = null;
     try {
-      const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
-      if (recentToolCalls.length > 0) {
-        const tc = recentToolCalls[recentToolCalls.length - 1];
+      const tc = latestCanonicalToolCall(sessionId);
+      if (tc) {
         const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
         if (tcData?.tool) {
           retryContext = {

@@ -9,6 +9,7 @@
  */
 import { apiGet, apiPost } from './api';
 import type { Tone } from '@/components/ui/StatusPill';
+import type { RunEnvironmentDetail } from './run-environment';
 
 export type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
 export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval';
@@ -46,6 +47,12 @@ export interface BoardCard {
   updatedAt: string;
   /** Allowed actions. Drag uses cancel/resume/promote; buttons may use the rest. */
   actions: string[];
+  /** Canonical harness identity. A session can serve many attempts, so Tasks
+   * uses these fields for exact Environment handoff and exact cancellation. */
+  attemptId?: string;
+  runScopeId?: string;
+  sourceUserSeq?: number;
+  cancelEndpoint?: string;
   primaryAction?: BoardPrimaryAction;
   continueMode?: BoardContinueMode;
   approvalId?: string;
@@ -178,6 +185,151 @@ export const COLUMNS: { id: BoardColumnId; label: string }[] = [
 
 export const listBoard = () => apiGet<{ cards: BoardCard[]; generatedAt: string }>('/api/console/board');
 
+export interface BoardRunSelection {
+  select: string;
+  attemptId?: string | null;
+  runScopeId?: string | null;
+}
+
+function boardLineageMatches(card: BoardCard, selected: string): boolean {
+  return card.id === selected
+    || card.sessionId === selected
+    || card.raw.runId === selected;
+}
+
+/** Resolve an Environment → Tasks handoff. When canonical identity is present,
+ * never fall back to a different card that merely shares a reusable session. */
+export function findBoardCardForRun(
+  cards: BoardCard[],
+  selection: BoardRunSelection,
+): BoardCard | undefined {
+  const selected = selection.select.trim();
+  const attemptId = selection.attemptId?.trim() || '';
+  const runScopeId = selection.runScopeId?.trim() || '';
+  if (!selected) return undefined;
+  if (attemptId || runScopeId) {
+    return cards.find((card) => (
+      boardLineageMatches(card, selected)
+      && (!attemptId || card.attemptId === attemptId)
+      && (!runScopeId || card.runScopeId === runScopeId)
+    ));
+  }
+  return cards.find((card) => boardLineageMatches(card, selected));
+}
+
+/** Convert the authoritative run detail into a temporary board card when an
+ * exact deep link points beyond the board's bounded page. Identity must match
+ * before any UI opens; a newer attempt on the same session fails closed. */
+export function boardCardFromRunDetail(
+  run: RunEnvironmentDetail,
+  selection: BoardRunSelection,
+): BoardCard | undefined {
+  const selected = selection.select.trim();
+  const attemptId = selection.attemptId?.trim() || '';
+  const runScopeId = selection.runScopeId?.trim() || '';
+  const runAttemptId = run.runEnvironmentMeta?.attemptId?.trim() || '';
+  const runScope = run.runEnvironmentMeta?.runScopeId?.trim() || '';
+  const sessionId = run.sessionId?.trim() || run.id;
+  if (!selected || (selected !== run.id && selected !== sessionId)) return undefined;
+  if (attemptId && attemptId !== runAttemptId) return undefined;
+  if (runScopeId && runScopeId !== runScope) return undefined;
+
+  const rawState = String(run.runState || run.status || '').toLowerCase();
+  const awaitingApproval = rawState === 'waiting_for_approval' || rawState === 'awaiting_approval';
+  const awaitingInput = rawState === 'waiting_for_input' || rawState === 'awaiting_user_input';
+  const queued = rawState === 'queued' || rawState === 'received';
+  const running = run.live === true || ['planning', 'executing', 'running', 'active', 'in_progress'].includes(rawState);
+  const column: BoardColumnId = awaitingApproval || awaitingInput
+    ? 'needs_you'
+    : queued
+      ? 'queued'
+      : running
+        ? 'running'
+        : 'done';
+  const updatedAt = run.updatedAt || run.completedAt || run.createdAt || new Date().toISOString();
+  const updatedMs = Date.parse(updatedAt);
+  const cancellable = run.canCancel === true
+    && typeof run.cancelEndpoint === 'string'
+    && run.cancelEndpoint.startsWith('/api/');
+  return {
+    id: runAttemptId ? `harness:${runAttemptId}` : run.id,
+    sourceKind: 'run',
+    title: run.title || run.objective || 'Clementine run',
+    column,
+    status: run.status || rawState || 'unknown',
+    progressHint: run.liveLine || run.outputPreview || run.summary?.result || '',
+    sessionId,
+    ageMs: Number.isFinite(updatedMs) ? Math.max(0, Date.now() - updatedMs) : 0,
+    updatedAt,
+    actions: cancellable ? ['cancel'] : [],
+    attemptId: runAttemptId || undefined,
+    runScopeId: runScope || undefined,
+    sourceUserSeq: run.runEnvironmentMeta?.sourceUserSeq ?? undefined,
+    cancelEndpoint: cancellable ? run.cancelEndpoint : undefined,
+    raw: {
+      source: run.source,
+      objective: run.objective,
+      runId: runScope || run.id,
+    },
+  };
+}
+
+/** Resolve an exact out-of-page Tasks deep link through the same authoritative
+ * run-detail projection used by Environment. */
+export async function resolveBoardRunSelection(
+  selection: BoardRunSelection,
+): Promise<BoardCard | undefined> {
+  const response = await apiGet<{ run: RunEnvironmentDetail }>(
+    `/api/runs/${encodeURIComponent(selection.select)}?view=environment`,
+  );
+  return boardCardFromRunDetail(response.run, selection);
+}
+
+/** Keep an already-open trace on the same canonical attempt while replacing
+ * its status/actions with the newest polled card. This is what removes stale
+ * Running/Cancel UI as soon as the backend settles the run. */
+export function reconcileOpenBoardCard(
+  open: BoardCard | null,
+  cards: BoardCard[],
+): BoardCard | null {
+  if (!open) return null;
+  if (open.attemptId || open.runScopeId) {
+    const exact = findBoardCardForRun(cards, {
+      select: open.sessionId || open.id,
+      attemptId: open.attemptId,
+      runScopeId: open.runScopeId,
+    });
+    if (exact) return exact;
+  }
+  const sameId = cards.find((card) => card.id === open.id);
+  if (sameId) return sameId;
+  const sameRunSession = open.sessionId
+    ? cards.find((card) => card.sourceKind === open.sourceKind && card.sessionId === open.sessionId)
+    : undefined;
+  return sameRunSession ?? open;
+}
+
+/** SSE replays events with seq > sinceSeq. Starting one event before the
+ * attempt's accepted user input includes that request while excluding prior
+ * turns from the reusable session. */
+export function boardTraceSinceSeq(card: BoardCard): number | undefined {
+  if (!card.attemptId || !Number.isFinite(card.sourceUserSeq) || Number(card.sourceUserSeq) <= 0) {
+    return undefined;
+  }
+  return Math.max(0, Math.floor(Number(card.sourceUserSeq)) - 1);
+}
+
+/** A canonical foreground run may expose Stop from its trace drawer only when
+ * the backend projected both the action and an API-scoped endpoint. Background
+ * tasks keep their existing cockpit controls, and approvals/workflows cannot
+ * accidentally inherit foreground-run cancellation UI. */
+export function canStopCanonicalRunFromDrawer(card: BoardCard): boolean {
+  return card.sourceKind === 'run'
+    && card.actions.includes('cancel')
+    && typeof card.cancelEndpoint === 'string'
+    && card.cancelEndpoint.startsWith('/api/');
+}
+
 export const getBackgroundTaskDetail = (id: string) =>
   apiGet<BackgroundTaskDetail>(`/api/console/background-tasks/${encodeURIComponent(id)}`);
 
@@ -309,6 +461,12 @@ export async function runBoardAction(card: BoardCard, intent: BoardButtonIntent)
       return await apiPost<{ ok: boolean; reason?: string }>(
         `/api/console/board/approval/${encodeURIComponent(id)}/${intent}`,
       );
+    }
+    if (intent === 'cancel' && card.cancelEndpoint) {
+      if (!card.cancelEndpoint.startsWith('/api/')) {
+        return { ok: false, reason: 'The run did not provide a safe cancellation endpoint.' };
+      }
+      return await apiPost<{ ok: boolean; reason?: string }>(card.cancelEndpoint);
     }
     if (card.sourceKind === 'workflow' && intent === 'retry_failed_items' && card.raw.runId) {
       const workflowName = card.raw.workflowSlug || card.raw.workflowName || card.title;

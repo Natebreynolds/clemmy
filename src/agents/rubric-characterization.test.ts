@@ -33,7 +33,8 @@ const GOLDEN = {
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
   // 2026-07-08: DECISION_CONTRACT swapped from the OrchestratorDecision JSON
   // envelope to the plain-text MARKER contract (ASK:/CONTINUE:/no-marker).
-  // 2026-07-09 stabilization: one beat MAXIMUM (a precise request is alignment),
+  // 2026-07-09 stabilization: one beat MAXIMUM (a precise request is normally
+  // alignment; a typed `[confirm-first]` turn explicitly takes precedence),
   // injected focus replaces per-turn focus_get, and completed work no longer
   // manufactures a closing question.
   // 2026-07-15 memory reliability replay: unified recall is the default agent
@@ -54,11 +55,14 @@ const GOLDEN = {
   // summaries; the rubric teaches synthesize-from-shards CONDITIONALLY (the
   // review's F8: the behavior is kill-switchable, so the prompt must not
   // promise it unconditionally).
-  instructions: { len: 35397, sha16: '3ecaedce880db18d' },
-  native: { len: 34500, sha16: 'a5c6b24cdd80de3e' },
-  claudeBrain: { len: 5599, sha16: '1a9c5be79e55335c' },
+  // 2026-07-17 turn-control/skill routing: the typed fresh-turn beat is explicit,
+  // matching skills are query-scoped, and the revised wording is shorter than
+  // the previous permanent rubric in every provider lane.
+  instructions: { len: 35341, sha16: '672cdc89384c2bdc' },
+  native: { len: 34444, sha16: '2c3f19b5fd6d3399' },
+  claudeBrain: { len: 5601, sha16: '4bb5b0886757e63a' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8858, sha16: '451032e10277d848' },
+  lean: { len: 8860, sha16: 'e3125c66a9a76038' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -133,7 +137,8 @@ test('provider parity: focus context is injected, never a mandatory per-turn too
 test('interaction contract: clarification is at most one beat, never a required closing question', () => {
   for (const rubric of [ORCHESTRATOR_INSTRUCTIONS, CLAUDE_BRAIN_RUBRIC]) {
     assert.match(rubric, /at most ONE/i);
-    assert.match(rubric, /precise request is already alignment/i);
+    assert.match(rubric, /precise request means act immediately/i);
+    assert.match(rubric, /\[confirm-first\].*(?:exception|required fresh-turn beat)/is);
     assert.doesNotMatch(rubric, /END your reply with ONE concrete offer/i);
   }
 });

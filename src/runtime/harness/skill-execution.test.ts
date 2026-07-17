@@ -182,7 +182,8 @@ test('summarizeToolCallsForJudge surfaces composio slugs + counts (so the judge 
   resetEventLog();
   const s = createSession({ kind: 'chat' });
   appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: 'c1', arguments: '{}' } });
-  appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'c2', arguments: JSON.stringify({ tool_slug: 'AIRTABLE_LIST_RECORDS' }) } });
+  appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'c2', accounting: 'top_level', arguments: JSON.stringify({ tool_slug: 'AIRTABLE_LIST_RECORDS' }) } });
+  appendEvent({ sessionId: s.id, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'mcp-c2', accounting: 'transport_mirror', args: { tool_slug: 'AIRTABLE_LIST_RECORDS' } } });
   const sum = summarizeToolCallsForJudge(s.id);
   assert.match(sum, /run_shell_command×1/);
   assert.match(sum, /composio:AIRTABLE_LIST_RECORDS×1/);

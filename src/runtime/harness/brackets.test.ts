@@ -45,6 +45,7 @@ const {
   startGate,
   OrphanedWriteRetryError,
 } = await import('./brackets.js');
+const { classifyTurnPreflight, recordTurnPreflightDecision } = await import('./turn-control.js');
 
 test.after(() => {
   try {
@@ -425,6 +426,320 @@ test('wrapToolForHarness: forwards the execute call when flag is on', async () =
     assert.deepEqual(receivedInput, { value: 42 });
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+test('wrapToolForHarness: an align preflight refuses before accounting or execution', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const message = 'Turn this research into a Google Doc for the client.';
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
+  recordTurnPreflightDecision(sess.id, classifyTurnPreflight({
+    message,
+    sessionId: sess.id,
+    sessionKind: 'chat',
+  }));
+  const counter = new ToolCallsCounter(10);
+  let executed = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'googledocs__create_document',
+    execute: async () => { executed += 1; return 'created'; },
+  });
+  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ title: 'Client' }));
+  assert.match(String(result), /PREFLIGHT_ALIGNMENT_REQUIRED/);
+  assert.equal(executed, 0);
+  assert.equal(counter.currentCount, 0, 'a refused preflight is not a real top-level call');
+});
+
+test('artifact admission: a duplicate create neither executes nor records/counts a second write', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create one Google Doc named Client brief.' },
+  });
+  try {
+    const counter = new ToolCallsCounter(10);
+    let providerInvocations = 0;
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      invoke: async () => {
+        providerInvocations += 1;
+        return {
+          document_id: 'doc-provider-123',
+          display_url: 'https://docs.google.com/document/d/doc-provider-123/edit',
+          title: 'Client brief',
+        };
+      },
+    });
+    const invoke = (callId: string) => (wrapped as unknown as {
+      invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+    }).invoke(
+      null,
+      JSON.stringify({
+        tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+        arguments: JSON.stringify({ title: 'Client brief', markdown_text: '# Client brief' }),
+      }),
+      { toolCall: { callId } },
+    );
+
+    await withHarnessRunContext(
+      { sessionId: sess.id, behaviorScopeId: 'artifact-denial-run', counter },
+      async () => {
+        const created = await invoke('native-create-1');
+        assert.equal((created as { document_id?: string }).document_id, 'doc-provider-123');
+
+        const refused = String(await invoke('native-create-2'));
+        assert.match(refused, /already bound|do not create another/i);
+      },
+    );
+
+    assert.equal(providerInvocations, 1, 'the duplicate never crossed the provider boundary');
+    assert.equal(counter.currentCount, 1, 'artifact reuse is admission, not a second top-level tool attempt');
+    const writes = listEvents(sess.id, { types: ['external_write'] });
+    assert.equal(writes.length, 1, 'durable write truth contains only the dispatched create');
+    assert.equal(writes[0]?.data.toolName, 'composio_execute_tool');
+    assert.equal(
+      listEvents(sess.id, { types: ['external_write_failed'] }).length,
+      0,
+      'no compensating fiction is needed because the denied write was never recorded',
+    );
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('artifact readback bookkeeping: an ordinary tool result does not mint artifact lineage', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Search memory for the client name.' },
+  });
+  try {
+    const behaviorScopeId = 'ordinary-read-no-artifact-root';
+    const counter = new ToolCallsCounter(10);
+    const wrapped = wrapToolForHarness({
+      name: 'memory_search_facts',
+      execute: async () => 'No matching fact.',
+    });
+    const result = await withHarnessRunContext(
+      { sessionId: sess.id, behaviorScopeId, counter },
+      () => wrapped.execute!({ query: 'client name' }),
+    );
+    assert.equal(result, 'No matching fact.');
+    assert.equal(counter.currentCount, 1, 'the ordinary read remains a normal tool call');
+
+    const { getArtifactRunScope } = await import('./artifact-ledger.js');
+    assert.equal(
+      getArtifactRunScope(sess.id, behaviorScopeId),
+      null,
+      'non-artifact output must not persist an artifact root mapping',
+    );
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('artifact lineage: create/readback stay on the context-bound source when a newer user event exists', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const sourceA = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create one Google Doc named Verified brief.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Unrelated newer request that must not steal artifact lineage.' },
+  });
+  try {
+    const createScopeId = 'source-a-create-scope';
+    const readbackScopeId = 'source-a-readback-scope';
+    const counter = new ToolCallsCounter(10);
+    const documentId = 'doc_provider_verified_123';
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      invoke: async (_runContext: unknown, input: unknown) => {
+        const request = JSON.parse(String(input)) as { tool_slug?: string };
+        return request.tool_slug === 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT'
+          ? { document_id: documentId, text: '# Verified brief' }
+          : {
+              document_id: documentId,
+              display_url: `https://docs.google.com/document/d/${documentId}/edit`,
+              title: 'Verified brief',
+            };
+      },
+    });
+    const invoke = (callId: string, input: unknown) => (wrapped as unknown as {
+      invoke: (runContext: unknown, rawInput: unknown, details?: unknown) => Promise<unknown>;
+    }).invoke(null, JSON.stringify(input), { toolCall: { callId } });
+
+    await withHarnessRunContext(
+      { sessionId: sess.id, behaviorScopeId: createScopeId, sourceUserSeq: sourceA.seq, counter },
+      () => invoke('create-for-readback', {
+        tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+        arguments: JSON.stringify({ title: 'Verified brief', markdown_text: '# Verified brief' }),
+      }),
+    );
+    await withHarnessRunContext(
+      { sessionId: sess.id, behaviorScopeId: readbackScopeId, sourceUserSeq: sourceA.seq, counter },
+      () => invoke('verify-by-readback', {
+        tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+        arguments: JSON.stringify({ document_id: documentId }),
+      }),
+    );
+
+    const { getArtifactRunScope, listRunArtifacts } = await import('./artifact-ledger.js');
+    const createScope = getArtifactRunScope(sess.id, createScopeId);
+    const readbackScope = getArtifactRunScope(sess.id, readbackScopeId);
+    assert.equal(createScope?.sourceUserSeq, sourceA.seq, 'create lineage uses the accepted source A');
+    assert.equal(readbackScope?.sourceUserSeq, sourceA.seq, 'readback lineage uses the accepted source A');
+    assert.equal(readbackScope?.rootScopeId, createScope?.rootScopeId, 'both lanes share source A authority');
+    const [artifact] = listRunArtifacts(sess.id, createScope?.rootScopeId);
+    assert.equal(artifact?.resourceId, documentId);
+    assert.ok(artifact?.bindingVerifiedAt, 'the exact provider readback still verifies the binding');
+    assert.equal(artifact?.verificationCallId, 'verify-by-readback');
+    assert.equal(counter.currentCount, 2);
+    assert.equal(listEvents(sess.id, { types: ['external_write'] }).length, 1, 'the readback is not a write');
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('artifact objective: confirmed go-ahead retains the aligned multi-document intent', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_CONFIRM_BEAT: process.env.CLEMMY_CONFIRM_BEAT,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const objective = 'Create a Google Doc set with two separate documents: a client brief and a technical appendix.';
+  const request = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  const align = classifyTurnPreflight({
+    message: objective,
+    sessionId: sess.id,
+    sessionKind: 'chat',
+    sourceUserSeq: request.seq,
+  });
+  assert.equal(align.phase, 'align');
+  recordTurnPreflightDecision(sess.id, align, request.seq);
+  const approval = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'go ahead' },
+  });
+  const execute = classifyTurnPreflight({
+    message: 'go ahead',
+    sessionId: sess.id,
+    sessionKind: 'chat',
+    sourceUserSeq: approval.seq,
+  });
+  assert.equal(execute.phase, 'execute');
+  assert.equal(execute.confirmedIntentKey, align.intentKey);
+  recordTurnPreflightDecision(sess.id, execute, approval.seq);
+  try {
+    const behaviorScopeId = 'confirmed-multi-doc-scope';
+    const counter = new ToolCallsCounter(10);
+    let providerInvocations = 0;
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      invoke: async (_runContext: unknown, input: unknown) => {
+        providerInvocations += 1;
+        const outer = JSON.parse(String(input)) as { arguments?: string };
+        const args = JSON.parse(outer.arguments ?? '{}') as { title?: string };
+        const suffix = args.title?.toLowerCase().includes('appendix') ? 'appendix' : 'brief';
+        return { document_id: `doc_${suffix}_provider_123`, title: args.title };
+      },
+    });
+    const invoke = (callId: string, title: string) => (wrapped as unknown as {
+      invoke: (runContext: unknown, rawInput: unknown, details?: unknown) => Promise<unknown>;
+    }).invoke(null, JSON.stringify({
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: JSON.stringify({ title, markdown_text: `# ${title}` }),
+    }), { toolCall: { callId } });
+
+    await withHarnessRunContext(
+      { sessionId: sess.id, behaviorScopeId, sourceUserSeq: approval.seq, counter },
+      async () => {
+        await invoke('create-client-brief', 'Client brief');
+        await invoke('create-technical-appendix', 'Technical appendix');
+      },
+    );
+
+    const { getArtifactRunScope, listRunArtifacts } = await import('./artifact-ledger.js');
+    const scope = getArtifactRunScope(sess.id, behaviorScopeId);
+    const artifacts = listRunArtifacts(sess.id, scope?.rootScopeId);
+    assert.equal(providerInvocations, 2, 'both user-requested documents reach the provider');
+    assert.equal(counter.currentCount, 2);
+    assert.deepEqual(
+      artifacts.map((artifact) => artifact.slotKey).sort(),
+      ['google_doc:client-brief', 'google_doc:technical-appendix'],
+      'the low-information approval turn must not collapse the aligned outputs into one primary slot',
+    );
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

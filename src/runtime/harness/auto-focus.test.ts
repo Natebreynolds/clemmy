@@ -54,6 +54,61 @@ test('maybeAutoFocusSession does not pin one-off chat turns', () => {
   assert.equal(getActiveFocus(), null);
 });
 
+test('maybeAutoFocusSession ignores gateway mirror inflation for thread and resource thresholds', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'single logical sheet lookup' });
+  const spreadsheetId = '1JTqfpx0MbNFg0iC-VG4D5aj7Jt0PNP5zgZURi1Cmxlc';
+  for (let turn = 1; turn <= 2; turn += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text: turn === 1 ? 'check this sheet once' : 'what did it say?' },
+    });
+  }
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'sheet-1',
+      canonicalCallId: 'sheet-1',
+      accounting: 'top_level',
+      arguments: JSON.stringify({ spreadsheet_id: spreadsheetId }),
+    },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'sheet-1',
+      accounting: 'transport_mirror',
+      args: { spreadsheet_id: spreadsheetId },
+    },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'sheet-1',
+      accounting: 'transport_mirror',
+      preview: JSON.stringify({ spreadsheet_id: spreadsheetId }),
+    },
+  });
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus(), null);
+});
+
 test('maybeAutoFocusSession pins repeated Google Sheet work to the concrete resource', () => {
   resetAll();
   const sess = createSession({ kind: 'chat', title: 'market leader sheet' });

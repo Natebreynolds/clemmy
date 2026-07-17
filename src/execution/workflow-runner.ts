@@ -14,13 +14,23 @@ import { resolveRoleModel, defaultForRole } from '../runtime/harness/model-roles
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
-import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents, clearKill } from '../runtime/harness/eventlog.js';
+import {
+  appendEvent as appendHarnessEvent,
+  beginRunAttempt,
+  finishRunAttempt,
+  isKillRequested,
+  listEvents as listHarnessEvents,
+  preserveCurrentKillAndClearStale,
+  recordRunAttemptUserInput,
+  requestKill,
+  type RunAttemptRef,
+} from '../runtime/harness/eventlog.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import { renderedComposioResultLooksFailed } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
-import { addRunEvent, startRun, finishRun } from '../runtime/run-events.js';
+import { addRunEvent, startRun, finishRun, getRun } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR, listWorkspaceProjects } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
@@ -57,6 +67,7 @@ import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprin
 import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
 import { sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { projectCanonicalTopLevelToolEvents } from '../runtime/harness/tool-effect.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
@@ -118,6 +129,7 @@ import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
+import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { looksLikeToolUnavailableSelfReport } from '../runtime/harness/tool-unavailable-text.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 import {
@@ -137,6 +149,23 @@ import { renderSessionHistoryForModel } from '../runtime/harness/session-transcr
 import type { AssistantRouteDiagnostics } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
+
+// Narrow test seams for the direct (non-SDK) workflow harness lane. Production
+// always uses the real builders/loop; tests can hold a step on an approval or
+// cancellation boundary without making a provider call.
+let buildWorkflowOrchestratorAgentImpl: typeof buildOrchestratorAgent = buildOrchestratorAgent;
+let runWorkflowConversationImpl: typeof runConversation = runConversation;
+let resumeWorkflowConversationImpl: typeof runConversationFromResume = runConversationFromResume;
+
+export function _setWorkflowHarnessLoopImplsForTests(input: {
+  buildAgent?: typeof buildOrchestratorAgent;
+  runConversation?: typeof runConversation;
+  runConversationFromResume?: typeof runConversationFromResume;
+} = {}): void {
+  buildWorkflowOrchestratorAgentImpl = input.buildAgent ?? buildOrchestratorAgent;
+  runWorkflowConversationImpl = input.runConversation ?? runConversation;
+  resumeWorkflowConversationImpl = input.runConversationFromResume ?? runConversationFromResume;
+}
 
 /**
  * Decide whether the runner's SUCCESS completion notification should be
@@ -597,7 +626,17 @@ function parkingEnabled(): boolean {
 function isWorkflowRunCancelled(runId: string): boolean {
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const record = readRunRecord(filePath);
-  return record?.status === 'cancelled';
+  if (record?.status === 'cancelled') return true;
+  // The Tasks board owns the generic run mirror (`run-events.ts`), while the
+  // workflow dashboard owns the durable run JSON above. Either surface is a
+  // valid stop authority. Treating the mirror as an input here closes the seam
+  // where cancelling `workflow:<runId>` only changed the card while the actual
+  // model kept executing in `workflow:<runId>:<stepId>`.
+  try {
+    return getRun(runId)?.status === 'cancelled';
+  } catch {
+    return false;
+  }
 }
 
 function throwIfWorkflowRunCancelled(runId: string): void {
@@ -1339,6 +1378,71 @@ export function workflowReportLaneForOutcome(opts: {
 const WORKFLOW_HARNESS_POLL_MS = parseInt(
   process.env.CLEMENTINE_WORKFLOW_HARNESS_POLL_MS ?? '5000', 10,
 );
+// Workflow cancellation has two durable entry points (the workflow run JSON
+// and the generic Tasks-board run mirror). Translate either into the exact
+// active child attempt quickly enough that a long model/tool wait feels
+// killable, without polling on every token ourselves.
+const WORKFLOW_CANCEL_POLL_CONFIG = Number.parseInt(
+  process.env.CLEMENTINE_WORKFLOW_CANCEL_POLL_MS ?? '500',
+  10,
+);
+const WORKFLOW_CANCEL_POLL_MS = Number.isFinite(WORKFLOW_CANCEL_POLL_CONFIG)
+  ? Math.max(100, WORKFLOW_CANCEL_POLL_CONFIG)
+  : 500;
+
+interface ActiveWorkflowStepAttempt {
+  sessionId: string;
+  attempt: RunAttemptRef;
+}
+
+// One cancellation watcher per WORKFLOW RUN, not per fan-out item. A 200-item
+// step can have several child attempts live at once; polling the two durable
+// run stores once and fanning an exact latch to each child keeps Stop responsive
+// without multiplying filesystem reads by worker concurrency.
+const activeWorkflowStepAttempts = new Map<string, Map<string, ActiveWorkflowStepAttempt>>();
+const workflowCancellationPolls = new Map<string, ReturnType<typeof setInterval>>();
+const observedWorkflowRunCancellations = new Set<string>();
+
+function latchWorkflowRunCancellation(workflowRunId: string): boolean {
+  if (!observedWorkflowRunCancellations.has(workflowRunId)) {
+    if (!isWorkflowRunCancelled(workflowRunId)) return false;
+    observedWorkflowRunCancellations.add(workflowRunId);
+  }
+  for (const { sessionId, attempt } of activeWorkflowStepAttempts.get(workflowRunId)?.values() ?? []) {
+    try {
+      requestKill(sessionId, 'Workflow run cancelled by user.', attempt);
+    } catch {
+      // The durable cancelled run record remains authoritative; ordinary step
+      // boundaries still stop progress if the event log is temporarily busy.
+    }
+  }
+  return true;
+}
+
+function registerActiveWorkflowStepAttempt(
+  workflowRunId: string,
+  sessionId: string,
+  attempt: RunAttemptRef,
+): () => void {
+  const attempts = activeWorkflowStepAttempts.get(workflowRunId) ?? new Map<string, ActiveWorkflowStepAttempt>();
+  attempts.set(attempt.attemptId, { sessionId, attempt });
+  activeWorkflowStepAttempts.set(workflowRunId, attempts);
+  if (!workflowCancellationPolls.has(workflowRunId)) {
+    const poll = setInterval(() => latchWorkflowRunCancellation(workflowRunId), WORKFLOW_CANCEL_POLL_MS);
+    poll.unref?.();
+    workflowCancellationPolls.set(workflowRunId, poll);
+  }
+  return () => {
+    const current = activeWorkflowStepAttempts.get(workflowRunId);
+    current?.delete(attempt.attemptId);
+    if (current && current.size > 0) return;
+    activeWorkflowStepAttempts.delete(workflowRunId);
+    observedWorkflowRunCancellations.delete(workflowRunId);
+    const poll = workflowCancellationPolls.get(workflowRunId);
+    if (poll) clearInterval(poll);
+    workflowCancellationPolls.delete(workflowRunId);
+  };
+}
 // 24h aligns with approval-registry's DEFAULT_APPROVAL_TTL_MS so the workflow
 // step waits exactly as long as the approval itself is alive. The reaper will
 // expire the approval at 24h; we time out the workflow step on the same beat.
@@ -1691,6 +1795,8 @@ export const workflowRunnerInternalsForTest = {
   shouldUseDeclarativeStepApproval,
   exactApprovedSendTools,
   workflowHarnessRouteMarker,
+  isWorkflowRunCancelled,
+  sampleStepAttemptMetrics,
 };
 
 async function runStepViaHarness(
@@ -1733,31 +1839,49 @@ async function runStepViaHarness(
     sessionIdSuffix,
   );
   const realSessionId = session.id;
-  // A kill latched during a PRIOR attempt on this stable step session (the
-  // parked-approval rerun reuses the same id by design) must not abort this
-  // fresh attempt before it starts — same one-shot invariant as
-  // respondViaHarness. The prior kill already did its job: that attempt died.
-  try { clearKill(realSessionId); } catch { /* best effort */ }
-  openPlanScope({
-    sessionId: realSessionId,
-    planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
-    approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
-    ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
-    allowedTools,
-    allowedSends: step.requiresApproval
-      ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
-      : [],
+  // The workflow's durable run id and the model's harness session are
+  // intentionally different: one workflow can fan out into many child step
+  // sessions. Give this PHYSICAL invocation its own attempt so a stale stop for
+  // retry A cannot jump to retry B (or to a sibling item). A stable runId keeps
+  // correlation while the random attempt id keeps execution ownership exact.
+  const stepAttempt: RunAttemptRef = beginRunAttempt(realSessionId, {
+    runId: `workflow-step:${sessionIdSuffix}`,
+    attemptId: `attempt:workflow:${workflowRunId}:${randomUUID().slice(0, 12)}`,
   });
-
-  // Self-heal move 2: arm submission-time contract validation for this step
-  // session (workflow_step_result refuses a wrong-shape result with the exact
-  // problems while the model is still alive to fix it).
-  if (!isItemInvocation) registerStepContract(realSessionId, step.output);
-  const approvalIds: string[] = [];
-  let hadApprovals = false;
-  const startedAt = Date.now();
-
+  let stepAttemptStatus: 'completed' | 'cancelled' | 'failed' | 'interrupted' = 'failed';
+  let unregisterActiveAttempt = (): void => {};
+  const stepAttemptWasKilled = (): boolean => {
+    try { return isKillRequested(realSessionId, stepAttempt); } catch { return false; }
+  };
   try {
+    preserveCurrentKillAndClearStale(realSessionId, stepAttempt);
+    unregisterActiveAttempt = registerActiveWorkflowStepAttempt(
+      workflowRunId,
+      realSessionId,
+      stepAttempt,
+    );
+    openPlanScope({
+      sessionId: realSessionId,
+      planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
+      approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
+      ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
+      allowedTools,
+      allowedSends: step.requiresApproval
+        ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
+        : [],
+    });
+
+    // Self-heal move 2: arm submission-time contract validation for this step
+    // session (workflow_step_result refuses a wrong-shape result with the exact
+    // problems while the model is still alive to fix it).
+    if (!isItemInvocation) registerStepContract(realSessionId, step.output);
+    const approvalIds: string[] = [];
+    let hadApprovals = false;
+    const startedAt = Date.now();
+
+    // Close the race where the board was cancelled after the caller's last
+    // step-boundary check but before this child attempt was registered.
+    if (latchWorkflowRunCancellation(workflowRunId)) throw new WorkflowRunCancelledError();
     // Build a fresh orchestrator each call so it picks up current memory
     // context + connected toolkit list.
     // Initial turn.
@@ -1776,6 +1900,17 @@ async function runStepViaHarness(
     const message = useWorkflowStepAgent() && stepContext
       ? `${proseMessage}\n\n${renderStepContextBlock(stepContext, { workflowName, runId: workflowRunId })}`
       : proseMessage;
+    const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: message,
+        workflowName,
+        workflowRunId,
+        stepId: step.id,
+        attemptId: stepAttempt.attemptId,
+      },
+    });
     // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
     // structured output via workflow_step_result and CANNOT re-trigger
     // workflows (no recursion). Default off → the full orchestrator +
@@ -1808,10 +1943,15 @@ async function runStepViaHarness(
           runId: workflowRunId, // attribute this step's fan-out to the workflow run
           prompt: message,
           modelId: stepModel,
-          // Run gated mutating tools on the step's REAL session so the workflow's
-          // plan-scope / auto-approval grants (opened by the runner) apply to the
-          // SDK lane's gated tools — required for unattended write/send steps.
-          sessionId: fullLane ? realSessionId : undefined,
+          // Every SDK profile receives the real child session + exact source,
+          // including read-only steps. Kill observation is a control-plane
+          // requirement, not a mutating-tool capability.
+          sessionId: realSessionId,
+          sourceUserSeq: sourceUserEvent.seq,
+          // The one-per-run watcher performs the durable file reads. The SDK
+          // calls this hook at every stream message, so keep this hot path an
+          // in-memory point read instead of hammering the filesystem.
+          shouldCancel: () => observedWorkflowRunCancellations.has(workflowRunId),
           fullLane,
           parkApprovals: canPark && parkingEnabled(),
         });
@@ -1824,6 +1964,9 @@ async function runStepViaHarness(
             approvalIds: [err.boundary.approvalId],
             sessionId: realSessionId,
           }]);
+        }
+        if (err instanceof AgentRuntimeCancelledError || stepAttemptWasKilled()) {
+          throw new WorkflowRunCancelledError();
         }
         markWorkflowHarnessSessionTerminal(session, 'failed');
         throw err;
@@ -1861,6 +2004,7 @@ async function runStepViaHarness(
       if (isPhantomStepCompletion(step, sdkResult.toolUses, sdkOutput)) {
         sdkOutput = phantomBlockedOutput(step);
       }
+      stepAttemptStatus = 'completed';
       markWorkflowHarnessSessionTerminal(session, 'completed');
       return {
         output: sdkOutput,
@@ -1876,7 +2020,7 @@ async function runStepViaHarness(
     appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
     const agent = useWorkflowStepAgent()
       ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools, model: stepModel })
-      : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId, model: stepModel });
+      : await buildWorkflowOrchestratorAgentImpl({ userInput: message, sessionId: realSessionId, model: stepModel });
     let result: RunConversationResult;
     if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {
       result = {
@@ -1886,10 +2030,12 @@ async function runStepViaHarness(
         lastTurn: 0,
       };
     } else {
-      result = await runConversation({
+      result = await runWorkflowConversationImpl({
         agent,
         sessionId: realSessionId,
         input: message,
+        sourceUserSeq: sourceUserEvent.seq,
+        reuseRecordedUserInput: true,
         // P2-10: bound the step on the harness path too. The legacy path passes
         // this (see below); without it a harness step fell back to the 120-min
         // chat budget, so a hung/runaway step wasn't bounded at the intended
@@ -1968,6 +2114,7 @@ async function runStepViaHarness(
         // a /cancel command. Loop until the session has no more pending.
         while (true) {
           await new Promise((resolve) => setTimeout(resolve, WORKFLOW_HARNESS_POLL_MS));
+          if (latchWorkflowRunCancellation(workflowRunId)) throw new WorkflowRunCancelledError();
           const stillPending = approvalRegistry.listPending({ sessionId: realSessionId, status: 'pending' });
           if (stillPending.length === 0) break;
           if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
@@ -1988,7 +2135,7 @@ async function runStepViaHarness(
       const anyExpired = resolved.some((r) => r.resolution === 'expired');
       const decision: 'approve' | 'reject' = (anyRejected || anyExpired) ? 'reject' : 'approve';
 
-      result = await runConversationFromResume({
+      result = await resumeWorkflowConversationImpl({
         agent,
         sessionId: realSessionId,
         decision,
@@ -1998,6 +2145,14 @@ async function runStepViaHarness(
       // gate so the next "still running" interval can fire normally
       // (the loop will re-mark if another approval surfaces).
       clearWorkflowRunPausedForApproval(workflowRunId);
+    }
+
+    // `killed` has one meaning on this child: a user/control-plane stop. Never
+    // let a previously captured partial result turn that stop into permission
+    // for downstream workflow steps to continue.
+    if (result.status === 'killed') {
+      stepAttemptStatus = 'cancelled';
+      throw new WorkflowRunCancelledError();
     }
 
     // Pull the user-visible output from the most recent
@@ -2085,6 +2240,7 @@ async function runStepViaHarness(
       );
     }
     if (captured.found) {
+      stepAttemptStatus = 'completed';
       return { output: guardPhantom(captured.value), hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
     }
     if (result.status !== 'completed') {
@@ -2095,8 +2251,25 @@ async function runStepViaHarness(
     if (looksLikeWorkflowStepStructuralResultMiss(prose)) {
       throw new WorkflowStepStructuralResultError(step.id, prose);
     }
+    stepAttemptStatus = 'completed';
     return { output: guardPhantom(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
+  } catch (err) {
+    if (err instanceof ParkRunSignal) {
+      stepAttemptStatus = 'interrupted';
+    } else if (
+      err instanceof WorkflowRunCancelledError
+      || err instanceof AgentRuntimeCancelledError
+      || isWorkflowRunCancelled(workflowRunId)
+      || stepAttemptWasKilled()
+    ) {
+      stepAttemptStatus = 'cancelled';
+      try { session.markStatus('cancelled'); } catch { /* run record remains canonical */ }
+      if (!(err instanceof WorkflowRunCancelledError)) throw new WorkflowRunCancelledError();
+    }
+    throw err;
   } finally {
+    unregisterActiveAttempt();
+    try { finishRunAttempt(stepAttempt, stepAttemptStatus); } catch { /* control telemetry must not mask step outcome */ }
     // The submission-time contract dies with the step session (a later chat
     // turn on a reused session must never be gated).
     clearStepContract(realSessionId);
@@ -2789,7 +2962,10 @@ async function runStepVerifiedAttempt(
 function sampleStepAttemptMetrics(step: WorkflowStepInput, ctx: StepExecutionContext): AttemptMetricSample {
   try {
     const sid = getWorkflowHarnessSession(ctx.workflow.name, step.id, ctx.runId, `${ctx.runId}:${step.id}`).id;
-    const toolCalls = listHarnessEvents(sid, { types: ['tool_called'] }).length;
+    const toolCalls = projectCanonicalTopLevelToolEvents(
+      listHarnessEvents(sid, { types: ['tool_called'] }),
+      'tool_called',
+    ).length;
     const tokens = sumUsageTokensForSource(sid);
     return { tokens, toolCalls };
   } catch {
@@ -3432,6 +3608,8 @@ export async function executeStep(
                 const response = await respondPreferHarness('workflow', {
                   sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
                   channel: 'workflow',
+                  runId: `workflow-step:${ctx.runId}:${step.id}:${key}`,
+                  shouldCancel: () => isWorkflowRunCancelled(ctx.runId),
                   maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
                   message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
                   // ONE model resolution for every run/lane: explicit step.model →
@@ -3637,6 +3815,8 @@ export async function executeStep(
     const response = await respondPreferHarness('workflow', {
       sessionId: `workflow:${ctx.runId}:${step.id}`,
       channel: 'workflow',
+      runId: `workflow-step:${ctx.runId}:${step.id}`,
+      shouldCancel: () => isWorkflowRunCancelled(ctx.runId),
       maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
       message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
       // ONE model resolution for every run/lane: explicit step.model →

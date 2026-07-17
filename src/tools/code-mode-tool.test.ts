@@ -435,16 +435,23 @@ test('dispatchBatchItemTool establishes tool-output context for the inner tool (
   // GATE context but never the tool-output ALS the inner tool reads.
   const { dispatchBatchItemTool, _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
   const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const { ToolCallsCounter, withHarnessRunContext, harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
   _setCodeModeToolsForTests(new Map([
     ['ctx_probe', {
       name: 'ctx_probe',
-      invoke: async () => JSON.stringify({ seenSessionId: getToolOutputContext()?.sessionId ?? null }),
+      invoke: async () => JSON.stringify({
+        seenSessionId: getToolOutputContext()?.sessionId ?? null,
+        seenSourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq ?? null,
+      }),
     }],
   ]) as never);
   try {
-    const out = await dispatchBatchItemTool('ctx_probe', {}, 'sess-ctx-regression', new ToolCallsCounter(10)) as { seenSessionId?: string | null };
+    const out = await withHarnessRunContext(
+      { sessionId: 'sess-ctx-regression', sourceUserSeq: 42, counter: new ToolCallsCounter(10) },
+      () => dispatchBatchItemTool('ctx_probe', {}, 'sess-ctx-regression', new ToolCallsCounter(10)),
+    ) as { seenSessionId?: string | null; seenSourceUserSeq?: number | null };
     assert.equal(out?.seenSessionId, 'sess-ctx-regression', 'inner tool must see the session via getToolOutputContext');
+    assert.equal(out?.seenSourceUserSeq, 42, 'inner tool must retain the exact source turn instead of consulting the latest ambient user input');
   } finally {
     _setCodeModeToolsForTests(null);
   }

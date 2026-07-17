@@ -65,7 +65,11 @@ export function renderConsoleHtml(token: string): string {
         </button>
       </div>
       <div class="status-row" data-status-row>
-        <span class="stat" data-stat-runs>RUNS · <em>—</em></span>
+        <button type="button" class="stat stat-run-environment-toggle" data-stat-runs data-run-environment-toggle
+                aria-expanded="false" aria-controls="run-environment-drawer"
+                title="Open the active run environment">
+          RUNS · <em>—</em>
+        </button>
         <span class="stat" data-stat-memory>MEM · <em>—</em></span>
         <span class="stat" data-stat-approvals>APPRV · <em>—</em></span>
         <span class="stat" data-stat-policy>MODE · <em>—</em></span>
@@ -2378,11 +2382,43 @@ export function renderConsoleHtml(token: string): string {
     -->
 
     <footer class="foot-bar">
-      <span class="foot-cell">poll · 2s</span>
+      <span class="foot-cell">poll · 5s + live</span>
       <span class="foot-cell">last · <em data-last-sync>—</em></span>
       <span class="foot-cell" data-foot-version>—</span>
       <span class="foot-cell foot-right">⌘K · coming soon</span>
     </footer>
+
+    <!--
+      Compact, global run environment drawer. It deliberately consumes only
+      a compact /api/runs/:id?view=environment projection. That keeps the
+      surface honest and bounded: workspace,
+      branch, canonical call counts, helpers, and resources appear only when
+      a run actually recorded them. The RUNS chip in the status bar toggles
+      this drawer from any panel, including while the Home chat is running.
+    -->
+    <button type="button" class="run-environment-backdrop" data-run-environment-backdrop hidden
+            aria-label="Close run environment" tabindex="-1"></button>
+    <aside id="run-environment-drawer" class="run-environment-drawer"
+           data-run-environment-drawer hidden role="complementary"
+           aria-labelledby="run-environment-heading" tabindex="-1">
+      <div class="run-environment-head">
+        <div class="run-environment-heading">
+          <span class="run-environment-kicker">ACTIVE CONTEXT</span>
+          <strong id="run-environment-heading">Run environment</strong>
+          <span class="run-environment-sr-status" data-run-environment-status aria-live="polite"></span>
+        </div>
+        <button type="button" class="run-environment-close" data-run-environment-close
+                aria-label="Close run environment" title="Close">×</button>
+      </div>
+      <div class="run-environment-body" data-run-environment-body>
+        <div class="run-environment-empty">
+          <span class="run-environment-empty-mark">◎</span>
+          <strong>No active run</strong>
+          <span>Start a chat or select an Activity item to inspect it here.</span>
+        </div>
+      </div>
+      <div class="run-environment-footer" data-run-environment-footer hidden></div>
+    </aside>
 
     <!--
       ── Meeting-capture floating layer ─────────────────────────────
@@ -2846,6 +2882,264 @@ body {
   letter-spacing: 0.16em;
 }
 .nav.active .nav-key { color: var(--accent); }
+.stat-run-environment-toggle {
+  appearance: none;
+  border: 0;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+  border-radius: 5px;
+  transition: color 120ms ease, background 120ms ease;
+}
+.stat-run-environment-toggle:hover,
+.stat-run-environment-toggle[aria-expanded="true"] { color: var(--fg); background: var(--bg-3); }
+.stat-run-environment-toggle[data-live="true"] em {
+  color: var(--accent-3);
+  text-shadow: 0 0 9px color-mix(in srgb, var(--accent-3) 65%, transparent);
+}
+.run-environment-drawer {
+  position: fixed;
+  z-index: 2300;
+  top: 52px;
+  right: 8px;
+  bottom: 36px;
+  width: min(348px, calc(100vw - 24px));
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line-bright);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-1) 97%, transparent);
+  box-shadow: 0 18px 55px color-mix(in srgb, #000 58%, transparent), 0 0 0 1px color-mix(in srgb, var(--bg-0) 40%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  animation: runEnvironmentIn 150ms ease-out;
+}
+.run-environment-drawer[hidden] { display: none; }
+.run-environment-backdrop { display: none; }
+@keyframes runEnvironmentIn {
+  from { opacity: 0; transform: translateX(10px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.run-environment-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 16px 13px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-2) 92%, transparent), var(--bg-1));
+}
+.run-environment-heading { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.run-environment-heading strong { color: var(--fg); font: 600 15px/1.2 var(--sans, inherit); letter-spacing: -0.01em; }
+.run-environment-kicker { color: var(--fg-3); font: 9px/1 var(--mono); letter-spacing: 0.18em; }
+.run-environment-sr-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.run-environment-close {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-3);
+  font: 18px/1 var(--sans, inherit);
+  cursor: pointer;
+}
+.run-environment-close:hover { color: var(--fg); background: var(--bg-3); border-color: var(--line); }
+.run-environment-body { min-height: 0; flex: 1; overflow-y: auto; padding: 4px 16px 12px; }
+.run-environment-footer {
+  flex: 0 0 auto;
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg-1) 97%, transparent);
+  box-shadow: 0 -10px 22px -22px #000;
+}
+.run-environment-footer[hidden] { display: none; }
+.run-environment-empty {
+  min-height: 210px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 22px;
+  text-align: center;
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.run-environment-empty-mark { color: var(--fg-mute); font-size: 28px; }
+.run-environment-empty strong { color: var(--fg-2); font-size: 13px; font-weight: 500; }
+.run-environment-empty > .run-env-action { flex: 0 0 auto; padding: 0 14px; }
+.run-env-overview {
+  margin: 12px 0 4px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-2);
+}
+.run-env-overview-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.run-env-title { min-width: 0; color: var(--fg); font-size: 13px; font-weight: 600; line-height: 1.35; }
+.run-env-status {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  color: var(--fg-2);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.run-env-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-mute); }
+.run-env-status[data-tone="live"] { color: var(--accent-3); border-color: color-mix(in srgb, var(--accent-3) 48%, var(--line)); }
+.run-env-status[data-tone="live"] .run-env-status-dot { background: var(--accent-3); box-shadow: 0 0 7px var(--accent-3); animation: pulse 1.5s ease-in-out infinite; }
+.run-env-status[data-tone="done"] { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 42%, var(--line)); }
+.run-env-status[data-tone="done"] .run-env-status-dot { background: var(--accent-2); }
+.run-env-status[data-tone="warn"] { color: var(--accent-warn); border-color: color-mix(in srgb, var(--accent-warn) 48%, var(--line)); }
+.run-env-status[data-tone="warn"] .run-env-status-dot { background: var(--accent-warn); }
+.run-env-status[data-tone="fail"] { color: var(--accent-fail); border-color: color-mix(in srgb, var(--accent-fail) 48%, var(--line)); }
+.run-env-status[data-tone="fail"] .run-env-status-dot { background: var(--accent-fail); }
+.run-env-now { margin-top: 7px; color: var(--fg-3); font-size: 10px; line-height: 1.4; }
+.run-env-section { padding: 15px 0 2px; border-top: 1px solid var(--line); }
+.run-env-section:first-of-type { border-top: 0; }
+.run-env-section[open] { padding-bottom: 2px; }
+.run-env-section > summary { cursor: pointer; list-style: none; }
+.run-env-section > summary::-webkit-details-marker { display: none; }
+.run-env-section:not([open]) > summary { margin-bottom: 0; }
+.run-env-section > summary::after {
+  content: '⌄';
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+  font-size: 12px;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+.run-env-section[open] > summary::after { transform: none; }
+.run-env-section > summary:focus-visible { outline: 2px solid var(--accent-3); outline-offset: 3px; }
+.run-env-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.run-env-section-head em { color: var(--fg-mute); font-style: normal; font-size: 9px; letter-spacing: 0.06em; text-transform: none; }
+.run-env-rows { display: flex; flex-direction: column; gap: 2px; }
+.run-env-row {
+  min-height: 28px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 3px;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.run-env-row-icon { color: var(--fg-3); font-size: 12px; text-align: center; }
+.run-env-row-main { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-env-row-main strong { color: var(--fg); font-weight: 500; }
+.run-env-row-meta { color: var(--fg-3); font: 9.5px/1.2 var(--mono); white-space: nowrap; }
+.run-env-row[data-state="running"] .run-env-row-icon,
+.run-env-row[data-state="running"] .run-env-row-meta { color: var(--accent-3); }
+.run-env-row[data-state="done"] .run-env-row-icon,
+.run-env-row[data-state="done"] .run-env-row-meta { color: var(--accent-2); }
+.run-env-row[data-state="failed"] .run-env-row-icon,
+.run-env-row[data-state="failed"] .run-env-row-meta { color: var(--accent-fail); }
+.run-env-row[data-state="warn"] .run-env-row-icon,
+.run-env-row[data-state="warn"] .run-env-row-meta { color: var(--accent-warn); }
+.run-env-muted { padding: 3px; color: var(--fg-mute); font-size: 10.5px; line-height: 1.45; }
+.run-env-objective {
+  margin: 2px 3px 8px;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.run-env-tool-list { display: flex; flex-wrap: wrap; gap: 5px; margin: 2px 3px 8px; }
+.run-env-tool {
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--fg-2);
+  background: var(--bg-2);
+  font: 9.5px/1.25 var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-env-resource { color: var(--accent-3); text-decoration: none; }
+.run-env-resource:hover { text-decoration: underline; color: var(--fg); }
+.run-env-resource-label {
+  margin: 10px 3px 4px;
+  color: var(--fg-mute);
+  font: 9px/1.2 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.run-env-actions { display: flex; gap: 7px; }
+.run-env-action {
+  flex: 1;
+  min-height: 31px;
+  border: 1px solid var(--line-bright);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-2);
+  font: 10px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.run-env-action:hover { color: var(--fg); background: var(--bg-3); }
+.run-env-action.stop { border-color: color-mix(in srgb, var(--accent-fail) 55%, var(--line)); color: var(--accent-fail); }
+.run-env-action.stop:hover { background: color-mix(in srgb, var(--accent-fail) 13%, transparent); }
+.run-env-action[disabled] { opacity: 0.48; cursor: wait; }
+@media (max-width: 720px) {
+  .run-environment-backdrop:not([hidden]) {
+    position: fixed;
+    inset: 0;
+    z-index: 2299;
+    display: block;
+    width: 100%;
+    border: 0;
+    background: color-mix(in srgb, #000 34%, transparent);
+  }
+  .run-environment-drawer { top: 50px; right: 6px; bottom: 34px; width: calc(100vw - 12px); border-radius: 10px; }
+  .run-env-actions { flex-wrap: wrap; }
+  .run-env-action { min-width: 112px; }
+  .status-row .stat-run-environment-toggle { display: inline-flex; }
+}
+
 .nav-badge {
   margin-left: auto;
   min-width: 19px;
@@ -12009,7 +12303,7 @@ const CONSOLE_JS = `
   'use strict';
 
   const TOKEN = window.__CLEMENTINE_TOKEN__ || '';
-  const POLL_MS = 2000;
+  const POLL_MS = 5000;
 
   // ── General-purpose toast helper ────────────────────────────────
   //
@@ -12104,6 +12398,12 @@ const CONSOLE_JS = `
     readingTitle: document.querySelector('[data-reading-title]'),
     readingStatus:document.querySelector('[data-reading-status]'),
     activityBadge:document.querySelector('[data-activity-badge]'),
+    runEnvironmentToggle: document.querySelector('[data-run-environment-toggle]'),
+    runEnvironmentBackdrop: document.querySelector('[data-run-environment-backdrop]'),
+    runEnvironmentDrawer: document.querySelector('[data-run-environment-drawer]'),
+    runEnvironmentBody:   document.querySelector('[data-run-environment-body]'),
+    runEnvironmentFooter: document.querySelector('[data-run-environment-footer]'),
+    runEnvironmentStatus: document.querySelector('[data-run-environment-status]'),
     // detailBody / detailId are aliases to the reading-pane nodes so the
     // background-task detail renderer (which writes detail-block markup)
     // keeps working unchanged.
@@ -12134,6 +12434,11 @@ const CONSOLE_JS = `
   let lastSnapshotJSON = '';
   let lastRunsJSON = '';
   let lastDetailSig = '';
+  let runEnvironmentCurrentRun = null;
+  let runEnvironmentLoadSeq = 0;
+  let runEnvironmentPinnedRunId = null;
+  let runEnvironmentLastListSig = '';
+  let runEnvironmentReturnFocus = null;
 
   function withToken(path) {
     if (!TOKEN) return path;
@@ -12517,10 +12822,655 @@ const CONSOLE_JS = `
   // ── Activity inbox state ────────────────────────────────────────
   // Most-recent-activity-first ordering uses the SAME field we display
   // (last-active time) so the visible order is monotonic top-to-bottom.
+  // Global run environment drawer. This projects only data exposed by the
+  // compact /api/runs/:id?view=environment contract; absent evidence stays absent.
+  const RUN_ENV_OPEN_KEY = 'clemmy.run-environment.open';
+
+  function escAttr(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function isRunEnvironmentOpen() {
+    return !!(els.runEnvironmentDrawer && !els.runEnvironmentDrawer.hasAttribute('hidden'));
+  }
+
+  function announceRunEnvironment(message) {
+    if (els.runEnvironmentStatus) els.runEnvironmentStatus.textContent = String(message || '');
+  }
+
+  function renderRunEnvironmentEmpty(message, heading, retryId) {
+    runEnvironmentCurrentRun = null;
+    if (!els.runEnvironmentBody) return;
+    els.runEnvironmentBody.innerHTML = [
+      '<div class="run-environment-empty">',
+      '  <span class="run-environment-empty-mark">◎</span>',
+      '  <strong>' + esc(heading || 'No run to show') + '</strong>',
+      '  <span>' + esc(message || 'Start a chat or select an Activity item to inspect it here.') + '</span>',
+      retryId ? '  <button type="button" class="run-env-action" data-run-environment-retry>Retry</button>' : '',
+      '</div>',
+    ].join('');
+    const retry = els.runEnvironmentBody.querySelector('[data-run-environment-retry]');
+    if (retry) retry.addEventListener('click', () => loadRunEnvironment(retryId));
+    if (els.runEnvironmentFooter) {
+      els.runEnvironmentFooter.setAttribute('hidden', '');
+      els.runEnvironmentFooter.innerHTML = '';
+    }
+    announceRunEnvironment(heading || 'No run to show');
+  }
+
+  function renderRunEnvironmentLoading() {
+    renderRunEnvironmentEmpty('Loading the compact plan, helper, tool, and output view…', 'Loading run context');
+  }
+
+  function setRunEnvironmentOpen(open) {
+    if (!els.runEnvironmentDrawer || !els.runEnvironmentToggle) return;
+    const wasOpen = isRunEnvironmentOpen();
+    if (open) {
+      if (!wasOpen && document.activeElement instanceof HTMLElement) runEnvironmentReturnFocus = document.activeElement;
+      els.runEnvironmentDrawer.removeAttribute('hidden');
+    } else {
+      els.runEnvironmentDrawer.setAttribute('hidden', '');
+      runEnvironmentPinnedRunId = null;
+      runEnvironmentLastListSig = '';
+      runEnvironmentLoadSeq += 1;
+    }
+    syncRunEnvironmentAccessibility();
+    els.runEnvironmentToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    els.runEnvironmentToggle.setAttribute('title', open ? 'Close the run environment' : 'Open the active run environment');
+    try { localStorage.setItem(RUN_ENV_OPEN_KEY, open ? '1' : '0'); } catch (_) {}
+    if (open) {
+      refreshRunEnvironmentFromList(lastInboxList);
+      const close = document.querySelector('[data-run-environment-close]');
+      if (!wasOpen && close && typeof close.focus === 'function') window.requestAnimationFrame(() => close.focus());
+    } else if (wasOpen && runEnvironmentReturnFocus && runEnvironmentReturnFocus.isConnected) {
+      runEnvironmentReturnFocus.focus();
+      runEnvironmentReturnFocus = null;
+    }
+  }
+
+  function isRunEnvironmentModal() {
+    return typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 720px)').matches;
+  }
+
+  function syncRunEnvironmentAccessibility() {
+    if (!els.runEnvironmentDrawer) return;
+    const open = isRunEnvironmentOpen();
+    const modal = open && isRunEnvironmentModal();
+    els.runEnvironmentDrawer.setAttribute('role', modal ? 'dialog' : 'complementary');
+    if (modal) els.runEnvironmentDrawer.setAttribute('aria-modal', 'true');
+    else els.runEnvironmentDrawer.removeAttribute('aria-modal');
+    if (els.runEnvironmentBackdrop) {
+      if (modal) els.runEnvironmentBackdrop.removeAttribute('hidden');
+      else els.runEnvironmentBackdrop.setAttribute('hidden', '');
+    }
+  }
+
+  function firstText() {
+    for (let i = 0; i < arguments.length; i += 1) {
+      const value = arguments[i];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+  }
+
+  function parseEventArgs(data) {
+    if (!data || typeof data !== 'object') return {};
+    const raw = data.args !== undefined ? data.args
+      : data.arguments !== undefined ? data.arguments
+        : data.input !== undefined ? data.input : null;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+    if (typeof raw !== 'string' || !raw.trim()) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) { return {}; }
+  }
+
+  function fmtRunElapsed(run) {
+    const scopedStart = run && run.runEnvironmentMeta && run.runEnvironmentMeta.scopeStartedAt;
+    const startMs = Date.parse(scopedStart || (run && run.createdAt ? run.createdAt : ''));
+    if (!Number.isFinite(startMs)) return '';
+    const terminalAt = run.completedAt || (!run.live ? run.updatedAt : '') || '';
+    const endMs = terminalAt ? Date.parse(terminalAt) : Date.now();
+    if (!Number.isFinite(endMs)) return '';
+    const totalSeconds = Math.max(0, Math.floor((endMs - startMs) / 1000));
+    if (totalSeconds < 60) return totalSeconds + 's';
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes < 60) return minutes + 'm ' + String(seconds).padStart(2, '0') + 's';
+    const hours = Math.floor(minutes / 60);
+    return hours + 'h ' + String(minutes % 60).padStart(2, '0') + 'm';
+  }
+
+  function runEnvironmentTone(run) {
+    const state = String((run && (run.runState || run.status)) || '').toLowerCase();
+    if (state === 'failed') return 'fail';
+    if (state === 'completed') return 'done';
+    if (/waiting|approval|attention|stalled|paused/.test(state)) return 'warn';
+    if (run && run.live) return 'live';
+    return 'idle';
+  }
+
+  function runEnvironmentRow(icon, main, meta, state, title) {
+    return '<div class="run-env-row"' + (state ? ' data-state="' + escAttr(state) + '"' : '')
+      + (title ? ' title="' + escAttr(title) + '"' : '') + '>'
+      + '<span class="run-env-row-icon" aria-hidden="true">' + esc(icon) + '</span>'
+      + '<span class="run-env-row-main">' + esc(main) + '</span>'
+      + '<span class="run-env-row-meta">' + esc(meta || '') + '</span>'
+      + '</div>';
+  }
+
+  function runEnvironmentStepLabel(event) {
+    const data = event && event.data && typeof event.data === 'object' ? event.data : {};
+    return firstText(event && event.stepId, data.stepId, data.step, data.label, data.name);
+  }
+
+  function buildRunEnvironmentPlan(run) {
+    const events = Array.isArray(run.events) ? run.events : [];
+    let drafted = null;
+    const steps = new Map();
+    events.forEach((event) => {
+      const type = String(event.type || '');
+      if (type === 'plan_drafted') drafted = event.data || {};
+      if (type !== 'step_started' && type !== 'step_completed' && type !== 'step_verified' && type !== 'step_failed') return;
+      const label = runEnvironmentStepLabel(event);
+      if (!label) return;
+      const prior = steps.get(label) || { label, state: 'pending' };
+      prior.state = type === 'step_failed' ? 'failed'
+        : (type === 'step_completed' || type === 'step_verified') ? 'done'
+          : 'running';
+      steps.set(label, prior);
+    });
+    const rows = Array.from(steps.values());
+    const objective = firstText(drafted && drafted.objective, run.objective, run.summary && run.summary.ask, run.input);
+    const declaredCount = drafted && Number.isFinite(Number(drafted.stepCount)) ? Number(drafted.stepCount) : null;
+    return { objective, declaredCount, steps: rows, recorded: !!drafted || rows.length > 0 };
+  }
+
+  function buildRunEnvironmentHelpers(run) {
+    const events = Array.isArray(run.events) ? run.events : [];
+    const helpers = new Map();
+    let handoffIndex = 0;
+    events.forEach((event) => {
+      const type = String(event.type || '');
+      const data = event.data && typeof event.data === 'object' ? event.data : {};
+      if (type === 'worker_started' || type === 'subagent_started' || type === 'agent_started') {
+        const item = firstText(data.item, data.task, data.name, data.role) || ('Helper ' + (helpers.size + 1));
+        helpers.set(item, { item, state: 'running', model: firstText(data.model, data.role, data.provider) });
+      } else if (type === 'worker_result' || type === 'subagent_result' || type === 'agent_result') {
+        const item = firstText(data.item, data.task, data.name, data.role) || ('Helper ' + (helpers.size + 1));
+        const prior = helpers.get(item) || { item, state: 'running', model: '' };
+        prior.state = data.ok === false ? 'failed' : 'done';
+        prior.model = prior.model || firstText(data.model, data.role, data.provider);
+        helpers.set(item, prior);
+      } else if (type === 'handoff') {
+        const item = firstText(data.to, data.agent, data.role);
+        if (!item) return;
+        handoffIndex += 1;
+        helpers.set('handoff:' + item + ':' + handoffIndex, { item, state: 'done', model: 'handoff' });
+      }
+    });
+    return Array.from(helpers.values());
+  }
+
   const lastActiveFor = (run) => run.updatedAt || run.completedAt || run.createdAt || '';
+  function runEnvironmentToolName(event) {
+    const data = event && event.data && typeof event.data === 'object' ? event.data : {};
+    const args = parseEventArgs(data);
+    let nestedArgs = {};
+    if (typeof args.arguments === 'string') {
+      try { nestedArgs = JSON.parse(args.arguments); } catch (_) {}
+    } else if (args.arguments && typeof args.arguments === 'object') {
+      nestedArgs = args.arguments;
+    }
+    const slug = firstText(data.slug, data.toolSlug, args.tool_slug, args.toolSlug, nestedArgs.slug);
+    const name = firstText(data.tool, data.toolName, data.name);
+    if ((name === 'composio_execute_tool' || name === 'composio_search_tools') && slug) return slug;
+    return slug || name || 'tool';
+  }
+
+  function buildRunEnvironmentTools(run) {
+    const aggregate = run.toolSummary && typeof run.toolSummary === 'object' ? run.toolSummary : null;
+    if (aggregate) {
+      const rawCounts = aggregate.countsByName && typeof aggregate.countsByName === 'object' ? aggregate.countsByName : {};
+      const countsByName = {};
+      Object.keys(rawCounts).forEach((rawName) => {
+        const count = Number(rawCounts[rawName]);
+        const name = String(rawName || '').trim();
+        if (name && Number.isFinite(count) && count > 0) countsByName[name] = Math.floor(count);
+      });
+      const usedNames = [];
+      const seenNames = new Set();
+      (Array.isArray(aggregate.names) ? aggregate.names : []).concat(Object.keys(countsByName)).forEach((rawName) => {
+        const name = typeof rawName === 'string' ? rawName.trim() : '';
+        if (!name || seenNames.has(name)) return;
+        seenNames.add(name);
+        usedNames.push(name);
+        if (!countsByName[name]) countsByName[name] = 1;
+      });
+      const logical = aggregate.logicalCount == null ? null : Number(aggregate.logicalCount);
+      const recorded = Number(aggregate.recordedCalls);
+      const mirrors = Number(aggregate.mirrorEvents);
+      return {
+        usedNames,
+        countsByName,
+        recordedEvents: Number.isFinite(recorded) ? Math.max(0, Math.floor(recorded)) : 0,
+        mirrorEvents: Number.isFinite(mirrors) ? Math.max(0, Math.floor(mirrors)) : 0,
+        canonicalCount: logical !== null && Number.isFinite(logical) ? Math.max(0, Math.floor(logical)) : null,
+      };
+    }
+    const events = Array.isArray(run.events) ? run.events : [];
+    const allCalls = events.filter((event) => event.type === 'tool_called');
+    const mirrorEvents = allCalls.filter((event) => {
+      const data = event.data && typeof event.data === 'object' ? event.data : {};
+      return data.accounting === 'transport_mirror';
+    });
+    const calls = allCalls.filter((event) => {
+      const data = event.data && typeof event.data === 'object' ? event.data : {};
+      return data.accounting !== 'transport_mirror';
+    });
+    const usedNames = [];
+    const countsByName = {};
+    const seenNames = new Set();
+    calls.forEach((event) => {
+      const name = runEnvironmentToolName(event);
+      countsByName[name] = (countsByName[name] || 0) + 1;
+      if (seenNames.has(name)) return;
+      seenNames.add(name);
+      usedNames.push(name);
+    });
+    const canonicalIds = calls.map((event) => {
+      const data = event.data && typeof event.data === 'object' ? event.data : {};
+      return firstText(data.canonicalCallId, data.logicalCallId, data.invocationId);
+    });
+    const hasCanonicalCount = calls.length > 0 && canonicalIds.every(Boolean);
+    return {
+      usedNames,
+      countsByName,
+      recordedEvents: calls.length,
+      mirrorEvents: mirrorEvents.length,
+      canonicalCount: hasCanonicalCount ? new Set(canonicalIds).size : null,
+    };
+  }
+
+  function runEnvironmentScope(run) {
+    const meta = run && run.runEnvironmentMeta && typeof run.runEnvironmentMeta === 'object'
+      ? run.runEnvironmentMeta : {};
+    const scopeLabel = meta.scopeKind === 'current_attempt' ? 'current attempt'
+      : meta.scopeKind === 'latest_turn' ? 'latest turn'
+        : meta.scopeKind === 'session_history' ? 'session history'
+          : 'run scope';
+    const coverage = (noun, returnedValue, totalValue, omittedValue) => {
+      const parse = (value) => Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.floor(Number(value)) : null;
+      const returned = parse(returnedValue);
+      const total = parse(totalValue);
+      const omitted = parse(omittedValue);
+      if (returned === null && total === null && omitted === null) return '';
+      const visible = returned !== null ? returned : total !== null && omitted !== null ? Math.max(0, total - omitted) : null;
+      const whole = total !== null ? total : visible !== null && omitted !== null ? visible + omitted : null;
+      const base = visible !== null && whole !== null ? visible + ' of ' + whole + ' ' + noun : (whole !== null ? whole : visible || 0) + ' ' + noun;
+      return omitted && omitted > 0 ? base + ' · ' + omitted + ' omitted' : base;
+    };
+    return {
+      label: scopeLabel,
+      runScopeId: firstText(meta.runScopeId),
+      audit: Number.isFinite(Number(meta.auditEventsTotal)) && Number(meta.auditEventsTotal) >= 0
+        ? Math.floor(Number(meta.auditEventsTotal)) + ' audit events in scope' : '',
+      projection: coverage('structural events', meta.projectionEventsReturned, meta.projectionEventsTotal, meta.projectionEventsOmitted),
+      artifacts: meta.artifactCoverageStatus === 'unavailable'
+        ? 'unavailable'
+        : coverage('artifacts', meta.artifactsReturned, meta.artifactsTotal, meta.artifactsOmitted),
+    };
+  }
+
+  function safeRunResourceUrl(value) {
+    if (typeof value !== 'string' || !value.trim()) return '';
+    try {
+      const url = new URL(value.trim());
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+    } catch (_) { return ''; }
+  }
+
+  function collectRunResources(run) {
+    const urls = new Set();
+    const files = new Set();
+    const scan = (value, key, depth) => {
+      if (depth > 3 || value == null) return;
+      if (typeof value === 'string') {
+        const urlMatches = value.split(/\\s+/).filter((part) =>
+          part.startsWith('http://') || part.startsWith('https://'),
+        );
+        urlMatches.forEach((match) => {
+          const safe = safeRunResourceUrl(match.replace(/[.,;:]+$/, ''));
+          if (safe) urls.add(safe);
+        });
+        if (/sourceUri|url|href/i.test(key || '')) {
+          const safe = safeRunResourceUrl(value);
+          if (safe) urls.add(safe);
+        }
+        if (/path|file|artifact|document/i.test(key || '')) {
+          const pathValue = value.trim();
+          if ((pathValue.startsWith('/') || pathValue.startsWith('~/')) && pathValue.length < 500) files.add(pathValue);
+        }
+        const pathMatches = value.split(/\\s+/).filter((part) =>
+          part.startsWith('~/') || part.startsWith('/Users/') || part.startsWith('/tmp/') || part.startsWith('/var/'),
+        );
+        pathMatches.forEach((match) => files.add(match.replace(/[.,;:]+$/, '')));
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.slice(0, 20).forEach((entry) => scan(entry, key, depth + 1));
+        return;
+      }
+      if (typeof value === 'object') {
+        Object.keys(value).slice(0, 40).forEach((childKey) => scan(value[childKey], childKey, depth + 1));
+      }
+    };
+    scan(run.outputPreview, 'outputPreview', 0);
+    scan(run.metadata && run.metadata.artifacts, 'artifacts', 0);
+    (Array.isArray(run.events) ? run.events : []).forEach((event) => {
+      const data = event.data && typeof event.data === 'object' ? event.data : {};
+      if (event.type === 'tool_returned' || event.type === 'conversation_completed' || event.type === 'run_completed' || event.type === 'completed') {
+        scan(data, 'result', 0);
+      } else {
+        ['sourceUri', 'url', 'href', 'artifactUrl', 'artifactPath', 'resultPath'].forEach((key) => {
+          if (data[key] !== undefined) scan(data[key], key, 0);
+        });
+      }
+    });
+    return { urls: Array.from(urls).slice(0, 6), files: Array.from(files).slice(0, 6) };
+  }
+
+  function runEnvironmentWorkspace(run) {
+    const metadata = run.metadata && typeof run.metadata === 'object' ? run.metadata : {};
+    const recordedWorkspace = firstText(run.workspace, run.cwd, run.workDir, metadata.workspacePath, metadata.workspace, metadata.workDir, metadata.cwd, metadata.projectPath);
+    const recordedBranch = firstText(run.branch, metadata.branch, metadata.gitBranch, metadata.branchName);
+    const recordedModel = firstText(run.model, metadata.model, metadata.modelId);
+    let observedWorkspace = '';
+    let observedBranch = '';
+    let observedModel = '';
+    const events = Array.isArray(run.events) ? run.events.slice().reverse() : [];
+    events.forEach((event) => {
+      if (observedWorkspace && observedBranch && observedModel) return;
+      const data = event.data && typeof event.data === 'object' ? event.data : {};
+      const args = parseEventArgs(data);
+      observedWorkspace = observedWorkspace || firstText(data.workspacePath, data.workspace, data.cwd, data.workDir, data.projectPath, args.cwd, args.workDir);
+      observedBranch = observedBranch || firstText(data.branch, data.gitBranch, data.branchName, args.branch);
+      observedModel = observedModel || firstText(data.model, data.modelId);
+    });
+    const value = (recorded, observed) => recorded
+      ? { value: recorded, provenance: 'recorded' }
+      : observed ? { value: observed, provenance: 'observed' } : null;
+    return {
+      workspace: value(recordedWorkspace, observedWorkspace),
+      branch: value(recordedBranch, observedBranch),
+      model: value(recordedModel, observedModel),
+    };
+  }
+
+  function isRunCancellable(run) {
+    return !!(run && run.canCancel === true
+      && typeof run.cancelEndpoint === 'string'
+      && run.cancelEndpoint.indexOf('/api/') === 0);
+  }
+
+  function isRunBackgroundable(run) {
+    return !!(run && run.canBackground === true
+      && typeof run.backgroundEndpoint === 'string'
+      && run.backgroundEndpoint.indexOf('/api/') === 0);
+  }
+
   let activeFilter = 'all';
   let searchQuery = '';
   let lastInboxList = [];
+
+  function renderRunEnvironment(run) {
+    if (!els.runEnvironmentBody) return;
+    if (!run) { renderRunEnvironmentEmpty(); return; }
+    runEnvironmentCurrentRun = run;
+    const plan = buildRunEnvironmentPlan(run);
+    const helpers = buildRunEnvironmentHelpers(run);
+    const toolsUsed = buildRunEnvironmentTools(run);
+    const scope = runEnvironmentScope(run);
+    const resources = collectRunResources(run);
+    const artifacts = Array.isArray(run.artifacts) ? run.artifacts.filter((artifact) => artifact && typeof artifact === 'object') : [];
+    const environment = runEnvironmentWorkspace(run);
+    const status = run.statusLabel || run.runStateLabel || run.runState || run.status || 'Unknown';
+    const elapsed = fmtRunElapsed(run);
+    const tone = runEnvironmentTone(run);
+    const source = [run.kindLabel || run.source || 'Run', run.channel && run.channel !== run.source ? run.channel : ''].filter(Boolean).join(' · ');
+    const helperDone = helpers.filter((helper) => helper.state === 'done').length;
+    const helperFailed = helpers.filter((helper) => helper.state === 'failed').length;
+    const toolCountLabel = toolsUsed.canonicalCount !== null
+      ? toolsUsed.canonicalCount + ' logical call' + (toolsUsed.canonicalCount === 1 ? '' : 's') + ' · ' + scope.label
+      : toolsUsed.recordedEvents > 0
+        ? toolsUsed.recordedEvents + ' recorded call event' + (toolsUsed.recordedEvents === 1 ? '' : 's') + ' · ' + scope.label
+        : 'no calls recorded';
+
+    const envRows = [
+      runEnvironmentRow('◉', source || 'Run', elapsed, run.live ? 'running' : '', 'Source and elapsed time'),
+    ];
+    if (environment.workspace) envRows.push(runEnvironmentRow('▣', environment.workspace.value, environment.workspace.provenance === 'observed' ? 'observed in run' : 'recorded', '', 'Workspace context; observed values are not asserted as current local state'));
+    if (environment.branch) envRows.push(runEnvironmentRow('⎇', environment.branch.value, environment.branch.provenance === 'observed' ? 'observed in run' : 'branch', '', 'Branch context; observed values may be a target rather than the local branch'));
+    if (environment.model) envRows.push(runEnvironmentRow('◇', environment.model.value, environment.model.provenance === 'observed' ? 'observed in run' : 'model', '', 'Model context recorded or observed in this run'));
+
+    let planHtml = '<div class="run-env-muted">No structured plan was recorded for this run.</div>';
+    if (plan.recorded) {
+      const visibleSteps = plan.steps.slice(-8);
+      const stepRows = visibleSteps.map((step) => runEnvironmentRow(
+        step.state === 'done' ? '✓' : step.state === 'failed' ? '!' : '→',
+        step.label,
+        step.state,
+        step.state,
+      )).join('');
+      planHtml = (plan.objective ? '<div class="run-env-objective">' + esc(plan.objective) + '</div>' : '')
+        + (stepRows ? '<div class="run-env-rows">' + stepRows + '</div>' : '<div class="run-env-muted">Plan drafted; individual step names were not recorded.</div>')
+        + (plan.steps.length > visibleSteps.length ? '<div class="run-env-muted">Latest ' + visibleSteps.length + ' of ' + plan.steps.length + ' projected steps shown</div>' : '');
+    }
+
+    const visibleHelpers = helpers.slice(-8);
+    const helperHtml = helpers.length
+      ? '<div class="run-env-rows">' + visibleHelpers.map((helper) => runEnvironmentRow(
+        helper.state === 'done' ? '✓' : helper.state === 'failed' ? '!' : '◌',
+        helper.item,
+        helper.model || helper.state,
+        helper.state,
+      )).join('') + '</div>'
+        + (helpers.length > visibleHelpers.length ? '<div class="run-env-muted">Latest ' + visibleHelpers.length + ' of ' + helpers.length + ' projected helpers shown</div>' : '')
+      : '<div class="run-env-muted">No helpers or handoffs were recorded.</div>';
+
+    const visibleToolNames = toolsUsed.usedNames.slice(0, 12);
+    const toolNamesOmitted = Math.max(0, toolsUsed.usedNames.length - visibleToolNames.length);
+    const toolPills = visibleToolNames.length
+      ? '<div class="run-env-tool-list">' + visibleToolNames.map((name) => {
+        const count = Number(toolsUsed.countsByName[name]) || 1;
+        return '<span class="run-env-tool" title="' + escAttr(name) + '">' + esc(name + (count > 1 ? ' ' + count + '×' : '')) + '</span>';
+      }).join('') + '</div>'
+      : '<div class="run-env-muted">No tool use was recorded.</div>';
+    const boundUris = new Set(artifacts.map((artifact) => safeRunResourceUrl(artifact.uri)).filter(Boolean));
+    const artifactRows = artifacts.map((artifact) => {
+      const uri = safeRunResourceUrl(artifact.uri);
+      const label = firstText(artifact.title, artifact.slotKey, artifact.resourceId, artifact.kind, 'Artifact');
+      const statusLabel = firstText(artifact.status, 'recorded');
+      const bindingVerified = statusLabel === 'bound' && !!artifact.bindingVerifiedAt;
+      const presentation = bindingVerified
+        ? { state: 'done', meta: 'provider verified' }
+        : statusLabel === 'bound'
+          ? { state: 'warn', meta: 'resource found · verification pending' }
+          : statusLabel === 'uncertain'
+            ? { state: 'warn', meta: 'outcome uncertain' }
+            : { state: 'running', meta: statusLabel === 'pending' ? 'creating' : statusLabel };
+      const proofTitle = bindingVerified
+        ? 'Provider read-back verified ' + artifact.bindingVerifiedAt + (artifact.resourceId ? ' · ' + artifact.resourceId : '')
+        : (artifact.resourceId || 'Artifact ledger entry');
+      if (uri) {
+        return '<div class="run-env-row" data-state="' + presentation.state + '" title="' + escAttr(proofTitle) + '">'
+          + '<span class="run-env-row-icon">◈</span>'
+          + '<a class="run-env-row-main run-env-resource" href="' + escAttr(uri) + '" target="_blank" rel="noopener noreferrer" title="' + escAttr(uri) + '">' + esc(label) + '</a>'
+          + '<span class="run-env-row-meta">' + esc(presentation.meta) + '</span></div>';
+      }
+      return runEnvironmentRow('◈', label, presentation.meta, presentation.state, proofTitle);
+    }).join('');
+    const observedResourceRows = resources.urls.filter((url) => !boundUris.has(url)).map((url) => {
+      let label = url;
+      try { const parsed = new URL(url); label = parsed.hostname + (parsed.pathname === '/' ? '' : parsed.pathname); } catch (_) {}
+      return '<div class="run-env-row"><span class="run-env-row-icon">↗</span>'
+        + '<a class="run-env-row-main run-env-resource" href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer" title="' + escAttr(url) + '">' + esc(label) + '</a>'
+        + '<span class="run-env-row-meta">observed</span></div>';
+    }).concat(resources.files.map((file) => runEnvironmentRow('▤', file.split('/').filter(Boolean).pop() || file, 'file', '', file))).join('');
+
+    const planMeta = plan.declaredCount !== null ? plan.declaredCount + ' planned' : plan.steps.length ? plan.steps.length + ' recorded' : '';
+    const helperMeta = helpers.length ? helperDone + ' done' + (helperFailed ? ' · ' + helperFailed + ' failed' : '') : '';
+    const actions = [
+      '<button type="button" class="run-env-action" data-run-env-open-activity>Open activity</button>',
+      isRunBackgroundable(run)
+        ? '<button type="button" class="run-env-action" data-run-env-action="background" title="Move this exact run attempt to durable background work">Background</button>'
+        : '',
+      isRunCancellable(run)
+        ? '<button type="button" class="run-env-action stop" data-run-env-action="cancel" title="Stop this exact run attempt">Stop run</button>'
+        : '',
+    ].filter(Boolean).join('');
+    const countTruthTitle = toolsUsed.canonicalCount === null
+      ? 'The API does not expose a canonical count for this run, so raw telemetry is not presented as logical usage.'
+      : 'Canonical logical invocation ids were recorded for every call.' + (toolsUsed.mirrorEvents ? ' ' + toolsUsed.mirrorEvents + ' transport mirror events were omitted.' : '');
+
+    els.runEnvironmentBody.innerHTML = [
+      '<div class="run-env-overview">',
+      '  <div class="run-env-overview-top">',
+      '    <div class="run-env-title">' + esc(run.title || run.input || '(untitled run)') + '</div>',
+      '    <span class="run-env-status" data-tone="' + escAttr(tone) + '"><span class="run-env-status-dot"></span>' + esc(status) + '</span>',
+      '  </div>',
+      run.live ? '  <div class="run-env-now">' + esc(run.liveLine || run.preview || 'Working…') + '</div>' : '',
+      '</div>',
+      '<section class="run-env-section">',
+      '  <div class="run-env-section-head"><span>Environment / run</span><em>' + esc(elapsed) + '</em></div>',
+      '  <div class="run-env-rows">' + envRows.join('') + '</div>',
+      '</section>',
+      '<details class="run-env-section">',
+      '  <summary class="run-env-section-head"><span>Plan</span><em>' + esc(planMeta) + '</em></summary>',
+      planHtml,
+      '</details>',
+      '<details class="run-env-section">',
+      '  <summary class="run-env-section-head"><span>Helpers</span><em>' + esc(helperMeta) + '</em></summary>',
+      helperHtml,
+      '</details>',
+      '<details class="run-env-section"' + (artifactRows ? ' open' : '') + '>',
+      '  <summary class="run-env-section-head"><span>Tools &amp; resources</span><em title="' + escAttr(countTruthTitle) + '">' + esc(toolCountLabel) + '</em></summary>',
+      toolPills,
+      toolNamesOmitted ? '  <div class="run-env-muted">' + esc(toolNamesOmitted + ' additional tool name' + (toolNamesOmitted === 1 ? '' : 's') + ' omitted from this compact view') + '</div>' : '',
+      toolsUsed.mirrorEvents ? '  <div class="run-env-muted">' + esc(toolsUsed.mirrorEvents + ' transport mirror event' + (toolsUsed.mirrorEvents === 1 ? '' : 's') + ' omitted from usage') + '</div>' : '',
+      artifactRows ? '  <div class="run-env-resource-label">Artifact ledger</div><div class="run-env-rows">' + artifactRows + '</div>' : '',
+      observedResourceRows ? '  <div class="run-env-resource-label">Observed references</div><div class="run-env-rows">' + observedResourceRows + '</div>' : '',
+      '</details>',
+      '<details class="run-env-section">',
+      '  <summary class="run-env-section-head"><span>Details</span><em>' + esc(scope.label) + '</em></summary>',
+      '  <div class="run-env-rows">',
+      runEnvironmentRow('⌘', String(run.id || 'unknown'), 'run id', '', 'Exact run id'),
+      scope.runScopeId ? runEnvironmentRow('⌁', scope.runScopeId, 'scope id', '', 'Exact projected run scope') : '',
+      '  </div>',
+      scope.audit ? '  <div class="run-env-muted">' + esc(scope.audit) + '</div>' : '',
+      scope.projection ? '  <div class="run-env-muted">Projection · ' + esc(scope.projection) + '</div>' : '',
+      scope.artifacts ? '  <div class="run-env-muted">Artifact coverage · ' + esc(scope.artifacts) + '</div>' : '',
+      '</details>',
+    ].join('');
+
+    if (els.runEnvironmentFooter) {
+      els.runEnvironmentFooter.innerHTML = '<div class="run-env-actions">' + actions + '</div>';
+      els.runEnvironmentFooter.removeAttribute('hidden');
+    }
+    announceRunEnvironment('Showing ' + (run.title || run.input || 'run') + ', ' + status);
+
+    const stop = els.runEnvironmentFooter && els.runEnvironmentFooter.querySelector('[data-run-env-action="cancel"]');
+    if (stop) stop.addEventListener('click', () => handleReadingAction('cancel', run));
+    const background = els.runEnvironmentFooter && els.runEnvironmentFooter.querySelector('[data-run-env-action="background"]');
+    if (background) background.addEventListener('click', () => handleReadingAction('background', run));
+    const openActivity = els.runEnvironmentFooter && els.runEnvironmentFooter.querySelector('[data-run-env-open-activity]');
+    if (openActivity) openActivity.addEventListener('click', () => {
+      selectedRunId = run.id;
+      setRunEnvironmentOpen(false);
+      switchPanel('activity');
+      renderInbox(lastInboxList);
+      loadDetail(run.id);
+    });
+  }
+
+  async function loadRunEnvironment(id) {
+    if (!id || !isRunEnvironmentOpen()) return;
+    const seq = ++runEnvironmentLoadSeq;
+    if (!runEnvironmentCurrentRun || String(runEnvironmentCurrentRun.id || '') !== String(id)) renderRunEnvironmentLoading();
+    try {
+      const data = await fetchJSON('/api/runs/' + encodeURIComponent(id) + '?view=environment');
+      if (seq !== runEnvironmentLoadSeq || !isRunEnvironmentOpen()) return;
+      renderRunEnvironment(data && data.run ? data.run : data);
+    } catch (err) {
+      if (seq !== runEnvironmentLoadSeq || !isRunEnvironmentOpen()) return;
+      if (runEnvironmentCurrentRun && String(runEnvironmentCurrentRun.id || '') === String(id)) {
+        announceRunEnvironment('Live refresh paused; last loaded run context remains visible');
+        return;
+      }
+      renderRunEnvironmentEmpty('Run details are unavailable: ' + ((err && err.message) || err), 'Could not load run', id);
+    }
+  }
+
+  function refreshRunEnvironmentFromList(runs) {
+    if (!isRunEnvironmentOpen()) return;
+    const list = Array.isArray(runs) ? runs : [];
+    const activityPanel = document.querySelector('.panel-frame[data-section="activity"]');
+    const selectionIsCurrentContext = !!(activityPanel && !activityPanel.hasAttribute('hidden'));
+    const selected = selectionIsCurrentContext && selectedRunId ? list.find((run) => run.id === selectedRunId) : null;
+    if (selected) runEnvironmentPinnedRunId = selected.id;
+    if (!runEnvironmentPinnedRunId) {
+      const newest = list.slice().sort((left, right) => lastActiveFor(right).localeCompare(lastActiveFor(left)));
+      const initial = selected || newest.find((run) => run.live) || newest[0] || null;
+      runEnvironmentPinnedRunId = initial && initial.id ? initial.id : null;
+    }
+    const candidate = runEnvironmentPinnedRunId
+      ? list.find((run) => run.id === runEnvironmentPinnedRunId) || (runEnvironmentCurrentRun && runEnvironmentCurrentRun.id === runEnvironmentPinnedRunId ? runEnvironmentCurrentRun : { id: runEnvironmentPinnedRunId })
+      : null;
+    if (!candidate) { renderRunEnvironmentEmpty(); return; }
+    const sig = [candidate.id, candidate.status, candidate.runState, candidate.updatedAt, candidate.completedAt].join(':');
+    if (!candidate.live && runEnvironmentCurrentRun && runEnvironmentCurrentRun.id === candidate.id && runEnvironmentLastListSig === sig) return;
+    runEnvironmentLastListSig = sig;
+    loadRunEnvironment(candidate.id);
+  }
+
+  if (els.runEnvironmentToggle) {
+    els.runEnvironmentToggle.addEventListener('click', () => setRunEnvironmentOpen(!isRunEnvironmentOpen()));
+  }
+  const runEnvironmentClose = document.querySelector('[data-run-environment-close]');
+  if (runEnvironmentClose) runEnvironmentClose.addEventListener('click', () => setRunEnvironmentOpen(false));
+  if (els.runEnvironmentBackdrop) els.runEnvironmentBackdrop.addEventListener('click', () => setRunEnvironmentOpen(false));
+  window.addEventListener('resize', syncRunEnvironmentAccessibility);
+  document.addEventListener('keydown', (event) => {
+    if (!isRunEnvironmentOpen()) return;
+    if (event.key === 'Escape') {
+      setRunEnvironmentOpen(false);
+      return;
+    }
+    if (event.key !== 'Tab' || !isRunEnvironmentModal() || !els.runEnvironmentDrawer) return;
+    const focusable = Array.from(els.runEnvironmentDrawer.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+    )).filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      els.runEnvironmentDrawer.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || !els.runEnvironmentDrawer.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || !els.runEnvironmentDrawer.contains(document.activeElement))) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  let runEnvironmentSaved = '0';
+  try { runEnvironmentSaved = localStorage.getItem(RUN_ENV_OPEN_KEY) || '0'; } catch (_) {}
+  if (runEnvironmentSaved === '1') setRunEnvironmentOpen(true);
 
   function dayBucket(iso) {
     if (!iso) return 'Earlier';
@@ -12612,23 +13562,33 @@ const CONSOLE_JS = `
 
   async function handleReadingAction(action, run) {
     if (action === 'approval') { switchPanel('approvals'); return; }
-    if (action === 'cancel') {
-      const btn = els.detailBody.querySelector('[data-read-action="cancel"]');
-      if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
-      // Harness chat sessions cancel via their own JSON endpoint; everything
-      // else routes through the run-cancel action (which resolves the linked
-      // or own background task).
-      const endpoint = String(run.id || '').indexOf('sess-') === 0
-        ? '/api/console/harness-sessions/' + encodeURIComponent(run.id) + '/cancel'
-        : '/dashboard/actions/runs/' + encodeURIComponent(run.id) + '/cancel';
+    if (action === 'cancel' || action === 'background') {
+      const moving = action === 'background';
+      const selector = moving
+        ? '[data-run-env-action="background"]'
+        : '[data-read-action="cancel"], [data-run-env-action="cancel"]';
+      const buttons = Array.from(document.querySelectorAll(selector));
+      buttons.forEach((btn) => { btn.disabled = true; btn.textContent = moving ? 'Moving…' : 'Stopping…'; });
+      const endpoint = moving
+        ? (typeof run.backgroundEndpoint === 'string' && run.backgroundEndpoint.indexOf('/api/') === 0 ? run.backgroundEndpoint : '')
+        : (typeof run.cancelEndpoint === 'string' && run.cancelEndpoint.indexOf('/api/') === 0 ? run.cancelEndpoint : '');
+      if (!endpoint) {
+        buttons.forEach((btn) => { btn.disabled = false; btn.textContent = moving ? 'Background' : (btn.hasAttribute('data-run-env-action') ? 'Stop run' : 'Stop'); });
+        if (window.__clementineToast) window.__clementineToast.showError('This exact run control is no longer available. Refresh before trying again.');
+        return;
+      }
       try {
         const r = await fetch(withToken(endpoint), { method: 'POST', headers: { Accept: 'application/json' } });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        if (window.__clementineToast) window.__clementineToast.showSuccess('Stop requested.');
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body && (body.error || body.message) ? (body.error || body.message) : 'HTTP ' + r.status);
+        if (window.__clementineToast) window.__clementineToast.showSuccess(moving ? 'Moved to background work.' : 'Stop requested.');
         try { await tick(); } catch (_) {}
       } catch (err) {
-        if (btn) { btn.disabled = false; btn.textContent = 'Stop'; }
-        if (window.__clementineToast) window.__clementineToast.showError('Could not stop: ' + ((err && err.message) || err));
+        buttons.forEach((btn) => {
+          btn.disabled = false;
+          btn.textContent = moving ? 'Background' : (btn.hasAttribute('data-run-env-action') ? 'Stop run' : 'Stop');
+        });
+        if (window.__clementineToast) window.__clementineToast.showError((moving ? 'Could not move to background: ' : 'Could not stop: ') + ((err && err.message) || err));
       }
       return;
     }
@@ -12680,9 +13640,7 @@ const CONSOLE_JS = `
     // sessions, and runs backed by a background task. Workflow runs are
     // cancelled from the Workflows page (different id scheme) — omitted here.
     const id = String(run.id || '');
-    const cancellable = run.live
-      && (id.indexOf('sess-') === 0 || run.queuedTaskId || id.indexOf('run-bg') === 0 || (run.category === 'background' && id.indexOf('run-') === 0));
-    if (cancellable) {
+    if (isRunCancellable(run)) {
       actions.push('<button type="button" class="read-btn" data-read-action="cancel">Stop</button>');
     }
     if (((run.runState || run.status) === 'failed' || run.status === 'failed') && id.indexOf('run-') === 0) {
@@ -12754,7 +13712,13 @@ const CONSOLE_JS = `
       // /api/runs/:id returns { run: {...} } envelope; older clients
       // expected the bare run object. Unwrap defensively so renderReading
       // gets the run regardless of which shape the server returns.
-      renderReading(data && data.run ? data.run : data);
+      const run = data && data.run ? data.run : data;
+      renderReading(run);
+      if (isRunEnvironmentOpen() && run && run.id) {
+        runEnvironmentPinnedRunId = run.id;
+        runEnvironmentLastListSig = '';
+        loadRunEnvironment(run.id);
+      }
     } catch (err) {
       els.detailBody.innerHTML = '<p class="reading-hint">Failed to load · ' + esc(err.message || err) + '</p>';
     }
@@ -13070,6 +14034,9 @@ const CONSOLE_JS = `
       const hasWorkflowRun = item.actionKind === 'workflow-run' && item.workflowName && item.runId;
       const hasHarnessSession = item.actionKind === 'harness-session' && item.sessionId;
       const hasBackgroundTask = item.actionKind === 'background-task' && item.taskId;
+      const harnessCancelEndpoint = hasHarnessSession && typeof item.cancelEndpoint === 'string' && item.cancelEndpoint.indexOf('/api/') === 0
+        ? item.cancelEndpoint
+        : '';
       const canEdit = hasApproval && item.approvalKind === 'harness' && item.approvalArgs;
       const editArgsAttr = canEdit ? ' data-home-approval-args="' + escMem(item.approvalArgs) + '"' : '';
       const editButton = canEdit
@@ -13096,7 +14063,9 @@ const CONSOLE_JS = `
         ? [
             '<div class="home-item-actions">',
             '  <button type="button" data-home-harness-action="open" data-home-harness-session-id="' + escMem(item.sessionId) + '">WATCH</button>',
-            '  <button type="button" data-home-harness-action="cancel" data-home-harness-session-id="' + escMem(item.sessionId) + '">CANCEL</button>',
+            harnessCancelEndpoint
+              ? '  <button type="button" data-home-harness-action="cancel" data-home-harness-session-id="' + escMem(item.sessionId) + '" data-home-harness-cancel-endpoint="' + escMem(harnessCancelEndpoint) + '">CANCEL</button>'
+              : '',
             '</div>',
           ].join('')
         : '';
@@ -13415,6 +14384,11 @@ const CONSOLE_JS = `
       return;
     }
     if (action !== 'cancel') return;
+    const cancelEndpoint = button.getAttribute('data-home-harness-cancel-endpoint') || '';
+    if (cancelEndpoint.indexOf('/api/') !== 0) {
+      alert('This run changed before it could be stopped. Refresh Working now and try again.');
+      return;
+    }
     if (!confirm('Cancel this running Clementine session? It will stop at the next kill check and abandon pending approvals.')) return;
     const row = button.closest('.home-item');
     const buttons = row ? Array.from(row.querySelectorAll('[data-home-harness-action]')) : [button];
@@ -13422,7 +14396,7 @@ const CONSOLE_JS = `
     const original = button.textContent;
     button.textContent = 'CANCELLING';
     try {
-      const r = await fetch(withToken('/api/console/harness-sessions/' + encodeURIComponent(sessionId) + '/cancel'), {
+      const r = await fetch(withToken(cancelEndpoint), {
         method: 'POST',
         headers: { Accept: 'application/json' },
       });
@@ -13744,11 +14718,17 @@ const CONSOLE_JS = `
       updateHome(snapWithApprovals);
 
       const list = runs.runs || runs || [];
+      const liveCount = list.filter((r) => r.live).length;
+      if (els.runEnvironmentToggle) {
+        els.runEnvironmentToggle.setAttribute('data-live', liveCount > 0 ? 'true' : 'false');
+        els.runEnvironmentToggle.setAttribute('aria-label', liveCount > 0
+          ? 'Open run environment, ' + liveCount + ' active'
+          : 'Open run environment');
+      }
 
       // Live-count badge on the Activity nav so background/live work is
       // visible without opening the panel.
       if (els.activityBadge) {
-        const liveCount = list.filter((r) => r.live).length;
         if (liveCount > 0) {
           els.activityBadge.textContent = liveCount > 99 ? '99+' : String(liveCount);
           els.activityBadge.removeAttribute('hidden');
@@ -13770,7 +14750,9 @@ const CONSOLE_JS = `
       }
       lastSnapshotJSON = snapshotJSON;
 
-      if (selectedRunId) {
+      const activityPanel = document.querySelector('.panel-frame[data-section="activity"]');
+      const selectedRunIsVisible = !!(selectedRunId && activityPanel && !activityPanel.hasAttribute('hidden'));
+      if (selectedRunIsVisible) {
         const stillThere = list.find((r) => r.id === selectedRunId);
         if (stillThere) {
           // Re-fetch the detail only when the selection is live (timeline
@@ -13780,6 +14762,11 @@ const CONSOLE_JS = `
           if (stillThere.live || sig !== lastDetailSig) loadDetail(selectedRunId);
           lastDetailSig = sig;
         }
+      } else if (isRunEnvironmentOpen()) {
+        // With no explicit Activity selection, the drawer follows the most
+        // recently updated live run. The full detail fetch is lazy: closed
+        // drawers add no polling traffic.
+        refreshRunEnvironmentFromList(list);
       }
 
       els.lastSync.textContent = new Date().toLocaleTimeString();
@@ -23575,26 +24562,136 @@ const CONSOLE_JS = `
   // Turns are sequential per the await in sendHarnessChat, so there is only
   // ever one active stream. Used by cancelActiveHarnessTurn (the STOP button).
   let __activeHarnessFinish = null;
+  // Exact attempt identity returned by the chat 202. A reusable session id is
+  // never sufficient Stop authority: a late click could otherwise kill the
+  // next turn in the same thread.
+  let __activeHarnessAttempt = null;
+  // BEGIN harness request identity helpers
+  // One ambiguous POST/stream interruption keeps one request identity. A
+  // same-message retry replays/rejoins the server receipt instead of starting
+  // a second brain run after a lost 202. Definitive 4xx/terminal outcomes clear
+  // it so a later deliberate send receives a fresh identity.
+  let __retryableHarnessChatRequest = null;
+
+  function mintHarnessClientRequestId() {
+    return (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+      ? globalThis.crypto.randomUUID()
+      : ('web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+  }
+
+  function sameHarnessAttachmentIds(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((value, index) => value === right[index]);
+  }
+
+  function normalizeHarnessRequestSessionId(sessionId) {
+    return typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
+  }
+
+  function acquireHarnessChatRequest(input, attachmentIds, sessionId) {
+    const text = String(input || '');
+    const attachments = Array.isArray(attachmentIds) ? attachmentIds.slice() : [];
+    const normalizedSessionId = normalizeHarnessRequestSessionId(sessionId);
+    const prior = __retryableHarnessChatRequest;
+    // Attachments disappear from the composer after a successful 202, so an
+    // empty retry selection may still be the exact attached request. A newly
+    // selected, different attachment set is always deliberate new work.
+    if (prior && prior.input === text && prior.sessionId === normalizedSessionId
+      && (attachments.length === 0 || sameHarnessAttachmentIds(attachments, prior.attachments))) {
+      return { ...prior, reused: true };
+    }
+    const created = {
+      input: text,
+      attachments,
+      sessionId: normalizedSessionId,
+      clientRequestId: mintHarnessClientRequestId(),
+    };
+    __retryableHarnessChatRequest = created;
+    return { ...created, reused: false };
+  }
+
+  function updateRetryableHarnessChatSession(clientRequestId, sessionId) {
+    if (__retryableHarnessChatRequest
+      && __retryableHarnessChatRequest.clientRequestId === clientRequestId) {
+      __retryableHarnessChatRequest.sessionId = normalizeHarnessRequestSessionId(sessionId);
+    }
+  }
+
+  function clearRetryableHarnessChatRequest(clientRequestId) {
+    if (__retryableHarnessChatRequest
+      && __retryableHarnessChatRequest.clientRequestId === clientRequestId) {
+      __retryableHarnessChatRequest = null;
+    }
+  }
+  // END harness request identity helpers
+
+  async function postHarnessControlWithRetry(endpoint, body) {
+    const delays = [250, 750, 1500];
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const response = await fetchWithToken(endpoint, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (response.ok) return result.ok !== false;
+        if (response.status < 500 || attempt >= delays.length) return false;
+      } catch (_) {
+        if (attempt >= delays.length) return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+    }
+  }
+
+  async function cancelAcceptedHarnessAttempt(attempt) {
+    if (!attempt || attempt.cancelSent) return !!(attempt && attempt.cancelConfirmed);
+    const endpoint = typeof attempt.cancelEndpoint === 'string' && attempt.cancelEndpoint.indexOf('/api/') === 0
+      ? attempt.cancelEndpoint
+      : '';
+    if (!endpoint) return false;
+    attempt.cancelSent = true;
+    attempt.cancelConfirmed = await postHarnessControlWithRetry(endpoint);
+    return attempt.cancelConfirmed;
+  }
+
+  async function cancelPendingHarnessRequest(attempt) {
+    if (!attempt || !attempt.clientRequestId) return false;
+    if (attempt.cancelRequestPromise) return attempt.cancelRequestPromise;
+    attempt.cancelRequestPromise = (async () => {
+      attempt.cancelRequestConfirmed = await postHarnessControlWithRetry(
+        '/api/harness/chat/cancel',
+        { clientRequestId: attempt.clientRequestId },
+      );
+      return attempt.cancelRequestConfirmed;
+    })();
+    return attempt.cancelRequestPromise;
+  }
 
   // Stop the in-flight turn: fire the server-side kill switch (interrupts at
   // the next bracket boundary) AND end the local stream immediately so the
   // composer frees up even if the backend is wedged in a long tool/model call.
   async function cancelActiveHarnessTurn() {
-    const sid = __harnessSessionId;
+    const attempt = __activeHarnessAttempt;
+    if (attempt) attempt.stopped = true;
     // Optimistic local stop first — the user gets control back instantly.
     try { if (typeof __activeHarnessFinish === 'function') __activeHarnessFinish(); }
     catch (_) {}
-    if (sid) {
-      try {
-        await fetchWithToken('/api/console/harness-sessions/' + encodeURIComponent(sid) + '/cancel', {
-          method: 'POST',
-          headers: { Accept: 'application/json' },
-        });
-      } catch (_) { /* best-effort — the local stop already freed the UI */ }
+    if (attempt && attempt.turn) setChatTurnStatus(attempt.turn, 'stopping');
+    if (attempt && attempt.cancelEndpoint) {
+      const confirmed = await cancelAcceptedHarnessAttempt(attempt);
+      if (confirmed) clearRetryableHarnessChatRequest(attempt.clientRequestId);
+      if (attempt.turn) setChatTurnStatus(attempt.turn, confirmed ? 'stopped' : 'stop not confirmed');
+      if (!confirmed) alert('The view stopped, but Clementine could not confirm the exact server-side run was cancelled. Check Activity before retrying.');
+    } else if (attempt && attempt.clientRequestId) {
+      const confirmed = await cancelPendingHarnessRequest(attempt);
+      if (confirmed) clearRetryableHarnessChatRequest(attempt.clientRequestId);
+      if (attempt.turn) setChatTurnStatus(attempt.turn, confirmed ? 'stopped' : 'stop not confirmed');
+      if (!confirmed) alert('The view stopped, but Clementine could not record the server-side cancellation. Check Activity before retrying.');
     }
-    // The session is now cancelled (a kill switch is set on it); start the
-    // next message on a fresh session so a lingering kill can't pre-empt it.
-    setHomeHarnessSessionId(null);
   }
 
   function updateHomeChatMeta(text) {
@@ -23781,20 +24878,48 @@ const CONSOLE_JS = `
     const assistantTurn = appendChatTurn('assistant', '');
     assistantTurn && assistantTurn.classList.add('pending');
     setChatTurnStatus(assistantTurn, 'Clem is starting up...');
+    const activeSessionId = options.sessionId || __harnessSessionId || null;
+    const requestIdentity = acquireHarnessChatRequest(text, attachIds, activeSessionId);
+    const clientRequestId = requestIdentity.clientRequestId;
+    const attemptControl = {
+      stopped: false,
+      clientRequestId,
+      cancelEndpoint: '',
+      cancelSent: false,
+      cancelConfirmed: false,
+      cancelRequestPromise: null,
+      cancelRequestConfirmed: false,
+      turn: assistantTurn,
+    };
+    __activeHarnessAttempt = attemptControl;
 
     const thinkTimer = startThinkingButton(send);
 
     try {
-      const activeSessionId = options.sessionId || __harnessSessionId || null;
       const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: text, sessionId: activeSessionId, attachments: attachIds }),
+        body: JSON.stringify({
+          input: requestIdentity.input,
+          sessionId: requestIdentity.sessionId,
+          attachments: requestIdentity.attachments,
+          clientRequestId,
+        }),
       });
       if (r.ok) clearHomeAttachments();
       if (!r.ok) {
+        // A 4xx is a definitive rejection/conflict/cancellation. A 5xx can be
+        // a proxy or post-acceptance response loss, so retain the id for replay.
+        if (r.status >= 400 && r.status < 500) clearRetryableHarnessChatRequest(clientRequestId);
+        if (attemptControl.stopped) {
+          setChatTurnStatus(
+            assistantTurn,
+            attemptControl.cancelRequestConfirmed ? 'stopped' : 'stopping',
+          );
+          return { ok: !!attemptControl.cancelRequestConfirmed, stopped: true };
+        }
         const j = await r.json().catch(() => ({}));
-        if (r.status === 404 && activeSessionId) {
+        if (r.status === 404 && requestIdentity.sessionId) {
           setHomeHarnessSessionId(null);
         }
         const msg = j.error || ('HTTP ' + r.status);
@@ -23803,22 +24928,52 @@ const CONSOLE_JS = `
         return { ok: false, text: msg };
       }
       const body = await r.json();
+      updateRetryableHarnessChatSession(clientRequestId, body.sessionId);
+      attemptControl.cancelEndpoint = typeof body.cancelEndpoint === 'string' && body.cancelEndpoint.indexOf('/api/') === 0
+        ? body.cancelEndpoint
+        : '';
+      // Stop may win while the POST response is crossing the daemon boundary.
+      // The 202 now carries the exact accepted attempt, so cancel it before a
+      // stream can attach or the stopped bubble can be revived.
+      if (attemptControl.stopped) {
+        const confirmed = await cancelAcceptedHarnessAttempt(attemptControl);
+        if (confirmed) clearRetryableHarnessChatRequest(clientRequestId);
+        setChatTurnStatus(assistantTurn, confirmed ? 'stopped' : 'stop not confirmed');
+        if (!confirmed) {
+          setChatTurnText(assistantTurn, 'The view stopped, but Clementine could not confirm the exact server-side run was cancelled. Check Activity before retrying.');
+        }
+        return { ok: confirmed, stopped: true };
+      }
       if (body.status === 'new-pending' || body.status === 'cancelled') {
         setHomeHarnessSessionId(body.sessionId, 'closing');
       } else {
         setHomeHarnessSessionId(body.sessionId, body.status === 'resuming' ? 'resuming' : 'chat');
       }
       const streamResult = await streamHarnessSession(body.sessionId, assistantTurn, { ...options, sinceSeq: body.sinceSeq || 0 });
-      if (body.status === 'new-pending' || body.status === 'cancelled') {
+      if ((body.status === 'new-pending' || body.status === 'cancelled')
+        && (!streamResult || streamResult.ok !== false)) {
         setHomeHarnessSessionId(null);
+      }
+      if (!attemptControl.stopped && (!streamResult || streamResult.ok !== false)) {
+        clearRetryableHarnessChatRequest(clientRequestId);
       }
       homeChatHistory.push({ role: 'assistant', text: assistantTurn.querySelector('[data-home-chat-turn-text]')?.textContent || '' });
       return { ok: !streamResult || streamResult.ok !== false };
     } catch (err) {
+      if (attemptControl.stopped) {
+        if (attemptControl.cancelConfirmed || attemptControl.cancelRequestConfirmed) {
+          clearRetryableHarnessChatRequest(clientRequestId);
+        }
+        return {
+          ok: !!(attemptControl.cancelConfirmed || attemptControl.cancelRequestConfirmed),
+          stopped: true,
+        };
+      }
       setChatTurnText(assistantTurn, 'Network error: ' + ((err && err.message) || err));
       setChatTurnStatus(assistantTurn, 'failed');
       return { ok: false };
     } finally {
+      if (__activeHarnessAttempt === attemptControl) __activeHarnessAttempt = null;
       assistantTurn?.classList.remove('pending');
       stopThinkingButton(send, thinkTimer);
     }
@@ -24398,31 +25553,70 @@ const CONSOLE_JS = `
     const buttons = actions ? Array.from(actions.querySelectorAll('button')) : [button];
     const send = document.querySelector('.home-chat-send');
     buttons.forEach((btn) => { btn.disabled = true; });
+    const input = decision + (approvalId ? ' ' + approvalId : '');
+    const requestIdentity = acquireHarnessChatRequest(input, [], sessionId);
+    const clientRequestId = requestIdentity.clientRequestId;
+    const attemptControl = {
+      stopped: false,
+      clientRequestId,
+      cancelEndpoint: '',
+      cancelSent: false,
+      cancelConfirmed: false,
+      cancelRequestPromise: null,
+      cancelRequestConfirmed: false,
+      turn,
+    };
+    __activeHarnessAttempt = attemptControl;
+    // The Stop control becomes visible only after its pre-acceptance tombstone
+    // identity is already bound to the active attempt.
     const thinkTimer = startThinkingButton(send);
     button.textContent = decision === 'approve' ? 'Approved' : 'Rejected';
     turn?.classList?.add('pending');
     setChatTurnStatus(turn, (decision === 'approve' ? 'approved' : 'rejected') + ' · continuing…');
     try {
-      const input = decision + (approvalId ? ' ' + approvalId : '');
       const r = await fetchWithToken('/api/harness/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input, sessionId }),
+        body: JSON.stringify({
+          input: requestIdentity.input,
+          sessionId: requestIdentity.sessionId,
+          attachments: requestIdentity.attachments,
+          clientRequestId,
+        }),
       });
       if (!r.ok) {
+        if (r.status >= 400 && r.status < 500) clearRetryableHarnessChatRequest(clientRequestId);
         const j = await r.json().catch(() => ({}));
         throw new Error(j.error || ('HTTP ' + r.status));
       }
       const body = await r.json();
+      updateRetryableHarnessChatSession(clientRequestId, body.sessionId || sessionId);
+      attemptControl.cancelEndpoint = typeof body.cancelEndpoint === 'string' && body.cancelEndpoint.indexOf('/api/') === 0
+        ? body.cancelEndpoint
+        : '';
+      if (attemptControl.stopped) {
+        const confirmed = await cancelAcceptedHarnessAttempt(attemptControl);
+        if (confirmed) clearRetryableHarnessChatRequest(clientRequestId);
+        setChatTurnStatus(turn, confirmed ? 'stopped' : 'stop not confirmed');
+        if (!confirmed) alert('The view stopped, but Clementine could not confirm the exact server-side run was cancelled. Check Activity before retrying.');
+        return;
+      }
       setHomeHarnessSessionId(body.sessionId || sessionId, 'resuming');
-      await streamHarnessSession(__harnessSessionId, turn, { ...(options || {}), sinceSeq: body.sinceSeq || 0 });
+      const streamResult = await streamHarnessSession(__harnessSessionId, turn, { ...(options || {}), sinceSeq: body.sinceSeq || 0 });
+      if (!attemptControl.stopped && (!streamResult || streamResult.ok !== false)) {
+        clearRetryableHarnessChatRequest(clientRequestId);
+      }
       homeChatHistory.push({ role: 'assistant', text: turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '' });
     } catch (err) {
+      // cancelActiveHarnessTurn owns the stopped/stopping result. Do not revive
+      // a pre-ack tombstoned approval as an actionable "approval failed" card.
+      if (attemptControl.stopped) return;
       buttons.forEach((btn) => { btn.disabled = false; });
       button.textContent = decision === 'approve' ? 'Approve' : 'Reject';
       setChatTurnStatus(turn, 'approval failed');
       alert('Could not resolve approval: ' + ((err && err.message) || err));
     } finally {
+      if (__activeHarnessAttempt === attemptControl) __activeHarnessAttempt = null;
       turn?.classList?.remove('pending');
       stopThinkingButton(send, thinkTimer);
     }
@@ -29709,12 +30903,17 @@ const CONSOLE_JS = `
   switchPanel(panelFromHash());
   window.addEventListener('hashchange', () => switchPanel(panelFromHash()));
   tick();
-  setInterval(tick, POLL_MS);
+  setInterval(() => {
+    if (document.visibilityState === 'visible') tick();
+  }, POLL_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') tick();
+  });
 
   // ── Activity live stream ──────────────────────────────────────────
   // Subscribe to the in-process action bus (SSE) so the inbox reflects
-  // run/session changes within ~300ms instead of waiting up to one 2s
-  // poll. The 2s poll above stays as the safety net (and EventSource
+  // run/session changes within ~300ms instead of waiting up to one 5s
+  // poll. The visible-tab 5s poll above stays as the safety net (and EventSource
   // auto-reconnects), so a dropped stream degrades gracefully.
   (function initActivityLiveStream() {
     if (typeof EventSource === 'undefined') return;

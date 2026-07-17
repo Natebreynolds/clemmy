@@ -24,6 +24,7 @@ import os from 'node:os';
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'clementine-runner-test-'));
 process.env.CLEMENTINE_HOME = tmp;
 process.env.CLEMENTINE_WORKFLOW_CONCURRENCY = '5';
+process.env.CLEMENTINE_WORKFLOW_HARNESS_POLL_MS = '20';
 
 const skillsDir = path.join(tmp, 'skills');
 mkdirSync(path.join(skillsDir, 'test-skill'), { recursive: true });
@@ -76,6 +77,7 @@ const {
   looksLikeWorkflowStepStructuralResultMiss,
   WorkflowStepStructuralResultError,
   isWorkflowStepStructuralResultError,
+  _setWorkflowHarnessLoopImplsForTests,
 } = await import('./workflow-runner.js');
 // The workflow watcher would otherwise place a REAL judge call from any
 // multi-step test run (live OAuth tokens make the judge reachable on dev
@@ -102,13 +104,41 @@ const { SessionStore: RunnerSessionStore } = await import('../memory/session-sto
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 const { clearStepWatermark, readSeenItemKeys } = await import('./workflow-watermark-store.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
-const { resetEventLog, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
+const {
+  resetEventLog,
+  listEvents,
+  appendEvent,
+  getLatestRunAttempt,
+  isKillRequested,
+} = await import('../runtime/harness/eventlog.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { setClaudeAgentSdkWorkflowStepRunForTest } = await import('../runtime/harness/claude-agent-workflow-step.js');
 const { ClaudeAgentSdkApprovalBoundaryError } = await import('../runtime/harness/claude-agent-sdk.js');
+const { AgentRuntimeCancelledError } = await import('../runtime/provider.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+
+test('workflow attempt metrics count one native MCP action, not its transport mirror', () => {
+  resetEventLog();
+  const runId = `metric-accounting-${Date.now()}`;
+  const step = { id: 'create-doc', prompt: 'Create the document.' };
+  const workflow = { name: 'Metric Accounting Workflow' };
+  const session = workflowRunnerInternalsForTest.getWorkflowHarnessSession(
+    workflow.name,
+    step.id,
+    runId,
+    `${runId}:${step.id}`,
+  );
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'toolu-doc', accounting: 'top_level', arguments: '{}' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'mcp-doc', accounting: 'transport_mirror', args: {} } });
+
+  const sample = workflowRunnerInternalsForTest.sampleStepAttemptMetrics(
+    step as never,
+    { workflow, runId } as never,
+  );
+  assert.equal(sample.toolCalls, 1);
+});
 
 // ---------------------------------------------------------------------------
 // P0 — event-driven approval parking (WORKFLOW_APPROVAL_PARKING)
@@ -1340,6 +1370,9 @@ test('workflow Claude-routed read-only step uses Claude Agent SDK and returns st
     const output = await executeStep(step, ctx);
     assert.deepEqual(output, { report: 'CLAUDE_WORKFLOW_STEP_OK' });
     assert.equal(captured.modelId, 'claude-sonnet-4-6');
+    assert.equal(captured.sessionId, 'workflow:wf-sdk-1:design_report', 'read-only SDK steps remain attached to their killable child session');
+    assert.equal(Number.isSafeInteger(captured.sourceUserSeq), true, 'SDK step receives the exact accepted source event');
+    assert.equal(await captured.shouldCancel(), false);
     assert.ok(captured.prompt.includes('Test Skill Instructions'));
     assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
     assert.deepEqual(captured.outputSchema.required, ['status', 'output']);
@@ -1363,12 +1396,185 @@ test('workflow Claude-routed read-only step uses Claude Agent SDK and returns st
       'completed',
       'Claude SDK workflow-step lane closes the harness step session',
     );
+    const settledAttempt = getLatestRunAttempt('workflow:wf-sdk-1:design_report');
+    assert.equal(settledAttempt?.sourceUserSeq, captured.sourceUserSeq);
+    assert.equal(settledAttempt?.status, 'completed');
+    assert.equal(isKillRequested('workflow:wf-sdk-1:design_report', settledAttempt ?? undefined), false);
     const completed = readWorkflowEvents('claude-workflow-step-smoke', 'wf-sdk-1')
       .filter((event) => event.kind === 'step_completed' && event.stepId === 'design_report');
     assert.equal(completed.length, 1);
     assert.deepEqual(completed[0].meta?.modelRoute, data.modelRoute);
   } finally {
     setClaudeAgentSdkWorkflowStepRunForTest(null);
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('Tasks-board stop reaches the exact active Claude workflow step attempt', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const prev = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+  };
+  const runId = `wf-sdk-board-cancel-${Date.now()}`;
+  const sessionId = `workflow:${runId}:long_read`;
+  let entered!: (options: { shouldCancel?: () => boolean | Promise<boolean> }) => void;
+  const enteredPromise = new Promise<{ shouldCancel?: () => boolean | Promise<boolean> }>((resolve) => { entered = resolve; });
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.WORKFLOW_USE_HARNESS = 'on';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
+    runEvents.startRun({
+      id: runId,
+      sessionId: `workflow:${runId}`,
+      source: 'workflow',
+      title: 'Cancelable SDK step',
+      message: 'Run a long read step.',
+    });
+    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+      entered(options);
+      while (!(await options.shouldCancel?.())) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new AgentRuntimeCancelledError('Run cancelled by caller.');
+    });
+    const step = {
+      id: 'long_read',
+      prompt: 'Read and summarize a large source.',
+      model: 'claude-sonnet-4-6',
+      sideEffect: 'read' as const,
+    };
+    const ctx = {
+      workflow: { name: 'Board Cancel SDK', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
+      workflowSlug: 'board-cancel-sdk',
+      runId,
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+
+    const running = executeStep(step, ctx);
+    const controls = await enteredPromise;
+    assert.equal(typeof controls.shouldCancel, 'function');
+    const active = getLatestRunAttempt(sessionId);
+    assert.equal(active?.status, 'active');
+    runEvents.finishRun(runId, { status: 'cancelled', message: 'Cancelled from the Tasks board.' });
+    await assert.rejects(running, /Workflow run cancelled by user/);
+
+    const settled = getLatestRunAttempt(sessionId);
+    assert.equal(settled?.status, 'cancelled');
+    assert.equal(isKillRequested(sessionId, settled ?? undefined), false, 'terminal owner consumes only its exact latch');
+  } finally {
+    setClaudeAgentSdkWorkflowStepRunForTest(null);
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('Tasks-board stop releases a standard workflow step waiting in-place on approval', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const prev = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+    WORKFLOW_APPROVAL_PARKING: process.env.WORKFLOW_APPROVAL_PARKING,
+    WORKFLOW_STEP_AGENT: process.env.WORKFLOW_STEP_AGENT,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+  };
+  const runId = `wf-standard-approval-cancel-${Date.now()}`;
+  const sessionId = `workflow:${runId}:needs_approval`;
+  let approvalId = '';
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  let resumeCalls = 0;
+  let standardRunOptions: { sourceUserSeq?: number; reuseRecordedUserInput?: boolean } | undefined;
+  try {
+    const stateDir = path.join(tmp, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, 'auth.json'),
+      JSON.stringify({ codexOauth: { accessToken: 'codex-standard-cancel-test-token', refreshToken: 'refresh' } }),
+      'utf-8',
+    );
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.WORKFLOW_USE_HARNESS = 'on';
+    process.env.WORKFLOW_APPROVAL_PARKING = 'off';
+    process.env.WORKFLOW_STEP_AGENT = 'off';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'off';
+    runEvents.startRun({
+      id: runId,
+      sessionId: `workflow:${runId}`,
+      source: 'workflow',
+      title: 'Cancelable approval wait',
+      message: 'Wait for a protected action.',
+    });
+    _setWorkflowHarnessLoopImplsForTests({
+      buildAgent: (async () => ({})) as never,
+      runConversation: (async (options: { sessionId: string; sourceUserSeq?: number; reuseRecordedUserInput?: boolean }) => {
+        standardRunOptions = options;
+        const row = approvalRegistry.register({
+          sessionId: options.sessionId,
+          subject: 'Approve the protected action?',
+          tool: 'composio_execute_tool',
+          ttlMs: 60_000,
+        });
+        approvalId = row.approvalId;
+        entered();
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_approval',
+          steps: 1,
+          lastTurn: 1,
+        };
+      }) as never,
+      runConversationFromResume: (async () => {
+        resumeCalls += 1;
+        throw new Error('cancelled approval wait must not resume');
+      }) as never,
+    });
+    const step = {
+      id: 'needs_approval',
+      prompt: 'Perform the protected action.',
+      model: 'gpt-5.4',
+      sideEffect: 'write' as const,
+    };
+    const ctx = {
+      workflow: { name: 'Standard Approval Cancel', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
+      workflowSlug: 'standard-approval-cancel',
+      runId,
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+
+    const running = executeStep(step, ctx);
+    await enteredPromise;
+    const activeAttempt = getLatestRunAttempt(sessionId);
+    assert.equal(activeAttempt?.status, 'active');
+    assert.equal(standardRunOptions?.sourceUserSeq, activeAttempt?.sourceUserSeq);
+    assert.equal(standardRunOptions?.reuseRecordedUserInput, true, 'the standard lane reuses the one attempt-bound input row');
+    runEvents.finishRun(runId, { status: 'cancelled', message: 'Cancelled from the Tasks board.' });
+    await assert.rejects(running, /Workflow run cancelled by user/);
+    assert.equal(resumeCalls, 0, 'approval continuation never starts after Stop');
+    assert.equal(getLatestRunAttempt(sessionId)?.status, 'cancelled');
+  } finally {
+    if (approvalId) approvalRegistry.resolve(approvalId, 'cancelled_by_user', 'test-cleanup');
+    _setWorkflowHarnessLoopImplsForTests();
     resetHarnessRuntimeConfig();
     for (const [key, value] of Object.entries(prev)) {
       if (value === undefined) delete process.env[key];
@@ -1470,6 +1676,28 @@ test('workflow harness sessions are deterministic per run step', () => {
   assert.equal(first.id, 'workflow:run-123:surface_for_approval');
   assert.equal(second.id, first.id);
   assert.equal(second.sessionRow.metadata.workflowRunId, 'run-123');
+});
+
+test('generic Tasks-board cancellation is stop authority for workflow child steps', () => {
+  const runId = `wf-board-stop-${Date.now()}`;
+  rmSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), { force: true });
+  runEvents.startRun({
+    id: runId,
+    sessionId: `workflow:${runId}`,
+    source: 'workflow',
+    title: 'Board stop bridge',
+    message: 'Run a long workflow step.',
+  });
+  assert.equal(workflowRunnerInternalsForTest.isWorkflowRunCancelled(runId), false);
+  runEvents.finishRun(runId, {
+    status: 'cancelled',
+    message: 'Cancelled from the Tasks board.',
+  });
+  assert.equal(
+    workflowRunnerInternalsForTest.isWorkflowRunCancelled(runId),
+    true,
+    'the base workflow:<runId> card stops child workflow:<runId>:<stepId> work',
+  );
 });
 
 test('workflow harness resume reuses already parked legacy approval session', () => {

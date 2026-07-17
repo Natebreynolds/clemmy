@@ -27,6 +27,14 @@ const { renderLearnedBlocks } = await import('../agents/harness-context.js');
 const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
 const { rememberFact, setFactPinned, renderFactsForInstructions } = await import('../memory/facts.js');
 
+function installSkill(name: string, description: string): void {
+  const dir = path.join(TMP_HOME, 'skills', name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'SKILL.md'), [
+    '---', `name: ${name}`, `description: ${description}`, '---', '', 'Full body is loaded only by skill_read.',
+  ].join('\n'));
+}
+
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
   delete process.env.CLEMMY_TIERED_CONTEXT;
@@ -73,6 +81,33 @@ test('tiered ON: Constitution (voice+reasoning+SOUL) stays in instructions; dyna
   } finally {
     delete process.env.CLEMMY_TIERED_CONTEXT;
   }
+});
+
+test('tiered prompt keeps skill discovery stable and injects only query-relevant summaries per turn', () => {
+  installSkill('firm-document', 'Create polished Google Docs and Word document briefs for firms.');
+  installSkill('calendar-operator', 'Schedule meetings and coordinate calendar availability.');
+  process.env.CLEMMY_TIERED_CONTEXT = 'on';
+  try {
+    const instructions = buildAssistantInstructions(ctx, 'dashboard', 'action', 'Create a Google Doc about a firm.');
+    assert.match(instructions, /## Skill Discovery/);
+    assert.match(instructions, /skill_list\(\)/);
+    assert.equal((instructions.match(/## Relevant Skills/g) ?? []).length, 0, 'tiered system prompt contains no per-turn skill menu');
+    assert.doesNotMatch(instructions, /firm-document|calendar-operator/, 'installed names stay out of the cacheable prefix');
+
+    const tail = buildTurnContextBlock(ctx, 'action', 'Create a Google Doc about a firm.');
+    assert.match(tail, /## Relevant Skills/);
+    assert.equal((tail.match(/## Relevant Skills/g) ?? []).length, 1, 'tiered turn context injects one relevant-skill menu');
+    assert.doesNotMatch(tail, /## Skill Discovery/, 'tiered turn context does not repeat the stable discovery pointer');
+    assert.match(tail, /firm-document/);
+    assert.doesNotMatch(tail, /calendar-operator/);
+    assert.match(tail, /skill_read/);
+  } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
+  }
+
+  const legacy = buildAssistantInstructions(ctx, 'dashboard', 'action', 'Create a Google Doc about a firm.');
+  assert.equal((legacy.match(/## Relevant Skills/g) ?? []).length, 1, 'legacy unsplit prompt injects one relevant-skill menu');
+  assert.equal(buildTurnContextBlock(ctx, 'action', 'Create a Google Doc about a firm.'), '', 'legacy path has no second turn-context injection');
 });
 
 test('renderFactsForInstructions mode split: pinned vs scored vs all', () => {

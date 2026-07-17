@@ -20,6 +20,10 @@
  * mistaken for a finished, trusted workflow.
  */
 import { listEvents, getToolOutput } from '../runtime/harness/eventlog.js';
+import {
+  pairTransportMirrorToolCalls,
+  projectCanonicalTopLevelToolEvents,
+} from '../runtime/harness/tool-effect.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from '../agents/workflow-step-agent.js';
 import type { WorkflowStepCall, WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
@@ -434,7 +438,10 @@ export function traceToWorkflowDraft(
  * both read from this single substrate seam.
  */
 export function readSessionTrace(sessionId: string): TraceToolCall[] {
-  const events = listEvents(sessionId, { types: ['tool_called'] });
+  const events = projectCanonicalTopLevelToolEvents(
+    listEvents(sessionId, { types: ['tool_called'] }),
+    'tool_called',
+  );
   return events
     .map((e) => {
       const tool = typeof e.data.tool === 'string' ? e.data.tool : '';
@@ -451,25 +458,45 @@ export function readSessionTrace(sessionId: string): TraceToolCall[] {
  * Pair each tool call's RESULT text back to its callId from the event log — the
  * other half of readSessionTrace (which reads only the calls). Used by the skill
  * distiller's recovery-tip path (Lane D) to see WHICH call failed and how it was
- * corrected. Results are the event log's write-time-clipped payloads (≤8KB),
- * which is plenty for an error signature. */
+ * corrected. Prefer the durable provider-call output when present; otherwise
+ * use the canonical event's bounded result/error/preview evidence. */
 export function readSessionToolReturns(sessionId: string): Map<string, string> {
   const out = new Map<string, string>();
-  for (const e of listEvents(sessionId, { types: ['tool_returned'] })) {
-    const callId = typeof e.data.callId === 'string' ? e.data.callId : '';
+  const calls = listEvents(sessionId, { types: ['tool_called'] });
+  const returns = listEvents(sessionId, { types: ['tool_returned'] });
+  const canonicalCalls = projectCanonicalTopLevelToolEvents(calls, 'tool_called');
+  const canonicalReturns = new Map(
+    projectCanonicalTopLevelToolEvents(returns, 'tool_returned')
+      .map((event) => [String(event.data.callId ?? ''), event] as const),
+  );
+  const allReturns = new Map(
+    returns.map((event) => [String(event.data.callId ?? ''), event] as const),
+  );
+
+  // Older native-SDK rows have a sparse provider-level return (`{ok}`) while
+  // the later inner MCP mirror carries the bounded error/result preview under a
+  // different call ID. Pair production-shaped inputs, then attach that evidence
+  // to the canonical ID without exposing another logical call.
+  const pairs = pairTransportMirrorToolCalls(calls);
+
+  const eventText = (event: (typeof returns)[number] | undefined): string => {
+    if (!event) return '';
+    const value = event.data.result ?? event.data.error ?? event.data.preview ?? '';
+    return typeof value === 'string' ? value : JSON.stringify(value);
+  };
+  for (const call of canonicalCalls) {
+    const callId = typeof call.data.callId === 'string' ? call.data.callId : '';
     if (!callId) continue;
-    const result = typeof e.data.result === 'string'
-      ? e.data.result
-      : JSON.stringify(e.data.result ?? '');
-    out.set(callId, result);
+    const parked = getToolOutput(sessionId, callId)?.output ?? '';
+    const canonicalReturn = canonicalReturns.get(callId);
+    const mirrorReturn = allReturns.get(pairs.canonicalToMirrorCallId.get(callId) ?? '');
+    const result = parked || eventText(canonicalReturn) || eventText(mirrorReturn);
+    if (canonicalReturn || mirrorReturn || result) out.set(callId, result.slice(0, 8_000));
   }
   return out;
 }
 
 export function draftWorkflowFromSession(sessionId: string): WorkflowDraft {
   const calls = readSessionTrace(sessionId);
-  // getToolOutput is available for a future data-flow pass (match an upstream
-  // output to a downstream arg); v1 keeps the linear chain.
-  void getToolOutput;
   return traceToWorkflowDraft(calls, { sessionId });
 }

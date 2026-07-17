@@ -8,7 +8,8 @@
  * so the card lands where its true state puts it. Click "View trace" to watch
  * the agent work live.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   DndContext, DragOverlay, PointerSensor, KeyboardSensor,
@@ -28,20 +29,78 @@ import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
 import { NowStrip } from '@/components/board/NowStrip';
 import {
   listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
-  type BoardCard, type BoardColumnId, type BoardButtonIntent,
+  findBoardCardForRun, reconcileOpenBoardCard, resolveBoardRunSelection,
+  type BoardCard, type BoardColumnId, type BoardButtonIntent, type BoardRunSelection,
 } from '@/lib/board';
 
 interface Toast { tone: 'success' | 'danger'; text: string; }
 
 export function BackgroundTasks() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const board = usePoll(['board'], listBoard, 4000);
   const cards = useMemo(() => board.data?.cards ?? [], [board.data]);
 
   const [active, setActive] = useState<BoardCard | null>(null);
   const [open, setOpen] = useState<BoardCard | null>(null);
+  const [pinnedSelection, setPinnedSelection] = useState<BoardRunSelection | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [keptStale, setKeptStale] = useState(false); // "Keep them" dismisses the banner for this view
+
+  const requestedSelection = useMemo<BoardRunSelection | null>(() => {
+    const select = searchParams.get('select')?.trim() || '';
+    return select ? {
+      select,
+      attemptId: searchParams.get('attemptId'),
+      runScopeId: searchParams.get('runScopeId'),
+    } : null;
+  }, [searchParams]);
+  const selectedIdentity = requestedSelection ?? pinnedSelection;
+  const boardSelectionMatch = useMemo(() => (
+    selectedIdentity ? findBoardCardForRun(cards, selectedIdentity) : undefined
+  ), [cards, selectedIdentity]);
+  const exactSelection = Boolean(selectedIdentity?.attemptId || selectedIdentity?.runScopeId);
+  const selectedRun = usePoll(
+    [
+      'board-selected-run',
+      selectedIdentity?.select ?? 'none',
+      selectedIdentity?.attemptId ?? '',
+      selectedIdentity?.runScopeId ?? '',
+    ],
+    () => resolveBoardRunSelection(selectedIdentity!),
+    4000,
+    { enabled: exactSelection && !boardSelectionMatch },
+  );
+  const outOfPageCard = !boardSelectionMatch ? selectedRun.data : undefined;
+  const openBasis = pinnedSelection && outOfPageCard
+    && findBoardCardForRun([outOfPageCard], pinnedSelection)
+    ? outOfPageCard
+    : open;
+  const openCard = useMemo(
+    () => reconcileOpenBoardCard(openBasis, cards),
+    [openBasis, cards],
+  );
+
+  // The global Environment rail hands off the canonical attempt/scope when it
+  // has them. Resolve through run detail when that exact attempt sits beyond
+  // the board's bounded page; never substitute a same-session neighbor.
+  useEffect(() => {
+    if (!requestedSelection || board.isLoading) return;
+    const match = boardSelectionMatch ?? selectedRun.data;
+    if (!match) return;
+    setPinnedSelection(requestedSelection);
+    setOpen(match);
+    const next = new URLSearchParams(searchParams);
+    next.delete('select');
+    next.delete('attemptId');
+    next.delete('runScopeId');
+    setSearchParams(next, { replace: true });
+  }, [board.isLoading, boardSelectionMatch, requestedSelection, searchParams, selectedRun.data, setSearchParams]);
+
+  const closeTrace = () => {
+    setOpen(null);
+    setPinnedSelection(null);
+  };
 
   const staleCards = useMemo(() => cards.filter((c) => c.stale), [cards]);
 
@@ -179,7 +238,7 @@ export function BackgroundTasks() {
         </DndContext>
       )}
 
-      {open && <LiveTraceDrawer card={open} onClose={() => setOpen(null)} onAction={(card, intent) => void onCardAction(card, intent)} />}
+      {openCard && <LiveTraceDrawer card={openCard} onClose={closeTrace} onAction={(card, intent) => void onCardAction(card, intent)} />}
 
       {toast && (
         <div

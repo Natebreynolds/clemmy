@@ -2,7 +2,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { redactSensitiveValue } from '../runtime/security.js';
-import { listEvents, countEvents, type EventRow } from '../runtime/harness/eventlog.js';
+import { listEvents, type EventRow } from '../runtime/harness/eventlog.js';
+import { projectCanonicalTopLevelToolEvents } from '../runtime/harness/tool-effect.js';
 import { listPending, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 import { listNotifications, type NotificationRecord } from '../runtime/notifications.js';
 import {
@@ -35,8 +36,8 @@ export interface BackgroundTaskStatusDetails {
   pendingApprovals: PendingApprovalRow[];
   harnessEvents: EventRow[];
   toolEvents: BackgroundToolEvent[];
-  /** Authoritative live tool-call tally for the run session (count of
-   *  `tool_called` events) — matches the "N tool calls" the check-ins report,
+  /** Authoritative live logical tool-call tally for the run session — matches
+   *  the "N tool calls" the check-ins report without counting MCP mirrors,
    *  independent of the (housekeeping-filtered) toolEvents feed above. */
   toolCallCount: number;
   notifications: NotificationRecord[];
@@ -181,7 +182,11 @@ export function isHousekeepingToolName(name: string | undefined): boolean {
 function harnessToolEventsForSession(sessionId: string, limit = 200): BackgroundToolEvent[] {
   let rows: EventRow[];
   try {
-    rows = listEvents(sessionId, { types: ['tool_called', 'tool_returned'], limit });
+    rows = projectCanonicalTopLevelToolEvents(
+      // Native calls can occupy four raw rows (canonical + mirror call/return).
+      // Fetch enough bounded audit tail to still render `limit` logical calls.
+      listEvents(sessionId, { types: ['tool_called', 'tool_returned'], limit: limit * 4, desc: true }),
+    );
   } catch {
     return [];
   }
@@ -198,10 +203,10 @@ function harnessToolEventsForSession(sessionId: string, limit = 200): Background
     const toolName = String(data.tool || data.name || 'tool');
     const callId = String(data.callId ?? '');
     const ret = callId ? returnsByCallId.get(callId) : undefined;
-    const resultText = typeof (ret?.data as { result?: unknown } | undefined)?.result === 'string'
-      ? String((ret!.data as { result?: unknown }).result)
-      : '';
-    const erroredOut = /^\s*(error|failed|exception)\b/i.test(resultText);
+    const returnData = (ret?.data ?? {}) as Record<string, unknown>;
+    const resultText = ([returnData.result, returnData.error, returnData.preview]
+      .find((value) => typeof value === 'string' && value.trim().length > 0) as string | undefined) ?? '';
+    const erroredOut = returnData.ok === false || /^\s*(error|failed|exception)\b/i.test(resultText);
     events.push({
       at: row.createdAt,
       sessionId,
@@ -212,7 +217,7 @@ function harnessToolEventsForSession(sessionId: string, limit = 200): Background
       ...(erroredOut ? { errorMessage: resultText.slice(0, 200) } : {}),
     });
   }
-  return events;
+  return events.slice(-limit);
 }
 
 /**
@@ -288,7 +293,10 @@ export function getBackgroundTaskStatus(input?: string): BackgroundTaskStatusDet
     // Human-facing feed: real tool calls with their names, reflection/housekeeping
     // filtered out (P4). The truthful total is toolCallCount below (P3).
     toolEvents: buildHumanizedToolFeed(task.runSessionId),
-    toolCallCount: countEvents(task.runSessionId, 'tool_called'),
+    toolCallCount: projectCanonicalTopLevelToolEvents(
+      listEvents(task.runSessionId, { types: ['tool_called'] }),
+      'tool_called',
+    ).length,
     notifications: notificationsForTask(task),
   };
   return {

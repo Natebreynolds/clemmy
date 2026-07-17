@@ -12,7 +12,15 @@ import { rmSync } from 'node:fs';
 const TEST_HOME = '/tmp/clemmy-test-auto-resume';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { resetEventLog, appendEvent, listEvents } = await import('./eventlog.js');
+const {
+  appendEvent,
+  beginRunAttempt,
+  isKillRequested,
+  listEvents,
+  recordRunAttemptUserInput,
+  requestKill,
+  resetEventLog,
+} = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { recoverInterruptedChatRuns, markRunInFlight, AUTO_RESUME_DIRECTIVE } = await import('./restart-recovery.js');
 
@@ -62,6 +70,29 @@ test('a clean interrupted run (no external writes) is AUTO-RESUMED with the trut
       bootResumeOrdinal: 1,
     },
   );
+});
+
+test('a persisted user stop is never resurrected by restart auto-resume', async () => {
+  const sess = HarnessSession.create({ kind: 'chat', title: 'stopped work' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'stopped-before-restart' });
+  recordRunAttemptUserInput(attempt, {
+    turn: 1, role: 'user', data: { text: 'Do the long task' },
+  });
+  markRunInFlight(sess.id, true);
+  requestKill(sess.id, 'user pressed Stop', attempt);
+
+  const dispatched: string[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => { dispatched.push(sessionId); });
+  assert.equal(summary.records[0].autoResumed, false);
+  assert.equal(summary.records[0].autoResumeSkipped, 'user_stopped');
+  assert.equal(summary.records[0].replayPrepared, false, 'stopped work gets no continue/resume primer');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(dispatched, []);
+  const notice = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)?.data as { reason?: string; reply?: string };
+  assert.equal(notice.reason, 'stopped_before_restart');
+  assert.match(String(notice.reply ?? ''), /stopped as requested/i);
+  assert.doesNotMatch(String(notice.reply ?? ''), /reply `continue`/i);
+  assert.equal(isKillRequested(sess.id, attempt), false, 'restart terminal cleanup consumes only the stopped attempt latch');
 });
 
 test('answer -> successful space_save -> crash uses the generic durable-result reconciler', async () => {
