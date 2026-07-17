@@ -94,6 +94,7 @@ import {
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
+import { backgroundOfferEnabled } from './turn-control.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -3610,7 +3611,9 @@ function goalContractEnabled(): boolean {
  *  multi-step action task without offering/dispatching. Default off: background
  *  movement is a user/model choice, not a runtime-injected second gate. */
 function backgroundOfferNudgeEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'off') ?? 'off').trim());
+  // 2026-07-16 policy: ALWAYS offer background on long execution — graduated
+  // to default ON via the shared turn-control spine (single authority).
+  return backgroundOfferEnabled();
 }
 
 /** Tool-call floor before the background-offer nudge can fire — enough work that

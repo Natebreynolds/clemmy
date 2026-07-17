@@ -184,4 +184,6 @@ export function shouldOfferBackground(input: {
 }
 
 export const BACKGROUND_OFFER_TEXT =
-  '[background offer] This is turning into a long run. Offer the user a background handoff NOW: call offer_background with a one-line summary of the remaining work, then STOP and wait — do not keep grinding in the foreground.';
+  '[background offer] This is turning into a long run while the user waits in the foreground. '
+  + 'If finishing needs more than a step or two, call `offer_background` NOW with a one-line summary of the remaining work, then STOP and wait — do not keep grinding in the foreground. '
+  + 'If you are genuinely a step or two from done, just finish; do not offer.';

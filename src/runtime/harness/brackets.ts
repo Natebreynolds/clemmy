@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput } from './eventlog.js';
+import { backgroundOfferEnabled as spineBackgroundOfferEnabled } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
@@ -831,7 +832,8 @@ export function harnessToolBracketsEnabled(): boolean {
 // as the loop nudge (CLEMMY_BG_OFFER_NUDGE). Defined locally to avoid a
 // brackets→loop import cycle.
 function backgroundOfferNudgeEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'off') ?? 'off').trim());
+  // 2026-07-16 policy: default ON via the shared turn-control spine.
+  return spineBackgroundOfferEnabled();
 }
 const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
 

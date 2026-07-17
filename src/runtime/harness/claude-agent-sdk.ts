@@ -1413,6 +1413,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ceilingState.stoppedKind = null;
     ceilingState.pausedMs = 0;
     const startedAt = Date.now();
+    let lastHeartbeatAt = startedAt;
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     try {
@@ -1442,6 +1443,28 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         if (effectiveShouldCancel && await effectiveShouldCancel()) {
           try { await stream?.interrupt?.(); } catch { /* best-effort */ }
           throw new AgentRuntimeCancelledError('Run cancelled by caller.');
+        }
+        // TURN-CONTROL SPINE: liveness heartbeats. The harness loop emits
+        // progress_check_in ticks between steps; this lane emitted none, so a
+        // long SDK run looked dead in the operator view (the 2026-07-16
+        // 33-minute incident's eventlog had zero liveness rows). Same event
+        // shape, message-boundary cadence.
+        if (options.sessionId && Date.now() - lastHeartbeatAt >= 60_000) {
+          lastHeartbeatAt = Date.now();
+          try {
+            appendEvent({
+              sessionId: options.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'heartbeat',
+              data: {
+                kind: 'progress_check_in',
+                toolCalls: toolCallLedger.length,
+                elapsedMs: Date.now() - startedAt,
+                message: `Still working (${toolCallLedger.length} tool call${toolCallLedger.length === 1 ? '' : 's'} so far).`,
+              },
+            });
+          } catch { /* telemetry must never break the stream */ }
         }
         // Wall-clock backstop: a genuinely stuck stream never hangs the turn. EXCLUDE
         // approval-wait (pausedMs) so a long confirm-first approval — the user may

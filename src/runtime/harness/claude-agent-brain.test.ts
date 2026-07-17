@@ -1589,6 +1589,32 @@ test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds 
   assert.match(contPrompt, /APIFY_GET_DATASET_ITEMS/, 'args preview present');
 });
 
+test('spine: the FIRST auto-continue of a long chat run carries the background offer, one-shot', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  let calls = 0;
+  const prompts: string[] = [];
+  const manyTools = Array.from({ length: 8 }, () => 'mcp__clementine-local__composio_execute_tool');
+  setClaudeAgentSdkBrainRunForTest(async (opts: any) => {
+    calls += 1;
+    prompts.push(String(opts.prompt ?? ''));
+    // Two limit-hits in a row: the offer must ride the first continuation only.
+    if (calls <= 2) return { text: `batch ${calls} done, more remain`, sessionId: 's', toolUses: manyTools, limitHit: true };
+    return { text: 'All batches done.', sessionId: 's', toolUses: manyTools, limitHit: false };
+  });
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'process 30 firms', sessionId: 'brain-bg-offer' });
+  assert.equal(calls, 3);
+  assert.match(res.text, /All batches done/);
+  assert.match(prompts[1], /\[background offer\]/, 'first auto-continue carries the offer');
+  assert.match(prompts[1], /offer_background/, 'steers to the terminal tool');
+  assert.doesNotMatch(prompts[2], /\[background offer\]/, 'one-shot — never repeated');
+  const nudgeEvent = listEvents('brain-bg-offer').find(
+    (e) => (e as { type?: string }).type === 'heartbeat'
+      && ((e as { data?: { kind?: string } }).data?.kind === 'background_offer_nudge'),
+  );
+  assert.ok(nudgeEvent, 'nudge telemetry emitted at the boundary');
+});
+
 test('overflow A2: committed overflow with ZERO external writes falls through to the reduced retry (reads are safe)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

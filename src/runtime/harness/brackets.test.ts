@@ -846,6 +846,9 @@ test('confirm-first gate: explicit off escape hatch lets batches pass', async ()
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
+  // This test exercises OTHER gates with 8+ distinct mutating writes — keep
+  // the (now default-ON) same-mut halt out of its way.
+  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'off';
   process.env.CLEMMY_CONFIRM_FIRST = 'off'; // explicitly off (default flipped to on for release)
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   resetEventLog();
@@ -1070,6 +1073,9 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   const prevDest = process.env.CLEMMY_DESTINATION_GATE;
   const prevOffer = process.env.CLEMMY_BG_OFFER_NUDGE;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
+  // This test exercises OTHER gates with 8+ distinct mutating writes — keep
+  // the (now default-ON) same-mut halt out of its way.
+  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'off';
   process.env.CLEMMY_CONFIRM_FIRST = 'off';
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_GROUNDING_GATE = 'off';
@@ -1449,6 +1455,8 @@ test('Inc A2: background-offer nudge appends once after the tool-call floor in a
     assert.doesNotMatch(res2, /\[background offer\]/, 'nudge fires at most once per runTurn');
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevB;
+    delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
+    delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
     if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE; else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
   }
 });
@@ -1464,10 +1472,11 @@ test('Inc A2: no offer nudge below the floor, with the kill-switch off, or in a 
     return (await withHarnessRunContext({ sessionId, counter }, async () => wrapped.execute!({}))) as string;
   };
   try {
-    // default off → no injected conversational gate even past the floor
+    // 2026-07-16 policy graduation: default is now ON — past the floor the
+    // nudge fires with no flag set.
     delete process.env.CLEMMY_BG_OFFER_NUDGE;
     const chatDefault = createSession({ kind: 'chat' });
-    assert.doesNotMatch(await run(chatDefault.id, 5), /\[background offer\]/, 'default off → no nudge');
+    assert.match(await run(chatDefault.id, 5), /\[background offer\]/, 'default ON → nudge past the floor');
     // below the floor (2 calls) → no nudge
     process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
     const chatA = createSession({ kind: 'chat' });

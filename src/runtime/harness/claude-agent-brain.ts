@@ -22,7 +22,8 @@ import { getSessionTokensUsed, isKillRequested } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
-import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
+import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
+import { shouldOfferBackground, BACKGROUND_OFFER_TEXT } from './turn-control.js';
 import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
@@ -1460,6 +1461,14 @@ export async function respondViaClaudeAgentSdkBrain(
       // it just re-loops — restores the guard the 33-shell-call incident added).
       const autoStart = Date.now();
       let autoContinues = 0;
+      // TURN-CONTROL SPINE (policy 2026-07-16): an auto-continue means a full
+      // turn budget is gone and we're about to grind on while a chat user
+      // waits — the exact boundary where the loop lane's mid-turn nudge fires.
+      // The SDK lane's wrapped tools get that nudge too, but the native-MCP
+      // tier never does, so a run grinding on external tools reaches this
+      // point un-nudged. One-shot per run; skipped when an offer already
+      // stands or the session isn't an interactive chat.
+      let backgroundOfferNudged = false;
       // Re-inject any SKILL bodies loaded this run into the continuation. The stateless
       // SDK lane rebuilds each query from the transcript, which EXCLUDES tool results —
       // so a `skill_read` from turn 1 is LOST on the continuation, and the model would
@@ -1499,11 +1508,27 @@ export async function respondViaClaudeAgentSdkBrain(
         && !budgetWindowExhausted() // Stage 4: never auto-continue past the token window
       ) {
         const progress = (result.text || '').trim().slice(0, 1500);
+        const offerBackground = !backgroundOfferNudged
+          && !sessionHasBackgroundOffer(sessionId)
+          && shouldOfferBackground({
+            sessionId,
+            toolCalls: result.toolUses.length,
+            elapsedMs: Date.now() - autoStart,
+            alreadyNudged: false,
+          });
+        if (offerBackground) {
+          backgroundOfferNudged = true;
+          try {
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'heartbeat', data: { kind: 'background_offer_nudge', boundary: 'sdk_auto_continue', attempt: autoContinues + 1 } });
+          } catch { /* telemetry best-effort */ }
+        }
         const cont = await runContinuation({
           prompt:
             `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}${reinjectedSkills}${renderLedger()}\n\n`
             + `Continue from where you left off and FINISH ALL remaining items from the original request: "${request.message}". `
-            + `Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.`,
+            + (offerBackground
+              ? `Do NOT redo items already completed above. ${BACKGROUND_OFFER_TEXT}`
+              : `Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.`),
           ...cleanContinuationRunOptions(),
         });
         autoContinues += 1;
