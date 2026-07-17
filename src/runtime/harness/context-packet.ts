@@ -13,6 +13,7 @@ import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-sy
 import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
 import { classifyTurnIntent } from './turn-intent.js';
+import { confirmBeatDirective } from './turn-control.js';
 
 export interface MemoryPrimerSummary {
   enabled: boolean;
@@ -75,6 +76,9 @@ export interface AgentContextPacket {
     fanoutPosture: FanoutPosture | 'unknown';
     recommendedWorkerWaveSize: number;
   };
+  /** True when the turn-control confirm-beat directive was injected (fresh
+   *  chat session + execution-shaped request). Telemetry/test surface. */
+  confirmBeatOffered: boolean;
   text: string;
 }
 
@@ -572,6 +576,18 @@ export function buildAgentContextPacket(
       ? fanoutPolicyLine(multiItem, agentSystem)
       : STATIC_PARALLELISM_LINE;
 
+  // TURN-CONTROL SPINE confirm beat (policy 2026-07-16): a FRESH chat session
+  // opening with an execution-shaped request gets one conversational
+  // confirm-the-plan / surface-missing-tools / offer-background beat before
+  // the work starts. Continuations, questions, and non-chat kinds are null.
+  const confirmBeat = confirmBeatDirective({
+    message: input,
+    sessionId: opts?.sessionId,
+    sessionKind: opts?.sessionKind,
+    isMultiItem: multiItem.isMultiItem,
+    itemCount: multiItem.itemCount,
+  });
+
   const lines = [
     '[AGENT CONTEXT PACKET]',
     'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
@@ -588,6 +604,7 @@ export function buildAgentContextPacket(
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
     agentSystem.text,
     parallelismLine,
+    confirmBeat,
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
@@ -615,6 +632,7 @@ export function buildAgentContextPacket(
       fanoutPosture,
       recommendedWorkerWaveSize,
     },
+    confirmBeatOffered: Boolean(confirmBeat),
     text: lines.join('\n'),
   };
 }

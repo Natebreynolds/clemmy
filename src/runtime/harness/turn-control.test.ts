@@ -20,7 +20,9 @@ const {
   evaluateTurnBoundary,
   shouldOfferBackground,
   backgroundOfferEnabled,
+  confirmBeatDirective,
 } = await import('./turn-control.js');
+const { appendEvent } = await import('./eventlog.js');
 
 let seq = 0;
 function freshSession(kind = 'chat'): string {
@@ -35,6 +37,7 @@ afterEach(() => {
   delete process.env.CLEMMY_GUARDRAIL_MUT_WARN;
   delete process.env.CLEMMY_GUARDRAIL_MUT_HALT;
   delete process.env.CLEMMY_GUARDRAIL_EXACT_BLOCK;
+  delete process.env.CLEMMY_CONFIRM_BEAT;
 });
 
 test.after(() => {
@@ -145,6 +148,34 @@ test('evaluateTurnBoundary precedence: kill → wall-clock → token budget → 
 });
 
 // ── background offer (policy: default ON) ────────────────────────────────────
+
+// ── confirm beat (the shovel policy) ─────────────────────────────────────────
+
+test('confirm beat: fires for a FRESH chat execution-shaped request only', () => {
+  const chat = freshSession('chat');
+  const msg = 'send outreach emails to the 20 firms on my prospect list';
+  assert.ok(confirmBeatDirective({ message: msg, sessionId: chat, sessionKind: 'chat' }), 'fresh + execution-shaped → beat');
+  // multi-item without an external-write verb still counts as execution-shaped
+  const chat2 = freshSession('chat');
+  assert.ok(
+    confirmBeatDirective({ message: 'research these 8 companies and rank their weaknesses in detail', sessionId: chat2, sessionKind: 'chat', isMultiItem: true, itemCount: 8 }),
+    'multi-item shape → beat',
+  );
+});
+
+test('confirm beat: never on continuations, questions, control words, non-chat kinds, or with the kill-switch off', () => {
+  const continued = freshSession('chat');
+  appendEvent({ sessionId: continued, turn: 1, role: 'Clem', type: 'conversation_completed', data: { reason: 'success' } });
+  const msg = 'send outreach emails to the 20 firms on my prospect list';
+  assert.equal(confirmBeatDirective({ message: msg, sessionId: continued, sessionKind: 'chat' }), null, 'a completed turn means aligned — never re-ask');
+  const chat = freshSession('chat');
+  assert.equal(confirmBeatDirective({ message: 'what emails did I send to acme corp yesterday?', sessionId: chat, sessionKind: 'chat' }), null, 'pure question → no beat');
+  assert.equal(confirmBeatDirective({ message: 'go ahead and send the emails we discussed to everyone', sessionId: chat, sessionKind: 'chat' }), null, 'control lead-in → no beat');
+  assert.equal(confirmBeatDirective({ message: 'summarize the quarterly report for me please today', sessionId: chat, sessionKind: 'chat' }), null, 'read-only shape → no beat');
+  assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('execution'), sessionKind: 'execution' }), null, 'non-chat → no beat');
+  process.env.CLEMMY_CONFIRM_BEAT = 'off';
+  assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('chat'), sessionKind: 'chat' }), null, 'kill-switch respected');
+});
 
 test('background offer: default ON; triggers on tool count OR elapsed; one-shot; chat-only', () => {
   assert.equal(backgroundOfferEnabled(), true, 'graduated to default ON per the 2026-07-16 policy');

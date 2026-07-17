@@ -23,7 +23,7 @@ import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
-import { shouldOfferBackground, BACKGROUND_OFFER_TEXT } from './turn-control.js';
+import { shouldOfferBackground, BACKGROUND_OFFER_TEXT, confirmBeatDirective } from './turn-control.js';
 import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
@@ -853,10 +853,22 @@ async function buildClaudeAgentBrainTurnContext(request: AssistantRequest): Prom
   // step cap and parked at ~item #15. Now a detected multi-item turn gets the loud
   // "do NOT serialize — run_worker in parallel waves" directive so she actually swarms.
   let fanoutDirective = '';
+  // Confirm beat (parity with the context packet's confirm-first line — this
+  // lane doesn't consume the packet): a FRESH chat session opening with an
+  // execution-shaped request gets one conversational confirm/capability/
+  // background beat before the work starts. The 2026-07-16 incident lane.
+  let confirmBeat = '';
   try {
     const multi = detectMultiItemIntent(request.message ?? '');
     if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
-  } catch { fanoutDirective = ''; }
+    confirmBeat = confirmBeatDirective({
+      message: request.message ?? '',
+      sessionId: request.sessionId,
+      sessionKind: getSession(request.sessionId)?.kind,
+      isMultiItem: multi.isMultiItem,
+      itemCount: multi.itemCount,
+    }) ?? '';
+  } catch { fanoutDirective = ''; confirmBeat = ''; }
   // Pre-flight error library (parity with the context packet's Known-pitfalls
   // line — this lane doesn't consume the packet): the freshest distilled
   // lessons for the skills this turn will likely use, so a known failure mode
@@ -875,7 +887,7 @@ async function buildClaudeAgentBrainTurnContext(request: AssistantRequest): Prom
     convergenceSteer = CONVERGENCE_STEER;
   }
   return {
-    text: [convergenceSteer, volatile, continuationContext, harnessHealth, recall, breadcrumbs, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n'),
+    text: [convergenceSteer, volatile, continuationContext, harnessHealth, recall, breadcrumbs, sessionActions, fanoutDirective, confirmBeat, pitfalls].filter(Boolean).join('\n\n'),
     memoryPrimer,
   };
 }

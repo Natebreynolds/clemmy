@@ -22,7 +22,7 @@
  *    `evaluateTurnBoundary` unifies its between-step limit checks so both
  *    lanes park with identical verdicts.
  */
-import { isKillRequested, appendEvent, getSession } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession, listEvents } from './eventlog.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import { checkRunTokenWindow, type RunTokenWindow, type RunTokenStatus } from './run-token-budget.js';
 import { getRuntimeEnv } from '../../config.js';
@@ -181,6 +181,64 @@ export function shouldOfferBackground(input: {
   if (kind !== 'chat') return false;
   return input.toolCalls >= BACKGROUND_OFFER_MIN_TOOLS
     || input.elapsedMs >= BACKGROUND_OFFER_MIN_ELAPSED_MS;
+}
+
+// ── confirm beat (policy 2026-07-16: "shovel before driving over") ──────────
+// "If I asked a friend to help me dig a hole and they just blindly drove to my
+// house without a shovel it would be a waste of time." A FRESH chat request
+// that is execution-shaped gets ONE conversational beat — confirm the plan,
+// surface missing tools/connections, offer background — before the work
+// starts. Delivered as a directive in the agent context packet (both lanes
+// read it), NOT a formal plan card: the 2026-06-01 converse-until-aligned
+// rollback stands — the model converses, the trigger is deterministic.
+
+/** Mirrors plan-first's EXTERNAL_WRITE_RE (kept inline so the spine stays
+ *  import-light — plan-first pulls the planner subsystem). */
+const CONFIRM_EXECUTION_SHAPE_RE =
+  /\b(?:send|sent|post|publish|deploy|host|netlify|vercel|railway|notify(?:\s+externally|\s+prospects?)?|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|outlook|email|emails|draft\s+emails?|create\s+drafts?|slack|github|pull\s+request|commit|delete|remove|mutate\s+external)\b/i;
+const CONFIRM_QUESTION_LEAD_RE =
+  /^(?:who|whom|whose|what|when|where|why|how|which|is|are|was|were|do|does|did|can|could|should|would|will|has|have|had)\b/i;
+const CONFIRM_CONTROL_RE =
+  /^(?:approve|approved|yes|yep|yeah|y|ok|okay|go|go ahead|proceed|continue|resume|cancel|stop|halt|no|nope|reject)\b/i;
+
+export function confirmBeatEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'on') ?? 'on').trim().toLowerCase();
+  return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
+}
+
+export const CONFIRM_BEAT_TEXT =
+  '[confirm-first] This is the FIRST turn of a session and the request is execution-shaped (external writes or many items). '
+  + 'Take ONE conversational beat before doing the work, the way a colleague would:\n'
+  + '1. Confirm the plan in 2-4 lines — what you will do, in what order, and where the results land.\n'
+  + '2. Verify you actually have the tools/connections the plan needs (the MCP scope and health warnings above; check_capability for CLIs). If something is missing, SAY so and offer to help connect it — never improvise around a missing tool.\n'
+  + '3. If the work will take more than a couple of minutes, offer to run it in the background.\n'
+  + 'Then STOP and wait for the go-ahead; once the user says go, run it to completion without re-asking. '
+  + 'EXCEPTION: if the request is actually a quick read-only task (a lookup, a summary, one small read), skip the beat and just do it now.';
+
+/** Directive for a fresh execution-shaped chat turn, or null. Pure over its
+ *  inputs plus one point read (prior completed turns); never throws. */
+export function confirmBeatDirective(input: {
+  message: string;
+  sessionId?: string;
+  sessionKind?: string;
+  isMultiItem?: boolean;
+  itemCount?: number;
+}): string | null {
+  try {
+    if (!confirmBeatEnabled()) return null;
+    if (input.sessionKind !== 'chat' || !input.sessionId) return null;
+    const text = (input.message ?? '').trim();
+    if (text.length < 24) return null; // control words and quick asks never confirm-beat
+    if (CONFIRM_CONTROL_RE.test(text)) return null;
+    if (CONFIRM_QUESTION_LEAD_RE.test(text) && text.endsWith('?')) return null;
+    const executionShaped = CONFIRM_EXECUTION_SHAPE_RE.test(text)
+      || (input.isMultiItem === true && (input.itemCount ?? 0) >= 3);
+    if (!executionShaped) return null;
+    // FRESH sessions only. Any completed turn means the conversation already
+    // aligned (approve-once-then-run) — the beat must never re-ask mid-thread.
+    if (listEvents(input.sessionId, { types: ['conversation_completed'] }).length > 0) return null;
+    return CONFIRM_BEAT_TEXT;
+  } catch { return null; }
 }
 
 export const BACKGROUND_OFFER_TEXT =

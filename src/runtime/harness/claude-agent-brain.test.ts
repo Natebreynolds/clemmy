@@ -443,6 +443,17 @@ test('CONVERGE guard: after the user answers a clarifying question, the turn con
   delete process.env.CLEMMY_BRAIN_CONVERGE;
 });
 
+test('spine confirm beat: a FRESH chat execution-shaped request carries [confirm-first]; a continuation does not', async () => {
+  const sid = createSession({ kind: 'chat' }).id;
+  const msg = 'send outreach emails to the 20 firms on my prospect list';
+  const fresh = await renderClaudeAgentBrainTurnContext({ message: msg, sessionId: sid });
+  assert.match(fresh, /\[confirm-first\]/, 'fresh execution-shaped turn gets the beat');
+  assert.match(fresh, /offer to help connect it/, 'the shovel line — missing tools are surfaced, not improvised around');
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed', data: { reason: 'success' } });
+  const continued = await renderClaudeAgentBrainTurnContext({ message: msg, sessionId: sid });
+  assert.doesNotMatch(continued, /\[confirm-first\]/, 'after any completed turn the beat never re-asks');
+});
+
 test('Claude SDK dispatch receives convergence state on a clarification answer', async () => {
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_TOOL_JIT = 'off';
