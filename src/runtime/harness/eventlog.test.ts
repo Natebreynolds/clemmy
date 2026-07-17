@@ -53,6 +53,7 @@ const {
   findUserInputEventForRun,
   renewRunAttemptLease,
   interruptForeignRunAttemptLeases,
+  interruptOrphanedRunAttemptsAtBoot,
   claimHarnessChatRequest,
   getHarnessChatRequestReceipt,
   requestHarnessChatCancellation,
@@ -526,6 +527,38 @@ test('latest run attempts are projected for many sessions in one deterministic b
   assert.equal(projected.get(firstSession.id)?.attemptId, latest.attemptId);
   assert.equal(projected.get(secondSession.id)?.attemptId, other.attemptId);
   assert.equal(projected.has('missing-session'), false);
+});
+
+test('fold #7: the boot sweep interrupts NULL-run_id attempts (Discord/webhook lanes)', () => {
+  resetEventLog();
+  const discordSess = createSession({ kind: 'chat', channel: 'discord' });
+  // Discord/webhook attempts carry no external run id — the crash shape that leaked.
+  const orphaned = beginRunAttempt(discordSess.id);
+  assert.equal(orphaned.runId, null);
+  assert.equal(getLatestRunAttempt(discordSess.id)?.status, 'active');
+
+  const swept = interruptOrphanedRunAttemptsAtBoot();
+  assert.ok(swept >= 1, 'the NULL-run_id attempt is swept at daemon boot');
+  const latest = getLatestRunAttempt(discordSess.id);
+  assert.equal(latest?.status, 'interrupted');
+  assert.ok(latest?.finishedAt, 'the phantom active row is terminal after boot');
+});
+
+test('fold #7: the foreign-lease sweep with no prefix also reaches NULL-run_id rows', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  beginRunAttempt(sess.id);
+  const swept = interruptForeignRunAttemptLeases('boot-owner-x');
+  assert.ok(swept >= 1, 'run_id LIKE alone can never match NULL — the explicit NULL arm must');
+  assert.equal(getLatestRunAttempt(sess.id)?.status, 'interrupted');
+  // A prefixed sweep still targets only its own lane.
+  const desktopSess = createSession({ kind: 'chat', channel: 'desktop' });
+  beginRunAttempt(desktopSess.id, { runId: 'desktop:live' });
+  const discordSess2 = createSession({ kind: 'chat', channel: 'discord' });
+  beginRunAttempt(discordSess2.id);
+  const sweptPrefixed = interruptForeignRunAttemptLeases('boot-owner-x', { runIdPrefix: 'desktop:' });
+  assert.equal(sweptPrefixed, 1, 'prefix sweep touches only the prefixed lane');
+  assert.equal(getLatestRunAttempt(discordSess2.id)?.status, 'active', 'NULL-run_id rows are untouched by a prefixed sweep');
 });
 
 test('run attempt binds idempotently to one exact same-session user input', () => {

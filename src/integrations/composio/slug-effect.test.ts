@@ -50,3 +50,31 @@ test('CALL is only a read noun when no other mutation action is present', () => 
     assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
   }
 });
+
+test('fold #3: unknown-verb mutations with a trailing read STATE word never classify read', () => {
+  // MARK/FLAG/PIN-style verbs are not in the write list; the trailing READ is a
+  // state noun, not the action — these must stay conservative writes.
+  for (const slug of [
+    'GMAIL_MARK_AS_READ',
+    'SLACK_MARK_CHANNEL_READ',
+    'ACME_SET_TO_PREVIEW',
+    'SOMETOOL_RUN_CHECK',
+  ]) {
+    assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
+  }
+});
+
+test('fold #5: POST as the OBJECT of a read verb classifies read; bare POST actions stay writes', () => {
+  for (const slug of ['TWITTER_GET_POST', 'REDDIT_GET_POST_COMMENTS', 'LINKEDIN_GET_POSTS']) {
+    assert.equal(classifyComposioSlugEffect(slug), 'read', slug);
+  }
+  for (const slug of ['TWITTER_POST', 'TWITTER_CREATE_POST', 'LINKEDIN_POST_UPDATE']) {
+    assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
+  }
+});
+
+test('trailing pure read VERBS still classify read (search/fetch/get suffixes)', () => {
+  for (const slug of ['GMAIL_SEARCH', 'NOTION_GET', 'LINEAR_LIST', 'WEB_FETCH']) {
+    assert.equal(classifyComposioSlugEffect(slug), 'read', slug);
+  }
+});

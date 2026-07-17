@@ -930,10 +930,14 @@ function relevantHarnessApprovalsForContext(input: {
 }): approvalRegistry.PendingApprovalRow[] {
   const rows = approvalRegistry.listPending({ status: 'pending' })
     .filter((row) => approvalRegistry.isActionable(row));
-  // Never pull a lone workflow/other-channel approval into this chat merely
-  // because it is globally pending. Explicit approval ids remain addressable;
-  // bare approval/stop vocabulary is scoped to the current conversation.
-  return rows.filter((row) => row.channelId === input.channelId);
+  // Never pull another Discord channel's approval into this chat merely
+  // because it is globally pending. But a DM keeps the non-Discord fallback
+  // (restored in the fold — review wf_30a7ce7e-e9c #9): workflow/background
+  // approvals carry no Discord channelId, and the DM is the user's only
+  // Discord surface for seeing and resolving them — dropping the fallback made
+  // a parked workflow write invisible and unresolvable until it expired.
+  if (input.guildId) return rows.filter((row) => row.channelId === input.channelId);
+  return rows.filter((row) => row.channelId === input.channelId || !isDiscordHarnessRow(row));
 }
 
 function liveHarnessApprovalsForContext(input: {

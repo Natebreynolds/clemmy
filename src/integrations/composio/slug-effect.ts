@@ -45,13 +45,30 @@ export function isReadOnlyCallAction(value: string | null | undefined): boolean 
   return !tokens.some((token) => WRITE_ACTIONS.has(token) && token !== 'CALL');
 }
 
+/** Write-shaped tokens that are just as often the OBJECT being read: a phone
+ * call (`GONG_GET_CALL_TRANSCRIPT`) or a social post (`TWITTER_GET_POST`).
+ * They count as writes only when no read verb anchors the action. */
+const AMBIGUOUS_OBJECT_TOKENS: ReadonlySet<string> = new Set(['CALL', 'POST']);
+
+/** Read tokens that are commonly a trailing STATE/NOUN rather than the action:
+ * `GMAIL_MARK_AS_READ` mutates, `…_UPDATE_VIEW` mutates, `RUN_CHECK` acts. A
+ * read token in FINAL position is only trusted when it cannot be a state noun
+ * (`GMAIL_SEARCH`, `NOTION_GET`). */
+const STATE_NOUN_READ_TOKENS: ReadonlySet<string> = new Set([
+  'READ', 'VIEW', 'STATUS', 'PREVIEW', 'CHECK', 'AUDIT', 'HEAD', 'PEEK',
+]);
+
 /**
  * Classify the user-visible effect of a Composio action slug.
  *
  * Provider-side research jobs are reads even when their implementation uses a
- * CREATE/POST endpoint. For every other toolkit, an explicit write token wins
- * over a read token so mixed actions such as FIND_OR_CREATE cannot bypass
- * mutation controls. Missing and unfamiliar action names remain conservative.
+ * CREATE/POST endpoint. For every other toolkit, an unambiguous write token
+ * wins so mixed actions such as FIND_OR_CREATE cannot bypass mutation
+ * controls; a read token is trusted only in ACTION position (fold 2026-07-17,
+ * review wf_30a7ce7e-e9c #3/#5: `GMAIL_MARK_AS_READ` must never classify read
+ * — MARK is not a known write verb and READ is a trailing state word — while
+ * `TWITTER_GET_POST` must never classify write — POST there is the object).
+ * Missing and unfamiliar action names remain conservative writes.
  */
 export function classifyComposioSlugEffect(slug: string | null | undefined): ComposioSlugEffect {
   const upper = String(slug ?? '').trim().toUpperCase();
@@ -65,9 +82,17 @@ export function classifyComposioSlugEffect(slug: string | null | undefined): Com
   }
 
   const tokens = actionTokens(upper);
-  if (isReadOnlyCallAction(upper)) return 'read';
-  if (tokens.some((token) => WRITE_ACTIONS.has(token))) return 'external_write';
-  if (tokens.some((token) => READ_ACTIONS.has(token))) return 'read';
+  // An unambiguous write verb anywhere is a mutation, full stop.
+  if (tokens.some((token) => WRITE_ACTIONS.has(token) && !AMBIGUOUS_OBJECT_TOKENS.has(token))) {
+    return 'external_write';
+  }
+  // A read verb is trusted as the ACTION when it is not a trailing state noun.
+  const readIndex = tokens.findIndex((token) => READ_ACTIONS.has(token));
+  const trustedRead = readIndex >= 0
+    && (readIndex < tokens.length - 1 || !STATE_NOUN_READ_TOKENS.has(tokens[readIndex] ?? ''));
+  if (trustedRead) return 'read';
+  // Bare CALL/POST actions (no anchoring read verb) are outbound writes.
+  if (tokens.some((token) => AMBIGUOUS_OBJECT_TOKENS.has(token))) return 'external_write';
   return 'external_write';
 }
 

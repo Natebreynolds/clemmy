@@ -34,7 +34,6 @@ import {
   killGateVerdict,
   grindGateVerdict,
   composeKillAwareShouldCancel,
-  preflightGateVerdict,
 } from './turn-control.js';
 import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
@@ -1507,11 +1506,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       options.sourceUserSeq ? { sourceUserSeq: options.sourceUserSeq } : undefined,
     );
     if (kill) return kill as PermissionResult;
-    // Native MCP calls never enter wrapToolForHarness. Consult the same typed
-    // persisted preflight here so the SDK lane cannot execute around the
-    // conversational alignment beat.
-    const preflight = preflightGateVerdict(options.sessionId, toolName, input, options.sourceUserSeq);
-    if (preflight) return preflight as PermissionResult;
     const providerCallId = typeof opts.toolUseID === 'string' && opts.toolUseID.trim()
       ? opts.toolUseID.trim()
       : '';

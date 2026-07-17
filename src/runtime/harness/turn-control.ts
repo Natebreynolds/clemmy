@@ -26,7 +26,7 @@ import { createHash } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, type KillRequestTarget } from './eventlog.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import { checkRunTokenWindow, type RunTokenWindow, type RunTokenStatus } from './run-token-budget.js';
-import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
+import type { RuntimeToolEffect } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 
 // The SDK's PermissionResult shape (structural — avoids importing SDK types here).
@@ -354,18 +354,6 @@ function genericProviderAliasesFromObjective(text: string): string[] {
   return [...new Set(aliases)];
 }
 
-function providerAliasForTool(toolName: string, input: unknown): string | null {
-  const normalized = toolName.replace(/^mcp__/, '');
-  const tail = normalized.split('__').at(-1) ?? normalized;
-  let raw = normalized.includes('__') ? normalized.split('__')[0] ?? '' : '';
-  if (/composio_execute_tool$/i.test(tail) && input && typeof input === 'object') {
-    const slug = (input as Record<string, unknown>).tool_slug;
-    if (typeof slug === 'string') raw = slug.split(/[_-]+/)[0] ?? '';
-  }
-  const alias = normalizeProviderAlias(raw.replace(/(?:-?mcp|-?server)$/i, ''));
-  return alias && !/^(?:clementine|clem|local)$/.test(alias) ? `provider:${alias}` : null;
-}
-
 function mutationAuthorityForObjective(
   text: string,
   externalAction: boolean,
@@ -421,63 +409,6 @@ function actionFamiliesFromText(text: string, objective: boolean): ConfirmedActi
   // publishing; authorize that narrow pair without widening document creates.
   if (objective && actions.includes('create') && destinationKeysFromText(text).includes('website')) actions.push('publish');
   return [...new Set(actions)];
-}
-
-function toolIdentityText(toolName: string, input: unknown): string {
-  const normalized = toolName.replace(/^mcp__/, ' ');
-  if (!input || typeof input !== 'object') return normalized;
-  const args = input as Record<string, unknown>;
-  const identityFields = ['tool_slug', 'toolSlug', 'tool', 'toolName', 'name', 'action']
-    .map((key) => args[key])
-    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  // A shell's destination lives in the command rather than its generic tool
-  // name. Do not inspect arbitrary content/body fields: an email containing a
-  // Google Docs link must still classify as email, not as an authorized doc.
-  if (/run_shell_command$/i.test(normalized)) {
-    const command = args.command;
-    if (typeof command === 'string') identityFields.push(command);
-  }
-  return `${normalized} ${identityFields.join(' ')}`.replace(/[_-]+/g, ' ');
-}
-
-function toolDestinationKeys(toolName: string, input: unknown, effect: RuntimeToolEffect): string[] {
-  const keys = destinationKeysFromText(toolIdentityText(toolName, input));
-  const providerAlias = providerAliasForTool(toolName, input);
-  if (providerAlias) keys.push(providerAlias);
-  if (effect === 'local_write') keys.push('local');
-  return [...new Set(keys)];
-}
-
-function toolActionFamilies(toolName: string, input: unknown): ConfirmedActionFamily[] {
-  return actionFamiliesFromText(toolIdentityText(toolName, input), false);
-}
-
-const DELEGATING_EXECUTION_TOOLS = new Set([
-  'run_tool_program',
-  'run_batch',
-  'run_worker',
-  'call_tool',
-]);
-
-function normalizedControlToolTail(toolName: string): string {
-  const normalized = toolName.replace(/^mcp__/, '');
-  const tail = normalized.split('__').at(-1) ?? normalized;
-  return tail
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .replace(/-/g, '_')
-    .toLowerCase();
-}
-
-function isDelegatingExecutionTool(toolName: string): boolean {
-  const normalized = toolName.replace(/^mcp__/, '');
-  const parts = normalized.split('__');
-  // A provider may itself expose an action named RUN_BATCH. Only Clementine's
-  // own carriers get this exemption; an unknown external namespace still fails
-  // closed and can never use a matching tail as an authority bypass.
-  if (parts.length > 1 && !/^(?:clementine(?:-local)?|clem(?:entine)?_local)$/i.test(parts[0] ?? '')) {
-    return false;
-  }
-  return DELEGATING_EXECUTION_TOOLS.has(normalizedControlToolTail(toolName));
 }
 
 function decisionAuthoritySignature(decision: TurnPreflightDecision): string {
@@ -652,19 +583,6 @@ export function confirmBeatDirective(input: {
   } catch { return null; }
 }
 
-export class TurnPreflightPersistenceError extends Error {
-  readonly sessionId: string;
-  readonly phase: TurnPreflightDecision['phase'];
-
-  constructor(sessionId: string, phase: TurnPreflightDecision['phase'], cause: unknown) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
-    super(`Could not persist the ${phase} turn-preflight decision for ${sessionId}: ${detail}`, { cause });
-    this.name = 'TurnPreflightPersistenceError';
-    this.sessionId = sessionId;
-    this.phase = phase;
-  }
-}
-
 export interface TurnPreflightPersistenceIo {
   list: typeof listEvents;
   append: typeof appendEvent;
@@ -675,45 +593,10 @@ const DEFAULT_TURN_PREFLIGHT_IO: TurnPreflightPersistenceIo = {
   append: appendEvent,
 };
 
-/** Attempt-local belt behind the thrown persistence error. Production callers
- * must not dispatch the model after the throw, but if a future caller catches it
- * incorrectly, the exact source turn still cannot mutate in this process. Each
- * source has its own latch so a concurrently persisted turn cannot clear an
- * older turn's failure. An unknown source is a conservative session wildcard. */
-const UNKNOWN_PREFLIGHT_SOURCE = '*';
-type FailedPreflightSource = number | typeof UNKNOWN_PREFLIGHT_SOURCE;
-const failedPreflightPersistence = new Map<string, Set<FailedPreflightSource>>();
-
 function exactPreflightSource(sourceUserSeq: number | undefined): number | null {
   return Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
     ? sourceUserSeq as number
     : null;
-}
-
-function latchFailedPreflightPersistence(sessionId: string, sourceUserSeq: number | undefined): void {
-  const failedSources = failedPreflightPersistence.get(sessionId) ?? new Set<FailedPreflightSource>();
-  failedSources.add(exactPreflightSource(sourceUserSeq) ?? UNKNOWN_PREFLIGHT_SOURCE);
-  failedPreflightPersistence.set(sessionId, failedSources);
-}
-
-function clearFailedPreflightPersistence(sessionId: string, sourceUserSeq: number | undefined): void {
-  const failedSources = failedPreflightPersistence.get(sessionId);
-  if (!failedSources) return;
-  const exactSource = exactPreflightSource(sourceUserSeq);
-  // A successful exact-source write proves recovery only for that source. It
-  // must not clear either another turn or an earlier unknown-source failure.
-  if (exactSource !== null) failedSources.delete(exactSource);
-  if (failedSources.size === 0) failedPreflightPersistence.delete(sessionId);
-}
-
-function hasFailedPreflightPersistence(sessionId: string, sourceUserSeq: number | undefined): boolean {
-  const failedSources = failedPreflightPersistence.get(sessionId);
-  if (!failedSources?.size) return false;
-  if (failedSources.has(UNKNOWN_PREFLIGHT_SOURCE)) return true;
-  const exactSource = exactPreflightSource(sourceUserSeq);
-  // A tool call without source identity cannot safely exclude any outstanding
-  // failure in the session, so it is treated as matching every exact latch.
-  return exactSource === null || failedSources.has(exactSource);
 }
 
 /** Persist one preflight decision for the latest user turn. Idempotent across
@@ -744,94 +627,21 @@ export function recordTurnPreflightDecision(
         data: { ...decision, sourceUserSeq: exactSourceUserSeq },
       });
     }
-    clearFailedPreflightPersistence(sessionId, exactSourceUserSeq);
-  } catch (cause) {
-    latchFailedPreflightPersistence(sessionId, exactSourceUserSeq);
-    // This row is execution authority, not telemetry. Continuing context/model
-    // assembly after a failed write recreates the original fail-open hole: the
-    // tool boundary observes "no decision" and assumes ordinary execution.
-    throw new TurnPreflightPersistenceError(sessionId, decision.phase, cause);
-  }
+  } catch { /* telemetry/anchoring state — a failed persist must never break the turn */ }
 }
 
-function mutationDenied(message: string): ToolGateDeny {
-  return { behavior: 'deny', interrupt: false, message };
-}
-
-/** Enforce alignment and the exact mutation authority it created. The approval
- * turn copies the original intent key/objective/effect/destination scope; the
- * tool boundary re-loads the matching align record instead of trusting a bare
- * acknowledgement or whichever user row happens to be latest globally. */
-export function preflightGateVerdict(
-  sessionId: string | undefined,
-  toolName?: string,
-  input?: unknown,
-  sourceUserSeq?: number,
-): ToolGateDeny | null {
-  if (!sessionId) return null;
-  let requestedEffect: RuntimeToolEffect | null = null;
-  if (toolName) {
-    try { requestedEffect = classifyRuntimeToolEffect(toolName, input).effect; } catch { requestedEffect = 'unknown'; }
-  }
-  try {
-    if (
-      hasFailedPreflightPersistence(sessionId, sourceUserSeq)
-      && requestedEffect !== 'read'
-      && requestedEffect !== 'compute'
-    ) {
-      return mutationDenied('Clementine could not persist this turn’s approval state. The mutating tool was blocked fail-closed before dispatch; retry the alignment turn after local storage recovers.');
-    }
-    const rows = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
-    const exactSourceUserSeq = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
-      ? sourceUserSeq as number
-      : latestUserSeq(rows);
-    const decision = decisionForSource(sessionId, rows, exactSourceUserSeq);
-    if (decision?.phase === 'align') {
-      return mutationDenied('Alignment is still pending for this request. Do not call tools in this turn. Give the brief plan/destination beat in plain language and wait for the user’s next message.');
-    }
-    if (!toolName || decision?.phase !== 'execute' || !decision.confirmedIntentKey) return null;
-
-    const aligned = alignedDecisionForIntent(rows, decision.confirmedIntentKey);
-    if (!aligned) {
-      return mutationDenied('The approved intent could not be matched to its original alignment record. No mutating tool may run; ask the user to restate and confirm the intended action.');
-    }
-    // These tools delegate rather than perform the destination mutation. Their
-    // inner calls re-enter the same preflight boundary (code-mode/batch carry
-    // sourceUserSeq), so validate the concrete provider action there. Blocking
-    // the carrier itself would force dozens of discrete calls and defeat the
-    // tool-economy path without adding safety.
-    if (isDelegatingExecutionTool(toolName)) return null;
-    const effect = requestedEffect ?? classifyRuntimeToolEffect(toolName, input).effect;
-    if (effect === 'read' || effect === 'compute') return null;
-    if (effect === 'unknown') {
-      return mutationDenied('This tool has no trustworthy runtime effect classification, so it cannot run under a consequential approval. Use a classified read/action tool or ask the user to align on a supported action.');
-    }
-    const allowedEffects = new Set(aligned.allowedMutationEffects ?? []);
-    if (!allowedEffects.has(effect as ConfirmedMutationEffect)) {
-      return mutationDenied(`The confirmed request did not authorize a ${effect.replace(/_/g, ' ')} action. Continue with read-only work or ask for a new alignment beat for this mutation.`);
-    }
-    const allowedDestinations = new Set(aligned.allowedDestinations ?? []);
-    const actualDestinations = toolDestinationKeys(toolName, input, effect);
-    if (allowedDestinations.size === 0 || !actualDestinations.some((key) => allowedDestinations.has(key))) {
-      const expected = [...allowedDestinations].join(', ') || 'an explicitly named destination';
-      const actual = actualDestinations.join(', ') || 'an unrecognized destination';
-      return mutationDenied(`This tool targets ${actual}, but the confirmed request authorized ${expected}. Use the aligned destination or ask the user to confirm the new destination.`);
-    }
-    const allowedActions = new Set(aligned.allowedActionFamilies ?? []);
-    const actualActions = toolActionFamilies(toolName, input);
-    if (allowedActions.size === 0 || !actualActions.some((action) => allowedActions.has(action))) {
-      const expected = [...allowedActions].join(', ') || 'an explicitly named action';
-      const actual = actualActions.join(', ') || 'an unrecognized action';
-      return mutationDenied(`This tool would ${actual}, but the confirmed request authorized ${expected}. Use the aligned action or ask the user to confirm the new action.`);
-    }
-    return null;
-  } catch {
-    if (toolName && requestedEffect !== 'read' && requestedEffect !== 'compute') {
-      return mutationDenied('Clementine could not verify this turn’s persisted approval authority. The mutating tool was blocked fail-closed; retry the alignment beat rather than executing with ambiguous consent.');
-    }
-    return null;
-  }
-}
+// NOTE (fold, 2026-07-17): the fail-closed `preflightGateVerdict` tool-boundary
+// gate that lived here was DEMOTED after adversarial review wf_30a7ce7e-e9c
+// confirmed it failed in both directions — bypassable (delegating carriers
+// dispatch native-MCP writes past it, non-exact acknowledgements skip the
+// envelope, interpreter shell scripts classify as compute) while hard-denying
+// approved work (empty destination/action envelopes deny-all with no recovery,
+// and the align phase blocked even reads). Alignment is delivered as the
+// conversational [confirm-first] directive (confirmBeatDirective) with the
+// typed decision persisted for telemetry/objective anchoring; CONSENT
+// enforcement stays with the one existing authority — plan-scope /
+// isAutoApprovedByScope and the approval registry (guardrails inform, they
+// don't override).
 
 /** Recover the aligned objective for an acknowledgement turn. This keeps
  * artifact identity and completion judging anchored to "create two docs", not
@@ -854,13 +664,6 @@ export function effectiveTurnObjective(
     }
   } catch { /* fallback remains authoritative */ }
   return fallback;
-}
-
-export class PreflightAlignmentRequiredError extends Error {
-  constructor(public readonly sessionId: string, message: string) {
-    super(`PREFLIGHT_ALIGNMENT_REQUIRED: ${message}`);
-    this.name = 'PreflightAlignmentRequiredError';
-  }
 }
 
 export const BACKGROUND_OFFER_TEXT =

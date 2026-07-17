@@ -31,9 +31,7 @@ const {
   classifyTurnPreflight,
   confirmBeatDirective,
   effectiveTurnObjective,
-  preflightGateVerdict,
   recordTurnPreflightDecision,
-  TurnPreflightPersistenceError,
 } = await import('./turn-control.js');
 const { appendEvent } = await import('./eventlog.js');
 
@@ -295,7 +293,12 @@ test('confirm beat: old completions never grant permanent alignment; reads and n
   assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('chat'), sessionKind: 'chat' }), null, 'kill-switch respected');
 });
 
-test('typed preflight is durable and blocks tools only until the next user go-ahead', () => {
+// (fold 2026-07-17) The fail-closed preflightGateVerdict tool gate was DEMOTED
+// after review wf_30a7ce7e-e9c — bypassable AND falsely denying. The typed
+// decision remains as directive trigger + telemetry + objective anchoring;
+// these tests pin the surviving classification/persistence semantics.
+
+test('typed preflight is durable; approval binds to the exact pending request', () => {
   const sessionId = freshSession('chat');
   appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Turn this into a Google Doc.' } });
   const align = classifyTurnPreflight({
@@ -305,23 +308,18 @@ test('typed preflight is durable and blocks tools only until the next user go-ah
   });
   assert.equal(align.phase, 'align');
   recordTurnPreflightDecision(sessionId, align);
-  assert.equal(preflightGateVerdict(sessionId)?.behavior, 'deny', 'prompt advice has a tool-boundary backstop');
+  assert.equal(listEvents(sessionId, { types: ['turn_preflight_decision'] }).length, 1, 'the align decision is durable');
 
   appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Go ahead.' } });
   const execute = classifyTurnPreflight({ message: 'Go ahead.', sessionId, sessionKind: 'chat' });
   assert.equal(execute.phase, 'execute');
   assert.equal(execute.confirmedIntentKey, align.intentKey, 'approval binds to the exact pending request');
-  recordTurnPreflightDecision(sessionId, execute);
-  assert.equal(preflightGateVerdict(sessionId), null, 'the next user turn clears alignment without a mutable latch');
 });
 
-test('typed preflight write failure throws before dispatch and keeps mutations fail-closed', () => {
+test('preflight persistence is best-effort telemetry — a failed write never throws or breaks the turn', () => {
   const sessionId = freshSession('chat');
   const source = appendEvent({
-    sessionId,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Create a Google Doc for the client.' },
   });
   const align = classifyTurnPreflight({
@@ -331,160 +329,11 @@ test('typed preflight write failure throws before dispatch and keeps mutations f
     sourceUserSeq: source.seq,
   });
   assert.equal(align.phase, 'align');
-
-  assert.throws(
-    () => recordTurnPreflightDecision(sessionId, align, source.seq, {
-      list: listEvents,
-      append: () => { throw new Error('simulated sqlite write failure'); },
-    }),
-    (error: unknown) => error instanceof TurnPreflightPersistenceError
-      && /simulated sqlite write failure/.test(error.message),
-  );
+  assert.doesNotThrow(() => recordTurnPreflightDecision(sessionId, align, source.seq, {
+    list: listEvents,
+    append: () => { throw new Error('simulated sqlite write failure'); },
+  }), 'demoted semantics: the decision is directive/telemetry, not execution authority');
   assert.equal(listEvents(sessionId, { types: ['turn_preflight_decision'] }).length, 0);
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Client' },
-      source.seq,
-    )?.message ?? '',
-    /could not persist.*blocked fail-closed/i,
-  );
-  assert.equal(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_GET_DOCUMENT',
-      { document_id: 'doc_1' },
-      source.seq,
-    ),
-    null,
-    'a storage failure blocks mutation, not useful read-only recovery',
-  );
-
-  // Recovery is explicit: once the exact decision persists, the transient latch
-  // clears and the normal durable alignment verdict becomes authoritative.
-  recordTurnPreflightDecision(sessionId, align, source.seq);
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Client' },
-      source.seq,
-    )?.message ?? '',
-    /Alignment is still pending/i,
-  );
-});
-
-test('a later turn persistence success cannot clear an earlier turn failure latch', () => {
-  const sessionId = freshSession('chat');
-  const sourceA = appendEvent({
-    sessionId,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Create a Google Doc for Acme.' },
-  });
-  const alignA = classifyTurnPreflight({
-    message: 'Create a Google Doc for Acme.',
-    sessionId,
-    sessionKind: 'chat',
-    sourceUserSeq: sourceA.seq,
-  });
-  assert.throws(
-    () => recordTurnPreflightDecision(sessionId, alignA, sourceA.seq, {
-      list: listEvents,
-      append: () => { throw new Error('simulated turn A write failure'); },
-    }),
-    TurnPreflightPersistenceError,
-  );
-
-  const sourceB = appendEvent({
-    sessionId,
-    turn: 2,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Create a Google Doc for Beta.' },
-  });
-  const alignB = classifyTurnPreflight({
-    message: 'Create a Google Doc for Beta.',
-    sessionId,
-    sessionKind: 'chat',
-    sourceUserSeq: sourceB.seq,
-  });
-  recordTurnPreflightDecision(sessionId, alignB, sourceB.seq);
-
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Acme' },
-      sourceA.seq,
-    )?.message ?? '',
-    /could not persist.*blocked fail-closed/i,
-    'turn B persistence must not release a delayed mutation from failed turn A',
-  );
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Beta' },
-      sourceB.seq,
-    )?.message ?? '',
-    /Alignment is still pending/i,
-    'turn B uses its own durable decision rather than inheriting turn A failure',
-  );
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Unknown attempt' },
-    )?.message ?? '',
-    /could not persist.*blocked fail-closed/i,
-    'a tool missing exact source identity must match any outstanding session latch',
-  );
-});
-
-test('an unknown-source persistence failure conservatively latches the session', () => {
-  const sessionId = freshSession('chat');
-  const source = appendEvent({
-    sessionId,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'Create a Google Doc.' },
-  });
-  const align = classifyTurnPreflight({
-    message: 'Create a Google Doc.',
-    sessionId,
-    sessionKind: 'chat',
-    sourceUserSeq: source.seq,
-  });
-  assert.throws(
-    () => recordTurnPreflightDecision(sessionId, align, undefined, {
-      list: () => { throw new Error('source lookup unavailable'); },
-      append: appendEvent,
-    }),
-    TurnPreflightPersistenceError,
-  );
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Client' },
-      source.seq,
-    )?.message ?? '',
-    /could not persist.*blocked fail-closed/i,
-  );
-  assert.equal(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_GET_DOCUMENT',
-      { document_id: 'doc_1' },
-      source.seq,
-    ),
-    null,
-    'the conservative wildcard still permits recovery reads',
-  );
 });
 
 test('a richer same-phase preflight decision supersedes a weaker builder record', () => {
@@ -501,17 +350,9 @@ test('a richer same-phase preflight decision supersedes a weaker builder record'
   const decisions = listEvents(sessionId, { types: ['turn_preflight_decision'] });
   assert.equal(decisions.length, 2, 'immutable history keeps both decisions and the latest correction becomes authority');
   assert.deepEqual(decisions.at(-1)?.data.allowedDestinations, full.allowedDestinations);
-  const approval = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'yes' } });
-  const execute = classifyTurnPreflight({ message: 'yes', sessionId, sessionKind: 'chat', sourceUserSeq: approval.seq });
-  recordTurnPreflightDecision(sessionId, execute, approval.seq);
-  assert.equal(
-    preflightGateVerdict(sessionId, 'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT', { title: 'Client' }, approval.seq),
-    null,
-    'the newest corrected authority—not the earlier weak record—controls the tool boundary',
-  );
 });
 
-test('confirmed intent is source-, action-, effect-, and destination-bound at the tool boundary', () => {
+test('the aligned objective anchors acknowledgement turns (effectiveTurnObjective)', () => {
   const sessionId = freshSession('chat');
   const source = appendEvent({
     sessionId, turn: 1, role: 'user', type: 'user_input_received',
@@ -528,7 +369,6 @@ test('confirmed intent is source-, action-, effect-, and destination-bound at th
     message: 'Go ahead.', sessionId, sessionKind: 'chat', sourceUserSeq: approval.seq,
   });
   recordTurnPreflightDecision(sessionId, execute, approval.seq);
-
   // A newer ambient input cannot steal authority from this exact attempt.
   appendEvent({ sessionId, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Actually, unrelated question.' } });
   assert.equal(
@@ -536,85 +376,15 @@ test('confirmed intent is source-, action-, effect-, and destination-bound at th
     'Create a Google Doc for the client.',
     'the low-information control turn preserves the original objective',
   );
-  assert.equal(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_CREATE_DOCUMENT',
-      { title: 'Client brief' },
-      approval.seq,
-    ),
-    null,
-    'the exact approved create on the aligned provider is allowed',
-  );
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_DELETE_DOCUMENT',
-      { document_id: 'doc_123' },
-      approval.seq,
-    )?.message ?? '',
-    /would delete.*authorized create/i,
-    'same destination does not widen create consent into delete consent',
-  );
-  assert.match(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__outlook__OUTLOOK_SEND_EMAIL',
-      { to: 'client@example.com' },
-      approval.seq,
-    )?.message ?? '',
-    /did not authorize|targets email/i,
-    'same broad external-write effect cannot switch destinations',
-  );
-  assert.match(
-    preflightGateVerdict(sessionId, 'mcp__mystery__DO_THING', {}, approval.seq)?.message ?? '',
-    /no trustworthy runtime effect classification/i,
-    'unknown native tools cannot escape mutation authority',
-  );
-  assert.equal(
-    preflightGateVerdict(
-      sessionId,
-      'mcp__google-docs__GOOGLEDOCS_GET_DOCUMENT',
-      { document_id: 'doc_123' },
-      approval.seq,
-    ),
-    null,
-    'supporting reads remain available after confirmation',
-  );
-  assert.equal(
-    preflightGateVerdict(sessionId, 'ToolSearch', { query: 'Google Docs create' }, approval.seq),
-    null,
-    'deferred tool discovery remains available after confirmation',
-  );
-  assert.equal(
-    preflightGateVerdict(sessionId, 'run_tool_program', { program: 'return clem.tool_search({ query: "Google Docs" })' }, approval.seq),
-    null,
-    'Clementine execution carriers are allowed because each concrete inner call re-enters the gate',
-  );
-  assert.match(
-    preflightGateVerdict(sessionId, 'mcp__untrusted__RUN_BATCH', {}, approval.seq)?.message ?? '',
-    /no trustworthy runtime effect classification/i,
-    'an external provider cannot borrow the local run_batch carrier exemption',
-  );
 });
 
-test('draft consent never widens into send consent, while an explicit email verb still authorizes send', () => {
-  const sessionId = freshSession('chat');
-  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Draft an email in Outlook.' } });
-  const align = classifyTurnPreflight({ message: 'Draft an email in Outlook.', sessionId, sessionKind: 'chat', sourceUserSeq: source.seq });
-  recordTurnPreflightDecision(sessionId, align, source.seq);
-  const approval = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'yes' } });
-  const execute = classifyTurnPreflight({ message: 'yes', sessionId, sessionKind: 'chat', sourceUserSeq: approval.seq });
-  recordTurnPreflightDecision(sessionId, execute, approval.seq);
-  assert.equal(
-    preflightGateVerdict(sessionId, 'mcp__outlook__OUTLOOK_CREATE_DRAFT', { subject: 'Hello' }, approval.seq),
-    null,
-  );
-  assert.match(
-    preflightGateVerdict(sessionId, 'mcp__outlook__OUTLOOK_SEND_EMAIL', { to: 'bob@example.com' }, approval.seq)?.message ?? '',
-    /would send.*authorized create/i,
-  );
-
+test('classification: an explicit email verb authorizes send; a draft ask does not', () => {
+  const draftSession = freshSession('chat');
+  const draftDecision = classifyTurnPreflight({
+    message: 'Draft an email in Outlook.', sessionId: draftSession, sessionKind: 'chat',
+  });
+  assert.equal(draftDecision.phase, 'align');
+  assert.ok(!draftDecision.allowedActionFamilies?.includes('send'), 'draft consent never widens into send consent');
   const sendSession = freshSession('chat');
   const sendDecision = classifyTurnPreflight({
     message: 'Email Bob the approved update.', sessionId: sendSession, sessionKind: 'chat',
@@ -623,24 +393,12 @@ test('draft consent never widens into send consent, while an explicit email verb
   assert.ok(sendDecision.allowedActionFamilies?.includes('send'));
 });
 
-test('provider-generic consequential intent aligns and binds an Airtable create without a closed service list', () => {
+test('provider-generic consequential intent aligns without a closed service list', () => {
   const sessionId = freshSession('chat');
-  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Create an Airtable record for Acme.' } });
-  const align = classifyTurnPreflight({ message: 'Create an Airtable record for Acme.', sessionId, sessionKind: 'chat', sourceUserSeq: source.seq });
+  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Create an Airtable record for Acme.' } });
+  const align = classifyTurnPreflight({ message: 'Create an Airtable record for Acme.', sessionId, sessionKind: 'chat' });
   assert.equal(align.phase, 'align');
   assert.ok(align.allowedDestinations?.includes('provider:airtable'));
-  recordTurnPreflightDecision(sessionId, align, source.seq);
-  const approval = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'go ahead' } });
-  const execute = classifyTurnPreflight({ message: 'go ahead', sessionId, sessionKind: 'chat', sourceUserSeq: approval.seq });
-  recordTurnPreflightDecision(sessionId, execute, approval.seq);
-  assert.equal(
-    preflightGateVerdict(sessionId, 'mcp__airtable__AIRTABLE_CREATE_RECORD', { fields: { Name: 'Acme' } }, approval.seq),
-    null,
-  );
-  assert.match(
-    preflightGateVerdict(sessionId, 'mcp__airtable__AIRTABLE_DELETE_RECORD', { record_id: 'rec1' }, approval.seq)?.message ?? '',
-    /would delete.*authorized create/i,
-  );
 });
 
 test('a stale alignment cannot be approved after an unrelated intervening input', () => {

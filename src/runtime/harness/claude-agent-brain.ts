@@ -47,7 +47,6 @@ import {
   classifyTurnPreflight,
   effectiveTurnObjective,
   recordTurnPreflightDecision,
-  TurnPreflightPersistenceError,
   CONFIRM_BEAT_TEXT,
 } from './turn-control.js';
 import {
@@ -1016,12 +1015,10 @@ async function buildClaudeAgentBrainTurnContext(
       recordTurnPreflightDecision(request.sessionId, preflight, opts?.sourceUserSeq);
     }
     confirmBeat = preflight.phase === 'align' ? CONFIRM_BEAT_TEXT : '';
-  } catch (error) {
-    // Turn-preflight state is execution authority, not optional prompt garnish.
-    // A live accepted source row must never proceed when classification or its
-    // durable decision cannot be established before SDK model/tool dispatch.
-    if ((sourceBoundTurn && preflightSessionKind === 'chat')
-      || error instanceof TurnPreflightPersistenceError) throw error;
+  } catch {
+    // (fold 2026-07-17) Preflight state is directive/telemetry, not execution
+    // authority — a classify/persist failure degrades to no beat, never a
+    // failed turn. Consent enforcement lives in plan-scope/approvals.
     fanoutDirective = '';
     confirmBeat = '';
   }

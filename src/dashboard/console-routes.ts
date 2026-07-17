@@ -2497,13 +2497,13 @@ function stopExactHarnessAttempt(
   attempt: RunAttemptRef,
   reason: string,
   resolver: string,
-): number {
+): { cancelledApprovals: number; cancelledTasks: number } {
   requestHarnessKill(sessionId, reason, {
     attemptId: attempt.attemptId,
     runId: attempt.runId,
   });
   const current = getActiveHarnessRunAttempt(sessionId);
-  if (!current || current.attemptId !== attempt.attemptId) return 0;
+  if (!current || current.attemptId !== attempt.attemptId) return { cancelledApprovals: 0, cancelledTasks: 0 };
 
   const pending = approvalRegistry.listPending({ sessionId, status: 'pending' })
     .filter((row) => row.requestedAt >= attempt.startedAt);
@@ -2520,7 +2520,24 @@ function stopExactHarnessAttempt(
       HarnessSession.load(sessionId)?.clearInterruptState({ emitEvent: false });
     } catch { /* the durable kill and approval resolutions remain authoritative */ }
   }
-  return cancelledApprovals;
+  // Cascade (restored in the fold — review wf_30a7ce7e-e9c #6): any still-active
+  // background task this session spawned (or that runs AS this session) dies
+  // with the stop. Without this the task row kept polling "Working now" on Home
+  // after the user explicitly stopped the chat that owned it (live 2026-07-08
+  // zombie banner), and its external writes kept landing.
+  let cancelledTasks = 0;
+  try {
+    for (const task of listBackgroundTasks()) {
+      const t = task as { id: string; status: string; sessionId?: string; originSessionId?: string; runSessionId?: string };
+      const linked = t.sessionId === sessionId || t.originSessionId === sessionId || t.runSessionId === sessionId;
+      const active = t.status === 'pending' || t.status === 'running' || t.status === 'awaiting_approval';
+      if (linked && active) {
+        cancelBackgroundTask(t.id, 'Cancelled with its chat session from the desktop command center.');
+        cancelledTasks += 1;
+      }
+    }
+  } catch { /* best effort — the stale-runner sweeper still interrupts them later */ }
+  return { cancelledApprovals, cancelledTasks };
 }
 
 export function registerConsoleRoutes(
@@ -11484,7 +11501,7 @@ export function registerConsoleRoutes(
     }
 
     try {
-      const cancelledApprovals = stopExactHarnessAttempt(
+      const stopped = stopExactHarnessAttempt(
         sessionId,
         activeAttempt,
         'cancelled from desktop command center',
@@ -11499,8 +11516,8 @@ export function registerConsoleRoutes(
         sessionId,
         attemptId: activeAttempt.attemptId,
         runScopeId: activeRunScopeId,
-        cancelledApprovals,
-        cancelledTasks: 0,
+        cancelledApprovals: stopped.cancelledApprovals,
+        cancelledTasks: stopped.cancelledTasks,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -12057,7 +12074,7 @@ export function registerConsoleRoutes(
           attempt,
           'cancelled from chat before acknowledgement',
           'chat-request-cancellation',
-        );
+        ).cancelledApprovals;
       }
       res.json({
         ok: true,

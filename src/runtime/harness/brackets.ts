@@ -4,8 +4,6 @@ import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput, ty
 import {
   backgroundOfferEnabled as spineBackgroundOfferEnabled,
   effectiveTurnObjective,
-  preflightGateVerdict,
-  PreflightAlignmentRequiredError,
 } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
@@ -1298,12 +1296,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
       ctx.sessionId,
       ctx.sourceUserSeq ? { sourceUserSeq: ctx.sourceUserSeq } : undefined,
     );
-    // 1b. Typed turn preflight. Prompt prose asks for the conversational beat;
-    // this boundary makes it authoritative for every local/code-mode tool. It
-    // runs before accounting, so a refused preflight attempt does not inflate
-    // the user's tool count or burn the execution budget.
-    const preflight = preflightGateVerdict(ctx.sessionId, tool.name, parsedInput, ctx.sourceUserSeq);
-    if (preflight) throw new PreflightAlignmentRequiredError(ctx.sessionId, preflight.message);
+    // (fold 2026-07-17: the fail-closed turn-preflight gate that ran here was
+    // demoted — alignment is a conversational directive; consent enforcement
+    // stays with plan-scope/approvals. See turn-control.ts.)
     // Artifact idempotency is an admission decision, not a tool attempt. Claim
     // immediately after kill/preflight authority but BEFORE counters, loop
     // tracking, batch accounting, and the external_write ledger. A durable
@@ -2573,7 +2568,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
 export function softToolError(err: unknown): string | null {
   if (
     err instanceof MissingExecutionWrapError ||
-    err instanceof PreflightAlignmentRequiredError ||
     err instanceof ConfirmFirstRequiredError ||
     err instanceof ToolGuardrailBlocked ||
     err instanceof ToolCallsLimitExceeded ||

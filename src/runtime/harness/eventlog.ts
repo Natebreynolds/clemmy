@@ -2147,15 +2147,35 @@ export function interruptForeignRunAttemptLeases(
   if (!owner) throw new Error('ownerId is required');
   const now = new Date(options.nowMs ?? Date.now()).toISOString();
   const prefix = options.runIdPrefix ?? '';
+  // NULL-run_id rows (Discord/webhook attempts carry no external run id) can
+  // never match `run_id LIKE ?` — with no prefix requested they must still be
+  // sweepable, or a crashed lane leaks permanently-active attempts (fold,
+  // review wf_30a7ce7e-e9c #7).
   const result = openEventLog().prepare(
     `UPDATE run_attempts
         SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
       WHERE finished_at IS NULL
         AND status = 'active'
-        AND run_id LIKE ?
+        AND (run_id LIKE ? OR (? = '' AND run_id IS NULL))
         AND (lease_owner IS NULL OR lease_owner != ?)`,
-  ).run(now, `${prefix}%`, owner);
+  ).run(now, `${prefix}%`, prefix, owner);
   return result.changes;
+}
+
+/** DAEMON-BOOT recovery (fold, review wf_30a7ce7e-e9c #7): at daemon startup
+ * every still-'active' attempt necessarily belonged to the dead process —
+ * Discord/webhook attempts carry no run id and no lease, so the desktop-only
+ * foreign-lease sweep never reached them and they showed as phantom running
+ * sessions forever. Call ONLY from daemon startup (a CLI process opening the
+ * same DB must never sweep the live daemon's rows). */
+export function interruptOrphanedRunAttemptsAtBoot(nowMs: number = Date.now()): number {
+  const now = new Date(nowMs).toISOString();
+  return openEventLog().prepare(
+    `UPDATE run_attempts
+        SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
+      WHERE finished_at IS NULL
+        AND status = 'active'`,
+  ).run(now).changes;
 }
 
 function rowToHarnessChatRequestReceipt(row: {

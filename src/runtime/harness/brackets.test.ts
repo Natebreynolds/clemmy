@@ -429,7 +429,11 @@ test('wrapToolForHarness: forwards the execute call when flag is on', async () =
   }
 });
 
-test('wrapToolForHarness: an align preflight refuses before accounting or execution', async () => {
+test('wrapToolForHarness: an align-phase turn no longer hard-blocks tools (fold: gate demoted to directive)', async () => {
+  // Review wf_30a7ce7e-e9c: the align-phase all-tool deny was removed — the
+  // beat is delivered conversationally via the [confirm-first] directive, and
+  // consent enforcement stays with plan-scope/approvals. A tool call during an
+  // align turn rides the normal gate chain instead of a blanket refusal.
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const message = 'Turn this research into a Google Doc for the client.';
@@ -442,13 +446,12 @@ test('wrapToolForHarness: an align preflight refuses before accounting or execut
   const counter = new ToolCallsCounter(10);
   let executed = 0;
   const wrapped = wrapToolForHarness({
-    name: 'googledocs__create_document',
-    execute: async () => { executed += 1; return 'created'; },
+    name: 'memory_search',
+    execute: async () => { executed += 1; return 'found'; },
   });
-  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ title: 'Client' }));
-  assert.match(String(result), /PREFLIGHT_ALIGNMENT_REQUIRED/);
-  assert.equal(executed, 0);
-  assert.equal(counter.currentCount, 0, 'a refused preflight is not a real top-level call');
+  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ query: 'client research' }));
+  assert.doesNotMatch(String(result), /PREFLIGHT_ALIGNMENT_REQUIRED/);
+  assert.equal(executed, 1, 'reads during the alignment beat are allowed (the beat itself may need them)');
 });
 
 test('artifact admission: a duplicate create neither executes nor records/counts a second write', async () => {
