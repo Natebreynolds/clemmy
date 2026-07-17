@@ -303,3 +303,12 @@ test('modelContextLimit: org-prefixed + mixed-case BYO ids resolve (zai-org/GLM-
   // A genuinely unknown id still falls back conservatively.
   assert.equal(modelContextLimit('totally-unknown-model'), 128_000);
 });
+
+test('modelContextLimit: Moonshot (Kimi) family — K3 is 1M, plan/coding ids take the 256K family floor', () => {
+  assert.equal(modelContextLimit('kimi-k3'), 1_000_000);
+  assert.equal(modelContextLimit('k3'), 1_000_000, "the Kimi plan's bare k3 id");
+  assert.equal(modelContextLimit('kimi-for-coding'), 256_000);
+  assert.equal(modelContextLimit('kimi-for-coding-highspeed'), 256_000);
+  assert.equal(modelContextLimit('kimi-k2.5'), 256_000, 'generic kimi prefix');
+  assert.equal(modelContextLimit('moonshotai/kimi-k3'), 1_000_000, 'org-prefixed BYO id resolves on the bare name');
+});

@@ -175,6 +175,14 @@ const MODEL_CONTEXT_LIMITS: ReadonlyMap<string, number> = new Map([
   // GLM (Z.ai). Longest-prefix match resolves "glm-5.2" before the generic "glm".
   ['glm-5.2', 1_000_000],
   ['glm', 128_000],
+  // Moonshot (Kimi). kimi-k3 = 1M context (verified 2026-07 via the provider /
+  // OpenRouter listings). The Kimi Code plan's auto-mapping ids
+  // (kimi-for-coding*) ride the K2.x-code backends → the safe 256K family
+  // floor, as does the generic kimi prefix. The plan's bare `k3` id gets the
+  // K3 window. Override per-id via CLEMMY_MODEL_CONTEXT_LIMIT_<id>.
+  ['kimi-k3', 1_000_000],
+  ['k3', 1_000_000],
+  ['kimi', 256_000],
 ]);
 
 /** Hard floor for the budget threshold. Smaller models with tiny
