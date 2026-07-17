@@ -35,6 +35,7 @@ import {
   deriveGuardrailReadMutators,
 } from '../../tools/tool-registry.js';
 import { MUTATING_VERBS, isMutatingExternalWrite } from './execution-gate.js';
+import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
 import { getRuntimeEnv } from '../../config.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
@@ -79,16 +80,18 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
   const distinctEntitiesByFanoutKey = new Map<string, Set<string>>();
   for (const call of recent) {
     countBySignature.set(call.signature, (countBySignature.get(call.signature) ?? 0) + 1);
-    // Same-mut seeding is NAME-based (args aren't persisted, so the slug-aware
-    // classifier can't run at rehydrate). composio_execute_tool is a gateway
-    // whose calls are MOSTLY reads — folding them in inflated the mutating
-    // distinct-count after a restart and could prematurely halt the first
-    // genuine write. Exclude the gateway name: a real composio write runaway
-    // rebuilds its count live within a few calls, and the goal-fidelity send
-    // gate remains the authoritative floor. (This was blocker (b) keeping
-    // same-mut halt enforcement opt-in; the classifier blocker (a) was fixed
-    // 2026-07-12 via isMutatingExternalWrite.)
-    if (MUTATING_TOOLS.has(call.toolName) && call.toolName !== 'composio_execute_tool') {
+    // Same-mut seeding prefers the PERSISTED live classification (`mutating`,
+    // recorded at track time) — a gateway WRITE runaway survives a mid-batch
+    // restart, a gateway READ never inflates the count. Rows persisted before
+    // that field existed fall back to NAME-based seeding, still excluding the
+    // composio gateway (its calls are mostly reads; folding them in inflated
+    // the mutating distinct-count after a restart and could prematurely halt
+    // the first genuine write — the old blocker (b) that kept same-mut halt
+    // enforcement opt-in; classifier blocker (a) was fixed 2026-07-12 via
+    // isMutatingExternalWrite).
+    const seedsMutating = call.mutating === true
+      || (call.mutating === undefined && MUTATING_TOOLS.has(call.toolName) && call.toolName !== 'composio_execute_tool');
+    if (seedsMutating) {
       let set = distinctArgsByMutTool.get(call.toolName);
       if (!set) {
         set = new Set();
@@ -450,6 +453,12 @@ export interface GuardrailDecision {
   rule: 'exact_args_repeat' | 'same_mut_tool_repeat' | 'allowed';
   /** Current count for the matched signature/tool. */
   count: number;
+  /** True when the user's open plan scope / standing grant covers THIS call
+   *  (isAutoApprovedByScope, send-lock included) — an approved batch of
+   *  distinct writes is deliberate work, not a runaway, so the enforced
+   *  same-mut halt demotes back to warn (approve-once-then-run). Computed
+   *  only on halt decisions. */
+  scopeApproved?: boolean;
   /** Slug-aware mutating verdict for THIS call (composio_execute_tool is
    *  classified by its inner slug; native tools by set membership). Carried
    *  on the decision so `applyMode` can demote a looping READ to warn even
@@ -542,6 +551,12 @@ interface TrackedCall {
    *  count gates the block so pagination/refinement on few entities never fires.
    *  Optional — absent on non-fanout rows and rows persisted before this field. */
   fanoutEntity?: string;
+  /** Slug-aware live classification (isMutatingCall) persisted at track time so
+   *  rehydrate can seed the same-mut count AUTHORITATIVELY — a gateway read is
+   *  never folded in, and a gateway WRITE survives a restart (review
+   *  wf_2ed83f94 #9: a mid-runaway restart used to reset the halt counter).
+   *  Optional — absent on rows persisted before this field. */
+  mutating?: boolean;
   /** SDK call_id of this invocation — lets the within-task fetch-memory nudge
    *  (FIX 2) point at the PRIOR identical call's tool_outputs row. Optional:
    *  absent on the legacy/test path and on rows persisted before this field. */
@@ -646,9 +661,10 @@ export function evaluateToolCall(
   const mcpFanoutTool = !slug && toolName.includes('__') && !/clementine/i.test(toolName);
   const fanoutKey = slug ? `composio::${slug}` : mcpFanoutTool ? `mcp::${toolName}` : undefined;
   const fanoutEntity = fanoutKey ? fanoutEntityOf(toolName, args) : undefined;
+  const mutatingCall = isMutatingCall(toolName, args);
 
   // Push + bound the window
-  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}), ...(fanoutEntity != null ? { fanoutEntity } : {}), ...(callId ? { callId } : {}) });
+  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}), ...(fanoutEntity != null ? { fanoutEntity } : {}), ...(callId ? { callId } : {}), ...(mutatingCall ? { mutating: true } : {}) });
   if (tracker.recent.length > thresholds.recentWindowSize) {
     const dropped = tracker.recent.shift();
     if (dropped) {
@@ -671,7 +687,7 @@ export function evaluateToolCall(
   }
   tracker.countBySignature.set(signature, (tracker.countBySignature.get(signature) ?? 0) + 1);
 
-  if (isMutatingCall(toolName, args)) {
+  if (mutatingCall) {
     let set = tracker.distinctArgsByMutTool.get(toolName);
     if (!set) {
       set = new Set();
@@ -844,6 +860,11 @@ export function evaluateToolCall(
   if (isMut) {
     const distinctArgsCount = tracker.distinctArgsByMutTool.get(toolName)?.size ?? 0;
     if (distinctArgsCount >= thresholds.sameMutToolHaltAt) {
+      // Approved-batch exemption (review wf_2ed83f94 #4): a user-blessed plan
+      // scope covering this exact call means the distinct writes are the
+      // APPROVED WORK, not a runaway — applyMode demotes the halt to warn.
+      let scopeApproved = false;
+      try { scopeApproved = isAutoApprovedByScope(sessionId, toolName, args); } catch { scopeApproved = false; }
       return {
         action: 'halt',
         signature,
@@ -852,6 +873,7 @@ export function evaluateToolCall(
         rule: 'same_mut_tool_repeat',
         count: distinctArgsCount,
         mutating: isMut,
+        scopeApproved,
         // Carry fanoutBlock so the recoverable refusal wins over a mutating-halt
         // for a fanout-keyed read (2026-07-12). With the isMutatingCall fix a read
         // no longer reaches here, but keep the belt-and-suspenders.
@@ -979,6 +1001,7 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
     decision.action === 'halt'
     && decision.rule === 'same_mut_tool_repeat'
     && decision.mutating === true // EXPLICIT slug-classified write only — never the composio gateway name-fallback (a looping read must not enforce)
+    && decision.scopeApproved !== true // an approved batch is deliberate work — approve-once-then-run wins
     && sameMutHaltEnforcedInWarn()
   ) {
     return decision;

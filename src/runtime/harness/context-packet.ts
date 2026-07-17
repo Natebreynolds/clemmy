@@ -521,7 +521,7 @@ function harnessCapabilityHealthWarnings(limit = 3): string[] {
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
-  opts?: { sessionKind?: string; sessionId?: string },
+  opts?: { sessionKind?: string; sessionId?: string; suppressConfirmBeat?: boolean },
 ): AgentContextPacket {
   const complexity = classifyComplexity(input);
   // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
@@ -580,13 +580,18 @@ export function buildAgentContextPacket(
   // opening with an execution-shaped request gets one conversational
   // confirm-the-plan / surface-missing-tools / offer-background beat before
   // the work starts. Continuations, questions, and non-chat kinds are null.
-  const confirmBeat = confirmBeatDirective({
-    message: input,
-    sessionId: opts?.sessionId,
-    sessionKind: opts?.sessionKind,
-    isMultiItem: multiItem.isMultiItem,
-    itemCount: multiItem.itemCount,
-  });
+  // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
+  // continuation/retry inputs (review wf_2ed83f94 #8) — the beat must only
+  // ever evaluate a REAL user message, never a substituted one mid-run.
+  const confirmBeat = opts?.suppressConfirmBeat
+    ? null
+    : confirmBeatDirective({
+        message: input,
+        sessionId: opts?.sessionId,
+        sessionKind: opts?.sessionKind,
+        isMultiItem: multiItem.isMultiItem,
+        itemCount: multiItem.itemCount,
+      });
 
   const lines = [
     '[AGENT CONTEXT PACKET]',

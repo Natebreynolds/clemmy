@@ -100,20 +100,25 @@ test('grindGateVerdict: an IDENTICAL-args mutating loop reaches the terminal esc
   assert.ok(sawTerminal, 'identical mutating repeats end the turn (escalate)');
 });
 
-test('grindGateVerdict: a fanout refuse carries the fanout tag (callers without run_tool_program skip it)', () => {
+test('grindGateVerdict: a fanout refuse fires only for honorFanout callers, silently allows otherwise', () => {
   const sess = freshSession();
   // Distinct-args read grinding trips the fanout block (entity-gated ≥6 distinct).
   let fanout: ReturnType<typeof grindGateVerdict> = null;
   for (let i = 1; i <= 12; i++) {
-    const v = grindGateVerdict(sess, 'dataforseo__serp_organic_live_advanced', { keyword: `firm ${i} san antonio`, url: `https://firm${i}.com` });
+    const v = grindGateVerdict(sess, 'dataforseo__serp_organic_live_advanced', { keyword: `firm ${i} san antonio`, url: `https://firm${i}.com` }, { honorFanout: true });
     if (v?.fanout) { fanout = v; break; }
   }
   if (fanout) {
     assert.equal(fanout.interrupt, false, 'fanout steer is a soft deny the model reads');
     assert.match(fanout.message, /REFUSED|one-at-a-time|program/i);
   }
-  // (entity-gate specifics may keep this advisory-only for some shapes — the
-  // tagged pathway is what this test pins when it does fire)
+  // A caller WITHOUT run_tool_program (worker/step) gets a silent allow — no
+  // deny and no phantom guardrail_tripped event (review wf_2ed83f94 #6).
+  const sess2 = freshSession();
+  for (let i = 1; i <= 12; i++) {
+    const v = grindGateVerdict(sess2, 'dataforseo__serp_organic_live_advanced', { keyword: `firm ${i} austin`, url: `https://tx${i}.com` });
+    assert.ok(!v?.fanout, 'un-honored fanout verdicts never surface');
+  }
 });
 
 test('grindGateVerdict: normal varied usage is untouched', () => {
@@ -172,6 +177,9 @@ test('confirm beat: never on continuations, questions, control words, non-chat k
   assert.equal(confirmBeatDirective({ message: 'what emails did I send to acme corp yesterday?', sessionId: chat, sessionKind: 'chat' }), null, 'pure question → no beat');
   assert.equal(confirmBeatDirective({ message: 'go ahead and send the emails we discussed to everyone', sessionId: chat, sessionKind: 'chat' }), null, 'control lead-in → no beat');
   assert.equal(confirmBeatDirective({ message: 'summarize the quarterly report for me please today', sessionId: chat, sessionKind: 'chat' }), null, 'read-only shape → no beat');
+  // Review wf_2ed83f94 #10: service NOUNS and read-lead openers never confirm.
+  assert.equal(confirmBeatDirective({ message: 'check my email and tell me if the accountant replied about the invoice', sessionId: chat, sessionKind: 'chat' }), null, 'read-lead + bare noun → no beat');
+  assert.equal(confirmBeatDirective({ message: 'look at the github repo and summarize the recent commits', sessionId: chat, sessionKind: 'chat' }), null, 'read-lead over write-ish nouns → no beat');
   assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('execution'), sessionKind: 'execution' }), null, 'non-chat → no beat');
   process.env.CLEMMY_CONFIRM_BEAT = 'off';
   assert.equal(confirmBeatDirective({ message: msg, sessionId: freshSession('chat'), sessionKind: 'chat' }), null, 'kill-switch respected');

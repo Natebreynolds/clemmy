@@ -65,6 +65,14 @@ export function grindGateVerdict(
   sessionId: string | undefined,
   strippedToolName: string,
   input: unknown,
+  opts?: {
+    /** The caller's recovery skeleton has run_tool_program, so the fanout
+     *  refuse-and-steer is actionable. When false the fanout branch is a
+     *  silent allow — no deny AND no guardrail_tripped event (review
+     *  wf_2ed83f94 #6: emitting a discarded verdict fills the operator view
+     *  with trips that never happened). */
+    honorFanout?: boolean;
+  },
 ): ToolGateDeny | null {
   try {
     if (!sessionId) return null;
@@ -78,6 +86,7 @@ export function grindGateVerdict(
       } catch { /* telemetry never blocks */ }
     };
     if (decision.fanoutBlock) {
+      if (!opts?.honorFanout) return null; // not actionable here — allow, and do not log a phantom trip
       emit('fanout_block', decision.fanoutBlock);
       return { behavior: 'deny', message: decision.fanoutBlock, interrupt: false, fanout: true };
     }
@@ -192,10 +201,16 @@ export function shouldOfferBackground(input: {
 // read it), NOT a formal plan card: the 2026-06-01 converse-until-aligned
 // rollback stands — the model converses, the trigger is deterministic.
 
-/** Mirrors plan-first's EXTERNAL_WRITE_RE (kept inline so the spine stays
- *  import-light — plan-first pulls the planner subsystem). */
+/** Write-VERB anchored (review wf_2ed83f94 #10: plan-first's EXTERNAL_WRITE_RE
+ *  matches bare service NOUNS — "check my email" tripped the beat). Verbs only;
+ *  a read-only mention of a service never confirms. Kept inline so the spine
+ *  stays import-light — plan-first pulls the planner subsystem. */
 const CONFIRM_EXECUTION_SHAPE_RE =
-  /\b(?:send|sent|post|publish|deploy|host|netlify|vercel|railway|notify(?:\s+externally|\s+prospects?)?|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|outlook|email|emails|draft\s+emails?|create\s+drafts?|slack|github|pull\s+request|commit|delete|remove|mutate\s+external)\b/i;
+  /\b(?:send|sends|sending|post|posting|publish|publishing|deploy|deploying|host|hosting|notify|notifying|email|emailing|message|draft|drafting|create|creating|update|updating|upload|uploading|submit|submitting|schedule|scheduling|dispatch|dispatching|delete|deleting|remove|removing|commit|committing|push|merge|merging|migrate|migrating|import|importing|export|exporting|sync|syncing|blast)\b/i;
+/** A read-verb opener means the ask is a lookup even when write-ish words
+ *  appear later ("check my email and tell me if…") — bias-to-action wins. */
+const CONFIRM_READ_LEAD_RE =
+  /^(?:check|look|read|show|summari[sz]e|tell|find|list|review|search|browse|view|explain|describe|analy[sz]e|compare|give\s+me|pull\s+up|what'?s)\b/i;
 const CONFIRM_QUESTION_LEAD_RE =
   /^(?:who|whom|whose|what|when|where|why|how|which|is|are|was|were|do|does|did|can|could|should|would|will|has|have|had)\b/i;
 const CONFIRM_CONTROL_RE =
@@ -230,6 +245,7 @@ export function confirmBeatDirective(input: {
     const text = (input.message ?? '').trim();
     if (text.length < 24) return null; // control words and quick asks never confirm-beat
     if (CONFIRM_CONTROL_RE.test(text)) return null;
+    if (CONFIRM_READ_LEAD_RE.test(text)) return null;
     if (CONFIRM_QUESTION_LEAD_RE.test(text) && text.endsWith('?')) return null;
     const executionShaped = CONFIRM_EXECUTION_SHAPE_RE.test(text)
       || (input.isMultiItem === true && (input.itemCount ?? 0) >= 3);
@@ -243,5 +259,8 @@ export function confirmBeatDirective(input: {
 
 export const BACKGROUND_OFFER_TEXT =
   '[background offer] This is turning into a long run while the user waits in the foreground. '
-  + 'If finishing needs more than a step or two, call `offer_background` NOW with a one-line summary of the remaining work, then STOP and wait — do not keep grinding in the foreground. '
+  + 'If finishing needs more than a step or two, offer the user a background handoff NOW: '
+  + 'if the `offer_background` tool is available to you, call it with a one-line summary of the remaining work; '
+  + 'otherwise END your reply by asking whether to (a) run the rest in the background, (b) hold it for later, or (c) keep going here. '
+  + 'Then STOP and wait — do not keep grinding in the foreground. '
   + 'If you are genuinely a step or two from done, just finish; do not offer.';

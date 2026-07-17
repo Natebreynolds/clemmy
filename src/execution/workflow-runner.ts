@@ -14,7 +14,7 @@ import { resolveRoleModel, defaultForRole } from '../runtime/harness/model-roles
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
-import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents, clearKill } from '../runtime/harness/eventlog.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import { renderedComposioResultLooksFailed } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
@@ -1733,6 +1733,11 @@ async function runStepViaHarness(
     sessionIdSuffix,
   );
   const realSessionId = session.id;
+  // A kill latched during a PRIOR attempt on this stable step session (the
+  // parked-approval rerun reuses the same id by design) must not abort this
+  // fresh attempt before it starts — same one-shot invariant as
+  // respondViaHarness. The prior kill already did its job: that attempt died.
+  try { clearKill(realSessionId); } catch { /* best effort */ }
   openPlanScope({
     sessionId: realSessionId,
     planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,

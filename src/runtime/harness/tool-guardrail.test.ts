@@ -809,6 +809,11 @@ test('applyMode: a MUTATING same-mut-tool HALT enforces by DEFAULT (graduated 20
   }
   // A READ-classified call (mutating:false / absent explicit flag) NEVER halt-enforces.
   assert.equal(applyMode({ ...sendRunaway, mutating: undefined }, 'warn').action, 'warn', 'name-fallback (gateway) never enforces');
+  // Approved-batch exemption (review wf_2ed83f94 #4): a plan scope the user
+  // blessed covering this call means the distinct writes ARE the approved
+  // work — approve-once-then-run wins, the halt demotes to advisory.
+  assert.equal(applyMode({ ...sendRunaway, scopeApproved: true }, 'warn').action, 'warn', 'a user-approved batch never stalls at the halt threshold');
+  assert.equal(applyMode({ ...sendRunaway, scopeApproved: false }, 'warn').action, 'halt', 'unapproved runaway still halts');
 });
 
 test('applyMode: strict mode passes block/halt through unchanged', () => {

@@ -781,6 +781,11 @@ export interface ClaudeAgentSdkRunOptions {
    *  run_tool_program (the recovery the refusal steers to) exists; workers/steps
    *  leave it off so a refusal never strands a run with no recovery. */
   readFanoutGuard?: boolean;
+  /** Skip the session-scoped grind ladder on this run's canUseTool gate. Set by
+   *  WORKERS, which deliberately share the parent session id — pooling their
+   *  calls into the parent's tracker would poison the orchestrator's own gate
+   *  and log phantom guardrail trips. The kill gate is never skipped. */
+  skipSessionGrindGate?: boolean;
   /**
    * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
    * spawned advertising ONLY these tools, so the model receives only their schemas
@@ -1227,12 +1232,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const canUseTool: CanUseTool = (async (toolName, input, opts) => {
     const kill = killGateVerdict(options.sessionId);
     if (kill) return kill as PermissionResult;
-    if (typeof toolName === 'string' && options.sessionId) {
+    // Workers share the PARENT session id by design (one batch approval covers
+    // the fan-out) — running the session-scoped grind ladder inside each worker
+    // would pool every worker's calls into one tracker and poison the
+    // orchestrator's own gate (review wf_2ed83f94 #6). The parent's gate owns
+    // grind control; the kill gate above still covers workers.
+    if (typeof toolName === 'string' && options.sessionId && !options.skipSessionGrindGate) {
       const stripped = toolName.replace(/^mcp__/, '');
       const isNativeExternalMcp = stripped.includes('__') && !/clement/i.test(stripped);
       if (isNativeExternalMcp) {
-        const grind = grindGateVerdict(options.sessionId, stripped, input);
-        if (grind && (grind.fanout !== true || options.readFanoutGuard)) {
+        const grind = grindGateVerdict(options.sessionId, stripped, input, { honorFanout: Boolean(options.readFanoutGuard) });
+        if (grind) {
           return { behavior: 'deny', message: grind.message, interrupt: grind.interrupt } as PermissionResult;
         }
       }

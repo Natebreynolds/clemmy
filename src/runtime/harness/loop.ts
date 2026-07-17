@@ -4282,6 +4282,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     input: classifierInput,
     sessionId: options.sessionId,
     sessionKind: session.sessionRow.kind,
+    // The confirm beat only ever evaluates a REAL user message: synthetic
+    // continuation nudges (classified against the goal objective above) and
+    // stall-retry boilerplate must not trip it mid-run (review wf_2ed83f94 #8).
+    suppressConfirmBeat: options.input === CONTINUATION_INPUT || Boolean(syntheticRetryOriginalInput),
     memory: {
       enabled: turnMemoryPrimer.enabled,
       hitCount: turnMemoryPrimer.hitCount,

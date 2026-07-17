@@ -113,6 +113,11 @@ export async function runClaudeAgentSdkWorker(
     nativeMcpScopeMode: 'resolved_tools',
     agentic,
     maxTurns: resolvedMaxTurns,
+    // Workers share the PARENT session id (one batch approval covers the
+    // fan-out) — the session-scoped grind ladder must not pool every worker's
+    // calls into the parent's tracker. The parent's own gate owns grind
+    // control; the kill gate still applies inside workers.
+    skipSessionGrindGate: true,
   });
   // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say
   // continue" text. Returning that verbatim made the fan-out ledger record the

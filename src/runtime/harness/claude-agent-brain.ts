@@ -21,7 +21,7 @@ import { runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
 import { getSessionTokensUsed, isKillRequested } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
-import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
+import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog, updateSession } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
 import { shouldOfferBackground, BACKGROUND_OFFER_TEXT, confirmBeatDirective } from './turn-control.js';
 import {
@@ -1567,8 +1567,22 @@ export async function respondViaClaudeAgentSdkBrain(
       try {
         appendEvent({ sessionId, turn: 0, role: 'system', type: 'kill_requested', data: { reason: 'during run (sdk lane)' } });
       } catch { /* telemetry best-effort */ }
+      const stoppedText = 'Stopped — you asked me to halt this run. Nothing further will execute; tell me how you\'d like to proceed.';
+      // Terminal tail parity (review wf_2ed83f94 #5): surfaces that settle the
+      // final reply via conversation_completed (Discord/SSE) and everything
+      // keyed off runtime.completed (Tasks board, report-back, watchdog) must
+      // see a killed run TERMINATE — the early return used to skip all three,
+      // leaving the run "Running" forever with the stop text never rendered.
+      try {
+        appendEvent({
+          sessionId, turn: 0, role: 'system', type: 'conversation_completed',
+          data: { reason: 'cancelled', summary: stoppedText.slice(0, 400), reply: stoppedText, transport: 'claude_agent_sdk_brain' },
+        });
+      } catch { /* terminal telemetry is best-effort */ }
+      try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
+      try { updateSession(sessionId, { status: 'cancelled' }); } catch { /* status is observability metadata */ }
       return {
-        text: 'Stopped — you asked me to halt this run. Nothing further will execute; tell me how you\'d like to proceed.',
+        text: stoppedText,
         sessionId,
         stoppedReason: 'cancelled',
         turnsUsed: 1,

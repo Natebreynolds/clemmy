@@ -74,7 +74,7 @@ import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from 
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
 import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
-import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
+import { queueBackgroundTaskApprovalResolution, listBackgroundTasks } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
@@ -1448,16 +1448,38 @@ async function handleDiscordCommand(message: Message<boolean>, assistant: Clemen
   // pending approvals here). requestKill is a one-shot latch the run's
   // kill-aware shouldCancel + canUseTool gate now actually observe.
   if (/^(stop|halt|abort|kill it|stop it|cancel the run|stop the run)$/i.test(normalized)) {
-    const sessionId = getOrCreateDiscordSessionId({
-      channelId: message.channelId,
-      userId: message.author.id,
-      guildId: message.guildId ?? undefined,
-    });
-    const hasPendingApproval = listPendingHarnessApprovals({ status: 'pending' }).some((a) => a.sessionId === sessionId);
+    // Approval vocabulary keeps STRICT priority: if ANY approval is pending —
+    // not just one registered under this chat session id (workflow/background
+    // runs surface approvals in the channel under THEIR OWN session ids) —
+    // fall through so resolveNaturalApproval owns "stop"/"cancel" as a reject.
+    // Intercepting here would swallow the rejection and leave the external
+    // write approvable later.
+    const hasPendingApproval = listPendingHarnessApprovals({ status: 'pending' }).length > 0;
     if (!hasPendingApproval) {
+      const sessionId = getOrCreateDiscordSessionId({
+        channelId: message.channelId,
+        userId: message.author.id,
+        guildId: message.guildId ?? undefined,
+      });
       try {
+        // Kill the chat session's own in-flight turn AND any running
+        // background runs it dispatched (offer_background moves the work to a
+        // `background:<id>` session — killing only the now-idle chat session
+        // would confirm a stop that never happened, the incident class).
         requestKill(sessionId, 'stopped from Discord');
-        await sendChunks(message.channel, '⏹ Stopping the current run — it halts at the next safe boundary (a second or two).', message);
+        const stoppedRuns: string[] = [];
+        try {
+          for (const task of listBackgroundTasks({ status: 'running' })) {
+            if (task.originSessionId === sessionId || task.runSessionId === sessionId) {
+              requestKill(task.runSessionId, 'stopped from Discord');
+              stoppedRuns.push(task.title || task.id);
+            }
+          }
+        } catch { /* best-effort — the chat-session kill above still stands */ }
+        const detail = stoppedRuns.length > 0
+          ? ` (including background run${stoppedRuns.length === 1 ? '' : 's'}: ${stoppedRuns.slice(0, 3).join(', ')})`
+          : '';
+        await sendChunks(message.channel, `⏹ Stopping${detail} — it halts at the next safe boundary (a second or two).`, message);
       } catch (err) {
         await sendChunks(message.channel, `Could not stop the run: ${err instanceof Error ? err.message : String(err)}`, message);
       }
