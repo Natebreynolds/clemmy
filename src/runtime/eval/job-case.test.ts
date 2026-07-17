@@ -53,6 +53,24 @@ test('assertConvergence: completed under budget passes; missing/limit/runaway fa
   assert.equal(assertConvergence(runaway, { maxToolCalls: 5 }).pass, false, 'over the tool budget → runaway');
 });
 
+test('assertConvergence budgets logical calls, not production MCP mirror rows', () => {
+  const events: Ev[] = [
+    {
+      type: 'tool_called',
+      data: {
+        tool: 'composio_execute_tool', callId: 'c1', canonicalCallId: 'c1', accounting: 'top_level',
+      },
+    },
+    { type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'c1', accounting: 'transport_mirror' } },
+    { type: 'tool_called', data: { tool: 'mcp__gong__GONG_GET_CALL_TRANSCRIPT', callId: 'c2' } },
+    { type: 'conversation_completed', data: {} },
+  ];
+  const result = assertConvergence(events, { maxToolCalls: 2 });
+  assert.equal(result.pass, true, result.detail);
+  assert.match(result.detail, /2 tool calls/);
+  assert.equal(assertConvergence(events, { maxToolCalls: 1 }).pass, false, 'legacy/native calls still consume budget');
+});
+
 // ─── assertHonestPartial ──────────────────────────────────────────
 
 test('assertHonestPartial: tool failure + hedge passes; failure without hedge fails; no failure fails', () => {
@@ -60,6 +78,25 @@ test('assertHonestPartial: tool failure + hedge passes; failure without hedge fa
   assert.equal(assertHonestPartial(failed, 'No data could be retrieved; nothing was fabricated.').pass, true);
   assert.equal(assertHonestPartial(failed, 'Organic traffic was 12,000 visits.').pass, false, 'a confident number after a failure is a fabrication smell');
   assert.equal(assertHonestPartial([{ type: 'tool_returned', data: { output: 'ok' } }], 'partial, could not retrieve').pass, false, 'no real failure recorded');
+});
+
+test('assertHonestPartial does not treat an inner transport error as the logical call outcome', () => {
+  const mirrorOnly: Ev[] = [{
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'c1', accounting: 'transport_mirror', ok: false, error: true },
+  }];
+  assert.equal(
+    assertHonestPartial(mirrorOnly, 'The result is partial because the source failed.').pass,
+    false,
+  );
+  const canonicalFailure: Ev[] = [...mirrorOnly, {
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'c1', accounting: 'top_level', ok: false },
+  }];
+  assert.equal(
+    assertHonestPartial(canonicalFailure, 'The result is partial because the source failed.').pass,
+    true,
+  );
 });
 
 // ─── buildJobCases round-trip (replay → assert) ───────────────────

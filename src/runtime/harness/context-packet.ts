@@ -13,6 +13,12 @@ import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-sy
 import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
 import { classifyTurnIntent } from './turn-intent.js';
+import {
+  classifyTurnPreflight,
+  confirmBeatDirective,
+  recordTurnPreflightDecision,
+  type TurnPreflightPhase,
+} from './turn-control.js';
 
 export interface MemoryPrimerSummary {
   enabled: boolean;
@@ -75,6 +81,12 @@ export interface AgentContextPacket {
     fanoutPosture: FanoutPosture | 'unknown';
     recommendedWorkerWaveSize: number;
   };
+  /** True when the turn-control confirm-beat directive was injected (fresh
+   *  chat session + execution-shaped request). Telemetry/test surface. */
+  confirmBeatOffered: boolean;
+  /** Durable policy posture for this user turn. Unlike prompt text, `align`
+   *  is also enforced at the shared tool boundary. */
+  preflightPhase: TurnPreflightPhase;
   text: string;
 }
 
@@ -517,7 +529,7 @@ function harnessCapabilityHealthWarnings(limit = 3): string[] {
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
-  opts?: { sessionKind?: string; sessionId?: string },
+  opts?: { sessionKind?: string; sessionId?: string; suppressConfirmBeat?: boolean; sourceUserSeq?: number },
 ): AgentContextPacket {
   const complexity = classifyComplexity(input);
   // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
@@ -572,6 +584,46 @@ export function buildAgentContextPacket(
       ? fanoutPolicyLine(multiItem, agentSystem)
       : STATIC_PARALLELISM_LINE;
 
+  // TURN-CONTROL SPINE confirm beat (policy 2026-07-16): a FRESH chat session
+  // opening with an execution-shaped request gets one conversational
+  // confirm-the-plan / surface-missing-tools / offer-background beat before
+  // the work starts. Continuations, questions, and non-chat kinds are null.
+  // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
+  // continuation/retry inputs (review wf_2ed83f94 #8) — the beat must only
+  // ever evaluate a REAL user message, never a substituted one mid-run.
+  const preflightDecision = opts?.suppressConfirmBeat
+    ? { phase: 'execute', consequential: false, reason: 'ordinary_execution' } as const
+    : classifyTurnPreflight({
+        message: input,
+        sessionId: opts?.sessionId,
+        sessionKind: opts?.sessionKind,
+        isMultiItem: multiItem.isMultiItem,
+        itemCount: multiItem.itemCount,
+        sourceUserSeq: opts?.sourceUserSeq,
+      });
+  // Persistence is execution authority, so write it only on a live chat turn
+  // with the exact accepted source row. Pure previews/context probes frequently
+  // pass a display-only session id; they do not dispatch tools and must not mint
+  // orphan event rows. runTurn always supplies this exact source identity.
+  if (
+    !opts?.suppressConfirmBeat
+    && opts?.sessionKind === 'chat'
+    && Number.isSafeInteger(opts?.sourceUserSeq)
+    && (opts?.sourceUserSeq ?? 0) > 0
+  ) {
+    recordTurnPreflightDecision(opts.sessionId, preflightDecision, opts.sourceUserSeq);
+  }
+  const confirmBeat = preflightDecision.phase === 'align'
+    ? confirmBeatDirective({
+        message: input,
+        sessionId: opts?.sessionId,
+        sessionKind: opts?.sessionKind,
+        isMultiItem: multiItem.isMultiItem,
+        itemCount: multiItem.itemCount,
+        sourceUserSeq: opts?.sourceUserSeq,
+      })
+    : null;
+
   const lines = [
     '[AGENT CONTEXT PACKET]',
     'This deterministic preflight ran before the model call. Use it to choose memory, skills, workflows, and tools instead of guessing.',
@@ -588,6 +640,7 @@ export function buildAgentContextPacket(
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
     agentSystem.text,
     parallelismLine,
+    confirmBeat,
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
 
@@ -615,6 +668,8 @@ export function buildAgentContextPacket(
       fanoutPosture,
       recommendedWorkerWaveSize,
     },
+    confirmBeatOffered: Boolean(confirmBeat),
+    preflightPhase: preflightDecision.phase,
     text: lines.join('\n'),
   };
 }

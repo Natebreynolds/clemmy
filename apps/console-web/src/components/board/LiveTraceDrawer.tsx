@@ -21,6 +21,8 @@ import { Input, Select } from '@/components/ui/Field';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
 import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
 import {
+  boardTraceSinceSeq,
+  canStopCanonicalRunFromDrawer,
   cardTone,
   getBackgroundTaskDetail,
   listReportBackChannels,
@@ -441,6 +443,7 @@ export function LiveTraceDrawer({
     if (!traceSessionId) return;
     setRawHarness([]);
     const handle = runHarnessStream(traceSessionId, {
+      sinceSeq: boardTraceSinceSeq(card),
       onEvent: (ev) => {
         setRawHarness((prev) => (prev.length > 400 ? [...prev.slice(-400), ev] : [...prev, ev]));
         const text = humanHarnessText(ev.data, '');
@@ -448,7 +451,7 @@ export function LiveTraceDrawer({
       },
     });
     return () => handle.stop();
-  }, [traceSessionId]);
+  }, [traceSessionId, card.attemptId, card.sourceUserSeq]);
 
   // Run-events poll for workflow cards.
   useEffect(() => {
@@ -518,6 +521,7 @@ export function LiveTraceDrawer({
 
   const tone = cardTone(card);
   const taskResult = taskDetail?.task.resultFull ?? taskDetail?.task.result ?? '';
+  const canStopCanonicalRun = Boolean(onAction && canStopCanonicalRunFromDrawer(card));
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`Live trace: ${card.title}`}>
@@ -537,11 +541,20 @@ export function LiveTraceDrawer({
         </header>
 
         <div className="border-b border-border px-5 py-3">
-          <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
-            <Radio className={cn('h-3.5 w-3.5', card.column === 'running' ? 'text-primary animate-breathe' : 'text-faint')} />
-            Current
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+                <Radio className={cn('h-3.5 w-3.5', card.column === 'running' ? 'text-primary animate-breathe' : 'text-faint')} />
+                Current
+              </div>
+              <p className="mt-1 text-body text-fg">{current || 'Waiting for activity…'}</p>
+            </div>
+            {canStopCanonicalRun && (
+              <Button size="sm" variant="secondary" onClick={() => onAction?.(card, 'cancel')}>
+                <X className="h-4 w-4" aria-hidden /> Stop run
+              </Button>
+            )}
           </div>
-          <p className="mt-1 text-body text-fg">{current || 'Waiting for activity…'}</p>
         </div>
 
         {isBackground && (

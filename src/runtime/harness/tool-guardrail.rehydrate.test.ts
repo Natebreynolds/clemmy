@@ -71,6 +71,40 @@ test('strand-hunt F: legacy persisted rows (no fanoutEntity) still arm the entit
   }
 });
 
+test('review #9: a persisted composio WRITE runaway survives restart; persisted reads never inflate', async () => {
+  const sid = 'sess-rehydrate-mut';
+  createSession({ id: sid, kind: 'chat' });
+
+  // 7 distinct gateway WRITES persisted with the live classification, plus 5
+  // gateway READS (no mutating flag on a modern row means classified read),
+  // plus 2 legacy rows (no mutating field at all — pre-upgrade shape).
+  const rows = [
+    ...Array.from({ length: 7 }, (_v, i) => ({
+      signature: `send-sig-${i}`, toolName: 'composio_execute_tool', firstSeenMs: 1_000 + i, mutating: true,
+    })),
+    ...Array.from({ length: 5 }, (_v, i) => ({
+      signature: `read-sig-${i}`, toolName: 'composio_execute_tool', firstSeenMs: 2_000 + i, mutating: false,
+    })),
+    ...Array.from({ length: 2 }, (_v, i) => ({
+      signature: `legacy-sig-${i}`, toolName: 'composio_execute_tool', firstSeenMs: 3_000 + i,
+    })),
+  ];
+  writeGuardrailState(sid, JSON.stringify(rows));
+  _simulateRestartForTests(sid);
+
+  // The 8th distinct WRITE after restart must land at the halt threshold
+  // (default sameMutToolHaltAt = 8): 7 persisted writes + this one. If reads
+  // or legacy rows had inflated the count, the halt would have fired EARLIER
+  // (false positive); if writes hadn't survived, action would be allow/warn.
+  const d = evaluateToolCall(sid, 'composio_execute_tool', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: { to: 'someone-new@example.com' },
+  });
+  assert.equal(d.rule, 'same_mut_tool_repeat', 'the persisted write count survived the restart');
+  assert.equal(d.action, 'halt', '7 persisted writes + 1 live write = the halt threshold exactly');
+  assert.equal(d.count, 8, 'reads and legacy gateway rows did NOT inflate the count');
+});
+
 after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });

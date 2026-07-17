@@ -42,6 +42,9 @@ export interface PlanFirstRunInput extends PlanFirstInput {
    * the plan appears character-by-character to the user, not as a block.
    */
   onChunk?: (delta: string) => void | Promise<void>;
+  /** The request boundary already persisted and attempt-bound this exact user
+   * turn. Plan-first must consume that row instead of duplicating history. */
+  reuseRecordedUserInput?: boolean;
 }
 
 export interface PlanFirstResult {
@@ -313,13 +316,15 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     type: 'turn_started',
     data: { input: input.input.slice(0, 200), mode: 'plan_first' },
   });
-  appendEvent({
-    sessionId: input.sessionId,
-    turn: 0,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: input.input },
-  });
+  if (!input.reuseRecordedUserInput) {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: 0,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: input.input },
+    });
+  }
 
   try {
     const captured = captureInteractionSignals({

@@ -67,6 +67,59 @@ test('buildTraceReplayPreview produces a safe replay prompt with risks and key t
   assert.ok(preview.risks.some((risk) => /failure events/.test(risk)));
 });
 
+test('Trace Lab counts logical top-level calls while retaining transport mirrors for audit', () => {
+  resetEventLog();
+  const sess = createSession({ id: 'trace-accounting', kind: 'chat', title: 'Trace Accounting' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'call-1',
+      canonicalCallId: 'call-1',
+      accounting: 'top_level',
+      arguments: '{"tool_slug":"OUTLOOK_LIST_MESSAGES"}',
+    },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'call-1', accounting: 'transport_mirror' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'call-1', accounting: 'transport_mirror', ok: true },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'call-1', accounting: 'top_level', ok: true },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'mcp__gong__GONG_GET_CALL_TRANSCRIPT', callId: 'call-legacy' },
+  });
+
+  const trace = buildTraceDetail(sess.id);
+  assert.ok(trace);
+  assert.equal(trace.metrics.toolCalls, 2, 'one top-level gateway call + one legacy/native call');
+  assert.equal(trace.metrics.toolReturns, 1);
+  assert.equal(trace.nodes.filter((node) => node.type === 'tool_called').length, 3, 'mirror remains visible as audit detail');
+  assert.match(buildTraceReplayPreview(sess.id)?.prompt ?? '', /tools: 2/);
+});
+
 test('listTraceSummaries returns newest sessions with replay posture', () => {
   resetEventLog();
   const a = createSession({ id: 'trace-a', kind: 'chat', title: 'A' });

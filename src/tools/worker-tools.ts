@@ -14,6 +14,7 @@ import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -120,6 +121,7 @@ export function registerWorkerTools(server: McpServer): void {
       if (!sessionId) {
         return textResult('ERROR: run_worker needs a live session context. Do this item inline instead.');
       }
+      const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       // Wave 4 Stage 1: packet key identifies this exact job so a resumed run can
       // detect a worker that already completed and skip re-executing it.
       const packetKey = workerPacketKey(input);
@@ -244,10 +246,10 @@ export function registerWorkerTools(server: McpServer): void {
         // cross-provider runner drags in the whole agent surface, so keep it out
         // of the module graph — mirrors code-mode-tool's runtime imports).
         const result: { text: string; model?: string } = route.claudeLane
-          ? await runClaudeAgentSdkWorker(input, workerModel, sessionId)
+          ? await runClaudeAgentSdkWorker(input, workerModel, sessionId, sourceUserSeq)
           : await (async () => {
               const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
-              return runCrossProviderWorker(input, workerModel, sessionId);
+              return runCrossProviderWorker(input, workerModel, sessionId, sourceUserSeq);
             })();
         const ok = !/^\s*ERROR:/i.test(result.text ?? '');
         // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the

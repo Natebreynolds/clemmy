@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -29,7 +29,19 @@ const {
   claudeAgentSdkAdvertisedToolUniverse,
   partitionClaudeAgentSdkJitSurface,
 } = brain;
-const { appendEvent, createSession, getSession, listEvents, resetEventLog, writeToolOutput } = await import('./eventlog.js');
+const {
+  appendEvent,
+  beginRunAttempt,
+  claimHarnessChatRequest,
+  createSession,
+  getLatestRunAttempt,
+  getSession,
+  listEvents,
+  requestKill,
+  recordRunAttemptUserInput,
+  resetEventLog,
+  writeToolOutput,
+} = await import('./eventlog.js');
 const { saveUserProfile } = await import('../user-profile.js');
 const {
   ClaudeSdkProviderOverloadError,
@@ -37,10 +49,12 @@ const {
   _resetClaudeAgentSdkAdvertisableLocalToolsForTest,
 } = await import('./claude-agent-sdk.js');
 const capabilityHealth = await import('./capability-health.js');
+const artifactLedger = await import('./artifact-ledger.js');
 const { openMemoryDb } = await import('../../memory/db.js');
 
 beforeEach(() => {
   resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
   capabilityHealth._resetHarnessCapabilityHealthForTest();
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
@@ -56,11 +70,14 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
   delete process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT;
   delete process.env.CLEMMY_CLAUDE_SDK_SESSION_HISTORY;
+  delete process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE;
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
   delete process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS;
   delete process.env.CLEMMY_UNIFIED_RECALL;
   delete process.env.CLEMMY_UNIFIED_TURN_PRIMER;
+  delete process.env.CLEMMY_CONFIRM_BEAT;
+  delete process.env.CLEMMY_INTERACTIVE_TOOL_ECONOMY;
   process.env.AUTH_MODE = 'api_key';
 });
 
@@ -186,6 +203,71 @@ test('Move 1: the SDK brain ARMS the in-flight marker during the run and CLEARS 
   await respondViaClaudeAgentSdkBrain('home', { message: 'hello', sessionId: 'brain-marker' });
   assert.notEqual(armedDuringRun, null, 'marker was ARMED during the run');
   assert.equal(HarnessSession.load('brain-marker')?.runInFlightSince(), null, 'marker CLEARED after completion');
+});
+
+test('run-scoped stop registered before SDK dispatch is not erased and emits one terminal completion', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  const sessionId = 'brain-pre-dispatch-stop';
+  const runId = 'run-pre-dispatch-stop';
+  createSession({ id: sessionId, kind: 'chat', title: 'stop me' });
+  const attempt = beginRunAttempt(sessionId, { runId });
+  requestKill(sessionId, 'Discord stop before model dispatch', attempt);
+  let modelCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    modelCalls += 1;
+    return { text: 'should not run', sessionId: 'sdk', model: 'm', toolUses: [] };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('discord', {
+    message: 'make the document',
+    sessionId,
+    runId,
+  });
+
+  assert.equal(response.stoppedReason, 'cancelled');
+  assert.equal(modelCalls, 0, 'the stop wins before the first model/tool dispatch');
+  const completions = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0]?.data.reason, 'cancelled');
+  assert.equal(completions[0]?.data.attemptId, attempt.attemptId);
+  assert.equal(completions[0]?.data.runId, runId);
+});
+
+test('a late SDK completion remains owned by turn A after turn B becomes active', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  const sessionId = 'brain-late-terminal-owner';
+  createSession({ id: sessionId, kind: 'chat', title: 'overlapping attempts' });
+  let firstAttemptId = '';
+  let firstSourceUserSeq: number | null = null;
+  let secondAttemptId = '';
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    const first = getLatestRunAttempt(sessionId);
+    firstAttemptId = first?.attemptId ?? '';
+    firstSourceUserSeq = first?.sourceUserSeq ?? null;
+    const second = beginRunAttempt(sessionId, { runId: 'run-turn-b' });
+    secondAttemptId = second.attemptId;
+    recordRunAttemptUserInput(second, {
+      turn: 2,
+      role: 'user',
+      data: { text: 'Turn B' },
+    });
+    return { text: 'Turn A finished.', sessionId: 'sdk', model: 'm', toolUses: [] };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Turn A',
+    sessionId,
+    runId: 'run-turn-a',
+  });
+
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.ok(firstAttemptId);
+  assert.equal(terminal?.data.attemptId, firstAttemptId);
+  assert.equal(terminal?.data.runId, 'run-turn-a');
+  assert.equal(terminal?.data.sourceUserSeq, firstSourceUserSeq);
+  assert.notEqual(terminal?.data.attemptId, secondAttemptId);
 });
 
 test('Claude SDK brain creates background sessions as execution sessions, not chat sessions', async () => {
@@ -384,6 +466,42 @@ test('renderClaudeAgentBrainSystemAppend carries Clementine context and the read
   assert.doesNotMatch(prompt, /tool_called event|tool_returned event|\[clipped:/);
 });
 
+test('Claude brain keeps the installed catalog out of the stable prompt and injects only relevant skills per turn', async () => {
+  const install = (name: string, description: string): void => {
+    const dir = path.join(TMP_HOME, 'skills', name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'SKILL.md'), [
+      '---', `name: ${name}`, `description: ${description}`, '---', '', 'The full procedure is intentionally not preloaded.',
+    ].join('\n'));
+  };
+  install('firm-document', 'Create polished Google Docs and Word document briefs for firms.');
+  install('calendar-operator', 'Schedule meetings and coordinate calendar availability.');
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  try {
+    const system = renderClaudeAgentBrainSystemAppend(
+      'home',
+      { message: 'Create a Google Doc about a firm.', sessionId: 'brain-skill-bloat' },
+      'read_only',
+    );
+    assert.match(system, /## Skill Discovery/);
+    assert.equal((system.match(/## Skill Discovery/g) ?? []).length, 1, 'canonical context and brain fallback must not duplicate discovery');
+    assert.doesNotMatch(system, /firm-document|calendar-operator/, 'the cacheable system prefix never enumerates installed skills');
+
+    const turn = await renderClaudeAgentBrainTurnContext({
+      message: 'Create a Google Doc about a firm.',
+      sessionId: 'brain-skill-bloat',
+    });
+    assert.match(turn, /## Relevant Skills/);
+    assert.equal((turn.match(/## Relevant Skills/g) ?? []).length, 1, 'Claude turn context injects one relevant-skill menu');
+    assert.doesNotMatch(turn, /## Skill Discovery/, 'Claude turn context does not repeat the stable discovery pointer');
+    assert.match(turn, /firm-document/);
+    assert.doesNotMatch(turn, /calendar-operator/);
+  } finally {
+    rmSync(path.join(TMP_HOME, 'skills'), { recursive: true, force: true });
+    delete process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT;
+  }
+});
+
 test('stable memory freezing is opt-in and supports explicit invalidation', () => {
   process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on'; // the freeze applies only on the split (cacheable-prefix) path
   process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT = 'on';
@@ -441,6 +559,21 @@ test('CONVERGE guard: after the user answers a clarifying question, the turn con
   const killed = await renderClaudeAgentBrainTurnContext({ message: 'winback action please', sessionId: sid });
   assert.doesNotMatch(killed, /CONVERGE/, 'kill-switch disables the steer');
   delete process.env.CLEMMY_BRAIN_CONVERGE;
+});
+
+test('spine confirm beat: each new consequential intent aligns; an old completion is never permanent consent', async () => {
+  const sid = createSession({ kind: 'chat' }).id;
+  const msg = 'send outreach emails to the 20 firms on my prospect list';
+  const fresh = await renderClaudeAgentBrainTurnContext({ message: msg, sessionId: sid });
+  assert.match(fresh, /\[confirm-first\]/, 'fresh execution-shaped turn gets the beat');
+  assert.match(fresh, /name the connection\/capability/, 'the shovel line — required capabilities are surfaced, not improvised around');
+  const firstDecision = listEvents(sid, { types: ['turn_preflight_decision'] }).at(-1);
+  assert.equal(firstDecision?.data.phase, 'align', 'the typed alignment decision is persisted for enforcement');
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed', data: { reason: 'success' } });
+  const continued = await renderClaudeAgentBrainTurnContext({ message: msg, sessionId: sid });
+  assert.match(continued, /\[confirm-first\]/, 'an old completion cannot authorize a later consequential request');
+  const continuedDecision = listEvents(sid, { types: ['turn_preflight_decision'] }).at(-1);
+  assert.equal(continuedDecision?.data.phase, 'align');
 });
 
 test('Claude SDK dispatch receives convergence state on a clarification answer', async () => {
@@ -657,6 +790,7 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(getSession('brain-run')?.metadata?.readOnly, true);
   assert.equal(captured.prompt, 'search memory');
   assert.equal(captured.sessionId, 'brain-run');
+  assert.match(captured.trackerScopeId, /^brain-run::brain:attempt-/);
   assert.equal(captured.maxTurns, 24);
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
   assert.ok(captured.allowedLocalMcpTools.includes('memory_remember'));
@@ -671,6 +805,134 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   const effort = listEvents('brain-run', { types: ['reasoning_effort'] })[0]?.data as { transport?: string; effort?: string } | undefined;
   assert.equal(effort?.transport, 'claude_agent_sdk_brain');
   assert.equal(effort?.effort, 'provider_default');
+});
+
+test('brain tracker scope survives a settled retry with the same durable run id and rotates for a new run', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const scopes: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    scopes.push(options.trackerScopeId ?? '');
+    return {
+      text: 'done',
+      sessionId: options.sessionId,
+      model: 'claude-sonnet-5',
+      toolUses: [],
+    };
+  });
+
+  const base = { message: 'read the current status', sessionId: 'brain-stable-scope' };
+  await respondViaClaudeAgentSdkBrain('home', { ...base, runId: 'run-stable-retry' });
+  await respondViaClaudeAgentSdkBrain('home', { ...base, runId: 'run-stable-retry' });
+  await respondViaClaudeAgentSdkBrain('home', { ...base, runId: 'run-new-work' });
+
+  assert.equal(scopes[0], 'brain-stable-scope::brain:run-stable-retry');
+  assert.equal(scopes[1], scopes[0], 'a re-dispatch of the same durable run cannot reset dedupe counters');
+  assert.equal(scopes[2], 'brain-stable-scope::brain:run-new-work');
+  assert.notEqual(scopes[2], scopes[0]);
+});
+
+test('desktop brain reuses and binds the exact pre-recorded request input without echoing it as history', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const sid = 'brain-pre-recorded-input';
+  const runId = 'desktop:pre-recorded-run';
+  const acceptedMessage = '/goal start Create the firm brief.';
+  const runtimeMessage = 'Execute the normalized goal objective: create the firm brief.';
+  createSession({ id: sid, kind: 'chat', channel: 'desktop' });
+  claimHarnessChatRequest({
+    requestId: 'client-pre-recorded-1234',
+    sessionId: sid,
+    runId,
+    inputHash: 'hash',
+    sinceSeq: 0,
+  });
+  const acceptedAttempt = beginRunAttempt(sid, { runId });
+  const source = recordRunAttemptUserInput(acceptedAttempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: acceptedMessage, requestId: 'client-pre-recorded-1234', runId },
+  });
+  let seenPriorTurns: unknown[] | undefined;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    seenPriorTurns = options.priorTurns;
+    return { text: 'Brief created.', sessionId: 'sdk', model: 'claude', toolUses: [] };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: runtimeMessage,
+    sessionId: sid,
+    runId,
+    channel: 'desktop',
+  });
+
+  const inputs = listEvents(sid, { types: ['user_input_received'] });
+  assert.equal(inputs.length, 1, 'pre-recorded input is not appended a second time');
+  assert.equal(inputs[0].seq, source.seq);
+  assert.deepEqual(seenPriorTurns, [], 'the literal accepted input is not echoed into transformed runtime history');
+  assert.equal(getLatestRunAttempt(sid)?.sourceUserSeq, source.seq);
+});
+
+test('ordinary manual continue rotates attempt scopes without minting artifact lineage', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE = 'off';
+  const trackerScopes: string[] = [];
+  const artifactScopes: string[] = [];
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    trackerScopes.push(options.trackerScopeId ?? '');
+    artifactScopes.push(options.artifactRunScopeId ?? '');
+    return calls === 1
+      ? {
+          text: 'I reached the turn budget. Say continue.', sessionId: 'sdk', model: 'claude',
+          toolUses: ['mcp__clementine-local__read_file'], limitHit: true,
+        }
+      : { text: 'Finished.', sessionId: 'sdk', model: 'claude', toolUses: [] };
+  });
+  const sid = 'brain-manual-continue-root';
+  await respondViaClaudeAgentSdkBrain('home', { message: 'Review the long report.', sessionId: sid, runId: 'run-first' });
+  await respondViaClaudeAgentSdkBrain('home', { message: 'continue', sessionId: sid, runId: 'run-continue' });
+  assert.notEqual(trackerScopes[1], trackerScopes[0], 'guardrail counters start fresh for the new user turn');
+  assert.notEqual(artifactScopes[1], artifactScopes[0], 'unpersisted candidates rotate with the real user attempt');
+  assert.equal(artifactLedger.getArtifactRunScope(sid, artifactScopes[0]), null);
+  assert.equal(artifactLedger.getArtifactRunScope(sid, artifactScopes[1]), null);
+  const terminal = listEvents(sid, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.artifactRunScopeId, undefined, 'ordinary read-only work projects no fake artifact root');
+  delete process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE;
+});
+
+test('a go-ahead turn preserves the confirmed multi-document objective for SDK scope and artifact identity', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const sid = 'brain-confirmed-objective';
+  const original = 'Create two separate Google Docs: a client brief and a technical appendix.';
+  const captured: Array<{ artifactObjective?: string; artifactRunScopeId?: string; nativeMcpScopeInput?: string; sourceUserSeq?: number }> = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured.push(options);
+    return {
+      text: captured.length === 1 ? 'I will create both documents in Google Docs. Say go ahead.' : 'Starting the confirmed work.',
+      sessionId: 'sdk', model: 'claude', toolUses: [],
+    };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', { message: original, sessionId: sid, runId: 'confirm-plan' });
+  const aligned = listEvents(sid, { types: ['turn_preflight_decision'] }).at(-1);
+  assert.equal(aligned?.data.phase, 'align');
+  assert.equal(aligned?.data.objective, original);
+  await respondViaClaudeAgentSdkBrain('home', { message: 'Go ahead.', sessionId: sid, runId: 'confirm-execute' });
+
+  assert.equal(captured.length, 2);
+  assert.equal(captured[1]?.artifactObjective, original);
+  assert.equal(captured[1]?.nativeMcpScopeInput, original, 'tool scoping sees the approved task, not only the control phrase');
+  const latestInput = listEvents(sid, { types: ['user_input_received'] }).at(-1);
+  assert.equal(captured[1]?.sourceUserSeq, latestInput?.seq, 'approval authority is pinned to the exact accepted control turn');
+  assert.equal(
+    artifactLedger.getArtifactRunScope(sid, captured[1]?.artifactRunScopeId ?? ''),
+    null,
+    'objective recovery alone does not mint artifact lineage',
+  );
 });
 
 test('Claude dispatch telemetry carries exact unified-primer refs and recall id', async () => {
@@ -738,8 +1000,10 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   const prompts: string[] = [];
+  const trackerScopes: string[] = [];
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     prompts.push(options.prompt);
+    trackerScopes.push(options.trackerScopeId ?? '');
     return {
       text: prompts.length === 1 ? "I'll send the emails next." : 'Sent all 3 emails — here are the message links.',
       sessionId: 'sdk', model: 'claude-opus-4-8',
@@ -755,9 +1019,148 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-judge' });
 
   assert.equal(prompts.length, 2, 'one continuation fired after the not-done verdict');
+  assert.equal(new Set(trackerScopes).size, 1, 'initial dispatch and continuation share one durable attempt scope');
+  assert.match(trackerScopes[0], /^brain-judge::brain:attempt-/);
   assert.match(prompts[1], /continue now and FINISH it/i);
   assert.match(prompts[1], /do NOT proceed on your own/i, 'continuation permits asking before external actions');
   assert.match(res.text, /Sent all 3 emails/);
+});
+
+test('artifact completion performs one exact-ID read-back before reporting success', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-artifact-verified';
+  const documentId = 'doc_verified_123456';
+  const prompts: string[] = [];
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    prompts.push(options.prompt);
+    const scope = artifactLedger.resolveArtifactRunScopeId(
+      sessionId,
+      options.artifactRunScopeId ?? options.trackerScopeId as string,
+      options.sourceUserSeq,
+    );
+    if (calls === 1) {
+      const intent = artifactLedger.artifactIntentForTool('composio_execute_tool', {
+        tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT',
+        arguments: JSON.stringify({ title: 'Firm brief' }),
+      });
+      assert.ok(intent);
+      artifactLedger.claimArtifactSlot(sessionId, intent!, 'toolu_create_doc', scope);
+      artifactLedger.bindArtifactSlot(sessionId, intent!.slotKey, {
+        resourceId: documentId,
+        uri: `https://docs.google.com/document/d/${documentId}/edit`,
+        title: 'Firm brief',
+      }, 'toolu_create_doc', scope);
+      return {
+        text: `Created the firm brief: https://docs.google.com/document/d/${documentId}/edit`,
+        sessionId: 'sdk', model: 'm',
+        toolUses: ['mcp__clementine-local__composio_execute_tool'],
+        artifactRunScopeId: scope,
+      };
+    }
+    assert.match(options.prompt, new RegExp(`document_id=${documentId}`));
+    assert.doesNotMatch(options.prompt, /GOOGLEDOCS_CREATE_DOCUMENT/);
+    assert.deepEqual(options.artifactVerificationOnly, [{ kind: 'google_doc', resourceId: documentId }], 'repair is enforced at the permission boundary');
+    artifactLedger.verifyArtifactBindingFromToolResult(
+      sessionId,
+      scope,
+      'composio_execute_tool',
+      {
+        tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+        arguments: JSON.stringify({ document_id: documentId }),
+      },
+      { data: { document_id: documentId, document_url: `https://docs.google.com/document/d/${documentId}/edit` } },
+      'toolu_verify_doc',
+      true,
+    );
+    return {
+      text: 'Provider read-back succeeded.', sessionId: 'sdk', model: 'm',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+      artifactRunScopeId: scope,
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('background', {
+    message: 'Create the firm brief in Google Docs.',
+    sessionId,
+  });
+
+  assert.equal(calls, 2, 'one create query plus one bounded verification query');
+  assert.equal(response.stoppedReason, 'success');
+  assert.match(response.text, /Created the firm brief/);
+  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 0);
+  assert.ok(artifactLedger.listRunArtifacts(sessionId)[0]?.bindingVerifiedAt);
+});
+
+test('artifact completion stays honest when exact read-back cannot verify the binding', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  const sessionId = 'brain-artifact-unverified';
+  const documentId = 'doc_unverified_123456';
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    const scope = artifactLedger.resolveArtifactRunScopeId(
+      sessionId,
+      options.artifactRunScopeId ?? options.trackerScopeId as string,
+      options.sourceUserSeq,
+    );
+    if (calls === 1) {
+      const intent = artifactLedger.artifactIntentForTool('composio_execute_tool', {
+        tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT',
+        arguments: JSON.stringify({ title: 'Unverified brief' }),
+      });
+      assert.ok(intent);
+      artifactLedger.claimArtifactSlot(sessionId, intent!, 'toolu_create_unverified', scope);
+      artifactLedger.bindArtifactSlot(sessionId, intent!.slotKey, {
+        resourceId: documentId,
+        uri: `https://docs.google.com/document/d/${documentId}/edit`,
+      }, 'toolu_create_unverified', scope);
+      return {
+        text: 'Done — document created.', sessionId: 'sdk', model: 'm',
+        toolUses: ['mcp__clementine-local__composio_execute_tool'],
+        artifactRunScopeId: scope,
+      };
+    }
+    // Simulate a provider response for the wrong id. The real SDK observer
+    // correctly leaves the ledger unverified in this case.
+    artifactLedger.verifyArtifactBindingFromToolResult(
+      sessionId,
+      scope,
+      'composio_execute_tool',
+      {
+        tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+        arguments: JSON.stringify({ document_id: documentId }),
+      },
+      { data: { document_id: 'different_document_999' } },
+      'toolu_wrong_readback',
+      true,
+    );
+    return {
+      text: 'Looks verified.', sessionId: 'sdk', model: 'm',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+      artifactRunScopeId: scope,
+    };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('background', {
+    message: 'Create the brief in Google Docs.',
+    sessionId,
+  });
+
+  assert.equal(calls, 2, 'verification is attempted once and never loops');
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.match(response.text, /could not independently verify/i);
+  assert.match(response.text, /did not create a replacement/i);
+  assert.equal(artifactLedger.listRunArtifacts(sessionId).length, 1, 'no duplicate resource slot');
+  assert.equal(artifactLedger.listUnverifiedRunArtifacts(sessionId).length, 1);
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.reason, 'awaiting_user_input');
+  assert.equal((terminal?.data.artifactVerification as { status?: string } | undefined)?.status, 'pending');
 });
 
 test('Phase 1.3: a SHARED continuation budget caps narration + judge so corrective re-runs cannot stack', async () => {
@@ -1324,14 +1727,38 @@ test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-inpu
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   let runCalls = 0;
   let judgeCalls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => {
+  let pausedArtifactScope = '';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
     runCalls += 1;
+    pausedArtifactScope = artifactLedger.resolveArtifactRunScopeId(
+      'brain-ask-awaiting',
+      options.artifactRunScopeId ?? '',
+      options.sourceUserSeq,
+    );
+    const intent = artifactLedger.artifactIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT',
+      arguments: JSON.stringify({ title: 'Deployment runbook' }),
+    });
+    assert.ok(intent);
+    artifactLedger.claimArtifactSlot(
+      'brain-ask-awaiting', intent!, 'toolu_pause_create', pausedArtifactScope,
+    );
+    artifactLedger.bindArtifactSlot(
+      'brain-ask-awaiting', intent!.slotKey,
+      {
+        resourceId: 'doc_pause_123456789',
+        uri: 'https://docs.google.com/document/d/doc_pause_123456789/edit',
+      },
+      'toolu_pause_create',
+      pausedArtifactScope,
+    );
     return {
       text: 'Which environment should I use?',
       sessionId: 'sdk-session',
       model: 'claude-sonnet-5',
       toolUses: ['mcp__clementine-local__ask_user_question'],
       stoppedReason: 'awaiting-input',
+      artifactRunScopeId: pausedArtifactScope,
     };
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => {
@@ -1354,17 +1781,44 @@ test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-inpu
   const completions = listEvents('brain-ask-awaiting', { types: ['conversation_completed'] });
   assert.equal(completions.at(-1)?.data.reason, 'awaiting_user_input');
   assert.equal(completions.at(-1)?.data.awaitingUser, true);
+  assert.equal(completions.at(-1)?.data.artifactRunScopeId, pausedArtifactScope);
+  assert.equal(
+    (completions.at(-1)?.data.artifactVerification as { status?: string } | undefined)?.status,
+    'pending',
+    'a pause persists the resource that was created before asking the question',
+  );
 
   let nextTurnContext = '';
+  let resumedArtifactScope = '';
+  let resumedAttemptScope = '';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     runCalls += 1;
     nextTurnContext = options.turnContext ?? '';
+    resumedArtifactScope = artifactLedger.resolveArtifactRunScopeId(
+      'brain-ask-awaiting',
+      options.artifactRunScopeId ?? '',
+      options.sourceUserSeq,
+    );
+    resumedAttemptScope = options.trackerScopeId ?? '';
+    artifactLedger.verifyArtifactBindingFromToolResult(
+      'brain-ask-awaiting',
+      resumedArtifactScope,
+      'composio_execute_tool',
+      {
+        tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+        arguments: JSON.stringify({ document_id: 'doc_pause_123456789' }),
+      },
+      { data: { document_id: 'doc_pause_123456789' } },
+      'toolu_pause_verify',
+      true,
+    );
     return {
       text: 'Configured the production deployment.',
       sessionId: 'sdk-session',
       model: 'claude-sonnet-5',
       toolUses: [],
+      artifactRunScopeId: resumedArtifactScope,
     };
   });
   await respondViaClaudeAgentSdkBrain('background', {
@@ -1373,6 +1827,15 @@ test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-inpu
   });
   assert.equal(runCalls, 2);
   assert.equal(judgeCalls, 0, 'the convergence assertion is independent of completion judging');
+  assert.equal(
+    resumedArtifactScope,
+    pausedArtifactScope,
+    'the immediate answer inherits the typed pause root instead of creating a new artifact run',
+  );
+  assert.equal(
+    artifactLedger.getArtifactRunScope('brain-ask-awaiting', resumedAttemptScope)?.reason,
+    'awaiting_user_input_reply',
+  );
   assert.match(nextTurnContext, /CONVERGE/);
   assert.match(nextTurnContext, /EXECUTE the work this turn/);
 });
@@ -1439,12 +1902,16 @@ test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmati
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE; // default on
   createSession({ id: 'salvage-committed', kind: 'chat', title: 'salvage' });
-  // The 3 emails already sent this turn — recorded as external_write events.
-  for (const t of ['a@x.com', 'b@y.com', 'c@z.com']) {
-    appendEvent({ sessionId: 'salvage-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
-  }
   let calls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed)."); });
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    // These sends happened inside the current SDK dispatch, after the brain's
+    // salvage watermark. Prior-session writes must never satisfy this branch.
+    for (const t of ['a@x.com', 'b@y.com', 'c@z.com']) {
+      appendEvent({ sessionId: 'salvage-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
+    }
+    throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed).");
+  });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send those 3 emails', sessionId: 'salvage-committed' });
   assert.equal(calls, 1, 'must NOT re-run after a committed send (no double-send)');
@@ -1457,17 +1924,72 @@ test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmati
   assert.doesNotMatch(res.text, /could not be parsed|went wrong|✅ Done/i);
 });
 
+test('salvage reconciles explicit native failures instead of calling them landed', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sid = 'salvage-native-failed';
+  createSession({ id: sid, kind: 'chat', title: 'failed write' });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) {
+      appendEvent({
+        sessionId: sid, turn: 0, role: 'system', type: 'external_write',
+        data: { callId: 'toolu-failed', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+      });
+      appendEvent({
+        sessionId: sid, turn: 0, role: 'system', type: 'external_write_failed',
+        data: { callId: 'toolu-failed', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+      });
+      throw new Error("The model's tool call could not be parsed (retry also failed).");
+    }
+    return { text: 'Recovered after the failed dispatch.', sessionId: 'sdk', model: 'claude', toolUses: [] };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'recovered' }));
+  const response = await respondViaClaudeAgentSdkBrain('home', { message: 'send the email', sessionId: sid });
+  assert.equal(calls, 2, 'a demonstrably failed dispatch is safe to retry once');
+  assert.doesNotMatch(response.text, /already went through|nothing was duplicated/i);
+});
+
+test('salvage reports an orphan as uncertain and never blindly replays it', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sid = 'salvage-native-orphan';
+  createSession({ id: sid, kind: 'chat', title: 'orphaned write' });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    appendEvent({
+      sessionId: sid, turn: 0, role: 'system', type: 'external_write',
+      data: { callId: 'toolu-orphan', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+    });
+    appendEvent({
+      sessionId: sid, turn: 0, role: 'system', type: 'external_write_orphaned',
+      data: { callId: 'toolu-orphan', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+    });
+    throw new Error("The model's tool call could not be parsed (retry also failed).");
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'honest uncertainty' }));
+  const response = await respondViaClaudeAgentSdkBrain('home', { message: 'send the email', sessionId: sid });
+  assert.equal(calls, 1, 'an ambiguous provider boundary is never replayed');
+  assert.match(response.text, /may have gone through/i);
+  assert.match(response.text, /did not replay/i);
+});
+
 test('salvage A2: a COMMITTED provider overload returns an honest partial (never re-runs, no double-send)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE; // default on
   createSession({ id: 'overload-committed', kind: 'chat', title: 'overload salvage' });
-  // 2 emails already sent this turn when the provider 529'd mid-run (21-min-in case).
-  for (const t of ['a@x.com', 'b@y.com']) {
-    appendEvent({ sessionId: 'overload-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
-  }
   let calls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', true); });
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    // 2 emails landed during this dispatch before the provider 529'd.
+    for (const t of ['a@x.com', 'b@y.com']) {
+      appendEvent({ sessionId: 'overload-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
+    }
+    throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', true);
+  });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send those 2 emails', sessionId: 'overload-committed' });
   assert.equal(calls, 1, 'must NOT re-run after a committed overload (no double-send)');
@@ -1508,6 +2030,42 @@ test('salvage B: a parse error with NOTHING committed retries once and succeeds'
   assert.match(res.text, /Here is your answer/);
 });
 
+test('salvage ignores writes from an older turn in the same reusable chat', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+  const sid = 'salvage-old-session-write';
+  createSession({ id: sid, kind: 'chat', title: 'reusable chat' });
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'tool',
+    type: 'external_write',
+    data: {
+      callId: 'old-send',
+      shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+      toolName: 'composio_execute_tool',
+      targets: ['old@example.com'],
+    },
+  });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("The model's tool call could not be parsed (retry also failed).");
+    return { text: 'The current read-only question recovered.', sessionId: 'sdk', model: 'claude', toolUses: [] };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'recovered' }));
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'What is on my calendar today?',
+    sessionId: sid,
+  });
+
+  assert.equal(calls, 2, 'old writes cannot suppress the current turn safe retry');
+  assert.match(response.text, /current read-only question recovered/i);
+  assert.doesNotMatch(response.text, /already went through|nothing was duplicated|old@example\.com/i);
+});
+
 test('salvage: kill-switch off ⇒ the parse error propagates (byte-identical to before)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
@@ -1527,9 +2085,12 @@ test('overflow A2: a COMMITTED context overflow salvages an honest partial (neve
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE; // default on
   createSession({ id: 'overflow-committed', kind: 'chat', title: 'overflow salvage' });
-  appendEvent({ sessionId: 'overflow-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['a@x.com'] } });
   let calls = 0;
-  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; throw new ClaudeSdkContextOverflowError('prompt is too long: 214000 tokens > 200000 maximum', true); });
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    appendEvent({ sessionId: 'overflow-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['a@x.com'] } });
+    throw new ClaudeSdkContextOverflowError('prompt is too long: 214000 tokens > 200000 maximum', true);
+  });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send that email', sessionId: 'overflow-committed' });
   assert.equal(calls, 1, 'must NOT re-run after a committed overflow (no double-send)');
@@ -1587,6 +2148,32 @@ test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds 
   assert.match(contPrompt, /tool_output_query/, 'ledger instruction present');
   assert.match(contPrompt, /toolu_abc123/, 'earlier callId handed to the continuation');
   assert.match(contPrompt, /APIFY_GET_DATASET_ITEMS/, 'args preview present');
+});
+
+test('spine: the FIRST auto-continue of a long chat run carries the background offer, one-shot', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  let calls = 0;
+  const prompts: string[] = [];
+  const manyTools = Array.from({ length: 8 }, () => 'mcp__clementine-local__composio_execute_tool');
+  setClaudeAgentSdkBrainRunForTest(async (opts: any) => {
+    calls += 1;
+    prompts.push(String(opts.prompt ?? ''));
+    // Two limit-hits in a row: the offer must ride the first continuation only.
+    if (calls <= 2) return { text: `batch ${calls} done, more remain`, sessionId: 's', toolUses: manyTools, limitHit: true };
+    return { text: 'All batches done.', sessionId: 's', toolUses: manyTools, limitHit: false };
+  });
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'process 30 firms', sessionId: 'brain-bg-offer' });
+  assert.equal(calls, 3);
+  assert.match(res.text, /All batches done/);
+  assert.match(prompts[1], /\[background offer\]/, 'first auto-continue carries the offer');
+  assert.match(prompts[1], /offer_background/, 'steers to the terminal tool');
+  assert.doesNotMatch(prompts[2], /\[background offer\]/, 'one-shot — never repeated');
+  const nudgeEvent = listEvents('brain-bg-offer').find(
+    (e) => (e as { type?: string }).type === 'heartbeat'
+      && ((e as { data?: { kind?: string } }).data?.kind === 'background_offer_nudge'),
+  );
+  assert.ok(nudgeEvent, 'nudge telemetry emitted at the boundary');
 });
 
 test('overflow A2: committed overflow with ZERO external writes falls through to the reduced retry (reads are safe)', async () => {

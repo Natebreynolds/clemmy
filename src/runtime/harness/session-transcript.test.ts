@@ -104,6 +104,63 @@ test('renderSessionHistoryForModel keeps cross-session continuation context with
   assert.match(history, /USER: go ahead with those/);
 });
 
+test('renderSessionHistoryForModel throughSeq freezes turns, actions, and prefixes at the handoff boundary', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat', channel: 'desktop', title: 'Bounded handoff' }).id;
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: { text: '[CONTINUATION CONTEXT]\n  USER: PRE-BOUND-PREFIX-101' },
+  });
+  appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'TURN-A-REQUEST-202' } });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'DOC_CREATE', targets: ['doc:pre-bound-303'] },
+  });
+  const boundary = appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: { reply: 'TURN-A-PROGRESS-404' },
+  });
+
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: { text: '[CONTINUATION CONTEXT]\n  USER: POST-BOUND-PREFIX-505' },
+  });
+  appendEvent({ sessionId: sid, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'TURN-B-REQUEST-606' } });
+  appendEvent({
+    sessionId: sid,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'EMAIL_SEND', targets: ['post-bound-707@example.com'] },
+  });
+  appendEvent({ sessionId: sid, turn: 2, role: 'Clem', type: 'conversation_completed', data: { reply: 'TURN-B-ANSWER-808' } });
+
+  const history = renderSessionHistoryForModel(sid, 10, 12_000, boundary.seq);
+
+  assert.match(history, /PRE-BOUND-PREFIX-101/);
+  assert.match(history, /TURN-A-REQUEST-202/);
+  assert.match(history, /DOC_CREATE/);
+  assert.match(history, /doc:pre-bound-303/);
+  assert.match(history, /TURN-A-PROGRESS-404/);
+  assert.doesNotMatch(history, /POST-BOUND-PREFIX-505/);
+  assert.doesNotMatch(history, /TURN-B-REQUEST-606/);
+  assert.doesNotMatch(history, /EMAIL_SEND/);
+  assert.doesNotMatch(history, /post-bound-707@example\.com/);
+  assert.doesNotMatch(history, /TURN-B-ANSWER-808/);
+});
+
 test('renderSessionHistoryForModel aggregates sibling workflow-step sessions for cross-model parity', () => {
   resetEventLog();
   const step1 = createSession({

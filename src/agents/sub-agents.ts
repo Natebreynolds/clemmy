@@ -213,6 +213,7 @@ export async function runCrossProviderWorker(
   input: WorkerToolInput,
   modelId: string,
   sessionId: string,
+  sourceUserSeq?: number,
 ): Promise<CrossProviderWorkerResult> {
   const worker = await buildWorkerAgent({ model: modelId, workerInput: input });
   const guard = workerThrashGuardEnabled();
@@ -231,7 +232,12 @@ export async function runCrossProviderWorker(
   const runner = new Runner({ workflowName: 'clementine-sdk-brain-cross-worker', groupId: sessionId });
   try {
     const result = await withHarnessRunContext(
-      { sessionId, counter, ...(guard ? { guardrailScopeId: scopeId } : {}) },
+      {
+        sessionId,
+        counter,
+        ...(guard ? { guardrailScopeId: scopeId } : {}),
+        ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
+      },
       () =>
         runner.run(worker, buildWorkerJobPrompt(input), {
           context: { sessionId, turn: 0 },

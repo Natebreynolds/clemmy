@@ -18,6 +18,24 @@ process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
 process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
 const { __test__ } = await import('./discord.js');
+const {
+  __test__: harnessTest,
+  bindDiscordHarnessSession,
+  clearDiscordHarnessSession,
+} = await import('./discord-harness.js');
+const { getOrCreateDiscordSessionId } = await import('./discord-store.js');
+const {
+  createSession,
+  beginRunAttempt,
+  getActiveRunAttempt,
+  getKillRequest,
+  isKillRequested,
+} = await import('../runtime/harness/eventlog.js');
+const {
+  createBackgroundTask,
+  getBackgroundTask,
+  markBackgroundTaskRunning,
+} = await import('../execution/background-tasks.js');
 
 after(() => {
   if (PREV_HARNESS_WEBHOOK === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
@@ -64,6 +82,8 @@ function pendingApproval(patch: Partial<PendingApproval> = {}): PendingApproval 
     createdAt: patch.createdAt ?? new Date().toISOString(),
     status: patch.status ?? 'pending',
     state: patch.state ?? '',
+    userId: patch.userId,
+    channel: patch.channel,
   };
 }
 
@@ -120,4 +140,129 @@ test('buildDiscordRestTransport: exposes sendFollowup (finalFlush needs it for o
   const transport = __test__.buildDiscordRestTransport('chan-rest');
   assert.equal(typeof transport.sendFollowup, 'function');
   assert.equal(typeof transport.sendInitial, 'function');
+});
+
+test('bare approval vocabulary only sees approvals linked to this Discord conversation', () => {
+  const context = { channelId: 'chan-current', userId: 'user-same', guildId: 'guild-current' };
+  const currentChannel = 'discord:guild-current:chan-current';
+  const approvals = [
+    pendingApproval({ id: 'current', userId: 'user-same', channel: currentChannel }),
+    pendingApproval({ id: 'foreign-channel', userId: 'user-same', channel: 'discord:guild-other:chan-other' }),
+    pendingApproval({ id: 'legacy-user-only', userId: 'user-same' }),
+    pendingApproval({ id: 'different-user', userId: 'user-other' }),
+  ];
+
+  assert.deepEqual(
+    __test__.relevantApprovalsForContext(context, approvals).map((approval) => approval.id),
+    ['current', 'legacy-user-only'],
+  );
+});
+
+test('Discord stop targets the actual in-memory gateway attempt and linked background work', async () => {
+  const context = { channelId: 'chan-stop-test', userId: 'user-stop-test', guildId: 'guild-stop-test' };
+  const sessionId = getOrCreateDiscordSessionId(context);
+  createSession({
+    id: sessionId,
+    kind: 'chat',
+    channel: 'discord:guild-stop-test:chan-stop-test',
+    userId: context.userId,
+  });
+  const task = createBackgroundTask({
+    title: 'linked long research',
+    prompt: 'research',
+    originSessionId: sessionId,
+    userId: context.userId,
+    channel: 'discord:guild-stop-test:chan-stop-test',
+    source: 'discord',
+  });
+  markBackgroundTaskRunning(task.id);
+  // A running task can temporarily have no registered model attempt (startup /
+  // between turns). Task-state cancellation must not widen to a session latch.
+  const queuedTask = createBackgroundTask({
+    title: 'linked queued export',
+    prompt: 'export later',
+    originSessionId: sessionId,
+    userId: context.userId,
+    channel: 'discord:guild-stop-test:chan-stop-test',
+    source: 'discord',
+  });
+
+  let entered!: () => void;
+  let release!: () => void;
+  const assistantEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const assistantReleased = new Promise<void>((resolve) => { release = resolve; });
+  const running = __test__.runGatewayPrompt({
+    assistant: {
+      async respond(request: { sessionId: string }) {
+        entered();
+        await assistantReleased;
+        return { text: 'Stopped.', sessionId: request.sessionId, stoppedReason: 'cancelled' as const };
+      },
+    } as never,
+    prompt: 'do the current foreground work',
+    ...context,
+  });
+  await assistantEntered;
+  const attempt = getActiveRunAttempt(sessionId);
+  assert.ok(attempt, 'gateway registers the attempt before model work');
+
+  const stopped = __test__.stopDiscordContext(context);
+
+  assert.deepEqual(stopped.stoppedSessionIds, [sessionId]);
+  assert.deepEqual(new Set(stopped.stoppedTaskIds), new Set([task.id, queuedTask.id]));
+  assert.equal(isKillRequested(sessionId, attempt!), true);
+  assert.equal(getBackgroundTask(task.id)?.status, 'cancelling');
+  assert.equal(getBackgroundTask(queuedTask.id)?.status, 'aborted');
+  assert.equal(getKillRequest(task.runSessionId), null, 'no active task attempt means no session-wide kill latch');
+  release();
+  await running;
+});
+
+test('Discord REST/gateway stop resolution sees the exact active harness attempt', () => {
+  const context = { channelId: 'chan-harness-stop', userId: 'user-harness-stop', guildId: 'guild-harness-stop' };
+  const session = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId: context.userId,
+    metadata: { channelId: context.channelId, guildId: context.guildId },
+  });
+  const active = harnessTest.registerActiveChannelRunForTest({
+    channel: 'discord',
+    ...context,
+    sessionId: session.id,
+  });
+
+  try {
+    const stopped = __test__.stopDiscordContext(context);
+    assert.deepEqual(stopped.stoppedSessionIds, [session.id]);
+    assert.equal(isKillRequested(session.id, active), true);
+  } finally {
+    harnessTest.unregisterActiveChannelRunForTest(active, 'cancelled');
+  }
+});
+
+test('Discord stop rehydrates and exact-kills the durable active attempt after restart', () => {
+  const context = { channelId: 'chan-restart-stop', userId: 'user-restart-stop', guildId: 'guild-restart-stop' };
+  const session = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    userId: context.userId,
+    metadata: {
+      source: 'discord',
+      channelId: context.channelId,
+      userId: context.userId,
+      guildId: context.guildId,
+    },
+  });
+  assert.equal(bindDiscordHarnessSession({ ...context, sessionId: session.id }), true);
+  const attempt = beginRunAttempt(session.id);
+
+  // Simulate a daemon restart: process-local continuity and active-run maps no
+  // longer know this turn, while the channel binding + attempt remain in SQLite.
+  clearDiscordHarnessSession(context.channelId);
+  const stopped = __test__.stopDiscordContext(context);
+
+  assert.deepEqual(stopped.stoppedSessionIds, [session.id]);
+  assert.equal(isKillRequested(session.id, attempt), true);
+  assert.equal(getKillRequest(session.id, attempt)?.attemptId, attempt.attemptId);
 });

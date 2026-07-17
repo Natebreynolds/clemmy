@@ -50,6 +50,9 @@ const AMBIENT_COUNTER_LIMIT = 1000;
 export interface ClementineMcpServerOptions {
   sessionId?: string;
   runScopeId?: string;
+  /** Exact accepted user event owned by this SDK attempt. The in-process and
+   * stdio MCP transports must carry the same authority into nested carriers. */
+  sourceUserSeq?: number;
   gatedMutations?: boolean;
   allowedTools?: string[];
   /** Tools that must remain first-class when the client supports MCP tool
@@ -75,6 +78,11 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
   const workflowName = opts.workflowName?.trim() || process.env.CLEMENTINE_MCP_WORKFLOW_NAME?.trim() || undefined;
   const stepId = opts.stepId?.trim() || process.env.CLEMENTINE_MCP_STEP_ID?.trim() || undefined;
   const runScopeId = opts.runScopeId?.trim() || process.env.CLEMENTINE_MCP_RUN_SCOPE_ID?.trim() || undefined;
+  const sourceUserSeq = (() => {
+    if (Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0) return opts.sourceUserSeq;
+    const value = Number.parseInt(process.env.CLEMENTINE_MCP_SOURCE_USER_SEQ ?? '', 10);
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  })();
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
@@ -92,7 +100,12 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
         // The gated mutating tools nest their own inner context (with the real
         // per-call counter), so this is a safe outer fallback for everything else.
         () => withHarnessRunContext(
-          { sessionId, behaviorScopeId: runScopeId, counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT) },
+          {
+            sessionId,
+            behaviorScopeId: runScopeId,
+            counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT),
+            ...(sourceUserSeq ? { sourceUserSeq } : {}),
+          },
           () => handler(...handlerArgs),
         ),
       );
@@ -228,6 +241,8 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerGatedMutatingTools(server, {
     enabled: opts.gatedMutations,
     sessionId: opts.sessionId,
+    runScopeId: opts.runScopeId,
+    sourceUserSeq: opts.sourceUserSeq,
   });
 
   // Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so

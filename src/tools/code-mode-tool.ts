@@ -345,7 +345,12 @@ async function runCodeModeWorker(input: WorkerToolInput, modelId: string, sessio
   // clean fix is an AbortSignal.timeout passed as a 4th arg; runCrossProviderWorker
   // does not yet accept a signal on this branch, so it's deferred until that lands
   // rather than reaching into the worker subsystem here.
-  const r = await runCrossProviderWorker(input, modelId, sessionId);
+  const r = await runCrossProviderWorker(
+    input,
+    modelId,
+    sessionId,
+    harnessRunContextStorage.getStore()?.sourceUserSeq,
+  );
   return { text: r.text, model: r.model };
 }
 
@@ -490,6 +495,32 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
 
 /** A local clem tool: route through wrapToolForHarness (the full bracket gate
  *  battery) under the shared run-context, exactly as before. */
+function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
+  NonNullable<ReturnType<typeof harnessRunContextStorage.getStore>>,
+  | 'sourceUserSeq'
+  | 'behaviorScopeId'
+  | 'guardrailScopeId'
+  | 'suppressBackgroundOffer'
+  | 'recallBudget'
+  | 'defaultTimeoutMs'
+  | 'turnRecallRunIds'
+>> {
+  const parent = harnessRunContextStorage.getStore();
+  if (!parent || parent.sessionId !== sessionId) return {};
+  // Preserve attempt authority and per-run accounting across a carrier's nested
+  // ALS context. Never inherit certifiedBatch implicitly: only the batch
+  // executor's byte-pinned argument may grant that optimization.
+  return {
+    ...(parent.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
+    ...(parent.behaviorScopeId ? { behaviorScopeId: parent.behaviorScopeId } : {}),
+    ...(parent.guardrailScopeId ? { guardrailScopeId: parent.guardrailScopeId } : {}),
+    ...(parent.suppressBackgroundOffer ? { suppressBackgroundOffer: true } : {}),
+    ...(parent.recallBudget ? { recallBudget: parent.recallBudget } : {}),
+    ...(parent.defaultTimeoutMs ? { defaultTimeoutMs: parent.defaultTimeoutMs } : {}),
+    ...(parent.turnRecallRunIds ? { turnRecallRunIds: parent.turnRecallRunIds } : {}),
+  };
+}
+
 async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }): Promise<unknown> {
   const real = (await realToolsByName()).get(method);
   if (!real || typeof real.invoke !== 'function') {
@@ -527,7 +558,13 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
   return withToolOutputContext({ sessionId, callId, toolName: method }, () =>
     // codeMode:true exempts these reads from the deterministic read-fanout block —
     // a program's batched reads ARE the sanctioned execution the block steers to.
-    withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000), codeMode: true, ...(certifiedBatch ? { certifiedBatch } : {}) }, () =>
+    withHarnessRunContext({
+      ...inheritedNestedHarnessContext(sessionId),
+      sessionId,
+      counter: counter ?? new ToolCallsCounter(1000),
+      codeMode: true,
+      ...(certifiedBatch ? { certifiedBatch } : {}),
+    }, () =>
       wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
     ),
   );
@@ -558,7 +595,13 @@ async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId:
   if (typeof shim.listTools === 'function') { try { await shim.listTools(); } catch { /* routing rebuilds on call */ } }
   const argObj = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
   return withHarnessRunContext(
-    { sessionId, counter: counter ?? new ToolCallsCounter(1000), codeMode: true, ...(certifiedBatch ? { certifiedBatch } : {}) },
+    {
+      ...inheritedNestedHarnessContext(sessionId),
+      sessionId,
+      counter: counter ?? new ToolCallsCounter(1000),
+      codeMode: true,
+      ...(certifiedBatch ? { certifiedBatch } : {}),
+    },
     () => shim.callTool(method, argObj),
   );
 }

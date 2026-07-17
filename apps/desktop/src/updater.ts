@@ -30,7 +30,12 @@ import path from 'node:path';
 const { autoUpdater } = electronUpdater;
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { compareVersions } from './version-compare.js';
-import { isMissingReleaseMetadataError, updaterErrorMessage } from './updater-errors.js';
+import {
+  isMissingReleaseMetadataError,
+  shouldReportUpdaterCondition,
+  shouldSuppressUpdaterInternalError,
+  updaterErrorMessage,
+} from './updater-errors.js';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const MOVE_TO_APPLICATIONS_MESSAGE =
@@ -70,6 +75,7 @@ let onStatusChangeListeners: Array<(s: UpdaterStatus) => void> = [];
 let periodicHandle: NodeJS.Timeout | null = null;
 let downloadInFlight = false;
 let updaterLog: UpdaterLog | undefined;
+let lastMissingReleaseReportedAt = 0;
 
 type UpdaterLog = (level: 'info' | 'warn' | 'error', msg: string, extra?: Record<string, unknown>) => void;
 
@@ -85,6 +91,9 @@ function updateStatus(next: Partial<UpdaterStatus>): void {
 }
 
 function markMissingReleaseMetadataAsNoUpdate(err: unknown, log = updaterLog): void {
+  const now = Date.now();
+  if (!shouldReportUpdaterCondition(lastMissingReleaseReportedAt, now)) return;
+  lastMissingReleaseReportedAt = now;
   const message = updaterErrorMessage(err);
   log?.('warn', 'updater release metadata missing — treating as no update', { err: message });
   updateStatus({
@@ -370,7 +379,10 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   autoUpdater.logger = {
     info: (msg: string) => log('info', String(msg)),
     warn: (msg: string) => log('warn', String(msg)),
-    error: (msg: string) => log('error', String(msg)),
+    error: (msg: string) => {
+      if (shouldSuppressUpdaterInternalError(msg)) return;
+      log('error', String(msg));
+    },
     debug: () => {},
   } as unknown as typeof autoUpdater.logger;
 
@@ -489,6 +501,7 @@ export function disposeAutoUpdater(): void {
     clearInterval(periodicHandle);
     periodicHandle = null;
   }
+  lastMissingReleaseReportedAt = 0;
   onStatusChangeListeners = [];
 }
 

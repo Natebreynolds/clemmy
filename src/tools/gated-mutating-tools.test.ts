@@ -24,6 +24,7 @@ const destination = await import('../runtime/harness/destination-gate.js');
 const { registerGatedMutatingTools, gatedMutationsEnabled, getGatedToolSchemas } = await import('./gated-mutating-tools.js');
 const { getComputerTools } = await import('./computer-tools.js');
 const { getComposioRuntimeTools } = await import('./composio-tools.js');
+const { toolCallCorrelationFingerprint } = await import('../runtime/harness/tool-correlation.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown>;
 
@@ -73,7 +74,9 @@ test('gate bridge: the destination gate FIRES when Claude calls run_shell_comman
   // A publish verb with NO explicit destination → the destination gate soft-blocks.
   // The binary is intentionally nonexistent: even if a gate ever missed, this is a
   // harmless "command not found", never a real deploy.
-  const out = await shell({ command: 'clemmy-fake-deploy-cli deploy --dir "/x/site" --prod --json' });
+  const command = `clemmy-fake-deploy-cli deploy --dir "/x/site" --prod --json # ${'private-shell-payload '.repeat(30)}`;
+  assert.ok(command.length > 500);
+  const out = await shell({ command });
 
   const tripped = listEvents(sess.id, { types: ['guardrail_tripped'] })
     .map((e) => (e.data as { kind?: string }).kind)
@@ -86,6 +89,14 @@ test('gate bridge: the destination gate FIRES when Claude calls run_shell_comman
   // textResult shape ({ content: [{ type:'text', text }] }), not command output.
   const text = (out as { content?: Array<{ text?: string }> })?.content?.[0]?.text ?? '';
   assert.ok(text.length > 0, 'bridge returns the gate block as a tool result');
+  const mirrorCall = listEvents(sess.id, { types: ['tool_called'] }).find((event) => event.data.tool === 'run_shell_command');
+  assert.equal(mirrorCall?.data.accounting, 'transport_mirror', 'inner MCP telemetry cannot inflate top-level call counts');
+  assert.equal(
+    mirrorCall?.data.correlationFingerprint,
+    toolCallCorrelationFingerprint('run_shell_command', { command }),
+    'mirror correlation uses the full input before previewArgs clips it',
+  );
+  assert.doesNotMatch(String(mirrorCall?.data.correlationFingerprint), /private-shell-payload/);
 });
 
 // ─── C3 conformance: gated schema is DERIVED from the base tool, never a fork ──

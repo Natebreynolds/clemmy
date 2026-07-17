@@ -47,6 +47,11 @@ export const EVENT_TYPES = [
   'handoff',
   'awaiting_user_input',
   'user_input_received',
+  // Turn-control preflight: one typed read/align/execute decision tied to the
+  // latest user-input event. The prompt may explain an alignment beat, but the
+  // tool boundary reads this durable state so ignoring the prose cannot start
+  // execution before the user's next turn.
+  'turn_preflight_decision',
   'approval_requested',
   'approval_resolved',
   // Token-level streaming: emitted for each output_text_delta from the model.
@@ -334,6 +339,64 @@ export interface HarnessSessionSignal {
   metadata: Record<string, string | number | boolean | null>;
 }
 
+export interface RunAttemptRef {
+  sessionId: string;
+  attemptId: string;
+  runId: string | null;
+  startedAt: string;
+}
+
+export interface KillRequestRef {
+  sessionId: string;
+  scopeKey: string;
+  attemptId: string | null;
+  runId: string | null;
+  requestedAt: string;
+  reason: string | null;
+}
+
+export interface KillRequestTarget {
+  attemptId?: string | null;
+  runId?: string | null;
+  /** Exact accepted user event when the runtime boundary does not directly
+   * carry the outer transport's attempt id. */
+  sourceUserSeq?: number | null;
+}
+
+export interface RunAttemptRecord extends RunAttemptRef {
+  finishedAt: string | null;
+  status: 'active' | 'completed' | 'cancelled' | 'failed' | 'superseded' | 'interrupted';
+  leaseOwner: string | null;
+  leaseExpiresAt: string | null;
+  /** Exact durable user-input event that originated this attempt. */
+  sourceUserSeq: number | null;
+}
+
+export interface RunAttemptLeaseClaim {
+  attempt: RunAttemptRef | null;
+  claimed: boolean;
+  reason: 'claimed' | 'active' | 'terminal';
+  interruptedAttemptId: string | null;
+}
+
+export interface HarnessChatRequestReceipt {
+  requestId: string;
+  sessionId: string;
+  runId: string;
+  inputHash: string;
+  sinceSeq: number;
+  createdAt: string;
+}
+
+/** Durable negative authority for a client-owned chat request. This row may
+ * exist before the corresponding request receipt: that is what closes the
+ * race where Stop wins locally while the POST acknowledgement is in flight. */
+export interface HarnessChatRequestCancellation {
+  requestId: string;
+  requestedAt: string;
+  reason: string | null;
+}
+
 export interface EventRow {
   seq: number;
   id: string;
@@ -368,6 +431,9 @@ export interface CreateSessionInput {
 
 export interface ListEventsOptions {
   sinceSeq?: number;
+  /** Inclusive ISO timestamp boundary. Useful for old run-attempt rows that
+   * predate an explicit sequence watermark. Prefer sinceSeq when available. */
+  sinceAt?: string;
   types?: EventType[];
   limit?: number;
   /** v0.5.19 Bug H — sort by seq DESC instead of ASC. Useful when
@@ -599,6 +665,310 @@ const MIGRATIONS: EventLogMigration[] = [
                 THEN substr(legacy.session_id, 1, instr(legacy.session_id, '::') - 1)
               ELSE legacy.session_id
             END;
+      `);
+    },
+  },
+  {
+    // Turn-control reliability: cancellation belongs to one concrete run
+    // attempt, not to a reusable chat session forever. `kill_switches` is kept
+    // for compatibility with the Codex-loop callers, while the two additive
+    // tables below carry the precise run/attempt identity used by interactive
+    // channels and the Claude SDK brain.
+    //
+    // The terminal-key index makes a brain attempt's
+    // `conversation_completed` append atomic/idempotent. A session legitimately
+    // has many completion events across turns, so uniqueness is scoped to the
+    // explicit terminalKey rather than merely (session,type).
+    version: 7,
+    sql: '',
+    backfill: (db) => {
+      const hasTable = (name: string): boolean => Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+      ).get(name));
+      if (!hasTable('sessions')) return;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS run_attempts (
+          attempt_id  TEXT PRIMARY KEY,
+          session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          run_id      TEXT,
+          started_at  TEXT NOT NULL,
+          finished_at TEXT,
+          status      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_attempts_session_active
+          ON run_attempts(session_id, finished_at, started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS run_kill_requests (
+          session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          attempt_id  TEXT REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+          run_id      TEXT,
+          requested_at TEXT NOT NULL,
+          reason      TEXT
+        );
+      `);
+      if (hasTable('events')) {
+        db.exec(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_events_terminal_key
+            ON events(session_id, type, json_extract(data_json, '$.terminalKey'))
+            WHERE type = 'conversation_completed'
+              AND json_extract(data_json, '$.terminalKey') IS NOT NULL;
+        `);
+      }
+    },
+  },
+  {
+    // Desktop POST idempotency: the client owns request_id before sending, and
+    // this durable receipt binds it to the server-created session, run identity,
+    // original SSE cursor, and exact payload. A retry after a lost 202 or daemon
+    // restart therefore rejoins the same turn instead of starting a second run.
+    version: 8,
+    sql: `
+      CREATE TABLE IF NOT EXISTS harness_chat_requests (
+        request_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL UNIQUE,
+        input_hash TEXT NOT NULL,
+        since_seq INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_harness_chat_requests_session
+        ON harness_chat_requests(session_id, created_at DESC);
+    `,
+  },
+  {
+    // A durable request receipt is only half of restart safety: an unfinished
+    // attempt also needs bounded ownership. The desktop route renews this
+    // lease while its process is alive; a new daemon interrupts foreign-owner
+    // attempts at startup, and an expired lease can be reclaimed. This keeps a
+    // crash between the 202 and terminal event from making a replay inert
+    // forever, without permitting a second executor while the first is alive.
+    version: 9,
+    sql: '',
+    backfill: (db) => {
+      const hasAttempts = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_attempts'`,
+      ).get());
+      if (!hasAttempts) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(run_attempts)').all() as Array<{ name: string }>).map((row) => row.name),
+      );
+      if (!columns.has('lease_owner')) db.exec('ALTER TABLE run_attempts ADD COLUMN lease_owner TEXT');
+      if (!columns.has('lease_expires_at')) db.exec('ALTER TABLE run_attempts ADD COLUMN lease_expires_at TEXT');
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_run_attempts_lease
+        ON run_attempts(finished_at, lease_expires_at)`);
+    },
+  },
+  {
+    // A run attempt must point at the exact user-input event that created it.
+    // Timestamps are not an identity: a reusable desktop chat can receive a new
+    // input while the prior attempt is still the newest row, and recovery/UI
+    // projections otherwise guess the wrong scope. Keep this additive so old
+    // attempts remain valid (NULL means the historical source was not recorded).
+    version: 10,
+    sql: '',
+    backfill: (db) => {
+      const hasAttempts = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_attempts'`,
+      ).get());
+      if (!hasAttempts) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(run_attempts)').all() as Array<{ name: string }>).map((row) => row.name),
+      );
+      if (!columns.has('source_user_seq')) {
+        db.exec('ALTER TABLE run_attempts ADD COLUMN source_user_seq INTEGER REFERENCES events(seq)');
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_run_attempts_source_user
+        ON run_attempts(session_id, source_user_seq)`);
+    },
+  },
+  {
+    // A reusable chat can briefly have attempt A still executing while attempt
+    // B is accepted (for example, Move to background followed by a new message).
+    // The v7 kill table used PRIMARY KEY(session_id), so B could overwrite or
+    // clear A's stop before A observed it. Store independent latches per target;
+    // session-scoped rows remain only as the legacy/no-active compatibility
+    // shape. The old kill_switch mirror is rebuilt from session rows so a v7
+    // targeted latch cannot accidentally become a global stop after migration.
+    version: 11,
+    sql: '',
+    backfill: (db) => {
+      const hasTable = (name: string): boolean => Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+      ).get(name));
+      const hasKillTable = hasTable('run_kill_requests');
+      if (!hasKillTable) return;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS kill_switches (
+          session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          requested_at TEXT NOT NULL,
+          reason       TEXT
+        );
+        ALTER TABLE run_kill_requests RENAME TO run_kill_requests_v7;
+        CREATE TABLE run_kill_requests (
+          session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          scope_key    TEXT NOT NULL,
+          attempt_id   TEXT REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+          run_id       TEXT,
+          requested_at TEXT NOT NULL,
+          reason       TEXT,
+          PRIMARY KEY (session_id, scope_key)
+        );
+        CREATE INDEX idx_run_kill_requests_attempt
+          ON run_kill_requests(attempt_id) WHERE attempt_id IS NOT NULL;
+        CREATE INDEX idx_run_kill_requests_run
+          ON run_kill_requests(session_id, run_id) WHERE run_id IS NOT NULL;
+
+        INSERT INTO run_kill_requests
+          (session_id, scope_key, attempt_id, run_id, requested_at, reason)
+        SELECT session_id,
+               CASE
+                 WHEN attempt_id IS NOT NULL THEN 'attempt:' || attempt_id
+                 WHEN run_id IS NOT NULL THEN 'run:' || run_id
+                 ELSE 'session:*'
+               END,
+               attempt_id, run_id, requested_at, reason
+          FROM run_kill_requests_v7;
+
+        INSERT OR IGNORE INTO run_kill_requests
+          (session_id, scope_key, attempt_id, run_id, requested_at, reason)
+        SELECT legacy.session_id, 'session:*', NULL, NULL,
+               legacy.requested_at, legacy.reason
+          FROM kill_switches AS legacy
+         WHERE NOT EXISTS (
+           SELECT 1 FROM run_kill_requests AS scoped
+            WHERE scoped.session_id = legacy.session_id
+         );
+
+        DROP TABLE run_kill_requests_v7;
+        DELETE FROM kill_switches;
+        INSERT INTO kill_switches (session_id, requested_at, reason)
+        SELECT session_id, requested_at, reason
+          FROM run_kill_requests
+         WHERE scope_key = 'session:*';
+      `);
+      // Older builds could delete a session while foreign-key enforcement was
+      // disabled, leaving unreachable approval/guardrail rows behind. They are
+      // not recoverable execution state (their owning session no longer
+      // exists), and they make `foreign_key_check` noisy on otherwise healthy
+      // databases. Remove only those proven orphans; valid historical rows are
+      // preserved exactly.
+      if (hasTable('sessions') && hasTable('tool_guardrail_state')) {
+        db.exec(`DELETE FROM tool_guardrail_state
+          WHERE NOT EXISTS (
+            SELECT 1 FROM sessions WHERE sessions.id = tool_guardrail_state.session_id
+          )`);
+      }
+      if (hasTable('sessions') && hasTable('pending_approvals')) {
+        db.exec(`DELETE FROM pending_approvals
+          WHERE NOT EXISTS (
+            SELECT 1 FROM sessions WHERE sessions.id = pending_approvals.session_id
+          )`);
+      }
+    },
+  },
+  {
+    // Artifact/resource truth and pre-acknowledgement Stop authority must be
+    // present before a turn begins. The artifact ledger originally guarded its
+    // tables with lazy CREATE statements; keep that repair path, but move the
+    // canonical schema into this numbered migration. Chat cancellation rows
+    // intentionally have no session FK because Stop can arrive before the
+    // server has accepted the request and created/bound its session receipt.
+    version: 12,
+    sql: `
+      CREATE TABLE IF NOT EXISTS run_artifacts (
+        id             TEXT PRIMARY KEY,
+        session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        run_scope_id   TEXT NOT NULL,
+        slot_key       TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        provider       TEXT NOT NULL,
+        title          TEXT,
+        create_shape   TEXT NOT NULL,
+        status         TEXT NOT NULL CHECK (status IN ('pending','bound','uncertain')),
+        resource_id    TEXT,
+        uri            TEXT,
+        source_call_id TEXT,
+        binding_verified_at TEXT,
+        verification_call_id TEXT,
+        verification_shape TEXT,
+        verification_fingerprint TEXT,
+        created_at     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL,
+        UNIQUE(session_id, run_scope_id, slot_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_artifacts_session
+        ON run_artifacts(session_id, run_scope_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_run_artifacts_resource
+        ON run_artifacts(provider, resource_id);
+
+      CREATE TABLE IF NOT EXISTS artifact_run_scopes (
+        session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        attempt_scope_id TEXT NOT NULL,
+        root_scope_id    TEXT NOT NULL,
+        source_user_seq  INTEGER NOT NULL DEFAULT 0,
+        reason           TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        PRIMARY KEY(session_id, attempt_scope_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_artifact_run_scopes_user
+        ON artifact_run_scopes(session_id, source_user_seq DESC, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS artifact_source_roots (
+        session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_user_seq INTEGER NOT NULL,
+        root_scope_id   TEXT NOT NULL,
+        created_at      TEXT NOT NULL,
+        PRIMARY KEY(session_id, source_user_seq)
+      );
+
+      CREATE TABLE IF NOT EXISTS harness_chat_request_cancellations (
+        request_id   TEXT PRIMARY KEY,
+        requested_at TEXT NOT NULL,
+        reason       TEXT
+      );
+    `,
+    backfill: (db) => {
+      // Some installs already have the original lazy run_artifacts table. Add
+      // proof columns in place and preserve every existing resource pointer.
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>).map((row) => row.name),
+      );
+      for (const [name, declaration] of [
+        ['binding_verified_at', 'binding_verified_at TEXT'],
+        ['verification_call_id', 'verification_call_id TEXT'],
+        ['verification_shape', 'verification_shape TEXT'],
+        ['verification_fingerprint', 'verification_fingerprint TEXT'],
+      ] as const) {
+        if (!columns.has(name)) db.exec(`ALTER TABLE run_artifacts ADD COLUMN ${declaration}`);
+      }
+
+      // Retain the established root for an old attempt-scoped ledger. The
+      // earliest row is authoritative; do not guess a new root during upgrade.
+      // Partially recovered legacy fixtures may not have their sessions table;
+      // leave their empty child tables repairable instead of invoking the FK.
+      const hasSessions = Boolean(db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'`,
+      ).get());
+      if (!hasSessions) return;
+      db.exec(`
+        INSERT OR IGNORE INTO artifact_source_roots
+          (session_id, source_user_seq, root_scope_id, created_at)
+        SELECT s.session_id, s.source_user_seq, s.root_scope_id, s.created_at
+          FROM artifact_run_scopes s
+         WHERE s.source_user_seq > 0
+           AND EXISTS (
+             SELECT 1 FROM sessions owner WHERE owner.id = s.session_id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+               FROM artifact_run_scopes earlier
+              WHERE earlier.session_id = s.session_id
+                AND earlier.source_user_seq = s.source_user_seq
+                AND (
+                  earlier.created_at < s.created_at
+                  OR (earlier.created_at = s.created_at AND earlier.rowid < s.rowid)
+                )
+           );
       `);
     },
   },
@@ -915,6 +1285,24 @@ export function getSessionTokensUsed(sessionId: string): number {
   }
 }
 
+function publishPersistedEvent(event: EventRow): EventRow {
+  const session = getSession(event.sessionId);
+  // Fan out for live SSE subscribers. Best-effort — emit errors are
+  // swallowed inside actionBus so a flaky listener can never block
+  // an event write.
+  actionBus.emit({
+    kind: 'harness.event',
+    sessionId: event.sessionId,
+    event,
+    session: session ? summarizeSessionForSignal(session) : undefined,
+  });
+  // Mirror whitelisted events into the operational-telemetry store so the
+  // dashboard / Slack / Discord see run lifecycle, swarms, verdicts and
+  // fallovers without touching the hot files. Fail-open — never throws.
+  mirrorEventToOperational(event, session);
+  return event;
+}
+
 export function appendEvent(input: AppendEventInput): EventRow {
   if (!EVENT_TYPE_SET.has(input.type)) {
     throw new Error(`unknown event type: ${input.type}`);
@@ -922,8 +1310,77 @@ export function appendEvent(input: AppendEventInput): EventRow {
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
-  const data = JSON.stringify(input.data ?? {});
   const tx = db.transaction(() => {
+    let eventData = input.data ?? {};
+    if (input.type === 'conversation_completed') {
+      type TerminalOwner = {
+        attempt_id: string;
+        run_id: string | null;
+        source_user_seq: number | null;
+      };
+      const explicit = eventData as Record<string, unknown>;
+      const explicitAttemptId = typeof explicit.attemptId === 'string'
+        ? explicit.attemptId.trim()
+        : '';
+      const explicitRunId = typeof explicit.runId === 'string'
+        ? explicit.runId.trim()
+        : '';
+      const explicitSourceUserSeq = Number.isSafeInteger(explicit.sourceUserSeq)
+        && Number(explicit.sourceUserSeq) > 0
+        ? Number(explicit.sourceUserSeq)
+        : null;
+      // Prefer the identity already carried by the physical turn. Falling
+      // straight back to the DB-active attempt can misattribute a late A
+      // completion to newer turn B on the same reusable chat session.
+      const owner = explicitAttemptId
+        ? db.prepare(
+          `SELECT attempt_id, run_id, source_user_seq
+             FROM run_attempts
+            WHERE session_id = ? AND attempt_id = ?
+            LIMIT 1`,
+        ).get(input.sessionId, explicitAttemptId) as TerminalOwner | undefined
+        : explicitRunId
+          ? db.prepare(
+            `SELECT attempt_id, run_id, source_user_seq
+               FROM run_attempts
+              WHERE session_id = ? AND run_id = ?
+              ORDER BY (finished_at IS NULL) DESC, started_at DESC, rowid DESC
+              LIMIT 1`,
+          ).get(input.sessionId, explicitRunId) as TerminalOwner | undefined
+          : explicitSourceUserSeq !== null
+            ? db.prepare(
+              `SELECT attempt_id, run_id, source_user_seq
+                 FROM run_attempts
+                WHERE session_id = ? AND source_user_seq = ?
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT 1`,
+            ).get(input.sessionId, explicitSourceUserSeq) as TerminalOwner | undefined
+            : db.prepare(
+              `SELECT attempt_id, run_id, source_user_seq
+                 FROM run_attempts
+                WHERE session_id = ? AND finished_at IS NULL
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT 1`,
+            ).get(input.sessionId) as TerminalOwner | undefined;
+      if (owner) {
+        // Terminal ownership is written in the SAME transaction as the event.
+        // Recovery can therefore distinguish this request's terminal from a
+        // late completion belonging to another turn without timestamp guesses.
+        eventData = {
+          ...eventData,
+          ...(!Object.prototype.hasOwnProperty.call(eventData, 'attemptId')
+            ? { attemptId: owner.attempt_id }
+            : {}),
+          ...(owner.run_id && !Object.prototype.hasOwnProperty.call(eventData, 'runId')
+            ? { runId: owner.run_id }
+            : {}),
+          ...(owner.source_user_seq !== null && !Object.prototype.hasOwnProperty.call(eventData, 'sourceUserSeq')
+            ? { sourceUserSeq: owner.source_user_seq }
+            : {}),
+        };
+      }
+    }
+    const data = JSON.stringify(eventData);
     db.prepare(
       `INSERT INTO events
          (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
@@ -943,21 +1400,106 @@ export function appendEvent(input: AppendEventInput): EventRow {
   tx();
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   const event = rowToEvent(row);
-  const session = getSession(event.sessionId);
-  // Fan out for live SSE subscribers. Best-effort — emit errors are
-  // swallowed inside actionBus so a flaky listener can never block
-  // an event write.
-  actionBus.emit({
-    kind: 'harness.event',
-    sessionId: event.sessionId,
-    event,
-    session: session ? summarizeSessionForSignal(session) : undefined,
+  return publishPersistedEvent(event);
+}
+
+/**
+ * Atomically insert-or-reuse a user input and bind it to one run attempt.
+ *
+ * This is the write-side counterpart to `source_user_seq`: agentic execution
+ * must never begin in the crash window between a durable chat row and its run
+ * binding. When `existingEventSeq` is supplied (for a desktop acceptance row),
+ * the same transaction validates and binds it. When the attempt is already
+ * bound, that exact source wins even if the runtime prompt was transformed.
+ */
+export function recordRunAttemptUserInput(
+  attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
+  input: Omit<AppendEventInput, 'sessionId' | 'type'>,
+  options: { existingEventSeq?: number } = {},
+): EventRow {
+  const db = openEventLog();
+  const id = randomUUID();
+  const now = nowIso();
+  const data = JSON.stringify(input.data ?? {});
+  const tx = db.transaction((): { event: EventRow; inserted: boolean } => {
+    const attemptRow = db.prepare(
+      'SELECT session_id, source_user_seq FROM run_attempts WHERE attempt_id = ?',
+    ).get(attempt.attemptId) as { session_id: string; source_user_seq: number | null } | undefined;
+    if (!attemptRow) throw new Error(`run attempt not found: ${attempt.attemptId}`);
+    if (attemptRow.session_id !== attempt.sessionId) {
+      throw new Error(`run attempt ${attempt.attemptId} belongs to another session`);
+    }
+
+    const selectedSeq = attemptRow.source_user_seq ?? options.existingEventSeq ?? null;
+    if (selectedSeq !== null) {
+      const existing = db.prepare('SELECT * FROM events WHERE seq = ?').get(selectedSeq) as RawEventRow | undefined;
+      if (!existing || existing.session_id !== attempt.sessionId || existing.type !== 'user_input_received') {
+        throw new Error(`event ${selectedSeq} is not a user input for attempt session ${attempt.sessionId}`);
+      }
+      db.prepare(
+        `UPDATE run_attempts
+            SET source_user_seq = COALESCE(source_user_seq, ?)
+          WHERE attempt_id = ? AND session_id = ?`,
+      ).run(selectedSeq, attempt.attemptId, attempt.sessionId);
+      return { event: rowToEvent(existing), inserted: false };
+    }
+
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, ?, 'user_input_received', ?, ?, ?)`,
+    ).run(
+      id,
+      attempt.sessionId,
+      input.turn,
+      input.role,
+      input.parentEventId ?? null,
+      data,
+      now,
+    );
+    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    db.prepare(
+      'UPDATE run_attempts SET source_user_seq = ? WHERE attempt_id = ? AND session_id = ?',
+    ).run(inserted.seq, attempt.attemptId, attempt.sessionId);
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, attempt.sessionId);
+    return { event: rowToEvent(inserted), inserted: true };
   });
-  // Mirror whitelisted events into the operational-telemetry store so the
-  // dashboard / Slack / Discord see run lifecycle, swarms, verdicts and
-  // fallovers without touching the hot files. Fail-open — never throws.
-  mirrorEventToOperational(event, session);
-  return event;
+  const result = tx();
+  return result.inserted ? publishPersistedEvent(result.event) : result.event;
+}
+
+/**
+ * Append one terminal completion for a concrete run attempt. The v7 partial
+ * unique index makes the check atomic across concurrent callers/processes; the
+ * loser receives the already-durable event and, critically, does not fan out a
+ * second completion on actionBus.
+ */
+export function appendTerminalEventOnce(
+  input: Omit<AppendEventInput, 'type'> & { type?: 'conversation_completed' },
+  terminalKey: string,
+): { event: EventRow; inserted: boolean } {
+  const key = terminalKey.trim();
+  if (!key) throw new Error('terminalKey is required');
+  try {
+    const event = appendEvent({
+      ...input,
+      type: 'conversation_completed',
+      data: { ...(input.data ?? {}), terminalKey: key },
+    });
+    return { event, inserted: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/unique constraint failed/i.test(message)) throw err;
+    const row = openEventLog().prepare(
+      `SELECT * FROM events
+        WHERE session_id = ?
+          AND type = 'conversation_completed'
+          AND json_extract(data_json, '$.terminalKey') = ?
+        LIMIT 1`,
+    ).get(input.sessionId, key) as RawEventRow | undefined;
+    if (!row) throw err;
+    return { event: rowToEvent(row), inserted: false };
+  }
 }
 
 /**
@@ -984,6 +1526,10 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
     clauses.push('seq > ?');
     params.push(options.sinceSeq);
   }
+  if (options.sinceAt !== undefined) {
+    clauses.push('created_at >= ?');
+    params.push(options.sinceAt);
+  }
   if (options.types && options.types.length > 0) {
     const placeholders = options.types.map(() => '?').join(',');
     clauses.push(`type IN (${placeholders})`);
@@ -1001,6 +1547,51 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   // back, so reverse the result. The caller can post-reverse if they
   // truly want newest-first.
   return options.desc ? mapped.reverse() : mapped;
+}
+
+/** Return the newest logical provider-level tool call without relying on a
+ * bounded raw-event tail. A single native MCP call can emit a later transport
+ * mirror, and a busy turn can emit hundreds of those audit rows after the call
+ * whose arguments recovery needs. Keep the raw rows; exclude only mirrors at
+ * the indexed query boundary. */
+export function getLatestCanonicalTopLevelToolEvent(sessionId: string): EventRow | undefined {
+  const row = openEventLog().prepare(
+    `SELECT * FROM events
+      WHERE session_id = ?
+        AND type = 'tool_called'
+        AND COALESCE(json_extract(data_json, '$.accounting'), '') <> 'transport_mirror'
+      ORDER BY seq DESC
+      LIMIT 1`,
+  ).get(sessionId) as RawEventRow | undefined;
+  return row ? rowToEvent(row) : undefined;
+}
+
+/** Count the exact event scope represented by listEvents without loading its
+ * data_json payloads. This keeps UI aggregates truthful even when the rendered
+ * event window is intentionally bounded. */
+export function countMatchingEvents(
+  sessionId: string,
+  options: Pick<ListEventsOptions, 'sinceSeq' | 'sinceAt' | 'types'> = {},
+): number {
+  const db = openEventLog();
+  const clauses: string[] = ['session_id = ?'];
+  const params: unknown[] = [sessionId];
+  if (options.sinceSeq !== undefined) {
+    clauses.push('seq > ?');
+    params.push(options.sinceSeq);
+  }
+  if (options.sinceAt !== undefined) {
+    clauses.push('created_at >= ?');
+    params.push(options.sinceAt);
+  }
+  if (options.types && options.types.length > 0) {
+    clauses.push(`type IN (${options.types.map(() => '?').join(',')})`);
+    params.push(...options.types);
+  }
+  const row = db.prepare(
+    `SELECT COUNT(*) AS n FROM events WHERE ${clauses.join(' AND ')}`,
+  ).get(...params) as { n: number } | undefined;
+  return Number.isFinite(row?.n) ? row!.n : 0;
 }
 
 /** Count events of a given type for a session — an authoritative tally (e.g.
@@ -1033,25 +1624,928 @@ export function getEvent(eventId: string): EventRow | null {
   return row ? rowToEvent(row) : null;
 }
 
-export function requestKill(sessionId: string, reason?: string): void {
+/**
+ * Find an unsettled user-input event already recorded for a durable run.
+ *
+ * The desktop owns a request receipt before dispatch and may append the input
+ * before the selected brain starts. Reusing that row prevents a duplicate chat
+ * turn. Both run ids and client request ids are accepted because the receipt is
+ * the durable bridge between those two identities.
+ */
+export function findUserInputEventForRun(
+  sessionId: string,
+  runId: string,
+  expectedText: string,
+): EventRow | null {
+  const sid = sessionId.trim();
+  const rid = runId.trim();
+  if (!sid || !rid || !expectedText) return null;
+  const db = openEventLog();
+  const identities = new Set<string>([rid]);
+  try {
+    const receipt = db.prepare(
+      'SELECT request_id FROM harness_chat_requests WHERE session_id = ? AND run_id = ?',
+    ).get(sid, rid) as { request_id: string } | undefined;
+    if (receipt?.request_id) identities.add(receipt.request_id);
+  } catch { /* old/partial fixtures may not have the receipt table */ }
+  const values = [...identities];
+  const placeholders = values.map(() => '?').join(',');
+  const params = [
+    sid,
+    expectedText,
+    ...values,
+    ...values,
+    ...values,
+    ...values,
+  ];
+  const row = db.prepare(
+    `SELECT input.*
+       FROM events AS input
+      WHERE input.session_id = ?
+        AND input.type = 'user_input_received'
+        AND json_extract(input.data_json, '$.text') = ?
+        AND (
+          json_extract(input.data_json, '$.runId') IN (${placeholders})
+          OR json_extract(input.data_json, '$.requestRunId') IN (${placeholders})
+          OR json_extract(input.data_json, '$.requestId') IN (${placeholders})
+          OR json_extract(input.data_json, '$.clientRequestId') IN (${placeholders})
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM events AS terminal
+           WHERE terminal.session_id = input.session_id
+             AND terminal.type = 'conversation_completed'
+             AND terminal.seq > input.seq
+        )
+      ORDER BY input.seq DESC
+      LIMIT 1`,
+  ).get(...params) as RawEventRow | undefined;
+  return row ? rowToEvent(row) : null;
+}
+
+/** Bind one attempt to its exact, same-session user-input event. Idempotent for
+ * the same sequence and deliberately refuses an identity-changing rebind. */
+export function bindRunAttemptSourceUserEvent(
+  attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
+  sourceUserSeq: number,
+): void {
+  if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    throw new Error('sourceUserSeq must be a positive event sequence');
+  }
+  const db = openEventLog();
+  const tx = db.transaction(() => {
+    const attemptRow = db.prepare(
+      'SELECT session_id, source_user_seq FROM run_attempts WHERE attempt_id = ?',
+    ).get(attempt.attemptId) as { session_id: string; source_user_seq: number | null } | undefined;
+    if (!attemptRow) throw new Error(`run attempt not found: ${attempt.attemptId}`);
+    if (attemptRow.session_id !== attempt.sessionId) {
+      throw new Error(`run attempt ${attempt.attemptId} belongs to another session`);
+    }
+    const source = db.prepare(
+      'SELECT session_id, type FROM events WHERE seq = ?',
+    ).get(sourceUserSeq) as { session_id: string; type: string } | undefined;
+    if (!source) throw new Error(`source user event not found: ${sourceUserSeq}`);
+    if (source.session_id !== attempt.sessionId || source.type !== 'user_input_received') {
+      throw new Error(`event ${sourceUserSeq} is not a user input for attempt session ${attempt.sessionId}`);
+    }
+    if (attemptRow.source_user_seq !== null && attemptRow.source_user_seq !== sourceUserSeq) {
+      throw new Error(
+        `run attempt ${attempt.attemptId} is already bound to user event ${attemptRow.source_user_seq}`,
+      );
+    }
+    db.prepare(
+      `UPDATE run_attempts
+          SET source_user_seq = COALESCE(source_user_seq, ?)
+        WHERE attempt_id = ? AND session_id = ?`,
+    ).run(sourceUserSeq, attempt.attemptId, attempt.sessionId);
+  });
+  tx();
+}
+
+/** Read the exact durable user input already bound to an attempt. */
+export function getRunAttemptSourceUserEvent(
+  attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
+): EventRow | null {
+  const row = openEventLog().prepare(
+    `SELECT event.*
+       FROM run_attempts AS attempt
+       JOIN events AS event ON event.seq = attempt.source_user_seq
+      WHERE attempt.attempt_id = ?
+        AND attempt.session_id = ?
+        AND event.session_id = attempt.session_id
+        AND event.type = 'user_input_received'`,
+  ).get(attempt.attemptId, attempt.sessionId) as RawEventRow | undefined;
+  return row ? rowToEvent(row) : null;
+}
+
+/** Register the one live attempt that a reusable session is currently serving. */
+export function beginRunAttempt(
+  sessionId: string,
+  input: { runId?: string | null; attemptId?: string } = {},
+): RunAttemptRef {
+  const db = openEventLog();
+  const runId = input.runId?.trim() || null;
+  // A lease recovery may have minted a suffixed attempt identity under the
+  // same durable run id. Downstream wrappers (for example the SDK brain) only
+  // know that run id, so reuse its active attempt instead of deriving the base
+  // id again and accidentally superseding the lease holder.
+  const activeForRun = !input.attemptId && runId
+    ? db.prepare(
+      `SELECT attempt_id FROM run_attempts
+        WHERE session_id = ? AND run_id = ? AND finished_at IS NULL
+        ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+    ).get(sessionId, runId) as { attempt_id: string } | undefined
+    : undefined;
+  let attemptId = input.attemptId?.trim()
+    || activeForRun?.attempt_id
+    || (runId
+      ? (/^attempt(?::|-)/.test(runId) ? runId : `attempt:${runId}`)
+      : `attempt-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`);
+  let existing = db.prepare(
+    'SELECT session_id, run_id, started_at, finished_at FROM run_attempts WHERE attempt_id = ?',
+  ).get(attemptId) as {
+    session_id: string;
+    run_id: string | null;
+    started_at: string;
+    finished_at: string | null;
+  } | undefined;
+  if (existing && existing.session_id !== sessionId) {
+    throw new Error(`run attempt ${attemptId} belongs to another session`);
+  }
+  // A repeated external run id after its prior attempt settled is a retry, not
+  // permission to reopen/rewrite the historical attempt. Keep the run id for
+  // correlation but mint a fresh terminal identity.
+  if (existing?.finished_at) {
+    attemptId = `${attemptId}:${randomUUID().slice(0, 8)}`;
+    existing = undefined;
+  }
+  const startedAt = existing?.started_at ?? nowIso();
+  const tx = db.transaction(() => {
+    // A single chat session is serialized. If a caller starts a new attempt
+    // after a process-level error left the previous row active, retire the old
+    // marker so a stale stop can never target the fresh work.
+    db.prepare(
+      `UPDATE run_attempts
+          SET finished_at = COALESCE(finished_at, ?), status = 'superseded'
+        WHERE session_id = ? AND finished_at IS NULL AND attempt_id != ?`,
+    ).run(startedAt, sessionId, attemptId);
+    db.prepare(
+      `INSERT INTO run_attempts
+         (attempt_id, session_id, run_id, started_at, finished_at, status)
+       VALUES (?, ?, ?, ?, NULL, 'active')
+       ON CONFLICT(attempt_id) DO UPDATE SET
+         run_id = COALESCE(excluded.run_id, run_attempts.run_id),
+         status = 'active'`,
+    ).run(attemptId, sessionId, runId, startedAt);
+    db.prepare("UPDATE sessions SET status = 'active', updated_at = ? WHERE id = ?")
+      .run(startedAt, sessionId);
+  });
+  tx();
+  return { sessionId, attemptId, runId: runId ?? existing?.run_id ?? null, startedAt };
+}
+
+export function finishRunAttempt(
+  attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
+  status: 'completed' | 'cancelled' | 'failed' | 'superseded' | 'interrupted' = 'completed',
+): void {
+  const db = openEventLog();
+  const tx = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT run_id FROM run_attempts WHERE attempt_id = ? AND session_id = ?',
+    ).get(attempt.attemptId, attempt.sessionId) as { run_id: string | null } | undefined;
+    db.prepare(
+      `UPDATE run_attempts
+          SET finished_at = ?, status = ?, lease_expires_at = NULL
+        WHERE attempt_id = ? AND session_id = ? AND finished_at IS NULL`,
+    ).run(nowIso(), status, attempt.attemptId, attempt.sessionId);
+    // The physical owner is settling now. This remains necessary when a newer
+    // attempt already marked the row superseded: its exact stop latch still had
+    // to survive until this old process reached its terminal finally.
+    db.prepare(
+      'DELETE FROM run_kill_requests WHERE session_id = ? AND scope_key = ?',
+    ).run(attempt.sessionId, `attempt:${attempt.attemptId}`);
+    if (row?.run_id) {
+      const otherLive = db.prepare(
+        `SELECT 1 FROM run_attempts
+          WHERE session_id = ? AND run_id = ? AND attempt_id != ? AND finished_at IS NULL
+          LIMIT 1`,
+      ).get(attempt.sessionId, row.run_id, attempt.attemptId);
+      if (!otherLive) {
+        db.prepare(
+          'DELETE FROM run_kill_requests WHERE session_id = ? AND scope_key = ?',
+        ).run(attempt.sessionId, `run:${row.run_id}`);
+      }
+    }
+  });
+  tx();
+}
+
+export function getActiveRunAttempt(sessionId: string): RunAttemptRef | null {
+  const row = openEventLog().prepare(
+    `SELECT attempt_id, run_id, started_at
+       FROM run_attempts
+      WHERE session_id = ? AND finished_at IS NULL
+      ORDER BY started_at DESC
+      LIMIT 1`,
+  ).get(sessionId) as { attempt_id: string; run_id: string | null; started_at: string } | undefined;
+  return row
+    ? { sessionId, attemptId: row.attempt_id, runId: row.run_id, startedAt: row.started_at }
+    : null;
+}
+
+/** Latest durable attempt for a reusable session, terminal or active. */
+export function getLatestRunAttempt(sessionId: string): RunAttemptRecord | null {
+  const row = openEventLog().prepare(
+    `SELECT attempt_id, run_id, started_at, finished_at, status,
+            lease_owner, lease_expires_at, source_user_seq
+       FROM run_attempts
+      WHERE session_id = ?
+      ORDER BY started_at DESC, rowid DESC
+      LIMIT 1`,
+  ).get(sessionId) as {
+    attempt_id: string;
+    run_id: string | null;
+    started_at: string;
+    finished_at: string | null;
+    status: RunAttemptRecord['status'];
+    lease_owner: string | null;
+    lease_expires_at: string | null;
+    source_user_seq: number | null;
+  } | undefined;
+  return row ? {
+    sessionId,
+    attemptId: row.attempt_id,
+    runId: row.run_id,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    status: row.status,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: row.lease_expires_at,
+    sourceUserSeq: row.source_user_seq,
+  } : null;
+}
+
+/** Batch projection for polling surfaces. Avoid one SQLite prepare/query per
+ * session while preserving getLatestRunAttempt's exact ordering semantics. */
+export function listLatestRunAttemptsForSessions(
+  sessionIds: readonly string[],
+): Map<string, RunAttemptRecord> {
+  const ids = [...new Set(sessionIds.map((id) => id.trim()).filter(Boolean))];
+  const out = new Map<string, RunAttemptRecord>();
+  const db = openEventLog();
+  for (let offset = 0; offset < ids.length; offset += 400) {
+    const chunk = ids.slice(offset, offset + 400);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = db.prepare(
+      `SELECT session_id, attempt_id, run_id, started_at, finished_at, status,
+              lease_owner, lease_expires_at, source_user_seq
+         FROM (
+           SELECT session_id, attempt_id, run_id, started_at, finished_at, status,
+                  lease_owner, lease_expires_at, source_user_seq,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY session_id
+                    ORDER BY started_at DESC, rowid DESC
+                  ) AS latest_rank
+             FROM run_attempts
+            WHERE session_id IN (${placeholders})
+         )
+        WHERE latest_rank = 1`,
+    ).all(...chunk) as Array<{
+      session_id: string;
+      attempt_id: string;
+      run_id: string | null;
+      started_at: string;
+      finished_at: string | null;
+      status: RunAttemptRecord['status'];
+      lease_owner: string | null;
+      lease_expires_at: string | null;
+      source_user_seq: number | null;
+    }>;
+    for (const row of rows) {
+      out.set(row.session_id, {
+        sessionId: row.session_id,
+        attemptId: row.attempt_id,
+        runId: row.run_id,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at,
+        status: row.status,
+        leaseOwner: row.lease_owner,
+        leaseExpiresAt: row.lease_expires_at,
+        sourceUserSeq: row.source_user_seq,
+      });
+    }
+  }
+  return out;
+}
+
+export function getLatestRunAttemptByRunId(sessionId: string, runId: string): RunAttemptRecord | null {
+  const row = openEventLog().prepare(
+    `SELECT attempt_id, run_id, started_at, finished_at, status,
+            lease_owner, lease_expires_at, source_user_seq
+       FROM run_attempts
+      WHERE session_id = ? AND run_id = ?
+      ORDER BY started_at DESC, rowid DESC
+      LIMIT 1`,
+  ).get(sessionId, runId) as {
+    attempt_id: string;
+    run_id: string | null;
+    started_at: string;
+    finished_at: string | null;
+    status: RunAttemptRecord['status'];
+    lease_owner: string | null;
+    lease_expires_at: string | null;
+    source_user_seq: number | null;
+  } | undefined;
+  return row ? {
+    sessionId,
+    attemptId: row.attempt_id,
+    runId: row.run_id,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    status: row.status,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: row.lease_expires_at,
+    sourceUserSeq: row.source_user_seq,
+  } : null;
+}
+
+/**
+ * Atomically acquire bounded ownership of one durable run identity.
+ *
+ * A live, unexpired lease is never stolen. An unfinished attempt whose lease
+ * expired is first closed as `interrupted`, then a fresh attempt identity is
+ * created under the same run id so terminal history remains immutable. A
+ * completed/cancelled/failed run is terminal and is only replayed, never run a
+ * second time.
+ */
+export function claimRunAttemptLease(input: {
+  sessionId: string;
+  runId: string;
+  ownerId: string;
+  leaseMs: number;
+  nowMs?: number;
+}): RunAttemptLeaseClaim {
+  const sessionId = input.sessionId.trim();
+  const runId = input.runId.trim();
+  const ownerId = input.ownerId.trim();
+  if (!sessionId || !runId || !ownerId) throw new Error('sessionId, runId, and ownerId are required');
+  if (!Number.isFinite(input.leaseMs) || input.leaseMs < 1_000) throw new Error('leaseMs must be at least 1000');
+
+  const db = openEventLog();
+  const nowMs = input.nowMs ?? Date.now();
+  const now = new Date(nowMs).toISOString();
+  const leaseExpiresAt = new Date(nowMs + input.leaseMs).toISOString();
+  const tx = db.transaction((): RunAttemptLeaseClaim => {
+    const latest = db.prepare(
+      `SELECT attempt_id, run_id, started_at, finished_at, status,
+              lease_owner, lease_expires_at, source_user_seq
+         FROM run_attempts
+        WHERE session_id = ? AND run_id = ?
+        ORDER BY started_at DESC, rowid DESC
+        LIMIT 1`,
+    ).get(sessionId, runId) as {
+      attempt_id: string;
+      run_id: string | null;
+      started_at: string;
+      finished_at: string | null;
+      status: RunAttemptRecord['status'];
+      lease_owner: string | null;
+      lease_expires_at: string | null;
+      source_user_seq: number | null;
+    } | undefined;
+
+    if (latest?.finished_at && latest.status !== 'interrupted') {
+      return {
+        attempt: { sessionId, attemptId: latest.attempt_id, runId: latest.run_id, startedAt: latest.started_at },
+        claimed: false,
+        reason: 'terminal',
+        interruptedAttemptId: null,
+      };
+    }
+
+    // A process can crash after the user-visible terminal event commits but
+    // before its finally block settles run_attempts. The terminal is the
+    // authoritative no-replay boundary: reconcile the stale active lease
+    // instead of reclaiming it and executing the accepted request again.
+    if (latest && !latest.finished_at) {
+      const terminal = db.prepare(
+        `SELECT terminal.created_at
+           FROM events AS terminal
+          WHERE terminal.session_id = ?
+            AND terminal.type = 'conversation_completed'
+            AND (
+              json_extract(terminal.data_json, '$.terminalKey') = ?
+              OR json_extract(terminal.data_json, '$.attemptId') = ?
+              OR json_extract(terminal.data_json, '$.runId') = ?
+              OR (? IS NOT NULL AND json_extract(terminal.data_json, '$.sourceUserSeq') = ?)
+            )
+          ORDER BY terminal.seq ASC
+          LIMIT 1`,
+      ).get(
+        sessionId,
+        `brain:${latest.attempt_id}`,
+        latest.attempt_id,
+        latest.run_id,
+        latest.source_user_seq,
+        latest.source_user_seq,
+      ) as { created_at: string } | undefined;
+      if (terminal) {
+        db.prepare(
+          `UPDATE run_attempts
+              SET finished_at = ?, status = 'completed', lease_expires_at = NULL
+            WHERE attempt_id = ? AND session_id = ? AND finished_at IS NULL`,
+        ).run(terminal.created_at, latest.attempt_id, sessionId);
+        return {
+          attempt: {
+            sessionId,
+            attemptId: latest.attempt_id,
+            runId: latest.run_id,
+            startedAt: latest.started_at,
+          },
+          claimed: false,
+          reason: 'terminal',
+          interruptedAttemptId: null,
+        };
+      }
+    }
+
+    let interruptedAttemptId: string | null = null;
+    if (latest && !latest.finished_at) {
+      const leaseExpiry = latest.lease_expires_at ? Date.parse(latest.lease_expires_at) : Number.NaN;
+      if (latest.lease_owner && Number.isFinite(leaseExpiry) && leaseExpiry > nowMs) {
+        return {
+          attempt: { sessionId, attemptId: latest.attempt_id, runId: latest.run_id, startedAt: latest.started_at },
+          claimed: false,
+          reason: 'active',
+          interruptedAttemptId: null,
+        };
+      }
+      db.prepare(
+        `UPDATE run_attempts
+            SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
+          WHERE attempt_id = ? AND session_id = ? AND finished_at IS NULL`,
+      ).run(now, latest.attempt_id, sessionId);
+      interruptedAttemptId = latest.attempt_id;
+    }
+
+    const baseAttemptId = /^attempt(?::|-)/.test(runId) ? runId : `attempt:${runId}`;
+    const baseExists = Boolean(db.prepare('SELECT 1 FROM run_attempts WHERE attempt_id = ?').get(baseAttemptId));
+    const attemptId = baseExists ? `${baseAttemptId}:${randomUUID().slice(0, 8)}` : baseAttemptId;
+
+    // Keep the session serialization contract from beginRunAttempt: a newer
+    // request retires any unrelated unfinished marker before it becomes live.
+    db.prepare(
+      `UPDATE run_attempts
+          SET finished_at = COALESCE(finished_at, ?), status = 'superseded', lease_expires_at = NULL
+        WHERE session_id = ? AND finished_at IS NULL`,
+    ).run(now, sessionId);
+    db.prepare(
+      `INSERT INTO run_attempts
+         (attempt_id, session_id, run_id, started_at, finished_at, status,
+          lease_owner, lease_expires_at, source_user_seq)
+       VALUES (?, ?, ?, ?, NULL, 'active', ?, ?, ?)`,
+    ).run(attemptId, sessionId, runId, now, ownerId, leaseExpiresAt, latest?.source_user_seq ?? null);
+    db.prepare("UPDATE sessions SET status = 'active', updated_at = ? WHERE id = ?").run(now, sessionId);
+
+    return {
+      attempt: { sessionId, attemptId, runId, startedAt: now },
+      claimed: true,
+      reason: 'claimed',
+      interruptedAttemptId,
+    };
+  });
+  return tx();
+}
+
+/** Extend a lease only when the same process still owns the active attempt. */
+export function renewRunAttemptLease(
+  attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
+  ownerId: string,
+  leaseMs: number,
+  nowMs = Date.now(),
+): boolean {
+  if (!ownerId.trim() || !Number.isFinite(leaseMs) || leaseMs < 1_000) return false;
+  const expiresAt = new Date(nowMs + leaseMs).toISOString();
+  const result = openEventLog().prepare(
+    `UPDATE run_attempts
+        SET lease_expires_at = ?
+      WHERE attempt_id = ? AND session_id = ?
+        AND finished_at IS NULL AND status = 'active' AND lease_owner = ?`,
+  ).run(expiresAt, attempt.attemptId, attempt.sessionId, ownerId);
+  return result.changes === 1;
+}
+
+/**
+ * Startup recovery for process-owned attempts. A lease belonging to another
+ * process (or a pre-lease row) cannot still have a live executor in this
+ * daemon, so close it immediately rather than waiting for its wall-clock TTL.
+ */
+export function interruptForeignRunAttemptLeases(
+  ownerId: string,
+  options: { runIdPrefix?: string; nowMs?: number } = {},
+): number {
+  const owner = ownerId.trim();
+  if (!owner) throw new Error('ownerId is required');
+  const now = new Date(options.nowMs ?? Date.now()).toISOString();
+  const prefix = options.runIdPrefix ?? '';
+  // NULL-run_id rows (Discord/webhook attempts carry no external run id) can
+  // never match `run_id LIKE ?` — with no prefix requested they must still be
+  // sweepable, or a crashed lane leaks permanently-active attempts (fold,
+  // review wf_30a7ce7e-e9c #7).
+  const result = openEventLog().prepare(
+    `UPDATE run_attempts
+        SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
+      WHERE finished_at IS NULL
+        AND status = 'active'
+        AND (run_id LIKE ? OR (? = '' AND run_id IS NULL))
+        AND (lease_owner IS NULL OR lease_owner != ?)`,
+  ).run(now, `${prefix}%`, prefix, owner);
+  return result.changes;
+}
+
+/** DAEMON-BOOT recovery (fold, review wf_30a7ce7e-e9c #7): at daemon startup
+ * every still-'active' attempt necessarily belonged to the dead process —
+ * Discord/webhook attempts carry no run id and no lease, so the desktop-only
+ * foreign-lease sweep never reached them and they showed as phantom running
+ * sessions forever. Call ONLY from daemon startup (a CLI process opening the
+ * same DB must never sweep the live daemon's rows). */
+export function interruptOrphanedRunAttemptsAtBoot(nowMs: number = Date.now()): number {
+  const now = new Date(nowMs).toISOString();
+  return openEventLog().prepare(
+    `UPDATE run_attempts
+        SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
+      WHERE finished_at IS NULL
+        AND status = 'active'`,
+  ).run(now).changes;
+}
+
+function rowToHarnessChatRequestReceipt(row: {
+  request_id: string;
+  session_id: string;
+  run_id: string;
+  input_hash: string;
+  since_seq: number;
+  created_at: string;
+}): HarnessChatRequestReceipt {
+  return {
+    requestId: row.request_id,
+    sessionId: row.session_id,
+    runId: row.run_id,
+    inputHash: row.input_hash,
+    sinceSeq: row.since_seq,
+    createdAt: row.created_at,
+  };
+}
+
+export function getHarnessChatRequestReceipt(requestId: string): HarnessChatRequestReceipt | null {
+  const row = openEventLog().prepare(
+    `SELECT request_id, session_id, run_id, input_hash, since_seq, created_at
+       FROM harness_chat_requests WHERE request_id = ?`,
+  ).get(requestId) as {
+    request_id: string;
+    session_id: string;
+    run_id: string;
+    input_hash: string;
+    since_seq: number;
+    created_at: string;
+  } | undefined;
+  return row ? rowToHarnessChatRequestReceipt(row) : null;
+}
+
+function rowToHarnessChatRequestCancellation(row: {
+  request_id: string;
+  requested_at: string;
+  reason: string | null;
+}): HarnessChatRequestCancellation {
+  return {
+    requestId: row.request_id,
+    requestedAt: row.requested_at,
+    reason: row.reason,
+  };
+}
+
+/** Persist Stop authority independently of request acceptance. INSERT OR
+ * IGNORE makes retries idempotent and preserves the timestamp of the first
+ * user decision; once cancelled, the same request id can never execute later. */
+export function requestHarnessChatCancellation(
+  requestIdInput: string,
+  reason = 'cancelled by user before chat acknowledgement',
+): HarnessChatRequestCancellation {
+  const requestId = requestIdInput.trim();
+  if (!requestId) throw new Error('requestId is required');
   const db = openEventLog();
   db.prepare(
-    `INSERT OR REPLACE INTO kill_switches (session_id, requested_at, reason)
+    `INSERT OR IGNORE INTO harness_chat_request_cancellations
+       (request_id, requested_at, reason)
      VALUES (?, ?, ?)`,
-  ).run(sessionId, nowIso(), reason ?? null);
+  ).run(requestId, nowIso(), reason.trim() || null);
+  const row = db.prepare(
+    `SELECT request_id, requested_at, reason
+       FROM harness_chat_request_cancellations
+      WHERE request_id = ?`,
+  ).get(requestId) as {
+    request_id: string;
+    requested_at: string;
+    reason: string | null;
+  } | undefined;
+  if (!row) throw new Error(`failed to persist chat cancellation ${requestId}`);
+  return rowToHarnessChatRequestCancellation(row);
 }
 
-export function isKillRequested(sessionId: string): boolean {
+export function getHarnessChatCancellation(requestIdInput: string): HarnessChatRequestCancellation | null {
+  const requestId = requestIdInput.trim();
+  if (!requestId) return null;
+  const row = openEventLog().prepare(
+    `SELECT request_id, requested_at, reason
+       FROM harness_chat_request_cancellations
+      WHERE request_id = ?`,
+  ).get(requestId) as {
+    request_id: string;
+    requested_at: string;
+    reason: string | null;
+  } | undefined;
+  return row ? rowToHarnessChatRequestCancellation(row) : null;
+}
+
+/** Atomically claim or replay a desktop chat request. A request id is bound to
+ * exactly one payload/session/run for its lifetime; conflicting reuse fails
+ * closed instead of silently executing different work under an old dedupe key. */
+export function claimHarnessChatRequest(input: {
+  requestId: string;
+  sessionId: string;
+  runId: string;
+  inputHash: string;
+  sinceSeq: number;
+}): { receipt: HarnessChatRequestReceipt; inserted: boolean } {
+  const requestId = input.requestId.trim();
+  if (!requestId) throw new Error('requestId is required');
   const db = openEventLog();
-  const row = db
+  const claim = db.transaction((): { receipt: HarnessChatRequestReceipt; inserted: boolean } => {
+    const cancelled = db.prepare(
+      'SELECT 1 FROM harness_chat_request_cancellations WHERE request_id = ?',
+    ).get(requestId);
+    if (cancelled) throw new Error(`client request id ${requestId} was cancelled before acceptance`);
+
+    const createdAt = nowIso();
+    const result = db.prepare(
+      `INSERT OR IGNORE INTO harness_chat_requests
+         (request_id, session_id, run_id, input_hash, since_seq, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(requestId, input.sessionId, input.runId, input.inputHash, input.sinceSeq, createdAt);
+    const row = db.prepare(
+      `SELECT request_id, session_id, run_id, input_hash, since_seq, created_at
+         FROM harness_chat_requests WHERE request_id = ?`,
+    ).get(requestId) as {
+      request_id: string;
+      session_id: string;
+      run_id: string;
+      input_hash: string;
+      since_seq: number;
+      created_at: string;
+    } | undefined;
+    if (!row) throw new Error(`failed to persist chat request ${requestId}`);
+    const receipt = rowToHarnessChatRequestReceipt(row);
+    if (
+      receipt.sessionId !== input.sessionId
+      || receipt.runId !== input.runId
+      || receipt.inputHash !== input.inputHash
+    ) {
+      throw new Error(`client request id ${requestId} is already bound to a different chat request`);
+    }
+    return { receipt, inserted: result.changes === 1 };
+  });
+  // Serialize the cancellation check with receipt creation. Whichever durable
+  // decision reaches SQLite first wins; a second daemon/process cannot slip a
+  // receipt between a pre-ack Stop and this acceptance boundary.
+  return claim.immediate();
+}
+
+const SESSION_KILL_SCOPE = 'session:*';
+
+interface RawKillRequestRow {
+  session_id: string;
+  scope_key: string;
+  attempt_id: string | null;
+  run_id: string | null;
+  requested_at: string;
+  reason: string | null;
+}
+
+function rowToKillRequest(row: RawKillRequestRow): KillRequestRef {
+  return {
+    sessionId: row.session_id,
+    scopeKey: row.scope_key,
+    attemptId: row.attempt_id,
+    runId: row.run_id,
+    requestedAt: row.requested_at,
+    reason: row.reason,
+  };
+}
+
+function listKillRequests(sessionId: string): KillRequestRef[] {
+  return (openEventLog().prepare(
+    `SELECT session_id, scope_key, attempt_id, run_id, requested_at, reason
+       FROM run_kill_requests
+      WHERE session_id = ?
+      ORDER BY requested_at DESC, scope_key ASC`,
+  ).all(sessionId) as RawKillRequestRow[]).map(rowToKillRequest);
+}
+
+/** Resolve source-event authority without relying on the session's newest/active
+ * attempt. Superseded attempts stay queryable because their process may still
+ * be unwinding and must be able to observe its own stop. */
+export function getRunAttemptBySourceUserSeq(
+  sessionId: string,
+  sourceUserSeq: number,
+): RunAttemptRecord | null {
+  if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return null;
+  const row = openEventLog().prepare(
+    `SELECT attempt_id, run_id, started_at, finished_at, status,
+            lease_owner, lease_expires_at, source_user_seq
+       FROM run_attempts
+      WHERE session_id = ? AND source_user_seq = ?
+      ORDER BY started_at DESC, rowid DESC
+      LIMIT 1`,
+  ).get(sessionId, sourceUserSeq) as {
+    attempt_id: string;
+    run_id: string | null;
+    started_at: string;
+    finished_at: string | null;
+    status: RunAttemptRecord['status'];
+    lease_owner: string | null;
+    lease_expires_at: string | null;
+    source_user_seq: number | null;
+  } | undefined;
+  return row ? {
+    sessionId,
+    attemptId: row.attempt_id,
+    runId: row.run_id,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    status: row.status,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: row.lease_expires_at,
+    sourceUserSeq: row.source_user_seq,
+  } : null;
+}
+
+function resolveKillTarget(
+  sessionId: string,
+  target: KillRequestTarget | undefined,
+  useActiveFallback: boolean,
+): Pick<RunAttemptRef, 'attemptId' | 'runId'> | null {
+  if (target && Number.isSafeInteger(target.sourceUserSeq) && (target.sourceUserSeq ?? 0) > 0) {
+    const attempt = getRunAttemptBySourceUserSeq(sessionId, target.sourceUserSeq as number);
+    if (!attempt) return null;
+    return { attemptId: attempt.attemptId, runId: attempt.runId };
+  }
+  const attemptId = target?.attemptId?.trim() || null;
+  const runId = target?.runId?.trim() || null;
+  if (attemptId || runId) return { attemptId: attemptId ?? '', runId };
+  if (!useActiveFallback) return { attemptId: '', runId: null };
+  const active = getActiveRunAttempt(sessionId);
+  return active ? { attemptId: active.attemptId, runId: active.runId } : { attemptId: '', runId: null };
+}
+
+function targetScopeKeys(target: Pick<RunAttemptRef, 'attemptId' | 'runId'>): string[] {
+  return [
+    target.attemptId ? `attempt:${target.attemptId}` : '',
+    target.runId ? `run:${target.runId}` : '',
+  ].filter(Boolean);
+}
+
+function killMatchesTarget(
+  kill: Pick<KillRequestRef, 'scopeKey' | 'attemptId' | 'runId'>,
+  target: Pick<RunAttemptRef, 'attemptId' | 'runId'>,
+): boolean {
+  if (kill.scopeKey === SESSION_KILL_SCOPE) return true;
+  if (kill.attemptId) return Boolean(target.attemptId) && kill.attemptId === target.attemptId;
+  if (kill.runId) return Boolean(target.runId) && kill.runId === target.runId;
+  return false;
+}
+
+/** Relevant kill for the current active attempt (or the session compatibility
+ * row when idle). Historical attempt latches are intentionally not projected as
+ * a kill for a newer active turn. */
+export function getKillRequest(sessionId: string, target?: KillRequestTarget): KillRequestRef | null {
+  const rows = listKillRequests(sessionId);
+  const sessionWide = rows.find((row) => row.scopeKey === SESSION_KILL_SCOPE) ?? null;
+  const resolved = resolveKillTarget(sessionId, target, target === undefined);
+  if (!resolved) return sessionWide;
+  return rows.find((row) => killMatchesTarget(row, resolved))
+    ?? sessionWide
+    ?? null;
+}
+
+/**
+ * Latch a stop to the active attempt when one exists. Callers that already
+ * resolved the concrete channel run can pass it explicitly, covering the
+ * pre-dispatch window before the model runtime starts.
+ */
+export function requestKill(
+  sessionId: string,
+  reason?: string,
+  target: KillRequestTarget = {},
+): void {
+  const db = openEventLog();
+  const resolved = resolveKillTarget(sessionId, target, true);
+  if (!resolved) {
+    throw new Error(`no run attempt for source user event ${target.sourceUserSeq} in session ${sessionId}`);
+  }
+  const attemptId = resolved.attemptId || null;
+  const runId = resolved.runId || null;
+  if (attemptId) {
+    const owner = db.prepare('SELECT session_id FROM run_attempts WHERE attempt_id = ?')
+      .get(attemptId) as { session_id: string } | undefined;
+    if (!owner || owner.session_id !== sessionId) {
+      throw new Error(`run attempt ${attemptId} is not registered to session ${sessionId}`);
+    }
+  } else if (runId) {
+    const owner = db.prepare('SELECT 1 FROM run_attempts WHERE session_id = ? AND run_id = ? LIMIT 1')
+      .get(sessionId, runId);
+    if (!owner) throw new Error(`run ${runId} is not registered to session ${sessionId}`);
+  }
+  const scopeKey = attemptId ? `attempt:${attemptId}` : runId ? `run:${runId}` : SESSION_KILL_SCOPE;
+  const requestedAt = nowIso();
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO run_kill_requests
+         (session_id, scope_key, attempt_id, run_id, requested_at, reason)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, scope_key) DO UPDATE SET
+         attempt_id = excluded.attempt_id,
+         run_id = excluded.run_id,
+         requested_at = excluded.requested_at,
+         reason = excluded.reason`,
+    ).run(sessionId, scopeKey, attemptId, runId, requestedAt, reason ?? null);
+    // The old table is only a compatibility mirror for a genuinely unscoped
+    // request. Mirroring an attempt target recreates the session-wide race this
+    // table exists to remove.
+    if (scopeKey === SESSION_KILL_SCOPE) {
+      db.prepare(
+        `INSERT OR REPLACE INTO kill_switches (session_id, requested_at, reason)
+         VALUES (?, ?, ?)`,
+      ).run(sessionId, requestedAt, reason ?? null);
+    }
+  });
+  tx();
+}
+
+export function isKillRequested(
+  sessionId: string,
+  target?: KillRequestTarget,
+): boolean {
+  const rows = listKillRequests(sessionId);
+  if (rows.some((kill) => kill.scopeKey === SESSION_KILL_SCOPE)) return true;
+  const resolved = resolveKillTarget(sessionId, target, target === undefined);
+  if (resolved && rows.some((kill) => killMatchesTarget(kill, resolved))) return true;
+  // Compatibility for a database written by an older process. v11 rebuilds
+  // this table with session-only rows, so it can never widen an exact target.
+  return Boolean(openEventLog()
     .prepare('SELECT 1 AS x FROM kill_switches WHERE session_id = ?')
-    .get(sessionId);
-  return !!row;
+    .get(sessionId));
 }
 
-export function clearKill(sessionId: string): void {
+/**
+ * Prepare a fresh attempt without erasing a stop aimed at that attempt. Any
+ * scoped stop for a superseded attempt (or an old unscoped compatibility row)
+ * is discarded so a reusable session cannot be permanently bricked.
+ */
+export function preserveCurrentKillAndClearStale(
+  sessionId: string,
+  attempt: Pick<RunAttemptRef, 'attemptId' | 'runId'>,
+): boolean {
+  const exact = listKillRequests(sessionId).some((kill) =>
+    kill.scopeKey !== SESSION_KILL_SCOPE && killMatchesTarget(kill, attempt));
+  // An idle-session compatibility latch must not curse the next fresh turn.
+  // Clear it even when the current attempt also has an exact latch: the exact
+  // row remains authoritative and latches for other attempts still survive.
+  clearKill(sessionId);
+  return exact;
+}
+
+export function clearKill(
+  sessionId: string,
+  target?: KillRequestTarget,
+): void {
   const db = openEventLog();
-  db.prepare('DELETE FROM kill_switches WHERE session_id = ?').run(sessionId);
+  const resolved = target ? resolveKillTarget(sessionId, target, false) : null;
+  // A source-bound caller that cannot resolve its attempt must never clear a
+  // different attempt's latch as a fallback.
+  if (target && !resolved) return;
+  const tx = db.transaction(() => {
+    if (target && resolved) {
+      const keys = targetScopeKeys(resolved);
+      for (const key of keys) {
+        db.prepare('DELETE FROM run_kill_requests WHERE session_id = ? AND scope_key = ?')
+          .run(sessionId, key);
+      }
+      return;
+    }
+    db.prepare('DELETE FROM run_kill_requests WHERE session_id = ? AND scope_key = ?')
+      .run(sessionId, SESSION_KILL_SCOPE);
+    db.prepare('DELETE FROM kill_switches WHERE session_id = ?').run(sessionId);
+  });
+  tx();
 }
 
 // Lossless side-store cap for a single tool result. This bounds ONLY what's

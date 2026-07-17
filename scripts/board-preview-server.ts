@@ -109,6 +109,150 @@ approvalRegistry.register({
 
 const app = express();
 app.use(express.json());
+
+// The same isolated preview doubles as the Run Environment visual fixture.
+// Model the incident that motivated the rail: many canonical calls, transport
+// mirrors, helpers, and a document whose provider read-back is independently
+// verified. This is API-only fixture data; it never enters the real event log.
+const previewNow = new Date().toISOString();
+const previewRunId = 'sess-preview-135-call-run';
+const previewRun = {
+  id: previewRunId,
+  sessionId: previewRunId,
+  kind: 'chat',
+  source: 'desktop',
+  channel: 'desktop',
+  title: 'Research Northstar Legal and create the client brief',
+  input: 'Research Northstar Legal and create the client brief',
+  objective: 'Research Northstar Legal once, synthesize the evidence, and create one verified Google Doc.',
+  status: 'running',
+  statusLabel: 'Working',
+  live: true,
+  liveLine: 'Verifying the finished client brief…',
+  createdAt: new Date(Date.now() - 124_000).toISOString(),
+  updatedAt: previewNow,
+  metadata: {
+    workspacePath: REPO_ROOT,
+    gitBranch: 'feat/turn-control-spine',
+    modelId: 'claude-sonnet',
+  },
+  canCancel: true,
+  cancelEndpoint: `/api/console/harness-sessions/${previewRunId}/cancel?attemptId=attempt-preview&runScopeId=${encodeURIComponent(`${previewRunId}::brain:preview`)}`,
+  canBackground: true,
+  backgroundEndpoint: `/api/console/harness-sessions/${previewRunId}/background?attemptId=attempt-preview&runScopeId=${encodeURIComponent(`${previewRunId}::brain:preview`)}`,
+  toolSummary: {
+    names: ['FIRECRAWL_SEARCH', 'FIRECRAWL_SCRAPE', 'GOOGLEDOCS_CREATE_DOCUMENT', 'GOOGLEDOCS_GET_DOCUMENT'],
+    countsByName: {
+      FIRECRAWL_SEARCH: 74,
+      FIRECRAWL_SCRAPE: 59,
+      GOOGLEDOCS_CREATE_DOCUMENT: 1,
+      GOOGLEDOCS_GET_DOCUMENT: 1,
+    },
+    logicalCount: 135,
+    recordedCalls: 135,
+    mirrorEvents: 137,
+  },
+  runEnvironmentMeta: {
+    scopeKind: 'current_attempt',
+    runScopeId: `${previewRunId}::brain:preview`,
+    attemptScopeId: `${previewRunId}::brain:preview`,
+    artifactRootScopeId: `${previewRunId}::brain:preview`,
+    attemptId: 'attempt-preview',
+    scopeStartedAt: new Date(Date.now() - 124_000).toISOString(),
+    latestSeq: 412,
+    auditEventsTotal: 412,
+    projectionEventsTotal: 28,
+    projectionEventsReturned: 28,
+    projectionEventsOmitted: 0,
+    artifactsTotal: 2,
+    artifactsReturned: 2,
+    artifactsOmitted: 0,
+    artifactCoverageStatus: 'available',
+  },
+  events: [
+    { type: 'plan_drafted', data: { objective: 'Research once, then create and verify one brief.', stepCount: 3 } },
+    { type: 'step_completed', stepId: 'Collect firm evidence', data: { step: 'Collect firm evidence' } },
+    { type: 'step_completed', stepId: 'Synthesize the brief', data: { step: 'Synthesize the brief' } },
+    { type: 'step_started', stepId: 'Verify the document', data: { step: 'Verify the document' } },
+    ...Array.from({ length: 10 }, (_, index) => ({
+      type: index < 8 ? 'worker_completed' : index === 8 ? 'worker_failed' : 'worker_started',
+      data: { item: `Research helper ${index + 1}`, model: 'fast', ok: index !== 8 },
+    })),
+  ],
+  artifacts: [
+    {
+      id: 'artifact-preview-doc',
+      slotKey: 'google-doc:client-brief',
+      kind: 'google_doc',
+      provider: 'google_docs',
+      title: 'Northstar Legal client brief',
+      status: 'bound',
+      resourceId: 'doc-preview-123',
+      uri: 'https://docs.google.com/document/d/doc-preview-123/edit',
+      bindingVerifiedAt: previewNow,
+      verificationCallId: 'toolu-readback-preview',
+    },
+    {
+      id: 'artifact-preview-source-pack',
+      slotKey: 'local-file:source-pack',
+      kind: 'file',
+      provider: 'workspace',
+      title: 'Source pack',
+      status: 'uncertain',
+      resourceId: null,
+      uri: null,
+    },
+  ],
+  outputPreview: 'Verified client brief: https://docs.google.com/document/d/doc-preview-123/edit',
+};
+
+const completedPreviewRun = {
+  ...previewRun,
+  id: 'sess-preview-completed-run',
+  sessionId: 'sess-preview-completed-run',
+  title: 'Published the Meridian Coffee landing page',
+  status: 'completed',
+  statusLabel: 'Done',
+  live: false,
+  canCancel: false,
+  cancelEndpoint: undefined,
+  canBackground: false,
+  backgroundEndpoint: undefined,
+  updatedAt: new Date(Date.now() - 300_000).toISOString(),
+  completedAt: new Date(Date.now() - 300_000).toISOString(),
+};
+
+const approvalPreviewRun = {
+  ...previewRun,
+  id: 'sess-preview-awaiting-approval',
+  sessionId: 'sess-preview-awaiting-approval',
+  title: 'Send the client brief after approval',
+  status: 'awaiting_approval',
+  statusLabel: 'Waiting for approval',
+  live: true,
+  liveLine: 'Waiting for you to approve or reject the email send.',
+  canCancel: true,
+  cancelEndpoint: '/api/console/harness-sessions/sess-preview-awaiting-approval/cancel?attemptId=attempt-approval-preview&runScopeId=sess-preview-awaiting-approval%3A%3Abrain%3Apreview',
+  canBackground: false,
+  backgroundEndpoint: undefined,
+  updatedAt: new Date(Date.now() - 30_000).toISOString(),
+};
+
+app.get('/api/runs', (_req, res) => {
+  const compact = (run: typeof previewRun) => {
+    const { events: _events, artifacts: _artifacts, toolSummary: _toolSummary, ...row } = run;
+    return row;
+  };
+  res.json({ runs: [compact(previewRun), compact(approvalPreviewRun), compact(completedPreviewRun)] });
+});
+app.get('/api/runs/:id', (req, res) => {
+  const run = req.params.id === previewRun.id ? previewRun
+    : req.params.id === approvalPreviewRun.id ? approvalPreviewRun
+    : req.params.id === completedPreviewRun.id ? completedPreviewRun
+      : null;
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  return res.json({ run });
+});
 const served = registerConsoleSpaRoutes(app, () => true, { distDir: DIST });
 registerConsoleRoutes(app, () => true, {} as never, { serveLegacyAtRoot: false });
 

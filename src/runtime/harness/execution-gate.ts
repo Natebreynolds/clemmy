@@ -31,6 +31,8 @@
  * Tested as pure logic in execution-gate.test.ts (no SDK, no DB).
  */
 
+import { isReadOnlyCallAction } from '../../integrations/composio/slug-effect.js';
+
 /**
  * Verbs in a Composio tool_slug that indicate external state mutation.
  * Conservative: when a tool slug contains any of these as a path
@@ -194,6 +196,9 @@ export function isMutatingExternalWrite(
     for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
       if (pattern.test(slug)) return false;
     }
+    // CALL is also a communication object. GONG_GET_CALL_TRANSCRIPT and
+    // VAPI_RETRIEVE_CALL are reads; another mutation verb still wins.
+    if (isReadOnlyCallAction(slug)) return false;
     // Mutating verb anywhere in the slug path?
     const parts = slug.split('_');
     for (const part of parts) {

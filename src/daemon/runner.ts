@@ -40,6 +40,7 @@ import { listUsableConnectedToolkits } from '../integrations/composio/client.js'
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
+import { interruptOrphanedRunAttemptsAtBoot } from '../runtime/harness/eventlog.js';
 import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
@@ -1127,6 +1128,18 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const interrupted = interruptStaleRunningBackgroundTasks();
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
+  }
+  // Every run attempt still 'active' at daemon boot belonged to the dead
+  // process — Discord/webhook attempts carry no run id or lease, so the
+  // desktop-only foreign-lease sweep never reached them and they showed as
+  // phantom running sessions forever (fold, review wf_30a7ce7e-e9c #7).
+  try {
+    const orphanedAttempts = interruptOrphanedRunAttemptsAtBoot();
+    if (orphanedAttempts > 0) {
+      logger.warn({ orphanedAttempts }, 'Interrupted orphaned run attempts from the previous process on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot run-attempt sweep failed');
   }
   // Re-queue tasks interrupted by a previous restart/crash so the work
   // resumes instead of stranding (bounded by resumeCount to avoid loops).

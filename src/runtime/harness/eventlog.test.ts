@@ -32,7 +32,9 @@ const {
   updateSession,
   listSessions,
   appendEvent,
+  appendTerminalEventOnce,
   listEvents,
+  countMatchingEvents,
   writeToolOutput,
   getToolOutput,
   TOOL_OUTPUT_MAX_BYTES,
@@ -40,6 +42,24 @@ const {
   requestKill,
   isKillRequested,
   clearKill,
+  beginRunAttempt,
+  bindRunAttemptSourceUserEvent,
+  claimRunAttemptLease,
+  finishRunAttempt,
+  getActiveRunAttempt,
+  getLatestRunAttempt,
+  listLatestRunAttemptsForSessions,
+  getLatestRunAttemptByRunId,
+  findUserInputEventForRun,
+  renewRunAttemptLease,
+  interruptForeignRunAttemptLeases,
+  interruptOrphanedRunAttemptsAtBoot,
+  claimHarnessChatRequest,
+  getHarnessChatRequestReceipt,
+  requestHarnessChatCancellation,
+  getHarnessChatCancellation,
+  preserveCurrentKillAndClearStale,
+  recordRunAttemptUserInput,
   reapStaleSessions,
   openEventLog,
   HARNESS_DB_PATH,
@@ -93,7 +113,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    6,
+    12,
   );
   resetEventLog();
 });
@@ -129,8 +149,186 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
     { scope_id: 'sess-valid::codeMode', parent_session_id: 'sess-valid' },
   ]);
   assert.equal(
+    (migrated.prepare(
+      'SELECT COUNT(*) AS n FROM tool_guardrail_state WHERE session_id = ?',
+    ).get('sess-missing::codeMode') as { n: number }).n,
+    0,
+    'a legacy row with no owning session is unreachable state and is removed',
+  );
+  assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    6,
+    12,
+  );
+  resetEventLog();
+});
+
+test('schema v11 preserves a legacy targeted stop without widening its compatibility mirror', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (10, '2026-07-16T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    INSERT INTO sessions (id) VALUES ('sess-v10-kill');
+    CREATE TABLE run_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      run_id TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      source_user_seq INTEGER
+    );
+    INSERT INTO run_attempts
+      (attempt_id, session_id, run_id, started_at, finished_at, status)
+    VALUES
+      ('attempt-v10-a', 'sess-v10-kill', 'run-v10-a', '2026-07-16T00:00:00.000Z', NULL, 'active'),
+      ('attempt-v10-b', 'sess-v10-kill', 'run-v10-b', '2026-07-16T00:00:01.000Z', NULL, 'active');
+    CREATE TABLE run_kill_requests (
+      session_id TEXT PRIMARY KEY,
+      attempt_id TEXT,
+      run_id TEXT,
+      requested_at TEXT NOT NULL,
+      reason TEXT
+    );
+    INSERT INTO run_kill_requests
+      (session_id, attempt_id, run_id, requested_at, reason)
+    VALUES
+      ('sess-v10-kill', 'attempt-v10-a', 'run-v10-a', '2026-07-16T00:00:02.000Z', 'stop A');
+    CREATE TABLE kill_switches (
+      session_id TEXT PRIMARY KEY,
+      requested_at TEXT NOT NULL,
+      reason TEXT
+    );
+    INSERT INTO kill_switches
+      (session_id, requested_at, reason)
+    VALUES
+      ('sess-v10-kill', '2026-07-16T00:00:02.000Z', 'legacy mirror of stop A');
+    CREATE TABLE pending_approvals (
+      approval_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL
+    );
+    INSERT INTO pending_approvals (approval_id, session_id) VALUES
+      ('apr-valid-v10', 'sess-v10-kill'),
+      ('apr-orphan-v10', 'sess-deleted');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const rows = migrated.prepare(
+    'SELECT scope_key, attempt_id, run_id FROM run_kill_requests WHERE session_id = ?',
+  ).all('sess-v10-kill') as Array<{ scope_key: string; attempt_id: string | null; run_id: string | null }>;
+  assert.deepEqual(rows, [{ scope_key: 'attempt:attempt-v10-a', attempt_id: 'attempt-v10-a', run_id: 'run-v10-a' }]);
+  assert.equal(
+    (migrated.prepare('SELECT COUNT(*) AS n FROM kill_switches WHERE session_id = ?').get('sess-v10-kill') as { n: number }).n,
+    0,
+    'the old compatibility mirror is not reinterpreted as a session-wide stop',
+  );
+  assert.equal(isKillRequested('sess-v10-kill', { attemptId: 'attempt-v10-a' }), true);
+  assert.equal(isKillRequested('sess-v10-kill', { attemptId: 'attempt-v10-b' }), false);
+  assert.deepEqual(
+    migrated.prepare('SELECT approval_id FROM pending_approvals ORDER BY approval_id').all(),
+    [{ approval_id: 'apr-valid-v10' }],
+    'only approvals with a durable owning session survive migration hygiene',
+  );
+  resetEventLog();
+});
+
+test('fresh schema v12 creates artifact truth and pre-ack cancellation tables eagerly', () => {
+  resetEventLog();
+  const db = openEventLog();
+  const tables = new Set(
+    (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name),
+  );
+  for (const name of [
+    'run_artifacts',
+    'artifact_run_scopes',
+    'artifact_source_roots',
+    'harness_chat_request_cancellations',
+  ]) assert.ok(tables.has(name), `${name} exists before the first turn`);
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  for (const name of [
+    'binding_verified_at',
+    'verification_call_id',
+    'verification_shape',
+    'verification_fingerprint',
+  ]) assert.ok(columns.has(name), name);
+  assert.equal(
+    (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    12,
+  );
+  resetEventLog();
+});
+
+test('schema v12 upgrades a lazy artifact ledger in place and preserves its earliest source root', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (11, '2026-07-16T00:00:00.000Z');
+    CREATE TABLE sessions (id TEXT PRIMARY KEY);
+    INSERT INTO sessions (id) VALUES ('sess-v11-artifact');
+    CREATE TABLE run_artifacts (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      run_scope_id TEXT NOT NULL,
+      slot_key TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      title TEXT,
+      create_shape TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending','bound','uncertain')),
+      resource_id TEXT,
+      uri TEXT,
+      source_call_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(session_id, run_scope_id, slot_key)
+    );
+    INSERT INTO run_artifacts
+      (id, session_id, run_scope_id, slot_key, kind, provider, title, create_shape,
+       status, resource_id, uri, source_call_id, created_at, updated_at)
+    VALUES
+      ('artifact-v11', 'sess-v11-artifact', 'scope-late', 'google_doc:primary',
+       'google_doc', 'Google Docs', 'Preserved', 'CREATE', 'bound', 'doc-v11',
+       'https://docs.google.com/document/d/doc-v11/edit', 'call-v11',
+       '2026-07-16T00:00:03.000Z', '2026-07-16T00:00:03.000Z');
+    CREATE TABLE artifact_run_scopes (
+      session_id TEXT NOT NULL,
+      attempt_scope_id TEXT NOT NULL,
+      root_scope_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(session_id, attempt_scope_id)
+    );
+    INSERT INTO artifact_run_scopes
+      (session_id, attempt_scope_id, root_scope_id, source_user_seq, reason, created_at)
+    VALUES
+      ('sess-v11-artifact', 'scope-late', 'root-late', 42, 'retry', '2026-07-16T00:00:02.000Z'),
+      ('sess-v11-artifact', 'scope-first', 'root-first', 42, 'initial', '2026-07-16T00:00:01.000Z');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const artifact = migrated.prepare(
+    'SELECT resource_id, binding_verified_at FROM run_artifacts WHERE id = ?',
+  ).get('artifact-v11') as { resource_id: string; binding_verified_at: string | null };
+  assert.deepEqual(artifact, { resource_id: 'doc-v11', binding_verified_at: null });
+  const root = migrated.prepare(
+    'SELECT root_scope_id FROM artifact_source_roots WHERE session_id = ? AND source_user_seq = ?',
+  ).get('sess-v11-artifact', 42) as { root_scope_id: string };
+  assert.equal(root.root_scope_id, 'root-first');
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    12,
   );
   resetEventLog();
 });
@@ -281,6 +479,189 @@ test('listEvents filters by sinceSeq and types', () => {
   const onlyTools = listEvents(sess.id, { types: ['tool_called'] });
   assert.equal(onlyTools.length, 1);
   assert.equal(onlyTools[0].type, 'tool_called');
+  assert.equal(countMatchingEvents(sess.id, { sinceSeq: e1.seq }), 2);
+  assert.equal(countMatchingEvents(sess.id, { types: ['tool_called'] }), 1);
+});
+
+test('newest limited event window is returned in chronological order', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  for (const type of ['turn_started', 'heartbeat', 'tool_called', 'tool_returned'] as EventType[]) {
+    appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type, data: {} });
+  }
+  const newest = listEvents(sess.id, { desc: true, limit: 2 });
+  assert.deepEqual(newest.map((event) => event.type), ['tool_called', 'tool_returned']);
+  assert.ok(newest[0].seq < newest[1].seq);
+});
+
+test('latest run attempt follows a reusable session across terminal turns', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const first = beginRunAttempt(sess.id, { runId: 'desktop:first' });
+  finishRunAttempt(first, 'completed');
+  const second = beginRunAttempt(sess.id, { runId: 'desktop:second' });
+  const latest = getLatestRunAttempt(sess.id);
+  assert.equal(latest?.attemptId, second.attemptId);
+  assert.equal(latest?.runId, 'desktop:second');
+  assert.equal(latest?.status, 'active');
+  assert.equal(latest?.finishedAt, null);
+  assert.equal(latest?.sourceUserSeq, null);
+});
+
+test('latest run attempts are projected for many sessions in one deterministic batch', () => {
+  resetEventLog();
+  const firstSession = createSession({ kind: 'chat' });
+  const secondSession = createSession({ kind: 'chat' });
+  const old = beginRunAttempt(firstSession.id, { runId: 'desktop:old' });
+  finishRunAttempt(old, 'completed');
+  const latest = beginRunAttempt(firstSession.id, { runId: 'desktop:latest' });
+  const other = beginRunAttempt(secondSession.id, { runId: 'desktop:other' });
+
+  const projected = listLatestRunAttemptsForSessions([
+    firstSession.id,
+    secondSession.id,
+    firstSession.id,
+    'missing-session',
+  ]);
+  assert.equal(projected.size, 2);
+  assert.equal(projected.get(firstSession.id)?.attemptId, latest.attemptId);
+  assert.equal(projected.get(secondSession.id)?.attemptId, other.attemptId);
+  assert.equal(projected.has('missing-session'), false);
+});
+
+test('fold #7: the boot sweep interrupts NULL-run_id attempts (Discord/webhook lanes)', () => {
+  resetEventLog();
+  const discordSess = createSession({ kind: 'chat', channel: 'discord' });
+  // Discord/webhook attempts carry no external run id — the crash shape that leaked.
+  const orphaned = beginRunAttempt(discordSess.id);
+  assert.equal(orphaned.runId, null);
+  assert.equal(getLatestRunAttempt(discordSess.id)?.status, 'active');
+
+  const swept = interruptOrphanedRunAttemptsAtBoot();
+  assert.ok(swept >= 1, 'the NULL-run_id attempt is swept at daemon boot');
+  const latest = getLatestRunAttempt(discordSess.id);
+  assert.equal(latest?.status, 'interrupted');
+  assert.ok(latest?.finishedAt, 'the phantom active row is terminal after boot');
+});
+
+test('fold #7: the foreign-lease sweep with no prefix also reaches NULL-run_id rows', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  beginRunAttempt(sess.id);
+  const swept = interruptForeignRunAttemptLeases('boot-owner-x');
+  assert.ok(swept >= 1, 'run_id LIKE alone can never match NULL — the explicit NULL arm must');
+  assert.equal(getLatestRunAttempt(sess.id)?.status, 'interrupted');
+  // A prefixed sweep still targets only its own lane.
+  const desktopSess = createSession({ kind: 'chat', channel: 'desktop' });
+  beginRunAttempt(desktopSess.id, { runId: 'desktop:live' });
+  const discordSess2 = createSession({ kind: 'chat', channel: 'discord' });
+  beginRunAttempt(discordSess2.id);
+  const sweptPrefixed = interruptForeignRunAttemptLeases('boot-owner-x', { runIdPrefix: 'desktop:' });
+  assert.equal(sweptPrefixed, 1, 'prefix sweep touches only the prefixed lane');
+  assert.equal(getLatestRunAttempt(discordSess2.id)?.status, 'active', 'NULL-run_id rows are untouched by a prefixed sweep');
+});
+
+test('run attempt binds idempotently to one exact same-session user input', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'desktop:source-bound' });
+  const firstInput = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Build the memo.', runId: 'desktop:source-bound' },
+  });
+  bindRunAttemptSourceUserEvent(attempt, firstInput.seq);
+  bindRunAttemptSourceUserEvent(attempt, firstInput.seq);
+  assert.equal(getLatestRunAttempt(sess.id)?.sourceUserSeq, firstInput.seq);
+
+  const secondInput = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Different request.' },
+  });
+  assert.throws(
+    () => bindRunAttemptSourceUserEvent(attempt, secondInput.seq),
+    /already bound to user event/,
+  );
+
+  const other = createSession({ kind: 'chat' });
+  const foreignInput = appendEvent({
+    sessionId: other.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Foreign request.' },
+  });
+  const otherAttempt = beginRunAttempt(sess.id, { runId: 'desktop:other-attempt' });
+  assert.throws(
+    () => bindRunAttemptSourceUserEvent(otherAttempt, foreignInput.seq),
+    /not a user input for attempt session/,
+  );
+});
+
+test('recordRunAttemptUserInput atomically inserts once and binding wins over transformed prompts', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'desktop:atomic-source' });
+  const literal = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: '/goal start Build the firm brief.' },
+  });
+  const transformed = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Execute the normalized goal objective.' },
+  });
+
+  assert.equal(transformed.seq, literal.seq, 'the exact binding outranks runtime prompt text');
+  assert.equal(listEvents(sess.id, { types: ['user_input_received'] }).length, 1);
+  assert.equal(getLatestRunAttempt(sess.id)?.sourceUserSeq, literal.seq);
+});
+
+test('desktop run finds a pre-recorded request-id input only while it is unsettled', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  claimHarnessChatRequest({
+    requestId: 'client-request-source-1234',
+    sessionId: sess.id,
+    runId: 'desktop:source-request',
+    inputHash: 'hash',
+    sinceSeq: 0,
+  });
+  const input = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create the exact brief.', requestId: 'client-request-source-1234' },
+  });
+
+  assert.equal(
+    findUserInputEventForRun(sess.id, 'desktop:source-request', 'Create the exact brief.')?.seq,
+    input.seq,
+  );
+  assert.equal(
+    findUserInputEventForRun(sess.id, 'desktop:source-request', 'Different text.'),
+    null,
+    'run identity alone cannot dedupe a different message',
+  );
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'conversation_completed',
+    data: { summary: 'Done.' },
+  });
+  assert.equal(
+    findUserInputEventForRun(sess.id, 'desktop:source-request', 'Create the exact brief.'),
+    null,
+    'a settled request is historical input, not the source of a fresh attempt',
+  );
 });
 
 test('getLatestEventSeq returns the current replay cursor for a session', () => {
@@ -366,6 +747,321 @@ test('kill switch is sticky until cleared', () => {
   assert.equal(isKillRequested(sess.id), true);
   clearKill(sess.id);
   assert.equal(isKillRequested(sess.id), false);
+});
+
+test('run-scoped kill survives current-attempt preparation but not a fresh attempt', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  requestKill(sess.id, 'legacy idle-session stop');
+  const first = beginRunAttempt(sess.id, { runId: 'run-current' });
+  requestKill(sess.id, 'stop current', first);
+  assert.equal(preserveCurrentKillAndClearStale(sess.id, first), true);
+  assert.equal(isKillRequested(sess.id, first), true);
+  assert.equal(
+    (openEventLog().prepare(
+      "SELECT COUNT(*) AS n FROM run_kill_requests WHERE session_id = ? AND scope_key = 'session:*'",
+    ).get(sess.id) as { n: number }).n,
+    0,
+    'preparing an exact attempt clears a stale session fallback while preserving its exact stop',
+  );
+
+  finishRunAttempt(first, 'cancelled');
+  const next = beginRunAttempt(sess.id, { runId: 'run-next' });
+  assert.equal(preserveCurrentKillAndClearStale(sess.id, next), false);
+  assert.equal(isKillRequested(sess.id), false);
+  assert.equal(isKillRequested(sess.id, first), false, 'the old attempt already settled and consumed its latch');
+  assert.equal(getActiveRunAttempt(sess.id)?.attemptId, next.attemptId);
+});
+
+test('attempt kill latches coexist, survive reopen, and resolve by exact source turn', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const first = beginRunAttempt(sess.id, { runId: 'run-a' });
+  const firstInput = recordRunAttemptUserInput(first, {
+    turn: 1, role: 'user', data: { text: 'attempt A' },
+  });
+  requestKill(sess.id, 'stop A', first);
+
+  const second = beginRunAttempt(sess.id, { runId: 'run-b' });
+  const secondInput = recordRunAttemptUserInput(second, {
+    turn: 2, role: 'user', data: { text: 'attempt B' },
+  });
+  assert.equal(preserveCurrentKillAndClearStale(sess.id, second), false);
+  requestKill(sess.id, 'stop B', second);
+
+  assert.equal(isKillRequested(sess.id, { sourceUserSeq: firstInput.seq }), true);
+  assert.equal(isKillRequested(sess.id, { sourceUserSeq: secondInput.seq }), true);
+  assert.equal(
+    (openEventLog().prepare('SELECT COUNT(*) AS n FROM run_kill_requests WHERE session_id = ?').get(sess.id) as { n: number }).n,
+    2,
+    'one session can retain independent A and B stop latches',
+  );
+  assert.equal(
+    (openEventLog().prepare('SELECT COUNT(*) AS n FROM kill_switches WHERE session_id = ?').get(sess.id) as { n: number }).n,
+    0,
+    'attempt-targeted stops never widen into the legacy session-global mirror',
+  );
+
+  closeEventLog();
+  assert.equal(isKillRequested(sess.id, first), true, 'A latch survives a database reopen');
+  assert.equal(isKillRequested(sess.id, second), true, 'B latch survives a database reopen');
+
+  clearKill(sess.id, second);
+  assert.equal(isKillRequested(sess.id, second), false);
+  assert.equal(isKillRequested(sess.id, first), true, 'clearing B cannot consume A');
+  clearKill(sess.id, first);
+  assert.equal(isKillRequested(sess.id, first), false);
+});
+
+test('a stop in the pre-dispatch window targets the already-registered attempt', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'run-pre-dispatch' });
+  requestKill(sess.id, 'stop before model dispatch');
+  assert.equal(isKillRequested(sess.id, attempt), true);
+  assert.equal(preserveCurrentKillAndClearStale(sess.id, attempt), true);
+});
+
+test('reusing a settled external run id creates a fresh attempt identity', () => {
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  const first = beginRunAttempt(sess.id, { runId: 'run-retried' });
+  finishRunAttempt(first, 'completed');
+  const retry = beginRunAttempt(sess.id, { runId: 'run-retried' });
+
+  assert.notEqual(retry.attemptId, first.attemptId);
+  assert.equal(retry.runId, first.runId);
+  assert.equal(getLatestRunAttemptByRunId(sess.id, 'run-retried')?.attemptId, retry.attemptId);
+});
+
+test('desktop chat request receipt persists one payload/session/run and replays idempotently', () => {
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const input = {
+    requestId: 'client-request-1234',
+    sessionId: sess.id,
+    runId: 'desktop:stable-run',
+    inputHash: 'hash-one',
+    sinceSeq: 12,
+  };
+  const first = claimHarnessChatRequest(input);
+  const replay = claimHarnessChatRequest(input);
+
+  assert.equal(first.inserted, true);
+  assert.equal(replay.inserted, false);
+  assert.deepEqual(replay.receipt, first.receipt);
+  closeEventLog();
+  assert.deepEqual(getHarnessChatRequestReceipt(input.requestId), first.receipt, 'receipt survives reopen/restart');
+  assert.throws(
+    () => claimHarnessChatRequest({ ...input, inputHash: 'different-payload' }),
+    /different chat request/,
+  );
+});
+
+test('a pre-ack chat cancellation is durable, idempotent, and prevents later receipt acceptance', () => {
+  resetEventLog();
+  const requestId = 'client-request-cancel-before-ack';
+  const first = requestHarnessChatCancellation(requestId, 'user pressed Stop');
+  const replay = requestHarnessChatCancellation(requestId, 'duplicate click');
+  assert.deepEqual(replay, first, 'the first Stop remains the durable authority');
+  assert.equal(first.reason, 'user pressed Stop');
+
+  closeEventLog();
+  assert.deepEqual(getHarnessChatCancellation(requestId), first, 'the tombstone survives restart');
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  assert.throws(
+    () => claimHarnessChatRequest({
+      requestId,
+      sessionId: sess.id,
+      runId: 'desktop:must-not-run',
+      inputHash: 'cancelled-hash',
+      sinceSeq: 0,
+    }),
+    /cancelled before acceptance/,
+  );
+  assert.equal(getHarnessChatRequestReceipt(requestId), null);
+});
+
+test('run attempt lease suppresses live replay and reclaims an expired attempt under a fresh identity', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const first = claimRunAttemptLease({
+    sessionId: sess.id,
+    runId: 'desktop:leased-run',
+    ownerId: 'daemon-old',
+    leaseMs: 5_000,
+    nowMs: 10_000,
+  });
+  assert.equal(first.claimed, true);
+  assert.ok(first.attempt);
+  const source = recordRunAttemptUserInput(first.attempt!, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Resume this exact request.' },
+  });
+
+  const liveReplay = claimRunAttemptLease({
+    sessionId: sess.id,
+    runId: 'desktop:leased-run',
+    ownerId: 'daemon-new',
+    leaseMs: 5_000,
+    nowMs: 12_000,
+  });
+  assert.equal(liveReplay.claimed, false);
+  assert.equal(liveReplay.reason, 'active');
+  assert.equal(liveReplay.attempt?.attemptId, first.attempt?.attemptId);
+
+  assert.equal(renewRunAttemptLease(first.attempt!, 'daemon-old', 5_000, 13_000), true);
+  const recovered = claimRunAttemptLease({
+    sessionId: sess.id,
+    runId: 'desktop:leased-run',
+    ownerId: 'daemon-new',
+    leaseMs: 5_000,
+    nowMs: 19_000,
+  });
+  assert.equal(recovered.claimed, true);
+  assert.equal(recovered.interruptedAttemptId, first.attempt?.attemptId);
+  assert.notEqual(recovered.attempt?.attemptId, first.attempt?.attemptId);
+  const recoveredRecord = getLatestRunAttemptByRunId(sess.id, 'desktop:leased-run');
+  assert.equal(recoveredRecord?.leaseOwner, 'daemon-new');
+  assert.equal(recoveredRecord?.sourceUserSeq, source.seq, 'interrupted recovery preserves the exact source input');
+
+  const nestedRuntimeAttempt = beginRunAttempt(sess.id, { runId: 'desktop:leased-run' });
+  assert.equal(
+    nestedRuntimeAttempt.attemptId,
+    recovered.attempt?.attemptId,
+    'a downstream runtime wrapper reuses the recovered lease attempt instead of superseding it',
+  );
+  assert.equal(getLatestRunAttemptByRunId(sess.id, 'desktop:leased-run')?.leaseOwner, 'daemon-new');
+
+  finishRunAttempt(recovered.attempt!, 'completed');
+  const terminalReplay = claimRunAttemptLease({
+    sessionId: sess.id,
+    runId: 'desktop:leased-run',
+    ownerId: 'daemon-new',
+    leaseMs: 5_000,
+    nowMs: 20_000,
+  });
+  assert.equal(terminalReplay.claimed, false);
+  assert.equal(terminalReplay.reason, 'terminal');
+});
+
+test('lease replay reconciles a durable terminal after a crash instead of re-executing', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const first = claimRunAttemptLease({
+    sessionId: sess.id,
+    runId: 'desktop:terminal-before-finally',
+    ownerId: 'daemon-old',
+    leaseMs: 5_000,
+    nowMs: 10_000,
+  });
+  assert.ok(first.attempt);
+  const source = recordRunAttemptUserInput(first.attempt!, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Create the report.' },
+  });
+  const terminal = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'success', summary: 'Report created.' },
+  });
+  assert.equal(terminal.data.attemptId, first.attempt?.attemptId);
+  assert.equal(terminal.data.runId, 'desktop:terminal-before-finally');
+  assert.equal(terminal.data.sourceUserSeq, source.seq);
+  // Simulate process death here: finishRunAttempt never ran and the lease later
+  // expired. The durable terminal after this exact source is still authority.
+  const replay = claimRunAttemptLease({
+    sessionId: sess.id,
+    runId: 'desktop:terminal-before-finally',
+    ownerId: 'daemon-new',
+    leaseMs: 5_000,
+    nowMs: 20_000,
+  });
+
+  assert.equal(replay.claimed, false);
+  assert.equal(replay.reason, 'terminal');
+  assert.equal(replay.attempt?.attemptId, first.attempt?.attemptId, 'no replacement executor was minted');
+  const settled = getLatestRunAttemptByRunId(sess.id, 'desktop:terminal-before-finally');
+  assert.equal(settled?.status, 'completed');
+  assert.equal(settled?.sourceUserSeq, source.seq);
+});
+
+test('a late completion keeps the source turn owner after a newer attempt becomes active', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const first = beginRunAttempt(sess.id, { runId: 'desktop:turn-a' });
+  const firstSource = recordRunAttemptUserInput(first, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Turn A' },
+  });
+  const second = beginRunAttempt(sess.id, { runId: 'desktop:turn-b' });
+  recordRunAttemptUserInput(second, {
+    turn: 2,
+    role: 'user',
+    data: { text: 'Turn B' },
+  });
+
+  const lateFirstTerminal = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'success', sourceUserSeq: firstSource.seq },
+  });
+
+  assert.equal(lateFirstTerminal.data.attemptId, first.attemptId);
+  assert.equal(lateFirstTerminal.data.runId, first.runId);
+  assert.equal(lateFirstTerminal.data.sourceUserSeq, firstSource.seq);
+  assert.notEqual(lateFirstTerminal.data.attemptId, second.attemptId);
+});
+
+test('daemon startup interrupts only foreign desktop leases so their request can resume immediately', () => {
+  resetEventLog();
+  const foreign = createSession({ kind: 'chat', channel: 'desktop' });
+  const owned = createSession({ kind: 'chat', channel: 'desktop' });
+  const otherSurface = createSession({ kind: 'chat', channel: 'discord' });
+  claimRunAttemptLease({ sessionId: foreign.id, runId: 'desktop:foreign', ownerId: 'old-daemon', leaseMs: 60_000, nowMs: 1_000 });
+  claimRunAttemptLease({ sessionId: owned.id, runId: 'desktop:owned', ownerId: 'new-daemon', leaseMs: 60_000, nowMs: 1_000 });
+  claimRunAttemptLease({ sessionId: otherSurface.id, runId: 'discord:foreign', ownerId: 'old-daemon', leaseMs: 60_000, nowMs: 1_000 });
+
+  assert.equal(interruptForeignRunAttemptLeases('new-daemon', { runIdPrefix: 'desktop:', nowMs: 2_000 }), 1);
+  assert.equal(getLatestRunAttemptByRunId(foreign.id, 'desktop:foreign')?.status, 'interrupted');
+  assert.equal(getLatestRunAttemptByRunId(owned.id, 'desktop:owned')?.status, 'active');
+  assert.equal(getLatestRunAttemptByRunId(otherSurface.id, 'discord:foreign')?.status, 'active');
+
+  const resumed = claimRunAttemptLease({
+    sessionId: foreign.id,
+    runId: 'desktop:foreign',
+    ownerId: 'new-daemon',
+    leaseMs: 60_000,
+    nowMs: 2_001,
+  });
+  assert.equal(resumed.claimed, true);
+  assert.notEqual(resumed.attempt?.attemptId, 'attempt:desktop:foreign');
+});
+
+test('terminal completion is appended and broadcast only once per attempt key', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const first = appendTerminalEventOnce({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    data: { reason: 'cancelled' },
+  }, 'brain:attempt-1');
+  const second = appendTerminalEventOnce({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    data: { reason: 'cancelled' },
+  }, 'brain:attempt-1');
+  assert.equal(first.inserted, true);
+  assert.equal(second.inserted, false);
+  assert.equal(first.event.id, second.event.id);
+  assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).length, 1);
 });
 
 test('updateSession patches and bumps updated_at', () => {

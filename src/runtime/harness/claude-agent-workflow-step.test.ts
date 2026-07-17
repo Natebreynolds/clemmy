@@ -22,6 +22,7 @@ writeFileSync(
 
 const mod = await import('./claude-agent-workflow-step.js');
 const sdkMod = await import('./claude-agent-sdk.js');
+const { AgentRuntimeCancelledError } = await import('../provider.js');
 const {
   claudeAgentSdkWorkflowStepEnabled,
   claudeWorkflowStepOutputSchema,
@@ -103,6 +104,9 @@ test('runClaudeAgentSdkWorkflowStep builds a schema-bound SDK call and returns s
     workflowName: 'Report Workflow',
     prompt: 'Workflow: Report Workflow\nStep: design_report\n\nDesign the report.',
     modelId: 'claude-sonnet-4-6',
+    sessionId: 'workflow:run-source:design_report',
+    sourceUserSeq: 42,
+    shouldCancel: () => false,
   });
 
   assert.deepEqual(result.output, { report: 'sdk workflow ok' });
@@ -110,6 +114,9 @@ test('runClaudeAgentSdkWorkflowStep builds a schema-bound SDK call and returns s
   assert.equal(result.sdkSessionId, 'sdk-workflow-session');
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__skill_read']);
   assert.equal(captured.modelId, 'claude-sonnet-4-6');
+  assert.equal(captured.sessionId, 'workflow:run-source:design_report');
+  assert.equal(captured.sourceUserSeq, 42);
+  assert.equal(await captured.shouldCancel(), false);
   assert.equal(captured.maxTurns, 6);
   assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
@@ -430,8 +437,10 @@ test('runClaudeAgentSdkWorkflowStep converts SDK turn limits into a blocked work
 
 test('F3: a workflow step that hits its turn budget WITH progress auto-continues and finishes (not blocked)', async () => {
   let calls = 0;
-  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+  const seen: Array<{ sourceUserSeq?: number; shouldCancel?: unknown }> = [];
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
     calls += 1;
+    seen.push({ sourceUserSeq: options.sourceUserSeq, shouldCancel: options.shouldCancel });
     if (calls === 1) {
       // Made tool progress but hit the per-query turn cap.
       return { text: 'partial: did 2 of 5', sessionId: 's', model: 'claude-sonnet-5', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: true };
@@ -443,10 +452,53 @@ test('F3: a workflow step that hits its turn budget WITH progress auto-continues
       toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false,
     };
   });
-  const result = await runClaudeAgentSdkWorkflowStep({ step, workflowName: 'WF', prompt: 'do 5 items', modelId: 'claude-sonnet-5', fullLane: true });
+  const shouldCancel = () => false;
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step,
+    workflowName: 'WF',
+    prompt: 'do 5 items',
+    modelId: 'claude-sonnet-5',
+    fullLane: true,
+    sourceUserSeq: 73,
+    shouldCancel,
+  });
   assert.equal(calls, 2, 'auto-continued once past the step turn budget');
+  assert.deepEqual(seen, [
+    { sourceUserSeq: 73, shouldCancel },
+    { sourceUserSeq: 73, shouldCancel },
+  ], 'the exact attempt source and stop hook survive SDK auto-continuation');
   assert.deepEqual(result.output, { report: 'all 5 done' }, 'finished — not blocked on turn budget');
   assert.notEqual((result.output as { blocked?: boolean }).blocked, true);
+});
+
+test('F3: cancellation during SDK auto-continue is re-thrown, never converted to prior partial output', async () => {
+  let calls = 0;
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        text: 'partial progress',
+        sessionId: 's',
+        model: 'claude-sonnet-5',
+        toolUses: ['mcp__clementine-local__skill_read'],
+        limitHit: true,
+      };
+    }
+    throw new AgentRuntimeCancelledError('Run cancelled by caller.');
+  });
+
+  await assert.rejects(
+    () => runClaudeAgentSdkWorkflowStep({
+      step,
+      workflowName: 'WF',
+      prompt: 'continue a long step',
+      modelId: 'claude-sonnet-5',
+      sourceUserSeq: 88,
+      shouldCancel: () => true,
+    }),
+    (err: unknown) => err instanceof AgentRuntimeCancelledError,
+  );
+  assert.equal(calls, 2, 'the stop lands on the first continuation and is not retried/swallowed');
 });
 
 test('F3: a step limit-hit with NO tool progress still BLOCKS (anti-loop)', async () => {

@@ -14,6 +14,7 @@ import {
   searchComposioCliTools,
   type ComposioCliStatus,
 } from './cli.js';
+import { composioSlugIsReadOnly } from './slug-effect.js';
 
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
@@ -380,6 +381,52 @@ export class ComposioReconnectRequiredError extends Error {
     this.name = 'ComposioReconnectRequiredError';
     this.cause = cause;
   }
+}
+
+/** AUTO backend protection: a CLI mutation can commit remotely and then lose
+ * its response. Falling through to the SDK on that ambiguous error would run
+ * the same external write twice. */
+export class ComposioDispatchUncertainError extends Error {
+  readonly cause: unknown;
+  readonly toolSlug: string;
+
+  constructor(toolSlug: string, cause: unknown) {
+    super(`${toolSlug} may already have completed through the Composio CLI. SDK fallback was suppressed. Verify the remote state before retrying this mutation.`);
+    this.name = 'ComposioDispatchUncertainError';
+    this.toolSlug = toolSlug;
+    this.cause = cause;
+  }
+}
+
+function errorText(value: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  const visit = (entry: unknown, depth: number): void => {
+    if (entry == null || depth > 3 || seen.has(entry)) return;
+    if (typeof entry === 'string' || typeof entry === 'number') { parts.push(String(entry)); return; }
+    if (typeof entry !== 'object') return;
+    seen.add(entry);
+    const row = entry as Record<string, unknown>;
+    if (entry instanceof Error) parts.push(entry.name, entry.message);
+    for (const key of ['code', 'message', 'stderr', 'cause']) visit(row[key], depth + 1);
+  };
+  visit(value, 0);
+  return parts.join(' ').slice(0, 8_000);
+}
+
+/** True only when the CLI could not have crossed the provider boundary. Keep
+ * this intentionally narrow; provider timeouts, 5xx, broken pipes, and generic
+ * non-zero exits are ambiguous for writes. */
+export function composioCliErrorProvesNoDispatch(error: unknown): boolean {
+  const text = errorText(error);
+  return /\[provider-dispatch:not-started:/i.test(text)
+    || /\bENOENT\b|command not found|executable not found|failed to spawn|spawn[^\n]*not found/i.test(text)
+    || /CLI is not installed|unsupported CLI version|version mismatch|unknown (?:command|option)|invalid CLI invocation/i.test(text)
+    || /not logged in|not authenticated|authentication required|run composio login/i.test(text);
+}
+
+export function composioAutoFallbackAllowed(toolSlug: string, error: unknown): boolean {
+  return composioSlugIsReadOnly(toolSlug) || composioCliErrorProvesNoDispatch(error);
 }
 
 export function maskApiKey(value: string): string {
@@ -1556,8 +1603,13 @@ export async function executeComposioTool(
           throw new ComposioReconnectRequiredError(toolSlug, error);
         }
         if (backend === 'cli') throw error;
-        // In auto mode, a CLI auth/version mismatch should not break
-        // existing users. Fall through to the SDK path.
+        // Reads can always fall back. A mutation may fall back only when the
+        // CLI proves it never dispatched (missing binary/auth/version). A
+        // timeout/5xx/generic exit may have committed remotely; replaying it
+        // through the SDK would duplicate the write under one logical call.
+        if (!composioAutoFallbackAllowed(toolSlug, error)) {
+          throw new ComposioDispatchUncertainError(toolSlug, error);
+        }
       }
     } else if (backend === 'cli') {
       throw new Error(cliStatus.installed

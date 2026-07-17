@@ -50,19 +50,35 @@ function uniqueSessionIds(sessionIds: string[]): string[] {
   return out;
 }
 
+/** Inclusive global event-log cursor used to freeze a session-history view at
+ * a handoff boundary. Event `seq` is global across harness sessions, so the
+ * same cursor safely bounds workflow sibling sessions as well. */
+function normalizeThroughSeq(throughSeq?: number): number | undefined {
+  if (throughSeq === undefined) return undefined;
+  if (!Number.isSafeInteger(throughSeq) || throughSeq <= 0) {
+    throw new Error('throughSeq must be a positive safe event sequence');
+  }
+  return throughSeq;
+}
+
 function readRecentActionRowsForSession(
   db: ReturnType<typeof openEventLog>,
   sessionId: string,
   limit: number,
+  throughSeq?: number,
 ): RawActionRow[] {
   const rowLimit = Math.max(1, Math.trunc(limit));
+  const boundedThroughSeq = normalizeThroughSeq(throughSeq);
   return db.prepare(
     `SELECT seq, type, data_json FROM events
        WHERE session_id = ?
          AND type IN ('external_write', 'external_write_failed')
+         ${boundedThroughSeq === undefined ? '' : 'AND seq <= ?'}
        ORDER BY seq DESC
        LIMIT ?`,
-  ).all(sessionId, rowLimit) as RawActionRow[];
+  ).all(...(boundedThroughSeq === undefined
+    ? [sessionId, rowLimit]
+    : [sessionId, boundedThroughSeq, rowLimit])) as RawActionRow[];
 }
 
 function renderRecentActionsForSessions(
@@ -70,12 +86,13 @@ function renderRecentActionsForSessions(
   sessionIds: string[],
   limit = 20,
   scopeLabel = 'THIS conversation',
+  throughSeq?: number,
 ): string {
   let rows: RawActionRow[];
   try {
     const rowLimit = Math.max(limit * 4, limit);
     rows = uniqueSessionIds(sessionIds)
-      .flatMap((sessionId) => readRecentActionRowsForSession(db, sessionId, rowLimit))
+      .flatMap((sessionId) => readRecentActionRowsForSession(db, sessionId, rowLimit, throughSeq))
       .sort((left, right) => right.seq - left.seq)
       .slice(0, rowLimit);
   } catch { return ''; }
@@ -120,18 +137,20 @@ export function renderRecentSessionActions(
   db: ReturnType<typeof openEventLog>,
   sessionId: string,
   limit = 20,
+  throughSeq?: number,
 ): string {
-  return renderRecentActionsForSessions(db, [sessionId], limit);
+  return renderRecentActionsForSessions(db, [sessionId], limit, 'THIS conversation', throughSeq);
 }
 
 export function renderRecentActionsForHarnessHistory(
   db: ReturnType<typeof openEventLog>,
   sessionId: string,
   limit = 20,
+  throughSeq?: number,
 ): string {
   let row: SessionRow | null = null;
   try { row = getHarnessSession(sessionId); } catch { row = null; }
-  if (!row) return renderRecentActionsForSessions(db, [sessionId], limit);
+  if (!row) return renderRecentActionsForSessions(db, [sessionId], limit, 'THIS conversation', throughSeq);
   const relatedRows = relatedHarnessRowsForHistory(row);
   const workflowRunId = workflowRunIdFor(row);
   const isWorkflowAggregate = workflowRunId && relatedRows.length > 1;
@@ -140,6 +159,7 @@ export function renderRecentActionsForHarnessHistory(
     relatedRows.map((related) => related.id),
     limit,
     isWorkflowAggregate ? 'THIS workflow run' : 'THIS conversation',
+    throughSeq,
   );
 }
 
@@ -147,15 +167,20 @@ function readRecentTranscriptRowsForSession(
   db: ReturnType<typeof openEventLog>,
   sessionId: string,
   maxTurns: number,
+  throughSeq?: number,
 ): RawTranscriptRow[] {
   const rowLimit = Math.max(1, Math.trunc(maxTurns) * 3);
+  const boundedThroughSeq = normalizeThroughSeq(throughSeq);
   return db.prepare(
     `SELECT seq, session_id, type, data_json, created_at, turn FROM events
        WHERE session_id = ?
          AND type IN ('user_input_received', 'conversation_completed', 'awaiting_user_input')
+         ${boundedThroughSeq === undefined ? '' : 'AND seq <= ?'}
        ORDER BY seq DESC
        LIMIT ?`,
-  ).all(sessionId, rowLimit) as RawTranscriptRow[];
+  ).all(...(boundedThroughSeq === undefined
+    ? [sessionId, rowLimit]
+    : [sessionId, boundedThroughSeq, rowLimit])) as RawTranscriptRow[];
 }
 
 /** Read the recent user+assistant turns for ONE session, chronological order. */
@@ -163,8 +188,9 @@ export function pullRecentTurnsForSession(
   db: ReturnType<typeof openEventLog>,
   sessionId: string,
   maxTurns: number,
+  throughSeq?: number,
 ): PriorTurn[] {
-  return pullRecentTurnsForSessions(db, [sessionId], maxTurns);
+  return pullRecentTurnsForSessions(db, [sessionId], maxTurns, throughSeq);
 }
 
 /** Read recent user+assistant turns across related sessions, chronological order. */
@@ -172,12 +198,13 @@ export function pullRecentTurnsForSessions(
   db: ReturnType<typeof openEventLog>,
   sessionIds: string[],
   maxTurns: number,
+  throughSeq?: number,
 ): PriorTurn[] {
   const turnLimit = Math.max(1, Math.trunc(maxTurns));
   // Read the last 2*maxTurns events (user inputs + agent completions) so we have
   // headroom to filter and reorder chronologically.
   const rows = uniqueSessionIds(sessionIds)
-    .flatMap((sessionId) => readRecentTranscriptRowsForSession(db, sessionId, turnLimit))
+    .flatMap((sessionId) => readRecentTranscriptRowsForSession(db, sessionId, turnLimit, throughSeq))
     .sort((left, right) => right.seq - left.seq);
   const completionTextByTurn = new Map<string, Set<string>>();
   for (const row of rows) {
@@ -270,7 +297,9 @@ export function renderCrossSessionPrefixesForModel(
   db: ReturnType<typeof openEventLog>,
   sessionId: string,
   limit = 4,
+  throughSeq?: number,
 ): string {
+  const boundedThroughSeq = normalizeThroughSeq(throughSeq);
   let sessionIds = [sessionId];
   try {
     const row = getHarnessSession(sessionId);
@@ -285,9 +314,12 @@ export function renderCrossSessionPrefixesForModel(
         `SELECT seq, data_json FROM events
          WHERE session_id = ?
            AND type = 'cross_session_prefix'
+           ${boundedThroughSeq === undefined ? '' : 'AND seq <= ?'}
          ORDER BY seq ASC
          LIMIT ?`,
-      ).all(id, rowLimit) as Array<{ seq: number; data_json: string }>)
+      ).all(...(boundedThroughSeq === undefined
+        ? [id, rowLimit]
+        : [id, boundedThroughSeq, rowLimit])) as Array<{ seq: number; data_json: string }>)
       .sort((left, right) => left.seq - right.seq)
       .slice(-rowLimit);
     const texts = rows.map((row) => {
@@ -347,11 +379,15 @@ function relatedHarnessRowsForHistory(row: SessionRow): SessionRow[] {
   }
 }
 
-export function pullRecentTurnsForHarnessHistory(sessionId: string, maxTurns = 20): PriorTurn[] {
+export function pullRecentTurnsForHarnessHistory(
+  sessionId: string,
+  maxTurns = 20,
+  throughSeq?: number,
+): PriorTurn[] {
   const row = getHarnessSession(sessionId);
   if (!row) return [];
   const relatedSessionIds = relatedHarnessRowsForHistory(row).map((session) => session.id);
-  return pullRecentTurnsForSessions(openEventLog(), relatedSessionIds, maxTurns);
+  return pullRecentTurnsForSessions(openEventLog(), relatedSessionIds, maxTurns, throughSeq);
 }
 
 /**
@@ -366,7 +402,9 @@ export function renderSessionHistoryForModel(
   sessionId: string,
   maxTurns = 12,
   maxChars = 12_000,
+  throughSeq?: number,
 ): string {
+  const boundedThroughSeq = normalizeThroughSeq(throughSeq);
   let harnessRow: SessionRow | null = null;
   try { harnessRow = getHarnessSession(sessionId); } catch { harnessRow = null; }
 
@@ -377,14 +415,15 @@ export function renderSessionHistoryForModel(
       const relatedSessionIds = relatedRows.map((row) => row.id);
       const workflowRunId = workflowRunIdFor(harnessRow);
       const isWorkflowAggregate = workflowRunId && relatedRows.length > 1;
-      const prefix = renderCrossSessionPrefixesForModel(db, sessionId);
+      const prefix = renderCrossSessionPrefixesForModel(db, sessionId, 4, boundedThroughSeq);
       const actions = renderRecentActionsForSessions(
         db,
         relatedSessionIds,
         20,
         isWorkflowAggregate ? 'THIS workflow run' : 'THIS conversation',
+        boundedThroughSeq,
       );
-      const turns = pullRecentTurnsForSessions(db, relatedSessionIds, maxTurns);
+      const turns = pullRecentTurnsForSessions(db, relatedSessionIds, maxTurns, boundedThroughSeq);
       const transcriptTitle = isWorkflowAggregate
         ? `Recent transcript for workflow run ${workflowRunId} (including ${relatedRows.length} step sessions):`
         : `Recent transcript for ${sessionId}:`;
@@ -400,6 +439,11 @@ export function renderSessionHistoryForModel(
       // Fall through to legacy store if the harness read is unavailable.
     }
   }
+
+  // A harness event cursor has no meaning in the legacy SessionStore. Falling
+  // back to its unbounded transcript would silently defeat the handoff snapshot
+  // and could expose a later turn, so bounded reads fail closed here.
+  if (boundedThroughSeq !== undefined) return '';
 
   try {
     const store = new SessionStore();

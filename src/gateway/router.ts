@@ -676,22 +676,27 @@ export class ClementineGateway {
         onReasoning: request.onReasoning,
         onToolActivity: request.onToolActivity,
       }, (req) => this.assistant.respond(req));
+      const runCancelled = response.stoppedReason === 'cancelled';
       // Report-back honesty: a non-pending, non-throwing respond() can still be
       // a blocked / promised / errored run. Fail-open + suspicious-only; the run
       // status enum has no 'blocked', so a not-delivered verdict maps to 'failed'
       // with the reason. The returned text is left as the agent wrote it.
-      const verdict = response.pendingApprovalId
+      const verdict = response.pendingApprovalId || runCancelled
         ? null
         : await verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason });
       const runFailedNotDelivered = verdict ? !verdict.delivered : false;
       const route = recordGatewayRoute(run.id, response, request.model);
       finishRun(run.id, {
-        status: response.pendingApprovalId
+        status: runCancelled
+          ? 'cancelled'
+          : response.pendingApprovalId
           ? 'awaiting_approval'
           : runFailedNotDelivered
             ? 'failed'
             : 'completed',
-        message: response.pendingApprovalId
+        message: runCancelled
+          ? 'Assistant run stopped by request.'
+          : response.pendingApprovalId
           ? `Approval required: ${response.pendingApprovalId}.`
           : runFailedNotDelivered
             ? `Assistant run did not finish cleanly: ${verdict?.reason ?? 'no verifiable result'}`

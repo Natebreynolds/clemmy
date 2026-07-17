@@ -5,6 +5,7 @@ import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
+import { runtimeToolAccountingMetadata, type RuntimeToolEffect } from './tool-effect.js';
 
 /**
  * RunHooks → event log writer.
@@ -188,6 +189,9 @@ export function attachEventLogHooks(
   const maxResultChars = options.maxResultChars ?? 8000;
   const maxOutputChars = options.maxOutputChars ?? 4000;
   const callIdToCalledEventId = new Map<string, string>();
+  const callIdToAccounting = new Map<string, { effect: RuntimeToolEffect; toolSlug?: string }>();
+  const seenToolCallIds = new Set<string>();
+  const seenToolReturnIds = new Set<string>();
   // run_worker item label captured at tool-start (args live on the START
   // event) for the fan-out ledger's failure report; read+cleared at tool-end.
   const callIdToWorkerItem = new Map<string, string | null>();
@@ -251,6 +255,9 @@ export function attachEventLogHooks(
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
     const callId = callIdFromDetails(details);
+    if (callId && seenToolCallIds.has(callId)) return;
+    if (callId) seenToolCallIds.add(callId);
+    const accounting = runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
     let event: EventRow;
     try {
       event = appendEvent({
@@ -261,6 +268,10 @@ export function attachEventLogHooks(
         data: {
           tool: tool?.name ?? null,
           callId: callId ?? null,
+          canonicalCallId: callId ?? null,
+          accounting: 'top_level',
+          effect: accounting.effect,
+          ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
           arguments: clip(details?.toolCall?.arguments ?? null, maxResultChars),
         },
       });
@@ -270,6 +281,7 @@ export function attachEventLogHooks(
     }
     if (callId) {
       callIdToCalledEventId.set(callId, event.id);
+      callIdToAccounting.set(callId, accounting);
       if (tool?.name === 'run_worker' && fanoutLedgerEnabled()) {
         callIdToWorkerItem.set(callId, workerItemFromDetails(details));
       }
@@ -287,8 +299,13 @@ export function attachEventLogHooks(
     const sessionId = options.getSessionId(runContext);
     if (!sessionId) return;
     const callId = callIdFromDetails(details);
+    if (callId && seenToolReturnIds.has(callId)) return;
+    if (callId) seenToolReturnIds.add(callId);
     const parentEventId = callId ? callIdToCalledEventId.get(callId) : undefined;
     if (callId) callIdToCalledEventId.delete(callId);
+    const accounting = (callId ? callIdToAccounting.get(callId) : undefined)
+      ?? runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
+    if (callId) callIdToAccounting.delete(callId);
     // Normalize the result to a string up front. The SDK *usually* hands us a
     // string, but a tool (or a worker via Agent.asTool) can return an
     // object/array/error. Previously the lossless write + clip footer were
@@ -400,6 +417,10 @@ export function attachEventLogHooks(
         data: {
           tool: tool?.name ?? null,
           callId: callId ?? null,
+          canonicalCallId: callId ?? null,
+          accounting: 'top_level',
+          effect: accounting.effect,
+          ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
           result: clipToolResult(
             resultStr,
             maxResultChars,

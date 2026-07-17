@@ -27,6 +27,7 @@ const {
   getBackgroundTask,
   listBackgroundTasks,
   resumeInterruptedBackgroundTasks,
+  interruptStaleRunningBackgroundTasks,
   resumeBackgroundTask,
   processBackgroundTasks,
   classifyBackgroundTaskOutcome,
@@ -47,6 +48,7 @@ const {
   registerBackgroundDrainKick,
   requestBackgroundDrain,
   markBackgroundTaskRunning,
+  cancelBackgroundTask,
   truncateResultBody,
   backgroundHeartbeatInternalsForTest,
   rootBackgroundTaskPromptForTests,
@@ -63,6 +65,7 @@ const { createSession, appendEvent, getSession, listEvents } = await import('../
 const { listNotifications, getNotificationDestinationsForRecord } = await import('../runtime/notifications.js');
 const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
+const { listRuns } = await import('../runtime/run-events.js');
 const { runBackgroundTaskWatchdog } = await import('./background-task-watchdog.js');
 
 test.after(() => {
@@ -209,6 +212,19 @@ test('resumeInterruptedBackgroundTasks ignores non-restart interrupted tasks', (
 
   assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
   assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, undefined);
+});
+
+test('daemon restart terminalizes a user-cancelling task instead of resurrecting it', () => {
+  const task = createBackgroundTask({ title: 'Do not resurrect', prompt: 'long task' });
+  assert.equal(markBackgroundTaskRunning(task.id)?.status, 'running');
+  assert.equal(cancelBackgroundTask(task.id, 'Stopped by the user before restart.')?.status, 'cancelling');
+
+  assert.equal(interruptStaleRunningBackgroundTasks(), 1);
+  const settled = getBackgroundTask(task.id);
+  assert.equal(settled?.status, 'aborted');
+  assert.equal(settled?.error, 'Stopped by the user before restart.');
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  assert.equal(settled?.resumedIntoTaskId, undefined);
 });
 
 test('P0 single ownership: a goal-bound interrupted run resumes IN PLACE — one executor, zero clones', async () => {
@@ -363,11 +379,14 @@ test('P3/P4 cockpit: toolCallCount is truthful; Tools feed keeps real calls, dro
   const task = createBackgroundTask({ title: 'Cockpit stats task', prompt: 'do work', source: 'desktop' });
   const sid = task.runSessionId;
   createSession({ id: sid, kind: 'execution', title: 'Cockpit stats task' });
-  const call = (tool: string, callId: string) => appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'tool_called', data: { tool, callId } });
-  const ret = (tool: string, callId: string, result = 'ok') => appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'tool_returned', data: { tool, callId, result } });
+  const call = (tool: string, callId: string, accounting?: string) => appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'tool_called', data: { tool, callId, ...(accounting ? { accounting } : {}) } });
+  const ret = (tool: string, callId: string, result = 'ok', accounting?: string) => appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'tool_returned', data: { tool, callId, result, ...(accounting ? { accounting } : {}) } });
 
   // Two REAL tool calls (with returns) + three housekeeping/reflection calls.
-  call('composio_execute_tool', 'c1'); ret('composio_execute_tool', 'c1');
+  call('composio_execute_tool', 'c1', 'top_level');
+  call('composio_execute_tool', 'mcp-c1', 'transport_mirror');
+  ret('composio_execute_tool', 'mcp-c1', 'ok', 'transport_mirror');
+  ret('composio_execute_tool', 'c1', 'ok', 'top_level');
   call('run_batch', 'c2'); ret('run_batch', 'c2');
   call('reflection', 'c3'); ret('reflection', 'c3');
   call('session_history', 'c4'); ret('session_history', 'c4');
@@ -375,9 +394,10 @@ test('P3/P4 cockpit: toolCallCount is truthful; Tools feed keeps real calls, dro
 
   const detail = getBackgroundTaskStatus(task.id);
   assert.ok(detail, 'status resolves');
-  // P3: the tally counts ALL tool_called events (parity with the live "N tool
-  // calls" check-in counter) — NOT the old NDJSON phase==='start' filter (0).
-  assert.equal(detail!.toolCallCount, 5, 'toolCallCount counts every tool_called event');
+  // P3: the tally counts logical top-level calls (parity with the live check-in
+  // counter), while the raw transport mirror remains in the audit log.
+  assert.equal(listEvents(sid, { types: ['tool_called'] }).length, 6);
+  assert.equal(detail!.toolCallCount, 5, 'toolCallCount excludes the native MCP mirror');
   // P4: the human-facing feed keeps the real calls and drops reflection +
   // session_history + *_status housekeeping noise.
   const names = detail!.toolEvents.map((event) => event.toolName).sort();
@@ -697,6 +717,69 @@ test('processBackgroundTasks auto-continues a max-turn pause before marking the 
   const updated = getBackgroundTask(task.id);
   assert.equal(updated?.status, 'done');
   assert.match(updated?.result ?? '', /all records were processed/);
+});
+
+test('processBackgroundTasks settles a cancelled response as cancelled/aborted, never blocked or failed', async () => {
+  const task = createBackgroundTask({ title: 'Stop this research run', prompt: 'research until stopped' });
+  const stubAssistant = {
+    getRuntime() { return {} as never; },
+    async respond(request: { sessionId: string }) {
+      return {
+        text: 'Stopped — you asked me to halt this run.',
+        sessionId: request.sessionId,
+        stoppedReason: 'cancelled' as const,
+      };
+    },
+  };
+
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.equal(getBackgroundTask(task.id)?.status, 'aborted', 'task store uses aborted for a user cancellation');
+  const tracked = listRuns(40).find((run) => run.sessionId === task.runSessionId);
+  assert.equal(tracked?.status, 'cancelled');
+  assert.equal(tracked?.events.filter((event) => event.type === 'cancelled').length, 1);
+  assert.equal(tracked?.events.some((event) => event.type === 'failed'), false);
+});
+
+test('a cancellation arriving during delivery verification wins over a blocked verdict', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({ title: 'Cancel while verifying', prompt: 'prepare the requested report' });
+  let enterJudge!: () => void;
+  let releaseJudge!: () => void;
+  const judgeEntered = new Promise<void>((resolve) => { enterJudge = resolve; });
+  const judgeReleased = new Promise<void>((resolve) => { releaseJudge = resolve; });
+  _setBackgroundDeliveryJudgeForTests(async () => {
+    enterJudge();
+    await judgeReleased;
+    return { done: false, reason: 'no verified report yet' };
+  });
+
+  try {
+    const processing = processBackgroundTasks({
+      getRuntime() { return {} as never; },
+      async respond(request: { sessionId: string }) {
+        return {
+          text: "I'll prepare and share the report next.",
+          sessionId: request.sessionId,
+          stoppedReason: 'success' as const,
+        };
+      },
+    } as any, 1);
+
+    await judgeEntered;
+    assert.equal(cancelBackgroundTask(task.id, 'Stopped during verification.')?.status, 'cancelling');
+    releaseJudge();
+    assert.equal(await processing, 1);
+
+    assert.equal(getBackgroundTask(task.id)?.status, 'aborted');
+    const tracked = listRuns(40).find((run) => run.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'cancelled');
+    assert.equal(tracked?.events.filter((event) => event.type === 'cancelled').length, 1);
+    assert.equal(tracked?.events.some((event) => event.type === 'failed'), false);
+  } finally {
+    releaseJudge?.();
+    _setBackgroundDeliveryJudgeForTests(null);
+  }
 });
 
 test('processBackgroundTasks clears per-turn fanout coverage before automatic continuation', async () => {

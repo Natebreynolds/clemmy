@@ -150,6 +150,25 @@ test('guard ON: the SDK receives the INTENT-AWARE cap (research widens to 18, nu
   });
 });
 
+test('workers receive stable isolated tracker scopes while retaining parent session authority', async () => {
+  await withThrashGuard('on', async () => {
+    const captured: any[] = [];
+    setClaudeAgentSdkWorkerRunForTest(async (options) => {
+      captured.push(options);
+      return { text: 'done', toolUses: [] };
+    });
+    await runClaudeAgentSdkWorker(researchPacket, 'claude-opus-4-8', 'sess-parent', 77);
+    await runClaudeAgentSdkWorker(researchPacket, 'claude-opus-4-8', 'sess-parent');
+    await runClaudeAgentSdkWorker({ ...researchPacket, item: 'Different firm' }, 'claude-opus-4-8', 'sess-parent');
+    assert.equal(captured[0].sessionId, 'sess-parent');
+    assert.equal(captured[0].sourceUserSeq, 77, 'worker inherits the exact parent user turn instead of session-global latest input');
+    assert.equal(captured[0].trackerScopeId, captured[1].trackerScopeId, 'resume/retry keeps the packet-stable scope');
+    assert.notEqual(captured[0].trackerScopeId, captured[2].trackerScopeId, 'different workers never share a tracker');
+    assert.match(captured[0].trackerScopeId, /^sess-parent::worker:/);
+    assert.equal('skipSessionGrindGate' in captured[0], false, 'workers no longer disable enforcement');
+  });
+});
+
 test('guard OFF: byte-identical rollback — friendly text verbatim + base cap regardless of intent', async () => {
   await withThrashGuard('off', async () => {
     let captured: any;

@@ -131,6 +131,55 @@ test('evaluateToolCall: a looping composio READ slug never escalates to a turn-k
   assert.equal(lastWrite?.action, 'escalate');
 });
 
+test('production-shaped native MCP sends halt; native reads never enter the mass-write ladder', () => {
+  _resetAllTrackersForTests();
+  let send;
+  for (let i = 1; i <= 12; i += 1) {
+    send = applyMode(evaluateToolCall(
+      'native-send-scope',
+      'outlook__send_mail',
+      { to: `recipient-${i}@example.com`, subject: `Message ${i}`, body: 'Hello' },
+    ));
+    if (send.action === 'halt') break;
+  }
+  assert.equal(send?.action, 'halt');
+  assert.equal(send?.effect, 'external_write');
+  assert.equal(send?.dangerousWrite, true);
+
+  _resetAllTrackersForTests();
+  let read;
+  for (let i = 1; i <= 12; i += 1) {
+    read = applyMode(evaluateToolCall(
+      'native-read-scope',
+      'outlook__list_messages',
+      { folder: 'inbox', page: i },
+    ));
+  }
+  assert.notEqual(read?.action, 'halt');
+  assert.equal(read?.effect, 'read');
+  assert.equal(read?.dangerousWrite, false);
+});
+
+test('approved certified batch authority is separate from its tracker scope and completes 20 sends', () => {
+  _resetAllTrackersForTests();
+  const authoritySessionId = 'parent-approved-session';
+  const trackerScopeId = `${authoritySessionId}::batch:approved-20`;
+  for (let i = 1; i <= 20; i += 1) {
+    const decision = applyMode(evaluateToolCall(
+      trackerScopeId,
+      'outlook__send_mail',
+      { to: `approved-${i}@example.com`, subject: `Approved ${i}`, body: 'Hello' },
+      `call-${i}`,
+      { authoritySessionId, approvedBatch: true },
+    ));
+    assert.notEqual(decision.action, 'halt', `approved item ${i} must not be halted`);
+    assert.notEqual(decision.action, 'escalate', `approved distinct item ${i} must not escalate`);
+    if (i >= 8) assert.equal(decision.scopeApproved, true);
+  }
+  assert.equal(_peekTracker(trackerScopeId).recentCount, 20, 'the isolated worker/batch tracker still enforces and persists all calls');
+  assert.equal(_peekTracker(authoritySessionId).recentCount, 0, 'approval authority is never reused as the tracker key');
+});
+
 test('evaluateToolCall: corrective-then-terminal — a mutating exact-args loop stays SOFT block through the advisory window, escalates only at hardStop', () => {
   // 2026-06-20: the bar is "inform, rarely block; hard-stop only on budget
   // abuse." A repeating identical mutating call now gets a LONG advisory window
@@ -785,11 +834,12 @@ test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () 
   assert.equal(applyMode(variedHalt, 'warn').action, 'warn');
 });
 
-test('applyMode: a MUTATING same-mut-tool HALT enforces ONLY when opted in (default off pending classifier reconciliation)', () => {
-  // The 45-emails-to-distinct-addresses class carries explicit mutating:true. The
-  // enforce is OPT-IN (default off) because the guardrail's composio mutating
-  // classifier is broader than the authoritative write classifier — see the
-  // sameMutHaltEnforcedInWarn() note (adversarial review 07-06).
+test('applyMode: a MUTATING same-mut-tool HALT enforces by DEFAULT (graduated 2026-07-16 after the unkillable-run incident)', () => {
+  // The 45-emails-to-distinct-addresses class carries explicit mutating:true.
+  // Both opt-in blockers are resolved (authoritative live classifier 07-12;
+  // rehydrate no longer folds composio reads into the mutating count 07-16),
+  // so the enforce graduated to default ON — 15 ignored advisories on the
+  // 07-16 serial-shell grind is the incident this closes.
   const sendRunaway = {
     action: 'halt' as const,
     signature: 'sig',
@@ -798,15 +848,22 @@ test('applyMode: a MUTATING same-mut-tool HALT enforces ONLY when opted in (defa
     rule: 'same_mut_tool_repeat' as const,
     count: 8,
     mutating: true,
+    dangerousWrite: true,
   };
-  // Default (unset) → demotes to warn (no false-halt on read-only DataForSEO/Firecrawl batches).
-  assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'default off → warn-only');
-  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'on';
+  assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'default ON enforces the runaway halt');
+  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'off';
   try {
-    assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'opt-in enforces the runaway halt');
+    assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'kill-switch off restores warn-only');
   } finally {
     delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
   }
+  // A READ-classified call (mutating:false / absent explicit flag) NEVER halt-enforces.
+  assert.equal(applyMode({ ...sendRunaway, mutating: undefined, dangerousWrite: false }, 'warn').action, 'warn', 'an explicit non-external classification never enforces');
+  // Approved-batch exemption (review wf_2ed83f94 #4): a plan scope the user
+  // blessed covering this call means the distinct writes ARE the approved
+  // work — approve-once-then-run wins, the halt demotes to advisory.
+  assert.equal(applyMode({ ...sendRunaway, scopeApproved: true }, 'warn').action, 'warn', 'a user-approved batch never stalls at the halt threshold');
+  assert.equal(applyMode({ ...sendRunaway, scopeApproved: false }, 'warn').action, 'halt', 'unapproved runaway still halts');
 });
 
 test('applyMode: strict mode passes block/halt through unchanged', () => {

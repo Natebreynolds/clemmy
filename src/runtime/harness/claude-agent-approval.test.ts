@@ -36,15 +36,13 @@ test('gated permission: read/local tools fast-allow, no approval registered', as
   assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 0, 'a read never registers an approval');
 });
 
-test('gated permission: tool_called event carries the SDK toolUseID for UI correlation', async () => {
+test('gated permission does not claim a tool executed before the SDK stream reports tool_use', async () => {
   const sess = createSession({ kind: 'chat' });
   const perm = buildGatedToolPermission(sess.id, ['memory_read']) as unknown as Perm;
   await perm('mcp__clementine-local__memory_read', { query: 'x' }, { signal: new AbortController().signal, toolUseID: 'toolu_visible_1' });
 
   const events = listEvents(sess.id, { types: ['tool_called'] });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].data.tool, 'memory_read');
-  assert.equal(events[0].data.callId, 'toolu_visible_1');
+  assert.equal(events.length, 0);
 });
 
 test('gated permission: auto-approved mutating tool (no human needed) also carries updatedInput', async () => {

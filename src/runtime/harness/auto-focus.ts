@@ -1,5 +1,6 @@
 import { createFocus, getActiveFocus, listFocuses } from '../../memory/focus.js';
 import { getSession, listEvents, type EventRow } from './eventlog.js';
+import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 
 const MIN_RESOURCE_HITS = 2;
 const MIN_THREAD_TOOL_CALLS = 4;
@@ -170,8 +171,7 @@ function collectHitsFromValue(value: unknown, hits: ResourceHit[], depth = 0): v
 
 function bestResource(events: EventRow[]): ResourceHit | null {
   const counts = new Map<string, { kind: string; count: number }>();
-  for (const event of events) {
-    if (event.type !== 'tool_called' && event.type !== 'tool_returned') continue;
+  for (const event of projectCanonicalTopLevelToolEvents(events)) {
     const hits: ResourceHit[] = [];
     collectHitsFromValue(event.data, hits);
     for (const hit of hits) {
@@ -209,7 +209,7 @@ export function maybeAutoFocusSession(options: MaybeAutoFocusOptions): AutoFocus
   if (hasNonTerminalFocusForSession(options.sessionId)) return null;
 
   const events = listEvents(options.sessionId, { limit: MAX_EVENT_SCAN, desc: true });
-  const toolCalls = events.filter((event) => event.type === 'tool_called').length;
+  const toolCalls = projectCanonicalTopLevelToolEvents(events, 'tool_called').length;
   const userInputs = events.filter((event) => event.type === 'user_input_received').length;
   const resource = bestResource(events);
   const qualifiesForThreadFocus =

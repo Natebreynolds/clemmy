@@ -5,7 +5,7 @@ import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
@@ -279,9 +279,22 @@ import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
 import {
   appendEvent as appendHarnessEvent,
+  claimRunAttemptLease,
+  claimHarnessChatRequest,
   createSession as createHarnessSession,
+  finishRunAttempt,
+  getActiveRunAttempt as getActiveHarnessRunAttempt,
+  getHarnessChatCancellation,
+  getHarnessChatRequestReceipt,
+  getLatestRunAttempt as getLatestHarnessRunAttempt,
+  getLatestRunAttemptByRunId as getLatestHarnessRunAttemptByRunId,
+  listLatestRunAttemptsForSessions as listLatestHarnessRunAttemptsForSessions,
   getLatestEventSeq as getLatestHarnessEventSeq,
   getSession as getHarnessSession,
+  interruptForeignRunAttemptLeases,
+  recordRunAttemptUserInput,
+  renewRunAttemptLease,
+  requestHarnessChatCancellation,
   requestKill as requestHarnessKill,
   listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
@@ -289,6 +302,7 @@ import {
   type EventType,
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
+  type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
@@ -1557,6 +1571,12 @@ function isDiscordHarnessSession(session: HarnessSessionRow): boolean {
     || session.metadata.source === 'discord';
 }
 
+function isWorkflowStepHarnessSession(session: HarnessSessionRow): boolean {
+  return Boolean(session.metadata.stepId)
+    || Boolean(session.metadata.workflowRunId)
+    || session.id.startsWith('workflow:');
+}
+
 function isConsoleVisibleHarnessSession(session: HarnessSessionRow): boolean {
   return session.kind === 'chat'
     || session.kind === 'workflow'
@@ -2320,6 +2340,11 @@ interface BoardCard {
   updatedAt: string;
   /** Drag/button actions the card allows. Drag uses only cancel/resume/promote; buttons may use the rest. */
   actions: string[];
+  /** Exact harness attempt identity and its server-authoritative stop target. */
+  attemptId?: string;
+  runScopeId?: string;
+  sourceUserSeq?: number;
+  cancelEndpoint?: string;
   primaryAction?: BoardPrimaryAction;
   continueMode?: BoardContinueMode;
   approvalId?: string;
@@ -2380,12 +2405,154 @@ function parseBackgroundReportBackTarget(input: unknown): BackgroundReportBackTa
   return null;
 }
 
+// A POST can receive a 202 while the browser loses the response or the daemon
+// restarts. The client-generated key is therefore the turn's durable identity,
+// not an in-memory fetch detail. Execution ownership is a renewable SQLite
+// lease: a live process suppresses replay, while a crash is recoverable both at
+// startup and after the bounded TTL.
+const HARNESS_CHAT_LEASE_OWNER = `console-${process.pid}-${randomBytes(8).toString('hex')}`;
+const HARNESS_CHAT_LEASE_MS = 90_000;
+const HARNESS_CHAT_LEASE_RENEW_MS = 30_000;
+
+function harnessChatRequestIdentity(
+  req: Request,
+  body: Record<string, unknown>,
+): { requestId: string; clientProvided: boolean } {
+  const supplied = [
+    typeof body.clientRequestId === 'string' ? body.clientRequestId.trim() : '',
+    typeof body.requestId === 'string' ? body.requestId.trim() : '',
+    (req.get('Idempotency-Key') ?? '').trim(),
+  ].filter(Boolean);
+  const distinct = [...new Set(supplied)];
+  if (distinct.length > 1) throw new Error('conflicting client request ids');
+  if (distinct.length === 0) {
+    return { requestId: `srv-${randomBytes(16).toString('hex')}`, clientProvided: false };
+  }
+  const requestId = distinct[0];
+  if (requestId.length < 8 || requestId.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(requestId)) {
+    throw new Error('client request id must be 8-160 URL-safe characters');
+  }
+  return { requestId, clientProvided: true };
+}
+
+function harnessChatStableDigest(requestId: string): string {
+  return createHash('sha256').update(requestId).digest('hex');
+}
+
+function harnessChatPayloadHash(input: string, attachmentIds: string[]): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ input, attachmentIds }))
+    .digest('hex');
+}
+
+function harnessAttemptRunScopeId(
+  sessionId: string,
+  attempt: Pick<RunAttemptRef, 'attemptId' | 'runId'>,
+): string {
+  return `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
+}
+
+function harnessAttemptCancelEndpoint(
+  sessionId: string,
+  attempt: Pick<RunAttemptRef, 'attemptId' | 'runId'>,
+): string {
+  const query = new URLSearchParams({
+    attemptId: attempt.attemptId,
+    runScopeId: harnessAttemptRunScopeId(sessionId, attempt),
+  });
+  return `/api/console/harness-sessions/${encodeURIComponent(sessionId)}/cancel?${query.toString()}`;
+}
+
+function harnessAttemptBackgroundEndpoint(
+  sessionId: string,
+  attempt: Pick<RunAttemptRef, 'attemptId' | 'runId'>,
+): string {
+  const query = new URLSearchParams({
+    attemptId: attempt.attemptId,
+    runScopeId: harnessAttemptRunScopeId(sessionId, attempt),
+  });
+  return `/api/console/harness-sessions/${encodeURIComponent(sessionId)}/background?${query.toString()}`;
+}
+
+function requestRunControlIdentityValue(req: Request, key: 'attemptId' | 'runScopeId'): string | null {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+    ? req.body as Record<string, unknown>
+    : {};
+  const collect = (value: unknown): string[] => {
+    if (typeof value === 'string' && value.trim()) return [value.trim()];
+    if (Array.isArray(value)) return value.flatMap(collect);
+    return [];
+  };
+  const values = [...collect(req.query[key]), ...collect(body[key])];
+  const distinct = [...new Set(values)];
+  if (distinct.length > 1) throw new Error(`conflicting ${key} values`);
+  return distinct[0] ?? null;
+}
+
+/** Apply Stop to one durable attempt. Approval rows predate attempt ids, so
+ * only the session's currently-active attempt may clear its time-bounded
+ * approvals/interrupt state; the kill latch itself is always exact. */
+function stopExactHarnessAttempt(
+  sessionId: string,
+  attempt: RunAttemptRef,
+  reason: string,
+  resolver: string,
+): { cancelledApprovals: number; cancelledTasks: number } {
+  requestHarnessKill(sessionId, reason, {
+    attemptId: attempt.attemptId,
+    runId: attempt.runId,
+  });
+  const current = getActiveHarnessRunAttempt(sessionId);
+  if (!current || current.attemptId !== attempt.attemptId) return { cancelledApprovals: 0, cancelledTasks: 0 };
+
+  const pending = approvalRegistry.listPending({ sessionId, status: 'pending' })
+    .filter((row) => row.requestedAt >= attempt.startedAt);
+  let cancelledApprovals = 0;
+  for (const row of pending) {
+    if (approvalRegistry.resolve(
+      row.approvalId,
+      'cancelled_by_user',
+      resolver,
+    ).ok) cancelledApprovals += 1;
+  }
+  if (cancelledApprovals > 0) {
+    try {
+      HarnessSession.load(sessionId)?.clearInterruptState({ emitEvent: false });
+    } catch { /* the durable kill and approval resolutions remain authoritative */ }
+  }
+  // Cascade (restored in the fold — review wf_30a7ce7e-e9c #6): any still-active
+  // background task this session spawned (or that runs AS this session) dies
+  // with the stop. Without this the task row kept polling "Working now" on Home
+  // after the user explicitly stopped the chat that owned it (live 2026-07-08
+  // zombie banner), and its external writes kept landing.
+  let cancelledTasks = 0;
+  try {
+    for (const task of listBackgroundTasks()) {
+      const t = task as { id: string; status: string; sessionId?: string; originSessionId?: string; runSessionId?: string };
+      const linked = t.sessionId === sessionId || t.originSessionId === sessionId || t.runSessionId === sessionId;
+      const active = t.status === 'pending' || t.status === 'running' || t.status === 'awaiting_approval';
+      if (linked && active) {
+        cancelBackgroundTask(t.id, 'Cancelled with its chat session from the desktop command center.');
+        cancelledTasks += 1;
+      }
+    }
+  } catch { /* best effort — the stale-runner sweeper still interrupts them later */ }
+  return { cancelledApprovals, cancelledTasks };
+}
+
 export function registerConsoleRoutes(
   app: Express,
   isAuthorized: (req: Request) => boolean,
   assistant: ClementineAssistant,
   opts?: { serveLegacyAtRoot?: boolean },
 ): void {
+  // Module load identifies this daemon process. Any unfinished desktop lease
+  // owned by a prior process is necessarily orphaned, so make it resumable now
+  // instead of forcing the first browser replay to wait out the full TTL.
+  try {
+    interruptForeignRunAttemptLeases(HARNESS_CHAT_LEASE_OWNER, { runIdPrefix: 'desktop:' });
+  } catch { /* eventlog startup recovery is best-effort; request-time TTL still applies */ }
+
   // Renders the legacy inlined-HTML console only when explicitly requested.
   // The renderer is intentionally lazy-loaded because it is a large inline
   // HTML module and should not sit on the normal React console startup path.
@@ -9284,12 +9451,23 @@ export function registerConsoleRoutes(
       const coveredApprovalIds = new Set<string>();
       const workflowByDisplayName = new Map(listWorkflows().map((entry) => [entry.data.name, entry]));
       const workflowBySlug = new Map(listWorkflows().map((entry) => [entry.name, entry]));
+      const pendingHarnessApprovals = approvalRegistry.listPending({ status: 'pending' });
+      const pendingHarnessApprovalBySession = new Map<string, (typeof pendingHarnessApprovals)[number]>();
+      for (const approval of pendingHarnessApprovals) {
+        if (!pendingHarnessApprovalBySession.has(approval.sessionId)) {
+          pendingHarnessApprovalBySession.set(approval.sessionId, approval);
+        }
+      }
+      const legacyRuns = listRuns(80);
+      const legacyRunById = new Map(legacyRuns.map((run) => [run.id, run]));
 
       // 1) Background tasks — the autonomous "go do this while I'm away" work.
       //    ?includeArchived=1 surfaces soft-deleted tasks (restore-only) for a
       //    future "Archived" view; default hides them.
       const includeArchived = req.query.includeArchived === '1' || req.query.archived === '1';
-      for (const task of listBackgroundTasks({ includeArchived })) {
+      const backgroundTasks = listBackgroundTasks({ includeArchived });
+      const backgroundHarnessSessionIds = new Set(backgroundTasks.map((task) => task.runSessionId));
+      for (const task of backgroundTasks) {
         const terminal = task.status === 'done' || task.status === 'failed'
           || task.status === 'aborted' || task.status === 'interrupted';
         const sKind = task.archived ? null : staleTaskKind(task, now);
@@ -9354,10 +9532,94 @@ export function registerConsoleRoutes(
         });
       }
 
-      // 2) Run records — chat/Discord/CLI/gateway runs. Drop background-backed
-      //    runs (id === `run-<taskId>`) so the same work isn't double-emitted.
-      for (const run of listRuns(80)) {
+      // 2) Canonical harness attempts. Sessions are reusable conversations;
+      //    attemptId + runScopeId are the actual unit shown by Environment and
+      //    targeted by Stop. Keep the latest attempt (including recent
+      //    terminal state) on the board so a polled drawer can shed stale
+      //    Running/Cancel controls immediately after settlement.
+      const canonicalHarnessSessionIds = new Set<string>();
+      const harnessSessions = listHarnessSessions({ limit: 80 })
+        .filter(isConsoleVisibleHarnessSession)
+        .filter((session) => !isWorkflowStepHarnessSession(session));
+      const latestHarnessAttempts = listLatestHarnessRunAttemptsForSessions(
+        harnessSessions.map((session) => session.id),
+      );
+      for (const session of harnessSessions) {
+        if (backgroundHarnessSessionIds.has(session.id)) continue;
+        const attempt = latestHarnessAttempts.get(session.id);
+        if (!attempt) continue;
+
+        const pendingApproval = attempt.status === 'active'
+          ? pendingHarnessApprovalBySession.get(session.id)
+          : undefined;
+        const pausedForInput = attempt.status === 'active'
+          && session.status === 'paused'
+          && !pendingApproval;
+        const status = pendingApproval
+          ? 'awaiting_approval'
+          : pausedForInput
+            ? 'awaiting_input'
+            : attempt.status === 'active'
+              ? 'running'
+              : attempt.status === 'superseded'
+                ? 'interrupted'
+                : attempt.status;
+        const column: BoardColumnId = pendingApproval || pausedForInput
+          ? 'needs_you'
+          : attempt.status === 'active'
+            ? 'running'
+            : 'done';
+        const actions = attempt.status === 'active'
+          ? pendingApproval ? ['approve', 'reject', 'cancel'] : ['cancel']
+          : [];
+        const runScopeId = harnessAttemptRunScopeId(session.id, attempt);
+        const linkedLegacy = attempt.runId ? legacyRunById.get(attempt.runId) : undefined;
+        const updatedAt = attempt.finishedAt || session.updatedAt || attempt.startedAt;
+        const source = harnessSessionSourceLabel(session);
+        const action = boardActionForStatus('run', status, Boolean(pendingApproval));
+        if (pendingApproval) coveredApprovalIds.add(pendingApproval.approvalId);
+        canonicalHarnessSessionIds.add(session.id);
+        cards.push({
+          id: `harness:${attempt.attemptId}`,
+          sourceKind: 'run',
+          title: trimConsoleTitle(
+            linkedLegacy?.title || session.objective || session.title || `${source} conversation`,
+            140,
+          ),
+          column,
+          status,
+          progressHint: pendingApproval?.subject
+            || linkedLegacy?.outputPreview?.slice(0, 600)
+            || (attempt.status === 'active' ? `Working in ${source}` : status),
+          sessionId: session.id,
+          ageMs: ageMs(updatedAt),
+          updatedAt,
+          actions,
+          attemptId: attempt.attemptId,
+          runScopeId,
+          sourceUserSeq: attempt.sourceUserSeq ?? undefined,
+          cancelEndpoint: attempt.status === 'active'
+            ? harnessAttemptCancelEndpoint(session.id, attempt)
+            : undefined,
+          primaryAction: action.primaryAction,
+          continueMode: action.continueMode,
+          approvalId: pendingApproval?.approvalId,
+          nextSafeAction: action.nextSafeAction,
+          raw: {
+            source,
+            runId: attempt.runId ?? undefined,
+            pendingApprovalId: pendingApproval?.approvalId,
+            attemptId: attempt.attemptId,
+            runScopeId,
+          },
+        });
+      }
+
+      // 3) Legacy run records — CLI/gateway/workflow runs without a canonical
+      //    attempt. Drop background-backed and canonical-session duplicates.
+      for (const run of legacyRuns) {
         if (run.id.startsWith('run-bg-')) continue; // background task's own run record
+        if (canonicalHarnessSessionIds.has(run.sessionId)) continue;
         const needsAttention = run.needsAttention === true;
         if (run.pendingApprovalId) coveredApprovalIds.add(run.pendingApprovalId);
         const column: BoardColumnId =
@@ -9409,7 +9671,7 @@ export function registerConsoleRoutes(
         });
       }
 
-      // 3) Executions — long-running, controller-driven work.
+      // 4) Executions — long-running, controller-driven work.
       for (const exec of new ExecutionStore().list(80)) {
         const column: BoardColumnId =
           exec.status === 'active' ? 'running'
@@ -9442,7 +9704,7 @@ export function registerConsoleRoutes(
         });
       }
 
-      // 4) In-flight workflow runs. Terminal workflow runs surface via their
+      // 5) In-flight workflow runs. Terminal workflow runs surface via their
       //    run record (source: 'workflow') in section 2 → Done. Live trace for
       //    these uses the run-events poll, not the session SSE (workflow steps
       //    run under per-step `workflow:<suffix>` sessions we can't address).
@@ -9470,9 +9732,9 @@ export function registerConsoleRoutes(
         });
       }
 
-      // 5) Standalone approvals — approvals not already represented by a
+      // 6) Standalone approvals — approvals not already represented by a
       // background task or run still need to be actionable from Tasks.
-      for (const row of approvalRegistry.listPending({ status: 'pending' })) {
+      for (const row of pendingHarnessApprovals) {
         if (coveredApprovalIds.has(row.approvalId)) continue;
         coveredApprovalIds.add(row.approvalId);
         const session = getHarnessSession(row.sessionId);
@@ -9660,8 +9922,21 @@ export function registerConsoleRoutes(
       return;
     }
     try {
-      // Best-effort: also signal the underlying harness session to stop.
-      if (run.sessionId) { try { requestHarnessKill(run.sessionId, 'Cancelled from the Tasks board.'); } catch { /* best effort */ } }
+      if (run.sessionId) {
+        const ownedAttempt = getLatestHarnessRunAttemptByRunId(run.sessionId, run.id);
+        if (ownedAttempt && ownedAttempt.status !== 'active') {
+          res.status(409).json({ ok: false, reason: 'this run attempt is already terminal; refresh the board' });
+          return;
+        }
+        if (ownedAttempt) {
+          requestHarnessKill(run.sessionId, 'Cancelled from the Tasks board.', ownedAttempt);
+        } else if (getActiveHarnessRunAttempt(run.sessionId)) {
+          // A reusable session is currently serving different work. Never let
+          // a stale card widen into a session-level kill of that newer turn.
+          res.status(409).json({ ok: false, reason: 'this card no longer owns the active run attempt; refresh the board' });
+          return;
+        }
+      }
       const updated = finishRun(run.id, { status: 'cancelled', message: 'Cancelled from the Tasks board.' });
       res.json({ ok: true, run: updated });
     } catch (err) {
@@ -10355,14 +10630,25 @@ export function registerConsoleRoutes(
             const t = task as { runSessionId?: string; sessionId?: string };
             return t.runSessionId === session.id || (t.sessionId === session.id && task.status === 'running');
           }))
-          .map((session) => ({
-            kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
-            title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine run'),
-            meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
-            panel: 'activity',
-            actionKind: 'harness-session',
-            sessionId: session.id,
-          })),
+          .map((session) => {
+            const attempt = getActiveHarnessRunAttempt(session.id);
+            return {
+              kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
+              title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine run'),
+              meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
+              panel: 'activity',
+              actionKind: 'harness-session',
+              sessionId: session.id,
+              ...(attempt
+                ? {
+                    attemptId: attempt.attemptId,
+                    runScopeId: harnessAttemptRunScopeId(session.id, attempt),
+                    cancelEndpoint: harnessAttemptCancelEndpoint(session.id, attempt),
+                    backgroundEndpoint: harnessAttemptBackgroundEndpoint(session.id, attempt),
+                  }
+                : {}),
+            };
+          }),
       ].map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
 
       const recentCompleted = [
@@ -11164,55 +11450,75 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/harness-sessions/:sessionId/cancel', async (req, res) => {
+  app.post('/api/console/harness-sessions/:sessionId/cancel', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const sessionId = req.params.sessionId;
     const session = getHarnessSession(sessionId);
     if (!session) { res.status(404).json({ error: 'session not found' }); return; }
+    let requestedAttemptId: string | null;
+    let requestedRunScopeId: string | null;
     try {
-      requestHarnessKill(sessionId, 'cancelled from desktop command center');
-      const harnessSession = HarnessSession.load(sessionId);
-      const { listPending: listPendingApprovals, resolve: resolveApproval } =
-        await import('../runtime/harness/approval-registry.js');
-      const pending = listPendingApprovals({ sessionId, status: 'pending' });
-      for (const row of pending) {
-        resolveApproval(row.approvalId, 'cancelled_by_user', 'desktop-command-center');
-      }
-      try {
-        harnessSession?.clearInterruptState();
-        harnessSession?.markStatus('cancelled');
-      } catch { /* best effort */ }
-      // Cascade: any still-active background task this session spawned (or that
-      // runs AS this session) dies with the cancel. Without this the task row
-      // kept polling "Working now" on Home after the user explicitly cancelled
-      // the chat that owned it (live 2026-07-08 — zombie banner, uncancellable
-      // from the Tasks pane because the SESSION was already gone).
-      let cancelledTasks = 0;
-      try {
-        const { listBackgroundTasks, cancelBackgroundTask } = await import('../execution/background-tasks.js');
-        for (const task of listBackgroundTasks()) {
-          const t = task as { id: string; status: string; sessionId?: string; originSessionId?: string };
-          const linked = t.sessionId === sessionId || t.originSessionId === sessionId;
-          const active = t.status === 'pending' || t.status === 'running' || t.status === 'awaiting_approval';
-          if (linked && active) {
-            cancelBackgroundTask(t.id, 'Cancelled with its chat session from the desktop command center.');
-            cancelledTasks += 1;
-          }
-        }
-      } catch { /* best effort — the stale-runner sweeper still interrupts them later */ }
-      appendHarnessEvent({
-        sessionId,
-        turn: 0,
-        role: 'system',
-        type: 'conversation_completed',
-        data: {
-          summary: 'Cancelled from the desktop command center.',
-          reason: 'cancelled_by_user',
-          approvalsCancelled: pending.length,
-          backgroundTasksCancelled: cancelledTasks,
-        },
+      requestedAttemptId = requestRunControlIdentityValue(req, 'attemptId');
+      requestedRunScopeId = requestRunControlIdentityValue(req, 'runScopeId');
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : String(err),
+        code: 'INVALID_RUN_ATTEMPT',
       });
-      res.json({ ok: true, sessionId, cancelledApprovals: pending.length, cancelledTasks });
+      return;
+    }
+    if (!requestedAttemptId) {
+      res.status(400).json({
+        error: 'attemptId is required; refresh the run before stopping it',
+        code: 'RUN_ATTEMPT_REQUIRED',
+      });
+      return;
+    }
+
+    // A chat session is reusable across many turns. Never translate a stale
+    // drawer/button click into a session-wide kill: the attempt identity the
+    // UI projected must still be the one nonterminal attempt at commit time.
+    const activeAttempt = getActiveHarnessRunAttempt(sessionId);
+    const activeRunScopeId = activeAttempt
+      ? harnessAttemptRunScopeId(sessionId, activeAttempt)
+      : null;
+    if (
+      !activeAttempt
+      || activeAttempt.attemptId !== requestedAttemptId
+      || (requestedRunScopeId && requestedRunScopeId !== activeRunScopeId)
+    ) {
+      res.status(409).json({
+        error: activeAttempt
+          ? 'the requested run attempt is stale; refresh before stopping'
+          : 'the requested run attempt is already terminal',
+        code: 'STALE_RUN_ATTEMPT',
+        sessionId,
+        requestedAttemptId,
+        currentAttemptId: activeAttempt?.attemptId ?? null,
+        currentRunScopeId: activeRunScopeId,
+      });
+      return;
+    }
+
+    try {
+      const stopped = stopExactHarnessAttempt(
+        sessionId,
+        activeAttempt,
+        'cancelled from desktop command center',
+        'desktop-command-center',
+      );
+      // Do not append conversation_completed here. The executor observes the
+      // durable kill latch and wins appendTerminalEventOnce for its attempt;
+      // writing another terminal key in the route made one Stop look like two
+      // completed runs and confused report-back/UI folding.
+      res.json({
+        ok: true,
+        sessionId,
+        attemptId: activeAttempt.attemptId,
+        runScopeId: activeRunScopeId,
+        cancelledApprovals: stopped.cancelledApprovals,
+        cancelledTasks: stopped.cancelledTasks,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -11227,13 +11533,57 @@ export function registerConsoleRoutes(
    */
   app.post('/api/console/harness-sessions/:sessionId/background', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = req.params.sessionId;
+    const session = getHarnessSession(sessionId);
+    if (!session) { res.status(404).json({ error: 'session not found' }); return; }
+    let requestedAttemptId: string | null;
+    let requestedRunScopeId: string | null;
     try {
-      const detached = detachRunningTurnToBackground(req.params.sessionId);
+      requestedAttemptId = requestRunControlIdentityValue(req, 'attemptId');
+      requestedRunScopeId = requestRunControlIdentityValue(req, 'runScopeId');
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : String(err),
+        code: 'INVALID_RUN_ATTEMPT',
+      });
+      return;
+    }
+    if (!requestedAttemptId || !requestedRunScopeId) {
+      res.status(400).json({
+        error: 'attemptId and runScopeId are required; wait for this run to start before moving it',
+        code: 'RUN_ATTEMPT_REQUIRED',
+      });
+      return;
+    }
+    try {
+      const detached = detachRunningTurnToBackground(
+        sessionId,
+        { attemptId: requestedAttemptId, runScopeId: requestedRunScopeId },
+        { source: 'desktop', channel: 'desktop' },
+      );
       if (!detached) {
-        res.status(409).json({ error: 'nothing running to move to the background' });
+        const activeAttempt = getActiveHarnessRunAttempt(sessionId);
+        res.status(409).json({
+          error: activeAttempt
+            ? 'the requested run attempt is stale; refresh before moving it'
+            : 'the requested run attempt is already terminal',
+          code: 'STALE_RUN_ATTEMPT',
+          sessionId,
+          requestedAttemptId,
+          currentAttemptId: activeAttempt?.attemptId ?? null,
+          currentRunScopeId: activeAttempt ? harnessAttemptRunScopeId(sessionId, activeAttempt) : null,
+        });
         return;
       }
-      res.json({ ok: true, taskId: detached.taskId, text: detached.text });
+      res.json({
+        ok: true,
+        sessionId,
+        attemptId: detached.attemptId,
+        runScopeId: requestedRunScopeId,
+        taskId: detached.taskId,
+        replayed: detached.replayed,
+        text: detached.text,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -11686,6 +12036,67 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Persist Stop before a chat POST has returned its exact attempt identity.
+   * The client-owned request id is the only safe authority in that window.
+   * A tombstone with no receipt blocks future acceptance; when a receipt is
+   * already present, this same call also targets its exact durable attempt.
+   */
+  app.post('/api/harness/chat/cancel', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+    let requestIdentity: ReturnType<typeof harnessChatRequestIdentity>;
+    try {
+      requestIdentity = harnessChatRequestIdentity(req, body);
+      if (!requestIdentity.clientProvided) throw new Error('clientRequestId is required');
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : String(err),
+        code: 'INVALID_CHAT_REQUEST_ID',
+      });
+      return;
+    }
+
+    try {
+      const cancellation = requestHarnessChatCancellation(
+        requestIdentity.requestId,
+        'cancelled from chat before acknowledgement',
+      );
+      const receipt = getHarnessChatRequestReceipt(requestIdentity.requestId);
+      const attempt = receipt
+        ? getLatestHarnessRunAttemptByRunId(receipt.sessionId, receipt.runId)
+        : null;
+      let cancelledApprovals = 0;
+      if (attempt && !attempt.finishedAt && attempt.status === 'active') {
+        cancelledApprovals = stopExactHarnessAttempt(
+          receipt!.sessionId,
+          attempt,
+          'cancelled from chat before acknowledgement',
+          'chat-request-cancellation',
+        ).cancelledApprovals;
+      }
+      res.json({
+        ok: true,
+        clientRequestId: cancellation.requestId,
+        requestedAt: cancellation.requestedAt,
+        pendingAcceptance: !receipt || !attempt,
+        ...(receipt ? { sessionId: receipt.sessionId, runId: receipt.runId } : {}),
+        ...(attempt
+          ? {
+              attemptId: attempt.attemptId,
+              runScopeId: harnessAttemptRunScopeId(receipt!.sessionId, attempt),
+              attemptStatus: attempt.status,
+            }
+          : {}),
+        cancelledApprovals,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Background-mode harness chat handler.
    *
    * The desktop UI and Discord bot POST here to start (or continue)
@@ -11698,7 +12109,8 @@ export function registerConsoleRoutes(
    *   { input: string, sessionId?: string }
    *
    * Response (202 Accepted):
-   *   { sessionId, streamUrl, status: 'started' }
+   *   { sessionId, streamUrl, status: 'started', attemptId, runScopeId,
+   *     cancelEndpoint, backgroundEndpoint }
    *
    * If auth (codex OAuth) is missing, returns 412 with the message
    * the CLI already prints; the caller surfaces it as a banner.
@@ -11713,8 +12125,42 @@ export function registerConsoleRoutes(
       : [];
     if (!input && attachmentIds.length === 0) { res.status(400).json({ error: 'input required' }); return; }
 
-    const existingId = typeof body.sessionId === 'string' ? body.sessionId : '';
-    let session = existingId ? getHarnessSession(existingId) : null;
+    let requestIdentity: ReturnType<typeof harnessChatRequestIdentity>;
+    try {
+      requestIdentity = harnessChatRequestIdentity(req, body as Record<string, unknown>);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    const payloadHash = harnessChatPayloadHash(input, attachmentIds);
+    const priorReceipt = getHarnessChatRequestReceipt(requestIdentity.requestId);
+    if (priorReceipt && priorReceipt.inputHash !== payloadHash) {
+      res.status(409).json({ error: 'client request id is already bound to different input' });
+      return;
+    }
+
+    const requestedSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+    if (priorReceipt && requestedSessionId && priorReceipt.sessionId !== requestedSessionId) {
+      res.status(409).json({ error: 'client request id belongs to a different session' });
+      return;
+    }
+    if (getHarnessChatCancellation(requestIdentity.requestId)) {
+      res.status(409).json({
+        error: 'this chat request was cancelled before acceptance',
+        code: 'CHAT_REQUEST_CANCELLED',
+        clientRequestId: requestIdentity.requestId,
+      });
+      return;
+    }
+    const existingId = requestedSessionId || priorReceipt?.sessionId || '';
+    const deterministicSessionId = requestIdentity.clientProvided
+      ? `sess-desktop-${harnessChatStableDigest(requestIdentity.requestId).slice(0, 24)}`
+      : '';
+    let session = existingId
+      ? getHarnessSession(existingId)
+      : deterministicSessionId
+        ? getHarnessSession(deterministicSessionId)
+        : null;
     const freshSession = !session;
     // A Workspace's floating dock binds a STABLE per-workspace session id
     // (space-<slug>) so the dock + re-engage share one continuous thread — but
@@ -11734,6 +12180,7 @@ export function registerConsoleRoutes(
     if (!session) {
       const titleSeed = input || (attachmentIds.length ? 'Attached file' : '');
       session = createHarnessSession({
+        ...(deterministicSessionId ? { id: deterministicSessionId } : {}),
         kind: 'chat',
         title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
         metadata: { source: 'desktop' },
@@ -11882,15 +12329,134 @@ export function registerConsoleRoutes(
     const autonomy = loadProactivityPolicy().autoApproveScope;
     const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession, autonomy });
 
+    const proposedRunId = priorReceipt?.runId
+      ?? `desktop:${harnessChatStableDigest(requestIdentity.requestId).slice(0, 40)}`;
+    let requestClaim: ReturnType<typeof claimHarnessChatRequest>;
+    try {
+      requestClaim = claimHarnessChatRequest({
+        requestId: requestIdentity.requestId,
+        sessionId,
+        runId: proposedRunId,
+        inputHash: payloadHash,
+        sinceSeq,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(409).json({
+        error: message,
+        ...(message.includes('cancelled before acceptance') ? { code: 'CHAT_REQUEST_CANCELLED' } : {}),
+      });
+      return;
+    }
+    const requestRunId = requestClaim.receipt.runId;
+    const executionClaim = claimRunAttemptLease({
+      sessionId,
+      runId: requestRunId,
+      ownerId: HARNESS_CHAT_LEASE_OWNER,
+      leaseMs: HARNESS_CHAT_LEASE_MS,
+    });
+    const shouldSchedule = executionClaim.claimed;
+    const requestAttempt: RunAttemptRef | null = executionClaim.attempt;
+
+    // A different daemon (or the request-cancel route after receipt creation)
+    // can persist Stop between the atomic receipt claim and attempt lease. Do
+    // not record input or schedule a model after that decision. An executor
+    // already owning this attempt receives the same exact durable kill latch.
+    if (getHarnessChatCancellation(requestIdentity.requestId)) {
+      try {
+        if (requestAttempt) {
+          stopExactHarnessAttempt(
+            sessionId,
+            requestAttempt,
+            'cancelled from chat before acknowledgement',
+            'chat-request-cancellation',
+          );
+          if (shouldSchedule) finishRunAttempt(requestAttempt, 'cancelled');
+        }
+      } catch (err) {
+        res.status(500).json({
+          error: 'chat cancellation was recorded but its accepted run could not be stopped',
+          detail: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      res.status(409).json({
+        error: 'this chat request was cancelled before acceptance',
+        code: 'CHAT_REQUEST_CANCELLED',
+        clientRequestId: requestIdentity.requestId,
+        sessionId,
+        runId: requestRunId,
+        ...(requestAttempt
+          ? {
+              attemptId: requestAttempt.attemptId,
+              runScopeId: harnessAttemptRunScopeId(sessionId, requestAttempt),
+            }
+          : {}),
+      });
+      return;
+    }
+
+    // Persist the accepted turn before any early-return branch (goal command,
+    // plan continuity, or background promotion). The receipt/run id makes this
+    // exact-once across a lost 202 and daemon recovery; the attempt binding is
+    // what lets /api/runs project only this turn instead of guessing by time.
+    if (shouldSchedule && requestAttempt) {
+      try {
+        recordRunAttemptUserInput(requestAttempt, {
+          turn: 1,
+          role: 'user',
+          data: {
+            text: turnInput,
+            displayText: input || (attachmentIds.length ? 'Attached file' : ''),
+            requestId: requestClaim.receipt.requestId,
+            clientRequestId: requestClaim.receipt.requestId,
+            runId: requestRunId,
+            attemptId: requestAttempt.attemptId,
+          },
+        });
+      } catch (err) {
+        try { finishRunAttempt(requestAttempt, 'interrupted'); } catch { /* best effort */ }
+        res.status(500).json({
+          error: 'could not durably record the accepted chat turn',
+          detail: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+    }
+
     res.status(202).json({
       sessionId,
       streamUrl,
       status: intent ? 'resuming' : planFirst ? 'planning' : 'started',
       mode: intent ? `approval-${intent.decision}` : planFirst ? 'plan-first' : 'fresh',
-      sinceSeq,
+      sinceSeq: requestClaim.receipt.sinceSeq,
+      clientRequestId: requestClaim.receipt.requestId,
+      runId: requestRunId,
+      replayed: !requestClaim.inserted,
+      ...(requestAttempt
+        ? {
+            attemptId: requestAttempt.attemptId,
+            runScopeId: harnessAttemptRunScopeId(sessionId, requestAttempt),
+            cancelEndpoint: harnessAttemptCancelEndpoint(sessionId, requestAttempt),
+            backgroundEndpoint: harnessAttemptBackgroundEndpoint(sessionId, requestAttempt),
+          }
+        : {}),
     });
 
+    // The first process is already running this receipt, or a prior process
+    // completed it. The caller simply rejoins the original SSE cursor; never
+    // schedule a second model/tool loop for the same client request.
+    if (!shouldSchedule) return;
+    if (!requestAttempt) return; // defensive: the durable lease claim is authoritative
+
     setImmediate(async () => {
+      let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'completed';
+      const leaseHeartbeat = setInterval(() => {
+        try {
+          renewRunAttemptLease(requestAttempt, HARNESS_CHAT_LEASE_OWNER, HARNESS_CHAT_LEASE_MS);
+        } catch { /* a later replay can reclaim after the bounded lease */ }
+      }, HARNESS_CHAT_LEASE_RENEW_MS);
+      leaseHeartbeat.unref?.();
       try {
         // /goal slash command (goal-contract P3): pin/inspect/cancel the
         // session's parked goal. status/cancel are reply-only; start/resume
@@ -11917,6 +12483,7 @@ export function registerConsoleRoutes(
             input: turnInput,
             sessionId,
             autonomy,
+            reuseRecordedUserInput: true,
             // Surface continuity notes (workflow resumed, set-aside, re-ask)
             // into the desktop stream the same way the cancel path does, so
             // desktop reaches parity with Discord's sendFollowup.
@@ -11995,6 +12562,7 @@ export function registerConsoleRoutes(
             freshSession,
             autonomy,
             onChunk,
+            reuseRecordedUserInput: true,
           });
           if (preflight.surfaced) return;
         }
@@ -12071,13 +12639,16 @@ export function registerConsoleRoutes(
           const brainReq = {
             message: effectiveInput,
             sessionId,
+            runId: requestRunId,
             channel: 'desktop',
             userId: 'desktop',
             onChunk: emitToken,
           };
           try {
-            await respondPreferHarness('home', brainReq, (req) => respondViaClaudeAgentSdkBrain('home', req));
+            const response = await respondPreferHarness('home', brainReq, (req) => respondViaClaudeAgentSdkBrain('home', req));
+            if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
           } catch (err) {
+            requestAttemptStatus = 'failed';
             appendHarnessEvent({
               sessionId,
               turn: 0,
@@ -12112,19 +12683,28 @@ export function registerConsoleRoutes(
         // salesforce turn). The legacy closure preserves the old direct call as
         // the bridge's own pre-run fallback (surface flag off / unenforceable
         // excludes / auth not ready) — never taken after a harness run starts.
-        await respondPreferHarness(
+        const response = await respondPreferHarness(
           'home',
-          { message: effectiveInput, sessionId, channel: 'desktop', userId: 'desktop', onChunk },
+          { message: effectiveInput, sessionId, runId: requestRunId, channel: 'desktop', userId: 'desktop', onChunk },
           async (req) => {
             const agent = await buildOrchestratorAgent({ userInput: req.message, sessionId });
-            const result = await runConversation({ agent, sessionId, input: req.message, judgeCompletion: true, onChunk });
+            const result = await runConversation({
+              agent,
+              sessionId,
+              input: req.message,
+              judgeCompletion: true,
+              onChunk,
+              reuseRecordedUserInput: true,
+            });
             const replyText = (result.lastDecision?.reply && result.lastDecision.reply.trim())
               ? result.lastDecision.reply
               : (result.lastDecision?.summary ?? '');
             return { text: replyText, sessionId };
           },
         );
+        if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
       } catch (err) {
+        requestAttemptStatus = 'failed';
         // The loop emits its own run_failed when a turn throws. If we
         // got here, the throw happened BEFORE any turn started
         // (typically inside buildOrchestratorAgent / handoff catalog
@@ -12141,6 +12721,9 @@ export function registerConsoleRoutes(
         } catch {
           // last-ditch — swallow to avoid an unhandled rejection
         }
+      } finally {
+        clearInterval(leaseHeartbeat);
+        try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* receipt telemetry is best-effort */ }
       }
     });
   });
@@ -12475,7 +13058,14 @@ export function registerConsoleRoutes(
     // currently-running foreground task to the background on demand, freeing the
     // chat. Handled here (before the model) so it works even mid-run.
     if (detectBackgroundItIntent(message)) {
-      const detached = detachRunningTurnToBackground(sessionId);
+      const activeAttempt = getActiveHarnessRunAttempt(sessionId);
+      const detached = activeAttempt
+        ? detachRunningTurnToBackground(
+          sessionId,
+          activeAttempt,
+          { source: 'desktop', channel: 'desktop' },
+        )
+        : null;
       if (detached) {
         res.json({ sessionId, text: detached.text });
         return;

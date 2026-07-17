@@ -16,6 +16,15 @@ export interface ChatPostResult {
   status: string; // started | planning | resuming | new-pending | cancelled
   mode: string;
   sinceSeq?: number;
+  clientRequestId?: string;
+  runId?: string;
+  /** Exact accepted attempt identity. Reusable chat sessions cannot be stopped
+   * safely by session id alone because a stale click could kill a newer turn. */
+  attemptId?: string;
+  runScopeId?: string;
+  cancelEndpoint?: string;
+  backgroundEndpoint?: string;
+  replayed?: boolean;
 }
 
 export interface PendingActionApprovalView {

@@ -231,6 +231,14 @@ test('classifyTool: composio_execute_tool routes through tool_slug', () => {
     'read',
   );
   assert.equal(
+    classifyTool('composio_execute_tool', { args: { tool_slug: 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST' } }),
+    'read',
+  );
+  assert.equal(
+    classifyTool('composio_execute_tool', { args: { tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT' } }),
+    'send',
+  );
+  assert.equal(
     classifyTool('composio_execute_tool', { args: { tool_slug: 'GMAIL_SEND_EMAIL' } }),
     'send',
   );

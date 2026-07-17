@@ -27,7 +27,7 @@ import { deliverableProbesEnabled, probeSessionDeliverables } from './deliverabl
 import { ExecutionStore } from './store.js';
 import type { AssistantResponse, RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
-import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
+import { addRunEvent, finishRun as persistFinishRun, getRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
@@ -48,6 +48,21 @@ import { recordOperationalEvent, type OperationalEventSeverity } from '../runtim
 import { getWorkspaceDirs } from '../tools/shared.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
+
+/** A worker has one terminal owner. Verification/report-back failures after a
+ * terminal write must not append a second contradictory completion event. */
+function finishRun(
+  runId: Parameters<typeof persistFinishRun>[0],
+  input: Parameters<typeof persistFinishRun>[1],
+): ReturnType<typeof persistFinishRun> {
+  if (runId) {
+    const existing = getRun(runId);
+    if (existing && (existing.status === 'completed' || existing.status === 'failed' || existing.status === 'cancelled')) {
+      return existing;
+    }
+  }
+  return persistFinishRun(runId, input);
+}
 
 let backgroundDeliveryJudgeForTests: ObjectiveJudgeFn | null = null;
 export function _setBackgroundDeliveryJudgeForTests(fn: ObjectiveJudgeFn | null): void {
@@ -91,6 +106,18 @@ export interface BackgroundTaskRecord {
   prompt: string;
   status: BackgroundTaskStatus;
   originSessionId?: string;
+  /** Durable provenance for a user-initiated foreground → background handoff.
+   * The exact attempt id is also the idempotency key: transport replays and
+   * double-clicks must rejoin this task instead of starting a second worker. */
+  foregroundHandoff?: {
+    sessionId: string;
+    attemptId: string;
+    runId?: string;
+    sourceUserSeq: number;
+    /** Inclusive event-log boundary captured when the user requested the
+     * handoff. Later turns in the reusable origin chat are not worker input. */
+    throughSeq: number;
+  };
   runSessionId: string;
   userId?: string;
   channel?: string;
@@ -168,6 +195,7 @@ export interface CreateBackgroundTaskInput {
    * session to wake — those report back only via notification.
    */
   originSessionId?: string;
+  foregroundHandoff?: BackgroundTaskRecord['foregroundHandoff'];
   userId?: string;
   channel?: string;
   reportBackTarget?: BackgroundReportBackTarget;
@@ -776,14 +804,21 @@ function writeFullResultFile(task: BackgroundTaskRecord, result: string): string
   return filePath;
 }
 
-function renderOriginLineageBlock(originSessionId: string | undefined): string {
+function renderOriginLineageBlock(
+  task: Pick<BackgroundTaskRecord, 'originSessionId' | 'foregroundHandoff'>,
+): string {
+  const originSessionId = task.originSessionId;
   if (!originSessionId) return '';
+  const throughSeq = task.foregroundHandoff?.throughSeq;
   let history = '';
-  try { history = renderSessionHistoryForModel(originSessionId, 8, 6_000); } catch { history = ''; }
+  try { history = renderSessionHistoryForModel(originSessionId, 8, 6_000, throughSeq); } catch { history = ''; }
   return [
     '## Origin Session Lineage',
-    `This task was spawned from session "${originSessionId}". Treat the origin history as authoritative for user decisions, constraints, resource ids, and already-completed external actions.`,
-    'Do not redo completed external writes unless the user explicitly asked to do them again. If you need more than the bounded history below, call session_history with the origin session id before acting.',
+    `This task was spawned from session "${originSessionId}"${throughSeq ? ` at event boundary ${throughSeq}` : ''}. Treat the bounded origin history as authoritative for user decisions, constraints, resource ids, and already-completed external actions.`,
+    'Do not redo completed external writes unless the user explicitly asked to do them again.',
+    throughSeq
+      ? `If you need more history, call session_history with session_id="${originSessionId}" and through_seq=${throughSeq}. Never read later turns from this reusable chat into this task.`
+      : 'If you need more than the bounded history below, call session_history with the origin session id before acting.',
     history,
   ].filter(Boolean).join('\n');
 }
@@ -828,7 +863,7 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     task.originSessionId ? `Origin session: ${task.originSessionId}` : '',
     `Soft max runtime: ${task.maxMinutes} minutes`,
     '',
-    renderOriginLineageBlock(task.originSessionId),
+    renderOriginLineageBlock(task),
     renderWorkspaceRootsBlock(),
     '',
     pinned
@@ -853,7 +888,7 @@ function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: st
     'The previous worker turn hit an internal run/turn budget before the objective was complete.',
     'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
     RESUME_NO_RESEND_DIRECTIVE,
-    renderOriginLineageBlock(task.originSessionId),
+    renderOriginLineageBlock(task),
     previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     '',
     'Original request:',
@@ -865,7 +900,7 @@ function buildWorkerInputResumePrompt(task: BackgroundTaskRecord, answer: string
   return [
     `The user answered your question: "${answer}". Continue the task with this answer.`,
     'Use the prior run session state, but preserve the origin session facts below if the continuation is picked up by a different model/backend.',
-    renderOriginLineageBlock(task.originSessionId),
+    renderOriginLineageBlock(task),
     '',
     'Original request:',
     task.prompt,
@@ -951,6 +986,7 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     prompt: input.prompt.trim(),
     status: 'pending',
     originSessionId: input.originSessionId,
+    foregroundHandoff: input.foregroundHandoff,
     runSessionId: `background:${id}`,
     userId: input.userId,
     channel: input.channel,
@@ -1849,6 +1885,7 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
     title: `Resume ${task.title}`,
     prompt: buildResumeClonePrompt(task),
     originSessionId: task.originSessionId,
+    foregroundHandoff: task.foregroundHandoff,
     userId: task.userId,
     channel: task.channel,
     model: task.model,
@@ -2070,7 +2107,17 @@ export function queueBackgroundTaskContinue(id: string, opts: { auto?: boolean; 
 export function interruptStaleRunningBackgroundTasks(): number {
   let interrupted = 0;
   for (const task of listBackgroundTasks()) {
-    if (task.status === 'running' || task.status === 'cancelling') {
+    if (task.status === 'cancelling') {
+      // The user already chose Stop. A daemon restart may interrupt the worker
+      // before its safe-checkpoint finally settles, but it must never transform
+      // that cancellation into restart-resumable work.
+      markBackgroundTaskFailed(
+        task.id,
+        task.cancellationReason ?? 'Cancelled by user before the daemon restarted.',
+        'aborted',
+      );
+      interrupted += 1;
+    } else if (task.status === 'running') {
       markBackgroundTaskFailed(task.id, DAEMON_RESTART_INTERRUPT_REASON, 'interrupted');
       interrupted += 1;
     }
@@ -2091,6 +2138,29 @@ async function finishWorkerRun(
   run: { id: string },
   response: { text: string; pendingApprovalId?: string; stoppedReason?: RunStoppedReason },
 ): Promise<void> {
+  const settleCancelled = (latest: BackgroundTaskRecord | null): void => {
+    const reason = latest?.cancellationReason ?? 'Cancelled by user.';
+    // `aborted` is the background-task store's canonical user-cancelled state;
+    // the tracked run settles as `cancelled` (never blocked/failed), and the
+    // delivery verifier is deliberately skipped.
+    markBackgroundTaskFailed(task.id, reason, 'aborted');
+    finishRun(run.id, {
+      status: 'cancelled',
+      message: `Background task ${task.id} was cancelled at a safe checkpoint.`,
+      outputPreview: response.text,
+    });
+    clearLedger(task.runSessionId);
+    logger.info({ taskId: task.id }, 'Background task cancelled (not blocked)');
+  };
+  const latestAtSettle = getBackgroundTask(task.id);
+  if (
+    response.stoppedReason === 'cancelled'
+    || latestAtSettle?.status === 'cancelling'
+    || latestAtSettle?.status === 'aborted'
+  ) {
+    settleCancelled(latestAtSettle);
+    return;
+  }
   if (response.pendingApprovalId) {
     markBackgroundTaskAwaitingApproval(task.id, response.pendingApprovalId, response.text);
     finishRun(run.id, {
@@ -2147,6 +2217,14 @@ async function finishWorkerRun(
     return;
   }
   const outcome = await verifyBackgroundTaskDelivery(task, response.text, response.stoppedReason);
+  // Verification may take long enough for a stop request to arrive. Re-read
+  // durable task state after the await so a late-but-valid cancellation cannot
+  // be overwritten with a contradictory blocked/failed completion.
+  const latestAfterVerification = getBackgroundTask(task.id);
+  if (latestAfterVerification?.status === 'cancelling' || latestAfterVerification?.status === 'aborted') {
+    settleCancelled(latestAfterVerification);
+    return;
+  }
   if (outcome.outcome === 'blocked') {
     markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text, outcome.blockerType);
     finishRun(run.id, {

@@ -15,6 +15,10 @@
  *   run_failed → an ERROR span.
  */
 import { listEvents, type EventRow } from '../harness/eventlog.js';
+import {
+  pairTransportMirrorToolCalls,
+  projectCanonicalTopLevelToolEvents,
+} from '../harness/tool-effect.js';
 
 export interface GenAiSpan {
   name: string;
@@ -38,33 +42,67 @@ function str(v: unknown): string { return typeof v === 'string' ? v : v == null 
 export function toGenAiSpans(events: EventRow[]): GenAiSpan[] {
   const spans: GenAiSpan[] = [];
 
-  // execute_tool spans — pair tool_called → tool_returned by callId.
-  const pendingTool = new Map<string, EventRow>();
-  for (const e of events) {
-    if (e.type === 'tool_called') {
-      const callId = str(e.data.callId) || e.id;
-      pendingTool.set(callId, e);
-    } else if (e.type === 'tool_returned') {
-      const callId = str(e.data.callId);
-      const called = callId ? pendingTool.get(callId) : undefined;
-      if (callId) pendingTool.delete(callId);
-      const tool = str(e.data.tool) || str(called?.data.tool) || 'unknown';
-      const result = str(e.data.result);
-      const failed = FAILURE_RE.test(result);
-      spans.push({
-        name: `execute_tool ${tool}`,
-        kind: 'CLIENT',
-        startTime: (called ?? e).createdAt,
-        endTime: e.createdAt,
-        attributes: {
-          'gen_ai.operation.name': 'execute_tool',
-          'gen_ai.tool.name': tool,
-          'gen_ai.tool.call.id': callId || 'unknown',
-          'gen_ai.system': 'clementine',
-        },
-        ...(failed ? { status: { code: 'ERROR' as const, message: result.slice(0, 160) } } : {}),
-      });
-    }
+  // execute_tool spans — one logical provider call, enriched with either/both
+  // its provider return and inner MCP transport return. This two-pass merge is
+  // deliberate: a sparse canonical return can arrive before or after a richer
+  // failed mirror return, but both must produce one canonical ERROR span.
+  const pairs = pairTransportMirrorToolCalls(events);
+  const returnsByCallId = new Map<string, EventRow[]>();
+  for (const event of events) {
+    if (event.type !== 'tool_returned') continue;
+    const callId = str(event.data.callId);
+    if (!callId) continue;
+    const bucket = returnsByCallId.get(callId) ?? [];
+    bucket.push(event);
+    returnsByCallId.set(callId, bucket);
+  }
+  const canonicalCalls = projectCanonicalTopLevelToolEvents(events, 'tool_called');
+  const canonicalCallIds = new Set<string>();
+  const appendToolSpan = (callId: string, called: EventRow | undefined, completions: EventRow[]): void => {
+    if (completions.length === 0) return;
+    const sortedCompletions = [...completions].sort((a, b) => a.seq - b.seq);
+    const failedCompletion = sortedCompletions.find((event) => {
+      const text = str(event.data.result || event.data.error || event.data.preview);
+      return event.data.ok === false || FAILURE_RE.test(text);
+    });
+    const evidenceEvent = failedCompletion
+      ?? sortedCompletions.find((event) => str(event.data.result || event.data.error || event.data.preview))
+      ?? sortedCompletions.at(-1)!;
+    const result = str(evidenceEvent.data.result || evidenceEvent.data.error || evidenceEvent.data.preview);
+    const tool = str(called?.data.tool)
+      || str(evidenceEvent.data.tool)
+      || 'unknown';
+    spans.push({
+      name: `execute_tool ${tool}`,
+      kind: 'CLIENT',
+      startTime: (called ?? sortedCompletions[0]).createdAt,
+      endTime: sortedCompletions.at(-1)!.createdAt,
+      attributes: {
+        'gen_ai.operation.name': 'execute_tool',
+        'gen_ai.tool.name': tool,
+        'gen_ai.tool.call.id': callId || 'unknown',
+        'gen_ai.system': 'clementine',
+      },
+      ...(failedCompletion ? { status: { code: 'ERROR' as const, message: result.slice(0, 160) } } : {}),
+    });
+  };
+
+  for (const called of canonicalCalls) {
+    const callId = str(called.data.callId) || called.id;
+    canonicalCallIds.add(callId);
+    const mirrorCallId = pairs.canonicalToMirrorCallId.get(callId);
+    appendToolSpan(callId, called, [
+      ...(returnsByCallId.get(callId) ?? []),
+      ...(mirrorCallId ? returnsByCallId.get(mirrorCallId) ?? [] : []),
+    ]);
+  }
+
+  // Preserve historical return-only spans for legacy/native rows. Explicit MCP
+  // mirrors never enter this fallback; paired canonical calls were handled above.
+  for (const returned of projectCanonicalTopLevelToolEvents(events, 'tool_returned')) {
+    const callId = str(returned.data.callId);
+    if (callId && canonicalCallIds.has(callId)) continue;
+    appendToolSpan(callId || 'unknown', undefined, [returned]);
   }
 
   // invoke_agent spans — pair turn_started → turn_ended by turn number.

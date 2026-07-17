@@ -34,6 +34,7 @@ import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 
 export type ToolKind =
   | 'read'      // pure lookup; never asks
@@ -397,25 +398,7 @@ function normalizeForMatch(name: string): string {
  * but keep the structure, so we can classify the same way for both.
  */
 function classifyComposioSlug(slug: string): ToolKind {
-  const upper = slug.toUpperCase();
-  // Firecrawl search/scrape/map/crawl actions may enqueue work on
-  // Firecrawl, but from the user's perspective they only read public
-  // web pages. Do not ask before normal research/enrichment.
-  if (/^FIRECRAWL_(BATCH_)?(SCRAPE|MAP|SEARCH|CRAWL)(_|$)/.test(upper)) {
-    return 'read';
-  }
-  // Read prefixes / contains
-  if (
-    /^(GET|LIST|SEARCH|FIND|FETCH|READ|QUERY|LOOKUP|RETRIEVE)_/.test(upper) ||
-    /_(GET|LIST|SEARCH|FIND|FETCH|READ|QUERY|LOOKUP)_/.test(upper) ||
-    upper.endsWith('_GET') ||
-    upper.endsWith('_LIST')
-  ) {
-    return 'read';
-  }
-  // Anything else from a Composio toolkit hits the network and mutates
-  // external state — by definition `send`.
-  return 'send';
+  return classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'send';
 }
 
 /** Public — used by every tool family's `needsApproval` factory. */

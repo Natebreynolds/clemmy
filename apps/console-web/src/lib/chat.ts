@@ -51,12 +51,149 @@ function withToken(path: string): string {
   return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
 
-export async function postChat(input: string, sessionId: string | null, attachments: string[]): Promise<ChatPostResult> {
-  return apiPost<ChatPostResult>('/api/harness/chat', { input, sessionId: sessionId || undefined, attachments });
+/** Minted by useChat before the first POST so every transport replay carries
+ * the same durable turn identity. */
+export function createChatClientRequestId(): string {
+  return globalThis.crypto?.randomUUID?.()
+    ?? `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-export async function cancelSession(sessionId: string): Promise<void> {
-  try { await apiPost(`/api/console/harness-sessions/${encodeURIComponent(sessionId)}/cancel`); } catch { /* best effort */ }
+export async function postChat(
+  input: string,
+  sessionId: string | null,
+  attachments: string[],
+  clientRequestId: string,
+): Promise<ChatPostResult> {
+  const result = await apiPost<ChatPostResult>('/api/harness/chat', {
+    input,
+    sessionId: sessionId || undefined,
+    attachments,
+    clientRequestId,
+  });
+  if (!result || typeof result.sessionId !== 'string' || !result.sessionId) {
+    throw Object.assign(new TypeError('chat acknowledgement was incomplete'), { status: 0 });
+  }
+  if (
+    ['started', 'planning', 'resuming'].includes(result.status)
+    && (!chatCancelEndpoint(result) || !chatBackgroundEndpoint(result))
+  ) {
+    throw Object.assign(new TypeError('chat acknowledgement omitted exact run control'), { status: 0 });
+  }
+  return result;
+}
+
+export function chatBackgroundEndpoint(
+  accepted: Pick<ChatPostResult, 'sessionId' | 'attemptId' | 'runScopeId' | 'backgroundEndpoint'>,
+): string | null {
+  if (typeof accepted.backgroundEndpoint === 'string' && accepted.backgroundEndpoint.startsWith('/api/')) {
+    return accepted.backgroundEndpoint;
+  }
+  if (!accepted.attemptId || !accepted.runScopeId) return null;
+  const query = new URLSearchParams({ attemptId: accepted.attemptId, runScopeId: accepted.runScopeId });
+  return `/api/console/harness-sessions/${encodeURIComponent(accepted.sessionId)}/background?${query.toString()}`;
+}
+
+export interface BackgroundHandoffResult {
+  ok: boolean;
+  sessionId: string;
+  attemptId: string;
+  runScopeId: string;
+  taskId: string;
+  replayed?: boolean;
+  text: string;
+}
+
+export async function moveSessionToBackground(
+  accepted: Pick<ChatPostResult, 'sessionId' | 'attemptId' | 'runScopeId' | 'backgroundEndpoint'>,
+  options: {
+    transport?: (endpoint: string) => Promise<BackgroundHandoffResult>;
+    retryDelaysMs?: number[];
+    wait?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<BackgroundHandoffResult> {
+  const endpoint = chatBackgroundEndpoint(accepted);
+  if (!endpoint) throw Object.assign(new TypeError('exact background handoff identity is unavailable'), { status: 0 });
+  const transport = options.transport ?? ((path: string) => apiPost<BackgroundHandoffResult>(path));
+  const waits = options.retryDelaysMs ?? [400, 1_200];
+  const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let attempt = 0;
+  while (true) {
+    try {
+      return await transport(endpoint);
+    } catch (error) {
+      const status = Number((error as { status?: unknown } | null)?.status);
+      const retryable = status === 0 || status >= 500 || (!Number.isFinite(status) && error instanceof TypeError);
+      if (!retryable || attempt >= waits.length) throw error;
+      await wait(waits[attempt]);
+      attempt += 1;
+    }
+  }
+}
+
+export function chatCancelEndpoint(
+  accepted: Pick<ChatPostResult, 'sessionId' | 'attemptId' | 'runScopeId' | 'cancelEndpoint'>,
+): string | null {
+  if (typeof accepted.cancelEndpoint === 'string' && accepted.cancelEndpoint.startsWith('/api/')) {
+    return accepted.cancelEndpoint;
+  }
+  if (!accepted.attemptId || !accepted.runScopeId) return null;
+  const query = new URLSearchParams({ attemptId: accepted.attemptId, runScopeId: accepted.runScopeId });
+  return `/api/console/harness-sessions/${encodeURIComponent(accepted.sessionId)}/cancel?${query.toString()}`;
+}
+
+interface IdempotentControlOptions {
+  transport?: (path: string, body: unknown) => Promise<unknown>;
+  retryDelaysMs?: number[];
+  wait?: (ms: number) => Promise<void>;
+}
+
+async function postIdempotentControl(
+  endpoint: string,
+  body: unknown,
+  options: IdempotentControlOptions,
+): Promise<boolean> {
+  const transport = options.transport ?? ((path: string, payload: unknown) => apiPost(path, payload));
+  const retryDelaysMs = options.retryDelaysMs ?? [250, 750, 1_500];
+  const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let attempt = 0;
+  while (true) {
+    try {
+      const result = await transport(endpoint, body);
+      return !result || typeof result !== 'object' || (result as { ok?: unknown }).ok !== false;
+    } catch (error) {
+      const status = Number((error as { status?: unknown } | null)?.status);
+      const retryable = status === 0 || status >= 500 || (!Number.isFinite(status) && error instanceof TypeError);
+      if (!retryable || attempt >= retryDelaysMs.length) return false;
+      await wait(retryDelaysMs[attempt]);
+      attempt += 1;
+    }
+  }
+}
+
+export async function cancelSession(
+  accepted: Pick<ChatPostResult, 'sessionId' | 'attemptId' | 'runScopeId' | 'cancelEndpoint'>,
+  options: IdempotentControlOptions = {},
+): Promise<boolean> {
+  const endpoint = chatCancelEndpoint(accepted);
+  if (!endpoint) return false;
+  return postIdempotentControl(endpoint, undefined, options);
+}
+
+/** Stop authority for the window before POST /api/harness/chat returns an
+ * attempt id. The endpoint persists an idempotent tombstone keyed by the
+ * client-owned request id, so a lost acknowledgement cannot leave work alive.
+ */
+export async function cancelPendingChatRequest(
+  clientRequestId: string,
+  options: IdempotentControlOptions = {},
+): Promise<boolean> {
+  const requestId = clientRequestId.trim();
+  if (!requestId) return false;
+  return postIdempotentControl(
+    '/api/harness/chat/cancel',
+    { clientRequestId: requestId },
+    options,
+  );
 }
 
 /** Upload one file → returns its inbox attachment id (to pass into postChat). */

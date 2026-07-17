@@ -23,17 +23,29 @@ import { actionBus } from '../runtime/action-bus.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import {
   appendEvent as appendHarnessEvent,
+  beginRunAttempt,
   createSession as createHarnessSession,
+  finishRunAttempt,
+  getActiveRunAttempt,
   getSession as getHarnessSession,
   listSessions as listHarnessSessions,
+  requestKill,
   updateSession as updateHarnessSession,
   type EventRow,
+  type RunAttemptRef,
   type SessionRow,
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
-import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
+import {
+  enqueueDurableChatTask,
+  renderDurableTaskQueued,
+  shouldPromoteToDurable,
+  detectBackgroundItIntent,
+  detachRunningTurnToBackground,
+  isBackgroundHandoffApprovalBlocked,
+} from '../execution/background-promote.js';
 import {
   findSoleAwaitingContinueTaskForOrigin,
   findSoleAwaitingInputTaskForOrigin,
@@ -162,6 +174,152 @@ interface ChannelSessionEntry {
 }
 const channelSessions = new Map<string, ChannelSessionEntry>();
 const CONTINUITY_WINDOW_MS = 30 * 60_000;
+
+export interface ActiveDiscordHarnessRun {
+  channel: string;
+  channelId: string;
+  userId: string;
+  guildId: string | null;
+  sessionId: string;
+  attemptId: string;
+  runId: string | null;
+  startedAt: string;
+}
+
+// The continuity map answers "which conversation is bound here?"; this map
+// answers the narrower control-plane question "which run is executing here
+// right now?". Keeping those concepts separate prevents a stop command from
+// latching onto an idle/reusable chat session.
+const activeChannelRuns = new Map<string, Map<string, ActiveDiscordHarnessRun>>();
+
+function activeChannelRunKey(channel: string, channelId: string): string {
+  return `${channel}:${channelId}`;
+}
+
+function registerActiveChannelRun(input: {
+  channel: string;
+  channelId: string;
+  userId: string;
+  guildId: string | null;
+  sessionId: string;
+}): ActiveDiscordHarnessRun {
+  const attempt = beginRunAttempt(input.sessionId);
+  const active: ActiveDiscordHarnessRun = { ...input, ...attempt };
+  const key = activeChannelRunKey(input.channel, input.channelId);
+  const runs = activeChannelRuns.get(key) ?? new Map<string, ActiveDiscordHarnessRun>();
+  runs.set(active.attemptId, active);
+  activeChannelRuns.set(key, runs);
+  return active;
+}
+
+function unregisterActiveChannelRun(active: ActiveDiscordHarnessRun, status: 'completed' | 'cancelled' | 'failed' = 'completed'): void {
+  const key = activeChannelRunKey(active.channel, active.channelId);
+  const runs = activeChannelRuns.get(key);
+  runs?.delete(active.attemptId);
+  if (runs?.size === 0) activeChannelRuns.delete(key);
+  try { finishRunAttempt(active, status); } catch { /* control telemetry is best-effort */ }
+}
+
+export function resolveActiveDiscordHarnessRuns(input: {
+  channelId: string;
+  userId?: string | null;
+  guildId?: string | null;
+  channel?: string;
+}): ActiveDiscordHarnessRun[] {
+  const channel = input.channel ?? 'discord';
+  const runs = activeChannelRuns.get(activeChannelRunKey(channel, input.channelId));
+  if (!runs) return [];
+  return [...runs.values()]
+    .filter((run) => !input.userId || run.userId === input.userId)
+    .filter((run) => input.guildId == null || run.guildId === input.guildId)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+}
+
+async function tryHandleBackgroundItControl(input: {
+  message: string;
+  channelId: string;
+  userId: string;
+  guildId: string | null;
+  channel: string;
+  channelLabel: string;
+  transport: DiscordHarnessTransport;
+}): Promise<boolean> {
+  if (!detectBackgroundItIntent(input.message)) return false;
+  const candidates = resolveActiveDiscordHarnessRuns(input);
+  if (candidates.length !== 1) {
+    await input.transport.sendInitial(candidates.length === 0
+      ? '🍊 I could not find a running turn here to move to the background.'
+      : '🍊 More than one turn is active here, so I did not guess which one to move. Stop or finish one, then try again.');
+    return true;
+  }
+  const foreground = candidates[0];
+  if (isBackgroundHandoffApprovalBlocked(foreground.sessionId)) {
+    await input.transport.sendInitial('🍊 This turn is waiting on an approval. Approve or reject that action first; I did not move or restart it.');
+    return true;
+  }
+  const detached = detachRunningTurnToBackground(
+    foreground.sessionId,
+    foreground,
+    {
+      source: input.channel as 'discord' | 'slack',
+      channel: input.channelLabel,
+      userId: input.userId,
+    },
+  );
+  await input.transport.sendInitial(detached
+    ? detached.text
+    : '🍊 That turn changed or finished before I could move it, so I left the current work alone.');
+  return true;
+}
+
+/** Bound origin session for finding background work dispatched by this chat. */
+export function getBoundDiscordHarnessSessionId(channelId: string, channel: string = 'discord'): string | null {
+  const recent = getOrHydrateChannelSession(channelId, channel);
+  if (recent) return recent.sessionId;
+
+  // A live attempt can legitimately outlast the conversational continuity
+  // window. Stop is a control-plane operation, so never make it depend on a
+  // warm process-local map (or on the user having spoken in the last 30m).
+  // Rehydrate the durable channel binding when SQLite still says that exact
+  // session owns an active attempt.
+  const durable = findMostRecentChannelSession(channelId, channel);
+  if (!durable || !getActiveRunAttempt(durable.sessionId)) return null;
+  channelSessions.set(channelId, { sessionId: durable.sessionId, lastUsedAt: durable.updatedAt });
+  return durable.sessionId;
+}
+
+export interface BoundChannelRunAttempt {
+  sessionId: string;
+  attempt: RunAttemptRef;
+}
+
+/**
+ * Resolve the exact SQLite attempt currently owned by a channel's durable
+ * conversation binding. Both Discord and Slack use this control-plane lookup,
+ * so a daemon restart cannot turn a user's Stop message into a fresh model
+ * turn merely because the in-memory active-run map was lost.
+ */
+export function resolveBoundChannelRunAttempt(input: {
+  channelId: string;
+  channel?: string;
+}): BoundChannelRunAttempt | null {
+  const sessionId = getBoundDiscordHarnessSessionId(input.channelId, input.channel ?? 'discord');
+  if (!sessionId) return null;
+  const attempt = getActiveRunAttempt(sessionId);
+  return attempt ? { sessionId, attempt } : null;
+}
+
+/** Exact-stop the bound attempt; never creates a session-wide/stale latch. */
+export function requestBoundChannelRunStop(input: {
+  channelId: string;
+  channel?: string;
+  reason: string;
+}): BoundChannelRunAttempt | null {
+  const target = resolveBoundChannelRunAttempt(input);
+  if (!target) return null;
+  requestKill(target.sessionId, input.reason, target.attempt);
+  return target;
+}
 
 /**
  * Look up the most recent harness session for a Discord channel in
@@ -558,7 +716,7 @@ export function bindDiscordHarnessSession(input: {
  * its status flips and its interrupt state is cleared so the next
  * message from the user starts fresh.
  */
-async function handleHarnessCancel(opts: {
+export async function handleHarnessCancel(opts: {
   channelId: string;
   transport: DiscordHarnessTransport;
   channel?: string;
@@ -1036,12 +1194,35 @@ function pendingDiscordApprovalsForChannel(channelId: string, channel: string = 
 }
 
 function globalApprovalRowsForDm(channelId: string, channel: string = 'discord'): approvalRegistry.PendingApprovalRow[] {
+  const boundSessionId = getOrHydrateChannelSession(channelId, channel)?.sessionId ?? null;
+  const activeSessionIds = new Set(resolveActiveDiscordHarnessRuns({ channelId, channel }).map((run) => run.sessionId));
+  if (boundSessionId) activeSessionIds.add(boundSessionId);
   return approvalRegistry
     .listPending({ status: 'pending' })
     .filter((row) => {
       if (!approvalRegistry.isActionable(row)) return false;
-      if (!isDiscordApproval(row, channel)) return true;
-      return row.channelId === channelId;
+      if (isDiscordApproval(row, channel)) return approvalBelongsToDiscordChannel(row, channelId, channel);
+      if (activeSessionIds.has(row.sessionId)) return true;
+
+      // A workflow/background approval is relevant only when its durable run is
+      // linked back to this exact chat. The old `!isDiscordApproval => true`
+      // rule let a lone approval from any other channel swallow a DM's "abort".
+      const linkedTask = listBackgroundTasks().find((task) => {
+        if (task.runSessionId !== row.sessionId) return false;
+        if (boundSessionId && task.originSessionId === boundSessionId) return true;
+        if (task.channel === `${channel}:${channelId}` || task.channel === `${channel}:dm:${channelId}`) return true;
+        const target = task.reportBackTarget;
+        if (channel === 'discord' && target?.type === 'discord_channel') return target.channelId === channelId;
+        if (channel === 'slack' && target?.type === 'slack_channel') return target.channelId === channelId;
+        return false;
+      });
+      if (linkedTask) return true;
+
+      const session = getHarnessSession(row.sessionId);
+      const metadata = session?.metadata ?? {};
+      return metadata.channelId === channelId
+        || metadata.discordChannelId === channelId
+        || metadata.slackChannelId === channelId;
     });
 }
 
@@ -1092,6 +1273,9 @@ export const __test__ = {
   renderFullBody,
   renderSessionPickerText,
   sessionPickerComponents,
+  registerActiveChannelRunForTest: registerActiveChannelRun,
+  unregisterActiveChannelRunForTest: unregisterActiveChannelRun,
+  tryHandleBackgroundItControl,
   /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
   setChannelSessionForTest(channelId: string, sessionId: string): void {
     channelSessions.set(channelId, { sessionId, lastUsedAt: Date.now() });
@@ -1947,6 +2131,20 @@ export async function runDiscordHarnessConversation(opts: {
     }
   }
 
+  // This is a control for the run that was already active BEFORE this inbound
+  // message. Handle it before resolving/creating a session or registering a new
+  // attempt; otherwise the control attempt supersedes the work it meant to move
+  // and the original foreground executor keeps running beside the new worker.
+  if (await tryHandleBackgroundItControl({
+    message: rawPromptForIntent,
+    channelId,
+    userId,
+    guildId,
+    channel,
+    channelLabel,
+    transport,
+  })) return;
+
   const parkedEntry = getOrHydrateChannelSession(channelId, channel);
   if (parkedEntry && await maybeRouteParkedBackgroundReply({ sessionId: parkedEntry.sessionId, message: prompt, transport })) {
     return;
@@ -1969,6 +2167,16 @@ export async function runDiscordHarnessConversation(opts: {
   }
 
   const session = resolveOrCreateSession({ channelId, userId, guildId, prompt, channel });
+  // Register before the placeholder/preflight/model dispatch. A second Discord
+  // message saying "stop" can now target this exact attempt even in the small
+  // window before the SDK brain begins.
+  const activeRun = registerActiveChannelRun({
+    channel,
+    channelId,
+    userId,
+    guildId,
+    sessionId: session.id,
+  });
   const autonomy = loadProactivityPolicy().autoApproveScope;
   const planFirst = shouldUsePlanFirst({ input: prompt, freshSession: !session.isContinuation, autonomy });
 
@@ -1989,6 +2197,7 @@ export async function runDiscordHarnessConversation(opts: {
     } catch {
       /* last-ditch */
     }
+    unregisterActiveChannelRun(activeRun, 'failed');
     return;
   }
 
@@ -2334,28 +2543,7 @@ export async function runDiscordHarnessConversation(opts: {
       // Decide on the RAW text (not folded attachments); enqueue the FULL
       // `prompt`. Skip when the session is paused on an approval so a stray
       // durable phrase can't orphan an in-flight gated workflow.
-      // User-initiated "background it" control (Claude Code ctrl+b model) —
-      // desktop↔Discord↔Slack parity. Push the running task to the background on
-      // demand; handled before the run. Skip while awaiting approval.
-      const isBackgroundItControl =
-        !goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel) && detectBackgroundItIntent(rawPromptForIntent);
-      if (isBackgroundItControl) {
-        const detached = detachRunningTurnToBackground(session.id);
-        if (detached) {
-          appendHarnessEvent({
-            sessionId: session.id,
-            turn: 0,
-            role: 'Clem',
-            type: 'conversation_completed',
-            data: { reason: 'moved_to_background', summary: detached.text, reply: detached.text, steps: 0, queuedTaskId: detached.taskId },
-          });
-          return;
-        }
-        // Matched the control but there's nothing to background → fall to a NORMAL
-        // turn (parity with the console), NOT the durable-promotion gate below
-        // (which would enqueue a nonsense task from the bare "background it" text).
-      }
-      if (!goalRunInput && !isBackgroundItControl && !isChannelSessionAwaitingApproval(channelId, channel) && shouldPromoteToDurable(rawPromptForIntent)) {
+      if (!goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel) && shouldPromoteToDurable(rawPromptForIntent)) {
         const task = enqueueDurableChatTask({
           message: prompt,
           sessionId: session.id,
@@ -2412,6 +2600,7 @@ export async function runDiscordHarnessConversation(opts: {
         sessionId: session.id,
         channel: channelLabel,
         userId,
+        runId: activeRun.attemptId,
         // Live streaming can come from either Claude SDK (plain prose) or from
         // harness recovery / direct harness (structured JSON). Auto-classify the
         // first non-space character so Discord never flashes raw `{ "reply": ... }`.
@@ -2439,7 +2628,12 @@ export async function runDiscordHarnessConversation(opts: {
     }
   })();
 
-  await finished;
+  try {
+    await finished;
+  } finally {
+    const finalStatus = getHarnessSession(session.id)?.status === 'cancelled' ? 'cancelled' : 'completed';
+    unregisterActiveChannelRun(activeRun, finalStatus);
+  }
 }
 
 /**

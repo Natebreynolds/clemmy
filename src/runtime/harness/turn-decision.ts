@@ -11,6 +11,7 @@
  */
 import { listEvents, type EventRow } from './eventlog.js';
 import { isToolSurfaceProbeTool } from './tool-evidence.js';
+import { isCanonicalTopLevelToolEvent, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
 import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 // Type-only import — erased at compile time, so there is no runtime cycle
@@ -580,7 +581,7 @@ export function evaluateStructuredDecisionStall(opts: {
 function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boolean {
   try {
     const toolNames = listEvents(sessionId)
-      .filter((event) => event.turn === turn && event.type === 'tool_called')
+      .filter((event) => event.turn === turn && isCanonicalTopLevelToolEvent(event, 'tool_called'))
       .map((event) => {
         const tool = event.data.tool;
         return typeof tool === 'string' ? tool : null;
@@ -607,7 +608,10 @@ function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boo
  */
 function sessionDidSubstantiveToolWork(sessionId: string, turn: number): boolean {
   try {
-    return listEvents(sessionId, { types: ['tool_called'] }).some((event) => {
+    return projectCanonicalTopLevelToolEvents(
+      listEvents(sessionId, { types: ['tool_called'] }),
+      'tool_called',
+    ).some((event) => {
       if (typeof event.turn !== 'number' || event.turn >= turn) return false;
       const tool = event.data.tool;
       return typeof tool === 'string' && tool.length > 0 && !isToolSurfaceProbeTool(tool);
@@ -639,7 +643,7 @@ function finalHandoffProgress(
     return {
       from: typeof handoff.data.from === 'string' ? handoff.data.from : null,
       to: typeof handoff.data.to === 'string' ? handoff.data.to : null,
-      toolCallsAfterHandoff: afterHandoff.filter((event) => event.type === 'tool_called').length,
+      toolCallsAfterHandoff: projectCanonicalTopLevelToolEvents(afterHandoff, 'tool_called').length,
     };
   } catch {
     return undefined;
@@ -800,9 +804,10 @@ export function evaluateProgress(opts: {
   // tool_called events for this session; if 3+ share (toolName, args
   // hash), the agent is looping on the same query.
   try {
-    const recentToolCalls = listEvents(opts.sessionId, {
-      types: ['tool_called'],
-    }).slice(-5);
+    const recentToolCalls = projectCanonicalTopLevelToolEvents(
+      listEvents(opts.sessionId, { types: ['tool_called'] }),
+      'tool_called',
+    ).slice(-5);
     if (recentToolCalls.length >= 3) {
       const counts = new Map<string, { count: number; toolName: string; argsExcerpt: string }>();
       for (const ev of recentToolCalls as EventRow[]) {

@@ -405,6 +405,188 @@ export function renderSkillsIndex(): string {
   return out.join('\n');
 }
 
+/** Stable prompt contract. This deliberately contains no installed names,
+ * descriptions, counts, or paths: changing the skill library must not bust the
+ * cacheable system prefix, and a large library must not tax every turn. */
+export function renderSkillDiscoveryPrompt(): string {
+  return 'Specialized skills are available on demand. When the request names a skill or needs a specialized procedure, style, audit, document, sheet, slide, PDF, or site workflow, use `skill_list()` to search installed names/descriptions, then `skill_read("<name>")` for the best match before creating the deliverable. If no match fits, continue normally.';
+}
+
+export interface RelevantSkillMatch {
+  skill: Skill;
+  score: number;
+  matchedTerms: string[];
+}
+
+export interface RelevantSkillOptions {
+  maxSkills?: number;
+  maxChars?: number;
+}
+
+export const RELEVANT_SKILLS_DEFAULT_MAX = 3;
+export const RELEVANT_SKILLS_DEFAULT_MAX_CHARS = 900;
+
+const SKILL_QUERY_STOPWORDS = new Set([
+  'about', 'after', 'again', 'also', 'analyze', 'and', 'are', 'before', 'build', 'can',
+  'create', 'do', 'draft', 'for', 'from', 'generate', 'help', 'how', 'into', 'make',
+  'need', 'our', 'please', 'prepare', 'pull', 'read', 'report', 'review', 'run',
+  'search', 'send', 'summarize', 'the', 'this', 'to', 'update', 'use', 'want',
+  'with', 'would', 'write', 'you',
+]);
+
+const SKILL_ARTIFACT_TERMS = new Set([
+  'document', 'spreadsheet', 'presentation', 'website', 'pdf', 'image', 'email',
+]);
+
+const SKILL_TOKEN_ALIASES: Record<string, string> = {
+  doc: 'document', docs: 'document', document: 'document', documents: 'document',
+  docx: 'document', gdoc: 'document', googledoc: 'document', googledocs: 'document',
+  sheet: 'spreadsheet', sheets: 'spreadsheet', spreadsheet: 'spreadsheet', spreadsheets: 'spreadsheet', excel: 'spreadsheet',
+  slide: 'presentation', slides: 'presentation', deck: 'presentation', decks: 'presentation', presentation: 'presentation', presentations: 'presentation', powerpoint: 'presentation',
+  site: 'website', sites: 'website', webpage: 'website', webpages: 'website', website: 'website', websites: 'website',
+  pdfs: 'pdf', pics: 'image', picture: 'image', pictures: 'image', photo: 'image', photos: 'image', images: 'image',
+  email: 'email', emails: 'email', mail: 'email',
+};
+
+function skillSearchTokens(value: string): string[] {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .filter((token) => !SKILL_QUERY_STOPWORDS.has(token))
+    .map((token) => SKILL_TOKEN_ALIASES[token]
+      ?? (token.length > 4 && token.endsWith('s') && !token.endsWith('ss') ? token.slice(0, -1) : token))
+    .filter((token) => token.length >= 3 || token === 'ui')
+    .filter((token) => !SKILL_QUERY_STOPWORDS.has(token));
+}
+
+function boundedInt(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+
+function relevantSkillLimits(options?: RelevantSkillOptions): Required<RelevantSkillOptions> {
+  return {
+    maxSkills: boundedInt(
+      options?.maxSkills === undefined
+        ? getRuntimeEnv('CLEMMY_RELEVANT_SKILLS_MAX', String(RELEVANT_SKILLS_DEFAULT_MAX))
+        : String(options.maxSkills),
+      RELEVANT_SKILLS_DEFAULT_MAX,
+      1,
+      8,
+    ),
+    maxChars: boundedInt(
+      options?.maxChars === undefined
+        ? getRuntimeEnv('CLEMMY_RELEVANT_SKILLS_MAX_CHARS', String(RELEVANT_SKILLS_DEFAULT_MAX_CHARS))
+        : String(options.maxChars),
+      RELEVANT_SKILLS_DEFAULT_MAX_CHARS,
+      320,
+      4_000,
+    ),
+  };
+}
+
+/** Lexical, local, deterministic skill retrieval. Names are strongest,
+ * applicability metadata is next, and description terms provide recall. Write
+ * verbs and generic task words are ignored so "create a thing" does not surface
+ * every installed skill. */
+export function findRelevantSkills(query: string, options?: RelevantSkillOptions): RelevantSkillMatch[] {
+  const q = query.replace(/\s+/g, ' ').trim().toLowerCase();
+  const queryTerms = [...new Set(skillSearchTokens(q))];
+  const queryArtifactTerms = queryTerms.filter((term) => SKILL_ARTIFACT_TERMS.has(term));
+  if (!q || queryTerms.length === 0) return [];
+
+  const matches: RelevantSkillMatch[] = [];
+  for (const skill of listSkills()) {
+    if (skill.frontmatter.quarantined) continue;
+    const nameTerms = new Set(skillSearchTokens(`${skill.name} ${skill.frontmatter.name ?? ''}`));
+    const descriptionTerms = new Set(skillSearchTokens(skill.frontmatter.description ?? ''));
+    const applicability = skill.frontmatter.applicability as { toolFamilies?: unknown; entitySlots?: unknown } | undefined;
+    const applicabilityText = [
+      ...(Array.isArray(applicability?.toolFamilies) ? applicability.toolFamilies : []),
+      ...(Array.isArray(applicability?.entitySlots) ? applicability.entitySlots : []),
+    ].filter((value): value is string => typeof value === 'string').join(' ');
+    const applicabilityTerms = new Set(skillSearchTokens(applicabilityText));
+    const normalizedName = skillSearchTokens(skill.name).join(' ');
+    const exactNameMatch = Boolean(normalizedName && q.includes(normalizedName));
+    const skillTerms = new Set([...nameTerms, ...descriptionTerms, ...applicabilityTerms]);
+    const skillArtifactTerms = [...skillTerms].filter((term) => SKILL_ARTIFACT_TERMS.has(term));
+    // An explicit artifact request must not surface a procedure for a different
+    // artifact merely because both descriptions say "Google" or "firm". Skills
+    // with no declared artifact remain eligible as domain-specific helpers.
+    if (!exactNameMatch
+      && queryArtifactTerms.length > 0
+      && skillArtifactTerms.length > 0
+      && !queryArtifactTerms.some((term) => skillArtifactTerms.includes(term))) continue;
+
+    let score = exactNameMatch ? 100 : 0;
+    const matchedTerms: string[] = [];
+    for (const term of queryTerms) {
+      let matched = false;
+      if (nameTerms.has(term)) { score += 12; matched = true; }
+      if (applicabilityTerms.has(term)) { score += 7; matched = true; }
+      if (descriptionTerms.has(term)) { score += 4; matched = true; }
+      if (matched) matchedTerms.push(term);
+    }
+    const uniqueMatches = [...new Set(matchedTerms)];
+    // One generic overlap is too weak for prompt injection (for example, every
+    // mail workflow matching "send an email"). Explicit skill names bypass this
+    // precision floor; otherwise require two independent lexical signals.
+    if (exactNameMatch || (score >= 8 && uniqueMatches.length >= 2)) {
+      matches.push({ skill, score, matchedTerms: uniqueMatches });
+    }
+  }
+
+  const { maxSkills } = relevantSkillLimits(options);
+  const ranked = matches.sort((a, b) => b.score - a.score
+    || Number(a.skill.frontmatter.tier === 'draft') - Number(b.skill.frontmatter.tier === 'draft')
+    || a.skill.name.localeCompare(b.skill.name));
+  const relativeFloor = Math.max(8, (ranked[0]?.score ?? 0) * 0.5);
+  return ranked
+    // Do not fill the bounded menu with weak same-artifact neighbors merely
+    // because capacity remains. A result must be competitive with the best hit.
+    .filter((match) => match.score >= relativeFloor)
+    .slice(0, maxSkills);
+}
+
+function clipSkillDescription(value: string, max = 180): string {
+  const normalized = value.replace(/\s+/g, ' ').trim() || '(no description)';
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
+}
+
+/** Bounded per-turn menu containing only query-relevant summaries. Full bodies
+ * remain behind skill_read; the complete catalog remains behind skill_list. */
+export function renderRelevantSkillsForPrompt(query: string, options?: RelevantSkillOptions): string {
+  const limits = relevantSkillLimits(options);
+  const matches = findRelevantSkills(query, limits);
+  if (matches.length === 0) return '';
+
+  const header = 'Likely installed skill matches for this request:';
+  const footer = 'Load the best match with `skill_read("<name>")` before creating the deliverable. If these do not fit, call `skill_list()` to search the complete catalog.';
+  // Reserve both complete discovery instructions first. Skill summaries consume
+  // only the remaining space, so hard clipping can never sever skill_list/read.
+  const fixedChars = header.length + footer.length + 2;
+  const lines: string[] = [];
+  let used = 0;
+  for (const match of matches) {
+    const applicability = match.skill.frontmatter.applicability as { toolFamilies?: string[]; entitySlots?: string[] } | undefined;
+    const line = formatSkillLine(
+      match.skill.name,
+      clipSkillDescription(match.skill.frontmatter.description ?? ''),
+      applicability ? {
+        toolFamilies: (applicability.toolFamilies ?? []).slice(0, 3),
+        entitySlots: (applicability.entitySlots ?? []).slice(0, 3),
+      } : undefined,
+    ) + (match.skill.frontmatter.tier === 'draft' ? ' [draft — verify output]' : '');
+    const remaining = limits.maxChars - fixedChars - used - lines.length;
+    if (remaining <= 8) break;
+    lines.push(line.length <= remaining ? line : `${line.slice(0, remaining - 1)}…`);
+    used += Math.min(line.length, remaining);
+  }
+  return [header, ...lines, footer].join('\n');
+}
+
 // ─── Capability compounding: distilled draft skills (C1) ─────────────────────
 
 export interface DistilledSkillInput {

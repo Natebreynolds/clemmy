@@ -64,6 +64,50 @@ test('session_history prefers harness transcript and action ledger over same-id 
   assert.doesNotMatch(text, /bg-ghost/);
 });
 
+test('session_history through_seq excludes later turns while retaining pre-bound actions', async () => {
+  const sessionId = 'sess-session-history-through-seq';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Bounded history' });
+  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'HANDOFF-TURN-A-111' } });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'SHEET_UPDATE', targets: ['sheet:before-handoff-222'] },
+  });
+  const boundary = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reply: 'HANDOFF-PROGRESS-333' },
+  });
+  appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'UNRELATED-TURN-B-444' } });
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'CRM_UPDATE', targets: ['record:after-handoff-555'] },
+  });
+
+  const history = registeredToolHandlers().get('session_history');
+  assert.ok(history);
+  const text = resultText(await history!({
+    session_id: sessionId,
+    max_turns: 10,
+    through_seq: boundary.seq,
+  }));
+
+  assert.match(text, /HANDOFF-TURN-A-111/);
+  assert.match(text, /SHEET_UPDATE/);
+  assert.match(text, /sheet:before-handoff-222/);
+  assert.match(text, /HANDOFF-PROGRESS-333/);
+  assert.doesNotMatch(text, /UNRELATED-TURN-B-444/);
+  assert.doesNotMatch(text, /CRM_UPDATE/);
+  assert.doesNotMatch(text, /record:after-handoff-555/);
+});
+
 test('session_resume and session_pause prefer harness continuity over same-id legacy ghost', async () => {
   const sessionId = 'sess-session-continuity-harness';
   createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Harness continuity' });

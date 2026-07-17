@@ -37,7 +37,13 @@ const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { queuePendingAction } = await import('../runtime/harness/pending-actions.js');
-const { appendEvent: appendHarnessEvent, createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent: appendHarnessEvent,
+  beginRunAttempt,
+  createSession: createHarnessSession,
+  finishRunAttempt,
+  recordRunAttemptUserInput,
+} = await import('../runtime/harness/eventlog.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { saveUserMcpServers } = await import('../runtime/mcp-config.js');
 
@@ -52,6 +58,10 @@ interface BoardCard {
   primaryAction?: string;
   nextSafeAction?: string;
   approvalId?: string;
+  attemptId?: string;
+  runScopeId?: string;
+  sourceUserSeq?: number;
+  cancelEndpoint?: string;
   failureSummary?: { failedItems: number; retryable: boolean; reason: string };
   raw?: Record<string, unknown>;
 }
@@ -152,6 +162,58 @@ test('GET /api/console/board normalizes every background-task status into the ri
     assert.equal(byId.get(awaitingContinue.id)?.primaryAction, 'continue');
     assert.equal(byId.get(awaitingInput.id)?.primaryAction, 'none');
     assert.match(byId.get(awaitingInput.id)?.nextSafeAction ?? '', /originating chat/i);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board represents canonical harness attempts with exact identity and fresh terminal controls', async () => {
+  const session = createHarnessSession({
+    id: 'sess-board-canonical-attempt',
+    kind: 'chat',
+    channel: 'desktop',
+    title: 'Create the canonical document',
+  });
+  const legacy = startRun({
+    id: 'run-board-canonical-attempt',
+    sessionId: session.id,
+    channel: 'desktop',
+    source: 'desktop',
+    title: 'Create the canonical document',
+    message: 'Create the canonical document',
+  });
+  const attempt = beginRunAttempt(session.id, { runId: legacy.id });
+  const sourceInput = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Create the canonical document' },
+  });
+
+  const h = await boot();
+  try {
+    const activeRes = await fetch(`${h.url}/api/console/board`);
+    assert.equal(activeRes.status, 200);
+    const activeBody = await activeRes.json() as { cards: BoardCard[] };
+    const active = activeBody.cards.find((candidate) => candidate.attemptId === attempt.attemptId);
+    assert.ok(active, 'latest canonical attempt is represented');
+    assert.equal(active!.id, `harness:${attempt.attemptId}`);
+    assert.equal(active!.sessionId, session.id);
+    assert.equal(active!.runScopeId, `${session.id}::brain:${legacy.id}`);
+    assert.equal(active!.sourceUserSeq, sourceInput.seq);
+    assert.match(active!.cancelEndpoint ?? '', /attemptId=/);
+    assert.deepEqual(active!.actions, ['cancel']);
+    assert.equal(activeBody.cards.some((candidate) => candidate.id === legacy.id), false, 'legacy mirror is deduplicated');
+
+    finishRunAttempt(attempt, 'completed');
+    const terminalRes = await fetch(`${h.url}/api/console/board`);
+    assert.equal(terminalRes.status, 200);
+    const terminalBody = await terminalRes.json() as { cards: BoardCard[] };
+    const terminal = terminalBody.cards.find((candidate) => candidate.attemptId === attempt.attemptId);
+    assert.ok(terminal, 'terminal canonical attempt remains available for drawer reconciliation');
+    assert.equal(terminal!.column, 'done');
+    assert.equal(terminal!.status, 'completed');
+    assert.deepEqual(terminal!.actions, []);
+    assert.equal(terminal!.cancelEndpoint, undefined);
   } finally {
     await h.close();
   }

@@ -15,6 +15,7 @@ import { isConvertibleExtension } from '../runtime/markitdown.js';
 import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { expandLiteralShellCommands } from '../runtime/harness/destination-gate.js';
 import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
 import { SPACES_DIR, isValidSpaceSlug, spaceStore } from '../spaces/store.js';
 
@@ -80,7 +81,7 @@ function needsApprovalUnlessInPlanScope(toolName: string) {
  * shutdown, etc.); this gate is the softer "human-in-the-loop please"
  * checkpoint for ops that mutate state outside Clementine.
  */
-export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
+function oneShellCommandNeedsApproval(rawCommand: unknown): boolean {
   if (typeof rawCommand !== 'string') return true; // unparseable → ask
   const cmd = rawCommand.trim();
   if (!cmd) return true;
@@ -158,6 +159,16 @@ export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
   ];
 
   return DANGER_PATTERNS.some((re) => re.test(stripped));
+}
+
+export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
+  if (typeof rawCommand !== 'string') return true;
+  const expanded = expandLiteralShellCommands(rawCommand);
+  // A real shell -c wrapper whose payload is dynamic, malformed, or deeper than
+  // the inspection bound is executable but not provably read-only. Ask rather
+  // than auto-approving it as harmless quoted text.
+  if (expanded.hasOpaqueShellWrapper) return true;
+  return expanded.commands.some(oneShellCommandNeedsApproval);
 }
 
 /**

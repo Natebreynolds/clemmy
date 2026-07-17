@@ -19,6 +19,7 @@
  * false / '') so a bug in skill verification can never wedge a real completion.
  */
 import { listEvents, getToolOutput } from './eventlog.js';
+import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -315,7 +316,10 @@ export function skillBodyExecutionShortfall(skillName: string, skillBody: string
 export function summarizeToolCallsForJudge(sessionId: string): string {
   try {
     const counts = new Map<string, number>();
-    for (const e of listEvents(sessionId, { types: ['tool_called'] })) {
+    for (const e of projectCanonicalTopLevelToolEvents(
+      listEvents(sessionId, { types: ['tool_called'] }),
+      'tool_called',
+    )) {
       const tool = typeof e.data?.tool === 'string' ? e.data.tool : 'unknown';
       let key = tool;
       if (tool === 'composio_execute_tool') {

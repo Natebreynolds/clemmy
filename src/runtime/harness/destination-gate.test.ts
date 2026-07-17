@@ -18,6 +18,7 @@ import {
   markDestinationNudged,
   ImplicitDestinationError,
   classifyShellNetworkMutation,
+  expandLiteralShellCommands,
   evaluateDestinationProvenance,
   extractExplicitPublishTargets,
   destinationIdentityForms,
@@ -158,7 +159,15 @@ test('classifyShellNetworkMutation: catches the clear send shapes', () => {
     'gh api -X DELETE /repos/o/r/issues/1',
     'gh pr create --title x --body y',
     'gh release create v1 ./dist',
+    'git push origin main',
+    'netlify deploy --prod',
+    'npx netlify-cli sites:create --name client-snapshot',
+    'npm publish',
+    'sf data create record --sobject Account --values "Name=Acme"',
     'sf data update --sobject Account --record-id 001 --values "Name=X"',
+    'docker push registry.example.com/client/app:latest',
+    'kubectl apply -f deployment.yaml',
+    'terraform apply -auto-approve',
     'sendmail a@b.com < msg.txt',
     'echo body | mail -s subj a@b.com',
     'aws s3 cp ./out.html s3://my-bucket/index.html',
@@ -183,11 +192,75 @@ test('classifyShellNetworkMutation: NO false positives on reads / benign command
     'git status',
     'echo "deploy the curl post to mail later"', // words inside a quoted string
     'cat notes-about-sendmail.txt',           // sendmail as part of a filename
-    'netlify deploy --prod',                  // a publish (different gate), not a network-mutation send
+    'npm test -- --runInBand',                // local build/test work
+    'docker build -t local-preview .',         // local compute, not a registry push
+    'kubectl get pods',                        // cluster read
+    'terraform plan',                          // preview only
   ];
   for (const cmd of benign) {
     assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, false, `should NOT flag: ${cmd}`);
   }
+});
+
+test('literal shell -c payloads are classified recursively without scanning arbitrary quoted text', () => {
+  assert.equal(
+    classifyShellNetworkMutation("bash -lc 'curl -X POST https://api.x.com/send -d x=1'").shapeKey,
+    'shell:curl',
+  );
+  assert.equal(
+    classifyShellNetworkMutation(`sh -lc "zsh -c 'git push origin main'"`).shapeKey,
+    'shell:git',
+  );
+  const publish = classifyShellCommand("/bin/zsh -lc 'netlify deploy --prod --site abc'");
+  assert.equal(publish.isPublish, true);
+  assert.equal(publish.hasExplicitDestination, true);
+  assert.equal(publish.isProd, true);
+
+  // The same words are inert data when they are not the command-string operand
+  // of an actual sh/bash/zsh -c invocation.
+  assert.equal(classifyShellNetworkMutation(`echo "bash -lc 'curl -X POST https://x -d x=1'"`).isNetworkMutation, false);
+  assert.equal(classifyShellNetworkMutation(`git commit -m "sh -c 'git push origin main'"`).isNetworkMutation, false);
+});
+
+test('literal shell payloads remain visible through structural env/command launchers', () => {
+  assert.equal(
+    classifyShellNetworkMutation("env FOO=x bash -lc 'curl -X POST https://api.x.com/send -d x=1'").shapeKey,
+    'shell:curl',
+  );
+  assert.equal(
+    classifyShellNetworkMutation("/usr/bin/env -i sh -c 'git push origin main'").shapeKey,
+    'shell:git',
+  );
+  assert.ok(
+    expandLiteralShellCommands("command bash -c 'rm -rf dist'").commands.includes('rm -rf dist'),
+  );
+
+  // Launcher-looking text outside executable position is still inert data.
+  assert.equal(
+    classifyShellNetworkMutation(`echo "env FOO=x bash -lc 'curl -X POST https://x -d x=1'"`).isNetworkMutation,
+    false,
+  );
+  assert.equal(expandLiteralShellCommands('command -v bash').hasOpaqueShellWrapper, false);
+  assert.equal(
+    expandLiteralShellCommands(`env -S "bash -lc 'curl -X POST https://x -d x=1'"`).hasOpaqueShellWrapper,
+    true,
+    'env split-string synthesizes argv and must remain opaque',
+  );
+  for (const command of [
+    `nohup bash -c "curl -X POST https://x -d x=1"`,
+    `nice sh -c "git push origin main"`,
+    `time bash -c "curl -X POST https://x -d x=1"`,
+    `sudo bash -c "curl -X POST https://x -d x=1"`,
+  ]) {
+    assert.equal(classifyShellNetworkMutation(command).isNetworkMutation, true, command);
+  }
+});
+
+test('literal shell expansion has a strict recursion bound and marks deeper code opaque', () => {
+  const command = `sh -lc "bash -lc 'zsh -lc \\"sh -lc \\\'curl -X POST https://x -d x=1\\\'\\"'"`;
+  const expanded = expandLiteralShellCommands(command);
+  assert.ok(expanded.commands.length <= 4, 'root plus at most three literal payloads');
+  assert.equal(expanded.hasOpaqueShellWrapper, true);
 });
 
 test('ImplicitDestinationError carries a recoverable, explicit message', () => {

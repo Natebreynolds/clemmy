@@ -18,10 +18,17 @@ const { __test__ } = await import('./discord-harness.js');
 const {
   createBackgroundTask,
   getBackgroundTask,
+  listBackgroundTasks,
   markBackgroundTaskAwaitingContinue,
   markBackgroundTaskAwaitingInput,
 } = await import('../execution/background-tasks.js');
-const { createSession } = await import('../runtime/harness/eventlog.js');
+const {
+  createSession,
+  getActiveRunAttempt,
+  isKillRequested,
+  recordRunAttemptUserInput,
+} = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -248,4 +255,120 @@ test('stale channel fallback refuses ambiguous parked background questions', asy
   assert.equal(tx.sent.length, 0);
   assert.equal(getBackgroundTask(taskA.id)?.status, 'awaiting_input');
   assert.equal(getBackgroundTask(taskB.id)?.status, 'awaiting_input');
+});
+
+test('typed background control moves the prior exact channel attempt without registering a control attempt', async () => {
+  const channelId = 'chan-exact-background-control';
+  const userId = 'user-exact-background-control';
+  const session = createSession({
+    kind: 'chat',
+    channel: `discord:${channelId}`,
+    userId,
+    metadata: { channelId },
+  });
+  const active = __test__.registerActiveChannelRunForTest({
+    channel: 'discord',
+    channelId,
+    userId,
+    guildId: null,
+    sessionId: session.id,
+  });
+  recordRunAttemptUserInput(active, {
+    turn: 0,
+    role: 'user',
+    data: { text: 'research the firm and prepare its document' },
+  });
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const tx = transport();
+  try {
+    const handled = await __test__.tryHandleBackgroundItControl({
+      message: 'background it',
+      channelId,
+      userId,
+      guildId: null,
+      channel: 'discord',
+      channelLabel: `discord:${channelId}`,
+      transport: tx.api,
+    });
+
+    assert.equal(handled, true);
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, active.attemptId, 'the control does not mint/supersede an attempt');
+    assert.equal(isKillRequested(session.id, active), true, 'the prior exact attempt receives the handoff stop');
+    const created = listBackgroundTasks({ includeArchived: true }).slice(0, 1)[0];
+    assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1);
+    assert.equal(created.foregroundHandoff?.attemptId, active.attemptId);
+    assert.equal(created.source, 'discord');
+    assert.equal(created.channel, `discord:${channelId}`);
+    assert.match(tx.sent[0], /moving .* to the background/i);
+  } finally {
+    __test__.unregisterActiveChannelRunForTest(active, 'cancelled');
+  }
+});
+
+test('typed background control fails closed when no exact channel attempt is active', async () => {
+  const tx = transport();
+  const handled = await __test__.tryHandleBackgroundItControl({
+    message: 'background it',
+    channelId: 'chan-no-background-run',
+    userId: 'user-no-background-run',
+    guildId: null,
+    channel: 'discord',
+    channelLabel: 'discord:chan-no-background-run',
+    transport: tx.api,
+  });
+  assert.equal(handled, true);
+  assert.match(tx.sent[0], /could not find a running turn/i);
+});
+
+test('typed background control explains that a pending approval must be resolved first', async () => {
+  const channelId = 'chan-approval-background-control';
+  const userId = 'user-approval-background-control';
+  const session = createSession({
+    kind: 'chat',
+    channel: `discord:${channelId}`,
+    userId,
+    metadata: { channelId },
+  });
+  const active = __test__.registerActiveChannelRunForTest({
+    channel: 'discord',
+    channelId,
+    userId,
+    guildId: null,
+    sessionId: session.id,
+  });
+  recordRunAttemptUserInput(active, {
+    turn: 0,
+    role: 'user',
+    data: { text: 'send the client email after approval' },
+  });
+  const approval = approvalRegistry.register({
+    sessionId: session.id,
+    channel: 'discord',
+    channelId,
+    subject: 'Send the client email',
+    tool: 'OUTLOOK_SEND_EMAIL',
+    args: { to: 'client@example.com' },
+  });
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const tx = transport();
+  try {
+    const handled = await __test__.tryHandleBackgroundItControl({
+      message: 'background it',
+      channelId,
+      userId,
+      guildId: null,
+      channel: 'discord',
+      channelLabel: `discord:${channelId}`,
+      transport: tx.api,
+    });
+
+    assert.equal(handled, true);
+    assert.equal(listBackgroundTasks({ includeArchived: true }).length, before);
+    assert.equal(isKillRequested(session.id, active), false);
+    assert.match(tx.sent[0], /waiting on an approval/i);
+    assert.match(tx.sent[0], /approve or reject/i);
+  } finally {
+    approvalRegistry.resolve(approval.approvalId, 'cancelled_by_user', 'test-cleanup');
+    __test__.unregisterActiveChannelRunForTest(active, 'cancelled');
+  }
 });

@@ -14,6 +14,9 @@ import {
 } from '../config.js';
 import {
   bindDiscordHarnessSession,
+  handleHarnessCancel,
+  isChannelSessionAwaitingApproval,
+  requestBoundChannelRunStop,
   tryHandleHarnessApprovalReply,
   type DiscordHarnessTransport,
 } from './discord-harness.js';
@@ -584,6 +587,30 @@ export function buildSlackActionsForNotification(metadata: Record<string, unknow
 }
 
 // ── Inbound message dispatch ───────────────────────────────────────────────
+interface SlackRunStopControl {
+  /** Bare `cancel` keeps the established paused-session fallback; `/cancel`
+   *  is the explicit form of that same command. */
+  fallbackToPausedCancel: boolean;
+  /** A conversational stop/cancel first answers the approval Clementine is
+   *  currently asking about. `/cancel` remains the explicit abandon-session
+   *  command and therefore does not masquerade as a rejection. */
+  rejectRelevantApprovalFirst: boolean;
+}
+
+function parseSlackRunStopControl(prompt: string): SlackRunStopControl | null {
+  const text = prompt.trim().toLowerCase().replace(/[.!?]+$/, '').trim();
+  if (text === '/cancel') {
+    return { fallbackToPausedCancel: true, rejectRelevantApprovalFirst: false };
+  }
+  if (text === 'cancel') {
+    return { fallbackToPausedCancel: true, rejectRelevantApprovalFirst: true };
+  }
+  if (/^(stop|halt|abort|kill it|stop it|stop (?:the )?run|cancel[- ](?:the[- ]?)?run)$/.test(text)) {
+    return { fallbackToPausedCancel: false, rejectRelevantApprovalFirst: true };
+  }
+  return null;
+}
+
 async function dispatchInbound(opts: {
   client: WebClient;
   channelId: string;
@@ -609,15 +636,46 @@ async function dispatchInbound(opts: {
   // Approval-resume shortcut: "approve apr-xxxx" while a session is paused.
   const transport = buildSlackHarnessTransport({ client: opts.client, channel: opts.channelId, threadTs: opts.threadTs });
   const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs);
+  const stopControl = parseSlackRunStopControl(opts.prompt);
   try {
     const handled = await tryHandleHarnessApprovalReply({
       channelId: conversationId,
-      prompt: opts.prompt,
+      // Approval remains the highest-priority state. A bare stop/cancel means
+      // "reject the action you just asked me about" when this exact Slack
+      // conversation has one; unrelated global approvals are filtered by the
+      // shared channel-aware resolver.
+      prompt: stopControl?.rejectRelevantApprovalFirst ? 'reject' : opts.prompt,
       transport,
       allowGlobalApprovalFallback: !opts.threadTs, // DMs (no thread) allow the global fallback, like Discord DMs
       channel: 'slack',
     });
     if (handled) {
+      completeInbound({ ...inboxKey, status: 'replied' });
+      return;
+    }
+    if (stopControl) {
+      const explicitPausedCancel = opts.prompt.trim().toLowerCase() === '/cancel'
+        && isChannelSessionAwaitingApproval(conversationId, 'slack');
+      const stopped = requestBoundChannelRunStop({
+        channelId: conversationId,
+        channel: 'slack',
+        reason: 'stopped from Slack',
+      });
+      if (stopped && !explicitPausedCancel) {
+        await transport.sendInitial('⏹ Stopping the current Slack run. It will halt at the next safe boundary.');
+        completeInbound({ ...inboxKey, status: 'replied' });
+        return;
+      }
+      if (!stopControl.fallbackToPausedCancel) {
+        await transport.sendInitial('Nothing is actively running in this Slack conversation. Pending approvals in other chats were left untouched.');
+        completeInbound({ ...inboxKey, status: 'replied' });
+        return;
+      }
+      // Preserve the established bare-/slash-cancel semantics without entering
+      // model preflight. For an explicit /cancel on a paused approval we have
+      // ALSO latched the exact attempt above; this resolves the approval as
+      // cancelled_by_user and clears the durable interrupt/session binding.
+      await handleHarnessCancel({ channelId: conversationId, transport, channel: 'slack' });
       completeInbound({ ...inboxKey, status: 'replied' });
       return;
     }
@@ -1324,4 +1382,6 @@ export const __test__ = {
   stripMention,
   buildSuggestedPrompts,
   buildAppHomeBlocks,
+  dispatchInbound,
+  parseSlackRunStopControl,
 };

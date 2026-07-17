@@ -13,6 +13,7 @@ import {
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
+import { toolCallCorrelationFingerprint } from '../runtime/harness/tool-correlation.js';
 import { textResult } from './shared.js';
 
 function previewArgs(input: unknown): Record<string, unknown> {
@@ -114,6 +115,8 @@ export function gatedMutationsEnabled(): boolean {
 export interface RegisterGatedMutatingToolsOptions {
   enabled?: boolean;
   sessionId?: string;
+  runScopeId?: string;
+  sourceUserSeq?: number;
 }
 
 /**
@@ -126,6 +129,12 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
   if (!enabled) return;
   const sessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
   if (!sessionId) return;
+  const runScopeId = opts.runScopeId?.trim() || process.env.CLEMENTINE_MCP_RUN_SCOPE_ID?.trim() || undefined;
+  const sourceUserSeq = (() => {
+    if (Number.isSafeInteger(opts.sourceUserSeq) && (opts.sourceUserSeq ?? 0) > 0) return opts.sourceUserSeq;
+    const value = Number.parseInt(process.env.CLEMENTINE_MCP_SOURCE_USER_SEQ ?? '', 10);
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  })();
 
   const byName = new Map<string, InvokableTool>();
   for (const t of [...getComputerTools(), ...getComposioRuntimeTools()] as InvokableTool[]) {
@@ -144,6 +153,11 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
       async (rawInput: Record<string, unknown>) => {
         const counter = new ToolCallsCounter(PER_CALL_COUNTER_LIMIT);
         const callId = `mcp-${randomUUID()}`;
+        // Compute this from the original full MCP payload before previewArgs
+        // clips long strings. The canonical SDK row computes the same digest,
+        // allowing one logical call to be reconstructed without storing another
+        // copy of a long email/document/shell payload.
+        const correlationFingerprint = toolCallCorrelationFingerprint(name, rawInput);
         // STRICT-MODE NORMALIZATION (the crux of the gated lane's reliability).
         // The real @openai/agents tool defs run under SDK strict mode: optional
         // fields are declared `.nullable()` (NOT `.optional()`), so the strict
@@ -169,15 +183,32 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
         // tool_called before and a tool_returned (with ok/error) after — also the
         // single source of truth for diagnosing gated-call failures.
         try {
-          appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: name, callId, args: previewArgs(input) } });
+          appendEvent({
+            sessionId,
+            turn: 0,
+            role: 'Clem',
+            type: 'tool_called',
+            data: {
+              tool: name,
+              callId,
+              args: previewArgs(input),
+              accounting: 'transport_mirror',
+              correlationFingerprint,
+            },
+          });
         } catch { /* telemetry must never block the call */ }
         try {
-          const out = await withHarnessRunContext({ sessionId, counter }, () =>
+          const out = await withHarnessRunContext({
+            sessionId,
+            counter,
+            behaviorScopeId: runScopeId,
+            ...(sourceUserSeq ? { sourceUserSeq } : {}),
+          }, () =>
             wrapped.invoke!(runContext, JSON.stringify(input ?? {}), details),
           );
           const text = typeof out === 'string' ? out : out == null ? '' : JSON.stringify(out);
           try {
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: true, preview: text.slice(0, 400) } });
+            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: true, preview: text.slice(0, 400), accounting: 'transport_mirror' } });
           } catch { /* best-effort */ }
           // Token efficiency (parity with the Codex lane, computer-tools.ts): digest a
           // large result + park the full payload in tool_outputs keyed by this
@@ -189,7 +220,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: false, error: message.slice(0, 400) } });
+            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: false, error: message.slice(0, 400), accounting: 'transport_mirror' } });
           } catch { /* best-effort */ }
           throw err;
         }

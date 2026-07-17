@@ -128,7 +128,7 @@ test('Autonomy section: balanced (default) renders NO autonomy line (byte-identi
   assert.doesNotMatch(context, /## Autonomy/);
 });
 
-test('persistent context includes compact installed skills index', () => {
+test('stable context carries compact skill discovery while the volatile query gets only relevant skills', () => {
   const skillDir = path.join(TMP_HOME, 'skills', 'proposal-style');
   mkdirSync(skillDir, { recursive: true });
   writeFileSync(
@@ -144,10 +144,20 @@ test('persistent context includes compact installed skills index', () => {
     'utf-8',
   );
 
-  const context = renderHarnessMemoryContext();
-  assert.match(context, /## Available Skills/);
-  assert.match(context, /`proposal-style`: Brand rules for polished proposal artifacts\./);
-  assert.doesNotMatch(context, /Full body should remain behind skill_read/);
+  const stable = renderHarnessMemoryContext({ partition: 'stable' });
+  assert.match(stable, /## Skill Discovery/);
+  assert.match(stable, /skill_list\(\)/);
+  assert.doesNotMatch(stable, /`proposal-style`/, 'installed names do not bloat or churn the stable prefix');
+
+  const relevant = renderHarnessMemoryContext({
+    query: 'Create a polished proposal document for a client.',
+    partition: 'volatile',
+  });
+  assert.match(relevant, /## Relevant Skills/);
+  assert.equal((relevant.match(/## Relevant Skills/g) ?? []).length, 1, 'canonical volatile context injects one menu');
+  assert.doesNotMatch(relevant, /## Skill Discovery/, 'volatile context does not repeat the stable discovery pointer');
+  assert.match(relevant, /`proposal-style`: Brand rules for polished proposal artifacts\./);
+  assert.doesNotMatch(relevant, /Full body should remain behind skill_read/);
 });
 
 test('stale focus is not rendered as active persistent context', () => {
@@ -192,6 +202,7 @@ test('partition: stable EXCLUDES the volatile tail (Now / query recall / Current
   assert.match(stable, /## Persistent Facts/);
   assert.doesNotMatch(stable, /## Now/);
   assert.doesNotMatch(stable, /## Relevant To Your Request/);
+  assert.doesNotMatch(stable, /## Relevant Skills/);
   assert.doesNotMatch(stable, /## Current Focus/);
 
   const volatile = renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'volatile' });

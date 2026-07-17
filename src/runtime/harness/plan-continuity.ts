@@ -336,6 +336,7 @@ export interface PlanContinuityRouteInput {
   sessionId: string;
   autonomy?: AutoApproveScope;
   sendNote?: (message: string) => Promise<void> | void;
+  reuseRecordedUserInput?: boolean;
 }
 
 export interface PlanContinuityRouteResult {
@@ -434,6 +435,7 @@ export async function routeOpenQuestionPlan(
       freshSession: false,
       autonomy: input.autonomy,
       priorAnswers: answers ?? input.input,
+      reuseRecordedUserInput: input.reuseRecordedUserInput,
       // No `force`: plan-first is now opt-in (commit 396ba57). Let
       // shouldUsePlanFirst gate this re-entry like everywhere else — an
       // explicit-plan originating request ("draft me a plan…") still
@@ -456,6 +458,7 @@ export async function routeOpenQuestionPlan(
       channel: input.channel,
       freshSession: false,
       autonomy: input.autonomy,
+      reuseRecordedUserInput: input.reuseRecordedUserInput,
       // No `force`: see the answers branch above. An explicit "resume"
       // of an explicit-plan request still re-surfaces the plan; an
       // ordinary resumed request returns {surfaced:false} → handled:false

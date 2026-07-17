@@ -24,7 +24,16 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 // v0.5.20 Bug K — live presence reads pending approvals + active
 // workflow sessions to drive what shows in the Discord bot status.
 const listPendingHarnessApprovals = approvalRegistry.listPending;
-import { listSessions as listHarnessSessions } from '../runtime/harness/eventlog.js';
+import {
+  beginRunAttempt,
+  createSession as createHarnessSession,
+  finishRunAttempt,
+  getActiveRunAttempt,
+  getSession as getHarnessSession,
+  listSessions as listHarnessSessions,
+  requestKill,
+  type RunAttemptRef,
+} from '../runtime/harness/eventlog.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
@@ -41,8 +50,11 @@ import {
 } from '../config.js';
 import {
   bindDiscordHarnessSession,
+  getBoundDiscordHarnessSessionId,
   handleDiscordHarnessMessage,
   handleHarnessSessions,
+  resolveActiveDiscordHarnessRuns,
+  resolveBoundChannelRunAttempt,
   runDiscordHarnessConversation,
   type DiscordHarnessTransport,
   tryHandleHarnessApprovalReply,
@@ -73,7 +85,7 @@ import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from 
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
 import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
-import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
+import { cancelBackgroundTask, queueBackgroundTaskApprovalResolution, listBackgroundTasks } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 
 const logger = pino({ name: 'clementine-next.discord' });
@@ -918,6 +930,12 @@ function relevantHarnessApprovalsForContext(input: {
 }): approvalRegistry.PendingApprovalRow[] {
   const rows = approvalRegistry.listPending({ status: 'pending' })
     .filter((row) => approvalRegistry.isActionable(row));
+  // Never pull another Discord channel's approval into this chat merely
+  // because it is globally pending. But a DM keeps the non-Discord fallback
+  // (restored in the fold — review wf_30a7ce7e-e9c #9): workflow/background
+  // approvals carry no Discord channelId, and the DM is the user's only
+  // Discord surface for seeing and resolving them — dropping the fallback made
+  // a parked workflow write invisible and unresolvable until it expired.
   if (input.guildId) return rows.filter((row) => row.channelId === input.channelId);
   return rows.filter((row) => row.channelId === input.channelId || !isDiscordHarnessRow(row));
 }
@@ -1136,8 +1154,8 @@ export function buildActionsForNotification(metadata: Record<string, unknown> | 
 
 function relevantApprovalsForMessage(message: Message<boolean>, approvals: PendingApproval[]): PendingApproval[] {
   const channel = buildChannelLabel(message);
-  const owned = approvals.filter((approval) => approval.userId === message.author.id || approval.channel === channel);
-  return owned.length > 0 ? owned : approvals;
+  return approvals.filter((approval) => approval.channel === channel
+    || (!approval.channel && approval.userId === message.author.id));
 }
 
 function relevantApprovalsForContext(input: {
@@ -1146,8 +1164,8 @@ function relevantApprovalsForContext(input: {
   guildId?: string | null;
 }, approvals: PendingApproval[]): PendingApproval[] {
   const channel = buildChannelLabelFromParts(input.channelId, input.guildId);
-  const owned = approvals.filter((approval) => approval.userId === input.userId || approval.channel === channel);
-  return owned.length > 0 ? owned : approvals;
+  return approvals.filter((approval) => approval.channel === channel
+    || (!approval.channel && approval.userId === input.userId));
 }
 
 type NaturalApprovalAction = 'approve_one' | 'approve_all' | 'reject_one' | 'reject_all';
@@ -1398,16 +1416,42 @@ async function runGatewayPrompt(input: {
     userId: input.userId,
     guildId: input.guildId ?? undefined,
   });
-
-  return new ClementineGateway(input.assistant).handleMessage({
-    message: input.prompt,
-    sessionId,
-    userId: input.userId,
-    channel: buildChannelLabelFromParts(input.channelId, input.guildId),
-    source: 'discord',
-    onChunk: input.onChunk,
-    onToolActivity: input.onToolActivity,
-  });
+  if (!getHarnessSession(sessionId)) {
+    createHarnessSession({
+      id: sessionId,
+      kind: 'chat',
+      channel: buildChannelLabelFromParts(input.channelId, input.guildId),
+      userId: input.userId,
+      title: input.prompt.trim().slice(0, 80),
+      metadata: { source: 'discord-gateway', channelId: input.channelId, guildId: input.guildId ?? null },
+    });
+  }
+  // Register before ClementineGateway's async preflight so a concurrent stop
+  // message cannot land in the gap and then be erased by brain startup.
+  const attempt = beginRunAttempt(sessionId);
+  const activeKey = discordGatewayRunKey(input);
+  const activeRuns = activeDiscordGatewayRuns.get(activeKey) ?? new Map<string, { sessionId: string; attempt: RunAttemptRef }>();
+  activeRuns.set(attempt.attemptId, { sessionId, attempt });
+  activeDiscordGatewayRuns.set(activeKey, activeRuns);
+  let status: 'completed' | 'cancelled' | 'failed' = 'failed';
+  try {
+    const response = await new ClementineGateway(input.assistant).handleMessage({
+      message: input.prompt,
+      sessionId,
+      userId: input.userId,
+      channel: buildChannelLabelFromParts(input.channelId, input.guildId),
+      source: 'discord',
+      runId: attempt.attemptId,
+      onChunk: input.onChunk,
+      onToolActivity: input.onToolActivity,
+    });
+    status = response.stoppedReason === 'cancelled' ? 'cancelled' : 'completed';
+    return response;
+  } finally {
+    try { finishRunAttempt(attempt, status); } catch { /* control telemetry best-effort */ }
+    activeRuns.delete(attempt.attemptId);
+    if (activeRuns.size === 0) activeDiscordGatewayRuns.delete(activeKey);
+  }
 }
 
 async function continueDiscordSessionFromButton(input: {
@@ -1428,16 +1472,168 @@ async function continueDiscordSessionFromButton(input: {
 
 export const __test__ = {
   continueDiscordSessionFromButton,
+  runGatewayPrompt,
   renderGatewayTail,
   renderApprovalCardContent,
   renderHarnessApprovalCardContent,
   approvalResultText,
   buildDiscordRestTransport,
+  relevantApprovalsForContext,
+  stopDiscordContext,
 };
+
+const DISCORD_STOP_CONTROL_RE = /^(stop|halt|abort|kill it|stop it|cancel the run|stop the run)$/i;
+
+const activeDiscordGatewayRuns = new Map<string, Map<string, { sessionId: string; attempt: RunAttemptRef }>>();
+
+function discordGatewayRunKey(input: { channelId: string; userId: string; guildId?: string | null }): string {
+  return `${input.guildId ?? 'dm'}:${input.channelId}:${input.userId}`;
+}
+
+interface DiscordStopResult {
+  stoppedSessionIds: string[];
+  stoppedTaskIds: string[];
+  detail: string;
+}
+
+function backgroundTaskBelongsToDiscordContext(
+  task: ReturnType<typeof listBackgroundTasks>[number],
+  input: { channelId: string; userId: string; guildId?: string | null },
+  contextSessionIds: Set<string>,
+): boolean {
+  if (task.originSessionId && contextSessionIds.has(task.originSessionId)) return true;
+  if (contextSessionIds.has(task.runSessionId)) return true;
+  if (task.channel === buildChannelLabelFromParts(input.channelId, input.guildId)) return true;
+  const target = task.reportBackTarget;
+  if (target?.type === 'discord_channel' && target.channelId === input.channelId) return true;
+  if (target?.type === 'discord_user' && target.userId === input.userId) return true;
+  return false;
+}
+
+/** Resolve and stop the concrete work executing for one Discord context. */
+function stopDiscordContext(input: {
+  channelId: string;
+  userId: string;
+  guildId?: string | null;
+}): DiscordStopResult {
+  const contextSessionIds = new Set<string>();
+  const targets = new Map<string, { sessionId: string; attempt: RunAttemptRef }>();
+
+  for (const active of resolveActiveDiscordHarnessRuns(input)) {
+    contextSessionIds.add(active.sessionId);
+    targets.set(active.attemptId, { sessionId: active.sessionId, attempt: active });
+  }
+
+  const boundHarnessSession = getBoundDiscordHarnessSessionId(input.channelId);
+  if (boundHarnessSession) contextSessionIds.add(boundHarnessSession);
+  const boundHarnessRun = resolveBoundChannelRunAttempt({ channelId: input.channelId, channel: 'discord' });
+  if (boundHarnessRun) {
+    contextSessionIds.add(boundHarnessRun.sessionId);
+    // Keying by attempt id intentionally collapses the durable SQLite result
+    // with the process-local activeChannelRuns entry. After a restart only the
+    // former exists; before a restart both describe the same physical run.
+    targets.set(boundHarnessRun.attempt.attemptId, boundHarnessRun);
+  }
+
+  // The non-harness Discord gateway uses its own continuity id. Include it only
+  // when an attempt is truly active; never create a stale session-level latch.
+  for (const gateway of activeDiscordGatewayRuns.get(discordGatewayRunKey(input))?.values() ?? []) {
+    contextSessionIds.add(gateway.sessionId);
+    targets.set(gateway.attempt.attemptId, gateway);
+  }
+
+  const stoppedSessionIds: string[] = [];
+  for (const target of targets.values()) {
+    try {
+      requestKill(target.sessionId, 'stopped from Discord', target.attempt);
+      stoppedSessionIds.push(target.sessionId);
+    } catch (err) {
+      logger.warn({ err, sessionId: target.sessionId }, 'Failed to latch Discord stop to active run attempt');
+    }
+  }
+
+  const stoppedTaskIds: string[] = [];
+  const stoppedTaskLabels: string[] = [];
+  for (const task of listBackgroundTasks()) {
+    if (![
+      'pending',
+      'running',
+      'cancelling',
+      'awaiting_approval',
+      'awaiting_input',
+      'awaiting_continue',
+    ].includes(task.status)) continue;
+    if (!backgroundTaskBelongsToDiscordContext(task, input, contextSessionIds)) continue;
+    if (task.status === 'running' || task.status === 'cancelling') {
+      const activeAttempt = getActiveRunAttempt(task.runSessionId);
+      if (activeAttempt) {
+        try {
+          requestKill(task.runSessionId, 'stopped from Discord', activeAttempt);
+        } catch { /* task-state cancellation below remains authoritative */ }
+      }
+    }
+    if (task.status !== 'cancelling') cancelBackgroundTask(task.id, 'Stopped from Discord.');
+    stoppedTaskIds.push(task.id);
+    stoppedTaskLabels.push(`background task “${(task.title || 'untitled task').slice(0, 70)}”`);
+  }
+
+  const labels = [
+    ...(stoppedSessionIds.length === 0
+      ? []
+      : [stoppedSessionIds.length === 1 ? 'the current chat run' : `${stoppedSessionIds.length} active chat runs`]),
+    ...stoppedTaskLabels,
+  ];
+  return {
+    stoppedSessionIds,
+    stoppedTaskIds,
+    detail: labels.length > 0
+      ? `⏹ Stopping ${labels.slice(0, 4).join(', ')}${labels.length > 4 ? `, +${labels.length - 4} more` : ''}. It will halt at the next safe boundary.`
+      : 'Nothing is actively running in this Discord conversation. Pending approvals in other chats were left untouched.',
+  };
+}
 
 async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {
   const normalized = normalizeCommandText(prompt);
   const runtime = assistant.getRuntime();
+
+  // TURN-CONTROL SPINE (2026-07-16 incident: "i couldnt even stop it from
+  // discord"): a bare stop/halt/abort with NO pending approval kills the
+  // channel's ACTIVE run. Approval vocabulary keeps priority — when an
+  // approval is pending, "stop"/"cancel" still mean reject (the
+  // resolveNaturalApproval below handles it first because we require zero
+  // pending approvals here). requestKill is a one-shot latch the run's
+  // kill-aware shouldCancel + canUseTool gate now actually observe.
+  if (DISCORD_STOP_CONTROL_RE.test(normalized)) {
+    const naturalApproval = detectNaturalApprovalAction(normalized);
+    const relevantRuntimeApprovals = relevantApprovalsForMessage(message, runtime.listPendingApprovals());
+    if (naturalApproval && DISCORD_HARNESS_ENABLED) {
+      // `stop` is intentionally not a global approval synonym. Re-offer it as
+      // an explicit rejection only to the contextual harness resolver, which
+      // proves the approval belongs to this channel/linked DM before acting.
+      const handled = await tryHandleHarnessApprovalReply({
+        channelId: message.channelId,
+        prompt: 'reject',
+        transport: buildDiscordMessageHarnessTransport(message),
+        // Safe for guilds too: the fallback now proves a durable
+        // origin/report-back/session link to this exact conversation.
+        allowGlobalApprovalFallback: true,
+      });
+      if (handled) return true;
+    }
+    // "stop" is rejection vocabulary only when THIS conversation actually has
+    // an approval waiting. An unrelated global approval must never swallow the
+    // user's attempt to stop their live run.
+    if (!naturalApproval || relevantRuntimeApprovals.length === 0) {
+      const stopped = stopDiscordContext({
+        channelId: message.channelId,
+        userId: message.author.id,
+        guildId: message.guildId,
+      });
+      await sendChunks(message.channel, stopped.detail, message);
+      return true;
+    }
+    // fall through — the relevant approval resolver owns stop/cancel as reject.
+  }
 
   if (isSessionsCommand(normalized)) {
     await handleHarnessSessions({
@@ -1595,6 +1791,25 @@ async function handleDiscordRestCommand(input: {
   const normalized = normalizeCommandText(input.prompt);
   const runtime = input.assistant.getRuntime();
   const send = (text: string) => sendDiscordRestChunks(input.channelId, text);
+
+  if (DISCORD_STOP_CONTROL_RE.test(normalized)) {
+    const naturalApproval = detectNaturalApprovalAction(normalized);
+    const relevantRuntimeApprovals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
+    if (naturalApproval && DISCORD_HARNESS_ENABLED) {
+      const handled = await tryHandleHarnessApprovalReply({
+        channelId: input.channelId,
+        prompt: 'reject',
+        transport: buildDiscordRestTransport(input.channelId),
+        allowGlobalApprovalFallback: true,
+      });
+      if (handled) return true;
+    }
+    if (!naturalApproval || relevantRuntimeApprovals.length === 0) {
+      const stopped = stopDiscordContext(input);
+      await send(stopped.detail);
+      return true;
+    }
+  }
 
   if (isSessionsCommand(normalized)) {
     await handleHarnessSessions({

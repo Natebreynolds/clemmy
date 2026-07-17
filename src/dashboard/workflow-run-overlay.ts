@@ -1,5 +1,6 @@
 import type { AttemptRecord, WorkflowEvent, WorkflowEventKind } from '../execution/workflow-events.js';
 import type { WorkflowExecutionPlan, WorkflowToolReadiness, WorkflowToolReadinessItem } from './workflow-execution-plan.js';
+import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 
 export type WorkflowRunGraphStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 export type WorkflowRunGraphAttentionLevel = 'none' | 'watch' | 'blocked' | 'failed';
@@ -1045,6 +1046,10 @@ function applyHarnessEventToStep(step: MutableStepOverlay, event: WorkflowRunHar
   const type = event.type;
   const data = event.data ?? {};
   if (type === 'tool_called') {
+    // The inner MCP row is retained in the raw trace, but the workflow overlay
+    // reports logical actions. Counting it here would double every native SDK
+    // gateway call and distort step cost/efficiency diagnostics.
+    if (!isCanonicalTopLevelToolEvent(event, 'tool_called')) return;
     step.harnessToolEvents += 1;
     pushUnique(step.tools, toolNameFromHarnessRecord(data));
     return;

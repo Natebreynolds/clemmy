@@ -15,6 +15,7 @@ export interface CanonicalContextPack {
   inputPreview: string;
   sessionId?: string;
   sessionKind?: string;
+  sourceUserSeq?: number;
   memory: MemoryPrimerSummary;
   turn: AgentContextPacket;
   diagnostics: {
@@ -29,7 +30,12 @@ export interface BuildCanonicalContextPackOptions {
   memory: MemoryPrimerSummary;
   sessionId?: string;
   sessionKind?: string;
+  sourceUserSeq?: number;
   includeMemoryDiagnostics?: boolean;
+  /** True when `input` is a synthetic/substituted turn input (continuation
+   *  nudge classified against a goal objective, stall-retry boilerplate) —
+   *  the confirm beat must never evaluate those as a fresh user ask. */
+  suppressConfirmBeat?: boolean;
 }
 
 function clip(text: string, max: number): string {
@@ -51,6 +57,8 @@ export function buildCanonicalContextPack(opts: BuildCanonicalContextPackOptions
   const turn = buildAgentContextPacket(opts.input, opts.memory, {
     sessionId: opts.sessionId,
     sessionKind: opts.sessionKind,
+    sourceUserSeq: opts.sourceUserSeq,
+    suppressConfirmBeat: opts.suppressConfirmBeat,
   });
 
   let stableMemoryAvailable = false;

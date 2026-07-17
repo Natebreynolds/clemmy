@@ -90,6 +90,26 @@ test('isMutatingExternalWrite: OUTLOOK_LIST_MESSAGES is a read', () => {
   );
 });
 
+test('isMutatingExternalWrite: CALL is a read object after GET/LIST/RETRIEVE', () => {
+  for (const slug of ['GONG_GET_CALL_TRANSCRIPT', 'VAPI_RETRIEVE_CALL', 'TWILIO_LIST_CALLS']) {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: slug }),
+      false,
+      slug,
+    );
+  }
+  assert.equal(
+    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GONG_GET_CALL_AND_UPDATE_CONTACT' }),
+    true,
+    'another mutation token must still win',
+  );
+  assert.equal(
+    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'VAPI_CREATE_CALL' }),
+    true,
+    'placing a call remains a mutation',
+  );
+});
+
 test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_UPDATE is a write (BATCH verb)', () => {
   assert.equal(
     isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_UPDATE' }),

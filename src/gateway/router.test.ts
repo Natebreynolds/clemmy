@@ -337,6 +337,30 @@ test('gateway records max-turns-with-grace as a non-completed run', async () => 
   assert.match(run?.error ?? '', /continue|budget/i);
 });
 
+test('gateway records an intentionally stopped run as cancelled exactly once', async () => {
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({
+      text: 'Stopped.',
+      sessionId: req.sessionId,
+      stoppedReason: 'cancelled',
+    }),
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'Answer this short prompt.',
+    sessionId: 'sess-gateway-cancelled',
+    channel: 'mobile',
+    source: 'mobile',
+    runId: 'run-gateway-cancelled',
+  });
+
+  assert.equal(response.stoppedReason, 'cancelled');
+  const run = getRun('run-gateway-cancelled');
+  assert.equal(run?.status, 'cancelled');
+  assert.equal(run?.events.filter((event) => event.type === 'cancelled').length, 1);
+  assert.equal(run?.events.filter((event) => event.type === 'failed').length, 0);
+});
+
 test('gateway returns and records model route diagnostics', async () => {
   const gateway = new ClementineGateway({
     respond: async (req: { sessionId: string }) => ({

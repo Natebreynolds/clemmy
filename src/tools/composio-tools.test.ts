@@ -17,6 +17,8 @@ const {
   formatComposioExecuteOutput,
   detectComposioFailure,
   composioThrownErrorOutput,
+  composioUncertainMutationOutput,
+  runComposioExecuteForTest,
   asyncResultItemCount,
   formatComposioBudgetExceededOutput,
   normalizeInlineConnectedAccountId,
@@ -85,6 +87,31 @@ test('formatComposioToolOutput falls back to a non-recallable clip without harne
   assert.doesNotMatch(output, /recall_tool_result/);
 });
 
+test('ambiguous Composio mutation errors never replay the provider dispatch', async () => {
+  let dispatches = 0;
+  const output = await runComposioExecuteForTest(
+    'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    { title: 'One document', markdown_text: '# Snapshot' },
+    async () => {
+      dispatches += 1;
+      throw new Error('Socket timeout after provider accepted the request');
+    },
+  );
+  assert.equal(dispatches, 1, 'a create crosses the provider boundary at most once');
+  assert.match(output, /provider-dispatch:uncertain/);
+  assert.match(output, /Do NOT repeat this mutation/);
+  assert.doesNotMatch(output, /Retry this EXACT call/i);
+});
+
+test('the uncertain mutation corrective never claims a remote write failed', () => {
+  const output = composioUncertainMutationOutput(new Error('503 Service unavailable'), {
+    toolName: 'composio_execute_tool',
+    toolSlug: 'OUTLOOK_SEND_EMAIL',
+  });
+  assert.match(output, /MAY already exist/);
+  assert.match(output, /matching list\/get\/search action/);
+});
+
 test('normalizeInlineConnectedAccountId lifts accidental inner connection metadata out of provider args', () => {
   const args = {
     connected_account_id: 'ca_live_outlook',
@@ -112,6 +139,15 @@ test('normalizeInlineConnectedAccountId lets the explicit outer connection win a
   const junk = normalizeInlineConnectedAccountId({ connected_account_id: 'null', q: 'x' }, undefined);
   assert.equal(junk.connectedAccountId, undefined);
   assert.deepEqual(junk.args, { q: 'x' });
+});
+
+test('normalizeInlineConnectedAccountId strips Clementine artifact-slot metadata before provider validation', () => {
+  const normalized = normalizeInlineConnectedAccountId({
+    artifact_key: 'appendix',
+    outputKey: 'client-copy',
+    title: 'Appendix',
+  }, undefined);
+  assert.deepEqual(normalized.args, { title: 'Appendix' });
 });
 
 test('applySuppressedComposioConnectionPolicy repairs stale pins for read-only Composio calls', () => {

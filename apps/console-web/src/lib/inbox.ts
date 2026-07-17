@@ -35,6 +35,10 @@ export interface RunRow {
   completedAt?: string;
   outputPreview?: string;
   error?: string;
+  canCancel?: boolean;
+  cancelEndpoint?: string;
+  canBackground?: boolean;
+  backgroundEndpoint?: string;
 }
 
 export interface NotificationRow {

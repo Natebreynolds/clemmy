@@ -8,7 +8,7 @@ import { getRecallObjective } from '../memory/focus.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderLearnedBlocks, renderAutonomy, renderCurrentTimeForInstructions, renderFocusForInstructions } from '../agents/harness-context.js';
-import { renderSkillsIndex } from '../memory/skill-store.js';
+import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import type { MessageIntent } from './message-intent.js';
@@ -223,7 +223,7 @@ export function tieredContextEnabled(): boolean {
 
 // CANON-SELFASM kill-switch (default ON). The chat assembler historically
 // omitted four blocks the harness always injects — Now/date, Autonomy, Current
-// Focus, Available Skills — so chat/Discord-default/mobile/bg turns did date
+// Focus, Skill Discovery — so chat/Discord-default/mobile/bg turns did date
 // math against the training cutoff and never saw the active focus or installed
 // skills. We port them byte-faithfully from the harness (same render functions).
 export function chatContextParityEnabled(): boolean {
@@ -242,15 +242,21 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const connectedTools = section('Connected Tools', buildIntegrationsContext());
 
   // CANON-SELFASM parity blocks (chat was missing all four vs the harness).
-  // Now/date + Current Focus are DYNAMIC (per-turn); Autonomy + Available Skills
-  // are stable enough to ride the cached Tier-1 prefix.
+  // Now/date + Current Focus are DYNAMIC (per-turn); Autonomy + the fixed-size
+  // Skill Discovery pointer are stable enough to ride the cached Tier-1 prefix.
   const parityOn = chatContextParityEnabled();
   const nowBlock = parityOn ? section('Now', renderCurrentTimeForInstructions()) : '';
   const autonomyBlock = parityOn ? section('Autonomy', renderAutonomy()) : '';
   const focusBlock = parityOn ? section('Current Focus', renderFocusForInstructions()) : '';
   let skillsBlock = '';
+  let relevantSkillsBlock = '';
   if (parityOn) {
-    try { skillsBlock = section('Available Skills', renderSkillsIndex()); } catch { skillsBlock = ''; }
+    try { skillsBlock = section('Skill Discovery', renderSkillDiscoveryPrompt()); } catch { skillsBlock = ''; }
+    // Tiered mode injects this once in buildTurnContextBlock. Only the legacy
+    // unsplit path needs to compute it here.
+    if (!tieredContextEnabled()) {
+      try { relevantSkillsBlock = section('Relevant Skills', renderRelevantSkillsForPrompt(message ?? '')); } catch { relevantSkillsBlock = ''; }
+    }
   }
 
   // ── Tier-1: stable Constitution — voice + reasoning rules + SOUL/identity/
@@ -323,6 +329,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
     longTermMemory,
     section('Active Goals', buildGoalsContext()),
     focusBlock,
+    relevantSkillsBlock,
     skillsBlock,
     connectedTools,
   ]
@@ -340,6 +347,10 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
  */
 export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIntent, message?: string): string {
   if (!tieredContextEnabled()) return '';
+  let relevantSkills = '';
+  if (chatContextParityEnabled()) {
+    try { relevantSkills = section('Relevant Skills', renderRelevantSkillsForPrompt(message ?? '')); } catch { relevantSkills = ''; }
+  }
   // Step 2: casual greetings / meta turns don't need the working context — keep
   // them lean. The standing/pinned facts live in Tier-1, so nothing durable is
   // lost here. Every WORKING turn (action/lookup/tool) + all workflow runs get
@@ -354,12 +365,12 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     // A pinned Active Task is binding even on a casual/approval turn ("ok",
     // "go ahead") — surface it so the model never acts blind to the list it
     // was told to use. Other working-memory content stays out on light turns.
-    return pointer;
+    return [pointer, relevantSkills].filter(Boolean).join('\n\n');
   }
   const objective = getRecallObjective(message);
   const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(objective);
   // CANON-SELFASM: Now/date + Current Focus are DYNAMIC, so in tiered mode they
-  // ride the per-turn tail (Autonomy + Available Skills are stable → Tier-1).
+  // ride the per-turn tail (Autonomy + Skill Discovery are stable → Tier-1).
   const parityOn = chatContextParityEnabled();
   const blocks = [
     parityOn ? section('Now', renderCurrentTimeForInstructions()) : '',
@@ -373,6 +384,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     section('Working Memory', context.workingMemory),
     section('Active Goals', buildGoalsContext()),
     parityOn ? section('Current Focus', renderFocusForInstructions()) : '',
+    relevantSkills,
   ].filter(Boolean);
   if (blocks.length === 0) return '';
   return ['Context for this turn (private — use as needed, do not recite):', ...blocks].join('\n\n');

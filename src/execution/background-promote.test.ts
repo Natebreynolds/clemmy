@@ -32,7 +32,17 @@ const {
   detachRunningTurnToBackground,
 } = await import('./background-promote.js');
 const { getBackgroundTask, listBackgroundTasks } = await import('./background-tasks.js');
-const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
+const {
+  createSession,
+  appendEvent,
+  beginRunAttempt,
+  finishRunAttempt,
+  getActiveRunAttempt,
+  isKillRequested,
+  recordRunAttemptUserInput,
+} = await import('../runtime/harness/eventlog.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -186,11 +196,20 @@ test('detectBackgroundItIntent: matches the imperative forms, ignores normal men
 
 test('detachRunningTurnToBackground: stops the run + enqueues a goal-bound resume task from the recent objective', () => {
   const sess = createSession({ kind: 'chat' });
-  appendEvent({ sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'scrape 100 net-new Salesforce accounts similar to my customers' } });
+  const attempt = beginRunAttempt(sess.id, { runId: 'desktop:background-handoff' });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 0,
+    role: 'user',
+    data: { text: 'scrape 100 net-new Salesforce accounts similar to my customers' },
+  });
   // a later background-it message must NOT be picked as the objective
   appendEvent({ sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'background it' } });
   const before = listBackgroundTasks().length;
-  const res = detachRunningTurnToBackground(sess.id);
+  const res = detachRunningTurnToBackground(sess.id, attempt, {
+    source: 'discord',
+    channel: 'discord:test-channel',
+    userId: 'user-1',
+  });
   assert.ok(res, 'returns a result');
   assert.equal(res!.handled, true);
   assert.match(res!.text, /background/i);
@@ -201,11 +220,104 @@ test('detachRunningTurnToBackground: stops the run + enqueues a goal-bound resum
   assert.match(task!.prompt, /scrape 100 net-new Salesforce accounts/, 'objective = the recent real request, not "background it"');
   assert.match(task!.prompt, /session_history/, 'prompt tells it to resume from recorded progress');
   assert.equal(task!.originSessionId, sess.id, 'reports back to the originating chat');
+  assert.equal(task!.source, 'discord', 'handoff preserves its real surface');
+  assert.equal(task!.channel, 'discord:test-channel');
+  assert.equal(task!.userId, 'user-1');
+  assert.equal(task!.foregroundHandoff?.attemptId, attempt.attemptId);
+  assert.equal(task!.foregroundHandoff?.sourceUserSeq, source.seq);
+  assert.ok((task!.foregroundHandoff?.throughSeq ?? 0) >= source.seq);
+  assert.equal(isKillRequested(sess.id, attempt), true, 'only the exact foreground attempt is stopped');
 });
 
 test('detachRunningTurnToBackground: null when there is nothing to background', () => {
   const sess = createSession({ kind: 'chat' });
-  assert.equal(detachRunningTurnToBackground(sess.id), null, 'no objective → null (caller treats as a normal turn)');
+  assert.equal(
+    detachRunningTurnToBackground(sess.id, { attemptId: 'attempt-does-not-exist' }),
+    null,
+    'no exact active attempt → null',
+  );
+});
+
+test('detachRunningTurnToBackground: refuses to clone a turn with an actionable approval', () => {
+  const sess = createSession({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'desktop:approval-blocked-handoff' });
+  recordRunAttemptUserInput(attempt, {
+    turn: 0,
+    role: 'user',
+    data: { text: 'send the approved client update' },
+  });
+  const approval = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Send the client update',
+    tool: 'OUTLOOK_SEND_EMAIL',
+    args: { to: 'client@example.com' },
+  });
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  try {
+    assert.equal(detachRunningTurnToBackground(sess.id, attempt), null);
+    assert.equal(listBackgroundTasks({ includeArchived: true }).length, before, 'no replacement worker is created');
+    assert.equal(isKillRequested(sess.id, attempt), false, 'the paused foreground attempt is left intact');
+  } finally {
+    approvalRegistry.resolve(approval.approvalId, 'cancelled_by_user', 'test-cleanup');
+  }
+});
+
+test('detachRunningTurnToBackground: fails closed for an interrupt without a registry row', () => {
+  const sess = createSession({ kind: 'chat' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'desktop:interrupt-blocked-handoff' });
+  recordRunAttemptUserInput(attempt, {
+    turn: 0,
+    role: 'user',
+    data: { text: 'continue the paused provider action' },
+  });
+  const harnessSession = HarnessSession.load(sess.id);
+  assert.ok(harnessSession);
+  harnessSession!.saveInterruptState('opaque-pending-run-state');
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  try {
+    assert.equal(detachRunningTurnToBackground(sess.id, attempt), null);
+    assert.equal(listBackgroundTasks({ includeArchived: true }).length, before);
+    assert.equal(isKillRequested(sess.id, attempt), false);
+  } finally {
+    harnessSession!.clearInterruptState({ emitEvent: false });
+  }
+});
+
+test('detachRunningTurnToBackground: stale A cannot move or kill newer B; replay of B rejoins one task', () => {
+  const sess = createSession({ kind: 'chat' });
+  const attemptA = beginRunAttempt(sess.id, { runId: 'desktop:handoff-a' });
+  recordRunAttemptUserInput(attemptA, {
+    turn: 0,
+    role: 'user',
+    data: { text: 'prepare the first client brief' },
+  });
+  finishRunAttempt(attemptA, 'completed');
+
+  const attemptB = beginRunAttempt(sess.id, { runId: 'desktop:handoff-b' });
+  const sourceB = recordRunAttemptUserInput(attemptB, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'prepare the second and different client brief' },
+  });
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+
+  assert.equal(detachRunningTurnToBackground(sess.id, attemptA), null);
+  assert.equal(getActiveRunAttempt(sess.id)?.attemptId, attemptB.attemptId);
+  assert.equal(isKillRequested(sess.id, attemptB), false, 'stale A cannot latch B');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before);
+
+  const runScopeId = `${sess.id}::brain:${attemptB.runId}`;
+  const first = detachRunningTurnToBackground(sess.id, { ...attemptB, runScopeId });
+  assert.ok(first);
+  assert.equal(first!.replayed, false);
+  const replay = detachRunningTurnToBackground(sess.id, { ...attemptB, runScopeId });
+  assert.ok(replay);
+  assert.equal(replay!.replayed, true);
+  assert.equal(replay!.taskId, first!.taskId, 'lost-response replay rejoins the same durable task');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1);
+  const task = getBackgroundTask(first!.taskId);
+  assert.match(task!.prompt, /second and different client brief/);
+  assert.equal(task!.foregroundHandoff?.sourceUserSeq, sourceB.seq);
 });
 
 test('EVERY durable task is goal-bound at creation — including the auto-promote path (2026-07-08 zero-goal done-with-nothing)', async () => {

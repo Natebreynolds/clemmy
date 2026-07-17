@@ -35,11 +35,14 @@ import assert from 'node:assert/strict';
 
 const {
   classifyTurnText,
+  evaluateProgress,
+  evaluateStructuredDecisionStall,
   toOrchestratorDecision,
   isPlainTextContractDirective,
   requestedVerbatimReply,
   replyFulfillsVerbatimRequest,
 } = await import('./turn-decision.js');
+const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
 
 // ── Live bug 1: sess-mrcg3mtx — long draft-quoting answer must COMPLETE ───────
 
@@ -430,4 +433,163 @@ test('a short zero-tool "Sent the email." completion envelope is a punt unless p
   assert.equal(classifyTurnText(envelope, { toolCalls: 0, priorSubstantiveWork: true }).kind, 'answer');
   // And with tool calls this turn it is simply an answer.
   assert.equal(classifyTurnText(envelope, { toolCalls: 2 }).kind, 'answer');
+});
+
+// ── Canonical top-level tool accounting ─────────────────────────────────────
+
+test('MCP transport mirrors cannot manufacture a repeated-tool loop signal', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', title: 'mirror accounting' });
+  for (let index = 1; index <= 2; index += 1) {
+    const callId = `outlook-${index}`;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'composio_execute_tool',
+        callId,
+        canonicalCallId: callId,
+        accounting: 'top_level',
+        arguments: '{"tool_slug":"OUTLOOK_LIST_MESSAGES","arguments":"{}"}',
+      },
+    });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 0,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'composio_execute_tool',
+        callId,
+        accounting: 'transport_mirror',
+        arguments: '{"tool_slug":"OUTLOOK_LIST_MESSAGES","arguments":"{}"}',
+      },
+    });
+  }
+
+  assert.equal(evaluateProgress({
+    finalOutput: 'I found the relevant messages.',
+    toolCalls: 2,
+    sessionId: sess.id,
+  }), undefined, 'two logical calls plus their mirrors are still only two calls');
+
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'outlook-3',
+      canonicalCallId: 'outlook-3',
+      accounting: 'top_level',
+      arguments: '{"tool_slug":"OUTLOOK_LIST_MESSAGES","arguments":"{}"}',
+    },
+  });
+  const repeated = evaluateProgress({
+    finalOutput: 'I found the relevant messages.',
+    toolCalls: 3,
+    sessionId: sess.id,
+  });
+  assert.equal(repeated?.signal, 'B_repeated_tool');
+  assert.equal(repeated?.detail.repeatCount, 3);
+});
+
+test('legacy and native top-level rows still drive repeated-tool detection', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', title: 'native accounting' });
+  for (let index = 1; index <= 3; index += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        tool: 'GONG_GET_CALL_TRANSCRIPT',
+        callId: `gong-${index}`,
+        arguments: '{"call_id":"recording-123"}',
+        ...(index === 1 ? {} : { accounting: 'top_level', canonicalCallId: `gong-${index}` }),
+      },
+    });
+  }
+  assert.equal(evaluateProgress({
+    finalOutput: 'The transcript lookup completed.',
+    toolCalls: 3,
+    sessionId: sess.id,
+  })?.signal, 'B_repeated_tool');
+});
+
+test('a mirror-only prior cannot validate a zero-tool completion claim', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', title: 'prior accounting' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'OUTLOOK_SEND_EMAIL',
+      callId: 'send-1',
+      accounting: 'transport_mirror',
+    },
+  });
+  const decision = {
+    summary: 'Sent the email.',
+    reply: 'Sent the email.',
+    done: true,
+    nextAction: 'completed' as const,
+    reason: null,
+  };
+  assert.equal(evaluateStructuredDecisionStall({
+    decision,
+    toolCalls: 0,
+    sessionId: sess.id,
+    turn: 2,
+  })?.signal, 'A_zero_tools');
+
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'OUTLOOK_SEND_EMAIL',
+      callId: 'send-1',
+      canonicalCallId: 'send-1',
+      accounting: 'top_level',
+    },
+  });
+  assert.equal(evaluateStructuredDecisionStall({
+    decision,
+    toolCalls: 0,
+    sessionId: sess.id,
+    turn: 2,
+  }), undefined, 'a real prior top-level send still backs the completion');
+});
+
+test('a transport mirror after handoff does not masquerade as post-handoff progress', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', title: 'handoff accounting' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'handoff',
+    data: { from: 'Clem', to: 'Researcher' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'mirror-1', accounting: 'transport_mirror' },
+  });
+  assert.equal(evaluateProgress({
+    finalOutput: 'Continuing.',
+    toolCalls: 1,
+    sessionId: sess.id,
+    turn: 1,
+  })?.signal, 'A_zero_tools');
 });

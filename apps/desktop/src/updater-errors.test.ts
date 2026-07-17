@@ -5,7 +5,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isMissingReleaseMetadataError, updaterErrorMessage } from './updater-errors.js';
+import {
+  isMissingReleaseMetadataError,
+  shouldReportUpdaterCondition,
+  shouldSuppressUpdaterInternalError,
+  updaterErrorMessage,
+} from './updater-errors.js';
 
 test('isMissingReleaseMetadataError detects electron-updater latest-mac.yml 404', () => {
   const err = new Error('Cannot find latest-mac.yml in the latest release artifacts (https://github.com/Natebreynolds/clemmy/releases/download/v1.3.2/latest-mac.yml): HttpError: 404');
@@ -30,4 +35,18 @@ test('isMissingReleaseMetadataError does not hide unrelated updater failures', (
 test('updaterErrorMessage normalizes non-Error values', () => {
   assert.equal(updaterErrorMessage('plain'), 'plain');
   assert.equal(updaterErrorMessage(new Error('boom')), 'boom');
+});
+
+test('only expected missing-release noise is suppressed from the internal logger', () => {
+  assert.equal(shouldSuppressUpdaterInternalError('Error: No published versions on GitHub\n    at Provider.getLatestVersion'), true);
+  assert.equal(shouldSuppressUpdaterInternalError('HttpError: 404 Cannot find latest-mac.yml'), true);
+  assert.equal(shouldSuppressUpdaterInternalError('download failed: sha512 mismatch'), false);
+  assert.equal(shouldSuppressUpdaterInternalError('GitHub API rate limit exceeded'), false);
+});
+
+test('duplicate updater conditions are reported once per check window', () => {
+  assert.equal(shouldReportUpdaterCondition(0, 10_000), true);
+  assert.equal(shouldReportUpdaterCondition(10_000, 10_002), false);
+  assert.equal(shouldReportUpdaterCondition(10_000, 14_999), false);
+  assert.equal(shouldReportUpdaterCondition(10_000, 15_000), true);
 });
