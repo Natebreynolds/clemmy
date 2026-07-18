@@ -139,6 +139,33 @@ export function resolveAccountAlias(labelish: string, toolkit?: string): Account
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+/** UI entry point: set (or CLEAR, when label is empty) the single user label for
+ *  one specific connected account. Unlike the conversational `rememberAccountAlias`
+ *  gesture, this enforces one-label-per-account: any existing label bound to this
+ *  same account (by email or connectionId) is dropped first, so renaming from the
+ *  desktop UI never leaves an account carrying two names. Pass the account's email
+ *  (from the connections snapshot) so the binding is stable across re-auths. */
+export function setAccountLabel(input: {
+  toolkit: string;
+  label: string;
+  email?: string;
+  connectionId?: string;
+}): AccountAlias | null {
+  const toolkit = input.toolkit.trim().toLowerCase();
+  const email = normalizeEmail(input.email);
+  const connectionId = input.connectionId?.trim() || undefined;
+  if (!toolkit || (!email && !connectionId)) return null;
+  const aliases = load();
+  // Drop any label(s) already bound to THIS account so it never carries two.
+  const filtered = aliases.filter((a) => !(
+    a.toolkit === toolkit && ((email && a.email === email) || (connectionId && a.connectionId === connectionId))
+  ));
+  if (filtered.length !== aliases.length) cache = filtered;
+  const label = normalizeLabel(input.label);
+  if (!label) { persist(); return null; } // empty label = clear
+  return rememberAccountAlias({ toolkit, label, email, connectionId });
+}
+
 /** All aliases for a toolkit (for rendering names into the ambiguous ASK). */
 export function listAccountAliases(toolkit?: string): AccountAlias[] {
   const tk = toolkit?.trim().toLowerCase();

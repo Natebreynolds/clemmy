@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug } from 'lucide-react';
+import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
@@ -18,11 +18,12 @@ import { BrowserHarness } from '@/components/connect/BrowserHarness';
 import { usePoll } from '@/lib/poll';
 import { CodexReauth } from './settings/CodexLoginForm';
 import {
-  getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio, activeConnectionId,
+  getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio,
+  setAccountLabel, setComposioApiKey,
   getCredentials, setCredential, setDiscordOwner,
   normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
   connectedToolkits, reconnectConnectionId, searchToolkits, toolkitStatus,
-  type CredentialRow, type CredentialDescriptor, type ComposioToolkit,
+  type CredentialRow, type CredentialDescriptor, type ComposioToolkit, type ComposioConnection,
 } from '@/lib/connect';
 
 function prettyName(name: string): string {
@@ -120,15 +121,21 @@ export function Connect() {
     } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
   };
 
-  const disconnectApp = async (t: ComposioToolkit) => {
-    const id = activeConnectionId(t);
-    if (!id) { setAppNotice({ tone: 'error', text: 'No active connection found to disconnect.' }); return; }
+  // Disconnect ONE specific account (mailbox) of a multi-account app.
+  const disconnectConnection = async (slug: string, connectionId: string, who: string) => {
     setAppNotice(null);
     try {
-      await disconnectComposio(t.slug, id);
-      setAppNotice({ tone: 'info', text: `Disconnected ${t.displayName || t.slug}.` });
+      await disconnectComposio(slug, connectionId);
+      setAppNotice({ tone: 'info', text: `Disconnected ${who}.` });
       await refreshApps();
     } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
+  };
+
+  // Set / clear the memory label for one account, then refresh so the agent and
+  // the UI pick it up.
+  const saveLabel = async (slug: string, connectionId: string, email: string | null | undefined, label: string) => {
+    await setAccountLabel(connectionId, { toolkit: slug, label, email });
+    await qc.invalidateQueries({ queryKey: ['composio-toolkits'] });
   };
 
   return (
@@ -157,6 +164,14 @@ export function Connect() {
             {appNotice.text}
           </p>
         )}
+        {/* Composio API key — the ONE thing you get from composio.dev. Enter/reset
+            it here; everything else (connect, add accounts, label) stays in-app. */}
+        {composio.data && (
+          <ComposioApiKeyCard
+            present={Boolean(composio.data.apiKeyPresent)}
+            onSaved={() => { void refreshApps(); }}
+          />
+        )}
         {/* Search to find + connect a new app from the full catalog. */}
         <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3">
           <Search className="h-4 w-4 text-faint" aria-hidden />
@@ -176,13 +191,13 @@ export function Connect() {
           results.length === 0
             ? <Card className="p-4 text-body text-muted">No apps match “{appQuery}”.</Card>
             : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnect={() => disconnectApp(t)} />)}
+                {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
               </div>
         ) : connected.length === 0 ? (
           <Card className="p-5 text-body text-muted">No apps connected yet — search above to connect Gmail, Slack, your CRM, and more.</Card>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {connected.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnect={() => disconnectApp(t)} />)}
+            {connected.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
           </div>
         )}
       </Section>
@@ -226,23 +241,20 @@ export function Connect() {
   );
 }
 
-function AppCard({ t, onConnect, onReconnect, onDisconnect }: {
+function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabel }: {
   t: ComposioToolkit;
   onConnect: () => void | Promise<void>;
   onReconnect?: () => void | Promise<void>;
-  onDisconnect?: () => void | Promise<void>;
+  onDisconnectConnection?: (slug: string, connectionId: string, who: string) => void | Promise<void>;
+  onSaveLabel?: (slug: string, connectionId: string, email: string | null | undefined, label: string) => Promise<void>;
 }) {
   const status = toolkitStatus(t);
   const name = t.displayName || t.slug;
   const [imgOk, setImgOk] = useState(Boolean(t.logoUrl));
-  const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const canDisconnect = Boolean(onDisconnect) && status !== 'none';
-
-  const doDisconnect = async () => {
-    setBusy(true);
-    try { await onDisconnect?.(); } finally { setBusy(false); setConfirming(false); }
-  };
+  // Accounts under this app (a user may connect several mailboxes/workspaces).
+  const accounts = (t.connections ?? []).filter((c) => c.id || c.connectionId);
+  const isConnected = status !== 'none';
 
   const doConnect = async (reconnect: boolean) => {
     setBusy(true);
@@ -253,34 +265,171 @@ function AppCard({ t, onConnect, onReconnect, onDisconnect }: {
   };
 
   return (
-    <Card className="flex items-center gap-3 p-4">
-      {imgOk
-        ? <img src={t.logoUrl} alt="" width={28} height={28} className="h-7 w-7 shrink-0 rounded-md object-contain" onError={() => setImgOk(false)} />
-        : <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-subtle text-body font-semibold text-muted">{name.slice(0, 1).toUpperCase()}</div>}
-      <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{name}</span>
-      {confirming ? (
+    <Card className="p-4">
+      <div className="flex items-center gap-3">
+        {imgOk
+          ? <img src={t.logoUrl} alt="" width={28} height={28} className="h-7 w-7 shrink-0 rounded-md object-contain" onError={() => setImgOk(false)} />
+          : <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-subtle text-body font-semibold text-muted">{name.slice(0, 1).toUpperCase()}</div>}
+        <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{name}</span>
+        {status === 'active'
+          ? <StatusPill tone="success">{accounts.length > 1 ? `${accounts.length} accounts` : 'Connected'}</StatusPill>
+          : status === 'expired' || status === 'reconnect'
+            ? <Button size="sm" variant="secondary" onClick={() => void doConnect(true)} disabled={busy}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RotateCw className="h-4 w-4" aria-hidden />} Reconnect
+              </Button>
+            : <Button size="sm" variant="secondary" onClick={() => void doConnect(false)} disabled={busy}>
+                {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />} Connect
+              </Button>}
+      </div>
+
+      {isConnected && accounts.length > 0 && (
+        <div className="mt-3 space-y-1.5 border-t border-border pt-3">
+          {accounts.map((c) => (
+            <AccountRow
+              key={c.id ?? c.connectionId}
+              slug={t.slug}
+              conn={c}
+              onDisconnect={onDisconnectConnection}
+              onSaveLabel={onSaveLabel}
+            />
+          ))}
+          {/* Adding another account = start the OAuth flow again; Composio's
+              link(allowMultiple) lets the same app hold several mailboxes. */}
+          <button type="button" onClick={() => void doConnect(false)} disabled={busy}
+            className="mt-1 inline-flex items-center gap-1 text-caption font-medium text-primary hover:underline cursor-pointer disabled:opacity-50">
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Plus className="h-3.5 w-3.5" aria-hidden />} Add another account
+          </button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// One connected account (mailbox/workspace) with its status, memory label, and
+// a per-account disconnect. The label writes to the same store the agent reads,
+// so "send from my work mailbox" routes correctly.
+function AccountRow({ slug, conn, onDisconnect, onSaveLabel }: {
+  slug: string;
+  conn: ComposioConnection;
+  onDisconnect?: (slug: string, connectionId: string, who: string) => void | Promise<void>;
+  onSaveLabel?: (slug: string, connectionId: string, email: string | null | undefined, label: string) => Promise<void>;
+}) {
+  const id = conn.id ?? conn.connectionId ?? '';
+  const who = conn.accountEmail || conn.accountName || `${id.slice(0, 10)}…`;
+  const needsReconnect = conn.needsReconnect === true || (conn.status ?? '').toUpperCase() === 'NEEDS_RECONNECT';
+  const [editing, setEditing] = useState(false);
+  const [label, setLabel] = useState(conn.userLabel ?? '');
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  const save = async () => {
+    if (!onSaveLabel) return;
+    setBusy(true);
+    try { await onSaveLabel(slug, id, conn.accountEmail, label.trim()); setEditing(false); }
+    finally { setBusy(false); }
+  };
+  const doDisconnect = async () => {
+    setBusy(true);
+    try { await onDisconnect?.(slug, id, who); } finally { setBusy(false); setConfirming(false); }
+  };
+
+  return (
+    <div className="flex items-center gap-2 rounded-md px-1.5 py-1">
+      <Mail className={cn('h-3.5 w-3.5 shrink-0', needsReconnect ? 'text-warning' : 'text-faint')} aria-hidden />
+      <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
-          <span className="text-caption text-muted">Disconnect?</span>
-          <Button size="sm" variant="danger" onClick={doDisconnect} disabled={busy}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : 'Yes'}</Button>
+          <span className="truncate text-small text-fg">{who}</span>
+          {needsReconnect && <StatusPill tone="warning">Reconnect</StatusPill>}
+        </div>
+        {editing ? (
+          <div className="mt-1 flex items-center gap-1.5">
+            <Tag className="h-3 w-3 shrink-0 text-faint" aria-hidden />
+            <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Label (e.g. work, personal)"
+              className="h-7 flex-1 text-caption" autoFocus onKeyDown={(e) => { if (e.key === 'Enter') void save(); if (e.key === 'Escape') { setLabel(conn.userLabel ?? ''); setEditing(false); } }} />
+            <Button size="sm" variant="secondary" onClick={() => void save()} disabled={busy}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : 'Save'}</Button>
+            <Button size="sm" variant="ghost" onClick={() => { setLabel(conn.userLabel ?? ''); setEditing(false); }} disabled={busy}>Cancel</Button>
+          </div>
+        ) : conn.userLabel ? (
+          <button type="button" onClick={() => setEditing(true)} className="mt-0.5 inline-flex items-center gap-1 cursor-pointer" title="Rename label">
+            <span className="rounded bg-primary/10 px-1.5 py-0.5 text-caption font-medium text-primary">{conn.userLabel}</span>
+            <Pencil className="h-3 w-3 text-faint" aria-hidden />
+          </button>
+        ) : (
+          <button type="button" onClick={() => setEditing(true)} className="mt-0.5 inline-flex items-center gap-1 text-caption text-muted hover:text-fg cursor-pointer">
+            <Tag className="h-3 w-3" aria-hidden /> Add label
+          </button>
+        )}
+      </div>
+      {!editing && (confirming ? (
+        <div className="flex items-center gap-1">
+          <span className="text-caption text-muted">Remove?</span>
+          <Button size="sm" variant="danger" onClick={() => void doDisconnect()} disabled={busy}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : 'Yes'}</Button>
           <Button size="sm" variant="ghost" onClick={() => setConfirming(false)} disabled={busy}>No</Button>
         </div>
       ) : (
-        <div className="flex items-center gap-1.5">
-          {status === 'active'
-            ? <StatusPill tone="success">Connected</StatusPill>
-            : status === 'expired' || status === 'reconnect'
-              ? <Button size="sm" variant="secondary" onClick={() => void doConnect(true)} disabled={busy}>
-                  {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RotateCw className="h-4 w-4" aria-hidden />} Reconnect
-                </Button>
-              : <Button size="sm" variant="secondary" onClick={() => void doConnect(false)} disabled={busy}>
-                  {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />} Connect
-                </Button>}
-          {canDisconnect && (
-            <Button size="sm" variant="ghost" aria-label={`Disconnect ${name}`} title="Disconnect" onClick={() => setConfirming(true)}>
-              <Unplug className="h-4 w-4" aria-hidden />
-            </Button>
-          )}
-        </div>
+        <Button size="sm" variant="ghost" aria-label={`Disconnect ${who}`} title="Disconnect this account" onClick={() => setConfirming(true)}>
+          <Unplug className="h-3.5 w-3.5" aria-hidden />
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+// Composio API key entry/reset — the single thing sourced from composio.dev.
+// Expanded by default when no key is set (first-run), a quiet "Reset key" link
+// once connected. The daemon validates the key against Composio before saving.
+function ComposioApiKeyCard({ present, onSaved }: { present: boolean; onSaved: () => void }) {
+  const [open, setOpen] = useState(!present);
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+
+  const save = async () => {
+    const value = key.trim();
+    if (!value) return;
+    setBusy(true); setMsg(null);
+    try {
+      const res = await setComposioApiKey(value);
+      if (res?.error) { setMsg({ tone: 'error', text: res.error }); }
+      else {
+        setKey('');
+        setMsg({ tone: 'info', text: res?.warning || 'Composio API key saved.' });
+        setOpen(false);
+        onSaved();
+      }
+    } catch (e) { setMsg({ tone: 'error', text: (e as Error).message }); }
+    finally { setBusy(false); }
+  };
+
+  if (present && !open) {
+    return (
+      <div className="mb-4 flex items-center gap-2 text-caption text-muted">
+        <Check className="h-3.5 w-3.5 text-success" aria-hidden /> Composio API key set.
+        <button type="button" onClick={() => setOpen(true)} className="text-primary hover:underline cursor-pointer">Reset key</button>
+      </div>
+    );
+  }
+
+  return (
+    <Card className="mb-4 p-4">
+      <div className="mb-1 flex items-center gap-2">
+        <KeyRound className="h-4 w-4 text-primary" aria-hidden />
+        <span className="text-body font-medium text-fg">{present ? 'Reset your Composio API key' : 'Add your Composio API key'}</span>
+      </div>
+      <p className="mb-3 text-small text-muted">
+        Paste your key from Composio — you only need to do this once.{' '}
+        <a href="https://app.composio.dev/developers" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
+          Get your key <ExternalLink className="h-3 w-3" aria-hidden />
+        </a>
+      </p>
+      <div className="flex items-center gap-2">
+        <Input type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder="comp_…"
+          className="h-10 flex-1" autoComplete="off" onKeyDown={(e) => { if (e.key === 'Enter') void save(); }} />
+        <Button onClick={() => void save()} disabled={busy || !key.trim()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : 'Save'}</Button>
+        {present && <Button variant="ghost" onClick={() => { setOpen(false); setKey(''); setMsg(null); }} disabled={busy}>Cancel</Button>}
+      </div>
+      {msg && (
+        <p className={cn('mt-2 text-caption', msg.tone === 'error' ? 'text-danger' : 'text-muted')}>{msg.text}</p>
       )}
     </Card>
   );

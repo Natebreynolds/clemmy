@@ -15,6 +15,10 @@ export interface ComposioConnection {
   needsReconnect?: boolean;
   suppressionReason?: string | null;
   accountEmail?: string | null;
+  accountName?: string | null;
+  /** The user's memory label for this account ("work", "personal"), from
+   *  account-alias-store — what the agent uses to route the right mailbox. */
+  userLabel?: string | null;
   createdAt?: string;
 }
 export interface ComposioToolkit {
@@ -86,6 +90,23 @@ export const refreshComposio = () => apiPost<{ ok: boolean }>('/api/composio/ref
 // Disconnect a connected app (deletes the connected account). Needs the connection id.
 export const disconnectComposio = (slug: string, connectionId: string) =>
   apiPost<{ ok: boolean }>(`/api/composio/toolkits/${encodeURIComponent(slug)}/disconnect`, { connectionId });
+
+// Set (or clear, with an empty label) the user's memory label for one connected
+// account. Passing the account email binds the label to the stable mailbox so it
+// survives re-auth; the agent then routes "send from my <label> mailbox" correctly.
+export const setAccountLabel = (connectionId: string, body: { toolkit: string; label: string; email?: string | null }) =>
+  apiPost<{ ok: boolean; label: string | null }>(
+    `/api/composio/accounts/${encodeURIComponent(connectionId)}/label`,
+    { toolkit: body.toolkit, label: body.label, email: body.email ?? undefined },
+  );
+
+// Save/validate the Composio API key in-app (the value is copied from composio.dev).
+// The route validates against Composio before persisting, so a bad key is rejected.
+export const setComposioApiKey = (apiKey: string, userId?: string) =>
+  apiPost<{ ok?: boolean; error?: string; validation?: string; warning?: string }>(
+    '/api/composio/api-key',
+    { api_key: apiKey, ...(userId ? { user_id: userId } : {}) },
+  );
 
 export interface ComposioAuthorization { url?: string; redirectUrl?: string }
 export interface ComposioReconnectResult extends ComposioAuthorization { staleRemoved: boolean }

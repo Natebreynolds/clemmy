@@ -15,6 +15,7 @@ import {
   type ComposioCliStatus,
 } from './cli.js';
 import { composioSlugIsReadOnly } from './slug-effect.js';
+import { aliasLabelFor } from '../../memory/account-alias-store.js';
 
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
@@ -222,6 +223,10 @@ export interface ComposioDashboardConnection {
   accountName: string | null;
   accountAvatarUrl: string | null;
   createdAt: string | null;
+  /** The user's own memory label for this account (e.g. "work", "personal"),
+   *  from account-alias-store. Null when unlabeled. Drives the desktop UI and
+   *  the agent's mailbox routing. */
+  userLabel: string | null;
 }
 
 export interface ComposioDashboardToolkit {
@@ -1000,6 +1005,7 @@ export function toComposioDashboardConnection(
     accountName: connection.accountName ?? null,
     accountAvatarUrl: connection.accountAvatarUrl ?? null,
     createdAt: connection.createdAt ?? null,
+    userLabel: aliasLabelFor(connection.slug, connection.accountEmail ?? undefined, connection.connectionId) ?? null,
   };
 }
 

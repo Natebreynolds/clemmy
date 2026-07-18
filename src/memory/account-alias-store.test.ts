@@ -6,7 +6,7 @@ import path from 'node:path';
 
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-alias-store-'));
 
-const { rememberAccountAlias, resolveAccountAlias, resetAccountAliasesForTest } = await import('./account-alias-store.js');
+const { rememberAccountAlias, resolveAccountAlias, setAccountLabel, aliasLabelFor, listAccountAliases, resetAccountAliasesForTest } = await import('./account-alias-store.js');
 
 function reset() { resetAccountAliasesForTest(); }
 
@@ -63,4 +63,36 @@ test('a ca_ id or non-email is never stored as an email identity', () => {
   const r = rememberAccountAlias({ toolkit: 'outlook', label: 'x', email: 'ca_notanemail', connectionId: 'ca_z' });
   assert.equal(r?.email, undefined);
   assert.equal(r?.connectionId, 'ca_z');
+});
+
+// The desktop-UI entry point: setAccountLabel (one label per account, plus clear).
+test('setAccountLabel binds a label to an account and is readable by aliasLabelFor', () => {
+  reset();
+  setAccountLabel({ toolkit: 'gmail', label: 'Work', email: 'nate@work.com', connectionId: 'ca_w' });
+  assert.equal(aliasLabelFor('gmail', 'nate@work.com'), 'work', 'normalized + resolvable by email');
+  assert.equal(resolveAccountAlias('work', 'gmail')?.email, 'nate@work.com');
+});
+
+test('setAccountLabel renames in place — one account never carries two labels', () => {
+  reset();
+  setAccountLabel({ toolkit: 'gmail', label: 'work', email: 'nate@work.com', connectionId: 'ca_w' });
+  setAccountLabel({ toolkit: 'gmail', label: 'primary', email: 'nate@work.com', connectionId: 'ca_w' });
+  const labels = listAccountAliases('gmail').filter((a) => a.email === 'nate@work.com').map((a) => a.label);
+  assert.deepEqual(labels, ['primary'], 'the old label is dropped, not left dangling');
+  assert.equal(aliasLabelFor('gmail', 'nate@work.com'), 'primary');
+});
+
+test('setAccountLabel with an empty label clears the account label', () => {
+  reset();
+  setAccountLabel({ toolkit: 'gmail', label: 'work', email: 'nate@work.com', connectionId: 'ca_w' });
+  const cleared = setAccountLabel({ toolkit: 'gmail', label: '', email: 'nate@work.com', connectionId: 'ca_w' });
+  assert.equal(cleared, null);
+  assert.equal(aliasLabelFor('gmail', 'nate@work.com'), undefined, 'label removed');
+});
+
+test('setAccountLabel binds by connectionId when the email is unknown', () => {
+  reset();
+  const r = setAccountLabel({ toolkit: 'outlook', label: 'sales', connectionId: 'ca_only' });
+  assert.equal(r?.connectionId, 'ca_only');
+  assert.equal(aliasLabelFor('outlook', undefined, 'ca_only'), 'sales');
 });

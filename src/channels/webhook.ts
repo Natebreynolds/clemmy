@@ -106,6 +106,7 @@ import {
 import { readMemoryIndexStatus, rebuildVaultIndex } from '../memory/indexer.js';
 import { embedMissingChunks } from '../memory/embeddings.js';
 import { CRON_FILE } from '../memory/vault.js';
+import { setAccountLabel } from '../memory/account-alias-store.js';
 import {
   cancelBackgroundTask,
   createBackgroundTask,
@@ -1435,6 +1436,30 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     resetComposioClient();
     bustComposioDashboardCaches();
     res.json({ ok: true });
+  });
+
+  // Attach (or CLEAR, when label is empty) the user's memory label for one
+  // connected account — the desktop-UI path into the SAME account-alias store
+  // the agent already reads for mailbox routing ("send from my work mailbox").
+  // connectionId in the URL; toolkit + label (+ optional email) in the body.
+  // Passing the account's email from the connections snapshot binds the label to
+  // the stable mailbox identity so it survives re-auth.
+  app.post('/api/composio/accounts/:connectionId/label', requireAuth, (req, res) => {
+    const connectionId = Array.isArray(req.params.connectionId) ? req.params.connectionId[0] : req.params.connectionId;
+    const toolkit = typeof req.body?.toolkit === 'string' ? req.body.toolkit : '';
+    const label = typeof req.body?.label === 'string' ? req.body.label : '';
+    const email = typeof req.body?.email === 'string' ? req.body.email : undefined;
+    if (!connectionId || !toolkit) {
+      res.status(400).json({ error: 'connectionId (url) and toolkit (body) are required' });
+      return;
+    }
+    try {
+      const saved = setAccountLabel({ toolkit, label, email, connectionId });
+      bustComposioDashboardCaches();
+      res.json({ ok: true, label: saved?.label ?? null });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   // Setup metadata for the Clementine-native modal — exposes the
