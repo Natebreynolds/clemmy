@@ -28,7 +28,7 @@
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, WEBHOOK_PORT } from '../config.js';
 import { atomicJsonMutate } from './atomic-json.js';
 
 export type MobileAccessStatus =
@@ -67,6 +67,20 @@ export interface MobileAccessAccessAck {
   enabled: boolean;
 }
 
+/**
+ * The private loopback port cloudflared should be pointed at.
+ *
+ * Requests arriving on this port are provably tunnel-borne, which is what makes
+ * CF-Connecting-IP trustworthy for rate limiting (see mobile-ingress.ts). It is
+ * ephemeral, so it changes every daemon start — `pid` lets a reader tell a live
+ * publication from one left behind by a dead process.
+ */
+export interface MobileAccessIngress {
+  port: number;
+  pid: number;
+  updatedAt: string;
+}
+
 export interface MobileAccessRecord {
   version: 1;
   tunnel: MobileAccessTunnel | null;
@@ -75,6 +89,7 @@ export interface MobileAccessRecord {
   status: MobileAccessStatus;
   lastError?: string;
   cloudflareAccess?: MobileAccessAccessAck;
+  ingress?: MobileAccessIngress;
   updatedAt: string;
 }
 
@@ -124,6 +139,7 @@ export function readMobileAccess(opts?: MobileAccessStoreOptions): MobileAccessR
       status: parsed.status ?? 'inactive',
       lastError: parsed.lastError,
       cloudflareAccess: parsed.cloudflareAccess,
+      ingress: parsed.ingress,
       updatedAt: parsed.updatedAt ?? new Date().toISOString(),
     };
   } catch {
@@ -163,6 +179,52 @@ export async function setMobileAccessBinary(
   opts?: MobileAccessStoreOptions,
 ): Promise<MobileAccessRecord> {
   return updateMobileAccess((current) => ({ ...current, binary }), opts);
+}
+
+export async function setMobileAccessIngress(
+  ingress: { port: number; pid: number } | null,
+  opts?: MobileAccessStoreOptions,
+): Promise<MobileAccessRecord> {
+  return updateMobileAccess((current) => ({
+    ...current,
+    ingress: ingress ? { ...ingress, updatedAt: new Date().toISOString() } : undefined,
+  }), opts);
+}
+
+/**
+ * The origin cloudflared should forward to.
+ *
+ * Prefers the private ingress port published by the running daemon so tunnel
+ * traffic arrives on the door that proves its own origin. Falls back to the
+ * shared webhook port when the publication is missing or stale (an older
+ * daemon, a CLI running against a daemon that hasn't published yet, or the
+ * CLEMENTINE_MOBILE_INGRESS=shared kill switch) — that fallback is exactly the
+ * pre-split behavior and still works, it just classifies as tunnel-legacy.
+ */
+export function tunnelOriginUrl(opts?: MobileAccessStoreOptions): string {
+  const ingress = readMobileAccess(opts).ingress;
+  const port = ingress && isPidAlive(ingress.pid) ? ingress.port : WEBHOOK_PORT;
+  return `http://127.0.0.1:${port}`;
+}
+
+/**
+ * Liveness check for a published ingress pid.
+ *
+ * Signal 0 performs permission and existence checks without delivering
+ * anything. This matters because the port is ephemeral: a publication left
+ * behind by a crashed daemon names a port nothing is listening on, and pointing
+ * cloudflared at it would produce a tunnel to nowhere.
+ */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but belongs to another user — still alive.
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
 }
 
 export async function setMobileAccessTunnel(

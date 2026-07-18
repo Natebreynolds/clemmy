@@ -45,6 +45,7 @@ import {
   updateMobileAccess,
   type MobileAccessRecord,
   type MobileAccessStatus,
+  tunnelOriginUrl,
 } from '../runtime/mobile-access-state.js';
 
 const DEFAULT_CERT_PATH = path.join(os.homedir(), '.cloudflared', 'cert.pem');
@@ -277,7 +278,7 @@ export async function startTunnel(): Promise<{ ok: boolean; error?: string }> {
     await setMobileAccessStatus('error', error).catch(() => undefined);
     return { ok: false, error };
   }
-  const localUrl = `http://${WEBHOOK_HOST === '0.0.0.0' ? '127.0.0.1' : WEBHOOK_HOST}:${WEBHOOK_PORT}`;
+  const localUrl = tunnelOriginUrl();
   lastSupervisorEvents = [];
   const supervisor = new CloudflaredSupervisor({
     binary: record.binary.path,
@@ -322,7 +323,7 @@ export async function startQuickTunnel(): Promise<{ ok: boolean; error?: string 
   }
   const record = readMobileAccess();
   if (!record.binary?.path) return { ok: false, error: 'cloudflared binary not detected' };
-  const localUrl = `http://${WEBHOOK_HOST === '0.0.0.0' ? '127.0.0.1' : WEBHOOK_HOST}:${WEBHOOK_PORT}`;
+  const localUrl = tunnelOriginUrl();
   lastSupervisorEvents = [];
   await setMobileAccessStatus('configuring').catch(() => undefined);
   // Track the URL across supervisor restarts so we can detect rotation

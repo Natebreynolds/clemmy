@@ -45,6 +45,7 @@ import {
   upsertWebPushDestination,
 } from '../runtime/notifications.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
+import { trustsForwardedClientIp } from '../runtime/mobile-ingress.js';
 import { markPushSubscribed } from '../runtime/mobile-sessions.js';
 import {
   getSession as harnessGetSession,
@@ -421,17 +422,23 @@ function readSessionCookie(req: express.Request): string {
 }
 
 function clientIp(req: express.Request): string {
-  // Cloudflare adds CF-Connecting-IP. Behind the tunnel, req.ip is
-  // the tunnel daemon (loopback). We trust the CF header here because
-  // the only path to /m/* is via the tunnel; direct loopback access
-  // is for the dev box and shares the rate limit anyway.
-  const cfIp = req.headers['cf-connecting-ip'];
-  if (typeof cfIp === 'string' && cfIp.length > 0) return cfIp;
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.length > 0) {
-    return forwarded.split(',')[0]?.trim() || req.ip || 'unknown';
+  // Cloudflare adds CF-Connecting-IP, and behind the tunnel the socket peer is
+  // always cloudflared on loopback — so the real client IP can only come from
+  // that header. But it is only believable when we know Cloudflare set it.
+  //
+  // trustsForwardedClientIp() answers that from which listener accepted the
+  // connection, not from anything in the request. On the shared loopback door
+  // the header is attacker-controlled: previously it was trusted there too,
+  // which let any local caller rotate it per request and mint a fresh
+  // rate-limit bucket every time, making the per-IP lockout unenforceable.
+  //
+  // X-Forwarded-For is dropped entirely. We never sit behind a proxy we
+  // control that sets it, so it was only ever a spoofing surface.
+  if (trustsForwardedClientIp(req)) {
+    const cfIp = req.headers['cf-connecting-ip'];
+    if (typeof cfIp === 'string' && cfIp.trim().length > 0) return cfIp.trim();
   }
-  return req.ip || 'unknown';
+  return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
 export interface MobileSessionContext {

@@ -50,7 +50,17 @@ import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
 import { createMobileRouter } from './mobile-routes.js';
-import { readMobileAccess } from '../runtime/mobile-access-state.js';
+import { readMobileAccess, setMobileAccessIngress } from '../runtime/mobile-access-state.js';
+import {
+  classifyIngress,
+  restrictTunnelIngressToMobile,
+  startIngressListeners,
+} from '../runtime/mobile-ingress.js';
+import {
+  hostAllowlistMiddleware,
+  normalizeHostHeader,
+  requireSameOriginForMutations,
+} from '../runtime/http-origin-guard.js';
 import {
   addNotification,
   listNotifications,
@@ -535,17 +545,6 @@ function latestHarnessEvent(
     if (predicate(events[index])) return events[index];
   }
   return undefined;
-}
-
-function normalizeHostHeader(value: unknown): string {
-  if (typeof value !== 'string') return '';
-  const first = value.split(',')[0]?.trim().toLowerCase() ?? '';
-  if (!first) return '';
-  if (first.startsWith('[')) {
-    const end = first.indexOf(']');
-    return end >= 0 ? first.slice(1, end) : first.replace(/^\[/, '');
-  }
-  return first.replace(/:\d+$/, '');
 }
 
 function isConfiguredMobileHost(req: express.Request): boolean {
@@ -1160,8 +1159,19 @@ async function resolveApprovalOrQueueBackgroundContinuation(
   return assistant.getRuntime().resolveApproval(approvalId, approved);
 }
 
-export async function startWebhookServer(assistant: ClementineAssistant): Promise<void> {
+/**
+ * Builds the fully-wired Express app without binding a socket.
+ *
+ * Split out from startWebhookServer so tests can walk the finished route
+ * stack (see route-gating.test.ts, which asserts every reachable route
+ * declares an auth realm). Nothing here listens; callers bind the app.
+ */
+export async function buildWebhookApp(assistant: ClementineAssistant): Promise<express.Express> {
   const app = express();
+  // Explicit: req.ip must stay the socket peer. Ingress classification is
+  // decided by which listener a request arrived on (see mobile-ingress.ts),
+  // never by a client-supplied forwarding header.
+  app.set('trust proxy', false);
   const dashboardSessionCookieName = 'clementine_dashboard_session';
   const dashboardSessionToken = deriveDashboardSessionToken(WEBHOOK_SECRET);
 
@@ -1190,9 +1200,17 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     );
     next();
   });
+  // Order matters. Reject unknown Hosts before anything reads them, classify
+  // which door the request came through, then restrict tunnel traffic to the
+  // mobile surface by socket. requireMobileSurfaceForMobileHost stays mounted
+  // behind that as a redundant Host-based check.
+  app.use(hostAllowlistMiddleware);
+  app.use(classifyIngress);
+  app.use(restrictTunnelIngressToMobile);
   app.use(requireMobileSurfaceForMobileHost);
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: false, limit: '1mb', parameterLimit: 1000 }));
+  app.use(requireSameOriginForMutations);
 
   function buildConsoleRedirectPath(token: string, flash?: { kind: 'success' | 'error'; text: string }): string {
     const url = new URL('/console', 'http://localhost');
@@ -2747,25 +2765,35 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    if (!isLoopbackWebhookHost(WEBHOOK_HOST)) {
+  return app;
+}
+
+export async function startWebhookServer(assistant: ClementineAssistant): Promise<void> {
+  const app = await buildWebhookApp(assistant);
+  const listeners = await startIngressListeners(app, {
+    host: WEBHOOK_HOST,
+    port: WEBHOOK_PORT,
+    // The LAN double-gate applies only to the publicly-bindable listener. The
+    // private ingress listener is always loopback + ephemeral.
+    guardMainBind: () => {
+      if (isLoopbackWebhookHost(WEBHOOK_HOST)) return;
       if (!WEBHOOK_ALLOW_LAN) {
-        reject(new Error(`Refusing to bind webhook server to ${WEBHOOK_HOST}. Set WEBHOOK_ALLOW_LAN=true to opt in.`));
-        return;
+        throw new Error(`Refusing to bind webhook server to ${WEBHOOK_HOST}. Set WEBHOOK_ALLOW_LAN=true to opt in.`);
       }
       if (!WEBHOOK_SECRET_IS_STRONG) {
-        reject(new Error('Refusing LAN webhook bind because WEBHOOK_SECRET is missing, weak, or placeholder-like.'));
-        return;
+        throw new Error('Refusing LAN webhook bind because WEBHOOK_SECRET is missing, weak, or placeholder-like.');
       }
-    }
-    const server = app.listen(WEBHOOK_PORT, WEBHOOK_HOST, () => {
-      logger.info({ host: WEBHOOK_HOST, port: WEBHOOK_PORT }, 'Webhook server listening');
-      resolve();
-    });
-    server.on('error', (error) => {
-      reject(error);
-    });
+    },
   });
+  logger.info({ host: WEBHOOK_HOST, port: WEBHOOK_PORT }, 'Webhook server listening');
+
+  // Publish the private port BEFORE the tunnel auto-start reads it, or the
+  // tunnel would be pointed at the shared listener and land in tunnel-legacy.
+  if (listeners.tunnelPort !== null) {
+    await setMobileAccessIngress({ port: listeners.tunnelPort, pid: process.pid })
+      .catch((err) => logger.warn({ err }, 'Failed to publish mobile ingress port'));
+  }
+
   void autoStartMobileTunnelIfConfigured().catch((err) => {
     logger.warn({ err }, 'Mobile custom-domain tunnel auto-start failed');
   });

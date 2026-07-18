@@ -1,5 +1,32 @@
 # Roadmap — iOS Companion App for Clementine
 
+> ## ⚠️ SUPERSEDED — do not scope work from this document
+>
+> **Superseded on 2026-07-18.** The mobile surface shipped on a different stack than
+> the one described below. This file is retained for its design reasoning only.
+>
+> **What actually exists:**
+>
+> | This doc says | Reality |
+> |---|---|
+> | SwiftUI native app at `apps/mobile/` | **Preact + Vite PWA at `apps/mobile-web/`** — `apps/mobile/` does not exist |
+> | Tailscale mesh VPN | **Cloudflare Tunnel** — `src/runtime/cloudflared.ts`, `src/integrations/mobile-access.ts` |
+> | Direct APNs via `src/runtime/apns.ts` | **Web Push / VAPID** — `src/runtime/notification-delivery.ts`, `src/runtime/web-push-keys.ts` |
+> | Per-device bearer tokens in `src/runtime/device-tokens.ts` | **HttpOnly session cookie** — `src/runtime/mobile-sessions.ts` |
+> | Ad Hoc distribution via Apple Configurator | **Add to Home Screen** — no signing, no review |
+>
+> The PWA is served by the daemon itself at `/m` (`src/channels/mobile-routes.ts`) and is
+> substantially complete: chat, approvals, workflows, memory, and push all work.
+>
+> **What did survive:** the auth model. QR pairing with a one-time code exchanged for a
+> durable per-device credential, revocable from a desktop Devices panel, is what shipped
+> and is being hardened further — see `docs/plans/` for the current mobile hardening wave.
+>
+> The de-facto spec for the shipped system is the module-header comments in
+> `mobile-routes.ts`, `mobile-pin.ts`, `mobile-rate-limit.ts`, and `mobile-access-state.ts`.
+>
+> ---
+
 > **Status:** planned, not started. Architecture decided, ready to scope into sprints.
 > **Last updated:** 2026-05-23
 

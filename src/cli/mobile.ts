@@ -38,6 +38,7 @@ import {
   setMobileAccessStatus,
   setMobileAccessTunnel,
   updateMobileAccess,
+  tunnelOriginUrl,
 } from '../runtime/mobile-access-state.js';
 import { BASE_DIR, WEBHOOK_HOST, WEBHOOK_PORT } from '../config.js';
 import path from 'node:path';
@@ -284,7 +285,7 @@ async function runTunnelCli(args: string[]): Promise<number> {
       console.error('No tunnel configured. Run: clementine mobile tunnel create <name>');
       return 1;
     }
-    const localUrl = `http://${WEBHOOK_HOST === '0.0.0.0' ? '127.0.0.1' : WEBHOOK_HOST}:${WEBHOOK_PORT}`;
+    const localUrl = tunnelOriginUrl();
     const logFile = path.join(BASE_DIR, 'logs', 'cloudflared', 'tunnel.log');
     const supervisor = new CloudflaredSupervisor({
       binary: access.binary.path,

@@ -332,6 +332,37 @@ test('wrong PIN returns 401 then 429 after the 5th failure', async () => {
   } finally { await h.close(); }
 });
 
+test('a rotating CF-Connecting-IP cannot evade the PIN lockout', async () => {
+  // The header is only believable on the private tunnel listener, which stamps
+  // req.clemIngress itself. This harness mounts the router directly — i.e. the
+  // untrusted loopback door — so a caller-supplied CF-Connecting-IP must be
+  // ignored and every attempt must land in one bucket.
+  //
+  // Before ingress classification existed, clientIp() read this header
+  // unconditionally: each spoofed value minted a fresh 5-failure budget and the
+  // lockout could never trip.
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const statuses: number[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const res = await fetch(`${h.url}/m/auth/login`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'cf-connecting-ip': `198.51.100.${i}`,
+        },
+        body: JSON.stringify({ pin: 'WrongPin0' }),
+      });
+      statuses.push(res.status);
+    }
+    assert.ok(
+      statuses.includes(429),
+      `lockout must trip despite a rotating client IP, saw ${statuses.join(',')}`,
+    );
+  } finally { await h.close(); }
+});
+
 test('rotate is admin-gated and invalidates existing sessions', async () => {
   const nonAdmin = await startHarness({ admin: false });
   try {
