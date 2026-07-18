@@ -50,6 +50,7 @@ import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
 import { createMobileRouter } from './mobile-routes.js';
+import { defaultDenyAuthGate } from './auth-policy.js';
 import { readMobileAccess, setMobileAccessIngress } from '../runtime/mobile-access-state.js';
 import {
   classifyIngress,
@@ -1208,6 +1209,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   app.use(classifyIngress);
   app.use(restrictTunnelIngressToMobile);
   app.use(requireMobileSurfaceForMobileHost);
+  // Default-deny runs BEFORE any body parser. Two routes mount raw parsers with
+  // 30mb and 50mb limits as route middleware, which previously executed ahead of
+  // their own inline auth check — so an unauthenticated caller could make the
+  // daemon buffer tens of megabytes per request. Gating first removes that.
+  app.use(defaultDenyAuthGate({ isAdminAuthorized: isAuthorized }));
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: false, limit: '1mb', parameterLimit: 1000 }));
   app.use(requireSameOriginForMutations);
