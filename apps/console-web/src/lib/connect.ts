@@ -310,6 +310,38 @@ export const setCredential = (name: string, value: string) =>
 
 export const startQuickTunnel = () =>
   apiPost<{ ok: boolean; url?: string; error?: string }>('/api/console/mobile-access/quick/start');
+
+/**
+ * One-tap setup. Idempotent and resumable server-side, which is what lets the
+ * whole error UI be a single "Try again" that calls this again.
+ */
+export const setupMobileAccess = () =>
+  apiPost<{ ok: boolean; view: MobileSetupView; failure?: MobileSetupFailure }>(
+    '/api/console/mobile-access/setup',
+  );
+
+export interface MobileSetupFailure {
+  code: string;
+  message: string;
+  remedy: { label: string; action: 'retry' | 'install-brew' | 'open-url' | 'copy-command'; url?: string; command?: string };
+}
+
+export interface MobileSetupView {
+  phase: 'not-set-up' | 'installing' | 'connecting' | 'live' | 'error';
+  headline: string;
+  detail?: string;
+  url?: string;
+  qrReady: boolean;
+  progressLines?: string[];
+  failure?: MobileSetupFailure;
+  devices: Array<{ deviceId: string; deviceLabel?: string; lastSeenAt: string; pushSubscribed: boolean }>;
+  advanced: {
+    mode: 'quick' | 'named' | 'none';
+    hostname?: string;
+    permanentAvailable: boolean;
+    cloudflareAccess: 'enforcing' | 'not-enforcing' | 'unknown';
+  };
+}
 export const installMobileCloudflared = () =>
   apiPost<{ job: { id: string; status: string } }>('/api/console/mobile-access/install');
 export const startMobileCloudflareLogin = () =>

@@ -71,6 +71,43 @@ export async function runMobileCli(args: string[]): Promise<number> {
     return 0;
   }
 
+  /**
+   * One-tap setup from the terminal. Renders the same derived view the desktop
+   * panel does, so the two surfaces cannot disagree about what state you are in.
+   */
+  if (sub === 'setup') {
+    const { ensureMobileAccess } = await import('../integrations/mobile-setup.js');
+    console.log('Setting up mobile access…');
+    const result = await ensureMobileAccess();
+    const view = result.view;
+    console.log('');
+    console.log(view.headline);
+    if (view.detail) console.log(view.detail);
+    if (view.failure) {
+      console.log('');
+      console.log(`  ${view.failure.message}`);
+      const remedy = view.failure.remedy;
+      if (remedy.url) console.log(`  → ${remedy.label}: ${remedy.url}`);
+      else if (remedy.command) console.log(`  → ${remedy.label}: ${remedy.command}`);
+      else console.log(`  → ${remedy.label}: clementine mobile setup`);
+      return 1;
+    }
+    if (view.url) {
+      console.log('');
+      console.log(`  ${view.url}`);
+      console.log('');
+      console.log('  Open the desktop Mobile panel to scan the pairing QR.');
+    }
+    return result.ok ? 0 : 1;
+  }
+
+  if (sub === 'stop') {
+    const { stopTunnel } = await import('../integrations/mobile-access.js');
+    await stopTunnel();
+    console.log('Mobile link stopped.');
+    return 0;
+  }
+
   if (sub === 'tunnel') {
     return runTunnelCli(args.slice(1));
   }

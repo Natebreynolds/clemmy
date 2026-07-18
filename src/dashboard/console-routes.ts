@@ -6379,6 +6379,21 @@ export function registerConsoleRoutes(
     }
   });
 
+  /**
+   * One-tap setup. Idempotent and resumable, so the entire error UI is a single
+   * "Try again" that calls this same endpoint again.
+   */
+  app.post('/api/console/mobile-access/setup', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { ensureMobileAccess } = await import('../integrations/mobile-setup.js');
+      const result = await ensureMobileAccess();
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/mobile-access/tunnel/stop', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

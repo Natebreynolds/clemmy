@@ -681,6 +681,11 @@ export interface MobileAccessStatusPayload {
   target: MobileAccessTarget;
   targetUrl?: string;
   targetMode?: 'public' | 'local-preview';
+  /**
+   * The single derived view every surface renders. Added alongside the legacy
+   * fields rather than replacing them, so existing consumers keep working.
+   */
+  setup?: import('./mobile-setup.js').MobileSetupView;
 }
 
 export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatusPayload> {
@@ -713,7 +718,7 @@ export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatus
     pushSubscribed: row.pushSubscribed ?? false,
   }));
   const target = mobileAccessTarget({ record: stateAfter });
-  return {
+  const payload: MobileAccessStatusPayload = {
     detect,
     state: stateAfter,
     pin: { configured: hasPin(), updatedAt: pinMeta?.updatedAt },
@@ -726,6 +731,11 @@ export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatus
     targetUrl: target.url,
     targetMode: legacyTargetMode(target),
   };
+  // Derived last, from the finished payload, so there is exactly one place
+  // that decides "what state is setup in?".
+  const { mobileSetupView } = await import('./mobile-setup.js');
+  payload.setup = mobileSetupView(payload);
+  return payload;
 }
 
 export async function acknowledgeCloudflareAccess(enabled: boolean): Promise<MobileAccessRecord> {
