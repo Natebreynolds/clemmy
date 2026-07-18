@@ -23,7 +23,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PKG_DIR } from '../config.js';
-import { hasPin, readPinMeta, setPin, verifyPin } from '../runtime/mobile-pin.js';
+import { hasPin, pinNeedsRotation, readPinMeta, setPin, validatePinForSet, verifyPin } from '../runtime/mobile-pin.js';
 import { consumeMobilePairingCode } from '../runtime/mobile-pairing.js';
 import { beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
 import {
@@ -787,8 +787,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     await recordSuccess(ip, stateOpts);
+    // A PIN predating the 8-char floor still logs in — locking those users out
+    // would be a worse outcome than the weak PIN itself, especially since PIN
+    // is the recovery path when you are away from the Mac that holds the QR.
+    // Instead it lands in a sandbox that can do nothing but set a stronger one.
+    const needsRotation = pinNeedsRotation(stateOpts);
     const { token, record } = await createSession(
-      { deviceLabel, devicePublicKeyJwk: readDeviceKeyFromBody(req), ip },
+      {
+        deviceLabel,
+        devicePublicKeyJwk: readDeviceKeyFromBody(req),
+        ip,
+        scope: needsRotation ? 'pin-rotation' : 'full',
+      },
       stateOpts,
     );
     setSessionCookie(req, res, token);
@@ -797,6 +807,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       deviceLabel: record.deviceLabel,
       expiresAt: record.expiresAt,
       binding: record.binding,
+      scope: record.scope,
+      pinRotationRequired: needsRotation,
       // The client signs every subsequent proof over this, binding it to this
       // exact session token.
       sessionFingerprint: sessionFingerprint(token),
@@ -910,6 +922,73 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       binding: bound.record.binding,
       sessionFingerprint: sessionFingerprint(bound.token),
       expiresAt: bound.record.expiresAt,
+    });
+  });
+
+  /**
+   * Self-service PIN rotation — the way out of the pin-rotation sandbox.
+   *
+   * Requires the CURRENT PIN as well as the session, so a stolen session
+   * cannot silently change the credential out from under the owner. On success
+   * every session for this device is re-issued at full scope, because the
+   * reason for the sandbox no longer holds.
+   */
+  router.post('/auth/pin', requireMobileSession, async (req, res) => {
+    const currentPin = typeof req.body?.currentPin === 'string' ? req.body.currentPin : '';
+    const newPin = typeof req.body?.newPin === 'string' ? req.body.newPin : '';
+
+    const invalid = validatePinForSet(newPin);
+    if (invalid) {
+      res.status(400).json({ error: invalid.code, message: invalid.message });
+      return;
+    }
+
+    const ip = clientIp(req);
+    const gate = checkAttempt(ip, stateOpts);
+    if (!gate.allowed) {
+      res.status(429)
+        .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
+        .json({ error: 'LOCKED_OUT', retryAfterMs: gate.retryAfterMs });
+      return;
+    }
+
+    let ok = false;
+    try {
+      ok = await verifyPin(currentPin, stateOpts);
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      const decision = await recordFailure(ip, stateOpts);
+      await notifyGlobalLockdown('pin', decision);
+      res.status(401).json({ error: 'BAD_PIN' });
+      return;
+    }
+    await recordSuccess(ip, stateOpts);
+
+    await setPin(newPin, stateOpts);
+
+    // Re-issue at full scope. The old token is revoked rather than upgraded in
+    // place so the sandboxed value cannot keep being used.
+    const session = req.mobileSession!;
+    await revokeSession(session.token, stateOpts);
+    const { token, record } = await createSession(
+      {
+        deviceLabel: session.record.deviceLabel,
+        devicePublicKeyJwk: session.record.devicePublicKeyJwk,
+        deviceId: session.record.deviceId,
+        ip,
+        scope: 'full',
+      },
+      stateOpts,
+    );
+    setSessionCookie(req, res, token);
+    res.json({
+      ok: true,
+      deviceId: record.deviceId,
+      scope: record.scope,
+      binding: record.binding,
+      sessionFingerprint: sessionFingerprint(token),
     });
   });
 

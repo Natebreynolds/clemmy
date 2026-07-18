@@ -332,6 +332,110 @@ test('wrong PIN returns 401 then 429 after the 5th failure', async () => {
   } finally { await h.close(); }
 });
 
+// ---- legacy PIN sandbox ----------------------------------------------------
+
+/**
+ * Writes a PIN record in the pre-floor shape: a real scrypt hash, but with no
+ * `length` field, which is exactly how records written before the 8-char floor
+ * look on disk.
+ */
+async function writeLegacyPin(stateDir: string, pin: string): Promise<void> {
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const { scryptSync, randomBytes } = await import('node:crypto');
+  const params = { N: 32768, r: 8, p: 1, keylen: 32 };
+  const salt = randomBytes(16).toString('hex');
+  const hash = scryptSync(pin, Buffer.from(salt, 'hex'), params.keylen, {
+    N: params.N, r: params.r, p: params.p, maxmem: 256 * 1024 * 1024,
+  }).toString('hex');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'mobile-pin.json'),
+    JSON.stringify({ version: 1, salt, hash, params, updatedAt: new Date().toISOString() }),
+  );
+}
+
+test('a legacy weak PIN still logs in, but only into a rotation sandbox', async () => {
+  // Locking these users out would be worse than the weak PIN: PIN is the
+  // recovery path when you are away from the Mac that shows the QR.
+  const h = await startHarness();
+  try {
+    await writeLegacyPin(h.stateDir, '1234');
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: '1234' }),
+    });
+    assert.equal(login.status, 200, 'a legacy PIN must still authenticate');
+    const body = await login.json() as { scope: string; pinRotationRequired: boolean };
+    assert.equal(body.scope, 'pin-rotation');
+    assert.equal(body.pinRotationRequired, true);
+    const cookie = cookieFrom(login);
+
+    // The sandbox: everything of consequence is refused.
+    for (const p of ['/m/api/whoami', '/m/api/memory/facts', '/m/api/workflows']) {
+      const res = await fetch(`${h.url}${p}`, { headers: { cookie } });
+      assert.equal(res.status, 403, `${p} must be refused under the rotation sandbox`);
+      assert.equal((await res.json() as { error: string }).error, 'PIN_ROTATION_REQUIRED');
+    }
+
+    // But it can see itself and set a stronger PIN.
+    const status = await fetch(`${h.url}/m/auth/status`, { headers: { cookie } });
+    assert.equal(status.status, 200, 'status must stay reachable so the app can explain why');
+  } finally { await h.close(); }
+});
+
+test('rotating to a strong PIN escapes the sandbox', async () => {
+  const h = await startHarness();
+  try {
+    await writeLegacyPin(h.stateDir, '1234');
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: '1234' }),
+    });
+    const cookie = cookieFrom(login);
+
+    // A weak replacement is refused — the sandbox must not be escapable
+    // by rotating sideways.
+    const weak = await fetch(`${h.url}/m/auth/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ currentPin: '1234', newPin: '5678' }),
+    });
+    assert.equal(weak.status, 400);
+
+    // The wrong current PIN is refused, so a stolen session cannot change the
+    // credential out from under the owner.
+    const wrongCurrent = await fetch(`${h.url}/m/auth/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ currentPin: '9999', newPin: 'StrongPin1!' }),
+    });
+    assert.equal(wrongCurrent.status, 401);
+
+    const rotated = await fetch(`${h.url}/m/auth/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ currentPin: '1234', newPin: 'StrongPin1!' }),
+    });
+    assert.equal(rotated.status, 200);
+    assert.equal((await rotated.json() as { scope: string }).scope, 'full');
+
+    // The re-issued session has full capability.
+    const newCookie = cookieFrom(rotated);
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie: newCookie } });
+    assert.equal(whoami.status, 200, 'after rotation the session must work normally');
+
+    // And a fresh login with the new PIN is unsandboxed from the start.
+    const relogin = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'StrongPin1!' }),
+    });
+    assert.equal((await relogin.json() as { scope: string }).scope, 'full');
+  } finally { await h.close(); }
+});
+
 // ---- device-bound sessions -------------------------------------------------
 
 const { webcrypto } = await import('node:crypto');
