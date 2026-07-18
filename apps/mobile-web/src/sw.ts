@@ -108,14 +108,29 @@ sw.addEventListener('notificationclick', (event) => {
   const targetUrl = (event.notification.data && typeof event.notification.data.url === 'string')
     ? event.notification.data.url
     : '/m/';
+  // WindowClient.navigate() REJECTS on a cross-origin URL. A quick tunnel gets a
+  // new hostname when the machine reboots, so a notification pointing at the new
+  // origin would silently do nothing on any phone with the old PWA still open —
+  // exactly the device we most need to reach. Detect that and open a new window
+  // instead of trying to steer the existing one.
+  const crossOrigin = (() => {
+    try {
+      return new URL(targetUrl, sw.location.origin).origin !== sw.location.origin;
+    } catch {
+      return false;
+    }
+  })();
+
   event.waitUntil(
-    sw.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((all) => {
-      for (const client of all) {
-        if (client.url.includes('/m/') && 'focus' in client) {
-          return client.focus().then((c) => 'navigate' in c ? (c as WindowClient).navigate(targetUrl) : c);
+    crossOrigin
+      ? sw.clients.openWindow(targetUrl)
+      : sw.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((all) => {
+        for (const client of all) {
+          if (client.url.includes('/m/') && 'focus' in client) {
+            return client.focus().then((c) => 'navigate' in c ? (c as WindowClient).navigate(targetUrl) : c);
+          }
         }
-      }
-      return sw.clients.openWindow(targetUrl);
-    }),
+        return sw.clients.openWindow(targetUrl);
+      }),
   );
 });

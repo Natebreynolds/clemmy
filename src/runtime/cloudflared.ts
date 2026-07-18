@@ -22,7 +22,7 @@
  */
 
 import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
@@ -387,6 +387,118 @@ export function parseQuickTunnelUrl(text: string): string | null {
   return match ? match[0] : null;
 }
 
+/**
+ * Interprets one line of cloudflared output.
+ *
+ * Extracted from the supervisor's inline stream handler so both the piped path
+ * and the detached log-tailing path speak one event vocabulary instead of
+ * drifting into two subtly different parsers. Pure, so it is directly testable.
+ */
+export function interpretCloudflaredLine(
+  line: string,
+  alreadyConnected: boolean,
+): CloudflaredEvent[] {
+  if (!line) return [];
+  const events: CloudflaredEvent[] = [];
+  const quickUrl = parseQuickTunnelUrl(line);
+  if (quickUrl) {
+    try {
+      const parsed = new URL(quickUrl);
+      events.push({ type: 'url', url: quickUrl, hostname: parsed.hostname });
+      events.push({ type: 'connected' });
+      return events;
+    } catch {
+      /* malformed URL in output — fall through */
+    }
+  }
+  if (!alreadyConnected && /Registered tunnel connection|Connection .+ registered/i.test(line)) {
+    events.push({ type: 'connected' });
+  }
+  return events;
+}
+
+export interface DetachedTunnelHandle {
+  pid: number;
+  logFile: string;
+  startedAt: string;
+}
+
+/**
+ * Starts a quick tunnel as a DETACHED process that outlives this daemon.
+ *
+ * A trycloudflare hostname is stable for the lifetime of the cloudflared
+ * process. While that process was a child of the daemon, every daemon restart —
+ * upgrade, crash, dev reload, launchd respawn — rotated the hostname, and a new
+ * hostname is a new ORIGIN: it invalidates the home-screen icon, the session
+ * cookie, the service worker, the push subscription, and notification
+ * permission. Detaching makes the overwhelming majority of restarts invisible
+ * to the phone. Only a machine reboot rotates.
+ *
+ * stdio MUST go to a file, never a pipe: with `detached` + `pipe`, cloudflared
+ * writes into a closed pipe once the daemon exits and dies on EPIPE, which
+ * would defeat the entire point.
+ */
+export function spawnDetachedQuickTunnel(opts: {
+  binary: string;
+  localUrl: string;
+  logFile: string;
+}): DetachedTunnelHandle {
+  mkdirSync(path.dirname(opts.logFile), { recursive: true });
+  const fd = openSync(opts.logFile, 'a');
+  try {
+    const child = spawn(
+      opts.binary,
+      ['tunnel', '--no-autoupdate', '--url', opts.localUrl],
+      { detached: true, stdio: ['ignore', fd, fd] },
+    );
+    // Let the parent exit without waiting on this child.
+    child.unref();
+    if (typeof child.pid !== 'number') throw new Error('cloudflared did not report a pid');
+    return { pid: child.pid, logFile: opts.logFile, startedAt: new Date().toISOString() };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Signal-0 liveness check; EPERM means alive but owned by another user. */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+/**
+ * Waits for a detached quick tunnel to announce its hostname by tailing the log.
+ *
+ * The hostname is only discoverable from cloudflared's own output, so this is
+ * unavoidable on FIRST start. Adoption on later starts uses the persisted
+ * hostname plus an HTTP probe instead, which is stronger evidence than
+ * re-reading a log.
+ */
+export async function awaitQuickTunnelHostname(
+  logFile: string,
+  opts?: { timeoutMs?: number; pollMs?: number; since?: number },
+): Promise<string | null> {
+  const deadline = Date.now() + (opts?.timeoutMs ?? 60_000);
+  const pollMs = opts?.pollMs ?? 400;
+  const since = opts?.since ?? 0;
+  while (Date.now() < deadline) {
+    try {
+      const text = readFileSync(logFile, 'utf-8').slice(since);
+      const url = parseQuickTunnelUrl(text);
+      if (url) return new URL(url).hostname;
+    } catch {
+      /* log not written yet */
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return null;
+}
+
 export class CloudflaredSupervisor {
   private child: ChildProcessByStdio<null, Readable, Readable> | null = null;
   private logStream: ReturnType<typeof createWriteStream> | null = null;
@@ -422,20 +534,9 @@ export class CloudflaredSupervisor {
       for (const line of text.split(/\r?\n/)) {
         if (!line) continue;
         this.emit({ type: 'log', stream, line });
-        const quickUrl = parseQuickTunnelUrl(line);
-        if (quickUrl) {
-          try {
-            const parsed = new URL(quickUrl);
-            this.connected = true;
-            this.emit({ type: 'url', url: quickUrl, hostname: parsed.hostname });
-            this.emit({ type: 'connected' });
-          } catch {
-            /* malformed URL in output — ignore */
-          }
-        }
-        if (!this.connected && /Registered tunnel connection|Connection .+ registered/i.test(line)) {
-          this.connected = true;
-          this.emit({ type: 'connected' });
+        for (const event of interpretCloudflaredLine(line, this.connected)) {
+          if (event.type === 'connected') this.connected = true;
+          this.emit(event);
         }
       }
     };

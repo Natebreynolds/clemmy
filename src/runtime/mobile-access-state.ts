@@ -45,6 +45,22 @@ export interface MobileAccessTunnel {
   hostname: string;
   mode?: 'named' | 'quick';
   credentialsFile?: string;
+
+  // ---- detached quick-tunnel adoption ----
+  /**
+   * OS pid of a detached cloudflared. A quick tunnel is spawned detached so its
+   * hostname survives daemon restarts; this is how a restarted daemon finds it.
+   */
+  pid?: number;
+  /**
+   * Random value this daemon echoes from /m/health.
+   *
+   * Cloudflare can recycle a trycloudflare hostname, so "the hostname answers"
+   * does not prove the tunnel still points at us. Only an echo of this nonce
+   * does.
+   */
+  probeNonce?: string;
+  startedAt?: string;
 }
 
 export interface MobileAccessBinary {
@@ -216,6 +232,11 @@ export function tunnelOriginUrl(opts?: MobileAccessStoreOptions): string {
   const ingress = readMobileAccess(opts).ingress;
   const port = ingress && isPidAlive(ingress.pid) ? ingress.port : WEBHOOK_PORT;
   return `http://127.0.0.1:${port}`;
+}
+
+/** The nonce this daemon echoes from /m/health, for tunnel-adoption probes. */
+export function currentTunnelProbeNonce(opts?: MobileAccessStoreOptions): string | null {
+  return readMobileAccess(opts).tunnel?.probeNonce ?? null;
 }
 
 /**

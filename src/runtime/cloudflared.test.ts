@@ -205,3 +205,69 @@ test('every updateMobileAccess bumps updatedAt', async () => {
   const second = await setMobileAccessStatus('running', undefined, { stateDir });
   assert.ok(second.updatedAt >= first.updatedAt);
 });
+
+// ─── detached quick tunnels ────────────────────────────────────────────
+
+test('interpretCloudflaredLine reports a quick URL as both url and connected', async () => {
+  const { interpretCloudflaredLine } = await import('./cloudflared.js');
+  const events = interpretCloudflaredLine(
+    '2026-07-18T10:00:00Z INF |  https://brave-mountain-1234.trycloudflare.com  |',
+    false,
+  );
+  assert.equal(events.length, 2);
+  assert.equal(events[0]?.type, 'url');
+  assert.equal((events[0] as { hostname: string }).hostname, 'brave-mountain-1234.trycloudflare.com');
+  assert.equal(events[1]?.type, 'connected');
+});
+
+test('interpretCloudflaredLine emits connected once for a named tunnel', async () => {
+  const { interpretCloudflaredLine } = await import('./cloudflared.js');
+  const line = 'INF Registered tunnel connection connIndex=0';
+  assert.equal(interpretCloudflaredLine(line, false).length, 1);
+  // Already connected: no duplicate event.
+  assert.equal(interpretCloudflaredLine(line, true).length, 0);
+});
+
+test('interpretCloudflaredLine ignores unrelated output', async () => {
+  const { interpretCloudflaredLine } = await import('./cloudflared.js');
+  assert.deepEqual(interpretCloudflaredLine('INF Starting tunnel', false), []);
+  assert.deepEqual(interpretCloudflaredLine('', false), []);
+});
+
+test('isProcessAlive is true for this process and false for a dead pid', async () => {
+  const { isProcessAlive } = await import('./cloudflared.js');
+  assert.equal(isProcessAlive(process.pid), true);
+  assert.equal(isProcessAlive(0), false);
+  assert.equal(isProcessAlive(-1), false);
+  // 2^22 is above the default pid_max on macOS/Linux, so nothing can hold it.
+  assert.equal(isProcessAlive(4194303), false);
+});
+
+test('awaitQuickTunnelHostname reads the hostname from the log tail', async () => {
+  const { awaitQuickTunnelHostname } = await import('./cloudflared.js');
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-cfd-log-'));
+  const logFile = path.join(dir, 'tunnel.log');
+  writeFileSync(logFile, 'INF starting\nINF https://calm-river-99.trycloudflare.com\n');
+  const hostname = await awaitQuickTunnelHostname(logFile, { timeoutMs: 2000, pollMs: 50 });
+  assert.equal(hostname, 'calm-river-99.trycloudflare.com');
+});
+
+test('awaitQuickTunnelHostname ignores output written before `since`', async () => {
+  // A restart appends to the same log, so a stale URL from a previous run must
+  // not be mistaken for the new tunnel's hostname.
+  const { awaitQuickTunnelHostname } = await import('./cloudflared.js');
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-cfd-log2-'));
+  const logFile = path.join(dir, 'tunnel.log');
+  const stale = 'INF https://old-hostname-1.trycloudflare.com\n';
+  writeFileSync(logFile, stale);
+  const hostname = await awaitQuickTunnelHostname(logFile, {
+    timeoutMs: 300, pollMs: 50, since: stale.length,
+  });
+  assert.equal(hostname, null, 'a pre-existing URL must not be adopted as the new one');
+});

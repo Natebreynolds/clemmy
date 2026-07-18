@@ -11,6 +11,7 @@
  */
 
 import { existsSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import QRCode from 'qrcode';
@@ -24,6 +25,9 @@ import {
 } from '../runtime/mobile-sessions.js';
 import {
   CloudflaredSupervisor,
+  awaitQuickTunnelHostname,
+  isProcessAlive,
+  spawnDetachedQuickTunnel,
   type CloudflaredEvent,
   createTunnel,
   detectCloudflared,
@@ -254,14 +258,61 @@ export interface TunnelRuntime {
 
 let startedAt: string | undefined;
 
+/**
+ * A detached quick tunnel this daemon is currently adopting or running.
+ *
+ * Detached cloudflared has no pipes to watch, so liveness is a pid check plus
+ * the nonce probe rather than a stream of supervisor events.
+ */
+let detachedQuick: { pid: number; hostname: string } | null = null;
+
 export function getTunnelRuntime(): TunnelRuntime {
   if (tunnelRuntimeOverrideForTests) return tunnelRuntimeOverrideForTests;
+  if (detachedQuick && isProcessAlive(detachedQuick.pid)) {
+    return {
+      running: true,
+      connected: true,
+      events: [...lastSupervisorEvents],
+      startedAt,
+    };
+  }
   return {
     running: Boolean(currentSupervisor?.isRunning()),
     connected: Boolean(currentSupervisor?.isConnected()),
     events: [...lastSupervisorEvents],
     startedAt,
   };
+}
+
+/**
+ * Confirms a hostname is still OUR tunnel by asking it to echo our nonce.
+ *
+ * Cloudflare recycles trycloudflare hostnames, so a hostname that merely
+ * answers proves nothing — it could be a stranger's tunnel. Only the nonce
+ * echo is evidence.
+ */
+export async function probeTunnelOwnership(
+  hostname: string,
+  expectedNonce: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<boolean> {
+  if (!hostname || !expectedNonce) return false;
+  const doFetch = opts?.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 8000);
+  try {
+    const res = await doFetch(`https://${hostname}/m/health`, {
+      headers: { accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!res.ok) return false;
+    const body = await res.json() as { nonce?: unknown };
+    return body?.nonce === expectedNonce;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function startTunnel(): Promise<{ ok: boolean; error?: string }> {
@@ -274,7 +325,7 @@ export async function startTunnel(): Promise<{ ok: boolean; error?: string }> {
     await setMobileAccessStatus('error', error).catch(() => undefined);
     return { ok: false, error };
   }
-  if (!record.tunnel?.id || record.tunnel.mode === 'quick') {
+  if (!record.tunnel?.id || record.tunnel.mode !== 'named') {
     const error = 'no custom-domain tunnel configured';
     await setMobileAccessStatus('error', error).catch(() => undefined);
     return { ok: false, error };
@@ -315,98 +366,148 @@ export async function startTunnel(): Promise<{ ok: boolean; error?: string }> {
   return { ok: true };
 }
 
+/**
+ * Starts a quick tunnel as a detached process and records how to find it again.
+ *
+ * Detached is the whole point: a trycloudflare hostname lives exactly as long
+ * as its cloudflared process, and while that process was our child, every
+ * daemon restart rotated the hostname. A new hostname is a new ORIGIN, which
+ * invalidates the phone's home-screen icon, session cookie, service worker,
+ * push subscription, and notification permission — so a naive restart produced
+ * a live tunnel nobody's phone could use.
+ */
 export async function startQuickTunnel(): Promise<{ ok: boolean; error?: string }> {
-  if (currentSupervisor?.isRunning()) {
-    return { ok: true };
-  }
-  if (currentLogin && !currentLogin.outcome) {
-    cancelLogin();
-  }
+  if (detachedQuick && isProcessAlive(detachedQuick.pid)) return { ok: true };
+  if (currentSupervisor?.isRunning()) return { ok: true };
+  if (currentLogin && !currentLogin.outcome) cancelLogin();
+
   const record = readMobileAccess();
   if (!record.binary?.path) return { ok: false, error: 'cloudflared binary not detected' };
-  const localUrl = tunnelOriginUrl();
+
   lastSupervisorEvents = [];
   await setMobileAccessStatus('configuring').catch(() => undefined);
-  // Track the URL across supervisor restarts so we can detect rotation
-  // and fire a push to every paired device — their home-screen
-  // bookmark points at the OLD URL and will 404 after rotation.
-  let lastQuickHostname: string | undefined =
-    record.tunnel?.mode === 'quick' ? record.tunnel.hostname : undefined;
-  const supervisor = new CloudflaredSupervisor({
-    binary: record.binary.path,
-    quickTunnel: true,
-    localUrl,
-    logFile: TUNNEL_LOG_FILE,
-    onEvent: (event) => {
-      lastSupervisorEvents.push(event);
-      if (lastSupervisorEvents.length > EVENT_RING_SIZE) {
-        lastSupervisorEvents = lastSupervisorEvents.slice(-EVENT_RING_SIZE);
-      }
-      if (event.type === 'url') {
-        const newHostname = event.hostname;
-        const isRotation = lastQuickHostname !== undefined && lastQuickHostname !== newHostname;
-        void updateMobileAccess((current) => ({
-          ...current,
-          tunnel: {
-            id: 'quick',
-            name: 'Quick mobile link',
-            hostname: newHostname,
-            mode: 'quick',
-          },
-          status: 'running',
-          lastError: undefined,
-        })).catch(() => undefined);
-        if (isRotation) {
-          // Bookmark-rot alarm. Best-effort — must never break the
-          // supervisor. Push fans out to every paired device through
-          // the existing notification-delivery pipeline.
-          void import('../runtime/notifications.js').then(({ addNotification }) => {
-            try {
-              addNotification({
-                id: `mobile-quick-url-rotated-${Date.now().toString(36)}`,
-                kind: 'system',
-                title: 'Mobile link URL changed',
-                body: `Your temporary mobile URL rotated to https://${newHostname}/m/. The home-screen icon on your phone now points at a stale URL — open the desktop Mobile Access panel for a fresh QR code.`,
-                createdAt: new Date().toISOString(),
-                read: false,
-                metadata: {
-                  previousHostname: lastQuickHostname,
-                  newHostname,
-                  mode: 'quick',
-                },
-              });
-            } catch { /* swallow */ }
-          }).catch(() => undefined);
-        }
-        lastQuickHostname = newHostname;
-      } else if (event.type === 'connected') {
-        void setMobileAccessStatus('running').catch(() => undefined);
-      } else if (event.type === 'exit') {
-        void updateMobileAccess((current) => ({
-          ...current,
-          tunnel: current.tunnel?.mode === 'quick' ? null : current.tunnel,
-          status: 'inactive',
-        })).catch(() => undefined);
-      }
+
+  const previousHostname = record.tunnel?.mode === 'quick' ? record.tunnel.hostname : undefined;
+  const logSize = existsSync(TUNNEL_LOG_FILE) ? statSync(TUNNEL_LOG_FILE).size : 0;
+
+  let handle;
+  try {
+    handle = spawnDetachedQuickTunnel({
+      binary: record.binary.path,
+      localUrl: tunnelOriginUrl(),
+      logFile: TUNNEL_LOG_FILE,
+    });
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    await setMobileAccessStatus('error', error).catch(() => undefined);
+    return { ok: false, error };
+  }
+
+  // The hostname is only discoverable from cloudflared's own output, so this
+  // one read of the log is unavoidable on first start. Adoption later uses the
+  // persisted hostname plus the nonce probe instead.
+  const hostname = await awaitQuickTunnelHostname(TUNNEL_LOG_FILE, { since: logSize });
+  if (!hostname) {
+    try { process.kill(handle.pid); } catch { /* already gone */ }
+    const error = 'Cloudflare did not return a tunnel URL in time';
+    await setMobileAccessStatus('error', error).catch(() => undefined);
+    return { ok: false, error };
+  }
+
+  const probeNonce = randomBytes(16).toString('hex');
+  await updateMobileAccess((current) => ({
+    ...current,
+    tunnel: {
+      id: 'quick',
+      name: 'Quick mobile link',
+      hostname,
+      mode: 'quick',
+      pid: handle.pid,
+      probeNonce,
+      startedAt: handle.startedAt,
     },
-  });
-  currentSupervisor = supervisor;
-  startedAt = new Date().toISOString();
-  await supervisor.start();
-  await setMobileAccessAutoStart(false).catch(() => undefined);
+    status: 'running',
+    lastError: undefined,
+  })).catch(() => undefined);
+
+  detachedQuick = { pid: handle.pid, hostname };
+  startedAt = handle.startedAt;
+  // Quick tunnels now survive restarts, so they participate in boot auto-start
+  // like any other tunnel. Previously this was forced to false, which is what
+  // made them die on every restart.
+  await setMobileAccessAutoStart(true).catch(() => undefined);
+
+  if (previousHostname && previousHostname !== hostname) {
+    await notifyQuickTunnelRotation(previousHostname, hostname);
+  }
   return { ok: true };
 }
 
-export async function stopTunnel(): Promise<{ ok: boolean }> {
-  const wasQuick = readMobileAccess().tunnel?.mode === 'quick';
-  if (!currentSupervisor) {
-    if (wasQuick) {
-      await updateMobileAccess((current) => ({ ...current, tunnel: null, status: 'inactive' })).catch(() => undefined);
+/**
+ * Reattaches to a still-running detached tunnel, or starts a fresh one.
+ *
+ * Called at boot and from the status endpoint. Adoption is what makes a daemon
+ * restart invisible to an already-paired phone.
+ */
+export async function adoptOrStartQuickTunnel(
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<{ ok: boolean; adopted: boolean; error?: string }> {
+  const record = readMobileAccess();
+  const tunnel = record.tunnel;
+  if (tunnel?.mode === 'quick' && tunnel.pid && tunnel.probeNonce && isProcessAlive(tunnel.pid)) {
+    const ours = await probeTunnelOwnership(tunnel.hostname, tunnel.probeNonce, opts);
+    if (ours) {
+      detachedQuick = { pid: tunnel.pid, hostname: tunnel.hostname };
+      startedAt = tunnel.startedAt ?? new Date().toISOString();
+      await setMobileAccessStatus('running').catch(() => undefined);
+      return { ok: true, adopted: true };
     }
-    return { ok: true };
+    // Alive but not serving us — a recycled hostname or a stale process.
+    // Reap it rather than leaving an orphan holding a port.
+    try { process.kill(tunnel.pid); } catch { /* already gone */ }
   }
-  await currentSupervisor.stop();
-  currentSupervisor = null;
+  const started = await startQuickTunnel();
+  return { ok: started.ok, adopted: false, error: started.error };
+}
+
+/**
+ * Bookmark-rot alarm. Best-effort — must never break tunnel startup. Push fans
+ * out to every paired device through the existing notification pipeline.
+ */
+async function notifyQuickTunnelRotation(previousHostname: string, newHostname: string): Promise<void> {
+  try {
+    const { addNotification } = await import('../runtime/notifications.js');
+    addNotification({
+      id: `mobile-quick-url-rotated-${Date.now().toString(36)}`,
+      kind: 'system',
+      title: 'Mobile link URL changed',
+      body: `Your temporary mobile URL rotated to https://${newHostname}/m/. The home-screen icon on your phone now points at a stale URL — open the desktop Mobile Access panel for a fresh QR code.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { previousHostname, newHostname, mode: 'quick' },
+    });
+  } catch {
+    /* swallow */
+  }
+}
+
+export async function stopTunnel(): Promise<{ ok: boolean }> {
+  const record = readMobileAccess();
+  const wasQuick = record.tunnel?.mode === 'quick';
+
+  // A detached tunnel outlives this process, so it must be killed by pid.
+  // Leaving it running after an explicit stop would be an orphan the user
+  // cannot see or reach.
+  const pid = record.tunnel?.pid;
+  if (pid && isProcessAlive(pid)) {
+    try { process.kill(pid); } catch { /* already gone */ }
+  }
+  detachedQuick = null;
+
+  if (currentSupervisor) {
+    await currentSupervisor.stop();
+    currentSupervisor = null;
+  }
   startedAt = undefined;
   await setMobileAccessAutoStart(false).catch(() => undefined);
   if (wasQuick) {
@@ -591,13 +692,16 @@ export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatus
       await setMobileAccessBinary({ path: detect.binary, version: detect.version ?? 'unknown' });
     } catch { /* best effort */ }
   }
+  // A quick tunnel is no longer reaped here. This block used to null the
+  // persisted tunnel whenever no in-process supervisor was running, which erased
+  // the hostname on the FIRST status poll after a restart — before adoption ever
+  // got a chance to run. It was the real reason quick tunnels felt disposable.
   let stateAfter = readMobileAccess();
-  if (stateAfter.tunnel?.mode === 'quick' && !currentSupervisor?.isRunning()) {
-    stateAfter = await updateMobileAccess((current) => ({
-      ...current,
-      tunnel: null,
-      status: current.status === 'running' || current.status === 'configuring' ? 'inactive' : current.status,
-    })).catch(() => readMobileAccess());
+  if (stateAfter.tunnel?.mode === 'quick' && !detachedQuick && !currentSupervisor?.isRunning()) {
+    const pid = stateAfter.tunnel.pid;
+    if (pid && isProcessAlive(pid)) {
+      void adoptOrStartQuickTunnel().catch(() => undefined);
+    }
   }
   const pinMeta = readPinMeta();
   const sessions = listSessions().map((row) => ({

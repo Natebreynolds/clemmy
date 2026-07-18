@@ -220,3 +220,51 @@ test('status labels cover every MobileAccessStatus value', () => {
     assert.ok(labels[k], `missing label for ${k}`);
   }
 });
+
+// ─── tunnel adoption ───────────────────────────────────────────────────
+
+test('probeTunnelOwnership accepts only a matching nonce echo', async () => {
+  // Cloudflare recycles trycloudflare hostnames, so "the hostname answers" is
+  // NOT evidence that it still points at us. Without the nonce, adoption could
+  // silently attach us to a stranger's tunnel.
+  const ok = await integration.probeTunnelOwnership('x.trycloudflare.com', 'nonce-abc', {
+    fetchImpl: (async () => new Response(JSON.stringify({ ok: true, nonce: 'nonce-abc' }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch,
+  });
+  assert.equal(ok, true);
+
+  const recycled = await integration.probeTunnelOwnership('x.trycloudflare.com', 'nonce-abc', {
+    fetchImpl: (async () => new Response(JSON.stringify({ ok: true, nonce: 'someone-elses' }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch,
+  });
+  assert.equal(recycled, false, 'a different daemon answering must not be adopted');
+
+  const missing = await integration.probeTunnelOwnership('x.trycloudflare.com', 'nonce-abc', {
+    fetchImpl: (async () => new Response('nope', { status: 404 })) as unknown as typeof fetch,
+  });
+  assert.equal(missing, false);
+
+  const offline = await integration.probeTunnelOwnership('x.trycloudflare.com', 'nonce-abc', {
+    fetchImpl: (async () => { throw new Error('offline'); }) as unknown as typeof fetch,
+  });
+  assert.equal(offline, false);
+});
+
+test('probeTunnelOwnership refuses when there is no nonce to check', async () => {
+  assert.equal(await integration.probeTunnelOwnership('x.trycloudflare.com', ''), false);
+  assert.equal(await integration.probeTunnelOwnership('', 'nonce'), false);
+});
+
+test('a quick tunnel with a dead pid is not adopted', async () => {
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel({
+    id: 'quick', name: 'Quick mobile link', hostname: 'dead.trycloudflare.com', mode: 'quick',
+    pid: 4194303, probeNonce: 'n1',
+  } as never);
+  // No binary configured, so the fallback start fails — what matters is that it
+  // did NOT report an adoption of a process that is gone.
+  const result = await integration.adoptOrStartQuickTunnel();
+  assert.equal(result.adopted, false);
+});

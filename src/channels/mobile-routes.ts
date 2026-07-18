@@ -59,6 +59,7 @@ import {
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { trustsForwardedClientIp } from '../runtime/mobile-ingress.js';
 import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
+import { currentTunnelProbeNonce } from '../runtime/mobile-access-state.js';
 import { markPushSubscribed } from '../runtime/mobile-sessions.js';
 import {
   getSession as harnessGetSession,
@@ -723,6 +724,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   }
   (router as express.Router & { requireMobileSession: typeof requireMobileSession })
     .requireMobileSession = requireMobileSession;
+
+  /**
+   * Liveness probe for tunnel adoption.
+   *
+   * Must live under /m/ or the tunnel host guard 404s it. The nonce is what
+   * makes adoption safe: Cloudflare can recycle a trycloudflare hostname, so
+   * "the hostname answers" is not evidence that it still points at US. Only an
+   * echo of THIS daemon's nonce proves the tunnel we persisted is still ours.
+   */
+  router.get('/health', (_req, res) => {
+    res.json({ ok: true, nonce: currentTunnelProbeNonce(stateOpts) });
+  });
 
   router.get('/auth/status', async (req, res) => {
     const token = readSessionCookie(req);

@@ -573,9 +573,14 @@ function requireMobileSurfaceForMobileHost(
 
 async function autoStartMobileTunnelIfConfigured(): Promise<void> {
   const access = readMobileAccess();
-  if (!access.autoStart || !access.tunnel || access.tunnel.mode === 'quick') return;
-  const { startTunnel } = await import('../integrations/mobile-access.js');
-  const result = await startTunnel();
+  // Quick tunnels are no longer excluded: they now run detached and survive
+  // restarts, so a restarted daemon adopts the live one instead of orphaning it
+  // and handing the phone a dead hostname.
+  if (!access.autoStart || !access.tunnel) return;
+  const { startTunnel, adoptOrStartQuickTunnel } = await import('../integrations/mobile-access.js');
+  const result = access.tunnel.mode === 'quick'
+    ? await adoptOrStartQuickTunnel()
+    : await startTunnel();
   if (!result.ok) {
     logger.warn({ error: result.error }, 'Mobile custom-domain tunnel auto-start failed');
   }
