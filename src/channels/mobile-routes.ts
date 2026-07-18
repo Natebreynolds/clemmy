@@ -31,9 +31,20 @@ import {
   listSessions,
   revokeAllSessions,
   revokeSession,
+  revokeSessionByDeviceId,
   validateSession,
+  rotateSessionToken,
+  detectTokenReuse,
+  bindDeviceKey,
+  needsDeviceUpgrade,
+  shouldRotate,
   type MobileSessionRecord,
 } from '../runtime/mobile-sessions.js';
+import {
+  verifyDeviceProof,
+  sessionFingerprint,
+  isSupportedDeviceKey,
+} from '../runtime/mobile-device-proof.js';
 import {
   checkAttempt,
   recordFailure,
@@ -443,6 +454,42 @@ function clientIp(req: express.Request): string {
 }
 
 /**
+ * Short-lived single-use tickets for SSE streams.
+ *
+ * EventSource cannot set request headers, so a stream cannot carry the
+ * X-Clem-Device-Proof header every other authenticated request uses. Putting a
+ * proof in the query string instead would leak it into access logs, proxy logs,
+ * and browser history. So the client spends one proof-authenticated POST to
+ * mint an opaque ticket, and the stream URL carries only that.
+ *
+ * In-memory and deliberately tiny: 60-second TTL, single use, bound to both the
+ * device and the exact stream path. A daemon restart invalidates outstanding
+ * tickets, which costs a reconnect and nothing else.
+ */
+const STREAM_TICKET_TTL_MS = 60_000;
+const streamTickets = new Map<string, { deviceId: string; path: string; expiresAt: number }>();
+
+function mintStreamTicket(deviceId: string, pathname: string): string {
+  const now = Date.now();
+  for (const [key, value] of streamTickets) {
+    if (value.expiresAt <= now) streamTickets.delete(key);
+  }
+  const ticket = randomBytes(24).toString('base64url');
+  streamTickets.set(ticket, { deviceId, path: pathname, expiresAt: now + STREAM_TICKET_TTL_MS });
+  return ticket;
+}
+
+function consumeStreamTicket(ticket: string, deviceId: string, pathname: string): boolean {
+  const entry = streamTickets.get(ticket);
+  if (!entry) return false;
+  // Single use, whatever the outcome.
+  streamTickets.delete(ticket);
+  if (entry.expiresAt <= Date.now()) return false;
+  if (entry.deviceId !== deviceId) return false;
+  return entry.path === pathname;
+}
+
+/**
  * Distributed-brute-force alarm: a one-shot notification the moment a failure
  * tips the global counter into lockdown.
  *
@@ -520,24 +567,158 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * Used by anything mounted on /m/api/* (and equivalent paths) that
    * needs a valid mobile session. Sets `req.mobileSession` on success.
    */
+  /**
+   * Reads a device public key offered at credential time.
+   *
+   * Absent on an older cached PWA bundle, which is why a keyless session is
+   * still issued (with an upgrade grace) rather than refused — a stale service
+   * worker must not lock a user out of their own phone.
+   */
+  function readDeviceKeyFromBody(req: express.Request): JsonWebKey | undefined {
+    const jwk = req.body?.devicePublicKeyJwk as unknown;
+    return isSupportedDeviceKey(jwk) ? jwk : undefined;
+  }
+
+  function setSessionCookie(req: express.Request, res: express.Response, token: string): void {
+    res.cookie(MOBILE_SESSION_COOKIE, token, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: mobileCookieSecure(req),
+      path: '/',
+      maxAge: COOKIE_MAX_AGE_MS,
+    });
+  }
+
   async function requireMobileSession(
     req: express.Request,
     res: express.Response,
     next: express.NextFunction,
   ): Promise<void> {
+    const now = Date.now();
     const token = readSessionCookie(req);
     if (!token) {
       res.status(401).json({ error: 'NO_SESSION' });
       return;
     }
-    const record = await validateSession(token, stateOpts);
+    let record = await validateSession(token, stateOpts);
     if (!record) {
+      // A token we retired is being presented past its grace. The legitimate
+      // client always holds the newest one, so this means the value leaked and
+      // two parties hold session material. We cannot tell which caller is the
+      // owner, so the safe move is to kill the whole device chain and make
+      // both re-authenticate.
+      const reuse = await detectTokenReuse(token, stateOpts);
+      if (reuse.reused) {
+        await revokeSessionByDeviceId(reuse.deviceId, stateOpts).catch(() => undefined);
+        await notifySessionReuse(reuse.deviceId);
+        res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });
+        res.status(401).json({ error: 'SESSION_REVOKED' });
+        return;
+      }
       res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });
       res.status(401).json({ error: 'INVALID_SESSION' });
       return;
     }
-    req.mobileSession = { token, record };
+
+    if (record.binding === 'key') {
+      const verdict = await verifySessionProof(req, token, record);
+      if (!verdict.ok) {
+        // Budgeted separately from PIN and pairing: a client failing this many
+        // signature checks is broken or hostile, but it must never be able to
+        // consume the budget the credential paths depend on.
+        await recordFailure(clientIp(req), { ...stateOpts, scope: 'proof' });
+        res.status(401).json({ error: 'BAD_DEVICE_PROOF', reason: verdict.reason });
+        return;
+      }
+    } else if (needsDeviceUpgrade(record, now)) {
+      // A migrated v1 session that never bound a key within its grace. Fails to
+      // a login screen, not to a broken app.
+      res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });
+      res.status(401).json({ error: 'DEVICE_UPGRADE_REQUIRED' });
+      return;
+    }
+
+    // A legacy weak PIN gets in, but only into a sandbox that can do nothing
+    // except look at itself and set a stronger PIN.
+    if (record.scope === 'pin-rotation' && !isPinRotationPath(req.path)) {
+      res.status(403).json({ error: 'PIN_ROTATION_REQUIRED' });
+      return;
+    }
+
+    let activeToken = token;
+    if (shouldRotate(record, now)) {
+      const rotated = await rotateSessionToken(token, stateOpts).catch(() => undefined);
+      if (rotated) {
+        activeToken = rotated.token;
+        record = rotated.record;
+        setSessionCookie(req, res, rotated.token);
+      }
+    }
+
+    req.mobileSession = { token: activeToken, record };
     next();
+  }
+
+  /** The only paths a pin-rotation-scoped session may reach. */
+  function isPinRotationPath(pathname: string): boolean {
+    return pathname === '/auth/status' || pathname === '/auth/pin' || pathname === '/auth/logout';
+  }
+
+  /**
+   * Verifies the per-request device proof.
+   *
+   * EventSource cannot set headers, so SSE streams carry a short-lived
+   * single-use ticket in the query string instead. The ticket is minted by a
+   * proof-authenticated endpoint, so the guarantee is preserved without putting
+   * a signature into access logs and browser history.
+   */
+  async function verifySessionProof(
+    req: express.Request,
+    token: string,
+    record: MobileSessionRecord,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (!record.devicePublicKeyJwk) return { ok: false, reason: 'NO_DEVICE_KEY' };
+
+    const ticket = typeof req.query.ticket === 'string' ? req.query.ticket : '';
+    if (ticket) {
+      return consumeStreamTicket(ticket, record.deviceId, req.path)
+        ? { ok: true }
+        : { ok: false, reason: 'BAD_TICKET' };
+    }
+
+    const header = req.headers['x-clem-device-proof'];
+    const proof = typeof header === 'string' ? header : '';
+    if (!proof) return { ok: false, reason: 'PROOF_REQUIRED' };
+
+    const result = await verifyDeviceProof({
+      proof,
+      publicKeyJwk: record.devicePublicKeyJwk,
+      method: req.method,
+      // req.path is router-relative; proofs are signed over the full path the
+      // client actually requested.
+      path: req.originalUrl.split('?')[0] ?? req.path,
+      sessionFingerprint: sessionFingerprint(token),
+    });
+    return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+  }
+
+  async function notifySessionReuse(deviceId: string): Promise<void> {
+    try {
+      const { addNotification } = await import('../runtime/notifications.js');
+      addNotification({
+        id: `mobile-session-reuse-${Date.now().toString(36)}`,
+        kind: 'system',
+        title: 'A mobile session was revoked',
+        body: 'A retired session token was replayed, which means the value leaked. '
+          + 'That device has been signed out everywhere. Pair it again from the desktop '
+          + 'Mobile Access panel.',
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { deviceId },
+      });
+    } catch {
+      /* swallow — auth path must stay responsive */
+    }
   }
   (router as express.Router & { requireMobileSession: typeof requireMobileSession })
     .requireMobileSession = requireMobileSession;
@@ -551,6 +732,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       authenticated: Boolean(record),
       deviceId: record?.deviceId ?? null,
       deviceLabel: record?.deviceLabel ?? null,
+      binding: record?.binding ?? null,
+      scope: record?.scope ?? null,
+      // Drives the PWA's silent self-upgrade: on seeing this it generates a
+      // non-extractable keypair and POSTs the public half to /auth/device-key,
+      // with no user interaction.
+      needsDeviceUpgrade: record ? record.binding !== 'key' : false,
+      // Only meaningful to a caller that already holds this exact token.
+      sessionFingerprint: token && record ? sessionFingerprint(token) : null,
     });
   });
 
@@ -598,18 +787,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     await recordSuccess(ip, stateOpts);
-    const { token, record } = await createSession({ deviceLabel }, stateOpts);
-    res.cookie(MOBILE_SESSION_COOKIE, token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: mobileCookieSecure(req),
-      path: '/',
-      maxAge: COOKIE_MAX_AGE_MS,
-    });
+    const { token, record } = await createSession(
+      { deviceLabel, devicePublicKeyJwk: readDeviceKeyFromBody(req), ip },
+      stateOpts,
+    );
+    setSessionCookie(req, res, token);
     res.json({
       deviceId: record.deviceId,
       deviceLabel: record.deviceLabel,
       expiresAt: record.expiresAt,
+      binding: record.binding,
+      // The client signs every subsequent proof over this, binding it to this
+      // exact session token.
+      sessionFingerprint: sessionFingerprint(token),
     });
   });
 
@@ -656,18 +846,24 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     await recordSuccess(ip, pairOpts);
-    const { token, record } = await createSession({ deviceLabel }, stateOpts);
-    res.cookie(MOBILE_SESSION_COOKIE, token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: mobileCookieSecure(req),
-      path: '/',
-      maxAge: COOKIE_MAX_AGE_MS,
-    });
+    const { token, record } = await createSession(
+      {
+        deviceLabel,
+        devicePublicKeyJwk: readDeviceKeyFromBody(req),
+        ip,
+        // A re-pair of a known phone keeps its identity, so it stays one row in
+        // the device list instead of appearing as a stranger each time.
+        deviceId: pairing.deviceId,
+      },
+      stateOpts,
+    );
+    setSessionCookie(req, res, token);
     res.json({
       deviceId: record.deviceId,
       deviceLabel: record.deviceLabel,
       expiresAt: record.expiresAt,
+      binding: record.binding,
+      sessionFingerprint: sessionFingerprint(token),
     });
   });
 
@@ -676,6 +872,66 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     if (token) await revokeSession(token, stateOpts);
     res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });
     res.json({ ok: true });
+  });
+
+  /**
+   * Silent upgrade path for a session that predates device binding.
+   *
+   * Deliberately NOT behind requireMobileSession: that middleware demands a
+   * proof for key-bound sessions, and this is the one request a not-yet-bound
+   * client must be able to make. It authenticates on the cookie alone, then
+   * bindDeviceKey refuses outright if the session is already key-bound — so a
+   * stolen cookie cannot use this to swap in a key the thief controls.
+   */
+  router.post('/auth/device-key', async (req, res) => {
+    const token = readSessionCookie(req);
+    if (!token) {
+      res.status(401).json({ error: 'NO_SESSION' });
+      return;
+    }
+    const record = await validateSession(token, stateOpts);
+    if (!record) {
+      res.status(401).json({ error: 'INVALID_SESSION' });
+      return;
+    }
+    const jwk = req.body?.devicePublicKeyJwk as unknown;
+    if (!isSupportedDeviceKey(jwk)) {
+      res.status(400).json({ error: 'UNSUPPORTED_DEVICE_KEY' });
+      return;
+    }
+    const bound = await bindDeviceKey(token, jwk, stateOpts);
+    if (!bound) {
+      res.status(409).json({ error: 'ALREADY_BOUND' });
+      return;
+    }
+    setSessionCookie(req, res, bound.token);
+    res.json({
+      deviceId: bound.record.deviceId,
+      binding: bound.record.binding,
+      sessionFingerprint: sessionFingerprint(bound.token),
+      expiresAt: bound.record.expiresAt,
+    });
+  });
+
+  /**
+   * Mints a single-use ticket for an SSE stream.
+   *
+   * EventSource cannot set headers, so a stream cannot carry the device proof
+   * every other request uses. Spending one proof-authenticated POST to get an
+   * opaque 60-second ticket keeps the binding guarantee without writing a
+   * signature into access logs and browser history.
+   */
+  router.post('/auth/stream-ticket', requireMobileSession, (req, res) => {
+    const targetPath = typeof req.body?.path === 'string' ? req.body.path : '';
+    if (!targetPath.startsWith('/m/api/')) {
+      res.status(400).json({ error: 'INVALID_STREAM_PATH' });
+      return;
+    }
+    const record = req.mobileSession!.record;
+    res.json({
+      ticket: mintStreamTicket(record.deviceId, targetPath),
+      expiresInMs: STREAM_TICKET_TTL_MS,
+    });
   });
 
   router.post('/auth/rotate', async (req, res) => {

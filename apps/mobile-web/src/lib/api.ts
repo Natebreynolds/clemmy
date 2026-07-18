@@ -1,11 +1,56 @@
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
- * served by the Clementine daemon at /m/), so the PIN cookie set by
- * /m/auth/login is sent automatically. No Bearer token plumbing.
+ * served by the Clementine daemon at /m/), so the session cookie is sent
+ * automatically. No Bearer token plumbing.
+ *
+ * On top of the cookie, every request carries a device proof: a short ES256
+ * signature made with a non-extractable key held in IndexedDB. The cookie alone
+ * is not sufficient to authenticate, so copying it off the device gets an
+ * attacker nothing. See lib/device-key.ts.
  *
  * 401 from any request triggers a global "needs login" event; the App
  * shell listens and bounces the user back to the login screen.
  */
+import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
+
+/**
+ * The current session's fingerprint, which every proof is signed over.
+ *
+ * Held in memory only: it is derived from the session token, so it changes
+ * whenever the token rotates, and persisting it would just create a staleness
+ * bug. It is refreshed from /auth/status, /auth/login, and /auth/pair.
+ */
+let sessionFingerprint: string | null = null;
+
+export function setSessionFingerprint(value: string | null): void {
+  sessionFingerprint = value;
+}
+
+export function getSessionFingerprint(): string | null {
+  return sessionFingerprint;
+}
+
+/** Paths that establish a credential and therefore cannot require a proof. */
+function isPreAuthPath(path: string): boolean {
+  const clean = path.split('?')[0] ?? '';
+  return clean === '/m/auth/status'
+    || clean === '/m/auth/login'
+    || clean === '/m/auth/pair'
+    || clean === '/m/auth/logout'
+    || clean === '/m/auth/device-key'
+    || clean === '/m/push/vapid-key';
+}
+
+async function proofHeader(path: string, method: string): Promise<Record<string, string>> {
+  if (!sessionFingerprint || !deviceKeySupported() || isPreAuthPath(path)) return {};
+  try {
+    return { 'x-clem-device-proof': await signProof(method, path, sessionFingerprint) };
+  } catch {
+    // A signing failure must not silently downgrade to cookie-only auth; let
+    // the request go and be refused by the daemon, which is the honest outcome.
+    return {};
+  }
+}
 
 export interface ApiError extends Error {
   status: number;
@@ -31,6 +76,10 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
       ...(init?.headers ?? {}),
     },
   };
+  Object.assign(
+    opts.headers as Record<string, string>,
+    await proofHeader(path, (init?.method ?? 'GET').toUpperCase()),
+  );
   const res = await fetch(path, opts);
   const text = await res.text();
   let body: unknown = null;
@@ -55,34 +104,81 @@ export interface AuthStatus {
   authenticated: boolean;
   deviceId: string | null;
   deviceLabel: string | null;
+  binding?: 'key' | 'cookie' | null;
+  scope?: 'full' | 'pin-rotation' | null;
+  needsDeviceUpgrade?: boolean;
+  sessionFingerprint?: string | null;
 }
 
 export async function getAuthStatus(): Promise<AuthStatus> {
-  return api<AuthStatus>('/m/auth/status');
+  const status = await api<AuthStatus>('/m/auth/status');
+  if (status.sessionFingerprint) setSessionFingerprint(status.sessionFingerprint);
+  // A session that predates device binding upgrades itself here, with no user
+  // interaction and no re-pair. Best-effort: a failure just leaves it
+  // cookie-bound until the next status poll, and it keeps working until its
+  // grace window ends.
+  if (status.authenticated && status.needsDeviceUpgrade && deviceKeySupported()) {
+    await upgradeToDeviceKey().catch(() => undefined);
+  }
+  return status;
 }
 
 export interface LoginResponse {
   deviceId: string;
   deviceLabel?: string;
   expiresAt: string;
+  binding?: 'key' | 'cookie';
+  sessionFingerprint?: string;
+}
+
+/** Captures the fingerprint a credential response hands back. */
+function adoptSession(res: LoginResponse): LoginResponse {
+  if (res.sessionFingerprint) setSessionFingerprint(res.sessionFingerprint);
+  return res;
+}
+
+/**
+ * The device public key is offered at credential time so a fresh pair is
+ * key-bound immediately, with no window in which the cookie alone suffices.
+ */
+async function devicePublicKeyOrUndefined(): Promise<JsonWebKey | undefined> {
+  if (!deviceKeySupported()) return undefined;
+  try {
+    return await exportPublicJwk();
+  } catch {
+    return undefined;
+  }
 }
 
 export async function login(pin: string, deviceLabel?: string): Promise<LoginResponse> {
-  return api<LoginResponse>('/m/auth/login', {
+  const devicePublicKeyJwk = await devicePublicKeyOrUndefined();
+  return adoptSession(await api<LoginResponse>('/m/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ pin, deviceLabel }),
-  });
+    body: JSON.stringify({ pin, deviceLabel, devicePublicKeyJwk }),
+  }));
 }
 
 export async function pairDevice(pairToken: string, deviceLabel?: string): Promise<LoginResponse> {
-  return api<LoginResponse>('/m/auth/pair', {
+  const devicePublicKeyJwk = await devicePublicKeyOrUndefined();
+  return adoptSession(await api<LoginResponse>('/m/auth/pair', {
     method: 'POST',
-    body: JSON.stringify({ pairToken, deviceLabel }),
+    body: JSON.stringify({ pairToken, deviceLabel, devicePublicKeyJwk }),
+  }));
+}
+
+/** Binds a device key to an existing cookie-only session and rotates its token. */
+export async function upgradeToDeviceKey(): Promise<void> {
+  const devicePublicKeyJwk = await exportPublicJwk();
+  const res = await api<{ sessionFingerprint?: string }>('/m/auth/device-key', {
+    method: 'POST',
+    body: JSON.stringify({ devicePublicKeyJwk }),
   });
+  if (res.sessionFingerprint) setSessionFingerprint(res.sessionFingerprint);
 }
 
 export async function logout(): Promise<void> {
   await api('/m/auth/logout', { method: 'POST' });
+  setSessionFingerprint(null);
 }
 
 // ─── inbox shape (shape mirrors src/runtime/harness/approval-registry.ts) ─
@@ -279,27 +375,69 @@ export interface ChatStreamHandlers {
   onError?: (err: Event) => void;
 }
 
+/**
+ * EventSource cannot set request headers, so a stream cannot carry the device
+ * proof directly. Instead we spend one proof-authenticated POST to mint a
+ * single-use 60-second ticket and put only that opaque value in the URL, which
+ * keeps signatures out of access logs and browser history.
+ */
+async function mintStreamTicket(streamPath: string): Promise<string | null> {
+  if (!sessionFingerprint || !deviceKeySupported()) return null;
+  try {
+    const res = await api<{ ticket: string }>('/m/auth/stream-ticket', {
+      method: 'POST',
+      body: JSON.stringify({ path: streamPath }),
+    });
+    return res.ticket;
+  } catch {
+    return null;
+  }
+}
+
 export function subscribeChatStream(sessionId: string, handlers: ChatStreamHandlers, sinceSeq = 0): () => void {
-  const url = `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/stream${sinceSeq > 0 ? `?sinceSeq=${sinceSeq}` : ''}`;
-  const es = new EventSource(url, { withCredentials: true });
-  if (handlers.onReplay) {
-    es.addEventListener('replay', (ev) => {
-      try {
-        const parsed = JSON.parse((ev as MessageEvent).data);
-        handlers.onReplay?.(parsed);
-      } catch { /* ignore */ }
-    });
+  const streamPath = `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/stream`;
+  let es: EventSource | null = null;
+  let closed = false;
+
+  void (async () => {
+    const ticket = await mintStreamTicket(streamPath);
+    if (closed) return;
+    const params = new URLSearchParams();
+    if (sinceSeq > 0) params.set('sinceSeq', String(sinceSeq));
+    if (ticket) params.set('ticket', ticket);
+    const query = params.toString();
+    attach(new EventSource(`${streamPath}${query ? `?${query}` : ''}`, { withCredentials: true }));
+  })();
+
+  function attach(source: EventSource): void {
+    if (closed) { source.close(); return; }
+    es = source;
+    wire(source);
   }
-  if (handlers.onEvent) {
-    es.addEventListener('event', (ev) => {
-      try {
-        const parsed = JSON.parse((ev as MessageEvent).data);
-        handlers.onEvent?.(parsed);
-      } catch { /* ignore */ }
-    });
+
+
+  function wire(source: EventSource): void {
+    if (handlers.onReplay) {
+      source.addEventListener('replay', (ev) => {
+        try {
+          handlers.onReplay?.(JSON.parse((ev as MessageEvent).data));
+        } catch { /* ignore */ }
+      });
+    }
+    if (handlers.onEvent) {
+      source.addEventListener('event', (ev) => {
+        try {
+          handlers.onEvent?.(JSON.parse((ev as MessageEvent).data));
+        } catch { /* ignore */ }
+      });
+    }
+    if (handlers.onError) source.addEventListener('error', handlers.onError);
   }
-  if (handlers.onError) es.addEventListener('error', handlers.onError);
-  return () => es.close();
+
+  return () => {
+    closed = true;
+    es?.close();
+  };
 }
 
 // ─── memory ─

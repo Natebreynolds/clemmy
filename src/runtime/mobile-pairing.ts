@@ -20,6 +20,13 @@ export interface MobilePairingCodeRecord {
   expiresAt: string;
   usedAt?: string;
   targetUrl?: string;
+  /**
+   * Optional existing device identity. When a known phone is re-paired (e.g.
+   * after the tunnel hostname rotated), carrying its deviceId through keeps it
+   * as one row in the device list instead of accumulating a new stranger on
+   * every re-pair.
+   */
+  deviceId?: string;
 }
 
 interface MobilePairingCodesFile {
@@ -88,7 +95,7 @@ function pruneCodes(codes: MobilePairingCodeRecord[], now: number): MobilePairin
 }
 
 export async function createMobilePairingCode(
-  input: { targetUrl?: string } = {},
+  input: { targetUrl?: string; deviceId?: string } = {},
   opts?: MobilePairingStoreOptions,
 ): Promise<CreatedMobilePairingCode> {
   const now = opts?.now?.() ?? Date.now();
@@ -100,6 +107,7 @@ export async function createMobilePairingCode(
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + ttl).toISOString(),
     targetUrl: input.targetUrl,
+    deviceId: input.deviceId,
   };
   const file = pairingFile(opts);
   ensureParentDir(file);

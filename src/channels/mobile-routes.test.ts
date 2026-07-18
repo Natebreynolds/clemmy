@@ -332,6 +332,170 @@ test('wrong PIN returns 401 then 429 after the 5th failure', async () => {
   } finally { await h.close(); }
 });
 
+// ---- device-bound sessions -------------------------------------------------
+
+const { webcrypto } = await import('node:crypto');
+
+async function makeDeviceKey(): Promise<{ pair: CryptoKeyPair; publicJwk: JsonWebKey }> {
+  const pair = await webcrypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'],
+  );
+  return { pair, publicJwk: await webcrypto.subtle.exportKey('jwk', pair.publicKey) as JsonWebKey };
+}
+
+async function deviceProof(
+  pair: CryptoKeyPair,
+  method: string,
+  proofPath: string,
+  sfp: string,
+): Promise<string> {
+  const head = Buffer.from(JSON.stringify({ alg: 'ES256', typ: 'clem-dpop+jws' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify({
+    htm: method,
+    htu: proofPath,
+    iat: Math.floor(Date.now() / 1000),
+    jti: `n-${Math.random().toString(36).slice(2)}-${Date.now()}`,
+    sfp,
+  })).toString('base64url');
+  const sig = await webcrypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, Buffer.from(`${head}.${body}`),
+  );
+  return `${head}.${body}.${Buffer.from(new Uint8Array(sig)).toString('base64url')}`;
+}
+
+function cookieFrom(res: Response): string {
+  return (res.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+}
+
+test('a key-bound session requires a valid device proof on every request', async () => {
+  const h = await startHarness();
+  try {
+    const { pair, publicJwk } = await makeDeviceKey();
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+    });
+    assert.equal(paired.status, 200);
+    const body = await paired.json() as { binding: string; sessionFingerprint: string };
+    assert.equal(body.binding, 'key', 'pairing with a key must bind the session');
+    const cookie = cookieFrom(paired);
+
+    // The cookie ALONE is now worthless — this is the whole point.
+    const noProof = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    assert.equal(noProof.status, 401, 'a stolen cookie without the key must be refused');
+    assert.equal((await noProof.json() as { error: string }).error, 'BAD_DEVICE_PROOF');
+
+    // With the key, it works.
+    const proof = await deviceProof(pair, 'GET', '/m/api/whoami', body.sessionFingerprint);
+    const withProof = await fetch(`${h.url}/m/api/whoami`, {
+      headers: { cookie, 'x-clem-device-proof': proof },
+    });
+    assert.equal(withProof.status, 200, 'the real device must be served');
+  } finally { await h.close(); }
+});
+
+test('an attacker key cannot sign for a bound session', async () => {
+  const h = await startHarness();
+  try {
+    const victim = await makeDeviceKey();
+    const attacker = await makeDeviceKey();
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken, devicePublicKeyJwk: victim.publicJwk }),
+    });
+    const { sessionFingerprint: sfp } = await paired.json() as { sessionFingerprint: string };
+    const cookie = cookieFrom(paired);
+
+    const forged = await deviceProof(attacker.pair, 'GET', '/m/api/whoami', sfp);
+    const res = await fetch(`${h.url}/m/api/whoami`, {
+      headers: { cookie, 'x-clem-device-proof': forged },
+    });
+    assert.equal(res.status, 401, 'a proof signed by another key must be refused');
+  } finally { await h.close(); }
+});
+
+test('a proof cannot be replayed onto a different route', async () => {
+  const h = await startHarness();
+  try {
+    const { pair, publicJwk } = await makeDeviceKey();
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+    });
+    const { sessionFingerprint: sfp } = await paired.json() as { sessionFingerprint: string };
+    const cookie = cookieFrom(paired);
+
+    // Signed for whoami, presented at the memory API.
+    const proof = await deviceProof(pair, 'GET', '/m/api/whoami', sfp);
+    const res = await fetch(`${h.url}/m/api/memory/facts`, {
+      headers: { cookie, 'x-clem-device-proof': proof },
+    });
+    assert.equal(res.status, 401, 'a proof is bound to one path');
+  } finally { await h.close(); }
+});
+
+test('a legacy cookie-only session works, then silently upgrades to key binding', async () => {
+  // The migration promise: nobody is logged out, and the upgrade needs no
+  // user interaction.
+  const h = await startHarness();
+  try {
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken }), // no key — an older PWA bundle
+    });
+    const cookie = cookieFrom(paired);
+    assert.equal((await paired.json() as { binding: string }).binding, 'cookie');
+
+    // It still works during the grace window, with no proof.
+    const working = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    assert.equal(working.status, 200, 'a cookie-only session must keep working during grace');
+
+    const status = await fetch(`${h.url}/m/auth/status`, { headers: { cookie } });
+    assert.equal((await status.json() as { needsDeviceUpgrade: boolean }).needsDeviceUpgrade, true);
+
+    // The PWA sees that and upgrades itself.
+    const { publicJwk } = await makeDeviceKey();
+    const upgrade = await fetch(`${h.url}/m/auth/device-key`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ devicePublicKeyJwk: publicJwk }),
+    });
+    assert.equal(upgrade.status, 200);
+    assert.equal((await upgrade.json() as { binding: string }).binding, 'key');
+  } finally { await h.close(); }
+});
+
+test('a stolen cookie cannot rebind an already-key-bound session', async () => {
+  // Otherwise the upgrade endpoint would be a bypass of the entire scheme.
+  const h = await startHarness();
+  try {
+    const { publicJwk } = await makeDeviceKey();
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+    });
+    const cookie = cookieFrom(paired);
+
+    const attacker = await makeDeviceKey();
+    const res = await fetch(`${h.url}/m/auth/device-key`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ devicePublicKeyJwk: attacker.publicJwk }),
+    });
+    assert.equal(res.status, 409, 'rebinding a bound session must be refused');
+  } finally { await h.close(); }
+});
+
 test('pairing is rate limited, and its budget is separate from PIN', async () => {
   // /auth/pair mints a full session exactly like PIN login but was previously
   // unlimited. The 256-bit token means guessing is not the threat — this bounds

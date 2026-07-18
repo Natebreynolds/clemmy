@@ -124,6 +124,30 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
     realm: 'mobile-anon',
     reason: 'Returns the VAPID PUBLIC key, which is public by construction.',
   },
+  {
+    method: 'POST',
+    pattern: '/m/auth/device-key',
+    realm: 'mobile-anon',
+    reason:
+      'The silent upgrade path for sessions predating device binding. It cannot require '
+      + 'a device proof, because it is the request that establishes the key. It '
+      + 'authenticates on the session cookie and refuses outright if the session is '
+      + 'already key-bound, so a stolen cookie cannot swap in an attacker key.',
+  },
+  {
+    method: 'POST',
+    pattern: '/m/auth/pin',
+    realm: 'mobile-session',
+    reason:
+      'Self-service PIN rotation for a session sandboxed by a legacy weak PIN. Enforced '
+      + 'by requireMobileSession, which allows this path under the pin-rotation scope.',
+  },
+  {
+    method: 'POST',
+    pattern: '/m/auth/stream-ticket',
+    realm: 'mobile-session',
+    reason: 'Enforced by requireMobileSession, including the device proof.',
+  },
 
   // ---- Mobile: admin-only within the mobile router -------------------------
   // Listed explicitly rather than left to the default so the privilege boundary
