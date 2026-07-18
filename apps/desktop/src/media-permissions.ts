@@ -12,6 +12,7 @@ export function isTrustedDashboardMediaUrl(
     const url = new URL(rawUrl);
     if (!trustedOrigins.has(url.origin)) return false;
     const pathname = decodeURIComponent(url.pathname);
+    if (/^\/console\/notch(?:\/|$)/i.test(pathname)) return false;
     return !/^\/console\/spaces\/[^/]+\/view(?:\/|$)/i.test(pathname);
   } catch {
     return false;

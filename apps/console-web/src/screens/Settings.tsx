@@ -9,6 +9,7 @@ import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsRoutingSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
 import { StartupDoctorCard } from './settings/StartupDoctorCard';
+import { NotchSettingsCard } from './settings/NotchSettingsCard';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -37,7 +38,7 @@ function LinkRow({ title, desc, to }: { title: string; desc: string; to: string 
 export function Settings() {
   const { choice, setChoice } = useTheme();
   return (
-    <Page title="Settings" subtitle="Appearance, profile, and account" width="reading">
+    <Page title="Settings" subtitle="Personalize Clementine and manage how it works" width="reading">
       <div className="space-y-4">
         <Card className="p-5">
           <h3 className="mb-1 text-h3 text-fg">Appearance</h3>
@@ -57,6 +58,8 @@ export function Settings() {
             })}
           </div>
         </Card>
+
+        <NotchSettingsCard />
 
         <ProfileForm />
 

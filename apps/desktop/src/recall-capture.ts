@@ -20,6 +20,17 @@ export interface RecallCaptureStatus {
   initialized: boolean;
   enabled: boolean;
   recording: boolean;
+  /** Authoritative presentation phase. `starting` begins when an accepted
+   * Notch action may still start capture, including async consent persistence,
+   * and lasts through the native handshake. `recording` remains the broader
+   * compatibility flag (it is true during the optimistic start handshake). */
+  capturePhase: 'idle' | 'prompt' | 'starting' | 'recording' | 'stopping';
+  pendingMeeting?: {
+    windowId: string;
+    platform?: string;
+    title?: string;
+    detectedAt: string;
+  };
   /** Wall-clock ISO timestamp when the current recording started.
    *  Drives the live "MEETING LIVE · 02:14" pill in the dashboard. */
   recordingStartedAt?: string;
@@ -297,6 +308,15 @@ function extractTranscript(event: RecallRealtimeEvent): {
   return { text, speaker, recordingId, isFinal };
 }
 
+interface RecallNotchStartIntent {
+  windowId: string;
+  cancelled: boolean;
+  abortController: AbortController;
+  settled: Promise<void>;
+  settle: () => void;
+  cancelError?: Error;
+}
+
 export class RecallDesktopCapture {
   private settings: RecallCaptureSettings = DEFAULT_SETTINGS;
   private sdk: RecallSdk | null = null;
@@ -307,6 +327,7 @@ export class RecallDesktopCapture {
   private initializedRegion: RecallRegion | undefined;
   private sdkAvailable = false;
   private recording = false;
+  private recordingConfirmed = false;
   private currentWindowId: string | undefined;
   /** Create SDK Upload id. This is never Recall's eventual recording id. */
   private currentSdkUploadId: string | undefined;
@@ -349,6 +370,10 @@ export class RecallDesktopCapture {
    * the first start has either succeeded or rolled back. */
   private startPromise: Promise<void> | null = null;
   private startingWindowId: string | undefined;
+  /** Accepted Notch start actions that have not settled yet. This begins before
+   * initialization or durable auto-record persistence so native surfaces cannot
+   * be disabled during the gap before startPromise exists. */
+  private pendingNotchStartIntents = new Set<RecallNotchStartIntent>();
   /** Owns completion while a user-requested stop is awaiting the SDK's
    * synchronous recording-ended echo. The event handler must not complete a
    * second time with already-cleared identifiers. */
@@ -387,12 +412,28 @@ export class RecallDesktopCapture {
     const dismissedActive = Boolean(
       this.currentWindowId && this.userDismissedWindows.has(this.currentWindowId),
     );
+    const pendingMeeting = Array.from(this.detectedWindows.values())
+      .filter((window) => this.promptedWindows.has(window.windowId)
+        && !this.userDismissedWindows.has(window.windowId)
+        && !(this.recording && this.currentWindowId === window.windowId))
+      .sort((a, b) => b.detectedAt.localeCompare(a.detectedAt))[0];
+    const capturePhase: RecallCaptureStatus['capturePhase'] = this.stopPromise || this.manualStopContext
+      ? 'stopping'
+      : this.recording && this.recordingConfirmed && !dismissedActive
+        ? 'recording'
+        : this.pendingNotchStartIntents.size > 0 || this.startPromise || (this.recording && !this.recordingConfirmed)
+          ? 'starting'
+          : pendingMeeting
+            ? 'prompt'
+            : 'idle';
     return {
       sdkAvailable: this.sdkAvailable,
       platformSupport: { ...this.platformSupport },
       initialized: this.initialized,
       enabled: this.settings.enabled,
       recording: this.recording && !dismissedActive,
+      capturePhase,
+      pendingMeeting: pendingMeeting ? { ...pendingMeeting } : undefined,
       recordingStartedAt: dismissedActive ? undefined : this.recordingStartedAt,
       currentWindowId: dismissedActive ? undefined : this.currentWindowId,
       lastError: this.lastError,
@@ -540,11 +581,63 @@ export class RecallDesktopCapture {
     return best?.windowId;
   }
 
+  private pendingMeetingWindowId(): string | undefined {
+    return Array.from(this.detectedWindows.values())
+      .filter((window) => this.promptedWindows.has(window.windowId)
+        && !this.userDismissedWindows.has(window.windowId)
+        && !(this.recording && this.currentWindowId === window.windowId))
+      .sort((a, b) => b.detectedAt.localeCompare(a.detectedAt))[0]?.windowId;
+  }
+
   /** Whether the SDK currently sees an open, non-dismissed meeting
    *  window. Lets the dashboard label the button RECORD MEETING vs
    *  RECORD AUDIO without reaching into private state. */
   hasActiveMeetingWindow(): boolean {
     return this.pickActiveMeetingWindow() !== undefined;
+  }
+
+  /** Suppress the prompt (and any auto-record retry) for one detected meeting
+   * window until the SDK reports that the window closed. This is the native
+   * source of truth behind the Notch's "Not this time" action. */
+  dismissDetectedWindow(windowId: string): RecallCaptureStatus {
+    const id = windowId.trim();
+    if (!id || !this.detectedWindows.has(id)) {
+      throw new Error('That meeting is no longer available.');
+    }
+    if (this.recording && this.currentWindowId === id) {
+      throw new Error('Stop the active recording before dismissing this meeting.');
+    }
+    this.userDismissedWindows.add(id);
+    this.promptedWindows.add(id);
+    this.emit('meeting-prompt-dismissed', { windowId: id });
+    return this.status();
+  }
+
+  /** Cancel an accepted Notch start before native ownership exists, or stop the
+   * resulting recording if the native handshake has already crossed that line. */
+  async cancelOrStopPromptedRecording(windowId: string): Promise<RecallCaptureStatus> {
+    const id = windowId.trim();
+    const intents = Array.from(this.pendingNotchStartIntents)
+      .filter((intent) => intent.windowId === id);
+    for (const intent of intents) {
+      intent.cancelled = true;
+      intent.abortController.abort();
+    }
+    if (intents.length > 0) {
+      await Promise.all(intents.map((intent) => intent.settled));
+    }
+
+    let status = this.status();
+    if (status.currentWindowId === id
+        && (status.capturePhase === 'starting' || status.capturePhase === 'recording')) {
+      status = await this.stopRecording();
+    } else if (intents.length === 0) {
+      throw new Error('That meeting is no longer the active recording.');
+    }
+
+    const cancelError = intents.find((intent) => intent.cancelError)?.cancelError;
+    if (cancelError) throw cancelError;
+    return status;
   }
 
   async stopRecording(): Promise<RecallCaptureStatus> {
@@ -602,6 +695,7 @@ export class RecallDesktopCapture {
     };
     this.manualStopContext = context;
     this.recording = false;
+    this.recordingConfirmed = false;
     this.recordingStartedAt = undefined;
     this.currentSdkUploadId = undefined;
     this.currentSdkUploadRegion = undefined;
@@ -648,10 +742,12 @@ export class RecallDesktopCapture {
    * still reachable. This is intentionally public: Electron's normal quit and
    * updater hand-off both need to await it before stopping the daemon.
    *
-   * Calling this while a native start is waiting for its upload token first
-   * lets that handshake settle, then stops the resulting capture. Calling it
-   * during a user stop shares stopPromise. Finally it waits for natural-end or
-   * SDK-shutdown completion POSTs that may outlive the visible recording flag.
+   * Pending Notch starts are cancelled first so initialization, upload-token,
+   * and auto-record consent work settles (including rollback) while the daemon
+   * is still reachable. A dashboard/native start already waiting for its upload
+   * token is then allowed to settle and is stopped. Calling this during a user
+   * stop shares stopPromise. Finally it waits for natural-end or SDK-shutdown
+   * completion POSTs that may outlive the visible recording flag.
    */
   async prepareForShutdown(): Promise<void> {
     if (this.shutdownPreparationPromise) return this.shutdownPreparationPromise;
@@ -669,6 +765,15 @@ export class RecallDesktopCapture {
   }
 
   private async prepareForShutdownOnce(): Promise<void> {
+    const pendingNotchStarts = Array.from(this.pendingNotchStartIntents);
+    for (const intent of pendingNotchStarts) {
+      intent.cancelled = true;
+      intent.abortController.abort();
+    }
+    if (pendingNotchStarts.length > 0) {
+      await Promise.all(pendingNotchStarts.map((intent) => intent.settled));
+    }
+
     const pendingStart = this.startPromise;
     if (pendingStart) {
       await pendingStart.catch(() => undefined);
@@ -720,6 +825,7 @@ export class RecallDesktopCapture {
       this.initialized = false;
       this.initializedRegion = undefined;
       this.recording = false;
+      this.recordingConfirmed = false;
       this.currentWindowId = undefined;
       this.currentSdkUploadId = undefined;
       this.currentSdkUploadRegion = undefined;
@@ -842,7 +948,8 @@ export class RecallDesktopCapture {
     // stays open. Only act once per window per session — the daemon
     // detection write, the prompt event, and the permission auto-
     // request should all be idempotent.
-    const alreadySeen = this.detectedWindows.has(win.id);
+    const existing = this.detectedWindows.get(win.id);
+    const alreadySeen = Boolean(existing);
 
     this.noteEvent('meeting-detected');
     this.lastMeeting = { windowId: win.id, platform: win.platform, title: win.title };
@@ -850,7 +957,7 @@ export class RecallDesktopCapture {
       windowId: win.id,
       platform: win.platform,
       title: win.title,
-      detectedAt: new Date().toISOString(),
+      detectedAt: existing?.detectedAt ?? new Date().toISOString(),
       recording: this.recording && this.currentWindowId === win.id,
     });
     this.emit('meeting-detected', this.lastMeeting);
@@ -978,6 +1085,27 @@ export class RecallDesktopCapture {
     return this.status();
   }
 
+  /** Notch prompt path: unlike the dashboard's legacy method, this requires
+   * the exact still-open, non-dismissed window after async initialization. */
+  async recordPromptedWindow(windowId: string): Promise<RecallCaptureStatus> {
+    return this.withNotchStartIntent(windowId, async (intent) => {
+      await this.initialize();
+      this.throwIfNotchStartCancelled(intent);
+      const existing = this.detectedWindows.get(windowId);
+      if (!existing || this.userDismissedWindows.has(windowId)
+          || this.pendingMeetingWindowId() !== windowId) {
+        throw new Error('That meeting prompt is no longer active.');
+      }
+      await this.startRecording(
+        windowId,
+        { platform: existing.platform, title: existing.title },
+        intent.abortController.signal,
+      );
+      this.throwIfNotchStartCancelled(intent);
+      return this.status();
+    });
+  }
+
   /**
    * Public entry point for the "Always record" prompt button.
    * Persists the autoRecord toggle so future meetings are picked up
@@ -1004,7 +1132,116 @@ export class RecallDesktopCapture {
     return this.recordDetectedWindow(windowId);
   }
 
-  private async startRecording(windowId: string, meta: { platform?: string; title?: string } = {}): Promise<void> {
+  async enableAutoRecordAndRecordPrompted(windowId: string): Promise<RecallCaptureStatus> {
+    return this.withNotchStartIntent(windowId, async (intent) => {
+      await this.initialize();
+      this.throwIfNotchStartCancelled(intent);
+      const existing = this.detectedWindows.get(windowId);
+      if (!existing || this.userDismissedWindows.has(windowId)
+          || this.pendingMeetingWindowId() !== windowId) {
+        throw new Error('That meeting prompt is no longer active.');
+      }
+      const previousSettings = this.settings;
+      const autoRecordSettings = { ...previousSettings, autoRecord: true };
+
+      // The Notch action is transactional: if either durable auto-record or the
+      // current native start fails, restore the prior setting. This avoids a
+      // failed one-off recording silently opting future meetings into capture.
+      try {
+        await this.postDaemon(
+          '/api/console/meetings/recall/settings',
+          { ...autoRecordSettings },
+          'PATCH',
+          intent.abortController.signal,
+        );
+      } catch (error) {
+        if (intent.cancelled) {
+          try {
+            await this.postDaemon('/api/console/meetings/recall/settings', { ...previousSettings }, 'PATCH');
+            this.settings = previousSettings;
+          } catch (rollbackError) {
+            this.settings = autoRecordSettings;
+            intent.cancelError = new Error('Recording was cancelled, but auto-record could not be rolled back.');
+            this.emit('settings-persist-failed', {
+              error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+              phase: 'auto-record-cancel-rollback',
+            });
+            throw intent.cancelError;
+          }
+          throw new Error('Meeting recording start was cancelled.');
+        }
+        this.emit('settings-persist-failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw new Error('Auto-record could not be saved; the meeting was not started.');
+      }
+      this.settings = autoRecordSettings;
+      try {
+        this.throwIfNotchStartCancelled(intent);
+        await this.startRecording(
+          windowId,
+          { platform: existing.platform, title: existing.title },
+          intent.abortController.signal,
+        );
+        this.throwIfNotchStartCancelled(intent);
+      } catch (startError) {
+        try {
+          await this.postDaemon('/api/console/meetings/recall/settings', { ...previousSettings }, 'PATCH');
+          this.settings = previousSettings;
+        } catch (rollbackError) {
+          // The first write succeeded, so retain the known canonical value if its
+          // compensating write failed and surface a diagnostic event.
+          this.settings = autoRecordSettings;
+          if (intent.cancelled) {
+            intent.cancelError = new Error('Recording was cancelled, but auto-record could not be rolled back.');
+          }
+          this.emit('settings-persist-failed', {
+            error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+            phase: 'auto-record-rollback',
+          });
+          throw intent.cancelError
+            ?? new Error('Meeting recording did not start, and auto-record could not be rolled back.');
+        }
+        throw startError;
+      }
+      return this.status();
+    });
+  }
+
+  private async withNotchStartIntent<T>(
+    windowId: string,
+    operation: (intent: RecallNotchStartIntent) => Promise<T>,
+  ): Promise<T> {
+    if (this.preparingForShutdown || this.shuttingDown) {
+      throw new Error('Recall meeting capture is preparing to shut down.');
+    }
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    const intent: RecallNotchStartIntent = {
+      windowId,
+      cancelled: false,
+      abortController: new AbortController(),
+      settled,
+      settle,
+    };
+    this.pendingNotchStartIntents.add(intent);
+    try {
+      return await operation(intent);
+    } finally {
+      this.pendingNotchStartIntents.delete(intent);
+      intent.settle();
+    }
+  }
+
+  private throwIfNotchStartCancelled(intent: RecallNotchStartIntent): void {
+    if (intent.cancelled) throw new Error('Meeting recording start was cancelled.');
+  }
+
+  private async startRecording(
+    windowId: string,
+    meta: { platform?: string; title?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<void> {
     if (!this.sdk) throw new Error('Recall SDK is unavailable.');
     if (this.preparingForShutdown || this.shuttingDown) {
       throw new Error('Recall meeting capture is preparing to shut down.');
@@ -1021,7 +1258,7 @@ export class RecallDesktopCapture {
       throw new Error(`Recall is already recording ${this.currentWindowId ?? 'another meeting'}.`);
     }
 
-    const pending = this.startRecordingOnce(windowId, meta);
+    const pending = this.startRecordingOnce(windowId, meta, signal);
     this.startingWindowId = windowId;
     this.startPromise = pending;
     try {
@@ -1034,7 +1271,11 @@ export class RecallDesktopCapture {
     }
   }
 
-  private async startRecordingOnce(windowId: string, meta: { platform?: string; title?: string }): Promise<void> {
+  private async startRecordingOnce(
+    windowId: string,
+    meta: { platform?: string; title?: string },
+    signal?: AbortSignal,
+  ): Promise<void> {
     const sdk = this.sdk;
     if (!sdk) throw new Error('Recall SDK is unavailable.');
     const requestedRegion = this.initializedRegion ?? this.settings.region;
@@ -1048,7 +1289,7 @@ export class RecallDesktopCapture {
     }>('/api/console/meetings/recall/upload-token', {
       liveTranscript: this.settings.liveTranscript,
       region: requestedRegion,
-    });
+    }, 'POST', signal);
     const sdkUploadId = upload.sdkUploadId ?? upload.id;
     if (!sdkUploadId) {
       throw new Error('Clementine did not receive a Recall SDK upload id; recording was not started.');
@@ -1064,6 +1305,7 @@ export class RecallDesktopCapture {
     // start, transcript, or end events synchronously while this call resolves.
     this.userDismissedWindows.delete(windowId);
     this.recording = true;
+    this.recordingConfirmed = false;
     this.currentWindowId = windowId;
     this.currentSdkUploadId = sdkUploadId;
     this.currentSdkUploadRegion = sdkUploadRegion;
@@ -1091,6 +1333,7 @@ export class RecallDesktopCapture {
         && this.recordingStartedAt === startedAt;
       if (ownsContext) {
         this.recording = false;
+        this.recordingConfirmed = false;
         this.currentWindowId = undefined;
         this.currentSdkUploadId = undefined;
         this.currentSdkUploadRegion = undefined;
@@ -1166,6 +1409,7 @@ export class RecallDesktopCapture {
       return;
     }
     this.recording = true;
+    this.recordingConfirmed = true;
     this.noteEvent('recording-started');
     const existing = this.detectedWindows.get(windowId);
     if (existing) {
@@ -1224,6 +1468,7 @@ export class RecallDesktopCapture {
     };
     if (ownsCurrent) {
       this.recording = false;
+      this.recordingConfirmed = false;
       this.currentWindowId = undefined;
       this.currentSdkUploadId = undefined;
       this.currentSdkUploadRegion = undefined;
@@ -1296,7 +1541,7 @@ export class RecallDesktopCapture {
     this.emit('media-capture-status', {
       windowId,
       platform: event.window?.platform,
-      type: event.type,
+      mediaType: event.type,
       capturing: event.capturing,
     });
   }
@@ -1332,6 +1577,7 @@ export class RecallDesktopCapture {
       }
       : undefined;
     this.recording = false;
+    this.recordingConfirmed = false;
     this.recordingStartedAt = undefined;
     this.currentWindowId = undefined;
     this.currentSdkUploadId = undefined;
@@ -1339,10 +1585,14 @@ export class RecallDesktopCapture {
     this.currentRecallRetentionMode = undefined;
     this.currentRecallRetentionHours = undefined;
     this.currentRecordingId = undefined;
-    if (windowId) {
-      const existing = this.detectedWindows.get(windowId);
-      if (existing) this.detectedWindows.set(windowId, { ...existing, recording: false });
-    }
+    // Native shutdown invalidates every SDK window handle. Clear prompt and
+    // detection state so status hydration cannot resurrect a stale prompt;
+    // a restarted wrapper will emit fresh detections with valid handles.
+    this.detectedWindows.clear();
+    this.promptedWindows.clear();
+    this.userDismissedWindows.clear();
+    this.mediaCaptureStatuses.clear();
+    this.complianceMessageStatuses.clear();
     // Recall's wrapper automatically restarts only abnormal, non-termination
     // exits. A clean exit (or SIGINT/SIGTERM) needs a future initialize() call;
     // leaving initialized=true would make that call incorrectly return early.
@@ -1501,7 +1751,12 @@ export class RecallDesktopCapture {
     this.emit('error', { error });
   }
 
-  private async postDaemon<T = Record<string, unknown>>(pathname: string, body: Record<string, unknown>, method: 'POST' | 'PATCH' = 'POST'): Promise<T> {
+  private async postDaemon<T = Record<string, unknown>>(
+    pathname: string,
+    body: Record<string, unknown>,
+    method: 'POST' | 'PATCH' = 'POST',
+    signal?: AbortSignal,
+  ): Promise<T> {
     const base = this.opts.getDaemonBaseUrl();
     const token = this.opts.getWebhookToken();
     if (!base || !token) throw new Error('Clementine daemon URL/token is unavailable.');
@@ -1511,6 +1766,7 @@ export class RecallDesktopCapture {
       method,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -1524,10 +1780,10 @@ export class RecallDesktopCapture {
 
   private emit(type: string, payload: Record<string, unknown> = {}): void {
     this.opts.emit({
+      ...payload,
       type,
       source: 'recall-meeting-capture',
       at: new Date().toISOString(),
-      ...payload,
     });
   }
 }

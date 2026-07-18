@@ -114,9 +114,182 @@ test('new Recall lifecycle events update diagnostic status and are forwarded', a
   listeners.get('shutdown')?.({ code: 9, signal: 'SIGKILL' });
   status = capture.status();
   assert.equal(status.recording, false);
+  assert.equal(status.capturePhase, 'idle');
+  assert.equal(status.detectedWindows.length, 0);
   assert.equal(status.lastEvent, 'shutdown');
   assert.match(status.lastError ?? '', /stopped unexpectedly/);
   assert.equal(emitted.at(-1)?.type, 'shutdown');
+});
+
+test('meeting prompts recover, dismiss until close, and expose confirmed capture phases', async () => {
+  const emitted: Array<Record<string, unknown>> = [];
+  const listeners = new Map<string, (event: unknown) => void>();
+  let phaseDuringStartedEvent = '';
+  let capture!: RecallDesktopCapture;
+  capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => 'http://127.0.0.1:1',
+    getWebhookToken: () => 'test-token',
+    emit: (event) => {
+      emitted.push(event);
+      if (event.type === 'recording-started') phaseDuringStartedEvent = capture.status().capturePhase;
+    },
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  const fakeSdk = {
+    init: async () => null,
+    shutdown: async () => null,
+    startRecording: async ({ windowId }: { windowId: string }) => {
+      listeners.get('recording-started')?.({ window: { id: windowId } });
+      return null;
+    },
+    stopRecording: async () => null,
+    prepareDesktopAudioRecording: async () => 'desktop-audio-window',
+    requestPermission: async () => null,
+    addEventListener: (type: string, callback: (event: unknown) => void) => listeners.set(type, callback),
+    removeAllEventListeners: () => listeners.clear(),
+  };
+  Reflect.set(capture, 'loadSdk', async () => fakeSdk);
+  Reflect.set(capture, 'postDaemon', async (pathname: string) => pathname.endsWith('/upload-token')
+    ? { uploadToken: 'token', sdkUploadId: 'upload', region: 'us-west-2' }
+    : {});
+
+  await capture.configure({ enabled: true });
+  const detected = { window: { id: 'prompt-window', platform: 'zoom', title: 'Roadmap review' } };
+  listeners.get('meeting-detected')?.(detected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const firstDetectedAt = capture.status().pendingMeeting?.detectedAt;
+  assert.equal(capture.status().capturePhase, 'prompt');
+  assert.equal(capture.status().pendingMeeting?.windowId, 'prompt-window');
+
+  listeners.get('meeting-detected')?.(detected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(capture.status().pendingMeeting?.detectedAt, firstDetectedAt);
+  assert.equal(emitted.filter((event) => event.type === 'meeting-prompt-required').length, 1);
+
+  capture.dismissDetectedWindow('prompt-window');
+  assert.equal(capture.status().capturePhase, 'idle');
+  await assert.rejects(capture.recordPromptedWindow('prompt-window'), /no longer active/);
+  listeners.get('meeting-detected')?.(detected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(emitted.filter((event) => event.type === 'meeting-prompt-required').length, 1);
+
+  listeners.get('meeting-closed')?.(detected);
+  listeners.get('meeting-detected')?.(detected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(emitted.filter((event) => event.type === 'meeting-prompt-required').length, 2);
+  await capture.recordPromptedWindow('prompt-window');
+  assert.equal(phaseDuringStartedEvent, 'recording');
+  assert.equal(capture.status().capturePhase, 'recording');
+
+  listeners.get('media-capture-status')?.({
+    window: detected.window,
+    type: 'audio',
+    capturing: true,
+  });
+  const mediaEvent = emitted.filter((event) => event.type === 'media-capture-status').at(-1);
+  assert.equal(mediaEvent?.mediaType, 'audio');
+  await capture.stopRecording();
+  assert.equal(capture.status().capturePhase, 'idle');
+});
+
+test('ordinary Notch record reports starting throughout async initialization', async () => {
+  let releaseInitialization!: () => void;
+  let markInitializationStarted!: () => void;
+  const initializationGate = new Promise<void>((resolve) => { releaseInitialization = resolve; });
+  const initializationStarted = new Promise<void>((resolve) => { markInitializationStarted = resolve; });
+  const capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => 'http://127.0.0.1:1',
+    getWebhookToken: () => 'test-token',
+    emit: () => undefined,
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  const fakeSdk = {
+    init: async () => {
+      markInitializationStarted();
+      await initializationGate;
+      throw new Error('initialization failed');
+    },
+    shutdown: async () => null,
+    startRecording: async () => null,
+    stopRecording: async () => null,
+    prepareDesktopAudioRecording: async () => 'desktop-audio-window',
+    requestPermission: async () => null,
+    addEventListener: () => undefined,
+    removeAllEventListeners: () => undefined,
+  };
+  Reflect.set(capture, 'loadSdk', async () => fakeSdk);
+  Reflect.set(capture, 'detectedWindows', new Map([[
+    'prompt-window',
+    { windowId: 'prompt-window', platform: 'zoom', title: 'Roadmap review', detectedAt: new Date().toISOString() },
+  ]]));
+  Reflect.set(capture, 'promptedWindows', new Set(['prompt-window']));
+
+  const startAttempt = capture.recordPromptedWindow('prompt-window');
+  await initializationStarted;
+  assert.equal(capture.status().capturePhase, 'starting');
+  const rejectedStart = assert.rejects(startAttempt, /initialization failed/);
+  releaseInitialization();
+  await rejectedStart;
+  assert.equal(capture.status().capturePhase, 'prompt');
+});
+
+test('Notch always-record rolls back durable consent when the current start fails', async () => {
+  const listeners = new Map<string, (event: unknown) => void>();
+  const settingsWrites: boolean[] = [];
+  let nativeStarts = 0;
+  let releaseConsentWrite!: () => void;
+  let markConsentWriteStarted!: () => void;
+  const consentWriteGate = new Promise<void>((resolve) => { releaseConsentWrite = resolve; });
+  const consentWriteStarted = new Promise<void>((resolve) => { markConsentWriteStarted = resolve; });
+  const capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => 'http://127.0.0.1:1',
+    getWebhookToken: () => 'test-token',
+    emit: () => undefined,
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  const fakeSdk = {
+    init: async () => null,
+    shutdown: async () => null,
+    startRecording: async () => {
+      nativeStarts += 1;
+      throw new Error('native start failed');
+    },
+    stopRecording: async () => null,
+    prepareDesktopAudioRecording: async () => 'desktop-audio-window',
+    requestPermission: async () => null,
+    addEventListener: (type: string, callback: (event: unknown) => void) => listeners.set(type, callback),
+    removeAllEventListeners: () => listeners.clear(),
+  };
+  Reflect.set(capture, 'loadSdk', async () => fakeSdk);
+  Reflect.set(capture, 'postDaemon', async (pathname: string, body: Record<string, unknown>) => {
+    if (pathname.endsWith('/settings')) {
+      settingsWrites.push(body.autoRecord === true);
+      if (body.autoRecord === true) {
+        markConsentWriteStarted();
+        await consentWriteGate;
+      }
+      return {};
+    }
+    if (pathname.endsWith('/upload-token')) {
+      return { uploadToken: 'token', sdkUploadId: 'upload', region: 'us-west-2' };
+    }
+    return {};
+  });
+
+  await capture.configure({ enabled: true, autoRecord: false });
+  const detected = { window: { id: 'always-window', platform: 'zoom', title: 'Planning' } };
+  listeners.get('meeting-detected')?.(detected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const startAttempt = capture.enableAutoRecordAndRecordPrompted('always-window');
+  await consentWriteStarted;
+  assert.equal(capture.status().capturePhase, 'starting');
+  const rejectedStart = assert.rejects(startAttempt, /native start failed/);
+  releaseConsentWrite();
+  await rejectedStart;
+  assert.equal(nativeStarts, 1);
+  assert.deepEqual(settingsWrites, [true, false]);
+  assert.equal(capture.status().settings.autoRecord, false);
+  assert.equal(capture.status().capturePhase, 'prompt');
 });
 
 test('SDK upload id is never treated as the canonical Recall recording id', async () => {
@@ -534,6 +707,81 @@ test('prepareForShutdown drains a start-in-flight through native stop and daemon
   assert.equal(capture.status().recording, false);
 });
 
+test('prepareForShutdown cancels a pre-native Notch start and awaits consent rollback', async () => {
+  const listeners = new Map<string, (event: unknown) => void>();
+  const settingsWrites: boolean[] = [];
+  let nativeStarts = 0;
+  let markConsentWriteStarted!: () => void;
+  let markRollbackStarted!: () => void;
+  let releaseRollback!: () => void;
+  const consentWriteStarted = new Promise<void>((resolve) => { markConsentWriteStarted = resolve; });
+  const rollbackStarted = new Promise<void>((resolve) => { markRollbackStarted = resolve; });
+  const rollbackGate = new Promise<void>((resolve) => { releaseRollback = resolve; });
+  const capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => 'http://127.0.0.1:1',
+    getWebhookToken: () => 'test-token',
+    emit: () => undefined,
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  const fakeSdk = {
+    init: async () => null,
+    shutdown: async () => null,
+    startRecording: async () => { nativeStarts += 1; return null; },
+    stopRecording: async () => null,
+    prepareDesktopAudioRecording: async () => 'desktop-audio-window',
+    requestPermission: async () => null,
+    addEventListener: (type: string, callback: (event: unknown) => void) => listeners.set(type, callback),
+    removeAllEventListeners: () => listeners.clear(),
+  };
+  Reflect.set(capture, 'loadSdk', async () => fakeSdk);
+  Reflect.set(capture, 'postDaemon', async (
+    pathname: string,
+    body: Record<string, unknown>,
+    _method: string,
+    signal?: AbortSignal,
+  ) => {
+    if (!pathname.endsWith('/settings')) return {};
+    const autoRecord = body.autoRecord === true;
+    settingsWrites.push(autoRecord);
+    if (!autoRecord) {
+      markRollbackStarted();
+      await rollbackGate;
+      return {};
+    }
+    markConsentWriteStarted();
+    await new Promise<never>((_resolve, reject) => {
+      const abort = () => reject(new Error('consent write aborted for shutdown'));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
+  });
+
+  await capture.configure({ enabled: true, autoRecord: false });
+  listeners.get('meeting-detected')?.({
+    window: { id: 'shutdown-notch-window', platform: 'zoom', title: 'Planning' },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const starting = capture.enableAutoRecordAndRecordPrompted('shutdown-notch-window');
+  const rejectedStart = assert.rejects(starting, /cancelled/);
+  await consentWriteStarted;
+  assert.equal(capture.status().capturePhase, 'starting');
+
+  let prepared = false;
+  const preparing = capture.prepareForShutdown().then(() => { prepared = true; });
+  await rollbackStarted;
+  assert.equal(prepared, false, 'shutdown must keep the daemon alive for consent rollback');
+  assert.equal(nativeStarts, 0);
+  assert.deepEqual(settingsWrites, [true, false]);
+
+  releaseRollback();
+  await rejectedStart;
+  await preparing;
+  assert.equal(prepared, true);
+  assert.equal(nativeStarts, 0);
+  assert.equal(capture.status().settings.autoRecord, false);
+  assert.equal(capture.status().capturePhase, 'prompt');
+});
+
 test('prepareForShutdown waits for a natural recording-ended completion after visible state clears', async () => {
   const listeners = new Map<string, (event: unknown) => void>();
   let resolveComplete!: (value: Record<string, unknown>) => void;
@@ -672,7 +920,11 @@ test('native SDK shutdown completes the owned upload and clean exit can initiali
   });
 
   await capture.configure({ enabled: true, region: 'eu-central-1' });
-  await capture.recordDetectedWindow('exit-window');
+  const detected = { window: { id: 'exit-window', platform: 'zoom', title: 'Exit meeting' } };
+  listeners.get('meeting-detected')?.(detected);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(capture.status().capturePhase, 'prompt');
+  await capture.recordPromptedWindow('exit-window');
   listeners.get('shutdown')?.({ code: 0, signal: '' });
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -681,6 +933,9 @@ test('native SDK shutdown completes the owned upload and clean exit can initiali
   assert.equal(complete?.body.sdkUploadRegion, 'eu-central-1');
   assert.equal(complete?.body.recallRetentionMode, 'zero');
   assert.equal(capture.status().recording, false);
+  assert.equal(capture.status().capturePhase, 'idle');
+  assert.equal(capture.status().pendingMeeting, undefined);
+  assert.equal(capture.status().detectedWindows.length, 0);
   assert.equal(capture.status().initialized, false);
 
   await capture.testConnection();

@@ -4,12 +4,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const from = path.join(desktopDir, 'dist', 'preload.js');
-const to = path.join(desktopDir, 'dist', 'preload.cjs');
+for (const name of ['preload', 'live-preload']) {
+  const from = path.join(desktopDir, 'dist', `${name}.js`);
+  const to = path.join(desktopDir, 'dist', `${name}.cjs`);
 
-if (!existsSync(from)) {
-  throw new Error(`Expected compiled preload at ${from}`);
+  if (!existsSync(from)) {
+    throw new Error(`Expected compiled preload at ${from}`);
+  }
+
+  rmSync(to, { force: true });
+  renameSync(from, to);
 }
-
-rmSync(to, { force: true });
-renameSync(from, to);

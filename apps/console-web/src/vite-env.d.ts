@@ -17,8 +17,36 @@ interface ClemBootstrap {
   flags?: { memory3d?: boolean };
 }
 
+interface ClementineLiveBounds {
+  width: number;
+  height: number;
+}
+
+interface ClementineLiveMountAck {
+  generation: number;
+  nonce: string;
+}
+
+interface ClementineLiveBridge {
+  resize?: (bounds: ClementineLiveBounds) => void | Promise<void>;
+  mounted?: (mount: ClementineLiveMountAck) => void | Promise<void>;
+  toggle?: () => void | Promise<void>;
+  openConsole?: () => void | Promise<void>;
+  dismiss?: () => void | Promise<void>;
+  meetingStatus?: () => unknown | Promise<unknown>;
+  recordDetectedMeeting?: (windowId: string) => unknown | Promise<unknown>;
+  alwaysRecordMeeting?: (windowId: string) => unknown | Promise<unknown>;
+  dismissMeetingPrompt?: (windowId: string) => unknown | Promise<unknown>;
+  stopMeetingRecording?: (windowId: string) => unknown | Promise<unknown>;
+  requestMeetingPermissions?: () => unknown | Promise<unknown>;
+  onPreview?: (callback: (payload: unknown) => void) => void | (() => void);
+  onMeetingEvent?: (callback: (payload: unknown) => void) => void | (() => void);
+}
+
 interface Window {
   __CLEM_BOOTSTRAP__?: ClemBootstrap;
   /** Electron preload bridge (apps/desktop/src/preload.ts). Absent in a plain browser. */
   clemmy?: Record<string, unknown>;
+  /** Optional native Clementine Live helper bridge. Absent in browser preview. */
+  clementineLive?: ClementineLiveBridge;
 }

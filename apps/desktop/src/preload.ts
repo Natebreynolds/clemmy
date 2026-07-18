@@ -28,6 +28,11 @@ const api = {
   tailLog: (maxLines?: number) => ipcRenderer.invoke('clemmy:tail-log', maxLines) as Promise<{ lines: string[] }>,
   /** Open the log file in the OS default viewer. */
   openLogs: () => ipcRenderer.invoke('clemmy:open-logs') as Promise<{ opened: boolean }>,
+  /** macOS notch preferences are desktop-owned and only callable from the
+   * Settings route. */
+  notchStatus: () => ipcRenderer.invoke('clemmy:notch-status') as Promise<Record<string, unknown>>,
+  notchUpdate: (patch: Record<string, unknown>) => ipcRenderer.invoke('clemmy:notch-update', patch) as Promise<Record<string, unknown>>,
+  notchOpen: () => ipcRenderer.invoke('clemmy:notch-open') as Promise<Record<string, unknown>>,
   /** Optional Recall.ai Desktop Recording SDK integration. */
   recallStatus: () => ipcRenderer.invoke('clemmy:recall-status') as Promise<Record<string, unknown> | null>,
   recallConfigure: (settings: Record<string, unknown>) => ipcRenderer.invoke('clemmy:recall-configure', settings) as Promise<Record<string, unknown> | null>,

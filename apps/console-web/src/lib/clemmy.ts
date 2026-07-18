@@ -15,6 +15,9 @@ interface ClemmyBridge {
   supervisorStatus?: () => Promise<{ running: boolean; port: number; url: string }>;
   restartDaemon?: () => Promise<unknown>;
   openLogs?: () => Promise<unknown>;
+  notchStatus?: () => Promise<unknown>;
+  notchUpdate?: (patch: Record<string, unknown>) => Promise<unknown>;
+  notchOpen?: () => Promise<unknown>;
   updaterStatus?: () => Promise<unknown>;
   updaterCheck?: () => Promise<unknown>;
   onUpdaterEvent?: (cb: (event: UpdaterEvent) => void) => void;

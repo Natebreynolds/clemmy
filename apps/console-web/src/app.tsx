@@ -5,6 +5,7 @@ import { AppShell } from './components/AppShell';
 import { Chat } from './screens/Chat';
 import { ChatScreen } from './features/conversations/ChatScreen';
 import { ConversationThread } from './features/conversations/chat/ConversationThread';
+import { NotchSurface } from './features/notch/NotchSurface';
 
 /** Route-level splitting keeps the everyday Chat boot path lean while retaining
  * every screen. Named exports are adapted to React.lazy's default-export shape;
@@ -106,6 +107,10 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter basename="/console">
         <Routes>
+          {/* Transparent companion surface: deliberately outside AppShell so
+              the native notch helper never inherits dashboard chrome. */}
+          <Route path="/notch" element={<NotchSurface />} />
+
           <Route element={<AppShell />}>
             <Route index element={<Navigate to="/chat" replace />} />
 
