@@ -58,6 +58,7 @@ import {
 } from '../runtime/notifications.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { trustsForwardedClientIp } from '../runtime/mobile-ingress.js';
+import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
 import { markPushSubscribed } from '../runtime/mobile-sessions.js';
 import {
   getSession as harnessGetSession,
@@ -620,7 +621,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
 
-    if (record.binding === 'key') {
+    if (record.binding === 'key' && deviceKeyRequired()) {
       const verdict = await verifySessionProof(req, token, record);
       if (!verdict.ok) {
         // Budgeted separately from PIN and pairing: a client failing this many
@@ -630,7 +631,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         res.status(401).json({ error: 'BAD_DEVICE_PROOF', reason: verdict.reason });
         return;
       }
-    } else if (needsDeviceUpgrade(record, now)) {
+    } else if (deviceKeyRequired() && needsDeviceUpgrade(record, now)) {
       // A migrated v1 session that never bound a key within its grace. Fails to
       // a login screen, not to a broken app.
       res.clearCookie(MOBILE_SESSION_COOKIE, { path: '/', secure: mobileCookieSecure(req), sameSite: 'lax' });

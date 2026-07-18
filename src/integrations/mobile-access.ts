@@ -47,6 +47,7 @@ import {
   type MobileAccessStatus,
   tunnelOriginUrl,
 } from '../runtime/mobile-access-state.js';
+import { mobileAuthPosture, type MobileAuthPostureGap } from '../runtime/mobile-auth-posture.js';
 
 const DEFAULT_CERT_PATH = path.join(os.homedir(), '.cloudflared', 'cert.pem');
 const TUNNEL_LOG_FILE = path.join(BASE_DIR, 'logs', 'cloudflared', 'tunnel.log');
@@ -428,11 +429,23 @@ export async function rotatePin(pin: string): Promise<{ revokedSessions: number;
 
 export type MobileAccessTargetMode = 'local-preview' | 'quick' | 'custom-domain';
 
+export interface MobileAccessHardening {
+  /**
+   * Observed, not claimed. 'unknown' means we have not successfully probed this
+   * hostname — never that Access is off.
+   */
+  cloudflareAccess: 'enforcing' | 'not-enforcing' | 'unknown';
+  checkedAt?: string;
+  /** Weaknesses in the daemon's own auth. Blocking ones prevent the QR. */
+  postureGaps?: MobileAuthPostureGap[];
+}
+
 export interface MobileAccessTarget {
   url: string;
   mode: MobileAccessTargetMode;
   qrReady: boolean;
   qrBlockedReason?: string;
+  hardening?: MobileAccessHardening;
 }
 
 export class MobileQrNotReadyError extends Error {
@@ -466,39 +479,52 @@ export function mobileAccessTarget(
 
   if (host) {
     const mode: MobileAccessTargetMode = !cleanOverride && tunnel?.mode === 'quick' ? 'quick' : 'custom-domain';
-    if (mode === 'quick') {
-      const connected = runtime.running && runtime.connected;
-      return {
-        url: baseUrlForHostname(host),
-        mode,
-        qrReady: connected,
-        qrBlockedReason: connected
-          ? undefined
-          : 'Start the temporary mobile link and wait for Cloudflare to finish connecting before scanning the QR.',
-      };
+    const running = runtime.running;
+    const connected = runtime.running && runtime.connected;
+
+    // Both modes now gate on the same two things: the tunnel is up, and OUR OWN
+    // auth is sound.
+    //
+    // Cloudflare Access used to gate the custom-domain branch, via an
+    // `acknowledged && enabled` pair the user set by ticking "I've enabled it"
+    // — never verified. That made the security model depend on a self-report,
+    // and made the hard setup steps (own a domain, configure a Cloudflare app)
+    // load-bearing. Now that sessions are device-bound, rate limits are
+    // unspoofable, and the route surface is default-deny, the daemon can face
+    // the internet on its own. Access becomes defense-in-depth, reported as a
+    // badge from an actual probe rather than trusted as a claim.
+    const posture = mobileAuthPosture();
+
+    let qrBlockedReason: string | undefined;
+    if (!posture.ok) {
+      qrBlockedReason = posture.gaps.find((gap) => gap.blocking)?.message
+        ?? 'Mobile access is not safe to expose yet.';
+    } else if (!running) {
+      qrBlockedReason = mode === 'quick'
+        ? 'Start the temporary mobile link and wait for Cloudflare to finish connecting before scanning the QR.'
+        : 'Start the custom-domain tunnel before scanning the QR.';
+    } else if (!connected) {
+      qrBlockedReason = 'Wait for Cloudflare to finish connecting before scanning the QR.';
     }
 
     const access = record.cloudflareAccess;
-    const accessConfirmed = Boolean(
-      access?.enabled
-      && access.acknowledged
-      && access.hostname.trim().toLowerCase() === host.toLowerCase(),
-    );
-    const running = runtime.running;
-    const connected = runtime.running && runtime.connected;
-    let qrBlockedReason: string | undefined;
-    if (!accessConfirmed) {
-      qrBlockedReason = 'Confirm Cloudflare Access for this hostname before scanning the QR.';
-    } else if (!running) {
-      qrBlockedReason = 'Start the custom-domain tunnel before scanning the QR.';
-    } else if (!connected) {
-      qrBlockedReason = 'Wait for the custom-domain tunnel to finish connecting before scanning the QR.';
-    }
+    const matchesHost = access?.hostname.trim().toLowerCase() === host.toLowerCase();
+    const cloudflareAccess: MobileAccessHardening['cloudflareAccess'] = !matchesHost || !access
+      ? 'unknown'
+      : access.verified
+        ? (access.verified.enforcing ? 'enforcing' : 'not-enforcing')
+        : 'unknown';
+
     return {
       url: baseUrlForHostname(host),
       mode,
-      qrReady: accessConfirmed && connected,
+      qrReady: connected && posture.ok,
       qrBlockedReason,
+      hardening: {
+        cloudflareAccess,
+        checkedAt: matchesHost ? access?.verified?.checkedAt : undefined,
+        postureGaps: posture.gaps,
+      },
     };
   }
 

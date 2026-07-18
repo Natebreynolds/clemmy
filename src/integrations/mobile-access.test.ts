@@ -103,18 +103,67 @@ test('generateQrSvg blocks local-preview QR when no hostname is configured', asy
   );
 });
 
-test('generateQrSvg blocks custom-domain QR until Access is confirmed and tunnel is connected', async () => {
+test('custom-domain QR no longer requires a Cloudflare Access acknowledgement', async () => {
+  // INVERTED DELIBERATELY. This used to assert that the QR was blocked until
+  // the user ticked "I've enabled Access" — an acknowledgement nothing ever
+  // verified, which meant the security model rested on a self-report and the
+  // hard setup steps (own a domain, configure a Cloudflare app) were
+  // load-bearing. The daemon's own auth now stands on its own: device-bound
+  // sessions, unspoofable rate limits, default-deny routing. Access is
+  // defense-in-depth, reported from a real probe rather than trusted.
   integration._resetMobileAccessForTests();
   await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' });
   integration._setTunnelRuntimeForTests({ running: true, connected: true, events: [] });
-  await assert.rejects(
-    () => integration.generateQrSvg(),
-    (err: unknown) => {
-      assert.ok(err instanceof integration.MobileQrNotReadyError);
-      assert.match(err.target.qrBlockedReason ?? '', /Access/i);
-      return true;
-    },
-  );
+
+  const result = await integration.generateQrSvg();
+  assert.equal(result.target.qrReady, true, 'a connected tunnel with sound posture is enough');
+  assert.equal(result.target.hardening?.cloudflareAccess, 'unknown', 'unprobed means unknown, not off');
+});
+
+test('a blocking auth-posture gap still blocks the QR', async () => {
+  // The gate did not disappear, it moved to something we can actually verify.
+  // Without this the change would just be "ship an open door".
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' });
+  integration._setTunnelRuntimeForTests({ running: true, connected: true, events: [] });
+
+  const prior = process.env.CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY;
+  process.env.CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY = 'false';
+  try {
+    await assert.rejects(
+      () => integration.generateQrSvg(),
+      (err: unknown) => {
+        assert.ok(err instanceof integration.MobileQrNotReadyError);
+        assert.match(err.target.qrBlockedReason ?? '', /device binding/i);
+        return true;
+      },
+    );
+  } finally {
+    if (prior === undefined) delete process.env.CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY;
+    else process.env.CLEMENTINE_MOBILE_REQUIRE_DEVICE_KEY = prior;
+  }
+});
+
+test('a spoofed Access acknowledgement is corrected by the probe, not trusted', async () => {
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' });
+  await setMobileAccessAccessAck({ enabled: true }); // the user claims Access is on
+
+  const { refreshCloudflareAccessVerification } = await import('./cloudflare-access-probe.js');
+  // Reality: our own origin answers, so Access is not enforcing.
+  const result = await refreshCloudflareAccessVerification('clem.example.com', {
+    fetchImpl: (async () => new Response(JSON.stringify({ pinConfigured: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch,
+  });
+  assert.equal(result.enforcing, false);
+  assert.equal(result.evidence, 'origin-served');
+
+  const { readMobileAccess } = await import('../runtime/mobile-access-state.js');
+  const stored = readMobileAccess().cloudflareAccess;
+  assert.equal(stored?.enabled, false, 'the unverified claim must be corrected');
+  assert.equal(stored?.verified?.enforcing, false);
 });
 
 test('generateQrSvg returns one-time pairing SVG when custom-domain target is ready', async () => {

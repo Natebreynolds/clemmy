@@ -65,6 +65,17 @@ export interface MobileAccessAccessAck {
   acknowledgedAt: string;
   /** true = "I've enabled Access", false = "I opted out". */
   enabled: boolean;
+  /**
+   * What an actual unauthenticated probe of the hostname observed.
+   *
+   * `enabled` above is only the user's claim. This is the measurement, and it
+   * is what any security decision should read.
+   */
+  verified?: {
+    enforcing: boolean;
+    checkedAt: string;
+    evidence: string;
+  };
 }
 
 /**
