@@ -262,6 +262,97 @@ function IssueList({ icon: Icon, tone, title, items }: { icon: LucideIcon; tone:
   );
 }
 
+// Prettify a model id for humans: claude-sonnet-5 → Sonnet, claude-opus-4-8 →
+// Opus, gpt-5.4 → GPT-5.4, glm-5.2 → GLM-5.2.
+function shortModel(id?: string | null): string {
+  if (!id) return 'AI';
+  const m = id.toLowerCase();
+  if (m.includes('opus')) return 'Opus';
+  if (m.includes('sonnet')) return 'Sonnet';
+  if (m.includes('haiku')) return 'Haiku';
+  if (m.includes('fable')) return 'Fable';
+  if (m.startsWith('gpt')) return id.toUpperCase().replace('GPT', 'GPT-').replace('GPT--', 'GPT-');
+  return id;
+}
+
+// First sentence of a step prompt, as a plain-English one-liner.
+function plainStepPurpose(prompt?: string): string {
+  if (!prompt) return '';
+  const firstSentence = prompt.trim().split(/(?<=[.!?])\s/)[0] ?? prompt.trim();
+  return firstSentence.length > 160 ? `${firstSentence.slice(0, 157)}…` : firstSentence;
+}
+
+type DryRunTraceStep = NonNullable<NonNullable<WorkflowCertification['dryRun']>['steps']>[number];
+
+// A readable, deterministic "here's what this does" view built entirely from the
+// workflow definition + dry-run trace (no LLM). Accurate by construction: the
+// impact strip and per-step effects come from the same trace the runner uses.
+function WorkflowHowItWorks({ wf }: { wf: WorkflowDetail }) {
+  const steps = wf.steps ?? [];
+  if (steps.length === 0) return null;
+  const trace = new Map<string, DryRunTraceStep>((wf.certification?.dryRun?.steps ?? []).map((s) => [s.stepId, s]));
+  const fx = wf.certification?.dryRun?.effectCounts;
+
+  const runBadge = (t?: DryRunTraceStep) => {
+    const ex = t?.executor ?? 'model';
+    if (ex === 'call') return <StatusPill tone="success">⚡ direct call{t?.touches?.tools?.[0] ? ` · ${t.touches.tools[0]}` : ''}</StatusPill>;
+    if (ex === 'deterministic') return <StatusPill tone="success">📜 script</StatusPill>;
+    if (ex === 'skill') return <StatusPill tone="info">🧩 skill</StatusPill>;
+    return <StatusPill tone="info">🤖 AI · {shortModel(t?.model)}</StatusPill>;
+  };
+  const effectBadge = (t?: DryRunTraceStep) => {
+    if (!t) return null;
+    if (t.effect === 'external_send') return <StatusPill tone="warning">⚠️ sends externally</StatusPill>;
+    if (t.effect === 'external_write') return <StatusPill tone="info">✍️ writes</StatusPill>;
+    return null;
+  };
+
+  return (
+    <section className="mb-5">
+      <h3 className="mb-2 text-h3 text-fg">How it works</h3>
+      {fx && (fx.sends + fx.writes + fx.approvals) > 0 && (
+        <div className="mb-3 flex flex-wrap items-center gap-1.5">
+          <span className="text-caption text-muted">Real-world impact:</span>
+          {fx.writes > 0 && <StatusPill tone="info">✍️ writes to {fx.writes} place{fx.writes === 1 ? '' : 's'}</StatusPill>}
+          {fx.sends > 0 && <StatusPill tone="warning">⚠️ sends {fx.sends} externally</StatusPill>}
+          {fx.approvals > 0 && <StatusPill tone="warning">🔒 {fx.approvals} approval{fx.approvals === 1 ? '' : 's'}</StatusPill>}
+        </div>
+      )}
+      <ol>
+        {steps.map((s, i) => {
+          const t = trace.get(s.id ?? '');
+          const purpose = plainStepPurpose(s.prompt) || t?.label || '';
+          const uses = t?.reads?.length ? `uses ${t.reads.join(', ')}` : '';
+          const produces = t?.emits ? `produces ${t.emits}` : '';
+          return (
+            <li key={s.id || i}>
+              <div className="rounded-md border border-border bg-surface p-3">
+                <div className="flex items-start gap-2.5">
+                  <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-caption font-semibold text-primary">{i + 1}</div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-body font-medium text-fg">{s.name || s.id || `Step ${i + 1}`}</span>
+                      {runBadge(t)}
+                      {effectBadge(t)}
+                      {t?.gated && <StatusPill tone="warning">🔒 needs approval</StatusPill>}
+                    </div>
+                    {purpose && <p className="mt-1 text-small text-muted">{purpose}</p>}
+                    {(uses || produces) && (
+                      <p className="mt-1 text-caption text-faint">{[uses, produces].filter(Boolean).join(' · ')}</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+              {i < steps.length - 1 && <div className="ml-[1.4rem] h-3 w-px bg-border" aria-hidden />}
+            </li>
+          );
+        })}
+      </ol>
+      <p className="mt-2 text-caption text-faint">To change the steps, ask Clementine in Chat — it'll rewrite the workflow for you.</p>
+    </section>
+  );
+}
+
 export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () => void }) {
   const qc = useQueryClient();
   const [wf, setWf] = useState<WorkflowDetail | null>(null);
@@ -359,21 +450,11 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
               <ScheduleEditor value={cron} onChange={(c) => { setCron(c); setSaved(false); }}
                 timezone={tz} onTimezoneChange={(z) => { setTz(z); setSaved(false); }} />
 
+              <WorkflowHowItWorks wf={wf} />
+
               <div id="wf-engine-panel">
                 <WorkflowEnginePanel certification={wf.certification} stepCount={wf.steps?.length ?? 0} resources={wf.resources} resourceBinding={wf.resourceBinding} />
               </div>
-
-              <h3 className="mb-2 mt-5 text-h3 text-fg">Steps</h3>
-              <ol className="space-y-2">
-                {(wf.steps ?? []).map((s, i) => (
-                  <li key={s.id || i} className="rounded-md border border-border px-3.5 py-2.5">
-                    <div className="text-body font-medium text-fg">{i + 1}. {s.name || s.id || `Step ${i + 1}`}</div>
-                    {s.prompt && <p className="mt-0.5 line-clamp-2 text-small text-muted">{s.prompt}</p>}
-                  </li>
-                ))}
-                {(!wf.steps || wf.steps.length === 0) && <li className="text-body text-muted">No steps defined.</li>}
-              </ol>
-              <p className="mt-2 text-caption text-faint">To change the steps, ask Clementine in Chat — it'll rewrite the workflow for you.</p>
 
               {error && <p className="mt-3 text-small text-danger">{error}</p>}
             </>

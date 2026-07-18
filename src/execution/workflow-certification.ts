@@ -1,5 +1,6 @@
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { analyzeWorkflowGaps, type WorkflowGap } from './workflow-gap-test.js';
+import { analyzeWorkflowRouting, renderWorkflowRoutingAdvisories } from './workflow-routing-check.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { prepareWorkflowVerification } from './workflow-authoring.js';
 import {
@@ -7,7 +8,7 @@ import {
   type WorkflowDryRunPlanOptions,
   type WorkflowDryRunSimulation,
 } from './workflow-dry-run-simulation.js';
-import { classifyWorkflowExecutionMode, type WorkflowExecutionMode } from './workflow-execution-mode.js';
+import { classifyWorkflowExecutionMode, type WorkflowExecutionMode, type WorkflowCodifyCandidate } from './workflow-execution-mode.js';
 import { resourceHasSurface, resourceHasSelector } from './workflow-resource-binding.js';
 
 export type WorkflowCertificationState =
@@ -43,6 +44,11 @@ export interface WorkflowCertification {
   enabled: boolean;
   state: WorkflowCertificationState;
   executionMode: WorkflowExecutionMode;
+  /** Token-efficiency nudge: LLM steps that look mechanical enough to run as
+   *  free `call` code (already computed for the execution mode — surfaced so the
+   *  UI can show the savings on the table). Advisory only; never gates a run. */
+  codifyCandidateCount: number;
+  codifyCandidates: WorkflowCodifyCandidate[];
   label: string;
   summary: string;
   canRun: boolean;
@@ -72,6 +78,11 @@ export function certifyWorkflow(
   });
   const execution = classifyWorkflowExecutionMode(def);
   const readinessGaps = analyzeWorkflowGaps(def);
+  // Model-routing advisories (silent no-op tag / missed routing) ride the
+  // contract-advisory channel so the Automate UI surfaces them alongside other
+  // advisories. Advisory only — they never flip canRun/canEnable.
+  const routingAdvisories = renderWorkflowRoutingAdvisories(analyzeWorkflowRouting(def));
+  const contractAdvisories = [...dryRun.contractAdvisories, ...routingAdvisories];
   const verification = prepareWorkflowVerification(def, testInputs);
   const missingRunInputs = missingWorkflowRunInputs(def, runInputs);
   const resourceGaps = workflowResourceBindingGaps(def);
@@ -96,7 +107,7 @@ export function certifyWorkflow(
   });
   const nextActions = certificationActions({
     state,
-    hasContractAdvisories: dryRun.contractAdvisories.length > 0,
+    hasContractAdvisories: contractAdvisories.length > 0,
   });
 
   return {
@@ -104,6 +115,8 @@ export function certifyWorkflow(
     enabled,
     state,
     executionMode: execution.mode,
+    codifyCandidateCount: execution.codifyCandidates.length,
+    codifyCandidates: execution.codifyCandidates,
     label: certificationLabel(state),
     summary: certificationSummary(def.name, state),
     canRun,
@@ -115,7 +128,7 @@ export function certifyWorkflow(
     resourceGaps,
     readinessGaps,
     blockingReasons,
-    contractAdvisories: dryRun.contractAdvisories,
+    contractAdvisories,
     nextActions,
     dryRun,
   };

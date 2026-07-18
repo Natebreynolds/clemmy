@@ -29,6 +29,10 @@ export interface WorkflowCertification {
   state: WorkflowCertificationState;
   /** How much runs as code vs an agent: agentless (pure code) → agent (all LLM). */
   executionMode?: WorkflowExecutionMode;
+  /** Token-savings nudge: LLM steps that look mechanical enough to run as free
+   *  `call` code. Advisory only. */
+  codifyCandidateCount?: number;
+  codifyCandidates?: Array<{ stepId: string; reason: string; tool?: string }>;
   label: string;
   summary: string;
   canRun: boolean;
@@ -73,6 +77,8 @@ export interface WorkflowCertification {
       gated?: boolean;
       touches?: { tools?: string[]; skills?: string[]; scripts?: string[]; project?: string | null };
       fanout?: { source: string; newOnly: boolean } | null;
+      /** The model this step actually runs on (pinned/intent-routed/default); null for non-LLM. */
+      model?: string | null;
     }>;
     effects?: {
       sends: Array<{ stepId: string; detail: string }>;

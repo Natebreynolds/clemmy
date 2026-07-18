@@ -20,6 +20,7 @@ import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-s
 import { shortStepLabel } from './workflow-describe.js';
 import { classifyStepSideEffect, type StepSideEffectClass } from './workflow-enforce.js';
 import { stepExecutor } from './workflow-execution-mode.js';
+import { resolveStepDisplayModel } from './workflow-routing-check.js';
 import { preflightWorkflow } from './workflow-preflight.js';
 import { checkWorkflowRunReadiness } from './workflow-run-readiness.js';
 import { workflowQualityCriteria } from './workflow-quality-contract.js';
@@ -167,7 +168,9 @@ export function simulateWorkflowDryRun(
       emits: stepEmits(step),
       gated: step.requiresApproval === true,
       fanout: fan ? { source: fan.source, newOnly: fan.newOnly } : null,
-      model: step.model ?? null,
+      // The model this step ACTUALLY runs on (pinned, intent-routed, or the
+      // worker default) — not just an explicit pin. Null for non-LLM steps.
+      model: resolveStepDisplayModel(step),
     };
   });
 

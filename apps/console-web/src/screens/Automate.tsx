@@ -368,6 +368,11 @@ function WorkflowEngineStrip({ workflow, onOpen }: { workflow: WorkflowRow; onOp
             </StatusPill>
           </span>
         )}
+        {(cert.codifyCandidateCount ?? 0) > 0 && (
+          <span title={`Token savings on the table — these mechanical steps could run as free code:\n${(cert.codifyCandidates ?? []).map((c) => `• ${c.stepId}${c.tool ? ` (${c.tool})` : ''}`).join('\n')}`}>
+            <StatusPill tone="info">💡 {cert.codifyCandidateCount} step{cert.codifyCandidateCount === 1 ? '' : 's'} could be free code</StatusPill>
+          </span>
+        )}
         <span className="text-caption text-faint">{counts.parallelWaves}/{counts.waves} parallel waves</span>
         {resourceCount > 0 && <span className="text-caption text-faint">{resourceCount} resources</span>}
         <span className="text-caption text-faint">{counts.tools} tools</span>

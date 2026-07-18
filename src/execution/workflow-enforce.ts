@@ -10,6 +10,7 @@ import {
   workflowAuthoringAdvisories,
 } from './workflow-contract-proposals.js';
 import { textMentionsDeliverable } from './workflow-deliverable-hints.js';
+import { analyzeWorkflowRouting, renderWorkflowRoutingAdvisories } from './workflow-routing-check.js';
 
 /**
  * Author/enable-time enforcement (typed-workflow-contract).
@@ -747,7 +748,12 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
   const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def)];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);
-  const warnings = [...result.warnings, ...runnabilityWarnings, ...workflowAuthoringAdvisories(def)];
+  // Model-routing advisories: a step tagged with an intent that matches no active
+  // model rule (silent no-op), or an untagged step that would use a special model
+  // if tagged. Non-blocking — a silent routing regression is a quality issue, not
+  // a structural failure, so it warns but never blocks the write.
+  const routingWarnings = renderWorkflowRoutingAdvisories(analyzeWorkflowRouting(def));
+  const warnings = [...result.warnings, ...runnabilityWarnings, ...workflowAuthoringAdvisories(def), ...routingWarnings];
   return { ok: errors.length === 0, errors, warnings };
 }
 
