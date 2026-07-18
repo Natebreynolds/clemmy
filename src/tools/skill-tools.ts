@@ -1,7 +1,7 @@
 import { readdirSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { listSkills, loadSkill, type Skill } from '../memory/skill-store.js';
+import { listActiveSkills, loadSkill, type Skill } from '../memory/skill-store.js';
 import { checkSkillPreconditions } from '../runtime/capability-preconditions.js';
 import { textResult } from './shared.js';
 
@@ -68,7 +68,7 @@ export function registerSkillTools(server: McpServer): void {
     ].join('\n'),
     {},
     async () => {
-      const skills = listSkills();
+      const skills = listActiveSkills();
       if (skills.length === 0) {
         return textResult('No skills installed. The user can install skills from GitHub via the Skills panel in the dashboard.');
       }

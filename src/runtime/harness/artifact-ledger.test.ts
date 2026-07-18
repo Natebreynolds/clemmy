@@ -564,6 +564,37 @@ test('only an explicit pre-dispatch proof makes an artifact claim releasable', (
   assert.equal(ledger.artifactOutputProvesNoDispatch({ successful: false, error: 'provider failed' }), false);
 });
 
+test('typed shell outcome releases local materialization and authoritative no-effect failures only', async () => {
+  const { classifyShellExecutionOutcome } = await import('../shell-execution-outcome.js');
+  const materialization = classifyShellExecutionOutcome({
+    command: 'npx provider-cli resource:create --name x',
+    externalMutation: true,
+    exitCode: 1,
+    stdout: '',
+    stderr: 'npm error code EACCES\nnpm error path /Users/me/.npm/_cacache\nnpm error permission denied',
+  });
+  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', materialization), true);
+
+  const accountRejected = classifyShellExecutionOutcome({
+    command: 'netlify sites:create --name x --account-slug wrong-team --json',
+    externalMutation: true,
+    exitCode: 1,
+    stdout: '',
+    stderr: 'createSiteInTeam error: 404: Not Found',
+  });
+  assert.equal(accountRejected.effect, 'none');
+  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', accountRejected), true);
+
+  const unknownProviderExit = classifyShellExecutionOutcome({
+    command: 'provider-cli resource:create --name x',
+    externalMutation: true,
+    exitCode: 1,
+    stdout: 'resource may have been created',
+    stderr: 'final readback failed',
+  });
+  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', unknownProviderExit), false);
+});
+
 test('classifies Netlify site creation but not deploy/status commands', () => {
   const create = ledger.artifactIntentForTool('run_shell_command', { command: 'npx netlify-cli sites:create --name client-snapshot' });
   assert.equal(create?.slotKey, 'site:primary');

@@ -855,6 +855,7 @@ function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => voi
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-h3 text-fg">{skill.displayName || skill.name}</h3>
+            {skill.supersededBy && <StatusPill tone="neutral">Retired → {skill.supersededBy}</StatusPill>}
             {skill.source?.updateAvailable && <StatusPill tone="warning">Update available</StatusPill>}
             {skill.hasScripts && badge('scripts')}
             {skill.hasReferences && badge('references')}

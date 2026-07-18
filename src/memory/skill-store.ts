@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
@@ -32,6 +33,25 @@ import { BASE_DIR, getRuntimeEnv } from '../config.js';
 export const SKILLS_DIR = path.join(BASE_DIR, 'skills');
 const SOURCE_FILE = '.clementine-source.json';
 
+export interface SkillOrigin {
+  kind: 'chat' | 'workflow' | 'manual';
+  sourceId?: string;
+  distilledAt?: string;
+}
+
+/** Audit trail retained on the canonical draft when equivalent drafts are
+ * superseded. The source files remain on disk too; this compact copy makes the
+ * merged provenance visible without having to know the old aliases. */
+export interface SkillLineageEntry {
+  skillName: string;
+  description: string;
+  origin?: SkillOrigin;
+  useCount: number;
+  failureCount: number;
+  capabilityFingerprint?: string;
+  mergedAt: string;
+}
+
 export interface SkillFrontmatter {
   name: string;
   description: string;
@@ -43,7 +63,20 @@ export interface SkillFrontmatter {
    */
   tier?: 'draft' | 'approved';
   /** Where a distilled draft came from + when. */
-  origin?: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string; distilledAt?: string };
+  origin?: SkillOrigin;
+  /** Stable, task-semantic identity for a self-distilled capability. Names,
+   * descriptions, and providers may change without changing this identity. */
+  capabilityFingerprint?: string;
+  /** Every chat goal / workflow run / manual session observed for this same
+   * capability. This is lineage evidence, not a validated-use counter. */
+  capabilityOrigins?: SkillOrigin[];
+  /** Non-destructive duplicate reconciliation. Superseded aliases remain on
+   * disk, but are omitted from active skill discovery. */
+  supersededBy?: string;
+  supersededAt?: string;
+  disabled?: boolean;
+  /** Provenance copied from drafts folded into this canonical skill. */
+  lineage?: SkillLineageEntry[];
   /** Times this draft was read into a session that then validated success. */
   useCount?: number;
   /** Times this draft was implicated in a judged failure. */
@@ -162,16 +195,33 @@ export function listSkills(): Skill[] {
   }
   const skills: Skill[] = [];
   for (const dirName of entries) {
-    const skill = loadSkill(dirName);
+    const skill = loadSkill(dirName, { raw: true });
     if (skill) skills.push(skill);
   }
   return skills.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function loadSkill(name: string): Skill | null {
+/** Active catalog used by agent discovery/retrieval. `listSkills()` deliberately
+ * remains the complete management/audit view for backwards compatibility. */
+export function listActiveSkills(): Skill[] {
+  return listSkills().filter((skill) => !skill.frontmatter.supersededBy && !skill.frontmatter.disabled);
+}
+
+/** Load a skill for execution. A stale superseded name resolves to its canonical
+ * replacement, so an old workflow cannot execute the retired alias body. Pass
+ * `{raw:true}` only for maintenance/audit code that needs the alias itself. */
+export function loadSkill(name: string, options: { raw?: boolean } = {}): Skill | null {
   if (!isSafeSkillName(name)) return null;
-  const skillPath = path.join(SKILLS_DIR, name, 'SKILL.md');
-  return parseSkillFile(skillPath, name);
+  let currentName = name;
+  const seen = new Set<string>();
+  while (true) {
+    if (!isSafeSkillName(currentName) || seen.has(currentName)) return null;
+    seen.add(currentName);
+    const skillPath = path.join(SKILLS_DIR, currentName, 'SKILL.md');
+    const skill = parseSkillFile(skillPath, currentName);
+    if (!skill || options.raw || !skill.frontmatter.supersededBy) return skill;
+    currentName = skill.frontmatter.supersededBy;
+  }
 }
 
 export function isSafeSkillName(name: string): boolean {
@@ -379,7 +429,7 @@ export function capSkillLines(lines: string[], max: number, kind: string): strin
 }
 
 export function renderSkillsIndex(): string {
-  const skills = listSkills();
+  const skills = listActiveSkills();
   if (skills.length === 0) return '';
   // Quarantined drafts vanish from the index (kept on disk for the dashboard).
   const visible = skills.filter((s) => !s.frontmatter.quarantined);
@@ -498,7 +548,7 @@ export function findRelevantSkills(query: string, options?: RelevantSkillOptions
   if (!q || queryTerms.length === 0) return [];
 
   const matches: RelevantSkillMatch[] = [];
-  for (const skill of listSkills()) {
+  for (const skill of listActiveSkills()) {
     if (skill.frontmatter.quarantined) continue;
     const nameTerms = new Set(skillSearchTokens(`${skill.name} ${skill.frontmatter.name ?? ''}`));
     const descriptionTerms = new Set(skillSearchTokens(skill.frontmatter.description ?? ''));
@@ -589,11 +639,234 @@ export function renderRelevantSkillsForPrompt(query: string, options?: RelevantS
 
 // ─── Capability compounding: distilled draft skills (C1) ─────────────────────
 
+const CAPABILITY_FINGERPRINT_PREFIX = 'cap-v1:';
+
+/** Phrase aliases are intentionally provider-agnostic. They normalize common
+ * ways of stating a task, while leaving provider/product nouns in the token set
+ * so two unrelated capabilities that use similar verbs do not collapse. */
+const CAPABILITY_PHRASE_ALIASES: Array<[RegExp, string]> = [
+  [/\bsearch engine optimi[sz]ation\b/g, ' seo '],
+  [/\bcustomer relationship management\b/g, ' crm '],
+  [/\b(?:law|legal) (?:firms?|practices?)\b/g, ' lawfirm '],
+  [/\bgoogle sheets?\b/g, ' googlesheet '],
+  [/\bweb[ -]?sites?\b/g, ' website '],
+  [/\be[ -]?mails?\b/g, ' email '],
+];
+
+const CAPABILITY_STOPWORDS = new Set([
+  'a', 'an', 'and', 'after', 'at', 'automatically', 'before', 'by', 'capability',
+  'daily', 'do', 'every', 'for', 'from', 'how', 'in', 'into', 'morning', 'of',
+  'on', 'please', 'procedure', 'reusable', 'scheduled', 'skill', 'task', 'the',
+  'then', 'this', 'to', 'use', 'using', 'via', 'weekday', 'weekly', 'with',
+  'workflow', 'would',
+]);
+
+const CAPABILITY_TOKEN_ALIASES: Record<string, string> = {
+  analyse: 'audit', analyze: 'audit', analyzed: 'audit', analyzing: 'audit',
+  audit: 'audit', audited: 'audit', auditing: 'audit', assess: 'audit', assessed: 'audit',
+  evaluate: 'audit', evaluated: 'audit', inspect: 'audit', inspected: 'audit',
+  review: 'audit', reviewed: 'audit', reviewing: 'audit',
+  build: 'create', built: 'create', create: 'create', created: 'create', creating: 'create',
+  draft: 'create', drafted: 'create', generate: 'create', generated: 'create', make: 'create',
+  made: 'create', prepare: 'create', prepared: 'create', produce: 'create', produced: 'create',
+  write: 'create', wrote: 'create', written: 'create',
+  brief: 'report', briefs: 'report', digest: 'report', digests: 'report', report: 'report',
+  reports: 'report', summarize: 'report', summarized: 'report', summarise: 'report',
+  summary: 'report', summaries: 'report', synthesize: 'report', synthesise: 'report',
+  collect: 'fetch', collected: 'fetch', crawl: 'fetch', crawled: 'fetch', fetch: 'fetch',
+  fetched: 'fetch', gather: 'fetch', gathered: 'fetch', pull: 'fetch', pulled: 'fetch',
+  retrieve: 'fetch', retrieved: 'fetch', scrape: 'fetch', scraped: 'fetch',
+  deploy: 'publish', deployed: 'publish', host: 'publish', hosted: 'publish',
+  publish: 'publish', published: 'publish', release: 'publish', released: 'publish',
+  delete: 'delete', deleted: 'delete', destroy: 'delete', destroyed: 'delete',
+  remove: 'delete', removed: 'delete',
+  edit: 'update', edited: 'update', modify: 'update', modified: 'update', refresh: 'update',
+  refreshed: 'update', sync: 'update', synced: 'update', update: 'update', updated: 'update',
+  mails: 'email', site: 'website', sites: 'website', webpage: 'website', webpages: 'website', websites: 'website',
+};
+
+const CAPABILITY_ACTION_TOKENS = new Set([
+  'audit', 'copy', 'create', 'delete', 'fetch', 'move', 'publish', 'report', 'send',
+  'transfer', 'update',
+]);
+
+function explicitCapabilityAction(word: string): string | null {
+  const token = canonicalCapabilityToken(word);
+  if (!CAPABILITY_ACTION_TOKENS.has(token)) return null;
+  // report/brief/summary are commonly artifact nouns. Only their unambiguous
+  // verb forms establish execution order; they remain ordinary semantic tokens.
+  if (token === 'report' && !/^(?:summari[sz]e[sd]?|synthesi[sz]e[sd]?)$/.test(word)) return null;
+  return token;
+}
+
+function singularCapabilityToken(token: string): string {
+  if (token.length > 4 && token.endsWith('ies')) return `${token.slice(0, -3)}y`;
+  if (token.length > 4 && token.endsWith('s') && !/(?:ss|us|is|ous)$/.test(token)) return token.slice(0, -1);
+  return token;
+}
+
+function canonicalCapabilityToken(token: string): string {
+  const lowered = token.toLowerCase();
+  return CAPABILITY_TOKEN_ALIASES[lowered]
+    ?? CAPABILITY_TOKEN_ALIASES[singularCapabilityToken(lowered)]
+    ?? singularCapabilityToken(lowered);
+}
+
+function normalizedCapabilityWords(task: string): string[] {
+  let normalized = task
+    .normalize('NFKD')
+    .replace(/[’]/g, "'")
+    .replace(/'s\b/g, '')
+    .toLowerCase();
+  for (const [pattern, replacement] of CAPABILITY_PHRASE_ALIASES) {
+    normalized = normalized.replace(pattern, replacement);
+  }
+  return normalized.match(/[a-z0-9]+/g) ?? [];
+}
+
+function nextCapabilityTerm(words: string[], start: number): string | null {
+  for (let i = start; i < words.length; i += 1) {
+    const word = words[i];
+    if (word === 'to' || word === 'into' || word === 'from') return null;
+    const token = canonicalCapabilityToken(word);
+    if (!CAPABILITY_STOPWORDS.has(word) && !CAPABILITY_STOPWORDS.has(token)) return token;
+  }
+  return null;
+}
+
+function previousCapabilityTerm(words: string[], start: number): string | null {
+  for (let i = start; i >= 0; i -= 1) {
+    const word = words[i];
+    if (word === 'to' || word === 'into' || word === 'from') return null;
+    const token = canonicalCapabilityToken(word);
+    if (!CAPABILITY_STOPWORDS.has(word)
+      && !CAPABILITY_STOPWORDS.has(token)
+      && !CAPABILITY_ACTION_TOKENS.has(token)) return token;
+  }
+  return null;
+}
+
+/** Deterministic semantic normal form used by capabilityTaskFingerprint. It is
+ * deliberately based on task actions + subjects, never on the provider/tool
+ * list. Thus rewording is stable, while "publish a Netlify site" and "delete a
+ * Netlify site" remain different capabilities despite using the same CLI. */
+export function canonicalizeCapabilityTask(task: string): string {
+  const words = normalizedCapabilityWords(task ?? '');
+  const tokens = new Set<string>();
+  const routes = new Set<string>();
+
+  for (const word of words) {
+    const token = canonicalCapabilityToken(word);
+    if (!token || CAPABILITY_STOPWORDS.has(word) || CAPABILITY_STOPWORDS.has(token)) continue;
+    tokens.add(token);
+  }
+
+  // Preserve source/destination and result/source roles. Sorting the ordinary
+  // token bag makes word order irrelevant; these edges keep reverse operations
+  // distinct even when only `from` is present ("event from email" vs reverse).
+  for (let i = 0; i < words.length; i += 1) {
+    if (words[i] !== 'from') continue;
+    const source = nextCapabilityTerm(words, i + 1);
+    const destinationMarker = words.findIndex((word, idx) => idx > i && (word === 'to' || word === 'into'));
+    const destination = destinationMarker >= 0 ? nextCapabilityTerm(words, destinationMarker + 1) : null;
+    if (source && destination) routes.add(`${source}>${destination}`);
+    else {
+      const result = previousCapabilityTerm(words, i - 1);
+      if (result && source) routes.add(`${result}<${source}`);
+    }
+  }
+  const actionPositions = words
+    .map((word, index) => ({ action: explicitCapabilityAction(word), index }))
+    .filter((entry): entry is { action: string; index: number } => Boolean(entry.action));
+  const orderMarkers = words
+    .map((word, index) => ({ word, index }))
+    .filter((entry) => entry.word === 'before' || entry.word === 'after');
+  if (orderMarkers.length > 0) {
+    for (const marker of orderMarkers) {
+      const left = [...actionPositions].reverse().find((entry) => entry.index < marker.index)?.action;
+      const right = actionPositions.find((entry) => entry.index > marker.index)?.action;
+      if (left && right) routes.add(marker.word === 'before' ? `action:${left}>${right}` : `action:${right}>${left}`);
+    }
+  } else {
+    for (let i = 1; i < actionPositions.length; i += 1) {
+      const previous = actionPositions[i - 1].action;
+      const current = actionPositions[i].action;
+      if (previous !== current) routes.add(`action:${previous}>${current}`);
+    }
+  }
+
+  const stableTokens = [...tokens].sort();
+  const stableRoutes = [...routes].sort();
+  // Keep even very short objectives deterministic rather than falling back to
+  // a random/name-derived identity.
+  return `tokens:${stableTokens.join(',') || 'unspecified'}|routes:${stableRoutes.join(',')}`;
+}
+
+/** Stable task identity persisted in every newly distilled SKILL.md. */
+export function capabilityTaskFingerprint(task: string): string {
+  return `${CAPABILITY_FINGERPRINT_PREFIX}${createHash('sha256').update(canonicalizeCapabilityTask(task)).digest('hex')}`;
+}
+
+function validCapabilityFingerprint(value: string): boolean {
+  return new RegExp(`^${CAPABILITY_FINGERPRINT_PREFIX}[a-f0-9]{64}$`).test(value);
+}
+
+export interface CapabilitySkillMatch {
+  skill: Skill;
+  fingerprint: string;
+  /** True when an older self-distilled skill matched by its stored description
+   * and still needs the new field backfilled. */
+  legacy: boolean;
+}
+
+/** Find the canonical active skill for a task. New skills match by exact stable
+ * fingerprint. Legacy matching is intentionally limited to self-distilled
+ * skills (origin/draft metadata) so Clementine never rewrites a user-installed
+ * third-party skill merely because its prose happens to look similar. */
+export function findDistilledSkillByCapabilityTask(task: string): CapabilitySkillMatch | null {
+  const fingerprint = capabilityTaskFingerprint(task);
+  const skills = listActiveSkills();
+  const exact = skills
+    .filter((skill) => skill.frontmatter.capabilityFingerprint === fingerprint)
+    .sort((a, b) => Number((b.frontmatter.tier ?? 'approved') === 'approved')
+      - Number((a.frontmatter.tier ?? 'approved') === 'approved')
+      || (b.frontmatter.useCount ?? 0) - (a.frontmatter.useCount ?? 0)
+      || a.name.localeCompare(b.name))[0];
+  if (exact) return { skill: exact, fingerprint, legacy: false };
+
+  for (const skill of skills) {
+    if (skill.frontmatter.capabilityFingerprint) continue;
+    if (!skill.frontmatter.origin && skill.frontmatter.tier !== 'draft') continue;
+    const candidates = [skill.frontmatter.description, skill.frontmatter.name, skill.name.replace(/[-_]+/g, ' ')];
+    if (candidates.some((candidate) => candidate && capabilityTaskFingerprint(candidate) === fingerprint)) {
+      return { skill, fingerprint, legacy: true };
+    }
+  }
+  return null;
+}
+
+/** Backfill/claim a legacy skill's capability identity. A conflicting existing
+ * identity is never overwritten. */
+export function claimSkillCapabilityFingerprint(name: string, fingerprint: string): Skill | null {
+  if (!validCapabilityFingerprint(fingerprint)) return null;
+  const skill = loadSkill(name);
+  if (!skill) return null;
+  if (!skill.frontmatter.origin && skill.frontmatter.tier !== 'draft') return null;
+  if (skill.frontmatter.capabilityFingerprint
+    && skill.frontmatter.capabilityFingerprint !== fingerprint) return null;
+  if (skill.frontmatter.capabilityFingerprint === fingerprint) return skill;
+  return updateSkillFrontmatter(skill.name, { capabilityFingerprint: fingerprint });
+}
+
 export interface DistilledSkillInput {
   name: string;
   description: string;
   body: string;
-  origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string };
+  origin: Omit<SkillOrigin, 'distilledAt'>;
+  /** The accomplished task/objective. Falls back to description for backwards
+   * compatibility with older direct callers; agent distillation paths always
+   * pass the original objective. */
+  capabilityTask?: string;
   /** Lane D Phase 2: machine-checkable applicability — which tool families the
    *  procedure touches + which entity-class slots it is parameterized over. The
    *  retrieval filter surfaces a procedure only when these match the live task. */
@@ -611,11 +884,15 @@ export function writeDistilledSkill(input: DistilledSkillInput): string | null {
   ensureSkillsDir();
   const dir = path.join(SKILLS_DIR, input.name);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const distilledAt = new Date().toISOString();
+  const origin: SkillOrigin = { ...input.origin, distilledAt };
   const frontmatter: SkillFrontmatter = {
     name: input.name,
     description: input.description,
     tier: 'draft',
-    origin: { ...input.origin, distilledAt: new Date().toISOString() },
+    origin,
+    capabilityFingerprint: capabilityTaskFingerprint(input.capabilityTask ?? input.description),
+    capabilityOrigins: [origin],
     useCount: 0,
     failureCount: 0,
     ...(input.applicability ? { applicability: input.applicability } : {}),
@@ -630,14 +907,166 @@ export function writeDistilledSkill(input: DistilledSkillInput): string | null {
  *  Skill or null. */
 export function updateSkillFrontmatter(
   name: string,
-  patch: Partial<Pick<SkillFrontmatter, 'tier' | 'useCount' | 'failureCount' | 'quarantined'>>,
+  patch: Partial<Pick<SkillFrontmatter,
+    | 'tier' | 'useCount' | 'failureCount' | 'quarantined'
+    | 'capabilityFingerprint' | 'capabilityOrigins'
+    | 'supersededBy' | 'supersededAt' | 'disabled' | 'lineage'>>,
 ): Skill | null {
-  const skill = loadSkill(name);
+  const skill = loadSkill(name, { raw: true });
   if (!skill) return null;
   const merged: SkillFrontmatter = { ...skill.frontmatter, ...patch };
   const file = matter.stringify(`\n${skill.body.trim()}\n`, merged);
   writeFileSync(skill.skillPath, file, 'utf-8');
-  return loadSkill(name);
+  return loadSkill(name, { raw: true });
+}
+
+/** Record another source that accomplished the same capability without
+ * incrementing useCount. The harness owns validated-use reinforcement; dedup
+ * must not promote a draft merely because distillation ran after that success. */
+export function recordSkillCapabilityOrigin(
+  name: string,
+  origin: Omit<SkillOrigin, 'distilledAt'>,
+): Skill | null {
+  const skill = loadSkill(name);
+  if (!skill || (!skill.frontmatter.origin && skill.frontmatter.tier !== 'draft')) return null;
+  const known = skill.frontmatter.capabilityOrigins ?? (skill.frontmatter.origin ? [skill.frontmatter.origin] : []);
+  const duplicate = known.some((entry) => entry.kind === origin.kind
+    && (entry.sourceId ?? '') === (origin.sourceId ?? ''));
+  if (duplicate) return skill;
+  return updateSkillFrontmatter(skill.name, {
+    capabilityOrigins: [...known, { ...origin, distilledAt: new Date().toISOString() }],
+  });
+}
+
+export interface ReconcileDistilledSkillsResult {
+  canonical: string | null;
+  superseded: string[];
+  skipped: Array<{ name: string; reason: string }>;
+}
+
+/**
+ * Non-destructively reconcile a known family of semantically equivalent
+ * self-distilled drafts. The canonical file is retained; every alias remains
+ * intact on disk and points to the canonical name. Origin/counter metadata from
+ * each alias is copied into canonical.lineage so schedule/session evidence is
+ * not lost.
+ *
+ * This is deliberately explicit rather than a fuzzy bulk mutation: callers
+ * provide the reviewed task + aliases, and the function refuses approved or
+ * user-installed skills. That gives maintenance code a safe migration path for
+ * legacy duplicates without risking unrelated skills that share providers.
+ */
+export function reconcileDistilledSkillDuplicates(input: {
+  canonicalName: string;
+  duplicateNames: string[];
+  capabilityTask: string;
+}): ReconcileDistilledSkillsResult {
+  const result: ReconcileDistilledSkillsResult = { canonical: null, superseded: [], skipped: [] };
+  const canonical = loadSkill(input.canonicalName, { raw: true });
+  if (!canonical) {
+    result.skipped.push({ name: input.canonicalName, reason: 'canonical skill not found' });
+    return result;
+  }
+  if (canonical.frontmatter.tier !== 'draft' || !canonical.frontmatter.origin) {
+    result.skipped.push({ name: input.canonicalName, reason: 'canonical must be a self-distilled draft' });
+    return result;
+  }
+  if (canonical.frontmatter.supersededBy) {
+    result.skipped.push({ name: input.canonicalName, reason: 'canonical is already superseded' });
+    return result;
+  }
+
+  const fingerprint = capabilityTaskFingerprint(input.capabilityTask);
+  if (canonical.frontmatter.capabilityFingerprint
+    && canonical.frontmatter.capabilityFingerprint !== fingerprint) {
+    result.skipped.push({ name: input.canonicalName, reason: 'canonical has a conflicting capability fingerprint' });
+    return result;
+  }
+
+  const at = new Date().toISOString();
+  const aliases: Skill[] = [];
+  for (const name of new Set(input.duplicateNames)) {
+    if (name === canonical.name) {
+      result.skipped.push({ name, reason: 'same as canonical' });
+      continue;
+    }
+    const alias = loadSkill(name, { raw: true });
+    if (!alias) {
+      result.skipped.push({ name, reason: 'skill not found' });
+      continue;
+    }
+    if (alias.frontmatter.tier !== 'draft' || !alias.frontmatter.origin) {
+      result.skipped.push({ name, reason: 'approved or user-installed skills are never superseded' });
+      continue;
+    }
+    if (alias.frontmatter.supersededBy) {
+      result.skipped.push({ name, reason: `already superseded by ${alias.frontmatter.supersededBy}` });
+      continue;
+    }
+    if (alias.frontmatter.capabilityFingerprint
+      && alias.frontmatter.capabilityFingerprint !== fingerprint) {
+      result.skipped.push({ name, reason: 'conflicting capability fingerprint' });
+      continue;
+    }
+    aliases.push(alias);
+  }
+
+  const existingLineage = Array.isArray(canonical.frontmatter.lineage)
+    ? canonical.frontmatter.lineage
+    : [];
+  const lineageByIdentity = new Map<string, SkillLineageEntry>();
+  for (const entry of existingLineage) {
+    const key = `${entry.skillName}\u0000${entry.origin?.sourceId ?? ''}`;
+    lineageByIdentity.set(key, entry);
+  }
+  for (const alias of aliases) {
+    const entry: SkillLineageEntry = {
+      skillName: alias.name,
+      description: alias.frontmatter.description ?? '',
+      origin: alias.frontmatter.origin,
+      useCount: alias.frontmatter.useCount ?? 0,
+      failureCount: alias.frontmatter.failureCount ?? 0,
+      ...(alias.frontmatter.capabilityFingerprint
+        ? { capabilityFingerprint: alias.frontmatter.capabilityFingerprint }
+        : {}),
+      mergedAt: at,
+    };
+    lineageByIdentity.set(`${entry.skillName}\u0000${entry.origin?.sourceId ?? ''}`, entry);
+    for (const inherited of alias.frontmatter.lineage ?? []) {
+      const key = `${inherited.skillName}\u0000${inherited.origin?.sourceId ?? ''}`;
+      if (!lineageByIdentity.has(key)) lineageByIdentity.set(key, inherited);
+    }
+  }
+
+  const updatedCanonical = updateSkillFrontmatter(canonical.name, {
+    capabilityFingerprint: fingerprint,
+    capabilityOrigins: [
+      ...(canonical.frontmatter.capabilityOrigins
+        ?? (canonical.frontmatter.origin ? [canonical.frontmatter.origin] : [])),
+      ...aliases.flatMap((alias) => alias.frontmatter.capabilityOrigins
+        ?? (alias.frontmatter.origin ? [alias.frontmatter.origin] : [])),
+    ].filter((origin, index, all) => all.findIndex((candidate) => candidate.kind === origin.kind
+      && (candidate.sourceId ?? '') === (origin.sourceId ?? '')) === index),
+    lineage: [...lineageByIdentity.values()],
+    disabled: false,
+  });
+  if (!updatedCanonical) {
+    result.skipped.push({ name: canonical.name, reason: 'could not update canonical skill' });
+    return result;
+  }
+  result.canonical = updatedCanonical.name;
+
+  for (const alias of aliases) {
+    const updated = updateSkillFrontmatter(alias.name, {
+      capabilityFingerprint: fingerprint,
+      supersededBy: canonical.name,
+      supersededAt: at,
+      disabled: true,
+    });
+    if (updated) result.superseded.push(alias.name);
+    else result.skipped.push({ name: alias.name, reason: 'could not mark alias superseded' });
+  }
+  return result;
 }
 
 /** Append a dated pitfall line to a draft's body (self-improvement, C4),

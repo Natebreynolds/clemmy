@@ -24,7 +24,7 @@ process.env.CLEMENTINE_HOME = TMP;
 
 const { regenerateIdentityMd } = await import('./identity-md-builder.js');
 const { saveUserProfile } = await import('../runtime/user-profile.js');
-const { IDENTITY_FILE } = await import('./vault.js');
+const { IDENTITY_FILE, loadMemoryContext } = await import('./vault.js');
 
 // Seed a starter IDENTITY.md so we have user-curated content to preserve.
 const SEED = [
@@ -81,6 +81,10 @@ test('regenerateIdentityMd: populated profile writes auto-section, preserves use
   // Weekday helper kicked in
   assert.match(body, /weekdays \(Mon–Fri\)/);
   assert.match(body, /08:00–17:30/);
+
+  const injectedIdentity = loadMemoryContext().identity ?? '';
+  assert.match(injectedIdentity, /I am Clementine/);
+  assert.doesNotMatch(injectedIdentity, /AUTO-GENERATED|## Working with|SVP of Sales/, 'generated profile projection is not duplicated into the prompt');
 });
 
 test('regenerateIdentityMd: idempotent — second call is a no-op', () => {

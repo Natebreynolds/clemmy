@@ -99,6 +99,12 @@ export interface ContextFile {
   content?: string;
   bytes?: number;
   empty?: boolean;
+  /** Long-Term Memory (`memory` key) only: count of durable facts backing the
+   *  generated projection — rendered as a "View N learned facts" link to Facts. */
+  learnedFactCount?: number;
+  /** Working Memory (`working_memory` key) only: which session the shown
+   *  short-term memory was resolved from. */
+  sessionLabel?: string;
 }
 
 export const getContext = () =>

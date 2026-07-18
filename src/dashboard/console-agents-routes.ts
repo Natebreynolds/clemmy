@@ -15,7 +15,7 @@ import {
   type TeamAgentRecord,
 } from '../tools/shared.js';
 import { listAutonomyRuns, getAutonomyRun } from '../agents/run-tracking.js';
-import { listSkills } from '../memory/skill-store.js';
+import { listActiveSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import {
   approveAgentProposal,
@@ -283,7 +283,7 @@ export function registerConsoleAgentsRoutes(
   app.get('/api/console/agents/catalog', (req: Request, res: Response) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const skills = listSkills().map((s) => ({ name: s.name, description: s.frontmatter.description ?? '' }));
+      const skills = listActiveSkills().map((s) => ({ name: s.name, description: s.frontmatter.description ?? '' }));
       const workflows = listWorkflows()
         .map((w) => ({ name: w.data.name, description: w.data.description ?? '' }))
         .sort((a, b) => a.name.localeCompare(b.name));

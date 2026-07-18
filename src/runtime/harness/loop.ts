@@ -83,6 +83,8 @@ import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
+import { isUserFacingSession } from '../../execution/scope.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
@@ -1929,9 +1931,28 @@ export async function runConversation(
   try {
     const result = await runConversationCore(options);
     emitRuntimeTerminalEvent(options.sessionId, result);
+    refreshTerminalWorkingMemory(options.sessionId);
     return result;
   } finally {
     markRunInFlight(options.sessionId, false);
+  }
+}
+
+/** Refresh short-term memory only after the conversation terminal is durable.
+ * The transcript reader is event-log-backed, so running this before completion
+ * records a user-only snapshot that lags the assistant by one turn. End-of-turn
+ * disk work is acceptable here (streaming has already delivered the reply), and
+ * remains best-effort so memory observability can never fail a conversation. */
+function refreshTerminalWorkingMemory(sessionId: string): void {
+  try {
+    const session = getSession(sessionId);
+    if (session?.kind !== 'chat') return;
+    const channel = session.channel ?? undefined;
+    if (!isUserFacingSession(sessionId, channel)) return;
+    refreshWorkingMemoryForSession(sessionId, channel);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('refreshWorkingMemory failed:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -5445,6 +5466,7 @@ export async function runConversationFromResume(opts: {
 }): Promise<RunConversationResult> {
   const result = await runConversationFromResumeCore(opts);
   emitRuntimeTerminalEvent(opts.sessionId, result);
+  refreshTerminalWorkingMemory(opts.sessionId);
   return result;
 }
 

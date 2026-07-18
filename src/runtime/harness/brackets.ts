@@ -6,6 +6,10 @@ import {
   effectiveTurnObjective,
 } from './turn-control.js';
 import { runWithToolAbortSignal } from '../tool-abort-context.js';
+import {
+  takeShellExecutionOutcome,
+  type ShellExecutionOutcome,
+} from '../shell-execution-outcome.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
@@ -1095,6 +1099,7 @@ function compensateFailedExternalWrite(
   toolName: string,
   parsedInput: unknown,
   result: unknown,
+  shellOutcome?: ShellExecutionOutcome,
 ): void {
   if (!sessionId) return;
   try {
@@ -1132,10 +1137,13 @@ function compensateFailedExternalWrite(
         : '';
       if (!command) return;
       const mutation = classifyShellNetworkMutation(command);
-      // computer-tools renders `exit_code: <code>`; non-zero = failure. Also
-      // catch the run_worker-style ERROR: stub. exit_code: 0 → success, no comp.
-      const failed = /(?:^|\s)exit_code:\s*[1-9]/.test(resultStr) || /^ERROR:/.test(resultStr);
-      if (mutation.isNetworkMutation && mutation.shapeKey && failed) {
+      // A generic non-zero provider CLI exit is NOT proof the write did not
+      // land. Compensate only typed execution evidence that proves no effect
+      // (local resolve/materialization failure or an authoritative provider
+      // precondition adapter). Unknown/possible remains counted and must be
+      // reconciled before retry.
+      const demonstrablyNoEffect = shellOutcome?.effect === 'none';
+      if (mutation.isNetworkMutation && mutation.shapeKey && demonstrablyNoEffect) {
         appendEvent({
           sessionId,
           turn: 0,
@@ -1161,9 +1169,15 @@ function compensateFailedExternalWrite(
  * "deploy blocked because it's a new session" recurrence). Only fires on a clear
  * success; best-effort (never perturbs the tool result).
  */
-function recordPublishIfSucceeded(toolName: string, parsedInput: unknown, result: unknown): void {
+function recordPublishIfSucceeded(
+  toolName: string,
+  parsedInput: unknown,
+  result: unknown,
+  shellOutcome?: ShellExecutionOutcome,
+): void {
   try {
     if (toolName !== 'run_shell_command') return;
+    if (shellOutcome && shellOutcome.dispatch !== 'acknowledged') return;
     const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
       ? (parsedInput as { command: string }).command : '';
     if (!command || !classifyShellCommand(command).isPublish) return;
@@ -1185,7 +1199,13 @@ function recordPublishIfSucceeded(toolName: string, parsedInput: unknown, result
  * tool name (so an MCP tool result matches its own recalled identifier).
  * Composio is skipped upstream (noteRecalledIntent ignores it). Best-effort.
  */
-function creditRecallFromToolResult(sessionId: string | undefined, toolName: string, parsedInput: unknown, result: unknown): void {
+function creditRecallFromToolResult(
+  sessionId: string | undefined,
+  toolName: string,
+  parsedInput: unknown,
+  result: unknown,
+  shellOutcome?: ShellExecutionOutcome,
+): void {
   try {
     if (!sessionId) return;
     // Only a shell command (CLI memo) or a native MCP tool (`server__tool`, which
@@ -1195,6 +1215,12 @@ function creditRecallFromToolResult(sessionId: string | undefined, toolName: str
     // by its own slug path, not here.
     const isShell = toolName === 'run_shell_command';
     if (!isShell && !toolName.includes('__')) return;
+    // A remembered CLI/provider procedure was not exercised when resolution or
+    // package materialization failed locally. Do not penalize that provider
+    // procedure; the recovery-learning lane records the local repair instead.
+    if (isShell
+      && shellOutcome?.dispatch === 'not_started'
+      && (shellOutcome.phase === 'resolve' || shellOutcome.phase === 'materialize')) return;
     const command = isShell && typeof (parsedInput as { command?: unknown })?.command === 'string'
       ? (parsedInput as { command: string }).command : '';
     const haystack = isShell ? command : toolName;
@@ -1202,7 +1228,8 @@ function creditRecallFromToolResult(sessionId: string | undefined, toolName: str
     const resultStr = typeof result === 'string' ? result : '';
     // Failure shapes the harness already recognizes (computer-tools exit_code,
     // run_worker ERROR stub, composio FAILED banner); otherwise treat as success.
-    const failed = /(?:^|\s)exit_code:\s*[1-9]/.test(resultStr)
+    const failed = shellOutcome?.errorKind !== undefined
+      || /(?:^|\s)exit_code:\s*[1-9]/.test(resultStr)
       || /^ERROR:/.test(resultStr)
       || resultStr.startsWith('⚠️ composio_execute_tool FAILED');
     // CLI/MCP failure signal starts flowing here (it never did before the store
@@ -2267,10 +2294,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (!claim.acquired) return { deny: artifactReuseMessage(claim.artifact) };
     return { dispatch: { sessionId, runScopeId, artifactId: claim.artifact.id, intent, callId } };
   };
-  const settleArtifact = (dispatch: ArtifactDispatch | undefined, result: unknown): void => {
+  const settleArtifact = (
+    dispatch: ArtifactDispatch | undefined,
+    result: unknown,
+    shellOutcome?: ShellExecutionOutcome,
+  ): void => {
     if (!dispatch) return;
     try {
-      if (artifactOutputProvesNoDispatch(result)) {
+      if (artifactOutputProvesNoDispatch(result, shellOutcome)) {
         releaseClaimedArtifact(dispatch.artifactId, dispatch.callId);
         return;
       }
@@ -2286,8 +2317,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
       try { markClaimedArtifactUncertain(dispatch.artifactId, dispatch.callId); } catch { /* fail closed via durable pending claim */ }
     }
   };
-  const failArtifact = (dispatch: ArtifactDispatch | undefined): void => {
+  const failArtifact = (
+    dispatch: ArtifactDispatch | undefined,
+    shellOutcome?: ShellExecutionOutcome,
+  ): void => {
     if (!dispatch) return;
+    if (shellOutcome?.effect === 'none' || shellOutcome?.dispatch === 'not_started') {
+      try { releaseClaimedArtifact(dispatch.artifactId, dispatch.callId); } catch { /* keep pending fail-closed */ }
+      return;
+    }
     try { markClaimedArtifactUncertain(dispatch.artifactId, dispatch.callId); } catch { /* pending claim still blocks retries */ }
   };
   const releaseUndispatchedArtifact = (dispatch: ArtifactDispatch | undefined): void => {
@@ -2402,14 +2440,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
             ) as Promise<unknown>)
           : invokeOnce();
       invokePromise = invokePromise.then((result) => {
-        settleArtifact(artifact.dispatch, result);
+        const shellOutcome = tool.name === 'run_shell_command'
+          ? takeShellExecutionOutcome(invokeCallId)
+          : undefined;
+        settleArtifact(artifact.dispatch, result, shellOutcome);
         settleArtifactReadback(ctx, parsedInput, result, invokeCallId);
-        compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result);
-        recordPublishIfSucceeded(tool.name, parsedInput, result);
-        creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result);
+        compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
+        recordPublishIfSucceeded(tool.name, parsedInput, result, shellOutcome);
+        creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
         return result;
       }, (err) => {
-        failArtifact(artifact.dispatch);
+        const shellOutcome = tool.name === 'run_shell_command'
+          ? takeShellExecutionOutcome(invokeCallId)
+          : undefined;
+        failArtifact(artifact.dispatch, shellOutcome);
+        compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, err, shellOutcome);
         throw err;
       });
       // run_worker (Agent.asTool fan-out leaf) MUST return something into the

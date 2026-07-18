@@ -10,6 +10,8 @@ import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
+import { isUserFacingSession } from '../../execution/scope.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
 import { recallMemory } from '../../memory/recall-memory.js';
 import { isTemporalMeetingQuery } from '../../memory/recall.js';
@@ -2085,6 +2087,19 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   }
   if (terminalEventRecorded) markRunInFlight(sessionId, false);
+  // The transcript reader consumes conversation_completed, so refresh only
+  // after that terminal row is durable. The old pre-dispatch hook always wrote
+  // a user-only snapshot and lagged the assistant by one turn. Keep this
+  // per-session-only so the model-authored global scratchpad is never clobbered.
+  if (terminalEventRecorded) {
+    try {
+      const wmSession = getSession(sessionId);
+      const wmChannel = wmSession?.channel ?? undefined;
+      if (wmSession?.kind === 'chat' && isUserFacingSession(sessionId, wmChannel)) {
+        refreshWorkingMemoryForSession(sessionId, wmChannel);
+      }
+    } catch { /* working-memory observability must never affect delivery */ }
+  }
   // Post-turn memory credit: match this turn's primer recall run against the
   // reply + tool-use record and credit demonstrable use (code-level
   // replacement for the never-called memory_mark_used prompt rule).

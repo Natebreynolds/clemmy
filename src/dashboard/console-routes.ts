@@ -38,7 +38,7 @@ import {
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
 import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
+import { countActiveFacts, FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
 import { MEMORY_DB_PATH, openMemoryDb } from '../memory/db.js';
@@ -64,7 +64,8 @@ import { listEntityIdentityConflicts } from '../memory/entity-identity.js';
 import { consolidateFact, readReflectionReplayHealth } from '../memory/reflection.js';
 import { readReflectionCandidateHealth } from '../memory/reflection-candidates.js';
 import { promoteReflectionCandidateById, rejectReflectionCandidateClusterById } from '../memory/candidate-review.js';
-import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
+import { composeCuratedMemory, IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, splitCuratedMemory, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
+import { resolveWorkingMemoryForConsole } from '../memory/working-memory.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   listWorkflows,
@@ -183,7 +184,7 @@ import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { getSavedClis, addSavedCli, removeSavedCli } from '../runtime/saved-clis.js';
-import { SKILLS_DIR, listSkills, loadSkill, uninstallSkill } from '../memory/skill-store.js';
+import { SKILLS_DIR, listActiveSkills, listSkills, loadSkill, uninstallSkill } from '../memory/skill-store.js';
 import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
@@ -492,6 +493,13 @@ interface ContextFileDefinition {
   filePath: string;
   minUsefulChars: number;
   /**
+   * True for files that carry an AUTO-GENERATED marker (MEMORY.md, IDENTITY.md):
+   * user-curated content above, a machine-regenerated projection below. The
+   * console shows/edits ONLY the curated part — the generated dump is searchable
+   * on demand, not something to render into or overwrite from the editor.
+   */
+  twoPartFile?: boolean;
+  /**
    * Optional starter templates the dashboard surfaces in a dropdown
    * next to the editor. Picking one populates the textarea (the user
    * still has to click SAVE). Lets first-time users go from blank
@@ -577,6 +585,7 @@ const CONTEXT_FILES: ContextFileDefinition[] = [
     filePath: IDENTITY_FILE,
     minUsefulChars: 80,
     presets: IDENTITY_PRESETS,
+    twoPartFile: true,
   },
   {
     key: 'soul',
@@ -592,6 +601,7 @@ const CONTEXT_FILES: ContextFileDefinition[] = [
     description: 'Curated standing context above the generated marker stays visible on every surface. The generated fact projection remains searchable and is recalled on demand instead of duplicated into every prompt.',
     filePath: MEMORY_FILE,
     minUsefulChars: 120,
+    twoPartFile: true,
   },
   {
     key: 'working_memory',
@@ -1631,8 +1641,34 @@ function actionEventTime(event: ActionEvent): string {
 }
 
 function readContextFile(def: ContextFileDefinition): Record<string, unknown> {
-  const exists = fs.existsSync(def.filePath);
-  const content = exists ? fs.readFileSync(def.filePath, 'utf-8') : '';
+  let exists = fs.existsSync(def.filePath);
+  const raw = exists ? fs.readFileSync(def.filePath, 'utf-8') : '';
+
+  const extra: Record<string, unknown> = {};
+  // Two-part files (MEMORY.md, IDENTITY.md) carry an AUTO-GENERATED marker:
+  // user-curated content above + a machine-regenerated projection below. Only
+  // the curated part is authoritative — every prompt surface reads just that
+  // (readCuratedMemoryMaybe). The console must match: show/edit the curated
+  // portion, not the generated dump (which is what made "Long-Term Memory look
+  // off"; the Identity card had the same latent issue). The generated section
+  // stays indexed and semantically searchable — we simply don't render it here.
+  let content = raw;
+  if (def.twoPartFile) {
+    content = splitCuratedMemory(raw).curated;
+    // Fact count backs the "View N learned facts" link — memory only; the
+    // Identity projection is derived from the user profile, not the facts store.
+    if (def.key === 'memory') extra.learnedFactCount = countActiveFacts();
+  }
+  if (def.key === 'working_memory') {
+    // Short-term memory: the canonical harness loop maintains per-session
+    // working-memory files; the global file it also writes can lag. Resolve the
+    // freshest available so the card reflects live session state.
+    const resolved = resolveWorkingMemoryForConsole();
+    content = resolved.content;
+    exists = resolved.source !== 'none';
+    if (resolved.sessionLabel) extra.sessionLabel = resolved.sessionLabel;
+  }
+
   const bytes = Buffer.byteLength(content, 'utf-8');
   const usefulChars = content.trim().length;
   return {
@@ -1649,6 +1685,7 @@ function readContextFile(def: ContextFileDefinition): Record<string, unknown> {
     // one-click starter dropdown. Empty array if the file has no
     // presets configured (working memory + long-term memory don't).
     presets: def.presets ?? [],
+    ...extra,
   };
 }
 
@@ -5409,7 +5446,7 @@ export function registerConsoleRoutes(
     // (uses_skill on a step). Without this the model has no way to
     // know which skills the user has installed — and skills are the
     // most leverage primitive for re-using captured expertise.
-    const installedSkills = listSkills();
+    const installedSkills = listActiveSkills();
     const skillsBlock = installedSkills.length > 0
       ? [
           'Installed skills (use them by setting `uses_skill: "<name>"` on a step — the runner injects the SKILL.md body before the step prompt):',
@@ -5554,7 +5591,7 @@ export function registerConsoleRoutes(
       // step can bind to a skill via usesSkill, which causes the
       // runner to inject the SKILL.md body into the step's prompt.
       // Read-only on this endpoint — install/uninstall lives elsewhere.
-      const skills = listSkills().map((s) => ({
+      const skills = listActiveSkills().map((s) => ({
         name: s.name,
         description: s.frontmatter.description || '',
         bodyPreview: s.bodyPreview,
@@ -6084,6 +6121,10 @@ export function registerConsoleRoutes(
           hasScripts: s.hasScripts,
           hasReferences: s.hasReferences,
           hasSrc: s.hasSrc,
+          tier: s.frontmatter.tier ?? 'approved',
+          disabled: Boolean(s.frontmatter.disabled),
+          supersededBy: s.frontmatter.supersededBy ?? null,
+          supersededAt: s.frontmatter.supersededAt ?? null,
           source: s.source ?? null,
         })),
       });
@@ -6115,13 +6156,20 @@ export function registerConsoleRoutes(
   // expand a card to read the whole skill (not just the preview).
   app.get('/api/console/skills/:name', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const skill = loadSkill(req.params.name);
+    // This is a management/audit surface. Preserve a retired alias's own body
+    // and metadata here; execution-oriented callers intentionally resolve it
+    // through loadSkill's canonical redirect.
+    const skill = loadSkill(req.params.name, { raw: true });
     if (!skill) { res.status(404).json({ error: 'skill not found' }); return; }
     res.json({
       name: skill.name,
       displayName: skill.frontmatter.name,
       description: skill.frontmatter.description,
       body: skill.body,
+      tier: skill.frontmatter.tier ?? 'approved',
+      disabled: Boolean(skill.frontmatter.disabled),
+      supersededBy: skill.frontmatter.supersededBy ?? null,
+      supersededAt: skill.frontmatter.supersededAt ?? null,
       source: skill.source ?? null,
       hasScripts: skill.hasScripts,
       hasReferences: skill.hasReferences,
@@ -6561,7 +6609,17 @@ export function registerConsoleRoutes(
     }
     try {
       ensureDir(path.dirname(def.filePath));
-      fs.writeFileSync(def.filePath, content.trimEnd() + (content.trim() ? '\n' : ''), 'utf-8');
+      if (def.twoPartFile) {
+        // The editor only sends the curated portion (the read path returns
+        // curated-only). Preserve the auto-generated projection below the marker
+        // so a manual save doesn't clobber it — dropping it would blank the
+        // searchable projection until the next tick AND thrash the vault
+        // reindexer (remove chunks now, re-embed on regeneration).
+        const existingRaw = fs.existsSync(def.filePath) ? fs.readFileSync(def.filePath, 'utf-8') : '';
+        fs.writeFileSync(def.filePath, composeCuratedMemory(content, existingRaw), 'utf-8');
+      } else {
+        fs.writeFileSync(def.filePath, content.trimEnd() + (content.trim() ? '\n' : ''), 'utf-8');
+      }
       res.json({ file: readContextFile(def) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

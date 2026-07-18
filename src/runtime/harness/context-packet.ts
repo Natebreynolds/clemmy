@@ -2,7 +2,7 @@ import { existsSync, statfsSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { getFocusSnapshot } from '../../memory/focus.js';
-import { listSkills } from '../../memory/skill-store.js';
+import { listActiveSkills } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
@@ -371,7 +371,7 @@ function rankSkills(input: string): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
   try {
-    return listSkills()
+    return listActiveSkills()
       .map((skill) => {
         const description = skill.frontmatter.description || skill.bodyPreview || '';
         const { score, matched } = candidateScore(queryTokens, [

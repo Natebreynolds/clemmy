@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { BASE_DIR } from '../config.js';
-import { augmentPath } from './spawn-env.js';
+import { augmentPath, mergedSpawnEnv } from './spawn-env.js';
 
 /**
  * Local CLI discovery. Two operations, both global:
@@ -164,6 +164,10 @@ function runQuick(command: string, args: string[], cwd: string, timeoutMs = 2000
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       // No shell — direct exec is faster and avoids shell-injection surface.
+      // Use the SAME canonical environment as real shell execution. The caller
+      // passes the already-resolved absolute executable, so discovery cannot
+      // claim a version-manager CLI exists and then fail to launch its bare name.
+      env: mergedSpawnEnv(),
     });
     const chunks: Buffer[] = [];
     const onData = (b: Buffer): void => { chunks.push(b); };
@@ -496,8 +500,8 @@ export async function probe(command: string, candidatePath?: string): Promise<Cl
   let helpOut: string | undefined;
   try {
     chmodSync(scratchCwd, 0o700);
-    versionOut = await runQuick(safe.command, ['--version'], scratchCwd);
-    helpOut = versionOut ? undefined : await runQuick(safe.command, ['--help'], scratchCwd);
+    versionOut = await runQuick(safe.path, ['--version'], scratchCwd);
+    helpOut = versionOut ? undefined : await runQuick(safe.path, ['--help'], scratchCwd);
   } finally {
     rmSync(scratchCwd, { recursive: true, force: true });
   }

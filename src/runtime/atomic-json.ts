@@ -148,7 +148,7 @@ function releaseFileLock(filePath: string): void {
   }
 }
 
-async function withFileLock<T>(filePath: string, work: () => Promise<T> | T): Promise<T> {
+export async function withFileLock<T>(filePath: string, work: () => Promise<T> | T): Promise<T> {
   const inProcessRelease = await acquireInProcessLock(filePath);
   const startedAt = Date.now();
   try {

@@ -114,6 +114,26 @@ test('same binary, two ops: a `netlify status` outcome is NOT credited to the de
   assert.equal(peekToolChoice('netlify.deploy.x')!.choice!.successCount ?? 0, 0, 'deploy memo untouched by the status outcome');
 });
 
+test('single pending CLI recall still requires the recalled operation, not just its binary', () => {
+  rememberToolChoice({
+    intent: 'netlify.deploy.single',
+    choice: {
+      kind: 'cli',
+      identifier: 'netlify',
+      invocationTemplate: 'netlify deploy --dir {{directory}} --json',
+      testEvidence: 'worked',
+    },
+  });
+  noteRecalledIntent(SID, 'netlify.deploy.single', 'netlify', 'cli');
+  assert.equal(creditMatchingRecall(SID, 'netlify status', true), null);
+  assert.equal(peekToolChoice('netlify.deploy.single')!.choice!.successCount ?? 0, 0);
+  assert.equal(
+    creditMatchingRecall(SID, 'netlify deploy --dir ./dist --json', true),
+    'netlify.deploy.single',
+    'the unconsumed recall is credited only when its operation actually runs',
+  );
+});
+
 test('same binary, genuinely ambiguous (no operation distinction) → credits NOTHING', () => {
   freshCliMemo('netlify.a', 'netlify');
   freshCliMemo('netlify.b', 'netlify');
@@ -140,7 +160,10 @@ test('Map does not leak: consuming the last recall deletes the session key', () 
 // represents, with NO prior recall noted.
 
 test('store fallback: an injected CLI proven path is credited on use with NO explicit recall', () => {
-  freshCliMemo('netlify.deploy.local_site', 'netlify');
+  rememberToolChoice({
+    intent: 'netlify.deploy.local_site',
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --site {{site}}', testEvidence: 'worked' },
+  });
   // NOTE: no noteRecalledIntent — this is the injected-context path that produced 0% coverage
   const credited = creditMatchingRecall(SID, 'cd site && netlify deploy --prod --site x', true);
   assert.equal(credited, 'netlify.deploy.local_site');
@@ -154,15 +177,18 @@ test('store fallback: an MCP tool-name match credits with no recall', () => {
 });
 
 test('store fallback: binary-only brush (no operation token) credits NOTHING', () => {
-  freshCliMemo('netlify.deploy.x', 'netlify');
+  rememberToolChoice({
+    intent: 'netlify.deploy.x',
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --site {{site}}', testEvidence: 'worked' },
+  });
   // `netlify status` shares the binary but not the deploy operation → must not penalize the deploy memo
   assert.equal(creditMatchingRecall(SID, 'netlify status', false), null);
   assert.equal(peekToolChoice('netlify.deploy.x')!.choice!.failureCount ?? 0, 0, 'deploy memo untouched by an unrelated netlify command');
 });
 
 test('store fallback: two same-binary memos the command cannot disambiguate → NOTHING', () => {
-  freshCliMemo('netlify.deploy.x', 'netlify');
-  freshCliMemo('netlify.rollback.x', 'netlify');
+  rememberToolChoice({ intent: 'netlify.deploy.x', choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --site {{site}}', testEvidence: 'worked' } });
+  rememberToolChoice({ intent: 'netlify.rollback.x', choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify rollback --site {{site}}', testEvidence: 'worked' } });
   // bare `netlify` has no operation token to pick deploy vs rollback → ambiguous → skip
   assert.equal(creditMatchingRecall(SID, 'netlify', true), null);
 });
@@ -186,11 +212,39 @@ test('store fallback: composio store memos are never credited here (slug path ow
 });
 
 test('store fallback: kill-switch off → no store crediting', () => {
-  freshCliMemo('netlify.deploy.k', 'netlify');
+  rememberToolChoice({ intent: 'netlify.deploy.k', choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod', testEvidence: 'worked' } });
   process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'off';
   try {
     assert.equal(creditMatchingRecall(SID, 'netlify deploy --prod', true), null);
   } finally {
     process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
   }
+});
+
+test('store fallback: filenames mentioning netlify/json never credit a deploy procedure', () => {
+  rememberToolChoice({
+    intent: 'netlify.deploy.site',
+    choice: {
+      kind: 'cli',
+      identifier: 'netlify',
+      invocationTemplate: 'netlify deploy --dir {{directory}} --json',
+      testEvidence: 'worked',
+    },
+  });
+  const inspection = "find . -type f \\( -name package.json -o -name netlify.toml \\)";
+  assert.equal(creditMatchingRecall(SID, inspection, true), null);
+  assert.equal(peekToolChoice('netlify.deploy.site')!.choice!.successCount ?? 0, 0);
+  assert.equal(
+    creditMatchingRecall(SID, 'netlify deploy --dir ./dist --json', true),
+    'netlify.deploy.site',
+    'the deterministic executable + operation prefix still earns credit',
+  );
+});
+
+test('explicit recall still requires the CLI to be causally invoked', () => {
+  freshCliMemo('netlify.deploy.explicit', 'netlify');
+  noteRecalledIntent(SID, 'netlify.deploy.explicit', 'netlify', 'cli');
+  assert.equal(creditMatchingRecall(SID, 'find . -name netlify.toml -o -name package.json', true), null);
+  assert.equal(peekToolChoice('netlify.deploy.explicit')!.choice!.successCount ?? 0, 0);
+  assert.equal(creditMatchingRecall(SID, 'netlify deploy --site x', true), 'netlify.deploy.explicit');
 });

@@ -17,12 +17,17 @@
 import pino from 'pino';
 import { z } from 'zod';
 import { Agent, Runner } from '@openai/agents';
+import path from 'node:path';
 import { getRuntimeEnv, MODELS } from '../config.js';
+import { withFileLock } from '../runtime/atomic-json.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { isPackageRunnerMaterializationFailure } from '../runtime/shell-execution-outcome.js';
 import { readSessionTrace, readSessionToolReturns, type TraceToolCall } from '../execution/trace-to-workflow.js';
 import {
-  listSkills, loadSkill, writeDistilledSkill, isSafeSkillName,
-  updateSkillFrontmatter, appendSkillPitfall, type Skill,
+  SKILLS_DIR, ensureSkillsDir, loadSkill, writeDistilledSkill, isSafeSkillName,
+  updateSkillFrontmatter, appendSkillPitfall, findDistilledSkillByCapabilityTask,
+  claimSkillCapabilityFingerprint, capabilityTaskFingerprint, recordSkillCapabilityOrigin,
+  type SkillOrigin,
 } from './skill-store.js';
 import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
 import { isTransientFailure } from './procedural-recall-link.js';
@@ -31,6 +36,7 @@ import { consolidateFact } from './reflection.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
+const CAPABILITY_CLAIM_LOCK_FILE = path.join(SKILLS_DIR, '.capability-claim');
 
 function distillerEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
@@ -67,15 +73,190 @@ export interface NoveltyAssessment {
   substantiveCalls: number;
   families: number;
   hadDiscovery: boolean;
+  hadCliRecovery: boolean;
+}
+
+interface CausalCliRecovery {
+  identity: string;
+  failedCall: TraceToolCall;
+  successfulCall: TraceToolCall;
+  failureEvidence: string;
+  discoveryTools: string[];
+}
+
+function shellCommandFromArgs(args: string): string {
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      const command = obj.command ?? obj.cmd;
+      if (typeof command === 'string') return command.trim();
+    }
+  } catch { /* legacy traces sometimes stored the raw command */ }
+  return (args ?? '').trim();
+}
+
+function shellWords(command: string): string[] {
+  return (command.match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+/g) ?? [])
+    .map((word) => word.replace(/^['"]|['"]$/g, '').replace(/[;&|]+$/g, ''))
+    .filter(Boolean);
+}
+
+function normalizedCliIdentity(value: string): string {
+  let token = value.trim().replace(/^['"]|['"]$/g, '');
+  if (token.startsWith('@')) {
+    const slash = token.lastIndexOf('/');
+    const version = token.lastIndexOf('@');
+    if (version > slash) token = token.slice(0, version);
+  } else {
+    token = token.replace(/@(?:latest|next|[~^]?\d[^/]*)$/i, '');
+  }
+  token = token.split('/').filter(Boolean).pop() ?? token;
+  return token
+    .toLowerCase()
+    .replace(/\.(?:cmd|exe|js|mjs|cjs)$/i, '')
+    .replace(/(?:-cli|_cli)$/i, '')
+    .replace(/[^a-z0-9_.-]/g, '');
+}
+
+/** Resolve the provider CLI identity across package-runner and direct-binary
+ * forms: `npx netlify-cli …` and `/resolved/.bin/netlify …` both become
+ * `netlify`. This never executes or resolves a path. */
+function cliIdentityForShellCall(call: TraceToolCall): string | null {
+  if (call.tool !== 'run_shell_command') return null;
+  const words = shellWords(shellCommandFromArgs(call.args));
+  if (words.length === 0) return null;
+
+  const runnerIndex = words.findIndex((word) => /^(?:npx|bunx)$/i.test(pathBasename(word)));
+  if (runnerIndex >= 0) {
+    const packageName = words.slice(runnerIndex + 1).find((word) => !word.startsWith('-'));
+    return packageName ? normalizedCliIdentity(packageName) || null : null;
+  }
+  const managerIndex = words.findIndex((word) => /^(?:npm|pnpm|yarn)$/i.test(pathBasename(word)));
+  if (managerIndex >= 0 && /^(?:exec|dlx)$/i.test(words[managerIndex + 1] ?? '')) {
+    const packageName = words.slice(managerIndex + 2).find((word) => word !== '--' && !word.startsWith('-'));
+    return packageName ? normalizedCliIdentity(packageName) || null : null;
+  }
+
+  let index = 0;
+  while (index < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index])
+    || /^(?:env|sudo|command)$/i.test(pathBasename(words[index])))) index += 1;
+  if (/^(?:node|bash|sh|zsh)$/i.test(pathBasename(words[index] ?? ''))) index += 1;
+  const executable = words[index];
+  return executable ? normalizedCliIdentity(executable) || null : null;
+}
+
+function pathBasename(value: string): string {
+  return value.replace(/\\/g, '/').split('/').pop() ?? value;
+}
+
+function cliEvidenceFailed(text: string): boolean {
+  return evidenceLooksFailedOrBlocked(text)
+    || /\bexit(?:_| )?code\s*[:=]?\s*[1-9]\d*\b/i.test(text)
+    || /\b(?:npm err!|could not determine executable|command not found|enoent|eacces|permission denied)\b/i.test(text)
+    || /(?:^|\n)\s*(?:error|failed):/i.test(text);
+}
+
+function cliEvidenceSucceeded(text: string): boolean {
+  if (!text.trim() || cliEvidenceFailed(text)) return false;
+  return /\bexit(?:_| )?code\s*[:=]?\s*0\b/i.test(text)
+    || /["']?(?:ok|success)["']?\s*:\s*true\b/i.test(text)
+    || /\b(?:command )?(?:completed|succeeded|finished) successfully\b/i.test(text);
+}
+
+const PACKAGE_RUNNER_COMMAND_RE = /(?:^|[;&|]\s*)(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?(?:npx(?:\s|$)|npm\s+exec(?:\s|$)|pnpm\s+(?:dlx|exec)(?:\s|$)|yarn\s+dlx(?:\s|$)|bunx(?:\s|$))/i;
+const PACKAGE_RUNNER_NOT_FOUND_RE = /(?:^|\n)\s*(?:[^:\n]*\/)?(?:npx|npm|pnpm|yarn|bunx)(?::|\s).*\b(?:command not found|not found|enoent)\b/i;
+
+function packageRunnerFailedBeforeProvider(command: string, evidence: string): boolean {
+  return isPackageRunnerMaterializationFailure(command, evidence)
+    || (PACKAGE_RUNNER_COMMAND_RE.test(command) && PACKAGE_RUNNER_NOT_FOUND_RE.test(evidence));
+}
+
+function shellExecutables(command: string): string[] {
+  const executables: string[] = [];
+  for (const segment of command.split(/&&|\|\||;|\n/)) {
+    const words = shellWords(segment);
+    let index = 0;
+    while (index < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index])
+      || /^(?:env|sudo|command)$/i.test(pathBasename(words[index])))) index += 1;
+    const executable = words[index];
+    if (executable && !/^(?:cd|export)$/i.test(pathBasename(executable))) executables.push(executable);
+  }
+  return executables;
+}
+
+function isResolvedDirectCliCall(call: TraceToolCall, identity: string): boolean {
+  if (call.tool !== 'run_shell_command') return false;
+  const command = shellCommandFromArgs(call.args);
+  if (PACKAGE_RUNNER_COMMAND_RE.test(command)) return false;
+  return shellExecutables(command).some((executable) => executable.includes('/')
+    && normalizedCliIdentity(executable) === identity);
+}
+
+function discoveryResolvedIdentity(
+  call: TraceToolCall,
+  identity: string,
+  returnsByCallId: Map<string, string>,
+): boolean {
+  if (call.tool !== 'local_cli_list' && call.tool !== 'local_cli_probe') return false;
+  const evidence = `${call.args}\n${returnsByCallId.get(call.callId) ?? ''}`.toLowerCase();
+  const escaped = identity.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^a-z0-9_.-])${escaped}(?:$|[^a-z0-9_.-])`, 'i').test(evidence);
+}
+
+/** A CLI retry is reusable discovery only when the trace proves the whole
+ * causal chain: non-transient failure, local CLI discovery, changed invocation
+ * of the same CLI, and an explicit success result. Mere repeated shell calls do
+ * not qualify. */
+function findCausalCliRecovery(
+  calls: TraceToolCall[],
+  returnsByCallId: Map<string, string>,
+): CausalCliRecovery | null {
+  for (let failedIndex = 0; failedIndex < calls.length; failedIndex += 1) {
+    const failedCall = calls[failedIndex];
+    const identity = cliIdentityForShellCall(failedCall);
+    if (!identity) continue;
+    if (!PACKAGE_RUNNER_COMMAND_RE.test(shellCommandFromArgs(failedCall.args))) continue;
+    const failureEvidence = returnsByCallId.get(failedCall.callId) ?? '';
+    if (!cliEvidenceFailed(failureEvidence)
+      || !packageRunnerFailedBeforeProvider(shellCommandFromArgs(failedCall.args), failureEvidence)
+      || isTransientFailure(failureEvidence)) continue;
+
+    for (let successIndex = failedIndex + 1; successIndex < calls.length; successIndex += 1) {
+      const successfulCall = calls[successIndex];
+      if (cliIdentityForShellCall(successfulCall) !== identity) continue;
+      if (!isResolvedDirectCliCall(successfulCall, identity)) continue;
+      if (shellCommandFromArgs(successfulCall.args) === shellCommandFromArgs(failedCall.args)) continue;
+      const successEvidence = returnsByCallId.get(successfulCall.callId) ?? '';
+      if (!cliEvidenceSucceeded(successEvidence)) continue;
+      const discoveryTools = calls
+        .slice(failedIndex + 1, successIndex)
+        .filter((call) => discoveryResolvedIdentity(call, identity, returnsByCallId))
+        .map((call) => call.tool);
+      if (discoveryTools.length === 0) continue;
+      return {
+        identity,
+        failedCall,
+        successfulCall,
+        failureEvidence,
+        discoveryTools: [...new Set(discoveryTools)],
+      };
+    }
+  }
+  return null;
 }
 
 /**
  * Did this session figure something out worth keeping? Requires real work
  * (≥5 substantive calls), breadth (≥2 tool families), AND evidence of discovery
- * (a composio_search_tools call, or the same slug retried with changed args —
- * trial-and-error). A session that just executed a known recipe fails the gate.
+ * (a composio_search_tools call, the same slug retried with changed args, or a
+ * proven CLI failure → local discovery → changed successful retry). A session
+ * that just executed a known recipe fails the gate.
  */
-export function assessNovelty(calls: TraceToolCall[]): NoveltyAssessment {
+export function assessNovelty(
+  calls: TraceToolCall[],
+  returnsByCallId: Map<string, string> = new Map(),
+): NoveltyAssessment {
   const substantive = calls.filter((c) => c.tool && c.tool !== 'memory_think');
   const families = new Set(substantive.map(toolFamily));
   const searched = calls.some((c) => /search_tools|list_tools/.test(c.tool));
@@ -89,16 +270,25 @@ export function assessNovelty(calls: TraceToolCall[]): NoveltyAssessment {
     bySlug.get(c.slug)!.add(c.args);
   }
   const retriedWithChange = [...bySlug.values()].some((argSet) => argSet.size >= 2);
-  const hadDiscovery = searched || retriedWithChange;
-  const novel = substantive.length >= 5 && families.size >= 2 && hadDiscovery;
+  const cliRecovery = findCausalCliRecovery(calls, returnsByCallId);
+  const hadDiscovery = searched || retriedWithChange || Boolean(cliRecovery);
+  // A fully evidenced CLI recovery is already a dense discovery trajectory, so
+  // it needs only the three causal calls (failure → discovery → success). The
+  // ordinary heuristic retains its broader five-call threshold.
+  const novel = cliRecovery
+    ? substantive.length >= 3 && families.size >= 2
+    : substantive.length >= 5 && families.size >= 2 && hadDiscovery;
   return {
     novel,
     reason: novel
-      ? 'session did multi-system discovery worth distilling'
-      : `not novel (calls=${substantive.length}/5, families=${families.size}/2, discovery=${hadDiscovery})`,
+      ? cliRecovery
+        ? `session recovered ${cliRecovery.identity} through local CLI discovery`
+        : 'session did multi-system discovery worth distilling'
+      : `not novel (calls=${substantive.length}/${cliRecovery ? 3 : 5}, families=${families.size}/2, discovery=${hadDiscovery})`,
     substantiveCalls: substantive.length,
     families: families.size,
     hadDiscovery,
+    hadCliRecovery: Boolean(cliRecovery),
   };
 }
 
@@ -116,9 +306,11 @@ function errorSignature(text: string): string {
  * call IS the figured-out recovery — so mint a tip keyed to the error signature
  * ("hit X → don't repeat; retry with corrected args"), not a flat "FAILED".
  *
- * Returns null when there's no corrected retry, or when the failure is TRANSIENT
- * (429/timeout/5xx) — a transient blip is not a reusable lesson and would poison
- * the draft with a bogus "recovery". Pure: caller supplies calls + results.
+ * Also recognizes a provider CLI that failed before/during local resolution,
+ * was investigated with local_cli_list/local_cli_probe, and then succeeded via
+ * a changed direct invocation. Returns null when there's no proven correction,
+ * or when the failure is TRANSIENT (429/timeout/5xx). Pure: caller supplies
+ * calls + results.
  */
 export function deriveRecoveryTip(
   calls: TraceToolCall[],
@@ -146,6 +338,11 @@ export function deriveRecoveryTip(
       if (!sig) continue;
       return `${slug}: hit "${sig}" — don't repeat the same call; retry with corrected args.`;
     }
+  }
+  const cli = findCausalCliRecovery(calls, returnsByCallId);
+  if (cli) {
+    const sig = errorSignature(cli.failureEvidence);
+    return `${cli.identity}: hit "${sig}" — the package-runner invocation failed. Use local_cli_list/local_cli_probe to resolve the installed CLI, then invoke the resolved binary directly.`;
   }
   return null;
 }
@@ -354,29 +551,107 @@ function renderDistillerPrompt(input: {
   ].filter(Boolean).join('\n');
 }
 
-/** Cheap dedup: an existing skill with the same name, or a near-identical
- *  description (normalized-token Jaccard ≥ 0.8), means we don't spawn a variant. */
-function findDuplicate(name: string, description: string): Skill | null {
-  const existing = listSkills();
-  const byName = existing.find((s) => s.name === name);
-  if (byName) return byName;
-  const tokens = (t: string) => new Set(t.toLowerCase().split(/\W+/).filter((w) => w.length > 2));
-  const a = tokens(description);
-  for (const s of existing) {
-    const b = tokens(s.frontmatter.description || '');
-    if (a.size === 0 || b.size === 0) continue;
-    let inter = 0;
-    for (const w of a) if (b.has(w)) inter++;
-    const jaccard = inter / (a.size + b.size - inter);
-    if (jaccard >= 0.8) return s;
+/** Never overwrite an unrelated same-named skill. The fingerprint suffix is
+ * stable, so a retry of this exact task chooses the same collision-safe name. */
+function availableDistilledSkillName(preferred: string, fingerprint: string): string {
+  if (!loadSkill(preferred)) return preferred;
+  const suffix = fingerprint.replace(/^cap-v\d+:/, '').slice(0, 8);
+  const stem = preferred.slice(0, Math.max(3, 60 - suffix.length - 1)).replace(/-+$/g, '');
+  let candidate = `${stem}-${suffix}`;
+  let attempt = 2;
+  while (loadSkill(candidate)) {
+    const tail = `-${suffix}-${attempt}`;
+    candidate = `${preferred.slice(0, Math.max(3, 60 - tail.length)).replace(/-+$/g, '')}${tail}`;
+    attempt += 1;
   }
-  return null;
+  return candidate;
 }
 
 export interface DistillResult {
   status: 'written' | 'skipped_not_novel' | 'skipped_duplicate' | 'skipped_disabled' | 'failed';
   name?: string;
   detail?: string;
+}
+
+/** Shared front door for manual distillation, satisfied chat goals, and
+ * successful workflows. A legacy match is backfilled and the new source is
+ * retained as lineage; trust/use counters stay owned by the harness boundary. */
+function reuseExistingCapability(
+  objective: string,
+  origin?: Omit<SkillOrigin, 'distilledAt'>,
+): DistillResult | null {
+  if (!objective.trim()) return null;
+  const match = findDistilledSkillByCapabilityTask(objective);
+  if (!match) return null;
+  if (match.legacy) claimSkillCapabilityFingerprint(match.skill.name, match.fingerprint);
+  // Distillation is downstream of validated-success reinforcement in the chat
+  // harness. Counting this lookup too would promote a draft twice for one run.
+  // Preserve the new run/session as lineage evidence instead; counters remain
+  // owned by reinforceDraftSkills at the validated execution boundary.
+  if (origin) recordSkillCapabilityOrigin(match.skill.name, origin);
+  return {
+    status: 'skipped_duplicate',
+    name: match.skill.name,
+    detail: `reused existing capability "${match.skill.name}" (${match.fingerprint})`,
+  };
+}
+
+async function reuseExistingCapabilityLocked(
+  objective: string,
+  origin?: Omit<SkillOrigin, 'distilledAt'>,
+): Promise<DistillResult | null> {
+  ensureSkillsDir();
+  return withFileLock(CAPABILITY_CLAIM_LOCK_FILE, () => reuseExistingCapability(objective, origin));
+}
+
+interface DistilledCapabilityClaim {
+  preferredName: string;
+  description: string;
+  body: string;
+  objective: string;
+  origin: Omit<SkillOrigin, 'distilledAt'>;
+  applicability: { toolFamilies: string[]; entitySlots: string[] };
+}
+
+/**
+ * Atomically claim one task fingerprint and write its draft. The initial
+ * pre-LLM duplicate check is only an efficiency optimization; this locked
+ * check is the correctness boundary. It serializes both concurrent turns in
+ * one daemon and distillers running in separate Clementine processes.
+ */
+async function claimDistilledCapability(input: DistilledCapabilityClaim): Promise<DistillResult> {
+  ensureSkillsDir();
+  return withFileLock(CAPABILITY_CLAIM_LOCK_FILE, () => {
+    const duplicate = reuseExistingCapability(input.objective, input.origin);
+    if (duplicate) return duplicate;
+
+    const fingerprint = capabilityTaskFingerprint(input.objective);
+    const safeName = availableDistilledSkillName(input.preferredName, fingerprint);
+    const name = writeDistilledSkill({
+      name: safeName,
+      description: input.description,
+      body: input.body,
+      origin: input.origin,
+      capabilityTask: input.objective,
+      applicability: input.applicability,
+    });
+    return name
+      ? { status: 'written', name }
+      : { status: 'failed', detail: 'write failed' };
+  });
+}
+
+export async function _testOnly_claimDistilledCapability(
+  input: DistilledCapabilityClaim,
+): Promise<DistillResult> {
+  return claimDistilledCapability(input);
+}
+
+export async function _testOnly_reuseExistingCapability(
+  objective: string,
+  origin?: Omit<SkillOrigin, 'distilledAt'>,
+): Promise<DistillResult | null> {
+  return reuseExistingCapabilityLocked(objective, origin);
 }
 
 /**
@@ -390,13 +665,16 @@ export async function distillSkillFromSession(
 ): Promise<DistillResult> {
   if (!distillerEnabled()) return { status: 'skipped_disabled' };
   try {
+    const existing = await reuseExistingCapabilityLocked(context.objective, context.origin);
+    if (existing) return existing;
     const calls = readSessionTrace(sessionId);
+    const returnsByCallId = readSessionToolReturns(sessionId);
     if (!context.force) {
-      const novelty = assessNovelty(calls);
+      const novelty = assessNovelty(calls, returnsByCallId);
       if (!novelty.novel) return { status: 'skipped_not_novel', detail: novelty.reason };
     }
     if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
-    return distillFromCalls(calls, context);
+    return distillFromCalls(calls, context, returnsByCallId);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err, sessionId }, 'skill distillation failed');
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
@@ -408,6 +686,7 @@ export async function distillSkillFromSession(
 async function distillFromCalls(
   calls: TraceToolCall[],
   context: { objective: string; evidence?: string; origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string } },
+  returnsByCallId: Map<string, string> = new Map(),
 ): Promise<DistillResult> {
   try {
     if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
@@ -422,12 +701,8 @@ async function distillFromCalls(
     if (!draft) return { status: 'failed', detail: 'distiller output did not parse' };
     if (!isSafeSkillName(draft.name)) return { status: 'failed', detail: `unsafe skill name: ${draft.name}` };
 
-    const dup = findDuplicate(draft.name, draft.description);
-    if (dup) {
-      // A re-distillation of an existing DRAFT merges (we just bump useCount via
-      // the normal success path); an approved match is left untouched.
-      return { status: 'skipped_duplicate', detail: `matches existing skill "${dup.name}"`, name: dup.name };
-    }
+    const recoveryTip = deriveRecoveryTip(calls, returnsByCallId);
+    if (recoveryTip && !draft.pitfalls.includes(recoveryTip)) draft.pitfalls.push(recoveryTip);
 
     // Lane D Phase 2: slot-parameterize concrete ids out of the procedure + each
     // proven call (global slots only), and derive applicability from the result.
@@ -442,15 +717,16 @@ async function distillFromCalls(
     });
     const applicability = deriveApplicability(draft.provenTools, [...allSlots]);
 
-    const body = renderSkillBody(draft);
-    const name = writeDistilledSkill({
-      name: draft.name,
+    const claim = await claimDistilledCapability({
+      preferredName: draft.name,
       description: draft.description,
-      body,
+      body: renderSkillBody(draft),
+      objective: context.objective,
       origin: context.origin,
       applicability,
     });
-    if (!name) return { status: 'failed', detail: 'write failed' };
+    if (claim.status !== 'written' || !claim.name) return claim;
+    const name = claim.name;
 
     try {
       addNotification({
@@ -483,10 +759,20 @@ export async function distillSkillFromSessions(
 ): Promise<DistillResult> {
   if (!distillerEnabled()) return { status: 'skipped_disabled' };
   try {
+    const existing = await reuseExistingCapabilityLocked(context.objective, {
+      kind: 'workflow', sourceId: context.sourceId,
+    });
+    if (existing) return existing;
     const calls = sessionIds.flatMap((id) => {
       try { return readSessionTrace(id); } catch { return []; }
     });
-    const novelty = assessNovelty(calls);
+    const returnsByCallId = new Map<string, string>();
+    for (const id of sessionIds) {
+      try {
+        for (const [callId, value] of readSessionToolReturns(id)) returnsByCallId.set(callId, value);
+      } catch { /* one missing trace should not poison the combined run */ }
+    }
+    const novelty = assessNovelty(calls, returnsByCallId);
     if (!novelty.novel) return { status: 'skipped_not_novel', detail: novelty.reason };
     // Reuse the single-session path by faking a combined trace through a tiny
     // shim: write the calls onto a synthetic objective + run the same pipeline.
@@ -494,7 +780,7 @@ export async function distillSkillFromSessions(
       objective: context.objective,
       evidence: context.evidence ?? '',
       origin: { kind: 'workflow', sourceId: context.sourceId },
-    });
+    }, returnsByCallId);
   } catch (err) {
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }
@@ -529,15 +815,16 @@ export async function reinforceDraftSkills(
     try {
       const skill = loadSkill(name);
       if (!skill || skill.frontmatter.tier !== 'draft' || skill.frontmatter.quarantined) continue;
+      const canonicalName = skill.name;
       if (outcome === 'success') {
         const useCount = (skill.frontmatter.useCount ?? 0) + 1;
-        updateSkillFrontmatter(name, useCount >= 2 ? { useCount, tier: 'approved' } : { useCount });
+        updateSkillFrontmatter(canonicalName, useCount >= 2 ? { useCount, tier: 'approved' } : { useCount });
       } else {
         const failureCount = (skill.frontmatter.failureCount ?? 0) + 1;
         const line = recoveryTip ?? (reason ? `FAILED: ${reason}` : 'FAILED (unspecified)');
-        appendSkillPitfall(name, line.slice(0, 200));
+        appendSkillPitfall(canonicalName, line.slice(0, 200));
         const quarantined = failureCount >= 2;
-        updateSkillFrontmatter(name, quarantined ? { failureCount, quarantined: true } : { failureCount });
+        updateSkillFrontmatter(canonicalName, quarantined ? { failureCount, quarantined: true } : { failureCount });
         // Wave 2 Move B: when an approach is QUARANTINED, persist the lesson as a
         // durable, deduped 'feedback' fact so it survives the draft's deletion AND
         // surfaces via unified recall on a future relevant turn. Quarantine itself
@@ -554,8 +841,8 @@ export async function reinforceDraftSkills(
         if (quarantined && substantive && !infraTransient && failureLearningEnabled()) {
           try {
             const evidenceSessionId = sessionId ?? 'skill-distiller';
-            const callId = `skill-reinforce:${name}:${failureCount}`;
-            const sourceUri = `clementine://skills/${encodeURIComponent(name)}/failure/${failureCount}`;
+            const callId = `skill-reinforce:${canonicalName}:${failureCount}`;
+            const sourceUri = `clementine://skills/${encodeURIComponent(canonicalName)}/failure/${failureCount}`;
             // Persist the observed failure before deriving a durable lesson.
             // The claim must replay through this source episode, never through
             // a synthetic episode whose excerpt is merely the claim itself.
@@ -565,13 +852,13 @@ export async function reinforceDraftSkills(
               sessionId: evidenceSessionId,
               callId,
               sourceUri,
-              title: `Repeated failure evidence for ${name}`,
+              title: `Repeated failure evidence for ${canonicalName}`,
               content: line,
-              metadata: { skill: name, failureCount, recoveryTip: Boolean(recoveryTip) },
+              metadata: { skill: canonicalName, failureCount, recoveryTip: Boolean(recoveryTip) },
             });
             await consolidateFact({
               kind: 'feedback',
-              text: `Avoid repeating this: the "${name}" approach failed repeatedly and was retired. ${line}`.slice(0, 400),
+              text: `Avoid repeating this: the "${canonicalName}" approach failed repeatedly and was retired. ${line}`.slice(0, 400),
               trustLevel: 0.6,
               authority: 'derived',
               sourceUri,

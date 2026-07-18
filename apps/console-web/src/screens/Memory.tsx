@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
   FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
-  ShieldCheck, AlertTriangle,
+  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Layers,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -34,12 +34,12 @@ import {
 } from '@/lib/memory';
 import { memoryAssuranceView, memoryClaimTemporalStatus } from '@/lib/memory-assurance';
 
-type Tab = 'overview' | 'facts' | 'episodes' | 'entities' | 'procedures' | 'sources' | 'you' | 'import';
+type Tab = 'tiers' | 'overview' | 'facts' | 'episodes' | 'entities' | 'procedures' | 'sources' | 'you' | 'import';
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
 
 export function Memory() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>('overview');
+  const [tab, setTab] = useState<Tab>('tiers');
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
@@ -47,6 +47,7 @@ export function Memory() {
   const searching = debouncedQ.length >= 2;
 
   const tabs: { key: Tab; label: string; icon: typeof Search }[] = [
+    { key: 'tiers', label: 'Short-term & Long-term', icon: Brain },
     { key: 'overview', label: 'Overview', icon: Network },
     { key: 'facts', label: 'Facts', icon: BookOpen },
     { key: 'episodes', label: 'Timeline', icon: History },
@@ -82,17 +83,78 @@ export function Memory() {
               );
             })}
           </div>
+          {tab === 'tiers' && <TiersTab onNavigate={setTab} />}
           {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
           {tab === 'facts' && <FactsTab qc={qc} />}
           {tab === 'episodes' && <EpisodesTab />}
           {tab === 'entities' && <EntitiesTab />}
           {tab === 'procedures' && <ProceduresTab />}
-          {tab === 'sources' && <SourcesTab />}
+          {tab === 'sources' && <SourcesTab onNavigate={setTab} />}
           {tab === 'you' && <YouTab qc={qc} />}
           {tab === 'import' && <ImportTab qc={qc} />}
         </>
       )}
     </Page>
+  );
+}
+
+// ─────────── Short-term & Long-term: the tier model, made legible ───────────
+function TiersTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
+  const ctx = usePoll(['context'], getContext, 20000);
+  const health = usePoll(['brain-health'], getBrainHealth, 30000);
+  const files = usePoll(['memory-files'], getMemoryFiles, 60000);
+  const h = health.data ?? {};
+  const workingMem = (ctx.data?.files ?? []).find((f) => f.key === 'working_memory');
+
+  const longTerm: { label: string; value?: number; sub: string; tab: Tab; icon: typeof Database }[] = [
+    { label: 'Facts', value: h.activeFacts, sub: `${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned`, tab: 'facts', icon: BookOpen },
+    { label: 'People & things', value: h.entitiesTotal, sub: `${h.entitiesPerson ?? 0} people · ${h.entitiesCompany ?? 0} orgs`, tab: 'entities', icon: Users },
+    { label: 'Timeline', value: h.memoryEpisodesTotal, sub: `${h.memoryEpisodesRecent ?? 0} recent episodes`, tab: 'episodes', icon: History },
+    { label: 'Knowledge files', value: files.data?.files?.length, sub: 'indexed & searchable', tab: 'sources', icon: Database },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <p className="text-small text-muted">
+        Clementine keeps two kinds of memory. <span className="font-medium text-fg">Short-term</span> is the live working set for your current session — rewritten as you chat.{' '}
+        <span className="font-medium text-fg">Long-term</span> is everything durable she's learned, stored permanently and recalled on demand.
+      </p>
+      <div className="grid gap-5 lg:grid-cols-2">
+        <section>
+          <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Clock className="h-5 w-5 text-primary" aria-hidden /> Short-term</h3>
+          <p className="mb-3 text-small text-muted">Working memory & current session focus. Rewritten every turn and retained while the session remains resumable.</p>
+          {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : workingMem
+            ? <ContextFileCard file={workingMem} onNavigate={onNavigate} />
+            : <Card className="p-4 text-body text-muted">No working memory yet — it fills in as you chat.</Card>}
+        </section>
+
+        <section>
+          <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Layers className="h-5 w-5 text-primary" aria-hidden /> Long-term</h3>
+          <p className="mb-3 text-small text-muted">Durable knowledge — facts, people, timeline, and indexed files. Open any store to explore it.</p>
+          <div className="grid grid-cols-2 gap-3">
+            {longTerm.map((s) => {
+              const Icon = s.icon;
+              return (
+                <button key={s.label} type="button" onClick={() => onNavigate(s.tab)}
+                  className="group rounded-lg border border-border bg-surface p-4 text-left transition-colors hover:border-primary cursor-pointer">
+                  <div className="mb-1 flex items-center gap-2 text-faint group-hover:text-primary">
+                    <Icon className="h-4 w-4" aria-hidden />
+                    <ArrowRight className="ml-auto h-3.5 w-3.5 opacity-0 transition-opacity group-hover:opacity-100" aria-hidden />
+                  </div>
+                  <div className="text-h2 text-fg">{typeof s.value === 'number' ? s.value.toLocaleString() : '—'}</div>
+                  <div className="text-small font-medium text-fg">{s.label}</div>
+                  <div className="mt-0.5 text-caption text-faint">{s.sub}</div>
+                </button>
+              );
+            })}
+          </div>
+          <button type="button" onClick={() => onNavigate('overview')}
+            className="mt-3 inline-flex items-center gap-1 text-small font-medium text-primary hover:underline cursor-pointer">
+            See the full knowledge graph <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+          </button>
+        </section>
+      </div>
+    </div>
   );
 }
 
@@ -1441,7 +1503,7 @@ function ProcedureCard({ rec }: { rec: ToolRecallRecord }) {
   );
 }
 
-function SourcesTab() {
+function SourcesTab({ onNavigate }: { onNavigate?: (tab: Tab) => void }) {
   const ctx = usePoll(['context'], getContext, 30000);
   const files = usePoll(['memory-files'], getMemoryFiles, 30000);
   const sources = usePoll(['source-map'], getSourceMap, 30000);
@@ -1453,7 +1515,7 @@ function SourcesTab() {
       <section>
         <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><BookOpen className="h-5 w-5 text-primary" aria-hidden /> Core context</h3>
         <p className="mb-3 text-small text-muted">The notes Clementine reads on every turn — her personality, who you are, and what to keep in mind. This is the seeded memory you can shape.</p>
-        {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : <div className="space-y-2">{coreFiles.map((f) => <ContextFileCard key={f.key} file={f} />)}</div>}
+        {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : <div className="space-y-2">{coreFiles.map((f) => <ContextFileCard key={f.key} file={f} onNavigate={onNavigate} />)}</div>}
       </section>
 
       {pointers.length > 0 && (
@@ -1493,18 +1555,38 @@ function SourcesTab() {
   );
 }
 
-function ContextFileCard({ file }: { file: ContextFile }) {
+function ContextFileCard({ file, onNavigate }: { file: ContextFile; onNavigate?: (tab: Tab) => void }) {
   const [open, setOpen] = useState(false);
+  const isMemory = file.key === 'memory';
+  const isWorking = file.key === 'working_memory';
+  const factCount = file.learnedFactCount ?? 0;
+  // Working memory fills in as you chat, so an empty state there is normal, not
+  // broken — say so instead of a bare "Empty".
+  const emptyPill = isWorking ? 'No live session yet' : 'Empty';
+  const emptyBody = isWorking
+    ? 'No working memory for the current session yet — this fills in as you chat.'
+    : '(empty)';
   return (
     <Card className="p-4">
       <button type="button" onClick={() => setOpen((v) => !v)} className="flex w-full items-center gap-3 text-left cursor-pointer">
         <div className="min-w-0 flex-1">
           <div className="text-body font-semibold text-fg">{file.title}</div>
           {file.description && <div className="text-caption text-muted">{file.description}</div>}
+          {isWorking && file.sessionLabel && !file.empty && (
+            <div className="mt-0.5 text-caption text-faint">Session: {file.sessionLabel}</div>
+          )}
         </div>
-        <StatusPill tone={file.empty ? 'neutral' : 'success'}>{file.empty ? 'Empty' : `${file.bytes ?? 0} bytes`}</StatusPill>
+        <StatusPill tone={file.empty ? 'neutral' : 'success'}>{file.empty ? emptyPill : `${file.bytes ?? 0} bytes`}</StatusPill>
       </button>
-      {open && <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-subtle p-3 text-small text-muted">{file.content?.trim() || '(empty)'}</pre>}
+      {open && <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-subtle p-3 text-small text-muted">{file.content?.trim() || emptyBody}</pre>}
+      {isMemory && (
+        // The generated fact projection is no longer dumped into this editor —
+        // it lives in the Facts tab (canonical, typed store). Link there.
+        <button type="button" onClick={() => onNavigate?.('facts')}
+          className="mt-3 inline-flex items-center gap-1 text-small font-medium text-primary hover:underline cursor-pointer">
+          View {factCount} learned {factCount === 1 ? 'fact' : 'facts'} <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+        </button>
+      )}
     </Card>
   );
 }

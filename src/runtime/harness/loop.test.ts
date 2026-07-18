@@ -18,7 +18,7 @@
  * (returns a Node EventEmitter stub) and runRunner (synthesizes a
  * RunOutcome). That keeps the loop test fast and offline.
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -81,6 +81,7 @@ const { rememberFact } = await import('../../memory/facts.js');
 const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
 const artifactLedger = await import('./artifact-ledger.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
+const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 
 test.after(() => {
   try {
@@ -253,6 +254,35 @@ test('W1a: a transient error falls over to the next brain and completes (no ask)
   assert.deepEqual(rebuilt, ['brain-2'], 'rebuilt the agent once on the next brain');
   assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 1, 'one brain_fallover advisory');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no ask when fallover succeeds');
+});
+
+test('runConversation refreshes working memory after the terminal reply is durable', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'Terminal WM test' });
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
+    history: items,
+    lastResponseId: undefined,
+    finalOutput: {
+      summary: 'WM terminal summary',
+      reply: 'WM-TERMINAL-REPLY is now durable.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  } as never);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Remember WM-TERMINAL-USER in this turn.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const snapshot = readFileSync(workingMemoryPathForSession(sess.id), 'utf-8');
+  assert.match(snapshot, /WM-TERMINAL-USER/);
+  assert.match(snapshot, /WM-TERMINAL-REPLY/, 'writeback includes the current assistant reply, not a one-turn-late snapshot');
 });
 
 test('W1a: when every brain hits the transient error, fall through to the infra-recovery ask', async () => {

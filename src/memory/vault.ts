@@ -39,7 +39,7 @@ function readMaybe(filePath: string, maxChars = 4000): string | undefined {
   }
 }
 
-function readCuratedMemoryMaybe(filePath: string, maxChars: number): string | undefined {
+function readCuratedVaultFileMaybe(filePath: string, maxChars: number, heading: string): string | undefined {
   if (!existsSync(filePath)) return undefined;
   try {
     const raw = readFileSync(filePath, 'utf-8');
@@ -52,11 +52,12 @@ function readCuratedMemoryMaybe(filePath: string, maxChars: number): string | un
     const curated = raw.slice(0, compatibleMarkerIndex >= 0 ? compatibleMarkerIndex : raw.length).trim();
     // A scaffold-only heading carries no memory and should not consume a prompt
     // section. Any content beneath it remains eligible for injection.
-    const meaningful = curated.replace(/^#\s+Memory\s*/i, '').trim();
+    const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const meaningful = curated.replace(new RegExp(`^#\\s+${escapedHeading}\\s*`, 'i'), '').trim();
     if (!meaningful) return undefined;
     if (curated.length <= maxChars) return curated;
 
-    const clipNotice = '\n\n_[Curated MEMORY.md clipped; full text remains in the vault.]_';
+    const clipNotice = `\n\n_[Curated ${heading.toUpperCase()}.md clipped; full text remains in the vault.]_`;
     const contentBudget = Math.max(0, maxChars - clipNotice.length);
     return `${curated.slice(0, contentBudget).trimEnd()}${clipNotice}`;
   } catch {
@@ -66,6 +67,63 @@ function readCuratedMemoryMaybe(filePath: string, maxChars: number): string | un
 
 export function readVaultFile(filePath: string, maxChars = 12000): string | undefined {
   return readMaybe(filePath, maxChars);
+}
+
+export interface CuratedMemorySplit {
+  /** User-curated content above the marker (marker stripped, trailing whitespace trimmed). */
+  curated: string;
+  /** Auto-generated section INCLUDING the marker line, verbatim, or '' if none present. */
+  autoSection: string;
+  hadMarker: boolean;
+}
+
+/** Split MEMORY.md into its user-curated prefix and the auto-generated fact
+ *  projection below the marker. Mirrors the split logic in memory-md-builder.ts
+ *  and readCuratedMemoryMaybe, but returns the full (unclipped) curated text and
+ *  preserves the auto section verbatim so callers can round-trip it. Tolerates
+ *  older/future marker wording that retains the AUTO-GENERATED prefix. */
+export function splitCuratedMemory(raw: string): CuratedMemorySplit {
+  const exactIdx = raw.indexOf(MEMORY_AUTO_SECTION_MARKER);
+  const idx = exactIdx >= 0 ? exactIdx : raw.indexOf('<!-- AUTO-GENERATED');
+  if (idx === -1) {
+    return { curated: raw.replace(/\s+$/, ''), autoSection: '', hadMarker: false };
+  }
+  return {
+    curated: raw.slice(0, idx).replace(/\s+$/, ''),
+    autoSection: raw.slice(idx).replace(/\s+$/, ''),
+    hadMarker: true,
+  };
+}
+
+/** Recompose MEMORY.md from newly-edited curated content, preserving the
+ *  existing auto-generated projection below the marker. The console editor only
+ *  ever sends the curated portion (the read path returns curated-only), so a
+ *  plain overwrite would drop the auto section until the next maintenance tick;
+ *  preserving it verbatim keeps the file whole in the meantime. */
+export function composeCuratedMemory(curated: string, existingRaw: string): string {
+  const { autoSection } = splitCuratedMemory(existingRaw);
+  // Guard against a marker embedded in the user-supplied curated text: if the
+  // saved content itself contains the AUTO-GENERATED marker (e.g. the user
+  // pasted it), the NEXT split would treat everything after their pasted marker
+  // as the auto section and silently drop it on the next regeneration. Neutralize
+  // any marker in the curated portion so exactly one canonical marker remains.
+  const sanitizedCurated = sanitizeCuratedMemory(curated);
+  const curatedTrimmed = sanitizedCurated.replace(/\s+$/, '');
+  if (!autoSection) {
+    return curatedTrimmed ? `${curatedTrimmed}\n` : '';
+  }
+  return `${curatedTrimmed}\n\n${autoSection}\n`;
+}
+
+/** Remove any AUTO-GENERATED marker comment from user-curated text so it can't
+ *  be mistaken for the section separator. Strips the exact marker and any
+ *  compatible `<!-- AUTO-GENERATED ... -->` comment line. */
+export function sanitizeCuratedMemory(curated: string): string {
+  // Remove the marker COMMENT wherever it appears while preserving surrounding
+  // user text. Restrict the pattern to the AUTO-GENERATED comment itself; a
+  // broad split at the token would silently discard everything after an inline
+  // or multiline pasted marker.
+  return curated.replace(/<!--\s*AUTO-GENERATED\b[\s\S]*?-->/gi, '');
 }
 
 export function ensureVaultScaffold(): void {
@@ -81,8 +139,11 @@ export function loadMemoryContext(): MemoryContext {
   ensureVaultScaffold();
   return {
     soul: readMaybe(SOUL_FILE),
-    memory: readCuratedMemoryMaybe(MEMORY_FILE, MEMORY_PROMPT_READ_CHARS),
-    identity: readMaybe(IDENTITY_FILE),
+    memory: readCuratedVaultFileMaybe(MEMORY_FILE, MEMORY_PROMPT_READ_CHARS, 'Memory'),
+    // IDENTITY.md has the same two-part contract as MEMORY.md. The generated
+    // "Working with" projection duplicates the canonical user-profile block;
+    // inject only the user-curated identity so prompts do not carry two truths.
+    identity: readCuratedVaultFileMaybe(IDENTITY_FILE, 4000, 'Identity'),
     workingMemory: readMaybe(WORKING_MEMORY_FILE, 3000),
   };
 }

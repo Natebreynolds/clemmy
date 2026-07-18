@@ -8,6 +8,7 @@ import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapSta
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
+import { reapStaleWorkingMemory } from './working-memory.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
 import {
@@ -648,6 +649,18 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'sessions reaper tick failed');
+    }
+    // The session reaper drops the session ROW but orphans its per-session
+    // working-memory file (state/working-memory/<sha1>.md). Sweep those on the
+    // same TTL so the dir doesn't grow unbounded. Files live outside the vault,
+    // so this never touches embeddings.
+    try {
+      const reapedWorkingMemory = reapStaleWorkingMemory();
+      if (reapedWorkingMemory > 0) {
+        logger.info({ reapedWorkingMemory }, 'working-memory reaper tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'working-memory reaper tick failed');
     }
     try {
       const expiredPending = reapExpiredPendingReflections();

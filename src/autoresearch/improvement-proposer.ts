@@ -36,7 +36,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { approveEnabled, retireInternalNoise } from './memory-approve.js';
-import { appendSkillPitfall, listSkills } from '../memory/skill-store.js';
+import { appendSkillPitfall, listActiveSkills } from '../memory/skill-store.js';
 import { listWorkflowNamesWithRuns, listWorkflowRunIds, readWorkflowEvents } from '../execution/workflow-events.js';
 import { applyStepPromptAddendum } from '../execution/workflow-step-edit.js';
 import { listProposedFixes, type ProposedFix } from '../execution/workflow-diagnosis.js';
@@ -131,7 +131,7 @@ export interface ProposerDeps {
 
 function defaultListSkills(): Array<{ name: string; body: string }> {
   try {
-    return listSkills().map((s) => ({ name: s.name, body: s.body }));
+    return listActiveSkills().map((s) => ({ name: s.name, body: s.body }));
   } catch {
     return [];
   }

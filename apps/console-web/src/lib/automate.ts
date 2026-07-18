@@ -209,6 +209,10 @@ export interface SkillRow {
   displayName?: string;
   description?: string;
   bodyPreview?: string;
+  tier?: 'draft' | 'approved';
+  disabled?: boolean;
+  supersededBy?: string | null;
+  supersededAt?: string | null;
   hasScripts?: boolean;
   hasReferences?: boolean;
   hasSrc?: boolean;
@@ -220,6 +224,10 @@ export interface SkillDetail {
   displayName?: string;
   description?: string;
   body: string;
+  tier?: 'draft' | 'approved';
+  disabled?: boolean;
+  supersededBy?: string | null;
+  supersededAt?: string | null;
   source?: { repo?: string; updateAvailable?: boolean } | null;
   hasScripts?: boolean;
   hasReferences?: boolean;

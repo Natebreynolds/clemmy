@@ -51,6 +51,8 @@ import {
 interface PendingRecall {
   intent: string;
   identifier: string;
+  kind: 'cli' | 'mcp';
+  invocationTemplate?: string;
   procedureId?: string;
   useId?: string;
   atMs: number;
@@ -113,6 +115,131 @@ function tokenPresent(token: string, haystackLower: string): boolean {
   }
 }
 
+function shellSegments(command: string): string[] {
+  const out: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (escaped) { current += ch; escaped = false; continue; }
+    if (ch === '\\' && quote !== "'") { current += ch; escaped = true; continue; }
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; current += ch; continue; }
+    if (ch === ';' || ch === '\n' || ch === '|' || ch === '&') {
+      if (current.trim()) out.push(current.trim());
+      current = '';
+      if ((ch === '|' || ch === '&') && command[i + 1] === ch) i += 1;
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) out.push(current.trim());
+  return out;
+}
+
+function shellTokens(segment: string): string[] {
+  const tokens: string[] = [];
+  const re = /"((?:\\.|[^"\\])*)"|'([^']*)'|([^\s]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(segment)) !== null) {
+    tokens.push((match[1] ?? match[2] ?? match[3] ?? '').replace(/\\(["'\\ ])/g, '$1'));
+  }
+  return tokens;
+}
+
+function normalizedExecutable(value: string): string {
+  let raw = value.trim().toLowerCase().replace(/\\/g, '/');
+  raw = raw.slice(raw.lastIndexOf('/') + 1).replace(/\.(?:cmd|exe|bat)$/i, '');
+  raw = raw.replace(/@(?:latest|next|\d+(?:\.\d+){0,2}(?:-[a-z0-9.-]+)?)$/i, '');
+  if (value.startsWith('@')) {
+    const [scope, pkg = ''] = value.toLowerCase().split('/', 2);
+    raw = pkg === 'cli' ? scope.replace(/^@/, '') : pkg.replace(/-cli$/, '');
+  }
+  return raw.replace(/[-_]cli$/, '');
+}
+
+interface CliInvocation {
+  executable: string;
+  args: string[];
+}
+
+function invocationFromSegment(segment: string): CliInvocation | null {
+  const tokens = shellTokens(segment);
+  if (tokens.length === 0) return null;
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i += 1;
+  if (tokens[i] === 'env') {
+    i += 1;
+    while (i < tokens.length && (tokens[i].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) i += 1;
+  }
+  if (tokens[i] === 'sudo') {
+    i += 1;
+    // Stay conservative for complex sudo option/value forms: if the next token
+    // is still an option, decline causal attribution instead of guessing.
+    if (tokens[i]?.startsWith('-')) return null;
+  }
+  while (tokens[i] === 'command' || tokens[i] === 'exec' || tokens[i] === 'nohup') i += 1;
+  if (i >= tokens.length) return null;
+
+  const runner = normalizedExecutable(tokens[i]);
+  if (runner === 'npx' || runner === 'bunx') {
+    i += 1;
+    while (i < tokens.length && tokens[i].startsWith('-')) i += 1;
+    if (i >= tokens.length) return null;
+    return { executable: normalizedExecutable(tokens[i]), args: tokens.slice(i + 1) };
+  }
+  if (runner === 'npm' && tokens[i + 1]?.toLowerCase() === 'exec') {
+    i += 2;
+    while (i < tokens.length && tokens[i].startsWith('-')) i += 1;
+    if (i >= tokens.length) return null;
+    return { executable: normalizedExecutable(tokens[i]), args: tokens.slice(i + 1) };
+  }
+  if ((runner === 'pnpm' || runner === 'yarn') && /^(?:dlx|exec)$/.test(tokens[i + 1]?.toLowerCase() ?? '')) {
+    i += 2;
+    while (i < tokens.length && tokens[i].startsWith('-')) i += 1;
+    if (i >= tokens.length) return null;
+    return { executable: normalizedExecutable(tokens[i]), args: tokens.slice(i + 1) };
+  }
+  return { executable: runner, args: tokens.slice(i + 1) };
+}
+
+function cliInvocations(command: string, identifier: string): CliInvocation[] {
+  const wanted = normalizedExecutable(identifier);
+  if (!wanted) return [];
+  return shellSegments(command)
+    .map(invocationFromSegment)
+    .filter((invocation): invocation is CliInvocation => invocation?.executable === wanted);
+}
+
+function templateOperationPrefix(identifier: string, template: string | undefined): string[] {
+  if (!template) return [];
+  const invocation = cliInvocations(template, identifier)[0];
+  if (!invocation) return [];
+  const prefix: string[] = [];
+  for (const raw of invocation.args) {
+    const token = raw.toLowerCase();
+    if (!token || token === '...' || token.startsWith('-') || /\{\{|\$[A-Za-z_{]/.test(token)) break;
+    prefix.push(token);
+    if (prefix.length >= 3) break;
+  }
+  return prefix;
+}
+
+function invocationMatchesTemplate(identifier: string, executed: string, template: string | undefined): number {
+  const prefix = templateOperationPrefix(identifier, template);
+  if (prefix.length === 0) return 0;
+  for (const invocation of cliInvocations(executed, identifier)) {
+    const actual = invocation.args.slice(0, prefix.length).map((token) => token.toLowerCase());
+    if (prefix.every((token, index) => actual[index] === token)) return prefix.length;
+  }
+  return 0;
+}
+
 /** The OPERATION tokens of an intent slug (everything except the identifier's
  *  own tokens), used to disambiguate two recalls that share a binary (e.g.
  *  `netlify.deploy` vs `netlify.status` both id `netlify`). */
@@ -121,19 +248,20 @@ function intentOpTokens(intent: string, identifier: string): string[] {
   return intent.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !idToks.has(t));
 }
 
-/** Distinctive operation tokens for a memo, unioned from its intent slug AND its
- *  invocation template (so a memo with a vague intent like "my netlify thing" but
- *  a concrete invocation `netlify deploy --prod` still contributes `deploy`).
- *  Identifier tokens are excluded — they're the binary, not the operation. */
-function opTokensForMemo(intent: string, identifier: string, invocationTemplate?: string): Set<string> {
-  const idToks = new Set(identifier.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
-  const out = new Set(intentOpTokens(intent, identifier));
-  if (invocationTemplate) {
-    for (const t of invocationTemplate.toLowerCase().split(/[^a-z0-9]+/)) {
-      if (t.length >= 3 && !idToks.has(t)) out.add(t);
-    }
+/**
+ * Causal operation evidence for a buffered CLI recall. A concrete invocation
+ * template is authoritative: it must match and may not be rescued by fuzzy
+ * intent words. Older/vague recalls with no concrete template fall back to
+ * whole-token operation overlap from the intent slug.
+ */
+function pendingCliOperationScore(recall: PendingRecall, executed: string): number {
+  const prefix = templateOperationPrefix(recall.identifier, recall.invocationTemplate);
+  if (prefix.length > 0) {
+    return invocationMatchesTemplate(recall.identifier, executed, recall.invocationTemplate) * 100;
   }
-  return out;
+  return intentOpTokens(recall.intent, recall.identifier)
+    .filter((token) => tokenPresent(token, executed))
+    .length;
 }
 
 /**
@@ -153,9 +281,12 @@ export function noteRecalledIntent(
     if (kind !== 'cli' && kind !== 'mcp') return; // composio handled by its own slug path
     const list = prune(pending.get(sessionId) ?? [], nowMs);
     const use = beginToolProcedureUse(intent, sessionId);
+    const invocationTemplate = listToolChoices().find((record) => record.intent === intent)?.choice?.invocationTemplate;
     list.push({
       intent,
       identifier: identifier.toLowerCase(),
+      kind,
+      invocationTemplate,
       procedureId: use?.procedureId,
       useId: use?.useId,
       atMs: nowMs,
@@ -164,12 +295,10 @@ export function noteRecalledIntent(
   } catch { /* best-effort */ }
 }
 
-/** Does a buffered recall's identifier match this executed command/tool name?
- *  WORD-BOUNDARY token match (the identifier as a whole token, or its leading
- *  token so `npx netlify-cli …` recalls match an `npx …` command) — so a short
- *  binary like `gh` matches `gh pr create` but NOT inside `highlight`. */
+/** Does a CLI identifier occupy an executable position in this shell command?
+ * Filenames, arguments, and quoted prose never count as causal procedure use. */
 function identifierMatches(identifier: string, haystackLower: string): boolean {
-  return tokenPresent(identifier, haystackLower) || tokenPresent(identifier.split(/\s+/)[0], haystackLower);
+  return cliInvocations(haystackLower, identifier).length > 0;
 }
 
 /** Score a stored CLI/MCP memo against an executed command / tool name. Returns
@@ -187,11 +316,11 @@ function scoreStoreCandidate(rec: ToolChoiceRecord, haystackLower: string): numb
   }
   if (choice.kind === 'cli') {
     if (!identifierMatches(id, haystackLower)) return 0;
-    let ops = 0;
-    for (const t of opTokensForMemo(rec.intent, id, choice.invocationTemplate)) {
-      if (tokenPresent(t, haystackLower)) ops++;
-    }
-    return ops; // binary-only (ops===0) is NOT enough — avoids `netlify status` → deploy
+    // No explicit recall means no causal-use signal. Require the stored
+    // invocation template's executable + operation prefix to match exactly;
+    // fuzzy intent tokens or incidental filenames (`package.json`,
+    // `netlify.toml`) are never evidence that the CLI procedure ran.
+    return invocationMatchesTemplate(id, haystackLower, choice.invocationTemplate);
   }
   return 0; // composio handled by its slug path
 }
@@ -229,7 +358,9 @@ function creditFromStore(executed: string, succeeded: boolean): string | null {
  * Credit the buffered CLI/MCP recall that this tool result belongs to, then
  * CONSUME it (one recall → one credit). `succeeded` drives success vs failure on
  * that specific intent — precise PER-OPERATION crediting:
- *   - one recall matches the binary → credit it,
+ *   - one CLI recall still needs operation evidence → credit it only when the
+ *     deterministic template prefix (or, for an old vague memo, intent operation)
+ *     matches,
  *   - several share the binary (e.g. `netlify.deploy` + `netlify.status`) →
  *     disambiguate by which intent's OPERATION tokens appear in the executed
  *     command; if none distinguishes them (genuinely ambiguous), credit NOTHING
@@ -248,7 +379,14 @@ export function creditMatchingRecall(
     const list = prune(pending.get(sessionId) ?? [], nowMs);
     if (list.length === 0) { storeSession(sessionId, list); return creditFromStore(executed, succeeded); }
     const haystack = executed.toLowerCase();
-    const matches = list.map((r, i) => ({ r, i })).filter((m) => identifierMatches(m.r.identifier, haystack));
+    const matches = list.map((r, i) => ({
+      r,
+      i,
+      score: r.kind === 'cli' ? pendingCliOperationScore(r, haystack) : 0,
+    })).filter((m) =>
+      m.r.kind === 'mcp'
+        ? tokenPresent(m.r.identifier, haystack)
+        : identifierMatches(m.r.identifier, haystack) && m.score > 0);
     if (matches.length === 0) { storeSession(sessionId, list); return creditFromStore(executed, succeeded); }
 
     let chosen = matches[matches.length - 1].i; // default: most-recent (recall→immediate-use)
@@ -256,7 +394,9 @@ export function creditMatchingRecall(
       // Same binary recalled more than once — disambiguate by operation overlap.
       const scored = matches.map((m) => ({
         i: m.i,
-        score: intentOpTokens(m.r.intent, m.r.identifier).filter((t) => tokenPresent(t, haystack)).length,
+        score: m.r.kind === 'cli'
+          ? m.score
+          : (m.r.identifier === haystack.trim() ? 1 : 0),
       }));
       const max = Math.max(...scored.map((s) => s.score));
       const top = scored.filter((s) => s.score === max);

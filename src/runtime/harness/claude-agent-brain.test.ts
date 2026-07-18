@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -51,6 +51,7 @@ const {
 const capabilityHealth = await import('./capability-health.js');
 const artifactLedger = await import('./artifact-ledger.js');
 const { openMemoryDb } = await import('../../memory/db.js');
+const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -809,6 +810,9 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   const effort = listEvents('brain-run', { types: ['reasoning_effort'] })[0]?.data as { transport?: string; effort?: string } | undefined;
   assert.equal(effort?.transport, 'claude_agent_sdk_brain');
   assert.equal(effort?.effort, 'provider_default');
+  const workingMemory = readFileSync(workingMemoryPathForSession('brain-run'), 'utf-8');
+  assert.match(workingMemory, /search memory/);
+  assert.match(workingMemory, /Claude brain reply/, 'Claude-lane writeback runs after the terminal assistant reply is durable');
 });
 
 test('brain tracker scope survives a settled retry with the same durable run id and rotates for a new run', async () => {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getSession, listEvents, openEventLog } from './eventlog.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
+import type { ShellExecutionOutcome } from '../shell-execution-outcome.js';
 
 /**
  * Durable artifact transactions for create-style tool calls.
@@ -1130,7 +1131,15 @@ export function artifactReuseMessage(artifact: RunArtifact): string {
  * mutation boundary (bad args, missing/ambiguous connection, standing-rule
  * block). Only that explicit proof makes releasing a pending claim safe. Any
  * timeout, thrown error, or unmarked failure remains uncertain. */
-export function artifactOutputProvesNoDispatch(output: unknown): boolean {
+export function artifactOutputProvesNoDispatch(
+  output: unknown,
+  executionOutcome?: ShellExecutionOutcome,
+): boolean {
+  // Typed execution truth outranks rendered shell prose. `effect:none` includes
+  // local no-start failures and narrow provider-adapter precondition rejections;
+  // either makes retrying this artifact slot safe.
+  if (executionOutcome?.effect === 'none') return true;
+  if (executionOutcome?.dispatch === 'not_started') return true;
   if (typeof output === 'string') {
     return /\[provider-dispatch:not-started:[a-z0-9_-]+\]/i.test(output);
   }

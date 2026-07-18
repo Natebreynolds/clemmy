@@ -526,6 +526,113 @@ test('artifact admission: a duplicate create neither executes nor records/counts
   }
 });
 
+test('artifact settlement: local npx failure and authoritative account rejection release the slot for same-turn recovery', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+    CLEMMY_PROCEDURAL_OUTCOMES: process.env.CLEMMY_PROCEDURAL_OUTCOMES,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create one new site named clementine-harness.' },
+  });
+  const { classifyShellExecutionOutcome, recordShellExecutionOutcome } = await import('../shell-execution-outcome.js');
+  const { listRunArtifacts } = await import('./artifact-ledger.js');
+  const { rememberToolChoice, peekToolChoice, deleteToolChoice } = await import('../../memory/tool-choice-store.js');
+  const { noteRecalledIntent, _resetProceduralRecallLinkForTests } = await import('../../memory/procedural-recall-link.js');
+  const command = 'npx netlify-cli sites:create --name clementine-harness --account-slug wrong-team --json';
+  const procedureIntent = 'netlify.create_site.typed_local_failure';
+  deleteToolChoice(procedureIntent);
+  _resetProceduralRecallLinkForTests();
+  rememberToolChoice({
+    intent: procedureIntent,
+    choice: {
+      kind: 'cli', identifier: 'netlify',
+      invocationTemplate: 'netlify sites:create --name {{name}} --account-slug {{account}} --json',
+      testEvidence: 'previously worked',
+    },
+  });
+  noteRecalledIntent(sess.id, procedureIntent, 'netlify', 'cli');
+  let attempt = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'run_shell_command',
+    invoke: async (_runContext: unknown, _input: unknown, details?: unknown) => {
+      attempt += 1;
+      const callId = (details as { toolCall?: { callId?: string } } | undefined)?.toolCall?.callId;
+      if (attempt === 1) {
+        recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
+          command, externalMutation: true, exitCode: 1, stdout: '',
+          stderr: 'npm error code EACCES\nnpm error path /Users/nate/.npm/_cacache\nnpm error permission denied',
+        }));
+        return 'exit_code: 1\n\nstderr:\nnpm error code EACCES';
+      }
+      if (attempt === 2) {
+        recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
+          command, externalMutation: true, exitCode: 1, stdout: '',
+          stderr: 'createSiteInTeam error: 404: Not Found',
+        }));
+        return 'exit_code: 1\n\nstderr:\ncreateSiteInTeam error: 404: Not Found';
+      }
+      recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
+        command, externalMutation: true, exitCode: 0,
+        stdout: '{"id":"site-provider-123","ssl_url":"https://clementine-harness.netlify.app"}', stderr: '',
+      }));
+      return 'exit_code: 0\n\nstdout:\n{"id":"site-provider-123","ssl_url":"https://clementine-harness.netlify.app"}';
+    },
+  });
+  const invoke = (callId: string) => (wrapped as unknown as {
+    invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, JSON.stringify({ command, cwd: null, timeout_ms: null }), { toolCall: { callId } });
+
+  try {
+    const counter = new ToolCallsCounter(20);
+    await withHarnessRunContext({ sessionId: sess.id, behaviorScopeId: 'typed-shell-artifact', counter }, async () => {
+      assert.match(String(await invoke('npx-local-failure')), /EACCES/);
+      assert.equal(listRunArtifacts(sess.id).length, 0, 'local materialization never parks an uncertain artifact');
+      assert.equal(
+        peekToolChoice(procedureIntent)?.choice?.failureCount ?? 0,
+        0,
+        'a locally unstarted package-runner failure does not penalize the remembered provider procedure',
+      );
+
+      assert.match(String(await invoke('account-rejected')), /404/);
+      assert.equal(listRunArtifacts(sess.id).length, 0, 'authoritative provider no-effect rejection releases the slot');
+      assert.equal(
+        peekToolChoice(procedureIntent)?.choice?.failureCount ?? 0,
+        1,
+        'the later provider-acknowledged rejection does exercise and score the procedure',
+      );
+
+      assert.match(String(await invoke('created-after-discovery')), /site-provider-123/);
+      assert.equal(listRunArtifacts(sess.id)[0]?.status, 'bound');
+      assert.equal(listRunArtifacts(sess.id)[0]?.resourceId, 'site-provider-123');
+    });
+    assert.equal(attempt, 3, 'both proven-no-effect failures permit the corrected strategy');
+  } finally {
+    deleteToolChoice(procedureIntent);
+    _resetProceduralRecallLinkForTests();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test('artifact readback bookkeeping: an ordinary tool result does not mint artifact lineage', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
@@ -1642,7 +1749,7 @@ test('parallel shell pre-write gates consume the prestarted output-grounding pro
   }
 });
 
-test('shell-send compensation: a FAILED shell network-mutation is netted out — the retry is NOT a false duplicate (review 2026-06-14)', async () => {
+test('shell-send compensation: a generic nonzero provider exit remains possible and is not netted out', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
@@ -1660,21 +1767,21 @@ test('shell-send compensation: a FAILED shell network-mutation is netted out —
   const cmd = `curl -X POST https://api.example.com/send -d '{"to_email":"cliff@eleylawfirm.com"}'`;
   try {
     const counter = new ToolCallsCounter(100);
-    // First invocation fails (non-zero exit); second succeeds.
+    // First invocation exits non-zero after provider execution may have begun.
     let attempt = 0;
     const wrapped = wrapToolForHarness({
       name: 'run_shell_command',
       execute: async () => { attempt += 1; return attempt === 1 ? 'exit_code: 28  stderr: curl: (28) timed out' : 'exit_code: 0  stdout: sent'; },
     });
     const post = () => withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command: cmd }));
-    // 1. First send: grounding passes, the gate records an external_write, the
-    //    command FAILS → compensateFailedExternalWrite emits external_write_failed.
+    // 1. The non-zero exit is not proof the provider did nothing.
     assert.match(String(await post()), /exit_code: 28/);
     const { listEvents } = await import('./eventlog.js');
-    assert.ok(listEvents(sess.id, { types: ['external_write_failed'] }).length >= 1, 'failed shell send was compensated');
-    // 2. Retry of the SAME target → the failure nets out the prior write, so it is
-    //    NOT a DUPLICATE_EXTERNAL_WRITE. Before the fix this threw.
-    assert.match(String(await post()), /exit_code: 0/);
+    assert.equal(listEvents(sess.id, { types: ['external_write_failed'] }).length, 0, 'unknown provider effect is not compensated');
+    // 2. A blind retry remains blocked until the caller reconciles the possible
+    //    write; the second fake provider execution never runs.
+    assert.match(String(await post()), /DUPLICATE_EXTERNAL_WRITE/);
+    assert.equal(attempt, 1);
   } finally {
     grounding._setGroundingJudgeForTests(null);
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;

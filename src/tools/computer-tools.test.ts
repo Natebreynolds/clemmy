@@ -53,6 +53,28 @@ test('annotateShellStderr: a GENUINE command-not-found still gets the install hi
   assert.match(out, /brew install foo|npm install -g foo/);
 });
 
+test('annotateShellStderr: exact-run npx cache materialization failure routes to canonical CLI discovery', () => {
+  const stderr = [
+    'npm error code EEXIST',
+    'npm error syscall rename',
+    'npm error path /Users/nathan.reynolds/.npm/_cacache/tmp/7e49db14',
+    'npm error dest /Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/cache-entry',
+    'npm error errno EEXIST',
+    "npm error Invalid response body while trying to fetch https://registry.npmjs.org/gopd: EACCES: permission denied, rename '/Users/nathan.reynolds/.npm/_cacache/tmp/7e49db14' -> '/Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/cache-entry'",
+    'npm error File exists: /Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/cache-entry',
+  ].join('\n');
+  const out = annotateShellStderr(
+    stderr,
+    'npx --yes netlify-cli sites:create --name clementine-multi-mode-harness --account-slug nathan-reynolds',
+  );
+  assert.ok(out.startsWith(stderr), 'raw stderr is preserved ahead of the hint');
+  assert.match(out, /local_cli_list/);
+  assert.match(out, /local_cli_probe/);
+  assert.match(out, /resolved absolute binary path directly/i);
+  assert.match(out, /Do NOT repeat the identical npx\/npm-exec command/i);
+  assert.match(out, /before the requested CLI started/i);
+});
+
 // ─── resolveAllowedCwd: a stringified-null cwd must not ENOENT-loop ───
 // Live failure 2026-06-20: a BYO (GLM) brain emitted cwd:"null" (the literal
 // string) for `netlify sites:create`; it resolved to a non-existent dir → every

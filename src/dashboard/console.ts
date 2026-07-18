@@ -10785,6 +10785,16 @@ body {
   border-radius: 2px;
   vertical-align: middle;
 }
+.skill-card .skill-retired-badge {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  border-radius: 2px;
+  vertical-align: middle;
+}
 .skill-card .skill-update {
   font-size: 10px;
   letter-spacing: 0.12em;
@@ -24098,6 +24108,7 @@ const CONSOLE_JS = `
       gridEl.innerHTML = skills.map((s) => {
         const src = s.source || {};
         const updateAvailable = !!src.updateAvailable;
+        const retired = !!s.supersededBy || !!s.disabled;
         const shaBit = src.sha ? ' @ ' + escMem(src.sha.slice(0, 7)) : '';
         // When an update is pending, show the target SHA so the user
         // knows there's something newer to pull.
@@ -24113,8 +24124,10 @@ const CONSOLE_JS = `
           s.hasReferences ? '<span class="skill-tool-pill">references/</span>' : '',
         ].filter(Boolean).join('');
         const display = s.displayName && s.displayName !== s.name ? s.displayName : s.name;
-        const badge = updateAvailable ? '<span class="skill-update-badge">UPDATE</span>' : '';
-        const updateBtn = updateAvailable
+        const badge = retired
+          ? '<span class="skill-retired-badge">RETIRED → ' + escMem(s.supersededBy || 'inactive') + '</span>'
+          : updateAvailable ? '<span class="skill-update-badge">UPDATE</span>' : '';
+        const updateBtn = !retired && updateAvailable
           ? '<button class="skill-update" data-skill-update="' + escMem(s.name) + '" title="Pull the latest version from ' + escMem(src.repo || 'source') + '">UPDATE</button>'
           : '';
         return [

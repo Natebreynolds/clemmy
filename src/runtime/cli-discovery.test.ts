@@ -189,3 +189,27 @@ test('explicit probe runs in private scratch cwd, never process.cwd()', async ()
   assert.equal(existsSync(processCwdSentinel), false, 'probe must not write relative files in daemon cwd');
   assert.equal(existsSync(probeCwd), false, 'probe scratch directory should be removed after execution');
 });
+
+test('discovery and probe share the version-manager environment under a minimal GUI PATH', async () => {
+  const fakeHome = mkdtempSync(path.join(os.tmpdir(), 'clementine-cli-vm-home-'));
+  const vmBin = path.join(fakeHome, '.nvm', 'versions', 'node', 'v99.1.0', 'bin');
+  const executable = path.join(vmBin, 'vm-only-cli');
+  mkdirSync(vmBin, { recursive: true });
+  writeExecutable(executable, `printf 'vm-only-cli 9.1.0\n'`);
+
+  const originalHome = process.env.HOME;
+  const originalPath = process.env.PATH;
+  try {
+    process.env.HOME = fakeHome;
+    process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+    const entry = await probe('vm-only-cli');
+    assert.equal(entry?.path, executable, 'metadata discovery resolves the NVM executable');
+    assert.equal(entry?.version, 'vm-only-cli 9.1.0', 'the same resolved executable launches successfully');
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});

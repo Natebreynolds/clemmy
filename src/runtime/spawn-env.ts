@@ -1,5 +1,73 @@
 import path from 'node:path';
 import os from 'node:os';
+import { accessSync, mkdirSync, readdirSync, statSync, constants as fsConstants } from 'node:fs';
+
+function existingDirectory(candidate: string): boolean {
+  try {
+    return statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function versionDirectories(root: string, suffix: string[] = []): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return [];
+  }
+  return names
+    .sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }))
+    .map((name) => path.join(root, name, ...suffix))
+    .filter(existingDirectory);
+}
+
+/**
+ * Executable directories used by common user-level runtime managers. Discovery
+ * is file-metadata-only: app startup never sources a login shell (which may be
+ * interactive, slow, or side-effecting).
+ */
+export function userManagedExecutableDirs(home: string): string[] {
+  if (!home) return [];
+  const candidates = [
+    path.join(home, '.volta', 'bin'),
+    path.join(home, '.asdf', 'shims'),
+    path.join(home, '.local', 'share', 'mise', 'shims'),
+    path.join(home, '.mise', 'shims'),
+    path.join(home, '.local', 'share', 'fnm', 'aliases', 'default', 'bin'),
+    path.join(home, '.fnm', 'aliases', 'default', 'bin'),
+    ...versionDirectories(path.join(home, '.nvm', 'versions', 'node'), ['bin']),
+    ...versionDirectories(path.join(home, '.local', 'share', 'fnm', 'node-versions'), ['installation', 'bin']),
+    ...versionDirectories(path.join(home, '.fnm', 'node-versions'), ['installation', 'bin']),
+  ];
+  const npmPrefix = process.env.NPM_CONFIG_PREFIX ?? process.env.npm_config_prefix;
+  if (npmPrefix?.trim()) candidates.push(path.join(npmPrefix.trim(), 'bin'));
+  return [...new Set(candidates.filter(existingDirectory))];
+}
+
+function isolatedNpmCache(env: Record<string, string>): string | undefined {
+  // An explicit user/operator override is authoritative, including the lowercase
+  // spelling npm itself supports.
+  if (env.NPM_CONFIG_CACHE?.trim() || env.npm_config_cache?.trim()) return undefined;
+  let base: string;
+  try {
+    base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
+  } catch {
+    return undefined;
+  }
+  const cache = path.join(base, 'cache', 'npm');
+  try {
+    mkdirSync(cache, { recursive: true, mode: 0o700 });
+    if (!statSync(cache).isDirectory()) return undefined;
+    accessSync(cache, fsConstants.W_OK | fsConstants.X_OK);
+    return cache;
+  } catch {
+    // Spawn construction must remain usable even when the Clementine home is
+    // temporarily read-only. In that case leave npm's own default untouched.
+    return undefined;
+  }
+}
 
 /**
  * macOS Electron apps launched from /Applications inherit a minimal PATH
@@ -37,6 +105,7 @@ export function augmentPath(existing: string | undefined): string {
       if (process.platform === 'win32') {
         candidates.push(path.join(home, 'scoop', 'shims'));
       } else {
+        candidates.push(...userManagedExecutableDirs(home));
         candidates.push(path.join(home, '.local', 'bin'));
       }
     }
@@ -95,5 +164,10 @@ export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<strin
     }
   }
   env[pathKey] = augmentPath(currentPath);
+  // Consider per-call overrides before choosing a default, otherwise a lowercase
+  // `extra.npm_config_cache` would coexist with (and potentially lose to) our
+  // uppercase default.
+  const npmCache = isolatedNpmCache({ ...env, ...extra });
+  if (npmCache) env.NPM_CONFIG_CACHE = npmCache;
   return { ...env, ...extra };
 }

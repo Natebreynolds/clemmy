@@ -11,11 +11,17 @@ import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../runtime/spawn-env.js';
+import {
+  classifyShellExecutionOutcome,
+  isPackageRunnerMaterializationFailure,
+  recordShellExecutionOutcome,
+  type ShellExecutionOutcome,
+} from '../runtime/shell-execution-outcome.js';
 import { isConvertibleExtension } from '../runtime/markitdown.js';
 import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { expandLiteralShellCommands } from '../runtime/harness/destination-gate.js';
+import { classifyShellNetworkMutation, expandLiteralShellCommands } from '../runtime/harness/destination-gate.js';
 import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
 import { SPACES_DIR, isValidSpaceSlug, spaceStore } from '../spaces/store.js';
 
@@ -659,7 +665,17 @@ function developerToolStubBlockMessage(command: string): string | null {
 export function annotateShellStderr(stderr: string, command: string): string {
   if (!stderr) return stderr;
   const hints: string[] = [];
-  if (/EPERM:\s*operation not permitted,?\s*uv_cwd/i.test(stderr)) {
+  if (isPackageRunnerMaterializationFailure(command, stderr)) {
+    // The package runner failed locally before the requested provider CLI
+    // started. Route the model onto the canonical discovery surface whose PATH
+    // and env now exactly match execution, rather than encouraging another npx
+    // attempt against the same broken materialization path.
+    hints.push(
+      'CLEMENTINE HINT (recoverable local CLI materialization): the package runner failed before the requested CLI started. ' +
+      'Do NOT repeat the identical npx/npm-exec command. Call `local_cli_list` to find installed CLIs, then `local_cli_probe({command:"<cli>"})`; invoke the resolved absolute binary path directly. ' +
+      'If no installed binary is discoverable, change the package-runner/cache strategy before one bounded retry. This local failure did not exercise the provider operation.',
+    );
+  } else if (/EPERM:\s*operation not permitted,?\s*uv_cwd/i.test(stderr)) {
     hints.push(
       'CLEMENTINE HINT: macOS TCC blocked this Node-embedding CLI when spawned by the desktop daemon. ' +
       'Workarounds: (1) re-run via `clementine chat` in Terminal — the CLI entry point has no Electron parent and no TCC clamp; ' +
@@ -738,11 +754,33 @@ export function annotateSpawnError(error: unknown, command: string, cwd?: string
   return annotateShellStderr(base, command);
 }
 
-function runCommand(command: string, cwd: string, timeoutMs: number): Promise<string> {
+interface ShellCommandResult {
+  text: string;
+  outcome: ShellExecutionOutcome;
+}
+
+class ShellCommandExecutionError extends Error {
+  constructor(message: string, public readonly outcome: ShellExecutionOutcome) {
+    super(message);
+    this.name = 'ShellCommandExecutionError';
+  }
+}
+
+function runCommand(command: string, cwd: string, timeoutMs: number): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
   const stubMessage = developerToolStubBlockMessage(command);
-  if (stubMessage) return Promise.resolve(stubMessage);
+  const externalMutation = classifyShellNetworkMutation(command).isNetworkMutation;
+  if (stubMessage) {
+    return Promise.resolve({
+      text: stubMessage,
+      outcome: {
+        phase: 'resolve', dispatch: 'not_started', effect: 'none', externalMutation,
+        errorKind: 'command_not_found', executable: command.trim().split(/\s+/)[0],
+      },
+    });
+  }
   return new Promise((resolve, reject) => {
+    let settled = false;
     const child = spawn(command, {
       cwd,
       shell: true,
@@ -755,8 +793,13 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
     let stdout = '';
     let stderr = '';
     const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       child.kill('SIGTERM');
-      reject(new Error(`Command timed out after ${timeoutMs}ms.`));
+      reject(new ShellCommandExecutionError(
+        `Command timed out after ${timeoutMs}ms.`,
+        classifyShellExecutionOutcome({ command, externalMutation, stdout, stderr, timedOut: true }),
+      ));
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
@@ -766,13 +809,26 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
       stderr = appendCapturedOutput(stderr, String(chunk));
     });
     child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
       // A spawn-level failure (ENOENT/EACCES/…) never reaches the close handler
       // and so never hit annotateShellStderr — the model saw the raw error and
       // could not self-correct. Annotate it here so the cause + fix ride back.
-      reject(new Error(annotateSpawnError(error, command, cwd)));
+      reject(new ShellCommandExecutionError(
+        annotateSpawnError(error, command, cwd),
+        classifyShellExecutionOutcome({
+          command,
+          externalMutation,
+          stdout,
+          stderr,
+          spawnErrorCode: (error as NodeJS.ErrnoException).code,
+        }),
+      ));
     });
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
       const annotated = annotateShellStderr(stderr, command);
       const output = [
@@ -780,7 +836,18 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
         stdout ? `stdout:\n${stdout}` : '',
         annotated ? `stderr:\n${annotated}` : '',
       ].filter(Boolean).join('\n\n');
-      resolve(output || `exit_code: ${code ?? 0}`);
+      resolve({
+        text: output || `exit_code: ${code ?? 0}`,
+        // Classify from RAW stderr: appended model hints must never become
+        // execution evidence or change dispatch state.
+        outcome: classifyShellExecutionOutcome({
+          command,
+          externalMutation,
+          exitCode: code,
+          stdout,
+          stderr,
+        }),
+      });
     });
   });
 }
@@ -1085,12 +1152,22 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
             + 'or update the skill through the skill install/update path.',
         );
       }
-      return formatToolOutput(
-        'run_shell_command',
-        runContext,
-        details,
-        await runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS),
-      );
+      const callId = callIdFromToolDetails(details);
+      try {
+        const execution = await runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);
+        recordShellExecutionOutcome(callId, execution.outcome);
+        return formatToolOutput(
+          'run_shell_command',
+          runContext,
+          details,
+          execution.text,
+        );
+      } catch (error) {
+        if (error instanceof ShellCommandExecutionError) {
+          recordShellExecutionOutcome(callId, error.outcome);
+        }
+        throw error;
+      }
     },
   });
 
