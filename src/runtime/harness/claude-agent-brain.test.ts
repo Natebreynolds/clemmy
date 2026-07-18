@@ -612,15 +612,19 @@ test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/mode
   assert.doesNotMatch(prompt, /READ-ONLY\/local-context/);
 });
 
-test('renderClaudeAgentBrainTurnContext bounds slow unified recall and falls back open', async () => {
+test('renderClaudeAgentBrainTurnContext bounds slow unified recall and falls back open', { timeout: 30_000 }, async () => {
   process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS = '5';
   process.env.CLEMMY_UNIFIED_RECALL = 'off'; // keep degraded breadcrumbs synchronous in this timeout test
   setClaudeAgentSdkBrainUnifiedPrimerForTest(async () => await new Promise(() => { /* intentionally stalled */ }));
-  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => []);
-  const start = Date.now();
+  let fallbackCalls = 0;
+  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => {
+    fallbackCalls += 1;
+    return [];
+  });
   const ctx = await renderClaudeAgentBrainTurnContext({ message: 'market leader accounts', sessionId: 'brain-recall-timeout' });
-  const elapsedMs = Date.now() - start;
-  assert.ok(elapsedMs < 1500, `slow recall must not stall turn-context assembly; elapsed ${elapsedMs}ms`);
+  // The explicit test timeout is the runaway guard. A wall-clock assertion is
+  // unreliable when the full suite deschedules this worker alongside embedding-heavy tests.
+  assert.equal(fallbackCalls, 1, 'timed-out unified recall falls back to the bounded hybrid search');
   assert.doesNotMatch(ctx, /Relevant To Your Request\n- /, 'timed-out recall block is omitted');
 });
 

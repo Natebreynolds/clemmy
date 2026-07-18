@@ -24,7 +24,54 @@ test('AUTO fallback never replays an ambiguous CLI mutation through the SDK', ()
   assert.equal(composioAutoFallbackAllowed('OUTLOOK_LIST_MESSAGES', timeout), true, 'reads remain retry/fallback safe');
   assert.equal(composioAutoFallbackAllowed('GOOGLEDOCS_CREATE_DOCUMENT', Object.assign(new Error('spawn failed'), { code: 'ENOENT' })), true, 'proven pre-dispatch CLI failures may fall back');
   assert.equal(composioCliErrorProvesNoDispatch(new Error('ECONNRESET')), false);
+  // Genuine pre-dispatch throws now prove no-dispatch STRUCTURALLY via the
+  // not-started marker (the executeComposioTool gates emit these verbatim).
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('[provider-dispatch:not-started:no-api-key] COMPOSIO_API_KEY is not configured.')), true);
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('[provider-dispatch:not-started:cli-auth] Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.')), true, 'pre-dispatch CLI-auth gate carries the marker');
   assert.match(new ComposioDispatchUncertainError('GOOGLEDOCS_CREATE_DOCUMENT', timeout).message, /Verify the remote state/);
+});
+
+test('composioCliErrorProvesNoDispatch: bare auth/key text is NOT proof of no-dispatch (post-dispatch false-positive guard)', () => {
+  // A non-zero CLI exit AFTER dispatch that carries the provider's response body
+  // (or a downstream sub-call failing on auth once the mutation already
+  // committed): the flattened ~8KB error mentions auth, but the write may have
+  // landed. Without the not-started marker this MUST stay ambiguous — proving
+  // no-dispatch here would authorize an auto-fallback replay that double-writes.
+  assert.equal(
+    composioCliErrorProvesNoDispatch(new Error('Composio CLI execute failed for OUTLOOK_SEND_EMAIL: 401 authentication required')),
+    false,
+    'provider auth error in a post-dispatch CLI exit is not proof of no-dispatch',
+  );
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('not logged in')), false);
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('not authenticated')), false);
+  // Composio's OWN wrapper thrown AFTER runComposioCli already dispatched — the
+  // "run composio login" phrase must no longer prove no-dispatch.
+  assert.equal(
+    composioCliErrorProvesNoDispatch(new Error('Composio CLI execute produced no output for OUTLOOK_SEND_EMAIL; run composio login or use the SDK backend.')),
+    false,
+    'post-dispatch no-output wrapper mentioning "run composio login" is ambiguous',
+  );
+  // Bare API-key prose nested in a post-dispatch error body is likewise not proof.
+  assert.equal(
+    composioCliErrorProvesNoDispatch(Object.assign(new Error('Composio CLI execute failed for GOOGLEDOCS_CREATE_DOCUMENT'), { stderr: 'upstream: API key required for the referenced datasource' })),
+    false,
+    'API-key phrase in provider stderr after dispatch is ambiguous',
+  );
+  // Hard process-launch failures still prove no-dispatch (the binary never ran).
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.')), true);
+  assert.equal(composioCliErrorProvesNoDispatch(Object.assign(new Error('spawn composio ENOENT'), { code: 'ENOENT' })), true);
+});
+
+test('composioAutoFallbackAllowed: a post-dispatch CLI auth error on a mutation no longer authorizes SDK replay', () => {
+  // The receipt-ledger double-write class: a CLI mutation that crossed the
+  // boundary and failed with auth-shaped text must NOT fall back to the SDK.
+  assert.equal(
+    composioAutoFallbackAllowed('OUTLOOK_SEND_EMAIL', new Error('Composio CLI execute failed for OUTLOOK_SEND_EMAIL: 401 not authenticated')),
+    false,
+  );
+  // Reads still fall back (idempotent), and a marked pre-dispatch failure still may.
+  assert.equal(composioAutoFallbackAllowed('OUTLOOK_LIST_MESSAGES', new Error('401 not authenticated')), true, 'reads stay fallback-safe');
+  assert.equal(composioAutoFallbackAllowed('OUTLOOK_SEND_EMAIL', new Error('[provider-dispatch:not-started:cli-auth] no CLI login was detected')), true, 'marked pre-dispatch failure may still fall back');
 });
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {

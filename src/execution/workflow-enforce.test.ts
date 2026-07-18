@@ -14,6 +14,9 @@ import {
   autoRepairWorkflowDefinition,
   prepareWorkflowForWrite,
   stepLooksMutating,
+  workflowStepMutationReceiptContract,
+  buildWorkflowMutationContractSnapshot,
+  isWorkflowMutationContractSnapshot,
   stepIsTestableRead,
   workflowNeedsCreationTest,
   workflowExecutionSurfaceChanged,
@@ -470,6 +473,46 @@ test('stepLooksMutating: a send/write step is mutating; a pure read step is not'
   assert.equal(stepLooksMutating({ call: { tool: 'composio_gmail_send_email' } }), true);
   assert.equal(stepLooksMutating({ call: { tool: 'composio_airtable_create_record' } }), true);
   assert.equal(stepLooksMutating({ call: { tool: 'composio_hubspot_list_contacts' } }), false);
+});
+
+test('workflowStepMutationReceiptContract: only mutating structured calls have durable receipt authority', () => {
+  assert.equal(workflowStepMutationReceiptContract({ id: 'plain', prompt: 'Summarize this.' }), 'non_mutating');
+  assert.equal(workflowStepMutationReceiptContract({ id: 'read', prompt: 'Fetch records.', sideEffect: 'read' }), 'non_mutating');
+  assert.equal(workflowStepMutationReceiptContract({
+    id: 'unstructured',
+    prompt: 'Update the CRM record.',
+    sideEffect: 'write',
+  }), 'unreceipted_mutation');
+  assert.equal(workflowStepMutationReceiptContract({
+    id: 'structured',
+    prompt: 'Create the record.',
+    call: { tool: 'AIRTABLE_CREATE_RECORD', args: {} },
+  }), 'structured_call_receipt');
+  assert.equal(workflowStepMutationReceiptContract({
+    id: 'structured-read',
+    prompt: 'List records.',
+    call: { tool: 'AIRTABLE_LIST_RECORDS', args: {} },
+  }), 'non_mutating');
+});
+
+test('workflow mutation contract snapshot records only exact mutating step contracts and validates strictly', () => {
+  const snapshot = buildWorkflowMutationContractSnapshot([
+    { id: 'read', prompt: 'Fetch records.', sideEffect: 'read' },
+    { id: 'plain_write', prompt: 'Update the CRM.', sideEffect: 'write' },
+    { id: 'direct_write', prompt: 'Create it.', call: { tool: 'AIRTABLE_CREATE_RECORD', args: {} } },
+  ]);
+  assert.deepEqual(snapshot, {
+    version: 1,
+    steps: {
+      direct_write: 'structured_call_receipt',
+      plain_write: 'unreceipted_mutation',
+    },
+  });
+  assert.equal(isWorkflowMutationContractSnapshot(snapshot), true);
+  assert.equal(isWorkflowMutationContractSnapshot({ version: 1, steps: {} }), true);
+  assert.equal(isWorkflowMutationContractSnapshot({ version: 1, steps: { write: 'non_mutating' } }), false);
+  assert.equal(isWorkflowMutationContractSnapshot({ version: 1, steps: [] }), false);
+  assert.equal(isWorkflowMutationContractSnapshot({ version: 2, steps: {} }), false);
 });
 
 test('stepIsTestableRead: read step with an external tool surface is testable', () => {

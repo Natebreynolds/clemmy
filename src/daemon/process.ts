@@ -1,10 +1,25 @@
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
 export const PID_FILE = path.join(BASE_DIR, 'daemon.pid');
+export const DAEMON_LEASE_DIR = path.join(BASE_DIR, 'daemon.lock');
 export const LOG_DIR = path.join(BASE_DIR, 'logs');
 export const DAEMON_LOG_FILE = path.join(LOG_DIR, 'daemon.log');
 
@@ -12,7 +27,31 @@ export function ensureLogDir(): void {
   if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
 }
 
-export function readDaemonPid(): number | null {
+interface DaemonLeaseOwner {
+  version: 1;
+  pid: number;
+  token: string;
+  startedAt: string;
+  file: string;
+}
+
+interface DaemonLeaseDirectoryGeneration {
+  dev: bigint;
+  ino: bigint;
+}
+
+const EMPTY_DAEMON_LEASE_RECLAIM_MS = 5_000;
+
+let afterDaemonLeaseDirectoryCreatedForTest: (() => void) | undefined;
+
+/** Narrow synchronous seam for deterministic cross-process lease tests. */
+export const daemonProcessInternalsForTest = {
+  setAfterLeaseDirectoryCreatedHook(hook?: () => void): void {
+    afterDaemonLeaseDirectoryCreatedForTest = hook;
+  },
+};
+
+function readLegacyPidProjection(): number | null {
   if (!existsSync(PID_FILE)) return null;
   try {
     const pid = parseInt(readFileSync(PID_FILE, 'utf-8').trim(), 10);
@@ -22,38 +61,363 @@ export function readDaemonPid(): number | null {
   }
 }
 
-export function isDaemonRunning(): boolean {
-  const pid = readDaemonPid();
-  if (!pid) return false;
+function readDaemonLeaseOwner(): DaemonLeaseOwner | null {
+  if (!existsSync(DAEMON_LEASE_DIR)) return null;
+  let entries: string[];
   try {
-    process.kill(pid, 0); // Signal 0 just checks if process exists
-    return true;
+    entries = readdirSync(DAEMON_LEASE_DIR).filter((entry) => /^owner-[a-f0-9-]+\.json$/.test(entry));
   } catch {
-    return false; // ESRCH = no such process
+    return null;
+  }
+  if (entries.length !== 1) return null;
+  const file = path.join(DAEMON_LEASE_DIR, entries[0]);
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as Partial<DaemonLeaseOwner>;
+    if (
+      parsed.version !== 1
+      || !Number.isSafeInteger(parsed.pid)
+      || (parsed.pid ?? 0) <= 0
+      || typeof parsed.token !== 'string'
+      || !parsed.token
+      || entries[0] !== `owner-${parsed.token}.json`
+      || typeof parsed.startedAt !== 'string'
+      || !Number.isFinite(Date.parse(parsed.startedAt))
+    ) return null;
+    return { ...parsed, file } as DaemonLeaseOwner;
+  } catch {
+    return null;
   }
 }
 
-export function writeDaemonPid(pid: number): void {
-  mkdirSync(path.dirname(PID_FILE), { recursive: true });
-  writeFileSync(PID_FILE, String(pid), 'utf-8');
+export function readDaemonPid(): number | null {
+  if (existsSync(DAEMON_LEASE_DIR)) return readDaemonLeaseOwner()?.pid ?? null;
+  return readLegacyPidProjection();
 }
 
-export function clearDaemonPid(): void {
-  rmSync(PID_FILE, { force: true });
+export function isDaemonRunning(): boolean {
+  const pid = readDaemonPid();
+  if (!pid) return false;
+  return processIsAlive(pid);
+}
+
+function syncDaemonDirectory(): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(path.dirname(PID_FILE), 'r');
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function readDaemonLeaseDirectoryGeneration(): DaemonLeaseDirectoryGeneration | null {
+  try {
+    const stat = statSync(DAEMON_LEASE_DIR, { bigint: true });
+    if (!stat.isDirectory()) return null;
+    return { dev: stat.dev, ino: stat.ino };
+  } catch {
+    return null;
+  }
+}
+
+function sameDaemonLeaseDirectoryGeneration(
+  expected: DaemonLeaseDirectoryGeneration,
+  actual: DaemonLeaseDirectoryGeneration | null,
+): boolean {
+  return actual !== null && expected.dev === actual.dev && expected.ino === actual.ino;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM still proves a process owns the pid; only ESRCH proves absence.
+    // This answers "does the pid exist"; a lease-takeover decision needs a
+    // stricter "is this pid our daemon" — see pidBlocksLeaseAcquisition.
+    return (err as NodeJS.ErrnoException)?.code !== 'ESRCH';
+  }
+}
+
+/** Whether `pid` may be THIS installation's live daemon — the only thing allowed
+ *  to block a lease takeover. Our daemon always runs as the current user, so a
+ *  pid we cannot signal (EPERM — another user, typically a root process that
+ *  reused the pid across a reboot) is provably not ours and must not block.
+ *  Unlike processIsAlive, EPERM here means "stale", not "alive". */
+function pidBlocksLeaseAcquisition(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    // ESRCH: gone. EPERM: owned by another user, so never our daemon. Both are
+    // stale and takeable. Any other errno is unexpected — keep blocking rather
+    // than risk evicting a genuinely live owner.
+    return code !== 'ESRCH' && code !== 'EPERM';
+  }
+}
+
+/** Argv signature of the real daemon: it always runs its entrypoint with a
+ *  daemon/service subcommand (a `/daemon/` resource path or the `daemon` verb)
+ *  or the `--foreground` flag. Deliberately excludes the bare app-bundle name,
+ *  which every packaged Electron helper shares. */
+const DAEMON_ARGV_RE = /--foreground\b|\bdaemon\b/i;
+
+/** Best-effort command line for `pid`, or null when it cannot be read. */
+function readProcessCommandLine(pid: number): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+    });
+    return out.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a live same-user `pid` looks like a real Clementine daemon — the only
+ *  thing allowed to block a lease takeover once ESRCH (gone) and EPERM (foreign
+ *  user) are ruled out. Both the legacy bare-pid file and a persisted
+ *  current-format lease record a pid that may have been REUSED by an unrelated
+ *  same-user process across a reboot or after an unclean daemon exit; a reused
+ *  pid must never block the real daemon from starting.
+ *
+ *  The signature must NOT include the bare app-bundle name: every process the
+ *  packaged Electron app spawns (main, GPU/renderer/network helpers, the recall
+ *  SDK) has "/Applications/Clementine.app/…" in its argv, so matching
+ *  "clementine" let ANY of the app's OWN helpers that reused the pid block the
+ *  daemon forever — a non-deterministic, per-machine hard boot brick that
+ *  presents as the app flickering (8 supervisor restarts) then a dead daemon.
+ *  Only the real daemon carries a `/daemon/` resource path or a `--foreground`
+ *  flag; the helpers carry neither, so this stays specific without the bundle
+ *  name (2026-07-17: brick matched to a live report). An unreadable command line
+ *  falls back to conservative blocking. Residual risk: a same-user pid reused by
+ *  a process whose argv coincidentally carries a daemon signature still blocks —
+ *  rare, and it only costs a manual daemon.pid/daemon.lock delete, never a
+ *  wrong-owner eviction (a genuine live daemon always matches, so this can never
+ *  evict a real one → no split-brain). */
+function livePidLooksLikeDaemon(pid: number): boolean {
+  if (!pidBlocksLeaseAcquisition(pid)) return false;
+  const command = readProcessCommandLine(pid);
+  if (command === null) return true;
+  return DAEMON_ARGV_RE.test(command);
+}
+
+/** Positive confirmation that a live `pid` is NOT our daemon — a legacy/lease
+ *  pid reused by an unrelated same-user process. True ONLY when the command line
+ *  is readable AND lacks a daemon signature. An unreadable command line (e.g.
+ *  Windows, where `ps` is absent) returns false so callers fall back to their
+ *  prior behavior rather than refuse to act. Used by the STOP and START paths so
+ *  `daemon stop`/`restart` never SIGTERMs an innocent reused pid, and `daemon
+ *  start` is not fooled into "already running" by one (2026-07-17). */
+export function daemonPidIsForeignReuse(pid: number): boolean {
+  if (!pidBlocksLeaseAcquisition(pid)) return false; // dead/foreign-user: cannot be (or be killed as) our daemon
+  const command = readProcessCommandLine(pid);
+  return command !== null && !DAEMON_ARGV_RE.test(command);
+}
+
+function writePidProjection(pid: number): void {
+  const temp = `${PID_FILE}.${pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, 'wx', 0o600);
+    writeFileSync(fd, `${pid}\n`, 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, PID_FILE);
+    syncDaemonDirectory();
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    try { unlinkSync(temp); } catch { /* best effort */ }
+  }
+}
+
+/** Atomically acquire the one-daemon lease. The directory mkdir is the CAS;
+ * token-scoped owner filenames prevent stale reclaimers from deleting a newer
+ * owner, while dev/inode verification binds publication to the exact directory
+ * generation created by this claimant. */
+export function acquireDaemonLease(pid = process.pid): boolean {
+  mkdirSync(path.dirname(PID_FILE), { recursive: true });
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (!existsSync(DAEMON_LEASE_DIR)) {
+      const legacyOwner = readLegacyPidProjection();
+      if (legacyOwner && legacyOwner !== pid && livePidLooksLikeDaemon(legacyOwner)) return false;
+      if (legacyOwner) {
+        try { unlinkSync(PID_FILE); } catch { /* another claimant may have cleaned it */ }
+      }
+    }
+    const token = randomUUID();
+    const temp = path.join(BASE_DIR, `.daemon-owner-${token}.tmp`);
+    const ownerFile = path.join(DAEMON_LEASE_DIR, `owner-${token}.json`);
+    let fd: number | undefined;
+    try {
+      fd = openSync(temp, 'wx', 0o600);
+      writeFileSync(fd, JSON.stringify({ version: 1, pid, token, startedAt: new Date().toISOString() }), 'utf-8');
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      let claimedGeneration: DaemonLeaseDirectoryGeneration | null = null;
+      try {
+        mkdirSync(DAEMON_LEASE_DIR, { mode: 0o700 });
+        claimedGeneration = readDaemonLeaseDirectoryGeneration();
+        if (!claimedGeneration) continue;
+        afterDaemonLeaseDirectoryCreatedForTest?.();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+        let entries: string[];
+        try {
+          entries = readdirSync(DAEMON_LEASE_DIR).filter((entry) => /^owner-.*\.json$/.test(entry));
+        } catch (readErr) {
+          if ((readErr as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+          throw readErr;
+        }
+        if (entries.length === 0) {
+          // A freshly-created empty directory is an owner being installed, not
+          // stale state. Reaping it immediately lets its suspended creator later
+          // publish into a replacement directory and grants two claimants the
+          // same fixed path. Age-gate cleanup; generation verification below is
+          // the backstop when a creator is paused longer than this grace window.
+          let ageMs = 0;
+          try { ageMs = Date.now() - statSync(DAEMON_LEASE_DIR).mtimeMs; } catch { continue; }
+          if (ageMs < EMPTY_DAEMON_LEASE_RECLAIM_MS) return false;
+          try { rmdirSync(DAEMON_LEASE_DIR); } catch { /* creator may have published its owner */ }
+          continue;
+        }
+        if (entries.length !== 1) return false;
+        const owner = readDaemonLeaseOwner();
+        if (!owner) return false;
+        if (owner.pid === pid) return true;
+        // A current-format lease carries owner metadata but still cannot prove
+        // the pid was not reused; the EPERM rule evicts a foreign-user reuse,
+        // and same-user pid reuse remains the documented residual risk. This
+        // stays a plain liveness check (NOT the daemon-shape heuristic used for
+        // the legacy path): during a concurrent start the live competitor's argv
+        // may not yet be daemon-shaped, and evicting it would grant two owners.
+        // The correct pid-reuse disambiguator here is process-start-time vs the
+        // lease startedAt — a follow-up, tracked 2026-07-17.
+        if (pidBlocksLeaseAcquisition(owner.pid)) return false;
+        try {
+          unlinkSync(owner.file);
+        } catch {
+          // A different stale reclaimer already advanced the generation.
+          continue;
+        }
+        try { rmdirSync(DAEMON_LEASE_DIR); } catch { /* a new generation now owns it */ }
+        syncDaemonDirectory();
+        continue;
+      }
+      try {
+        renameSync(temp, ownerFile);
+      } catch (publishErr) {
+        // A stale reclaimer may have removed the pathname generation after
+        // observing an older owner. Losing the path is a failed claim, not a
+        // daemon-start crash; retry from a fresh mkdir generation.
+        if ((publishErr as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+        throw publishErr;
+      }
+      if (!claimedGeneration || !sameDaemonLeaseDirectoryGeneration(
+        claimedGeneration,
+        readDaemonLeaseDirectoryGeneration(),
+      )) {
+        // The fixed path was removed/recreated between mkdir and publication.
+        // Remove only this claimant's token from the replacement generation;
+        // never remove that generation or any other owner's file.
+        try { unlinkSync(ownerFile); } catch { /* the replacement owner may already have cleaned it */ }
+        try {
+          if (process.platform !== 'win32') {
+            const leaseFd = openSync(DAEMON_LEASE_DIR, 'r');
+            try { fsyncSync(leaseFd); } finally { closeSync(leaseFd); }
+          }
+          syncDaemonDirectory();
+        } catch { /* cleanup durability is best-effort; ownership is still refused */ }
+        continue;
+      }
+      if (process.platform !== 'win32') {
+        const leaseFd = openSync(DAEMON_LEASE_DIR, 'r');
+        try { fsyncSync(leaseFd); } finally { closeSync(leaseFd); }
+      }
+      syncDaemonDirectory();
+      writePidProjection(pid);
+      return true;
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* best effort */ }
+      }
+      try { unlinkSync(temp); } catch { /* best effort */ }
+    }
+  }
+  return false;
+}
+
+/** Release only the caller's lease. An old daemon finishing shutdown can never
+ * erase a newer owner's pid file. Omit expectedPid only for stale cleanup. */
+export function clearDaemonPid(expectedPid?: number): boolean {
+  const lease = readDaemonLeaseOwner();
+  const owner = lease?.pid ?? readLegacyPidProjection();
+  if (expectedPid !== undefined && owner !== expectedPid) return false;
+  let removed = false;
+  if (lease) {
+    try {
+      unlinkSync(lease.file);
+      rmdirSync(DAEMON_LEASE_DIR);
+      removed = true;
+      syncDaemonDirectory();
+    } catch {
+      return false;
+    }
+  } else if (existsSync(DAEMON_LEASE_DIR)) {
+    return false;
+  }
+  try {
+    unlinkSync(PID_FILE);
+    syncDaemonDirectory();
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return removed;
+    throw err;
+  }
+}
+
+/** Backward-compatible name for callers that used to overwrite daemon.pid. */
+export function writeDaemonPid(pid: number): void {
+  if (!acquireDaemonLease(pid)) {
+    throw new Error(`Another Clementine daemon already owns the singleton lease (PID ${readDaemonPid() ?? 'unknown'}).`);
+  }
 }
 
 export function stopDaemon(): { stopped: boolean; pid: number | null } {
   const pid = readDaemonPid();
   if (!pid) return { stopped: false, pid: null };
   const wasRunning = isDaemonRunning();
-  clearDaemonPid();
-  if (!wasRunning) return { stopped: false, pid };
+  if (!wasRunning) {
+    clearDaemonPid(pid);
+    return { stopped: false, pid };
+  }
+  // Never SIGTERM a pid we can POSITIVELY identify as an unrelated same-user
+  // process that reused a stale legacy/lease pid. Killing it would take down an
+  // innocent process on `daemon stop`/`restart`; clear the stale record instead.
+  if (daemonPidIsForeignReuse(pid)) {
+    clearDaemonPid(pid);
+    return { stopped: false, pid };
+  }
   try {
     process.kill(pid, 'SIGTERM');
     return { stopped: true, pid };
   } catch {
     return { stopped: false, pid };
   }
+}
+
+export async function waitForDaemonExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (processIsAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return true;
 }
 
 export function spawnDaemonProcess(): number {
@@ -120,7 +484,6 @@ export function registerCrashGuards(): void {
       return;
     }
     console.error('[daemon] FATAL uncaughtException — exiting:', err);
-    try { clearDaemonPid(); } catch { /* best effort */ }
     process.exit(1);
   });
   process.on('unhandledRejection', (reason) => {
@@ -131,7 +494,6 @@ export function registerCrashGuards(): void {
     // Node's default is to crash on an unhandled rejection; keep that contract
     // (the supervisor restarts us) but log a structured line first.
     console.error('[daemon] FATAL unhandledRejection — exiting:', reason);
-    try { clearDaemonPid(); } catch { /* best effort */ }
     process.exit(1);
   });
 }
@@ -146,7 +508,9 @@ export function registerShutdownHandlers(onShutdown: () => Promise<void>): void 
     onShutdown()
       .catch((err: unknown) => console.error('[daemon] Shutdown error:', err))
       .finally(() => {
-        clearDaemonPid();
+        // Leave the lease record in place until the process is actually dead.
+        // A successor atomically reclaims that stale owner only after signal 0
+        // proves the old PID is gone, eliminating release-before-exit overlap.
         process.exit(0);
       });
   };

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -78,6 +80,7 @@ const {
   WorkflowStepStructuralResultError,
   isWorkflowStepStructuralResultError,
   _setWorkflowHarnessLoopImplsForTests,
+  publishWorkflowRunTerminalForTest,
 } = await import('./workflow-runner.js');
 // The workflow watcher would otherwise place a REAL judge call from any
 // multi-step test run (live OAuth tokens make the judge reachable on dev
@@ -118,6 +121,82 @@ const { AgentRuntimeCancelledError } = await import('../runtime/provider.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { readWorkflowRunRecord } = await import('./workflow-run-record.js');
+
+test('SIGKILL after terminal publication cannot leave status without its exact report envelope', async () => {
+  const runId = `terminal-envelope-crash-${Date.now()}`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({
+    id: runId,
+    workflow: 'Crash Envelope Workflow',
+    status: 'running',
+  }), 'utf-8');
+  const ready = path.join(tmp, `${runId}.ready`);
+  const release = path.join(tmp, `${runId}.release`);
+  const moduleUrl = new URL('./workflow-runner.ts', import.meta.url).href;
+  const childCode = String.raw`
+    const mod = await import(process.env.CLEM_RUNNER_MODULE_URL);
+    mod.publishWorkflowRunTerminalForTest(
+      process.env.CLEM_RUNNER_FILE,
+      JSON.parse(process.env.CLEM_RUNNER_RECORD),
+      JSON.parse(process.env.CLEM_RUNNER_REPORT),
+    );
+  `;
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childCode], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEM_RUNNER_MODULE_URL: moduleUrl,
+      CLEM_RUNNER_FILE: file,
+      CLEM_RUNNER_RECORD: JSON.stringify({
+        id: runId,
+        workflow: 'Crash Envelope Workflow',
+        status: 'completed',
+        finishedAt: new Date().toISOString(),
+        output: 'exact durable result',
+      }),
+      CLEM_RUNNER_REPORT: JSON.stringify({
+        workflowName: 'Crash Envelope Workflow',
+        outcome: 'done',
+        detail: 'exact durable result',
+      }),
+      CLEMENTINE_TEST_TERMINAL_PUBLISH_READY: ready,
+      CLEMENTINE_TEST_TERMINAL_PUBLISH_RELEASE: release,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(ready)) {
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for terminal publication crash barrier.');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    child.kill('SIGKILL');
+    const [code, signal] = await once(child, 'close') as [number | null, NodeJS.Signals | null];
+    assert.equal(code, null);
+    assert.equal(signal, 'SIGKILL');
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
+    assert.equal(raw.status, 'completed');
+    assert.equal(raw.output, 'exact durable result');
+    assert.deepEqual(raw.reportBack, {
+      version: 1,
+      workflowName: 'Crash Envelope Workflow',
+      outcome: 'done',
+      detail: 'exact durable result',
+      acknowledgedOriginSessionIds: [],
+    });
+    assert.equal(
+      readWorkflowRunRecord<Record<string, unknown>>(file)?.status,
+      'completed',
+      'the next reader safely reclaims the dead lock owner without changing the atomic record',
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    rmSync(ready, { force: true });
+    rmSync(release, { force: true });
+  }
+});
 
 test('workflow attempt metrics count one native MCP action, not its transport mirror', () => {
   resetEventLog();
@@ -805,7 +884,10 @@ test('runWithStepRetry: workflow structural result miss is retryable when opted 
 // ---------------------------------------------------------------------------
 
 test('enqueueWorkflowOutcomeTurn: appends ONE role:user outcome turn to the origin session', () => {
-  enqueueWorkflowOutcomeTurn({ id: 'gapE-1', workflow: 'wf' as never, originSessionId: 'sessE1' }, 'My WF', 'done', 'the deliverable');
+  assert.equal(
+    enqueueWorkflowOutcomeTurn({ id: 'gapE-1', workflow: 'wf' as never, originSessionId: 'sessE1' }, 'My WF', 'done', 'the deliverable'),
+    true,
+  );
   const turns = new RunnerSessionStore().get('sessE1').turns;
   const mine = turns.filter((t: { text?: string }) => typeof t.text === 'string' && t.text.startsWith('[workflow run gapE-1 '));
   assert.equal(mine.length, 1, 'exactly one outcome turn');
@@ -815,8 +897,12 @@ test('enqueueWorkflowOutcomeTurn: appends ONE role:user outcome turn to the orig
 });
 
 test('enqueueWorkflowOutcomeTurn: idempotent — a second call (drain retry / restart) does not double-post', () => {
-  enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r');
-  enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r');
+  assert.equal(enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r'), true);
+  assert.equal(
+    enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r'),
+    true,
+    'an idempotent duplicate still acknowledges durable delivery',
+  );
   const turns = new RunnerSessionStore().get('sessE2').turns;
   assert.equal(turns.filter((t: { text?: string }) => typeof t.text === 'string' && t.text.startsWith('[workflow run gapE-2 ')).length, 1);
 });
@@ -2774,6 +2860,22 @@ test('self-heal: a completed upstream IRREVERSIBLE-SEND step (unmarked) blocks a
   );
 });
 
+test('self-heal: a completed structured write blocks a fresh-run duplicate even with a stale read label', () => {
+  const steps = [
+    {
+      id: 'create',
+      prompt: 'Store the approved record.',
+      sideEffect: 'read',
+      call: { tool: 'AIRTABLE_CREATE_RECORD', args: { table: 'Prospects' } },
+    },
+    { id: 'find', prompt: 'x' },
+  ];
+  assert.equal(
+    workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(steps as never, 'find', new Set(['create', 'find'])),
+    true,
+  );
+});
+
 test('self-heal: an ungated future post/send step blocks auto re-run after a prompt edit', async () => {
   const wf = 'heal-ungated-post';
   writeHealWorkflow(wf, [
@@ -2965,19 +3067,19 @@ test('P0-3 halts crash-resume of an autonomous write/send step', () => {
   assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'save'])), { stepId: 'send', cls: 'send', declared: true });
 });
 
-test('P0-3 ledger-aware resume: harness write with no recorded external_write auto-resumes', () => {
+test('P0-3 harness telemetry absence cannot authorize replay of an interrupted write', () => {
   const wf = wfWith([
     { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
     { id: 'save', prompt: 'Write to the sheet.', sideEffect: 'write', dependsOn: ['pull'] },
   ]);
-  assert.equal(
+  assert.deepEqual(
     shouldHaltResumeForSideEffect(
       wf,
       resumeState('save', ['pull']),
       undefined,
       { harnessEnabled: true, claimedExternalWrite: false },
     ),
-    null,
+    { stepId: 'save', cls: 'write', declared: true },
   );
 });
 
@@ -2993,6 +3095,22 @@ test('P0-3 ledger-aware resume: claimed external_write still halts', () => {
       { harnessEnabled: true, claimedExternalWrite: true },
     ),
     { stepId: 'save', cls: 'write', declared: true },
+  );
+});
+
+test('P0-3 structured mutation resume defers to the exact-call receipt ledger', () => {
+  const wf = wfWith([
+    { id: 'send', prompt: '', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@b.co' } }, sideEffect: 'send' },
+  ]);
+  assert.equal(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState('send'),
+      undefined,
+      { mutationReceiptProtected: true },
+    ),
+    null,
+    'the exact-call ledger replays committed results and refuses ambiguous starts itself',
   );
 });
 
@@ -3023,7 +3141,7 @@ test('P0-3 halt reports declared=false when the class was only inferred from pro
   assert.equal(halt?.declared, false);
 });
 
-test('P0-3 does NOT halt a read step, a completed step, or the targeted re-run path', () => {
+test('P0-3 does not halt a read/completed step, but a crashed targeted run still parks', () => {
   const wf = wfWith([
     { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
     { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', dependsOn: ['pull'] },
@@ -3032,29 +3150,105 @@ test('P0-3 does NOT halt a read step, a completed step, or the targeted re-run p
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('pull')), null);
   // in-flight step already completed → no halt
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'send'])), null);
-  // explicit single-step re-run → exempt
-  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull']), 'send'), null);
+  // A newly requested single-step run has no in-flight event, but a restart of
+  // that same targeted run does. It must park rather than dispatch twice.
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull']), 'send'),
+    { stepId: 'send', cls: 'send', declared: true },
+  );
   // nothing in flight → no halt
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState(undefined)), null);
 });
 
-test('Lane B (bug #8 FIXED): a crashed forEach SEND auto-resumes (no halt) — now SAFE via per-item dedup', () => {
-  // forEach steps are item-tracked, so a crashed forEach SHOULD auto-resume
-  // (skip done items, retry the rest) rather than halt-for-a-human. The bug was
-  // the crash WINDOW: an item whose send fired but whose item_completed wasn't
-  // recorded got re-sent. The fix is NOT to halt forEach (that loses the
-  // auto-resume) — it's the runner-level per-item guard (itemSendAlreadyFired:
-  // an item with a prior external_write under its deterministic session is
-  // skipped on resume). So shouldHaltResumeForSideEffect STILL returns null for
-  // forEach (auto-resume), and that is now correct + safe.
+test('P0-3 a crash-resumed run with a lost lifecycle event parks before an uncompleted plain mutation', () => {
+  const wf = wfWith([
+    { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
+    { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', dependsOn: ['pull'] },
+  ]);
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState(undefined, ['pull']),
+      undefined,
+      { resumedRun: true, durableMutationProtocolStepIds: new Set() },
+    ),
+    { stepId: 'send', cls: 'send', declared: true },
+  );
+});
+
+test('P0-3 a lost-event crash resume does NOT park a downstream mutation execution never reached', () => {
+  // Crash during the FIRST read step: the send step deep in the chain provably
+  // never started (its dependency never completed), so a lost step_started must
+  // not park it (2026-07-17 final-wave review #3 — the over-halt regression).
+  const wf = wfWith([
+    { id: 'scrape', prompt: 'Scrape the listing.', sideEffect: 'read' },
+    { id: 'summarize', prompt: 'Summarize the rows.', sideEffect: 'read', dependsOn: ['scrape'] },
+    { id: 'send', prompt: 'Email the summary.', sideEffect: 'send', dependsOn: ['summarize'] },
+  ]);
+  assert.equal(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState(undefined, []),
+      undefined,
+      { resumedRun: true, durableMutationProtocolStepIds: new Set() },
+    ),
+    null,
+    'send is not in the ready frontier while scrape is still the running step',
+  );
+  // Once its prerequisites completed, the same send IS in the frontier and a
+  // lost lifecycle event must park it conservatively.
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState(undefined, ['scrape', 'summarize']),
+      undefined,
+      { resumedRun: true, durableMutationProtocolStepIds: new Set() },
+    ),
+    { stepId: 'send', cls: 'send', declared: true },
+  );
+});
+
+test('P0-3 a dependsOn-less concurrent workflow still halts on any incomplete mutation after a lost event', () => {
+  // With no declared dependencies every step runs in one batch, so all are in
+  // the frontier — the guard must stay conservative and park the mutation.
+  const wf = wfWith([
+    { id: 'read1', prompt: 'Read A.', sideEffect: 'read' },
+    { id: 'write1', prompt: 'Write B.', sideEffect: 'write' },
+  ]);
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState(undefined, []),
+      undefined,
+      { resumedRun: true, durableMutationProtocolStepIds: new Set() },
+    ),
+    { stepId: 'write1', cls: 'write', declared: true },
+  );
+});
+
+test('P0-3 a structured direct mutation may start after restart only under the durable receipt protocol', () => {
+  const wf = wfWith([
+    { id: 'send', prompt: '', sideEffect: 'send', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@b.co' } } },
+  ]);
+  assert.equal(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState(undefined),
+      undefined,
+      { resumedRun: true, durableMutationProtocolStepIds: new Set(['send']) },
+    ),
+    null,
+  );
+});
+
+test('Lane B: a legacy crashed forEach SEND parks when the interrupted item has no exact receipt proof', () => {
   const wf = wfWith([
     { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
     { id: 'blast', prompt: 'Email each lead.', sideEffect: 'send', forEach: 'pull', dependsOn: ['pull'] },
   ]);
-  assert.equal(
+  assert.deepEqual(
     shouldHaltResumeForSideEffect(wf, resumeState('blast', ['pull'])),
-    null,
-    'forEach send auto-resumes (no halt); the per-item dedup, not a halt, prevents the double-send',
+    { stepId: 'blast', cls: 'send', declared: true },
   );
 });
 
@@ -3105,11 +3299,21 @@ test('P0-3 runtime-request_approval park is exempt (in-flight step has a step_fa
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('send', [], ['send'])), null);
 });
 
-test('P0-3 forEach step is exempt (resume is item-level idempotent)', () => {
+test('P0-3 mutating forEach parks; completed-item tracking alone cannot prove the interrupted item did not commit', () => {
   const wf = wfWith([
     { id: 'blast', prompt: 'Email each prospect.', sideEffect: 'send', forEach: 'pull' },
   ]);
-  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('blast')), null);
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(wf, resumeState('blast')),
+    { stepId: 'blast', cls: 'send', declared: true },
+  );
+});
+
+test('P0-3 read-only forEach remains restart-safe', () => {
+  const wf = wfWith([
+    { id: 'lookup', prompt: 'Fetch each prospect profile.', sideEffect: 'read', forEach: 'pull' },
+  ]);
+  assert.equal(shouldHaltResumeForSideEffect(wf, resumeState('lookup')), null);
 });
 
 test('P0-3 end-to-end: park → approve → crash mid-send HALTS (closes the double-send hole)', () => {

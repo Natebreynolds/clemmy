@@ -17,7 +17,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const TEST_HOME = '/tmp/clemmy-test-run-goal';
@@ -311,11 +311,24 @@ test('run queue: goalAttempt + goalFeedback persist and carry through requeue', 
   assert.equal(rec.goalFeedback, '- UNMET: at least 10 rows');
   assert.equal(rec.originSessionId, 'sess-1');
   // Requeue from this run with bumped lineage WHILE the source is still
-  // 'queued' on disk — a goal re-pursuit queues mid-completion, when the
-  // source record still reads running/queued, so the same-inputs dedupe must
-  // EXCLUDE the source run (regression: re-pursuit silently returned
-  // 'duplicate' of its own source and never queued).
-  const requeued = requeueWorkflowFromRun(queued.id!, { goalAttempt: 2, goalFeedback: '- UNMET: still short' });
+  // executing — a goal re-pursuit queues mid-completion, when the source record
+  // still reads running, so the same-inputs dedupe must EXCLUDE the source run
+  // (regression: re-pursuit silently returned 'duplicate' of its own source and
+  // never queued). A real mid-completion source has begun executing, so the
+  // runner has already written its durable mutation-contract snapshot before the
+  // first step ran; reflect that here (all-non-mutating steps → empty snapshot).
+  // The runner invokes this path with sourceExecutionSettled: true to authorize
+  // requeue over the non-terminal source.
+  const srcFile = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const srcRec = JSON.parse(readFileSync(srcFile, 'utf-8'));
+  srcRec.status = 'running';
+  srcRec.mutationContractSnapshot = { version: 1, steps: {} };
+  writeFileSync(srcFile, JSON.stringify(srcRec), 'utf-8');
+  const requeued = requeueWorkflowFromRun(queued.id!, {
+    goalAttempt: 2,
+    goalFeedback: '- UNMET: still short',
+    sourceExecutionSettled: true,
+  });
   assert.equal(requeued.status, 'queued');
   const rec2 = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${requeued.id}.json`), 'utf-8'));
   assert.equal(rec2.goalAttempt, 2);

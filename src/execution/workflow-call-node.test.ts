@@ -12,7 +12,13 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const { test } = await import('node:test');
 const assert = (await import('node:assert/strict')).default;
-const { renderCallArgs, renderCallArgValue, callToolSideEffectClass, stepSideEffectClass } = await import('./workflow-runner.js');
+const {
+  renderCallArgs,
+  renderCallArgValue,
+  callToolSideEffectClass,
+  stepSideEffectClass,
+  structuredCallNeedsMutationReceipt,
+} = await import('./workflow-runner.js');
 const { validateWorkflowDefinition } = await import('./workflow-validator.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
@@ -63,8 +69,12 @@ test('callToolSideEffectClass: classifies send / write / read from the tool slug
   assert.equal(callToolSideEffectClass('COMPOSIO_TWITTER_POST'), 'send');
   assert.equal(callToolSideEffectClass('composio_airtable_create_record'), 'write');
   assert.equal(callToolSideEffectClass('composio_sheets_update_row'), 'write');
+  assert.equal(callToolSideEffectClass('ONE_DRIVE_UPLOAD_FILE'), 'write');
+  assert.equal(callToolSideEffectClass('GMAIL_MARK_AS_READ'), 'write');
+  assert.equal(callToolSideEffectClass('COMPOSIO_UNFAMILIAR_ACTION'), 'write');
   assert.equal(callToolSideEffectClass('composio_gmail_search'), 'read');
   assert.equal(callToolSideEffectClass('composio_hubspot_list_contacts'), 'read');
+  assert.equal(callToolSideEffectClass('TWITTER_GET_POST'), 'read');
 });
 
 test('stepSideEffectClass: declared sideEffect can STRENGTHEN but never downgrade a real send (re-hunt round 2 author-side)', () => {
@@ -76,6 +86,16 @@ test('stepSideEffectClass: declared sideEffect can STRENGTHEN but never downgrad
   // For a NON-send slug the declared class still wins (an author can strengthen a
   // read-classified call to write, or knows their read-only call best).
   assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'composio_gmail_search' }, sideEffect: 'write' }), 'write');
+  assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'TWITTER_GET_POST' } }), 'read');
+  assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'GMAIL_MARK_AS_READ' }, sideEffect: 'read' }), 'write');
+});
+
+test('structuredCallNeedsMutationReceipt: obvious writes cannot disable receipts with a stale read label', () => {
+  assert.equal(structuredCallNeedsMutationReceipt({ id: 's', prompt: '', call: { tool: 'composio_airtable_create_record' } }), true);
+  assert.equal(structuredCallNeedsMutationReceipt({ id: 's', prompt: '', call: { tool: 'composio_airtable_create_record' }, sideEffect: 'read' }), true);
+  assert.equal(structuredCallNeedsMutationReceipt({ id: 's', prompt: '', call: { tool: 'GMAIL_MARK_AS_READ' }, sideEffect: 'read' }), true);
+  assert.equal(structuredCallNeedsMutationReceipt({ id: 's', prompt: '', call: { tool: 'UNKNOWN_PROVIDER_ACTION' }, sideEffect: 'read' }), true);
+  assert.equal(structuredCallNeedsMutationReceipt({ id: 's', prompt: '', call: { tool: 'composio_gmail_search' }, sideEffect: 'read' }), false);
 });
 
 function frontmatter(steps: unknown[]) {
@@ -101,6 +121,18 @@ test('validation: a call step needs no prompt, allows read fan-out, and blocks u
     { id: 'enrich', call: { tool: 'composio_hubspot_get_contact', args: { id: '{{item.id}}' } }, forEach: 'list', dependsOn: ['list'] },
   ]));
   assert.equal(readFanout.errors.some((e) => /call with forEach|call and forEach/.test(e)), false, 'read-class call+forEach is allowed');
+
+  const objectNounReadFanout = validateWorkflowDefinition(frontmatter([
+    { id: 'list', prompt: 'produce a list', output: { type: 'array' } },
+    { id: 'fetch', call: { tool: 'TWITTER_GET_POST', args: { id: '{{item.id}}' } }, forEach: 'list', dependsOn: ['list'] },
+  ]));
+  assert.equal(objectNounReadFanout.errors.some((e) => /call with forEach|call and forEach/.test(e)), false);
+
+  const trailingStateWriteFanout = validateWorkflowDefinition(frontmatter([
+    { id: 'list', prompt: 'produce a list', output: { type: 'array' } },
+    { id: 'mark', call: { tool: 'GMAIL_MARK_AS_READ', args: { id: '{{item.id}}' } }, sideEffect: 'read', forEach: 'list', dependsOn: ['list'] },
+  ]));
+  assert.ok(trailingStateWriteFanout.errors.some((e) => /call with forEach|call and forEach/.test(e)));
 
   // a SEND-class call + forEach → error (double-send risk)
   const sendFanout = validateWorkflowDefinition(frontmatter([

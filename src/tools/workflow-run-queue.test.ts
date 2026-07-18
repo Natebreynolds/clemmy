@@ -6,17 +6,36 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { existsSync, mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, utimesSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-queue-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
-const { queueWorkflowRun, queueWorkflowDryRun, resumeWorkflowRun, requeueWorkflowFromRun, requeueWorkflowFailedItemsFromRun, queueWorkflowCreationTest } = await import('./workflow-run-queue.js');
+const {
+  queueWorkflowRun,
+  queueWorkflowDryRun,
+  resumeWorkflowRun,
+  requeueWorkflowFromRun,
+  requeueWorkflowFailedItemsFromRun,
+  queueWorkflowCreationTest,
+  readWorkflowTriggerReceiptAcceptance,
+  readWorkflowRunOriginSessionIds,
+  WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+} = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+const {
+  executeWorkflowCallMutation,
+  WorkflowCallMutationAmbiguousError,
+  WorkflowCallMutationProvenFailureError,
+} = await import('../execution/workflow-call-receipts.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 
@@ -26,13 +45,94 @@ function writeAuditWorkflow(enabled = true): void {
     description: 'Audit a site from a URL.',
     enabled,
     trigger: { manual: true },
-    steps: [{ id: 'normalize', prompt: 'Normalize the prospect: {{input.url}}.' }],
+    steps: [
+      { id: 'normalize', prompt: 'Normalize the prospect: {{input.url}}.' },
+      { id: 'blast', prompt: 'Analyze this prospect.', dependsOn: ['normalize'], forEach: 'normalize', sideEffect: 'read' },
+      { id: 'blast_one', prompt: 'Run the first read-only analysis.', dependsOn: ['normalize'], forEach: 'normalize', sideEffect: 'read' },
+      { id: 'blast_two', prompt: 'Run the second read-only analysis.', dependsOn: ['normalize'], forEach: 'normalize', sideEffect: 'read' },
+    ],
   });
 }
 
 function runFiles(): string[] {
   try { return readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json')); }
   catch { return []; }
+}
+
+async function waitForPath(file: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+const QUEUE_MODULE_URL = pathToFileURL(path.join(process.cwd(), 'src/tools/workflow-run-queue.ts')).href;
+
+function launchQueueChild(
+  url: string,
+  resultFile: string,
+  extraEnv: Record<string, string> = {},
+) {
+  const childCode = `
+    import { writeFileSync } from 'node:fs';
+    const mod = await import(process.env.CLEM_QUEUE_MODULE_URL);
+    try {
+      const result = mod.queueWorkflowRun('audit-brief', { url: process.env.CLEM_QUEUE_URL }, {
+        ...(process.env.CLEM_QUEUE_ORIGIN ? { originSessionId: process.env.CLEM_QUEUE_ORIGIN } : {}),
+        ...(process.env.CLEM_QUEUE_RECEIPT ? { triggerReceiptId: process.env.CLEM_QUEUE_RECEIPT } : {}),
+      });
+      writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify(result));
+    } catch (error) {
+      writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  `;
+  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childCode], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      CLEM_QUEUE_MODULE_URL: QUEUE_MODULE_URL,
+      CLEM_QUEUE_URL: url,
+      CLEM_QUEUE_RESULT: resultFile,
+      ...extraEnv,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function launchReaperChild(
+  resultFile: string,
+  beforeLockReady: string,
+  beforeLockRelease: string,
+) {
+  const schedulerModuleUrl = pathToFileURL(path.join(process.cwd(), 'src/execution/workflow-scheduler.ts')).href;
+  const childCode = `
+    import { existsSync, writeFileSync } from 'node:fs';
+    const mod = await import(process.env.CLEM_SCHEDULER_MODULE_URL);
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    mod._setWorkflowRunReaperBeforeLockForTests(() => {
+      writeFileSync(process.env.CLEM_REAPER_BEFORE_LOCK_READY, 'ready', 'utf-8');
+      while (!existsSync(process.env.CLEM_REAPER_BEFORE_LOCK_RELEASE)) Atomics.wait(wait, 0, 0, 10);
+    });
+    try {
+      writeFileSync(process.env.CLEM_REAPER_RESULT, JSON.stringify(mod.reapStaleWorkflowRuns()), 'utf-8');
+    } catch (error) {
+      writeFileSync(process.env.CLEM_REAPER_RESULT, JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), 'utf-8');
+    }
+  `;
+  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childCode], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      CLEM_SCHEDULER_MODULE_URL: schedulerModuleUrl,
+      CLEM_REAPER_RESULT: resultFile,
+      CLEM_REAPER_BEFORE_LOCK_READY: beforeLockReady,
+      CLEM_REAPER_BEFORE_LOCK_RELEASE: beforeLockRelease,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 }
 
 beforeEach(() => {
@@ -49,11 +149,258 @@ test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () =>
   assert.match(first.message, /report back/i);
   assert.match(first.message, /do NOT (wait|poll)/i);
   assert.equal(runFiles().length, 1);
+  const record = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8')) as {
+    mutationReceiptProtocolVersion?: unknown;
+  };
+  assert.equal(record.mutationReceiptProtocolVersion, WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION);
 
   const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
   assert.equal(second.status, 'duplicate');
   assert.match(second.message, /No duplicate was queued/);
   assert.match(second.message, /running in the background/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('queue writers use create-only installs and never replace a colliding canonical run id', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const cases: Array<{ forcedId: string; queue: () => { status: string; id?: string } }> = [
+    {
+      forcedId: 'forced-production-collision',
+      queue: () => queueWorkflowRun('audit-brief', { url: 'https://collision-production.test' }, { dedupe: false }),
+    },
+    {
+      forcedId: 'forced-dry-run-collision',
+      queue: () => queueWorkflowDryRun('audit-brief', { url: 'https://collision-dry.test' }),
+    },
+    {
+      forcedId: 'forced-creation-test-collision',
+      queue: () => queueWorkflowCreationTest('audit-brief', { url: 'https://collision-creation.test' }),
+    },
+  ];
+
+  for (const { forcedId, queue } of cases) {
+    const sentinel = {
+      id: forcedId,
+      workflow: 'do-not-replace',
+      status: 'completed',
+      sentinel: `${forcedId}-original`,
+    };
+    const sentinelFile = path.join(WORKFLOW_RUNS_DIR, `${forcedId}.json`);
+    writeFileSync(sentinelFile, JSON.stringify(sentinel), 'utf-8');
+    process.env.CLEMENTINE_TEST_QUEUE_RUN_ID_ONCE = forcedId;
+    let result: { status: string; id?: string };
+    try {
+      result = queue();
+    } finally {
+      delete process.env.CLEMENTINE_TEST_QUEUE_RUN_ID_ONCE;
+    }
+    assert.equal(result.status, 'queued');
+    assert.notEqual(result.id, forcedId);
+    assert.deepEqual(JSON.parse(readFileSync(sentinelFile, 'utf-8')), sentinel);
+  }
+  assert.equal(runFiles().length, 6);
+});
+
+test('queueWorkflowRun: a paused creator cannot enter a replacement lock generation (cross-process ABA)', async () => {
+  writeAuditWorkflow();
+  const prefix = path.join(TMP_HOME, 'dedupe-aba');
+  const aReady = `${prefix}-a-mkdir`;
+  const aRelease = `${prefix}-a-release`;
+  const aLost = `${prefix}-a-lost`;
+  const aResult = `${prefix}-a-result`;
+  const bOwned = `${prefix}-b-owned`;
+  const bRelease = `${prefix}-b-release`;
+  const bResult = `${prefix}-b-result`;
+  for (const file of [aReady, aRelease, aLost, aResult, bOwned, bRelease, bResult]) rmSync(file, { force: true });
+  const moduleUrl = pathToFileURL(path.join(process.cwd(), 'src/tools/workflow-run-queue.ts')).href;
+  const childCode = `
+    import { writeFileSync } from 'node:fs';
+    const mod = await import(process.env.CLEM_QUEUE_MODULE_URL);
+    const result = mod.queueWorkflowRun('audit-brief', { url: 'https://aba.test' });
+    writeFileSync(process.env.CLEM_QUEUE_RESULT, JSON.stringify(result));
+  `;
+  const launch = (result: string, extraEnv: Record<string, string>) => spawn(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', childCode],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CLEMENTINE_HOME: TMP_HOME,
+        HOME: TMP_HOME,
+        CLEM_QUEUE_MODULE_URL: moduleUrl,
+        CLEM_QUEUE_RESULT: result,
+        ...extraEnv,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+
+  const a = launch(aResult, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_MKDIR_READY: aReady,
+    CLEMENTINE_TEST_DEDUPE_LOCK_MKDIR_RELEASE: aRelease,
+    CLEMENTINE_TEST_DEDUPE_LOCK_GENERATION_LOST: aLost,
+  });
+  await waitForPath(aReady);
+  const lockRoot = path.join(WORKFLOW_RUNS_DIR, '.dedupe-locks');
+  const [oldGeneration] = readdirSync(lockRoot);
+  assert.ok(oldGeneration);
+  utimesSync(path.join(lockRoot, oldGeneration), new Date(0), new Date(0));
+
+  const b = launch(bResult, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_READY: bOwned,
+    CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_RELEASE: bRelease,
+  });
+  await waitForPath(bOwned);
+  writeFileSync(aRelease, 'go');
+  await waitForPath(aLost);
+  writeFileSync(bRelease, 'go');
+
+  const [[aCode], [bCode]] = await Promise.all([once(a, 'close'), once(b, 'close')]) as [[number | null], [number | null]];
+  assert.equal(aCode, 0);
+  assert.equal(bCode, 0);
+  const outcomes = [aResult, bResult]
+    .map((file) => JSON.parse(readFileSync(file, 'utf-8')) as { status: string });
+  assert.deepEqual(outcomes.map((entry) => entry.status).sort(), ['duplicate', 'queued']);
+  assert.equal(runFiles().length, 1);
+});
+
+test('queueWorkflowRun: corrupt live-owner evidence fails closed instead of being age-reclaimed', async (t) => {
+  writeAuditWorkflow();
+  const prefix = path.join(TMP_HOME, 'dedupe-corrupt-live');
+  const ownerReady = `${prefix}-owned`;
+  const ownerRelease = `${prefix}-release`;
+  const ownerResult = `${prefix}-owner-result`;
+  const contenderResult = `${prefix}-contender-result`;
+  const url = 'https://corrupt-live-owner.test';
+  const owner = launchQueueChild(url, ownerResult, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_READY: ownerReady,
+    CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_RELEASE: ownerRelease,
+  });
+  t.after(() => {
+    try { writeFileSync(ownerRelease, 'release'); } catch { /* best-effort child cleanup */ }
+    if (owner.exitCode === null) owner.kill('SIGKILL');
+  });
+  const ownerClosed = once(owner, 'close');
+  await waitForPath(ownerReady);
+
+  const lockRoot = path.join(WORKFLOW_RUNS_DIR, '.dedupe-locks');
+  const [lockName] = readdirSync(lockRoot);
+  assert.ok(lockName);
+  const lockDir = path.join(lockRoot, lockName);
+  const [ownerName] = readdirSync(lockDir).filter((entry) => entry.startsWith('owner-'));
+  assert.ok(ownerName);
+  const ownerFile = path.join(lockDir, ownerName);
+  writeFileSync(ownerFile, '{', 'utf-8');
+  utimesSync(lockDir, new Date(0), new Date(0));
+
+  const contender = launchQueueChild(url, contenderResult, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_TIMEOUT_MS: '250',
+  });
+  const contenderClosed = once(contender, 'close');
+  await waitForPath(contenderResult);
+  await contenderClosed;
+  const contenderOutcome = JSON.parse(readFileSync(contenderResult, 'utf-8')) as { error?: string };
+  assert.match(contenderOutcome.error ?? '', /unreadable owner record|refusing to reclaim/i);
+  assert.equal(existsSync(ownerFile), true, 'contender did not unlink corrupt evidence owned by a live holder');
+  assert.equal(runFiles().length, 0);
+
+  writeFileSync(ownerRelease, 'release');
+  await waitForPath(ownerResult);
+  await ownerClosed;
+  assert.equal((JSON.parse(readFileSync(ownerResult, 'utf-8')) as { status?: string }).status, 'queued');
+  assert.equal(runFiles().length, 1);
+  assert.equal(existsSync(ownerFile), true, 'holder release also leaves replaced/corrupt owner evidence fail-closed');
+});
+
+test('queueWorkflowRun: an old lock with malformed filename evidence is not mistaken for an empty pre-owner crash', async () => {
+  writeAuditWorkflow();
+  const prefix = path.join(TMP_HOME, 'dedupe-malformed-filename');
+  const ready = `${prefix}-ready`;
+  const release = `${prefix}-release-never`;
+  const ownerResult = `${prefix}-owner-result-never`;
+  const contenderResult = `${prefix}-contender-result`;
+  const url = 'https://malformed-owner-filename.test';
+  const creator = launchQueueChild(url, ownerResult, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_MKDIR_READY: ready,
+    CLEMENTINE_TEST_DEDUPE_LOCK_MKDIR_RELEASE: release,
+  });
+  const creatorClosed = once(creator, 'close');
+  await waitForPath(ready);
+  const lockRoot = path.join(WORKFLOW_RUNS_DIR, '.dedupe-locks');
+  const [lockName] = readdirSync(lockRoot);
+  assert.ok(lockName);
+  const lockDir = path.join(lockRoot, lockName);
+  const malformedEvidence = path.join(lockDir, 'unexpected-owner-evidence.json');
+  writeFileSync(malformedEvidence, JSON.stringify({ pid: creator.pid }), 'utf-8');
+  creator.kill('SIGKILL');
+  await creatorClosed;
+  utimesSync(lockDir, new Date(0), new Date(0));
+
+  const contender = launchQueueChild(url, contenderResult, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_TIMEOUT_MS: '250',
+  });
+  const contenderClosed = once(contender, 'close');
+  await waitForPath(contenderResult);
+  await contenderClosed;
+  const outcome = JSON.parse(readFileSync(contenderResult, 'utf-8')) as { error?: string };
+  assert.match(outcome.error ?? '', /invalid owner record|refusing to reclaim/i);
+  assert.equal(existsSync(malformedEvidence), true);
+  assert.equal(runFiles().length, 0);
+});
+
+test('queueWorkflowRun: an old empty generation from a pre-owner crash remains reclaimable', async () => {
+  writeAuditWorkflow();
+  const prefix = path.join(TMP_HOME, 'dedupe-empty-crash');
+  const ready = `${prefix}-ready`;
+  const release = `${prefix}-release-never`;
+  const resultFile = `${prefix}-result-never`;
+  const url = 'https://empty-owner-crash.test';
+  const creator = launchQueueChild(url, resultFile, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_MKDIR_READY: ready,
+    CLEMENTINE_TEST_DEDUPE_LOCK_MKDIR_RELEASE: release,
+  });
+  const creatorClosed = once(creator, 'close');
+  await waitForPath(ready);
+  creator.kill('SIGKILL');
+  await creatorClosed;
+
+  const lockRoot = path.join(WORKFLOW_RUNS_DIR, '.dedupe-locks');
+  const [lockName] = readdirSync(lockRoot);
+  assert.ok(lockName);
+  const lockDir = path.join(lockRoot, lockName);
+  assert.deepEqual(readdirSync(lockDir), []);
+  utimesSync(lockDir, new Date(0), new Date(0));
+
+  const recovered = queueWorkflowRun('audit-brief', { url });
+  assert.equal(recovered.status, 'queued');
+  assert.equal(runFiles().length, 1);
+});
+
+test('queueWorkflowRun: a valid dead owner is reclaimed without treating it as corruption', async () => {
+  writeAuditWorkflow();
+  const prefix = path.join(TMP_HOME, 'dedupe-dead-owner');
+  const ready = `${prefix}-owned`;
+  const release = `${prefix}-release-never`;
+  const resultFile = `${prefix}-result-never`;
+  const url = 'https://dead-owner.test';
+  const creator = launchQueueChild(url, resultFile, {
+    CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_READY: ready,
+    CLEMENTINE_TEST_DEDUPE_LOCK_OWNED_RELEASE: release,
+  });
+  const creatorClosed = once(creator, 'close');
+  await waitForPath(ready);
+  creator.kill('SIGKILL');
+  await creatorClosed;
+
+  const lockRoot = path.join(WORKFLOW_RUNS_DIR, '.dedupe-locks');
+  const [lockName] = readdirSync(lockRoot);
+  assert.ok(lockName);
+  assert.equal(readdirSync(path.join(lockRoot, lockName)).filter((entry) => entry.startsWith('owner-')).length, 1);
+
+  const recovered = queueWorkflowRun('audit-brief', { url });
+  assert.equal(recovered.status, 'queued');
   assert.equal(runFiles().length, 1);
 });
 
@@ -72,8 +419,8 @@ test('queueWorkflowRun: duplicate attaches the current origin so report-back can
   assert.equal(second.status, 'duplicate');
 
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
-  assert.equal(rec.originSessionId, 'sess-chat-dup');
-  assert.ok(!('originSessionIds' in rec), 'single origin stays on the legacy field only');
+  assert.ok(!('originSessionId' in rec), 'live run record is not rewritten by a duplicate observer');
+  assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-chat-dup']);
 });
 
 test('queueWorkflowRun: duplicate preserves primary origin and adds secondary origin observers', () => {
@@ -85,11 +432,124 @@ test('queueWorkflowRun: duplicate preserves primary origin and adds secondary or
 
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.equal(rec.originSessionId, 'sess-chat-a');
-  assert.deepEqual(rec.originSessionIds, ['sess-chat-a', 'sess-chat-b']);
+  assert.ok(!('originSessionIds' in rec), 'the runner-owned record remains immutable');
+  assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-chat-b']);
 
   queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-b' });
-  const rec2 = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
-  assert.deepEqual(rec2.originSessionIds, ['sess-chat-a', 'sess-chat-b'], 'duplicate observer is not repeated');
+  assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-chat-b'], 'duplicate observer is not repeated');
+});
+
+test('queueWorkflowRun: late observer installation wins its record lock before retention can reap the acknowledged run', async () => {
+  writeAuditWorkflow();
+  const receiptId = 'receipt-late-observer-reaper-race';
+  const first = queueWorkflowRun('audit-brief', { url: 'https://late-observer.test' }, {
+    triggerReceiptId: receiptId,
+    originSessionId: 'sess-original',
+  });
+  assert.equal(first.status, 'queued');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${first.id}.json`);
+  const oldFinishedAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000).toISOString();
+  const queued = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...queued,
+    status: 'completed',
+    finishedAt: oldFinishedAt,
+    notifiedAt: oldFinishedAt,
+    reportBackAcknowledgedAt: oldFinishedAt,
+    reportBack: {
+      version: 1,
+      workflowName: 'audit-brief',
+      outcome: 'done',
+      detail: 'Original terminal result',
+      acknowledgedOriginSessionIds: ['sess-original'],
+    },
+  }), 'utf-8');
+
+  const prefix = path.join(TMP_HOME, 'late-observer-reaper-race');
+  const attachOwned = `${prefix}-attach-owned`;
+  const attachRelease = `${prefix}-attach-release`;
+  const attachResult = `${prefix}-attach-result`;
+  const reaperBeforeLock = `${prefix}-reaper-before-lock`;
+  const reaperRelease = `${prefix}-reaper-release`;
+  const reaperResult = `${prefix}-reaper-result`;
+  const observer = launchQueueChild('https://late-observer.test', attachResult, {
+    CLEM_QUEUE_ORIGIN: 'sess-late',
+    CLEM_QUEUE_RECEIPT: receiptId,
+    CLEMENTINE_TEST_RUN_RECORD_LOCK_OWNED_READY: attachOwned,
+    CLEMENTINE_TEST_RUN_RECORD_LOCK_OWNED_RELEASE: attachRelease,
+  });
+  const observerClosed = once(observer, 'close') as Promise<[number | null]>;
+  let reaper: ReturnType<typeof launchReaperChild> | undefined;
+  try {
+    await waitForPath(attachOwned);
+    reaper = launchReaperChild(reaperResult, reaperBeforeLock, reaperRelease);
+    const reaperClosed = once(reaper, 'close') as Promise<[number | null]>;
+    await waitForPath(reaperBeforeLock);
+    // The reaper has selected the old terminal record. Let it approach the
+    // linearization lock while the observer owns that lock but has not yet
+    // installed its sidecar, then release the observer to commit first.
+    writeFileSync(reaperRelease, 'continue', 'utf-8');
+    writeFileSync(attachRelease, 'continue', 'utf-8');
+    const [[observerCode], [reaperCode]] = await Promise.all([
+      observerClosed,
+      reaperClosed,
+    ]);
+    assert.equal(observerCode, 0);
+    assert.equal(reaperCode, 0);
+    assert.equal((JSON.parse(readFileSync(attachResult, 'utf-8')) as { status?: string }).status, 'duplicate');
+    assert.deepEqual(JSON.parse(readFileSync(reaperResult, 'utf-8')), { scanned: 1, deleted: 0 });
+    assert.equal(existsSync(file), true, 'retention preserves the record until the late observer is acknowledged');
+    assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-late']);
+  } finally {
+    if (observer.exitCode === null) observer.kill('SIGKILL');
+    if (reaper?.exitCode === null) reaper.kill('SIGKILL');
+  }
+});
+
+test('queueWorkflowRun: distinct durable trigger receipts each own a run; same receipt retries do not duplicate', () => {
+  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-a' });
+  assert.equal(first.status, 'queued');
+
+  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-b' });
+  assert.equal(second.status, 'queued');
+
+  assert.equal(readWorkflowTriggerReceiptAcceptance('receipt-a'), first.id);
+  assert.equal(readWorkflowTriggerReceiptAcceptance('receipt-b'), second.id);
+  assert.equal(runFiles().length, 2, 'distinct events are not silently coalesced merely because mapped inputs match');
+
+  const retry = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-a' });
+  assert.equal(retry.status, 'duplicate');
+  assert.equal(retry.id, first.id);
+  assert.equal(runFiles().length, 2);
+});
+
+test('queueWorkflowRun: v2 trigger acceptance survives normal terminal run-file retention', () => {
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-retained-proof' });
+  assert.equal(queued.status, 'queued');
+  unlinkSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`));
+  assert.equal(
+    readWorkflowTriggerReceiptAcceptance('receipt-retained-proof'),
+    queued.id,
+    'post-run marker remains terminal acceptance after the run record is reaped',
+  );
+});
+
+test('queueWorkflowRun: a verified legacy v1 marker is promoted before its run can be reaped', () => {
+  const receiptId = 'legacy-v1-receipt';
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: receiptId });
+  assert.equal(queued.status, 'queued');
+  const markerFile = path.join(
+    WORKFLOW_RUNS_DIR,
+    '.trigger-receipts',
+    `${createHash('sha256').update(receiptId).digest('hex')}.json`,
+  );
+  const marker = JSON.parse(readFileSync(markerFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(markerFile, JSON.stringify({ ...marker, version: 1 }), 'utf-8');
+
+  assert.equal(readWorkflowTriggerReceiptAcceptance(receiptId), queued.id);
+  assert.equal((JSON.parse(readFileSync(markerFile, 'utf-8')) as { version: number }).version, 2);
+  unlinkSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`));
+  assert.equal(readWorkflowTriggerReceiptAcceptance(receiptId), queued.id);
 });
 
 test('queueWorkflowRun: omits originSessionId when absent for notification-only runs (Gap E)', () => {
@@ -192,6 +652,36 @@ test('queueWorkflowRun: blocks production runs when required workflow capabiliti
   assert.equal(result.readiness?.blockers[0]?.name, 'missing.py');
 });
 
+test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and later each recover exactly once', () => {
+  writeWorkflow('pending-trigger-flow', {
+    name: 'pending-trigger-flow',
+    description: 'Waits for its deterministic helper.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'merge', prompt: 'Merge evidence.', deterministic: { runner: 'missing.py' } }],
+  });
+
+  const blockedA = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-a' });
+  const blockedB = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-b' });
+  assert.equal(blockedA.status, 'blocked_readiness');
+  assert.equal(blockedB.status, 'blocked_readiness');
+  assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-a'), null);
+  assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-b'), null);
+  assert.equal(runFiles().length, 0);
+
+  const scriptsDir = path.join(WORKFLOWS_DIR, 'pending-trigger-flow', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("ready")\n', 'utf-8');
+
+  const first = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-a' });
+  const second = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-b' });
+  assert.equal(first.status, 'queued');
+  assert.equal(second.status, 'queued');
+  assert.equal(runFiles().length, 2);
+  assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-a'), first.id);
+  assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-b'), second.id);
+});
+
 test('queueWorkflowRun: allows unknown Composio slugs as warnings when the broker exists', () => {
   writeWorkflow('unknown-composio-flow', {
     name: 'unknown-composio-flow',
@@ -260,6 +750,8 @@ test('queueWorkflowDryRun: writes fresh dry_run records with console metadata', 
   const records = runFiles().map((file) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>);
   assert.ok(records.every((record) => record.status === 'dry_run'));
   assert.ok(records.every((record) => record.source === 'console'));
+  assert.ok(records.every((record) =>
+    record.mutationReceiptProtocolVersion === WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION));
 });
 
 test('resumeWorkflowRun: carries originSessionId through to the queued run (Gap E ask-then-resume)', () => {
@@ -340,6 +832,429 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
     sourceRunId: origId,
     reason: 'whole-run requeue',
   });
+});
+
+test('requeueWorkflowFromRun refuses to overlap a source run that is still executing', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-still-running';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'running' }),
+    'utf-8',
+  );
+
+  const result = requeueWorkflowFromRun(origId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /not terminal|still dispatch/i);
+  assert.deepEqual(runFiles(), [`${origId}.json`]);
+});
+
+function writeMutationRequeueFixture(runId: string, receiptProtocol = false): void {
+  writeWorkflow('mutation-requeue', {
+    name: 'mutation-requeue',
+    description: 'Creates a record before downstream work.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'create', prompt: 'Create the record.', sideEffect: 'write', call: { tool: 'AIRTABLE_CREATE_RECORD', args: { table: 'Prospects' } } },
+      { id: 'finish', prompt: 'Summarize it.', dependsOn: ['create'] },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'mutation-requeue',
+    inputs: {},
+    status: 'error',
+    ...(receiptProtocol
+      ? {
+          mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+          mutationContractSnapshot: {
+            version: 1,
+            steps: { create: 'structured_call_receipt' },
+          },
+        }
+      : {}),
+  }), 'utf-8');
+}
+
+function mutationReceiptInput(runId: string) {
+  return {
+    workflowSlug: 'mutation-requeue',
+    runId,
+    stepId: 'create',
+    tool: 'AIRTABLE_CREATE_RECORD',
+    account: { connectionId: 'ca-airtable' },
+    args: { table: 'Prospects', fields: { name: 'Ada' } },
+  };
+}
+
+function writeStructuredFanoutRequeueFixture(runId: string, receiptProtocol = false): void {
+  writeWorkflow('structured-fanout-requeue', {
+    name: 'structured-fanout-requeue',
+    description: 'Creates one external record per source item.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'source', prompt: 'Read source items.', sideEffect: 'read' },
+      {
+        id: 'create_each',
+        prompt: 'Create this item.',
+        dependsOn: ['source'],
+        forEach: 'source',
+        sideEffect: 'write',
+        call: { tool: 'AIRTABLE_CREATE_RECORD', args: { table: 'Prospects' } },
+      },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'structured-fanout-requeue',
+    inputs: { batch: runId },
+    status: 'completed_with_errors',
+    ...(receiptProtocol
+      ? {
+          mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+          mutationContractSnapshot: {
+            version: 1,
+            steps: { create_each: 'structured_call_receipt' },
+          },
+        }
+      : {}),
+  }), 'utf-8');
+  appendWorkflowEvent('structured-fanout-requeue', runId, {
+    kind: 'item_failed',
+    stepId: 'create_each',
+    itemKey: 'item-a',
+    error: 'provider response unavailable',
+  });
+}
+
+function structuredFanoutReceiptInput(runId: string) {
+  return {
+    workflowSlug: 'structured-fanout-requeue',
+    runId,
+    stepId: 'create_each',
+    itemKey: 'item-a',
+    tool: 'AIRTABLE_CREATE_RECORD',
+    account: { connectionId: 'ca-airtable' },
+    args: { table: 'Prospects', fields: { name: 'Ada' } },
+  };
+}
+
+test('requeueWorkflowFromRun: current unreceipted mutations fail closed with empty or completed lifecycle telemetry', () => {
+  writeWorkflow('unreceipted-mutation-requeue', {
+    name: 'unreceipted-mutation-requeue',
+    description: 'Mutates through an unstructured prompt step.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'update', prompt: 'Update the CRM record.', sideEffect: 'write' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  for (const runId of ['unreceipted-empty-source', 'unreceipted-completed-source']) {
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+      id: runId,
+      workflow: 'unreceipted-mutation-requeue',
+      inputs: {},
+      status: 'error',
+      mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+    }), 'utf-8');
+  }
+  appendWorkflowEvent('unreceipted-mutation-requeue', 'unreceipted-completed-source', {
+    kind: 'step_completed',
+    stepId: 'update',
+    output: { updated: true },
+  });
+
+  const empty = requeueWorkflowFromRun('unreceipted-empty-source');
+  const completed = requeueWorkflowFromRun('unreceipted-completed-source');
+
+  assert.equal(empty.status, 'ambiguous');
+  assert.equal(completed.status, 'ambiguous');
+  // The empty-telemetry source carries no step events, so its history cannot
+  // bound the run's progress — the reach gate fails closed first because empty
+  // telemetry is not proof the unreceipted mutation was never reached (this
+  // fires before the downstream snapshot gate; both refuse).
+  assert.match(empty.message, /without a structured direct-call receipt|reached that step|repeat/i);
+  // The completed source has step-reach evidence (step_completed on the mutating
+  // step), so the reach-conditioned unreceipted gate refuses.
+  assert.match(completed.message, /without a structured direct-call receipt|reached that step|repeat/i);
+  assert.equal(runFiles().length, 2);
+});
+
+test('requeueWorkflowFromRun: empty (lost) telemetry on a non-protocol source blocks an unreceipted mutation', () => {
+  // The event log is best-effort (appendWorkflowEvent swallows disk failures),
+  // so an EMPTY history on a run that actually executed is LOST telemetry, not
+  // proof the mutation was never reached. A source with no receipt-protocol
+  // marker skips the snapshot gate, so the reach gate must fail closed when the
+  // history cannot bound progress at all — absence of telemetry is not proof of
+  // absence of effect (2026-07-17 final-wave review P0).
+  writeWorkflow('unreceipted-lost-telemetry', {
+    name: 'unreceipted-lost-telemetry',
+    description: 'Sends via an unstructured prompt step.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'notify', prompt: 'Send the summary email to the client.', sideEffect: 'send' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'lost-telemetry-source';
+  // status:'error' (terminal, so it executed) + NO mutationReceiptProtocolVersion
+  // (pre-protocol / legacy) + NO events written at all (empty history).
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'unreceipted-lost-telemetry',
+    inputs: {},
+    status: 'error',
+  }), 'utf-8');
+
+  const rq = requeueWorkflowFromRun(runId);
+
+  assert.equal(rq.status, 'ambiguous', 'lost telemetry must not authorize repeating an unreceipted mutation');
+  assert.match(rq.message, /without a structured direct-call receipt|reached that step|repeat/i);
+  assert.equal(runFiles().length, 1, 'no fresh run was queued');
+});
+
+test('requeueWorkflowFromRun: an unreceipted mutation the prior run never reached does not block the requeue', () => {
+  // A read-first workflow whose LATER prompt step is an unreceipted send. The
+  // prior run failed at the early read step (step_started only, then step_failed
+  // with no completion), so the send never dispatched. The reach-conditioned
+  // gate must NOT refuse: a fresh whole-run retry cannot repeat a send that
+  // never happened. (Regression: any current unreceipted-mutation step used to
+  // block every whole-run requeue regardless of what the prior run reached.)
+  writeWorkflow('read-then-send', {
+    name: 'read-then-send',
+    description: 'Read the inbox, then draft and send the weekly summary email.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'read_inbox', prompt: 'Read the latest inbox items.', sideEffect: 'read' },
+      { id: 'send_summary', prompt: 'Draft and send the weekly summary email.', dependsOn: ['read_inbox'], sideEffect: 'send' },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'read-fail-before-send';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'read-then-send',
+    inputs: {},
+    status: 'error',
+  }), 'utf-8');
+  // Prior run only ever started+failed the read step; the send was never reached.
+  appendWorkflowEvent('read-then-send', runId, { kind: 'step_started', stepId: 'read_inbox' });
+  appendWorkflowEvent('read-then-send', runId, { kind: 'step_failed', stepId: 'read_inbox', error: 'inbox fetch failed' });
+
+  const rq = requeueWorkflowFromRun(runId);
+
+  assert.equal(rq.status, 'queued');
+  const queued = runFiles()
+    .filter((f) => f !== `${runId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { workflow: string; status: string });
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].workflow, 'read-then-send');
+  assert.equal(queued[0].status, 'queued');
+});
+
+test('requeueWorkflowFromRun: an unreceipted mutation the prior run completed still refuses', () => {
+  // Same read-then-send shape, but the prior run reached AND completed the send.
+  // Reach evidence (step_completed on the mutating step) means a fresh whole-run
+  // retry could repeat the send, so the gate fails closed.
+  writeWorkflow('read-then-send-done', {
+    name: 'read-then-send-done',
+    description: 'Read the inbox, then draft and send the weekly summary email.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'read_inbox', prompt: 'Read the latest inbox items.', sideEffect: 'read' },
+      { id: 'send_summary', prompt: 'Draft and send the weekly summary email.', dependsOn: ['read_inbox'], sideEffect: 'send' },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'send-completed-then-failed';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'read-then-send-done',
+    inputs: {},
+    status: 'error',
+  }), 'utf-8');
+  appendWorkflowEvent('read-then-send-done', runId, { kind: 'step_completed', stepId: 'read_inbox', output: { items: 3 } });
+  appendWorkflowEvent('read-then-send-done', runId, { kind: 'step_completed', stepId: 'send_summary', output: { sent: true } });
+
+  const rq = requeueWorkflowFromRun(runId);
+
+  assert.equal(rq.status, 'ambiguous');
+  assert.match(rq.message, /without a structured direct-call receipt|reached that step/i);
+  assert.deepEqual(runFiles(), [`${runId}.json`]);
+});
+
+test('requeueWorkflowFromRun: legacy structured mutation with no exact ledger fails closed on an empty lifecycle log', () => {
+  const runId = 'mutation-legacy-empty-source';
+  writeMutationRequeueFixture(runId);
+
+  const result = requeueWorkflowFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /no matching source mutation contract|empty best-effort lifecycle/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: positive legacy completion evidence blocks a structured mutation without a ledger', () => {
+  const runId = 'mutation-legacy-completed-source';
+  writeMutationRequeueFixture(runId);
+  appendWorkflowEvent('mutation-requeue', runId, {
+    kind: 'step_completed',
+    stepId: 'create',
+    output: { id: 'legacy-record' },
+  });
+
+  const result = requeueWorkflowFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /completed mutating direct-call step|legacy mutation/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: protocol-marked structured mutation may retry when its exact ledger is empty', () => {
+  const runId = 'mutation-protocol-empty-source';
+  writeMutationRequeueFixture(runId, true);
+
+  const result = requeueWorkflowFromRun(runId);
+
+  assert.equal(result.status, 'queued');
+  assert.equal(runFiles().length, 2);
+});
+
+test('requeueWorkflowFromRun: protocol marker without its admission-time contract snapshot fails closed', () => {
+  const runId = 'mutation-protocol-missing-snapshot';
+  writeMutationRequeueFixture(runId);
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({
+    ...record,
+    mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+  }), 'utf-8');
+
+  const result = requeueWorkflowFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /no valid mutation-contract snapshot|protocol marker alone/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: plain-to-structured definition drift cannot turn a source unreceipted mutation into marker authority', () => {
+  writeWorkflow('mutation-drift', {
+    name: 'mutation-drift',
+    description: 'Current definition uses a structured update.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'update',
+      prompt: 'Update the CRM.',
+      sideEffect: 'write',
+      call: { tool: 'AIRTABLE_UPDATE_RECORD', args: { table: 'Prospects' } },
+    }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'plain-to-structured-drift';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'mutation-drift',
+    inputs: {},
+    status: 'error',
+    mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+    mutationContractSnapshot: {
+      version: 1,
+      steps: { update: 'unreceipted_mutation' },
+    },
+  }), 'utf-8');
+
+  const result = requeueWorkflowFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /definition drift|unreceipted_mutation/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: removing a source mutating step does not erase its admission-time risk', () => {
+  writeWorkflow('removed-mutation-drift', {
+    name: 'removed-mutation-drift',
+    description: 'Current definition removed the old external write.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'summarize', prompt: 'Summarize local evidence.', sideEffect: 'read' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'removed-mutation-source';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'removed-mutation-drift',
+    inputs: {},
+    status: 'error',
+    mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+    mutationContractSnapshot: {
+      version: 1,
+      steps: { old_write: 'unreceipted_mutation' },
+    },
+  }), 'utf-8');
+
+  const result = requeueWorkflowFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /old_write|definition drift/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: ambiguous external mutation refuses a fresh run id', async () => {
+  const runId = 'mutation-ambiguous-source';
+  writeMutationRequeueFixture(runId);
+  await assert.rejects(
+    executeWorkflowCallMutation(mutationReceiptInput(runId), async () => {
+      throw new Error('response lost after submit');
+    }),
+    (err: unknown) => err instanceof WorkflowCallMutationAmbiguousError,
+  );
+
+  const result = requeueWorkflowFromRun(runId);
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /No rerun was queued|no rerun was queued/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: committed external mutation is not repeated by an apply-fix style rerun', async () => {
+  const runId = 'mutation-committed-source';
+  writeMutationRequeueFixture(runId);
+  await executeWorkflowCallMutation(mutationReceiptInput(runId), async () => ({ id: 'rec-created' }));
+
+  const result = requeueWorkflowFromRun(runId);
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /committed/);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFromRun: durable proven-no-commit failure may start one fresh attempt', async () => {
+  const runId = 'mutation-proven-failure-source';
+  writeMutationRequeueFixture(runId);
+  await assert.rejects(
+    executeWorkflowCallMutation(
+      mutationReceiptInput(runId),
+      async () => ({ successful: false, error: 'invalid required field' }),
+      { classifyFailure: (result) => ({ summary: result.error, provenNoCommit: true }) },
+    ),
+    (err: unknown) => err instanceof WorkflowCallMutationProvenFailureError,
+  );
+  // Best-effort lifecycle evidence may disagree after a crash. Exact durable
+  // no-commit proof remains authoritative and therefore retryable.
+  appendWorkflowEvent('mutation-requeue', runId, {
+    kind: 'step_completed',
+    stepId: 'create',
+    output: { stale: true },
+  });
+
+  const result = requeueWorkflowFromRun(runId);
+  assert.equal(result.status, 'queued');
+  assert.equal(runFiles().length, 2);
 });
 
 test('requeueWorkflowFromRun: missing original run → not_found (best-effort, no throw)', () => {
@@ -425,6 +1340,166 @@ test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed for
   });
 });
 
+test('requeueWorkflowFailedItemsFromRun blocks unreceipted mutating fan-out with absent or unreadable external-write telemetry', async (t) => {
+  const { HARNESS_DB_PATH, closeEventLog, resetEventLog } = await import('../runtime/harness/eventlog.js');
+  t.after(() => {
+    closeEventLog();
+    rmSync(HARNESS_DB_PATH, { recursive: true, force: true });
+    resetEventLog();
+  });
+  resetEventLog();
+  writeWorkflow('unreceipted-fanout-requeue', {
+    name: 'unreceipted-fanout-requeue',
+    description: 'Mutates each item through an unstructured prompt.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'source', prompt: 'Read source items.', sideEffect: 'read' },
+      {
+        id: 'update_each',
+        prompt: 'Update this CRM record.',
+        dependsOn: ['source'],
+        forEach: 'source',
+        sideEffect: 'write',
+      },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const writeSource = (runId: string): void => {
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+      id: runId,
+      workflow: 'unreceipted-fanout-requeue',
+      inputs: { batch: runId },
+      status: 'completed_with_errors',
+      mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+    }), 'utf-8');
+    appendWorkflowEvent('unreceipted-fanout-requeue', runId, {
+      kind: 'item_failed',
+      stepId: 'update_each',
+      itemKey: 'item-a',
+      error: 'response unavailable',
+    });
+  };
+
+  writeSource('unreceipted-fanout-no-telemetry');
+  const absent = requeueWorkflowFailedItemsFromRun('unreceipted-fanout-no-telemetry');
+  assert.equal(absent.status, 'ambiguous');
+  assert.match(absent.message, /without per-item structured direct-call receipts|missing/i);
+
+  writeSource('unreceipted-fanout-unreadable-telemetry');
+  closeEventLog();
+  for (const suffix of ['', '-wal', '-shm']) {
+    rmSync(HARNESS_DB_PATH + suffix, { recursive: true, force: true });
+  }
+  mkdirSync(path.dirname(HARNESS_DB_PATH), { recursive: true });
+  mkdirSync(HARNESS_DB_PATH);
+  const unreadable = requeueWorkflowFailedItemsFromRun('unreceipted-fanout-unreadable-telemetry');
+  assert.equal(unreadable.status, 'ambiguous');
+  assert.match(unreadable.message, /unreadable external-write telemetry|no retry was queued/i);
+  assert.equal(runFiles().length, 2);
+});
+
+test('requeueWorkflowFailedItemsFromRun: legacy structured failed item needs an exact ledger', () => {
+  const runId = 'structured-fanout-legacy-empty';
+  writeStructuredFanoutRequeueFixture(runId);
+
+  const result = requeueWorkflowFailedItemsFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /no matching source mutation contract|no exact ledger/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFailedItemsFromRun: protocol marker makes empty exact item ledger authoritative', () => {
+  const runId = 'structured-fanout-protocol-empty';
+  writeStructuredFanoutRequeueFixture(runId, true);
+
+  const result = requeueWorkflowFailedItemsFromRun(runId);
+
+  assert.equal(result.status, 'queued');
+  assert.deepEqual(result.failedItems?.map((item) => item.itemKey), ['item-a']);
+  assert.equal(runFiles().length, 2);
+});
+
+test('requeueWorkflowFailedItemsFromRun: legacy exact proven-no-commit item ledger remains retryable', async () => {
+  const runId = 'structured-fanout-proven-failure';
+  writeStructuredFanoutRequeueFixture(runId);
+  await assert.rejects(
+    executeWorkflowCallMutation(
+      structuredFanoutReceiptInput(runId),
+      async () => ({ successful: false, error: 'invalid required field' }),
+      { classifyFailure: (result) => ({ summary: result.error, provenNoCommit: true }) },
+    ),
+    (err: unknown) => err instanceof WorkflowCallMutationProvenFailureError,
+  );
+
+  const result = requeueWorkflowFailedItemsFromRun(runId);
+
+  assert.equal(result.status, 'queued');
+  assert.equal(runFiles().length, 2);
+});
+
+test('requeueWorkflowFailedItemsFromRun: later exact ledger cannot erase a source unreceipted fan-out contract', async () => {
+  const runId = 'structured-fanout-source-was-unreceipted';
+  writeStructuredFanoutRequeueFixture(runId, true);
+  const sourceFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const source = JSON.parse(readFileSync(sourceFile, 'utf-8')) as Record<string, unknown>;
+  writeFileSync(sourceFile, JSON.stringify({
+    ...source,
+    mutationContractSnapshot: {
+      version: 1,
+      steps: { create_each: 'unreceipted_mutation' },
+    },
+  }), 'utf-8');
+  await assert.rejects(
+    executeWorkflowCallMutation(
+      structuredFanoutReceiptInput(runId),
+      async () => ({ successful: false, error: 'invalid required field' }),
+      { classifyFailure: (result) => ({ summary: result.error, provenNoCommit: true }) },
+    ),
+    (err: unknown) => err instanceof WorkflowCallMutationProvenFailureError,
+  );
+
+  const result = requeueWorkflowFailedItemsFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /executed.*as an unreceipted mutation|source agentic mutation/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFailedItemsFromRun: committed exact item receipt blocks inconsistent failed-item telemetry', async () => {
+  const runId = 'structured-fanout-committed';
+  writeStructuredFanoutRequeueFixture(runId, true);
+  await executeWorkflowCallMutation(
+    structuredFanoutReceiptInput(runId),
+    async () => ({ id: 'rec-created' }),
+  );
+
+  const result = requeueWorkflowFailedItemsFromRun(runId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /committed external mutation receipt|may already have committed/i);
+  assert.equal(runFiles().length, 1);
+});
+
+test('requeueWorkflowFailedItemsFromRun refuses to overlap a live fan-out', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-live-fanout';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: {}, status: 'running' }),
+    'utf-8',
+  );
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_failed', stepId: 'blast', itemKey: 'b', error: 'temporary b failure' });
+
+  const result = requeueWorkflowFailedItemsFromRun(origId);
+
+  assert.equal(result.status, 'ambiguous');
+  assert.match(result.message, /not terminal|still be processing/i);
+  assert.deepEqual(runFiles(), [`${origId}.json`]);
+});
+
 test('requeueWorkflowFailedItemsFromRun asks for a step when multiple fan-outs failed', () => {
   writeAuditWorkflow();
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
@@ -493,6 +1568,7 @@ test('queueWorkflowCreationTest: writes a creation_test run record (Part B autho
   assert.equal(rec.workflow, 'audit-brief');
   assert.equal(rec.inputs.url, 'https://x.com');
   assert.equal(rec.originSessionId, 'sess-create');
+  assert.equal(rec.mutationReceiptProtocolVersion, WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION);
 });
 
 test('queueWorkflowCreationTest: does NOT dedupe (each authoring test is fresh)', () => {

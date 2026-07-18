@@ -69,6 +69,21 @@ export interface DeliverContext {
   proactiveTurn?: boolean;
 }
 
+/**
+ * Delivery acknowledgement for callers that own a durable completion marker.
+ *
+ * `deliverOutcome()` intentionally keeps its historical boolean contract
+ * (true only when this call appended a turn). Workflow report-back also needs
+ * to distinguish an idempotent duplicate from an actual write failure: both
+ * were previously `false`, which let a failed origin write be mistaken for a
+ * completed delivery or made a successful retry impossible to acknowledge.
+ */
+export interface OutcomeDeliveryAcknowledgement {
+  acknowledged: boolean;
+  written: boolean;
+  disposition: 'delivered' | 'already_delivered' | 'not_applicable' | 'failed';
+}
+
 /** Pure gate for the proactive report-back turn: only an idle CHAT session
  *  qualifies — a session mid-turn (recent event) must not get a colliding
  *  turn, and workflow/agent sessions have no human watching them. */
@@ -333,10 +348,15 @@ function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: 
  * Returns true if a turn was written, false if it was a no-op (no origin
  * session) or a duplicate.
  */
-export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
+export function deliverOutcomeWithAcknowledgement(
+  outcome: Outcome,
+  ctx: DeliverContext,
+): OutcomeDeliveryAcknowledgement {
   try {
     const sessionId = ctx.originSessionId;
-    if (!sessionId) return false;
+    if (!sessionId) {
+      return { acknowledged: true, written: false, disposition: 'not_applicable' };
+    }
     const idPrefix = outcomePrefix(ctx);
     const text = renderOutcomeText(outcome, ctx);
 
@@ -345,7 +365,9 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
     // that loses the original harness transcript on reopen.
     const harnessRow = getHarnessSession(sessionId);
     if (harnessRow) {
-      if (harnessEventLogHasOutcome(sessionId, outcome, ctx, text)) return false;
+      if (harnessEventLogHasOutcome(sessionId, outcome, ctx, text)) {
+        return { acknowledged: true, written: false, disposition: 'already_delivered' };
+      }
       appendEvent({
         sessionId,
         turn: 0,
@@ -367,12 +389,12 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
       logger.info({ sourceId: ctx.sourceId, sessionId, status: outcome.status, store: 'harness' }, 'Outcome delivered to origin session');
       appendGoalEvidence(sessionId, outcome, ctx);
       maybeScheduleProactiveReport(sessionId, outcome, ctx);
-      return true;
+      return { acknowledged: true, written: true, disposition: 'delivered' };
     }
 
     const store = new SessionStore();
     if (sessionStoreHasOutcome(store, sessionId, outcome, ctx, text)) {
-      return false; // already reported — idempotent across retries / restarts
+      return { acknowledged: true, written: false, disposition: 'already_delivered' };
     }
     store.appendTurn(sessionId, { role: 'user', text, createdAt: new Date().toISOString() });
     // Stage into the harness conversation snapshot so the desktop/Discord
@@ -388,12 +410,16 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
     // the goal's progress timeline reflects sub-work it dispatched. Best-effort.
     appendGoalEvidence(sessionId, outcome, ctx);
     maybeScheduleProactiveReport(sessionId, outcome, ctx);
-    return true;
+    return { acknowledged: true, written: true, disposition: 'delivered' };
   } catch (err) {
     logger.warn(
       { err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId },
       'deliverOutcome failed (best-effort; run + notification unaffected)',
     );
-    return false;
+    return { acknowledged: false, written: false, disposition: 'failed' };
   }
+}
+
+export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
+  return deliverOutcomeWithAcknowledgement(outcome, ctx).written;
 }

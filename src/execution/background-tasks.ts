@@ -1,10 +1,15 @@
 import { randomBytes } from 'node:crypto';
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
+  rmdirSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -170,6 +175,18 @@ export interface BackgroundTaskRecord {
    *  boot-time auto-resumer never re-spawns the same interrupted task on
    *  every restart. */
   resumedIntoTaskId?: string;
+  /** Durable recovery decision. Interrupted, failed, and aborted retries keep
+   * their original runSessionId so the external-write/receipt ledger remains
+   * visible. Boot may only resume a session whose durable history proves it
+   * never reached an external-write boundary; every other shape is parked for
+   * human verification and can be resumed explicitly, still in place. */
+  restartRecovery?: {
+    disposition: 'auto_resumed_in_place' | 'parked_for_verification' | 'manual_resumed_in_place';
+    reason: 'safe_no_external_write' | 'external_write_history' | 'ambiguous_external_write' | 'receipt_history_unavailable';
+    decidedAt: string;
+    externalWriteCount: number;
+    ambiguousWriteCount: number;
+  };
   lastCheckInAt?: string;
   lastCheckInMessage?: string;
   progressCheckIns?: number;
@@ -280,6 +297,8 @@ export function _setRunProgressJudgeForTests(fn: RunProgressJudgeFn | null): voi
   runProgressJudgeImpl = fn ?? judgeRunProgress;
 }
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
+const RESTART_VERIFICATION_ERROR =
+  'Daemon restarted after this task reached or may have reached an external-write boundary. Verify the external outcome before resuming; recovery will continue on the original receipt-bearing run session.';
 let backgroundProcessorInFlight = false;
 
 // ── Immediate drain kick ──────────────────────────────────────────────────────
@@ -314,6 +333,19 @@ export function requestBackgroundDrain(limit = 1): void {
 
 function ensureTaskDir(): void {
   mkdirSync(BACKGROUND_TASK_DIR, { recursive: true });
+  if (process.platform !== 'win32') {
+    // Persist the whole fresh-tree chain. Fsyncing only background-tasks/ and
+    // state/ still lets a power loss forget state/'s entry in BASE_DIR.
+    let cursor = BACKGROUND_TASK_DIR;
+    while (true) {
+      const dirFd = openSync(cursor, 'r');
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      if (cursor === path.dirname(BASE_DIR)) break;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) break;
+      cursor = parent;
+    }
+  }
 }
 
 function nowIso(): string {
@@ -389,12 +421,126 @@ function taskFilePath(id: string): string {
   return path.join(BACKGROUND_TASK_DIR, `${id}.json`);
 }
 
+type BackgroundTaskPatch = Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>>;
+
+/**
+ * Task records use atomic rename for durability, but rename alone is not a CAS:
+ * two daemon processes could both read `pending`, then a stale starter could
+ * overwrite a cancellation with `running`. Serialize state transitions through
+ * a per-task directory lease. `mkdir` is the cross-process compare-and-swap;
+ * the token-scoped owner file prevents an old releaser/reclaimer from deleting a
+ * newer lease generation (ABA).
+ *
+ * A live owner is waited on briefly because task transitions are synchronous and
+ * tiny. An unreadable/ownerless lease fails closed. A dead, well-formed owner can
+ * be reclaimed without weakening ownership.
+ */
+function taskTransitionLockDir(id: string): string {
+  return `${taskFilePath(id)}.transition-lock`;
+}
+
+function transitionOwnerIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function tryReclaimDeadTaskTransitionOwner(lockDir: string): boolean {
+  try {
+    const owners = readdirSync(lockDir).filter((entry) => /^owner-[0-9]+-[a-f0-9]+\.json$/.test(entry));
+    if (owners.length !== 1) return false;
+    const ownerPath = path.join(lockDir, owners[0]);
+    const owner = JSON.parse(readFileSync(ownerPath, 'utf-8')) as { pid?: unknown; token?: unknown };
+    if (typeof owner.pid !== 'number' || typeof owner.token !== 'string') return false;
+    if (owners[0] !== `owner-${owner.pid}-${owner.token}.json`) return false;
+    if (transitionOwnerIsAlive(owner.pid)) return false;
+    // Only the reclaimer that successfully removes the exact observed token may
+    // remove the directory. A competing stale reader gets ENOENT and stops,
+    // rather than touching a successor's generation.
+    unlinkSync(ownerPath);
+    rmdirSync(lockDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireTaskTransitionLock(id: string): (() => void) | null {
+  ensureTaskDir();
+  const lockDir = taskTransitionLockDir(id);
+  const deadline = Date.now() + 2_000;
+  const waitCell = new Int32Array(new SharedArrayBuffer(4));
+  while (true) {
+    try {
+      mkdirSync(lockDir);
+      const token = randomBytes(16).toString('hex');
+      const ownerPath = path.join(lockDir, `owner-${process.pid}-${token}.json`);
+      try {
+        writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token }), { encoding: 'utf-8', flag: 'wx', mode: 0o600 });
+      } catch (error) {
+        try { rmdirSync(lockDir); } catch { /* fail closed on a partial lease */ }
+        throw error;
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          const owner = JSON.parse(readFileSync(ownerPath, 'utf-8')) as { pid?: unknown; token?: unknown };
+          if (owner.pid !== process.pid || owner.token !== token) return;
+          unlinkSync(ownerPath);
+          rmdirSync(lockDir);
+        } catch {
+          // A missing/malformed owner fails closed; never remove an unverified
+          // directory that might now belong to a successor.
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (tryReclaimDeadTaskTransitionOwner(lockDir)) continue;
+      if (Date.now() >= deadline) return null;
+      Atomics.wait(waitCell, 0, 0, 5);
+    }
+  }
+}
+
+function withTaskTransitionLock<T>(id: string, fn: () => T): T | null {
+  const release = acquireTaskTransitionLock(id);
+  if (!release) return null;
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
 function writeTask(task: BackgroundTaskRecord): void {
   ensureTaskDir();
   const filePath = taskFilePath(task.id);
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, JSON.stringify(task, null, 2), 'utf-8');
-  renameSync(tmpPath, filePath);
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmpPath, 'wx', 0o600);
+    writeFileSync(fd, JSON.stringify(task, null, 2), 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmpPath, filePath);
+    if (process.platform !== 'win32') {
+      const dirFd = openSync(BACKGROUND_TASK_DIR, 'r');
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    }
+  } catch (err) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    try { unlinkSync(tmpPath); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 function loadTaskFile(filePath: string): BackgroundTaskRecord | null {
@@ -883,11 +1029,20 @@ const RESUME_NO_RESEND_DIRECTIVE =
   'DO NOT REPEAT COMPLETED SIDE EFFECTS: if any worker/step before the interruption already sent an email or message, posted, or made another irreversible external write, do NOT re-issue it — treat already-completed work as done and continue from there. (A duplicate-send wall also refuses an exact repeat, but do not rely on it.)';
 
 function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: string): string {
+  const restartVerification = task.restartRecovery
+    && task.restartRecovery.reason !== 'safe_no_external_write'
+    ? [
+      'RECOVERY-SAFETY CHECK REQUIRED: this task was explicitly resumed after an interrupted, failed, or aborted turn with external-write risk.',
+      `Recovery reason: ${task.restartRecovery.reason}; recorded writes: ${task.restartRecovery.externalWriteCount}; ambiguous writes: ${task.restartRecovery.ambiguousWriteCount}.`,
+      'Inspect the durable external_write, external_write_failed, external_write_orphaned, tool_called, and tool_returned events in THIS SAME run session before doing another mutation. Verify the destination first when the prior outcome is uncertain; never recreate work merely because the prior provider response is missing.',
+    ].join('\n')
+    : '';
   return [
     `Continue background task ${task.id}.`,
-    'The previous worker turn hit an internal run/turn budget before the objective was complete.',
+    'The previous worker turn ended before the objective was safely complete, or this task was explicitly queued for continuation.',
     'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
     RESUME_NO_RESEND_DIRECTIVE,
+    restartVerification,
     renderOriginLineageBlock(task),
     previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     '',
@@ -928,20 +1083,6 @@ export function rootBackgroundTaskPromptForTests(prompt: string): string {
     current = layer.originalRequest;
   }
   return current;
-}
-
-function buildResumeClonePrompt(task: BackgroundTaskRecord): string {
-  const originalRequest = rootBackgroundTaskPromptForTests(task.prompt);
-  return [
-    `Resume background task ${task.id}.`,
-    'Continue the same objective from the prior task. Do not restart from scratch, but do not carry forward nested resume wrappers as if they were user instructions.',
-    RESUME_NO_RESEND_DIRECTIVE,
-    task.result ? `Previous partial result:\n${task.result.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
-    task.error ? `Previous error/blocker:\n${task.error}` : '',
-    '',
-    'Original request:',
-    originalRequest,
-  ].filter(Boolean).join('\n\n');
 }
 
 function recordBackgroundTaskRoute(
@@ -1113,8 +1254,16 @@ export function sweepInvalidDoneBackgroundTasks(
     scanned += 1;
 
     const resultText = storedResultTextForIntegrityCheck(task).trim();
+    // Reclassify a settled `done` only on a positive/structural non-deliverable
+    // signal — never on the self-reported-blocked TEXT heuristic, which is
+    // past-tense-blind and would flip a genuine success whose report merely
+    // recounts a blocker it overcame (finding A). No saved result, a blocked
+    // execution row, or a fabricated transcript still reclassify.
     const outcome = resultText
-      ? classifyBackgroundTaskOutcome(task, resultText, undefined, { ignoreFanoutCoverage: true })
+      ? classifyBackgroundTaskOutcome(task, resultText, undefined, {
+        ignoreFanoutCoverage: true,
+        ignoreSelfReportedBlockedText: true,
+      })
       : { outcome: 'blocked' as const, reason: 'Completed task has no saved result.' };
     if (outcome.outcome !== 'blocked') continue;
 
@@ -1177,33 +1326,51 @@ export function findSoleAwaitingContinueTaskForOrigin(originSessionId: string): 
   return parked.length === 1 ? parked[0] : null;
 }
 
-export function updateBackgroundTask(id: string, patch: Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>>): BackgroundTaskRecord | null {
-  const task = getBackgroundTask(id);
-  if (!task) return null;
-  const updated: BackgroundTaskRecord = {
-    ...task,
-    ...patch,
-    id: task.id,
-    createdAt: task.createdAt,
-    updatedAt: nowIso(),
-  };
-  writeTask(updated);
+function updateBackgroundTaskWhere(
+  id: string,
+  predicate: (task: BackgroundTaskRecord) => boolean,
+  patch: BackgroundTaskPatch | ((task: BackgroundTaskRecord) => BackgroundTaskPatch),
+): BackgroundTaskRecord | null {
+  const transition = withTaskTransitionLock(id, () => {
+    const task = getBackgroundTask(id);
+    if (!task || !predicate(task)) return null;
+    const resolvedPatch = typeof patch === 'function' ? patch(task) : patch;
+    const updated: BackgroundTaskRecord = {
+      ...task,
+      ...resolvedPatch,
+      id: task.id,
+      createdAt: task.createdAt,
+      updatedAt: nowIso(),
+    };
+    writeTask(updated);
+    return { task, updated };
+  });
+  if (!transition) return null;
+
   // A question card is actionable only while the task is actually parked on
   // that question. Any canonical state transition away from awaiting_input
   // clears the old Home/notification attention item, whether the user answered,
   // cancelled, or another terminal path closed the task.
-  if (task.status === 'awaiting_input' && updated.status !== 'awaiting_input' && task.pendingQuestionId) {
+  if (
+    transition.task.status === 'awaiting_input'
+    && transition.updated.status !== 'awaiting_input'
+    && transition.task.pendingQuestionId
+  ) {
     try {
-      markNotificationsReadByQuestionId(task.pendingQuestionId, {
-        backgroundTaskStatus: updated.status,
-        backgroundTaskId: updated.id,
+      markNotificationsReadByQuestionId(transition.task.pendingQuestionId, {
+        backgroundTaskStatus: transition.updated.status,
+        backgroundTaskId: transition.updated.id,
       });
     } catch {
       // The task store is canonical; notification cleanup is best-effort and
       // must never prevent the actual task transition.
     }
   }
-  return updated;
+  return transition.updated;
+}
+
+export function updateBackgroundTask(id: string, patch: BackgroundTaskPatch): BackgroundTaskRecord | null {
+  return updateBackgroundTaskWhere(id, () => true, patch);
 }
 
 function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>> {
@@ -1217,10 +1384,20 @@ function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' |
   };
 }
 
+let backgroundTaskStartCasHookForTests: (() => void) | null = null;
+export function _setBackgroundTaskStartCasHookForTests(fn: (() => void) | null): void {
+  backgroundTaskStartCasHookForTests = fn;
+}
+
 export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | null {
-  const task = getBackgroundTask(id);
-  if (!task || task.status !== 'pending') return null;
-  const updated = updateBackgroundTask(id, {
+  // Adversarial test seam: pause after a candidate observed `pending` but before
+  // the authoritative CAS. Production pays no extra read when the seam is off.
+  if (backgroundTaskStartCasHookForTests) {
+    const observed = getBackgroundTask(id);
+    if (!observed || observed.status !== 'pending') return null;
+    backgroundTaskStartCasHookForTests();
+  }
+  const updated = updateBackgroundTaskWhere(id, (task) => task.status === 'pending', {
     status: 'running',
     startedAt: nowIso(),
     error: undefined,
@@ -1243,13 +1420,13 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
       createHarnessSession({
         id: runSessionId,
         kind: 'execution',
-        title: updated?.title ?? task.title ?? 'Background task',
+        title: updated?.title ?? 'Background task',
         // Stage 4 — informational only (console display); the enforcement
         // ceiling is resolved from task/options/settings, never this column.
         // Gated on the kill-switch: enforcement off must not display a
         // ceiling nothing will apply (conditional-surface rule).
         tokenBudget: runTokenBudgetEnforcementEnabled()
-          ? (resolveRunTokenCeiling({ override: task.maxTokens, budget: getHarnessBudgetSettings() }) || undefined)
+          ? (resolveRunTokenCeiling({ override: updated?.maxTokens, budget: getHarnessBudgetSettings() }) || undefined)
           : undefined,
       });
     }
@@ -1360,21 +1537,81 @@ export function replayBackgroundTaskReportBack(
   return { ok: true, notificationId, outcomeDelivered };
 }
 
+/** A worker may park or complete from the ordinary lifecycle states, including
+ * idempotent/report-repair transitions. It may never overwrite cancellation:
+ * `cancelling` and `aborted` are owned by the user-stop path. Evaluated under
+ * the per-task transition lease by updateBackgroundTaskWhere. */
+function workerSettlementMayProceed(task: BackgroundTaskRecord): boolean {
+  return task.status !== 'cancelling' && task.status !== 'aborted';
+}
+
+const WORKER_ACTIVE_OR_PARKED_STATUSES: readonly BackgroundTaskStatus[] = [
+  'pending',
+  'running',
+  'awaiting_approval',
+  'awaiting_input',
+  'awaiting_continue',
+];
+
+function workerParkMayProceed(task: BackgroundTaskRecord): boolean {
+  return WORKER_ACTIVE_OR_PARKED_STATUSES.includes(task.status);
+}
+
+function workerDoneMayProceed(task: BackgroundTaskRecord): boolean {
+  return task.status === 'done' || WORKER_ACTIVE_OR_PARKED_STATUSES.includes(task.status);
+}
+
+function workerBlockedMayProceed(task: BackgroundTaskRecord): boolean {
+  // `done` is accepted for the integrity sweep that repairs historical false
+  // completions; `blocked` keeps the repair idempotent.
+  return task.status === 'done'
+    || task.status === 'blocked'
+    || WORKER_ACTIVE_OR_PARKED_STATUSES.includes(task.status);
+}
+
+function workerFailureMayProceed(
+  task: BackgroundTaskRecord,
+  status: Extract<BackgroundTaskStatus, 'failed' | 'aborted' | 'interrupted'>,
+): boolean {
+  if (status === 'aborted') {
+    return task.status !== 'done';
+  }
+  return task.status === status || WORKER_ACTIVE_OR_PARKED_STATUSES.includes(task.status);
+}
+
+let backgroundTaskSettlementCasHookForTests: (() => void) | null = null;
+export function _setBackgroundTaskSettlementCasHookForTests(fn: (() => void) | null): void {
+  backgroundTaskSettlementCasHookForTests = fn;
+}
+
+function prepareWorkerSettlementForCas(id: string): boolean {
+  if (!backgroundTaskSettlementCasHookForTests) return true;
+  const observed = getBackgroundTask(id);
+  if (!observed || !workerSettlementMayProceed(observed)) return false;
+  backgroundTaskSettlementCasHookForTests();
+  return true;
+}
+
 export function markBackgroundTaskDone(
   id: string,
   result: string,
   opts?: { notificationBody?: string },
 ): BackgroundTaskRecord | null {
-  const task = getBackgroundTask(id);
-  if (!task) return null;
-  const resultPath = writeFullResultFile(task, result);
-  const updated = updateBackgroundTask(id, {
-    ...clearParkedBackgroundState(),
-    status: 'done',
-    completedAt: nowIso(),
-    result: resultPath ? `${result.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : result,
-    resultPath,
-    error: undefined,
+  if (!prepareWorkerSettlementForCas(id)) return null;
+  // Cancellation is a terminal authority boundary. The result file and task
+  // completion are created only after the latest record is checked while the
+  // task transition lease is held, so a stale worker cannot complete after a
+  // cross-process stop committed.
+  const updated = updateBackgroundTaskWhere(id, workerDoneMayProceed, (task) => {
+    const resultPath = writeFullResultFile(task, result);
+    return {
+      ...clearParkedBackgroundState(),
+      status: 'done',
+      completedAt: nowIso(),
+      result: resultPath ? `${result.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : result,
+      resultPath,
+      error: undefined,
+    };
   });
   if (updated) {
     // The HUMAN sees a conversational body: a caller-supplied one when the raw
@@ -1408,7 +1645,8 @@ export function markBackgroundTaskDone(
  * talking, and can just answer there (the answer is routed back to resume).
  */
 export function markBackgroundTaskAwaitingInput(id: string, questionId: string, question: string): BackgroundTaskRecord | null {
-  const updated = updateBackgroundTask(id, {
+  if (!prepareWorkerSettlementForCas(id)) return null;
+  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
     ...clearParkedBackgroundState(),
     status: 'awaiting_input',
     pendingQuestionId: questionId,
@@ -1438,7 +1676,8 @@ export function markBackgroundTaskAwaitingInput(id: string, questionId: string, 
 }
 
 export function markBackgroundTaskAwaitingApproval(id: string, approvalId: string, resultText: string): BackgroundTaskRecord | null {
-  const updated = updateBackgroundTask(id, {
+  if (!prepareWorkerSettlementForCas(id)) return null;
+  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
     ...clearParkedBackgroundState(),
     status: 'awaiting_approval',
     pendingApprovalId: approvalId,
@@ -1462,8 +1701,9 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
 }
 
 export function markBackgroundTaskAwaitingContinue(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
+  if (!prepareWorkerSettlementForCas(id)) return null;
   const reasonText = clean(reason || 'The task reached its internal run budget before finishing.', 1000);
-  const updated = updateBackgroundTask(id, {
+  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
     ...clearParkedBackgroundState(),
     status: 'awaiting_continue',
     completedAt: undefined,
@@ -1506,7 +1746,8 @@ export function markBackgroundTaskAwaitingContinue(id: string, reason: string, r
  * would just re-block); the user re-runs once the blocker is cleared.
  */
 export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string, knownBlockerType?: BlockerType): BackgroundTaskRecord | null {
-  const updated = updateBackgroundTask(id, {
+  if (!prepareWorkerSettlementForCas(id)) return null;
+  const updated = updateBackgroundTaskWhere(id, workerBlockedMayProceed, {
     ...clearParkedBackgroundState(),
     status: 'blocked',
     completedAt: nowIso(),
@@ -1553,32 +1794,43 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
   return updated;
 }
 
-export function markBackgroundTaskFailed(id: string, error: string, status: Extract<BackgroundTaskStatus, 'failed' | 'aborted' | 'interrupted'> = 'failed'): BackgroundTaskRecord | null {
-  const updated = updateBackgroundTask(id, {
-    ...clearParkedBackgroundState(),
-    status,
-    completedAt: nowIso(),
-    error: clean(error, 1000),
+function emitBackgroundTaskFailedTransition(
+  updated: BackgroundTaskRecord,
+  error: string,
+  status: Extract<BackgroundTaskStatus, 'failed' | 'aborted' | 'interrupted'>,
+): void {
+  addNotification({
+    id: `${Date.now()}-background-${updated.id}-${status}`,
+    kind: 'execution',
+    title: `Background task ${status}: ${updated.title}`,
+    body: updated.error ?? status,
+    createdAt: nowIso(),
+    read: false,
+    metadata: taskNotificationMetadata(updated, { status, terminalReportBack: true }),
   });
-  if (updated) {
-    addNotification({
-      id: `${Date.now()}-background-${updated.id}-${status}`,
-      kind: 'execution',
-      title: `Background task ${status}: ${updated.title}`,
-      body: updated.error ?? status,
-      createdAt: nowIso(),
-      read: false,
-      metadata: taskNotificationMetadata(updated, { status, terminalReportBack: true }),
-    });
-    // Report-back without fail: a genuine FAILURE re-enters the origin session
-    // so Clementine can retry/adjust or tell the user. Skip 'interrupted'
-    // (a daemon-restart transient that is auto-resumed) and 'aborted' (the
-    // user cancelled it — they already know).
-    if (status === 'failed') {
-      enqueueBackgroundTaskOutcomeTurn(updated, 'failed', updated.error ?? error);
-    }
-    emitBackgroundTaskOperational('background_task_finished', updated, { status }, 'error');
+  // Report-back without fail: a genuine FAILURE re-enters the origin session
+  // so Clementine can retry/adjust or tell the user. Skip 'interrupted'
+  // (a daemon-restart transient that is auto-resumed) and 'aborted' (the
+  // user cancelled it — they already know).
+  if (status === 'failed') {
+    enqueueBackgroundTaskOutcomeTurn(updated, 'failed', updated.error ?? error);
   }
+  emitBackgroundTaskOperational('background_task_finished', updated, { status }, 'error');
+}
+
+export function markBackgroundTaskFailed(id: string, error: string, status: Extract<BackgroundTaskStatus, 'failed' | 'aborted' | 'interrupted'> = 'failed'): BackgroundTaskRecord | null {
+  if (status !== 'aborted' && !prepareWorkerSettlementForCas(id)) return null;
+  const updated = updateBackgroundTaskWhere(
+    id,
+    (task) => workerFailureMayProceed(task, status),
+    {
+      ...clearParkedBackgroundState(),
+      status,
+      completedAt: nowIso(),
+      error: clean(error, 1000),
+    },
+  );
+  if (updated) emitBackgroundTaskFailedTransition(updated, error, status);
   return updated;
 }
 
@@ -1607,7 +1859,7 @@ export function classifyBackgroundTaskOutcome(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,
   finalText: string,
   stoppedReason?: RunStoppedReason,
-  opts: { ignoreFanoutCoverage?: boolean } = {},
+  opts: { ignoreFanoutCoverage?: boolean; ignoreSelfReportedBlockedText?: boolean } = {},
 ): { outcome: 'done' | 'blocked'; reason?: string } {
   // 1) Structured signal: did the worker explicitly mark an execution
   //    blocked in its own session? This is the strongest signal — it's
@@ -1660,7 +1912,17 @@ export function classifyBackgroundTaskOutcome(
         reason: `The worker wrote a fake tool call transcript instead of calling the tool: ${text.slice(0, 320)}`,
       };
     }
-    if (matchesBlockedText(text)) {
+    // The self-reported-blocked TEXT heuristic is negation-aware but still
+    // past-tense-blind: a SUCCESS narrative that recounts a blocker it already
+    // OVERCAME ("was blocked on X, then reconnected and finished") matches the
+    // same phrase patterns as a live blocker. On the finish path that is paired
+    // with the runtime stoppedReason + execution-store signals, so a stray match
+    // self-corrects. The integrity SWEEP has neither — it runs over long-settled
+    // done tasks with no stoppedReason — so it opts OUT of this heuristic and
+    // reclassifies only on a positive/structural non-deliverable (no saved
+    // result, a blocked execution row, a fabricated transcript, or a fan-out
+    // coverage failure), never on the narrative alone. (Finding A false-positive.)
+    if (!opts.ignoreSelfReportedBlockedText && matchesBlockedText(text)) {
       return { outcome: 'blocked', reason: text.slice(0, 400) };
     }
   }
@@ -1819,21 +2081,26 @@ function fanoutCoverageBlock(runSessionId: string): { outcome: 'blocked'; reason
 }
 
 export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'): BackgroundTaskRecord | null {
-  const task = getBackgroundTask(id);
-  if (!task) return null;
-  if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted') {
-    return task;
-  }
-  if (task.status === 'running') {
-    const now = nowIso();
-    const updated = updateBackgroundTask(id, {
-      status: 'cancelling',
-      cancellationRequestedAt: now,
-      cancellationReason: reason,
-      lastCheckInAt: now,
-      lastCheckInMessage: `Cancellation requested. ${reason}`,
-    });
-    if (updated) {
+  // Read/branch/write is retried as a conditional transition. Whichever of
+  // pending->running or pending->aborted obtains the task lease first becomes
+  // authoritative; a stale starter can never overwrite the cancellation.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const task = getBackgroundTask(id);
+    if (!task) return null;
+    if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted') {
+      return task;
+    }
+    if (task.status === 'running' || task.status === 'cancelling') {
+      if (task.status === 'cancelling') return task;
+      const now = nowIso();
+      const updated = updateBackgroundTaskWhere(id, (latest) => latest.status === 'running', {
+        status: 'cancelling',
+        cancellationRequestedAt: now,
+        cancellationReason: reason,
+        lastCheckInAt: now,
+        lastCheckInMessage: `Cancellation requested. ${reason}`,
+      });
+      if (!updated) continue;
       addNotification({
         id: `${Date.now()}-background-${updated.id}-cancelling`,
         kind: 'execution',
@@ -1843,10 +2110,19 @@ export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'):
         read: false,
         metadata: taskNotificationMetadata(updated, { status: 'cancelling' }),
       });
+      return updated;
     }
+    const updated = updateBackgroundTaskWhere(id, (latest) => latest.status === task.status, {
+      ...clearParkedBackgroundState(),
+      status: 'aborted',
+      completedAt: nowIso(),
+      error: clean(reason, 1000),
+    });
+    if (!updated) continue;
+    emitBackgroundTaskFailedTransition(updated, reason, 'aborted');
     return updated;
   }
-  return markBackgroundTaskFailed(id, reason, 'aborted');
+  return getBackgroundTask(id);
 }
 
 /** Task statuses that mean a resume clone is STILL live (an executor exists or is
@@ -1855,61 +2131,354 @@ const LIVE_TASK_STATUSES: readonly BackgroundTaskStatus[] = [
   'pending', 'running', 'cancelling', 'awaiting_approval', 'awaiting_input', 'awaiting_continue',
 ];
 
-export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
-  const task = getBackgroundTask(id);
-  if (!task) return null;
-  if (task.status === 'awaiting_continue') {
-    return queueBackgroundTaskContinue(id);
-  }
-  if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
-    return null;
-  }
-  // SINGLE OWNERSHIP: a run that owns its own resume path (an active goal contract
-  // bound to its run session) is resumed IN PLACE — same id, same run session,
-  // handed straight back to the runner — so a goal-bound objective can never have
-  // two executors. Shared by the boot auto-resumer AND the manual board resume
-  // route, so the manual route stops cloning goal-bound tasks (live 2026-07-08).
-  if (runHasOwnResumePath(task.runSessionId)) {
-    return reattachInterruptedTaskInPlace(task.id);
-  }
-  // Double-clone guard: if this task was already carried forward into a clone that
-  // is STILL live, hand back that clone instead of spawning a second one. The
-  // manual resume route ignored `resumedIntoTaskId`, so it re-cloned a task the
-  // boot auto-resumer had already carried forward (bg-mrbqlkpv → bg-mrbqprgv then
-  // → bg-mrbr8za2, two executors on one objective).
-  if (task.resumedIntoTaskId) {
-    const existing = getBackgroundTask(task.resumedIntoTaskId);
-    if (existing && LIVE_TASK_STATUSES.includes(existing.status)) return existing;
-  }
-  const resumed = createBackgroundTask({
-    title: `Resume ${task.title}`,
-    prompt: buildResumeClonePrompt(task),
-    originSessionId: task.originSessionId,
-    foregroundHandoff: task.foregroundHandoff,
-    userId: task.userId,
-    channel: task.channel,
-    model: task.model,
-    maxMinutes: task.maxMinutes,
-    source: task.source,
-    reportBackTarget: task.reportBackTarget,
-    resumedFromTaskId: task.id,
-    resumeCount: (task.resumeCount ?? 0) + 1,
-  });
-  // Stamp the original so the boot-time auto-resumer (and the UI) can tell
-  // it's already been carried forward and won't re-spawn it.
-  updateBackgroundTask(task.id, { resumedIntoTaskId: resumed.id });
-  // Hand the clone back to the runner now instead of waiting on the 15s tick. The
-  // boot path also drains on setImmediate, but the MANUAL resume route runs at
-  // runtime with no boot drain — without this the clone sat pending. Idempotent:
-  // the drain is guarded by backgroundProcessorInFlight + markRunning(pending).
-  requestBackgroundDrain(1);
-  return resumed;
+export interface BackgroundRestartSafetyAssessment {
+  safeToAutoResume: boolean;
+  reason: NonNullable<BackgroundTaskRecord['restartRecovery']>['reason'];
+  externalWriteCount: number;
+  ambiguousWriteCount: number;
 }
 
 /**
- * Boot-time recovery: re-queue background tasks that were marked
- * `interrupted` by interruptStaleRunningBackgroundTasks (a daemon
- * restart/crash mid-run) so the work resumes instead of stranding.
+ * Inspect the ORIGINAL background run's durable receipt history before boot
+ * recovery. A new safety session is never an acceptable substitute: it cannot
+ * see the old duplicate-write ledger. The current harness event producers are
+ * best-effort, so an EMPTY ledger is never proof that no mutation was attempted
+ * — it parks as `receipt_history_unavailable`. But a ledger that DID record
+ * tool activity, all of it read-only (no committed, compensated, failed, or
+ * unreturned external write), is positive evidence the producers were running
+ * and the run never touched an external system: it reattaches automatically as
+ * `safe_no_external_write`. Committed writes park as `external_write_history`;
+ * unreturned external calls and explicit orphan markers are the stronger,
+ * ambiguous class (`ambiguous_external_write`).
+ */
+export function assessBackgroundTaskRestartSafety(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+): BackgroundRestartSafetyAssessment {
+  try {
+    if (!getHarnessSessionRow(task.runSessionId)) {
+      return {
+        safeToAutoResume: false,
+        reason: 'receipt_history_unavailable',
+        externalWriteCount: 0,
+        ambiguousWriteCount: 0,
+      };
+    }
+
+    const events = listHarnessEventsForRefute(task.runSessionId, {
+      types: [
+        'tool_called',
+        'tool_returned',
+        'external_write',
+        'external_write_failed',
+        'external_write_orphaned',
+        'orphaned_tool_inflight',
+      ],
+    });
+    const returnedCallIds = new Set<string>();
+    const externalCallIds = new Set<string>();
+    for (const event of events) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      if (event.type === 'tool_returned') {
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        if (callId) returnedCallIds.add(callId);
+      } else if (
+        event.type === 'tool_called'
+        && data.accounting !== 'transport_mirror'
+        && data.effect === 'external_write'
+      ) {
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        if (callId) externalCallIds.add(callId);
+      }
+    }
+
+    type WriteEvidence = {
+      seq: number;
+      callId?: string;
+      shapeKey?: string;
+      targets: string[];
+    };
+    const asWriteEvidence = (event: (typeof events)[number]): WriteEvidence => {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      return {
+        seq: event.seq,
+        ...(typeof data.callId === 'string' ? { callId: data.callId } : {}),
+        ...(typeof data.shapeKey === 'string' ? { shapeKey: data.shapeKey } : {}),
+        targets: Array.isArray(data.targets)
+          ? data.targets.filter((target): target is string => typeof target === 'string').map((target) => target.toLowerCase())
+          : [],
+      };
+    };
+    const canonicalWrites = events.filter((event) => event.type === 'external_write').map(asWriteEvidence);
+    const failedWrites = events.filter((event) => event.type === 'external_write_failed').map(asWriteEvidence);
+    const failureMatchesWrite = (write: WriteEvidence, failure: WriteEvidence): boolean => {
+      if (write.seq >= failure.seq) return false;
+      if (write.callId && failure.callId) return write.callId === failure.callId;
+      if (write.shapeKey !== failure.shapeKey) return false;
+      return write.targets.length === 0
+        || failure.targets.length === 0
+        || failure.targets.some((target) => write.targets.includes(target));
+    };
+    const compensatedWriteIndexes = new Set<number>();
+    for (const failure of failedWrites) {
+      for (let index = canonicalWrites.length - 1; index >= 0; index -= 1) {
+        if (compensatedWriteIndexes.has(index) || !failureMatchesWrite(canonicalWrites[index], failure)) continue;
+        compensatedWriteIndexes.add(index);
+        break;
+      }
+    }
+    const ledgerWriteEvidence = new Set(
+      canonicalWrites
+        .filter((_write, index) => !compensatedWriteIndexes.has(index))
+        .map((write) => write.callId ? `call:${write.callId}` : `event:${write.seq}`),
+    );
+    const returnedWriteEvidence = new Set<string>();
+    const ambiguousEvidence = new Set<string>();
+    for (const event of events) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      if (event.type === 'external_write' || event.type === 'external_write_failed') {
+        continue;
+      }
+      if (event.type === 'external_write_orphaned') {
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        ambiguousEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
+        continue;
+      }
+      if (event.type === 'tool_returned') {
+        // FIX (finding B): an external-write effect stamped on the RETURN row —
+        // with no matching external-effect `tool_called` row (partial best-effort
+        // logging where only the return was recorded) — is still positive
+        // evidence of a committed external call. Count it (fail CLOSED) instead
+        // of letting the run read as safe-to-replay. The transport mirror still
+        // describes the same physical dispatch and must not inflate it; and an
+        // ordinary read-return (no `effect`) is untouched, so this never
+        // double-counts the normal paired case.
+        if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        returnedWriteEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
+        continue;
+      }
+      if (event.type === 'tool_called') {
+        // The top-level row is the logical provider call. The native MCP mirror
+        // describes the same physical dispatch and must not inflate/risk-split it.
+        if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        if (!callId || !returnedCallIds.has(callId)) {
+          ambiguousEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
+        } else {
+          returnedWriteEvidence.add(`call:${callId}`);
+        }
+        continue;
+      }
+      if (event.type === 'orphaned_tool_inflight') {
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        if (callId && externalCallIds.has(callId)) {
+          ambiguousEvidence.add(`call:${callId}`);
+        }
+      }
+    }
+
+    // external_write is the canonical pre-dispatch ledger. Fall back to a
+    // completed external-write tool boundary only if that ledger append was
+    // unavailable, avoiding a misleading double-count for the ordinary case
+    // where one physical mutation emitted both rows.
+    const externalWriteCount = canonicalWrites.length > 0
+      ? ledgerWriteEvidence.size
+      : returnedWriteEvidence.size;
+
+    if (ambiguousEvidence.size > 0) {
+      return {
+        safeToAutoResume: false,
+        reason: 'ambiguous_external_write',
+        externalWriteCount,
+        ambiguousWriteCount: ambiguousEvidence.size,
+      };
+    }
+    if (externalWriteCount > 0) {
+      return {
+        safeToAutoResume: false,
+        reason: 'external_write_history',
+        externalWriteCount,
+        ambiguousWriteCount: 0,
+      };
+    }
+
+    // Reaching here means: no committed writes and no ambiguous/unreturned
+    // external calls. Two histories look identical on those two counters yet
+    // must diverge:
+    //
+    //   (a) The producers recorded real tool activity for this run and ALL of
+    //       it was read-only — no external_write ledger row (even a compensated
+    //       one), no external_write_failed, no external-effect tool_called. The
+    //       non-empty ledger is positive evidence the best-effort producers WERE
+    //       functioning, so the absence of write rows is now meaningful: the run
+    //       provably never touched an external system. Read-only work reattaches
+    //       automatically (`safe_no_external_write`).
+    //
+    //   (b) An empty best-effort ledger (nothing recorded), or a history that
+    //       DID attempt a write which then failed/compensated to a net-zero
+    //       remainder. Neither proves the run stayed read-only, so both stay
+    //       fail-closed as `receipt_history_unavailable` and park for manual
+    //       verification.
+    //
+    // external_write_orphaned and unreturned external-effect tool_called are
+    // already routed to `ambiguous_external_write` above, so the only lingering
+    // write evidence to exclude here is a compensated canonical write or a bare
+    // external_write_failed row.
+    const historyRecordedToolActivity = events.length > 0;
+    const historyHasWriteEvidence = canonicalWrites.length > 0 || failedWrites.length > 0;
+    if (historyRecordedToolActivity && !historyHasWriteEvidence) {
+      return {
+        safeToAutoResume: true,
+        reason: 'safe_no_external_write',
+        externalWriteCount: 0,
+        ambiguousWriteCount: 0,
+      };
+    }
+    return {
+      safeToAutoResume: false,
+      reason: 'receipt_history_unavailable',
+      externalWriteCount: 0,
+      ambiguousWriteCount: 0,
+    };
+  } catch {
+    return {
+      safeToAutoResume: false,
+      reason: 'receipt_history_unavailable',
+      externalWriteCount: 0,
+      ambiguousWriteCount: 0,
+    };
+  }
+}
+
+function parkInterruptedTaskForVerification(
+  task: BackgroundTaskRecord,
+  assessment: BackgroundRestartSafetyAssessment,
+): BackgroundTaskRecord | null {
+  const decidedAt = nowIso();
+  const restartRecovery: NonNullable<BackgroundTaskRecord['restartRecovery']> = {
+    disposition: 'parked_for_verification',
+    reason: assessment.reason,
+    decidedAt,
+    externalWriteCount: assessment.externalWriteCount,
+    ambiguousWriteCount: assessment.ambiguousWriteCount,
+  };
+  const updated = updateBackgroundTask(task.id, {
+    error: RESTART_VERIFICATION_ERROR,
+    restartRecovery,
+    lastCheckInAt: decidedAt,
+    lastCheckInMessage: 'Restart recovery parked for external-outcome verification.',
+  });
+  if (!updated) return null;
+
+  try {
+    appendEvent({
+      sessionId: updated.runSessionId,
+      turn: 0,
+      role: 'system',
+      type: 'restart_recovery_decision',
+      data: {
+        taskId: updated.id,
+        disposition: restartRecovery.disposition,
+        reason: restartRecovery.reason,
+        externalWriteCount: restartRecovery.externalWriteCount,
+        ambiguousWriteCount: restartRecovery.ambiguousWriteCount,
+        preservedRunSessionId: updated.runSessionId,
+      },
+    });
+  } catch { /* the task record remains the recovery authority */ }
+
+  addNotification({
+    id: `${Date.now()}-background-${updated.id}-restart-verification`,
+    kind: 'approval',
+    title: `Verify before resuming: ${updated.title}`,
+    body: [
+      `Task ${updated.id} was interrupted after an external write was attempted or could not be ruled out. It was NOT auto-resumed.`,
+      `Verify the destination first, then choose Resume. The task will continue on its original run session (${updated.runSessionId}) with the prior receipts and duplicate-write safeguards intact.`,
+    ].join('\n\n'),
+    createdAt: decidedAt,
+    read: false,
+    metadata: taskNotificationMetadata(updated, {
+      status: 'interrupted',
+      verificationRequired: true,
+      restartRecoveryReason: restartRecovery.reason,
+      runSessionId: updated.runSessionId,
+    }),
+  });
+  emitBackgroundTaskOperational('background_task_parked', updated, {
+    reason: 'restart_verification_required',
+    restartRecoveryReason: restartRecovery.reason,
+  }, 'warn');
+  return updated;
+}
+
+export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
+  const resolved = resolveLatestBackgroundResumeOwner(id);
+  if (!resolved) return null;
+  const { task, followed } = resolved;
+  if (task.status === 'awaiting_continue') {
+    return queueBackgroundTaskContinue(task.id);
+  }
+  // A resolved descendant that is already live remains the sole owner. The
+  // original task itself keeps the historical API behavior (Resume on a task
+  // that is already live is a no-op).
+  if (followed && LIVE_TASK_STATUSES.includes(task.status)) return task;
+  if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') return null;
+
+  // Every terminal retry stays on the SAME task and run session. Failed/aborted
+  // turns can contain the same committed or ambiguous mutations as a restart;
+  // cloning them would hide that evidence from the next executor. Manual Resume
+  // is the explicit verification boundary, and the continuation prompt directs
+  // the worker to inspect the retained receipt history before another mutation.
+  return reattachBackgroundTaskInPlace(task.id, {
+    mode: task.status === 'interrupted' ? 'manual_restart' : 'manual_retry',
+    assessment: assessBackgroundTaskRestartSafety(task),
+  });
+}
+
+const MAX_BACKGROUND_RESUME_CHAIN_HOPS = 256;
+const BACKGROUND_TASK_ID_PATTERN = /^bg-[a-z0-9]+-[a-f0-9]+$/;
+
+/**
+ * Follow the complete legacy clone ownership chain. A one-hop lookup is unsafe:
+ * with A -> B -> C and C live, reattaching terminal B creates a second executor.
+ * Missing/malformed targets, contradictory backlinks, cycles, and unreasonable
+ * depth all fail closed rather than guessing which run session owns receipts.
+ */
+function resolveLatestBackgroundResumeOwner(
+  id: string,
+): { task: BackgroundTaskRecord; followed: boolean } | null {
+  let currentId = id;
+  let followed = false;
+  const visited = new Set<string>();
+
+  for (let hop = 0; hop <= MAX_BACKGROUND_RESUME_CHAIN_HOPS; hop += 1) {
+    if (visited.has(currentId)) return null;
+    visited.add(currentId);
+
+    const task = getBackgroundTask(currentId);
+    if (!task || task.id !== currentId) return null;
+    const nextId = (task as BackgroundTaskRecord & { resumedIntoTaskId?: unknown }).resumedIntoTaskId;
+    if (nextId === undefined) return { task, followed };
+    if (typeof nextId !== 'string' || !BACKGROUND_TASK_ID_PATTERN.test(nextId)) return null;
+    if (visited.has(nextId)) return null;
+
+    const next = getBackgroundTask(nextId);
+    if (!next || next.id !== nextId) return null;
+    if (next.resumedFromTaskId !== undefined && next.resumedFromTaskId !== task.id) return null;
+
+    currentId = nextId;
+    followed = true;
+  }
+  return null;
+}
+
+/**
+ * Boot-time recovery for tasks marked `interrupted` by
+ * interruptStaleRunningBackgroundTasks. A run whose durable ledger recorded
+ * tool activity and proves it stayed read-only (`safe_no_external_write`)
+ * reattaches automatically to the SAME task/run session. Everything else —
+ * committed/ambiguous writes, or a best-effort empty log that cannot authorize
+ * replay — parks for explicit verification and reattaches only on manual Resume.
  *
  * Bounded two ways so a task that reliably crashes the daemon can't loop
  * forever: we skip tasks already carried forward (`resumedIntoTaskId`) and
@@ -1922,65 +2491,81 @@ export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): n
     if (task.error !== DAEMON_RESTART_INTERRUPT_REASON) continue;
     if (task.resumedIntoTaskId) continue;          // already carried forward (clone path)
     if ((task.resumeCount ?? 0) >= cap) continue;  // give up after cap retries
-    // resumeBackgroundTask owns the SINGLE-OWNERSHIP decision (reattach a
-    // goal-bound run in place vs. fresh-clone a non-goal run) so the boot
-    // auto-resumer and the manual board route stay identical. Cloning a
-    // goal-bound task here spawned a SECOND executor alongside its still-active
-    // goal/run (bg-mrbkxeoe/bg-mrblgh1r off one original, live 2026-07-08).
-    if (resumeBackgroundTask(task.id)) resumedCount += 1;
+    const assessment = assessBackgroundTaskRestartSafety(task);
+    if (!assessment.safeToAutoResume) {
+      parkInterruptedTaskForVerification(task, assessment);
+      continue;
+    }
+    // Safe read-only recovery still reattaches IN PLACE. Even this branch never
+    // clones: retaining one session gives future turns the exact same receipts,
+    // tool outputs, and duplicate-write ledger that the interrupted turn saw.
+    if (reattachBackgroundTaskInPlace(task.id, { mode: 'automatic_restart', assessment })) {
+      resumedCount += 1;
+    }
   }
   return resumedCount;
 }
 
-/** Kill-switch (default ON) for the single-owner in-place resume. `=off` reverts
- *  to the legacy clone-on-restart behavior for every interrupted task. */
-function singleOwnerResumeEnabled(): boolean {
-  return (process.env.CLEMMY_BG_SINGLE_OWNER_RESUME ?? 'on').trim().toLowerCase() !== 'off';
-}
-
 /**
- * Does this run session already own a resume path, so re-cloning it as a fresh
- * task would double-drive the objective? True when an active goal contract is
- * bound to the run session (`background:<id>`). The goal contract IS the durable
- * unit of a detached / goal-bound background run: its run session holds the
- * partial progress and its criteria gate completion, so the run is resumed in
- * place on the SAME session rather than forked into a clone. Best-effort — a
- * reader failure falls back to the legacy clone path (never worse than before).
+ * Reattach a task to its own resuming run instead of cloning it: flip the SAME
+ * record back to `pending` (so the drain re-drives its existing
+ * `background:<id>` session), clear the interrupt error, and carry a continuation
+ * marker. Used for every restart interruption and every explicit failed/aborted
+ * retry. The resumeCount bump keeps crash caps meaningful. No new task record,
+ * exactly one executor, and the receipt ledger remains attached.
  */
-function runHasOwnResumePath(runSessionId: string): boolean {
-  if (!singleOwnerResumeEnabled()) return false;
-  try {
-    return getActiveGoalForSession(runSessionId) != null;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Reattach an interrupted, goal-bound task to its own resuming run instead of
- * cloning it: flip the SAME record back to `pending` (so the drain re-drives it
- * on its existing run session `background:<id>`), clear the interrupt error, and
- * carry a continuation marker so the worker resumes from prior session state
- * (buildWorkerContinuePrompt) rather than restarting the original prompt. The
- * resumeCount bump keeps the crash cap meaningful (a run that reliably kills the
- * daemon still stops after `cap` in-place resumes). No new task record, exactly
- * one executor.
- */
-function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null {
+function reattachBackgroundTaskInPlace(
+  id: string,
+  opts: {
+    mode: 'automatic_restart' | 'manual_restart' | 'manual_retry';
+    assessment?: BackgroundRestartSafetyAssessment;
+  },
+): BackgroundTaskRecord | null {
+  backgroundTaskReattachCasHookForTests?.();
   const task = getBackgroundTask(id);
   if (!task) return null;
-  const updated = updateBackgroundTask(id, {
+  const mode = opts.mode;
+  // Automatic boot recovery revives ONLY a still-`interrupted` task. A user abort
+  // ('aborted'/'cancelling') that landed between the interrupted-scan and this
+  // reattach must survive — never be clobbered back to `pending` (finding C). We
+  // both bail on a non-interrupted read here AND pin the CAS below to
+  // 'interrupted', closing the abort-before-read and abort-before-write windows.
+  // Manual retries legitimately resume failed/aborted tasks, so they keep
+  // anchoring the CAS to the status this reattach observed.
+  if (mode === 'automatic_restart' && task.status !== 'interrupted') return null;
+  const requiredStatus = mode === 'automatic_restart' ? 'interrupted' : task.status;
+  const assessment = opts.assessment;
+  const restartRecovery = assessment
+    ? {
+      disposition: mode === 'automatic_restart' ? 'auto_resumed_in_place' as const : 'manual_resumed_in_place' as const,
+      reason: assessment.reason,
+      decidedAt: nowIso(),
+      externalWriteCount: assessment.externalWriteCount,
+      ambiguousWriteCount: assessment.ambiguousWriteCount,
+    }
+    : task.restartRecovery;
+  const reason = mode === 'automatic_restart'
+    ? 'Resumed in place after a daemon restart (durable history proved no external writes).'
+    : mode === 'manual_restart'
+      ? 'Explicitly resumed in place after a daemon restart; verify prior external outcomes before any retry.'
+      : 'Explicitly retried in place after a failed or aborted run; verify prior external outcomes before any retry.';
+  const updated = updateBackgroundTaskWhere(id, (latest) => (
+    latest.status === requiredStatus
+    && latest.resumedIntoTaskId === task.resumedIntoTaskId
+    && latest.resumedFromTaskId === task.resumedFromTaskId
+  ), (latest) => ({
     status: 'pending',
     error: undefined,
     startedAt: undefined,
     completedAt: undefined,
-    resumeCount: (task.resumeCount ?? 0) + 1,
+    resumeCount: (latest.resumeCount ?? 0) + 1,
+    restartRecovery,
     continueResolution: {
       queuedAt: nowIso(),
-      reason: 'Resumed in place after a daemon restart (single owner — no clone).',
-      auto: true,
+      reason,
+      auto: mode === 'automatic_restart',
     },
-  });
+  }));
   if (updated) {
     // Wave 4 Stage 1 (durable swarm resume): no ledger rehydrate needed — coverage
     // is now summarized directly from the durable worker_result log at the check
@@ -1991,11 +2576,16 @@ function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null
       id: `${Date.now()}-background-${updated.id}-reattached`,
       kind: 'execution',
       title: `Background task resuming: ${updated.title}`,
-      body: `Task ${updated.id} was interrupted by a restart and is resuming on its own run — no duplicate was created.`,
+      body: `Task ${updated.id} is resuming on its original run session (${updated.runSessionId}) — no duplicate was created and its receipt history remains attached.`,
       createdAt: nowIso(),
       read: false,
       silent: true,
-      metadata: taskNotificationMetadata(updated, { status: 'pending', reattachedInPlace: true }),
+      metadata: taskNotificationMetadata(updated, {
+        status: 'pending',
+        reattachedInPlace: true,
+        restartResumeMode: mode,
+        preservedRunSessionId: updated.runSessionId,
+      }),
     });
     // Hand the reattached task back to the runner. Updating the JSON to `pending`
     // alone relied on the next drain tick; a manual resume (runtime, drain kick
@@ -2008,11 +2598,36 @@ function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null
   return updated;
 }
 
+let backgroundTaskResolutionCasHookForTests: (() => void) | null = null;
+export function _setBackgroundTaskResolutionCasHookForTests(fn: (() => void) | null): void {
+  backgroundTaskResolutionCasHookForTests = fn;
+}
+
+// Deterministic seam for the reattach authority boundary. Fires at the very top
+// of reattachBackgroundTaskInPlace, BEFORE it reads the task, so a test can
+// commit a user abort in the window between the interrupted-scan read and the
+// reattach read — the exact race finding C closes.
+let backgroundTaskReattachCasHookForTests: (() => void) | null = null;
+export function _setBackgroundTaskReattachCasHookForTests(fn: (() => void) | null): void {
+  backgroundTaskReattachCasHookForTests = fn;
+}
+
+// Deterministic seam for the approval-continuation authority boundary. Tests use
+// it to commit cancellation after pending->running won but before the final
+// cancellation read that guards resolveApproval/provider dispatch.
+let backgroundTaskApprovalDispatchCheckHookForTests: (() => void) | null = null;
+export function _setBackgroundTaskApprovalDispatchCheckHookForTests(fn: (() => void) | null): void {
+  backgroundTaskApprovalDispatchCheckHookForTests = fn;
+}
+
 export function queueBackgroundTaskApprovalResolution(approvalId: string, approved: boolean): BackgroundTaskRecord | null {
   const task = getBackgroundTaskByApprovalId(approvalId);
   if (!task || task.status !== 'awaiting_approval') return null;
+  backgroundTaskResolutionCasHookForTests?.();
   const now = nowIso();
-  const updated = updateBackgroundTask(task.id, {
+  const updated = updateBackgroundTaskWhere(task.id, (latest) => (
+    latest.status === 'awaiting_approval' && latest.pendingApprovalId === approvalId
+  ), {
     status: 'pending',
     pendingApprovalId: approvalId,
     approvalResolution: {
@@ -2048,8 +2663,11 @@ export function queueBackgroundTaskApprovalResolution(approvalId: string, approv
 export function queueBackgroundTaskInputResolution(questionId: string, answer: string): BackgroundTaskRecord | null {
   const task = getBackgroundTaskByQuestionId(questionId);
   if (!task || task.status !== 'awaiting_input') return null;
+  backgroundTaskResolutionCasHookForTests?.();
   const now = nowIso();
-  const updated = updateBackgroundTask(task.id, {
+  const updated = updateBackgroundTaskWhere(task.id, (latest) => (
+    latest.status === 'awaiting_input' && latest.pendingQuestionId === questionId
+  ), {
     status: 'pending',
     pendingQuestionId: questionId,
     inputResolution: { questionId, answer: clean(answer, RESULT_TRUNCATE_CHARS), queuedAt: now },
@@ -2076,19 +2694,22 @@ export function queueBackgroundTaskInputResolution(questionId: string, answer: s
 export function queueBackgroundTaskContinue(id: string, opts: { auto?: boolean; reason?: string } = {}): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task || task.status !== 'awaiting_continue') return null;
+  backgroundTaskResolutionCasHookForTests?.();
   const now = nowIso();
-  const updated = updateBackgroundTask(task.id, {
+  const updated = updateBackgroundTaskWhere(task.id, (latest) => (
+    latest.status === 'awaiting_continue' && latest.resumedIntoTaskId === undefined
+  ), (latest) => ({
     status: 'pending',
     continueResolution: {
       queuedAt: now,
-      reason: clean(opts.reason ?? task.error ?? 'Continue requested.', 700),
+      reason: clean(opts.reason ?? latest.error ?? 'Continue requested.', 700),
       auto: opts.auto,
     },
     lastCheckInAt: now,
     lastCheckInMessage: opts.auto
       ? 'Internal run budget reached; queued automatic continuation.'
       : 'Continue requested; queued daemon continuation.',
-  });
+  }));
   if (updated) {
     addNotification({
       id: `${Date.now()}-background-${updated.id}-continue-queued`,
@@ -2152,6 +2773,18 @@ async function finishWorkerRun(
     clearLedger(task.runSessionId);
     logger.info({ taskId: task.id }, 'Background task cancelled (not blocked)');
   };
+  const acceptWorkerTransition = (updated: BackgroundTaskRecord | null, intendedStatus: string): boolean => {
+    if (updated) return true;
+    const latest = getBackgroundTask(task.id);
+    if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
+      settleCancelled(latest);
+      return false;
+    }
+    // A missing record or an unrecoverable lease conflict must not be followed
+    // by a contradictory run completion. Throw into the outer worker catch,
+    // which records a failure if task ownership still exists.
+    throw new Error(`Background task ${task.id} could not transition to ${intendedStatus}; latest durable state is ${latest?.status ?? 'missing'}.`);
+  };
   const latestAtSettle = getBackgroundTask(task.id);
   if (
     response.stoppedReason === 'cancelled'
@@ -2162,7 +2795,8 @@ async function finishWorkerRun(
     return;
   }
   if (response.pendingApprovalId) {
-    markBackgroundTaskAwaitingApproval(task.id, response.pendingApprovalId, response.text);
+    const parked = markBackgroundTaskAwaitingApproval(task.id, response.pendingApprovalId, response.text);
+    if (!acceptWorkerTransition(parked, 'awaiting_approval')) return;
     finishRun(run.id, {
       status: 'awaiting_approval',
       message: `Background task paused for approval ${response.pendingApprovalId}.`,
@@ -2177,7 +2811,8 @@ async function finishWorkerRun(
     // needs_input (surfaced to origin chat + needs-you card) and resume on the
     // answer. The question text IS response.text. MUST precede coverage/classify.
     const questionId = `bgq-${task.id}-${Date.now().toString(36)}`;
-    markBackgroundTaskAwaitingInput(task.id, questionId, response.text || 'I need your input to continue.');
+    const parked = markBackgroundTaskAwaitingInput(task.id, questionId, response.text || 'I need your input to continue.');
+    if (!acceptWorkerTransition(parked, 'awaiting_input')) return;
     finishRun(run.id, {
       status: 'awaiting_approval', // run-record paused state (the task status is 'awaiting_input')
       message: 'Background task paused for your input.',
@@ -2195,7 +2830,8 @@ async function finishWorkerRun(
     // budget" ≠ "turn budget".
     const reason = 'Run token budget reached before finishing. Reply continue to authorize another budget window.';
     clearLedger(task.runSessionId);
-    markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
+    const parked = markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
+    if (!acceptWorkerTransition(parked, 'awaiting_continue')) return;
     finishRun(run.id, {
       status: 'awaiting_approval',
       message: `Background task ${task.id} paused at its run token budget and can be continued.`,
@@ -2207,7 +2843,8 @@ async function finishWorkerRun(
   if (response.stoppedReason === 'max-turns-with-grace') {
     const reason = (response.text || 'The run hit its turn budget before finishing; continue is required.').trim().slice(0, 400);
     clearLedger(task.runSessionId);
-    markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
+    const parked = markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
+    if (!acceptWorkerTransition(parked, 'awaiting_continue')) return;
     finishRun(run.id, {
       status: 'awaiting_approval',
       message: `Background task ${task.id} paused at its internal run budget and can be continued.`,
@@ -2226,7 +2863,8 @@ async function finishWorkerRun(
     return;
   }
   if (outcome.outcome === 'blocked') {
-    markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text, outcome.blockerType);
+    const blocked = markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text, outcome.blockerType);
+    if (!acceptWorkerTransition(blocked, 'blocked')) return;
     finishRun(run.id, {
       status: 'failed',
       message: `Background task ${task.id} did not complete: ${outcome.reason ?? 'run did not finish cleanly'}`,
@@ -2236,7 +2874,8 @@ async function finishWorkerRun(
     logger.warn({ taskId: task.id, reason: outcome.reason, stoppedReason: response.stoppedReason }, 'Background task did not complete cleanly (blocked, not done)');
     return;
   }
-  markBackgroundTaskDone(task.id, response.text);
+  const done = markBackgroundTaskDone(task.id, response.text);
+  if (!acceptWorkerTransition(done, 'done')) return;
   finishRun(run.id, { status: 'completed', message: `Background task ${task.id} completed.`, outputPreview: response.text });
   clearLedger(task.runSessionId);
   logger.info({ taskId: task.id }, 'Background task completed');
@@ -2373,18 +3012,71 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        });
 	      }, progressCheckInMinMs);
 	      heartbeatTimer.unref?.();
-      if (task.approvalResolution) {
-        const resolution = task.approvalResolution;
+	      if (task.approvalResolution) {
+	        const resolution = task.approvalResolution;
+	        const settleApprovalCancellation = (
+	          latest: BackgroundTaskRecord,
+	          outputPreview = '',
+	        ): void => {
+	          const reason = latest.cancellationReason ?? latest.error ?? 'Cancelled by user.';
+	          if (latest.status !== 'aborted') markBackgroundTaskFailed(task.id, reason, 'aborted');
+	          finishRun(run.id, {
+	            status: 'cancelled',
+	            message: `Background task ${task.id} was cancelled before approval ${resolution.approvalId} dispatched.`,
+	            outputPreview,
+	          });
+	          clearLedger(task.runSessionId);
+	          logger.info(
+	            { taskId: task.id, approvalId: resolution.approvalId },
+	            'Background task cancelled before approval continuation dispatch',
+	          );
+	        };
+	        const acceptApprovalTransition = (updated: BackgroundTaskRecord | null, intendedStatus: string, outputPreview: string): boolean => {
+	          if (updated) return true;
+	          const latest = getBackgroundTask(task.id);
+	          if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
+	            settleApprovalCancellation(latest, outputPreview);
+	            return false;
+	          }
+	          throw new Error(`Background task ${task.id} could not transition to ${intendedStatus}; latest durable state is ${latest?.status ?? 'missing'}.`);
+	        };
         addRunEvent(run.id, {
           type: 'status',
-          message: `${resolution.approved ? 'Approving' : 'Rejecting'} pending approval ${resolution.approvalId} and resuming from serialized SDK state.`,
-          data: { approvalId: resolution.approvalId, approved: resolution.approved },
-        });
-        const result = await assistant.getRuntime().resolveApproval(resolution.approvalId, resolution.approved);
+	          message: `${resolution.approved ? 'Approving' : 'Rejecting'} pending approval ${resolution.approvalId} and resuming from serialized SDK state.`,
+	          data: { approvalId: resolution.approvalId, approved: resolution.approved },
+	        });
+	        // pending->running was authoritative only at task admission. A user may
+	        // cancel while the processor opens its plan scope / tracked run /
+	        // heartbeat. Re-read at the actual approval-dispatch boundary and bind
+	        // the continuation to the exact resolution this worker observed. If
+	        // cancellation won that intervening CAS, settle it without ever calling
+	        // resolveApproval (which may execute the already-approved mutation).
+	        backgroundTaskApprovalDispatchCheckHookForTests?.();
+	        const latestAtApprovalDispatch = getBackgroundTask(task.id);
+	        if (
+	          latestAtApprovalDispatch?.status === 'cancelling'
+	          || latestAtApprovalDispatch?.status === 'aborted'
+	        ) {
+	          settleApprovalCancellation(latestAtApprovalDispatch);
+	          continue;
+	        }
+	        if (
+	          latestAtApprovalDispatch?.status !== 'running'
+	          || latestAtApprovalDispatch.approvalResolution?.approvalId !== resolution.approvalId
+	          || latestAtApprovalDispatch.approvalResolution.approved !== resolution.approved
+	        ) {
+	          throw new Error(
+	            `Background task ${task.id} lost approval ${resolution.approvalId} dispatch authority; `
+	            + `latest durable state is ${latestAtApprovalDispatch?.status ?? 'missing'}.`,
+	          );
+	        }
+	        task = latestAtApprovalDispatch;
+	        const result = await assistant.getRuntime().resolveApproval(resolution.approvalId, resolution.approved);
         if (heartbeatTimer) clearInterval(heartbeatTimer);
 
         if (!resolution.approved) {
-          markBackgroundTaskFailed(task.id, result.text || `Approval ${resolution.approvalId} rejected.`, 'aborted');
+          const aborted = markBackgroundTaskFailed(task.id, result.text || `Approval ${resolution.approvalId} rejected.`, 'aborted');
+          if (!acceptApprovalTransition(aborted, 'aborted', result.text)) continue;
           finishRun(run.id, {
             status: 'cancelled',
             message: `Background task stopped after approval ${resolution.approvalId} was rejected.`,
@@ -2395,7 +3087,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         }
 
         if (result.nextApprovalId) {
-          markBackgroundTaskAwaitingApproval(task.id, result.nextApprovalId, result.text);
+          const parked = markBackgroundTaskAwaitingApproval(task.id, result.nextApprovalId, result.text);
+          if (!acceptApprovalTransition(parked, 'awaiting_approval', result.text)) continue;
           finishRun(run.id, {
             status: 'awaiting_approval',
             message: `Background task paused for follow-up approval ${result.nextApprovalId}.`,
@@ -2408,7 +3101,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 
         const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {
-          markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text, postApprovalOutcome.blockerType);
+          const blocked = markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text, postApprovalOutcome.blockerType);
+          if (!acceptApprovalTransition(blocked, 'blocked', result.text)) continue;
           finishRun(run.id, {
             status: 'failed',
             message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${postApprovalOutcome.reason ?? 'could not complete'}`,
@@ -2418,7 +3112,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           logger.warn({ taskId: task.id, approvalId: resolution.approvalId, reason: postApprovalOutcome.reason }, 'Background task blocked after approval continuation (not marked done)');
           continue;
         }
-        markBackgroundTaskDone(task.id, result.text);
+        const done = markBackgroundTaskDone(task.id, result.text);
+        if (!acceptApprovalTransition(done, 'done', result.text)) continue;
         finishRun(run.id, {
           status: 'completed',
           message: `Background task ${task.id} completed after approval ${resolution.approvalId}.`,
@@ -2496,15 +3191,14 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          runId: run.id,
 	          shouldCancel: () => {
 	            if (Date.now() > wallClockDeadlineMs) {
-	              const latest = getBackgroundTask(task.id);
-	              if (latest && latest.status !== 'cancelling' && latest.status !== 'aborted') {
-	                updateBackgroundTask(task.id, {
+	              const cancelling = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
 	                  status: 'cancelling',
 	                  cancellationRequestedAt: new Date().toISOString(),
 	                  cancellationReason: `Exceeded soft max runtime of ${task.maxMinutes} minutes. Re-queue with a higher cap to continue.`,
-	                });
-	              }
-	              return true;
+	              });
+	              if (cancelling) return true;
+	              const latest = getBackgroundTask(task.id);
+	              return !latest || latest.status !== 'running';
 	            }
 	            const latest = getBackgroundTask(task.id);
 	            return latest?.status === 'cancelling' || latest?.status === 'aborted';

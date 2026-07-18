@@ -16,6 +16,7 @@ const {
   formatComposioToolOutput,
   formatComposioExecuteOutput,
   detectComposioFailure,
+  composioFailureProvesNoCommit,
   composioThrownErrorOutput,
   composioUncertainMutationOutput,
   runComposioExecuteForTest,
@@ -322,6 +323,48 @@ test('detectComposioFailure: flags Composio API error shapes, ignores successes'
   assert.equal(detectComposioFailure({ error: '' }).failed, false); // empty error = success
   assert.equal(detectComposioFailure({ configured: false, message: 'not configured', matches: [] }).failed, false);
   assert.equal(detectComposioFailure('a plain string').failed, false);
+});
+
+test('composioFailureProvesNoCommit: uncertain transport/status signals override validation-looking text', () => {
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 400, message: 'missing required field title' } }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'No connected account found' }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: '503 upstream record not found' }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: '409 conflict: invalid recipient' }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { message: 'validation failed after submit timeout' } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'provider rejected request' }), false);
+});
+
+test('composioFailureProvesNoCommit: proof derives from STRUCTURED status, never from a number in prose', () => {
+  // A structured 4xx client-error FIELD proves no-commit (rejected at the door).
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 422 } }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 404 } }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, status: 429 }), true);
+  // …but a coincidental 4xx-LOOKING number scavenged out of free-text prose is
+  // NOT an HTTP status. "row 422" after a dropped connection has an UNKNOWN
+  // outcome and must stay AMBIGUOUS (park), never proven-no-commit — otherwise a
+  // duplicate external write is authorized (the receipt-ledger regression class).
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'failed to sync row 422 to the sheet' }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { message: 'could not write record 404 to Contacts' } }), false);
+  // A structured 5xx / retry-conflict status FIELD stays ambiguous.
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 500 } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 409 } }), false);
+});
+
+test('composioFailureProvesNoCommit: prose-only NOT-FOUND is not proof — only a structured 404/410 status is', () => {
+  // detectComposioFailure sets `notFound` off a free-text regex. A "not found"
+  // phrase can surface AFTER a partial/committed multi-target write or refer to a
+  // sub-resource, so text alone is NOT proof of no-commit — it must PARK.
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'Table "Current Prospects" not found' }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { message: 'no such record: rec123' } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'The referenced object could not be found' }), false);
+  // …but the SAME not-found backed by a structured 404/410-class status FIELD
+  // proves no-commit (the provider rejected the id at the door).
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 404, message: 'Record not found' } }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 410, message: 'Table not found' } }), true);
+  // not-CONNECTED (Composio's connection router refused to route) stays proof —
+  // it is unambiguously pre-dispatch even though it also matches the not-found regex.
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'Connected account not found for toolkit GMAIL' }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'ToolRouterV2_NoActiveConnection' }), true);
 });
 
 test('detectComposioFailure: a 5-digit API "Ok" status code (DataForSEO 20000) is NOT a failure', () => {

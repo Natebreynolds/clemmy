@@ -13,7 +13,8 @@ import { startChatCli } from './cli/chat.js';
 import { startSupervisorIpcHeartbeat } from './daemon/phase.js';
 import { startDaemon } from './daemon/runner.js';
 import {
-  clearDaemonPid,
+  acquireDaemonLease,
+  daemonPidIsForeignReuse,
   DAEMON_LOG_FILE,
   generateLaunchdPlist,
   generateSystemdUnit,
@@ -24,7 +25,7 @@ import {
   registerShutdownHandlers,
   spawnDaemonProcess,
   stopDaemon,
-  writeDaemonPid,
+  waitForDaemonExit,
 } from './daemon/process.js';
 import { bootstrapCodexAuth, clearImportedAuth, formatAuthStatus, importCodexCliAuth, loginWithNativeOAuth, loginWithCodexDeviceCode, refreshStoredNativeOAuth } from './runtime/auth-store.js';
 import { createRuntimeFromConfig } from './runtime/factory.js';
@@ -117,17 +118,41 @@ Options
 
 // --- Daemon commands ---
 
+function claimForegroundDaemonLease(): boolean {
+  if (acquireDaemonLease(process.pid)) return true;
+  console.error(`Another Clementine daemon is already running (PID ${readDaemonPid() ?? 'unknown'}).`);
+  process.exitCode = 1;
+  return false;
+}
+
 async function cmdDaemonStart(): Promise<number> {
-  if (isDaemonRunning()) {
-    const pid = readDaemonPid();
-    console.log(`Daemon is already running (PID ${pid}).`);
+  const runningPid = readDaemonPid();
+  // A stale legacy/lease pid reused by an unrelated same-user process is not our
+  // daemon — don't report "already running" and skip a legitimate start.
+  if (isDaemonRunning() && runningPid !== null && !daemonPidIsForeignReuse(runningPid)) {
+    console.log(`Daemon is already running (PID ${runningPid}).`);
     return 0;
   }
   try {
     const pid = spawnDaemonProcess();
-    // Give it a moment to write its own PID file before we exit
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    console.log(`Daemon started (PID ${pid}).`);
+    // Poll the child/lease handshake: module loading on a cold packaged start
+    // can legitimately exceed 300 ms, while a dead child must fail promptly.
+    const deadline = Date.now() + 10_000;
+    let owner: number | null = null;
+    while (Date.now() < deadline) {
+      owner = readDaemonPid();
+      if (owner && isDaemonRunning()) break;
+      try { process.kill(pid, 0); } catch {
+        console.error(`Daemon process ${pid} exited before acquiring the singleton lease. Check ${DAEMON_LOG_FILE}.`);
+        return 1;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!owner || !isDaemonRunning()) {
+      console.error(`Daemon process ${pid} did not acquire the singleton lease within 10 seconds. Check ${DAEMON_LOG_FILE}.`);
+      return 1;
+    }
+    console.log(owner === pid ? `Daemon started (PID ${pid}).` : `Daemon is already running (PID ${owner}).`);
     console.log(`Logs: ${DAEMON_LOG_FILE}`);
     return 0;
   } catch (err) {
@@ -155,8 +180,10 @@ async function cmdDaemonRestart(): Promise<number> {
   if (stopped) {
     console.log(`Stopped daemon (PID ${pid}).`);
   }
-  // Brief pause to let the process exit cleanly
-  await new Promise((resolve) => setTimeout(resolve, 800));
+  if (stopped && pid && !(await waitForDaemonExit(pid, 10_000))) {
+    console.error(`Daemon ${pid} did not exit within 10 seconds; refusing to start a competing process.`);
+    return 1;
+  }
   return cmdDaemonStart();
 }
 
@@ -476,7 +503,7 @@ async function main(): Promise<void> {
 
     // Internal foreground mode — spawned by `daemon start`
     if (sub === '--foreground') {
-      writeDaemonPid(process.pid);
+      if (!claimForegroundDaemonLease()) return;
       registerShutdownHandlers(async () => {
         logger.info('Daemon shutting down...');
         await shutdownLocalTranscriptionRuntime();
@@ -507,7 +534,7 @@ async function main(): Promise<void> {
     }
 
     // Anything else: treat as legacy foreground (old behavior)
-    writeDaemonPid(process.pid);
+    if (!claimForegroundDaemonLease()) return;
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
     });
@@ -625,6 +652,7 @@ async function main(): Promise<void> {
   }
 
   // --- Service commands (need assistant) ---
+  if (command === 'service' && !claimForegroundDaemonLease()) return;
   const assistant = new ClementineAssistant(createRuntimeFromConfig());
 
   if (command === 'chat') {
@@ -694,10 +722,8 @@ async function main(): Promise<void> {
     } else {
       logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
     }
-    writeDaemonPid(process.pid);
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
-      clearDaemonPid();
     });
     await prepareLocalTranscriptionRuntime();
     // Warm the markitdown runtime in the background so a user's FIRST file

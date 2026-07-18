@@ -23,6 +23,7 @@
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { validateCronExpression } from '../shared/cron.js';
 import {
   outputContractSuggestionFromPrompt,
@@ -549,10 +550,17 @@ function callSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send'
   // node `sideEffect: read`/`write` cannot skip the SEND-CALL GATE (2026-07-09
   // re-hunt author-side vector). For non-sends the declared class still wins —
   // authors know their read-only calls best.
-  if (isIrreversibleSendSlug(t)) return 'send';
-  if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
-  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/i.test(t)) return 'write';
-  return 'read';
+  const evidence = composioSlugEffectEvidence(t);
+  if (evidence === 'read') {
+    return step.sideEffect === 'write' || step.sideEffect === 'send' ? step.sideEffect : 'read';
+  }
+  if (isIrreversibleSendSlug(t) || step.sideEffect === 'send') return 'send';
+  // No verb evidence either way (noun-shaped API slug such as
+  // SLACK_CONVERSATIONS_HISTORY): an author-declared read wins so a genuinely
+  // read-only workflow keeps validating. Affirmative write evidence and real
+  // send slugs above can never be downgraded (fold 2026-07-17 final-wave #4).
+  if (evidence === 'unknown' && step.sideEffect === 'read') return 'read';
+  return 'write';
 }
 
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {

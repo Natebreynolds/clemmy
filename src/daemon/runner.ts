@@ -31,7 +31,7 @@ import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
-import { syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
+import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
@@ -1600,7 +1600,10 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // /api/hooks/workflows route can match them. Cheap (no-op upserts are
     // skipped) and best-effort.
     await withDaemonRuntimePhase('daemon.loop.workflow_trigger_registry', { tickCount }, async () => {
-      try { syncWorkflowTriggerRegistry(); } catch (err) {
+      try {
+        syncWorkflowTriggerRegistry();
+        recoverPendingWorkflowTriggerEvents();
+      } catch (err) {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'syncWorkflowTriggerRegistry tick failed');
       }
     });

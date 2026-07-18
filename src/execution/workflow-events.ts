@@ -122,12 +122,19 @@ function runDir(workflowName: string, runId: string): string {
   return path.join(WORKFLOWS_DIR, workflowName, 'runs', runId);
 }
 
-/** Delete a run's event-log directory (best-effort). Called by the run-record
- *  reaper so the per-workflow events.jsonl dirs are removed TOGETHER with the
- *  flat record — otherwise they accumulate orphaned (P0-2: 334 dirs vs 122
- *  records) and a reaped run's lingering log used to read as phantom-pending. */
+/** Delete a run's best-effort event history while preserving correctness-
+ * critical structured-call receipts. Those receipts are intentionally retained
+ * beyond the seven-day UI/run-record window for duplicate prevention, manual
+ * verification, and audit. */
 export function reapRunEventDir(workflowName: string, runId: string): void {
-  try { rmSync(runDir(workflowName, runId), { recursive: true, force: true }); } catch { /* best-effort */ }
+  const dir = runDir(workflowName, runId);
+  try {
+    if (existsSync(path.join(dir, 'call-mutations'))) {
+      rmSync(path.join(dir, 'events.jsonl'), { force: true });
+      return;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  } catch { /* best-effort */ }
 }
 
 function eventsPath(workflowName: string, runId: string): string {

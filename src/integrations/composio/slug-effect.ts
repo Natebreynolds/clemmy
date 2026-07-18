@@ -7,6 +7,13 @@
 
 export type ComposioSlugEffect = 'read' | 'external_write';
 
+/** Evidence-grade classification: 'read' and 'write' are affirmative verb
+ * evidence; 'unknown' means the action name carries no recognized verb at all
+ * (noun-shaped API slugs such as SLACK_CONVERSATIONS_HISTORY). Consumers that
+ * honor an author-declared `sideEffect: read` may do so only for 'unknown' —
+ * never against affirmative write/send evidence. */
+export type ComposioSlugEffectEvidence = 'read' | 'write' | 'unknown';
+
 const READ_ACTIONS: ReadonlySet<string> = new Set([
   'GET', 'LIST', 'SEARCH', 'FIND', 'FETCH', 'READ', 'QUERY', 'LOOKUP',
   'RETRIEVE', 'DESCRIBE', 'BROWSE', 'SCAN', 'VIEW', 'INSPECT', 'STATUS',
@@ -71,8 +78,19 @@ const STATE_NOUN_READ_TOKENS: ReadonlySet<string> = new Set([
  * Missing and unfamiliar action names remain conservative writes.
  */
 export function classifyComposioSlugEffect(slug: string | null | undefined): ComposioSlugEffect {
+  return composioSlugEffectEvidence(slug) === 'read' ? 'read' : 'external_write';
+}
+
+/**
+ * Same verb analysis as classifyComposioSlugEffect, but keeps "an affirmative
+ * write verb is present" distinct from "no recognized verb at all". A blank
+ * slug is 'unknown' (nothing to prove either way); a bare CALL/POST action
+ * with no anchoring read verb is affirmative 'write' (outbound), matching the
+ * 2026-07-09 send-gate incident rule.
+ */
+export function composioSlugEffectEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
   const upper = String(slug ?? '').trim().toUpperCase();
-  if (!upper) return 'external_write';
+  if (!upper) return 'unknown';
 
   if (
     upper.startsWith('DATAFORSEO_')
@@ -84,16 +102,25 @@ export function classifyComposioSlugEffect(slug: string | null | undefined): Com
   const tokens = actionTokens(upper);
   // An unambiguous write verb anywhere is a mutation, full stop.
   if (tokens.some((token) => WRITE_ACTIONS.has(token) && !AMBIGUOUS_OBJECT_TOKENS.has(token))) {
-    return 'external_write';
+    return 'write';
   }
   // A read verb is trusted as the ACTION when it is not a trailing state noun.
   const readIndex = tokens.findIndex((token) => READ_ACTIONS.has(token));
-  const trustedRead = readIndex >= 0
-    && (readIndex < tokens.length - 1 || !STATE_NOUN_READ_TOKENS.has(tokens[readIndex] ?? ''));
-  if (trustedRead) return 'read';
+  if (readIndex >= 0) {
+    const trustedRead = readIndex < tokens.length - 1 || !STATE_NOUN_READ_TOKENS.has(tokens[readIndex] ?? '');
+    if (trustedRead) return 'read';
+    // A read token present only as a trailing STATE noun (GMAIL_MARK_AS_READ,
+    // SLACK_MARK_CHANNEL_READ, SOMETOOL_RUN_CHECK) means the action mutates
+    // that state — a conservative write, NOT a declaration-trusted unknown.
+    return 'write';
+  }
   // Bare CALL/POST actions (no anchoring read verb) are outbound writes.
-  if (tokens.some((token) => AMBIGUOUS_OBJECT_TOKENS.has(token))) return 'external_write';
-  return 'external_write';
+  if (tokens.some((token) => AMBIGUOUS_OBJECT_TOKENS.has(token))) return 'write';
+  // No recognized read/write/ambiguous token at all: a pure noun endpoint such
+  // as SLACK_CONVERSATIONS_HISTORY or TWITTER_USER_TIMELINE. Genuinely unknown
+  // — a caller's declared `sideEffect: read` is the best available signal, so
+  // an existing declared-read workflow keeps validating (fold 2026-07-17 #4).
+  return 'unknown';
 }
 
 export function composioSlugIsReadOnly(slug: string | null | undefined): boolean {

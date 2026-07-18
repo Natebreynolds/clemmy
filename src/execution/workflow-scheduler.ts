@@ -7,6 +7,14 @@ import { reapRunEventDir } from './workflow-events.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
+import {
+  readWorkflowRunRecordUnlocked,
+  withWorkflowRunRecordLock,
+} from './workflow-run-record.js';
+import {
+  workflowRunReportBackNeedsRetry,
+  type WorkflowRunReportBackRecord,
+} from './workflow-run-report-back.js';
 
 /**
  * Workflow scheduling tick.
@@ -422,15 +430,56 @@ function enqueueScheduledRun(workflowName: string): string {
  * leave 1440 completed run JSON files in WORKFLOW_RUNS_DIR, and
  * processWorkflowRuns re-reads every file every tick.
  *
- * Conservative: only deletes records with status in {completed, error,
- * cancelled} older than RETENTION days. Non-terminal records are never
- * touched.
+ * Conservative: only deletes canonical terminal records older than RETENTION
+ * days after their report-back evidence is fully acknowledged. Non-terminal or
+ * pending-report records are never touched.
  */
 const RUN_RETENTION_DAYS = 7;
-// creation_test / dry_run are one-shot validation runs — terminal once written, so
-// they age out on the same retention window instead of lingering forever (the
-// 2026-06-19 clem-smoke-flow creation_tests that piled up on the board).
-const TERMINAL_STATUSES: ReadonlySet<string> = new Set(['completed', 'error', 'cancelled', 'creation_test', 'dry_run']);
+// creation_test / dry_run retain the same status from admission through finish,
+// so finishedAt (checked below) is their terminal discriminator.
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  'completed',
+  'completed_with_errors',
+  'error',
+  'failed',
+  'cancelled',
+]);
+
+interface ReapableWorkflowRunRecord extends WorkflowRunReportBackRecord {
+  status?: string;
+  finishedAt?: string;
+  workflow?: string;
+}
+
+let beforeRunRecordReapLockForTests: ((filePath: string) => void) | undefined;
+
+/** Deterministic race seam: runs after directory enumeration and immediately
+ * before the authoritative per-record lock/read. */
+export function _setWorkflowRunReaperBeforeLockForTests(
+  hook?: (filePath: string) => void,
+): void {
+  beforeRunRecordReapLockForTests = hook;
+}
+
+function isTerminalWorkflowRunRecord(record: ReapableWorkflowRunRecord): boolean {
+  if (record.status === 'dry_run' || record.status === 'creation_test') {
+    return typeof record.finishedAt === 'string';
+  }
+  return typeof record.status === 'string' && TERMINAL_STATUSES.has(record.status);
+}
+
+function hasOutstandingWorkflowRunReportBack(record: ReapableWorkflowRunRecord): boolean {
+  // A retry/quarantine marker is durable evidence that report-back did not
+  // cleanly close. Preserve it even if the envelope is malformed or internally
+  // inconsistent so retention never turns an evidence problem into data loss.
+  if (record.reportBackRetry !== undefined) return true;
+  if (record.reportBack === undefined) return false;
+  try {
+    return workflowRunReportBackNeedsRetry(record);
+  } catch {
+    return true;
+  }
+}
 
 export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return { scanned: 0, deleted: 0 };
@@ -445,18 +494,28 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   for (const file of files) {
     const full = path.join(WORKFLOW_RUNS_DIR, file);
     try {
-      const raw = JSON.parse(readFileSync(full, 'utf-8')) as { status?: string; finishedAt?: string; workflow?: string };
-      if (!raw.status || !TERMINAL_STATUSES.has(raw.status)) continue;
-      // Prefer finishedAt; fall back to file mtime if absent (older records).
-      const finishedMs = raw.finishedAt ? Date.parse(raw.finishedAt) : NaN;
-      const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
-      if (ageRef >= cutoffMs) continue;
-      unlinkSync(full);
-      // P0-2: reap the run's events.jsonl dir together with the record so the
-      // two sources of truth can't diverge (orphaned event logs that read as
-      // phantom-pending / accumulate unbounded). Best-effort.
-      if (raw.workflow) reapRunEventDir(raw.workflow, file.replace(/\.json$/, ''));
-      deleted += 1;
+      beforeRunRecordReapLockForTests?.(full);
+      const reaped = withWorkflowRunRecordLock(full, () => {
+        // Every deletion decision is made from a fresh snapshot after acquiring
+        // the same lock used by terminal publication, cancellation, and report
+        // acknowledgement. An optimistic scan can never delete their successor.
+        const raw = readWorkflowRunRecordUnlocked<ReapableWorkflowRunRecord>(full);
+        if (!raw || !isTerminalWorkflowRunRecord(raw)) return false;
+        if (hasOutstandingWorkflowRunReportBack(raw)) return false;
+
+        // Prefer finishedAt; fall back to file mtime for legacy terminal records.
+        const finishedMs = raw.finishedAt ? Date.parse(raw.finishedAt) : Number.NaN;
+        const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
+        if (ageRef >= cutoffMs) return false;
+
+        unlinkSync(full);
+        // Keep the event ledger deletion in the same critical section. A report
+        // writer can therefore never recreate the record after its events were
+        // reaped as a consequence of an unlocked interleaving.
+        if (raw.workflow) reapRunEventDir(raw.workflow, file.replace(/\.json$/, ''));
+        return true;
+      });
+      if (reaped) deleted += 1;
     } catch {
       // Unreadable / disappeared — skip.
     }

@@ -29,12 +29,12 @@
   },
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
-    "@electron/rebuild": "^4.1.0",
+    "@electron/rebuild": "^4.2.0",
     "@types/node": "^24.13.2",
     "electron": "^43.0.0",
     "electron-builder": "^26.15.3",
     "tar": "7.5.19",
-    "tsx": "^4.22.5",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.0"
   },
   "build": {

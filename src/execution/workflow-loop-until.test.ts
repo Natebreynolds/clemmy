@@ -75,6 +75,14 @@ test('stepLoopUntilEnabled: write steps require the explicit loopSafe assertion'
   assert.equal(stepLoopUntilEnabled(step({ sideEffect: 'write', loopSafe: true })), true);
 });
 
+test('stepLoopUntilEnabled: mutating structured calls never reuse one receipt slot across attempts', () => {
+  assert.equal(stepLoopUntilEnabled(step({
+    sideEffect: 'write',
+    loopSafe: true,
+    call: { tool: 'AIRTABLE_UPDATE_RECORD', args: { id: 'rec-1' } },
+  })), false);
+});
+
 test('stepLoopUntilEnabled: requires loopUntil + an output contract; plain steps only', () => {
   assert.equal(stepLoopUntilEnabled(step({ loopUntil: undefined })), false);
   assert.equal(stepLoopUntilEnabled(step({ output: undefined })), false);
@@ -321,6 +329,30 @@ test('checkLoopUntilAuthoring: refuses loop_until on send and unsafe write; loop
   assert.match(checkLoopUntilAuthoring(wf([step({ sideEffect: 'send' })]))[0], /never loop/);
   assert.match(checkLoopUntilAuthoring(wf([step({ sideEffect: 'write' })]))[0], /loop_safe/);
   assert.deepEqual(checkLoopUntilAuthoring(wf([step({ sideEffect: 'write', loopSafe: true })])), []);
+});
+
+test('checkLoopUntilAuthoring: refuses a mutating structured call even when loop_safe is asserted', () => {
+  const errors = checkLoopUntilAuthoring(wf([step({
+    sideEffect: 'write',
+    loopSafe: true,
+    call: { tool: 'AIRTABLE_UPDATE_RECORD', args: { id: 'rec-1' } },
+  })]));
+  assert.match(errors[0], /mutating structured call/);
+});
+
+test('checkLoopUntilAuthoring: a declared-read noun-slug call loops; a trailing-state mutation slug does not', () => {
+  // A pure noun endpoint (no action verb) the author declared read must keep
+  // validating — unfamiliarity is not proof of mutation (fold 2026-07-17 #4).
+  assert.deepEqual(checkLoopUntilAuthoring(wf([step({
+    sideEffect: 'read',
+    call: { tool: 'TWITTER_USER_TIMELINE', args: { handle: '{{input.handle}}' } },
+  })])), []);
+  // A read token in trailing-state position (MARK_AS_READ) is a mutation signal
+  // the declaration cannot downgrade — it still fails the loop_until law.
+  assert.match(checkLoopUntilAuthoring(wf([step({
+    sideEffect: 'read',
+    call: { tool: 'GMAIL_MARK_AS_READ', args: { id: '{{input.id}}' } },
+  })]))[0], /mutating structured call/);
 });
 
 test('checkLoopUntilAuthoring: refuses forEach/deterministic; never blocks a disabled draft', () => {

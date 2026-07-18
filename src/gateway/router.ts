@@ -554,6 +554,7 @@ export class ClementineGateway {
           if (requeue.status === 'queued') text += `\n↻ Re-running "${fix.workflow}" now — ${requeue.message}`;
           else if (requeue.status === 'duplicate') text += `\n(An identical run is already queued; not duplicating.)`;
           else if (requeue.status === 'blocked_readiness') text += `\nI applied the fix, but could not re-run it yet: ${requeue.message}`;
+          else text += `\nI applied the fix, but did not re-run the workflow: ${requeue.message}`;
         } catch { /* re-queue is best-effort */ }
       }
       return { sessionId: request.sessionId, handledControl: true, text };

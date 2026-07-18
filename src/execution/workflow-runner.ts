@@ -1,8 +1,9 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync, openSync, writeSync, fsyncSync, closeSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
@@ -108,12 +109,37 @@ import {
   type ProposedFix,
   type BlockedStep,
 } from './workflow-diagnosis.js';
-import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
-import { checkWorkflowForWrite, classifyStepSideEffect, prepareWorkflowForWrite, stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
+import {
+  readWorkflowRunOriginSessionIds,
+  requeueWorkflowFromRun,
+  WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+} from '../tools/workflow-run-queue.js';
+import {
+  cancelWorkflowRunAtBoundary,
+  readWorkflowRunCancellation,
+  workflowRunCancellationRequested,
+} from './workflow-run-cancellation.js';
+import {
+  checkWorkflowForWrite,
+  classifyStepSideEffect,
+  prepareWorkflowForWrite,
+  stepLooksLikeIrreversibleSend,
+  stepLooksMutating,
+  buildWorkflowMutationContractSnapshot,
+  isWorkflowMutationContractSnapshot,
+  workflowStepMutationReceiptContract,
+  type WorkflowMutationContractSnapshot,
+} from './workflow-enforce.js';
 import { recordAndDeriveStableTightenings } from './workflow-contract-evidence-store.js';
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
 import { simulateWorkflowDryRun, renderWorkflowDryRunSimulation } from './workflow-dry-run-simulation.js';
-import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
+import {
+  clearWorkflowFailures,
+  escalateThreshold,
+  getConsecutiveFailures,
+  recordWorkflowOutcome,
+  shouldStopAutoHeal,
+} from './workflow-failure-ledger.js';
 import { clearStepContract, registerStepContract, takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
@@ -131,7 +157,28 @@ import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { looksLikeToolUnavailableSelfReport } from '../runtime/harness/tool-unavailable-text.js';
-import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
+import { reportedBackRunIdsFrom, terminalDashboardNotificationRunIdsFrom } from './workflow-watchdog.js';
+import {
+  attemptWorkflowRunReportBack,
+  deliverWorkflowRunOutcome,
+  recordAndAttemptWorkflowRunReportBack,
+  workflowRunReportBackNeedsRetry,
+  workflowRunReportBackRetryDue,
+  type WorkflowRunReportBackEnvelope,
+  type WorkflowRunReportBackRetryState,
+} from './workflow-run-report-back.js';
+import {
+  readWorkflowRunRecord,
+  readWorkflowRunRecordUnlocked,
+  withWorkflowRunRecordLock,
+  writeWorkflowRunRecordDurablyUnlocked,
+} from './workflow-run-record.js';
+import {
+  assessWorkflowRunMutationRequeue,
+  executeWorkflowCallMutation,
+  replayWorkflowCallMutationSlot,
+  workflowCallMutationSlotHasLedger,
+} from './workflow-call-receipts.js';
 import {
   recallWorkflowPatterns,
   recordSuccessfulWorkflowPattern,
@@ -417,7 +464,7 @@ function startWorkflowHeartbeat(
   };
 }
 
-interface QueuedRunRecord {
+export interface QueuedRunRecord {
   id: string;
   workflow: string;
   inputs?: Record<string, string>;
@@ -425,6 +472,7 @@ interface QueuedRunRecord {
   createdAt?: string;
   startedAt?: string;
   finishedAt?: string;
+  cancelledAt?: string;
   source?: string;
   /**
    * Gap E — chat re-entry. Set ONLY when a workflow run was triggered from a
@@ -480,6 +528,13 @@ interface QueuedRunRecord {
    *  escalate | advisory) + the one-line reason — rendered by run_status. */
   goalOutcome?: string;
   goalReason?: string;
+  /** Capability marker: this occurrence was admitted under the fsynced exact
+   * structured-mutation receipt protocol. Legacy records omit it. */
+  mutationReceiptProtocolVersion?: number;
+  /** Immutable admission-time evidence of which mutating steps were protected
+   * by structured exact-call receipts. Crash recovery must never infer this
+   * authority from a later workflow definition. */
+  mutationContractSnapshot?: unknown;
   /**
    * Failed-item retry lineage. A retry run inherits completed upstream step
    * outputs and completed forEach items from the source run, then leaves only
@@ -508,9 +563,15 @@ interface QueuedRunRecord {
    * the result never dies silently.
    */
   notifiedAt?: string;
+  reportBackAcknowledgedAt?: string;
+  /** Exact terminal origin report plus its durable per-origin acknowledgements.
+   * The drain/watchdog retries it until every inline and late-observer origin
+   * has the idempotent passive outcome turn. */
+  reportBack?: WorkflowRunReportBackEnvelope;
+  reportBackRetry?: WorkflowRunReportBackRetryState;
 }
 
-function workflowRunOriginSessionIds(run: Pick<QueuedRunRecord, 'originSessionId' | 'originSessionIds'>): string[] {
+function workflowRunOriginSessionIds(run: Pick<QueuedRunRecord, 'id' | 'originSessionId' | 'originSessionIds'>): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   const add = (value: unknown): void => {
@@ -528,6 +589,9 @@ function workflowRunOriginSessionIds(run: Pick<QueuedRunRecord, 'originSessionId
   };
   add(run.originSessionId);
   add(run.originSessionIds);
+  if (typeof run.id === 'string') {
+    try { add(readWorkflowRunOriginSessionIds(run.id)); } catch { /* watchdog retries terminal delivery */ }
+  }
   return out;
 }
 
@@ -547,7 +611,7 @@ interface ParkedRunState {
 }
 
 function readRunRecord(filePath: string): QueuedRunRecord | null {
-  try { return JSON.parse(readFileSync(filePath, 'utf-8')) as QueuedRunRecord; }
+  try { return readWorkflowRunRecord<QueuedRunRecord>(filePath); }
   catch { return null; }
 }
 
@@ -559,16 +623,173 @@ function isUnattendedScheduledRun(runId: string): boolean {
   return rec?.source === 'schedule' || rec?.source === 'cron';
 }
 
-function writeRunRecord(filePath: string, record: QueuedRunRecord): void {
-  const tmp = `${filePath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
-  const fd = openSync(tmp, 'w');
-  try {
-    writeSync(fd, JSON.stringify(record, null, 2));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, filePath);
+const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
+
+function isTerminalRunRecord(record: Pick<QueuedRunRecord, 'status' | 'finishedAt'>): boolean {
+  return TERMINAL_RUN_RECORD_STATUSES.has(record.status ?? '')
+    || ((record.status === 'dry_run' || record.status === 'creation_test') && typeof record.finishedAt === 'string');
+}
+
+export type TerminalReportInput = Omit<WorkflowRunReportBackEnvelope, 'version' | 'acknowledgedOriginSessionIds'>;
+
+function waitAfterTerminalPublishForTest(): void {
+  const ready = process.env.CLEMENTINE_TEST_TERMINAL_PUBLISH_READY;
+  const release = process.env.CLEMENTINE_TEST_TERMINAL_PUBLISH_RELEASE;
+  if (!ready || !release) return;
+  writeFileSync(ready, 'ready', 'utf-8');
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(release)) Atomics.wait(wait, 0, 0, 10);
+}
+
+function terminalReportMatchesStatus(record: QueuedRunRecord, report: TerminalReportInput): boolean {
+  if (record.status === 'cancelled') return report.outcome === 'failed';
+  if (record.status === 'error' || record.status === 'failed') return report.outcome !== 'done';
+  if (
+    record.status === 'completed'
+    || record.status === 'completed_with_errors'
+    || ((record.status === 'dry_run' || record.status === 'creation_test') && typeof record.finishedAt === 'string')
+  ) return report.outcome !== 'failed';
+  return false;
+}
+
+function sameTerminalReport(envelope: WorkflowRunReportBackEnvelope, report: TerminalReportInput): boolean {
+  return envelope.version === 1
+    && envelope.workflowName === report.workflowName
+    && envelope.outcome === report.outcome
+    && envelope.detail === report.detail;
+}
+
+interface WorkflowRunRecordWriteResult {
+  record: QueuedRunRecord;
+  /** True only for the caller that made terminal truth visible in this locked
+   * write. Seeing an already-terminal record (even the same envelope) is not
+   * publication authority for ledger/activity/notification side effects. */
+  publishedTerminal: boolean;
+}
+
+function writeRunRecord(
+  filePath: string,
+  record: QueuedRunRecord,
+  terminalReport?: TerminalReportInput,
+  admissionMutationContractSnapshot?: WorkflowMutationContractSnapshot,
+): WorkflowRunRecordWriteResult {
+  return withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    const currentStatus = typeof current?.status === 'string' ? current.status : '';
+    const requestedStatus = typeof record.status === 'string' ? record.status : '';
+    // Once a terminal projection wins this lock, a stale running/error/cancel
+    // writer cannot replace it. Same-status metadata merges remain allowed.
+    if (current && isTerminalRunRecord(current)) {
+      if (currentStatus === 'cancelled') {
+        const receipt = readWorkflowRunCancellation(current.id);
+        if (receipt && (
+          current.cancelledAt !== receipt.requestedAt
+          || current.finishedAt !== receipt.requestedAt
+          || current.error !== receipt.reason
+        )) {
+          const canonical = {
+            ...current,
+            cancelledAt: receipt.requestedAt,
+            finishedAt: receipt.requestedAt,
+            error: receipt.reason,
+          };
+          writeWorkflowRunRecordDurablyUnlocked(filePath, canonical);
+          return { record: canonical, publishedTerminal: false };
+        }
+      }
+      // Business terminal projection is first-writer immutable, including a
+      // same-status stale snapshot. Report acknowledgements/notifiedAt mutate
+      // only through their dedicated locked coordinators.
+      return { record: current, publishedTerminal: false };
+    }
+
+    // Report envelopes/acks have their own locked coordinator. Never let a
+    // runner snapshot overwrite a newer acknowledgement generation.
+    const {
+      reportBack: _staleReportBack,
+      reportBackRetry: _staleReportBackRetry,
+      reportBackAcknowledgedAt: _staleReportBackAcknowledgedAt,
+      notifiedAt: _staleNotifiedAt,
+      mutationContractSnapshot: _staleMutationContractSnapshot,
+      ...businessRecord
+    } = record;
+    let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
+    // Admission evidence is first-transition immutable. A resumed/parked run
+    // preserves even malformed or missing legacy evidence verbatim; it must
+    // never gain authority from today's workflow definition. Only the process
+    // that wins the queued -> running transition may stamp the current contract.
+    if (current?.status === 'queued' && requestedStatus === 'running' && admissionMutationContractSnapshot) {
+      nextRecord.mutationContractSnapshot = admissionMutationContractSnapshot;
+    } else if (current && Object.prototype.hasOwnProperty.call(current, 'mutationContractSnapshot')) {
+      nextRecord.mutationContractSnapshot = current.mutationContractSnapshot;
+    } else {
+      delete nextRecord.mutationContractSnapshot;
+    }
+    if (current?.reportBack !== undefined) nextRecord.reportBack = current.reportBack;
+    else delete nextRecord.reportBack;
+    if (current?.reportBackRetry !== undefined) nextRecord.reportBackRetry = current.reportBackRetry;
+    else delete nextRecord.reportBackRetry;
+    if (current?.reportBackAcknowledgedAt !== undefined) {
+      nextRecord.reportBackAcknowledgedAt = current.reportBackAcknowledgedAt;
+    } else delete nextRecord.reportBackAcknowledgedAt;
+    if (current?.notifiedAt !== undefined) nextRecord.notifiedAt = current.notifiedAt;
+    else delete nextRecord.notifiedAt;
+
+    // The immutable first receipt owns cancellation diagnostics even for a
+    // stale same-status writer. Always re-project it; never let later catch or
+    // dashboard snapshots replace requestedAt/reason.
+    const cancellation = readWorkflowRunCancellation(nextRecord.id);
+    if (cancellation) {
+      nextRecord = {
+        ...nextRecord,
+        status: 'cancelled',
+        cancelledAt: cancellation.requestedAt,
+        finishedAt: cancellation.requestedAt,
+        error: cancellation.reason,
+      };
+      // A cancellation that wins a proposed success/error terminal write still
+      // needs one exact durable report in the same commit as terminal visibility.
+      terminalReport = {
+        workflowName: nextRecord.workflow,
+        outcome: 'failed',
+        detail: cancellation.reason,
+      };
+    }
+    if (terminalReport) {
+      if (!isTerminalRunRecord(nextRecord) || !terminalReportMatchesStatus(nextRecord, terminalReport)) {
+        throw new Error(`Terminal report does not match canonical workflow run status ${nextRecord.status ?? 'unknown'}.`);
+      }
+      if (current?.reportBack && !sameTerminalReport(current.reportBack, terminalReport)) {
+        throw new Error('Workflow run already has a different immutable terminal report envelope.');
+      }
+      nextRecord.reportBack = current?.reportBack ?? {
+        version: 1,
+        ...terminalReport,
+        acknowledgedOriginSessionIds: [],
+      };
+      if (!current?.reportBack) {
+        delete nextRecord.notifiedAt;
+        delete nextRecord.reportBackAcknowledgedAt;
+        delete nextRecord.reportBackRetry;
+      }
+    }
+    writeWorkflowRunRecordDurablyUnlocked(filePath, nextRecord);
+    if (terminalReport && isTerminalRunRecord(nextRecord)) waitAfterTerminalPublishForTest();
+    return {
+      record: nextRecord,
+      publishedTerminal: Boolean(terminalReport && isTerminalRunRecord(nextRecord)),
+    };
+  });
+}
+
+/** Crash-injection seam proving terminal projection + exact report envelope are
+ * one durable record commit. Production code uses the same private writer. */
+export function publishWorkflowRunTerminalForTest(
+  filePath: string,
+  record: QueuedRunRecord,
+  report: TerminalReportInput,
+): QueuedRunRecord {
+  return writeRunRecord(filePath, record, report).record;
 }
 
 /**
@@ -578,11 +799,45 @@ function writeRunRecord(filePath: string, record: QueuedRunRecord): void {
  * and the watchdog re-surfaces the run. Best-effort: a failed marker write is
  * the same failure mode the watchdog already covers, so never let it throw.
  */
-function markRunNotified(filePath: string): void {
+function markRunNotified(filePath: string, notifiedAt: string = new Date().toISOString()): void {
   try {
-    const rec = readRunRecord(filePath);
-    if (rec) writeRunRecord(filePath, { ...rec, notifiedAt: new Date().toISOString() });
+    withWorkflowRunRecordLock(filePath, () => {
+      const rec = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+      if (rec && !rec.notifiedAt) {
+        writeWorkflowRunRecordDurablyUnlocked(filePath, { ...rec, notifiedAt });
+      }
+    });
   } catch { /* best-effort; watchdog backstops an unmarked terminal run */ }
+}
+
+function stopAfterCancellationWonWrite(filePath: string, written: QueuedRunRecord): boolean {
+  if (written.status !== 'cancelled') return false;
+  if (!written.notifiedAt) notifyCancelledRunOnce(filePath, written);
+  try {
+    finishRun(written.id, {
+      status: 'cancelled',
+      message: written.error || 'Workflow run cancelled.',
+      outputPreview: written.error || 'Workflow run cancelled.',
+    });
+  } catch { /* activity mirror is best-effort */ }
+  return true;
+}
+
+function terminalPublicationMatches(
+  filePath: string,
+  written: WorkflowRunRecordWriteResult,
+  expected: TerminalReportInput,
+): boolean {
+  if (stopAfterCancellationWonWrite(filePath, written.record)) return false;
+  if (!written.publishedTerminal) {
+    if (written.record.reportBack) attemptWorkflowRunReportBack(filePath);
+    return false;
+  }
+  if (!written.record.reportBack || !sameTerminalReport(written.record.reportBack, expected)) {
+    if (written.record.reportBack) attemptWorkflowRunReportBack(filePath);
+    return false;
+  }
+  return true;
 }
 
 class WorkflowRunCancelledError extends Error {
@@ -624,6 +879,7 @@ function parkingEnabled(): boolean {
 }
 
 function isWorkflowRunCancelled(runId: string): boolean {
+  if (workflowRunCancellationRequested(runId)) return true;
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const record = readRunRecord(filePath);
   if (record?.status === 'cancelled') return true;
@@ -986,11 +1242,74 @@ export function renderCallArgs(args: Record<string, unknown> | undefined, inputs
  *  and typed blocks as chat/Space) — a workflow exact-call can never dispatch
  *  under an ambiguous or non-compliant account. Args are rendered against
  *  inputs/upstream/(item). */
-async function executeWorkflowCallNode(step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown): Promise<unknown> {
+async function executeWorkflowCallNode(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  item?: unknown,
+  mutationItemKey?: string,
+): Promise<unknown> {
   const call = step.call!;
   const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
-  const { dispatchComposioTool } = await import('../tools/composio-tools.js');
-  const outcome = await dispatchComposioTool(call.tool, args, { sessionId: `workflow:${ctx.runId}:${step.id}` });
+  const durableReplay = replayWorkflowCallMutationSlot({
+    workflowSlug: ctx.workflowSlug,
+    runId: ctx.runId,
+    stepId: step.id,
+    ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
+  });
+  if (durableReplay.replayed) return durableReplay.result;
+  const {
+    composioDispatchErrorProvesNoCommit,
+    composioFailureProvesNoCommit,
+    detectComposioFailure,
+    dispatchComposioTool,
+  } = await import('../tools/composio-tools.js');
+  // The slug is an independent safety signal: an author-supplied `read` label
+  // must not disable receipts for an obviously create/update/delete call.
+  const mutatesExternally = structuredCallNeedsMutationReceipt(step);
+  const outcome = await dispatchComposioTool(call.tool, args, {
+    sessionId: `workflow:${ctx.runId}:${step.id}`,
+    ...(mutatesExternally
+      ? {
+        dispatchBoundary: (resolved, dispatch) => {
+          // The gateway already refused every auth-required-but-unconnected
+          // route (`not-connected`/`identity-absent`/`ambiguous-account`/…) as a
+          // typed block BEFORE this boundary is reached — dispatchComposioTool
+          // only invokes the boundary on an `ok` resolution. An `ok` resolution
+          // with no connectionId is a legitimate no-auth toolkit deferring to
+          // composio's default entity; it must still record intent/started/
+          // receipt (the ledger fingerprints a null account as the provider
+          // default), not be permanently refused with no account to connect.
+          return executeWorkflowCallMutation({
+            workflowSlug: ctx.workflowSlug,
+            runId: ctx.runId,
+            stepId: step.id,
+            ...(mutationItemKey ? { itemKey: mutationItemKey } : {}),
+            tool: resolved.toolSlug,
+            account: {
+              ...(resolved.connectionId ? { connectionId: resolved.connectionId } : {}),
+              ...(resolved.identity ? { identity: resolved.identity } : {}),
+            },
+            args: resolved.args,
+          }, dispatch, {
+            classifyFailure: (result) => {
+              const failure = detectComposioFailure(result);
+              return failure.failed
+                ? {
+                  summary: failure.summary || 'provider reported failure',
+                  provenNoCommit: composioFailureProvesNoCommit(result),
+                }
+                : null;
+            },
+            classifyThrownFailure: (error) => (
+              composioDispatchErrorProvesNoCommit(error)
+                ? (error instanceof Error ? error.message : String(error))
+                : null
+            ),
+          });
+        },
+      }
+      : {}),
+  });
   if (!outcome.ok) {
     // Typed gateway block → fail the step VISIBLY with the deterministic
     // corrective (which account / reconnect / fix args) instead of dispatching.
@@ -2578,6 +2897,7 @@ export function stepLoopUntilEnabled(step: WorkflowStepInput): boolean {
   // (T2.3: deterministic scripts/ helper verified against `until`), or both.
   if (!step.output && !stepHasLoopProbe(step)) return false;
   if (step.forEach || step.deterministic) return false;
+  if (structuredCallNeedsMutationReceipt(step)) return false;
   const cls = stepSideEffectClass(step);
   if (cls === 'send') return false;
   if (cls === 'write' && step.loopSafe !== true) return false;
@@ -3526,14 +3846,14 @@ export async function executeStep(
           if (ctx.completedItems.has(key)) {
             return { itemKey: key, output: ctx.completedItems.get(key), index: idx };
           }
-          // Bug #8 (Lane B): a SEND-class item whose send already fired on a prior
+          // Bug #8 (Lane B): a mutating item whose external write already fired on a prior
           // pass (external_write under the item's deterministic session) but never
           // recorded completion (the crash window) must NOT be re-sent — re-running
           // would DOUBLE-SEND. Skip + reconcile + advise (favor no-duplicate, report
           // back). Only bites on resume: a fresh pass has no prior external_write.
-          if (stepSideEffectClass(step) === 'send'
+          if (stepSideEffectClass(step) !== 'read'
             && itemSendAlreadyFired(ctx.runId, step.id, key)) {
-            const skipNote = '[skipped on resume — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
+            const skipNote = '[skipped on resume — a prior external mutation for this item already fired; not repeated to avoid a duplicate. Verify it landed.]';
             appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
               kind: 'item_completed',
               stepId: step.id,
@@ -3545,7 +3865,7 @@ export async function executeStep(
               stepId: step.id,
               itemKey: key,
               kind: 'idempotent_skip',
-              note: `forEach item "${key}"'s send fired on a prior attempt but the run crashed before recording completion — SKIPPED on resume to avoid a duplicate send. Verify that send landed.`,
+              note: `forEach item "${key}" mutated externally on a prior attempt but the run crashed before recording completion — SKIPPED on resume to avoid a duplicate. Verify that mutation landed.`,
             });
             return { itemKey: key, output: skipNote, index: idx };
           }
@@ -3580,7 +3900,7 @@ export async function executeStep(
               // restricts this to read-class calls (idempotent → safe to retry/
               // resume), so no external-write double-act guard is needed here.
               if (step.call?.tool) {
-                output = await executeWorkflowCallNode(step, ctx, item);
+                output = await executeWorkflowCallNode(step, ctx, item, key);
                 // no lane: a direct call has no LLM output to ground (the
                 // claude_sdk grounding advisory below is correctly skipped).
                 return;
@@ -4292,18 +4612,34 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
   return cls === 'unknown' ? 'read' : cls;
 }
 
-/** Derive a call node's side-effect class from its tool slug (conservative:
- *  send/publish/post/email → send; create/update/delete/write/upsert → write;
- *  else read). Exported for tests. */
+/** Derive a call node's side-effect class from the shared conservative
+ * Composio classifier. Unknown actions are writes; only a proven read action
+ * may bypass mutation receipts. Exported for tests. */
 export function callToolSideEffectClass(tool: string): 'read' | 'write' | 'send' {
+  // A canonical read decision wins before the broad irreversible-send
+  // predicate sees object nouns such as POST in TWITTER_GET_POST.
+  if (classifyComposioSlugEffect(tool) === 'read') return 'read';
   // Delegate the send determination to the ONE canonical predicate so the
   // runtime agrees with the validator + the unattended auto-approve carve-out
   // (2026-07-09 re-hunt: workflow call-node lane). The old regex missed
   // CALL/DIAL/OUTBOUND/MAKE+CALL/RESPOND+EVENT.
   if (isIrreversibleSendSlug(tool)) return 'send';
-  const t = tool.toLowerCase();
-  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
-  return 'read';
+  return 'write';
+}
+
+/** Whether a structured call must cross the durable mutation receipt boundary.
+ * Both the declared/canonical step class and the tool slug are considered so a
+ * stale `sideEffect: read` annotation cannot downgrade an obvious mutation. */
+export function structuredCallNeedsMutationReceipt(step: WorkflowStepInput): boolean {
+  if (!step.call?.tool) return false;
+  // Deliberately conservative and independent of the authoring/parking class:
+  // an unfamiliar slug the author declared read is a non-mutating READ for the
+  // approval gate and requeue contract (via stepSideEffectClass — fold
+  // 2026-07-17 #4), yet still gets a cheap durable receipt here as insurance. A
+  // receipt on a genuinely read call is a harmless no-op; a missing one on a
+  // mislabeled mutation is not, so a stale `sideEffect: read` never disables it.
+  return stepSideEffectClass(step) !== 'read'
+    || callToolSideEffectClass(step.call.tool) !== 'read';
 }
 
 /** Phantom-completion guard (#2): the trust-critical correctness check for
@@ -4461,7 +4797,6 @@ export function summarizeRunArtifacts(steps: WorkflowStepInput[], rawOutputs: Re
  * side-effecting (write/send) step may have partially sent/written. Everything
  * that isn't a silent side-effect crash is exempt:
  *
- *  - targetStepId set            → explicit operator re-run, not auto-resume.
  *  - completed already           → nothing to re-run.
  *  - in-flight step has a        → it PARKED on a runtime request_approval
  *    step_failed event             (ParkRunSignal is caught + logged as
@@ -4472,17 +4807,14 @@ export function summarizeRunArtifacts(steps: WorkflowStepInput[], rawOutputs: Re
  *                                   Re-running just resumes from the approval.
  *  - requiresApproval (declar.)  → the gate emits step_started before the wait,
  *                                   so a parked gate legitimately shows in-flight.
- *  - forEach                     → resume is idempotent at the ITEM level
- *                                   (completed items are skipped), so a crashed
- *                                   forEach re-runs only the unfinished items.
  *  - read class                  → no external side effect to duplicate.
  *
  * Pure + exported so the predicate is unit-tested.
  */
-// forEach idempotency on crash-resume is ALWAYS on (validated: injected-crash
-// forEach-send eval showed 0 double-sends, bug #8). A SEND-class item whose send
-// already fired on a prior pass is skipped on resume to avoid a duplicate.
-// (Graduated from CLEMMY_IDEMPOTENT_FOREACH 2026-06-24.)
+// Completed forEach items are skipped on resume, but an interrupted item from a
+// legacy build may have mutated externally before its completion event landed.
+// Mutating fanout therefore parks unless exact per-item receipt evidence can be
+// established by a future recovery coordinator.
 
 /** PURE: did a forEach item's send already CLAIM (an external_write) without
  *  being netted by a failure compensation? More writes than failures ⇒ a send
@@ -4573,6 +4905,56 @@ export function seedFailedItemRetryRun(
   if (!retryStep) throw new Error(`Failed-item retry step "${stepId}" does not exist in workflow "${workflow.name}".`);
   if (!retryStep.forEach) throw new Error(`Failed-item retry step "${stepId}" is not a forEach step.`);
 
+  const mutationContract = workflowStepMutationReceiptContract(retryStep);
+  if (mutationContract === 'unreceipted_mutation') {
+    throw new Error(
+      `Cannot retry failed items for "${stepId}" because it mutates external state without structured per-item receipts.`,
+    );
+  }
+  if (mutationContract === 'structured_call_receipt') {
+    const sourceRecord = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${fromRunId}.json`));
+    const sourceSnapshot = isWorkflowMutationContractSnapshot(sourceRecord?.mutationContractSnapshot)
+      ? sourceRecord.mutationContractSnapshot
+      : undefined;
+    if (sourceSnapshot?.steps[stepId] === 'unreceipted_mutation') {
+      throw new Error(
+        `Cannot retry failed items for "${stepId}" because source run "${fromRunId}" admitted that step as an unreceipted mutation.`,
+      );
+    }
+    const sourceUsesProtocol = sourceRecord?.mutationReceiptProtocolVersion
+      === WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION
+      && sourceSnapshot?.steps[stepId] === 'structured_call_receipt';
+    let assessment: ReturnType<typeof assessWorkflowRunMutationRequeue>;
+    try {
+      assessment = assessWorkflowRunMutationRequeue({ workflowSlug, runId: fromRunId });
+    } catch (err) {
+      throw new Error(
+        `Cannot retry failed items for "${stepId}" because mutation receipt evidence is unreadable: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const failedSet = new Set(failedKeys);
+    const blocking = assessment.blocking.find((item) =>
+      item.stepId === stepId && (item.itemKey === undefined || failedSet.has(item.itemKey)));
+    if (blocking) {
+      throw new Error(
+        `Cannot retry failed item "${blocking.itemKey ?? '(unknown item)'}" for "${stepId}" because its prior mutation receipt is ${blocking.status}.`,
+      );
+    }
+    if (!sourceUsesProtocol) {
+      const uncovered = failedKeys.find((itemKey) => !workflowCallMutationSlotHasLedger({
+        workflowSlug,
+        runId: fromRunId,
+        stepId,
+        itemKey,
+      }));
+      if (uncovered) {
+        throw new Error(
+          `Cannot retry failed item "${uncovered}" for "${stepId}" because source run "${fromRunId}" predates durable mutation receipts and has no exact slot ledger.`,
+        );
+      }
+    }
+  }
+
   const source = computeResumeState(workflowSlug, fromRunId);
   if (!source.completedSteps.has(retryStep.forEach)) {
     throw new Error(
@@ -4608,10 +4990,10 @@ export function seedFailedItemRetryRun(
   }
 
   let sentSkips = 0;
-  if (stepSideEffectClass(retryStep) === 'send') {
+  if (stepSideEffectClass(retryStep) !== 'read') {
     for (const itemKey of failedSet) {
       if (!itemSendAlreadyFired(fromRunId, stepId, itemKey)) continue;
-      const skipNote = '[skipped on failed-item retry — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
+      const skipNote = '[skipped on failed-item retry — a prior external mutation for this item already fired; not repeated to avoid a duplicate. Verify it landed.]';
       appendWorkflowEvent(workflowSlug, runId, {
         kind: 'item_completed',
         stepId,
@@ -4626,7 +5008,7 @@ export function seedFailedItemRetryRun(
           reason: 'idempotent_failed_item_retry_skip',
           fromRunId,
           itemKey,
-          note: `Item "${itemKey}" was not re-sent because the source run already recorded an external write for it.`,
+          note: `Item "${itemKey}" was not repeated because the source run already recorded an external mutation for it.`,
         },
       });
       sentSkips += 1;
@@ -4648,29 +5030,84 @@ export function seedFailedItemRetryRun(
   return { inheritedSteps, inheritedItems, sentSkips };
 }
 
+/** The set of not-yet-completed steps execution could have reached given what
+ * already completed: a step whose `dependsOn` are all satisfied. A step with an
+ * unsatisfied dependency provably never started, so a crash-resume guard must
+ * not treat it as a possibly-dispatched mutation. Falls back to "every
+ * incomplete step" if the dependency graph can't be planned (cyclic/unknown
+ * dep) — the conservative direction. */
+function reachableResumeFrontier(
+  steps: WorkflowStepInput[],
+  completedSteps: Map<string, unknown>,
+): Set<string> {
+  const completedIds = new Set(completedSteps.keys());
+  try {
+    const batches = planWorkflowExecutionBatches(steps, completedIds);
+    return new Set((batches[0] ?? []).map((step) => step.id));
+  } catch {
+    return new Set(steps.filter((step) => !completedIds.has(step.id)).map((step) => step.id));
+  }
+}
+
 export function shouldHaltResumeForSideEffect(
   workflow: WorkflowDefinition,
   resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },
-  targetStepId?: string,
-  evidence?: { claimedExternalWrite?: boolean; harnessEnabled?: boolean },
+  _targetStepId?: string,
+  evidence?: {
+    claimedExternalWrite?: boolean;
+    harnessEnabled?: boolean;
+    /** The run record was already `running` when this process admitted it. */
+    resumedRun?: boolean;
+    /** Steps whose dispatch boundary is guarded by the fail-closed structured
+     * mutation receipt protocol. With no receipt, prior dispatch is impossible. */
+    durableMutationProtocolStepIds?: ReadonlySet<string>;
+    /** Structured mutating calls have a stricter exact-call receipt ledger.
+     * Defer their recovery decision to that ledger instead of the prose/harness
+     * heuristic, which cannot replay a successful direct-call result. */
+    mutationReceiptProtected?: boolean;
+  },
 ): { stepId: string; cls: 'write' | 'send'; declared: boolean } | null {
-  if (targetStepId) return null;
   const id = resume.inFlightStepId;
+  if (!id && evidence?.resumedRun) {
+    // The lifecycle journal is best-effort. A lost/corrupt step_started event
+    // must not turn a crash-resumed run into permission to repeat a plain or
+    // harness mutation. Structured direct calls are the exception: their
+    // fsynced receipt protocol proves that absence of a ledger means dispatch
+    // never crossed its boundary.
+    //
+    // Only a step in the READY FRONTIER could have been the step whose
+    // step_started event was lost: a step with an unsatisfied dependency
+    // provably never ran, so it must not halt resume (a read step 1 crashing
+    // must not park a downstream send step 3 that execution never reached —
+    // 2026-07-17 final-wave review #3). A dependsOn-less workflow runs every
+    // step in one batch, so all incomplete steps stay in the frontier and the
+    // guard remains conservative there.
+    const frontier = reachableResumeFrontier(workflow.steps, resume.completedSteps);
+    const uncertain = workflow.steps.find((step) =>
+      frontier.has(step.id)
+      && !resume.failedSteps?.has(step.id)
+      && step.requiresApproval !== true
+      && stepSideEffectClass(step) !== 'read'
+      && !evidence.durableMutationProtocolStepIds?.has(step.id));
+    if (uncertain) {
+      const cls = stepSideEffectClass(uncertain) as 'write' | 'send';
+      return { stepId: uncertain.id, cls, declared: uncertain.sideEffect === cls };
+    }
+  }
   if (!id || resume.completedSteps.has(id) || resume.failedSteps?.has(id)) return null;
   const crashed = workflow.steps.find((s) => s.id === id);
-  if (!crashed || crashed.requiresApproval === true || crashed.forEach) return null;
+  if (!crashed || crashed.requiresApproval === true) return null;
   const cls = stepSideEffectClass(crashed);
   // `declared` distinguishes an explicit sideEffect from a prose-heuristic
   // guess — the halt message uses it to teach the one-line fix when the
   // class was only inferred (inferred read-only steps parking on crash was
   // the scorpion-facebook-trends failure mode, 2026-06-11).
   if (cls === 'read') return null;
-  // Current harness paths record external_write BEFORE dispatch. If an
-  // interrupted write/send step has a trustworthy harness session and the net
-  // external-write ledger is empty, there is no duplicated side effect to avoid:
-  // resume it instead of parking forever. Legacy/non-harness paths stay
-  // conservative because they may have acted without the shared ledger.
-  if (evidence?.harnessEnabled === true && evidence.claimedExternalWrite === false) return null;
+  if (evidence?.mutationReceiptProtected === true) return null;
+  // Harness external_write telemetry is useful positive evidence, but its
+  // writers are best-effort. Absence cannot prove that provider dispatch never
+  // happened, so only the fail-closed structured receipt protocol may bypass
+  // this crash guard.
   return { stepId: id, cls, declared: crashed.sideEffect === cls };
 }
 
@@ -4683,6 +5120,9 @@ async function executeWorkflow(
   targetStepId?: string,
   goalFeedback?: string,
   originSessionId?: string,
+  crashResume = false,
+  mutationReceiptProtocolVersion?: number,
+  mutationContractSnapshot?: unknown,
 ): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>; qualityAdvisories: WorkflowQualityAdvisory[] }> {
   const resume = computeResumeState(workflowSlug, runId);
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
@@ -4726,13 +5166,72 @@ async function executeWorkflow(
   const claimedExternalWrite = inFlightStep
     ? stepExternalWriteAlreadyClaimed(runId, inFlightStep.id)
     : undefined;
+  const sourceUsesMutationReceiptProtocol =
+    mutationReceiptProtocolVersion === WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION;
+  const admittedMutationContracts = isWorkflowMutationContractSnapshot(mutationContractSnapshot)
+    ? mutationContractSnapshot
+    : undefined;
+  const durableMutationProtocolStepIds = new Set<string>();
+  for (const step of workflow.steps) {
+    if (step.forEach || workflowStepMutationReceiptContract(step) !== 'structured_call_receipt') continue;
+    if (
+      sourceUsesMutationReceiptProtocol
+      && admittedMutationContracts?.steps[step.id] === 'structured_call_receipt'
+    ) {
+      durableMutationProtocolStepIds.add(step.id);
+      continue;
+    }
+    // Admission said this exact step used an agentic/unreceipted mutation
+    // boundary. A ledger created by a later definition cannot retroactively
+    // prove the original dispatch never committed.
+    if (admittedMutationContracts?.steps[step.id] === 'unreceipted_mutation') continue;
+    try {
+      if (workflowCallMutationSlotHasLedger({ workflowSlug, runId, stepId: step.id })) {
+        durableMutationProtocolStepIds.add(step.id);
+      }
+    } catch {
+      // Unreadable legacy evidence cannot authorize an empty-ledger bypass.
+    }
+  }
+  let mutationReceiptProtected = false;
+  if (
+    inFlightStep
+    && !inFlightStep.forEach
+    && workflowStepMutationReceiptContract(inFlightStep) === 'structured_call_receipt'
+  ) {
+    const admittedContract = admittedMutationContracts?.steps[inFlightStep.id];
+    mutationReceiptProtected = sourceUsesMutationReceiptProtocol
+      && admittedContract === 'structured_call_receipt';
+    if (admittedContract !== 'unreceipted_mutation') {
+      try {
+        mutationReceiptProtected = mutationReceiptProtected || workflowCallMutationSlotHasLedger({
+          workflowSlug,
+          runId,
+          stepId: inFlightStep.id,
+        });
+      } catch {
+        // An unreadable ledger cannot authorize bypassing the legacy duplicate
+        // guard. The exact-call path will surface corruption after manual review.
+        // Keep valid admission-snapshot authority, but never infer legacy
+        // authority from unreadable exact-ledger evidence.
+      }
+    }
+  }
   const resumeHalt = shouldHaltResumeForSideEffect(
     workflow,
     resume,
     targetStepId,
-    inFlightStep
-      ? { claimedExternalWrite, harnessEnabled: workflowHarnessEnabled(inFlightStep) }
-      : undefined,
+    {
+      resumedRun: crashResume,
+      durableMutationProtocolStepIds,
+      ...(inFlightStep
+        ? {
+            claimedExternalWrite,
+            harnessEnabled: workflowHarnessEnabled(inFlightStep),
+            mutationReceiptProtected,
+          }
+        : {}),
+    },
   );
   if (resumeHalt) {
     throw new Error(
@@ -4745,26 +5244,6 @@ async function executeWorkflow(
       `in the workflow definition and it will auto-resume after interruptions instead of parking here.`,
     );
   }
-  if (
-    inFlightStep
-    && !targetStepId
-    && stepSideEffectClass(inFlightStep) !== 'read'
-    && workflowHarnessEnabled(inFlightStep)
-    && claimedExternalWrite === false
-    && !resume.completedSteps.has(inFlightStep.id)
-    && !resume.failedSteps?.has(inFlightStep.id)
-  ) {
-    appendWorkflowEvent(workflowSlug, runId, {
-      kind: 'step_advisory',
-      stepId: inFlightStep.id,
-      meta: {
-        reason: 'resume_after_interrupted_write_without_external_write',
-        sideEffect: stepSideEffectClass(inFlightStep),
-        note: 'Prior attempt was interrupted, but the workflow harness recorded no net external write before the interruption, so this step is safe to resume automatically.',
-      },
-    });
-  }
-
   const learnedPatternMatches = targetStepId
     ? []
     : recallWorkflowPatterns(`${workflow.name} ${workflow.description ?? ''}`, 2);
@@ -5161,14 +5640,27 @@ export function reapResolvedParkedRuns(): void {
     // occurrence without disabling its recurring schedule.
     const stopped = rows.find((row) => row?.resolution !== 'approved');
     if (stopped) {
-      clearWorkflowRunPausedForApproval(run.id);
-      const stoppedAt = new Date().toISOString();
       const decision = stopped.resolution === 'rejected'
         ? 'declined by the user'
         : stopped.resolution === 'expired'
           ? 'not approved before it expired'
           : 'cancelled by the user';
       const reason = `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
+
+      // Approval rejection is a cancellation producer too. Publish through
+      // the one shared cancellation boundary before mutating SDK/activity
+      // mirrors, so a dashboard cancel or terminal completion that won first
+      // remains authoritative in every downstream side effect.
+      const cancellation = cancelWorkflowRunAtBoundary({
+        runId: run.id,
+        reason,
+        source: `approval-${stopped.resolution ?? 'not-approved'}`,
+      });
+      if (cancellation.status !== 'cancelled' && cancellation.status !== 'already_cancelled') continue;
+      const stoppedRecord = cancellation.run as QueuedRunRecord;
+      const canonicalReason = cancellation.request?.reason
+        ?? (typeof stoppedRecord.error === 'string' ? stoppedRecord.error : reason);
+      clearWorkflowRunPausedForApproval(run.id);
 
       // Clear every parked SDK session for this occurrence so a later recovery
       // scan cannot revive the interrupted model state and ask again.
@@ -5181,24 +5673,18 @@ export function reapResolvedParkedRuns(): void {
         } catch { /* terminal run record below remains the source of truth */ }
       }
 
-      writeRunRecord(filePath, {
-        ...run,
-        status: 'cancelled',
-        finishedAt: stoppedAt,
-        error: reason,
-        parked: undefined,
-        // The approval surface already reports the reject/expiry. Marking the
-        // run notified prevents a second generic cancellation card.
-        notifiedAt: stoppedAt,
-      });
+      // Persist the exact stable terminal card and origin acknowledgements for
+      // whichever cancellation reason won; only that successful card stamps
+      // the dashboard-notified marker.
+      notifyCancelledRunOnce(filePath, stoppedRecord);
       try {
-        appendWorkflowEvent(run.workflow, run.id, { kind: 'run_cancelled', error: reason });
+        appendWorkflowEvent(run.workflow, run.id, { kind: 'run_cancelled', error: canonicalReason });
       } catch { /* workflow event history is best-effort */ }
       try {
         finishRun(run.id, {
           status: 'cancelled',
-          message: reason,
-          outputPreview: reason,
+          message: canonicalReason,
+          outputPreview: canonicalReason,
         });
       } catch { /* activity mirror is best-effort */ }
       logger.info(
@@ -5214,7 +5700,8 @@ export function reapResolvedParkedRuns(): void {
     // stale flag that silences the resumed run's heartbeats. Covers every
     // park path (declarative gate throws before its own finally can clear).
     clearWorkflowRunPausedForApproval(run.id);
-    writeRunRecord(filePath, { ...run, status: 'running' });
+    const resumedRecord = writeRunRecord(filePath, { ...run, status: 'running' }).record;
+    if (isTerminalRunRecord(resumedRecord)) continue;
     try {
       addRunEvent(run.id, {
         type: 'run_resumed',
@@ -5364,33 +5851,12 @@ export function enqueueWorkflowOutcomeTurn(
   workflowName: string,
   outcome: 'done' | 'blocked' | 'failed',
   detail: string,
-): void {
+): boolean {
   // Unified report-back (Move 4): delegate to the shared deliverOutcome so the
   // desktop/Discord/mobile surfaces render the SAME structure as every other
   // lane. Preserves the `[workflow run <id> …]` prefix + the "needs attention"
   // wording for a soft-blocked workflow (idempotency + tests depend on it).
-  for (const originSessionId of workflowRunOriginSessionIds(run)) {
-    deliverOutcome(
-      { status: outcome, detail },
-      {
-        originSessionId,
-        sourceLabel: 'workflow run',
-        sourceId: run.id,
-        title: workflowName,
-        statusHint: `workflow_run_status run_id="${run.id}"`,
-        headWord: { blocked: 'needs attention' },
-        // Was 1500 — the most aggressive cut of any report-back lane, and it
-        // carries the actual user-facing report on a CHAT-fired workflow. Aligned
-        // to the outcome default (4000) so this lane is no more starved than the
-        // background-task lane; the marker + statusHint still recover the rest.
-        maxDetailChars: 4000,
-        // Report-back v2: a chat-fired run's outcome is SPOKEN into the idle
-        // origin conversation (creation tests included — "verified, set to
-        // run: fire now or wait?"), not just staged for the user's next turn.
-        proactiveTurn: true,
-      },
-    );
-  }
+  return deliverWorkflowRunOutcome(run, workflowName, outcome, detail);
 }
 
 // A daemon restart drains EVERY run file, so the cancelled-notify path must not
@@ -5415,9 +5881,13 @@ export function shouldNotifyCancelledRun(
 function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
   try {
     let reported = new Set<string>();
+    let dashboardNotified = new Set<string>();
     try {
-      reported = reportedBackRunIdsFrom(loadNotifications());
+      const notifications = loadNotifications();
+      reported = reportedBackRunIdsFrom(notifications);
+      dashboardNotified = terminalDashboardNotificationRunIdsFrom(notifications);
     } catch { /* best-effort: a bad notification log must not block the cancel notify */ }
+    let notificationPersisted = reported.has(run.id) || dashboardNotified.has(run.id);
     if (shouldNotifyCancelledRun(run, Date.now(), reported)) {
       addNotification({
         // Stable id → addNotification id-dedup makes this at-most-once even if
@@ -5426,20 +5896,31 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
         id: `workflow-${run.id}-cancelled`,
         kind: 'workflow',
         title: `Workflow cancelled: ${run.workflow}`,
-        body: 'This workflow run was cancelled.',
+        body: run.error || 'This workflow run was cancelled.',
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { workflow: run.workflow, runId: run.id, status: 'cancelled' },
       });
+      notificationPersisted = true;
       // A chat-fired run's cancellation re-enters the origin chat too —
       // the user who asked for it in conversation shouldn't have to find a
       // notification card to learn it stopped. No-op without originSessionId;
       // deliverOutcome's idempotency makes drain retries safe.
-      enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', 'This run was cancelled before it finished. Queue it again with workflow_run if it should still happen.');
+      if (run.reportBack) {
+        attemptWorkflowRunReportBack(filePath);
+      } else {
+        recordAndAttemptWorkflowRunReportBack(filePath, {
+          workflowName: run.workflow,
+          outcome: 'failed',
+          detail: run.error || 'This workflow run was cancelled.',
+        });
+      }
     }
-    // Stamp the marker either way so a stale/already-reported file isn't
-    // re-checked every drain tick (and the watchdog skips it too).
-    markRunNotified(filePath);
+    // `notifiedAt` proves a terminal dashboard/global card is durable. A stale
+    // cancellation with no such evidence remains unmarked; the bounded
+    // watchdog window prevents historical backlog alerts without inventing
+    // notification truth.
+    if (notificationPersisted) markRunNotified(filePath);
   } catch { /* best-effort; the watchdog backstops an unmarked terminal run */ }
 }
 
@@ -5448,8 +5929,19 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
   const eligible: Array<{ file: string; filePath: string; run: QueuedRunRecord }> = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
-    const run = readRunRecord(filePath);
+    let run = readRunRecord(filePath);
     if (!run) continue;
+    // A terminal outcome is a durable delivery intent, not a one-shot side
+    // effect. Retry failed origins and late observer sidecars every drain tick;
+    // duplicate turns acknowledge successfully without being appended again.
+    if (
+      run.reportBack
+      && workflowRunReportBackNeedsRetry(run)
+      && workflowRunReportBackRetryDue(run)
+    ) {
+      attemptWorkflowRunReportBack(filePath);
+      run = readRunRecord(filePath) ?? run;
+    }
     // A cancelled run never enters processOneRunFile (skipped just below), so
     // notify it here once before dropping it — otherwise a queued-then-cancelled
     // run (or a mid-flight cancel whose notify was lost) goes silent.
@@ -5504,10 +5996,10 @@ function selfHealAutoMaxAttempts(): number {
 /** Side-effect guard: a FRESH re-run re-executes every step, so it's only safe
  *  when no OTHER mutating step already completed before the blocked one — else
  *  the re-run could double an irreversible write. A step counts as mutating if
- *  it's approval-gated (the author's own "this writes" signal) OR its prompt
- *  reads as an irreversible send/publish (reusing the send-gate heuristic) — so
- *  an unmarked "send the emails" step still blocks auto-heal. Conservative: if
- *  any such step completed, escalate instead of auto-running. */
+ *  it is classified as write/send by the same shared runtime classifier used
+ *  for execution receipts (with approval gates retained as an independent
+ *  author signal). Conservative: if any such step completed, escalate instead
+ *  of creating a fresh run whose new run id cannot replay the old receipt. */
 function hasCompletedUpstreamMutation(
   steps: WorkflowStepInput[],
   blockedStepId: string,
@@ -5518,7 +6010,8 @@ function hasCompletedUpstreamMutation(
     && completedStepIds.has(s.id)
     && (s.requiresApproval === true
       || (s as { requires_approval?: boolean }).requires_approval === true
-      || stepLooksLikeIrreversibleSend(s.prompt ?? '')));
+      || structuredCallNeedsMutationReceipt(s)
+      || stepSideEffectClass(s) !== 'read'));
 }
 
 function stepRequiresApproval(step: WorkflowStepInput): boolean {
@@ -5635,6 +6128,7 @@ async function tryAutoHealAndRequeue(args: {
     return null;
   }
   let applied: { ok: boolean; message: string; backupId?: string };
+  throwIfWorkflowRunCancelled(run.id);
   try {
     applied = applyProposedFix(proposedFix.id);
   } catch (err) {
@@ -5649,10 +6143,12 @@ async function tryAutoHealAndRequeue(args: {
   try {
     appendWorkflowEvent(workflowSlug, run.id, { kind: 'step_retry', stepId: fix.stepId, meta: { selfHeal: true, attempt, backupId: applied.backupId, judge: healJudge.verdict } });
   } catch { /* heal log is best-effort */ }
+  throwIfWorkflowRunCancelled(run.id);
   const requeued = requeueWorkflowFromRun(run.id, {
     originSessionIds: workflowRunOriginSessionIds(run),
     selfHealAttempt: attempt,
     selfHealBackupId: applied.backupId,
+    sourceExecutionSettled: true,
   });
   if (requeued.status !== 'queued' && requeued.status !== 'duplicate') {
     // Fix is applied but we couldn't re-queue — report it so it's never silent.
@@ -5970,16 +6466,32 @@ async function processOneRunFile(
   workflows: ReturnType<typeof listWorkflows>,
   assistant: ClementineAssistant,
 ): Promise<void> {
+    const cancellationAtAdmission = readWorkflowRunCancellation(run.id);
+    if (cancellationAtAdmission) {
+      const current = readRunRecord(filePath) ?? run;
+      writeRunRecord(filePath, {
+        ...current,
+        status: 'cancelled',
+        cancelledAt: cancellationAtAdmission.requestedAt,
+        finishedAt: current.finishedAt ?? cancellationAtAdmission.requestedAt,
+        error: cancellationAtAdmission.reason,
+      }, { workflowName: current.workflow, outcome: 'failed', detail: cancellationAtAdmission.reason });
+      const cancelledRecord = readRunRecord(filePath);
+      if (cancelledRecord && !cancelledRecord.notifiedAt) notifyCancelledRunOnce(filePath, cancelledRecord);
+      return;
+    }
     const workflow = workflows.find((entry) => entry.data.name === run.workflow);
     if (!workflow) {
       const message = `Workflow not found: "${run.workflow}". It may have been renamed or deleted.`;
-      startWorkflowActivityRun(run, run.workflow, `Starting workflow "${run.workflow}"`);
-      writeRunRecord(filePath, {
+      const report = { workflowName: run.workflow, outcome: 'failed' as const, detail: message };
+      const terminalRecord = writeRunRecord(filePath, {
         ...run,
         status: 'error',
         error: message,
         finishedAt: new Date().toISOString(),
-      });
+      }, report);
+      if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      startWorkflowActivityRun(run, run.workflow, `Starting workflow "${run.workflow}"`);
       // Reports-back: a run that can't even resolve its workflow must not
       // die silently (the user queued it and is waiting).
       addNotification({
@@ -5991,12 +6503,17 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: run.workflow, runId: run.id },
       });
+      markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'failed',
         message: `Workflow failed before start: ${message}`,
         error: message,
       });
-      markRunNotified(filePath);
+      recordAndAttemptWorkflowRunReportBack(filePath, {
+        workflowName: run.workflow,
+        outcome: 'failed',
+        detail: message,
+      });
       return;
     }
     // DRY-RUN: a safe, side-effect-free runnability preflight (the dashboard
@@ -6004,7 +6521,6 @@ async function processOneRunFile(
     // draft (it's exactly what you dry-run), executes NOTHING, and reports a
     // per-issue "would this run?" verdict, then finalizes the record.
     if (run.status === 'dry_run') {
-      startWorkflowActivityRun(run, workflow.data.name, `Dry-running workflow "${workflow.data.name}"`);
       // Provable dry-run: trace the whole plan side-effect-free and enumerate
       // every external write/send BEFORE anything runs. The verdict mirrors what
       // the queue would actually refuse (structural preflight + authoritative
@@ -6014,12 +6530,19 @@ async function processOneRunFile(
         inputs: run.inputs ?? {},
       });
       const report = renderWorkflowDryRunSimulation(sim);
-      writeRunRecord(filePath, {
+      const terminalReport = {
+        workflowName: workflow.data.name,
+        outcome: sim.runnable ? 'done' as const : 'blocked' as const,
+        detail: report,
+      };
+      const terminalRecord = writeRunRecord(filePath, {
         ...run,
         status: 'dry_run',
         finishedAt: new Date().toISOString(),
         output: sim.summary,
-      });
+      }, terminalReport);
+      if (!terminalPublicationMatches(filePath, terminalRecord, terminalReport)) return;
+      startWorkflowActivityRun(run, workflow.data.name, `Dry-running workflow "${workflow.data.name}"`);
       addNotification({
         id: `workflow-${run.id}-dryrun`,
         kind: 'workflow',
@@ -6037,13 +6560,18 @@ async function processOneRunFile(
           writeCount: sim.effects.writes.length,
         },
       });
+      markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'completed',
         message: sim.runnable ? 'Workflow dry-run passed' : 'Workflow dry-run found blockers',
         outputPreview: report,
         needsAttention: !sim.runnable,
       });
-      markRunNotified(filePath);
+      recordAndAttemptWorkflowRunReportBack(filePath, {
+        workflowName: workflow.data.name,
+        outcome: sim.runnable ? 'done' : 'blocked',
+        detail: report,
+      });
       return;
     }
     // CREATION TEST (Part B): really run the read-only steps + preview mutating,
@@ -6051,7 +6579,6 @@ async function processOneRunFile(
     // draft disabled + report what to fix). Works on a disabled draft, so it
     // sits before the enabled gate.
     if (run.status === 'creation_test') {
-      startWorkflowActivityRun(run, workflow.data.name, `Creation-testing workflow "${workflow.data.name}"`);
       const ctInputs = normalizeWorkflowRunInputs({
         ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
         ...(run.inputs ?? {}),
@@ -6062,14 +6589,6 @@ async function processOneRunFile(
       } catch (err) {
         result = { pass: false, steps: [{ stepId: '(run)', status: 'error', detail: err instanceof Error ? err.message : String(err) }] };
       }
-      // On a clean pass, enable the draft so it's live + trusted; otherwise it
-      // stays disabled and the report says what to fix (informs, not a hard gate
-      // — the user can still enable manually).
-      if (result.pass) {
-        try { writeWorkflowAndSyncTriggers(workflow.name, { ...workflow.data, enabled: true }); } catch { /* best-effort */ }
-        try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
-      }
-      writeRunRecord(filePath, { ...run, status: 'creation_test', finishedAt: new Date().toISOString(), output: result.pass ? 'creation test passed' : 'creation test found issues' });
       const lines = result.steps.map((s) => {
         const icon = s.status === 'ok' ? '✅' : s.status === 'previewed' ? '⏭️ previewed (mutating — not run)' : '⚠️';
         return `- ${s.stepId}: ${s.status === 'ok' ? '✅ returned data' : s.status === 'previewed' ? '⏭️ previewed (mutating step — not run)' : `${icon} ${s.status}${s.detail ? ` — ${s.detail}` : ''}`}`;
@@ -6077,6 +6596,25 @@ async function processOneRunFile(
       const body = result.pass
         ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
         : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nFix the flagged step(s) with workflow_update (e.g. bind the right tool), then re-test. To run it as-is anyway: workflow_set_enabled.`;
+      const report = {
+        workflowName: workflow.data.name,
+        outcome: result.pass ? 'done' as const : 'blocked' as const,
+        detail: body,
+      };
+      const terminalRecord = writeRunRecord(
+        filePath,
+        { ...run, status: 'creation_test', finishedAt: new Date().toISOString(), output: result.pass ? 'creation test passed' : 'creation test found issues' },
+        report,
+      );
+      if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      startWorkflowActivityRun(run, workflow.data.name, `Creation-testing workflow "${workflow.data.name}"`);
+      // Only the process that published this creation-test terminal may enable
+      // the draft or clear its failure history. A cancellation/other terminal
+      // winner leaves workflow state untouched.
+      if (result.pass) {
+        try { writeWorkflowAndSyncTriggers(workflow.name, { ...workflow.data, enabled: true }); } catch { /* best-effort */ }
+        try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
+      }
       addNotification({
         id: `workflow-${run.id}-creationtest`,
         kind: 'workflow',
@@ -6086,14 +6624,18 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id, creationTest: true, pass: result.pass },
       });
-      enqueueWorkflowOutcomeTurn(run, workflow.data.name, result.pass ? 'done' : 'blocked', body);
+      markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'completed',
         message: result.pass ? 'Workflow creation test passed' : 'Workflow creation test found issues',
         outputPreview: body,
         needsAttention: !result.pass,
       });
-      markRunNotified(filePath);
+      recordAndAttemptWorkflowRunReportBack(filePath, {
+        workflowName: workflow.data.name,
+        outcome: result.pass ? 'done' : 'blocked',
+        detail: body,
+      });
       return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're
@@ -6101,14 +6643,16 @@ async function processOneRunFile(
     // the workflow to be approved.
     if (!run.targetStepId && !workflow.data.enabled) {
       const message = `Workflow "${workflow.data.name}" is disabled — approve/enable it before it can run.`;
-      startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
-      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
-      writeRunRecord(filePath, {
+      const report = { workflowName: workflow.data.name, outcome: 'failed' as const, detail: message };
+      const terminalRecord = writeRunRecord(filePath, {
         ...run,
         status: 'error',
         error: message,
         finishedAt: new Date().toISOString(),
-      });
+      }, report);
+      if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
+      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
       addNotification({
         id: `workflow-${run.id}-disabled`,
         kind: 'workflow',
@@ -6118,43 +6662,57 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id },
       });
+      markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'failed',
         message: `Workflow failed before start: ${message}`,
         error: message,
       });
-      markRunNotified(filePath);
+      recordAndAttemptWorkflowRunReportBack(filePath, {
+        workflowName: workflow.data.name,
+        outcome: 'failed',
+        detail: message,
+      });
       return;
     }
 
     if (!run.targetStepId) {
       const prep = prepareWorkflowForWrite(workflow.data);
       if (prep.ok && prep.repairs.length > 0) {
-        workflow.data = prep.def;
-        try { writeWorkflowAndSyncTriggers(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
-        try {
-          appendWorkflowEvent(workflow.name, run.id, {
-            kind: 'step_advisory',
-            stepId: '(preflight)',
-            meta: { reason: 'pre_run_auto_repair', repairs: prep.repairs.slice(0, 8) },
-          });
-        } catch { /* best-effort */ }
+        let repairAuthorized = false;
+        withWorkflowRunRecordLock(filePath, () => {
+          const authoritative = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+          if (!authoritative || isTerminalRunRecord(authoritative)) return;
+          repairAuthorized = true;
+          workflow.data = prep.def;
+          try { writeWorkflowAndSyncTriggers(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
+          try {
+            appendWorkflowEvent(workflow.name, run.id, {
+              kind: 'step_advisory',
+              stepId: '(preflight)',
+              meta: { reason: 'pre_run_auto_repair', repairs: prep.repairs.slice(0, 8) },
+            });
+          } catch { /* best-effort */ }
+        });
+        if (!repairAuthorized) return;
         logger.info({ workflow: workflow.data.name, runId: run.id, repairs: prep.repairs }, 'workflow pre-run auto-repair applied');
       }
       const preflight = preflightWorkflow(workflow.data, run.inputs ?? {});
       if (!preflight.ok) {
         const message = `Workflow "${workflow.data.name}" needs edits before it can run. ${preflight.summary}`;
+        const report = { workflowName: workflow.data.name, outcome: 'blocked' as const, detail: message };
+        const terminalRecord = writeRunRecord(filePath, {
+          ...run,
+          status: 'error',
+          error: message,
+          finishedAt: new Date().toISOString(),
+        }, report);
+        if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
         startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
         appendWorkflowEvent(workflow.name, run.id, {
           kind: 'run_failed',
           error: message,
           meta: { preflightErrors: preflight.errors.slice(0, 8), editAdvisories: preflight.editAdvisories.slice(0, 8) },
-        });
-        writeRunRecord(filePath, {
-          ...run,
-          status: 'error',
-          error: message,
-          finishedAt: new Date().toISOString(),
         });
         addNotification({
           id: `workflow-${run.id}-preflight`,
@@ -6165,12 +6723,17 @@ async function processOneRunFile(
           read: false,
           metadata: { workflow: workflow.data.name, runId: run.id, status: 'error', preflight: true },
         });
+        markRunNotified(filePath);
         finishWorkflowActivityRun(run.id, {
           status: 'failed',
           message,
           error: preflight.errors.join('\n'),
         });
-        markRunNotified(filePath);
+        recordAndAttemptWorkflowRunReportBack(filePath, {
+          workflowName: workflow.data.name,
+          outcome: 'blocked',
+          detail: message,
+        });
         logger.warn(
           { workflow: workflow.data.name, runId: run.id, errors: preflight.errors },
           'Workflow run rejected before start: preflight failed',
@@ -6202,17 +6765,19 @@ async function processOneRunFile(
     const missingInputs = missingWorkflowRunInputs(workflow.data, inputs);
     if (missingInputs.length > 0) {
       const message = `Missing required workflow input${missingInputs.length === 1 ? '' : 's'}: ${missingInputs.join(', ')}`;
-      startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
-      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
-      writeRunRecord(filePath, {
+      const report = { workflowName: workflow.data.name, outcome: 'failed' as const, detail: message };
+      const terminalRecord = writeRunRecord(filePath, {
         ...run,
         inputs,
         status: 'error',
         error: message,
         finishedAt: new Date().toISOString(),
-      });
+      }, report);
+      if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
+      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
       addNotification({
-        id: `${Date.now()}-workflow-${run.id}-missing-inputs`,
+        id: `workflow-${run.id}-missing-inputs`,
         kind: 'workflow',
         title: `Workflow failed before start: ${workflow.data.name}`,
         body: `${message}. Re-run the workflow with the missing input values.`,
@@ -6220,22 +6785,34 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id, status: 'error' },
       });
+      markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'failed',
         message: `Workflow failed before start: ${message}`,
         error: message,
       });
-      markRunNotified(filePath);
+      recordAndAttemptWorkflowRunReportBack(filePath, {
+        workflowName: workflow.data.name,
+        outcome: 'failed',
+        detail: message,
+      });
       logger.warn({ workflow: workflow.data.name, runId: run.id, missingInputs }, 'Workflow run rejected before start: missing required inputs');
       return;
     }
 
     const isResume = run.status === 'running';
-    writeRunRecord(filePath, {
+    const runningRecord = writeRunRecord(filePath, {
       ...run,
       status: 'running',
       startedAt: run.startedAt ?? new Date().toISOString(),
-    });
+    }, undefined, buildWorkflowMutationContractSnapshot(workflow.data.steps)).record;
+    if (isTerminalRunRecord(runningRecord)) {
+      const cancelledRecord = readRunRecord(filePath);
+      if (cancelledRecord?.status === 'cancelled' && !cancelledRecord.notifiedAt) {
+        notifyCancelledRunOnce(filePath, cancelledRecord);
+      }
+      return;
+    }
     appendWorkflowEvent(workflow.name, run.id, {
       kind: isResume ? 'run_resumed' : 'run_started',
       meta: { inputs, source: run.source, targetStepId: run.targetStepId ?? null },
@@ -6297,12 +6874,23 @@ async function processOneRunFile(
           itemKeys: run.retryFailedItemKeys,
         });
       }
-      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId, run.goalFeedback, run.originSessionId);
+      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(
+        workflow.data,
+        workflow.name,
+        run.id,
+        inputs,
+        assistant,
+        run.targetStepId,
+        run.goalFeedback,
+        run.originSessionId,
+        isResume,
+        runningRecord.mutationReceiptProtocolVersion,
+        runningRecord.mutationContractSnapshot,
+      );
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
       const rawStepOutputs = Object.fromEntries(resume.completedSteps);
       const stepOutputs = stringifyOutputs(rawStepOutputs);
-      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
 
       // Self-heal: a step that returned {blocked:true} ran cleanly but
       // could not finish its job. Today that still marks "completed" and
@@ -6492,10 +7080,12 @@ async function processOneRunFile(
           // error-path run.
           let requeued: ReturnType<typeof requeueWorkflowFromRun> | null = null;
           try {
+            throwIfWorkflowRunCancelled(run.id);
             requeued = requeueWorkflowFromRun(run.id, {
               originSessionIds: workflowRunOriginSessionIds(run),
               goalAttempt: (run.goalAttempt ?? 0) + 1,
               goalFeedback: goalFeedbackNext,
+              sourceExecutionSettled: true,
             });
           } catch { requeued = null; }
           if (requeued?.status === 'queued') {
@@ -6610,65 +7200,60 @@ async function processOneRunFile(
       // fail is genuinely stuck, and escalating then is correct. A goal-unmet
       // re-pursuit counts as a FAILURE so a workflow whose goal never passes
       // trips the chronic-failure breaker instead of burning attempts forever.)
-      const ledger = recordWorkflowOutcome(
-        workflow.name,
-        !needsAttention && !goalRepursuing,
-        needsAttention ? attentionReason : goalRepursuing ? 'pinned goal unmet — re-pursuing' : undefined,
-      );
-      // Capability compounding (C3): a CLEAN run that did real discovery
-      // distills into a reusable draft skill. Fire-and-forget; the novelty gate
-      // skips routine cron runs internally, so this is a no-op for them.
-      if (!needsAttention && !goalRepursuing) {
-        // RSH-5: this run finished CLEAN. If it was itself a healed re-run, the
-        // fix that produced it STUCK — promote the pending fix to the confirmed
-        // store so it sharpens the next diagnosis of the same failure.
-        if ((run.selfHealAttempt ?? 0) > 0) {
-          try { confirmPendingFix(run.id, new Date().toISOString()); } catch { /* best-effort */ }
-        }
-        void (async () => {
-          try {
-            const { distillSkillFromSessions } = await import('../memory/skill-distiller.js');
-            const stepSessionIds = (workflow.data.steps ?? []).map((s) => `workflow:${run.id}:${s.id}`);
-            await distillSkillFromSessions(stepSessionIds, {
-              objective: workflow.data.description || workflow.data.name,
-              evidence: typeof finalOutput === 'string' ? finalOutput : undefined,
-              sourceId: run.id,
-            });
-          } catch { /* distillation never affects the run */ }
-        })();
-        if (!run.targetStepId) {
-          try {
-            recordSuccessfulWorkflowPattern({
-              workflow: workflow.data,
-              workflowSlug: workflow.name,
-              runId: run.id,
-              finalOutput,
-            });
-          } catch { /* pattern learning never affects the run */ }
-          // T3.1 (success-path improvement): a clean run's VERIFIED outputs are
-          // ground truth — derive additive output contracts for steps that had
-          // none, so the next run is held to the shape this run proved
-          // achievable. Additive-only (author-declared contracts are never
-          // touched), validated before write, and backed up so `revert heal
-          // <id>` undoes a tightening that proves wrong. Never affects the run.
-          try {
-            tightenWorkflowContractsFromCleanRun(workflow.name, workflow.data, stepOutputs, run.id);
-          } catch (err) {
-            logger.warn({ workflow: workflow.name, err: err instanceof Error ? err.message : String(err) }, 'clean-run contract tightening skipped');
+      // Terminal-derived ledgers, learned patterns, and contract tightening are
+      // authorized only by the worker that actually publishes terminal truth.
+      // Compute the breaker preview without mutating it so report copy remains
+      // deterministic before publication.
+      const prospectiveConsecutiveFailures = !needsAttention && !goalRepursuing
+        ? 0
+        : getConsecutiveFailures(workflow.name) + 1;
+      const recordPublishedOutcomeLearning = (): void => {
+        recordWorkflowOutcome(
+          workflow.name,
+          !needsAttention && !goalRepursuing,
+          needsAttention ? attentionReason : goalRepursuing ? 'pinned goal unmet — re-pursuing' : undefined,
+        );
+        if (!needsAttention && !goalRepursuing) {
+          if ((run.selfHealAttempt ?? 0) > 0) {
+            try { confirmPendingFix(run.id, new Date().toISOString()); } catch { /* best-effort */ }
           }
+          void (async () => {
+            try {
+              const { distillSkillFromSessions } = await import('../memory/skill-distiller.js');
+              const stepSessionIds = (workflow.data.steps ?? []).map((s) => `workflow:${run.id}:${s.id}`);
+              await distillSkillFromSessions(stepSessionIds, {
+                objective: workflow.data.description || workflow.data.name,
+                evidence: typeof finalOutput === 'string' ? finalOutput : undefined,
+                sourceId: run.id,
+              });
+            } catch { /* distillation never affects the run */ }
+          })();
+          if (!run.targetStepId) {
+            try {
+              recordSuccessfulWorkflowPattern({
+                workflow: workflow.data,
+                workflowSlug: workflow.name,
+                runId: run.id,
+                finalOutput,
+              });
+            } catch { /* pattern learning never affects the run */ }
+            try {
+              tightenWorkflowContractsFromCleanRun(workflow.name, workflow.data, stepOutputs, run.id);
+            } catch (err) {
+              logger.warn({ workflow: workflow.name, err: err instanceof Error ? err.message : String(err) }, 'clean-run contract tightening skipped');
+            }
+          }
+        } else if (needsAttention && !run.targetStepId) {
+          try { recordFailedWorkflowPattern({ workflow: workflow.data, workflowSlug: workflow.name }); } catch { /* best-effort */ }
         }
-      } else if (needsAttention && !run.targetStepId) {
-        // Pattern quality (learning): this run needed attention — penalize the
-        // workflow's learned pattern so a since-degraded workflow stops being
-        // recalled as a confident hint until it succeeds cleanly again.
-        try { recordFailedWorkflowPattern({ workflow: workflow.data, workflowSlug: workflow.name }); } catch { /* best-effort */ }
-      }
-      const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
+      };
+      const autoHealPaused = needsAttention && prospectiveConsecutiveFailures >= escalateThreshold();
       const escalationBanner = autoHealPaused
-        ? `⚠️ "${workflow.data.name}" has failed ${ledger.consecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
+        ? `⚠️ "${workflow.data.name}" has failed ${prospectiveConsecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
         : '';
 
-      writeRunRecord(filePath, {
+      throwIfWorkflowRunCancelled(run.id);
+      const terminalProjection: QueuedRunRecord = {
         ...run,
         status: hasForEachFailures ? 'completed_with_errors' : 'completed',
         finishedAt: new Date().toISOString(),
@@ -6678,7 +7263,7 @@ async function processOneRunFile(
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
           : {}),
         ...(goalDecision ? { goalOutcome: goalDecision.action, goalReason: goalDecision.reason } : {}),
-      });
+      };
 
       // Pinned-goal re-pursuit: the run completed mechanically but its goal is
       // unmet and a FRESH attempt is already queued (with the validation
@@ -6691,6 +7276,12 @@ async function processOneRunFile(
           `🎯 "${workflow.data.name}" finished but its pinned goal isn't met yet:\n${goalFeedbackNext}\n\n`
           + `Re-running with this feedback — attempt ${attemptNowRunning} of ${runGoal?.maxAttempts ?? attemptNowRunning}`
           + `${goalRequeueId ? ` (run ${goalRequeueId})` : ''}. It will report back when it finishes.`;
+        const report = { workflowName: workflow.data.name, outcome: 'blocked' as const, detail: goalRetryMsg };
+        const terminalRecord = writeRunRecord(filePath, terminalProjection, report);
+        if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+        appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
+        recordPublishedOutcomeLearning();
+        attemptWorkflowRunReportBack(filePath);
         addNotification({
           id: `workflow-${run.id}-goalretry`,
           kind: 'workflow',
@@ -6708,7 +7299,6 @@ async function processOneRunFile(
             outputPreview: goalRetryMsg.slice(0, 800),
           });
         } catch { /* best-effort */ }
-        enqueueWorkflowOutcomeTurn(run, workflow.data.name, 'blocked', goalRetryMsg);
         logger.info(
           { workflow: workflow.data.name, runId: run.id, newRunId: goalRequeueId, attempt: attemptNowRunning },
           'pinned goal unmet — re-pursuit queued',
@@ -6750,7 +7340,7 @@ async function processOneRunFile(
             logger.warn({ runId: run.id, err: err instanceof Error ? err.message : String(err) }, 'self-heal auto-revert failed (backup may already be gone)');
           }
         }
-        const healed = healReverted ? null : await tryAutoHealAndRequeue({
+        const healed = (healReverted || autoHealPaused) ? null : await tryAutoHealAndRequeue({
           run,
           workflowSlug: workflow.name,
           steps: workflow.data.steps,
@@ -6760,6 +7350,12 @@ async function processOneRunFile(
           rawStepOutputs, // RSH-2: probe a contract fix against real output before re-running
         });
         if (healed) {
+          const report = { workflowName: workflow.data.name, outcome: 'blocked' as const, detail: healed.message };
+          const terminalRecord = writeRunRecord(filePath, terminalProjection, report);
+          if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+          appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
+          recordPublishedOutcomeLearning();
+          attemptWorkflowRunReportBack(filePath);
           addNotification({
             id: `workflow-${run.id}-selfheal`,
             kind: 'workflow',
@@ -6780,7 +7376,6 @@ async function processOneRunFile(
           // Gap E: also tell the origin chat in-context that we're healing +
           // re-running (the fresh run carries originSessionId and will report its
           // own final outcome). No-op for scheduled/cron runs.
-          enqueueWorkflowOutcomeTurn(run, workflow.data.name, 'blocked', healed.message);
           logger.info({ workflow: workflow.data.name, runId: run.id, attempt: healed.attempt }, 'Workflow run auto-healed and re-queued');
           return;
         }
@@ -6824,17 +7419,6 @@ async function processOneRunFile(
         : (targetVerdict?.judged && targetVerdict.reached)
           ? 'reached the workflow target'
           : `completed ${workflow.data.steps.length} step${workflow.data.steps.length === 1 ? '' : 's'}`;
-      try {
-        appendWorkflowEvent(workflow.name, run.id, {
-          kind: 'run_summary',
-          meta: {
-            because: succeededBecause,
-            needsAttention,
-            artifacts: runArtifacts,
-            emptyDeliverableReads: emptyDeliverableReads.map((e) => ({ stepId: e.stepId, consumer: e.consumerId })),
-          },
-        });
-      } catch { /* summary event is best-effort */ }
       const producedItems = [
         runArtifacts.counts.length ? runArtifacts.counts.join(', ') : '',
         ...runArtifacts.files,
@@ -6886,8 +7470,29 @@ async function processOneRunFile(
         runIsNoOp = voiced.nothingHappened
           && !needsAttention && !hasFailures && !hasAdvisories && !autoHealPaused && !interactive;
       }
+      const terminalReport = {
+        workflowName: workflow.data.name,
+        outcome: workflowReportLaneForOutcome({ needsAttention, advisories: qualityAdvisories }),
+        detail: reportBody,
+      };
+      const terminalRecord = writeRunRecord(filePath, terminalProjection, terminalReport);
+      if (!terminalPublicationMatches(filePath, terminalRecord, terminalReport)) return;
+      appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
+      recordPublishedOutcomeLearning();
+      try {
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'run_summary',
+          meta: {
+            because: succeededBecause,
+            needsAttention,
+            artifacts: runArtifacts,
+            emptyDeliverableReads: emptyDeliverableReads.map((e) => ({ stepId: e.stepId, consumer: e.consumerId })),
+          },
+        });
+      } catch { /* summary event is best-effort */ }
+      attemptWorkflowRunReportBack(filePath);
       addNotification({
-        id: `${Date.now()}-workflow-${run.id}`,
+        id: `workflow-${run.id}-completed`,
         kind: 'workflow',
         title: runIsNoOp
           ? `Nothing new — ${workflow.data.name}`
@@ -6937,14 +7542,6 @@ async function processOneRunFile(
       // Needs-attention OR a review-required advisory → 'blocked' so Clem knows
       // to review; informational advisories still ride the body on the done
       // lane. A routine no-op never wakes the chat.
-      if (!runIsNoOp) {
-        enqueueWorkflowOutcomeTurn(
-          run,
-          workflow.data.name,
-          workflowReportLaneForOutcome({ needsAttention, advisories: qualityAdvisories }),
-          reportBody,
-        );
-      }
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
       // P0 parking: the run paused on a human approval. Checkpoint the
@@ -6957,12 +7554,21 @@ async function processOneRunFile(
       if (error instanceof ParkRunSignal) {
         const parkedAt = new Date().toISOString();
         const approvalIds = error.parkedSteps.flatMap((step) => step.approvalIds);
-        writeRunRecord(filePath, {
+        const parkedRecord = writeRunRecord(filePath, {
           ...run,
           status: 'parked',
           startedAt: run.startedAt ?? new Date().toISOString(),
           parked: { parkedSteps: error.parkedSteps, parkedAt },
-        });
+        }).record;
+        // A dashboard cancellation or another terminal publisher may have won
+        // the shared record lock after the step raised ParkRunSignal. Do not
+        // emit approval cards / awaiting_approval activity / needs_input turns
+        // from the stale park path after that authoritative transition.
+        if (parkedRecord.status === 'cancelled') {
+          stopAfterCancellationWonWrite(filePath, parkedRecord);
+          return;
+        }
+        if (isTerminalRunRecord(parkedRecord)) return;
         // Belt-and-suspenders: the user-facing approval ask is normally posted
         // upstream in runStepViaHarness, but that post is gated + best-effort.
         // Re-emit it here with the SAME stable id `approval-<approvalId>` so
@@ -7037,29 +7643,15 @@ async function processOneRunFile(
         );
         return;
       }
-      const message = error instanceof Error ? error.message : String(error);
-      const cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
-      // Cross-fire failure ledger (#6): a thrown failure counts too (a user
-      // cancel does not). Surfaces the chronic-failure escalation on the error
-      // path, mirroring the blocked-step path above.
-      const errLedger = !cancelled ? recordWorkflowOutcome(workflow.name, false, message) : null;
-      const errEscalationBanner = errLedger && shouldStopAutoHeal(workflow.name)
-        ? `⚠️ "${workflow.data.name}" has failed ${errLedger.consecutiveFailures} runs in a row — please check it (and, for a scheduled workflow, consider disabling it until fixed). It resumes normal handling after one clean run.\n\n`
+      let message = error instanceof Error ? error.message : String(error);
+      let cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
+      const requestedCancellation = cancelled;
+      // Preview the post-failure count without mutating the advisory ledger.
+      // The real update happens only after an error terminal state wins.
+      const prospectiveFailureCount = cancelled ? 0 : getConsecutiveFailures(workflow.name) + 1;
+      const errEscalationBanner = prospectiveFailureCount >= escalateThreshold()
+        ? `⚠️ "${workflow.data.name}" has failed ${prospectiveFailureCount} runs in a row — please check it (and, for a scheduled workflow, consider disabling it until fixed). It resumes normal handling after one clean run.\n\n`
         : '';
-      logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');
-      appendWorkflowEvent(workflow.name, run.id, { kind: cancelled ? 'run_cancelled' : 'run_failed', error: message });
-      writeRunRecord(filePath, {
-        ...run,
-        status: cancelled ? 'cancelled' : 'error',
-        finishedAt: new Date().toISOString(),
-        error: message,
-        // P0-1: a genuine FAILURE must surface in the "Needs you" UI, which reads
-        // needsAttention OFF THE RECORD (the success/blocked path sets it; the
-        // error path never did, so failed runs were invisible). A user CANCEL
-        // never needs attention. proposedFixId is merged in below once the
-        // self-heal diagnosis (if any) computes a fix.
-        ...(cancelled ? {} : { needsAttention: true, blockedSteps: [{ stepId: '(run)', reason: message }] }),
-      });
       // Contract-aware self-heal: a step that FAILED its declared output
       // contract throws to here (contract failures throw, so they bypass the
       // success-with-blocked diagnosis above). Route it to the Doctor for an
@@ -7100,12 +7692,6 @@ async function processOneRunFile(
           logger.warn({ err: healErr, runId: run.id }, 'contract-violation self-heal failed (best-effort)');
         }
       }
-      // P0-1: persist the proposed fix id onto the RECORD too (the self-heal
-      // block above only put it in the notification), so the "Needs you" surface
-      // can offer "apply fix <id>" for a failed run.
-      if (healFixId) {
-        try { const rec = readRunRecord(filePath); if (rec) writeRunRecord(filePath, { ...rec, proposedFixId: healFixId }); } catch { /* best-effort */ }
-      }
       // Warm the failure tone too (fail-open, lane:'failed' so the rewrite can
       // never claim success or drop the `apply fix <id>` action). A user CANCEL
       // keeps the original text + is never rewritten. Failures are NEVER silenced.
@@ -7113,6 +7699,43 @@ async function processOneRunFile(
       if (!cancelled) {
         failureBody = (await rewriteInClementineVoice(failureBody, { workflowName: run.workflow, lane: 'failed' })).message;
       }
+      const requestedReport = { workflowName: run.workflow, outcome: 'failed' as const, detail: failureBody };
+      const terminalRecord = writeRunRecord(filePath, {
+        ...run,
+        status: cancelled ? 'cancelled' : 'error',
+        finishedAt: new Date().toISOString(),
+        error: message,
+        ...(cancelled ? {} : {
+          needsAttention: true,
+          blockedSteps: [{ stepId: '(run)', reason: message }],
+          ...(healFixId ? { proposedFixId: healFixId } : {}),
+        }),
+      }, requestedReport);
+      const canonicalTerminal = terminalRecord.record;
+      if (!terminalRecord.publishedTerminal) {
+        if (!stopAfterCancellationWonWrite(filePath, canonicalTerminal) && canonicalTerminal.reportBack) {
+          attemptWorkflowRunReportBack(filePath);
+        }
+        return;
+      }
+      if (canonicalTerminal.status !== 'error' && canonicalTerminal.status !== 'cancelled') return;
+      if (requestedCancellation && canonicalTerminal.status !== 'cancelled') return;
+      cancelled = canonicalTerminal.status === 'cancelled';
+      if (cancelled) {
+        message = typeof canonicalTerminal.error === 'string' && canonicalTerminal.error
+          ? canonicalTerminal.error
+          : message;
+        failureBody = canonicalTerminal.reportBack?.detail ?? message;
+        healTitle = undefined;
+        healFixId = null;
+      } else if (!canonicalTerminal.reportBack || !sameTerminalReport(canonicalTerminal.reportBack, requestedReport)) {
+        attemptWorkflowRunReportBack(filePath);
+        return;
+      }
+      attemptWorkflowRunReportBack(filePath);
+      if (!cancelled) recordWorkflowOutcome(workflow.name, false, message);
+      logger[cancelled ? 'info' : 'error']({ err: error, file }, cancelled ? 'Workflow run cancelled' : 'Workflow run failed');
+      appendWorkflowEvent(workflow.name, run.id, { kind: cancelled ? 'run_cancelled' : 'run_failed', error: message });
       addNotification({
         // Stable id (terminal state fires once per run): addNotification
         // id-dedup makes this at-most-once and shares the cancelled id with the
@@ -7134,9 +7757,6 @@ async function processOneRunFile(
       // Gap E: re-enter the origin chat on a genuine FAILURE (no-op for
       // scheduled/cron). Skip a user-initiated CANCEL — the user already knows
       // (mirrors background-tasks skipping aborted).
-      if (!cancelled) {
-        enqueueWorkflowOutcomeTurn(run, run.workflow, 'failed', failureBody);
-      }
       try {
         finishRun(run.id, {
           status: cancelled ? 'cancelled' : 'failed',

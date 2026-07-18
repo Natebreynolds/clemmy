@@ -416,13 +416,28 @@ function errorText(value: unknown): string {
 
 /** True only when the CLI could not have crossed the provider boundary. Keep
  * this intentionally narrow; provider timeouts, 5xx, broken pipes, and generic
- * non-zero exits are ambiguous for writes. */
+ * non-zero exits are ambiguous for writes.
+ *
+ * The ONLY reliable pre-dispatch signals are (1) the explicit
+ * `[provider-dispatch:not-started:…]` marker that the pre-dispatch gates emit
+ * before crossing the boundary (the gateway block in composio-tools, and the
+ * CLI-status / no-API-key throws that used to be recognized by their auth/key
+ * PROSE), and (2) hard process-launch failures where the CLI binary never ran.
+ *
+ * Bare auth/key text ("not authenticated", "run composio login", "API key
+ * required") was REMOVED: `errorText` flattens the ~8KB error including nested
+ * cause/stderr, and that same auth phrasing leaks into POST-dispatch errors — a
+ * non-zero CLI exit carrying the provider's response body, or Composio's own
+ * "produced no output; run composio login" wrapper thrown AFTER runComposioCli
+ * already dispatched. Matching it there falsely proved no-dispatch and
+ * authorized an auto-fallback retry / proven-no-commit receipt that could
+ * DOUBLE-WRITE. Genuine pre-dispatch auth/key failures now carry the
+ * not-started marker instead, so they are still proven — structurally. */
 export function composioCliErrorProvesNoDispatch(error: unknown): boolean {
   const text = errorText(error);
   return /\[provider-dispatch:not-started:/i.test(text)
     || /\bENOENT\b|command not found|executable not found|failed to spawn|spawn[^\n]*not found/i.test(text)
-    || /CLI is not installed|unsupported CLI version|version mismatch|unknown (?:command|option)|invalid CLI invocation/i.test(text)
-    || /not logged in|not authenticated|authentication required|run composio login/i.test(text);
+    || /CLI is not installed|unsupported CLI version|version mismatch|unknown (?:command|option)|invalid CLI invocation/i.test(text);
 }
 
 export function composioAutoFallbackAllowed(toolSlug: string, error: unknown): boolean {
@@ -1612,14 +1627,25 @@ export async function executeComposioTool(
         }
       }
     } else if (backend === 'cli') {
+      // Pre-dispatch gate: the CLI status check ran BEFORE executeComposioCliTool,
+      // so nothing crossed the provider boundary. Carry the not-started marker so
+      // composioCliErrorProvesNoDispatch proves no-dispatch STRUCTURALLY (via the
+      // marker) rather than off the bare "run composio login" text — the same
+      // auth phrase leaks into POST-dispatch errors (a non-zero CLI exit whose
+      // stderr mentions auth, or the "produced no output; run composio login"
+      // wrapper), which must stay ambiguous.
       throw new Error(cliStatus.installed
-        ? 'Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.'
-        : 'Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.');
+        ? '[provider-dispatch:not-started:cli-auth] Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.'
+        : '[provider-dispatch:not-started:cli-missing] Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.');
     }
   }
 
   const composio = getComposio();
-  if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
+  // No API key ⇒ no SDK client was ever constructed, so this throw is strictly
+  // pre-dispatch. Carry the not-started marker so the no-dispatch proof is
+  // structural, not reliant on the bare "COMPOSIO_API_KEY" text (which also
+  // appears in provider/stderr bodies AFTER a real dispatch attempt).
+  if (!composio) throw new Error('[provider-dispatch:not-started:no-api-key] COMPOSIO_API_KEY is not configured.');
   // "Know about the connection, then query the right one": when the caller
   // didn't pin a connection, resolve the toolkit's live connection by IDENTITY
   // (selectToolkitConnection) rather than relying on a stale baked id or the

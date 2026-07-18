@@ -41,7 +41,11 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { getArtifactRunScope, listRunArtifacts } from '../runtime/harness/artifact-ledger.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
-import { fireWorkflowWebhook, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
+import {
+  fireWorkflowWebhook,
+  syncWorkflowTriggerRegistry,
+  workflowWebhookResponseDisposition,
+} from '../execution/workflow-trigger-engine.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
@@ -1272,6 +1276,11 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   // via queueWorkflowRun. 404 when nothing subscribes to the path.
   app.post('/api/hooks/workflows/:hookPath', requireAuth, (req, res) => {
     const hookPath = String(req.params.hookPath ?? '');
+    // No daemon-liveness gate: fireWorkflowWebhook persists a durable receipt
+    // and queues the run file even with the daemon down (standalone `clementine
+    // webhook` mode runs this server with no daemon by design). Recovery on the
+    // next daemon boot/tick drains anything still pending. Gating here dropped
+    // every event for producers that never retry 5xx.
     let results;
     try {
       syncWorkflowTriggerRegistry(); // a hook may land before the next daemon tick
@@ -1284,7 +1293,12 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       res.status(404).json({ error: `No enabled workflow subscribes to webhook path "${hookPath}".` });
       return;
     }
-    res.json({ ok: true, results });
+    const disposition = workflowWebhookResponseDisposition(results);
+    res.status(disposition.httpStatus).json({
+      ok: disposition.ok,
+      pending: disposition.pending,
+      results,
+    });
   });
 
   app.get('/api/daemon/status', requireAuth, (_req, res) => {

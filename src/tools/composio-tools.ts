@@ -8,6 +8,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
+  composioCliErrorProvesNoDispatch,
   getComposioCredentialStatus,
   getComposioRuntimeStatus,
   listComposioToolkitTools,
@@ -182,6 +183,90 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
   const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(allFields) || isComposioReconnectRequiredError(value);
   const notFound = COMPOSIO_NOT_FOUND_RE.test(allFields);
   return { failed: true, summary, notFound, notConnected };
+}
+
+/** Narrow proof that a returned failure envelope could not have committed a
+ * mutation. Timeouts, conflicts, 5xx, and generic `successful:false` remain
+ * ambiguous even though they are visible failures.
+ *
+ * INVARIANT: a `true` (proven-no-commit) verdict marks the mutation slot safe
+ * for a fresh run, so it may ONLY derive from STRUCTURED evidence —
+ *   1. a numeric status/code FIELD in the provider envelope
+ *      (data.status_code / data.statusCode / status_code / statusCode / status), or
+ *   2. detectComposioFailure's typed not-found / not-connected classification.
+ * It must NEVER derive from a number scavenged out of free-text prose. A
+ * coincidental 4xx-looking digit run ("failed to sync row 422 to the sheet"
+ * after a dropped connection) is not an HTTP 422; treating it as one flipped an
+ * AMBIGUOUS failure to proven-no-commit and authorized a DUPLICATE external
+ * write — the exact class the receipt ledger exists to prevent.
+ *
+ * Prose IS still scanned, but only to force MORE caution (return false /
+ * ambiguous) on 5xx-, retry-, or transport-shaped language. Scanning text in
+ * the fail-closed direction can only ever park a run instead of re-dispatching
+ * it, which is always the safe error. The previous free-text validation-phrase
+ * path ("invalid recipient", "validation failed", …) was removed for the same
+ * reason: a partial multi-target write can surface such prose after committing,
+ * so a text-only match is not proof of no-commit — those failures now park. */
+export function composioFailureProvesNoCommit(value: unknown): boolean {
+  const failure = detectComposioFailure(value);
+  if (!failure.failed) return false;
+  const row = isRecord(value) ? value : {};
+  const data = isRecord(row.data) ? row.data : {};
+  const httpError = typeof data.http_error === 'string' ? data.http_error : '';
+  const topError = typeof row.error === 'string' ? row.error : '';
+  const dataMessage = typeof data.message === 'string' ? data.message : '';
+  const prose = `${failure.summary} ${httpError} ${topError} ${dataMessage}`;
+
+  // Structured statuses: numeric status/code FIELDS from the envelope only.
+  const structuredStatuses = [data.status_code, data.statusCode, row.status_code, row.statusCode, row.status]
+    .filter((candidate): candidate is number => typeof candidate === 'number' && candidate >= 400 && candidate < 600);
+
+  // Fail-closed uncertainty guard. Any 5xx / retry-conflict status (from a field
+  // OR from prose — scanning text here only ever parks, never authorizes) or
+  // transport/timeout language means the outcome is genuinely unknown → ambiguous.
+  const uncertaintyStatuses = [
+    ...structuredStatuses,
+    ...Array.from(prose.matchAll(/\b([45]\d{2})\b/g), (match) => Number.parseInt(match[1], 10)),
+  ];
+  if (
+    uncertaintyStatuses.some((statusCode) => statusCode >= 500 || [408, 409, 425, 499].includes(statusCode))
+    || /timeout|timed out|deadline|connection reset|ECONNRESET|broken pipe|response lost|unknown outcome|after submit/i.test(prose)
+  ) {
+    return false;
+  }
+
+  // Typed not-connected: Composio's connection router refused to route to the
+  // provider (ConnectedAccountNotFound / NoActiveConnection / reconnect codes
+  // 1810·1812 — see COMPOSIO_NOT_CONNECTED_RE + isComposioReconnectRequiredError).
+  // That rejection is UNAMBIGUOUSLY pre-dispatch for a direct mutation call, so no
+  // commit occurred.
+  if (failure.notConnected) return true;
+
+  // notFound is DELIBERATELY not trusted from prose here. detectComposioFailure
+  // sets `notFound` off a free-text regex (COMPOSIO_NOT_FOUND_RE) over the message/
+  // error fields, and a "not found" phrase can surface AFTER a partial/committed
+  // multi-target write or refer to a sub-resource — a text-only match is not proof
+  // of no-commit. A genuine wrong-id rejection carries a structured 404/410-class
+  // status FIELD, which the safeClientStatuses path below proves. So notFound
+  // proves no-commit ONLY when backed by that structured status; prose-only
+  // not-found falls through to the ambiguous `return false` (park), the safe error.
+  //
+  // A structured client-error status in the "rejected at the door" set proves
+  // no-commit. Nothing else does: with no structured status and no typed
+  // not-connected classification, prose is all we have, so the outcome stays
+  // AMBIGUOUS.
+  const safeClientStatuses = new Set([
+    400, 401, 403, 404, 405, 406, 410, 411, 412, 413, 414, 415, 416, 417,
+    422, 423, 424, 426, 428, 429, 431,
+  ]);
+  if (structuredStatuses.length > 0) return structuredStatuses.every((statusCode) => safeClientStatuses.has(statusCode));
+  return false;
+}
+
+/** Narrow thrown-error proof delegated to the provider client. Everything not
+ * recognized here crossed an uncertain boundary and must park as ambiguous. */
+export function composioDispatchErrorProvesNoCommit(error: unknown): boolean {
+  return composioCliErrorProvesNoDispatch(error);
 }
 
 /**
@@ -1143,6 +1228,21 @@ export interface ComposioGatewayOptions {
   preferredIdentity?: string;
 }
 
+/** Exact gateway-resolved call handed to a correctness-critical dispatch
+ * boundary. Resolution/validation has finished; invoking `dispatch` is the
+ * first operation that can reach the provider. */
+export interface ComposioDispatchBoundaryContext {
+  toolSlug: string;
+  args: Record<string, unknown>;
+  connectionId?: string;
+  identity?: string;
+}
+
+export type ComposioDispatchBoundary = (
+  context: ComposioDispatchBoundaryContext,
+  dispatch: () => Promise<unknown>,
+) => Promise<unknown>;
+
 // One-shot suppression revalidation: the pre-gateway user-routing bug (querying
 // under the wrong Composio user_id) MANUFACTURED entity-mismatch failures, and
 // their suppressions bench healthy connections for 7-30 days. Routing is fixed,
@@ -1405,12 +1505,34 @@ export async function resolveComposioDispatch(
 export async function dispatchComposioTool(
   toolSlug: string,
   args: Record<string, unknown>,
-  opts: ComposioGatewayOptions & { connectedAccountId?: string } = {},
+  opts: ComposioGatewayOptions & {
+    connectedAccountId?: string;
+    /** Optional exact-dispatch transaction wrapper. Used by structured
+     * workflow mutations to persist intent/receipt/commit around the raw call. */
+    dispatchBoundary?: ComposioDispatchBoundary;
+  } = {},
 ): Promise<{ ok: true; result: unknown; connectionId?: string; identity?: string } | ComposioGatewayBlocked> {
   const resolved = await resolveComposioDispatch(toolSlug, args, opts.connectedAccountId, opts);
   if (!resolved.ok) return resolved;
   try {
-    const result = await executeComposioTool(toolSlug, resolved.args, resolved.connectionId, resolved.identity);
+    const dispatch = (): Promise<unknown> => executeComposioTool(
+      toolSlug,
+      resolved.args,
+      resolved.connectionId,
+      resolved.identity,
+    );
+    const result = opts.dispatchBoundary
+      ? await opts.dispatchBoundary({
+        toolSlug,
+        args: resolved.args,
+        connectionId: resolved.connectionId,
+        identity: resolved.identity,
+      }, dispatch)
+      : await dispatch();
+    const failure = detectComposioFailure(result);
+    if (failure.failed) {
+      throw new Error(`Composio tool ${toolSlug} failed: ${failure.summary || 'provider reported failure'}`);
+    }
     clearReconnectBreaker(opts.sessionId, toolSlug);
     return { ok: true, result, connectionId: resolved.connectionId, identity: resolved.identity };
   } catch (err) {

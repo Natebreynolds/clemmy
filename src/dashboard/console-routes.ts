@@ -408,6 +408,7 @@ import {
   type QueueWorkflowRunRecoveryIntentInput,
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
+import { cancelWorkflowRunAtBoundary } from '../execution/workflow-run-cancellation.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -5254,7 +5255,6 @@ export function registerConsoleRoutes(
       return;
     }
     try {
-      const now = new Date().toISOString();
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
       if (raw.workflow !== entry.data.name) {
         res.status(404).json({ error: 'workflow run does not belong to this workflow' });
@@ -5264,25 +5264,39 @@ export function registerConsoleRoutes(
         ? req.body.reason.trim().slice(0, 500)
         : 'Cancelled from the desktop dashboard.';
       const events = readWorkflowEvents(entry.name, runId);
-      const hasTerminal = events.some((ev) =>
-        ev.kind === 'run_completed' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled',
-      );
-      if (!hasTerminal) {
+      const alreadyCancelled = raw.status === 'cancelled' || events.some((ev) => ev.kind === 'run_cancelled');
+      const alreadyFinished = ['completed', 'completed_with_errors', 'error', 'failed'].includes(String(raw.status ?? ''))
+        || events.some((ev) => ev.kind === 'run_completed' || ev.kind === 'run_failed');
+      if (alreadyFinished && !alreadyCancelled) {
+        res.status(409).json({ error: 'workflow run is already terminal and cannot be cancelled' });
+        return;
+      }
+      const cancellation = cancelWorkflowRunAtBoundary({
+        runId,
+        reason,
+        source: 'desktop-dashboard',
+        expectedWorkflow: entry.data.name,
+      });
+      if (cancellation.status === 'not_found') {
+        res.status(404).json({ error: 'workflow run not found' });
+        return;
+      }
+      if (cancellation.status === 'workflow_mismatch') {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      if (cancellation.status === 'already_terminal') {
+        res.status(409).json({ error: 'workflow run is already terminal and cannot be cancelled' });
+        return;
+      }
+      if (cancellation.status === 'cancelled' && !alreadyCancelled) {
         appendWorkflowEvent(entry.name, runId, {
           kind: 'run_cancelled',
-          error: reason,
+          error: cancellation.request.reason,
           meta: { source: 'desktop-dashboard' },
         });
       }
-      const next = {
-        ...raw,
-        status: 'cancelled',
-        cancelledAt: typeof raw.cancelledAt === 'string' ? raw.cancelledAt : now,
-        finishedAt: typeof raw.finishedAt === 'string' ? raw.finishedAt : now,
-        error: typeof raw.error === 'string' && raw.error ? raw.error : reason,
-      };
-      fs.writeFileSync(filePath, JSON.stringify(next, null, 2), 'utf-8');
-      res.json({ ok: true, run: next });
+      res.json({ ok: true, run: cancellation.run });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -9922,6 +9936,24 @@ export function registerConsoleRoutes(
       return;
     }
     try {
+      if (run.source === 'workflow') {
+        const workflowFile = path.join(WORKFLOW_RUNS_DIR, `${run.id}.json`);
+        if (fs.existsSync(workflowFile)) {
+          const cancellation = cancelWorkflowRunAtBoundary({
+            runId: run.id,
+            reason: 'Cancelled from the Tasks board.',
+            source: 'tasks-board',
+          });
+          if (cancellation.status === 'already_terminal') {
+            res.status(409).json({ ok: false, reason: 'this workflow run is already terminal; refresh the board' });
+            return;
+          }
+          if (cancellation.status === 'not_found' || cancellation.status === 'workflow_mismatch') {
+            res.status(409).json({ ok: false, reason: 'this workflow run changed; refresh the board' });
+            return;
+          }
+        }
+      }
       if (run.sessionId) {
         const ownedAttempt = getLatestHarnessRunAttemptByRunId(run.sessionId, run.id);
         if (ownedAttempt && ownedAttempt.status !== 'active') {

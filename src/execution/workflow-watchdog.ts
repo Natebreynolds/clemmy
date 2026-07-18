@@ -1,10 +1,22 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { latestEventAtForSessionPrefix } from '../runtime/harness/eventlog.js';
+import {
+  attemptWorkflowRunReportBack,
+  workflowRunReportBackNeedsRetry,
+  workflowRunReportBackRetryDue,
+  type WorkflowRunReportBackEnvelope,
+  type WorkflowRunReportBackRetryState,
+} from './workflow-run-report-back.js';
+import {
+  readWorkflowRunRecordUnlocked,
+  withWorkflowRunRecordLock,
+  writeWorkflowRunRecordDurablyUnlocked,
+} from './workflow-run-record.js';
 
 /**
  * Workflow watchdog (north star: REPORTS BACK WITHOUT FAIL).
@@ -58,7 +70,7 @@ const DEFAULT_TERMINAL_UNNOTIFIED_MAX_MS = 12 * 60 * 60_000;
 // be backstopped — the terminal_unnotified check only looks at this set. The
 // 12h MAX window + report-back dedup keep this from alerting on the historical
 // cancel backlog or on cancels that did notify.
-const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled']);
+const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed', 'cancelled']);
 
 export interface WatchdogRunView {
   id: string;
@@ -71,6 +83,11 @@ export interface WatchdogRunView {
   finishedAt?: string;
   /** ISO time the terminal user notification was delivered (report-back marker). */
   notifiedAt?: string;
+  reportBack?: WorkflowRunReportBackEnvelope;
+  reportBackRetry?: WorkflowRunReportBackRetryState;
+  /** Caller-populated aggregate: a delivery failed or a late origin sidecar has
+   * not reached the durable acknowledgement generation yet. */
+  reportBackPending?: boolean;
   /** Newest harness event across the run's step sessions (caller-populated
    *  for status='running' runs). Drives silent-running detection. */
   lastActivityAt?: string;
@@ -81,6 +98,7 @@ export interface StalledRun {
   workflow: string;
   ageMs: number;
   reason: 'queued_not_draining' | 'parked_awaiting_approval' | 'terminal_unnotified' | 'running_silent';
+  reportBackPending?: boolean;
 }
 
 export interface WorkflowRecommendedRecovery {
@@ -140,14 +158,20 @@ export function findStalledRuns(
       if (ageMs >= parkedStallMs) {
         out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'parked_awaiting_approval' });
       }
-    } else if (TERMINAL_STATUSES.has(status) && !run.notifiedAt) {
+    } else if (TERMINAL_STATUSES.has(status) && (!run.notifiedAt || run.reportBackPending === true)) {
       // Reached terminal but the report-back marker never landed — the notify
       // crashed or was lost. Surface it inside a bounded window (see constants).
       const finished = run.finishedAt ? Date.parse(run.finishedAt) : Number.NaN;
       if (!Number.isFinite(finished)) continue;
       const ageMs = now - finished;
       if (ageMs >= terminalStallMs && ageMs <= terminalMaxMs) {
-        out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'terminal_unnotified' });
+        out.push({
+          id: run.id,
+          workflow: run.workflow,
+          ageMs,
+          reason: 'terminal_unnotified',
+          ...(run.reportBackPending === true ? { reportBackPending: true } : {}),
+        });
       }
     }
   }
@@ -175,7 +199,11 @@ export function dropReportedBackTerminalRuns(
   reportedBackRunIds: Set<string>,
 ): StalledRun[] {
   return stalled.filter(
-    (run) => !(run.reason === 'terminal_unnotified' && reportedBackRunIds.has(run.id)),
+    (run) => !(
+      run.reason === 'terminal_unnotified'
+      && run.reportBackPending !== true
+      && reportedBackRunIds.has(run.id)
+    ),
   );
 }
 
@@ -257,6 +285,39 @@ export function reportedBackRunIdsFrom(
   return out;
 }
 
+/** Runs whose exact stable terminal card is already durable in the dashboard
+ * notification store. This is deliberately separate from external-delivery
+ * truth: a crash can occur after addNotification's atomic write but before the
+ * run's `notifiedAt` marker, including for intentionally silent/dashboard-only
+ * results. Lifecycle cards never qualify. */
+export function terminalDashboardNotificationRunIdsFrom(
+  notifications: Array<{ id?: string; metadata?: Record<string, unknown> }>,
+): Set<string> {
+  const terminalSuffixes = new Set([
+    'not-found',
+    'dryrun',
+    'creationtest',
+    'disabled',
+    'preflight',
+    'missing-inputs',
+    'goalretry',
+    'selfheal',
+    'completed',
+    'cancelled',
+    'error',
+  ]);
+  const out = new Set<string>();
+  for (const notification of notifications) {
+    const runId = notification.metadata?.runId;
+    if (typeof runId !== 'string' || !runId) continue;
+    if (typeof notification.id !== 'string') continue;
+    const prefix = `workflow-${runId}-`;
+    if (!notification.id.startsWith(prefix)) continue;
+    if (terminalSuffixes.has(notification.id.slice(prefix.length))) out.add(runId);
+  }
+  return out;
+}
+
 /** Stable watchdog ids already present in the durable notification store. The
  * notification writer dedupes these too, but checking up front avoids parsing
  * the same ~1 MB store again for every stalled run and avoids logging the same
@@ -281,11 +342,11 @@ function stampNotifiedAt(runId: string, now: number): void {
   try {
     const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
     if (!existsSync(file)) return;
-    const rec = JSON.parse(readFileSync(file, 'utf-8')) as { notifiedAt?: string };
-    if (rec && !rec.notifiedAt) {
-      rec.notifiedAt = new Date(now).toISOString();
-      writeFileSync(file, JSON.stringify(rec, null, 2), 'utf-8');
-    }
+    withWorkflowRunRecordLock(file, () => {
+      const rec = readWorkflowRunRecordUnlocked<Record<string, unknown> & { notifiedAt?: string }>(file);
+      if (!rec || rec.notifiedAt) return;
+      writeWorkflowRunRecordDurablyUnlocked(file, { ...rec, notifiedAt: new Date(now).toISOString() });
+    });
   } catch {
     // Best-effort — a write failure just means we re-check the log next tick.
   }
@@ -352,9 +413,25 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
   const runs: WatchdogRunView[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR)) {
     if (!file.endsWith('.json')) continue;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     try {
-      const parsed = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as WatchdogRunView;
-      if (parsed && typeof parsed.id === 'string') runs.push(parsed);
+      let parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as WatchdogRunView;
+      if (!parsed || typeof parsed.id !== 'string') continue;
+      // Retry the exact durable terminal report independently of the main run
+      // drain. This timer continues to make progress even when a long workflow
+      // occupies the drain, and idempotent duplicates count as acknowledgements.
+      if (
+        parsed.reportBack
+        && workflowRunReportBackNeedsRetry(parsed)
+        && workflowRunReportBackRetryDue(parsed, now)
+      ) {
+        attemptWorkflowRunReportBack(filePath, now);
+        parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as WatchdogRunView;
+      }
+      parsed.reportBackPending = parsed.reportBack
+        ? workflowRunReportBackNeedsRetry(parsed)
+        : false;
+      runs.push(parsed);
     } catch {
       // A malformed run file is its own (separate) problem; skip it.
     }
@@ -379,10 +456,14 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
   // backstop never fires a false "result wasn't delivered" alarm for a run that
   // finished under a prior code version or across a restart boundary.
   const reportedBack = reportedBackRunIdsFrom(notifications);
+  const dashboardNotified = terminalDashboardNotificationRunIdsFrom(notifications);
+  const durablyNotified = new Set([...reportedBack, ...dashboardNotified]);
   const existingAlertIds = workflowWatchdogAlertIdsFrom(notifications);
-  const stalled = dropReportedBackTerminalRuns(candidates, reportedBack);
+  const stalled = dropReportedBackTerminalRuns(candidates, durablyNotified);
   for (const run of candidates) {
-    if (run.reason === 'terminal_unnotified' && reportedBack.has(run.id)) stampNotifiedAt(run.id, now);
+    if (run.reason === 'terminal_unnotified' && run.reportBackPending !== true && durablyNotified.has(run.id)) {
+      stampNotifiedAt(run.id, now);
+    }
   }
 
   const surfaced: string[] = [];

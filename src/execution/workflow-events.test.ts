@@ -372,6 +372,18 @@ test('reapRunEventDir removes the run event-log directory — P0-2', () => {
   assert.ok(!existsSync(dir), 'event dir removed after reap');
 });
 
+test('reapRunEventDir preserves structured mutation receipts while removing best-effort events', () => {
+  appendWorkflowEvent('reap-receipts', 'rid', { kind: 'step_started', stepId: 'write' });
+  const dir = path.join(WORKFLOWS_DIR, 'reap-receipts', 'runs', 'rid');
+  const receiptDir = path.join(dir, 'call-mutations', 'fingerprint');
+  mkdirSync(receiptDir, { recursive: true });
+  writeFileSync(path.join(receiptDir, 'intent.json'), '{}', 'utf-8');
+
+  reapRunEventDir('reap-receipts', 'rid');
+  assert.equal(existsSync(path.join(dir, 'events.jsonl')), false);
+  assert.equal(existsSync(path.join(receiptDir, 'intent.json')), true);
+});
+
 test('listPendingRuns excludes runs with terminal queue-record status', () => {
   appendWorkflowEvent('queue-cancelled', 'r1', { kind: 'run_started' });
   appendWorkflowEvent('queue-cancelled', 'r1', { kind: 'step_started', stepId: 'one' });

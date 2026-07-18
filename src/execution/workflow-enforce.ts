@@ -1,6 +1,7 @@
-import type { WorkflowDefinition, WorkflowInputDef } from '../memory/workflow-store.js';
+import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
 import { stepLooksMultiItemWithoutForEach, validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
 import {
@@ -100,9 +101,14 @@ export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
   return IRREVERSIBLE_SEND_RE.test(p) || PUBLISH_RE.test(p);
 }
 
-function structuredCallSideEffectClass(call: { tool?: string } | undefined): 'read' | 'write' | 'send' {
+function structuredCallSideEffectClass(
+  call: { tool?: string } | undefined,
+  declaredSideEffect?: string,
+): 'read' | 'write' | 'send' {
   const t = call?.tool ?? '';
   if (!t) return 'read';
+  const evidence = composioSlugEffectEvidence(t);
+  if (evidence === 'read') return 'read';
   // Delegate the send determination to the ONE canonical predicate so this
   // RUNTIME classifier agrees with the validator (workflow-validator.ts already
   // uses isIrreversibleSendSlug). The old regex missed CALL/DIAL/OUTBOUND/
@@ -111,8 +117,12 @@ function structuredCallSideEffectClass(call: { tool?: string } | undefined): 're
   // carve-out reclassified those as 'write' and fired them with no consent
   // (2026-07-09 re-hunt: workflow call-node lane).
   if (isIrreversibleSendSlug(t)) return 'send';
-  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/i.test(t)) return 'write';
-  return 'read';
+  if (evidence === 'write') return 'write';
+  // No verb evidence either way (noun-shaped API slug): an author-declared
+  // read wins — affirmative write/send evidence above can never be downgraded,
+  // but mere unfamiliarity must not break existing declared-read workflows
+  // (fold 2026-07-17 final-wave review #4). Undeclared stays a conservative write.
+  return declaredSideEffect === 'read' ? 'read' : 'write';
 }
 
 // A step that WRITES to the outside world (creates/updates/deletes a record,
@@ -130,15 +140,27 @@ const EXTERNAL_WRITE_RE =
  * read/fetch/query step does not.
  */
 export function stepLooksMutating(step: { prompt?: string; sideEffect?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string } }): boolean {
+  if (step.call?.tool && structuredCallSideEffectClass(step.call, step.sideEffect) !== 'read') return true;
   if (step.sideEffect === 'read') return false;
   if (step.sideEffect === 'write' || step.sideEffect === 'send') return true;
   if (step.requiresApproval === true || step.requires_approval === true) return true;
-  if (structuredCallSideEffectClass(step.call) !== 'read') return true;
   const p = step.prompt ?? '';
   return stepLooksLikeIrreversibleSend(p) || EXTERNAL_WRITE_RE.test(p);
 }
 
 export type StepSideEffectClass = 'read' | 'write' | 'send' | 'unknown';
+
+export type WorkflowStepMutationReceiptContract =
+  | 'non_mutating'
+  | 'structured_call_receipt'
+  | 'unreceipted_mutation';
+
+export type WorkflowMutationContract = Exclude<WorkflowStepMutationReceiptContract, 'non_mutating'>;
+
+export interface WorkflowMutationContractSnapshot {
+  version: 1;
+  steps: Record<string, WorkflowMutationContract>;
+}
 
 /**
  * Canonical step side-effect classifier. ONE source of truth shared by the
@@ -165,13 +187,65 @@ export function classifyStepSideEffect(step: {
   // an explicit sideEffect — check it FIRST so the runtime auto-approve carve-out
   // agrees with the validator (an author labeling a VAPI_CREATE_CALL node
   // `sideEffect: read` must not skip the gate — 2026-07-09 re-hunt author-side).
-  if (step.call?.tool && structuredCallSideEffectClass(step.call) === 'send') return 'send';
+  if (step.call?.tool) {
+    const callClass = structuredCallSideEffectClass(step.call, step.sideEffect);
+    if (callClass === 'send') return 'send';
+    if (callClass === 'write') return step.sideEffect === 'send' ? 'send' : 'write';
+  }
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
-  if (step.call?.tool) return structuredCallSideEffectClass(step.call);
+  if (step.call?.tool) return structuredCallSideEffectClass(step.call, step.sideEffect);
   if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
   if (stepLooksMutating(step)) return 'write';
   if ((step.allowedTools?.length ?? 0) > 0 || step.usesSkill || step.forEach) return 'read';
   return 'unknown';
+}
+
+/**
+ * Recovery authority for a current workflow step.
+ *
+ * Only a mutating structured direct call crosses the fsynced exact-call receipt
+ * boundary. Prompt/skill/script mutations have no replayable commit proof, so a
+ * fresh run or failed-item retry must reject them even when best-effort
+ * lifecycle or harness telemetry is empty. This pure contract is shared by
+ * queue re-entry and the runner's crash-resume seed defense.
+ */
+export function workflowStepMutationReceiptContract(
+  step: WorkflowStepInput,
+): WorkflowStepMutationReceiptContract {
+  const sideEffect = classifyStepSideEffect(step);
+  if (sideEffect === 'read' || sideEffect === 'unknown') return 'non_mutating';
+  if (step.call?.tool) return 'structured_call_receipt';
+  return 'unreceipted_mutation';
+}
+
+/** Durable definition evidence written to a run before its first step executes.
+ * Read-only steps are intentionally omitted: recovery only needs to know which
+ * exact step ids could have mutated and whether each one crossed the structured
+ * receipt boundary. Stable key ordering keeps fixtures and diagnostics legible. */
+export function buildWorkflowMutationContractSnapshot(
+  steps: readonly WorkflowStepInput[],
+): WorkflowMutationContractSnapshot {
+  const entries = steps
+    .map((step) => [step.id, workflowStepMutationReceiptContract(step)] as const)
+    .filter((entry): entry is readonly [string, WorkflowMutationContract] => entry[1] !== 'non_mutating')
+    .sort(([left], [right]) => left.localeCompare(right));
+  return { version: 1, steps: Object.fromEntries(entries) };
+}
+
+/** Strict shape guard for run-record evidence. Missing/malformed snapshots must
+ * never be normalized into an empty contract map, because that would turn lost
+ * evidence into permission to repeat an old unreceipted mutation. */
+export function isWorkflowMutationContractSnapshot(
+  value: unknown,
+): value is WorkflowMutationContractSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const snapshot = value as Partial<WorkflowMutationContractSnapshot>;
+  if (snapshot.version !== 1 || !snapshot.steps || typeof snapshot.steps !== 'object' || Array.isArray(snapshot.steps)) {
+    return false;
+  }
+  return Object.entries(snapshot.steps).every(([stepId, contract]) =>
+    stepId.trim().length > 0
+    && (contract === 'structured_call_receipt' || contract === 'unreceipted_mutation'));
 }
 
 // Read/gather intent in a step's prose — the verbs whose job is to PULL external
@@ -338,6 +412,12 @@ export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
     if (step.forEach || step.deterministic) {
       errors.push(
         `Step "${step.id}" declares loop_until on a ${step.forEach ? 'forEach' : 'deterministic'} step — loop_until applies to plain LLM steps only. Remove loop_until or restructure the step.`,
+      );
+      continue;
+    }
+    if (step.call?.tool && structuredCallSideEffectClass(step.call, step.sideEffect) !== 'read') {
+      errors.push(
+        `Step "${step.id}" declares loop_until on a mutating structured call. Exact-call receipts bind one mutation per run/step slot, so a second loop attempt cannot safely dispatch. Remove loop_until or split the mutation from a separate read-only polling step.`,
       );
       continue;
     }

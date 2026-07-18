@@ -1,10 +1,11 @@
 /**
  * Run: npx tsx --test src/execution/background-tasks.test.ts
  *
- * Covers the boot-time auto-resume of interrupted background tasks:
- *   - resumeInterruptedBackgroundTasks re-queues an `interrupted` task
- *     once, stamps the original so it's not re-spawned, and respects the
- *     resume cap so a crash-looping task can't resume forever.
+ * Covers fail-closed boot recovery of interrupted background tasks:
+ *   - read-only work reattaches to its original receipt-bearing run session,
+ *   - write-touched / ambiguous work parks for verification,
+ *   - explicit resume stays in place, and
+ *   - the resume cap bounds crash loops without cloning the objective.
  *
  * Per-test temp dir via CLEMENTINE_HOME so we don't touch real state.
  */
@@ -51,11 +52,16 @@ const {
   cancelBackgroundTask,
   truncateResultBody,
   backgroundHeartbeatInternalsForTest,
-  rootBackgroundTaskPromptForTests,
   sweepInvalidDoneBackgroundTasks,
   replayBackgroundTaskReportBack,
   probeObjectiveForTask,
   selfResumeDecision,
+  assessBackgroundTaskRestartSafety,
+  _setBackgroundTaskSettlementCasHookForTests,
+  _setBackgroundTaskApprovalDispatchCheckHookForTests,
+  _setBackgroundTaskReattachCasHookForTests,
+  markBackgroundTaskAwaitingApproval,
+  queueBackgroundTaskApprovalResolution,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -176,34 +182,329 @@ test('operational mirror: background task lifecycle emits created → started �
   assert.equal((dParked!.payload as { reason?: string }).reason, 'blocked');
 });
 
-test('resumeInterruptedBackgroundTasks re-queues once and respects the cap', () => {
+test('an empty best-effort ledger parks instead of pretending to prove a read-only restart', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
   const task = createBackgroundTask({ title: 'Analyze meeting transcript: zoom', prompt: 'do the thing' });
+  markBackgroundTaskRunning(task.id); // creates a session, but not fail-closed write-history proof
   markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
 
-  // First boot: the interrupted task is resumed exactly once.
-  const resumed = resumeInterruptedBackgroundTasks({ cap: 2 });
-  assert.equal(resumed, 1);
+  assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
+    safeToAutoResume: false,
+    reason: 'receipt_history_unavailable',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 0,
+  });
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
 
-  const original = getBackgroundTask(task.id);
-  assert.ok(original?.resumedIntoTaskId, 'original should be stamped with the resume id');
-  const child = getBackgroundTask(original!.resumedIntoTaskId!);
-  assert.equal(child?.status, 'pending', 'resume should be a fresh pending task');
-  assert.equal(child?.resumeCount, 1);
+  let live = getBackgroundTask(task.id);
+  assert.equal(live?.status, 'interrupted');
+  assert.equal(live?.runSessionId, task.runSessionId, 'original receipt-bearing session is preserved');
+  assert.equal(live?.resumedIntoTaskId, undefined, 'no clone was stamped');
+  assert.equal(live?.resumeCount, undefined);
+  assert.equal(live?.restartRecovery?.disposition, 'parked_for_verification');
+  assert.equal(live?.restartRecovery?.reason, 'receipt_history_unavailable');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'only the original task exists');
 
-  // Second boot with the SAME interrupted original still on disk: it's
-  // already carried forward, so it must not be re-spawned.
-  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'stamped original is not re-resumed');
+  // Explicit Resume is the verification boundary and still reattaches in place.
+  const resumed = resumeBackgroundTask(task.id);
+  assert.equal(resumed?.id, task.id);
+  assert.equal(resumed?.runSessionId, task.runSessionId);
+  assert.equal(resumed?.status, 'pending');
+  assert.equal(resumed?.resumeCount, 1);
+  assert.equal(resumed?.restartRecovery?.disposition, 'manual_resumed_in_place');
 
-  // Now interrupt the child (resumeCount=1) and confirm it resumes once
-  // more (cap=2), then a grandchild at the cap does not.
-  markBackgroundTaskFailed(child!.id, 'Daemon restarted while task was running.', 'interrupted');
-  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 1, 'resumeCount 1 < cap 2 resumes');
+  // A later boot does not touch a task that is already pending.
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'crash bounces never fork a child');
+});
 
-  const grandchild = listBackgroundTasks({ status: 'pending' })
-    .find((t) => t.resumeCount === 2);
-  assert.ok(grandchild, 'grandchild created at resumeCount 2');
-  markBackgroundTaskFailed(grandchild!.id, 'Daemon restarted while task was running.', 'interrupted');
-  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'resumeCount 2 >= cap 2 does not resume');
+test('write-touched restart parks; explicit resume preserves the original receipts/session', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const task = createBackgroundTask({ title: 'Send the approved follow-up', prompt: 'send it', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'send-1', accounting: 'top_level', effect: 'external_write' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['casey@example.com'] },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'send-1', result: 'sent message m-1' },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
+    safeToAutoResume: false,
+    reason: 'external_write_history',
+    externalWriteCount: 1,
+    ambiguousWriteCount: 0,
+  });
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'boot does not replay write-touched work');
+  const parked = getBackgroundTask(task.id);
+  assert.equal(parked?.status, 'interrupted');
+  assert.equal(parked?.restartRecovery?.disposition, 'parked_for_verification');
+  assert.equal(parked?.restartRecovery?.reason, 'external_write_history');
+  assert.match(parked?.error ?? '', /Verify the external outcome before resuming/);
+  assert.equal(parked?.resumedIntoTaskId, undefined);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'no fresh safety session/task was created');
+  assert.ok(listEvents(task.runSessionId, { types: ['restart_recovery_decision'] })
+    .some((event) => (event.data as { disposition?: string }).disposition === 'parked_for_verification'));
+
+  // Choosing Resume is the explicit verification boundary. It reattaches the
+  // SAME id/session, so the send receipt and duplicate-write ledger remain in view.
+  const resumed = resumeBackgroundTask(task.id);
+  assert.equal(resumed?.id, task.id);
+  assert.equal(resumed?.runSessionId, task.runSessionId);
+  assert.equal(resumed?.restartRecovery?.disposition, 'manual_resumed_in_place');
+  assert.match(resumed?.continueResolution?.reason ?? '', /verify prior external outcomes/i);
+  assert.equal(listEvents(task.runSessionId, { types: ['external_write'] }).length, 1, 'original receipt is still attached');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'manual resume creates no clone');
+});
+
+test('a proven failed write is netted, but an empty best-effort remainder still requires verification', () => {
+  const task = createBackgroundTask({ title: 'Rejected update', prompt: 'update it', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'AIRTABLE_UPDATE_RECORD', targets: ['rec-1'] },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { shapeKey: 'AIRTABLE_UPDATE_RECORD', targets: ['rec-1'] },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
+    safeToAutoResume: false,
+    reason: 'receipt_history_unavailable',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 0,
+  });
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+});
+
+test('an unresolved external-write call is ambiguous and always parks on boot', () => {
+  const task = createBackgroundTask({ title: 'Ambiguous CRM update', prompt: 'update the account', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'crm-uncertain', accounting: 'top_level', effect: 'external_write' },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  const assessment = assessBackgroundTaskRestartSafety(task);
+  assert.equal(assessment.safeToAutoResume, false);
+  assert.equal(assessment.reason, 'ambiguous_external_write');
+  assert.equal(assessment.ambiguousWriteCount, 1);
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  assert.equal(getBackgroundTask(task.id)?.restartRecovery?.reason, 'ambiguous_external_write');
+  assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, undefined);
+});
+
+test('a lone tool_returned carrying an external-write effect counts as a write and fails closed (finding B)', () => {
+  const task = createBackgroundTask({ title: 'Partial-logged send', prompt: 'send it', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  // Partial best-effort logging: the external-write effect was recorded ONLY on
+  // the RETURN row — no matching external-effect tool_called row landed. The old
+  // assessment built external evidence only from tool_called rows, so this run
+  // looked read-only and was judged safe to auto-replay.
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'send-1', effect: 'external_write', result: 'sent message m-1' },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  const assessment = assessBackgroundTaskRestartSafety(task);
+  assert.equal(assessment.safeToAutoResume, false, 'an external-write effect on the return row must fail closed');
+  assert.equal(assessment.reason, 'external_write_history');
+  assert.equal(assessment.externalWriteCount, 1);
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'boot must not auto-replay a write-touched run');
+  assert.equal(getBackgroundTask(task.id)?.restartRecovery?.disposition, 'parked_for_verification');
+});
+
+test('a clean read-only complete history auto-resumes in place as safe_no_external_write', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const task = createBackgroundTask({ title: 'Summarize the quarterly transcript', prompt: 'read and summarize', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  // Durable evidence the best-effort producers WERE recording: two real read
+  // tool calls, each returned, and NOT one external_write / external_write_failed
+  // / external-effect tool_called among them.
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'google_drive_read_file', callId: 'read-1', accounting: 'top_level' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'google_drive_read_file', callId: 'read-1', result: 'transcript body' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'session_history', callId: 'read-2', accounting: 'top_level' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'session_history', callId: 'read-2', result: 'prior turns' },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
+    safeToAutoResume: true,
+    reason: 'safe_no_external_write',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 0,
+  });
+
+  // Boot recovery reattaches this read-only run automatically — no manual
+  // 'Verify before resuming' park, and no clone.
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 1, 'clean read-only history is auto-resumed on boot');
+  const resumed = getBackgroundTask(task.id);
+  assert.equal(resumed?.status, 'pending', 'reattached in place, re-queued for the drain');
+  assert.equal(resumed?.runSessionId, task.runSessionId, 'same receipt-bearing session — not a fresh one');
+  assert.equal(resumed?.resumedIntoTaskId, undefined, 'no carry-forward clone stamp');
+  assert.equal(resumed?.resumeCount, 1, 'resumeCount bumped so the crash cap still bounds it');
+  assert.equal(resumed?.restartRecovery?.disposition, 'auto_resumed_in_place');
+  assert.equal(resumed?.restartRecovery?.reason, 'safe_no_external_write');
+  assert.equal(resumed?.continueResolution?.auto, true, 'automatic (not user-initiated) continuation');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'auto-resume creates no clone');
+});
+
+test('boot recovery never clobbers a user abort that lands before reattach (finding C)', () => {
+  const task = createBackgroundTask({ title: 'Read-only run cancelled mid-recovery', prompt: 'read and summarize', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  // A clean read-only history so boot recovery WOULD auto-resume this run…
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'google_drive_read_file', callId: 'read-1', accounting: 'top_level' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'google_drive_read_file', callId: 'read-1', result: 'transcript body' },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+  assert.equal(assessBackgroundTaskRestartSafety(task).safeToAutoResume, true, 'sanity: this run is auto-resumable');
+
+  // …but a user abort commits in the window between the interrupted-scan read and
+  // the reattach. The hook fires at the very top of reattach, before it re-reads.
+  let hookCalls = 0;
+  _setBackgroundTaskReattachCasHookForTests(() => {
+    hookCalls += 1;
+    _setBackgroundTaskReattachCasHookForTests(null);
+    assert.equal(
+      cancelBackgroundTask(task.id, 'Cancelled by the user during boot recovery.')?.status,
+      'aborted',
+      'the abort wins on an interrupted task',
+    );
+  });
+
+  try {
+    const resumed = resumeInterruptedBackgroundTasks({ cap: 2 });
+    assert.equal(hookCalls, 1, 'reattach was entered exactly once');
+    assert.equal(resumed, 0, 'the aborted task is NOT auto-resumed');
+    assert.equal(getBackgroundTask(task.id)?.status, 'aborted', 'the user abort is preserved, not clobbered back to pending');
+  } finally {
+    _setBackgroundTaskReattachCasHookForTests(null);
+  }
+});
+
+test('a read-only history that also attempted a compensated write stays parked (write evidence blocks safe)', () => {
+  const task = createBackgroundTask({ title: 'Read then failed-write', prompt: 'read then try a write', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  // A genuine read (returned) …
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'airtable_list_records', callId: 'read-1', accounting: 'top_level' },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { tool: 'airtable_list_records', callId: 'read-1', result: 'rows' },
+  });
+  // … plus a write that was ATTEMPTED then compensated to a net-zero remainder.
+  // It nets externalWriteCount to 0, but the write-attempt evidence must keep the
+  // run fail-closed rather than letting the clean read flip it to safe.
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'AIRTABLE_UPDATE_RECORD', targets: ['rec-1'] },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { shapeKey: 'AIRTABLE_UPDATE_RECORD', targets: ['rec-1'] },
+  });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
+    safeToAutoResume: false,
+    reason: 'receipt_history_unavailable',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 0,
+  });
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'a compensated write attempt never auto-resumes');
+  assert.equal(getBackgroundTask(task.id)?.restartRecovery?.disposition, 'parked_for_verification');
+});
+
+test('missing original receipt session fails closed instead of cloning onto a blank session', () => {
+  const task = createBackgroundTask({ title: 'Legacy interrupted task', prompt: 'unknown prior work' });
+  // Deliberately skip markBackgroundTaskRunning: this simulates a legacy record
+  // whose original harness session/receipt history is unavailable.
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+  assert.equal(assessBackgroundTaskRestartSafety(task).reason, 'receipt_history_unavailable');
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  const parked = getBackgroundTask(task.id);
+  assert.equal(parked?.restartRecovery?.reason, 'receipt_history_unavailable');
+  assert.equal(parked?.resumedIntoTaskId, undefined);
 });
 
 test('resumeInterruptedBackgroundTasks ignores non-restart interrupted tasks', () => {
@@ -227,7 +528,7 @@ test('daemon restart terminalizes a user-cancelling task instead of resurrecting
   assert.equal(settled?.resumedIntoTaskId, undefined);
 });
 
-test('P0 single ownership: a goal-bound interrupted run resumes IN PLACE — one executor, zero clones', async () => {
+test('P0 single ownership: a goal-bound restart parks, then explicit resume reattaches in place', async () => {
   const { createGoalContract } = await import('../agents/plan-proposals.js');
   const before = listBackgroundTasks({ includeArchived: true }).length;
 
@@ -251,7 +552,7 @@ test('P0 single ownership: a goal-bound interrupted run resumes IN PLACE — one
   markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
 
   const resumed = resumeInterruptedBackgroundTasks({ cap: 2 });
-  assert.equal(resumed, 1, 'the interrupted goal-bound task is resumed');
+  assert.equal(resumed, 0, 'boot cannot infer replay safety from an empty best-effort ledger');
 
   // ZERO new task records: no "Resume X" clone was spawned to compete with the
   // goal-bound run — the objective has exactly ONE executor.
@@ -259,28 +560,35 @@ test('P0 single ownership: a goal-bound interrupted run resumes IN PLACE — one
   assert.equal(afterTasks.length, before + 1, 'no clone record was created (only the original exists)');
   assert.ok(!afterTasks.some((t) => t.resumedFromTaskId === task.id), 'nothing points back at the original as a clone');
 
-  // The SAME record is re-driven on its own run session.
-  const reattached = getBackgroundTask(task.id);
+  let reattached = getBackgroundTask(task.id);
+  assert.equal(reattached?.status, 'interrupted', 'boot parks for verification');
+  assert.equal(reattached?.restartRecovery?.reason, 'receipt_history_unavailable');
+
+  // Explicit Resume re-drives the SAME record on its own run session.
+  reattached = resumeBackgroundTask(task.id);
   assert.equal(reattached?.status, 'pending', 'the same task is re-queued in place (drain re-drives it)');
   assert.equal(reattached?.runSessionId, task.runSessionId, 'same run session — not a fresh one');
   assert.equal(reattached?.resumedIntoTaskId, undefined, 'no carry-forward stamp (not a clone)');
   assert.equal(reattached?.resumeCount, 1, 'resumeCount bumped so the crash cap still bounds it');
   assert.ok(reattached?.continueResolution, 'carries a continuation marker to resume from prior session state');
 
-  // Kill-switch: with single-owner resume OFF, the same shape clones as before
-  // (resumeCount is 1 after the in-place reattach, still under the cap).
+  // The older goal-only kill-switch cannot reopen the unsafe interrupted-task
+  // clone path: restart safety now applies to every background task.
   process.env.CLEMMY_BG_SINGLE_OWNER_RESUME = 'off';
   try {
+    markBackgroundTaskRunning(task.id);
     markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
-    resumeInterruptedBackgroundTasks({ cap: 2 });
-    const cloned = getBackgroundTask(task.id);
-    assert.ok(cloned?.resumedIntoTaskId, 'kill-switch off ⇒ a clone is stamped again (legacy path)');
+    assert.equal(resumeInterruptedBackgroundTasks({ cap: 3 }), 0, 'kill switch cannot bypass verification');
+    const reattachedAgain = resumeBackgroundTask(task.id);
+    assert.equal(reattachedAgain?.id, task.id);
+    assert.equal(reattachedAgain?.runSessionId, task.runSessionId);
+    assert.equal(reattachedAgain?.resumedIntoTaskId, undefined, 'interrupted recovery remains in place');
   } finally {
     delete process.env.CLEMMY_BG_SINGLE_OWNER_RESUME;
   }
 });
 
-test('single ownership: a DOUBLE interrupt (reattach → interrupt → boot) keeps ONE record, re-enqueued, zero clones', async () => {
+test('single ownership: two verified restart resumes keep one record and zero clones', async () => {
   const { createGoalContract } = await import('../agents/plan-proposals.js');
   const drainKicks: Array<number | undefined> = [];
   registerBackgroundDrainKick((limit) => drainKicks.push(limit));
@@ -289,10 +597,12 @@ test('single ownership: a DOUBLE interrupt (reattach → interrupt → boot) kee
     const task = createBackgroundTask({ title: 'Double-interrupt goal task', prompt: 'do the durable thing', source: 'desktop' });
     assert.ok(createGoalContract({ objective: 'do the durable thing', sessionId: task.runSessionId, origin: { kind: 'background' } }), 'goal bound');
 
-    // Bounce 1: running → interrupted → boot auto-resume reattaches in place.
+    // Bounce 1: boot parks; explicit verification reattaches in place.
     markBackgroundTaskRunning(task.id);
     markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
-    resumeInterruptedBackgroundTasks({ cap: 5 });
+    assert.equal(resumeInterruptedBackgroundTasks({ cap: 5 }), 0);
+    assert.equal(getBackgroundTask(task.id)?.status, 'interrupted');
+    resumeBackgroundTask(task.id);
     let live = getBackgroundTask(task.id);
     assert.equal(live?.status, 'pending', 'reattached in place (pending)');
     assert.equal(live?.resumeCount, 1);
@@ -301,7 +611,8 @@ test('single ownership: a DOUBLE interrupt (reattach → interrupt → boot) kee
     // Bounce 2: the reattached task ran again then got interrupted again.
     markBackgroundTaskRunning(task.id);
     markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
-    resumeInterruptedBackgroundTasks({ cap: 5 });
+    assert.equal(resumeInterruptedBackgroundTasks({ cap: 5 }), 0);
+    resumeBackgroundTask(task.id);
 
     // Exactly ONE record for THIS objective — no "Resume X" clone across bounces.
     // (Other leftover interrupted tasks in the shared temp home may clone; assert
@@ -341,37 +652,104 @@ test('manual resume: a goal-bound interrupted task reattaches SAME id and re-enq
   }
 });
 
-test('manual resume: double-clone guard returns the live clone instead of spawning a second (non-goal task)', () => {
+test('manual resume: an ordinary non-goal interrupted task reattaches in place', () => {
   const before = listBackgroundTasks({ includeArchived: true }).length;
-  const task = createBackgroundTask({ title: 'Non-goal resume task', prompt: 'clone me once', source: 'cli' });
+  const task = createBackgroundTask({ title: 'Non-goal resume task', prompt: 'continue me safely', source: 'cli' });
+  markBackgroundTaskRunning(task.id);
   markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
-  // First resume clones (no goal → legacy fresh-clone path).
-  const clone = resumeBackgroundTask(task.id);
-  assert.ok(clone && clone.id !== task.id, 'non-goal task clones');
-  assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, clone!.id);
-  // A second resume of the SAME original must NOT spawn a second clone while the
-  // first is still live — it returns the existing one (the bg-mrbqlkpv double-clone).
-  const again = resumeBackgroundTask(task.id);
-  assert.equal(again?.id, clone!.id, 'second resume returns the existing live clone, not a new one');
+  const resumed = resumeBackgroundTask(task.id);
+  assert.equal(resumed?.id, task.id);
+  assert.equal(resumed?.runSessionId, task.runSessionId);
+  assert.equal(resumed?.resumedIntoTaskId, undefined);
   const after = listBackgroundTasks({ includeArchived: true });
-  assert.equal(after.length, before + 2, 'exactly one clone exists (original + one clone), not two');
+  assert.equal(after.length, before + 1, 'only the original exists');
+  assert.ok(!after.some((candidate) => candidate.resumedFromTaskId === task.id));
 });
 
-test('resumeBackgroundTask flattens nested resume wrappers to the root original request', () => {
-  const rootPrompt = 'task please: fetch 10 keyword volumes and write the sheet.';
-  const original = createBackgroundTask({ title: 'Restart smoke', prompt: rootPrompt, source: 'desktop' });
-  markBackgroundTaskFailed(original.id, 'Daemon restarted while task was running.', 'interrupted');
+test('failed-task retry with committed write evidence stays on the receipt-bearing task/session', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const task = createBackgroundTask({ title: 'Retry write task', prompt: 'create the external record', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'external_write',
+    data: { callId: 'failed-write-1', shapeKey: 'create:record', targets: ['crm'] },
+  });
+  markBackgroundTaskFailed(task.id, 'Provider response was lost.', 'failed');
 
-  const first = resumeBackgroundTask(original.id)!;
-  assert.ok(first.id !== original.id, 'first non-goal resume creates a clone');
-  markBackgroundTaskFailed(first.id, 'Daemon restarted while task was running.', 'interrupted');
+  const resumed = resumeBackgroundTask(task.id)!;
+  assert.equal(resumed.id, task.id, 'retry reattaches the original task');
+  assert.equal(resumed.runSessionId, task.runSessionId, 'committed-write evidence remains in scope');
+  assert.equal(resumed.status, 'pending');
+  assert.equal(resumed.restartRecovery?.reason, 'external_write_history');
+  assert.match(resumed.continueResolution?.reason ?? '', /verify prior external outcomes/i);
+  assert.equal(listEvents(task.runSessionId, { types: ['external_write'] }).length, 1);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'retry creates no receipt-hiding clone');
+});
 
-  const second = resumeBackgroundTask(first.id)!;
-  assert.ok(second.id !== first.id, 'second interrupted clone creates another clone');
-  assert.equal(rootBackgroundTaskPromptForTests(second.prompt), rootPrompt);
-  assert.equal((second.prompt.match(/Original request:/g) ?? []).length, 1, 'resume prompt carries one root request block');
-  assert.doesNotMatch(second.prompt, /Original request:\s*\n\s*Resume background task/i, 'root request must not be another resume wrapper');
-  assert.match(second.prompt, /Continue the same objective from the prior task/);
+test('aborted-task retry with an unreturned mutation stays in place and records ambiguity', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const task = createBackgroundTask({ title: 'Retry ambiguous task', prompt: 'send the approved update', source: 'desktop' });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'connected_action', callId: 'aborted-write-1', effect: 'external_write' },
+  });
+  markBackgroundTaskFailed(task.id, 'Stopped after dispatch may have begun.', 'aborted');
+
+  const resumed = resumeBackgroundTask(task.id)!;
+  assert.equal(resumed.id, task.id);
+  assert.equal(resumed.runSessionId, task.runSessionId);
+  assert.equal(resumed.status, 'pending');
+  assert.equal(resumed.restartRecovery?.reason, 'ambiguous_external_write');
+  assert.equal(resumed.restartRecovery?.ambiguousWriteCount, 1);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'retry creates no fresh run session');
+});
+
+test('legacy multi-hop resume chain returns the latest live owner instead of reattaching an intermediate task', () => {
+  const first = createBackgroundTask({ title: 'Legacy owner A', prompt: 'do the original work', source: 'desktop' });
+  const second = createBackgroundTask({ title: 'Legacy owner B', prompt: 'legacy first retry', source: 'desktop' });
+  const latest = createBackgroundTask({ title: 'Legacy owner C', prompt: 'legacy second retry', source: 'desktop' });
+  markBackgroundTaskFailed(first.id, 'First legacy attempt failed.', 'failed');
+  markBackgroundTaskFailed(second.id, 'Second legacy attempt failed.', 'failed');
+  updateBackgroundTask(first.id, { resumedIntoTaskId: second.id });
+  updateBackgroundTask(second.id, { resumedFromTaskId: first.id, resumedIntoTaskId: latest.id });
+  updateBackgroundTask(latest.id, { resumedFromTaskId: second.id });
+
+  const resolved = resumeBackgroundTask(first.id);
+  assert.equal(resolved?.id, latest.id, 'A -> B -> C resolves all the way to C');
+  assert.equal(resolved?.runSessionId, latest.runSessionId);
+  assert.equal(resolved?.status, 'pending', 'the existing live owner is returned unchanged');
+  assert.equal(getBackgroundTask(second.id)?.status, 'failed', 'intermediate B is never reattached beside live C');
+});
+
+test('legacy resume ownership cycles and invalid targets fail closed', () => {
+  const cycleA = createBackgroundTask({ title: 'Cycle A', prompt: 'legacy cycle', source: 'desktop' });
+  const cycleB = createBackgroundTask({ title: 'Cycle B', prompt: 'legacy cycle', source: 'desktop' });
+  markBackgroundTaskFailed(cycleA.id, 'failed A', 'failed');
+  markBackgroundTaskFailed(cycleB.id, 'failed B', 'failed');
+  updateBackgroundTask(cycleA.id, { resumedFromTaskId: cycleB.id, resumedIntoTaskId: cycleB.id });
+  updateBackgroundTask(cycleB.id, { resumedFromTaskId: cycleA.id, resumedIntoTaskId: cycleA.id });
+  assert.equal(resumeBackgroundTask(cycleA.id), null, 'cycle cannot select an authoritative receipt owner');
+  assert.equal(getBackgroundTask(cycleA.id)?.status, 'failed');
+  assert.equal(getBackgroundTask(cycleB.id)?.status, 'failed');
+
+  const missing = createBackgroundTask({ title: 'Missing target', prompt: 'legacy missing target', source: 'desktop' });
+  markBackgroundTaskFailed(missing.id, 'failed', 'failed');
+  updateBackgroundTask(missing.id, { resumedIntoTaskId: 'bg-deadbeef-abcdef' });
+  assert.equal(resumeBackgroundTask(missing.id), null, 'missing target fails closed');
+  assert.equal(getBackgroundTask(missing.id)?.status, 'failed');
+
+  const malformed = createBackgroundTask({ title: 'Malformed target', prompt: 'legacy malformed target', source: 'desktop' });
+  markBackgroundTaskFailed(malformed.id, 'failed', 'failed');
+  updateBackgroundTask(malformed.id, { resumedIntoTaskId: '../not-a-task' });
+  assert.equal(resumeBackgroundTask(malformed.id), null, 'malformed target fails before any file lookup');
+  assert.equal(getBackgroundTask(malformed.id)?.status, 'failed');
 });
 
 test('P3/P4 cockpit: toolCallCount is truthful; Tools feed keeps real calls, drops reflection/housekeeping', async () => {
@@ -782,6 +1160,146 @@ test('a cancellation arriving during delivery verification wins over a blocked v
   }
 });
 
+test('a cancellation committing between completion observation and terminal CAS settles the run as cancelled', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({ title: 'Cancel at completion CAS', prompt: 'prepare the final report' });
+  let hookCalls = 0;
+  _setBackgroundTaskSettlementCasHookForTests(() => {
+    hookCalls += 1;
+    _setBackgroundTaskSettlementCasHookForTests(null);
+    assert.equal(cancelBackgroundTask(task.id, 'Stopped at the completion boundary.')?.status, 'cancelling');
+  });
+
+  try {
+    const processed = await processBackgroundTasks({
+      getRuntime() { return {} as never; },
+      async respond(request: { sessionId: string }) {
+        return {
+          text: 'Done — the requested report is complete and verified.',
+          sessionId: request.sessionId,
+          stoppedReason: 'success' as const,
+        };
+      },
+    } as any, 1);
+
+    assert.equal(processed, 1);
+    assert.equal(hookCalls, 1);
+    assert.equal(getBackgroundTask(task.id)?.status, 'aborted');
+    const tracked = listRuns(40).find((run) => run.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'cancelled');
+    assert.equal(tracked?.events.filter((event) => event.type === 'cancelled').length, 1);
+    assert.equal(tracked?.events.some((event) => event.type === 'completed'), false);
+  } finally {
+    _setBackgroundTaskSettlementCasHookForTests(null);
+  }
+});
+
+test('cancellation after approval continuation starts wins before the approved mutation dispatch', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const approvalId = 'approval-cancel-before-dispatch';
+  const task = createBackgroundTask({
+    title: 'Cancel approved send before dispatch',
+    prompt: 'Send the approved follow-up only if cancellation has not won.',
+  });
+  assert.equal(
+    markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Ready to send after approval.')?.status,
+    'awaiting_approval',
+  );
+  assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending');
+
+  let dispatchCalls = 0;
+  let hookCalls = 0;
+  _setBackgroundTaskApprovalDispatchCheckHookForTests(() => {
+    hookCalls += 1;
+    _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
+    assert.equal(getBackgroundTask(task.id)?.status, 'running', 'processor already won pending->running');
+    assert.equal(
+      cancelBackgroundTask(task.id, 'Cancelled after start but before the approved mutation dispatched.')?.status,
+      'cancelling',
+    );
+  });
+
+  try {
+    const processed = await processBackgroundTasks({
+      getRuntime() {
+        return {
+          async resolveApproval() {
+            dispatchCalls += 1;
+            throw new Error('approved mutation must not dispatch after cancellation wins');
+          },
+        };
+      },
+      async respond() {
+        throw new Error('respond should not run for an approval continuation');
+      },
+    } as any, 1);
+
+    assert.equal(processed, 1);
+    assert.equal(hookCalls, 1);
+    assert.equal(dispatchCalls, 0, 'resolveApproval/provider dispatch is never entered');
+    assert.equal(getBackgroundTask(task.id)?.status, 'aborted');
+    const tracked = listRuns(40).find((candidate) => candidate.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'cancelled');
+    assert.equal(tracked?.events.some((event) => event.type === 'completed'), false);
+  } finally {
+    _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
+  }
+});
+
+test('an approved continuation with no cancellation dispatches the mutation exactly once (finding D lock)', async () => {
+  // Finding D is already mitigated: between the dispatch-boundary re-read and
+  // resolveApproval there is no await, so no cancellation can interleave; the
+  // cancel-wins test above locks the fail-closed side. This locks the other
+  // side — the re-read guard must still let a LEGITIMATE approved dispatch
+  // through exactly once (no spurious fail-closed).
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const approvalId = 'approval-clean-dispatch';
+  const task = createBackgroundTask({ title: 'Send the approved follow-up', prompt: 'Send the approved follow-up.' });
+  assert.equal(
+    markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Ready to send after approval.')?.status,
+    'awaiting_approval',
+  );
+  assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending');
+
+  let dispatchCalls = 0;
+  let hookCalls = 0;
+  _setBackgroundTaskApprovalDispatchCheckHookForTests(() => {
+    hookCalls += 1;
+    _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
+    // No cancellation — the task is genuinely still running at the boundary.
+    assert.equal(getBackgroundTask(task.id)?.status, 'running', 'processor won pending->running');
+  });
+  _setBackgroundDeliveryJudgeForTests(async () => ({ done: true }));
+
+  try {
+    const processed = await processBackgroundTasks({
+      getRuntime() {
+        return {
+          async resolveApproval(id: string, approved: boolean) {
+            dispatchCalls += 1;
+            assert.equal(id, approvalId);
+            assert.equal(approved, true);
+            return { text: 'Sent the approved follow-up to casey@example.com (message m-1).' };
+          },
+        };
+      },
+      async respond() {
+        throw new Error('respond should not run for an approval continuation');
+      },
+    } as any, 1);
+
+    assert.equal(processed, 1);
+    assert.equal(hookCalls, 1);
+    assert.equal(dispatchCalls, 1, 'the approved mutation dispatched exactly once');
+    assert.equal(getBackgroundTask(task.id)?.status, 'done');
+    const tracked = listRuns(40).find((candidate) => candidate.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'completed');
+  } finally {
+    _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
+    _setBackgroundDeliveryJudgeForTests(null);
+  }
+});
+
 test('processBackgroundTasks clears per-turn fanout coverage before automatic continuation', async () => {
   const task = createBackgroundTask({ title: 'Recover failed fanout', prompt: 'process every prospect' });
   clearLedger(task.runSessionId);
@@ -1145,6 +1663,43 @@ test('sweepInvalidDoneBackgroundTasks leaves genuine completions alone', () => {
 
   assert.equal(repaired.ids.includes(task.id), false);
   assert.equal(getBackgroundTask(task.id)?.status, 'done');
+});
+
+test('sweepInvalidDoneBackgroundTasks does NOT reclassify a success that recounts an overcome blocker (finding A)', () => {
+  const task = createBackgroundTask({ title: 'SEO audit sheet', prompt: 'Pull the data and build the audit sheet.' });
+  // A GENUINE completion whose narrative recounts a blocker it already OVERCAME.
+  // The self-reported-blocked text patterns ("blocked on", "missing credentials")
+  // are past-tense-blind, so the old sweep flipped this true success to blocked —
+  // and emitted a contradictory "task blocked" notification for a done task.
+  markBackgroundTaskDone(
+    task.id,
+    'Done — I created the "90-Day SEO Audit" Google Sheet with 1,393 rows and shared it with you. '
+      + 'Earlier I was blocked on missing Salesforce credentials, but I reconnected the account and completed the full pull.',
+  );
+
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+
+  assert.equal(repaired.ids.includes(task.id), false, 'a success that only recounts an overcome blocker stays done');
+  assert.equal(getBackgroundTask(task.id)?.status, 'done');
+  // And no contradictory "Background task blocked: …" notification is emitted.
+  const blockedNotif = listNotifications(500).find(
+    (n) => n.metadata?.backgroundTaskId === task.id && /Background task blocked/i.test(n.title ?? ''),
+  );
+  assert.equal(blockedNotif, undefined, 'no contradictory blocked notification for a task that stays done');
+});
+
+test('sweepInvalidDoneBackgroundTasks still reclassifies a done task with no saved result (structural signal survives)', () => {
+  // The false-positive fix removes only the self-reported-blocked TEXT heuristic;
+  // a positive/structural non-deliverable (here: an empty saved result) must
+  // still reclassify so the sweep keeps healing genuine hollow completions.
+  const task = createBackgroundTask({ title: 'Empty completion', prompt: 'Produce the deliverable.' });
+  markBackgroundTaskDone(task.id, '   ');
+
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+
+  assert.ok(repaired.ids.includes(task.id), 'a done task with no saved result is still repaired');
+  assert.equal(getBackgroundTask(task.id)?.status, 'blocked');
+  assert.match(getBackgroundTask(task.id)?.error ?? '', /no saved result/i);
 });
 
 test('classifyBackgroundTaskOutcome: self-reported no tool access is blocked, not reported done', () => {

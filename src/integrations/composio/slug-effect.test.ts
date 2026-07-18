@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { classifyComposioSlugEffect } from './slug-effect.js';
+import { classifyComposioSlugEffect, composioSlugEffectEvidence } from './slug-effect.js';
 
 test('provider-side research jobs remain reads', () => {
   for (const slug of [
@@ -13,6 +13,24 @@ test('provider-side research jobs remain reads', () => {
   ]) {
     assert.equal(classifyComposioSlugEffect(slug), 'read', slug);
   }
+});
+
+test('evidence grade: pure noun endpoints are unknown; verb slugs are affirmative', () => {
+  // Pure noun endpoints carry NO action verb — genuinely unknown, so a caller's
+  // declared sideEffect is the best signal (an existing declared-read workflow
+  // must keep validating). classifyComposioSlugEffect stays conservative here.
+  for (const slug of ['SLACK_CONVERSATIONS_HISTORY', 'TWITTER_USER_TIMELINE', 'GMAIL_USERS_MESSAGES', 'ACME_DO_THING']) {
+    assert.equal(composioSlugEffectEvidence(slug), 'unknown', slug);
+    assert.equal(classifyComposioSlugEffect(slug), 'external_write', slug);
+  }
+  // A read token in a trailing STATE position is a mutation signal, NOT unknown
+  // — a mislabeled sideEffect:read must never downgrade these.
+  for (const slug of ['GMAIL_MARK_AS_READ', 'SLACK_MARK_CHANNEL_READ', 'SOMETOOL_RUN_CHECK']) {
+    assert.equal(composioSlugEffectEvidence(slug), 'write', slug);
+  }
+  assert.equal(composioSlugEffectEvidence('GMAIL_SEND_EMAIL'), 'write');
+  assert.equal(composioSlugEffectEvidence('TWITTER_GET_POST'), 'read');
+  assert.equal(composioSlugEffectEvidence(''), 'unknown');
 });
 
 test('write tokens win over read tokens and unknown slugs stay conservative', () => {

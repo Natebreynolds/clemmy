@@ -18,7 +18,12 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { renderOutcomeText, deliverOutcome, outcomePrefix } = await import('./outcome.js');
+const {
+  renderOutcomeText,
+  deliverOutcome,
+  deliverOutcomeWithAcknowledgement,
+  outcomePrefix,
+} = await import('./outcome.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
 const { reconstructHarnessTranscript } = await import('./harness/transcript.js');
@@ -85,6 +90,14 @@ test('deliverOutcome: idempotent — a second call does not double-post', () => 
   assert.equal(deliverOutcome({ status: 'failed', detail: 'r2' }, c), false, 'second (even different status) is a no-op');
   const turns = new SessionStore().get('sess-oc-2').turns.filter((t) => typeof t.text === 'string' && t.text.startsWith('[background task bg-d2 '));
   assert.equal(turns.length, 1, 'exactly one outcome turn for a single source id');
+});
+
+test('deliverOutcomeWithAcknowledgement: an idempotent duplicate is acknowledged, not a failed write', () => {
+  const c = ctx({ originSessionId: 'sess-oc-ack', sourceId: 'bg-ack' });
+  const first = deliverOutcomeWithAcknowledgement({ status: 'done', detail: 'r' }, c);
+  const replay = deliverOutcomeWithAcknowledgement({ status: 'failed', detail: 'ignored replay' }, c);
+  assert.deepEqual(first, { acknowledged: true, written: true, disposition: 'delivered' });
+  assert.deepEqual(replay, { acknowledged: true, written: false, disposition: 'already_delivered' });
 });
 
 test('deliverOutcome: needs_input does not suppress the later terminal report', () => {

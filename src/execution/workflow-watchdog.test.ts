@@ -10,6 +10,7 @@ import {
   findStalledRuns,
   dropReportedBackTerminalRuns,
   reportedBackRunIdsFrom,
+  terminalDashboardNotificationRunIdsFrom,
   workflowWatchdogAlertIdsFrom,
   recommendedRecoveryForStalledRun,
   type WatchdogRunView,
@@ -237,6 +238,37 @@ test('dropReportedBackTerminalRuns: KEEPS a terminal_unnotified run with no deli
   assert.deepEqual(kept.map((r) => r.id), ['truly-lost']);
 });
 
+test('dropReportedBackTerminalRuns: a delivered global notification cannot mask a pending origin acknowledgement', () => {
+  const stalled: StalledRun[] = [{
+    id: 'origin-write-failed',
+    workflow: 'wf',
+    ageMs: 8 * 60_000,
+    reason: 'terminal_unnotified',
+    reportBackPending: true,
+  }];
+  assert.deepEqual(
+    dropReportedBackTerminalRuns(stalled, new Set(['origin-write-failed'])).map((run) => run.id),
+    ['origin-write-failed'],
+  );
+});
+
+test('findStalledRuns keeps a terminal run visible when a late origin is pending after notifiedAt', () => {
+  const stalled = findStalledRuns(
+    [{
+      id: 'late-origin',
+      workflow: 'wf',
+      status: 'completed',
+      finishedAt: iso(10 * 60_000),
+      notifiedAt: iso(9 * 60_000),
+      reportBackPending: true,
+    }],
+    T0,
+    { queuedStallMs: FIVE_MIN },
+  );
+  assert.equal(stalled[0]?.reason, 'terminal_unnotified');
+  assert.equal(stalled[0]?.reportBackPending, true);
+});
+
 test('dropReportedBackTerminalRuns: never suppresses queued/parked reasons even if the runId reported before', () => {
   // A run can finish, report back, then be re-queued/parked under the same id —
   // the report-back set must only gate terminal_unnotified, not live stalls.
@@ -265,6 +297,17 @@ test('reportedBackRunIdsFrom: a SILENT/UNDELIVERED notification does NOT count (
     { id: 'echo2', deliveredDestinations: [], metadata: { runId: 'lost2' } },
   ]);
   assert.ok(!ids.has('lost') && !ids.has('lost2'), 'undelivered records must not satisfy ground truth');
+});
+
+test('terminal dashboard card recovery recognizes only the exact stable terminal id', () => {
+  const ids = terminalDashboardNotificationRunIdsFrom([
+    { id: 'workflow-dashboard-only-completed', metadata: { runId: 'dashboard-only' } },
+    { id: 'workflow-heartbeat-heartbeat-run-2', metadata: { runId: 'heartbeat-run', heartbeat: true } },
+    { id: 'approval-apr-1', metadata: { runId: 'approval-run' } },
+    { id: 'workflow-stalled-terminal-lost', metadata: { runId: 'lost' } },
+    { id: 'workflow-dashboard-only-completed-extra', metadata: { runId: 'dashboard-only' } },
+  ]);
+  assert.deepEqual([...ids], ['dashboard-only']);
 });
 
 test('reportedBackRunIdsFrom: accepts a step notify_user card keyed by workflowRunId', () => {
