@@ -332,6 +332,54 @@ test('wrong PIN returns 401 then 429 after the 5th failure', async () => {
   } finally { await h.close(); }
 });
 
+test('pairing is rate limited, and its budget is separate from PIN', async () => {
+  // /auth/pair mints a full session exactly like PIN login but was previously
+  // unlimited. The 256-bit token means guessing is not the threat — this bounds
+  // resource abuse and makes a photographed-QR window noisy.
+  const h = await startHarness();
+  try {
+    const statuses: number[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const res = await fetch(`${h.url}/m/auth/pair`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pairToken: `bogus-token-${i}` }),
+      });
+      statuses.push(res.status);
+    }
+    assert.ok(statuses.includes(401), 'early bad tokens should be a plain 401');
+    assert.ok(statuses.includes(429), `pairing must lock out, saw ${statuses.join(',')}`);
+
+    // PIN login must still be reachable — pairing lockout must not starve the
+    // other credential path, and vice versa.
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    assert.equal(login.status, 200, 'a pairing lockout must not block PIN login');
+  } finally { await h.close(); }
+});
+
+test('a valid pairing code still works and is unaffected by prior failures', async () => {
+  const h = await startHarness();
+  try {
+    await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken: 'wrong' }),
+    });
+    const { token } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const res = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken: token }),
+    });
+    assert.equal(res.status, 200, 'a genuine pairing code must still pair');
+  } finally { await h.close(); }
+});
+
 test('a rotating CF-Connecting-IP cannot evade the PIN lockout', async () => {
   // The header is only believable on the private tunnel listener, which stamps
   // req.clemIngress itself. This harness mounts the router directly — i.e. the

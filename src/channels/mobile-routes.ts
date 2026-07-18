@@ -38,6 +38,7 @@ import {
   checkAttempt,
   recordFailure,
   recordSuccess,
+  type MobileAttemptScope,
 } from '../runtime/mobile-rate-limit.js';
 import {
   removeWebPushDestinationByEndpoint,
@@ -441,6 +442,44 @@ function clientIp(req: express.Request): string {
   return req.socket.remoteAddress || req.ip || 'unknown';
 }
 
+/**
+ * Distributed-brute-force alarm: a one-shot notification the moment a failure
+ * tips the global counter into lockdown.
+ *
+ * Shared by every credential-establishing route so a new one cannot silently
+ * ship without the alarm. Best-effort by design — a notification failure must
+ * never block or delay the auth response.
+ */
+async function notifyGlobalLockdown(
+  scope: MobileAttemptScope,
+  decision: { globalTrippedNow: boolean; globalFailures: number; retryAfterMs: number },
+): Promise<void> {
+  if (!decision.globalTrippedNow) return;
+  const what = scope === 'pair' ? 'device pairing attempts' : 'mobile PIN attempts';
+  const remedy = scope === 'pair'
+    ? 'If this wasn’t you, regenerate the pairing QR in the desktop Mobile Access panel.'
+    : 'If this wasn’t you, rotate your PIN in the desktop Mobile Access panel.';
+  try {
+    const { addNotification } = await import('../runtime/notifications.js');
+    addNotification({
+      id: `mobile-${scope}-global-lockout-${Date.now().toString(36)}`,
+      kind: 'system',
+      title: 'Mobile sign-ins locked down',
+      body: `Too many failed ${what} from different sources in a short window. `
+        + `All mobile sign-ins are blocked for the next hour. ${remedy}`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: {
+        scope,
+        globalFailures: decision.globalFailures,
+        retryAfterMs: decision.retryAfterMs,
+      },
+    });
+  } catch {
+    /* swallow — auth path must stay responsive */
+  }
+}
+
 export interface MobileSessionContext {
   token: string;
   record: MobileSessionRecord;
@@ -552,28 +591,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (!decision.allowed) body.retryAfterMs = decision.retryAfterMs;
       if (!decision.allowed) res.set('Retry-After', String(Math.ceil(decision.retryAfterMs / 1000)));
 
-      // Distributed-bruteforce alarm: one-shot push when this failure
-      // is what tipped the global counter into lockdown. Best-effort;
-      // notification failures must not block the auth response.
-      if (decision.globalTrippedNow) {
-        try {
-          const { addNotification } = await import('../runtime/notifications.js');
-          addNotification({
-            id: `mobile-pin-global-lockout-${Date.now().toString(36)}`,
-            kind: 'system',
-            title: 'Mobile sign-ins locked down',
-            body: 'Too many failed mobile PIN attempts from different sources in a short window. All mobile sign-ins are blocked for the next hour. If this wasn’t you, rotate your PIN in the desktop Mobile Access panel.',
-            createdAt: new Date().toISOString(),
-            read: false,
-            metadata: {
-              globalFailures: decision.globalFailures,
-              retryAfterMs: decision.retryAfterMs,
-            },
-          });
-        } catch {
-          /* swallow — auth path must stay responsive */
-        }
-      }
+      await notifyGlobalLockdown('pin', decision);
 
       res.status(status).json(body);
       return;
@@ -596,6 +614,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   });
 
   router.post('/auth/pair', async (req, res) => {
+    const ip = clientIp(req);
     const pairToken = typeof req.body?.pairToken === 'string'
       ? req.body.pairToken.trim()
       : (typeof req.body?.token === 'string' ? req.body.token.trim() : '');
@@ -605,12 +624,38 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
 
+    // Pairing mints a full session exactly like PIN login does, but was
+    // previously unlimited. The 256-bit token means guessing is not the threat;
+    // this bounds resource abuse and makes the window after a photographed or
+    // shoulder-surfed QR noisy instead of silent. Budgeted separately from
+    // 'pin' so PIN failures can never lock out the pairing recovery path.
+    const pairOpts = { ...stateOpts, scope: 'pair' as const };
+    const gate = checkAttempt(ip, pairOpts);
+    if (!gate.allowed) {
+      res.status(429)
+        .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
+        .json({ error: 'LOCKED_OUT', retryAfterMs: gate.retryAfterMs });
+      return;
+    }
+
     const pairing = await consumeMobilePairingCode(pairToken, stateOpts);
     if (!pairing) {
+      const decision = await recordFailure(ip, pairOpts);
+      await notifyGlobalLockdown('pair', decision);
+      if (!decision.allowed) {
+        res.status(429)
+          .set('Retry-After', String(Math.ceil(decision.retryAfterMs / 1000)))
+          .json({
+            error: decision.globalLocked ? 'GLOBAL_LOCKED_OUT' : 'LOCKED_OUT',
+            retryAfterMs: decision.retryAfterMs,
+          });
+        return;
+      }
       res.status(401).json({ error: 'INVALID_PAIRING_CODE' });
       return;
     }
 
+    await recordSuccess(ip, pairOpts);
     const { token, record } = await createSession({ deviceLabel }, stateOpts);
     res.cookie(MOBILE_SESSION_COOKIE, token, {
       httpOnly: true,
