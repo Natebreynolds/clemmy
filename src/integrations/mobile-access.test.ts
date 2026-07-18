@@ -265,6 +265,11 @@ test('probeTunnelOwnership refuses when there is no nonce to check', async () =>
 
 test('a quick tunnel with a dead pid is not adopted', async () => {
   integration._resetMobileAccessForTests();
+  // _resetMobileAccessForTests only clears in-memory state; the binary lives in
+  // the persisted state file and leaks from an earlier test. Clear it so the
+  // fallback start takes the clean "no binary detected" path and never spawns a
+  // detached cloudflared (a stale binary path spawned async ENOENT on clean CI).
+  await setMobileAccessBinary(null as never);
   await setMobileAccessTunnel({
     id: 'quick', name: 'Quick mobile link', hostname: 'dead.trycloudflare.com', mode: 'quick',
     pid: 4194303, probeNonce: 'n1',

@@ -451,6 +451,13 @@ export function spawnDetachedQuickTunnel(opts: {
       ['tunnel', '--no-autoupdate', '--url', opts.localUrl],
       { detached: true, stdio: ['ignore', fd, fd] },
     );
+    // A detached spawn reports a launch failure (e.g. the binary is missing /
+    // was uninstalled → ENOENT) ASYNCHRONOUSLY, after this returns. Without a
+    // listener that becomes an uncaughtException that can crash the daemon (and,
+    // in tests, fail an unrelated file when a tunnel is started with a stale
+    // binary path). A failed launch surfaces via the pid liveness + log tail, so
+    // here we just make sure the error is never unhandled.
+    child.on('error', () => { /* launch failure detected via pid/log checks */ });
     // Let the parent exit without waiting on this child.
     child.unref();
     if (typeof child.pid !== 'number') throw new Error('cloudflared did not report a pid');
