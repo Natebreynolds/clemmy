@@ -201,6 +201,12 @@ test('install jobs are tracked in the module-scoped map and capped to 5 in recen
   const fetched = integration.getInstallJob(job1.id);
   assert.ok(fetched);
   assert.equal(fetched!.id, job1.id);
+  // Drain the fire-and-forget install so its background state writes settle
+  // WITHIN this test rather than racing a later test's reset / temp-home
+  // teardown on a clean CI runner (that was failing the whole file).
+  for (let i = 0; i < 100 && integration.getInstallJob(job1.id)?.status === 'running'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 });
 
 test('getLoginStatus reports certPresent based on cert.pem existence', () => {

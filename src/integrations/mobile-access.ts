@@ -120,8 +120,10 @@ export async function startInstallJob(): Promise<InstallJob> {
     job.exitOk = false;
     job.exitError = (err as Error).message;
     job.status = 'failed';
-    await setMobileAccessStatus('error', job.exitError);
-  });
+    await setMobileAccessStatus('error', job.exitError).catch(() => undefined);
+  }).catch(() => undefined); // fire-and-forget: a background install must NEVER
+  // leak an unhandled rejection (e.g. a status write that fails after the caller
+  // has moved on) — that would crash the process / fail a whole test file.
   return job;
 }
 
