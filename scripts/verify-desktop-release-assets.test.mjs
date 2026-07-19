@@ -22,7 +22,7 @@ function writeAsset(dir, name, content = 'asset') {
   return Buffer.byteLength(content);
 }
 
-function writeFeed(dir, version, files, pathEntry = files[0]?.url ?? '') {
+function writeFeed(dir, version, files, pathEntry = files[0]?.url ?? '', feedName = 'latest-mac.yml') {
   const body = [
     `version: ${version}`,
     'files:',
@@ -38,7 +38,7 @@ function writeFeed(dir, version, files, pathEntry = files[0]?.url ?? '') {
     "releaseDate: '2026-07-09T00:00:00.000Z'",
     '',
   ].join('\n');
-  writeFileSync(path.join(dir, 'latest-mac.yml'), body);
+  writeFileSync(path.join(dir, feedName), body);
 }
 
 test('parseLatestMacYml extracts version, path, and file entries', () => {
@@ -134,5 +134,35 @@ test('verifyDesktopReleaseAssets catches size mismatches and missing blockmaps',
     assert.match(result.errors.join('\n'), /size mismatch/);
     assert.match(result.errors.join('\n'), /sha512 mismatch/);
     assert.match(result.errors.join('\n'), /missing blockmap/);
+  });
+});
+
+test('verifyDesktopReleaseAssets accepts an updater-safe Windows installer fixture', () => {
+  withFixture((dir) => {
+    const installer = 'Clementine-Setup-1.2.3.exe';
+    const installerSize = writeAsset(dir, installer, 'windows installer payload');
+    writeFeed(dir, '1.2.3', [
+      { url: installer, size: installerSize },
+    ], installer, 'latest.yml');
+
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3', platform: 'windows' });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.ok, true);
+  });
+});
+
+test('verifyDesktopReleaseAssets rejects electron-builder default Windows names that GitHub normalizes', () => {
+  withFixture((dir) => {
+    const unsafeInstaller = 'Clementine Setup 1.2.3.exe';
+    const unsafeSize = writeAsset(dir, unsafeInstaller, 'windows installer payload');
+    const expectedInstaller = 'Clementine-Setup-1.2.3.exe';
+    writeFeed(dir, '1.2.3', [
+      { url: expectedInstaller, size: unsafeSize },
+    ], expectedInstaller, 'latest.yml');
+
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3', platform: 'windows' });
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join('\n'), /feed references missing artifact: Clementine-Setup-1\.2\.3\.exe/);
+    assert.match(result.errors.join('\n'), /updater-unsafe Windows installer names: Clementine Setup 1\.2\.3\.exe/);
   });
 });

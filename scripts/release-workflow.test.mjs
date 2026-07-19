@@ -141,3 +141,11 @@ test('one tag-only publisher owns GitHub Release mutation', () => {
   assert.deepEqual(mutationJobs, ['publish-release']);
   assert.match(String(workflow.jobs?.['release-windows']?.if ?? ''), /github\.event_name == 'push'/);
 });
+
+test('Windows artifacts use updater-safe names and are verified before upload', () => {
+  assert.equal(desktopPackage.build?.nsis?.artifactName, '${productName}-Setup-${version}.${ext}');
+  assert.match(
+    runScripts(workflow.jobs?.['release-windows']),
+    /verify-desktop-release-assets\.mjs.*--platform windows/,
+  );
+});

@@ -224,6 +224,9 @@
         "nsis"
       ]
     },
+    "nsis": {
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
     "linux": {
       "icon": "build/icon.png",
       "target": [

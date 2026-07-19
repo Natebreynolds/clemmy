@@ -5,11 +5,12 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 function parseArgs(argv) {
-  const args = { dir: 'apps/desktop/release', version: '' };
+  const args = { dir: 'apps/desktop/release', version: '', platform: 'mac' };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--dir') args.dir = argv[++i] ?? '';
     else if (arg === '--version') args.version = argv[++i] ?? '';
+    else if (arg === '--platform') args.platform = argv[++i] ?? '';
     else if (arg === '--help' || arg === '-h') args.help = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -69,9 +70,17 @@ export function sha512FileSync(filePath) {
 export function verifyDesktopReleaseAssets(options = {}) {
   const releaseDir = path.resolve(options.dir ?? 'apps/desktop/release');
   const expectedVersion = String(options.version ?? '').replace(/^v/, '').trim();
+  const platform = String(options.platform ?? 'mac').trim().toLowerCase();
   const errors = [];
   const notes = [];
-  const feedPath = path.join(releaseDir, 'latest-mac.yml');
+
+  if (platform !== 'mac' && platform !== 'windows') {
+    errors.push(`unsupported release platform: ${platform || '(empty)'}`);
+    return { ok: false, errors, notes };
+  }
+
+  const feedName = platform === 'windows' ? 'latest.yml' : 'latest-mac.yml';
+  const feedPath = path.join(releaseDir, feedName);
 
   if (!existsSync(releaseDir)) {
     errors.push(`release directory does not exist: ${releaseDir}`);
@@ -83,28 +92,43 @@ export function verifyDesktopReleaseAssets(options = {}) {
   }
 
   const feed = parseLatestMacYml(readFileSync(feedPath, 'utf-8'));
-  if (!feed.version) errors.push('latest-mac.yml is missing a version line');
+  if (!feed.version) errors.push(`${feedName} is missing a version line`);
   if (expectedVersion && feed.version !== expectedVersion) {
-    errors.push(`latest-mac.yml version ${feed.version || '(missing)'} does not match expected ${expectedVersion}`);
+    errors.push(`${feedName} version ${feed.version || '(missing)'} does not match expected ${expectedVersion}`);
   }
-  if (!feed.path) errors.push('latest-mac.yml is missing top-level path');
-  if (feed.files.length === 0) errors.push('latest-mac.yml has no files entries');
-  if (!feed.files.some((file) => file.url.endsWith('.zip'))) errors.push('latest-mac.yml does not reference a .zip artifact');
-  if (!feed.files.some((file) => file.url.endsWith('.dmg'))) errors.push('latest-mac.yml does not reference a .dmg artifact');
+  if (!feed.path) errors.push(`${feedName} is missing top-level path`);
+  if (feed.files.length === 0) errors.push(`${feedName} has no files entries`);
+
+  if (platform === 'mac') {
+    if (!feed.files.some((file) => file.url.endsWith('.zip'))) errors.push('latest-mac.yml does not reference a .zip artifact');
+    if (!feed.files.some((file) => file.url.endsWith('.dmg'))) errors.push('latest-mac.yml does not reference a .dmg artifact');
+  } else if (!feed.files.some((file) => file.url.endsWith('.exe'))) {
+    errors.push('latest.yml does not reference an .exe artifact');
+  }
 
   if (expectedVersion) {
-    const requiredMacArtifacts = [
-      `Clementine-${expectedVersion}-arm64-mac.zip`,
-      `Clementine-${expectedVersion}-arm64.dmg`,
-      `Clementine-${expectedVersion}-mac.zip`,
-      `Clementine-${expectedVersion}.dmg`,
-    ];
     const feedUrls = new Set(feed.files.map((file) => file.url));
-    for (const artifact of requiredMacArtifacts) {
-      if (!feedUrls.has(artifact)) errors.push(`latest-mac.yml is missing architecture artifact: ${artifact}`);
-    }
-    if (feed.path !== `Clementine-${expectedVersion}-mac.zip`) {
-      errors.push(`top-level path must remain the x64 legacy fallback, got: ${feed.path || '(missing)'}`);
+    if (platform === 'mac') {
+      const requiredMacArtifacts = [
+        `Clementine-${expectedVersion}-arm64-mac.zip`,
+        `Clementine-${expectedVersion}-arm64.dmg`,
+        `Clementine-${expectedVersion}-mac.zip`,
+        `Clementine-${expectedVersion}.dmg`,
+      ];
+      for (const artifact of requiredMacArtifacts) {
+        if (!feedUrls.has(artifact)) errors.push(`latest-mac.yml is missing architecture artifact: ${artifact}`);
+      }
+      if (feed.path !== `Clementine-${expectedVersion}-mac.zip`) {
+        errors.push(`top-level path must remain the x64 legacy fallback, got: ${feed.path || '(missing)'}`);
+      }
+    } else {
+      const expectedInstaller = `Clementine-Setup-${expectedVersion}.exe`;
+      if (!feedUrls.has(expectedInstaller)) {
+        errors.push(`latest.yml is missing updater-safe installer artifact: ${expectedInstaller}`);
+      }
+      if (feed.path !== expectedInstaller) {
+        errors.push(`top-level path must match the updater-safe Windows installer, got: ${feed.path || '(missing)'}`);
+      }
     }
   }
 
@@ -141,21 +165,32 @@ export function verifyDesktopReleaseAssets(options = {}) {
   }
 
   if (expectedVersion) {
-    const stale = listFilesRecursive(releaseDir)
-      .map((filePath) => path.relative(releaseDir, filePath))
-      .filter((rel) => /^Clementine-.*\.(?:dmg|zip|blockmap)$/.test(path.basename(rel)))
-      .filter((rel) => !path.basename(rel).startsWith(`Clementine-${expectedVersion}`));
-    if (stale.length > 0) {
-      errors.push(`release directory contains stale Clementine artifacts for other versions: ${stale.join(', ')}`);
+    const relativeFiles = listFilesRecursive(releaseDir).map((filePath) => path.relative(releaseDir, filePath));
+    if (platform === 'mac') {
+      const stale = relativeFiles
+        .filter((rel) => /^Clementine-.*\.(?:dmg|zip|blockmap)$/.test(path.basename(rel)))
+        .filter((rel) => !path.basename(rel).startsWith(`Clementine-${expectedVersion}`));
+      if (stale.length > 0) {
+        errors.push(`release directory contains stale Clementine artifacts for other versions: ${stale.join(', ')}`);
+      }
+    } else {
+      const expectedInstaller = `Clementine-Setup-${expectedVersion}.exe`;
+      const expectedNames = new Set([expectedInstaller, `${expectedInstaller}.blockmap`]);
+      const unexpected = relativeFiles
+        .filter((rel) => /^Clementine(?:[ .-])Setup.*\.exe(?:\.blockmap)?$/i.test(path.basename(rel)))
+        .filter((rel) => !expectedNames.has(path.basename(rel)));
+      if (unexpected.length > 0) {
+        errors.push(`release directory contains updater-unsafe Windows installer names: ${unexpected.join(', ')}`);
+      }
     }
   }
 
-  notes.push(`checked ${feed.files.length} feed artifacts in ${releaseDir}`);
-  return { ok: errors.length === 0, errors, notes, feed };
+  notes.push(`checked ${feed.files.length} ${platform} feed artifacts in ${releaseDir}`);
+  return { ok: errors.length === 0, errors, notes, feed, platform };
 }
 
 function printUsage() {
-  console.log('Usage: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version 1.3.3');
+  console.log('Usage: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version 1.3.3 [--platform mac|windows]');
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

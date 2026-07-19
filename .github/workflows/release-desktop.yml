@@ -293,6 +293,11 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
         run: npm run package:win
 
+      - name: Verify Windows release assets and updater feed
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "$VERSION" --platform windows
+
       - name: Upload private Windows build artifact
         uses: actions/upload-artifact@v4
         with:
