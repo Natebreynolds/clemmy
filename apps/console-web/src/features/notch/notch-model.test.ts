@@ -84,11 +84,11 @@ test('dismiss collapses the surface', () => {
 test('surface sizing is compact when collapsed and modest when expanded', () => {
   assert.deepEqual(notchSurfaceSize({ expanded: false }), { width: 62, height: 48 });
   // Status-only expanded (no bottom action) uses the shorter card...
-  assert.deepEqual(notchSurfaceSize({ expanded: true }), { width: 360, height: 144 });
+  assert.deepEqual(notchSurfaceSize({ expanded: true }), { width: 392, height: 144 });
   // ...and only the approval state (which renders a CTA row) uses the taller one.
   assert.deepEqual(
     notchSurfaceSize({ expanded: true, activity: { state: 'approval', title: '', detail: '', needsYouCount: 1, runningCount: 0, updatedAt: '' } }),
-    { width: 360, height: 190 },
+    { width: 392, height: 190 },
   );
 });
 

@@ -5,6 +5,7 @@ import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
+import { safeDetectCorrection } from './correction-hook.js';
 import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
@@ -488,6 +489,8 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       },
     });
 
+    // Negative half of the credit loop — BEFORE auto-credit (parity across lanes).
+    safeDetectCorrection({ sessionId: input.sessionId, turn: 0, userInput: input.input });
     // Post-plan memory credit: a primed memory that shows up in the drafted
     // plan (a filled slot, an id, a constraint) demonstrably earned its recall.
     try {

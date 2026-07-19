@@ -65,7 +65,7 @@ export function AutonomyForm() {
                 <option value="strict">Strict — ask before any action</option>
                 <option value="balanced">Balanced</option>
                 <option value="workspace">Workspace — auto inside your folders</option>
-                <option value="yolo">YOLO — auto everywhere (careful)</option>
+                <option value="yolo">YOLO — auto except protected sends</option>
               </Select>
             )}</Field>
             <Field label="Check in every (minutes)">{(id) => <Input id={id} type="number" min={1} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', Number(e.target.value))} />}</Field>

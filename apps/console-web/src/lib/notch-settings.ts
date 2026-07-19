@@ -37,6 +37,13 @@ export interface NotchSettingsSnapshot {
     platformSupport?: { supported: boolean; message?: string };
     autoRecord: boolean;
   } | null;
+  localMeetingCapture?: {
+    recording: boolean;
+    sessionId?: string;
+    title?: string;
+    startedAt?: string;
+    stale?: boolean;
+  };
 }
 
 export interface NotchSettingsMutation {
@@ -62,20 +69,20 @@ export function notchRecallCapabilityCopy(
   notchEnabled = true,
 ): string {
   if (!notchEnabled) {
-    return 'Clementine in the notch is off. Turn it on to use Recall meeting prompts and recording controls from the notch.';
+    return 'Clementine in the notch is off. Turn it on to use online meeting prompts and recording controls from the notch.';
   }
   switch (notchRecallCapability(meetingCapture)) {
     case 'ready':
-      return 'Recall meeting prompts and recording controls are live. Task and agent activity remains a clearly labeled preview until live run data is connected.';
+      return 'Online meeting prompts and recording controls are live. In-person microphone recording is available directly from the notch with Meet.';
     case 'off':
-      return 'Task and agent activity is available as a preview. Turn on Recall from Meetings to receive meeting prompts and recording controls.';
+      return 'In-person microphone recording is available from Meet. Turn on online meeting capture from Meetings to also detect Zoom, Google Meet, Microsoft Teams, and Slack Huddles.';
     case 'unsupported':
       return meetingCapture?.platformSupport?.message
-        ?? 'Recall meeting capture is unavailable on this Mac. Task and agent activity remains a preview.';
+        ?? 'Online meeting capture is unavailable on this Mac. In-person recording from the notch is still available.';
     case 'needs-attention':
       return meetingCapture?.lastError
-        ? `Recall meeting controls need attention: ${meetingCapture.lastError}`
-        : 'Recall meeting controls need attention. Review meeting capture before relying on prompts or recording controls.';
+        ? `Online meeting controls need attention: ${meetingCapture.lastError}`
+        : 'Online meeting controls need attention. Review meeting capture before relying on prompts or recording controls.';
   }
 }
 

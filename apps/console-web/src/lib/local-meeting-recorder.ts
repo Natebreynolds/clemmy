@@ -17,6 +17,18 @@ export interface LocalMeetingCaptureHandlers {
   onState?: (state: LocalMeetingCaptureState) => void;
 }
 
+/** Narrow desktop contract required by the microphone pump. The main dashboard
+ * and the macOS notch expose different preload globals, but both deliberately
+ * implement this same small recording surface. */
+export interface LocalMeetingCaptureBridge {
+  localMeetingStart?: (payload?: { title?: string }) => Promise<Record<string, unknown>>;
+  localMeetingAppend?: (sessionId: string, chunk: ArrayBuffer) => Promise<Record<string, unknown>>;
+  localMeetingStop?: (sessionId: string) => Promise<Record<string, unknown>>;
+  localMeetingCancel?: (sessionId: string) => Promise<Record<string, unknown>>;
+}
+
+export type LocalMeetingCaptureBridgeProvider = () => LocalMeetingCaptureBridge | null;
+
 /**
  * Stateful linear resampler. It carries the boundary sample and fractional
  * cursor between Web Audio callbacks, avoiding a click/gap at every chunk.
@@ -102,7 +114,10 @@ export class LocalMeetingCapture {
   private cancelRequested = false;
   private releasePromise: Promise<void> | null = null;
 
-  constructor(private readonly handlers: LocalMeetingCaptureHandlers = {}) {}
+  constructor(
+    private readonly handlers: LocalMeetingCaptureHandlers = {},
+    private readonly bridgeProvider: LocalMeetingCaptureBridgeProvider = clemmy,
+  ) {}
 
   state(): LocalMeetingCaptureState {
     const elapsedSeconds = this.startedAt
@@ -119,7 +134,7 @@ export class LocalMeetingCapture {
 
   async start(title?: string): Promise<LocalMeetingCaptureState> {
     if (this.phase !== 'idle' && this.phase !== 'error') throw new Error('a local meeting is already starting or recording');
-    const bridge = clemmy();
+    const bridge = this.bridgeProvider();
     if (!bridge?.localMeetingStart || !bridge.localMeetingAppend) {
       throw new Error('Local meeting recording is available in the Clementine desktop app.');
     }
@@ -172,12 +187,18 @@ export class LocalMeetingCapture {
       this.elapsedTimer = window.setInterval(() => this.emit(), 1000);
       return this.state();
     } catch (error) {
+      const cancelled = this.cancelRequested;
       await this.releaseMedia();
       if (this.sessionId && bridge.localMeetingCancel) {
         await bridge.localMeetingCancel(this.sessionId).catch(() => undefined);
       }
       this.sessionId = null;
       this.startedAt = null;
+      if (cancelled) {
+        this.writeError = null;
+        this.reset();
+        throw new Error('Local meeting recording start was cancelled.');
+      }
       this.writeError = new Error(captureErrorMessage(error));
       this.setPhase('error');
       throw this.writeError;
@@ -185,7 +206,7 @@ export class LocalMeetingCapture {
   }
 
   async stop(): Promise<Record<string, unknown>> {
-    const bridge = clemmy();
+    const bridge = this.bridgeProvider();
     const sessionId = this.sessionId;
     if (!sessionId || !bridge?.localMeetingStop) throw new Error('no local meeting is recording');
     if (this.phase === 'stopping') throw new Error('local meeting is already stopping');
@@ -215,17 +236,27 @@ export class LocalMeetingCapture {
   async cancel(): Promise<void> {
     this.cancelRequested = true;
     const sessionId = this.sessionId;
-    const bridge = clemmy();
+    const bridge = this.bridgeProvider();
     await this.releaseMedia();
     await this.writeQueue;
     if (sessionId && bridge?.localMeetingCancel) await bridge.localMeetingCancel(sessionId);
     this.reset();
   }
 
+  /** Another trusted Clementine surface can stop this writer (for example the
+   * Meetings page while the notch owns the microphone). Release renderer media
+   * without issuing a second stop/cancel IPC against an already-finalized WAV. */
+  async releaseAfterExternalStop(): Promise<void> {
+    this.cancelRequested = true;
+    await this.releaseMedia();
+    await this.writeQueue;
+    this.reset();
+  }
+
   private enqueue(chunk: ArrayBuffer): void {
     if (this.writeError || !this.sessionId) return;
     const sessionId = this.sessionId;
-    const bridge = clemmy();
+    const bridge = this.bridgeProvider();
     this.writeQueue = this.writeQueue.then(async () => {
       if (this.writeError) return;
       if (!bridge?.localMeetingAppend) throw new Error('desktop recording bridge disconnected');

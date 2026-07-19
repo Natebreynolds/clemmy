@@ -14,6 +14,7 @@ export interface ClementineLiveMountAck {
 
 export type ClementineLivePreviewListener = (payload: unknown) => void;
 export type ClementineLiveMeetingListener = (payload: unknown) => void;
+export type ClementineLiveLocalMeetingListener = (payload: unknown) => void;
 
 const clementineLive = Object.freeze({
   resize: (bounds: ClementineLiveResizeRequest): Promise<unknown> => (
@@ -40,6 +41,18 @@ const clementineLive = Object.freeze({
   requestMeetingPermissions: (): Promise<unknown> => (
     ipcRenderer.invoke('clemmy:live-meeting-request-permissions')
   ),
+  localMeetingStart: (payload?: { title?: string }): Promise<unknown> => (
+    ipcRenderer.invoke('clemmy:live-local-meeting-start', payload ?? {})
+  ),
+  localMeetingAppend: (sessionId: string, chunk: ArrayBuffer): Promise<unknown> => (
+    ipcRenderer.invoke('clemmy:live-local-meeting-append', { sessionId, chunk })
+  ),
+  localMeetingStop: (sessionId: string): Promise<unknown> => (
+    ipcRenderer.invoke('clemmy:live-local-meeting-stop', { sessionId })
+  ),
+  localMeetingCancel: (sessionId: string): Promise<unknown> => (
+    ipcRenderer.invoke('clemmy:live-local-meeting-cancel', { sessionId })
+  ),
   onPreview: (callback: ClementineLivePreviewListener): (() => void) => {
     if (typeof callback !== 'function') return () => undefined;
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown): void => callback(payload);
@@ -51,6 +64,12 @@ const clementineLive = Object.freeze({
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown): void => callback(payload);
     ipcRenderer.on('clemmy:live-meeting-event', listener);
     return () => ipcRenderer.removeListener('clemmy:live-meeting-event', listener);
+  },
+  onLocalMeetingEvent: (callback: ClementineLiveLocalMeetingListener): (() => void) => {
+    if (typeof callback !== 'function') return () => undefined;
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown): void => callback(payload);
+    ipcRenderer.on('clemmy:live-local-meeting-event', listener);
+    return () => ipcRenderer.removeListener('clemmy:live-local-meeting-event', listener);
   },
 });
 

@@ -30,8 +30,8 @@ const COLLAPSED_SIZE: NotchSurfaceSize = { width: 62, height: 48 };
 // needs the taller card. Heights fit the exact-size (non-scrolling) window:
 //   status-only: header 52 + content padding 26 + copy 56 + 10px island offset ≈ 144
 //   with action: + gap 9 + action row 36 ≈ 189.
-const EXPANDED_SIZE: NotchSurfaceSize = { width: 360, height: 144 };
-const EXPANDED_SIZE_WITH_ACTION: NotchSurfaceSize = { width: 360, height: 190 };
+const EXPANDED_SIZE: NotchSurfaceSize = { width: 392, height: 144 };
+const EXPANDED_SIZE_WITH_ACTION: NotchSurfaceSize = { width: 392, height: 190 };
 // Voice begins as a tight listening control and grows only when there is content
 // worth reading. A fixed tall frame made the initial mic state look unfinished.
 const VOICE_LISTENING_SIZE: NotchSurfaceSize = { width: 336, height: 108 };

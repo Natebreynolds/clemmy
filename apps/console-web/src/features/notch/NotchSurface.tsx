@@ -17,12 +17,17 @@ import {
   Mic,
   ShieldCheck,
   Sparkles,
+  Users,
   X,
 } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { cn } from '@/lib/cn';
 import { getLiveActivity, type NotchLiveActivity } from '@/lib/live-activity';
 import { NotchVoice, type NotchVoiceStatus } from '@/lib/notch-voice';
+import {
+  LocalMeetingCapture,
+  type LocalMeetingCaptureState,
+} from '@/lib/local-meeting-recorder';
 import {
   createInitialNotchState,
   notchReducer,
@@ -35,11 +40,13 @@ import {
   dismissDetectedMeeting,
   dismissLiveSurface,
   getLiveMeetingStatus,
+  liveLocalMeetingCaptureBridge,
   openClementineConsole,
   recordDetectedMeeting,
   requestLiveMeetingPermissions,
   resizeLiveSurface,
   stopDetectedMeeting,
+  subscribeToLiveLocalMeetingEvents,
   subscribeToLiveMeetingEvents,
   subscribeToLivePreview,
 } from './notch-bridge';
@@ -49,6 +56,7 @@ import {
   notchMeetingCaptureInterrupted,
   notchMeetingReducer,
   type NotchMeetingBusyAction,
+  type NotchMeetingState,
 } from './notch-meeting-model';
 import './notch.css';
 
@@ -59,6 +67,44 @@ let nextLiveLayoutId = Date.now() * 1_000;
 function createLiveLayoutId(): number {
   nextLiveLayoutId += 1;
   return nextLiveLayoutId;
+}
+
+const LOCAL_MEETING_PENDING_ID = 'local-pending';
+
+function localNotchMeetingState(
+  capture: LocalMeetingCaptureState,
+  previous: NotchMeetingState | null,
+): NotchMeetingState | null {
+  if (capture.phase === 'idle') return previous;
+  const meeting = {
+    windowId: capture.sessionId ?? previous?.meeting?.windowId ?? LOCAL_MEETING_PENDING_ID,
+    platform: 'in-person',
+    title: 'In-person meeting',
+  };
+  if (capture.phase === 'requesting') return { phase: 'starting', meeting };
+  if (capture.phase === 'recording') {
+    return {
+      phase: 'recording',
+      meeting,
+      recordingStartedAt: capture.startedAt,
+      audioCapturing: true,
+    };
+  }
+  if (capture.phase === 'stopping') {
+    return {
+      phase: 'stopping',
+      meeting,
+      recordingStartedAt: capture.startedAt ?? previous?.recordingStartedAt,
+      audioCapturing: previous?.audioCapturing,
+    };
+  }
+  return {
+    phase: 'error',
+    meeting,
+    recordingStartedAt: capture.startedAt ?? previous?.recordingStartedAt,
+    audioCapturing: capture.sessionId ? false : undefined,
+    error: capture.error ?? 'In-person meeting recording needs attention.',
+  };
 }
 
 /** State glyph for the current live-activity state. */
@@ -99,14 +145,26 @@ export function NotchSurface() {
   const [meetingState, dispatchMeeting] = useReducer(notchMeetingReducer, INITIAL_NOTCH_MEETING_STATE);
   const [meetingExpanded, setMeetingExpanded] = useState(true);
   const [meetingBusyAction, setMeetingBusyActionState] = useState<NotchMeetingBusyAction>(null);
+  const [localMeetingState, setLocalMeetingState] = useState<NotchMeetingState | null>(null);
   const [nativeHover, setNativeHover] = useState(false);
+  const localCaptureRef = useRef<LocalMeetingCapture | null>(null);
+  if (!localCaptureRef.current) {
+    localCaptureRef.current = new LocalMeetingCapture({
+      onState: (next) => setLocalMeetingState((previous) => localNotchMeetingState(next, previous)),
+    }, liveLocalMeetingCaptureBridge);
+  }
+  const localCapture = localCaptureRef.current;
   const meetingBusyActionRef = useRef(meetingBusyAction);
   const collapsedButtonRef = useRef<HTMLButtonElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const mountedAcknowledgedRef = useRef(false);
   const previouslyExpandedRef = useRef(state.expanded);
   const activity = state.activity;
-  const meetingActive = meetingState.phase !== 'idle';
+  const activeMeetingState = localMeetingState
+    ?? (meetingState.phase !== 'idle' ? meetingState : null);
+  const activeMeetingSource = localMeetingState ? 'local' as const : 'recall' as const;
+  const meetingActive = activeMeetingState !== null;
+  const localCanStop = Boolean(localCapture.state().sessionId);
   // Voice companion: press the mic (or the global shortcut) and speak a request
   // ("hey, pull up my pipeline"). NotchVoice records the clip, transcribes it
   // (whisper-1 — plain speech-to-text, no realtime voice), and sends the text to
@@ -126,11 +184,11 @@ export function NotchSurface() {
   const voiceActiveRef = useRef(false);
   const voiceStatusRef = useRef<NotchVoiceStatus>('idle');
   const meetingActiveRef = useRef(meetingActive);
-  const meetingPhaseRef = useRef(meetingState.phase);
+  const meetingPhaseRef = useRef(activeMeetingState?.phase ?? 'idle');
   useEffect(() => { voiceActiveRef.current = voiceActive; }, [voiceActive]);
   useEffect(() => { voiceStatusRef.current = voiceStatus; }, [voiceStatus]);
   useEffect(() => { meetingActiveRef.current = meetingActive; }, [meetingActive]);
-  useEffect(() => { meetingPhaseRef.current = meetingState.phase; }, [meetingState.phase]);
+  useEffect(() => { meetingPhaseRef.current = activeMeetingState?.phase ?? 'idle'; }, [activeMeetingState?.phase]);
   useEffect(() => { if (voiceStatus !== 'recording') setVoiceLevel(0); }, [voiceStatus]);
 
   const setMeetingBusyAction = useCallback((action: NotchMeetingBusyAction) => {
@@ -145,7 +203,7 @@ export function NotchSurface() {
   }, []);
   const size = useMemo(
     () => {
-      if (meetingActive) return notchMeetingSurfaceSize(meetingState, meetingExpanded);
+      if (activeMeetingState) return notchMeetingSurfaceSize(activeMeetingState, meetingExpanded);
       if (voiceActive) {
         return notchVoiceSurfaceSize({
           hasTranscript: Boolean(voiceUser),
@@ -162,7 +220,7 @@ export function NotchSurface() {
       voiceAssistant,
       voiceError,
       meetingExpanded,
-      meetingState,
+      activeMeetingState,
       state.expanded,
       activity.state,
     ],
@@ -272,20 +330,46 @@ export function NotchSurface() {
     };
   }, []);
 
-  useEffect(() => {
-    if (meetingState.phase === 'prompt'
-        || meetingState.phase === 'starting'
-        || meetingState.phase === 'recording'
-        || meetingState.phase === 'error') {
-      setMeetingExpanded(true);
-    }
-  }, [meetingState.phase]);
+  useEffect(() => subscribeToLiveLocalMeetingEvents((payload) => {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+    const event = payload as Record<string, unknown>;
+    const snapshot = localCapture.state();
+    if (typeof event.sessionId !== 'string' || event.sessionId !== snapshot.sessionId) return;
+    const meeting = { windowId: snapshot.sessionId, platform: 'in-person', title: 'In-person meeting' };
+    void localCapture.releaseAfterExternalStop().then(() => {
+      if (event.type === 'cancelled-elsewhere') {
+        setLocalMeetingState(null);
+        return;
+      }
+      if (event.type !== 'stopped-elsewhere') return;
+      const queueError = event.queued === false
+        ? (typeof event.error === 'string'
+            ? `Audio was saved locally, but transcription could not start yet: ${event.error}`
+            : 'Audio was saved locally, but transcription could not start yet.')
+        : undefined;
+      setLocalMeetingState({
+        phase: 'stopped',
+        meeting,
+        recordingStartedAt: snapshot.startedAt,
+        error: queueError,
+      });
+    }).catch(() => undefined);
+  }), [localCapture]);
 
   useEffect(() => {
-    if (meetingState.phase === 'recording' && notchMeetingCaptureInterrupted(meetingState)) {
+    if (activeMeetingState?.phase === 'prompt'
+        || activeMeetingState?.phase === 'starting'
+        || activeMeetingState?.phase === 'recording'
+        || activeMeetingState?.phase === 'error') {
       setMeetingExpanded(true);
     }
-  }, [meetingState.audioCapturing, meetingState.networkStatus, meetingState.phase]);
+  }, [activeMeetingState?.phase]);
+
+  useEffect(() => {
+    if (activeMeetingState?.phase === 'recording' && notchMeetingCaptureInterrupted(activeMeetingState)) {
+      setMeetingExpanded(true);
+    }
+  }, [activeMeetingState?.audioCapturing, activeMeetingState?.networkStatus, activeMeetingState?.phase]);
 
   useEffect(() => {
     let active = true;
@@ -447,8 +531,10 @@ export function NotchSurface() {
       }
       if (meetingActive && event.key === 'Escape') {
         event.preventDefault();
-        if (meetingState.phase === 'recording' && meetingExpanded) setMeetingExpanded(false);
-        else if (meetingState.phase === 'prompt' || meetingState.phase === 'stopped' || meetingState.phase === 'error') {
+        if (activeMeetingState?.phase === 'recording' && meetingExpanded) setMeetingExpanded(false);
+        else if (activeMeetingState?.phase === 'prompt' || activeMeetingState?.phase === 'stopped' || activeMeetingState?.phase === 'error') {
+          if (activeMeetingSource === 'local' && localCanStop) return;
+          if (activeMeetingSource === 'local') setLocalMeetingState(null);
           dismissLiveSurface();
         }
         return;
@@ -460,7 +546,76 @@ export function NotchSurface() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [dismiss, meetingActive, meetingExpanded, meetingState.phase, state.expanded, stopVoice, voiceActive]);
+  }, [activeMeetingSource, activeMeetingState?.phase, dismiss, localCanStop, meetingActive, meetingExpanded, state.expanded, stopVoice, voiceActive]);
+
+  const startLocalMeeting = async () => {
+    if (meetingActiveRef.current) return;
+    meetingActiveRef.current = true;
+    meetingPhaseRef.current = 'starting';
+    stopVoice();
+    setMeetingExpanded(true);
+    setLocalMeetingState({
+      phase: 'starting',
+      meeting: { windowId: LOCAL_MEETING_PENDING_ID, platform: 'in-person', title: 'In-person meeting' },
+    });
+    try {
+      await localCapture.start('In-person meeting');
+    } catch (error) {
+      if (/start was cancelled/i.test(error instanceof Error ? error.message : String(error))) {
+        setLocalMeetingState(null);
+        meetingActiveRef.current = meetingState.phase !== 'idle';
+        meetingPhaseRef.current = meetingState.phase;
+        return;
+      }
+      const snapshot = localCapture.state();
+      setLocalMeetingState((previous) => localNotchMeetingState({
+        ...snapshot,
+        phase: 'error',
+        error: error instanceof Error ? error.message : 'In-person meeting recording could not start.',
+      }, previous));
+    }
+  };
+
+  const stopLocalMeeting = async () => {
+    if (meetingBusyActionRef.current === 'stop') return;
+    const snapshot = localCapture.state();
+    setMeetingBusyAction('stop');
+    meetingPhaseRef.current = 'stopping';
+    setLocalMeetingState((previous) => previous ? { ...previous, phase: 'stopping' } : previous);
+    try {
+      if (snapshot.phase === 'requesting' || !snapshot.sessionId) {
+        await localCapture.cancel();
+        setLocalMeetingState(null);
+        meetingActiveRef.current = meetingState.phase !== 'idle';
+        meetingPhaseRef.current = meetingState.phase;
+        return;
+      }
+      const result = await localCapture.stop();
+      const queueError = result.queued === false
+        ? (typeof result.error === 'string'
+            ? `Audio was saved locally, but transcription could not start yet: ${result.error}`
+            : 'Audio was saved locally, but transcription could not start yet.')
+        : undefined;
+      setLocalMeetingState((previous) => ({
+        phase: 'stopped',
+        meeting: previous?.meeting ?? { windowId: snapshot.sessionId!, platform: 'in-person', title: 'In-person meeting' },
+        recordingStartedAt: previous?.recordingStartedAt ?? snapshot.startedAt,
+        error: queueError,
+      }));
+      meetingPhaseRef.current = 'stopped';
+    } catch (error) {
+      setLocalMeetingState((previous) => ({
+        phase: 'error',
+        meeting: previous?.meeting ?? { windowId: snapshot.sessionId ?? LOCAL_MEETING_PENDING_ID, platform: 'in-person', title: 'In-person meeting' },
+        recordingStartedAt: previous?.recordingStartedAt ?? snapshot.startedAt,
+        audioCapturing: localCapture.state().sessionId ? false : undefined,
+        error: error instanceof Error ? error.message : 'In-person meeting recording could not stop safely.',
+      }));
+      meetingPhaseRef.current = 'error';
+    } finally {
+      clearMeetingBusyAction('stop');
+    }
+  };
 
   const runMeetingStart = async (always: boolean) => {
     const meeting = meetingState.meeting;
@@ -535,10 +690,11 @@ export function NotchSurface() {
     '--clemmy-live-layout-opacity': layoutReady ? 1 : 0,
   } as CSSProperties;
 
-  if (meetingActive) {
+  if (activeMeetingState) {
     return (
       <NotchMeetingSurface
-        state={meetingState}
+        source={activeMeetingSource}
+        state={activeMeetingState}
         expanded={meetingExpanded}
         busyAction={meetingBusyAction}
         style={style}
@@ -548,10 +704,15 @@ export function NotchSurface() {
         onRecord={() => void runMeetingStart(false)}
         onAlwaysRecord={() => void runMeetingStart(true)}
         onDismissPrompt={() => void dismissMeeting()}
-        onStop={() => void stopMeeting()}
+        onStop={() => void (activeMeetingSource === 'local' ? stopLocalMeeting() : stopMeeting())}
         onRequestPermissions={() => void requestMeetingPermissions()}
         onOpenConsole={openConsole}
-        onClear={() => { dispatchMeeting({ type: 'clear' }); dismissLiveSurface(); }}
+        localCanStop={localCanStop}
+        onClear={() => {
+          if (activeMeetingSource === 'local') setLocalMeetingState(null);
+          else dispatchMeeting({ type: 'clear' });
+          dismissLiveSurface();
+        }}
       />
     );
   }
@@ -702,6 +863,16 @@ export function NotchSurface() {
           <div className="clemmy-live-window-actions">
             <button
               type="button"
+              onClick={() => void startLocalMeeting()}
+              aria-label="Record an in-person meeting"
+              title="Record an in-person meeting"
+              className="clemmy-live-mic clemmy-live-meet"
+            >
+              <Users aria-hidden />
+              <span>Meet</span>
+            </button>
+            <button
+              type="button"
               onClick={startVoice}
               aria-label="Talk to Clementine"
               title="Talk to Clementine"
@@ -729,7 +900,7 @@ export function NotchSurface() {
               {activity.state === 'approval' ? 'Needs you' : activity.state === 'working' ? 'Working' : 'Ready'}
             </span>
             <h1 ref={headingRef} tabIndex={-1}>{activity.title}</h1>
-            <p>{activity.detail || (activity.state === 'idle' ? 'Choose Talk to dictate a request.' : '')}</p>
+            <p>{activity.detail || (activity.state === 'idle' ? 'Choose Talk to dictate, or Meet to record in person.' : '')}</p>
           </div>
 
           {activity.state === 'approval' && (

@@ -56,6 +56,30 @@ test('unsupported Intel Macs return a clear status without importing the SDK', a
   );
 });
 
+test('the central Recall start gate blocks every capture path while local recording owns audio', async () => {
+  let nativeStarts = 0;
+  const capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => '',
+    getWebhookToken: () => '',
+    emit: () => undefined,
+    canStartRecording: () => 'An in-person meeting is already recording.',
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  Reflect.set(capture, 'sdk', {
+    startRecording: async () => { nativeStarts += 1; return null; },
+  });
+  const startRecording = Reflect.get(capture, 'startRecording') as (
+    this: RecallDesktopCapture,
+    windowId: string,
+  ) => Promise<void>;
+
+  await assert.rejects(
+    startRecording.call(capture, 'zoom-window-1'),
+    /in-person meeting is already recording/i,
+  );
+  assert.equal(nativeStarts, 0);
+});
+
 test('new Recall lifecycle events update diagnostic status and are forwarded', async () => {
   const emitted: Array<Record<string, unknown>> = [];
   const listeners = new Map<string, (event: unknown) => void>();

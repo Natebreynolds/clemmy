@@ -25,6 +25,9 @@ const { appendFactRecallTrace } = await import('../memory/recall-trace.js');
 const { recordRecallRun } = await import('../memory/recall-usage.js');
 const { listProposedMemoryFixes } = await import('../memory/self-heal.js');
 const { loadFactEmbeddings, _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
+const { getFactEvidence } = await import('../memory/temporal-memory.js');
+const { appendEvent, createSession, resetEventLog, writeToolOutput } = await import('../runtime/harness/eventlog.js');
+const { harnessRunContextStorage, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -32,6 +35,7 @@ test.after(() => {
 
 test.beforeEach(() => {
   resetMemoryDb();
+  resetEventLog();
   _setEmbeddingProviderForTest(undefined);
   rmSync(path.join(TMP_HOME, 'state', 'memory-self-heal'), { recursive: true, force: true });
   rmSync(path.join(TMP_HOME, 'state', 'memory-recall-trace.jsonl'), { force: true });
@@ -210,6 +214,7 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
     });
     assert.match(response.content[0].text, /linked 1 canonical entity/);
     assert.match(response.content[0].text, /rejected 2 unsupported annotation/);
+    assert.match(response.content[0].text, /MEMORY_GRAPH_INCOMPLETE/);
 
     const db = openMemoryDb();
     assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entities').get() as { c: number }).c, 1);
@@ -221,6 +226,72 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
     if (previous === undefined) delete process.env.CLEMMY_REMEMBER_RECONCILE;
     else process.env.CLEMMY_REMEMBER_RECONCILE = previous;
   }
+});
+
+test('memory_remember inherits the harness session and binds an exact roster to its source tool output', async () => {
+  const session = createSession({ kind: 'chat' });
+  const content = 'My team includes Bobby Romano (bobby.romano@example.com) and Brett Lorenzini (brett.lorenzini@example.com).';
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'sf-team-query',
+    tool: 'composio_execute_tool',
+    output: JSON.stringify({ records: [
+      { name: 'Bobby Romano', email: 'bobby.romano@example.com' },
+      { name: 'Brett Lorenzini', email: 'brett.lorenzini@example.com' },
+    ] }),
+  });
+  const handler = registeredToolHandlers().get('memory_remember');
+  assert.ok(handler);
+
+  const response = await harnessRunContextStorage.run(
+    { sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => handler!({ kind: 'project', content }),
+  );
+  assert.match(response.content[0].text, /Remembered/);
+
+  const factRow = openMemoryDb().prepare(`
+    SELECT id, source_session_id, derived_from_call_id, source_path
+    FROM consolidated_facts WHERE content = ?
+  `).get(content) as { id: number; source_session_id: string | null; derived_from_call_id: string | null; source_path: string | null };
+  assert.equal(factRow.source_session_id, session.id);
+  assert.equal(factRow.derived_from_call_id, 'sf-team-query');
+  assert.equal(factRow.source_path, `tool://${session.id}/sf-team-query`);
+  const evidence = getFactEvidence(factRow.id);
+  assert.equal(evidence[0]?.sourceUri, `tool://${session.id}/sf-team-query`);
+  assert.match(evidence[0]?.excerpt ?? '', /bobby\.romano@example\.com/);
+  assert.match(evidence[0]?.excerpt ?? '', /brett\.lorenzini@example\.com/);
+});
+
+test('memory_remember never treats an external-write confirmation as roster source evidence', async () => {
+  const session = createSession({ kind: 'chat' });
+  const content = 'My team includes Dana Smith (dana.smith@example.com) and Riley Jones (riley.jones@example.com).';
+  writeToolOutput({
+    sessionId: session.id,
+    callId: 'outlook-send-confirmation',
+    tool: 'OUTLOOK_CREATE_EVENT',
+    output: JSON.stringify({ attendees: ['dana.smith@example.com', 'riley.jones@example.com'], status: 'sent' }),
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: { callId: 'outlook-send-confirmation', tool: 'OUTLOOK_CREATE_EVENT', effect: 'external_write' },
+  });
+  const handler = registeredToolHandlers().get('memory_remember');
+  assert.ok(handler);
+
+  await harnessRunContextStorage.run(
+    { sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => handler!({ kind: 'project', content }),
+  );
+
+  const row = openMemoryDb().prepare(`
+    SELECT derived_from_call_id, source_path
+    FROM consolidated_facts WHERE content = ?
+  `).get(content) as { derived_from_call_id: string | null; source_path: string | null };
+  assert.equal(row.derived_from_call_id, null);
+  assert.equal(row.source_path, null);
 });
 
 test('memory_search_facts records an attribution run with snippets for post-turn auto-credit', async () => {

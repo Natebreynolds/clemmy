@@ -241,17 +241,40 @@ function memoryRefKey(ref: MemoryRef): string {
 /**
  * A small, bounded rerank signal from explicit material-use attribution.
  * Relevance, temporal validity, and evidence remain dominant: even a ref used
- * hundreds of times can gain at most 0.08. Explicit not-useful outcomes dampen
- * the bonus, but never push a candidate below its evidence-derived score.
+ * hundreds of times can gain at most +0.08.
+ *
+ * The signal is signed. When explicit `not_useful` outcomes (user corrections,
+ * recall-usage.ts) OUTWEIGH proven uses, the ref earns a bounded PENALTY down to
+ * -0.12 — enough to demote a repeatedly-corrected fact below fresh, well-evidenced
+ * ones, never enough to override strong current evidence. The penalty is
+ * accumulation-gated: a single stray correction against a well-used fact stays in
+ * the positive branch (reliability just dampens the bonus); only when corrections
+ * outnumber uses does the score go negative, and it deepens with repeated
+ * corrections. This is the teeth behind the correction loop — see
+ * correction-detector.ts. Symmetric to the positive cap so neither side can
+ * dominate evidence.
  */
 export function recallUtilityBonus(
   signal: RecallRefUtilitySignal | undefined,
   nowMs = Date.now(),
 ): number {
-  if (!signal || signal.used <= 0) return 0;
-  const total = Math.max(signal.used, signal.used + Math.max(0, signal.notUseful));
-  const reliability = clamp(signal.used / total, 0, 1);
-  const frequency = clamp(Math.log1p(signal.used) / Math.log1p(20), 0, 1);
+  const used = signal?.used ?? 0;
+  const notUseful = Math.max(0, signal?.notUseful ?? 0);
+  if (!signal || (used <= 0 && notUseful <= 0)) return 0;
+
+  // Negative branch: corrections outweigh proven uses -> bounded demotion.
+  if (notUseful > used) {
+    const total = used + notUseful;
+    const disutility = clamp(notUseful / total, 0, 1);
+    // log1p accumulation gate: 1 correction ~0.29, 3 ~0.58, saturating.
+    const magnitude = clamp(Math.log1p(notUseful) / Math.log1p(10), 0, 1);
+    return -clamp(disutility * (0.10 * magnitude), 0, 0.12);
+  }
+
+  if (used <= 0) return 0;
+  const total = Math.max(used, used + notUseful);
+  const reliability = clamp(used / total, 0, 1);
+  const frequency = clamp(Math.log1p(used) / Math.log1p(20), 0, 1);
   let recency = 0;
   const lastUsedMs = signal.lastUsedAt ? Date.parse(signal.lastUsedAt) : Number.NaN;
   if (Number.isFinite(lastUsedMs)) {
@@ -273,17 +296,20 @@ function applyUtilityRerank(
   const reranked = hits.map((hit) => {
     const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
     const bonus = recallUtilityBonus(signal, nowMs);
-    if (bonus <= 0 || !signal) return hit;
+    if (bonus === 0 || !signal) return hit;
     adjusted += 1;
     const outcomes = signal.used + signal.notUseful;
+    const why = bonus < 0
+      // Negative: corrections outweigh uses — demoted so a wrong memory stops resurfacing.
+      ? [`flagged not-useful ${signal.notUseful}× (recall demoted)`]
+      : [
+          `proven useful in ${signal.used} attributed recall${signal.used === 1 ? '' : 's'}`,
+          ...(signal.notUseful > 0 ? [`material-use evidence ${signal.used}/${outcomes}`] : []),
+        ];
     return {
       ...hit,
       score: clamp(hit.score + bonus, 0, 1),
-      whyRecalled: Array.from(new Set([
-        ...hit.whyRecalled,
-        `proven useful in ${signal.used} attributed recall${signal.used === 1 ? '' : 's'}`,
-        ...(signal.notUseful > 0 ? [`material-use evidence ${signal.used}/${outcomes}`] : []),
-      ])),
+      whyRecalled: Array.from(new Set([...hit.whyRecalled, ...why])),
     };
   });
   return { hits: reranked, adjusted };
@@ -391,12 +417,15 @@ function isValidAt(fact: ConsolidatedFact, asOfMs: number): boolean {
 function diversify(hits: MemoryEvidenceHit[], limit: number): MemoryEvidenceHit[] {
   const selected: MemoryEvidenceHit[] = [];
   for (const hit of hits.sort((a, b) => b.score - a.score)) {
-    const hitTokens = tokens(hit.text);
+    // Entity hit bodies intentionally share a compact type/count string; their
+    // identity lives in `title`. Comparing text alone collapsed an eight-person
+    // roster to one visible person. Diversify what the model actually sees.
+    const hitTokens = tokens(`${hit.title ?? ''} ${hit.text}`);
     const duplicate = selected.some((existing) => {
       // Cross-store corroboration is useful evidence, not duplication. Keep a
       // fact, its episode, and its policy projection independently visible.
       if (existing.ref.type !== hit.ref.type) return false;
-      const other = tokens(existing.text);
+      const other = tokens(`${existing.title ?? ''} ${existing.text}`);
       if (hitTokens.size === 0 || other.size === 0) return false;
       let intersection = 0;
       for (const token of hitTokens) if (other.has(token)) intersection += 1;

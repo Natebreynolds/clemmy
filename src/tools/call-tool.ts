@@ -64,6 +64,14 @@ export interface BuildCallToolOptions {
   /** Exact built-in names advertised as deferred on this turn. Omit for the
    * legacy full orchestrator surface (tests and non-scoped callers). */
   reachableBuiltinNames?: ReadonlySet<string>;
+  /** First-class built-ins on this turn's surface — directly callable, so NOT
+   * in the deferred set above. Admitted so a model that wraps a first-class tool
+   * in call_tool (a common confusion) gets a transparent dispatch instead of a
+   * `not_reachable` bounce it loops on. The inner-name gate is identical to a
+   * direct call, so this never widens authority. Live 2026-07-19: a Discord
+   * calendar-invite run looped 4× / ~3.5 min calling `memory_recall_all` via
+   * call_tool before self-correcting. */
+  firstClassNames?: ReadonlySet<string>;
   /** Explicit per-turn denials also apply to external MCP names. */
   deniedNames?: ReadonlySet<string>;
 }
@@ -77,6 +85,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     reason: 'call_tool default built-in reachability',
   });
   const reachableBuiltinNames = options.reachableBuiltinNames ?? new Set(defaultSurface.firstClass);
+  const firstClassNames = options.firstClassNames ?? new Set<string>();
   const deniedNames = options.deniedNames ?? new Set<string>();
   return tool({
     name: 'call_tool',
@@ -124,7 +133,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // live Phase-1 gap (2026-07-08): the model fell back to hand-rolling the
       // provider's REST API through shell calls, slower and less gated.
       if (!isMcpNamespacedTool(target)) {
-        if (!reachableBuiltinNames.has(target)) {
+        if (!reachableBuiltinNames.has(target) && !firstClassNames.has(target)) {
           return refuse({
             error: 'not_reachable',
             detail: `"${target}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.`,

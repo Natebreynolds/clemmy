@@ -137,6 +137,9 @@ export const EVENT_TYPES = [
   // the turn's output (reply / tool args / drafted plan). Replaces the
   // never-called memory_mark_used tool with code-level attribution.
   'recall_auto_credit',
+  // The negative half of the credit loop: a user correction of the prior turn
+  // recorded a bounded `not_useful` signal against the facts that fed it.
+  'memory_correction',
   // Per-turn deterministic context packet: summarizes the memory
   // primer, likely skills/workflows, MCP health, local health, and
   // complexity classification that were injected transiently before

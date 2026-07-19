@@ -1896,6 +1896,9 @@ test('runConversation: an answer to a genuine prior clarification reaches the st
   assert.equal(result.status, 'completed');
   assert.match(modelInput, /CONVERGE/);
   assert.match(modelInput, /EXECUTE the work this turn/);
+  const recordedInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.equal(recordedInputs.at(-1)?.data.text, 'Use the win-back queue.');
+  assert.ok(recordedInputs.every((event) => !String(event.data.text ?? '').includes('CONVERGE')), 'internal convergence text never enters durable user history');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'no second question emitted');
   assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
 });

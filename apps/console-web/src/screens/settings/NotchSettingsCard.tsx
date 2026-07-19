@@ -107,7 +107,8 @@ export function NotchSettingsCard() {
 
   const enabled = snapshot?.preferences.enabled ?? false;
   const capturePhase = snapshot?.meetingCapture?.capturePhase;
-  const captureActive = capturePhase === 'starting' || capturePhase === 'recording' || capturePhase === 'stopping';
+  const captureActive = Boolean(snapshot?.localMeetingCapture?.recording)
+    || capturePhase === 'starting' || capturePhase === 'recording' || capturePhase === 'stopping';
   const configuredShortcut = snapshot?.preferences.shortcut;
   const customShortcut = configuredShortcut && !SHORTCUTS.some((shortcut) => shortcut.value === configuredShortcut)
     ? configuredShortcut
@@ -124,12 +125,12 @@ export function NotchSettingsCard() {
       : !enabled
         ? <StatusPill tone="neutral">Off</StatusPill>
         : recallCapability === 'unsupported'
-          ? <StatusPill tone="warning">Recall unavailable</StatusPill>
+          ? <StatusPill tone="warning">Online capture unavailable</StatusPill>
           : recallNeedsAttention
-            ? <StatusPill tone="danger">Recall needs attention</StatusPill>
+            ? <StatusPill tone="danger">Online capture needs attention</StatusPill>
           : recallReady
             ? <StatusPill tone="info">Voice · tasks · meetings live</StatusPill>
-            : <StatusPill tone="neutral">Voice · tasks live</StatusPill>;
+            : <StatusPill tone="neutral">Voice · tasks · local meetings live</StatusPill>;
 
   const capabilityCopy = notchRecallCapabilityCopy(meetingCapture, enabled);
 
@@ -139,7 +140,7 @@ export function NotchSettingsCard() {
         <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-primary-tint"><DogMark size={30} /></span>
         <div className="min-w-0 flex-1">
           <h3 className="text-h3 text-fg">Clementine in the notch</h3>
-          <p className="mt-0.5 text-small text-muted">Click the Clementine icon to dictate a request, follow live work, and control detected Recall meetings.</p>
+          <p className="mt-0.5 text-small text-muted">Dictate requests, follow live work, control detected online calls, and record in-person meetings.</p>
         </div>
         {status}
       </div>
@@ -167,7 +168,7 @@ export function NotchSettingsCard() {
           <div className="divide-y divide-border">
             <SettingRow
               title="Enable Clementine in the notch"
-              description={captureActive ? 'Stop the active meeting recording before turning off the notch.' : 'Voice is included whenever this is on. Click the dog, choose Talk, or press ⌘ ⇧ V.'}
+              description={captureActive ? 'Stop the active meeting recording before turning off the notch.' : 'Click the dog for voice, choose Meet for an in-person recording, or press ⌘ ⇧ V.'}
             >
               <Switch checked={enabled} disabled={Boolean(busy) || captureActive} label="Enable Clementine in the notch" onChange={(value) => void apply('enabled', { enabled: value })} />
             </SettingRow>
@@ -216,14 +217,14 @@ export function NotchSettingsCard() {
             </SettingRow>
 
             <SettingRow
-              title="Ask before recording detected meetings"
-              description="When Recall sees Zoom, Google Meet, or Teams, open the notch with Record and Not this time controls. Active recordings always retain a Stop control."
+              title="Notify me about detected meetings"
+              description="When Clementine detects Zoom, Google Meet, Microsoft Teams, or a Slack Huddle, show a macOS notification and open the notch with Record and Not this time controls. Active recordings always retain a Stop control."
               disabled={!enabled}
             >
               <Switch
                 checked={snapshot.preferences.promptForDetectedMeetings}
                 disabled={!enabled || Boolean(busy)}
-                label="Ask before recording detected meetings"
+                label="Notify me about detected meetings"
                 onChange={(value) => void apply('meetings', { promptForDetectedMeetings: value })}
               />
             </SettingRow>
@@ -240,7 +241,7 @@ export function NotchSettingsCard() {
           </div>
 
           <div aria-live="polite" className="mt-3 min-h-5 text-small">
-            {error ? <span className="text-danger" role="alert">{error}</span> : notice ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> {notice}</span> : snapshot.runtime.shortcutError ? <span className="text-danger" role="alert">{snapshot.runtime.shortcutError}</span> : snapshot.runtime.clickHelperError ? <span className="text-danger" role="alert">Notch input needs a retry. Open the notch once from Settings to restore it.</span> : !meetingCapture?.enabled ? <span className="text-muted">Recall detection is off. Turn it on from Meetings to receive meeting prompts.</span> : recallNeedsAttention ? <span className="text-warning">Recall is not ready. Review meeting capture before relying on prompts or recording controls.</span> : null}
+            {error ? <span className="text-danger" role="alert">{error}</span> : notice ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> {notice}</span> : snapshot.runtime.shortcutError ? <span className="text-danger" role="alert">{snapshot.runtime.shortcutError}</span> : snapshot.runtime.clickHelperError ? <span className="text-danger" role="alert">Notch input needs a retry. Open the notch once from Settings to restore it.</span> : !meetingCapture?.enabled ? <span className="text-muted">Online meeting detection is off. Turn it on from Meetings to receive meeting prompts.</span> : recallNeedsAttention ? <span className="text-warning">Online meeting capture is not ready. Review meeting capture before relying on prompts or recording controls.</span> : null}
           </div>
         </>
       )}

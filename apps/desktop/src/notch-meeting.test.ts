@@ -4,6 +4,8 @@ import type { RecallCaptureStatus } from './recall-capture.js';
 import {
   isCurrentDetectedMeeting,
   recallCaptureRequiresVisibleControls,
+  recallMeetingDetectionNotificationCopy,
+  sanitizeLocalMeetingRecorderForNotch,
   sanitizeRecallEventForNotch,
   sanitizeRecallStatusForNotch,
 } from './notch-meeting.js';
@@ -93,4 +95,37 @@ test('starting, recording, and stopping require persistent native controls', () 
   assert.equal(recallCaptureRequiresVisibleControls({ capturePhase: 'prompt' }), false);
   assert.equal(recallCaptureRequiresVisibleControls({ capturePhase: 'idle' }), false);
   assert.equal(recallCaptureRequiresVisibleControls(null), false);
+});
+
+test('local recorder sanitizer never exposes audio paths to the notch', () => {
+  const safe = sanitizeLocalMeetingRecorderForNotch({
+    recording: true,
+    sessionId: 'local-session-123',
+    title: 'Customer workshop',
+    audioPath: '/private/clementine/meeting-audio.wav',
+    startedAt: '2026-07-19T10:00:00.000Z',
+    bytes: 32_000,
+    durationSeconds: 1,
+    sampleRate: 16_000,
+    channels: 1,
+    lastAppendAt: '2026-07-19T10:00:01.000Z',
+    stale: false,
+  });
+  assert.equal(safe.recording, true);
+  assert.equal(safe.sessionId, 'local-session-123');
+  assert.equal(safe.title, 'Customer workshop');
+  assert.equal('audioPath' in safe, false);
+  assert.equal('lastAppendAt' in safe, false);
+});
+
+test('native Recall detection alerts use safe provider-specific copy', () => {
+  assert.deepEqual(recallMeetingDetectionNotificationCopy('slack-huddle'), {
+    title: 'Slack Huddle detected',
+    body: 'Clementine is ready to record it. Click to choose from the notch.',
+  });
+  assert.deepEqual(recallMeetingDetectionNotificationCopy('microsoft-teams', true), {
+    title: 'Microsoft Teams meeting detected',
+    body: 'Clementine is recording it now. Click to open the notch controls.',
+  });
+  assert.equal(recallMeetingDetectionNotificationCopy('private-custom-provider').title, 'Online meeting detected');
 });

@@ -196,6 +196,10 @@ interface RecallCaptureOptions {
   getDaemonBaseUrl(): string;
   getWebhookToken(): string;
   emit(event: Record<string, unknown>): void;
+  /** Return a user-facing reason when another capture mode currently owns the
+   * audio pipeline. Checked in the single central start path so manual,
+   * prompted, and auto-record starts all obey the same exclusivity rule. */
+  canStartRecording?: () => string | undefined;
   /** Test hook; production always uses the current Electron runtime. */
   runtime?: { platform: NodeJS.Platform; arch: string };
 }
@@ -355,7 +359,7 @@ export class RecallDesktopCapture {
   // the SDK's repeating meeting-detected events would re-auto-record
   // it within seconds of the dismiss, producing a pill the user can
   // never get rid of. Cleared when the SDK fires meeting-closed for
-  // that window (i.e. they really closed Zoom/Meet/Teams).
+  // that window (i.e. they really closed Zoom/Meet/Teams/Slack).
   private userDismissedWindows = new Set<string>();
   // Permission slugs we've already asked the SDK to request during this
   // session. The SDK's native dialogs are sticky — once shown, asking
@@ -515,7 +519,7 @@ export class RecallDesktopCapture {
 
   /**
    * The "RECORD MEETING" path the dashboard's primary button uses.
-   * If the SDK has an open meeting window (Zoom/Meet/Teams) it records
+   * If the SDK has an open meeting window (Zoom/Meet/Teams/Slack) it records
    * THAT window — per-participant transcript + real title.
    *
    * It does NOT fall back to generic desktop audio when no window is
@@ -550,7 +554,7 @@ export class RecallDesktopCapture {
       : {
         reason: 'no-meeting-detected',
         message:
-          'No meeting window detected. Open your Zoom, Google Meet, or Teams window, then click RECORD '
+          'No meeting window detected. Open your Zoom, Google Meet, Microsoft Teams, or Slack Huddle window, then click RECORD '
           + 'MEETING. For an in-person meeting with no window, use In-person meeting → Start local recording '
           + 'on the Meetings page.',
       };
@@ -1257,6 +1261,8 @@ export class RecallDesktopCapture {
       if (this.currentWindowId === windowId) return;
       throw new Error(`Recall is already recording ${this.currentWindowId ?? 'another meeting'}.`);
     }
+    const captureConflict = this.opts.canStartRecording?.();
+    if (captureConflict) throw new Error(captureConflict);
 
     const pending = this.startRecordingOnce(windowId, meta, signal);
     this.startingWindowId = windowId;
@@ -1415,7 +1421,11 @@ export class RecallDesktopCapture {
     if (existing) {
       this.detectedWindows.set(windowId, { ...existing, recording: true });
     }
-    this.emit('recording-started', { windowId });
+    this.emit('recording-started', {
+      windowId,
+      platform: event.window?.platform ?? existing?.platform ?? this.lastMeeting?.platform,
+      title: event.window?.title ?? existing?.title ?? this.lastMeeting?.title,
+    });
   }
 
   private async onRecordingEnded(event: { window?: RecallSdkWindow }): Promise<void> {

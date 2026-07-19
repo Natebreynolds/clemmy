@@ -106,6 +106,46 @@ test('recallToolChoice returns null when there is no record', () => {
   assert.equal(recallToolChoice('something.that.was.never.remembered'), null);
 });
 
+// ── Procedural failure teeth (learning-wave item D) ─────────────────────────
+// Symmetric to the memory correction-loop teeth: a choice whose failures clearly
+// dominate must stop being recalled as authoritative, so the model re-probes a
+// working path instead of repeating a known-bad one.
+
+test('recallToolChoice suppresses a choice whose failures dominate (re-probe, not repeat)', () => {
+  try {
+    rememberToolChoice({ intent: 'flaky.sf.team.pull', choice: { kind: 'cli', identifier: 'sf' } });
+    assert.ok(recallToolChoice('flaky.sf.team.pull'), 'healthy choice recalls before failures accrue');
+    // Accrue clear negative evidence: 2 failures, 0 successes → score below floor.
+    updateToolChoiceOutcome('flaky.sf.team.pull', 'failure');
+    updateToolChoiceOutcome('flaky.sf.team.pull', 'failure');
+    assert.equal(recallToolChoice('flaky.sf.team.pull'), null, 'failing choice is suppressed → re-probe');
+  } finally {
+    deleteToolChoice('flaky.sf.team.pull');
+  }
+});
+
+test('recallToolChoice does NOT suppress a fresh choice or a single stray failure', () => {
+  try {
+    rememberToolChoice({ intent: 'fresh.choice.one', choice: { kind: 'cli', identifier: 'sf' } });
+    updateToolChoiceOutcome('fresh.choice.one', 'failure'); // only one negative
+    assert.ok(recallToolChoice('fresh.choice.one'), 'a single failure never suppresses (accumulation-gated)');
+  } finally {
+    deleteToolChoice('fresh.choice.one');
+  }
+});
+
+test('recallToolChoice keeps a mostly-successful choice despite some failures', () => {
+  try {
+    rememberToolChoice({ intent: 'reliable.choice.two', choice: { kind: 'cli', identifier: 'sf' } });
+    for (let i = 0; i < 5; i++) updateToolChoiceOutcome('reliable.choice.two', 'success');
+    updateToolChoiceOutcome('reliable.choice.two', 'failure');
+    updateToolChoiceOutcome('reliable.choice.two', 'failure');
+    assert.ok(recallToolChoice('reliable.choice.two'), 'successes still dominate → recalled');
+  } finally {
+    deleteToolChoice('reliable.choice.two');
+  }
+});
+
 test('stripBakedConnectionId: a saved choice never pins a (rot-prone) composio connection id', () => {
   // A representative stale Airtable connection shape.
   const dirty = 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_fixture_airtable_removed", arguments="{...}")';

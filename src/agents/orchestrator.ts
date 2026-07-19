@@ -418,7 +418,8 @@ async function pendingActionApprovedSlugs(args: RequestApprovalArgs): Promise<st
   try {
     const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
     const record = getPendingAction(id);
-    const slug = (record?.payload as { composioSlug?: string } | undefined)?.composioSlug;
+    const payload = record?.payload as { composioSlug?: string; tool_slug?: string } | undefined;
+    const slug = payload?.composioSlug ?? payload?.tool_slug;
     return typeof slug === 'string' && slug.trim() ? [slug.trim()] : [];
   } catch {
     return [];
@@ -461,7 +462,7 @@ async function pendingActionExecutionInstructions(args: RequestApprovalArgs): Pr
     return [
       ` Queued action ${record.id} is approved.`,
       `Execute ONLY the exact queued payload for ${record.toolName} (payload hash ${record.payloadHash}); do not reconstruct it from memory.`,
-      `Call pending_action_get if the payload is not already in context, then call pending_action_record_result after execution.`,
+      `Call pending_action_execute with id ${record.id}; it dispatches the byte-identical stored payload and records the result. Do NOT call pending_action_get followed by the underlying tool, which would create a second approval boundary and invite reconstruction drift.`,
     ].join(' ');
   } catch {
     // Approval is authoritative; pending-action status mirroring is best-effort.
@@ -1462,7 +1463,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         .map((t) => (t as { name?: string }).name === 'tool_search'
           ? buildScopedLocalToolSearch(deferredNames)
           : t);
-      callTool = buildCallTool({ reachableBuiltinNames: deferredNames, deniedNames: excludes });
+      callTool = buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames, deniedNames: excludes });
       const catalogText = buildToolCatalog({ allowedNames: deferredNames });
       searchCatalogCount = catalogText ? catalogText.split('\n').length : 0;
       searchCatalogTokens = Math.round(catalogText.length / 4);

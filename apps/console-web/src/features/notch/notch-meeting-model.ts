@@ -235,6 +235,7 @@ export function meetingDisplayName(meeting?: NotchMeetingIdentity): string {
   if (meeting?.title) return meeting.title;
   const platform = meeting?.platform?.toLowerCase() ?? '';
   if (platform.includes('zoom')) return 'Zoom meeting';
+  if (platform.includes('slack') || platform.includes('huddle')) return 'Slack Huddle';
   if (platform.includes('meet')) return 'Google Meet meeting';
   if (platform.includes('teams')) return 'Teams meeting';
   return 'Online meeting';
@@ -242,7 +243,10 @@ export function meetingDisplayName(meeting?: NotchMeetingIdentity): string {
 
 export function meetingPlatformLabel(meeting?: NotchMeetingIdentity): string {
   const platform = meeting?.platform?.trim();
-  if (!platform) return 'Recall';
+  if (!platform) return 'Online meeting';
+  if (/slack|huddle/i.test(platform)) return 'Slack Huddle';
+  if (/teams/i.test(platform)) return 'Microsoft Teams';
+  if (/zoom/i.test(platform)) return 'Zoom';
   if (/google.?meet/i.test(platform)) return 'Google Meet';
   return platform.slice(0, 1).toUpperCase() + platform.slice(1);
 }

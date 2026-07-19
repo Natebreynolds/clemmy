@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getToolOutput, TOOL_OUTPUT_MAX_BYTES } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
+import { parseShellToolOutput } from './code-mode-tool.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -155,7 +156,19 @@ export function registerRecallTools(server: McpServer): void {
       }
       let parsed: unknown;
       try { parsed = JSON.parse(row.output); } catch {
-        return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
+        // Very common footgun: the parked output is a run_shell_command wrapper
+        // (`exit_code:/stdout:/stderr:`) around a `--json` payload (sf, gh, aws…),
+        // so a whole-string JSON.parse fails even though the data IS structured.
+        // Extract and query the embedded stdout JSON instead of bouncing to
+        // recall_tool_result — which returns raw text the model must re-parse,
+        // the exact slow path that turned a Salesforce team pull into a
+        // multi-turn detour.
+        const shell = parseShellToolOutput(row.output);
+        if (shell?.stdout_json !== undefined) {
+          parsed = shell.stdout_json;
+        } else {
+          return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
+        }
       }
 
       const fields = Array.isArray(input.fields) ? (input.fields as string[]) : undefined;

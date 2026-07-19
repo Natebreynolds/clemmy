@@ -7,7 +7,7 @@ import { embedMissingChunks, embedMissingFacts, readEmbeddingStats, readFactEmbe
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, reviewStandingInstructions, searchFacts, setFactPinned, recordFactImpression } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
-import { recallEverything, formatUnifiedRecall, unifiedHitRecallRef, visibleUnifiedRecallHits } from '../memory/unified-recall.js';
+import { recallEverything, formatUnifiedRecall, projectedRecallAnswerability, unifiedHitRecallRef, visibleUnifiedRecallHits } from '../memory/unified-recall.js';
 import { createRecallRunId, recordRecallRun } from '../memory/recall-usage.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
 import { scheduleRecallShadow } from '../memory/recall-shadow.js';
@@ -23,6 +23,7 @@ import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelati
 import { getFactEvidence } from '../memory/temporal-memory.js';
 import { compileWordMatcher } from '../memory/word-match.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { listEvents, recentToolOutputs } from '../runtime/harness/eventlog.js';
 
 /** Register a recall run with the active turn so the post-turn auto-credit
  *  hook can match its candidates against what the turn produced. */
@@ -303,12 +304,18 @@ export function attachRememberedRelationships(
   return result;
 }
 
+interface RememberedFactEnrichment {
+  summary: string;
+  incomplete: boolean;
+  rejected: string[];
+}
+
 function enrichRememberedFact(
   factId: number,
   entities: RememberedEntityAnnotation[] | undefined,
   relationships: RememberedRelationshipAnnotation[] | undefined,
-): string {
-  if (!entities?.length && !relationships?.length) return '';
+): RememberedFactEnrichment {
+  if (!entities?.length && !relationships?.length) return { summary: '', incomplete: false, rejected: [] };
   const attached = entities?.length
     ? attachRememberedEntities(factId, entities)
     : { linkedEntityIds: [], identifiersStored: 0, skipped: [], resolved: [] } satisfies RememberedEntityAttachmentResult;
@@ -325,7 +332,61 @@ function enrichRememberedFact(
   }
   const rejected = attached.skipped.length + (relationResult?.skipped.length ?? 0);
   if (rejected > 0) parts.push(`rejected ${rejected} unsupported annotation(s)`);
-  return ` · ${parts.join(' · ')}`;
+  return {
+    summary: ` · ${parts.join(' · ')}`,
+    incomplete: rejected > 0,
+    rejected: [
+      ...attached.skipped.map((item) => `${item.name}: ${item.reason}`),
+      ...(relationResult?.skipped.map((item) => `${item.relationship}: ${item.reason}`) ?? []),
+    ],
+  };
+}
+
+const EXACT_MEMORY_IDENTIFIER_RE = /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}|https?:\/\/[^\s<>()"']+/gi;
+const MEMORY_SOURCE_ECHO_RE = /^(?:memory_|pending_action_|request_approval|approval_|execution_|notify_user|tool_output_query$)/i;
+
+/** Bind an explicit memory write to the read result it summarizes. This keeps a
+ * roster learned from Salesforce as Salesforce-backed evidence even when the
+ * model omits the optional session/source fields on memory_remember. Exact
+ * identifiers are required and every one must co-occur in one non-echo output. */
+function inferRememberedToolSource(sessionId: string | undefined, content: string): {
+  sessionId: string;
+  callId: string;
+  tool?: string;
+  sourceUri: string;
+} | null {
+  if (!sessionId) return null;
+  const identifiers = Array.from(new Set((content.match(EXACT_MEMORY_IDENTIFIER_RE) ?? []).map((value) => value.toLowerCase())));
+  if (identifiers.length === 0) return null;
+  try {
+    const effectsByCall = new Map<string, string>();
+    for (const event of listEvents(sessionId, { types: ['tool_returned'] })) {
+      const callId = typeof event.data.callId === 'string' ? event.data.callId : '';
+      const effect = typeof event.data.effect === 'string' ? event.data.effect : '';
+      if (callId && effect) effectsByCall.set(callId, effect);
+    }
+    const source = recentToolOutputs(sessionId, { limit: 30 })
+      .filter((row) => !MEMORY_SOURCE_ECHO_RE.test(row.tool ?? ''))
+      .filter((row) => {
+        const effect = effectsByCall.get(row.callId);
+        return !effect || effect === 'read' || effect === 'compute';
+      })
+      .find((row) => {
+        const outputIdentifiers = new Set(
+          (row.output.match(EXACT_MEMORY_IDENTIFIER_RE) ?? []).map((value) => value.toLowerCase()),
+        );
+        return identifiers.every((identifier) => outputIdentifiers.has(identifier));
+      });
+    if (!source) return null;
+    return {
+      sessionId,
+      callId: source.callId,
+      ...(source.tool ? { tool: source.tool } : {}),
+      sourceUri: `tool://${sessionId}/${source.callId}`,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function formatMemoryFix(fix: ProposedMemoryFix): string {
@@ -511,15 +572,21 @@ export function registerMemoryTools(server: McpServer): void {
         // public remember operation must pass through the same semantic
         // duplicate/conflict resolver, evidence capture, and temporal history
         // path or reliability depends on deployment configuration.
+        const effectiveSessionId = sessionId?.trim() || harnessRunContextStorage.getStore()?.sessionId;
+        const inferredSource = sourcePath ? null : inferRememberedToolSource(effectiveSessionId, content);
         const outcome = await consolidateFact(
           {
             kind: kind as (typeof FACT_KINDS)[number],
             text: content,
             trustLevel: 1.0,
             authority: 'user',
-            sourceUri: sourcePath,
+            sourceUri: sourcePath ?? inferredSource?.sourceUri,
+            sourceApp: inferredSource?.tool,
           },
-          { sessionId },
+          {
+            sessionId: effectiveSessionId,
+            ...(inferredSource ? { derivedFrom: inferredSource } : {}),
+          },
           { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
         );
         const verb = outcome.action === 'supersede'
@@ -529,14 +596,17 @@ export function registerMemoryTools(server: McpServer): void {
             : outcome.action === 'ignore'
               ? 'Already known — no change'
               : 'Remembered';
-        const graphSummary = outcome.factId
+        const graph = outcome.factId
           ? enrichRememberedFact(
               outcome.factId,
               entities as RememberedEntityAnnotation[] | undefined,
               relationships as RememberedRelationshipAnnotation[] | undefined,
             )
+          : { summary: '', incomplete: false, rejected: [] } satisfies RememberedFactEnrichment;
+        const warning = graph.incomplete
+          ? `\nMEMORY_GRAPH_INCOMPLETE: the durable fact text was saved, but requested structured annotations were not fully grounded (${graph.rejected.slice(0, 4).join('; ')}). Do not claim the complete graph was saved; correct the unsupported annotations or report the limitation.`
           : '';
-        return textResult(`${verb} (${kind}): ${content}${graphSummary}`);
+        return textResult(`${verb} (${kind}): ${content}${graph.summary}${warning}`);
       } catch (err) {
         return textResult(`memory_remember failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -654,6 +724,7 @@ export function registerMemoryTools(server: McpServer): void {
         const recallId = createRecallRunId();
         result.recallId = recallId;
         result.hits = visibleUnifiedRecallHits(result, 4000);
+        result.answerability = projectedRecallAnswerability(result, result.hits);
         const run = recordRecallRun({
           id: recallId,
           objective,

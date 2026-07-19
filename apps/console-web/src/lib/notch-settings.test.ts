@@ -41,3 +41,9 @@ test('Recall capability copy does not claim live notch controls while the notch 
   assert.match(copy, /notch is off/i);
   assert.doesNotMatch(copy, /controls are live/i);
 });
+
+test('notch capability copy keeps in-person recording discoverable when Recall is off', () => {
+  const copy = notchRecallCapabilityCopy(capture({ enabled: false }));
+  assert.match(copy, /in-person microphone recording/i);
+  assert.match(copy, /turn on online meeting capture/i);
+});

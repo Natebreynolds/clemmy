@@ -19,6 +19,7 @@ import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
+import { safeDetectCorrection } from './correction-hook.js';
 import { runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
 import {
   appendTerminalEventOnce,
@@ -2100,6 +2101,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     } catch { /* working-memory observability must never affect delivery */ }
   }
+  // Negative half of the credit loop — BEFORE auto-credit so the prior turn's
+  // credited facts are the ones we read (parity with loop.ts / plan-first.ts).
+  safeDetectCorrection({ sessionId, turn: 0, userInput: request.message });
   // Post-turn memory credit: match this turn's primer recall run against the
   // reply + tool-use record and credit demonstrable use (code-level
   // replacement for the never-called memory_mark_used prompt rule).

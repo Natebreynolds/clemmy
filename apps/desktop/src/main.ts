@@ -95,6 +95,8 @@ import {
 } from './notch-preferences.js';
 import {
   recallCaptureRequiresVisibleControls,
+  recallMeetingDetectionNotificationCopy,
+  sanitizeLocalMeetingRecorderForNotch,
   sanitizeRecallEventForNotch,
   sanitizeRecallStatusForNotch,
 } from './notch-meeting.js';
@@ -203,6 +205,10 @@ let pendingDashboardUrl = '';
 let dashboardNavigationGeneration = 0;
 let recallCapture: RecallDesktopCapture | null = null;
 const localMeetingRecorder = new LocalMeetingRecorder();
+type LocalMeetingCaptureOwner = 'dashboard' | 'live';
+let localMeetingStartOwner: LocalMeetingCaptureOwner | null = null;
+let localMeetingCaptureOwner: { owner: LocalMeetingCaptureOwner; sessionId: string } | null = null;
+const notifiedRecallMeetingWindows = new Set<string>();
 let quitPrepared = false;
 const RECALL_TRAY_STATE_EVENTS = new Set([
   'recording-start-requested',
@@ -237,7 +243,9 @@ function clementineLiveCaptureRequiresControls(): boolean {
   // Recall reports an accepted Notch start intent as `starting` before any
   // asynchronous initialization or auto-record persistence. This makes the
   // same native guard cover the entire operation, not only the SDK handshake.
-  return recallCaptureRequiresVisibleControls(recallCapture?.status());
+  const localOwnedByLive = localMeetingStartOwner === 'live'
+    || (localMeetingCaptureOwner?.owner === 'live' && localMeetingRecorder.status().recording);
+  return localOwnedByLive || recallCaptureRequiresVisibleControls(recallCapture?.status());
 }
 
 function initializeClementineNotchPreferencesStore(): void {
@@ -381,6 +389,7 @@ function clementineNotchSnapshot() {
       ),
     },
     meetingCapture: sanitizeRecallStatusForNotch(recallCapture?.status()),
+    localMeetingCapture: sanitizeLocalMeetingRecorderForNotch(localMeetingRecorder.status()),
   };
 }
 
@@ -887,6 +896,25 @@ function emitClementineLiveMeetingPresentation(expanded: boolean): void {
   emitClementineLivePreview({ kind: expanded ? 'meeting-expand' : 'meeting-collapse' });
 }
 
+function emitClementineLiveLocalMeetingEvent(payload: {
+  type: 'stopped-elsewhere' | 'cancelled-elsewhere';
+  sessionId: string;
+  queued?: boolean;
+  error?: string;
+}): void {
+  const win = clementineLiveWindow;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  try {
+    win.webContents.send('clemmy:live-local-meeting-event', {
+      ...payload,
+      error: payload.error ? redactSensitiveText(payload.error).slice(0, 500) : undefined,
+    });
+  } catch {
+    // A renderer can disappear after the liveness check. Its crash/reload hook
+    // already finalizes any recording it owned.
+  }
+}
+
 function revealClementineLiveAfterLayout(presentation: ClementineLivePresentation): void {
   if (!clementineLivePendingReveal
       || clementineLivePendingRevealPresentation !== presentation
@@ -921,6 +949,38 @@ function handleClementineLiveRecallEvent(event: Record<string, unknown>): void {
     clementineLivePendingReveal = 'passive';
     clementineLivePendingRevealPresentation = 'panel';
   }
+}
+
+function showRecallMeetingDetectionNotification(
+  event: Record<string, unknown>,
+  recording = false,
+): void {
+  const windowId = typeof event.windowId === 'string' ? event.windowId.trim() : '';
+  if (!windowId || notifiedRecallMeetingWindows.has(windowId)) return;
+  if (!recording && !clementineNotchPreferences.promptForDetectedMeetings) return;
+  if (!Notification.isSupported()) return;
+
+  const copy = recallMeetingDetectionNotificationCopy(event.platform, recording);
+  const notification = new Notification({
+    title: copy.title,
+    body: copy.body,
+    silent: false,
+  });
+  notification.on('click', () => {
+    if (!clementineNotchPreferences.enabled) {
+      revealMainWindow();
+      return;
+    }
+    ensureClementineLiveWindow();
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+    emitClementineLiveMeetingPresentation(true);
+    if (clementineLiveAvailability === 'ready' && clementineLivePresentation === 'panel') {
+      showClementineLive(true);
+    }
+  });
+  notification.show();
+  notifiedRecallMeetingWindows.add(windowId);
 }
 
 function emitClementineLiveShellState(reason: string): void {
@@ -1056,7 +1116,14 @@ function ensureClementineLiveWindow(resetRetryBudget = true): BrowserWindow | nu
   });
   win.webContents.on('render-process-gone', (_event, details) => {
     console.error('[main] Clementine Live renderer exited:', details.reason);
+    void finalizeOrphanedLocalCapture('the notch window crashed', 'live');
     scheduleClementineLiveRecovery(win, `renderer ${details.reason}`);
+  });
+  // A hard reload replaces the renderer that pumps microphone PCM. SPA state
+  // changes do not reach this event, so an active notch-owned capture is only
+  // finalized when its producer really disappeared.
+  win.webContents.on('did-navigate', () => {
+    void finalizeOrphanedLocalCapture('the notch window reloaded', 'live');
   });
   void loadClementineLiveDocument(win, dashboardUrl, resetRetryBudget);
   rebuildTrayMenu();
@@ -1364,6 +1431,41 @@ function liveMeetingWindowId(payload: unknown): string {
   return id;
 }
 
+function liveLocalMeetingTitle(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('In-person meeting start requires a title payload.');
+  }
+  const record = payload as Record<string, unknown>;
+  if (Object.keys(record).some((key) => key !== 'title')) {
+    throw new Error('In-person meeting start requires a title payload.');
+  }
+  if (record.title === undefined) return undefined;
+  if (typeof record.title !== 'string' || record.title.length > 160) {
+    throw new Error('In-person meeting title is invalid.');
+  }
+  return record.title;
+}
+
+function liveLocalMeetingSessionPayload(
+  payload: unknown,
+  requireChunk = false,
+): { sessionId: string; chunk?: unknown } {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('In-person meeting session is required.');
+  }
+  const record = payload as Record<string, unknown>;
+  const allowedKeys = requireChunk ? ['chunk', 'sessionId'] : ['sessionId'];
+  const keys = Object.keys(record).sort();
+  if (keys.length !== allowedKeys.length || keys.some((key, index) => key !== allowedKeys[index])) {
+    throw new Error('In-person meeting session is required.');
+  }
+  const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+  if (!/^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) {
+    throw new Error('In-person meeting session is required.');
+  }
+  return { sessionId, chunk: record.chunk };
+}
+
 function assertPendingLiveMeeting(windowId: string): void {
   const status = recallCapture?.status();
   if (status?.capturePhase !== 'prompt' || status.pendingMeeting?.windowId !== windowId) {
@@ -1387,6 +1489,20 @@ function safeLiveMeetingActionError(error: unknown, fallback: string): Error {
   }
   if (/auto-record/i.test(raw)) {
     return new Error('Clementine could not save auto-record, so this meeting was not started. Try again or review meeting capture settings.');
+  }
+  return new Error(fallback);
+}
+
+function safeLiveLocalMeetingActionError(error: unknown, fallback: string): Error {
+  const raw = redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 500);
+  if (/local meeting recording is disabled/i.test(raw)) {
+    return new Error('Turn on local transcription in Clementine Meetings, then try again.');
+  }
+  if (/daemon is not ready/i.test(raw)) {
+    return new Error('Clementine is still starting. Try the in-person recording again in a moment.');
+  }
+  if (/in-person meeting is already|online meeting is already recording|no longer owned by this recording surface/i.test(raw)) {
+    return new Error(raw);
   }
   return new Error(fallback);
 }
@@ -2095,6 +2211,12 @@ async function launchDaemon(): Promise<void> {
     recallCapture = new RecallDesktopCapture({
       getDaemonBaseUrl: () => supervisor?.getPort() ? `http://127.0.0.1:${supervisor.getPort()}` : '',
       getWebhookToken: () => getWebhookSecret(),
+      canStartRecording: () => {
+        const local = localMeetingRecorder.status();
+        return localMeetingStartOwner || local.recording
+          ? 'An in-person meeting is already recording. Stop and save it before starting an online meeting recording.'
+          : undefined;
+      },
       emit: (event) => {
         mainWindow?.webContents.send('clemmy:recall-event', event);
         handleClementineLiveRecallEvent(event);
@@ -2102,6 +2224,19 @@ async function launchDaemon(): Promise<void> {
         // tray indicator. Transcript/realtime events can arrive many times per
         // second, so never rebuild a native menu/image for those hot events.
         const type = typeof event.type === 'string' ? event.type : '';
+        if (type === 'meeting-prompt-required') {
+          showRecallMeetingDetectionNotification(event);
+        } else if (type === 'recording-started') {
+          // Auto-record can skip the prompt entirely. Notify on the confirmed
+          // native start, while the per-window set prevents a second alert for
+          // recordings that began from an already-notified prompt.
+          showRecallMeetingDetectionNotification(event, true);
+        } else if (type === 'meeting-closed') {
+          const windowId = typeof event.windowId === 'string' ? event.windowId.trim() : '';
+          if (windowId) notifiedRecallMeetingWindows.delete(windowId);
+        } else if (type === 'shutdown') {
+          notifiedRecallMeetingWindows.clear();
+        }
         if (RECALL_TRAY_STATE_EVENTS.has(type)) {
           rebuildTrayMenu();
         }
@@ -2166,7 +2301,7 @@ async function launchDaemon(): Promise<void> {
       console.error('[main] renderer process gone', JSON.stringify(details));
       // The renderer owned the mic pump — finalize any active local capture
       // instead of letting the tray show "Recording" over a dead producer.
-      void finalizeOrphanedLocalCapture('the app window crashed');
+      void finalizeOrphanedLocalCapture('the app window crashed', 'dashboard');
     });
     // A manual reload (Cmd+R) or any top-frame navigation also kills the mic
     // pump, and will-navigate does NOT fire for reloads — catch it here.
@@ -2178,7 +2313,7 @@ async function launchDaemon(): Promise<void> {
     // pump — are gone for real. Same-document SPA navigations never commit a
     // new document, so they can't reach this.
     mainWindow.webContents.on('did-navigate', () => {
-      void finalizeOrphanedLocalCapture('the page reloaded');
+      void finalizeOrphanedLocalCapture('the page reloaded', 'dashboard');
     });
     rebuildTrayMenu();
   } catch (err) {
@@ -2403,11 +2538,15 @@ async function ingestLocalMeeting(recording: LocalMeetingRecording): Promise<Rec
 let orphanFinalizeInFlight: Promise<void> | null = null;
 /** First-stale observation for the two-observation confirm in the status poll. */
 let staleObservation: { sessionId: string; bytes: number; atNs: bigint } | null = null;
-function finalizeOrphanedLocalCapture(reason: string): Promise<void> {
+function finalizeOrphanedLocalCapture(
+  reason: string,
+  expectedOwner?: LocalMeetingCaptureOwner,
+): Promise<void> {
   if (!orphanFinalizeInFlight) {
     orphanFinalizeInFlight = (async () => {
       const status = localMeetingRecorder.status();
       if (!status.recording || !status.sessionId) return;
+      if (expectedOwner && localMeetingCaptureOwner?.owner !== expectedOwner) return;
       console.warn('[local-meeting] finalizing orphaned capture:', reason, status.sessionId);
       try {
         const recording = await localMeetingRecorder.stop(status.sessionId);
@@ -2428,6 +2567,7 @@ function finalizeOrphanedLocalCapture(reason: string): Promise<void> {
       } catch (error) {
         console.error('[local-meeting] failed to finalize orphaned capture:', error instanceof Error ? error.message : error);
       } finally {
+        if (localMeetingCaptureOwner?.sessionId === status.sessionId) localMeetingCaptureOwner = null;
         rebuildTrayMenu();
       }
     })().finally(() => { orphanFinalizeInFlight = null; });
@@ -2464,6 +2604,184 @@ async function syncRecallCaptureFromDaemon(): Promise<void> {
   const payload = await fetchDaemonJson<{ settings?: RecallCaptureSettings }>('/api/console/meetings/recall');
   if (payload.settings) {
     await recallCapture?.configure(payload.settings);
+  }
+}
+
+function assertLocalMeetingCanStart(): void {
+  if (localMeetingStartOwner || localMeetingRecorder.status().recording) {
+    throw new Error('An in-person meeting is already starting or recording.');
+  }
+  const recallPhase = recallCapture?.status().capturePhase;
+  if (recallPhase === 'starting' || recallPhase === 'recording' || recallPhase === 'stopping') {
+    throw new Error('An online meeting is already recording. Stop it before starting an in-person meeting.');
+  }
+}
+
+function assertLocalMeetingSessionOwner(owner: LocalMeetingCaptureOwner, sessionId: string): void {
+  if (!/^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) throw new Error('invalid local meeting session ID');
+  const active = localMeetingCaptureOwner;
+  if (!active || active.sessionId !== sessionId || active.owner !== owner) {
+    throw new Error('That in-person meeting is no longer owned by this recording surface.');
+  }
+}
+
+async function startLocalMeetingCapture(
+  owner: LocalMeetingCaptureOwner,
+  title: unknown,
+): Promise<{ recorder: ReturnType<LocalMeetingRecorder['status']>; daemon: Record<string, unknown> }> {
+  assertLocalMeetingCanStart();
+  localMeetingStartOwner = owner;
+  let sessionId: string | undefined;
+  try {
+    const recorder = await localMeetingRecorder.start({ title });
+    sessionId = recorder.sessionId;
+    localMeetingCaptureOwner = { owner, sessionId: recorder.sessionId! };
+    try {
+      const daemon = await postDaemonJson<Record<string, unknown>>('/api/console/meetings/local/start', {
+        sessionId: recorder.sessionId!,
+        title: recorder.title,
+        audioPath: recorder.audioPath!,
+        startedAt: recorder.startedAt!,
+        sampleRate: recorder.sampleRate,
+        channels: recorder.channels,
+      });
+      return { recorder, daemon };
+    } catch (error) {
+      const original = error instanceof Error ? error.message : String(error);
+      let tombstoneError: unknown;
+      try {
+        rememberPendingLocalMeetingCancellation(recorder.sessionId!);
+      } catch (persistError) {
+        tombstoneError = persistError;
+      }
+      let localCancelError: unknown;
+      try {
+        await localMeetingRecorder.cancel(recorder.sessionId!);
+      } catch (cancelError) {
+        localCancelError = cancelError;
+      }
+      if (localCancelError) {
+        throw new Error(
+          `${original} Clementine could not stop the local audio writer: ${localCancelError instanceof Error ? localCancelError.message : String(localCancelError)}${tombstoneError ? ` It also could not persist daemon cleanup: ${tombstoneError instanceof Error ? tombstoneError.message : String(tombstoneError)}` : ''}`,
+        );
+      }
+      let cancellation: Awaited<ReturnType<typeof requestDaemonLocalMeetingCancellation>>;
+      try {
+        // This repeats the initial tombstone write intentionally. A transient
+        // persistence failure above may have cleared after the local writer was
+        // closed, and daemon cleanup still must never run without durable intent.
+        cancellation = await requestDaemonLocalMeetingCancellation(recorder.sessionId!);
+      } catch (cleanupError) {
+        throw new Error(
+          `${original} Local audio capture was stopped, but Clementine could not persist daemon cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+        );
+      }
+      if (cancellation.pending) {
+        throw new Error(
+          `${original} Local audio capture was stopped, but daemon cleanup is pending and will retry automatically.`,
+        );
+      }
+      throw error;
+    }
+  } finally {
+    if (localMeetingStartOwner === owner) localMeetingStartOwner = null;
+    if (!localMeetingRecorder.status().recording
+        && (!sessionId || localMeetingCaptureOwner?.sessionId === sessionId)) {
+      localMeetingCaptureOwner = null;
+    }
+    rebuildTrayMenu();
+  }
+}
+
+async function appendLocalMeetingCapture(
+  owner: LocalMeetingCaptureOwner,
+  sessionId: string,
+  chunk: unknown,
+): Promise<ReturnType<LocalMeetingRecorder['status']>> {
+  assertLocalMeetingSessionOwner(owner, sessionId);
+  return localMeetingRecorder.append(sessionId, chunk);
+}
+
+async function stopLocalMeetingCapture(
+  requester: LocalMeetingCaptureOwner,
+  sessionId: string,
+): Promise<Record<string, unknown>> {
+  if (requester === 'live') assertLocalMeetingSessionOwner('live', sessionId);
+  const notifyLiveOwner = requester !== 'live'
+    && localMeetingCaptureOwner?.owner === 'live'
+    && localMeetingCaptureOwner.sessionId === sessionId;
+  try {
+    const recording = await localMeetingRecorder.stop(sessionId);
+    let result: Record<string, unknown>;
+    try {
+      const daemon = await ingestLocalMeeting(recording);
+      result = { recording, queued: true, daemon };
+    } catch (error) {
+      // Recording success and transcription queueing are separate outcomes. The
+      // WAV is durable, so report a recoverable queue error instead of pretending
+      // the meeting itself was lost.
+      result = {
+        recording,
+        queued: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (notifyLiveOwner) {
+      emitClementineLiveLocalMeetingEvent({
+        type: 'stopped-elsewhere',
+        sessionId,
+        queued: result.queued === true,
+        error: typeof result.error === 'string' ? result.error : undefined,
+      });
+    }
+    return result;
+  } finally {
+    if (localMeetingCaptureOwner?.sessionId === sessionId) localMeetingCaptureOwner = null;
+    rebuildTrayMenu();
+  }
+}
+
+async function cancelLocalMeetingCapture(
+  requester: LocalMeetingCaptureOwner,
+  sessionId: string,
+): Promise<Record<string, unknown>> {
+  if (requester === 'live') assertLocalMeetingSessionOwner('live', sessionId);
+  const notifyLiveOwner = requester !== 'live'
+    && localMeetingCaptureOwner?.owner === 'live'
+    && localMeetingCaptureOwner.sessionId === sessionId;
+  try {
+    rememberPendingLocalMeetingCancellation(sessionId);
+    let result: Awaited<ReturnType<typeof localMeetingRecorder.cancel>>;
+    try {
+      result = await localMeetingRecorder.cancel(sessionId);
+    } catch (error) {
+      // The local recorder is still authoritative if its own cancellation
+      // failed. Do not let the retry worker delete the daemon record while an
+      // active writer may still exist.
+      forgetPendingLocalMeetingCancellation(sessionId);
+      throw error;
+    }
+    const cancellation = await requestDaemonLocalMeetingCancellation(sessionId);
+    const response = {
+      ...result,
+      daemonCancellationPending: cancellation.pending,
+      warning: cancellation.pending
+        ? 'Local audio was discarded, but meeting-history cleanup is pending and will retry automatically.'
+        : undefined,
+    };
+    if (notifyLiveOwner) {
+      emitClementineLiveLocalMeetingEvent({
+        type: 'cancelled-elsewhere',
+        sessionId,
+        error: response.warning,
+      });
+    }
+    return response;
+  } finally {
+    if (!localMeetingRecorder.status().recording && localMeetingCaptureOwner?.sessionId === sessionId) {
+      localMeetingCaptureOwner = null;
+    }
+    rebuildTrayMenu();
   }
 }
 
@@ -2602,14 +2920,63 @@ ipcMain.handle('clemmy:live-meeting-stop', async (event: IpcMainInvokeEvent, pay
 ipcMain.handle('clemmy:live-meeting-request-permissions', async (event: IpcMainInvokeEvent) => {
   assertClementineLiveIpcSender(event);
   const status = recallCapture?.status();
-  if (!status?.enabled) throw new Error('Turn on Recall meeting capture from Meetings first.');
+  if (!status?.enabled) throw new Error('Turn on online meeting capture from Meetings first.');
   if (!status.platformSupport.supported) {
-    throw new Error(status.platformSupport.message ?? 'Recall meeting capture is not supported on this computer.');
+    throw new Error(status.platformSupport.message ?? 'Online meeting capture is not supported on this computer.');
   }
   try {
     return sanitizeRecallStatusForNotch(await recallCapture?.requestPermissions());
   } catch (error) {
     throw safeLiveMeetingActionError(error, 'Meeting permissions could not be opened. Review them from Clementine Meetings.');
+  }
+});
+
+ipcMain.handle('clemmy:live-local-meeting-start', async (event: IpcMainInvokeEvent, payload: unknown) => {
+  assertClementineLiveIpcSender(event);
+  const title = liveLocalMeetingTitle(payload);
+  try {
+    const result = await startLocalMeetingCapture('live', title ?? 'In-person meeting');
+    return { recorder: sanitizeLocalMeetingRecorderForNotch(result.recorder) };
+  } catch (error) {
+    throw safeLiveLocalMeetingActionError(error, 'Clementine could not start the in-person meeting recording. Open Clementine Meetings for details, then try again.');
+  }
+});
+
+ipcMain.handle('clemmy:live-local-meeting-append', async (event: IpcMainInvokeEvent, payload: unknown) => {
+  assertClementineLiveIpcSender(event);
+  const { sessionId, chunk } = liveLocalMeetingSessionPayload(payload, true);
+  try {
+    return sanitizeLocalMeetingRecorderForNotch(await appendLocalMeetingCapture('live', sessionId, chunk));
+  } catch (error) {
+    throw safeLiveLocalMeetingActionError(error, 'Clementine could not save incoming meeting audio. Stop the recording to preserve the captured portion.');
+  }
+});
+
+ipcMain.handle('clemmy:live-local-meeting-stop', async (event: IpcMainInvokeEvent, payload: unknown) => {
+  assertClementineLiveIpcSender(event);
+  const { sessionId } = liveLocalMeetingSessionPayload(payload);
+  try {
+    const result = await stopLocalMeetingCapture('live', sessionId);
+    return {
+      queued: result.queued === true,
+      error: typeof result.error === 'string' ? redactSensitiveText(result.error).slice(0, 500) : undefined,
+    };
+  } catch (error) {
+    throw safeLiveLocalMeetingActionError(error, 'Clementine could not stop the in-person recording safely. Open Clementine and try again.');
+  }
+});
+
+ipcMain.handle('clemmy:live-local-meeting-cancel', async (event: IpcMainInvokeEvent, payload: unknown) => {
+  assertClementineLiveIpcSender(event);
+  const { sessionId } = liveLocalMeetingSessionPayload(payload);
+  try {
+    const result = await cancelLocalMeetingCapture('live', sessionId);
+    return {
+      daemonCancellationPending: result.daemonCancellationPending === true,
+      warning: typeof result.warning === 'string' ? result.warning : undefined,
+    };
+  } catch (error) {
+    throw safeLiveLocalMeetingActionError(error, 'Clementine could not discard the in-person recording safely. Open Clementine and try again.');
   }
 });
 
@@ -2776,56 +3143,7 @@ ipcMain.handle('clemmy:local-meeting-start', async (
   payload?: { title?: unknown },
 ) => {
   assertIpcSender(evt, ['dashboard']);
-  const recorder = await localMeetingRecorder.start({ title: payload?.title });
-  try {
-    const daemon = await postDaemonJson<Record<string, unknown>>('/api/console/meetings/local/start', {
-      sessionId: recorder.sessionId!,
-      title: recorder.title,
-      audioPath: recorder.audioPath!,
-      startedAt: recorder.startedAt!,
-      sampleRate: recorder.sampleRate,
-      channels: recorder.channels,
-    });
-    return { recorder, daemon };
-  } catch (error) {
-    const original = error instanceof Error ? error.message : String(error);
-    let tombstoneError: unknown;
-    try {
-      rememberPendingLocalMeetingCancellation(recorder.sessionId!);
-    } catch (persistError) {
-      tombstoneError = persistError;
-    }
-    let localCancelError: unknown;
-    try {
-      await localMeetingRecorder.cancel(recorder.sessionId!);
-    } catch (cancelError) {
-      localCancelError = cancelError;
-    }
-    if (localCancelError) {
-      throw new Error(
-        `${original} Clementine could not stop the local audio writer: ${localCancelError instanceof Error ? localCancelError.message : String(localCancelError)}${tombstoneError ? ` It also could not persist daemon cleanup: ${tombstoneError instanceof Error ? tombstoneError.message : String(tombstoneError)}` : ''}`,
-      );
-    }
-    let cancellation: Awaited<ReturnType<typeof requestDaemonLocalMeetingCancellation>>;
-    try {
-      // This repeats the initial tombstone write intentionally. A transient
-      // persistence failure above may have cleared after the local writer was
-      // closed, and daemon cleanup still must never run without durable intent.
-      cancellation = await requestDaemonLocalMeetingCancellation(recorder.sessionId!);
-    } catch (cleanupError) {
-      throw new Error(
-        `${original} Local audio capture was stopped, but Clementine could not persist daemon cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-      );
-    }
-    if (cancellation.pending) {
-      throw new Error(
-        `${original} Local audio capture was stopped, but daemon cleanup is pending and will retry automatically.`,
-      );
-    }
-    throw error;
-  } finally {
-    rebuildTrayMenu();
-  }
+  return startLocalMeetingCapture('dashboard', payload?.title);
 });
 
 ipcMain.handle('clemmy:local-meeting-append', async (
@@ -2834,7 +3152,7 @@ ipcMain.handle('clemmy:local-meeting-append', async (
 ) => {
   assertIpcSender(evt, ['dashboard']);
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
-  return localMeetingRecorder.append(sessionId, payload?.chunk);
+  return appendLocalMeetingCapture('dashboard', sessionId, payload?.chunk);
 });
 
 ipcMain.handle('clemmy:local-meeting-stop', async (
@@ -2843,24 +3161,7 @@ ipcMain.handle('clemmy:local-meeting-stop', async (
 ) => {
   assertIpcSender(evt, ['dashboard']);
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
-  try {
-    const recording = await localMeetingRecorder.stop(sessionId);
-    try {
-      const daemon = await ingestLocalMeeting(recording);
-      return { recording, queued: true, daemon };
-    } catch (error) {
-      // Recording success and transcription queueing are separate outcomes. The
-      // WAV is durable, so report a recoverable queue error instead of pretending
-      // the meeting itself was lost.
-      return {
-        recording,
-        queued: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  } finally {
-    rebuildTrayMenu();
-  }
+  return stopLocalMeetingCapture('dashboard', sessionId);
 });
 
 ipcMain.handle('clemmy:local-meeting-cancel', async (
@@ -2869,29 +3170,7 @@ ipcMain.handle('clemmy:local-meeting-cancel', async (
 ) => {
   assertIpcSender(evt, ['dashboard']);
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
-  try {
-    rememberPendingLocalMeetingCancellation(sessionId);
-    let result: Awaited<ReturnType<typeof localMeetingRecorder.cancel>>;
-    try {
-      result = await localMeetingRecorder.cancel(sessionId);
-    } catch (error) {
-      // The local recorder is still authoritative if its own cancellation
-      // failed. Do not let the retry worker delete the daemon record while an
-      // active writer may still exist.
-      forgetPendingLocalMeetingCancellation(sessionId);
-      throw error;
-    }
-    const cancellation = await requestDaemonLocalMeetingCancellation(sessionId);
-    return {
-      ...result,
-      daemonCancellationPending: cancellation.pending,
-      warning: cancellation.pending
-        ? 'Local audio was discarded, but meeting-history cleanup is pending and will retry automatically.'
-        : undefined,
-    };
-  } finally {
-    rebuildTrayMenu();
-  }
+  return cancelLocalMeetingCapture('dashboard', sessionId);
 });
 
 // ─── Auto-update IPC ────────────────────────────────────────────────

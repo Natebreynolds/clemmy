@@ -4,6 +4,7 @@ import {
   ChevronUp,
   ExternalLink,
   LoaderCircle,
+  Mic,
   Radio,
   ShieldAlert,
   Square,
@@ -71,6 +72,7 @@ function MeetingButton({
 }
 
 export function NotchMeetingSurface({
+  source,
   state,
   expanded,
   busyAction,
@@ -85,7 +87,9 @@ export function NotchMeetingSurface({
   onRequestPermissions,
   onOpenConsole,
   onClear,
+  localCanStop = false,
 }: {
+  source: 'recall' | 'local';
   state: NotchMeetingState;
   expanded: boolean;
   busyAction: NotchMeetingBusyAction;
@@ -100,6 +104,7 @@ export function NotchMeetingSurface({
   onRequestPermissions: () => void;
   onOpenConsole: () => void;
   onClear: () => void;
+  localCanStop?: boolean;
 }) {
   const [now, setNow] = useState(Date.now());
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -124,7 +129,9 @@ export function NotchMeetingSurface({
     [now, state.recordingStartedAt],
   );
   const title = meetingDisplayName(state.meeting);
-  const platform = meetingPlatformLabel(state.meeting);
+  const local = source === 'local';
+  const platform = local ? 'This Mac' : meetingPlatformLabel(state.meeting);
+  const bannerLabel = local ? 'In-person' : state.phase === 'recording' ? 'Live' : platform;
   const captureInterrupted = notchMeetingCaptureInterrupted(state);
   const stopControl = notchMeetingStopControl(state.phase, busyAction);
   const audioState = state.networkStatus === 'disconnected'
@@ -159,25 +166,33 @@ export function NotchMeetingSurface({
     );
   }
 
-  const permissionError = state.phase === 'error' && /permission|screen recording/i.test(state.error ?? '');
+  const permissionError = state.phase === 'error' && /permission|screen recording|microphone/i.test(state.error ?? '');
   const phaseCopy = (() => {
     switch (state.phase) {
       case 'prompt': return {
         label: 'Meeting detected',
         headline: title,
-        summary: platform === 'Recall' ? 'Clementine detected an online call.' : `Clementine detected this ${platform} call.`,
+        summary: platform === 'Online meeting' ? 'Clementine detected an online call.' : `Clementine detected this ${platform} call.`,
       };
-      case 'starting': return { label: 'Starting', headline: 'Starting recording…', summary: `${title} · ${platform}` };
+      case 'starting': return {
+        label: 'Starting',
+        headline: 'Starting recording…',
+        summary: local ? 'Preparing the microphone and local recorder.' : `${title} · ${platform}`,
+      };
       case 'recording': return {
         label: state.error ? 'Recording · Stop needs attention' : 'Recording',
-        headline: 'Recording meeting',
-        summary: state.error ?? `${title} · ${platform}`,
+        headline: local ? 'Recording in-person meeting' : 'Recording meeting',
+        summary: state.error ?? (local ? 'Microphone audio · saved locally on this Mac' : `${title} · ${platform}`),
       };
       case 'stopping': return { label: 'Saving', headline: 'Stopping & saving…', summary: 'Clementine is safely finalizing this recording.' };
-      case 'stopped': return { label: 'Stopped', headline: 'Recording stopped', summary: state.error ?? 'Clementine is finalizing the transcript and summary.' };
+      case 'stopped': return {
+        label: 'Saved',
+        headline: 'Recording saved',
+        summary: state.error ?? (local ? 'Local transcription is queued in Meetings.' : 'Clementine is finalizing the transcript and summary.'),
+      };
       case 'error': return {
         label: permissionError ? 'Permission needed' : 'Needs attention',
-        headline: permissionError ? 'Meeting permission needed' : 'Recording needs attention',
+        headline: permissionError ? `${local ? 'Microphone' : 'Meeting'} permission needed` : 'Recording needs attention',
         summary: state.error ?? 'Clementine could not start this meeting recording.',
       };
       case 'idle': return { label: 'Meeting', headline: title, summary: platform };
@@ -189,13 +204,17 @@ export function NotchMeetingSurface({
       <section className="clemmy-live-island clemmy-live-meeting" data-meeting-phase={state.phase} aria-label="Clementine meeting controls">
         <header className="clemmy-live-header clemmy-live-meeting-header">
           <div className="clemmy-live-brand"><span aria-hidden><DogMark size={28} className="clemmy-live-dog" /></span><strong>Clementine</strong></div>
-          <div className="clemmy-live-preview-banner clemmy-live-meeting-banner" role="status"><Video aria-hidden /><span>Recall meeting</span></div>
+          <div className="clemmy-live-preview-banner clemmy-live-meeting-banner" role="status">
+            {local ? <Mic aria-hidden /> : state.phase === 'recording' ? <Radio aria-hidden /> : <Video aria-hidden />}
+            <span>{bannerLabel}</span>
+          </div>
           <div className="clemmy-live-window-actions">
             <button type="button" onClick={onOpenConsole} aria-label="Open Clementine"><ExternalLink aria-hidden /></button>
             {state.phase === 'recording' && (
               <button type="button" onClick={onCollapse} aria-label="Collapse recording controls" aria-expanded="true"><ChevronUp aria-hidden /></button>
             )}
-            {state.phase !== 'starting' && state.phase !== 'recording' && state.phase !== 'stopping' && (
+            {state.phase !== 'starting' && state.phase !== 'recording' && state.phase !== 'stopping'
+              && !(local && localCanStop) && (
               <button type="button" onClick={onHide} aria-label="Hide meeting controls"><X aria-hidden /></button>
             )}
           </div>
@@ -204,7 +223,7 @@ export function NotchMeetingSurface({
         <div className="clemmy-live-meeting-content">
           <div className="clemmy-live-meeting-hero" aria-live="polite" aria-atomic="true">
             <span className="clemmy-live-meeting-icon" aria-hidden>
-              {state.phase === 'error' ? <ShieldAlert /> : state.phase === 'recording' ? <Radio /> : state.phase === 'starting' || state.phase === 'stopping' ? <LoaderCircle className="clemmy-live-spin" /> : <Video />}
+              {state.phase === 'error' ? <ShieldAlert /> : state.phase === 'recording' ? <Radio /> : state.phase === 'starting' || state.phase === 'stopping' ? <LoaderCircle className="clemmy-live-spin" /> : local ? <Mic /> : <Video />}
             </span>
             <div>
               <span>{phaseCopy.label}</span>
@@ -248,7 +267,8 @@ export function NotchMeetingSurface({
             )}
             {state.phase === 'error' && (
               <>
-                {permissionError && <MeetingButton primary onClick={onRequestPermissions} disabled={busyAction !== null}><ShieldAlert aria-hidden /> {busyAction === 'permissions' ? 'Opening…' : 'Review permissions'}</MeetingButton>}
+                {local && localCanStop && <MeetingButton danger onClick={onStop} disabled={busyAction === 'stop'}><Square aria-hidden /> {busyAction === 'stop' ? 'Saving…' : 'Stop & save'}</MeetingButton>}
+                {!local && permissionError && <MeetingButton primary onClick={onRequestPermissions} disabled={busyAction !== null}><ShieldAlert aria-hidden /> {busyAction === 'permissions' ? 'Opening…' : 'Review permissions'}</MeetingButton>}
                 <MeetingButton onClick={onOpenConsole}><ExternalLink aria-hidden /> Open Clementine</MeetingButton>
                 <MeetingButton onClick={onClear}>Dismiss</MeetingButton>
               </>

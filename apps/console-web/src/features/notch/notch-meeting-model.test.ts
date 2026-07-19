@@ -3,6 +3,8 @@ import test from 'node:test';
 import {
   AUTO_RECORD_CONSENT_LABEL,
   INITIAL_NOTCH_MEETING_STATE,
+  meetingDisplayName,
+  meetingPlatformLabel,
   notchMeetingCaptureInterrupted,
   notchMeetingReducer,
   notchMeetingStateFromStatus,
@@ -129,4 +131,13 @@ test('collapsed capture truth treats either audio or network interruption as int
 
 test('auto-record consent names its future-meeting effect', () => {
   assert.equal(AUTO_RECORD_CONSENT_LABEL, 'Record now & auto-record future meetings');
+});
+
+test('provider labels cover every Recall meeting source surfaced by the notch', () => {
+  assert.equal(meetingDisplayName({ windowId: 'slack-1', platform: 'slack' }), 'Slack Huddle');
+  assert.equal(meetingPlatformLabel({ windowId: 'slack-1', platform: 'slack-huddle' }), 'Slack Huddle');
+  assert.equal(meetingPlatformLabel({ windowId: 'teams-1', platform: 'microsoft-teams' }), 'Microsoft Teams');
+  assert.equal(meetingPlatformLabel({ windowId: 'zoom-1', platform: 'zoom' }), 'Zoom');
+  assert.equal(meetingPlatformLabel({ windowId: 'meet-1', platform: 'google-meet' }), 'Google Meet');
+  assert.equal(meetingPlatformLabel({ windowId: 'unknown-1' }), 'Online meeting');
 });

@@ -180,6 +180,10 @@ export const HARNESS_INJECTED_INPUT_PREFIXES = [
   'Your previous response could not be parsed into the required structured decision',
   'You already auto-resolved that approval question under YOLO',
   'Before you deliver this:',
+  // Clarification-convergence wrapper. The real user answer follows after a
+  // blank line; runConversation threads that answer separately for capture and
+  // recall, while this prefix protects any legacy/direct path.
+  'CONVERGE — your previous turn asked the user a clarifying question.',
   // Restart-recovery auto-resume directive (restart-recovery.ts
   // AUTO_RESUME_DIRECTIVE) — dispatched as the resumed session's input, never
   // typed by the user. Without this entry, later bare follow-ups in a resumed

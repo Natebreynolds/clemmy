@@ -69,6 +69,7 @@ export interface EntityRelationshipResult {
 const RELATIONSHIP_PREDICATE_ALIASES = new Map<string, string>([
   ['works at', 'works at'], ['works for', 'works at'], ['employed by', 'works at'], ['employee of', 'works at'],
   ['reports to', 'reports to'], ['reported to', 'reports to'],
+  ['reporting to', 'reports to'], ['reports directly to', 'reports to'], ['reporting directly to', 'reports to'],
   ['leads', 'leads'], ['led', 'leads'], ['heads', 'leads'], ['runs', 'leads'],
   ['owns', 'owns'], ['owned', 'owns'],
   ['member of', 'member of'], ['belongs to', 'member of'],

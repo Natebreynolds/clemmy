@@ -10,6 +10,8 @@ export interface UnifiedHit {
   ref: string;
   title: string;
   snippet: string;
+  /** True when the model-facing snippet is only a prefix of the stored value. */
+  truncated?: boolean;
   score: number;
   confidence?: number;
   evidence?: MemoryEvidenceHit['evidence'];
@@ -40,6 +42,29 @@ function trimSnippet(text: string, max = 240): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
+const COMPLETE_SET_QUERY_RE = /\b(?:all|every|complete|full|list|roster|team|teammates?|members?|people|contacts?|recipients?|attendees?|emails?|email addresses?)\b/i;
+
+/** Exact-value/list requests must not receive a prefix that silently drops the
+ * tail of a roster. Durable facts are capped at 800 chars, so 1,200 preserves a
+ * complete fact while ordinary semantic recall keeps the compact 240-char view. */
+function asksForCompleteSet(objective: string): boolean {
+  return COMPLETE_SET_QUERY_RE.test(objective);
+}
+
+export function projectedRecallAnswerability(
+  result: Pick<UnifiedRecallResult, 'objective' | 'answerability'>,
+  hits: UnifiedHit[],
+): UnifiedRecallResult['answerability'] {
+  if (!asksForCompleteSet(result.objective) || result.answerability !== 'supported') return result.answerability;
+  const completeSupport = hits.some((hit) => !hit.truncated && (hit.evidence?.length ?? 0) > 0 && hit.score >= 0.45);
+  return completeSupport ? 'supported' : (hits.length > 0 ? 'partial' : 'insufficient');
+}
+
+function projectSnippet(text: string, max: number): { snippet: string; truncated: boolean } {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return { snippet: normalized.slice(0, max), truncated: normalized.length > max };
+}
+
 function legacyType(hit: MemoryEvidenceHit): UnifiedHitType {
   if (hit.ref.type === 'note') return 'vault';
   if (hit.ref.type === 'procedure') return 'tool-recall';
@@ -55,7 +80,7 @@ function recallStore(type: UnifiedHitType): 'fact' | 'note' | 'entity' | 'resour
 export function unifiedHitRecallRef(hit: Pick<UnifiedHit, 'type' | 'ref'> & Partial<Pick<UnifiedHit, 'title' | 'snippet'>>): RecallCandidateRef {
   // Carry what the model actually SAW (title + snippet) so post-turn auto-credit
   // can match demonstrable use against it. Identity stays type:id.
-  const shown = trimSnippet([hit.title, hit.snippet].filter(Boolean).join(': '));
+  const shown = trimSnippet([hit.title, hit.snippet].filter(Boolean).join(': '), 1_200);
   return {
     type: recallStore(hit.type),
     id: hit.ref,
@@ -77,21 +102,28 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
     timeZone: opts.timeZone,
   });
   const perStore: Record<string, number> = {};
+  const completeSet = asksForCompleteSet(obj);
   const hits = result.hits.map((hit): UnifiedHit => {
     const type = legacyType(hit);
     perStore[type] = (perStore[type] ?? 0) + 1;
+    const projected = projectSnippet(hit.text, completeSet && (type === 'fact' || type === 'policy') ? 1_200 : 240);
     return {
       type,
       ref: String(hit.ref.id),
       title: hit.title ?? type,
-      snippet: trimSnippet(hit.text),
+      snippet: projected.snippet,
+      truncated: projected.truncated,
       score: hit.score,
       confidence: hit.confidence,
       evidence: hit.evidence,
       whyRecalled: hit.whyRecalled,
     };
   });
-  return { objective: obj, hits, perStore, answerability: result.answerability, diagnostics: result.diagnostics };
+  // `recallMemory` judges the full stored hit. A complete-set request can only
+  // be called supported when at least one evidence-backed supporting hit is also
+  // complete in the projection the model actually receives.
+  const answerability = projectedRecallAnswerability({ objective: obj, answerability: result.answerability }, hits);
+  return { objective: obj, hits, perStore, answerability, diagnostics: result.diagnostics };
 }
 
 export function formatUnifiedRecall(result: UnifiedRecallResult, maxChars = 2400): string {

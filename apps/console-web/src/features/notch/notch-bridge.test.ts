@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { resizeLiveSurface } from './notch-bridge';
+import { liveLocalMeetingCaptureBridge, resizeLiveSurface } from './notch-bridge';
 
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
 
@@ -43,4 +43,21 @@ test('stale or rejected native layouts stay pending for retry', async () => {
 test('browser preview has no native frame to wait for', async () => {
   installWindow();
   assert.equal(await resizeLiveSurface({ width: 360, height: 144 }, 'panel', 44), true);
+});
+
+test('local capture adapter exposes only the notch recording contract', async () => {
+  const calls: string[] = [];
+  installWindow({
+    localMeetingStart: async () => { calls.push('start'); return { recorder: {} }; },
+    localMeetingAppend: async () => { calls.push('append'); return {}; },
+    localMeetingStop: async () => { calls.push('stop'); return { queued: true }; },
+    localMeetingCancel: async () => { calls.push('cancel'); return {}; },
+  });
+  const bridge = liveLocalMeetingCaptureBridge();
+  assert.ok(bridge);
+  await bridge.localMeetingStart?.({ title: 'In-person meeting' });
+  await bridge.localMeetingAppend?.('session-1234', new ArrayBuffer(2));
+  await bridge.localMeetingStop?.('session-1234');
+  await bridge.localMeetingCancel?.('session-1234');
+  assert.deepEqual(calls, ['start', 'append', 'stop', 'cancel']);
 });

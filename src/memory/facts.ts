@@ -379,7 +379,7 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
           valid_to                 = CASE WHEN ? = 1 THEN NULL ELSE valid_to END,
           superseded_by_fact_id    = CASE WHEN ? = 1 THEN NULL ELSE superseded_by_fact_id END
       WHERE id = ?
-    `).run(now, input.sessionId ?? null, input.path ?? null,
+    `).run(now, input.sessionId ?? null, input.sourceUri ?? input.path ?? null,
            dfSession, dfCall, dfTool, trust, trust, extractedAt, importance, input.sourceApp ?? null, autoPin,
            reactivating, reactivationBoundary, reactivating, reactivating, existing.id);
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
@@ -407,7 +407,7 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
        derivation_depth, derived_from_fact_ids, source_app, pinned,
        valid_from, confidence)
     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(input.kind, content, hash, input.sessionId ?? null, input.path ?? null,
+  `).run(input.kind, content, hash, input.sessionId ?? null, input.sourceUri ?? input.path ?? null,
          initialScore, now, now,
          dfSession, dfCall, dfTool, trust, extractedAt, importance,
          derivationDepth, derivedFromIdsJson, input.sourceApp ?? null, autoPin,

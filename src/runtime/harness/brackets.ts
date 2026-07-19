@@ -37,6 +37,11 @@ import {
   DuplicateExternalWriteError,
 } from './grounding-gate.js';
 import {
+  evaluateRecipientSetIntegrity,
+  isRecipientIntegrityGateEnabled,
+  RecipientSetIntegrityError,
+} from './recipient-integrity-gate.js';
+import {
   isGoalFidelityGateEnabled,
   evaluateGoalFidelity,
   extractMessageBody,
@@ -1572,6 +1577,31 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // overlapping the other two collapses the trio to ≈ max-of-three latency.
     const preGateShape = classifyExternalWrite(tool.name, parsedInput);
     const preGateIrreversible = preGateShape.mutating && preGateShape.irreversible;
+    // Exact multi-recipient integrity runs before any model judge or approval
+    // machinery. It fails closed and never treats a queued/approved payload as
+    // its own evidence, preventing a fabricated attendee list from laundering
+    // itself through the confirmation UI.
+    if (preGateIrreversible && isRecipientIntegrityGateEnabled()) {
+      const recipientResult = evaluateRecipientSetIntegrity(ctx.sessionId, parsedInput);
+      if (recipientResult.action === 'block') {
+        try {
+          appendEvent({
+            sessionId: ctx.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'guardrail_tripped',
+            data: {
+              kind: 'recipient_set_integrity_blocked',
+              toolName: tool.name,
+              recipients: recipientResult.recipients.slice(0, 25),
+              unsupportedRecipients: (recipientResult.unsupportedRecipients ?? []).slice(0, 25),
+              reason: recipientResult.reason,
+            },
+          });
+        } catch { /* telemetry must never block the deterministic refusal */ }
+        throw new RecipientSetIntegrityError({ toolName: tool.name, result: recipientResult });
+      }
+    }
     const parallelGates = parallelPreWriteGatesEnabled();
     // CERTIFIED-BATCH item: skip the per-item LLM judges (goal-fidelity +
     // output-grounding). Deterministic gates below are untouched. Emit the skip
@@ -2617,6 +2647,7 @@ export function softToolError(err: unknown): string | null {
     err instanceof ToolGuardrailBlocked ||
     err instanceof ToolCallsLimitExceeded ||
     err instanceof GroundingCheckFailedError ||
+    err instanceof RecipientSetIntegrityError ||
     err instanceof GoalFidelityCheckFailedError ||
     err instanceof OutputGroundingCheckFailedError ||
     err instanceof DuplicateExternalWriteError ||

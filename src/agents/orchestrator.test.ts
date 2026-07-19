@@ -818,9 +818,38 @@ test('request_approval human resume preserves linked pending-action provenance',
 
   const result = await invokeFunctionTool(buildRequestApprovalTool(), args, { sessionId: sess.id, turn: 2 });
   assert.match(result, /Queued action .* is approved/);
+  assert.match(result, /pending_action_execute/);
+  assert.match(result, /Do NOT call pending_action_get/);
   const resumed = pendingActions.getPendingAction(action.id);
   assert.equal(resumed?.approvedBy, 'human');
   assert.deepEqual(resumed?.approvalEvidence, { kind: 'card', approvalId: approval.approvalId });
+});
+
+test('request_approval opens the queued composio tool_slug scope without reconstructing it', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const action = pendingActions.queuePendingAction({
+    title: 'Create exact calendar invite',
+    summary: 'Create the exact reviewed invite.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'OUTLOOK_CREATE_EVENT', arguments: JSON.stringify({ attendees: ['person@example.com'] }) },
+    sessionId: sess.id,
+  });
+  const args = {
+    subject: 'Create exact calendar invite',
+    reason: 'Reviewed invite payload.',
+    destructive: false,
+    preview: null,
+    pendingActionId: action.id,
+  };
+  const approval = approvalRegistry.register({ sessionId: sess.id, subject: args.subject, tool: 'request_approval', args });
+  approvalRegistry.resolve(approval.approvalId, 'approved', 'unit-test-human');
+
+  const result = await invokeFunctionTool(buildRequestApprovalTool(), args, { sessionId: sess.id, turn: 2 });
+  assert.match(result, /pending_action_execute/);
+  assert.match(result, /Approved scope opened for OUTLOOK_CREATE_EVENT/);
+  assert.deepEqual(getPlanScope(sess.id)?.allowedComposioSlugs, ['OUTLOOK_CREATE_EVENT']);
 });
 
 test('request_approval mints policy provenance only on a true YOLO auto-approval', async () => {

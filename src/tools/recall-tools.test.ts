@@ -132,6 +132,41 @@ test('tool_output_query reaches list rows that were UNQUERYABLE under the old 20
   assert.ok(text.includes('partner3999@firm.example'), 'the tail record is now stored and queryable');
 });
 
+test('tool_output_query queries JSON embedded in a run_shell_command wrapper (sf/gh/aws --json)', async () => {
+  // Regression: a Salesforce team pull parked its `sf data query --json` output
+  // inside an `exit_code:/stdout:` shell wrapper, so whole-string JSON.parse
+  // failed and tool_output_query bounced the model to recall_tool_result (raw
+  // text it had to re-parse) — a multi-turn detour. It must now query the
+  // embedded stdout JSON directly.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const records = Array.from({ length: 8 }, (_, i) => ({ Name: `Seller ${i}`, Email: `seller${i}@scorpion.co`, IsActive: true }));
+  const payload = JSON.stringify({ status: 0, result: { totalSize: 8, records } });
+  const wrapped = `exit_code: 0\n\nstdout:\n${payload}\n\nstderr:\n`;
+  writeToolOutput({ sessionId: sess.id, callId: 'call_sf', tool: 'run_shell_command', output: wrapped });
+
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_sf', fields: ['result'] }),
+  );
+  const text = res.content[0].text;
+  assert.doesNotMatch(text, /is not JSON — use recall_tool_result/, 'must not bounce shell-wrapped JSON');
+  assert.ok(text.includes('seller0@scorpion.co'), 'embedded records are queryable');
+});
+
+test('tool_output_query still bounces genuinely non-JSON output to recall_tool_result', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_txt', tool: 'run_shell_command', output: 'exit_code: 0\n\nstdout:\njust some log lines, not json\n' });
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_txt' }),
+  );
+  assert.match(res.content[0].text, /is not JSON — use recall_tool_result/);
+});
+
 test('tool_output_query bounds an unfiltered large-object response (no full-payload context dump)', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

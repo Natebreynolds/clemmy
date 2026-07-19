@@ -303,7 +303,7 @@ html.clemmy-live-document #root {
   -webkit-app-region: drag;
 }
 
-/* Meeting controls retain a centered Recall badge, unlike the two-column task
+/* Meeting controls retain a centered provider/status badge, unlike the two-column task
  * and voice headers. Scope the third column to that surface only. */
 .clemmy-live-meeting-header {
   grid-template-columns: minmax(100px, 1fr) auto minmax(72px, 1fr);
@@ -350,9 +350,10 @@ html.clemmy-live-document #root {
 .clemmy-live-window-actions button:disabled:hover { background: transparent; }
 .clemmy-live-window-actions svg { width: 13px; height: 13px; }
 /* Voice is a primary affordance, not a hidden icon revealed only on hover. */
-.clemmy-live-window-actions .clemmy-live-talk {
+.clemmy-live-window-actions .clemmy-live-talk,
+.clemmy-live-window-actions .clemmy-live-meet {
   width: auto;
-  min-width: 58px;
+  min-width: 54px;
   padding: 0 9px;
   display: inline-flex;
   gap: 5px;
@@ -362,10 +363,21 @@ html.clemmy-live-document #root {
   font-size: 10.5px;
   font-weight: 760;
 }
-.clemmy-live-window-actions .clemmy-live-talk:hover {
+.clemmy-live-window-actions .clemmy-live-talk:hover,
+.clemmy-live-window-actions .clemmy-live-meet:hover {
   border-color: rgba(255, 122, 61, 0.42);
   background: rgba(255, 122, 61, 0.19);
   color: #ffd2b8;
+}
+.clemmy-live-window-actions .clemmy-live-meet {
+  border-color: rgba(118, 213, 150, 0.24);
+  background: rgba(118, 213, 150, 0.1);
+  color: #a8e8ba;
+}
+.clemmy-live-window-actions .clemmy-live-meet:hover {
+  border-color: rgba(118, 213, 150, 0.4);
+  background: rgba(118, 213, 150, 0.17);
+  color: #ccf4d6;
 }
 
 .clemmy-live-content {
@@ -922,6 +934,11 @@ html.clemmy-live-document #root {
   border-color: rgba(255, 129, 116, 0.28);
   background: rgba(255, 129, 116, 0.1);
   color: #ffb0a8;
+}
+
+.clemmy-live-meeting[data-meeting-phase="recording"] .clemmy-live-meeting-banner svg {
+  fill: currentColor;
+  animation: clemmy-live-recording-pulse 1.8s ease-in-out infinite;
 }
 
 .clemmy-live-meeting-content {

@@ -247,6 +247,29 @@ test('grounded relationships require exact evidence and retries do not inflate r
   assert.equal(loadEntityEdges()[0].recurrenceCount, 1, 'co-occurrence is not corroboration');
 });
 
+test('reporting-to grammatical variants ground the canonical reports-to edge', () => {
+  const teammate = upsertEntity({ type: 'person', name: 'Bobby Romano' });
+  const manager = upsertEntity({ type: 'person', name: 'Nathan Reynolds' });
+  const sourceText = 'Bobby Romano is on the active team, reporting directly to Nathan Reynolds.';
+  const episode = recordMemoryEpisode({
+    kind: 'tool_result',
+    sessionId: 's-reporting',
+    callId: 'c-reporting',
+    content: sourceText,
+  });
+  const result = recordGroundedEntityRelationship({
+    subjectId: teammate,
+    predicate: 'reports_to',
+    objectId: manager,
+    evidenceEpisodeId: episode.id,
+    evidenceExcerpt: sourceText,
+    sourceText,
+  });
+
+  assert.equal(result.outcome, 'add');
+  assert.equal(loadEntityEdges()[0]?.predicate, 'reports to');
+});
+
 test('independent grounded evidence reinforces once and survives episode evidence reads', () => {
   const dana = upsertEntity({ type: 'person', name: 'Dana' });
   const acme = upsertEntity({ type: 'company', name: 'Acme' });

@@ -1541,11 +1541,11 @@ export function renderConsoleHtml(token: string): string {
                   <select name="autoApproveScope" data-policy-field>
                     <option value="strict">strict — every shell/write asks (default)</option>
                     <option value="workspace">workspace — auto inside your configured project dirs</option>
-                    <option value="yolo">YOLO — auto everywhere (only the danger denylist applies)</option>
+                    <option value="yolo">YOLO — auto except protected sends</option>
                   </select>
                   <span class="hint" style="display:block; margin-top: 4px; color: var(--fg-3); font-size: 10.5px; line-height: 1.5;">
                     Clementine's own data dir (<code>~/.clementine-next/</code>) always auto-approves regardless of scope — that's bookkeeping, not a user-visible action. <strong>workspace</strong> additionally auto-approves writes inside the dirs you listed in <code>WORKSPACE_DIRS</code>. Plan-scoped approvals (15 min) always work on top. The hard denylist (<code>rm -rf /</code>, <code>sudo</code>, fork bombs, disk wipes) is enforced regardless.
-                    <strong style="color: var(--accent-warn);">YOLO trusts the agent anywhere the user can write</strong> — use when you want zero friction.
+                    <strong style="color: var(--accent-warn);">YOLO trusts the agent anywhere the user can write</strong>, but irreversible send batches and destructive/admin actions still require an explicit human checkpoint.
                   </span>
                 </div>
                 <div class="settings-grid-2">

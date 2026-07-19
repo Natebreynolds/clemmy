@@ -3,6 +3,7 @@ import { getFact, recordFactImpression, type ConsolidatedFact } from './facts.js
 import { appendFactRecallTrace } from './recall-trace.js';
 import {
   formatUnifiedPrimer,
+  projectedRecallAnswerability,
   recallEverything,
   unifiedHitRecallRef,
   visibleUnifiedPrimerHits,
@@ -52,7 +53,6 @@ async function recallWithin(
       recallPromise,
       new Promise<{ kind: 'timeout' }>((resolve) => {
         timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
-        (timer as unknown as { unref?: () => void }).unref?.();
       }),
     ]);
   } finally {
@@ -173,6 +173,7 @@ export async function buildUnifiedTurnPrimer(input: {
   const recallBudget = Math.max(0, maxChars - preamble.length - useRule.length - 2);
   const retrievedHitCount = result.hits.length;
   result.hits = visibleUnifiedPrimerHits(result, recallBudget);
+  result.answerability = projectedRecallAnswerability(result, result.hits);
   if (result.hits.length === 0) {
     recordPrimerExposure(result, query, input.surface, { retrieved: retrievedHitCount, included: 0 }, input.sessionId);
     return {

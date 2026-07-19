@@ -804,6 +804,27 @@ function ensureCanonicalMigration(): void {
  * The fuzzy threshold is deliberately conservative: a borderline match
  * is more dangerous than a miss (false-positive picks a wrong tool).
  */
+/**
+ * A choice whose accumulated FAILURES clearly dominate its successes must not be
+ * recalled as authoritative — a known-bad path should trigger a re-probe, not be
+ * repeated. This is the procedural twin of the memory correction-loop teeth
+ * (recall-memory.ts `recallUtilityBonus`): the negative signal (`failureCount`,
+ * fed at runtime from composio/procedure outcomes) already exists; without this
+ * it just sat in the record while recall kept handing the choice back. Bounded
+ * and accumulation-gated — a freshly-learned choice (neutral 0.5 Laplace prior)
+ * or a single stray failure is NEVER suppressed.
+ */
+const FAILING_CHOICE_SCORE_FLOOR = 0.34;
+function isFailingChoice(record: ToolChoiceRecord | null | undefined): boolean {
+  const choice = record?.choice;
+  if (!choice) return false;
+  const neg = (choice.failureCount ?? 0) + (choice.rejectionCount ?? 0);
+  if (neg < 2) return false; // require accumulated negative evidence
+  const pos = (choice.successCount ?? 0) + (choice.approvalCount ?? 0);
+  if (pos > neg) return false; // successes still dominate → keep
+  return computeChoiceScore(choice) < FAILING_CHOICE_SCORE_FLOOR;
+}
+
 export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const slug = slugifyIntent(intent);
   if (!slug) return null;
@@ -813,8 +834,14 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const exactPath = path.join(machineDir(), `${slug}.md`);
   const exact = parseRecord(exactPath);
   if (exact && exact.aliasStatus !== 'quarantined' && exact.aliasStatus !== 'superseded') {
-    emitToolChoiceEvent('recall_hit', intent, exact.choice?.identifier);
-    return exact;
+    if (isFailingChoice(exact)) {
+      // Known-failing exact match: don't return it as authoritative. Fall
+      // through to a healthy alternative or a re-probe.
+      emitToolChoiceEvent('recall_suppressed_failing', intent, exact.choice?.identifier);
+    } else {
+      emitToolChoiceEvent('recall_hit', intent, exact.choice?.identifier);
+      return exact;
+    }
   }
 
   // Canonical fallback: score aliases WITHIN each procedure, then rank one
@@ -823,6 +850,9 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   const queryTokens = tokenize(slug);
   const scored = listToolChoices()
     .filter((record) => !record.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX))
+    // Clearly-failing choices are excluded so a healthy alternative can win, or
+    // a re-probe happens, instead of recalling a known-bad path (the teeth).
+    .filter((record) => !isFailingChoice(record))
     .map((record) => {
       const aliases = (record.aliases?.length ? record.aliases : [{
         intent: record.intent,
@@ -1933,7 +1963,7 @@ export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
  * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
  * is what's flag-gated, not this measurement.
  */
-type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'remember_rejected_failed' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'recall_suppressed_failing' | 'remember' | 'remember_rejected_failed' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
 function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
   try {
     recordToolEvent({
@@ -1941,7 +1971,7 @@ function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifie
       toolName: 'tool_choice',
       kind: 'read',
       phase: 'end',
-      outcome: action === 'recall_miss' ? 'cancelled' : 'success',
+      outcome: (action === 'recall_miss' || action === 'recall_suppressed_failing') ? 'cancelled' : 'success',
       argsSummary: `action=${action} intent=${slugifyIntent(intent)}${identifier ? ` id=${identifier}` : ''}`,
     });
   } catch {

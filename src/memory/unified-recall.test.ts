@@ -25,7 +25,7 @@ const { upsertResourcePointer } = await import('./source-map.js');
 // eslint-disable-next-line import/first
 const { rememberToolChoice } = await import('./tool-choice-store.js');
 // eslint-disable-next-line import/first
-const { recallEverything, formatUnifiedRecall, visibleUnifiedRecallHits } = await import('./unified-recall.js');
+const { recallEverything, formatUnifiedRecall, projectedRecallAnswerability, visibleUnifiedRecallHits } = await import('./unified-recall.js');
 // eslint-disable-next-line import/first
 const { recallMemory, recallUtilityBonus } = await import('./recall-memory.js');
 // eslint-disable-next-line import/first
@@ -93,6 +93,75 @@ test('visibleUnifiedRecallHits excludes candidates clipped from the bounded tool
   const visible = visibleUnifiedRecallHits(result, firstOnlyLimit);
   assert.deepEqual(visible.map((hit) => hit.ref), ['1']);
   assert.doesNotMatch(formatUnifiedRecall({ ...result, hits: visible }, firstOnlyLimit), /ref fact:2/);
+});
+
+test('complete-set answerability follows the visible projection, not a clipped stored hit', () => {
+  const result = {
+    objective: 'list all team members and emails',
+    answerability: 'supported' as const,
+  };
+  const clipped = [{
+    type: 'fact' as const,
+    ref: '9',
+    title: 'team fact',
+    snippet: 'Bobby only…',
+    truncated: true,
+    score: 0.9,
+    evidence: [{ episodeId: 'e1', excerpt: 'full source' }],
+  }];
+  assert.equal(projectedRecallAnswerability(result, clipped), 'partial');
+  assert.equal(projectedRecallAnswerability(result, [{ ...clipped[0], truncated: false }]), 'supported');
+});
+
+test('complete team recall preserves every name and email instead of returning a supported prefix', async () => {
+  const roster = [
+    ['Bobby Romano', 'bobby.romano@example.com'],
+    ['Brett Lorenzini', 'brett.lorenzini@example.com'],
+    ['Jake Wright', 'jake.wright@example.com'],
+    ['Jarrett Tyus', 'jarrett.tyus@example.com'],
+    ['Kim Hillman', 'kim.hillman@example.com'],
+    ['Taylor Saunders', 'taylor.saunders@example.com'],
+    ['Tim Demik', 'tim.demik@example.com'],
+    ['Tyler Jorgensen', 'tyler.jorgensen@example.com'],
+  ] as const;
+  const content = `My complete Northstar team roster is: ${roster.map(([name, email]) => `${name} <${email}>`).join('; ')}.`;
+  const fact = rememberFact({ kind: 'project', content });
+  const episode = recordMemoryEpisode({
+    kind: 'tool_result',
+    title: 'Northstar Salesforce roster',
+    sourceApp: 'Salesforce',
+    sourceUri: 'tool://sess-roster/sf-query',
+    content,
+  });
+  linkFactEvidence({ factId: fact.id, episodeId: episode.id, excerpt: content, sourceUri: episode.source_uri });
+
+  const result = await recallEverything('List all people and emails on my complete Northstar team roster', {
+    stores: ['fact'],
+    limit: 5,
+  });
+  const rendered = formatUnifiedRecall(result, 4_000);
+  assert.equal(result.answerability, 'supported');
+  for (const [name, email] of roster) {
+    assert.match(rendered, new RegExp(name.replace(/ /g, '\\s+')));
+    assert.match(rendered, new RegExp(email.replace(/\./g, '\\.')));
+  }
+  assert.equal(result.hits.find((hit) => hit.ref === String(fact.id))?.truncated, false);
+});
+
+test('graph-expanded people with identical compact bodies remain distinct by title', async () => {
+  const names = ['Bobby Romano', 'Brett Lorenzini', 'Jake Wright', 'Jarrett Tyus', 'Kim Hillman', 'Taylor Saunders', 'Tim Demik', 'Tyler Jorgensen'];
+  const people = names.map((name) => upsertEntity({ type: 'person', name }));
+  const fact = rememberFact({ kind: 'project', content: 'Northstar-cipher is the current eight-person team roster.' });
+  setFactEntityLinks(fact.id, people, { linkType: 'stored' });
+
+  const result = await recallMemory('Northstar-cipher team roster', {
+    stores: ['entity'],
+    graphDepth: 1,
+    perStore: 12,
+    limit: 20,
+  });
+  const recalledNames = new Set(result.hits.filter((hit) => hit.ref.type === 'entity').map((hit) => hit.title));
+  assert.deepEqual(recalledNames, new Set(names));
 });
 
 test('recallMemory traverses persisted entity links, not text guesses', async () => {
@@ -258,7 +327,10 @@ test('explicit material use breaks close cross-store ties without overpowering r
     notUseful: 0,
     lastUsedAt: new Date().toISOString(),
   });
-  assert.equal(maxBonus, 0.08, 'utility can only nudge close results');
+  assert.ok(
+    Math.abs(maxBonus - 0.08) < 1e-9,
+    'utility can only nudge close results',
+  );
   assert.ok(
     recallUtilityBonus({ used: 10, notUseful: 10, lastUsedAt: new Date().toISOString() }) <
       recallUtilityBonus({ used: 10, notUseful: 0, lastUsedAt: new Date().toISOString() }),

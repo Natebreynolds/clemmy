@@ -1,4 +1,5 @@
 import type { NotchSurfaceSize } from './notch-model';
+import type { LocalMeetingCaptureBridge } from '@/lib/local-meeting-recorder';
 
 const LIVE_MOUNT_NONCE_QUERY_PARAM = 'clemmyLiveMount';
 const LIVE_MOUNT_GENERATION_QUERY_PARAM = 'clemmyLiveGeneration';
@@ -120,8 +121,41 @@ export async function requestLiveMeetingPermissions(): Promise<unknown> {
   return await request();
 }
 
+/** Adapter used by the shared microphone pump. Keeping the capture class on a
+ * structural bridge lets the notch reuse the dashboard's proven PCM pipeline
+ * without exposing the dashboard's much broader preload API. */
+export function liveLocalMeetingCaptureBridge(): LocalMeetingCaptureBridge | null {
+  const live = window.clementineLive;
+  if (!live) return null;
+  return {
+    localMeetingStart: typeof live.localMeetingStart === 'function'
+      ? (payload) => Promise.resolve(live.localMeetingStart!(payload)) as Promise<Record<string, unknown>>
+      : undefined,
+    localMeetingAppend: typeof live.localMeetingAppend === 'function'
+      ? (sessionId, chunk) => Promise.resolve(live.localMeetingAppend!(sessionId, chunk)) as Promise<Record<string, unknown>>
+      : undefined,
+    localMeetingStop: typeof live.localMeetingStop === 'function'
+      ? (sessionId) => Promise.resolve(live.localMeetingStop!(sessionId)) as Promise<Record<string, unknown>>
+      : undefined,
+    localMeetingCancel: typeof live.localMeetingCancel === 'function'
+      ? (sessionId) => Promise.resolve(live.localMeetingCancel!(sessionId)) as Promise<Record<string, unknown>>
+      : undefined,
+  };
+}
+
 export function subscribeToLiveMeetingEvents(callback: (payload: unknown) => void): () => void {
   const subscribe = window.clementineLive?.onMeetingEvent;
+  if (typeof subscribe !== 'function') return () => undefined;
+  try {
+    const unsubscribe = subscribe(callback);
+    return typeof unsubscribe === 'function' ? unsubscribe : () => undefined;
+  } catch {
+    return () => undefined;
+  }
+}
+
+export function subscribeToLiveLocalMeetingEvents(callback: (payload: unknown) => void): () => void {
+  const subscribe = window.clementineLive?.onLocalMeetingEvent;
   if (typeof subscribe !== 'function') return () => undefined;
   try {
     const unsubscribe = subscribe(callback);

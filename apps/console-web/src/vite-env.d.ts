@@ -46,8 +46,13 @@ interface ClementineLiveBridge {
   dismissMeetingPrompt?: (windowId: string) => unknown | Promise<unknown>;
   stopMeetingRecording?: (windowId: string) => unknown | Promise<unknown>;
   requestMeetingPermissions?: () => unknown | Promise<unknown>;
+  localMeetingStart?: (payload?: { title?: string }) => Promise<Record<string, unknown>>;
+  localMeetingAppend?: (sessionId: string, chunk: ArrayBuffer) => Promise<Record<string, unknown>>;
+  localMeetingStop?: (sessionId: string) => Promise<Record<string, unknown>>;
+  localMeetingCancel?: (sessionId: string) => Promise<Record<string, unknown>>;
   onPreview?: (callback: (payload: unknown) => void) => void | (() => void);
   onMeetingEvent?: (callback: (payload: unknown) => void) => void | (() => void);
+  onLocalMeetingEvent?: (callback: (payload: unknown) => void) => void | (() => void);
 }
 
 interface Window {

@@ -318,6 +318,7 @@ test('isHarnessInjectedInput: recognizes harness re-prompts incl. the outcome ma
     'Your previous response could not be parsed into the required structured decision. Re-issue it now.',
     'You already auto-resolved that approval question under YOLO standing approval — do NOT wait.',
     'Before you deliver this: $24.5K in your report does not match your captured data.',
+    'CONVERGE — your previous turn asked the user a clarifying question. EXECUTE the work this turn.\n\nUse the exact roster.',
     'Continue with the next step of your plan.',
     '[background bg-completed-fixture just finished — continue from here.]',
   ]) {

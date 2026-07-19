@@ -15,6 +15,12 @@ import {
   type PendingActionStatus,
 } from '../runtime/harness/pending-actions.js';
 import { textResult } from './shared.js';
+import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
+import {
+  evaluateRecipientSetIntegrity,
+  isRecipientIntegrityGateEnabled,
+  RecipientSetIntegrityError,
+} from '../runtime/harness/recipient-integrity-gate.js';
 
 const statusEnum = z.enum(PENDING_ACTION_STATUSES);
 const kindEnum = z.enum(PENDING_ACTION_KINDS);
@@ -70,6 +76,30 @@ export function registerPendingActionTools(server: McpServer): void {
         return textResult(`pending_action_queue failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       const sessionId = currentSessionId(input.sessionId);
+      const shape = classifyExternalWrite(input.toolName, payload);
+      if (sessionId && shape.mutating && shape.irreversible && isRecipientIntegrityGateEnabled()) {
+        const recipientResult = evaluateRecipientSetIntegrity(sessionId, payload);
+        if (recipientResult.action === 'block') {
+          const error = new RecipientSetIntegrityError({ toolName: input.toolName, result: recipientResult });
+          try {
+            appendEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'guardrail_tripped',
+              data: {
+                kind: 'recipient_set_integrity_blocked',
+                phase: 'pending_action_queue',
+                toolName: input.toolName,
+                recipients: recipientResult.recipients,
+                unsupportedRecipients: recipientResult.unsupportedRecipients ?? [],
+                reason: recipientResult.reason,
+              },
+            });
+          } catch { /* refusal remains deterministic even if telemetry is unavailable */ }
+          return textResult(`pending_action_queue refused by harness: ${error.message}`);
+        }
+      }
       const record = queuePendingAction({
         title: input.title,
         summary: input.summary,
@@ -94,7 +124,7 @@ export function registerPendingActionTools(server: McpServer): void {
         `Pending action queued: ${record.id}`,
         formatPendingAction(record, { verbose: true }),
         '',
-        'Next step: ask the user whether to execute this queued action. For a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. Do not execute the target tool until approval is granted.',
+        'Next step: ask the user whether to execute this queued action. For a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.',
       ].join('\n'));
     },
   );

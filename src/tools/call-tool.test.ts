@@ -168,6 +168,26 @@ test('a successful dispatch records the reached tool to the session hot-set', as
   }
 });
 
+test('a first-class built-in accidentally wrapped in call_tool dispatches instead of bouncing not_reachable', async () => {
+  _setCodeModeToolsForTests(
+    new Map([['memory_recall_all', { name: 'memory_recall_all', invoke: async () => 'all eight teammates' }]]),
+  );
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(),
+      firstClassNames: new Set(['memory_recall_all']),
+    }) as unknown as ToolLike;
+    const out = await callTool.invoke!(
+      { context: { sessionId: 'sess-first-class-wrapper' } },
+      JSON.stringify({ name: 'memory_recall_all', args_json: JSON.stringify({ objective: 'my team', limit: null }) }),
+      { toolCall: { callId: 'first-class-wrapper' } },
+    );
+    assert.equal(String(out), 'all eight teammates');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
 test('production run context attributes the inner dispatch without a tool-output ALS shim', async () => {
   _resetHotSetForTest();
   resetEventLog();

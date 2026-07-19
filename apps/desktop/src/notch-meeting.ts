@@ -1,4 +1,5 @@
 import type { RecallCaptureStatus } from './recall-capture.js';
+import type { LocalMeetingRecorderStatus } from './local-meeting-recorder.js';
 import { redactSensitiveText } from './redaction.js';
 
 export interface ClementineNotchMeetingWindow {
@@ -47,6 +48,23 @@ export interface ClementineNotchMeetingEvent {
   mediaType?: string;
 }
 
+export interface ClementineNotchLocalMeetingRecorder {
+  recording: boolean;
+  sessionId?: string;
+  title?: string;
+  startedAt?: string;
+  bytes: number;
+  durationSeconds: number;
+  sampleRate: number;
+  channels: number;
+  stale?: boolean;
+}
+
+export interface RecallMeetingDetectionNotificationCopy {
+  title: string;
+  body: string;
+}
+
 const LIVE_EVENT_TYPES = new Set([
   'meeting-prompt-required',
   'meeting-prompt-dismissed',
@@ -79,6 +97,30 @@ function text(value: unknown, maxLength = 500): string | undefined {
 function safeError(value: unknown): string | undefined {
   const valueText = text(value, 1_500);
   return valueText ? redactSensitiveText(valueText).slice(0, 800) : undefined;
+}
+
+/** Native meeting alerts deliberately use a small provider allowlist instead
+ * of putting an SDK-controlled platform or meeting title on the lock screen. */
+export function recallMeetingDetectionNotificationCopy(
+  platform: unknown,
+  recording = false,
+): RecallMeetingDetectionNotificationCopy {
+  const normalized = text(platform, 80)?.toLowerCase() ?? '';
+  const provider = normalized.includes('slack') || normalized.includes('huddle')
+    ? 'Slack Huddle'
+    : normalized.includes('teams')
+      ? 'Microsoft Teams meeting'
+      : normalized.includes('zoom')
+        ? 'Zoom meeting'
+        : normalized.includes('meet')
+          ? 'Google Meet'
+          : 'Online meeting';
+  return {
+    title: `${provider} detected`,
+    body: recording
+      ? 'Clementine is recording it now. Click to open the notch controls.'
+      : 'Clementine is ready to record it. Click to choose from the notch.',
+  };
 }
 
 /** Only expose meeting presentation data to the sandboxed Notch renderer.
@@ -169,6 +211,24 @@ export function sanitizeRecallEventForNotch(event: unknown): ClementineNotchMeet
   const mediaType = text(raw.mediaType ?? raw.typeName);
   if (mediaType) safe.mediaType = mediaType;
   return safe;
+}
+
+/** The local recorder tracks absolute file paths and sidecar details that the
+ * sandboxed notch never needs. Keep only presentation and stream-health truth. */
+export function sanitizeLocalMeetingRecorderForNotch(
+  status: LocalMeetingRecorderStatus,
+): ClementineNotchLocalMeetingRecorder {
+  return {
+    recording: status.recording,
+    sessionId: text(status.sessionId, 80),
+    title: text(status.title, 160),
+    startedAt: text(status.startedAt, 80),
+    bytes: Math.max(0, Number.isFinite(status.bytes) ? status.bytes : 0),
+    durationSeconds: Math.max(0, Number.isFinite(status.durationSeconds) ? status.durationSeconds : 0),
+    sampleRate: Math.max(0, Number.isFinite(status.sampleRate) ? status.sampleRate : 0),
+    channels: Math.max(0, Number.isFinite(status.channels) ? status.channels : 0),
+    stale: typeof status.stale === 'boolean' ? status.stale : undefined,
+  };
 }
 
 export function isCurrentDetectedMeeting(

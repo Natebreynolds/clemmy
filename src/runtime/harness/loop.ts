@@ -93,6 +93,7 @@ import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/se
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { autoCreditRecallRuns, extractFunctionCallArgTexts } from '../../memory/recall-auto-credit.js';
+import { safeDetectCorrection } from './correction-hook.js';
 import {
   budgetLine,
   checkRunTokenWindow,
@@ -1021,6 +1022,10 @@ export interface RunTurnOptions {
   agent: Agent<any, any>;
   sessionId: string;
   input: string;
+  /** The real user-authored text when `input` includes a harness directive.
+   * Used for memory capture, semantic recall, correction detection, and durable
+   * user history so internal steering can never become learned memory. */
+  authoritativeUserInput?: string;
   maxTurns?: number;
   toolCallsPerTurn?: number;
   /** Test injection: build the Runner. Defaults to a fresh real Runner. */
@@ -2160,6 +2165,7 @@ async function runConversationCore(
       agent: currentAgent,
       sessionId: options.sessionId,
       input: nextInput,
+      authoritativeUserInput: stepIndex === 1 ? options.input : undefined,
       // Only the first step carries the real user message; every later step is a
       // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
       // A fallover re-attempt re-runs the SAME step → its input is already
@@ -4190,7 +4196,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     ? options.sourceUserSeq
     : undefined;
   if (!options.reuseRecordedUserInput && !sourceUserSeq) {
-    const recorded = session.recordUserInput(options.input, turn);
+    const recorded = session.recordUserInput(options.authoritativeUserInput ?? options.input, turn);
     sourceUserSeq ??= recorded.seq;
   } else if (!sourceUserSeq) {
     // Legacy callers can request reuse without threading attempt identity. Pin
@@ -4228,7 +4234,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     queueMicrotask(() => {
       try {
         const captured = captureInteractionSignals({
-          message: options.input,
+          message: options.authoritativeUserInput ?? options.input,
           sessionId: options.sessionId,
           sourceEventId: `turn:${turn}`,
         });
@@ -4304,7 +4310,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const syntheticRetryOriginalInput = isSyntheticStallRetryInput(options.input)
     ? latestHumanInputForStallRetry(options.sessionId)
     : undefined;
-  const semanticInput = syntheticRetryOriginalInput ?? options.input;
+  const semanticInput = syntheticRetryOriginalInput ?? options.authoritativeUserInput ?? options.input;
   // The recall-vector embed is FIRE-AND-FORGET, not awaited: it stashes into a
   // TTL'd slot that per-turn fact recall reads OPPORTUNISTICALLY (late arrival
   // still helps mid-turn recalls; absence just drops the relevance term). The
@@ -4972,6 +4978,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       },
     });
     safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
+    // Negative half of the credit loop — must run BEFORE auto-credit so the
+    // prior turn's credited facts are the ones we read.
+    safeDetectCorrection({ sessionId: options.sessionId, turn, userInput: options.authoritativeUserInput ?? options.input });
     safeAutoCreditRecall({
       sessionId: options.sessionId,
       turn,
@@ -5383,6 +5392,8 @@ export async function resumePendingApproval(
     // A resumed turn has no memory primer; credit only tool-recorded recall
     // runs. The resumed state's full history stands in for "this turn's"
     // items — any run credited here was recorded during the resume itself.
+    // (No correction detection here: an approval-resume carries no new user
+    // message to correct the prior answer.)
     safeAutoCreditRecall({
       sessionId: options.sessionId,
       turn,
