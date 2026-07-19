@@ -115,7 +115,7 @@ test('preflight: flags workflow steps whose required local MCP tool is excluded 
     const r = preflightWorkflow(wf({
       steps: [{
         id: 'main',
-        prompt: 'Use the authenticated Salesforce CLI via run_shell_command: sf data query --query "SELECT Id FROM Event" --json, then notify Nate.',
+        prompt: 'Use the authenticated Salesforce CLI via run_shell_command: sf data query --query "SELECT Id FROM Event" --json, then notify Alex.',
         sideEffect: 'send',
       }],
     }));

@@ -136,7 +136,7 @@ test('LEGIBILITY end-to-end: a real SyntaxError populates .logs with the user li
   assert.match(detail, /SyntaxError/);
 });
 
-// 2026-07-08 (sess-mrco803b): a program iterated a PATH STRING char-by-char —
+// Path-iteration regression: a program iterated a PATH STRING char-by-char —
 // 199 one-character list_files calls, all failing, for 4 minutes until the RPC
 // budget stopped it. The consecutive-failure breaker must abort a broken
 // program at ~10 failed calls and hand the error back to the model.
@@ -145,7 +145,7 @@ test('failure breaker: 10 consecutive tool-call failures abort the program with 
   const dispatch: CodeModeDispatch = async () => { calls++; throw new Error('ENOENT: no such directory "U"'); };
   const r = await runCodeModeProgram(
     // The observed bug shape: for..of over a string → one call per character.
-    `for (const dir of "/Users/nathan/some/path") { try { await clem.list_files({ directory: dir }); } catch { /* keep looping */ } } return 'done';`,
+    `for (const dir of "/Users/example/some/path") { try { await clem.list_files({ directory: dir }); } catch { /* keep looping */ } } return 'done';`,
     dispatch,
     { timeoutMs: 20_000 },
   );
@@ -164,7 +164,7 @@ test('failure breaker: tool-error text results also abort the program', async ()
   const r = await runCodeModeProgram(
     // The live bug did not throw: list_files returned a normal text result that
     // started with "Directory does not exist:", so the old failure breaker reset.
-    `for (const dir of "/Users/nathan/some/path") { await clem.list_files({ directory: dir }); } return 'done';`,
+    `for (const dir of "/Users/example/some/path") { await clem.list_files({ directory: dir }); } return 'done';`,
     dispatch,
     { timeoutMs: 20_000 },
   );

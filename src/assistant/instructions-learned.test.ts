@@ -113,7 +113,7 @@ test('tiered prompt keeps skill discovery stable and injects only query-relevant
 test('renderFactsForInstructions mode split: pinned vs scored vs all', () => {
   const pin = rememberFact({ kind: 'feedback', content: 'ALWAYS keep replies terse — no bullet bloat.', importance: 9 });
   setFactPinned(pin.id, true);
-  rememberFact({ kind: 'user', content: 'Nathan runs a coaching business in California.', importance: 6 });
+  rememberFact({ kind: 'user', content: 'Alexander runs a coaching business in California.', importance: 6 });
 
   const pinned = renderFactsForInstructions(12, 800, undefined, 'pinned');
   const scored = renderFactsForInstructions(12, 1600, undefined, 'scored');

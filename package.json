@@ -1,22 +1,27 @@
 {
   "name": "clemmy",
   "version": "1.17.2",
-  "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
+  "description": "Local-first AI operator with persistent memory, governed tools, workflows, voice, and meetings",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Natebreynolds/clemmy.git"
   },
+  "bugs": {
+    "url": "https://github.com/Natebreynolds/clemmy/issues"
+  },
   "keywords": [
     "agent",
     "ai",
     "assistant",
+    "automation",
+    "electron",
+    "local-first",
+    "memory",
     "openai",
     "mcp",
-    "background",
-    "autonomous",
-    "cli"
+    "workflows"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -34,12 +39,14 @@
   ],
   "scripts": {
     "clean:dist": "node scripts/clean-dist.mjs",
+    "check:public-hygiene": "node scripts/check-public-hygiene.mjs",
     "prebuild": "npm run clean:dist",
     "build": "tsc --outDir dist",
     "build:mobile-web": "npm --prefix apps/mobile-web run build",
     "build:console-web": "npm --prefix apps/console-web run build",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/run-tests-isolated.mjs",
+    "test:public-hygiene": "node --test scripts/check-public-hygiene.test.mjs",
     "test:release-assets": "node --test apps/desktop/scripts/vendor-recall-native.test.mjs scripts/merge-mac-update-feeds.test.mjs scripts/refresh-notarized-dmg-metadata.test.mjs scripts/release-workflow.test.mjs scripts/vendor-whispercpp-desktop.test.mjs scripts/verify-desktop-release-assets.test.mjs",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",
@@ -84,7 +91,6 @@
     "probe:code-mode": "tsx scripts/probe-code-mode.ts",
     "smoke:all": "bash scripts/smoke-all.sh",
     "eval:jobs": "tsx scripts/eval-jobs.ts",
-    "job:capture": "tsx scripts/capture-job-fixture.ts",
     "measure:judge-calibration": "tsx scripts/measure-judge-calibration.ts",
     "proof": "tsx scripts/proof/run-proof.ts",
     "proof:claude": "tsx scripts/proof/run-proof.ts --brain claude",

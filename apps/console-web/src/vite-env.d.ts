@@ -20,6 +20,14 @@ interface ClemBootstrap {
 interface ClementineLiveBounds {
   width: number;
   height: number;
+  presentation: 'dormant' | 'panel';
+  layoutId: number;
+}
+
+interface ClementineLiveLayoutResult {
+  ok: boolean;
+  applied: boolean;
+  layoutId: number;
 }
 
 interface ClementineLiveMountAck {
@@ -28,9 +36,8 @@ interface ClementineLiveMountAck {
 }
 
 interface ClementineLiveBridge {
-  resize?: (bounds: ClementineLiveBounds) => void | Promise<void>;
+  resize?: (bounds: ClementineLiveBounds) => ClementineLiveLayoutResult | Promise<ClementineLiveLayoutResult>;
   mounted?: (mount: ClementineLiveMountAck) => void | Promise<void>;
-  toggle?: () => void | Promise<void>;
   openConsole?: () => void | Promise<void>;
   dismiss?: () => void | Promise<void>;
   meetingStatus?: () => unknown | Promise<unknown>;

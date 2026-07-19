@@ -10,38 +10,24 @@ import {
   type ReactNode,
 } from 'react';
 import {
-  AlertCircle,
-  Check,
-  CheckCircle2,
-  ChevronDown,
+  ArrowUp,
   ChevronUp,
-  Circle,
-  CircleX,
   ExternalLink,
   LoaderCircle,
-  MicOff,
-  Pause,
-  Play,
-  RotateCcw,
-  Send,
+  Mic,
   ShieldCheck,
   Sparkles,
-  UsersRound,
   X,
 } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { cn } from '@/lib/cn';
+import { getLiveActivity, type NotchLiveActivity } from '@/lib/live-activity';
+import { NotchVoice, type NotchVoiceStatus } from '@/lib/notch-voice';
 import {
-  DEMO_SEQUENCE,
-  NOTCH_PREVIEW_FRAMES,
   createInitialNotchState,
   notchReducer,
   notchSurfaceSize,
-  previewActionFromBridge,
-  type NotchAction,
-  type NotchActivityTone,
-  type NotchAgentState,
-  type NotchPreviewPhase,
+  notchVoiceSurfaceSize,
 } from './notch-model';
 import {
   alwaysRecordDetectedMeeting,
@@ -66,49 +52,27 @@ import {
 } from './notch-meeting-model';
 import './notch.css';
 
-const DEMO_STEP_MS = 2_000;
+/** How often the non-meeting notch refetches live activity. */
+const LIVE_ACTIVITY_POLL_MS = 4_000;
+let nextLiveLayoutId = Date.now() * 1_000;
 
-function ActivityIcon({ tone }: { tone: NotchActivityTone }) {
-  const shared = 'h-3.5 w-3.5 shrink-0';
-  switch (tone) {
-    case 'complete':
-      return <Check className={shared} aria-hidden />;
-    case 'active':
-      return <LoaderCircle className={cn(shared, 'clemmy-live-spin')} aria-hidden />;
-    case 'waiting':
-      return <Circle className={shared} aria-hidden />;
-    case 'attention':
-      return <ShieldCheck className={shared} aria-hidden />;
-    case 'success':
-      return <CheckCircle2 className={shared} aria-hidden />;
-    case 'error':
-      return <AlertCircle className={shared} aria-hidden />;
-  }
+function createLiveLayoutId(): number {
+  nextLiveLayoutId += 1;
+  return nextLiveLayoutId;
 }
 
-function StateGlyph({ phase }: { phase: NotchPreviewPhase }) {
+/** State glyph for the current live-activity state. */
+function LiveStateGlyph({ state }: { state: NotchLiveActivity['state'] }) {
   const className = 'h-4 w-4';
-  switch (phase) {
-    case 'review':
-      return <Sparkles className={className} aria-hidden />;
+  switch (state) {
     case 'working':
       return <LoaderCircle className={cn(className, 'clemmy-live-spin')} aria-hidden />;
     case 'approval':
       return <ShieldCheck className={className} aria-hidden />;
-    case 'completed':
-      return <CheckCircle2 className={className} aria-hidden />;
-    case 'cancelled':
-      return <CircleX className={className} aria-hidden />;
-    case 'failure':
-      return <AlertCircle className={className} aria-hidden />;
+    case 'idle':
+      return <Sparkles className={className} aria-hidden />;
   }
 }
-
-const AGENT_STATE_LABELS: Readonly<Record<NotchAgentState, string>> = {
-  completed: 'Completed',
-  active: 'Active',
-  queued: 'Queued',
-};
 
 function SurfaceButton({
   children,
@@ -135,15 +99,39 @@ export function NotchSurface() {
   const [meetingState, dispatchMeeting] = useReducer(notchMeetingReducer, INITIAL_NOTCH_MEETING_STATE);
   const [meetingExpanded, setMeetingExpanded] = useState(true);
   const [meetingBusyAction, setMeetingBusyActionState] = useState<NotchMeetingBusyAction>(null);
+  const [nativeHover, setNativeHover] = useState(false);
   const meetingBusyActionRef = useRef(meetingBusyAction);
   const collapsedButtonRef = useRef<HTMLButtonElement>(null);
-  const transcriptRef = useRef<HTMLTextAreaElement>(null);
-  const phaseHeadingRef = useRef<HTMLHeadingElement>(null);
-  const focusAfterActionRef = useRef(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const mountedAcknowledgedRef = useRef(false);
   const previouslyExpandedRef = useRef(state.expanded);
-  const frame = NOTCH_PREVIEW_FRAMES[state.phase];
+  const activity = state.activity;
   const meetingActive = meetingState.phase !== 'idle';
+  // Voice companion: press the mic (or the global shortcut) and speak a request
+  // ("hey, pull up my pipeline"). NotchVoice records the clip, transcribes it
+  // (whisper-1 — plain speech-to-text, no realtime voice), and sends the text to
+  // the local Clementine agent (brain + tools + gates). The notch shows what you
+  // said + Clementine's reply so you can see it landed, then jump into the app.
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<NotchVoiceStatus>('idle');
+  const [voiceLabel, setVoiceLabel] = useState('');
+  const [voiceUser, setVoiceUser] = useState('');
+  const [voiceAssistant, setVoiceAssistant] = useState('');
+  const [voiceError, setVoiceError] = useState('');
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  const voiceRef = useRef<NotchVoice | null>(null);
+  // Refs so the global-shortcut handler (a stable subscription) can read live
+  // voice state without re-subscribing: first press starts recording, a second
+  // press while recording sends.
+  const voiceActiveRef = useRef(false);
+  const voiceStatusRef = useRef<NotchVoiceStatus>('idle');
+  const meetingActiveRef = useRef(meetingActive);
+  const meetingPhaseRef = useRef(meetingState.phase);
+  useEffect(() => { voiceActiveRef.current = voiceActive; }, [voiceActive]);
+  useEffect(() => { voiceStatusRef.current = voiceStatus; }, [voiceStatus]);
+  useEffect(() => { meetingActiveRef.current = meetingActive; }, [meetingActive]);
+  useEffect(() => { meetingPhaseRef.current = meetingState.phase; }, [meetingState.phase]);
+  useEffect(() => { if (voiceStatus !== 'recording') setVoiceLevel(0); }, [voiceStatus]);
 
   const setMeetingBusyAction = useCallback((action: NotchMeetingBusyAction) => {
     meetingBusyActionRef.current = action;
@@ -156,14 +144,38 @@ export function NotchSurface() {
     setMeetingBusyActionState(null);
   }, []);
   const size = useMemo(
-    () => meetingActive
-      ? notchMeetingSurfaceSize(meetingState, meetingExpanded)
-      : notchSurfaceSize(state),
-    [meetingActive, meetingExpanded, meetingState, state.expanded, state.phase],
+    () => {
+      if (meetingActive) return notchMeetingSurfaceSize(meetingState, meetingExpanded);
+      if (voiceActive) {
+        return notchVoiceSurfaceSize({
+          hasTranscript: Boolean(voiceUser),
+          hasResponse: Boolean(voiceAssistant),
+          hasError: Boolean(voiceError),
+        });
+      }
+      return notchSurfaceSize(state);
+    },
+    [
+      meetingActive,
+      voiceActive,
+      voiceUser,
+      voiceAssistant,
+      voiceError,
+      meetingExpanded,
+      meetingState,
+      state.expanded,
+      activity.state,
+    ],
   );
+  const presentation = !meetingActive && !voiceActive && !state.expanded
+    ? 'dormant' as const
+    : 'panel' as const;
+  const layoutKey = `${presentation}:${size.width}:${size.height}`;
+  const [appliedLayoutKey, setAppliedLayoutKey] = useState(layoutKey);
+  const layoutReady = appliedLayoutKey === layoutKey;
 
-  const toggle = useCallback(() => {
-    dispatch({ type: 'toggle' });
+  const collapse = useCallback(() => {
+    dispatch({ type: 'collapse' });
   }, []);
 
   const dismiss = useCallback(() => {
@@ -171,19 +183,62 @@ export function NotchSurface() {
     dismissLiveSurface();
   }, []);
 
-  const dispatchAction = useCallback((action: NotchAction) => {
-    focusAfterActionRef.current = true;
-    dispatch(action);
+  const stopVoice = useCallback(() => {
+    voiceRef.current?.cancel();
+    voiceRef.current = null;
+    setVoiceActive(false);
+  }, []);
+
+  const openConsole = useCallback(() => {
+    stopVoice();
+    dispatch({ type: 'collapse' });
+    openClementineConsole();
+  }, [stopVoice]);
+
+  const startVoice = useCallback(() => {
+    if (meetingActiveRef.current) return;
+    setVoiceActive(true);
+  }, []);
+
+  const sendVoice = useCallback(() => {
+    voiceRef.current?.stopAndSend().catch((err: Error) => {
+      setVoiceStatus('error');
+      setVoiceError(err?.message || 'Could not send that request.');
+    });
   }, []);
 
   useEffect(() => {
     document.documentElement.classList.add('clemmy-live-document');
-    if (!mountedAcknowledgedRef.current) {
-      mountedAcknowledgedRef.current = true;
-      acknowledgeLiveSurfaceMounted();
-    }
     return () => document.documentElement.classList.remove('clemmy-live-document');
   }, []);
+
+  // Voice lifecycle: when voice mode turns on, start recording the mic. The user
+  // taps Send (or the shortcut again) to transcribe + route the request into the
+  // Clementine brain. Teardown cancels any in-flight capture.
+  useEffect(() => {
+    if (!voiceActive) return undefined;
+    setVoiceError(''); setVoiceUser(''); setVoiceAssistant('');
+    setVoiceStatus('recording'); setVoiceLabel('Starting…');
+    const voice = new NotchVoice({
+      onStatus: (s, l) => { setVoiceStatus(s); if (l) setVoiceLabel(l); },
+      onUserText: setVoiceUser,
+      onAssistantText: setVoiceAssistant,
+      onLevel: (lvl) => setVoiceLevel((prev) => prev * 0.6 + lvl * 0.4),
+    });
+    voiceRef.current = voice;
+    voice.startRecording().catch((err: Error) => {
+      setVoiceStatus('error');
+      setVoiceError(err?.message || 'Microphone is unavailable right now.');
+    });
+    return () => { voice.cancel(); voiceRef.current = null; };
+  }, [voiceActive]);
+
+  // Meeting controls take exclusive ownership of the notch. Stop dictation as
+  // soon as that mode appears so microphone capture can never continue behind
+  // a meeting prompt or recording surface.
+  useEffect(() => {
+    if (meetingActive && voiceActiveRef.current) stopVoice();
+  }, [meetingActive, stopVoice]);
 
   useEffect(() => {
     let active = true;
@@ -233,20 +288,71 @@ export function NotchSurface() {
   }, [meetingState.audioCapturing, meetingState.networkStatus, meetingState.phase]);
 
   useEffect(() => {
-    resizeLiveSurface(size);
-  }, [size]);
+    let active = true;
+    let retryTimer: number | null = null;
+    let attempt = 0;
+    const layoutId = createLiveLayoutId();
+
+    const applyLayout = async (): Promise<void> => {
+      const applied = await resizeLiveSurface(size, presentation, layoutId);
+      if (!active) return;
+      if (applied) {
+        setAppliedLayoutKey(layoutKey);
+        return;
+      }
+      // The native frame must lead rendering. Retry a transient navigation/IPC
+      // race so the panel cannot remain stranded inside the dormant 62px frame.
+      attempt += 1;
+      const delay = Math.min(1_000, 40 * (2 ** Math.min(attempt, 5)));
+      retryTimer = window.setTimeout(() => { void applyLayout(); }, delay);
+    };
+
+    void applyLayout();
+    return () => {
+      active = false;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [layoutKey, presentation, size]);
+
+  // Poll real live activity for the non-meeting surface: immediately, on an
+  // interval, and on window focus. Errors are swallowed so a transient read
+  // failure keeps the last good state instead of blanking the notch. Skipped
+  // entirely during a meeting to avoid churn while the meeting surface owns it.
+  useEffect(() => {
+    if (meetingActive) return undefined;
+    let active = true;
+    let newestRequest = 0;
+    const refresh = async (): Promise<void> => {
+      newestRequest += 1;
+      const request = newestRequest;
+      try {
+        const next = await getLiveActivity();
+        if (active && request === newestRequest) dispatch({ type: 'set-activity', activity: next });
+      } catch {
+        // Keep the last good activity on any read failure.
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), LIVE_ACTIVITY_POLL_MS);
+    const onFocus = () => void refresh();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [meetingActive]);
 
   useEffect(() => {
     if (meetingActive) return;
     const wasExpanded = previouslyExpandedRef.current;
     previouslyExpandedRef.current = state.expanded;
     if (state.expanded && !wasExpanded) {
-      if (state.phase === 'review') transcriptRef.current?.focus({ preventScroll: true });
-      else phaseHeadingRef.current?.focus({ preventScroll: true });
+      headingRef.current?.focus({ preventScroll: true });
     } else if (!state.expanded && wasExpanded) {
       collapsedButtonRef.current?.focus({ preventScroll: true });
     }
-  }, [meetingActive, state.expanded, state.phase]);
+  }, [meetingActive, state.expanded]);
 
   useEffect(() => {
     if (meetingActive) return undefined;
@@ -258,40 +364,87 @@ export function NotchSurface() {
     return () => window.removeEventListener('focus', focusCollapsedSurface);
   }, [meetingActive, state.expanded]);
 
-  useEffect(() => subscribeToLivePreview((payload) => {
-    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-      const kind = (payload as { kind?: unknown }).kind;
-      if (kind === 'meeting-expand') {
-        setMeetingExpanded(true);
-        return;
-      }
-      if (kind === 'meeting-collapse') {
-        setMeetingExpanded(false);
-        return;
-      }
-    }
-    const action = previewActionFromBridge(payload);
-    if (action) dispatch(action);
-  }), []);
-
   useEffect(() => {
-    if (!state.playing || meetingActive) return undefined;
-    const timer = window.setTimeout(() => dispatch({ type: 'autoplay-tick' }), DEMO_STEP_MS);
-    return () => window.clearTimeout(timer);
-  }, [meetingActive, state.phase, state.playing]);
-
-  useEffect(() => {
-    if (meetingActive) return undefined;
-    if (!focusAfterActionRef.current) return undefined;
-    focusAfterActionRef.current = false;
-    const animationFrame = window.requestAnimationFrame(() => {
-      phaseHeadingRef.current?.focus({ preventScroll: true });
+    // Subscribe before acknowledging the mount. The main process may replay a
+    // queued shortcut/voice intent synchronously from the acknowledgement.
+    const unsubscribe = subscribeToLivePreview((payload) => {
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const kind = (payload as { kind?: unknown }).kind;
+        if (kind === 'meeting-expand') {
+          setMeetingExpanded(true);
+          return;
+        }
+        if (kind === 'meeting-collapse') {
+          setMeetingExpanded(false);
+          return;
+        }
+        // The desktop reports the physical notch / menu-bar inset so we can pad the
+        // surface DOWN below the notch (the window itself spans the inset at y=0).
+        if (kind === 'shell-state') {
+          const inset = (payload as { topInset?: unknown }).topInset;
+          if (typeof inset === 'number' && Number.isFinite(inset)) {
+            document.documentElement.style.setProperty('--notch-inset', `${Math.max(0, Math.round(inset))}px`);
+          }
+          return;
+        }
+        // The configurable notch shortcut opens/closes the panel (same as clicking
+        // the dormant logo).
+        if (kind === 'toggle-expand') {
+          if (meetingActiveRef.current) {
+            if (meetingPhaseRef.current === 'recording') {
+              setMeetingExpanded((current) => !current);
+            }
+            return;
+          }
+          if (voiceActiveRef.current) {
+            voiceRef.current?.cancel();
+            voiceRef.current = null;
+            setVoiceActive(false);
+            dispatch({ type: 'collapse' });
+            return;
+          }
+          dispatch({ type: 'toggle' });
+          return;
+        }
+        if (kind === 'expand') {
+          if (meetingActiveRef.current || voiceActiveRef.current) return;
+          dispatch({ type: 'expand' });
+          return;
+        }
+        if (kind === 'native-hover') {
+          setNativeHover((payload as { active?: unknown }).active === true);
+          return;
+        }
+        // The global voice shortcut (main process): first press starts recording,
+        // a second press while recording sends the request.
+        if (kind === 'start-voice') {
+          if (meetingActiveRef.current) return;
+          if (!voiceActiveRef.current) {
+            setVoiceActive(true);
+          } else if (voiceStatusRef.current === 'recording') {
+            voiceRef.current?.stopAndSend().catch((err: Error) => {
+              setVoiceStatus('error');
+              setVoiceError(err?.message || 'Could not send that request.');
+            });
+          }
+        }
+      }
     });
-    return () => window.cancelAnimationFrame(animationFrame);
-  }, [meetingActive, state.phase]);
+    if (!mountedAcknowledgedRef.current) {
+      mountedAcknowledgedRef.current = true;
+      acknowledgeLiveSurfaceMounted();
+    }
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (voiceActive && event.key === 'Escape') {
+        event.preventDefault();
+        stopVoice();
+        dispatch({ type: 'collapse' });
+        return;
+      }
       if (meetingActive && event.key === 'Escape') {
         event.preventDefault();
         if (meetingState.phase === 'recording' && meetingExpanded) setMeetingExpanded(false);
@@ -303,16 +456,11 @@ export function NotchSurface() {
       if (event.key === 'Escape' && state.expanded) {
         event.preventDefault();
         dismiss();
-        return;
-      }
-      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && state.expanded && state.phase === 'review') {
-        event.preventDefault();
-        dispatchAction({ type: 'submit-preview' });
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [dismiss, dispatchAction, meetingActive, meetingExpanded, meetingState.phase, state.expanded, state.phase]);
+  }, [dismiss, meetingActive, meetingExpanded, meetingState.phase, state.expanded, stopVoice, voiceActive]);
 
   const runMeetingStart = async (always: boolean) => {
     const meeting = meetingState.meeting;
@@ -384,6 +532,7 @@ export function NotchSurface() {
   const style = {
     '--clemmy-live-width': `${size.width}px`,
     '--clemmy-live-height': `${size.height}px`,
+    '--clemmy-live-layout-opacity': layoutReady ? 1 : 0,
   } as CSSProperties;
 
   if (meetingActive) {
@@ -401,11 +550,114 @@ export function NotchSurface() {
         onDismissPrompt={() => void dismissMeeting()}
         onStop={() => void stopMeeting()}
         onRequestPermissions={() => void requestMeetingPermissions()}
-        onOpenConsole={openClementineConsole}
+        onOpenConsole={openConsole}
         onClear={() => { dispatchMeeting({ type: 'clear' }); dismissLiveSurface(); }}
       />
     );
   }
+
+  // Working continuity: once the spoken turn returns, if it left a task running
+  // (per the live-activity poll) keep showing "Working — <task>" instead of a flat
+  // "Done", updating live until the task finishes.
+  const voiceWorking = voiceStatus === 'done' && !voiceError && activity.state === 'working';
+  const voiceDisplayLabel = voiceError
+    ? 'Voice unavailable'
+    : voiceWorking
+      ? (activity.title ? `Working — ${activity.title}` : 'Working…')
+      : (voiceLabel || 'Listening…');
+  const voiceDotStatus: NotchVoiceStatus = voiceWorking ? 'thinking' : voiceStatus;
+
+  if (voiceActive) {
+    const voiceHasContent = Boolean(voiceUser || voiceAssistant || voiceError);
+    return (
+      <main className="clemmy-live-stage" style={style} data-testid="clemmy-live-stage">
+        <section
+          className="clemmy-live-island clemmy-live-voice"
+          data-voice={voiceStatus}
+          data-has-content={voiceHasContent ? 'true' : undefined}
+          aria-label="Talk to Clementine"
+        >
+          <header className="clemmy-live-header clemmy-live-voice-header">
+            <button
+              type="button"
+              className="clemmy-live-voice-action"
+              onClick={stopVoice}
+              aria-label={voiceStatus === 'recording' ? 'Cancel voice request' : 'Close voice'}
+              title={voiceStatus === 'recording' ? 'Cancel' : 'Close'}
+            >
+              <X aria-hidden />
+            </button>
+            <div className="clemmy-live-brand clemmy-live-voice-brand">
+              <span aria-hidden><DogMark size={24} className="clemmy-live-dog" /></span>
+              <strong>Clementine</strong>
+            </div>
+            {voiceStatus === 'recording' && !voiceError ? (
+              <button
+                type="button"
+                className="clemmy-live-voice-action clemmy-live-voice-send"
+                onClick={sendVoice}
+                aria-label="Send voice request now"
+                title="Send now"
+              >
+                <ArrowUp aria-hidden />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="clemmy-live-voice-action"
+                onClick={openConsole}
+                aria-label="Open Clementine console"
+                title="Open Clementine"
+              >
+                <ExternalLink aria-hidden />
+              </button>
+            )}
+          </header>
+
+          <div className="clemmy-live-voice-body">
+            <p className="clemmy-live-voice-status" aria-live="polite">
+              {voiceStatus === 'recording' && !voiceError ? (
+                <span className="clemmy-live-voice-meter" aria-hidden style={{ '--lvl': voiceLevel } as CSSProperties}>
+                  <span className="clemmy-live-voice-bar" />
+                  <span className="clemmy-live-voice-bar" />
+                  <span className="clemmy-live-voice-bar" />
+                  <span className="clemmy-live-voice-bar" />
+                  <span className="clemmy-live-voice-bar" />
+                </span>
+              ) : (
+                <span className={cn('clemmy-live-voice-dot', voiceError ? 'is-error' : `is-${voiceDotStatus}`)} aria-hidden />
+              )}
+              <span className="clemmy-live-voice-status-label">{voiceDisplayLabel}</span>
+            </p>
+            {voiceError ? (
+              <p className="clemmy-live-voice-error">{voiceError}</p>
+            ) : voiceUser || voiceAssistant ? (
+              <div className="clemmy-live-voice-transcript" aria-live="polite">
+                {voiceUser && (
+                  <div className="clemmy-live-voice-message" data-speaker="you">
+                    <span>You</span>
+                    <p>{voiceUser}</p>
+                  </div>
+                )}
+                {voiceAssistant && (
+                  <div className="clemmy-live-voice-message" data-speaker="clementine">
+                    <span>Clementine</span>
+                    <p>{voiceAssistant}</p>
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  // Dormant: the Clementine logo sits beside the notch with a tiny mic badge so
+  // its voice-first action is discoverable. Live work replaces the badge with a
+  // status dot; the expanded panel keeps a labeled Talk action available.
+  const collapsedAriaLabel =
+    `Talk to Clementine.${activity.title ? ` ${activity.title}${activity.detail ? ', ' + activity.detail : ''}.` : ''}`;
 
   if (!state.expanded) {
     return (
@@ -413,24 +665,22 @@ export function NotchSurface() {
         <button
           ref={collapsedButtonRef}
           type="button"
-          className="clemmy-live-collapsed"
-          data-phase={state.phase}
-          onClick={toggle}
+          className="clemmy-live-collapsed clemmy-live-dormant"
+          data-native-hover={nativeHover ? 'true' : undefined}
+          data-phase={activity.state}
+          onClick={startVoice}
+          title="Talk to Clementine"
           aria-expanded="false"
-          aria-label={`Clementine preview, microphone off. ${frame.collapsedSummary}. Latest milestone: ${frame.latestMilestone}. Expand.`}
+          aria-label={collapsedAriaLabel}
         >
           <span className="clemmy-live-collapsed-avatar" aria-hidden>
-            <DogMark size={24} />
-            <span className="clemmy-live-availability-dot" />
+            <DogMark size={22} />
+            {activity.state === 'idle' ? (
+              <span className="clemmy-live-voice-badge"><Mic /></span>
+            ) : (
+              <span className="clemmy-live-availability-dot" />
+            )}
           </span>
-          <span className="clemmy-live-collapsed-copy">
-            <span className="clemmy-live-preview-label"><MicOff aria-hidden /> Preview — microphone off</span>
-            <span className="clemmy-live-collapsed-progress">
-              <strong>{frame.collapsedSummary}</strong>
-              <em>{frame.latestMilestone}</em>
-            </span>
-          </span>
-          <ChevronDown className="h-4 w-4" aria-hidden />
         </button>
       </main>
     );
@@ -440,8 +690,8 @@ export function NotchSurface() {
     <main className="clemmy-live-stage" style={style} data-testid="clemmy-live-stage">
       <section
         className="clemmy-live-island"
-        data-phase={state.phase}
-        aria-label="Clementine preview"
+        data-phase={activity.state}
+        aria-label="Clementine"
       >
         <header className="clemmy-live-header">
           <div className="clemmy-live-brand">
@@ -449,16 +699,21 @@ export function NotchSurface() {
             <strong>Clementine</strong>
           </div>
 
-          <div className="clemmy-live-preview-banner" role="status">
-            <MicOff aria-hidden />
-            <span>Preview — microphone off</span>
-          </div>
-
           <div className="clemmy-live-window-actions">
-            <button type="button" onClick={openClementineConsole} aria-label="Open Clementine console">
+            <button
+              type="button"
+              onClick={startVoice}
+              aria-label="Talk to Clementine"
+              title="Talk to Clementine"
+              className="clemmy-live-mic clemmy-live-talk"
+            >
+              <Mic aria-hidden />
+              <span>Talk</span>
+            </button>
+            <button type="button" onClick={openConsole} aria-label="Open Clementine console">
               <ExternalLink aria-hidden />
             </button>
-            <button type="button" onClick={toggle} aria-label="Collapse Clementine" aria-expanded="true">
+            <button type="button" onClick={collapse} aria-label="Collapse Clementine" aria-expanded="true">
               <ChevronUp aria-hidden />
             </button>
             <button type="button" onClick={dismiss} aria-label="Dismiss Clementine">
@@ -468,178 +723,22 @@ export function NotchSurface() {
         </header>
 
         <div className="clemmy-live-content">
-          <nav className="clemmy-live-state-nav" aria-label="Preview a Clementine state">
-            {DEMO_SEQUENCE.map((phase) => (
-              <button
-                key={phase}
-                type="button"
-                aria-pressed={state.phase === phase}
-                onClick={() => dispatch({ type: 'select-phase', phase })}
-              >
-                <Circle aria-hidden />
-                {NOTCH_PREVIEW_FRAMES[phase].navLabel}
-              </button>
-            ))}
-          </nav>
-
-          <div key={`${state.phase}-copy`} className="clemmy-live-state-copy" aria-live="polite" aria-atomic="true">
+          <div className="clemmy-live-state-copy" aria-live="polite" aria-atomic="true">
             <span className="clemmy-live-status-pill">
-              <StateGlyph phase={state.phase} />
-              {frame.statusLabel}
+              <LiveStateGlyph state={activity.state} />
+              {activity.state === 'approval' ? 'Needs you' : activity.state === 'working' ? 'Working' : 'Ready'}
             </span>
-            <h1 ref={phaseHeadingRef} tabIndex={-1}>{frame.title}</h1>
-            <p>{frame.summary}</p>
+            <h1 ref={headingRef} tabIndex={-1}>{activity.title}</h1>
+            <p>{activity.detail || (activity.state === 'idle' ? 'Choose Talk to dictate a request.' : '')}</p>
           </div>
 
-          <label className="clemmy-live-transcript" data-readonly={state.phase !== 'review'}>
-            <span>
-              <strong>{state.phase === 'review' ? 'Sample transcript' : 'Original request'}</strong>
-              <em>{state.phase === 'review' ? 'Editable · ⌘↵ previews send' : 'Read only'}</em>
-            </span>
-            <textarea
-              ref={transcriptRef}
-              value={state.transcript}
-              onChange={(event) => dispatch({ type: 'set-transcript', transcript: event.target.value })}
-              rows={2}
-              aria-label={state.phase === 'review' ? 'Editable sample transcript' : 'Original request, read only'}
-              aria-readonly={state.phase !== 'review'}
-              readOnly={state.phase !== 'review'}
-              spellCheck
-            />
-          </label>
-
-          {frame.parentTask && (
-            <section key={`${state.phase}-parent`} className="clemmy-live-parent-task" aria-label="Preview parent task">
-              <span className="clemmy-live-parent-icon" aria-hidden><UsersRound /></span>
-              <div>
-                <span>Preview parent task</span>
-                <strong>{frame.parentTask.title}</strong>
-                <em>{frame.parentTask.detail}</em>
-              </div>
-            </section>
-          )}
-
-          {frame.agents && (
-            <section key={`${state.phase}-agents`} className="clemmy-live-agents" aria-labelledby="clemmy-live-agents-heading">
-              <div className="clemmy-live-section-heading">
-                <h2 id="clemmy-live-agents-heading">Preview agent team</h2>
-                <span>{frame.agents.length} mock agents</span>
-              </div>
-              <ol>
-                {frame.agents.map((agent) => (
-                  <li key={agent.id} data-state={agent.state}>
-                    <span className="clemmy-live-agent-avatar" aria-hidden>{agent.name.slice(0, 1)}</span>
-                    <span className="clemmy-live-agent-copy">
-                      <span><strong>{agent.name}</strong><em>{agent.role}</em></span>
-                      <small>{agent.detail}</small>
-                    </span>
-                    <span className="clemmy-live-agent-state">
-                      {agent.state === 'active' && (
-                        <span className="clemmy-live-agent-dots" aria-hidden><i /><i /><i /></span>
-                      )}
-                      {agent.state === 'completed' && <Check aria-hidden />}
-                      {agent.state === 'queued' && <Circle aria-hidden />}
-                      <em>{AGENT_STATE_LABELS[agent.state]}</em>
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            </section>
-          )}
-
-          {frame.approval && (
-            <aside key={`${state.phase}-approval`} className="clemmy-live-approval" aria-label="Approval preview">
-              <span className="clemmy-live-approval-icon"><ShieldCheck aria-hidden /></span>
-              <div>
-                <strong>{frame.approval.title}</strong>
-                <span>{frame.approval.detail}</span>
-              </div>
-            </aside>
-          )}
-
-          <section key={`${state.phase}-activity`} className="clemmy-live-activity" aria-labelledby="clemmy-live-activity-heading">
-            <div className="clemmy-live-section-heading">
-              <h2 id="clemmy-live-activity-heading">Latest activity</h2>
-              <span>Friendly milestones</span>
+          {activity.state === 'approval' && (
+            <div className="clemmy-live-primary-actions">
+              <SurfaceButton kind="primary" onClick={openConsole}>
+                <ShieldCheck aria-hidden /> Review &amp; approve →
+              </SurfaceButton>
             </div>
-            <ol>
-              {frame.activities.slice(-3).map((activity) => (
-                <li key={activity.id} data-tone={activity.tone}>
-                  <span className="clemmy-live-activity-icon"><ActivityIcon tone={activity.tone} /></span>
-                  <strong>{activity.label}</strong>
-                  <span>{activity.detail}</span>
-                </li>
-              ))}
-            </ol>
-          </section>
-
-          <div key={`${state.phase}-actions`} className="clemmy-live-primary-actions">
-            {state.phase === 'review' && (
-              <>
-                <SurfaceButton kind="primary" onClick={() => dispatchAction({ type: 'submit-preview' })}>
-                  <Send aria-hidden /> Preview send
-                </SurfaceButton>
-                <SurfaceButton onClick={openClementineConsole}>Open full app</SurfaceButton>
-              </>
-            )}
-            {state.phase === 'working' && (
-              <>
-                <SurfaceButton kind="primary" onClick={() => dispatchAction({ type: 'select-phase', phase: 'approval' })}>
-                  <ShieldCheck aria-hidden /> Preview approval
-                </SurfaceButton>
-                <SurfaceButton onClick={dismiss}>Keep working quietly</SurfaceButton>
-              </>
-            )}
-            {state.phase === 'approval' && (
-              <>
-                <SurfaceButton kind="primary" onClick={() => dispatchAction({ type: 'approve-preview' })}>
-                  <Check aria-hidden /> Approve once
-                </SurfaceButton>
-                <SurfaceButton kind="danger" onClick={() => dispatchAction({ type: 'reject-preview' })}>Reject</SurfaceButton>
-              </>
-            )}
-            {state.phase === 'completed' && (
-              <>
-                <SurfaceButton kind="primary" onClick={openClementineConsole}>
-                  <ExternalLink aria-hidden /> Open result
-                </SurfaceButton>
-                <SurfaceButton onClick={dismiss}>Dismiss</SurfaceButton>
-              </>
-            )}
-            {state.phase === 'cancelled' && (
-              <>
-                <SurfaceButton kind="primary" onClick={() => dispatchAction({ type: 'restart-preview' })}>
-                  <RotateCcw aria-hidden /> Edit request
-                </SurfaceButton>
-                <SurfaceButton onClick={dismiss}>Dismiss</SurfaceButton>
-              </>
-            )}
-            {state.phase === 'failure' && (
-              <>
-                <SurfaceButton kind="primary" onClick={openClementineConsole}>Fix in Clementine</SurfaceButton>
-                <SurfaceButton onClick={() => dispatchAction({ type: 'restart-preview' })}>
-                  <RotateCcw aria-hidden /> Try preview again
-                </SurfaceButton>
-              </>
-            )}
-          </div>
-
-          <footer className="clemmy-live-demo-controls">
-            <span>Stage 0 · deterministic mock data</span>
-            <div>
-              <button
-                type="button"
-                onClick={() => dispatch({ type: 'toggle-play' })}
-                aria-label={state.playing ? 'Pause state preview' : 'Play state preview'}
-              >
-                {state.playing ? <Pause aria-hidden /> : <Play aria-hidden />}
-                {state.playing ? 'Pause' : 'Play'}
-              </button>
-              <button type="button" onClick={() => dispatch({ type: 'advance-demo' })}>
-                Next state <ChevronDown className="-rotate-90" aria-hidden />
-              </button>
-            </div>
-          </footer>
+          )}
         </div>
       </section>
     </main>

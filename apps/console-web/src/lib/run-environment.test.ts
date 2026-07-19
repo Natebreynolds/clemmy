@@ -205,11 +205,11 @@ test('labels telemetry-only URLs as observed references and computes terminal el
     status: 'completed',
     createdAt: '2026-07-16T12:00:00.000Z',
     completedAt: '2026-07-16T12:02:05.000Z',
-    outputPreview: 'Draft at https://example.com/report and /Users/nathan/report.docx',
+    outputPreview: 'Draft at https://example.com/report and /Users/example/report.docx',
   };
   assert.deepEqual(collectRunEnvironmentReferences(run), {
     urls: ['https://example.com/report'],
-    files: ['/Users/nathan/report.docx'],
+    files: ['/Users/example/report.docx'],
   });
   assert.equal(elapsedLabel(run), '2m 05s');
 });

@@ -126,7 +126,7 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
     // run_batch or a first-class call. The refusal names the fix.
     const sendOut = String(await invokeCallTool(
       sess.id, 'composio_execute_tool',
-      JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: 'p@x.com' }) }),
+      JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: 'p@site.example' }) }),
     ));
     assert.match(sendOut, /SEND_REQUIRES_APPROVAL|run_batch/i, 'a send via call_tool is refused, directed to run_batch/first-class');
     assert.equal(listEvents(sess.id, { types: ['external_write'] }).length, 0, 'no send dispatched');

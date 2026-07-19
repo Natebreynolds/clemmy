@@ -269,7 +269,7 @@ export interface WorkflowStepOutputContract {
    * Verifiable concrete handles (Hermes-style artifact verification):
    * after the step returns, the engine confirms the named output values
    * are REAL, not just well-shaped — so "produced a brief" can't pass
-   * when the file/URL doesn't actually exist (the revill "deploy
+   * when the file/URL doesn't actually exist (the missing-artifact "deploy
    * blocked, no URL" class). Values are dot-paths into the output.
    * Engine-checked in P3.5 (verifyStepOutput).
    */
@@ -906,7 +906,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.optional === true) out.optional = true;
       // Persist ALL declared classes including 'read'. Undeclared is NOT
       // the same as read: undeclared falls back to the prose heuristic,
-      // which has misclassified read-only steps as write (scorpion scrape,
+      // which has misclassified read-only steps as write (acme scrape,
       // SF overdue-meetings 2026-06-11) and parked them on crash-resume.
       // Dropping a declared 'read' on rewrite would resurrect that trap.
       if (s.sideEffect) out.side_effect = s.sideEffect;

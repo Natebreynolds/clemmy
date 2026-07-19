@@ -1775,7 +1775,7 @@ export function buildStallRetryMessage(sessionId: string, stall: StallInfo): str
   // to PRESENT the draft for approval, the stall nudge must NOT forbid text — a
   // user-facing reply IS the correct move. Steer to present-and-ask instead of
   // "call a tool, no text" (which is what sent the model hunting for tools and
-  // thrashing on the scorpion email batch, 2026-06-17).
+  // thrashing on the acme email batch, 2026-06-17).
   try {
     const recent = listEvents(sessionId, { types: ['tool_returned'], limit: 3, desc: true });
     for (const ev of recent) {
@@ -2508,8 +2508,8 @@ async function runConversationCore(
       // INSIDE the presented draft ("checking", "I'll") and flag compliance as
       // a stall — the harness then re-issues the same directive, gets the same
       // correct reply, and after MAX_STALL_RETRIES replaces the answer with the
-      // "unable to make progress" banner (sess-mrchgvkc: the Lloyd Baker draft
-      // was produced and discarded three times). A short generic ack ("OK.")
+      // "unable to make progress" banner. In the draft-present regression, the
+      // correct reply was produced and discarded three times. A short generic ack ("OK.")
       // is NOT compliance — it still falls through to the stall machinery.
       if (plainTextContractTurn && (turnResult.toolCalls ?? 0) === 0 && typeof turnResult.finalOutput === 'string') {
         const contractReply = turnResult.finalOutput.trim();
@@ -2697,8 +2697,8 @@ async function runConversationCore(
         // produced a coherent answer that just failed the STRICT decision parse
         // (D_decision_json carries the model's own `reply` in userVisibleMessage,
         // with detail.hasReply). Deliver that answer rather than the confusing
-        // "unable to make progress" prompt (the Brooke email-find lost a real
-        // "I didn't find any email from Brooke" answer this way). Only the real
+        // "unable to make progress" prompt (the synthetic Casey email-find lost a real
+        // "I didn't find any email from Casey" answer this way). Only the real
         // reply is delivered — a generic ack / announcement / empty-reply
         // sentinel (hasReply:false) is excluded and still asks the user.
         if (
@@ -2808,7 +2808,7 @@ async function runConversationCore(
       // EMPTY/UNSTRUCTURED-OUTPUT RETRY (2026-06-15): a null decision with zero
       // tools that is NOT a recognized stall is typically a TRANSIENT empty or
       // malformed model response (turn_ended items:1, lastResponseId:null — a
-      // "find email from Brooke" turn came back empty and gave up on turn 1).
+      // synthetic "find email from Casey" turn came back empty and gave up on turn 1).
       // Surfacing "couldn't be structured. Please ask again." as the answer is a
       // dead-end non-answer; re-prompt for a structured decision (and the next
       // concrete action) while we have budget. The toolCalls>0 case is already
@@ -2860,7 +2860,7 @@ async function runConversationCore(
       });
     }
 
-    // ASK-FIRST invariant (2026-07-09, sess-mrds80fu). A completed-tagged turn
+    // ASK-FIRST invariant from the batch-approval regression. A completed-tagged turn
     // whose CLOSING move is a direction/authorization question to the user is a
     // conversational beat — the question IS the deliverable. Downgrade it to
     // awaiting_user_input BEFORE the completion judge can see it: the judge's
@@ -3222,7 +3222,7 @@ async function runConversationCore(
         // It gets ONE bounce (with the ask-permitting continuation text below),
         // never two: the second disagreement becomes advisory. Full-advisory
         // would disable the completion net for every single-provider install;
-        // two hard self-bounces is what drove sess-mrds80fu into unapproved
+        // two hard self-bounces is what drove the ask-first regression into unapproved
         // sends. The delivery gate below still applies its deterministic
         // honesty checks either way.
         const selfJudgeAdvisory = !verdict.done && verdict.selfJudge === true && !skillGap
@@ -3997,7 +3997,7 @@ function modelStreamStallMs(): number {
  *  stream events for this long has not started — distinct from a long, ACTIVE
  *  tool turn (which keeps resetting the timer and is governed by the longer
  *  modelStreamStallMs ceiling). Shorter so a wedged/silent stream (the Claude
- *  tool-turn hang, sess-mqg45an3) fails fast and RETRIES instead of pinning the
+ *  tool-turn hang regression) fails fast and RETRIES instead of pinning the
  *  user for the full 5 min. 0 falls back to the stream-stall ceiling. */
 function modelFirstByteStallMs(): number {
   const ceiling = modelStreamStallMs();
@@ -4414,7 +4414,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // the agent only sees it if it explicitly calls session_history —
   // which it often skips. Prepending as a system message guarantees
   // the agent reads the continuation context BEFORE deciding what tool
-  // to call. (Observed 2026-05-24 in sess-mpjbmoez: agent skipped
+  // to call. (Observed in the missing-focus regression: agent skipped
   // session_history, called memory_recall, picked the wrong sheet.)
   // Only on the FIRST turn — subsequent turns already have it in
   // compactedItems via session history replay.
@@ -4641,7 +4641,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     sessionKind: session.sessionRow.kind,
     // The confirm beat only ever evaluates a REAL user message: synthetic
     // continuation nudges (classified against the goal objective above) and
-    // stall-retry boilerplate must not trip it mid-run (review wf_2ed83f94 #8).
+    // stall-retry boilerplate must not trip it mid-run (turn-control review).
     suppressConfirmBeat: options.input === CONTINUATION_INPUT || Boolean(syntheticRetryOriginalInput),
     sourceUserSeq,
     memory: {
@@ -6155,9 +6155,8 @@ const TRANSIENT_FALLOVER_KINDS = new Set<string>([
 
 // ── Unattended infra self-heal ────────────────────────────────────────────────
 // A workflow step or background task runs with NO human present, so an infra
-// "retry/switch/stop" ask strands it forever (Nathan's morning-prospect-prep died
-// at enrich_missing_seo_once "waiting for user input, which a background workflow
-// cannot provide", 2026-07-08). In an unattended run we AUTO-RETRY the same failed
+// "retry/switch/stop" ask can strand it forever. In an unattended run we
+// AUTO-RETRY the same failed
 // call a bounded number of times, then FAIL honestly — never awaiting_user_input,
 // never fake success. Interactive chat/Discord/console keep the ask verbatim.
 // Kill-switch CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask everywhere.
@@ -6499,7 +6498,7 @@ function handleRunError(
   // (v0.5.21.1) and ToolGuardrailEscalated (2026-06-01). A bare instanceof
   // misses it and the raw string got dumped at the user with "Didn't
   // finish" instead of a clean Stopped (observed live 2026-06-12,
-  // sess-mqbgayx6). Match the wrapped form too.
+  // stale-event regression). Match the wrapped form too.
   const wrappedKill =
     !(err instanceof KillRequested)
     && err instanceof Error
@@ -6601,7 +6600,7 @@ function handleRunError(
   }
 
   // v0.5.20 Bug I — route ToolTimeout through the same F4 ask-user
-  // pattern as BoundaryError infra-kinds. Observed sess-mpktnbps:
+  // pattern as BoundaryError infra-kinds. Observed in the stream-timeout regression:
   // run_worker (parent's sub-agent fan-out for parallel LinkedIn
   // lookups) hit 60s default timeout because the worker did
   // firecrawl_search + scrape — easily >60s. Without this branch,
@@ -6614,7 +6613,7 @@ function handleRunError(
   // re-throws our ToolTimeout inside a UserError with the message:
   //   "Failed to run function tools: ToolTimeout: tool X timed out after Yms"
   // The instanceof check fails on that wrapping. Verified 2026-05-25
-  // sess-mplmvrqu: draft_plan timed out → run_failed instead of the
+  // Plan-timeout regression: draft_plan timed out → run_failed instead of the
   // Retry card. Match by message pattern as a second-class catch.
   const wrappedToolTimeoutMatch = (!(err instanceof ToolTimeout) && err instanceof Error)
     ? err.message.match(/ToolTimeout: tool (\S+) timed out after (\d+)ms/)
@@ -7032,7 +7031,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // turns alive). The window is TWO-tiered: until the model produces content,
   // a SHORTER pre-content window applies (modelFirstByteStallMs) and a stall
   // there is RETRYABLE — a wedged/silent stream (the Claude tool-turn hang,
-  // sess-mqg45an3) re-runs cleanly because zero events means zero tool side
+  // tool-turn hang regression) re-runs cleanly because zero events means zero tool side
   // effects, so the user self-heals in seconds instead of hanging 5 min. Once
   // content has flowed, the longer modelStreamStallMs ceiling governs and a
   // stall is a hard failure (no replay — content was already emitted).
@@ -7240,7 +7239,7 @@ function extractApprovalSubject(info: InterruptionInfo): string {
   // run_batch: the plan carries everything a human needs — side effect, item
   // count, target tool, objective. The generic branch used to render the
   // literal "run_batch: propose", which is how a user got a naked Approve
-  // button for 10 outbound emails (2026-07-09, sess-mrds80fu).
+  // button for 10 outbound emails in the ask-first batch regression.
   if (info.toolName === 'run_batch') {
     const plan = (args.plan ?? null) as { sideEffect?: string; items?: unknown[]; composioSlug?: string; tool?: string; objective?: string } | null;
     if (plan && typeof plan === 'object') {

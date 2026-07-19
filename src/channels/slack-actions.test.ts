@@ -71,7 +71,7 @@ test('buildSlackActionsForNotification: Outlook workflow uses human labels and o
     tool: 'composio_execute_tool',
     args: {
       tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-      arguments: JSON.stringify({ to_email: 'nathan@example.com', subject: 'Daily Standup', body: 'Meetings today' }),
+      arguments: JSON.stringify({ to_email: 'alex@corp.example', subject: 'Daily Standup', body: 'Meetings today' }),
     },
   });
   const blocks = buildSlackActionsForNotification({ approvalId: row.approvalId, workflowName: 'daily-standup-email' });
@@ -83,7 +83,7 @@ test('buildSlackActionsForNotification: Outlook workflow uses human labels and o
   assert.ok(ids.includes(`clementine:workflow-pause:${row.approvalId}`));
   const message = formatSlackNotificationMessage('Approval pending', row.subject, { approvalId: row.approvalId });
   assert.match(message, /Send an Outlook email/);
-  assert.match(message, /nathan@example\.com/);
+  assert.match(message, /alex@corp\.example/);
   assert.match(message, /Daily Standup/);
   assert.match(message, /scheduled workflow/);
 });

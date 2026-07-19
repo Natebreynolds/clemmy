@@ -58,7 +58,7 @@ test('judgeStepSkillExecution: NOT executed when the judge finds a skipped deliv
 test('judgeStepSkillExecution: prompt tells the judge the skill was INJECTED + to judge only deliverables (H1 false-positive guard)', async () => {
   let objective = '';
   await judgeStepSkillExecution({
-    step: step({ usesSkill: 'scorpion-outbound' }),
+    step: step({ usesSkill: 'acme-outbound' }),
     sessionId: 's1',
     output: 'drafted 3 outreach emails in the right brand voice',
     judgeFn: async (obj: string): Promise<ObjectiveJudgeVerdict> => { objective = obj; return { done: true, reason: 'ok' }; },

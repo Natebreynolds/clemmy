@@ -24,7 +24,11 @@ export type ClementineNotchPreferencesPatch = Partial<ClementineNotchPreferences
 
 export const DEFAULT_CLEMENTINE_NOTCH_PREFERENCES: Readonly<ClementineNotchPreferences> = Object.freeze({
   enabled: true,
-  behavior: 'manual',
+  // A true macOS notch lives in the menu-bar region at all times, dormant until
+  // activated (blended into the physical notch), and expands downward when there
+  // is something to show. 'always' keeps that persistent presence; 'working'
+  // reveals only during activity; 'manual' only on the shortcut.
+  behavior: 'always',
   autoHideAfterCompletion: true,
   promptForDetectedMeetings: true,
   shortcut: DEFAULT_CLEMENTINE_LIVE_SHORTCUT,

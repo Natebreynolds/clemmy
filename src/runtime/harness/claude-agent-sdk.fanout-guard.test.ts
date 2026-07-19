@@ -47,7 +47,7 @@ test('SDK read-fanout guard: refinement on ONE entity (8 ways) never denies', as
   const name = 'mcp__dataforseo__serp_organic_live_advanced';
   let last: Result = { behavior: 'allow' };
   for (let i = 1; i <= 8; i += 1)
-    last = (await guard(name, { target: 'one-firm.com', depth: i * 10 }, {} as never)) as Result;
+    last = (await guard(name, { target: 'one-firm.example', depth: i * 10 }, {} as never)) as Result;
   assert.equal(last.behavior, 'allow', 'same-entity refinement is not a batch → never refused');
 });
 

@@ -23,20 +23,20 @@ const { MEMORY_AUTO_SECTION_MARKER, MEMORY_FILE } = await import('../memory/vaul
 
 test('query-driven recall: a request-relevant fact is surfaced UP FRONT for a matching message (never knowledge-starve the brain)', () => {
   resetMemoryDb();
-  rememberFact({ kind: 'project', content: 'The daily-prospect-outreach workflow targets Salesforce Accounts owned by Nathan Reynolds where Market_Leader__c is true and a usable website exists.' });
+  rememberFact({ kind: 'project', content: 'The daily-prospect-outreach workflow targets Salesforce Accounts owned by Alexander Chen where Priority_Account__c is true and a usable website exists.' });
   // The Claude SDK lane passes the user's message → the matching fact is recalled
   // into its own section instead of the model rediscovering the schema via tool thrash.
-  const ctx = renderHarnessMemoryContext({ query: 'pull 10 of my market leader accounts I have not touched in 15 days' });
+  const ctx = renderHarnessMemoryContext({ query: 'pull 10 of my priority account accounts I have not touched in 15 days' });
   assert.match(ctx, /## Relevant To Your Request/);
-  assert.match(ctx, /Market_Leader__c/);
+  assert.match(ctx, /Priority_Account__c/);
 });
 
 test('query-driven recall: kill-switch off ⇒ no per-request recall section', () => {
   resetMemoryDb();
-  rememberFact({ kind: 'project', content: 'Market_Leader__c is the Salesforce field marking market leader accounts.' });
+  rememberFact({ kind: 'project', content: 'Priority_Account__c is the Salesforce field marking priority account accounts.' });
   process.env.CLEMMY_BRAIN_QUERY_RECALL = 'off';
   try {
-    assert.doesNotMatch(renderHarnessMemoryContext({ query: 'market leader accounts' }), /## Relevant To Your Request/);
+    assert.doesNotMatch(renderHarnessMemoryContext({ query: 'priority account accounts' }), /## Relevant To Your Request/);
   } finally {
     delete process.env.CLEMMY_BRAIN_QUERY_RECALL;
   }
@@ -44,7 +44,7 @@ test('query-driven recall: kill-switch off ⇒ no per-request recall section', (
 
 test('query-driven recall: no query ⇒ no per-request recall section (byte-identical to before)', () => {
   resetMemoryDb();
-  rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.' });
+  rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts.' });
   assert.doesNotMatch(renderHarnessMemoryContext({ sessionId: 's' }), /## Relevant To Your Request/);
 });
 
@@ -166,7 +166,7 @@ test('stale focus is not rendered as active persistent context', () => {
   try {
     createFocus({
       resourceRef: 'https://docs.google.com/spreadsheets/d/stale-sheet',
-      title: 'Market leader sheet',
+      title: 'Priority account sheet',
       summary: 'Old sheet work',
       resourceKind: 'sheet',
     });
@@ -175,8 +175,8 @@ test('stale focus is not rendered as active persistent context', () => {
 
     const context = renderHarnessMemoryContext();
     assert.match(context, /No confirmed active focus/);
-    assert.match(context, /STALE focus #\d+: Market leader sheet/);
-    assert.doesNotMatch(context, /ACTIVE focus #\d+: Market leader sheet/);
+    assert.match(context, /STALE focus #\d+: Priority account sheet/);
+    assert.doesNotMatch(context, /ACTIVE focus #\d+: Priority account sheet/);
   } finally {
     delete process.env.CLEMMY_FOCUS_CONFIRM_MS;
   }
@@ -184,8 +184,8 @@ test('stale focus is not rendered as active persistent context', () => {
 
 test('partition: default ("all") is byte-identical to no partition (regression guard for the cache split)', () => {
   resetMemoryDb();
-  rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.' });
-  const q = 'pull my market leader accounts';
+  rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts.' });
+  const q = 'pull my priority account accounts';
   assert.equal(
     renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'all' }),
     renderHarnessMemoryContext({ sessionId: 's', query: q }),
@@ -194,8 +194,8 @@ test('partition: default ("all") is byte-identical to no partition (regression g
 
 test('partition: stable EXCLUDES the volatile tail (Now / query recall / Current Focus); volatile holds ONLY those', () => {
   resetMemoryDb();
-  rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts in Salesforce.' });
-  const q = 'market leader accounts';
+  rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts in Salesforce.' });
+  const q = 'priority account accounts';
 
   const stable = renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'stable' });
   // The big stable memory stays (cacheable); the per-turn-volatile blocks are gone.
@@ -263,10 +263,10 @@ process.on('exit', () => {
 
 test('query-recall lines are bounded: a runaway fact cannot blow the volatile context', () => {
   resetMemoryDb();
-  const runaway = `Salesforce market leader schema notes: ${'z'.repeat(5_000)}`;
+  const runaway = `Salesforce priority account schema notes: ${'z'.repeat(5_000)}`;
   rememberFact({ kind: 'project', content: runaway });
   rememberFact({ kind: 'constraint', content: `Always send from the approved sender. ${'c'.repeat(5_000)}` });
-  const ctx = renderHarnessMemoryContext({ query: 'salesforce market leader schema notes' });
+  const ctx = renderHarnessMemoryContext({ query: 'salesforce priority account schema notes' });
   // Query recall has its own per-line bound. Policy memory is bounded by the
   // Persistent Facts tier budgets and is not duplicated into another section.
   // (The Persistent Facts primer has its own TOTAL bound and allows longer lines.)
@@ -281,7 +281,7 @@ test('query-recall lines are bounded: a runaway fact cannot blow the volatile co
 
 test('recall + constraint lines under the bound are byte-identical (no clipping side effects)', () => {
   resetMemoryDb();
-  const content = 'The daily-prospect-outreach workflow targets Salesforce Accounts owned by Nathan Reynolds.';
+  const content = 'The daily-prospect-outreach workflow targets Salesforce Accounts owned by Alexander Chen.';
   rememberFact({ kind: 'project', content });
   const ctx = renderHarnessMemoryContext({ query: 'daily prospect outreach workflow salesforce' });
   assert.ok(ctx.includes(`- ${content}`), 'short fact renders unmodified');

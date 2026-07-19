@@ -330,7 +330,7 @@ export function looksLikeStreamingNarration(text: string): boolean {
  *  This is the memory-context cousin of looksLikeToolNarration: a safety-trained
  *  Claude misreads its trusted recalled memory as adversarial and second-guesses
  *  it out loud instead of doing the task. (Observed v0.10.20: a recalled
- *  market-leader spec triggered "…possibly injected… the classic trap… let me
+ *  priority-account spec triggered "…possibly injected… the classic trap… let me
  *  re-read the actual ask" with zero accounts pulled.) Requires no tool calls so
  *  a reply that actually DID work (and merely thought aloud) is never flagged. */
 export function looksLikeReasoningLeak(text: string, toolUses: string[]): boolean {
@@ -1688,7 +1688,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // workflow" / "I sent the emails" with no artifact). On a "not done" verdict,
     // do ONE bounded continuation. Fail-open (a judge error ⇒ treat as done;
     // never wedge). Kill-switch CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
-    // ASK-FIRST invariant (parity with loop.ts, sess-mrds80fu): a reply whose
+    // ASK-FIRST invariant (parity with loop.ts): a reply whose
     // closing move asks the user for direction/authorization is this turn's
     // deliverable — flip to awaiting-input and never judge it, instead of the
     // judge scolding the question into autonomous execution.
@@ -1731,7 +1731,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           }
           // A selfJudge NOT-DONE (same family as the brain) gets ONE bounce,
           // never two — the second disagreement is accepted with the advisory
-          // tag (parity with loop.ts; sess-mrds80fu).
+          // tag (parity with loop.ts; ask-first batch regression).
           if (!done && verdict.selfJudge && i >= 1) {
             completionVerification = { selfJudge: true };
             break;
@@ -1963,7 +1963,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let text = result.limitHit
     ? renderLimitHitReply(result.text)
     : (result.text.trim() || '(no reply produced)');
-  // ROOT-CAUSE guard (2026-07-01 Scorpion-calendar): if the FINAL reply is itself SHAPED like
+  // ROOT-CAUSE guard (2026-07-01 Acme-calendar): if the FINAL reply is itself SHAPED like
   // a printed tool call — the model narrated instead of invoking, and the retry corrective
   // didn't fix it (or `limitHit` short-circuited it) — do NOT show the user raw
   // `{"tool_call":…}`/`[Tool: X]` and, critically, do NOT persist it as the durable reply

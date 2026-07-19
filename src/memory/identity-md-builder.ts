@@ -16,8 +16,8 @@
  *   <!-- AUTO-GENERATED · do not edit below this line — overwritten on next refresh -->
  *
  *   ## Working with
- *   - Name: Nate Reynolds (preferred: Nate)
- *   - Role: SVP of Sales
+ *   - Name: Alex Chen (preferred: Alex)
+ *   - Role: Product Lead
  *   - ...
  *
  * Same refresh tick as MEMORY.md (every ~30min). No-op when content
@@ -140,7 +140,7 @@ function formatName(profile: UserProfile): string | undefined {
     return `${realDisplay} (preferred: ${preferred})`;
   }
   // Otherwise show whichever real value we have. Preferred wins so
-  // "Nate" beats a longer formal display name when both are real.
+  // "Alex" beats a longer formal display name when both are real.
   return preferred ?? realDisplay;
 }
 

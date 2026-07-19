@@ -1,6 +1,5 @@
 /**
- * tool_search — the schema-on-demand discovery entry (Phase 0 of
- * SCHEMA-ON-DEMAND-PLAN-2026-07-07.md).
+ * tool_search — the schema-on-demand discovery entry.
  *
  * Given a natural-language query it ranks the compact tool catalog (derived from
  * TOOL_REGISTRY) and returns the top matches as names + one-liners, plus the FULL
@@ -12,9 +11,8 @@
  * Registered on BOTH the MCP server (Claude Agent SDK lane) and the local runtime
  * (Codex/GLM lane), like every other built-in.
  *
- * Phase 0 is additive + dormant: the tool exists and works, but the surface-assembly
- * switch that would let it REPLACE first-class schemas (CLEMMY_CODEX_TOOL_SEARCH) is
- * a later phase — today it is simply an extra read-only tool.
+ * It remains additive while `CLEMMY_CODEX_TOOL_SEARCH` is off. When the switch is
+ * enabled, catalog discovery can replace most first-class schemas.
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';

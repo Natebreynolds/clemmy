@@ -4,7 +4,7 @@
  * Born from the 2026-06-13 wrong-site incident: a "build a NEW law-firm
  * site and host it" task ran `netlify deploy --prod` from a directory
  * that carried an inherited `.netlify` link to an UNRELATED live site
- * (revill-law-firm). The deploy succeeded — and clobbered that site —
+ * (example-law-site). The deploy succeeded — and clobbered that site —
  * because its destination is AMBIENT (read from cwd state), not in the
  * command's args. Every existing gate was structurally blind:
  *
@@ -639,7 +639,7 @@ export function evaluateShellDestination(command: string): DestinationGateResult
  * `isMutatingExternalWrite` only classifies `composio_execute_tool`, so these
  * sends bypass the grounding (payload-integrity) gate that composio/MCP sends
  * get. This recognizes the CLEAR network-mutation shapes so the brackets gate
- * can route them through grounding (the Eley/mailbox incident class via shell).
+ * can route them through grounding (the client-data/mailbox incident class via shell).
  *
  * CONSERVATIVE by construction (the codebase deferred shell classification as
  * "unreliable", execution-gate.ts) — we match only high-signal mutation shapes

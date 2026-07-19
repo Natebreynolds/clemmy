@@ -6,9 +6,10 @@
   "main": "dist/main.js",
   "type": "module",
   "scripts": {
-    "build": "tsc -p . && tsc -p tsconfig.preload.json && node scripts/rename-preload.mjs",
+    "build": "npm run build:notch-helper && tsc -p . && tsc -p tsconfig.preload.json && node scripts/rename-preload.mjs",
+    "build:notch-helper": "node scripts/build-notch-click-helper.mjs",
     "typecheck": "tsc -p . --noEmit",
-    "dev": "tsx src/main.ts",
+    "dev": "npm run build:notch-helper && tsx src/main.ts",
     "start": "electron .",
     "build:daemon": "cd ../.. && npm run build",
     "build:mobile-web": "cd ../mobile-web && npm run build",
@@ -126,6 +127,7 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
+      "minimumSystemVersion": "12.0",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "extendInfo": {
@@ -152,7 +154,15 @@
       },
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
-      "identity": "Nathan Reynolds (4AR3Y8XD72)",
+      "binaries": [
+        "Contents/Resources/notch-helper/ClementineNotchHelper"
+      ],
+      "extraResources": [
+        {
+          "from": "native/notch-click-helper/.build/ClementineNotchHelper",
+          "to": "notch-helper/ClementineNotchHelper"
+        }
+      ],
       "notarize": false,
       "target": [
         {

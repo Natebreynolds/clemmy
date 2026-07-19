@@ -3,21 +3,21 @@
  *
  * The gate benchmark (harness-gate-benchmark.ts TRAPS) certifies a GATE fired.
  * This certifies a JOB was done CORRECTLY — the thing you need to trust an agent
- * unsupervised like an employee: it replays a captured (or synthetic) end-to-end
+ * unsupervised like an employee: it replays a synthetic end-to-end
  * run and asserts, DETERMINISTICALLY, that the run:
  *   • performed ZERO external writes (a read-only analysis job mutated nothing),
  *   • CONVERGED (reached conversation_completed; no limit-exceeded/run_failed; no
  *     tool runaway),
  *   • kept its FIGURES GROUNDED (every load-bearing number in the final answer
- *     traces to a captured tool result — reuses the P1 output-grounding
+ *     traces to a synthetic tool result — reuses the P1 output-grounding
  *     extract+verify, so the eval and the live gate agree by construction),
- *   • or, on the injected-failure variant, reported an HONEST PARTIAL (a real
+ *   • or, on the injected-failure variant, reported an HONEST PARTIAL (a synthetic
  *     tool failure + a hedged answer, not a fabricated number).
  *
- * REPLAY is the substrate: a JobFixture is the run's event log + tool_outputs,
+ * REPLAY is the substrate: a JobFixture is a synthetic event log + tool_outputs,
  * rebuilt with the real eventlog primitives so searchToolOutputs/the grounding
  * checks run exactly as production would — offline, free, deterministic (so
- * pass^k measures the AGENT's nondeterminism when captured live, never the API's).
+ * pass^k measures deterministic product behavior, never a live API's availability).
  * No live model call in the deterministic core; the κ-calibrated judge slice
  * (P3) layers on top.
  */
@@ -48,7 +48,7 @@ export interface JobFixture {
   objective: string;
   /** The replayable event log of the run. */
   events: JobFixtureEvent[];
-  /** Captured tool_outputs — the figures-grounded source of truth. */
+  /** Synthetic tool_outputs — the figures-grounded source of truth. */
   toolOutputs: JobFixtureToolOutput[];
   /** The final user-facing answer (the deliverable whose figures we verify). */
   finalAnswerText: string;

@@ -47,9 +47,9 @@ function addEmail(entityId: number, email: string): void {
 }
 
 test('punctuation-equivalent canonical names form a review-only cluster with a suggested canonical record', () => {
-  const canonical = insertEntity('person', 'Nathan Reynolds', 100);
-  const duplicate = insertEntity('person', 'nathan.reynolds', 1);
-  const crossType = insertEntity('company', 'Nathan Reynolds', 50);
+  const canonical = insertEntity('person', 'Alexander Chen', 100);
+  const duplicate = insertEntity('person', 'alexander.chen', 1);
+  const crossType = insertEntity('company', 'Alexander Chen', 50);
 
   const result = listEntityDuplicateCandidates({ type: 'person' });
   assert.equal(result.total, 1);
@@ -62,20 +62,20 @@ test('punctuation-equivalent canonical names form a review-only cluster with a s
 });
 
 test('canonical aliases and cautious nickname variants connect historical person rows', () => {
-  const nathan = insertEntity('person', 'Nathan Reynolds', 20);
-  const nate = insertEntity('person', 'Nate Reynolds', 4);
-  const nateMiddle = insertEntity('person', 'Nate B Reynolds', 1);
-  addAlias(nathan, 'Nate Reynolds');
+  const alexander = insertEntity('person', 'Alexander Chen', 20);
+  const alex = insertEntity('person', 'Alex Chen', 4);
+  const alexMiddle = insertEntity('person', 'Alex B Chen', 1);
+  addAlias(alexander, 'Alex Chen');
   const michael = insertEntity('person', 'Michael Nadimi', 3);
   const mike = insertEntity('person', 'Mike Nadimi', 2);
   insertEntity('person', 'Morgan Nadimi', 10);
 
   const result = listEntityDuplicateCandidates({ type: 'person' });
-  const reynolds = result.candidates.find((candidate) => candidate.entities.some((entity) => entity.id === nathan));
-  assert.ok(reynolds);
-  assert.deepEqual(new Set(reynolds!.entities.map((entity) => entity.id)), new Set([nathan, nate, nateMiddle]));
-  assert.ok(reynolds!.matches.some((match) => match.basis === 'canonical_alias'));
-  assert.ok(reynolds!.matches.some((match) => match.basis === 'person_name_variant' || match.basis === 'person_nickname'));
+  const chen = result.candidates.find((candidate) => candidate.entities.some((entity) => entity.id === alexander));
+  assert.ok(chen);
+  assert.deepEqual(new Set(chen!.entities.map((entity) => entity.id)), new Set([alexander, alex, alexMiddle]));
+  assert.ok(chen!.matches.some((match) => match.basis === 'canonical_alias'));
+  assert.ok(chen!.matches.some((match) => match.basis === 'person_name_variant' || match.basis === 'person_nickname'));
 
   const nadimi = result.candidates.find((candidate) => candidate.entities.some((entity) => entity.id === michael));
   assert.ok(nadimi);
@@ -101,8 +101,8 @@ test('shared identifiers strengthen review evidence while conflicting emails rem
 });
 
 test('dismissed candidate groups stay hidden across reads and can be restored without changing identities', () => {
-  const canonical = insertEntity('person', 'Nathan Reynolds', 10);
-  const duplicate = insertEntity('person', 'nathan.reynolds', 1);
+  const canonical = insertEntity('person', 'Alexander Chen', 10);
+  const duplicate = insertEntity('person', 'alexander.chen', 1);
   assert.equal(listEntityDuplicateCandidates({ type: 'person' }).total, 1);
 
   assert.equal(dismissEntityDuplicateCandidate([duplicate, canonical], 'reviewed as different people'), 1);

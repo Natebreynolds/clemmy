@@ -1,5 +1,5 @@
 /**
- * Named account aliases — the durable "this is my scorpion email" memory.
+ * Named account aliases — the durable "this is my acme email" memory.
  *
  * A user with multiple connected accounts of one toolkit (5 mailboxes, several
  * Slack workspaces, …) names them conversationally; the binding lives HERE as a
@@ -10,7 +10,7 @@
  * stored only as a hint for accounts whose email is unknowable.
  *
  * Consumed by:
- *  - the gateway's owner resolution: `account_alias:"scorpion"` (meta-arg on
+ *  - the gateway's owner resolution: `account_alias:"acme"` (meta-arg on
  *    composio_execute_tool) → this store → email → live connection
  *  - the ambiguous-ASK renderer: candidates show their names
  * Written by:
@@ -24,7 +24,7 @@ import { BASE_DIR } from '../config.js';
 export interface AccountAlias {
   /** Toolkit slug (lowercase), e.g. 'outlook'. */
   toolkit: string;
-  /** Normalized label, e.g. 'scorpion'. */
+  /** Normalized label, e.g. 'acme'. */
   label: string;
   /** Stable mailbox identity (normalized email) when known — the primary key
    *  for re-attachment across re-auths. */
@@ -116,8 +116,8 @@ export function rememberAccountAlias(input: {
   return record;
 }
 
-/** Look up a name. Exact label first, then a WHOLE-WORD match so "my scorpion
- *  email" resolves the label "scorpion" — but "s" never matches "scorpion" and
+/** Look up a name. Exact label first, then a WHOLE-WORD match so "my acme
+ *  email" resolves the label "acme" — but "s" never matches "acme" and
  *  an unrelated request never binds a substring alias. A multi-word label must
  *  have all its words present. Ambiguous (2+ labels match) → undefined so the
  *  gateway ASKS rather than routing (a send) to an arbitrary account. */
@@ -130,7 +130,7 @@ export function resolveAccountAlias(labelish: string, toolkit?: string): Account
   if (exact) return exact;
   // Whole-word containment ONLY (no bidirectional substring): every token of a
   // saved label must appear as a whole word in the request. Guards against both
-  // the "s"→"scorpion" (request-substring-of-label) and unrelated-substring bugs.
+  // the "s"→"acme" (request-substring-of-label) and unrelated-substring bugs.
   const requestWords = new Set(wanted.split(/[^a-z0-9]+/i).filter(Boolean));
   const matches = pool.filter((a) => {
     const labelWords = a.label.split(/[^a-z0-9]+/i).filter((w) => w.length >= 2);

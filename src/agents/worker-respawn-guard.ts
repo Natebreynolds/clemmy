@@ -3,8 +3,8 @@ import { getRuntimeEnv } from '../config.js';
 
 /**
  * Drift-tolerant key for the respawn guard. The model re-describes a capped item
- * across respawns ("Howard Barker Lane — barkerlanelaw.com" then
- * "...barkerlanelaw.com (Savannah, GA)"), so exact-string matching misses the
+ * across respawns ("Birch Legal — birch-law.example" then
+ * "...birch-law.example (Savannah, GA)"), so exact-string matching misses the
  * loop. Anchor on the bare domain when present (most stable); else strip the
  * first parenthetical and fold separators/case. Pure + deterministic — no fuzzy
  * match. Deliberate trade-off: two distinct items sharing one domain collide

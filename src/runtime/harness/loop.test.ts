@@ -621,7 +621,7 @@ test('normalizeError: a non-Error object never renders as "[object Object]" (the
 test('goalObjectiveString: builds objective + success criteria from the parked plan', () => {
   const goal = {
     plan: {
-      objective: 'Build outbound emails for every market-leader prospect',
+      objective: 'Build outbound emails for every priority-account prospect',
       successCriteria: ['One email drafted per usable row', 'Rows without contacts skipped and listed'],
     },
   } as any;
@@ -1078,7 +1078,7 @@ test('kill switch set before the call short-circuits with kill_requested', async
 
   // The honored kill is one-shot: the latch is consumed, so the user's
   // next message on the same session runs normally instead of being
-  // assassinated by the stale row (live 2026-06-12 sess-mqbgayx6: a
+  // assassinated by the stale row (stale-event regression: a
   // post-Stop follow-up died on the leftover kill).
   const { isKillRequested, updateSession } = await import('./eventlog.js');
   assert.equal(isKillRequested(sess.id), false);
@@ -3061,19 +3061,19 @@ test('toOrchestratorDecision: empty / recovery-sentinel output stays null (stall
 
 test('runConversation: synthetic parse retry classifies against the original tool-backed ask', async () => {
   resetEventLog();
-  // The "scorpion" shorthand only scopes Outlook because the user has a
+  // The "acme" shorthand only scopes Outlook because the user has a
   // pinned-calendar constraint naming that label — seed it so this test
   // proves the full data-driven chain (constraint fact → label → tool scope).
   rememberFact({
     kind: 'constraint',
-    content: 'For Scorpion calendar lookups, use Outlook connection ca_LoopTestRoute1 as the Scorpion calendar connection.',
+    content: 'For Acme calendar lookups, use Outlook connection ca_LoopTestRoute1 as the Acme calendar connection.',
   });
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
     { finalOutput: "Clementine produced a response that couldn't be structured. Please ask again." },
     {
       finalOutput: {
-        summary: 'Recovered the Scorpion calendar check.',
+        summary: 'Recovered the Acme calendar check.',
         reply: 'Recovered with Outlook calendar tools available.',
         done: true,
         nextAction: 'completed',
@@ -3085,7 +3085,7 @@ test('runConversation: synthetic parse retry classifies against the original too
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'Check my scorpion for tomorrow',
+    input: 'Check my acme for tomorrow',
     makeRunner: makeRunnerStub,
     runRunner: runner,
   });
@@ -3097,7 +3097,7 @@ test('runConversation: synthetic parse retry classifies against the original too
     inputPreview?: string;
     toolScope?: { allowedServerSlugs?: string[]; reason?: string };
   };
-  assert.match(retryPacket.inputPreview ?? '', /Check my scorpion for tomorrow/i);
+  assert.match(retryPacket.inputPreview ?? '', /Check my acme for tomorrow/i);
   assert.ok(
     (retryPacket.toolScope?.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
     'retry must preserve Outlook calendar reach from the original user ask',
@@ -3311,7 +3311,7 @@ test('runConversation: stuck_detected fires Signal A when zero tools + generic a
 });
 
 test('runConversation: a zero-tool ACKNOWLEDGMENT turn is NOT flagged as a stall', async () => {
-  // Live regression (sess-mpzre9m2, turn 7): the user gave correction feedback;
+  // Success-payload regression: the user gave correction feedback;
   // the model correctly replied "You're right … going forward I'll treat SEO as
   // raw metrics" with done=true, nextAction=completed, 0 tool calls. The stray
   // "I'll" tripped STALL_ANNOUNCEMENT_PATTERN and the harness force-injected
@@ -3450,8 +3450,8 @@ test('runConversation: a real "Added 5 rows" reply does NOT fire any stall signa
   assert.equal(stuckEvents.length, 0);
 });
 
-test('runConversation: "Transferred to Executor" false claim is flagged (regression: sess-mpeu2wmk)', async () => {
-  // Repro from 2026-05-21 sess-mpeu2wmk-4785eded turn 2: after the
+test('runConversation: "Transferred to Executor" false claim is flagged', async () => {
+  // False-executor-claim regression: after the
   // stall_retry_attempted hook re-prompted the Executor for a multi-
   // step Composio + Salesforce chain, the model emitted:
   //   "Transferred to Executor to run the actual workflow now."
@@ -3480,8 +3480,8 @@ test('runConversation: "Transferred to Executor" false claim is flagged (regress
   assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
 });
 
-test('runConversation: past-tense FALSE CLAIM with zero tools is flagged (regression: sess-mper69si)', async () => {
-  // Repro from 2026-05-21 sess-mper69si-1a163ec1 turn 2:
+test('runConversation: past-tense FALSE CLAIM with zero tools is flagged', async () => {
+  // Zero-tool false-claim regression:
   // After the retry hook re-prompted the Executor with a clear
   // "act now" directive, the model produced past-tense narrative
   // claiming the work was done without calling a tool:
@@ -3515,7 +3515,7 @@ test('runConversation: past-tense FALSE CLAIM with zero tools is flagged (regres
 });
 
 test('runConversation: stall triggers one auto-retry; retry success completes conversation normally', async () => {
-  // Repro from the 2026-05-20 sess-mpepwb5r-348980f6 trace:
+  // Regression trace shape:
   // Orchestrator did discovery + tool_choice_remember + handoff with
   // structured toolCall, Executor announced "I'll search Outlook..."
   // with zero post-handoff tool calls. Detector caught it, but the
@@ -3539,7 +3539,7 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
     data: {
       to: 'Executor',
       input: {
-        directive: 'Search Nate’s Outlook for emails from Marlow today.',
+        directive: 'Search Alex’s Outlook for emails from Marlow today.',
         toolCall: {
           slug: 'OUTLOOK_LIST_MESSAGES',
           args: '{"user_id":"me","folder":"allfolders","search":"Marlow","top":25}',
@@ -3597,7 +3597,7 @@ test('runConversation: stall triggers one auto-retry; retry success completes co
 });
 
 test('runConversation: existing-work stall retry forces focus and memory before asking user', async () => {
-  // Repro class from sess-mposxsah-8b67f103: the user referenced a
+  // Referenced-output regression: the user referenced a
   // known prior creative project ("gala silet acution animation post"),
   // but the first model response asked for a file/path without trying
   // focus or memory. On the retry, that shape should be treated as a
@@ -3805,7 +3805,7 @@ test('runConversation: structured awaiting_handoff_result tool-runtime stall is 
   const scripted: unknown[] = [
     {
       summary:
-        'Need to run the Market Leader workflow with tools, but this turn only had a handoff summary and no executable tool results.',
+        'Need to run the Priority Account workflow with tools, but this turn only had a handoff summary and no executable tool results.',
       reply:
         'I need the tool runtime to continue this properly: query Salesforce, gather SEO signals, write the markdown report, then request one approval before creating drafts.',
       done: false,
@@ -3829,7 +3829,7 @@ test('runConversation: structured awaiting_handoff_result tool-runtime stall is 
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'run the Market Leader workflow',
+    input: 'run the Priority Account workflow',
     makeRunner: makeRunnerStub,
     runRunner,
   });
@@ -3844,7 +3844,7 @@ test('runConversation: structured awaiting_handoff_result tool-runtime stall is 
 });
 
 test('runConversation: narration-deferral (awaiting_handoff_result + 0 tools, no "unavailable" text) is force-corrected', async () => {
-  // Live repro sess-mqhj058j (2026-06-16): user asked to pull 25 Salesforce
+  // Narration-deferral regression: user asked to pull 25 Salesforce
   // accounts (one `sf data query`). Claude replied "On it. Running the Market
   // Leader pull now — I'll pull 25." with done:false, nextAction:
   // awaiting_handoff_result, and ZERO tool calls — promising imminent action and
@@ -3858,7 +3858,7 @@ test('runConversation: narration-deferral (awaiting_handoff_result + 0 tools, no
   const scripted: unknown[] = [
     {
       summary: 'User confirmed criteria; proceeding to query Salesforce for 25 stale accounts',
-      reply: 'On it. Running the Market Leader pull now — your owned accounts, no activity >15 days. I\'ll pull 25.',
+      reply: 'On it. Running the Priority Account pull now — your owned accounts, no activity >15 days. I\'ll pull 25.',
       done: false,
       nextAction: 'awaiting_handoff_result',
       reason: 'Next step is querying Salesforce via the sf CLI.',
@@ -3895,7 +3895,7 @@ test('runConversation: narration-deferral (awaiting_handoff_result + 0 tools, no
 });
 
 test('runConversation: discover-then-defer (only tool_choice_recall/local_cli_list, no execution) is force-corrected', async () => {
-  // Companion to the narration-deferral repro: turn 4 of sess-mqhj058j did ONLY
+  // Companion to the narration-deferral repro: the later turn did ONLY
   // discovery (tool_choice_recall ×2 + local_cli_list) and then deferred again
   // with awaiting_handoff_result. Discovery-ritual tools are probes, so a
   // probe-only turn that defers is still the deferral anti-pattern and must be
@@ -3905,7 +3905,7 @@ test('runConversation: discover-then-defer (only tool_choice_recall/local_cli_li
   let scriptIndex = 0;
   const scripted: unknown[] = [
     {
-      summary: 'Querying Salesforce via sf CLI for 25 owned market-leader accounts',
+      summary: 'Querying Salesforce via sf CLI for 25 owned priority-account accounts',
       reply: 'Pulling them now.',
       done: false,
       nextAction: 'awaiting_handoff_result',
@@ -4099,7 +4099,7 @@ test('runConversation: structured zero-tool completion claim is retried', async 
 });
 
 test('runConversation: plain self-reported no-tool-access completion is retried', async () => {
-  // Live background repro bg-mrbqprgv (2026-07-08): the model returned a
+  // Missing-tool-access background regression: the model returned a
   // plain-text "this environment has no tool access" answer. The markerless
   // text parser treated it as a completed reply, so the background task banked
   // a hollow done. This must route through the same zero-tool retry path.
@@ -4138,26 +4138,26 @@ test('runConversation: plain self-reported no-tool-access completion is retried'
   assert.equal(retryEvents.length, 1);
 });
 
-// BUG 1 (2026-06-15 Brooke email-find): a done:true completion that REPORTS the
+// Synthetic Casey email-find regression: a done:true completion that REPORTS the
 // result of work done in PRIOR turns must NOT be flagged a zero-tool prose claim.
-test('runConversation: done:true completion reporting PRIOR tool work is NOT a zero-tool stall (Brooke fix)', async () => {
+test('runConversation: done:true completion reporting PRIOR tool work is NOT a zero-tool stall', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
-  // Prior-turn substantive (non-probe) tool work — the real Outlook searches.
+  // Prior-turn substantive (non-probe) tool work — synthetic mailbox searches.
   appendEvent({
     sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
-    data: { tool: 'outlook_email_search', callId: 'c_prior', arguments: '{"query":"Brooke"}' },
+    data: { tool: 'outlook_email_search', callId: 'call-mailbox-fixture', arguments: '{"query":"Casey"}' },
   });
   const runRunner: RunRunnerFn = async (_r, _a, items) => ({
     history: items, lastResponseId: undefined,
     finalOutput: {
-      summary: 'Searched Outlook inbox and mailbox for Brooke this afternoon; no results.',
-      reply: "I searched this afternoon and didn't find any email from Brooke — the only afternoon hit was Stripe at 12:18.",
+      summary: 'Searched the fixture inbox and mailbox for Casey; no results.',
+      reply: "I searched the fixture mailbox and didn't find any email from Casey — the only result was a sample notification at noon.",
       done: true, nextAction: 'completed', reason: null,
     },
   });
   const result = await runConversation({
-    agent: makeAgentStub(), sessionId: sess.id, input: 'find the email from Brooke',
+    agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey',
     makeRunner: makeRunnerStub, runRunner,
   });
   assert.equal(result.status, 'completed');
@@ -4167,7 +4167,7 @@ test('runConversation: done:true completion reporting PRIOR tool work is NOT a z
   // And the model's answer is delivered.
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.ok(completed.length >= 1);
-  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Brooke/);
+  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Casey/);
 });
 
 // BUG 2: a coherent answer that failed the STRICT decision parse is DELIVERED,
@@ -4180,20 +4180,20 @@ test('runConversation: a coherent reply that failed strict parse is salvaged + d
   // Wording deliberately avoids past-tense action verbs so Signal A' (the
   // announcement-stall, checked first) does not pre-empt Signal D.
   const jsonString = JSON.stringify({
-    summary: 'No email from Brooke is present in the inbox for this afternoon.',
-    reply: "There's no email from Brooke this afternoon — the only afternoon item is a Stripe notification.",
+    summary: 'No email from Casey is present in the fixture inbox.',
+    reply: "There's no email from Casey in the fixture mailbox — the only item is a sample notification.",
     done: true, nextAction: 'completed', reason: null,
   });
   const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: jsonString });
   const result = await runConversation({
-    agent: makeAgentStub(), sessionId: sess.id, input: 'find the email from Brooke',
+    agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey',
     makeRunner: makeRunnerStub, runRunner,
   });
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   // NEW CONTRACT: the JSON envelope is parsed directly into the decision and its
   // reply delivered — no 'salvage' detour, no confusing "unable to make progress".
-  assert.match(String(completed[0].data.reply ?? completed[0].data.summary ?? ''), /Brooke/);
+  assert.match(String(completed[0].data.reply ?? completed[0].data.summary ?? ''), /Casey/);
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0);
 });
 
@@ -4213,7 +4213,7 @@ test('runConversation: a GENUINE punt (announcement, zero tools, no answer) is N
   assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'decision_json_salvaged'), 'an announcement punt is never salvaged');
 });
 
-// 2026-07-08 (sess-mrchgvkc, Lloyd Baker draft): the draft-present stall retry
+// Regression: the draft-present stall retry
 // says "Do NOT call another tool. Reply to the user NOW with the drafted
 // item(s)". The model complied — full draft, zero tools — but the announcement
 // heuristic matched "checking"/"I'll" INSIDE the email body and flagged the
@@ -4225,8 +4225,8 @@ test('runConversation: a GENUINE punt (announcement, zero tools, no answer) is N
 // still flags it — so these tests exercise the stall machinery, not the
 // parser fast-path. A LONGER draft now parses straight through (tested below).
 const PRESENTED_DRAFT =
-  'To: lloyd@example.com\nSubject: Quick market visibility question\n\n' +
-  'Lloyd, the piece worth checking now is whether your reputation carries into ' +
+  'To: casey@example.com\nSubject: Quick market visibility question\n\n' +
+  'Casey, the piece worth checking now is whether your reputation carries into ' +
   "AI-driven results. I'll include the full report link so you can see where " +
   'you show up across Google.\n\nGood to send?';
 
@@ -4347,23 +4347,23 @@ test('runConversation: a substantive answer repeated identically across stall re
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
 });
 
-// 2026-07-08 (sess-mrcg3mtx, "can i see 1 email example"): the announcement
+// Long-draft regression ("can i see 1 email example"): the announcement
 // heuristic nulled the model's REAL plain-text answer ("Here's one example:
-// To: lloyd@…") because the quoted draft contained "checking"/"I'll" — two
+// To: casey@…") because the quoted draft contained "checking"/"I'll" — two
 // full re-runs, 5 minutes, then the banner. The heuristic must only fire on
 // SHORT text; a substantive reply that happens to contain a future-tense verb
 // parses straight through as the completed reply.
 test('toOrchestratorDecision: a LONG reply containing announcement verbs parses as the completed answer (not nulled)', () => {
   const longDraft =
-    "Here's one example:\n\nTo: lloyd@example.com\nSubject: Lloyd Baker Injury Attorneys and AI search\n\n" +
-    'Lloyd, your firm already has the kind of reputation most firms want. The piece worth checking now is ' +
+    "Here's one example:\n\nTo: casey@example.com\nSubject: Harbor Law Group and AI search\n\n" +
+    'Casey, your firm already has the kind of reputation most firms want. The piece worth checking now is ' +
     "whether that reputation carries into AI-driven results when clients ask full legal questions. I'll " +
     'include the full report link so you can see where you show up across Google, local search, and the ' +
     'new AI answers surface.\n\nGood to send?';
   assert.ok(longDraft.length > 300, 'fixture must exceed the announcement bound');
   const d = toOrchestratorDecision(longDraft);
   assert.ok(d && d.done === true && d.nextAction === 'completed', 'a substantive reply is never a zero-work punt');
-  assert.match(d!.reply ?? '', /lloyd@example\.com/);
+  assert.match(d!.reply ?? '', /casey@example\.com/);
   // A SHORT future-tense punt is still nulled to the stall path.
   assert.equal(toOrchestratorDecision("I'll run the Outlook search now."), null);
 });
@@ -4371,7 +4371,7 @@ test('toOrchestratorDecision: a LONG reply containing announcement verbs parses 
 test('toOrchestratorDecision: a hallucinated tool transcript AFTER a lead-in sentence is still a PUNT', () => {
   const fake =
     'Let me find the correct file path.\n\n**Tool Call: run_shell_command**\nStatus: Completed\n\nTerminal:\n' +
-    '```\nfind /Users/n/.clementine-next -iname "*market-leader*"\n```';
+    '```\nfind /Users/n/.clementine-next -iname "*priority-account*"\n```';
   assert.equal(toOrchestratorDecision(fake), null, 'a lead-in sentence must not launder a fake transcript into a reply');
   assert.equal(
     toOrchestratorDecision('Calling `workflow_step_result` now with the required payload.'),
@@ -4436,7 +4436,7 @@ test('runConversation: a SHORT announcement repeated across retries is still a s
   }
 });
 
-// 2026-06-15 (scorpion-mailbox Brooke): an EMPTY/unstructured turn (items:1,
+// Synthetic Casey mailbox regression: an EMPTY/unstructured turn (items:1,
 // lastResponseId:null, zero tools) dropped straight to "couldn't be structured.
 // Please ask again." with no retry. It must be re-prompted instead.
 test('runConversation: an EMPTY zero-tool turn is RETRIED, then recovers (not dropped as "couldn\'t be structured")', async () => {
@@ -4447,19 +4447,19 @@ test('runConversation: an EMPTY zero-tool turn is RETRIED, then recovers (not dr
   let i = 0;
   const scripted: unknown[] = [
     EMPTY_SENTINEL, // turn 1: empty model response
-    { summary: 'Located the message.', reply: 'Found it — the email from Brooke arrived at 9:14am.', done: true, nextAction: 'completed', reason: null },
+    { summary: 'Located the fixture message.', reply: 'Found it — the email from Casey arrived at 10:00am.', done: true, nextAction: 'completed', reason: null },
   ];
   const runRunner: RunRunnerFn = async (_r, _a, items) => {
     const output = scripted[i] ?? scripted[scripted.length - 1];
     i += 1;
     return { history: items, lastResponseId: undefined, finalOutput: output };
   };
-  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find the email from Brooke', makeRunner: makeRunnerStub, runRunner });
+  const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'find the fixture email from Casey', makeRunner: makeRunnerStub, runRunner });
   assert.equal(result.status, 'completed');
   const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
   assert.ok(retries.some((e) => (e.data as { emptyOutput?: boolean }).emptyOutput === true), 'the empty turn was retried');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Brooke/);
+  assert.match(String((completed.at(-1)!.data as { summary?: string }).summary ?? ''), /Casey/);
   assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'no_structured_output'), 'did not give up with "couldn\'t be structured"');
 });
 
@@ -4761,7 +4761,7 @@ test('orphaned tool: the sweep driver fires ONE report turn per completed orphan
   assert.equal(sweepOrphanedToolReports({ now: () => Date.now(), recentSessionIds: () => [sess], drain: (id) => drainOrphanedToolCompletions(id), fire: () => { throw new Error('should not fire'); } }).fired, 0);
 });
 
-// ─── Ask-first contract (2026-07-09 sess-mrds80fu regression fixtures) ────────
+// ─── Ask-first contract regression fixtures ─────────────────────────────────
 // Live incident: the completion judge bounced a permission question ("want me
 // to send the 55?"), the scold-continuation pushed the agent from asking into
 // doing, and YOLO waved the send through. These pin the three loop-side fixes.
@@ -4772,7 +4772,7 @@ test('ask-first invariant: a completed-tagged direction question yields awaiting
   const runner = scriptedRunner([
     { finalOutput: {
       summary: 'Resumed the email thread and asked how to proceed',
-      reply: 'Yes — we’re on the 60 market-leader reactivation emails.\n\nDo you want me to pick up by sending the 55 send-ready emails now, or review the drafts first?',
+      reply: 'Yes — we’re on the 60 priority-account reactivation emails.\n\nDo you want me to pick up by sending the 55 send-ready emails now, or review the drafts first?',
       done: true, nextAction: 'completed', reason: null } },
   ]);
   let judgeInvoked = false;
@@ -4796,7 +4796,7 @@ test('ask-first invariant: a completed-tagged direction question yields awaiting
 test('selfJudge NOT-DONE gets exactly ONE bounce; the second disagreement is advisory', async () => {
   // Refined after adversarial review: full-advisory would disable the
   // completion net for every single-provider install, while TWO hard
-  // self-bounces is what drove sess-mrds80fu into unapproved sends. The
+  // self-bounces is what drove the regression into unapproved sends. The
   // contract is one bounce (with the ask-permitting text), then advisory.
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

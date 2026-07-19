@@ -39,7 +39,7 @@ function seed() {
   const junkA = rememberFact({ kind: 'project', content: 'Clementine requirement: Workflow: zz-smoke-hard Step: facts Item: Tokyo write one true fact' });
   const junkB = rememberFact({ kind: 'feedback', content: 'Standing product feedback: Workflow: zz-smoke-target-judge Step: write_haiku' });
   const junkC = rememberFact({ kind: 'project', content: 'native-compaction-proof run produced a long string' });
-  const real1 = rememberFact({ kind: 'user', content: 'Nathan prefers concise, strategic answers over band-aids.' });
+  const real1 = rememberFact({ kind: 'user', content: 'Alexander prefers concise, strategic answers over band-aids.' });
   const real2 = rememberFact({ kind: 'project', content: 'The console redesign lives on feat/console-web-redesign behind CLEMENTINE_CONSOLE_NEXT.' });
   // A legitimate fact that merely mentions "smoke test" as an English phrase —
   // must NOT be pruned (we exclude broad terms by design).
@@ -51,7 +51,7 @@ test('matchSyntheticJunk: matches test signatures, ignores real knowledge', () =
   assert.equal(matchSyntheticJunk('Workflow: zz-smoke-hard Step: facts'), 'zz-smoke');
   assert.equal(matchSyntheticJunk('native-compaction-proof'), 'native-compaction-proof');
   assert.equal(matchSyntheticJunk('Always run the smoke test before release'), null);
-  assert.equal(matchSyntheticJunk('Nathan prefers concise answers'), null);
+  assert.equal(matchSyntheticJunk('Alexander prefers concise answers'), null);
   assert.equal(matchSyntheticJunk(null), null);
   assert.equal(matchSyntheticJunk(''), null);
 });

@@ -3,7 +3,7 @@
  *
  * The existing grounding gate (grounding-gate.ts) verifies a write's payload
  * against the session's source artifacts for the write's TARGET (recipient
- * identity, city, name) — born from the Eley Houston→Denver mutation. It does
+ * identity, city, name) — born from the client-data Houston→Denver mutation. It does
  * NOT check the FIGURES in a deliverable. A report that says "ad spend was
  * $24.5K and traffic rose 18%" sails through every gate today, because gates
  * fire on the SAFETY of an action (right recipient, approved batch), not on the

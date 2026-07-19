@@ -27,7 +27,7 @@ test('extractApprovalContentPreview: works on a flat (non-composio) post + an im
 });
 
 test('extractApprovalContentPreview: an email body (no image) still previews', () => {
-  const p = extractApprovalContentPreview('outlook_send_email', { to: 'x@y.com', subject: 'Hi', body: 'Longer email body here.' });
+  const p = extractApprovalContentPreview('outlook_send_email', { to: 'x@personal.example', subject: 'Hi', body: 'Longer email body here.' });
   assert.equal(p!.body, 'Longer email body here.');
   assert.equal(p!.imageUrl, undefined);
 });
@@ -68,7 +68,7 @@ test('presentApproval explains an Outlook send with recipient, subject, preview,
     args: {
       tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
       arguments: JSON.stringify({
-        to_email: 'nathan@example.com',
+        to_email: 'alex@corp.example',
         subject: 'Daily Standup — July 15, 2026',
         body: 'Meetings today\n- 8:00 AM — Kickoff\n\nTop follow-ups\n- Confirm agenda',
       }),
@@ -80,7 +80,7 @@ test('presentApproval explains an Outlook send with recipient, subject, preview,
   });
 
   assert.equal(presentation.title, 'Send an Outlook email');
-  assert.match(presentation.detail, /nathan@example\.com/);
+  assert.match(presentation.detail, /alex@corp\.example/);
   assert.match(presentation.detail, /Daily Standup/);
   assert.match(presentation.detail, /Meetings today/);
   assert.match(presentation.detail, /scheduled workflow \*\*Daily Standup Email\*\*/);
@@ -98,7 +98,7 @@ test('presentApproval handles alternate Outlook recipient shapes and strips HTML
     args: {
       tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
       arguments: {
-        to_recipients: [{ name: 'Nathan', email: 'nathan@example.com' }],
+        to_recipients: [{ name: 'Alexander', email: 'alex@corp.example' }],
         subject: 'A readable subject',
         is_html: true,
         body: '<p><b>Meetings today</b></p><ul><li>Kickoff</li></ul>',
@@ -106,7 +106,7 @@ test('presentApproval handles alternate Outlook recipient shapes and strips HTML
     },
   });
 
-  assert.match(presentation.detail, /Nathan <nathan@example\.com>/);
+  assert.match(presentation.detail, /Alexander <alex@corp\.example>/);
   assert.match(presentation.detail, /Meetings today/);
   assert.doesNotMatch(presentation.detail, /<p>|<li>/);
   assert.equal(presentation.canPauseWorkflow, false);

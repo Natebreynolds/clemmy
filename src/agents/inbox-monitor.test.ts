@@ -24,7 +24,7 @@ const outlookResp = (msgs: Array<Partial<UnreadMessage> & { id: string }>): unkn
     value: msgs.map((m) => ({
       id: m.id,
       subject: m.subject ?? '(no subject)',
-      from: { emailAddress: { name: m.fromName ?? 'Person', address: m.fromAddress ?? 'person@corp.com' } },
+      from: { emailAddress: { name: m.fromName ?? 'Person', address: m.fromAddress ?? 'person@corp.example' } },
       receivedDateTime: m.receivedAt ?? '2026-06-16T10:00:00Z',
       bodyPreview: m.preview ?? '',
       webLink: m.webLink ?? 'https://outlook/x',
@@ -47,7 +47,7 @@ function makeDeps(over: Partial<InboxMonitorDeps> & {
   let state = over.state ?? { surfacedIds: [] as string[] };
   const deps: InboxMonitorDeps = {
     listConnections: over.listConnections ?? (async () => (over.connections ?? [
-      { slug: 'outlook', connectionId: 'ca_1', status: 'ACTIVE', accountEmail: 'nate@corp.com' },
+      { slug: 'outlook', connectionId: 'ca_1', status: 'ACTIVE', accountEmail: 'alex@corp.example' },
     ]) as any),
     executeTool: over.executeTool ?? (async (slug: string, args: any, conn?: string) => {
       toolCalls.push({ slug, args, conn });
@@ -72,25 +72,25 @@ function makeDeps(over: Partial<InboxMonitorDeps> & {
 
 // ── scoring ─────────────────────────────────────────────────────────────────
 test('scoreMessage: a person asking a question needs you', () => {
-  const s = scoreMessage({ id: '1', subject: 'Quick question', fromName: 'Dana', fromAddress: 'dana@corp.com', receivedAt: '', preview: 'Can you review the deck?' });
+  const s = scoreMessage({ id: '1', subject: 'Quick question', fromName: 'Dana', fromAddress: 'dana@corp.example', receivedAt: '', preview: 'Can you review the deck?' });
   assert.equal(s.needsYou, true);
   assert.ok(s.reasons.includes('asks you something'));
 });
 test('scoreMessage: an urgent message from a person needs you', () => {
-  const s = scoreMessage({ id: '2', subject: 'URGENT: contract', fromName: 'Sam', fromAddress: 'sam@corp.com', receivedAt: '', preview: 'Need this signed by EOD.' });
+  const s = scoreMessage({ id: '2', subject: 'URGENT: contract', fromName: 'Sam', fromAddress: 'sam@corp.example', receivedAt: '', preview: 'Need this signed by EOD.' });
   assert.equal(s.needsYou, true);
   assert.ok(s.reasons.includes('time-sensitive'));
 });
 test('scoreMessage: a bulk/no-reply sender does NOT need you even if it shouts urgent', () => {
-  const s = scoreMessage({ id: '3', subject: 'URGENT: your invoice is ready', fromName: 'Billing', fromAddress: 'no-reply@vendor.com', receivedAt: '', preview: 'Action required?' });
+  const s = scoreMessage({ id: '3', subject: 'URGENT: your invoice is ready', fromName: 'Billing', fromAddress: 'no-reply@vendor.example', receivedAt: '', preview: 'Action required?' });
   assert.equal(s.needsYou, false);
 });
 test('scoreMessage: a person with no ask/urgency does NOT need you', () => {
-  const s = scoreMessage({ id: '4', subject: 'FYI notes', fromName: 'Lee', fromAddress: 'lee@corp.com', receivedAt: '', preview: 'Sharing the notes from today.' });
+  const s = scoreMessage({ id: '4', subject: 'FYI notes', fromName: 'Lee', fromAddress: 'lee@corp.example', receivedAt: '', preview: 'Sharing the notes from today.' });
   assert.equal(s.needsYou, false);
 });
 test('scoreMessage: promo/marketing content is excluded even from a real-looking sender', () => {
-  const s = scoreMessage({ id: '5', subject: 'FREE Premium Tin. Your choice.', fromName: 'Acme', fromAddress: 'orders@acme.com', receivedAt: '', preview: 'Limited time! Can you act now?' });
+  const s = scoreMessage({ id: '5', subject: 'FREE Premium Tin. Your choice.', fromName: 'Acme', fromAddress: 'orders@acme.example', receivedAt: '', preview: 'Limited time! Can you act now?' });
   assert.equal(s.needsYou, false);
 });
 
@@ -98,8 +98,8 @@ test('scoreMessage: promo/marketing content is excluded even from a real-looking
 test('processInboxMonitor: runs and surfaces a needs-you card (read-only) labeled by account', async () => {
   const { deps, notified, toolCalls } = makeDeps({
     resp: outlookResp([
-      { id: 'm1', subject: 'Need your sign-off', fromName: 'Dana', fromAddress: 'dana@corp.com', preview: 'Can you approve the budget today?' },
-      { id: 'm2', subject: 'Newsletter', fromName: 'News', fromAddress: 'no-reply@news.com', preview: 'This week in tech?' },
+      { id: 'm1', subject: 'Need your sign-off', fromName: 'Dana', fromAddress: 'dana@corp.example', preview: 'Can you approve the budget today?' },
+      { id: 'm2', subject: 'Newsletter', fromName: 'News', fromAddress: 'no-reply@news.example', preview: 'This week in tech?' },
     ]),
   });
   const n = await processInboxMonitor(deps);
@@ -107,7 +107,7 @@ test('processInboxMonitor: runs and surfaces a needs-you card (read-only) labele
   const card = notified[0];
   assert.equal(card.metadata.needsAttention, true);
   assert.equal(card.metadata.source, 'inbox-monitor');
-  assert.equal(card.metadata.account, 'nate@corp.com');
+  assert.equal(card.metadata.account, 'alex@corp.example');
   assert.equal(card.metadata.connectionId, 'ca_1');
   assert.equal(card.silent, true, 'dashboard-only');
   assert.match(card.title, /Dana/);
@@ -117,14 +117,14 @@ test('processInboxMonitor: runs and surfaces a needs-you card (read-only) labele
 });
 
 test('processInboxMonitor: no-op when inbox-watch is toggled OFF (config.enabled=false)', async () => {
-  const { deps, notified, toolCalls } = makeDeps({ enabled: false, resp: outlookResp([{ id: 'm1', fromAddress: 'a@corp.com', preview: 'can you help?' }]) });
+  const { deps, notified, toolCalls } = makeDeps({ enabled: false, resp: outlookResp([{ id: 'm1', fromAddress: 'a@corp.example', preview: 'can you help?' }]) });
   assert.equal(await processInboxMonitor(deps), 0);
   assert.equal(notified.length, 0);
   assert.equal(toolCalls.length, 0, 'no mailbox read when disabled');
 });
 
 test('processInboxMonitor: no-op when proactive work is not allowed (quiet hours / master off)', async () => {
-  const { deps, notified } = makeDeps({ proactiveWorkAllowed: () => false, resp: outlookResp([{ id: 'm1', fromAddress: 'a@corp.com', preview: 'can you help?' }]) });
+  const { deps, notified } = makeDeps({ proactiveWorkAllowed: () => false, resp: outlookResp([{ id: 'm1', fromAddress: 'a@corp.example', preview: 'can you help?' }]) });
   assert.equal(await processInboxMonitor(deps), 0);
   assert.equal(notified.length, 0);
 });
@@ -132,7 +132,7 @@ test('processInboxMonitor: no-op when proactive work is not allowed (quiet hours
 test('processInboxMonitor: dedups — an already-surfaced message is not re-surfaced', async () => {
   const { deps, notified } = makeDeps({
     state: { surfacedIds: ['ca_1:m1'] },
-    resp: outlookResp([{ id: 'm1', subject: 'Re: budget', fromAddress: 'dana@corp.com', preview: 'Can you confirm?' }]),
+    resp: outlookResp([{ id: 'm1', subject: 'Re: budget', fromAddress: 'dana@corp.example', preview: 'Can you confirm?' }]),
   });
   assert.equal(await processInboxMonitor(deps), 0);
   assert.equal(notified.length, 0);
@@ -143,14 +143,14 @@ test('processInboxMonitor: a still-unread surfaced message stays in the dedup wi
   // sticky unread message can't age out and re-surface.
   const { deps, saved } = makeDeps({
     state: { surfacedIds: ['ca_1:m1'] },
-    resp: outlookResp([{ id: 'm1', subject: 'Re: budget', fromAddress: 'dana@corp.com', preview: 'Can you confirm?' }]),
+    resp: outlookResp([{ id: 'm1', subject: 'Re: budget', fromAddress: 'dana@corp.example', preview: 'Can you confirm?' }]),
   });
   await processInboxMonitor(deps);
   assert.ok(saved[0].surfacedIds.includes('ca_1:m1'), 'still-unread surfaced id retained');
 });
 
 test('processInboxMonitor: respects the per-scan cap (config.maxPerScan)', async () => {
-  const msgs = Array.from({ length: 5 }, (_, i) => ({ id: `m${i}`, fromAddress: `p${i}@corp.com`, subject: 'Need you', preview: 'Can you review?' }));
+  const msgs = Array.from({ length: 5 }, (_, i) => ({ id: `m${i}`, fromAddress: `p${i}@corp.example`, subject: 'Need you', preview: 'Can you review?' }));
   const { deps, notified } = makeDeps({ maxPerScan: 2, resp: outlookResp(msgs) });
   assert.equal(await processInboxMonitor(deps), 2, 'capped at 2');
   assert.equal(notified.length, 2);
@@ -159,7 +159,7 @@ test('processInboxMonitor: respects the per-scan cap (config.maxPerScan)', async
 test('processInboxMonitor: skips within the cadence window (config.intervalMs)', async () => {
   const { deps, notified } = makeDeps({
     state: { lastScanAt: '2026-06-16T11:58:00Z', surfacedIds: [] }, // 2 min before now(12:00); interval 15m
-    resp: outlookResp([{ id: 'm1', fromAddress: 'a@corp.com', preview: 'can you help?' }]),
+    resp: outlookResp([{ id: 'm1', fromAddress: 'a@corp.example', preview: 'can you help?' }]),
   });
   assert.equal(await processInboxMonitor(deps), 0);
   assert.equal(notified.length, 0);
@@ -167,21 +167,21 @@ test('processInboxMonitor: skips within the cadence window (config.intervalMs)',
 
 test('processInboxMonitor: watches ALL mailboxes status-agnostically, labels each (general, no pin)', async () => {
   const respByConn: Record<string, unknown> = {
-    ca_a: outlookResp([{ id: 'x', fromName: 'Ada', fromAddress: 'ada@a.com', subject: 'Need you', preview: 'Can you reply?' }]),
-    ca_b: outlookResp([{ id: 'y', fromName: 'Bo', fromAddress: 'bo@b.com', subject: 'Urgent', preview: 'Need this by EOD.' }]),
-    ca_c: outlookResp([{ id: 'z', fromName: 'Cy', fromAddress: 'cy@x.com', subject: 'Re: contract', preview: 'Can you sign today?' }]),
+    ca_a: outlookResp([{ id: 'x', fromName: 'Ada', fromAddress: 'ada@alpha.example', subject: 'Need you', preview: 'Can you reply?' }]),
+    ca_b: outlookResp([{ id: 'y', fromName: 'Bo', fromAddress: 'bo@beta.example', subject: 'Urgent', preview: 'Need this by EOD.' }]),
+    ca_c: outlookResp([{ id: 'z', fromName: 'Cy', fromAddress: 'cy@site.example', subject: 'Re: contract', preview: 'Can you sign today?' }]),
   };
   const { deps, notified } = makeDeps({
     connections: [
-      { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE', accountEmail: 'me@a.com' },
-      { slug: 'outlook', connectionId: 'ca_b', status: 'EXPIRED', accountEmail: 'me@b.com' }, // works despite EXPIRED label
-      { slug: 'outlook', connectionId: 'ca_c', status: 'UNKNOWN', accountEmail: 'me@x.com' },
+      { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE', accountEmail: 'me@alpha.example' },
+      { slug: 'outlook', connectionId: 'ca_b', status: 'EXPIRED', accountEmail: 'me@beta.example' }, // works despite EXPIRED label
+      { slug: 'outlook', connectionId: 'ca_c', status: 'UNKNOWN', accountEmail: 'me@site.example' },
     ],
     executeTool: async (_slug: string, _args: any, conn?: string) => respByConn[conn ?? ''] ?? outlookResp([]),
   });
   const n = await processInboxMonitor(deps);
   assert.equal(n, 3, 'every mailbox watched regardless of status label');
-  assert.deepEqual(notified.map((x) => x.metadata.account).sort(), ['me@a.com', 'me@b.com', 'me@x.com']);
+  assert.deepEqual(notified.map((x) => x.metadata.account).sort(), ['me@alpha.example', 'me@beta.example', 'me@site.example']);
 });
 
 test('processInboxMonitor: suppresses hard Composio auth failures by connection id', async () => {
@@ -265,9 +265,9 @@ test('inbox monitor real state loader preserves persisted connection suppression
 test('processInboxMonitor: excludes promo/survey content even from a real-looking sender', async () => {
   const { deps, notified } = makeDeps({
     resp: outlookResp([
-      { id: 'p1', subject: 'FREE Premium Tin. Your choice.', fromName: 'Acme', fromAddress: 'orders@acme.com', preview: 'Limited time! Can you act now?' },
-      { id: 'p2', subject: 'How was our support?', fromName: 'Stripe', fromAddress: 'noreply@stripe.com', preview: 'Rate your experience?' },
-      { id: 'real', subject: 'Re: budget sign-off', fromName: 'Dana', fromAddress: 'dana@corp.com', preview: 'Can you approve by EOD?' },
+      { id: 'p1', subject: 'FREE Premium Tin. Your choice.', fromName: 'Acme', fromAddress: 'orders@acme.example', preview: 'Limited time! Can you act now?' },
+      { id: 'p2', subject: 'How was our support?', fromName: 'Stripe', fromAddress: 'no-reply@payments.example', preview: 'Rate your experience?' },
+      { id: 'real', subject: 'Re: budget sign-off', fromName: 'Dana', fromAddress: 'dana@corp.example', preview: 'Can you approve by EOD?' },
     ]),
   });
   const n = await processInboxMonitor(deps);

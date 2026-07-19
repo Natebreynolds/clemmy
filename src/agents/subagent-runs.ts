@@ -186,8 +186,8 @@ export function readSubagentOutput(parentRunId: string, id: string): string | nu
  * worker's real output on resume instead of re-executing.
  *
  * Matches by `packetKey` FIRST (the same identity the guard matched) so two
- * DISTINCT packets that share an item label — e.g. "research acme.com" then
- * "draft outreach for acme.com" — never cross-contaminate (adversarial review
+ * DISTINCT packets that share an item label — e.g. "research acme.example" then
+ * "draft outreach for acme.example" — never cross-contaminate (adversarial review
  * Defect 1). Falls back to the item-string match ONLY for legacy records that
  * predate the packetKey field. Returns ONLY a real persisted work-product (the
  * `outputRef` file) — never the 600-char preview — so a missing/blank output

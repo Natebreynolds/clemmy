@@ -2,7 +2,7 @@
  * Per-session tool hot-set — a small capped LRU of the built-in tools a session
  * has actually reached for (via tool_search hits, and later call_tool dispatch).
  *
- * Phase 0 of SCHEMA-ON-DEMAND-PLAN-2026-07-07.md. It feeds resolveHotSet()
+ * Static schema-on-demand hot set. It feeds resolveHotSet()
  * (tool-catalog.ts): a tool the model searched for THIS turn is promoted to a
  * first-class schema NEXT turn, so repeated use of a discovered tool stops paying
  * the search round-trip. Dormant until the Codex schema-on-demand lane is enabled;

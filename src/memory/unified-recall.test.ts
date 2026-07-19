@@ -351,11 +351,11 @@ test('unified recall promotes the exact recorded meeting for the two observed fa
 type: meeting-transcript
 source: local whisper (base.en)
 recording_id: recording-in-person-review
-title: Scorpion Partnership Revenue and Legal Data Integration Review
+title: Acme Partnership Revenue and Legal Data Integration Review
 started_at: 2026-07-14T20:24:09.442Z
 ended_at: 2026-07-14T21:10:00.000Z
 ---`;
-  const summary = '## Summary\nInternal Scorpion team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.';
+  const summary = '## Summary\nInternal Acme team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.';
   insert.run(meetingPath, 0, metadata, null, mtime, Buffer.byteLength(metadata), 'meeting-metadata');
   insert.run(meetingPath, 1, summary, 'Summary', mtime, Buffer.byteLength(summary), 'meeting-summary');
 
@@ -371,7 +371,7 @@ ended_at: 2026-07-14T21:10:00.000Z
     const hit = result.hits[0];
     assert.equal(hit?.ref.type, 'note');
     assert.equal(hit?.ref.id, meetingPath);
-    assert.equal(hit?.title, 'Scorpion Partnership Revenue and Legal Data Integration Review');
+    assert.equal(hit?.title, 'Acme Partnership Revenue and Legal Data Integration Review');
     assert.ok(hit?.whyRecalled.includes('exact temporal match'));
     assert.ok(hit?.whyRecalled.includes('recorded meeting source'));
     if (query.includes('inperson')) assert.ok(hit?.whyRecalled.includes('in-person capture match'));

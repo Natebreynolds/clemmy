@@ -1,7 +1,7 @@
 /**
  * Grounding gate — integrity verification at the external-write boundary.
  *
- * Born from the 2026-06-11 Eley incident: the extraction worker produced a
+ * Born from a client-data integrity incident: the extraction worker produced a
  * CORRECT email ("workers compensation lawyer Denver"), the orchestrator
  * re-wrote 17 drafts in its own (compacted) context and swapped in
  * "Houston" from a different record, and the send worker faithfully sent
@@ -96,8 +96,8 @@ export function extractTargetKeys(rawArgs: unknown): string[] {
  * Identity keys for the DUPLICATE check — strictly who/what receives the
  * write: full email addresses, record/contact ids, phone numbers. NOT the
  * org domain and NOT display names: two different people at the same firm
- * are two legitimate sends (live false-positive: person1@x.com and
- * person2@x.com both carry target "x.com" → batch self-blocks). The
+ * are two legitimate sends (live false-positive: person1@site.example and
+ * person2@site.example both carry target "site.example" → batch self-blocks). The
  * broader extractTargetKeys (domains, names) is for SOURCE RETRIEVAL only.
  */
 const DUP_ID_KEY_RE = /(^|_)(contact_id|record_id|lead_id|account_id|to_number|phone)$/i;

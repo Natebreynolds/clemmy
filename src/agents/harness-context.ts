@@ -358,7 +358,7 @@ export function renderHarnessMemoryContext(opts?: {
   // surface the consolidated facts MOST RELEVANT to the user's CURRENT message. A
   // brain that runs on this self-assembled context (the Claude Agent SDK lane) only
   // got the GENERAL top-N "Persistent Facts" block, so it was blind to request-
-  // specific knowledge — e.g. "market leader = Account.Market_Leader__c is true" —
+  // specific knowledge — e.g. "priority account = Account.Priority_Account__c is true" —
   // and rediscovered it via tool thrash (2026-06-29). Recall it up front so the brain
   // KNOWS instead of relearning. Caller passes the user's message; kill-switch
   // CLEMMY_BRAIN_QUERY_RECALL. Empty query / flag off ⇒ '' (byte-identical).

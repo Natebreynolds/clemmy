@@ -35,7 +35,7 @@ function queueSendAction() {
     summary: 'one outbound email',
     kind: 'external_send',
     toolName: 'composio_execute_tool',
-    payload: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'a@firm.com', subject: 's', body: 'b' }) },
+    payload: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'a@firm.example', subject: 's', body: 'b' }) },
     sessionId: 'sess-grant',
     createdBy: 'test',
   });
@@ -89,7 +89,7 @@ test('EXHIBIT C replay: a certified (human-approved) batch item passes the execu
     const send = (certified: boolean) =>
       withHarnessRunContext(
         { sessionId: sess.id, counter: new ToolCallsCounter(50), ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
-        () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'x@y.com', subject: 's', body: 'b' }) }),
+        () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'x@personal.example', subject: 's', body: 'b' }) }),
       );
     // Ungranted ad-hoc send with no active execution → the gate still guards.
     const blocked = String(await send(false));
@@ -159,7 +159,7 @@ test('the send floor gates irreversible sends on EVERY session kind, not just ch
       const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', execute: async () => 'sent' });
       const send = (n: number) => withHarnessRunContext(
         { sessionId: sess.id, counter: new ToolCallsCounter(50) },
-        () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: `p${n}@x.com`, subject: 's', body: 'b' }) }),
+        () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: `p${n}@site.example`, subject: 's', body: 'b' }) }),
       );
       assert.ok(String(await send(1)).startsWith('sent'), `${kind} send #1 under threshold flows`);
       assert.ok(String(await send(2)).startsWith('sent'), `${kind} send #2 flows`);
@@ -189,7 +189,7 @@ test('Hole 4 (TOCTOU): concurrent fan-out of irreversible sends is counted as a 
     const results = await Promise.all(Array.from({ length: 6 }, (_, i) =>
       withHarnessRunContext(
         { sessionId: sess.id, counter: new ToolCallsCounter(50) },
-        () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: `p${i}@x.com`, subject: 's', body: 'b' }) }),
+        () => wrapped.execute!({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: `p${i}@site.example`, subject: 's', body: 'b' }) }),
       ).then((r) => String(r)).catch((e) => `blocked:${e instanceof Error ? e.message : e}`),
     ));
     const sent = results.filter((r) => r.startsWith('sent')).length;
@@ -256,10 +256,10 @@ test('re-hunt Lanes 2/3: a native comm-object send (create_event) is NOT auto-ap
   // The taxonomy verb list called create_event 'write' → kindHint 'other',
   // which used to short-circuit the send lock. Now the authoritative classifier
   // wins: YOLO must ask, and a wildcard '*' scope must NOT launder it.
-  const yolo = evaluateAutoApprove({ sessionId: undefined, toolName: 'claude_ai_Google_Calendar__create_event', args: { attendees: ['a@x.com'] }, scope: 'yolo', insideWorkspace: false, kindHint: 'other' });
+  const yolo = evaluateAutoApprove({ sessionId: undefined, toolName: 'claude_ai_Google_Calendar__create_event', args: { attendees: ['a@site.example'] }, scope: 'yolo', insideWorkspace: false, kindHint: 'other' });
   assert.equal(yolo.autoApproved, false, 'YOLO must not wave a calendar-invite send');
   openPlanScope({ sessionId: 'sess-wild', planProposalId: 'p', approvedPlanObjective: 'do work', allowedTools: ['*'] });
-  assert.equal(isAutoApprovedByScope('sess-wild', 'claude_ai_Google_Calendar__create_event', { attendees: ['a@x.com'] }, 'other'), false, 'a wildcard scope must not auto-approve an invite send');
+  assert.equal(isAutoApprovedByScope('sess-wild', 'claude_ai_Google_Calendar__create_event', { attendees: ['a@site.example'] }, 'other'), false, 'a wildcard scope must not auto-approve an invite send');
   // A genuinely reversible native write still flows under the wildcard scope.
   assert.equal(isAutoApprovedByScope('sess-wild', 'create_file', { path: 'x' }, 'other'), true, 'reversible work still flows under a wildcard scope');
   closePlanScope('sess-wild', 'test');

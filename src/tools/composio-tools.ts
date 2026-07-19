@@ -359,7 +359,7 @@ function intentSeedFromSlug(toolSlug?: string): string | undefined {
  *  composioFailureCorrective ALWAYS emits a first line
  *  '⚠️ <label> FAILED|NOT CONNECTED|NOT FOUND (slug=…): …' and result clipping
  *  never removes the head, so the first line is authoritative. ONE owner for
- *  the header format (fold-3 review wf_8e927519-d43: evidenceLooksFailedOrBlocked
+ *  the header format (check-first regression review: evidenceLooksFailedOrBlocked
  *  targets memo prose and let every real composio failure through the pin filter). */
 export function renderedComposioResultLooksFailed(resultStr: string | undefined): boolean {
   if (!resultStr) return false;
@@ -437,7 +437,7 @@ function composioFailureCorrective(
     // Pagination/offset error — almost always because the PREVIOUS list result
     // was clipped for size (full payload is stored) and the model then GUESSED
     // an offset to "get the rest". The fix is to RECALL, not paginate (the
-    // scorpion 44→4 / 'itr2' bug).
+    // acme 44→4 / 'itr2' bug).
     return [
       `⚠️ ${label} FAILED${where}: ${summary}`,
       `An offset/page token must be the EXACT opaque value returned in a prior response's \`offset\` field — never a guessed one. Most likely your previous list call returned everything but its result was CLIPPED for size: the FULL payload is stored.`,
@@ -1107,7 +1107,7 @@ function composioMultiAccountAskMessage(
     `⚠️ NEEDS-YOUR-CHOICE (${toolkit}): ${lead}\n\n`
     + `Connected ${toolkit} accounts:\n${mailboxes}\n\n`
     + `Nothing was dispatched. Ask the user which account to use, then re-call this tool with \`connected_account_id\` set to the chosen connection id. `
-    + `If the user NAMES the account (e.g. "that's my scorpion email"), ALSO pass \`account_alias\` (e.g. "scorpion") with the pinned re-call — the name is then remembered permanently, and future calls can use \`account_alias\` alone instead of asking again. Do NOT guess — acting on the wrong account is exactly the mistake this guard prevents.`
+    + `If the user NAMES the account (e.g. "that's my acme email"), ALSO pass \`account_alias\` (e.g. "acme") with the pinned re-call — the name is then remembered permanently, and future calls can use \`account_alias\` alone instead of asking again. Do NOT guess — acting on the wrong account is exactly the mistake this guard prevents.`
   );
 }
 

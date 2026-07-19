@@ -23,7 +23,7 @@
  *   4. On terminal state we update canonicalStatus on the record so
  *      the dashboard can show ready / timed_out / failed.
  *
- * Ported from breakthrough-coaching-zoombot-app/worker/index.ts's
+ * Ported from legacy-meeting-bot/worker/index.ts's
  * recall-transcript-done job (which does the same dance via BullMQ +
  * webhooks). Clementine has no public webhook URL, so we poll instead.
  */

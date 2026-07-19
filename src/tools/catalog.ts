@@ -3,7 +3,7 @@ import { deriveCatalogNames } from './tool-registry.js';
 /**
  * The CLI / workflow-architect allowlist of built-in tool names.
  *
- * DERIVED from the single tool registry (TOOL-REGISTRY-PLAN-2026-07-07.md, step 2):
+ * Derived from the single tool registry:
  * the hand-maintained array was deleted; membership now comes from
  * `deriveCatalogNames()` (every registry tool whose lanes include 'cli'). This is
  * the ONE place the CLI surface is declared — add a tool once in tool-registry.ts.

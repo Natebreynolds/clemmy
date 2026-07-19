@@ -107,18 +107,18 @@ test('entity detail flags source-backed one-off requests instead of presenting t
     kind: 'user_turn', sessionId: 'entity-quality-session', callId: 'entity-quality-call',
     occurredAt: '2026-07-11T00:00:00.000Z', content: 'Quick task: analyze one client and email me the result.',
   });
-  const nathan = upsertEntity({ type: 'person', name: 'Nathan Reynolds', evidenceEpisodeId: episode.id });
+  const person = upsertEntity({ type: 'person', name: 'Alexander Chen', evidenceEpisodeId: episode.id });
   const request = rememberFact({
     kind: 'user', content: 'Quick task: analyze one client and email me the result.',
     sessionId: 'entity-quality-session',
   });
   linkFactEvidence({ factId: request.id, episodeId: episode.id, excerpt: 'Quick task: analyze one client and email me the result.' });
-  addFactEntityLinks(request.id, [nathan], {
+  addFactEntityLinks(request.id, [person], {
     linkType: 'extracted', evidenceEpisodeId: episode.id,
     evidenceExcerpt: 'Quick task: analyze one client and email me the result.',
   });
 
-  const detail = getEntityMemoryDetail(nathan);
+  const detail = getEntityMemoryDetail(person);
   assert.equal(detail.claims[0]?.quality, 'needs_review');
   assert.match(detail.claims[0]?.reviewReason ?? '', /one-time command/i);
   assert.equal(detail.stats.groundedClaims, 1, 'the stored association remains truthfully visible');

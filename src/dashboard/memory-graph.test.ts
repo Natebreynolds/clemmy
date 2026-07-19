@@ -116,9 +116,9 @@ test('WS2: entity↔entity edges render as labeled "related" edges between entit
 });
 
 test('stored graph projects canonical identities and preserves redirected history off-canvas', () => {
-  const canonical = upsertEntity({ type: 'person', name: 'Nathan Reynolds' });
-  const duplicate = upsertEntity({ type: 'person', name: 'Nate' });
-  const fact = rememberFact({ kind: 'user', content: 'Nate leads the client review.' });
+  const canonical = upsertEntity({ type: 'person', name: 'Alexander Chen' });
+  const duplicate = upsertEntity({ type: 'person', name: 'Alex' });
+  const fact = rememberFact({ kind: 'user', content: 'Alex leads the client review.' });
   setFactEntityLinks(fact.id, [duplicate]);
   mergeEntities({ sourceEntityId: duplicate, canonicalEntityId: canonical, reason: 'reviewed test duplicate' });
 
@@ -369,7 +369,7 @@ test('stored neighborhood can load a fact omitted from the overview sample', () 
 
 test('WS1: non-fact stores (tool-recall, focus) appear as first-class nodes', () => {
   rememberToolChoice({ intent: 'pull stale salesforce accounts', choice: { kind: 'cli', identifier: 'sf', testedAt: new Date().toISOString() } });
-  createFocus({ resourceRef: 'deal-board', title: 'D’Amore renewal', summary: 'tracking the renewal' });
+  createFocus({ resourceRef: 'deal-board', title: 'Harbor renewal', summary: 'tracking the renewal' });
 
   const db = openMemoryDb();
   const { nodes, meta } = buildMemoryGraph(db);

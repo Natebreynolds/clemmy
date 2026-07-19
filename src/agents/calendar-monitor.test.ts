@@ -28,7 +28,7 @@ const gEv = (o: { id: string; subject?: string; start: string; end: string; isAl
   isCancelled: o.isCancelled ?? false,
   showAs: o.showAs ?? 'busy',
   responseStatus: { response: o.resp ?? 'accepted' },
-  attendees: Array.from({ length: o.att ?? 2 }, (_, i) => ({ emailAddress: { address: `a${i}@x.com` } })),
+  attendees: Array.from({ length: o.att ?? 2 }, (_, i) => ({ emailAddress: { address: `a${i}@site.example` } })),
   webLink: 'https://outlook/e',
 });
 const calResp = (evs: any[]): unknown => ({ data: { value: evs } });
@@ -51,7 +51,7 @@ function makeDeps(over: Partial<CalendarMonitorDeps> & {
   let state = over.state ?? ({ surfacedIds: [] as string[] } as any);
   const deps: CalendarMonitorDeps = {
     listConnections: over.listConnections ?? (async () => (over.connections ?? [
-      { slug: 'outlook', connectionId: 'ca_1', status: 'ACTIVE', accountEmail: 'nate@corp.com' },
+      { slug: 'outlook', connectionId: 'ca_1', status: 'ACTIVE', accountEmail: 'alex@corp.example' },
     ]) as any),
     executeTool: over.executeTool ?? (async (slug: string, args: any, conn?: string) => {
       toolCalls.push({ slug, args, conn });
@@ -125,7 +125,7 @@ test('processCalendarMonitor: surfaces a needs-you card (read-only) labeled by c
   const card = notified[0];
   assert.equal(card.metadata.needsAttention, true);
   assert.equal(card.metadata.source, 'calendar-monitor');
-  assert.equal(card.metadata.account, 'nate@corp.com');
+  assert.equal(card.metadata.account, 'alex@corp.example');
   assert.equal(card.silent, true);
   assert.match(card.title, /Client review/);
   assert.equal(toolCalls[0].slug, 'OUTLOOK_GET_CALENDAR_VIEW');
@@ -157,14 +157,14 @@ test('processCalendarMonitor: watches ALL calendars status-agnostically, labels 
   };
   const { deps, notified } = makeDeps({
     connections: [
-      { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE', accountEmail: 'me@a.com' },
-      { slug: 'outlook', connectionId: 'ca_b', status: 'EXPIRED', accountEmail: 'me@b.com' }, // works despite label
+      { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE', accountEmail: 'me@alpha.example' },
+      { slug: 'outlook', connectionId: 'ca_b', status: 'EXPIRED', accountEmail: 'me@beta.example' }, // works despite label
     ],
     executeTool: async (_slug: string, _args: any, conn?: string) => respByConn[conn ?? ''] ?? calResp([]),
   });
   const n = await processCalendarMonitor(deps);
   assert.equal(n, 2, 'each calendar surfaced regardless of status label');
-  assert.deepEqual(notified.map((x) => x.metadata.account).sort(), ['me@a.com', 'me@b.com']);
+  assert.deepEqual(notified.map((x) => x.metadata.account).sort(), ['me@alpha.example', 'me@beta.example']);
 });
 
 test('processCalendarMonitor: suppresses hard Composio auth failures by connection id', async () => {

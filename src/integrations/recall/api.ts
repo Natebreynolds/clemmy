@@ -3,10 +3,8 @@
  * authoritative async transcript after a Desktop SDK recording finishes
  * streaming.
  *
- * Ported from breakthrough-coaching-zoombot-app/lib/recall/index.ts
- * (Nathan's production zoombot). Battle-tested function shapes are kept
- * verbatim so behavior matches what the zoombot worker already relies
- * on — only the integration glue is rewritten for Clementine:
+ * Adapted from an existing production meeting integration. The proven function
+ * shapes are retained while the integration glue is rewritten for Clementine:
  *
  *   - reads the API key from the SecretStore (file vault / env) instead
  *     of expecting process.env.RECALL_API_KEY directly;
@@ -167,7 +165,7 @@ export async function getSdkUpload(
  * `media_shortcuts.transcript.data.download_url` is populated.
  *
  * Mirrors the zoombot's `recall-desktop-transcript-done` worker job
- * at breakthrough-coaching-zoombot-app/worker/index.ts:728.
+ * at legacy-meeting-bot/worker/index.ts:728.
  */
 export async function getRecording(
   recordingId: string,

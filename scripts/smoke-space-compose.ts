@@ -9,11 +9,11 @@ import { composeForSpace } from '../src/spaces/compose.js';
 
 const ROW = {
   contactName: 'Dana Reyes',
-  company: 'Aldous Law',
-  email: 'dana@aldouslaw.example',
+  company: 'Sample Law Partners',
+  email: 'dana@sample-law.example',
   uisCampaign: 'Spring Personal-Injury Push',
   metrics: { organicTrafficChange: '+18% MoM', topKeyword: 'birmingham injury lawyer (#3)' },
-  priorWork: 'https://reports.example/aldous-baseline',
+  priorWork: 'https://reports.example/sample-baseline',
 };
 
 async function main() {
@@ -21,7 +21,7 @@ async function main() {
   if (!configured.ok) { console.error(`✗ runtime not configured: ${configured.reason}`); process.exit(1); }
 
   const out = await composeForSpace(
-    'Write a warm, concise (~110 word) outreach email to the contact about their UIS campaign results. Put the subject on the first line prefixed "Subject:", then a blank line, then the body. Reference the prior work link. End with a soft CTA to book 15 minutes. Sign as "Nate".',
+    'Write a warm, concise (~110 word) outreach email to the contact about their UIS campaign results. Put the subject on the first line prefixed "Subject:", then a blank line, then the body. Reference the prior work link. End with a soft CTA to book 15 minutes. Sign as "Alex".',
     ROW,
     1200,
   );
@@ -31,7 +31,7 @@ async function main() {
 
   // Grounding checks: real facts present, and the obviously-fake guardrail (no
   // invented phone/number that wasn't supplied).
-  const hasCompany = /Aldous Law/.test(out.text);
+  const hasCompany = /Sample Law Partners/.test(out.text);
   const hasContact = /Dana/.test(out.text);
   const hasSubject = /^subject:/im.test(out.text);
   const ok = hasCompany && hasContact && hasSubject;

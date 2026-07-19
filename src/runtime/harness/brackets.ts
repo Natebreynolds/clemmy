@@ -409,13 +409,13 @@ export function timeoutForTool(toolName: string): number {
   }
   // v0.5.20 Bug I — run_worker spawns a sub-agent that itself does
   // tool calls (scrapes, SERP queries, file reads). Default 60s
-  // was way too short — observed sess-mpktnbps timeout at 60s on
+  // was way too short — the stream-timeout regression hit 60s on
   // a worker doing firecrawl_search for LinkedIn URL lookup. The
   // worker IS the external-API surface from the parent agent's
   // perspective. 5min externalApi bucket is the right shape.
   //
   // v0.5.21.1 — extended to ALL sub-agent-as-tool wrappings. Verified
-  // 2026-05-25 on sess-mplmvrqu: draft_plan (planner.asTool) timed
+  // In the plan-timeout regression, draft_plan (planner.asTool) timed
   // out at 60s during a chronic Codex-flake window — same root cause
   // as run_worker. Bucket policy: any tool that internally spins
   // up another agent (which itself makes a Codex call) belongs in
@@ -1105,7 +1105,7 @@ function compensateFailedExternalWrite(
   try {
     const resultStr = typeof result === 'string' ? result : '';
     // Composio hard-failure (the 2026-06-12 to/to_email case) — and the
-    // cold-start resolve NOT FOUND (sess-mrds80fu item 1: the slug 404s at the
+    // cold-start resolve NOT FOUND (ask-first batch regression item 1: the slug 404s at the
     // RESOLVE step, before any send, so the pre-recorded external_write must
     // compensate or the batch runner's side-effect-safe retry trips the
     // duplicate-target gate and the recipient is silently skipped).
@@ -1367,7 +1367,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // is wrong advice (workers can't spawn workers), so suppress it. Also
       // suppress for CERTIFIED batch items: run_batch IS the sanctioned
       // serial primitive — nudging its own approved execution toward
-      // run_worker is contradictory noise (fired mid-batch on sess-mrds80fu).
+      // run_worker is contradictory noise (it fired mid-batch in the ask-first regression).
       if (decision.fanoutNudge && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         fanoutNudge = decision.fanoutNudge;
         try {
@@ -1555,7 +1555,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       console.warn('[harness] orphaned-write retry check threw (fail-open)', err instanceof Error ? err.message : err);
     }
     // 2c2. Grounding + duplicate-target gates (integrity at the
-    // irreversible-write boundary — the 2026-06-11 Eley incident class).
+    // irreversible-write boundary — the 2026-06-11 client-data incident class).
     // Runs for IRREVERSIBLE shapes only (SEND/PUBLISH). Both fail open on
     // any evaluation error; both surface as SOFT tool errors the model
     // recovers from. Ordered BEFORE confirm-first so a corrupted or
@@ -1652,7 +1652,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           // session artifacts via an independent fast judge. A CERTIFIED batch
           // item skips it — certification already judged these exact byte-pinned
           // payloads once, and this per-item model call was the dominant slice
-          // of the ~30-45s/email pace on sess-mrds80fu's approved batch (the
+          // of the ~30-45s/email pace on the approved regression batch (the
           // judge-skip optimization covered the fidelity judges but forgot
           // this one).
           if (!skipItemJudge) {
@@ -1920,7 +1920,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // external-write vector (curl -X POST / gh api --method POST / sf data
     // update / sendmail), but isMutatingExternalWrite is composio-only, so
     // these sends never got the grounding (payload-integrity) + duplicate gates
-    // that composio/MCP sends get — the Eley/mailbox incident class, reachable
+    // that composio/MCP sends get — the client-data/mailbox incident class, reachable
     // through shell. Classify only the CLEAR network-mutation shapes
     // (conservative; misses = status quo) and route them through the SAME
     // fail-open gates, reading the target from the command string. The
@@ -2108,7 +2108,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             // writes the 2026-06-02 rationale stands: this approval gate is
             // pure friction under YOLO — skip it, still RECORD the write.
             // But YOLO never extends to an IRREVERSIBLE batch (2026-07-09,
-            // sess-mrds80fu: yolo waved 10 outbound emails through while
+            // Ask-first regression: yolo waved 10 outbound emails through while
             // batchConfirmThreshold sat unread). Irreversible batches at/over
             // the threshold require ONE reviewed approval regardless of scope.
             const yoloStandingApproval = policy.autoApproveScope === 'yolo' && !shape.irreversible;

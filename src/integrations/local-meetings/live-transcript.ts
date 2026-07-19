@@ -1,6 +1,6 @@
 /**
- * Live in-person transcription (2026-07-14, Nathan: "transcripts live in person
- * could use much improvements").
+ * Live in-person transcription, built to improve the quality and timeliness of
+ * local meeting transcripts.
  *
  * A VIEW, not the record: while a local meeting is recording, the daemon
  * incrementally transcribes the GROWING WAV part-file the desktop recorder is
@@ -74,7 +74,7 @@ const inFlightSlicePaths = new Set<string>();
 const LIVE_SLICE_NAME = /^live-slice-[a-zA-Z0-9._-]{1,200}-\d+\.wav$/;
 
 /**
- * Privacy sweep (review wf_612fba66-dd3): a daemon death mid-pass orphans a
+ * Privacy sweep review: a daemon death mid-pass orphans a
  * live-slice temp WAV (up to ~5.8MB of raw meeting audio) that nothing else
  * deletes — silently defeating the transcript-only promise. Called from the
  * sidecar-recovery readdir (5s-throttled) with the entries it already listed.
@@ -266,7 +266,7 @@ export function getLiveTranscriptSnapshot(sessionId: string): LiveTranscriptSnap
 /** The recording ended (stop/ingest/cancel) — the batch pass owns the truth. */
 export function clearLiveTranscript(sessionId: string): void {
   // Abort an in-flight whisper so the batch pass at stop never contends with a
-  // live pass over the same machine (review wf_612fba66-dd3).
+  // live pass over the same machine (meeting privacy review).
   states.get(sessionId)?.controller.abort();
   states.delete(sessionId);
 }

@@ -131,7 +131,7 @@ test('novelty gate: enough breadth but NO discovery ⇒ not novel', () => {
 
 test('distilled skill sanitizer accepts fenced schema-drifted JSON', () => {
   const skill = _testOnly_sanitizeDistilledSkillOutput('```json\n' + JSON.stringify({
-    title: 'Market Leader / Send Contacts!',
+    title: 'Priority Account / Send Contacts!',
     summary: 'Send approved contact batches using the proven mail workflow.',
     prerequisites: 'mcp:composio, secret:GMAIL_API_KEY',
     steps: [
@@ -145,7 +145,7 @@ test('distilled skill sanitizer accepts fenced schema-drifted JSON', () => {
     gotchas: 'Do not send to unapproved contacts.',
   }) + '\n```');
   assert.ok(skill);
-  assert.equal(skill.name, 'market-leader-send-contacts');
+  assert.equal(skill.name, 'priority-account-send-contacts');
   assert.match(skill.description, /approved contact batches/);
   assert.deepEqual(skill.requires, ['mcp:composio', 'secret:GMAIL_API_KEY']);
   assert.match(skill.procedureMarkdown, /approved contact batch/);

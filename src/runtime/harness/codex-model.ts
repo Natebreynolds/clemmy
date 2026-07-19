@@ -231,7 +231,7 @@ export function shouldForceSseTruncation(): boolean {
  * zero output items and surfaced no content to the SDK. That is a backend
  * blip, not an answer — and passing it through as a clean (empty)
  * ModelResponse dead-ends downstream as the "couldn't be structured"
- * sentinel (observed once live: the "find email from Brooke" turn came back
+ * sentinel (observed in the synthetic "find email from Casey" regression: the turn came back
  * empty and gave up on turn 1). An empty completion and a truncated stream
  * are the SAME class ("the model yielded no content"), so we fold the
  * former into the latter's existing retry-or-honest-error path instead of
@@ -469,7 +469,7 @@ export class CodexResponsesModel implements Model {
     // already yielded, we cannot safely retry (would duplicate tokens),
     // so we throw the BoundaryError as before.
     // v0.5.21.1 — bumped 1 → 3 (4 total attempts) with exponential
-    // backoff. Verified 2026-05-25 on sess-mplmvrqu: under the chronic
+    // backoff. In the plan-timeout regression, under the chronic
     // Codex SSE-flake window observed 2026-05-24/25 (7 truncations in
     // 48h), MAX_RETRY=1 surfaced the F4 ask-user card on every flake
     // and forced the user to click Retry manually — even though the
@@ -764,7 +764,7 @@ export class CodexResponsesModel implements Model {
         // enforces headersTimeout (15s) and bodyTimeout (30s) on this
         // request. Default undici timeouts are 5min each, which hung
         // chat indefinitely on a Cloudflare edge stall (2026-05-25
-        // sess-mplfm14j-f0985a98). Detect UND_ERR_HEADERS_TIMEOUT here
+        // transport-silence regression). Detect UND_ERR_HEADERS_TIMEOUT here
         // (the body-timeout case is detected inside the streaming
         // generator below).
         res = await fetch(CODEX_URL, {

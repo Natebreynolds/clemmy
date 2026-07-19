@@ -349,7 +349,7 @@ function DiscordMockup() {
           <span className="ml-2 font-semibold text-white">clementine-bot</span>
         </div>
         <div className="flex-1 overflow-hidden px-4 py-3 space-y-4 text-[13.5px]">
-          <DiscordMsg avatar="N" avatarColor="#5865f2" author="nathan" time="10:42 AM">
+          <DiscordMsg avatar="J" avatarColor="#5865f2" author="jordan" time="10:42 AM">
             <p>any urgent emails this morning?</p>
           </DiscordMsg>
           <DiscordMsg isClementine author="Clementine" time="10:42 AM">
@@ -427,7 +427,7 @@ function ApprovalCard() {
         Approval requested
       </div>
       <div className="mt-1 text-white text-[13px]">
-        Send draft reply to <span className="text-clem-300">product@stripe.com</span>?
+        Send draft reply to <span className="text-clem-300">product@payments.example</span>?
       </div>
       <div className="mt-2 flex gap-2">
         <button className="rounded bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/40 px-3 py-1 text-[12px] font-medium">

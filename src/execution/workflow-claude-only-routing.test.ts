@@ -45,7 +45,7 @@ const { getClaudeBrainModel, MODELS } = await import('../config.js');
 const { codexModelsAvailable } = await import('../runtime/harness/model-role-options.js');
 
 const readStep = { id: 'find_page', prompt: 'Find the official page', sideEffect: 'read' as const };
-const sendStep = { id: 'notify_nate', prompt: 'Notify Nate with the read', sideEffect: 'send' as const };
+const sendStep = { id: 'notify_owner', prompt: 'Notify Alex with the read', sideEffect: 'send' as const };
 
 test('pre-req: this run simulates a Claude-only machine (no Codex token)', () => {
   assert.equal(codexModelsAvailable(), false, 'temp home must have no Codex token to simulate Claude-only');

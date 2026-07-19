@@ -60,7 +60,7 @@ test('mixed advisory + real → only the real kind is kept', () => {
 test('buildJudgeCandidateCases: harvests goal-fidelity + numeric-grounding verdicts (pass + fail)', () => {
   const cases = buildJudgeCandidateCases('sess-j', [
     ev('turn_started', {}),
-    ev('goal_alignment_judged', { toolName: 'composio_execute_tool', fulfills: false, advisory: true, targets: ['acme.com'], reason: 'does not advance the goal' }, '2026-06-27T00:00:01.000Z'),
+    ev('goal_alignment_judged', { toolName: 'composio_execute_tool', fulfills: false, advisory: true, targets: ['acme.example'], reason: 'does not advance the goal' }, '2026-06-27T00:00:01.000Z'),
     ev('output_grounding_judged', { source: 'chat', grounded: true, advisory: true, figures: ['$11K'], reason: 'all figures trace' }, '2026-06-27T00:00:02.000Z'),
     ev('conversation_completed', {}),
   ]);
@@ -68,7 +68,7 @@ test('buildJudgeCandidateCases: harvests goal-fidelity + numeric-grounding verdi
   const gf = cases.find((c) => c.judge === 'goal_fidelity')!;
   assert.equal(gf.verdict, 'fail');
   assert.equal(gf.advisory, true);
-  assert.deepEqual(gf.input.targets, ['acme.com']);
+  assert.deepEqual(gf.input.targets, ['acme.example']);
   assert.equal(gf.capturedAt, '2026-06-27T00:00:01.000Z', 'capturedAt is the event time (deterministic)');
   assert.equal(gf.promoted, false);
   const ng = cases.find((c) => c.judge === 'numeric_grounding')!;

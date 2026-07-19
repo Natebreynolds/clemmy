@@ -8,7 +8,7 @@
  *      and never PERSIST it as the durable reply.
  *   3. SANITIZE prior assistant turns at the transcript READ boundary → the format can never be
  *      replayed as a `YOU:` exemplar the model then mimics (the self-reinforcing loop that turned
- *      a rare slip into a reproducible pattern — 2026-07-01 Scorpion-calendar root cause).
+ *      a rare slip into a reproducible pattern — 2026-07-01 Acme-calendar root cause).
  *
  * Line-anchored where a header could appear mid-prose so normal replies ("the [tool] I
  * recommend", "the arguments we set") never false-flag.

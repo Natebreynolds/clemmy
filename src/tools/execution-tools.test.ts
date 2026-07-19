@@ -101,7 +101,7 @@ test('pickFocusTarget: exact id match wins even if a substring would also match'
 
 test('pickFocusTarget: substring match against title (case-insensitive)', () => {
   const records = [
-    baseExec({ id: 'e1', title: 'LegalLady social media post' }),
+    baseExec({ id: 'e1', title: 'ExampleCo social media post' }),
     baseExec({ id: 'e2', title: 'morning briefing cron' }),
     baseExec({ id: 'e3', title: 'end-of-day cron' }),
   ];
@@ -112,7 +112,7 @@ test('pickFocusTarget: substring match against title (case-insensitive)', () => 
 
 test('pickFocusTarget: substring match against objective when title misses', () => {
   const records = [
-    baseExec({ id: 'a', title: 'unrelated', objective: 'write a Twitter post about LegalLady' }),
+    baseExec({ id: 'a', title: 'unrelated', objective: 'write a Twitter post about ExampleCo' }),
     baseExec({ id: 'b', title: 'unrelated 2', objective: 'morning briefing' }),
   ];
   const result = pickFocusTarget('twitter', records);
@@ -135,7 +135,7 @@ test('pickFocusTarget: nothing matches → none', () => {
 
 test('pickFocusTarget: multiple matches → ambiguous with all candidates returned', () => {
   const records = [
-    baseExec({ id: 'a', title: 'social media post for LegalLady' }),
+    baseExec({ id: 'a', title: 'social media post for ExampleCo' }),
     baseExec({ id: 'b', title: 'social media plan for the next quarter' }),
     baseExec({ id: 'c', title: 'unrelated cron job' }),
   ];
@@ -149,8 +149,8 @@ test('pickFocusTarget: multiple matches → ambiguous with all candidates return
 });
 
 test('pickFocusTarget: matcher is case-insensitive for query vs title', () => {
-  const records = [baseExec({ id: 'x', title: 'LegalLady Marketing' })];
-  for (const q of ['legalLADY', 'LEGALLADY', 'LegalLady', 'legallady']) {
+  const records = [baseExec({ id: 'x', title: 'ExampleCo Marketing' })];
+  for (const q of ['exampleCO', 'EXAMPLECO', 'ExampleCo', 'exampleco']) {
     const r = pickFocusTarget(q, records);
     assert.equal(r.kind, 'match', `query "${q}" should match`);
   }

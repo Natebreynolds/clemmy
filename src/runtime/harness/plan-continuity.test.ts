@@ -228,19 +228,19 @@ test('setWorkflowPendingInputValues accumulates supplied values', () => {
   const p = surfaceWorkflowPendingInputs({
     workflowName: 'multi-wf',
     requiredInputs: ['url', 'topic'],
-    providedInputs: { url: 'https://x.com' },
+    providedInputs: { url: 'https://site.example' },
     sessionId: 'sess-wf-3',
   });
   setWorkflowPendingInputValues(p.id, { topic: 'SEO' });
   const updated = getPlanProposal(p.id);
-  assert.deepEqual(updated!.pendingInputValues, { url: 'https://x.com', topic: 'SEO' });
+  assert.deepEqual(updated!.pendingInputValues, { url: 'https://site.example', topic: 'SEO' });
 });
 
 test('buildWorkflowInputClassifierPrompt includes workflow name, missing inputs, and the message', () => {
-  const prompt = buildWorkflowInputClassifierPrompt('audit-brief', ['url', 'topic'], 'use https://revill.co.uk');
+  const prompt = buildWorkflowInputClassifierPrompt('audit-brief', ['url', 'topic'], 'use https://site.example');
   assert.match(prompt, /audit-brief/);
   assert.match(prompt, /url, topic/);
-  assert.match(prompt, /use https:\/\/revill\.co\.uk/);
+  assert.match(prompt, /use https:\/\/site\.example/);
 });
 
 // ─── plain-text verdict parsers (pure — the schema→marker conversion) ──────
@@ -273,20 +273,20 @@ test('parsePlanContinuityVerdict: no marker → null (caller keeps its fail-safe
 });
 
 test('parseWorkflowInputVerdict: ANSWERS pulls each named value, tolerating a colon in the value', () => {
-  const raw = 'ANSWERS\nurl: https://revill.co.uk\ntopic: SEO';
+  const raw = 'ANSWERS\nurl: https://evergreen-group.example\ntopic: SEO';
   const out = parseWorkflowInputVerdict(raw, ['url', 'topic']);
-  assert.deepEqual(out, { kind: 'answers', values: { url: 'https://revill.co.uk', topic: 'SEO' } });
+  assert.deepEqual(out, { kind: 'answers', values: { url: 'https://evergreen-group.example', topic: 'SEO' } });
 });
 
 test('parseWorkflowInputVerdict: only allowed names are captured; unknown lines ignored', () => {
-  const out = parseWorkflowInputVerdict('ANSWERS\nurl: https://x.com\nnonsense: foo', ['url']);
-  assert.deepEqual(out!.values, { url: 'https://x.com' });
+  const out = parseWorkflowInputVerdict('ANSWERS\nurl: https://site.example\nnonsense: foo', ['url']);
+  assert.deepEqual(out!.values, { url: 'https://site.example' });
 });
 
 test('parseWorkflowInputVerdict: NEW_TOPIC / ABANDON carry no values; no marker → null', () => {
   assert.deepEqual(parseWorkflowInputVerdict('NEW_TOPIC: different ask', ['url']), { kind: 'new_topic', values: {} });
   assert.deepEqual(parseWorkflowInputVerdict('ABANDON: forget it', ['url']), { kind: 'abandon', values: {} });
-  assert.equal(parseWorkflowInputVerdict('https://x.com', ['url']), null);
+  assert.equal(parseWorkflowInputVerdict('https://site.example', ['url']), null);
 });
 
 // ─── classifier prompt builder (pure) ──────────────────────────

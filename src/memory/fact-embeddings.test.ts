@@ -160,7 +160,7 @@ test('findSimilarFacts (semantic) surfaces a paraphrased match with NO shared to
 });
 
 test('findSimilarFacts skips query embedding when the fact pool has no stored vectors yet', async () => {
-  rememberFact({ kind: 'user', content: 'Nathan prefers concise replies in markdown.' });
+  rememberFact({ kind: 'user', content: 'Alexander prefers concise replies in markdown.' });
 
   const similar = await findSimilarFacts('keep replies concise and in markdown', { kind: 'user', topK: 5 });
   assert.ok(similar.length >= 1, 'LIKE fallback returned a candidate');
@@ -171,7 +171,7 @@ test('findSimilarFacts falls back to LIKE when embeddings are disabled', async (
   delete process.env.OPENAI_API_KEY;
   try {
     assert.equal(isEmbeddingsEnabled(), false);
-    rememberFact({ kind: 'user', content: 'Nathan prefers concise replies in markdown.' });
+    rememberFact({ kind: 'user', content: 'Alexander prefers concise replies in markdown.' });
     rememberFact({ kind: 'user', content: 'The deployment runs on a nightly cron.' });
 
     // Shares the "markdown" + "concise" tokens → LIKE ranker finds it.
@@ -327,7 +327,7 @@ test('embedMissingFacts newestFirst embeds the most-recent facts first', async (
 
 test('triggerEmbedAtWrite embeds a just-written fact promptly', async () => {
   _resetEmbedAtWriteForTest();
-  const f = rememberFact({ kind: 'user', content: 'Nathan prefers oat milk in his coffee.' });
+  const f = rememberFact({ kind: 'user', content: 'Alexander prefers oat milk in his coffee.' });
   assert.equal(loadFactEmbeddings([f.id]).size, 0, 'no vector immediately after write');
 
   await triggerEmbedAtWrite();

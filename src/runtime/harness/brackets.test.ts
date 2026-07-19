@@ -577,7 +577,7 @@ test('artifact settlement: local npx failure and authoritative account rejection
       if (attempt === 1) {
         recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
           command, externalMutation: true, exitCode: 1, stdout: '',
-          stderr: 'npm error code EACCES\nnpm error path /Users/nate/.npm/_cacache\nnpm error permission denied',
+          stderr: 'npm error code EACCES\nnpm error path /Users/example/.npm/_cacache\nnpm error permission denied',
         }));
         return 'exit_code: 1\n\nstderr:\nnpm error code EACCES';
       }
@@ -590,9 +590,9 @@ test('artifact settlement: local npx failure and authoritative account rejection
       }
       recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
         command, externalMutation: true, exitCode: 0,
-        stdout: '{"id":"site-provider-123","ssl_url":"https://clementine-harness.netlify.app"}', stderr: '',
+        stdout: '{"id":"site_fixture_provider","ssl_url":"https://fixture-brackets-provider.netlify.app"}', stderr: '',
       }));
-      return 'exit_code: 0\n\nstdout:\n{"id":"site-provider-123","ssl_url":"https://clementine-harness.netlify.app"}';
+      return 'exit_code: 0\n\nstdout:\n{"id":"site_fixture_provider","ssl_url":"https://fixture-brackets-provider.netlify.app"}';
     },
   });
   const invoke = (callId: string) => (wrapped as unknown as {
@@ -618,9 +618,9 @@ test('artifact settlement: local npx failure and authoritative account rejection
         'the later provider-acknowledged rejection does exercise and score the procedure',
       );
 
-      assert.match(String(await invoke('created-after-discovery')), /site-provider-123/);
+      assert.match(String(await invoke('created-after-discovery')), /site_fixture_provider/);
       assert.equal(listRunArtifacts(sess.id)[0]?.status, 'bound');
-      assert.equal(listRunArtifacts(sess.id)[0]?.resourceId, 'site-provider-123');
+      assert.equal(listRunArtifacts(sess.id)[0]?.resourceId, 'site_fixture_provider');
     });
     assert.equal(attempt, 3, 'both proven-no-effect failures permit the corrected strategy');
   } finally {
@@ -1183,7 +1183,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
 
     const sendNo = (n: number) =>
       raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
-        wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
+        wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@site.example` }) }),
       ));
 
     // Writes 1..4 succeed. (The fan-out nudge may be appended from the 3rd
@@ -1217,7 +1217,7 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
 });
 
 test('confirm-first gate: YOLO never extends to an irreversible batch — threshold blocks; a certified batch passes', async () => {
-  // Supersedes the 2026-06-02 contract after sess-mrds80fu (2026-07-09): YOLO
+  // Supersedes the earlier contract after the ask-first batch regression: YOLO
   // waved 10 outbound emails through this gate. New contract: YOLO still skips
   // the gate for irreversible sends UNDER the threshold, but AT the threshold
   // an ad-hoc irreversible send requires a reviewed approval — and a certified
@@ -1242,7 +1242,7 @@ test('confirm-first gate: YOLO never extends to an irreversible batch — thresh
     const sendNo = (n: number, certified = false) =>
       withHarnessRunContext(
         { sessionId: sess.id, counter, ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
-        () => wrapped.execute!({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
+        () => wrapped.execute!({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@site.example` }) }),
       );
     // Under the threshold (5): YOLO standing approval still flows.
     for (let n = 1; n <= 4; n += 1) {
@@ -1287,7 +1287,7 @@ test('confirm-first gate: explicit off escape hatch lets batches pass', async ()
     // 8 same-shape writes, well past the threshold — all pass with flag off.
     for (let n = 1; n <= 8; n += 1) {
       const r = await withHarnessRunContext({ sessionId: sess.id, counter }, () =>
-        wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `p${n}@x.com` }) }),
+        wrapped.execute!({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `p${n}@site.example` }) }),
       );
       assert.ok(String(r).startsWith('sent'), `write #${n} should pass when confirm-first is off`);
     }
@@ -1367,7 +1367,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
   try {
     const counter = new ToolCallsCounter(100);
     const wrapped = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'memory rows' });
-    const args = JSON.stringify({ query: 'market leaders' });
+    const args = JSON.stringify({ query: 'priority accounts' });
     const invoke = (callId: string, scopeId?: string) =>
       withHarnessRunContext(
         { sessionId: sess.id, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
@@ -1422,7 +1422,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
   }
 });
 
-test('grounding gate: an irreversible send contradicting the target\'s own artifacts is soft-blocked; corrected payload passes; duplicate re-send bumps once (Eley incident replay)', async () => {
+test('grounding gate: an irreversible send contradicting the target\'s own artifacts is soft-blocked; corrected payload passes; duplicate re-send bumps once (client-data incident replay)', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
@@ -1440,9 +1440,9 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
   // The extraction worker's CORRECT artifact for this target (Denver).
   writeToolOutput({
     sessionId: sess.id,
-    callId: 'call_extract_eley',
+    callId: 'call_extract_fixture',
     tool: 'run_worker',
-    output: 'Eley Law Firm; verified search term: "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com; subject: Denver comp search gap',
+    output: 'Oakridge Law; verified search term: "workers compensation lawyer Denver"; contact casey@oakridge-law.example; subject: Denver comp search gap',
   });
   grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
     ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact for this target says Denver.' }
@@ -1457,7 +1457,7 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
       raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-          arguments: JSON.stringify({ to_email: 'cliff@eleylawfirm.com', subject, body: `${subject} body` }),
+          arguments: JSON.stringify({ to_email: 'casey@oakridge-law.example', subject, body: `${subject} body` }),
         }),
       ));
     // 1. Corrupted payload (Houston) → soft-blocked with the discrepancy.
@@ -1472,11 +1472,11 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
     //    duplicate bump fires once…
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'system', type: 'external_write',
-      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['cliff@eleylawfirm.com', 'eleylawfirm.com'] },
+      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['casey@oakridge-law.example', 'oakridge-law.example'] },
     });
     await assert.rejects(() => Promise.resolve(send('Denver comp search gap')), (err: Error) => {
       assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/);
-      assert.match(err.message, /cliff@eleylawfirm\.com/);
+      assert.match(err.message, /casey@oakridge-law\.example/);
       return true;
     });
     // …and the retry is STILL refused — a HARD WALL, not a speed bump (no double-send).
@@ -1542,24 +1542,24 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     assert.equal(await shell('netlify deploy --dir "/x/site"'), 'deployed');
     // 5. A non-publish command is untouched.
     assert.equal(await shell('ls -la /x/site'), 'deployed');
-    // 6. PROVENANCE via the API create path (2026-06-15 Fernwood false-positive):
+    // 6. PROVENANCE via the API create path regression:
     //    she self-recovered into `netlify api createSite` (not `sites:create`);
     //    the gate must recognize it and ALLOW the deploy to her own new site.
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
-      data: { tool: 'run_shell_command', callId: 'cs1', arguments: JSON.stringify({ command: 'netlify api createSite --data \'{"name":"fernwood","account_slug":"natebreynolds"}\'' }) },
+      data: { tool: 'run_shell_command', callId: 'cs1', arguments: JSON.stringify({ command: 'netlify api createSite --data \'{"name":"fixture-api-site","account_slug":"example-team"}\'' }) },
     });
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_returned',
-      data: { tool: 'run_shell_command', callId: 'cs1', result: 'exit_code: 0\n\n{"id":"244fc7d2-newsite","name":"fernwood","ssl_url":"https://fernwood.netlify.app"}' },
+      data: { tool: 'run_shell_command', callId: 'cs1', result: 'exit_code: 0\n\n{"id":"site_fixture_api_created","name":"fixture-api-site","ssl_url":"https://fixture-api-site.netlify.app"}' },
     });
-    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site 244fc7d2-newsite --json'), 'deployed');
+    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site site_fixture_api_created --json'), 'deployed');
     // 7. PROVENANCE via current Netlify CLI plain-text output. netlify-cli 24
     //    prints "Project ID:" instead of JSON; that id must confer provenance
     //    for the immediate explicit --site deploy.
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
-      data: { tool: 'run_shell_command', callId: 'cs2', arguments: JSON.stringify({ command: 'npx netlify-cli sites:create --name ai-agent-loop-runloop --account-slug natebreynolds' }) },
+      data: { tool: 'run_shell_command', callId: 'cs2', arguments: JSON.stringify({ command: 'npx netlify-cli sites:create --name fixture-runloop-site --account-slug example-team' }) },
     });
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_returned',
@@ -1572,25 +1572,25 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
           'stdout:',
           '',
           'Project Created',
-          '\x1B[32mAdmin URL: \x1B[39m https://app.netlify.com/projects/ai-agent-loop-runloop',
-          '\x1B[32mURL: \x1B[39m       https://ai-agent-loop-runloop.netlify.app',
-          '\x1B[32mProject ID: \x1B[39m9fce1eaf-84db-4d7c-911e-fb9bd4d92498',
+          '\x1B[32mAdmin URL: \x1B[39m https://app.netlify.com/projects/fixture-runloop-site',
+          '\x1B[32mURL: \x1B[39m       https://fixture-runloop-site.netlify.app',
+          '\x1B[32mProject ID: \x1B[39msite_fixture_runloop',
           '',
-          'Project already linked to "ai-agent-loop-site"',
-          'Admin url: https://app.netlify.com/projects/ai-agent-loop-site',
+          'Project already linked to "fixture-unrelated-site"',
+          'Admin url: https://app.netlify.com/projects/fixture-unrelated-site',
           '',
           'To unlink this project, run: npx netlify unlink',
         ].join('\n'),
       },
     });
-    assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site 9fce1eaf-84db-4d7c-911e-fb9bd4d92498 --json'), 'deployed');
-    await assert.rejects(() => Promise.resolve(shell('npx netlify-cli deploy --dir "/x/site" --prod --site ai-agent-loop-site --json')), /UNVERIFIED_DESTINATION/);
+    assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site site_fixture_runloop --json'), 'deployed');
+    await assert.rejects(() => Promise.resolve(shell('npx netlify-cli deploy --dir "/x/site" --prod --site fixture-unrelated-site --json')), /UNVERIFIED_DESTINATION/);
     // 8. PROVENANCE via the Claude Agent SDK gated-MCP trace shape. That lane
     //    logs `args` + `preview` instead of the legacy `arguments` + `result`;
     //    the destination gate must still see the CLI-created project id.
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
-      data: { tool: 'run_shell_command', callId: 'cs3', args: { command: 'npx netlify-cli sites:create --name sdk-agent-site --account-slug natebreynolds' } },
+      data: { tool: 'run_shell_command', callId: 'cs3', args: { command: 'npx netlify-cli sites:create --name fixture-sdk-site --account-slug example-team' } },
     });
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'tool', type: 'tool_returned',
@@ -1604,12 +1604,12 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
           'stdout:',
           '',
           'Project Created',
-          '\x1B[32mURL: \x1B[39m       https://sdk-agent-site.netlify.app',
-          '\x1B[32mProject ID: \x1B[39msdk-agent-site-id-123',
+          '\x1B[32mURL: \x1B[39m       https://fixture-sdk-site.netlify.app',
+          '\x1B[32mProject ID: \x1B[39msite_fixture_sdk',
         ].join('\n'),
       },
     });
-    assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site sdk-agent-site-id-123 --json'), 'deployed');
+    assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site site_fixture_sdk --json'), 'deployed');
     // A failed create attempt must not prove a target merely because the
     // command carried `--name`.
     appendEvent({
@@ -1648,7 +1648,7 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
   const sess = createSession({ kind: 'chat' });
   writeToolOutput({
     sessionId: sess.id, callId: 'c_extract', tool: 'run_worker',
-    output: 'Eley Law Firm; verified "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com',
+    output: 'Oakridge Law; verified "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
   });
   grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
     ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact says Denver.' }
@@ -1662,7 +1662,7 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
     const post = (city: string) =>
       raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({
-          command: `curl -X POST https://api.example.com/send -d '{"to_email":"cliff@eleylawfirm.com","body":"${city} comp search gap"}'`,
+          command: `curl -X POST https://api.example.com/send -d '{"to_email":"casey@oakridge-law.example","body":"${city} comp search gap"}'`,
         })));
     // Corrupted payload (Houston) → grounding soft-blocks the shell send.
     await assert.rejects(() => Promise.resolve(post('Houston')), (err: Error) => {
@@ -1764,7 +1764,7 @@ test('shell-send compensation: a generic nonzero provider exit remains possible 
   grounding._resetDuplicateStateForTests();
   grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'ok' }));
   const sess = createSession({ kind: 'chat' });
-  const cmd = `curl -X POST https://api.example.com/send -d '{"to_email":"cliff@eleylawfirm.com"}'`;
+  const cmd = `curl -X POST https://api.example.com/send -d '{"to_email":"casey@oakridge-law.example"}'`;
   try {
     const counter = new ToolCallsCounter(100);
     // First invocation exits non-zero after provider execution may have begun.
@@ -1818,12 +1818,12 @@ test('duplicate-target gate: a FAILED dispatch is netted out — the corrected r
       raiseSoftRefusal(withHarnessRunContext({ sessionId: sess.id, counter }, () =>
         wrapped.execute!({
           tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-          arguments: JSON.stringify({ to_email: 'nathan@example.com', subject: 'Gate test', body: 'b' }),
+          arguments: JSON.stringify({ to_email: 'alex@corp.example', subject: 'Gate test', body: 'b' }),
         }),
       ));
     const recordWrite = () => appendEvent({
       sessionId: sess.id, turn: 0, role: 'system', type: 'external_write',
-      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['nathan@example.com', 'example.com'] },
+      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['alex@corp.example', 'example.com'] },
     });
 
     // 1. The dispatch FAILS HARD at composio validation. The external_write
@@ -1973,7 +1973,7 @@ async function runCertifiedSendProbe(opts: { certifiedBatch?: { batchId: string;
     appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send 10 personalized intro emails to the prospect list I approved.' } });
     let invoked = 0;
     const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'OK sent'; } }, {});
-    const args = { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'a@firm.com', subject: 's', body: 'hello there, a personalized note for you' }) };
+    const args = { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'a@firm.example', subject: 's', body: 'hello there, a personalized note for you' }) };
     const counter = new ToolCallsCounter(100);
     await withHarnessRunContext(
       { sessionId: sess, counter, ...(opts.certifiedBatch ? { certifiedBatch: opts.certifiedBatch } : {}) },
@@ -2044,8 +2044,8 @@ async function runJudgeFailSendProbe(opts: {
     if (opts.judge === 'timeout') {
       // Two prior byte-identical sends to DISTINCT targets → a burst is in flight,
       // so a judge OUTAGE fails CLOSED (the exact live scenario).
-      seedSend(SEND, 'a@firm-a.com', sess, 's1');
-      seedSend(SEND, 'b@firm-b.com', sess, 's2');
+      seedSend(SEND, 'a@firm-a.example', sess, 's1');
+      seedSend(SEND, 'b@firm-b.example', sess, 's2');
       _setGoalFidelityJudgeForTests(async () => { throw new Error('judge timed out'); });
     } else {
       // A GENUINE gap verdict with a loaded skill → hard block, NOT a judge failure.
@@ -2056,7 +2056,7 @@ async function runJudgeFailSendProbe(opts: {
     }
     let invoked = 0;
     const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'OK sent'; } }, {});
-    const args = { tool_slug: SEND, arguments: JSON.stringify({ to_email: opts.targetEmail ?? 'c@firm-c.com', subject: 's', body: OPENING }) };
+    const args = { tool_slug: SEND, arguments: JSON.stringify({ to_email: opts.targetEmail ?? 'c@firm-c.example', subject: 's', body: OPENING }) };
     const counter = new ToolCallsCounter(100);
     const result = String(await withHarnessRunContext(
       { sessionId: sess, counter },
@@ -2083,13 +2083,13 @@ test('P0c: a goal-fidelity judge OUTAGE on an irreversible send refuses AND mint
 
 test('P0c: a repeated judge-fail on the SAME payload dedups — no second card', async () => {
   // First mint.
-  await runJudgeFailSendProbe({ judge: 'timeout', targetEmail: 'dedup@firm.com' });
+  await runJudgeFailSendProbe({ judge: 'timeout', targetEmail: 'dedup@firm.example' });
   // Second identical attempt in the same run would loop a batch; assert dedup by
   // driving a fresh probe that reuses the same payload against the same open card.
   const { listPendingActions, findOpenPendingActionByPayload } = await import('./pending-actions.js');
   // The probe resets the event log + pending dir each call, so instead assert the
   // helper directly: an open card for a payload is found and reused, not duplicated.
-  const r = await runJudgeFailSendProbe({ judge: 'timeout', targetEmail: 'dedup2@firm.com' });
+  const r = await runJudgeFailSendProbe({ judge: 'timeout', targetEmail: 'dedup2@firm.example' });
   assert.equal(r.pending.length, 1, 'one card for the run');
   // Re-minting the SAME payload finds the existing open card (dedup guard).
   const again = findOpenPendingActionByPayload(r.pending[0].toolName, r.pending[0].payload);

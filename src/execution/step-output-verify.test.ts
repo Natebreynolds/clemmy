@@ -37,7 +37,7 @@ test('verify.url_present accepts real http(s) URLs, rejects blanks/non-urls', ()
 });
 
 test('verify.url_present resolves dot-notation paths', () => {
-  const ok = verifyStepOutput({ verify: { url_present: ['result.deploy.url'] } }, { result: { deploy: { url: 'https://site.net' } } });
+  const ok = verifyStepOutput({ verify: { url_present: ['result.deploy.url'] } }, { result: { deploy: { url: 'https://site.example' } } });
   assert.ok(ok.ok);
 });
 
@@ -49,7 +49,7 @@ test('verify.path_exists uses the injected existence check', () => {
   assert.match(missing.problems[0], /does not exist/);
 });
 
-test('the revill regression: claims success but returns no real URL → caught', () => {
+test('the missing-artifact regression: claims success but returns no real URL → caught', () => {
   // deploy_to_netlify returned {status:"blocked"} with no url — the exact
   // class P4 exists to catch.
   const r = verifyStepOutput({ verify: { url_present: ['url'] } }, { status: 'blocked' });

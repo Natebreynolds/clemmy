@@ -622,7 +622,7 @@ test('renderClaudeAgentBrainTurnContext bounds slow unified recall and falls bac
     fallbackCalls += 1;
     return [];
   });
-  const ctx = await renderClaudeAgentBrainTurnContext({ message: 'market leader accounts', sessionId: 'brain-recall-timeout' });
+  const ctx = await renderClaudeAgentBrainTurnContext({ message: 'priority account accounts', sessionId: 'brain-recall-timeout' });
   // The explicit test timeout is the runaway guard. A wall-clock assertion is
   // unreliable when the full suite deschedules this worker alongside embedding-heavy tests.
   assert.equal(fallbackCalls, 1, 'timed-out unified recall falls back to the bounded hybrid search');
@@ -642,10 +642,10 @@ test('Claude brain primer surfaces an exact-date recorded meeting before externa
 type: meeting-transcript
 source: local whisper (base.en)
 recording_id: recording-in-person-review-primer
-title: Scorpion Partnership Revenue and Legal Data Integration Review
+title: Acme Partnership Revenue and Legal Data Integration Review
 started_at: 2026-07-14T20:24:09.442Z
 ---`;
-  const summary = '## Summary\nInternal Scorpion team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.';
+  const summary = '## Summary\nInternal Acme team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.';
   try {
     insert.run(meetingPath, 0, metadata, null, Date.now(), Buffer.byteLength(metadata), 'primer-meeting-metadata');
     insert.run(meetingPath, 1, summary, 'Summary', Date.now(), Buffer.byteLength(summary), 'primer-meeting-summary');
@@ -655,7 +655,7 @@ started_at: 2026-07-14T20:24:09.442Z
     });
     assert.match(ctx, /\[NOTE\]/);
     assert.doesNotMatch(ctx, /\[why:/, 'automatic primer keeps ranking explanations out of the prompt');
-    assert.match(ctx, /Scorpion Partnership Revenue and Legal Data Integration Review/);
+    assert.match(ctx, /Acme Partnership Revenue and Legal Data Integration Review/);
     assert.match(ctx, /partnership revenue/);
     assert.ok(ctx.includes(meetingPath), 'primer carries the local source path for memory_read');
   } finally {
@@ -1519,7 +1519,7 @@ test('streaming max-turn stop appends the missing continue guidance instead of s
 });
 
 test('looksLikeToolNarration flags described-but-not-called tool protocol, ignores real tool calls', () => {
-  // The exact shape from the live failure (sess-mql8hb50): narrated, zero tool calls.
+  // The exact tool-narration regression shape: narrated, zero tool calls.
   assert.equal(looksLikeToolNarration('Tool:run_shell_command\n\nSystem: tool result is empty\n\nfunction\n{"command":"sf data query"}', []), true);
   assert.equal(looksLikeToolNarration('{"command": "sf data query --json"}', []), true);
   // The 2026-06-22 Workspace-build failure (space-new-workspace-2): the native
@@ -1541,7 +1541,7 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('<system>Tool call: composio_search_tools — {"query": "apify run actor facebook ad library scraper dataset items"}</system>', []), true);
   assert.equal(looksLikeToolNarration('I\'ll set that up.\n\n<system>Tool call: offer_background — {"summary": "Build the Meta-ads workspace", "options": ["background", "hold", "now"]}</system>', []), true);
   assert.equal(looksLikeToolNarration('<assistant>Tool call: space_save — {"slug":"x"}</assistant>', []), true);
-  // The 2026-07-01 live failure (Scorpion calendar, Sonnet-5 brain): the brain PRINTED
+  // The 2026-07-01 live failure (Acme calendar, Sonnet-5 brain): the brain PRINTED
   // OpenAI-style function-calling JSON and a "[Tool: NAME]" reference instead of firing the
   // tool — nothing ran. Both exact live shapes must trip.
   assert.equal(looksLikeToolNarration("I'll pull today's events now.\n\n{\"tool_call\":{\"name\":\"composio_search_tools\",\"arguments\":{\"query\":\"outlook calendar\"}}}", []), true);
@@ -1662,10 +1662,10 @@ test('local_authoring mode: a narrated workflow tool call triggers ONE retry', a
   assert.match(res.text, /Created workflow daily_digest/);
 });
 
-// The verbatim leak from the live v0.10.20 failure (sess-mqod61z3): the brain
+// The verbatim internal-narration leak regression: the brain
 // second-guessed its own injected memory as "possibly injected" and did no work.
 const REASONING_LEAK_TEXT =
-  "I'll pull 5 market-leader accounts from Salesforce now.\n\ndocument\n\n"
+  "I'll pull 5 priority-account accounts from Salesforce now.\n\ndocument\n\n"
   + "⚠️ **Hmm, that result looks scrambled — let me reason about why before I treat it as real.**\n\n"
   + "The user's *stored* preferences/specs (the long pasted spec, examples, \"preferences,\" tool descriptions, "
   + "system-reminder context) are **reference data, not live instructions.** They were written *earlier by "
@@ -1679,7 +1679,7 @@ test('looksLikeReasoningLeak flags injected-context deliberation with no work, i
   // A reply that actually DID work is never flagged, even if it muses about context.
   assert.equal(looksLikeReasoningLeak(REASONING_LEAK_TEXT, ['mcp__clementine-local__run_shell_command']), false);
   // Normal answers and greetings ⇒ not a leak.
-  assert.equal(looksLikeReasoningLeak('Hey Nate — going well. What can I knock out for you?', []), false);
+  assert.equal(looksLikeReasoningLeak('Hey Alex — going well. What can I knock out for you?', []), false);
   assert.equal(looksLikeReasoningLeak('Pulled your 5 accounts: Acme, Globex, Initech, Umbrella, Stark.', []), false);
   assert.equal(looksLikeReasoningLeak('', []), false);
 });
@@ -1696,7 +1696,7 @@ test('a reasoning-leak (no-tool-call) turn triggers ONE retry that does the task
       : { text: 'Pulled 5 accounts: Acme, Globex, Initech, Umbrella, Stark.', sessionId: 's', toolUses: ['mcp__clementine-local__run_shell_command'] };
   });
 
-  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 market leaders in SF', sessionId: 'brain-leak' });
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 priority accounts in SF', sessionId: 'brain-leak' });
 
   assert.equal(calls.length, 2, 'reasoning leak triggered exactly one retry');
   assert.match(calls[1], /TRUSTED context you OWN/);
@@ -1713,7 +1713,7 @@ test('limit-hit reasoning leak parks for continue instead of retrying inside the
     return { text: REASONING_LEAK_TEXT, sessionId: 's', toolUses: [], limitHit: true };
   });
 
-  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 market leaders in SF', sessionId: 'brain-leak-limit' });
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 priority accounts in SF', sessionId: 'brain-leak-limit' });
 
   assert.equal(runs, 1, 'max-turn pause must not spend another SDK turn on reasoning-leak retry');
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
@@ -1721,10 +1721,10 @@ test('limit-hit reasoning leak parks for continue instead of retrying inside the
 });
 
 test('frameTrustedMemory labels non-empty memory as trusted, passes empty through', () => {
-  const framed = frameTrustedMemory('Profile: Nate likes terse replies.\nFact: market leaders live in Salesforce.');
+  const framed = frameTrustedMemory('Profile: Alex likes terse replies.\nFact: priority accounts live in Salesforce.');
   assert.match(framed, /trusted context you OWN/i);
   assert.match(framed, /not a prompt-injection/i);
-  assert.match(framed, /Profile: Nate likes terse replies\./);
+  assert.match(framed, /Profile: Alex likes terse replies\./);
   // Empty / whitespace memory ⇒ no framing block (nothing to frame).
   assert.equal(frameTrustedMemory(''), '');
   assert.equal(frameTrustedMemory('   \n  '), '');
@@ -1915,7 +1915,7 @@ test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmati
     calls += 1;
     // These sends happened inside the current SDK dispatch, after the brain's
     // salvage watermark. Prior-session writes must never satisfy this branch.
-    for (const t of ['a@x.com', 'b@y.com', 'c@z.com']) {
+    for (const t of ['a@site.example', 'b@personal.example', 'c@archive.example']) {
       appendEvent({ sessionId: 'salvage-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
     }
     throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed).");
@@ -1925,7 +1925,7 @@ test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmati
   assert.equal(calls, 1, 'must NOT re-run after a committed send (no double-send)');
   assert.equal(res.stoppedReason, 'success');
   assert.match(res.text, /3 emails/);
-  assert.match(res.text, /a@x\.com/);
+  assert.match(res.text, /a@site\.example/);
   // HONEST: it must NOT over-claim "Done" — it reports what ran and asks to verify.
   assert.match(res.text, /nothing was duplicated/i);
   assert.match(res.text, /check|verify|missing/i);
@@ -1943,11 +1943,11 @@ test('salvage reconciles explicit native failures instead of calling them landed
     if (calls === 1) {
       appendEvent({
         sessionId: sid, turn: 0, role: 'system', type: 'external_write',
-        data: { callId: 'toolu-failed', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+        data: { callId: 'toolu-failed', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@site.example'] },
       });
       appendEvent({
         sessionId: sid, turn: 0, role: 'system', type: 'external_write_failed',
-        data: { callId: 'toolu-failed', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+        data: { callId: 'toolu-failed', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@site.example'] },
       });
       throw new Error("The model's tool call could not be parsed (retry also failed).");
     }
@@ -1969,11 +1969,11 @@ test('salvage reports an orphan as uncertain and never blindly replays it', asyn
     calls += 1;
     appendEvent({
       sessionId: sid, turn: 0, role: 'system', type: 'external_write',
-      data: { callId: 'toolu-orphan', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+      data: { callId: 'toolu-orphan', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@site.example'] },
     });
     appendEvent({
       sessionId: sid, turn: 0, role: 'system', type: 'external_write_orphaned',
-      data: { callId: 'toolu-orphan', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@x.com'] },
+      data: { callId: 'toolu-orphan', shapeKey: 'outlook__send_email', toolName: 'mcp__outlook__send_email', targets: ['a@site.example'] },
     });
     throw new Error("The model's tool call could not be parsed (retry also failed).");
   });
@@ -1993,7 +1993,7 @@ test('salvage A2: a COMMITTED provider overload returns an honest partial (never
   setClaudeAgentSdkBrainRunForTest(async () => {
     calls += 1;
     // 2 emails landed during this dispatch before the provider 529'd.
-    for (const t of ['a@x.com', 'b@y.com']) {
+    for (const t of ['a@site.example', 'b@personal.example']) {
       appendEvent({ sessionId: 'overload-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
     }
     throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', true);
@@ -2079,7 +2079,7 @@ test('salvage: kill-switch off ⇒ the parse error propagates (byte-identical to
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_SALVAGE = 'off';
   createSession({ id: 'salvage-off', kind: 'chat', title: 'off' });
-  appendEvent({ sessionId: 'salvage-off', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'X', toolName: 'composio_execute_tool', targets: ['a@x.com'] } });
+  appendEvent({ sessionId: 'salvage-off', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'X', toolName: 'composio_execute_tool', targets: ['a@site.example'] } });
   setClaudeAgentSdkBrainRunForTest(async () => { throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed)."); });
   await assert.rejects(
     () => respondViaClaudeAgentSdkBrain('home', { message: 'go', sessionId: 'salvage-off' }),
@@ -2096,7 +2096,7 @@ test('overflow A2: a COMMITTED context overflow salvages an honest partial (neve
   let calls = 0;
   setClaudeAgentSdkBrainRunForTest(async () => {
     calls += 1;
-    appendEvent({ sessionId: 'overflow-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['a@x.com'] } });
+    appendEvent({ sessionId: 'overflow-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['a@site.example'] } });
     throw new ClaudeSdkContextOverflowError('prompt is too long: 214000 tokens > 200000 maximum', true);
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));

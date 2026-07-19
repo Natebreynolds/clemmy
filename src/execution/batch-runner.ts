@@ -423,7 +423,7 @@ function previewOf(value: unknown): string {
 function errorLooksTransient(message: string): boolean {
   // "NOT FOUND (slug=…)" is composio's COLD-START version-resolve race: the
   // resolve step 404s once before any side effect, then the warm registry
-  // serves every later item (sess-mrds80fu: item 1 of 10 died un-retried on
+  // serves every later item (ask-first batch regression: item 1 of 10 died un-retried on
   // exactly this). The resolve failure happens BEFORE the send executes, so
   // one retry is side-effect-safe.
   return /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed|429|rate.?limit|5\d\d|socket hang up|network|NOT FOUND \(slug=/i.test(message);

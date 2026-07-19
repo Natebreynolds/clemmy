@@ -1,13 +1,18 @@
 /**
  * Diagnostic: call the exact DataForSEO endpoint Clementine uses, via the real
- * execution path (executeComposioTool), for a previously-WORKING domain and a
- * previously-FAILING one — to tell quota/global failure from domain-specific.
- * Read-only. Run: CLEMENTINE_HOME=~/.clementine-next npx tsx scripts/diag-dataforseo.ts
+ * execution path (executeComposioTool), for caller-supplied domains. This can
+ * distinguish quota/global failure from domain-specific behavior.
+ * Read-only. Run with positional domains or:
+ * CLEMMY_DATAFORSEO_TARGETS="DOMAIN_A,DOMAIN_B" npx tsx scripts/diag-dataforseo.ts
  */
 import { executeComposioTool } from '../src/integrations/composio/client.js';
+import { readLiveDomains } from './lib/live-domain-input.js';
 
 const SLUG = 'DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE';
-const targets = ['ramoslaw.com', 'coloradolaw.net']; // worked earlier / failed earlier
+const targets = readLiveDomains({
+  envName: 'CLEMMY_DATAFORSEO_TARGETS',
+  usage: 'Usage: npx tsx scripts/diag-dataforseo.ts DOMAIN [DOMAIN ...]',
+});
 
 function summarize(label: string, r: unknown): void {
   const s = typeof r === 'string' ? r : JSON.stringify(r);
@@ -31,7 +36,7 @@ for (const target of targets) {
   };
   try {
     const r = await executeComposioTool(SLUG, args);
-    summarize(`${target} (OK path)`, r);
+    summarize(`${target} (returned)`, r);
   } catch (e) {
     const err = e as Error;
     console.log(`\n=== ${target} (THREW) ===`);

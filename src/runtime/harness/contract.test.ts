@@ -238,7 +238,7 @@ test('regular tool call round-trip: same pairing contract holds', () => {
 
 test('SDK round-trip: handoff produces an input on turn 2 that includes the function_call_result paired with the handoff function_call', async () => {
   // This is the runtime-level reproduction of the production failure
-  // observed 2026-05-19 (workflow run sess-mpcxx4v1-102cdfb2):
+  // observed in the duplicate-contract regression:
   //   Codex /responses returned 400: "No tool output found for
   //   function call call_FcJvAFqYbLnNZlg62XKGdiFt."
   // The wire serialization tests above pass — so the question this
@@ -331,7 +331,7 @@ test('SDK round-trip: handoff produces an input on turn 2 that includes the func
 });
 
 test('SDK round-trip: parallel handoffs (model emits transfer_to_X twice) still produces a fully-paired turn-2 input', async () => {
-  // The production failure (sess-mpcxx4v1-102cdfb2) logged TWO
+  // The duplicate-contract regression logged TWO
   // `handoff (Orchestrator -> Executor)` events. The SDK's
   // executeHandoffCalls handles this by accepting the first and
   // rejecting subsequent ones with a "Multiple handoffs detected"

@@ -478,7 +478,7 @@ process.on('exit', () => {
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-test('decideToolApproval: run_batch never takes the per-tool interrupt — approval lives on the pending action (sess-mrdy6vip double-approval)', () => {
+test('decideToolApproval: run_batch never takes the per-tool interrupt — approval lives on the pending action (double-approval regression)', () => {
   const propose = decideToolApproval({
     toolName: 'run_batch',
     args: { action: 'propose', plan: { tool: 'composio_execute_tool', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', sideEffect: 'send', objective: 'send 10 emails', items: [] } },

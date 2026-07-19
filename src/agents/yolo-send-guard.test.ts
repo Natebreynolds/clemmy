@@ -1,8 +1,8 @@
 /**
  * Run: npx tsx --test src/agents/yolo-send-guard.test.ts
  *
- * 2026-07-09 sess-mrds80fu regression: "Auto-approved by YOLO mode: Send
- * market-leader reactivation emails 1-10" put 10 unapproved emails on the
+ * Ask-first batch regression: "Auto-approved by YOLO mode: Send
+ * priority-account reactivation emails 1-10" put 10 unapproved emails on the
  * wire. YOLO covers reversible work, never irreversible sends or destructive
  * actions; the one concrete approval card owns those pauses.
  */
@@ -38,7 +38,7 @@ function queueSendBatch(items: number, kind: 'external_send' | 'external_write' 
 
 test('queued irreversible send requires a human regardless of batch size', async () => {
   const record = queueSendBatch(10);
-  assert.equal(await guard({ subject: 'Send market-leader reactivation emails 1-10', reason: null, destructive: false, pendingActionId: record.id } as never), true);
+  assert.equal(await guard({ subject: 'Send priority-account reactivation emails 1-10', reason: null, destructive: false, pendingActionId: record.id } as never), true);
   const single = queueSendBatch(1);
   assert.equal(await guard({ subject: 'Send one follow-up', reason: null, destructive: false, pendingActionId: single.id } as never), true);
 });
@@ -49,7 +49,7 @@ test('non-send pending action never blocks YOLO', async () => {
 });
 
 test('text fallback: every explicit irreversible action blocks; reversible drafts and writes do not', async () => {
-  assert.equal(await guard({ subject: 'Send market-leader reactivation emails 1-10', reason: null, destructive: false } as never), true);
+  assert.equal(await guard({ subject: 'Send priority-account reactivation emails 1-10', reason: null, destructive: false } as never), true);
   assert.equal(await guard({ subject: 'Send 25 outreach emails to the prospect list', reason: null, destructive: false } as never), true);
   assert.equal(await guard({ subject: 'Send daily standup email', reason: null, destructive: false } as never), true);
   assert.equal(await guard({ subject: 'Create 30 Outlook email drafts for review', reason: null, destructive: false } as never), false);

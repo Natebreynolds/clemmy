@@ -1,6 +1,6 @@
 /**
  * Workspace creation-time smoke — the Space mirror of the workflow read-only
- * creation test (the v0.5.70 "scorpion" fix). On save, RUN each data source once
+ * creation test (the v0.5.70 "acme" fix). On save, RUN each data source once
  * (read-only, no LLM) to confirm it returns real data, and VERIFY each action's
  * Composio toolkit is actually authed (without firing the action). A Space only
  * stays 'active' if every source ran; a source that ERRORED parks it 'paused'

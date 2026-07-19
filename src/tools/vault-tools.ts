@@ -195,7 +195,7 @@ export function registerVaultTools(server: McpServer): void {
     async ({ description, priority, due_date, project }) => {
       // Tier-2 architectural guard: task_add is one-shot. If the model
       // tried to use it for recurring/scheduled work (the lunar-audit-style
-      // miscall from sess-mpf3h80a where Clementine called task_add for a
+      // task-tool miscall regression where Clementine called task_add for a
       // "daily at 6pm" request), refuse with a message that names the
       // correct tools so the model self-corrects in one retry.
       // Only match unambiguously recurring language. The earlier draft

@@ -681,7 +681,7 @@ const SETUP_JS = `
       '  <h1>How should I talk to you?</h1>',
       '  <div class="step-desc">A little context up-front, so I sound right from message one.</div>',
       '  <div class="field-row">',
-      '    <div class="field"><label>PREFERRED NAME</label><input type="text" data-state="profile.preferredName" value="' + esc(p.preferredName) + '" placeholder="e.g. Nate" /></div>',
+      '    <div class="field"><label>PREFERRED NAME</label><input type="text" data-state="profile.preferredName" value="' + esc(p.preferredName) + '" placeholder="e.g. Alex" /></div>',
       '    <div class="field"><label>ROLE</label><input type="text" data-state="profile.role" value="' + esc(p.role) + '" placeholder="e.g. VP of Sales at an agency" /></div>',
       '  </div>',
       '  <div class="field-row">',

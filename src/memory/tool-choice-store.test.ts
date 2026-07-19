@@ -11,7 +11,7 @@
  *   - per-machine isolation: machine A writes, machine B can't recall
  *
  * Phase A of the intent-based tool dispatch plan
- * (/Users/nathan.reynolds/.claude/plans/intent-based-tool-dispatch.md).
+ * (/Users/example/.claude/plans/intent-based-tool-dispatch.md).
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -59,14 +59,14 @@ const {
 test('accountIdentity: persists a valid email, rejects a ca_ id and non-email; recalls by slug', () => {
   rememberToolChoice({
     intent: 'send weekly update to the team',
-    choice: { kind: 'composio', identifier: 'OUTLOOK_SEND_EMAIL', accountIdentity: 'Nathan@Scorpion.co' },
+    choice: { kind: 'composio', identifier: 'OUTLOOK_SEND_EMAIL', accountIdentity: 'alex@corp.example' },
   });
   // Stored normalized (lowercased).
-  assert.equal(recallComposioAccountIdentity('OUTLOOK_SEND_EMAIL'), 'nathan@scorpion.co');
+  assert.equal(recallComposioAccountIdentity('OUTLOOK_SEND_EMAIL'), 'alex@corp.example');
   // A volatile ca_ id is rejected at write → not learned as an identity.
   rememberToolChoice({
     intent: 'list my drive files',
-    choice: { kind: 'composio', identifier: 'GOOGLEDRIVE_LIST', accountIdentity: 'ca_uDzrJqqniJFk' as unknown as string },
+    choice: { kind: 'composio', identifier: 'GOOGLEDRIVE_LIST', accountIdentity: 'ca_fixture_drive_connection' as unknown as string },
   });
   assert.equal(recallComposioAccountIdentity('GOOGLEDRIVE_LIST'), undefined);
   // A non-email is rejected too.
@@ -80,25 +80,25 @@ test('accountIdentity: persists a valid email, rejects a ca_ id and non-email; r
 test('accountIdentity: re-validating the same slug carries the learned mailbox forward; a new valid email overrides', () => {
   rememberToolChoice({
     intent: 'draft reply to a client',
-    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', accountIdentity: 'first@x.com' },
+    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', accountIdentity: 'first@site.example' },
   });
   // Re-remember same slug WITHOUT an identity → keeps the learned one.
   rememberToolChoice({
     intent: 'draft reply to a client',
     choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', invocationTemplate: '{"a":1}' },
   });
-  assert.equal(recallComposioAccountIdentity('OUTLOOK_CREATE_DRAFT'), 'first@x.com');
+  assert.equal(recallComposioAccountIdentity('OUTLOOK_CREATE_DRAFT'), 'first@site.example');
   // A new valid email wins.
   rememberToolChoice({
     intent: 'draft reply to a client',
-    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', accountIdentity: 'second@y.com' },
+    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', accountIdentity: 'second@personal.example' },
   });
-  assert.equal(recallComposioAccountIdentity('OUTLOOK_CREATE_DRAFT'), 'second@y.com');
+  assert.equal(recallComposioAccountIdentity('OUTLOOK_CREATE_DRAFT'), 'second@personal.example');
 });
 
 test('recallComposioAccountIdentity: disagreeing mailboxes across intents for one slug → undefined (must ASK)', () => {
-  rememberToolChoice({ intent: 'send invoice reminders', choice: { kind: 'composio', identifier: 'GMAIL_SEND', accountIdentity: 'billing@co.com' } });
-  rememberToolChoice({ intent: 'send launch announcement', choice: { kind: 'composio', identifier: 'GMAIL_SEND', accountIdentity: 'press@co.com' } });
+  rememberToolChoice({ intent: 'send invoice reminders', choice: { kind: 'composio', identifier: 'GMAIL_SEND', accountIdentity: 'billing@company.example' } });
+  rememberToolChoice({ intent: 'send launch announcement', choice: { kind: 'composio', identifier: 'GMAIL_SEND', accountIdentity: 'press@company.example' } });
   assert.equal(recallComposioAccountIdentity('GMAIL_SEND'), undefined);
 });
 
@@ -107,11 +107,11 @@ test('recallToolChoice returns null when there is no record', () => {
 });
 
 test('stripBakedConnectionId: a saved choice never pins a (rot-prone) composio connection id', () => {
-  // The exact shape from the Airtable incident.
-  const dirty = 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_RIVsBNuVxfyI", arguments="{...}")';
+  // A representative stale Airtable connection shape.
+  const dirty = 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_fixture_airtable_removed", arguments="{...}")';
   const clean = stripBakedConnectionId(dirty);
   assert.doesNotMatch(clean ?? '', /connected_account_id/);
-  assert.doesNotMatch(clean ?? '', /ca_RIVsBNuVxfyI/);
+  assert.doesNotMatch(clean ?? '', /ca_fixture_airtable_removed/);
   assert.match(clean ?? '', /tool_slug="AIRTABLE_LIST_RECORDS"/);
   assert.match(clean ?? '', /arguments=/);
   assert.doesNotMatch(clean ?? '', /,\s*\)|\(\s*,/); // no dangling comma artifacts
@@ -126,11 +126,11 @@ test('rememberToolChoice strips a pinned connection id before persisting', () =>
   rememberToolChoice({
     intent: 'airtable.records.list',
     description: 'list',
-    choice: { kind: 'composio', identifier: 'AIRTABLE_LIST_RECORDS', invocationTemplate: 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_STALE123", arguments="{}")' },
+    choice: { kind: 'composio', identifier: 'AIRTABLE_LIST_RECORDS', invocationTemplate: 'composio_execute_tool(tool_slug="AIRTABLE_LIST_RECORDS", connected_account_id="ca_fixture_stale", arguments="{}")' },
   });
   const rec = recallToolChoice('airtable.records.list');
   assert.ok(rec?.choice?.invocationTemplate);
-  assert.doesNotMatch(rec.choice.invocationTemplate ?? '', /connected_account_id|ca_STALE123/);
+  assert.doesNotMatch(rec.choice.invocationTemplate ?? '', /connected_account_id|ca_fixture_stale/);
 });
 
 test('rememberToolChoice rejects placeholder identifiers instead of poisoning active choice recall', () => {
@@ -353,7 +353,7 @@ test('G1: a legacy tool-choice file with a baked connected_account_id is sanitiz
       'choice:',
       '  kind: composio',
       '  identifier: GOOGLESHEETS_VALUES_UPDATE',
-      '  invocationTemplate: composio_execute_tool(tool_slug="GOOGLESHEETS_VALUES_UPDATE", connected_account_id="ca_GJ_hJWV2Hw7P", arguments="{}")',
+      '  invocationTemplate: composio_execute_tool(tool_slug="GOOGLESHEETS_VALUES_UPDATE", connected_account_id="ca_fixture_sheets_removed", arguments="{}")',
       '  testedAt: 2026-05-25T00:00:00Z',
       '---',
       'notes',
@@ -361,10 +361,10 @@ test('G1: a legacy tool-choice file with a baked connected_account_id is sanitiz
 
   const rec = recallToolChoice('googlesheets.values.update');
   assert.ok(rec?.choice, 'choice recalled');
-  assert.doesNotMatch(rec!.choice!.invocationTemplate ?? '', /connected_account_id|ca_GJ_hJWV2Hw7P/, 'read path strips the baked id');
+  assert.doesNotMatch(rec!.choice!.invocationTemplate ?? '', /connected_account_id|ca_fixture_sheets_removed/, 'read path strips the baked id');
 
   const ctx = renderToolChoicesForContext();
-  assert.doesNotMatch(ctx, /connected_account_id|ca_GJ_hJWV2Hw7P/, 'context injection never exposes a baked id to the model');
+  assert.doesNotMatch(ctx, /connected_account_id|ca_fixture_sheets_removed/, 'context injection never exposes a baked id to the model');
 });
 
 // ─── v0.5.64: hard-delete + cluster forget (self-heal affordance) ──────────
@@ -400,8 +400,8 @@ test('P1-E: renderToolChoicesForContext promotes the objective-relevant choice (
   for (const r of listToolChoices()) deleteToolChoice(r.intent);
 
   rememberToolChoice({
-    intent: 'salesforce.accounts.query_nate_owned_non_market_leader',
-    description: 'Query Nate-owned Salesforce accounts not on the Market Leader list.',
+    intent: 'salesforce.accounts.query_owner_owned_non_priority_account',
+    description: 'Query Alex-owned Salesforce accounts not on the Priority Account list.',
     choice: { kind: 'cli', identifier: 'sf', invocationTemplate: 'sf data query --json --query "{{q}}"', testedAt: '2026-01-01T00:00:00.000Z' },
   });
   rememberToolChoice({
@@ -412,10 +412,10 @@ test('P1-E: renderToolChoicesForContext promotes the objective-relevant choice (
 
   const objective = 'salesforce email reply audit query pre-discovery last 90 days';
   const ranked = renderToolChoicesForContext(12, undefined, objective);
-  assert.ok(ranked.includes('★ salesforce.accounts.query_nate_owned_non_market_leader'), 'the relevant Salesforce choice is starred');
+  assert.ok(ranked.includes('★ salesforce.accounts.query_owner_owned_non_priority_account'), 'the relevant Salesforce choice is starred');
   assert.ok(!ranked.includes('★ airtable.create.base'), 'the unrelated Airtable choice is NOT starred');
   assert.ok(
-    ranked.indexOf('salesforce.accounts.query_nate_owned_non_market_leader') < ranked.indexOf('airtable.create.base'),
+    ranked.indexOf('salesforce.accounts.query_owner_owned_non_priority_account') < ranked.indexOf('airtable.create.base'),
     'the relevant (older) choice is promoted above the newer irrelevant one',
   );
 
@@ -423,7 +423,7 @@ test('P1-E: renderToolChoicesForContext promotes the objective-relevant choice (
   const recencyOnly = renderToolChoicesForContext(12);
   assert.ok(!recencyOnly.includes('★'), 'no objective → nothing is starred');
   assert.ok(
-    recencyOnly.indexOf('airtable.create.base') < recencyOnly.indexOf('salesforce.accounts.query_nate_owned_non_market_leader'),
+    recencyOnly.indexOf('airtable.create.base') < recencyOnly.indexOf('salesforce.accounts.query_owner_owned_non_priority_account'),
     'no objective → the newer Airtable choice sorts above the older Salesforce one',
   );
 });
@@ -594,29 +594,29 @@ test('P3 render: with outcomes on, net-negative choices are dropped and strong o
 });
 
 // ─── matchToolChoicesForStep precision: identity = command HEAD, not args ──
-// Regression for the live "scorpion-facebook-trends" bug: a Facebook-scrape
+// Regression for the live "acme-facebook-trends" bug: a Facebook-scrape
 // step got told to use a Salesforce SOQL choice because `LAST_N_DAYS:15` in the
 // SOQL collided with "the last 14 days" in the prompt. Core identity must be the
 // command head (sf data query), not argument values.
 
 const sfSoqlChoice = {
-  intent: 'pull market leader accounts needing follow-up',
-  description: 'Query Salesforce for market-leader accounts via the sf CLI',
+  intent: 'pull priority account accounts needing follow-up',
+  description: 'Query Salesforce for priority-account accounts via the sf CLI',
   choice: {
     kind: 'cli' as const,
-    identifier: `sf data query --query "SELECT Id, Name, Website, LastActivityDate, Owner.Name FROM Account WHERE Owner.Name = 'Nathan Reynolds' AND Market_Leader__c = TRUE AND (LastActivityDate = NULL OR LastActivityDate < LAST_N_DAYS:15) ORDER BY LastActivityDate ASC NULLS FIRST LIMIT 50"`,
+    identifier: `sf data query --query "SELECT Id, Name, Website, LastActivityDate, Owner.Name FROM Account WHERE Owner.Name = 'Alexander Chen' AND Priority_Account__c = TRUE AND (LastActivityDate = NULL OR LastActivityDate < LAST_N_DAYS:15) ORDER BY LastActivityDate ASC NULLS FIRST LIMIT 50"`,
     testedAt: '2026-01-01',
   },
   fallbacks: [], body: '', filePath: '/x',
 } as never;
 
 test('matchToolChoicesForStep: a Facebook-scrape step does NOT match a Salesforce SOQL choice (argument-value collision)', () => {
-  const fbPrompt = 'Scrape Scorpion\'s public Facebook page: pull recent public posts from the last 14 days and summarize posting trends.';
+  const fbPrompt = 'Scrape Acme\'s public Facebook page: pull recent public posts from the last 14 days and summarize posting trends.';
   assert.equal(matchToolChoicesForStep(fbPrompt, { choices: [sfSoqlChoice] }).length, 0);
 });
 
 test('matchToolChoicesForStep: a genuine Salesforce step STILL matches the SOQL choice (no regression)', () => {
-  const sfPrompt = 'Query Salesforce for my market-leader accounts that need follow-up and list their names and websites.';
+  const sfPrompt = 'Query Salesforce for my priority-account accounts that need follow-up and list their names and websites.';
   assert.ok(matchToolChoicesForStep(sfPrompt, { choices: [sfSoqlChoice] }).length >= 1);
 });
 
@@ -628,7 +628,7 @@ test('evidenceLooksFailedOrBlocked: recognizes gate refusals + manual-fallback +
   assert.equal(evidenceLooksFailedOrBlocked('could not deploy — token not readable for raw API upload'), true);
   assert.equal(evidenceLooksFailedOrBlocked('the write was refused by the grounding gate'), true);
   // …but a genuinely-working memo (even one that MENTIONS handling failures) is NOT dropped.
-  assert.equal(evidenceLooksFailedOrBlocked('netlify deploy returned production url https://x.netlify.app for site id 449cd146'), false);
+  assert.equal(evidenceLooksFailedOrBlocked('netlify deploy returned production url https://fixture-success.netlify.app for site id site_fixture_success'), false);
   assert.equal(evidenceLooksFailedOrBlocked('npx netlify-cli deploy succeeded; retries on a transient 5xx'), false);
   assert.equal(evidenceLooksFailedOrBlocked(undefined), false);
   // …and a SUCCESS that merely mentions a manual ALTERNATIVE is not a failure
@@ -642,12 +642,12 @@ test('evidenceLooksFailedOrBlocked: recognizes gate refusals + manual-fallback +
 
 test('rememberToolChoice: a BLOCKED attempt is NOT persisted as the active choice (poisoned-memo guard)', () => {
   const intent = 'netlify.deploy.guard.fresh';
-  // The exact 2026-06-21 poisoning shape: the model tries to remember a deploy
+  // Representative poisoned-choice shape: the model tries to remember a deploy
   // that the destination gate hard-blocked.
   rememberToolChoice({
     intent,
-    description: 'Deploy clementine-onepager — blocked by UNVERIFIED_DESTINATION gate; must run manually.',
-    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --dir . --site clementine-onepager.netlify.app', testEvidence: 'refused by harness UNVERIFIED_DESTINATION gate' },
+    description: 'Deploy fixture-onepager — blocked by UNVERIFIED_DESTINATION gate; must run manually.',
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --dir . --site fixture-onepager.netlify.app', testEvidence: 'refused by harness UNVERIFIED_DESTINATION gate' },
   });
   const rec = peekToolChoice(intent);
   assert.ok(rec, 'a record exists (the failed attempt is kept as history)');
@@ -661,12 +661,12 @@ test('rememberToolChoice: a blocked re-remember NEVER overwrites an existing PRO
   const intent = 'netlify.deploy.guard.proven';
   rememberToolChoice({
     intent,
-    choice: { kind: 'cli', identifier: 'npx', invocationTemplate: 'npx netlify-cli deploy --dir "{{dir}}" --prod --site {{site_id}}', testEvidence: 'returned production url https://x.netlify.app' },
+    choice: { kind: 'cli', identifier: 'npx', invocationTemplate: 'npx netlify-cli deploy --dir "{{dir}}" --prod --site {{site_id}}', testEvidence: 'returned production url https://fixture-success.netlify.app' },
   });
   // A later gate-blocked attempt must leave the proven choice intact.
   rememberToolChoice({
     intent,
-    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --site x.netlify.app', testEvidence: 'blocked by the gate; run it manually' },
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --site fixture-blocked.netlify.app', testEvidence: 'blocked by the gate; run it manually' },
   });
   const rec = peekToolChoice(intent);
   assert.equal(rec!.choice?.identifier, 'npx', 'the proven npx choice survives the blocked re-remember');
@@ -902,7 +902,7 @@ test('renderToolChoicesForContext: C6 — a choice bound to an account shows @id
       choice: {
         kind: 'composio',
         identifier: 'OUTLOOK_LIST_MESSAGES',
-        accountIdentity: 'nathan@breakthrough.example',
+        accountIdentity: 'alex@corp.example',
         testedAt: '2099-05-01T00:00:00.000Z',
       },
     });
@@ -914,7 +914,7 @@ test('renderToolChoicesForContext: C6 — a choice bound to an account shows @id
     const withIdentity = rendered.split('\n').find((l) => l.includes('c6.render.with-identity'));
     const withoutIdentity = rendered.split('\n').find((l) => l.includes('c6.render.without-identity'));
     assert.ok(withIdentity, 'identity-bound line rendered');
-    assert.match(withIdentity!, /OUTLOOK_LIST_MESSAGES @nathan@breakthrough\.example/);
+    assert.match(withIdentity!, /OUTLOOK_LIST_MESSAGES @alex@corp\.example/);
     assert.ok(withoutIdentity, 'identity-free line rendered');
     assert.doesNotMatch(withoutIdentity!, / @/, 'no identity marker when the choice has no accountIdentity');
   } finally {

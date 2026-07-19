@@ -3,6 +3,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 export interface ClementineLiveResizeRequest {
   width: number;
   height: number;
+  presentation: 'dormant' | 'panel';
+  layoutId: number;
 }
 
 export interface ClementineLiveMountAck {
@@ -20,7 +22,6 @@ const clementineLive = Object.freeze({
   mounted: (mount: ClementineLiveMountAck): Promise<unknown> => (
     ipcRenderer.invoke('clemmy:live-mounted', mount)
   ),
-  toggle: (): Promise<unknown> => ipcRenderer.invoke('clemmy:live-toggle'),
   openConsole: (): Promise<unknown> => ipcRenderer.invoke('clemmy:live-open-console'),
   dismiss: (): Promise<unknown> => ipcRenderer.invoke('clemmy:live-dismiss'),
   meetingStatus: (): Promise<unknown> => ipcRenderer.invoke('clemmy:live-meeting-status'),

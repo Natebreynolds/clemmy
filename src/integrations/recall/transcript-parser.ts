@@ -3,7 +3,7 @@
  * RecallTranscriptSegment shape that Clementine's meeting-capture
  * pipeline already understands.
  *
- * Ported from breakthrough-coaching-zoombot-app/worker/index.ts:511
+ * Ported from legacy-meeting-bot/worker/index.ts:511
  * `parseTranscriptToSegments`. Behavior preserved:
  *
  *   - One Map per participant.id → participant.name, captured once so

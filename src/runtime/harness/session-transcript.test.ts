@@ -33,19 +33,19 @@ const { SessionStore } = await import('../../memory/session-store.js');
 test('renderRecentSessionActions surfaces this session\'s completed sends so the brain knows it already did them', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;
-  for (const t of ['chris@macgilliswiemer.com', 'jhintermeister@okoonlaw.com', 'marvinm@mitchelldickmcnelis.com']) {
+  for (const t of ['alex@lakeside-law.example', 'blair@meadow-law.example', 'morgan@bridge-law.example']) {
     appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
   }
   const block = renderRecentSessionActions(openEventLog(), sid);
   assert.match(block, /ALREADY DONE/);
   assert.match(block, /Do NOT repeat/i);
-  for (const t of ['chris@macgilliswiemer.com', 'jhintermeister@okoonlaw.com', 'marvinm@mitchelldickmcnelis.com']) {
+  for (const t of ['alex@lakeside-law.example', 'blair@meadow-law.example', 'morgan@bridge-law.example']) {
     assert.ok(block.includes(t), `${t} must be listed as already-sent`);
   }
   // Dedup: a repeated external_write for the same target appears once.
-  appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['chris@macgilliswiemer.com'] } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['alex@lakeside-law.example'] } });
   const block2 = renderRecentSessionActions(openEventLog(), sid);
-  assert.equal((block2.match(/chris@macgilliswiemer\.com/g) ?? []).length, 1, 'deduped by (shape, target)');
+  assert.equal((block2.match(/alex@lakeside-law\.example/g) ?? []).length, 1, 'deduped by (shape, target)');
 });
 
 test('renderRecentSessionActions does not call compensated failed writes already done', () => {

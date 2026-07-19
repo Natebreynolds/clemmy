@@ -20,7 +20,7 @@ const {
 } = await import('./workflow-contract-evidence-store.js');
 
 test('observeStepOutputShape: objects yield non-empty identifier keys; scalars/blocked yield null', () => {
-  assert.deepEqual(observeStepOutputShape({ url: 'https://x.co', count: 3, blank: '', 'weird-key': 1 }), {
+  assert.deepEqual(observeStepOutputShape({ url: 'https://site-alt.example', count: 3, blank: '', 'weird-key': 1 }), {
     type: 'object', keys: ['url', 'count'],
   });
   assert.deepEqual(observeStepOutputShape([1, 2]), { type: 'array', nonEmpty: true });

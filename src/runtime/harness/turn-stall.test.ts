@@ -74,7 +74,7 @@ test('steady events keep the turn alive even when each gap is near the threshold
 });
 
 test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Claude tool-turn hang)', async () => {
-  // sess-mqg45an3: the first model call produced ZERO events for the window
+  // Tool-turn hang regression: the first model call produced ZERO events for the window
   // (a silent/wedged Claude stream). With pre-content retry, the SECOND call
   // streams normally and the turn recovers instead of hard-failing the user.
   const first = makeStreamResult({ events: 0, hang: true }); // wedges pre-content

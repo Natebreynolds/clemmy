@@ -18,8 +18,8 @@ const call = (slug: string, args: string, callId: string): TraceToolCall => ({
 
 test('failed-then-corrected (non-transient) → recovery tip keyed to the error signature', () => {
   const calls = [
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com","subject":"s"}', 'c1'),
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com","subject":"s","body":"b"}', 'c2'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example","subject":"s"}', 'c1'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example","subject":"s","body":"b"}', 'c2'),
   ];
   const returns = new Map([
     ['c1', 'could not send: missing required field body'],
@@ -34,8 +34,8 @@ test('failed-then-corrected (non-transient) → recovery tip keyed to the error 
 
 test('TRANSIENT failure (timed out) retried → NO tip (poison guard)', () => {
   const calls = [
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com"}', 'c1'),
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com","retry":true}', 'c2'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example"}', 'c1'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example","retry":true}', 'c2'),
   ];
   // evidenceLooksFailedOrBlocked TRUE ("could not send") AND isTransientFailure TRUE ("timed out")
   const returns = new Map([['c1', 'could not send: request timed out'], ['c2', 'sent ok']]);
@@ -43,15 +43,15 @@ test('TRANSIENT failure (timed out) retried → NO tip (poison guard)', () => {
 });
 
 test('single call (no retry) → null (nothing was figured out)', () => {
-  const calls = [call('GMAIL_SEND_EMAIL', '{"to":"a@b.com"}', 'c1')];
+  const calls = [call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example"}', 'c1')];
   const returns = new Map([['c1', 'could not send: missing body']]);
   assert.equal(deriveRecoveryTip(calls, returns), null);
 });
 
 test('identical re-fire (same args twice) → null (a loop, not a corrected retry)', () => {
   const calls = [
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com"}', 'c1'),
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com"}', 'c2'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example"}', 'c1'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example"}', 'c2'),
   ];
   const returns = new Map([['c1', 'could not send: missing body'], ['c2', 'could not send: missing body']]);
   assert.equal(deriveRecoveryTip(calls, returns), null);
@@ -59,8 +59,8 @@ test('identical re-fire (same args twice) → null (a loop, not a corrected retr
 
 test('success-only trajectory → null', () => {
   const calls = [
-    call('GMAIL_SEND_EMAIL', '{"to":"a@b.com"}', 'c1'),
-    call('GMAIL_SEND_EMAIL', '{"to":"x@y.com"}', 'c2'),
+    call('GMAIL_SEND_EMAIL', '{"to":"a@beta.example"}', 'c1'),
+    call('GMAIL_SEND_EMAIL', '{"to":"x@personal.example"}', 'c2'),
   ];
   const returns = new Map([['c1', 'sent ok'], ['c2', 'sent ok']]);
   assert.equal(deriveRecoveryTip(calls, returns), null);

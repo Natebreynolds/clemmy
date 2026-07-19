@@ -29,12 +29,12 @@ test('buildWorkflowObjective: includes description, body, synthesis intent, and 
       description_body: 'Cover keywords, backlinks, and a recommendation.',
       synthesis: { prompt: 'Assemble a single branded HTML brief.' },
     }),
-    { url: 'https://acme-law.com', depth: 3 },
+    { url: 'https://acme-law.example', depth: 3 },
   );
   assert.match(obj, /competitive SEO brief/i);
   assert.match(obj, /keywords, backlinks/i);
   assert.match(obj, /branded HTML brief/i);
-  assert.match(obj, /url=https:\/\/acme-law\.com/);
+  assert.match(obj, /url=https:\/\/acme-law\.example/);
   assert.match(obj, /depth=3/);
 });
 
@@ -69,13 +69,13 @@ test('deriveLegacyWorkflowRunGoal: derives provisional goal from intent, inputs,
         },
       ],
     }),
-    { url: 'https://acme-law.com' },
+    { url: 'https://acme-law.example' },
   );
   assert.ok(goal);
   assert.equal(goal!.source, 'legacy');
   assert.equal(goal!.maxAttempts, 1);
   assert.match(goal!.objective, /competitive SEO brief/i);
-  assert.match(goal!.objective, /url=https:\/\/acme-law\.com/);
+  assert.match(goal!.objective, /url=https:\/\/acme-law\.example/);
   assert.ok(goal!.successCriteria.some((c) => /synthesis intent/i.test(c)));
   assert.ok(goal!.successCriteria.some((c) => /required keys: url, path, items/.test(c)));
   assert.ok(goal!.successCriteria.some((c) => /http\(s\) URL at "url"/.test(c)));
@@ -123,8 +123,8 @@ test('renderDeliverableForJudge: passes a string deliverable through', () => {
 });
 
 test('renderDeliverableForJudge: serializes an object deliverable', () => {
-  const out = renderDeliverableForJudge({ url: 'https://x.com', ok: true });
-  assert.match(out, /"url": "https:\/\/x\.com"/);
+  const out = renderDeliverableForJudge({ url: 'https://site.example', ok: true });
+  assert.match(out, /"url": "https:\/\/site\.example"/);
 });
 
 test('renderDeliverableForJudge: appends a self-describing marker only when it truncates', () => {
@@ -147,8 +147,8 @@ test('judgeWorkflowTarget: reached when the judge says done', async () => {
   const j = judgeReturning({ done: true, reason: 'brief produced with a real URL' });
   const v = await judgeWorkflowTarget({
     workflow: wf(),
-    inputs: { url: 'https://acme-law.com' },
-    finalOutput: 'Brief at https://acme-law.com/brief',
+    inputs: { url: 'https://acme-law.example' },
+    finalOutput: 'Brief at https://acme-law.example/brief',
     judgeFn: j.fn,
   });
   assert.equal(v.reached, true);
@@ -181,9 +181,9 @@ test('judgeWorkflowTarget: includes provisional legacy success criteria in the j
 test('judgeWorkflowTarget: accepts structured send evidence without asking the model judge', async () => {
   const j = judgeReturning({ done: false, reason: 'no verifiable evidence the email was sent at 8am' });
   const v = await judgeWorkflowTarget({
-    workflow: wf({ description: 'Emails Nate a daily standup brief at 8am.' }),
+    workflow: wf({ description: 'Emails Alex a daily standup brief at 8am.' }),
     inputs: {},
-    finalOutput: '## main\n{"sent":true,"to":"nathan.reynolds@scorpion.co","subject":"Daily Standup","logId":"log_123"}',
+    finalOutput: '## main\n{"sent":true,"to":"alex.chen@corp.example","subject":"Daily Standup","logId":"log_123"}',
     judgeFn: j.fn,
   });
   assert.equal(v.reached, true);
@@ -195,9 +195,9 @@ test('judgeWorkflowTarget: accepts structured send evidence without asking the m
 test('judgeWorkflowTarget: does not accept negative send evidence', async () => {
   const j = judgeReturning({ done: false, reason: 'the email was not sent' });
   const v = await judgeWorkflowTarget({
-    workflow: wf({ description: 'Emails Nate a daily standup brief at 8am.' }),
+    workflow: wf({ description: 'Emails Alex a daily standup brief at 8am.' }),
     inputs: {},
-    finalOutput: '{"sent":false,"to":"nathan.reynolds@scorpion.co","logId":"log_123"}',
+    finalOutput: '{"sent":false,"to":"alex.chen@corp.example","logId":"log_123"}',
     judgeFn: j.fn,
   });
   assert.equal(v.reached, false);
@@ -209,7 +209,7 @@ test('judgeWorkflowTarget: NOT reached when the judge names a specific miss', as
   const j = judgeReturning({ done: false, reason: 'no backlinks section in the brief' });
   const v = await judgeWorkflowTarget({
     workflow: wf(),
-    inputs: { url: 'https://acme-law.com' },
+    inputs: { url: 'https://acme-law.example' },
     finalOutput: 'partial brief, keywords only',
     judgeFn: j.fn,
   });
@@ -261,7 +261,7 @@ test('judgeWorkflowTarget: SKIPS when there is no target to judge against', asyn
 test('judgeWorkflowTarget: FAILS OPEN when the judge throws (never breaks a good run)', async () => {
   const v = await judgeWorkflowTarget({
     workflow: wf(),
-    inputs: { url: 'https://acme-law.com' },
+    inputs: { url: 'https://acme-law.example' },
     finalOutput: 'a real deliverable',
     judgeFn: async () => { throw new Error('judge model unavailable'); },
   });

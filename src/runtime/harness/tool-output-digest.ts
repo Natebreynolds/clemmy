@@ -196,7 +196,7 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
   const moreKeys = entries.length - shownKeys;
   // Surface the TRUE count of a nested records/items array so the model knows
   // the full set size + that recall returns ALL of it — never reads the clip as
-  // "maybe more pages" and guesses an offset (the scorpion 44→4 / 'itr2' bug).
+  // "maybe more pages" and guesses an offset (the acme 44→4 / 'itr2' bug).
   const dom = countDominantArray(obj);
   const domNote = dom && dom.count > 0
     ? ` Contains ${dom.count} ${dom.key} — recall_tool_result returns ALL ${dom.count} (no pagination needed).`

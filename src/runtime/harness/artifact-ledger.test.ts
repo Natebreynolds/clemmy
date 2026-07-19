@@ -544,14 +544,14 @@ test('a dispatched create with no ID becomes uncertain and cannot be retried bli
 test('extracts stable Google Doc IDs from object and formatted provider output', () => {
   const intent = { kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary', title: 'Snapshot', createShape: 'CREATE' } as const;
   assert.deepEqual(ledger.extractArtifactResource(intent, {
-    data: { documentId: '1NjRHpNKX5aN1zObtKIA-_YqZtwpBXi', display_url: 'https://docs.google.com/document/d/1NjRHpNKX5aN1zObtKIA-_YqZtwpBXi/edit' },
+    data: { documentId: 'fixture_google_doc_0000000001', display_url: 'https://docs.google.com/document/d/fixture_google_doc_0000000001/edit' },
   }), {
-    resourceId: '1NjRHpNKX5aN1zObtKIA-_YqZtwpBXi',
-    uri: 'https://docs.google.com/document/d/1NjRHpNKX5aN1zObtKIA-_YqZtwpBXi/edit',
+    resourceId: 'fixture_google_doc_0000000001',
+    uri: 'https://docs.google.com/document/d/fixture_google_doc_0000000001/edit',
     title: 'Snapshot',
   });
-  const loose = ledger.extractArtifactResource(intent, 'data: { "documentId": "1FdV_RH8NHg5KaWNfEboVyscuxsB0lT6" }');
-  assert.equal(loose?.resourceId, '1FdV_RH8NHg5KaWNfEboVyscuxsB0lT6');
+  const loose = ledger.extractArtifactResource(intent, 'data: { "documentId": "fixture_google_doc_0000000002" }');
+  assert.equal(loose?.resourceId, 'fixture_google_doc_0000000002');
 });
 
 test('only an explicit pre-dispatch proof makes an artifact claim releasable', () => {
@@ -606,7 +606,7 @@ test('classifies Netlify site creation but not deploy/status commands', () => {
 test('Netlify binding requires an exact getSite request and matching successful top-level site id', () => {
   const sid = session();
   const runScope = 'run:netlify-readback';
-  const siteId = 'd554f560-2511-47f2-a658-abc123456789';
+  const siteId = '00000000-0000-4000-8000-000000000001';
   const intent = {
     kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
     title: 'snapshot-assets', createShape: 'NETLIFY_SITE_CREATE',
@@ -655,36 +655,36 @@ test('extracts Netlify CLI Project ID and gives a repairable reuse instruction',
     kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
     title: 'client-snapshot', createShape: 'NETLIFY_SITE_CREATE',
   } as const;
-  const resource = ledger.extractArtifactResource(intent, `Success! Site created\n\nProject ID: d554f560-2511-47f2-a658-abc123456789\nWebsite URL: https://client-snapshot.netlify.app\nAdmin URL: https://app.netlify.com/projects/client-snapshot`);
+  const resource = ledger.extractArtifactResource(intent, `Success! Site created\n\nProject ID: 00000000-0000-4000-8000-000000000001\nWebsite URL: https://fixture-client-snapshot.netlify.app\nAdmin URL: https://app.netlify.com/projects/fixture-client-snapshot`);
   assert.deepEqual(resource, {
-    resourceId: 'd554f560-2511-47f2-a658-abc123456789',
-    uri: 'https://client-snapshot.netlify.app',
+    resourceId: '00000000-0000-4000-8000-000000000001',
+    uri: 'https://fixture-client-snapshot.netlify.app',
     title: 'client-snapshot',
   });
   const sid = session();
   ledger.claimArtifactSlot(sid, intent, 'site-1', 'run:one');
   const bound = ledger.bindArtifactSlot(sid, intent.slotKey, resource!, 'site-1', 'run:one');
-  assert.match(ledger.artifactReuseMessage(bound), /--site d554f560-2511-47f2-a658-abc123456789/);
+  assert.match(ledger.artifactReuseMessage(bound), /--site 00000000-0000-4000-8000-000000000001/);
   assert.match(ledger.artifactReuseMessage(bound), /do not run sites:create again/i);
 });
 
-test('incident replay permits one Google Doc and one asset container despite renamed retries', () => {
+test('synthetic retry replay permits one Google Doc and one asset container despite renamed retries', () => {
   const sid = session();
-  const runScope = 'run:jeff-davis-snapshot';
+  const runScope = 'run:multi-artifact-retry';
   let providerCreates = 0;
 
   const docCalls = [
     {
       tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-      arguments: JSON.stringify({ title: 'San Antonio Live Search Snapshot — Jeff Davis Law Firm (Jul 16, 2026)', markdown_text: '# Snapshot' }),
+      arguments: JSON.stringify({ title: 'Metro Live Search Snapshot — Harbor Law Group (Jul 16, 2026)', markdown_text: '# Snapshot' }),
     },
     {
       tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-      arguments: JSON.stringify({ title: 'San Antonio Live Search Snapshot — Jeff Davis Law Firm (Jul 16, 2026)', markdown_text: '# Snapshot' }),
+      arguments: JSON.stringify({ title: 'Metro Live Search Snapshot — Harbor Law Group (Jul 16, 2026)', markdown_text: '# Snapshot' }),
     },
     {
       tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT',
-      arguments: JSON.stringify({ title: 'San Antonio PI — Live Search Snapshot (for Jeff Davis)', text: '' }),
+      arguments: JSON.stringify({ title: 'Metro Injury — Live Search Snapshot (for Harbor Law)', text: '' }),
     },
   ];
   for (const [index, args] of docCalls.entries()) {
@@ -693,7 +693,7 @@ test('incident replay permits one Google Doc and one asset container despite ren
     if (!claim.acquired) continue;
     providerCreates += 1;
     const resource = ledger.extractArtifactResource(intent, `{
-      data: { "display_url": "https://docs.google.com/document/d/1NjRHpNKX5aN1zObtKIA-_YqZtwpBXi-pWQjoneZ1JHw/edit", "documentId": "1NjRHpNKX5aN1zObtKIA-_YqZtwpBXi-pWQjoneZ1JHw" }
+      data: { "display_url": "https://docs.google.com/document/d/fixture_google_doc_0000000003/edit", "documentId": "fixture_google_doc_0000000003" }
     }`)!;
     ledger.bindArtifactSlot(sid, intent.slotKey, resource, `doc-${index + 1}`, runScope);
   }
@@ -706,7 +706,7 @@ test('incident replay permits one Google Doc and one asset container despite ren
     if (!claim.acquired) continue;
     providerCreates += 1;
     ledger.bindArtifactSlot(sid, intent.slotKey, {
-      resourceId: 'site_jeff_snapshot', uri: 'https://sapisnap56899.netlify.app',
+      resourceId: 'site_fixture_snapshot', uri: 'https://fixture-snapshot-assets.netlify.app',
     }, `site-${index + 1}`, runScope);
   }
 

@@ -12,6 +12,7 @@ import {
 const workflowPath = new URL('../.github/workflows/release-desktop.yml', import.meta.url);
 const workflowText = readFileSync(workflowPath, 'utf-8');
 const workflow = load(workflowText);
+const testWorkflow = load(readFileSync(new URL('../.github/workflows/test.yml', import.meta.url), 'utf-8'));
 const dispatcherText = readFileSync(new URL('./hotpatch-installed.sh', import.meta.url), 'utf-8');
 const dualArchScriptText = readFileSync(
   new URL('../apps/desktop/scripts/release-mac-dual-arch.sh', import.meta.url),
@@ -79,6 +80,29 @@ test('desktop releases securely vendor Recall and rebuild self-validating Whispe
   assert.match(windowsReleaseText, /vendor:whisper.*x86_64-pc-windows-msvc.*--force/);
   assert.match(String(desktopPackage.scripts?.['package:dist'] ?? ''), /vendor:recall-native/);
   assert.match(String(desktopPackage.scripts?.['package:mac:unsigned'] ?? ''), /WHISPER_ALLOW_VALIDATED_CACHE=true/);
+});
+
+test('macOS releases build, sign, package, and probe the native notch click helper', () => {
+  assert.match(String(desktopPackage.scripts?.build ?? ''), /build:notch-helper/);
+  assert.match(String(desktopPackage.scripts?.dev ?? ''), /build:notch-helper/);
+  assert.equal(desktopPackage.build?.mac?.minimumSystemVersion, '12.0');
+  assert.ok(desktopPackage.build?.mac?.binaries?.includes(
+    'Contents/Resources/notch-helper/ClementineNotchHelper',
+  ));
+  assert.ok(desktopPackage.build?.mac?.extraResources?.some((entry) => (
+    entry?.to === 'notch-helper/ClementineNotchHelper'
+  )));
+  assert.match(dualArchScriptText, /verify_notch_helper_packaged/);
+  assert.match(dualArchScriptText, /notch-helper\/ClementineNotchHelper/);
+  assert.match(dualArchScriptText, /"\$helper" --probe/);
+
+  const ciJob = testWorkflow.jobs?.['notch-helper-macos'];
+  assert.match(String(ciJob?.['runs-on'] ?? ''), /^macos-/);
+  assert.match(runScripts(ciJob), /npm run typecheck/);
+  assert.match(runScripts(ciJob), /build:notch-helper/);
+  assert.match(runScripts(ciJob), /--probe/);
+
+  assert.match(windowsReleaseText, /verifyPackagedPathAbsent\(\s*'notch-helper'/);
 });
 
 test('the universal npm package does not publish host-dependent Whisper binaries', () => {

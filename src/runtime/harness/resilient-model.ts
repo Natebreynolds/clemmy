@@ -3,8 +3,8 @@
  * brains (Claude, BYO) the model-boundary resilience + reasoning translation
  * that, until now, only the hand-rolled Codex adapter had.
  *
- * The multi-model strategy (CLAUDE-MULTI-MODEL-ABSTRACTION-STRATEGY-2026-06-16.md)
- * found that five concerns inside CodexResponsesModel are about the AGENT
+ * A review of the multi-model runtime found that five concerns inside
+ * CodexResponsesModel are about the AGENT
  * CONTRACT, not the Codex wire — yet only Codex got them, which is why Claude
  * struggled. This wrapper lifts them above the wire so every brain inherits them:
  *

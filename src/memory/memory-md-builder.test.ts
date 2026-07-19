@@ -46,13 +46,13 @@ test('regenerateMemoryMd: preserves user-curated content above the marker', () =
     '# Memory',
     '',
     '## My standing context',
-    '- I work at Scorpion',
+    '- I work at Acme',
     '- I lead the sales team',
     '',
   ].join('\n'), 'utf-8');
 
   // Seed a fact so the auto section has something
-  rememberFact({ kind: 'user', content: 'Nate works at Scorpion as Sales Director.' });
+  rememberFact({ kind: 'user', content: 'Alex works at Acme as Sales Director.' });
 
   const result = regenerateMemoryMd();
   assert.equal(result.written, true);
@@ -61,12 +61,12 @@ test('regenerateMemoryMd: preserves user-curated content above the marker', () =
   const body = readFileSync(MEMORY_FILE, 'utf-8');
   // User content preserved
   assert.match(body, /## My standing context/);
-  assert.match(body, /I work at Scorpion/);
+  assert.match(body, /I work at Acme/);
   assert.match(body, /I lead the sales team/);
   // Marker + auto content appended below
   assert.match(body, /AUTO-GENERATED/);
   assert.match(body, /## User/);
-  assert.match(body, /Nate works at Scorpion as Sales Director/);
+  assert.match(body, /Alex works at Acme as Sales Director/);
 });
 
 test('regenerateMemoryMd: idempotent — second call is a no-op', () => {
@@ -84,7 +84,7 @@ test('regenerateMemoryMd: groups facts by kind, sorted by score desc', () => {
   rememberFact({ kind: 'project',  content: 'Active workflow: daily-prospect-outreach.', score: 1.5 });
   rememberFact({ kind: 'project',  content: 'Active workflow: outlook-triage-hourly.', score: 1.2 });
   rememberFact({ kind: 'feedback', content: 'Prefer concise responses, no bullet bloat.', score: 2.0 });
-  rememberFact({ kind: 'reference', content: 'Scorpion CRM org user: nathan.reynolds@scorpion.co.', score: 1.0 });
+  rememberFact({ kind: 'reference', content: 'Acme CRM org user: alex.chen@corp.example', score: 1.0 });
 
   const result = regenerateMemoryMd();
   assert.equal(result.written, true);
@@ -114,7 +114,7 @@ test('regenerateMemoryMd: marker placement keeps user content separate after re-
   assert.ok(markerIdx > 0);
   const userSlice = body.slice(0, markerIdx);
   // The user content from earlier test should still be present
-  assert.match(userSlice, /I work at Scorpion/);
+  assert.match(userSlice, /I work at Acme/);
   assert.match(userSlice, /I lead the sales team/);
 });
 

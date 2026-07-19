@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 
 /**
  * Per-user agent persona/preferences.
@@ -118,6 +118,76 @@ export function loadUserProfile(): UserProfile {
   } catch {
     return normalizeUserProfile(DEFAULT_USER_PROFILE);
   }
+}
+
+const GENERIC_USER_ALIASES = new Set([
+  'the user',
+  'user',
+  'owner',
+  'me',
+  'myself',
+  'you',
+]);
+
+function normalizeUserAlias(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Names that may identify the configured user in natural-language prompts.
+ *
+ * This is intentionally live-read: Settings can update the saved profile or
+ * OWNER_NAME without restarting the daemon. Full names and their first-name
+ * forms are returned so "send Jordan the report" still works when the setup
+ * value is "Jordan Kim". Generic labels are handled by call-site policy and
+ * are excluded here to keep this list person-specific.
+ */
+export function configuredUserNameAliases(
+  profile: UserProfile = loadUserProfile(),
+  ownerName: string = getRuntimeEnv('OWNER_NAME', ''),
+): string[] {
+  const aliases = new Set<string>();
+  for (const candidate of [profile.preferredName, profile.displayName, ownerName]) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = normalizeUserAlias(candidate);
+    if (!normalized || GENERIC_USER_ALIASES.has(normalized)) continue;
+    aliases.add(normalized);
+
+    const [firstName, ...rest] = normalized.split(' ');
+    if (rest.length > 0 && firstName.length >= 2 && !GENERIC_USER_ALIASES.has(firstName)) {
+      aliases.add(firstName);
+    }
+  }
+  return [...aliases];
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Whether outbound wording names the configured user as its recipient. */
+export function textTargetsConfiguredUserRecipient(
+  text: string,
+  aliases: readonly string[] = configuredUserNameAliases(),
+): boolean {
+  if (!text.trim() || aliases.length === 0) return false;
+  const names = aliases
+    .map(normalizeUserAlias)
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+    .map((name) => name.split(' ').map(escapeRegex).join('\\s+'))
+    .join('|');
+  if (!names) return false;
+
+  const directRecipient = new RegExp(
+    `\\b(?:send(?:s|ing)?|e-?mail(?:s|ing)?|messag(?:e|es|ed|ing)|dm(?:s|ed|ing)?|notif(?:y|ies|ied|ying))\\s+(?:to\\s+)?(?:${names})(?=\\b|$)`,
+    'i',
+  );
+  const recipientAfterObject = new RegExp(
+    `\\b(?:send(?:s|ing)?|deliver(?:s|ed|ing)?|dispatch(?:es|ed|ing)?|e-?mail(?:s|ed|ing)?|messag(?:e|es|ed|ing)|dm(?:s|ed|ing)?|notif(?:y|ies|ied|ying))\\b[^\\n.!?]{0,80}\\bto\\s+(?:${names})(?=\\b|$)`,
+    'i',
+  );
+  return directRecipient.test(text) || recipientAfterObject.test(text);
 }
 
 export function saveUserProfile(patch: RawProfile): UserProfile {

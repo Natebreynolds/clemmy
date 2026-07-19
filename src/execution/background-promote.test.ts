@@ -139,7 +139,7 @@ test('stripBackgroundPrefix removes a leading background command only', () => {
 test('enqueueDurableChatTask creates a pending durable task wired for report-back', () => {
   const before = listBackgroundTasks().length;
   const task = enqueueDurableChatTask({
-    message: '/background build the Aldous Reeve law firm homepage and deploy it',
+    message: '/background build the Sample Law Partners law firm homepage and deploy it',
     sessionId: 'sess-desktop-123',
     channel: 'desktop',
     source: 'desktop',
@@ -158,7 +158,7 @@ test('enqueueDurableChatTask creates a pending durable task wired for report-bac
   assert.equal(stored!.channel, 'desktop');
 
   // The /background prefix is stripped from the worker prompt + title.
-  assert.equal(stored!.prompt, 'build the Aldous Reeve law firm homepage and deploy it');
+  assert.equal(stored!.prompt, 'build the Sample Law Partners law firm homepage and deploy it');
   assert.ok(!/^\/?background/i.test(stored!.title), 'title should not carry the command prefix');
   assert.ok(stored!.title.length > 0 && stored!.title.length <= 120);
 

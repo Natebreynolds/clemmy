@@ -91,17 +91,17 @@ test('completions never erase genuine waiters: queued decrements on SPAWN, not o
 
 test('per-worker rows track item status through queued → running, and drop on completion', () => {
   const lanes = fold([
-    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'acme.com' } }),
-    ev({ type: 'worker_spawned', sessionId: 's1', payload: { item: 'acme.com', model: 'claude-sonnet-5' } }),
-    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'globex.com' } }),
+    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'acme.example' } }),
+    ev({ type: 'worker_spawned', sessionId: 's1', payload: { item: 'acme.example', model: 'claude-sonnet-5' } }),
+    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'globex.example' } }),
   ]);
   const rows = workerRowsForDisplay(lanes.get('s1')!);
   // running first, then queued.
-  assert.deepEqual(rows.map((r) => `${r.item}:${r.status}`), ['acme.com:running', 'globex.com:queued']);
+  assert.deepEqual(rows.map((r) => `${r.item}:${r.status}`), ['acme.example:running', 'globex.example:queued']);
   assert.equal(rows[0].model, 'claude-sonnet-5');
   // Completion prunes the row (its count lives in the counter, not the live list).
-  foldOperationalEvent(lanes, ev({ type: 'worker_completed', sessionId: 's1', payload: { item: 'acme.com' } }));
-  assert.deepEqual(workerRowsForDisplay(lanes.get('s1')!).map((r) => r.item), ['globex.com']);
+  foldOperationalEvent(lanes, ev({ type: 'worker_completed', sessionId: 's1', payload: { item: 'acme.example' } }));
+  assert.deepEqual(workerRowsForDisplay(lanes.get('s1')!).map((r) => r.item), ['globex.example']);
   assert.equal(lanes.get('s1')!.workers.done, 1);
 });
 

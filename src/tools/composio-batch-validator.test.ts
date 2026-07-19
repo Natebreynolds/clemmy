@@ -136,11 +136,11 @@ import {
 {
   const normalized = normalizeComposioBatchItemArgs('OUTLOOK_OUTLOOK_SEND_EMAIL', {
     tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    arguments: JSON.stringify({ to: 'nate@example.com', subject: 'Hi', body: 'Body' }),
+    arguments: JSON.stringify({ to: 'alex@example.com', subject: 'Hi', body: 'Body' }),
     connected_account_id: 'ca_123',
   });
   if (normalized.errors.length > 0) throw new Error(`Should not reject same-slug wrapper: ${normalized.errors.join(', ')}`);
-  if (normalized.args.to_email !== 'nate@example.com' || 'to' in normalized.args) {
+  if (normalized.args.to_email !== 'alex@example.com' || 'to' in normalized.args) {
     throw new Error('Should map Outlook "to" alias to "to_email" and remove the alias');
   }
   if (normalized.connectedAccountId !== 'ca_123') {
@@ -152,7 +152,7 @@ import {
 // to_email can be repaired without slug-specific code.
 {
   const normalized = normalizeComposioBatchItemArgs('ACME_SEND', {
-    to: 'nate@example.com',
+    to: 'alex@example.com',
     subject: 'Hi',
     body: 'Body',
   }, {
@@ -160,7 +160,7 @@ import {
     required: ['to_email', 'subject', 'body'],
     properties: { to_email: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } },
   });
-  if (normalized.args.to_email !== 'nate@example.com' || 'to' in normalized.args) {
+  if (normalized.args.to_email !== 'alex@example.com' || 'to' in normalized.args) {
     throw new Error('Schema-required to_email should be repaired from to');
   }
 }
@@ -169,11 +169,11 @@ import {
 // alone unless a schema explicitly asks for to_email.
 {
   const normalized = normalizeComposioBatchItemArgs('GMAIL_SEND_EMAIL', {
-    to: 'nate@example.com',
+    to: 'alex@example.com',
     subject: 'Hi',
     body: 'Body',
   });
-  if (normalized.args.to !== 'nate@example.com' || 'to_email' in normalized.args || normalized.repairs.length > 0) {
+  if (normalized.args.to !== 'alex@example.com' || 'to_email' in normalized.args || normalized.repairs.length > 0) {
     throw new Error('Should not rewrite Gmail-style to into to_email without schema evidence');
   }
 }
@@ -183,7 +183,7 @@ import {
 {
   const normalized = normalizeComposioBatchItemArgs('OUTLOOK_OUTLOOK_SEND_EMAIL', {
     tool_slug: 'GMAIL_SEND_EMAIL',
-    arguments: JSON.stringify({ to: 'nate@example.com', subject: 'Hi', body: 'Body' }),
+    arguments: JSON.stringify({ to: 'alex@example.com', subject: 'Hi', body: 'Body' }),
   });
   if (!normalized.errors.some((err) => err.includes('does not match'))) {
     throw new Error('Should reject a mismatched nested wrapper slug');

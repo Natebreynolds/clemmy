@@ -57,15 +57,15 @@ test('annotateShellStderr: exact-run npx cache materialization failure routes to
   const stderr = [
     'npm error code EEXIST',
     'npm error syscall rename',
-    'npm error path /Users/nathan.reynolds/.npm/_cacache/tmp/7e49db14',
-    'npm error dest /Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/cache-entry',
+    'npm error path /Users/example/.npm/_cacache/tmp/7e49db14',
+    'npm error dest /Users/example/.npm/_cacache/content-v2/sha512/38/ed/cache-entry',
     'npm error errno EEXIST',
-    "npm error Invalid response body while trying to fetch https://registry.npmjs.org/gopd: EACCES: permission denied, rename '/Users/nathan.reynolds/.npm/_cacache/tmp/7e49db14' -> '/Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/cache-entry'",
-    'npm error File exists: /Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/cache-entry',
+    "npm error Invalid response body while trying to fetch https://registry.npmjs.org/gopd: EACCES: permission denied, rename '/Users/example/.npm/_cacache/tmp/7e49db14' -> '/Users/example/.npm/_cacache/content-v2/sha512/38/ed/cache-entry'",
+    'npm error File exists: /Users/example/.npm/_cacache/content-v2/sha512/38/ed/cache-entry',
   ].join('\n');
   const out = annotateShellStderr(
     stderr,
-    'npx --yes netlify-cli sites:create --name clementine-multi-mode-harness --account-slug nathan-reynolds',
+    'npx --yes netlify-cli sites:create --name clementine-multi-mode-harness --account-slug example-team',
   );
   assert.ok(out.startsWith(stderr), 'raw stderr is preserved ahead of the hint');
   assert.match(out, /local_cli_list/);

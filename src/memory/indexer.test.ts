@@ -35,7 +35,7 @@ test('reindexVault indexes Recall meeting transcripts', () => {
       '',
       '## Transcript',
       '',
-      '[2026-05-19T12:00:00.000Z] Nathan: Follow up with market leaders about SEO findings.',
+      '[2026-05-19T12:00:00.000Z] Alexander: Follow up with priority accounts about SEO findings.',
       '',
     ].join('\n'),
     'utf-8',
@@ -48,7 +48,7 @@ test('reindexVault indexes Recall meeting transcripts', () => {
     'SELECT path, content FROM vault_chunks WHERE path = ? ORDER BY chunk_index',
   ).all(meetingPath) as Array<{ path: string; content: string }>;
   assert.ok(rows.length > 0, 'meeting transcript should be indexed');
-  assert.match(rows.map((row) => row.content).join('\n'), /market leaders about SEO findings/);
+  assert.match(rows.map((row) => row.content).join('\n'), /priority accounts about SEO findings/);
 });
 
 test('chunkMarkdown: windowed sub-chunks (beyond the first) regain the heading breadcrumb; first window + short sections unchanged', () => {

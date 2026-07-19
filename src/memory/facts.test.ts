@@ -66,32 +66,32 @@ test('searchFactsByText: a freshly-remembered fact is the top hit despite a stop
   // not drown the relevant fact (the bug: common words matched thousands of
   // facts and evicted it before ranking). Stop-word filtering + recency order.
   for (let i = 0; i < 30; i++) {
-    rememberFact({ kind: 'user', content: `Just the noise: Nathan did thing number ${i} for the project.` });
+    rememberFact({ kind: 'user', content: `Just the noise: Alexander did thing number ${i} for the project.` });
   }
-  rememberFact({ kind: 'user', content: 'Nate\'s ship marker is VECTOR-1241.' });
+  rememberFact({ kind: 'user', content: 'Alex\'s ship marker is VECTOR-1241.' });
   const hits = searchFactsByText('What is my ship marker? Just the marker.', 5);
   assert.ok(hits.length > 0, 'returns hits');
   assert.match(hits[0].content, /VECTOR-1241/, 'the relevant fresh fact ranks first');
 });
 
 test('searchFactsByText: a query with only stop-words returns nothing (no false matches)', () => {
-  rememberFact({ kind: 'user', content: 'Nathan prefers concise replies.' });
+  rememberFact({ kind: 'user', content: 'Alexander prefers concise replies.' });
   assert.deepEqual(searchFactsByText('what is the just', 5), []);
 });
 
 test('rememberFact inserts a new row', () => {
-  const fact = rememberFact({ kind: 'user', content: 'Nathan prefers concise replies.' });
+  const fact = rememberFact({ kind: 'user', content: 'Alexander prefers concise replies.' });
   assert.equal(fact.kind, 'user');
-  assert.equal(fact.content, 'Nathan prefers concise replies.');
+  assert.equal(fact.content, 'Alexander prefers concise replies.');
   assert.equal(fact.active, true);
   assert.ok(fact.id > 0);
   assert.ok(fact.score >= 1);
 });
 
 test('rememberFact dedups on normalized content (same kind)', () => {
-  const a = rememberFact({ kind: 'user', content: 'Nathan likes action.' });
-  const b = rememberFact({ kind: 'user', content: 'Nathan   likes    action.' });  // extra whitespace
-  const c = rememberFact({ kind: 'user', content: 'NATHAN LIKES ACTION.' });        // different case
+  const a = rememberFact({ kind: 'user', content: 'Alexander likes action.' });
+  const b = rememberFact({ kind: 'user', content: 'Alexander   likes    action.' });  // extra whitespace
+  const c = rememberFact({ kind: 'user', content: 'ALEXANDER LIKES ACTION.' });     // different case
   assert.equal(a.id, b.id, 'whitespace-normalized dedup');
   assert.equal(a.id, c.id, 'case-normalized dedup');
   // Score bumped by 0.1 each repeat.
@@ -127,7 +127,7 @@ test('forgetFact hard delete drops the row', () => {
 
 test('renderFactsForInstructions groups by kind in fixed order', () => {
   rememberFact({ kind: 'feedback', content: 'Cite file:line when relevant.' });
-  rememberFact({ kind: 'user', content: 'Nathan is the project owner.' });
+  rememberFact({ kind: 'user', content: 'Alexander is the project owner.' });
   rememberFact({ kind: 'project', content: 'Clemmy is on the OpenAI Agents SDK.' });
   rememberFact({ kind: 'reference', content: 'See https://example.com/docs' });
 
@@ -175,7 +175,7 @@ test('characterization: no objective → ranking identical to plain Stanford ord
   // Seed a mix; capture the global order, then assert passing undefined
   // objective yields byte-identical output (no-regression guarantee).
   rememberFact({ kind: 'project', content: 'Home services plumbing lead funnel.', importance: 9 });
-  rememberFact({ kind: 'user', content: 'Nathan runs a legal practice.', importance: 6 });
+  rememberFact({ kind: 'user', content: 'Alexander runs a legal practice.', importance: 6 });
   rememberFact({ kind: 'feedback', content: 'Prefer concise replies.', importance: 5 });
 
   const baseline = renderFactsForInstructions(12, 1600);
@@ -281,8 +281,8 @@ test('a pinned instruction is always rendered even when out-ranked by many newer
 
 test('policy overflow is explicit and never claims omitted preferences were applied', () => {
   const pins = [
-    'Only ever add events to the Breakthrough Coaching calendar, never a personal calendar.',
-    'Default sending identity is nathan.reynolds@breakthroughcoaching.ai for all outbound email.',
+    'Only ever add events to the Example Coaching calendar, never a personal calendar.',
+    'Default sending identity is alex.chen@corp.example for all outbound email.',
     'Never email clients on Fridays or over the weekend without explicit approval.',
     'Always quote prices in USD and state the engagement scope before any number.',
   ];
@@ -297,8 +297,8 @@ test('policy overflow is explicit and never claims omitted preferences were appl
 });
 
 test('message-scoped recall surfaces a query-relevant fact that global recall buries (the "MY accounts" fix)', () => {
-  // The fact that should govern "pull MY market-leader accounts".
-  rememberFact({ kind: 'project', content: 'My market-leader accounts are Salesforce accounts owned by Nathan Reynolds where Market_Leader__c is true.' });
+  // The fact that should govern "pull MY priority-account accounts".
+  rememberFact({ kind: 'project', content: 'My priority-account accounts are Salesforce accounts owned by Alexander Chen where Priority_Account__c is true.' });
   // Flood with newer, unrelated facts so a small global top-N excludes it.
   for (let i = 0; i < 15; i += 1) {
     rememberFact({ kind: 'project', content: `Unrelated recent note ${i} about calendar scheduling and meeting prep.` });
@@ -307,10 +307,10 @@ test('message-scoped recall surfaces a query-relevant fact that global recall bu
   // Global recall (no objective): the owner-filter fact is buried.
   const global = renderFactsForInstructions(3, 4000);
   // Message-scoped recall: the query surfaces it.
-  const scoped = renderFactsForInstructions(3, 4000, 'pull my market leader accounts');
-  assert.match(scoped, /owned by Nathan Reynolds/, 'message-scoped recall must surface the owner-filter fact');
+  const scoped = renderFactsForInstructions(3, 4000, 'pull my priority account accounts');
+  assert.match(scoped, /owned by Alexander Chen/, 'message-scoped recall must surface the owner-filter fact');
   assert.ok(
-    !/owned by Nathan Reynolds/.test(global) || /owned by Nathan Reynolds/.test(scoped),
+    !/owned by Alexander Chen/.test(global) || /owned by Alexander Chen/.test(scoped),
     'scoped recall should rank the relevant fact at least as well as global',
   );
 });
@@ -324,9 +324,9 @@ test('listPinnedFacts returns only active pinned facts; unpin removes it', () =>
 });
 
 test('rememberFact auto-pins constraint facts; other kinds stay unpinned', () => {
-  const constraint = rememberFact({ kind: 'constraint', content: 'Scorpion sends must use the scorpion.co connection.' });
+  const constraint = rememberFact({ kind: 'constraint', content: 'Acme sends must use the corp.example connection.' });
   assert.equal(constraint.pinned, true, 'a constraint is born pinned (always-rendered)');
-  const plain = rememberFact({ kind: 'user', content: 'Nathan reviews pipeline on Mondays.' });
+  const plain = rememberFact({ kind: 'user', content: 'Alexander reviews pipeline on Mondays.' });
   assert.equal(plain.pinned, false, 'non-constraint kinds are unaffected');
 });
 
@@ -367,7 +367,7 @@ test('decayAndEvictFacts (binary kill-switch path) protects pinned, high-importa
   const pinnedLow = rememberFact({ kind: 'feedback', content: 'Always CC the partner on client emails.', importance: 2 });
   setFactPinned(pinnedLow.id, true);
   const important = rememberFact({ kind: 'project', content: 'Flagship Q3 launch is the top priority.', importance: 9 });
-  const defaultImp = rememberFact({ kind: 'user', content: 'Nathan works in the Pacific timezone.' }); // importance defaults to 5.0
+  const defaultImp = rememberFact({ kind: 'user', content: 'Alexander works in the Pacific timezone.' }); // importance defaults to 5.0
 
   const future = Date.now() + 120 * DAY_MS;
   decayAndEvictFacts({ nowMs: future, importanceAware: false });
@@ -461,7 +461,7 @@ test('consolidateFact pins the resulting fact when candidate.pin is set (prohibi
 
 test('consolidateFact does NOT pin when pin is unset (common path unchanged)', async () => {
   const { consolidateFact } = await import('./reflection.js');
-  await consolidateFact({ kind: 'user', text: 'Nathan prefers concise replies.', trustLevel: 1.0 }, {});
+  await consolidateFact({ kind: 'user', text: 'Alexander prefers concise replies.', trustLevel: 1.0 }, {});
   assert.equal(
     listPinnedFacts(12).some((f) => f.content.includes('concise replies')),
     false,
@@ -471,7 +471,7 @@ test('consolidateFact does NOT pin when pin is unset (common path unchanged)', a
 
 test('no-regression: a decay pass that evicts nothing leaves the rendered facts byte-identical', () => {
   rememberFact({ kind: 'project', content: 'High-priority launch note.', importance: 9 });
-  rememberFact({ kind: 'user', content: 'Nathan is the owner.' }); // default importance 5 > ceil 4
+  rememberFact({ kind: 'user', content: 'Alexander is the owner.' }); // default importance 5 > ceil 4
   const before = renderFactsForInstructions(12, 1600);
   const result = decayAndEvictFacts(); // "now" → nothing idle, nothing low enough
   assert.equal(result.deactivated, 0, 'nothing evicted');
@@ -483,7 +483,7 @@ test('no-regression: a decay pass that evicts nothing leaves the rendered facts 
 // ─────────────────────────────────────────────────────────────────
 
 test('findSimilarFactsScored reports sim=null on the lexical fallback path', async () => {
-  rememberFact({ kind: 'user', content: 'Nathan prefers concise replies in markdown.' });
+  rememberFact({ kind: 'user', content: 'Alexander prefers concise replies in markdown.' });
   const scored = await findSimilarFactsScored('concise markdown replies', { kind: 'user', topK: 5 });
   assert.ok(scored.length >= 1, 'lexical fallback returns a candidate');
   assert.equal(scored[0].sim, null, 'no cosine score available without embeddings');
@@ -492,7 +492,7 @@ test('findSimilarFactsScored reports sim=null on the lexical fallback path', asy
 
 test('searchFacts returns relevant facts via lexical fallback', async () => {
   rememberFact({ kind: 'project', content: 'The deployment runs on a nightly cron at 3am.' });
-  rememberFact({ kind: 'user', content: 'Nathan likes terse status updates.' });
+  rememberFact({ kind: 'user', content: 'Alexander likes terse status updates.' });
   const hits = await searchFacts('nightly cron deployment', { topK: 5 });
   assert.ok(hits.some((f) => /cron/i.test(f.content)), 'token-overlap match surfaces');
 });
@@ -554,7 +554,7 @@ test('listActiveFacts(stanford): a useful high-importance fact beyond the former
   // and high-importance — exactly what the Stanford score wants to surface.
   insert.run({
     kind: 'user',
-    content: 'Nathan default sending identity is nathan.reynolds@scorpion.com.',
+    content: 'Alex default sending identity is alex.chen@legacy.example',
     hash: 'recall-pool-target-high-importance',
     created: new Date(now - 30 * DAY_MS).toISOString(),
     updated: new Date(now - 30 * DAY_MS).toISOString(),
@@ -589,7 +589,7 @@ test('listActiveFacts(stanford): a semantically-relevant fact is promoted by the
   const setVec = (id: number, arr: number[]) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), factContentHash(id));
 
   // Relevant but LOW importance → loses on base Stanford score.
-  const relevant = rememberFact({ kind: 'user', content: 'Nathan default sending identity is scorpion email.', importance: 3 });
+  const relevant = rememberFact({ kind: 'user', content: 'Alexander default sending identity is acme email.', importance: 3 });
   setVec(relevant.id, [1, 0, 0, 0]);
   // Off-topic but HIGH importance → wins the slot on base score alone.
   const offtopic = rememberFact({ kind: 'project', content: 'Home services plumbing emergency funnel.', importance: 8 });

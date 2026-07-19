@@ -127,7 +127,7 @@ async function withInnerSdk<T>(
 test('Claude-lane guard: an EMPTY worker result becomes an ERROR: envelope the ok-gate marks FAILED (not a hollow done)', async () => {
   const r = await withInnerSdk(
     async () => ({ text: '', toolUses: [] }),
-    () => runClaudeAgentSdkWorker(packet('Acme LLP — acme.com'), 'claude-sonnet-5', 'sess-empty'),
+    () => runClaudeAgentSdkWorker(packet('Acme LLP — acme.example'), 'claude-sonnet-5', 'sess-empty'),
   );
   assert.match(r.text, /^ERROR:/, 'empty inner output is surfaced as an ERROR envelope');
   assert.ok(r.text.trim().length > 0, 'the surfaced text is a clear error, never empty');
@@ -137,7 +137,7 @@ test('Claude-lane guard: an EMPTY worker result becomes an ERROR: envelope the o
 test('Claude-lane guard: WHITESPACE-only worker output is also failed, never a hollow success', async () => {
   const r = await withInnerSdk(
     async () => ({ text: '   \n\t  ', toolUses: [] }),
-    () => runClaudeAgentSdkWorker(packet('Bar Law — barlaw.com'), 'claude-sonnet-5', 'sess-ws'),
+    () => runClaudeAgentSdkWorker(packet('Maple Law — maple-law.example'), 'claude-sonnet-5', 'sess-ws'),
   );
   assert.match(r.text, /^ERROR:/);
   assert.equal(handlerOkGate(r.text), false);
@@ -146,7 +146,7 @@ test('Claude-lane guard: WHITESPACE-only worker output is also failed, never a h
 test('Claude-lane guard: a turn-CAP (limitHit) becomes an ERROR: envelope naming the turn cap; a partial is preserved, not lost', async () => {
   const capped = await withInnerSdk(
     async () => ({ text: '', toolUses: [], limitHit: true }),
-    () => runClaudeAgentSdkWorker(packet('Qux Legal — qux.com'), 'claude-sonnet-5', 'sess-cap'),
+    () => runClaudeAgentSdkWorker(packet('Qux Legal — qux.example'), 'claude-sonnet-5', 'sess-cap'),
   );
   assert.match(capped.text, /^ERROR:/);
   assert.match(capped.text, /turn cap/i, 'the cap is named so worker_capped fires + the respawn guard sees it');
@@ -154,7 +154,7 @@ test('Claude-lane guard: a turn-CAP (limitHit) becomes an ERROR: envelope naming
 
   const partial = await withInnerSdk(
     async () => ({ text: 'found 3 of 5 keywords', toolUses: [], limitHit: true }),
-    () => runClaudeAgentSdkWorker(packet('Zed & Co — zed.com'), 'claude-sonnet-5', 'sess-cap2'),
+    () => runClaudeAgentSdkWorker(packet('Zed & Co — zed.example'), 'claude-sonnet-5', 'sess-cap2'),
   );
   assert.match(partial.text, /^ERROR:/, 'a capped item is still FAILED even with partial work');
   assert.match(partial.text, /found 3 of 5 keywords/, 'the partial output is preserved, never silently dropped');
@@ -164,7 +164,7 @@ test('Claude-lane guard: a genuine answer passes through verbatim and the ok-gat
   const answer = 'Acme LLP: domain authority 38, top keyword "acme law" pos 4.';
   const r = await withInnerSdk(
     async () => ({ text: answer, toolUses: [] }),
-    () => runClaudeAgentSdkWorker(packet('Acme LLP — acme.com'), 'claude-sonnet-5', 'sess-ok'),
+    () => runClaudeAgentSdkWorker(packet('Acme LLP — acme.example'), 'claude-sonnet-5', 'sess-ok'),
   );
   assert.equal(r.text, answer, 'a real success is handed back unchanged');
   assert.equal(handlerOkGate(r.text), true);
@@ -186,7 +186,7 @@ function captureRunWorker(): (params: unknown) => Promise<{ content: Array<{ typ
 
 test('handler respawn-guard: re-spawning an ALREADY-CAPPED item is refused with a visible ERROR + a failed worker_result (never a hollow re-run)', async () => {
   const sessionId = 'sess-handler-respawn';
-  const item = 'Howard Barker Lane — barkerlanelaw.com';
+  const item = 'Birch Legal — birch-law.example';
   // events FK-references sessions(id) — create the run's session first.
   createSession({ id: sessionId, kind: 'chat' });
   // Seed the prior turn-cap this run so the respawn guard trips on the re-spawn.
@@ -207,7 +207,7 @@ test('handler respawn-guard: re-spawning an ALREADY-CAPPED item is refused with 
 
 test('handler no-session branch: without a live session context the item is a visible ERROR, not empty and not an apology', async () => {
   const handler = captureRunWorker();
-  const res = await handler(packet('No Session LLP — nosession.com')); // no withToolOutputContext
+  const res = await handler(packet('No Session LLP — no-session.example')); // no withToolOutputContext
   const text = res.content[0].text;
   assert.match(text, /^ERROR:/);
   assert.ok(text.trim().length > 0);

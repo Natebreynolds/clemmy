@@ -9,9 +9,9 @@
  *     version: 1,
  *     tunnel: {
  *       id: "<tunnel uuid>",
- *       name: "clem-nathan",
- *       hostname: "clem.nathan.dev",
- *       credentialsFile: "/Users/.../.cloudflared/<id>.json",
+ *       name: "clem-desktop",
+ *       hostname: "clem.example.com",
+ *       credentialsFile: "/Users/<username>/.cloudflared/<id>.json",
  *       mode: "named"
  *     } | null,
  *     binary: { path, version } | null,

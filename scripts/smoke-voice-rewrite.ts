@@ -19,7 +19,7 @@ No qualifying unread Inbox emails were found using the bounded UTC filter window
 
 const DID_WORK_TRIAGE = `Outlook triage complete.
 
-Processed 4 unread Inbox messages. 2 archived as newsletters, 1 categorized as Finance, 1 flagged as needing your reply: "Contract renewal — Acme (due Fri)" from j.smith@acme.com. No drafts were sent.`;
+Processed 4 unread Inbox messages. 2 archived as newsletters, 1 categorized as Finance, 1 flagged as needing your reply: "Contract renewal — Acme (due Fri)" from j.smith@acme.example. No drafts were sent.`;
 
 const FAILURE = `Workflow "Daily SEO baseline" failed at step 2 (fetch_metrics).
 

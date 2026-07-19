@@ -163,8 +163,8 @@ export function RunEnvironmentPanel({
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
   // Select once per drawer opening. Polling can reorder the activity list as
-  // other runs start or finish, but the context Nathan is inspecting must not
-  // jump out from under him.
+  // other runs start or finish, but the context being inspected must not jump
+  // out from under the user.
   useEffect(() => {
     if (!open) {
       setPinnedRunId(null);

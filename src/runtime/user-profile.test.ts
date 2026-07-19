@@ -9,11 +9,13 @@ const TEST_HOME = '/tmp/clemmy-test-profile';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const {
+  configuredUserNameAliases,
   DEFAULT_USER_PROFILE,
   loadUserProfile,
   normalizeUserProfile,
   renderProfileForInstructions,
   saveUserProfile,
+  textTargetsConfiguredUserRecipient,
 } = await import('./user-profile.js');
 
 before(() => {
@@ -35,26 +37,50 @@ test('loadUserProfile returns defaults when file absent', () => {
 
 test('saveUserProfile persists and round-trips', () => {
   saveUserProfile({
-    displayName: 'Nathan Reynolds',
-    preferredName: 'Nathan',
+    displayName: 'Alexander Chen',
+    preferredName: 'Alexander',
     role: 'Building clemmy',
     communicationTone: 'terse',
     timezone: 'America/Los_Angeles',
   });
   const loaded = loadUserProfile();
-  assert.equal(loaded.preferredName, 'Nathan');
+  assert.equal(loaded.preferredName, 'Alexander');
   assert.equal(loaded.role, 'Building clemmy');
   assert.equal(loaded.communicationTone, 'terse');
   assert.equal(loaded.timezone, 'America/Los_Angeles');
 });
 
 test('saveUserProfile is a partial patch — preserves prior fields', () => {
-  saveUserProfile({ preferredName: 'Nate', timezone: 'UTC' });
+  saveUserProfile({ preferredName: 'Alex', timezone: 'UTC' });
   saveUserProfile({ communicationTone: 'verbose' });
   const loaded = loadUserProfile();
-  assert.equal(loaded.preferredName, 'Nate');
+  assert.equal(loaded.preferredName, 'Alex');
   assert.equal(loaded.timezone, 'UTC');
   assert.equal(loaded.communicationTone, 'verbose');
+});
+
+test('configured user aliases include preferred, display, owner, and first-name forms', () => {
+  const profile = normalizeUserProfile({ displayName: 'Taylor Morgan', preferredName: 'Tay' });
+  const aliases = configuredUserNameAliases(profile, 'Jordan Kim');
+  assert.ok(aliases.includes('tay'));
+  assert.ok(aliases.includes('taylor morgan'));
+  assert.ok(aliases.includes('taylor'));
+  assert.ok(aliases.includes('jordan kim'));
+  assert.ok(aliases.includes('jordan'));
+  assert.ok(!aliases.includes('the user'));
+});
+
+test('configured user recipient detection requires outbound recipient wording', () => {
+  const aliases = ['jordan', 'jordan kim'];
+  assert.equal(textTargetsConfiguredUserRecipient('Send Jordan the report.', aliases), true);
+  assert.equal(textTargetsConfiguredUserRecipient('Send the report to Jordan Kim.', aliases), true);
+  assert.equal(textTargetsConfiguredUserRecipient('Email the report to Jordan.', aliases), true);
+  assert.equal(textTargetsConfiguredUserRecipient('Message the result to Jordan.', aliases), true);
+  assert.equal(textTargetsConfiguredUserRecipient('DM the summary to Jordan.', aliases), true);
+  assert.equal(textTargetsConfiguredUserRecipient('Notify the result to Jordan.', aliases), true);
+  assert.equal(textTargetsConfiguredUserRecipient('Jordan approved the report.', aliases), false);
+  assert.equal(textTargetsConfiguredUserRecipient('Analyze email trends for Jordan.', aliases), false);
+  assert.equal(textTargetsConfiguredUserRecipient('Send Riley the report.', aliases), false);
 });
 
 test('normalizeUserProfile rejects invalid tone, falls to balanced', () => {
@@ -99,10 +125,10 @@ test('renderProfileForInstructions: empty when profile is default', () => {
 
 test('renderProfileForInstructions: includes preferred name when set', () => {
   const rendered = renderProfileForInstructions(normalizeUserProfile({
-    displayName: 'Nathan Reynolds',
-    preferredName: 'Nathan',
+    displayName: 'Alexander Chen',
+    preferredName: 'Alexander',
   }));
-  assert.match(rendered, /Address them as Nathan/);
+  assert.match(rendered, /Address them as Alexander/);
 });
 
 test('renderProfileForInstructions: surfaces working hours with days', () => {

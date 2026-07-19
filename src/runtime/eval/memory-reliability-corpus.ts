@@ -507,16 +507,16 @@ export function buildMemoryIntegrityEvalCases(reset: () => void): EvalCase[] {
         });
         try {
           const keep = rememberFact({
-            kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.',
+            kind: 'project', content: 'Example Legal Group SEO report lives at example-legal.example/report.',
             score: 1, importance: 6,
           });
           const drop = rememberFact({
-            kind: 'project', content: 'The Revill Law Firm SEO report is at revill-lawfirm.com/report.',
+            kind: 'project', content: 'The Example Legal Group SEO report is at example-legal.example/report.',
             score: 1, importance: 6,
           });
-          const entity = upsertEntity({ type: 'company', name: 'Revill Law Firm' });
+          const entity = upsertEntity({ type: 'company', name: 'Example Legal Group' });
           const resource = upsertResourcePointer({
-            app: 'Google Drive', kind: 'file', providerId: 'revill-report', name: 'Revill SEO Report',
+            app: 'Google Drive', kind: 'file', providerId: 'example-legal-report', name: 'Example Legal SEO Report',
           });
           const [dropEvidence] = getFactEvidence(drop.id);
           if (!dropEvidence) return { pass: false, detail: 'duplicate source episode missing before merge' };
@@ -782,7 +782,7 @@ export function buildMemoryIntegrityEvalCases(reset: () => void): EvalCase[] {
             dueDate: '2026-07-17',
           }],
           topics: ['Clio integration', 'client data quality'],
-          participants: ['Dana Smith', 'Nathan Reynolds'],
+          participants: ['Dana Smith', 'Alexander Chen'],
           generatedAt: '2026-07-15T22:00:00.000Z',
           source: 'agent',
         };
@@ -1129,14 +1129,14 @@ export function buildMemoryIntegrityEvalCases(reset: () => void): EvalCase[] {
       label: 'memory:identity_resolution',
       run: async () => {
         reset();
-        const first = upsertEntity({ type: 'person', name: 'Nathan Reynolds', aliases: ['nathan@example.com'] });
-        const replay = upsertEntity({ type: 'person', name: 'Nate Reynolds', aliases: ['nathan@example.com'] });
+        const first = upsertEntity({ type: 'person', name: 'Alexander Chen', aliases: ['alex@corp.example'] });
+        const replay = upsertEntity({ type: 'person', name: 'Alex Chen', aliases: ['alex@corp.example'] });
         const db = openMemoryDb();
         const row = db.prepare('SELECT aliases_json FROM entities WHERE id = ?').get(first) as { aliases_json: string };
         const count = (db.prepare("SELECT COUNT(*) AS count FROM entities WHERE entity_type = 'person'").get() as { count: number }).count;
         const aliases = JSON.parse(row.aliases_json) as string[];
-        const pass = first === replay && count === 1 && aliases.includes('Nate Reynolds');
-        return { pass, detail: `sameId=${first === replay}; people=${count}; alternateNameRetained=${aliases.includes('Nate Reynolds')}` };
+        const pass = first === replay && count === 1 && aliases.includes('Alex Chen');
+        return { pass, detail: `sameId=${first === replay}; people=${count}; alternateNameRetained=${aliases.includes('Alex Chen')}` };
       },
     },
     {

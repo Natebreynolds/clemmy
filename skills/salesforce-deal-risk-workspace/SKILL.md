@@ -8,8 +8,8 @@ Build a live, interactive **Workspace** (a Clementine space) that shows a rep's 
 a team's open Salesforce pipeline with each deal flagged **On Track / At Risk /
 Likely to Slip** — and, critically, a **"Why" built on concrete evidence**: email
 & call communications, whether a **Next Step** is set, notes on file, and the
-**age** of the opportunity. Proven against Darrin Sennott's team (294 deals);
-`src/refresh.reference.mjs` is the working runner to adapt.
+**age** of the opportunity. `src/refresh.reference.mjs` is the reusable runner
+to adapt for a synthetic or user-selected team.
 
 ## Defining requirements (what makes this trustworthy — do not skip)
 

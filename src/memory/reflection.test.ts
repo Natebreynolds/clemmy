@@ -135,7 +135,7 @@ test('reflection extractor binds to the active provider instead of a gpt-shaped 
 test('entities: upsert is idempotent + merges aliases', () => {
   resetMemoryDb();
   const id1 = upsertEntity({ type: 'person', name: 'Marlow Smith', aliases: ['Marlow'] });
-  const id2 = upsertEntity({ type: 'person', name: 'Marlow Smith', aliases: ['marlow@acme.com'] });
+  const id2 = upsertEntity({ type: 'person', name: 'Marlow Smith', aliases: ['marlow@acme.example'] });
   assert.equal(id1, id2, 'same canonical+type returns same row');
 
   const id3 = upsertEntity({ type: 'company', name: 'Marlow Smith' });
@@ -211,44 +211,44 @@ test('entities: a stable email converges different names into one canonical pers
   resetMemoryDb();
   const id1 = upsertEntity({
     type: 'person',
-    name: 'Nathan Reynolds',
-    aliases: ['nathan@example.com'],
+    name: 'Alexander Chen',
+    aliases: ['alex@corp.example'],
     evidenceEpisodeId: undefined,
   });
   const id2 = upsertEntity({
     type: 'person',
-    name: 'Nate Reynolds',
-    aliases: ['nathan@example.com'],
+    name: 'Alex Chen',
+    aliases: ['alex@corp.example'],
   });
   assert.equal(id2, id1, 'the shared stable identifier prevents a duplicate person row');
 
   const row = openMemoryDb().prepare('SELECT aliases_json FROM entities WHERE id = ?').get(id1) as { aliases_json: string };
-  assert.ok(JSON.parse(row.aliases_json).includes('Nate Reynolds'), 'the alternate display name is retained as an alias');
+  assert.ok(JSON.parse(row.aliases_json).includes('Alex Chen'), 'the alternate display name is retained as an alias');
 });
 
 test('entities: historical exact personal-email duplicates reconcile to the strongest canonical person', () => {
   resetMemoryDb();
   const canonical = upsertEntity({
-    type: 'person', name: 'Nathan Reynolds', aliases: ['nathan@example.com'],
+    type: 'person', name: 'Alexander Chen', aliases: ['alex@corp.example'],
   });
   const db = openMemoryDb();
   const now = '2026-01-01T00:00:00.000Z';
   const duplicate = Number(db.prepare(`
     INSERT INTO entities
       (entity_type, canonical_name, canonical_name_lc, aliases_json, first_seen_at, last_seen_at, mention_count)
-    VALUES ('person', 'Nate', 'nate', '[]', ?, ?, 1)
+    VALUES ('person', 'Alex', 'alex', '[]', ?, ?, 1)
   `).run(now, now).lastInsertRowid);
   db.prepare(`
     INSERT INTO entity_identifiers
       (entity_id, scheme, value, value_norm, confidence, evidence_episode_id, source_uri, first_seen_at, last_seen_at)
-    VALUES (?, 'email', 'nathan@example.com', 'nathan@example.com', 0.99, NULL, NULL, ?, ?)
+    VALUES (?, 'email', 'alex@corp.example', 'alex@corp.example', 0.99, NULL, NULL, ?, ?)
   `).run(duplicate, now, now);
 
   const result = autoReconcileStrongEntityIdentifiers();
   assert.equal(result.groupsMerged, 1);
   assert.equal(result.entitiesRedirected, 1);
   assert.equal(resolveCanonicalEntityId(duplicate), canonical);
-  assert.equal(upsertEntity({ type: 'person', name: 'Nate Reynolds', aliases: ['nathan@example.com'] }), canonical);
+  assert.equal(upsertEntity({ type: 'person', name: 'Alex Chen', aliases: ['alex@corp.example'] }), canonical);
 });
 
 test('entities: shared inboxes and cross-type email reuse never auto-merge identities', () => {
@@ -314,9 +314,9 @@ test('entities: a shared single-token nickname is not enough to auto-merge peopl
 
 test('entities: reviewed merge redirects history and retrieval without deleting the source row', () => {
   resetMemoryDb();
-  const canonical = upsertEntity({ type: 'person', name: 'Nathan Reynolds', aliases: ['Nathan'] });
-  const duplicate = upsertEntity({ type: 'person', name: 'Nate' });
-  const fact = rememberFact({ kind: 'user', content: 'Nate owns the weekly client review.' });
+  const canonical = upsertEntity({ type: 'person', name: 'Alexander Chen', aliases: ['Alexander'] });
+  const duplicate = upsertEntity({ type: 'person', name: 'Alex' });
+  const fact = rememberFact({ kind: 'user', content: 'Alex owns the weekly client review.' });
   setFactEntityLinks(fact.id, [duplicate]);
 
   assert.equal(mergeEntities({
@@ -326,7 +326,7 @@ test('entities: reviewed merge redirects history and retrieval without deleting 
   }), canonical);
   assert.equal(resolveCanonicalEntityId(duplicate), canonical);
   assert.ok(getFactIdsForEntity(duplicate).includes(fact.id), 'old ids replay through the canonical identity');
-  assert.deepEqual(resolveEntityIdsForText('What did Nate own?'), [canonical], 'the old name resolves once, to the canonical person');
+  assert.deepEqual(resolveEntityIdsForText('What did Alex own?'), [canonical], 'the old name resolves once, to the canonical person');
   assert.ok(openMemoryDb().prepare('SELECT id FROM entities WHERE id = ?').get(duplicate), 'the historical source entity remains queryable');
   assert.deepEqual(listEntityIdentityConflicts(), []);
 });
@@ -887,6 +887,19 @@ test('reflection extractor sanitizer preserves signal from schema-drifted JSON',
   ]);
 });
 
+test('reflection schema-drift recovery classifies configured user-name facts without hardcoded identities', () => {
+  const extraction = _testOnly_sanitizeExtractionOutput({
+    facts: [
+      { kind: 'memory', text: 'Jordan Rivera prefers concise weekly summaries.', importance: 7 },
+      { kind: 'memory', text: "Jordan Rivera's timezone is America/Los_Angeles.", importance: 5 },
+    ],
+    entities: [],
+    pointers: [],
+  }, { userNames: ['Jordan Rivera'] });
+
+  assert.deepEqual(extraction?.facts.map((fact) => fact.kind), ['user', 'user']);
+});
+
 test('reflection relationship sanitizer requires a bounded evidence quote', () => {
   const extraction = _testOnly_sanitizeExtractionOutput({
     facts: [],
@@ -1317,20 +1330,21 @@ test('consolidateActiveFacts (entity guard): never folds two facts about DISTINC
                             VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
   const setVec = (id: number, arr: number[]) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), factContentHash(id));
 
-  // The Revill-vs-Aldous data-loss case: two DISTINCT-client facts with identical
-  // phrasing (identical vector → cosine 1.0). Without the entity guard the older
-  // ties on score and is soft-deleted, corrupting recall for one client. The
+  // Two distinct fictional organizations with identical phrasing and vectors
+  // reproduce the cross-client data-loss class without customer identity.
+  // Without the entity guard the older fact ties on score and is soft-deleted,
+  // corrupting recall for one client. The
   // guard (extractAnchors/canMergeEntitySafe, shared with the paraphrase merge)
   // must keep BOTH.
-  const revill = rememberFact({ kind: 'project', content: 'Revill Law Firm ranks #3 for PI Birmingham.', score: 1.0 });
-  const aldous = rememberFact({ kind: 'project', content: 'Aldous Law ranks #3 for PI Birmingham.', score: 1.0 });
-  setVec(revill.id, [1, 0, 0, 0]);
-  setVec(aldous.id, [1, 0, 0, 0]);
+  const exampleLegal = rememberFact({ kind: 'project', content: 'Example Legal Group ranks #3 for PI Birmingham.', score: 1.0 });
+  const sampleLaw = rememberFact({ kind: 'project', content: 'Sample Law Partners ranks #3 for PI Birmingham.', score: 1.0 });
+  setVec(exampleLegal.id, [1, 0, 0, 0]);
+  setVec(sampleLaw.id, [1, 0, 0, 0]);
 
   const res = await consolidateActiveFacts({ useStoredEmbeddings: true, simThreshold: 0.95 });
   assert.equal(res.merged, 0, 'distinct-entity facts are NOT folded despite cosine 1.0');
-  assert.equal(getFact(revill.id)?.active, true, 'Revill survives');
-  assert.equal(getFact(aldous.id)?.active, true, 'Aldous survives');
+  assert.equal(getFact(exampleLegal.id)?.active, true, 'Example Legal survives');
+  assert.equal(getFact(sampleLaw.id)?.active, true, 'Sample Law survives');
 });
 
 test('consolidateActiveFacts (stored embeddings): makes ZERO new embed API calls (uses stored vectors)', async () => {
@@ -1378,7 +1392,7 @@ test('getResolverStats: a novel fact tallies as an ADD (resolver observability)'
   try {
     // A novel fact (no similar existing facts) takes the novelty fast-path → ADD,
     // no LLM resolver call — deterministic in the test env.
-    const out = await consolidateFact({ kind: 'user', text: 'Nathan keeps a standing 9am Monday review.' });
+    const out = await consolidateFact({ kind: 'user', text: 'Alexander keeps a standing 9am Monday review.' });
     assert.equal(out.written, 1, 'novel fact is added');
     const stats = getResolverStats();
     assert.ok(stats.add >= 1, 'the ADD decision is tallied');
@@ -1390,10 +1404,10 @@ test('getResolverStats: a novel fact tallies as an ADD (resolver observability)'
 
 test('consolidateFact: resolver DELETE on a pinned fact is blocked — fact stays active, candidate ADDed', async () => {
   resetMemoryDb();
-  const prot = rememberFact({ kind: 'feedback', content: 'Never send Scorpion mail from breakthrough.co.' });
+  const prot = rememberFact({ kind: 'feedback', content: 'Never send Acme mail from legacy-mail.example.' });
   setFactPinned(prot.id, true);
   const out = await consolidateFact(
-    { kind: 'feedback', text: 'Sending Scorpion mail from breakthrough.co is fine now.' },
+    { kind: 'feedback', text: 'Sending Acme mail from legacy-mail.example is fine now.' },
     {},
     { resolver: async () => ({ decision: 'DELETE', target_id: prot.id }) },
   );
@@ -1406,13 +1420,13 @@ test('consolidateFact: resolver DELETE on a pinned fact is blocked — fact stay
 
 test('consolidateFact: resolver UPDATE on a pinned fact is blocked — content unchanged, candidate ADDed', async () => {
   resetMemoryDb();
-  const content = 'Always route Scorpion sends through scorpion.co.';
+  const content = 'Always route Acme sends through corp.example.';
   const prot = rememberFact({ kind: 'feedback', content });
   setFactPinned(prot.id, true);
   const out = await consolidateFact(
-    { kind: 'feedback', text: 'Scorpion sends can route through any connection.' },
+    { kind: 'feedback', text: 'Acme sends can route through any connection.' },
     {},
-    { resolver: async () => ({ decision: 'UPDATE', target_id: prot.id, rewrite: 'Scorpion sends can route through any connection.' }) },
+    { resolver: async () => ({ decision: 'UPDATE', target_id: prot.id, rewrite: 'Acme sends can route through any connection.' }) },
   );
   assert.equal(getFact(prot.id)?.content, content, 'pinned content is untouched');
   assert.equal(out.updated, 0, 'no update tallied');

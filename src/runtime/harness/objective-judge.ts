@@ -77,7 +77,7 @@ export interface ObjectiveJudgeVerdict {
    * The judge ruled the turn's deliverable is a genuine direction/authorization
    * question to the user (AWAITING verdict). Treated as done for bounce purposes;
    * the caller should yield the turn as awaiting_user_input, never continue past
-   * the question (sess-mrds80fu: a bounced approval question became 10 unapproved
+   * the question (ask-first batch regression: a bounced approval question became 10 unapproved
    * emails).
    */
   awaitingUser?: boolean;
@@ -728,7 +728,7 @@ export async function judgeRunProgress(
  * else?" tail does not count; "do you want me to send the 55 emails?" does.
  * Pure + exported for tests. Used by the loop's ask-first invariant to convert
  * a completed-tagged question turn into awaiting_user_input BEFORE the
- * completion judge can bounce it (sess-mrds80fu: that bounce escalated a
+ * completion judge can bounce it (ask-first batch regression: that bounce escalated a
  * permission question into unapproved sends).
  */
 const DIRECTION_QUESTION_RE = new RegExp(

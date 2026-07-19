@@ -14,9 +14,9 @@ import { appendFanoutAdvisory, coarseArgShape } from './fanout-advisory.js';
 test('fires on the 3rd distinct same-shape call for an ARBITRARY tool name (not just composio)', () => {
   const sessionId = 'sess-fa-generic';
   const tool = 'dataforseo__serp_organic_live_advanced'; // a native MCP namespaced name
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'a.com' }, sessionId }), null, 'item 1');
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'b.com' }, sessionId }), null, 'item 2');
-  const advice = appendFanoutAdvisory({ toolName: tool, args: { target: 'c.com' }, sessionId });
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'alpha.example' }, sessionId }), null, 'item 1');
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'beta.example' }, sessionId }), null, 'item 2');
+  const advice = appendFanoutAdvisory({ toolName: tool, args: { target: 'gamma.example' }, sessionId });
   assert.ok(advice && /run_worker/.test(advice), 'item 3 fires with run_worker advice');
   assert.ok(advice && advice.includes(tool), 'advice names the tool');
 });
@@ -60,9 +60,9 @@ test('INDEPENDENCE GUARD: a dependent chain (each arg derived from prior result)
 test('INDEPENDENCE GUARD: an independent batch still fires (results do NOT contain the next item)', () => {
   const sessionId = 'sess-fa-batch';
   const tool = 'dataforseo__serp_organic_live_advanced';
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'alpha-firmxx.com' }, sessionId, resultText: 'rank 4, volume 200' }), null);
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'beta-firmxxx.com' }, sessionId, resultText: 'rank 9, volume 80' }), null);
-  const advice = appendFanoutAdvisory({ toolName: tool, args: { target: 'gamma-firmx.com' }, sessionId, resultText: 'rank 2, volume 500' });
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'alpha-firm.example' }, sessionId, resultText: 'rank 4, volume 200' }), null);
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { target: 'beta-firm.example' }, sessionId, resultText: 'rank 9, volume 80' }), null);
+  const advice = appendFanoutAdvisory({ toolName: tool, args: { target: 'gamma-firm.example' }, sessionId, resultText: 'rank 2, volume 500' });
   assert.ok(advice && /run_worker/.test(advice), 'independent 3-firm batch fires normally despite resultText present');
 });
 
@@ -70,13 +70,13 @@ test('INDEPENDENCE GUARD self-corrects: a coincidental match only delays the adv
   const sessionId = 'sess-fa-coincidence';
   const tool = 'firecrawl__scrape';
   // call 1's RESULT coincidentally mentions firm 2's domain (e.g. competitor list).
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { url: 'alpha-firmxx.com' }, sessionId, resultText: 'competitors: beta-firmxxx.com, x.io' }), null, 'item 1 counted (size 1)');
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { url: 'alpha-firm.example' }, sessionId, resultText: 'competitors: beta-firm.example, competitor.example' }), null, 'item 1 counted (size 1)');
   // call 2's url appears in call 1's result → flagged dependent → skipped (size stays 1).
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { url: 'beta-firmxxx.com' }, sessionId, resultText: 'rank 9' }), null, 'item 2 skipped (coincidental match)');
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { url: 'beta-firm.example' }, sessionId, resultText: 'rank 9' }), null, 'item 2 skipped (coincidental match)');
   // call 3 not in call 2 result → counted (size 2).
-  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { url: 'gamma-firmx.com' }, sessionId, resultText: 'rank 2' }), null, 'item 3 counted (size 2)');
+  assert.equal(appendFanoutAdvisory({ toolName: tool, args: { url: 'gamma-firm.example' }, sessionId, resultText: 'rank 2' }), null, 'item 3 counted (size 2)');
   // call 4 → size 3 → fires (delayed by exactly one vs the no-coincidence case).
-  const advice = appendFanoutAdvisory({ toolName: tool, args: { url: 'delta-firmx.com' }, sessionId, resultText: 'rank 1' });
+  const advice = appendFanoutAdvisory({ toolName: tool, args: { url: 'delta-firm.example' }, sessionId, resultText: 'rank 1' });
   assert.ok(advice && /run_worker/.test(advice), 'real batch still fires, just one item later');
 });
 

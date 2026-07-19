@@ -299,7 +299,7 @@ const requestApprovalParams = z.object({
  * the user's workspace). The user already consented by asking; an
  * approval gate here is friction the user reads as a bug.
  *
- * Observed failure mode (sess-mpbpih0u, 2026-05-18 14:27): user said
+ * Observed regression: the user said
  * "save salesforce CLI rule to memory please" → orchestrator called
  * request_approval(subject="Save Salesforce access rule to memory",
  * destructive:false) → the user's later "approve" landed on a

@@ -18,13 +18,13 @@ test('extractMailboxEmails: structuredOnly ignores an email buried in an error e
 });
 
 test('extractMailboxEmails: structuredOnly still reads REAL profile fields', () => {
-  const profile = { data: { response_data: { mail: 'Nate@Scorpion.co', userPrincipalName: 'nate@scorpion.co' } } };
-  assert.deepEqual(extractMailboxEmails(profile, { structuredOnly: true }), ['nate@scorpion.co']);
+  const profile = { data: { response_data: { mail: 'Alex.Chen@corp.example', userPrincipalName: 'alex.chen@corp.example' } } };
+  assert.deepEqual(extractMailboxEmails(profile, { structuredOnly: true }), ['alex.chen@corp.example']);
 });
 
 test('extractMailboxEmails: structuredOnly reads proxyAddresses (SMTP: prefixes normalized)', () => {
-  const profile = { data: { proxyAddresses: ['SMTP:Primary@corp.com', 'smtp:alias@corp.com'] } };
+  const profile = { data: { proxyAddresses: ['SMTP:Primary@corp.example', 'smtp:alias@corp.example'] } };
   const got = extractMailboxEmails(profile, { structuredOnly: true });
-  assert.ok(got.includes('primary@corp.com'));
-  assert.ok(got.includes('alias@corp.com'));
+  assert.ok(got.includes('primary@corp.example'));
+  assert.ok(got.includes('alias@corp.example'));
 });

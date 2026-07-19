@@ -43,8 +43,8 @@ test('hardBlock distinguishes PROD from non-prod ambient publishes (Test-5 fix)'
   assert.equal(draft.action, 'flag');
   assert.notEqual(draft.hardBlock, true, 'a draft ambient publish stays a one-shot nudge');
   // --create-site is NOT treated as an explicit destination (netlify ignores it
-  // when the cwd is already linked — exactly what clobbered aldous in Test 5).
-  assert.equal(evaluateShellDestination('netlify deploy --prod --create-site meridian').hardBlock, true);
+  // when the cwd is already linked — exactly what clobbered an unrelated site in Test 5).
+  assert.equal(evaluateShellDestination('netlify deploy --prod --create-site fixture-meridian').hardBlock, true);
   // Hardening (review 2026-06-14): a QUOTED --prod must still hard-block (the
   // verb-scan is quote-stripped, so this used to downgrade to a draft).
   assert.equal(evaluateShellDestination('netlify deploy "--prod" --dir ./site').hardBlock, true);
@@ -54,7 +54,7 @@ test('hardBlock distinguishes PROD from non-prod ambient publishes (Test-5 fix)'
 });
 
 test('an EXPLICIT --site makes it allow (the recovery the model eventually did)', () => {
-  const r = evaluateShellDestination('netlify deploy --dir "/x/site" --prod --site 6c97fed4-6043-4841 --json');
+  const r = evaluateShellDestination('netlify deploy --dir "/x/site" --prod --site site_fixture_explicit --json');
   assert.equal(r.action, 'allow');
 });
 
@@ -152,8 +152,8 @@ test('one-shot ledger: nudged once per (session, shape), then remembered', () =>
 
 test('classifyShellNetworkMutation: catches the clear send shapes', () => {
   const sends = [
-    'curl -X POST https://api.x.com/send -d \'{"to":"a@b.com"}\'',
-    'curl --json \'{"to":"a@b.com"}\' https://api.x.com/send',
+    'curl -X POST https://api.x.com/send -d \'{"to":"a@beta.example"}\'',
+    'curl --json \'{"to":"a@beta.example"}\' https://api.x.com/send',
     'curl -F file=@x.json https://api.x.com/upload',
     'gh api --method POST /repos/o/r/dispatches',
     'gh api -X DELETE /repos/o/r/issues/1',
@@ -168,8 +168,8 @@ test('classifyShellNetworkMutation: catches the clear send shapes', () => {
     'docker push registry.example.com/client/app:latest',
     'kubectl apply -f deployment.yaml',
     'terraform apply -auto-approve',
-    'sendmail a@b.com < msg.txt',
-    'echo body | mail -s subj a@b.com',
+    'sendmail a@beta.example < msg.txt',
+    'echo body | mail -s subj a@beta.example',
     'aws s3 cp ./out.html s3://my-bucket/index.html',
     'twilio api:core:messages:create --to +15555550100 --body hi',
     'scp ./secret.txt user@host:/tmp/',
@@ -272,21 +272,21 @@ test('ImplicitDestinationError carries a recoverable, explicit message', () => {
   assert.equal(e.verb, 'deploy');
 });
 
-// ─── Destination PROVENANCE (2026-06-15 clobber: coffee shop onto a law firm) ───
+// ─── Destination provenance cross-project clobber regression ────────────────
 
 test('extractExplicitPublishTargets pulls --site/--project values, ignores vars', () => {
-  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --prod --dir . --site 6c97fed4-abc'), ['6c97fed4-abc']);
-  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --site=harbor-coffee'), ['harbor-coffee']);
+  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --prod --dir . --site site_fixture_explicit'), ['site_fixture_explicit']);
+  assert.deepEqual(extractExplicitPublishTargets('netlify deploy --site=fixture-coffee'), ['fixture-coffee']);
   assert.deepEqual(extractExplicitPublishTargets('vercel --prod --project my-app'), ['my-app']);
   assert.deepEqual(extractExplicitPublishTargets('netlify deploy --site "$SITE_ID"'), []); // shell var → implicit gate owns it
   assert.deepEqual(extractExplicitPublishTargets('netlify deploy --prod'), []);            // no explicit target
 });
 
 test('provenance gate HARD-BLOCKS a deploy to an explicit target never created/named this session (the clobber)', () => {
-  // Session created/named only "harbor-coffee-cafe"; the deploy targets an
+  // Session created/named only "fixture-coffee-cafe"; the deploy targets an
   // UNRELATED existing site id grabbed from `netlify status` → must refuse.
-  const provenance = (t: string) => new Set(['harbor-coffee-cafe']).has(t);
-  const v = evaluateDestinationProvenance('cd /x && netlify deploy --prod --dir . --site 6c97fed4-6043-4841-975c-b8f99b2e274c', provenance);
+  const provenance = (t: string) => new Set(['fixture-coffee-cafe']).has(t);
+  const v = evaluateDestinationProvenance('cd /x && netlify deploy --prod --dir . --site 00000000-0000-4000-8000-000000000002', provenance);
   assert.equal(v.action, 'flag');
   assert.equal(v.hardBlock, true);
   assert.match(v.reason, /no session provenance/i);
@@ -294,7 +294,7 @@ test('provenance gate HARD-BLOCKS a deploy to an explicit target never created/n
 
 test('provenance gate reports multiline npx netlify-cli deploys as netlify deploys', () => {
   const v = evaluateDestinationProvenance(
-    ['set -e', 'cd /x', 'npx netlify-cli deploy --prod --dir . --site 6c97fed4-6043-4841-975c-b8f99b2e274c'].join('\n'),
+    ['set -e', 'cd /x', 'npx netlify-cli deploy --prod --dir . --site 00000000-0000-4000-8000-000000000002'].join('\n'),
     () => false,
   );
   assert.equal(v.action, 'flag');
@@ -304,14 +304,14 @@ test('provenance gate reports multiline npx netlify-cli deploys as netlify deplo
 
 test('provenance gate ALLOWS a deploy to a site created this session', () => {
   // create produced both the slug and the resolved id; deploy targets the id.
-  const provenance = (t: string) => new Set(['harbor-coffee-cafe', 'abc-123-id']).has(t);
-  const v = evaluateDestinationProvenance('netlify deploy --prod --dir . --site abc-123-id', provenance);
+  const provenance = (t: string) => new Set(['fixture-coffee-cafe', 'site_fixture_created']).has(t);
+  const v = evaluateDestinationProvenance('netlify deploy --prod --dir . --site site_fixture_created', provenance);
   assert.equal(v.action, 'allow');
 });
 
 test('provenance gate ALLOWS a deploy to a site the user explicitly named', () => {
-  const userNamed = (t: string) => 'deploy harbor coffee to my existing site harbor-coffee'.includes(t);
-  const v = evaluateDestinationProvenance('netlify deploy --prod --site harbor-coffee', userNamed);
+  const userNamed = (t: string) => 'deploy fixture coffee to my existing site fixture-coffee'.includes(t);
+  const v = evaluateDestinationProvenance('netlify deploy --prod --site fixture-coffee', userNamed);
   assert.equal(v.action, 'allow');
 });
 
@@ -327,7 +327,7 @@ test('provenance gate ignores non-publish commands', () => {
 });
 
 test('UnverifiedDestinationError is recoverable and directs discover-then-retry, not surrender', () => {
-  const e = new UnverifiedDestinationError({ command: 'netlify deploy --site x', verb: 'deploy', shapeKey: 'netlify:deploy:unverified', targets: ['6c97fed4'] });
+  const e = new UnverifiedDestinationError({ command: 'netlify deploy --site fixture-unknown', verb: 'deploy', shapeKey: 'netlify:deploy:unverified', targets: ['site_fixture_unverified'] });
   assert.match(e.message, /UNVERIFIED_DESTINATION/);
   assert.match(e.message, /sites:create/);            // how to make a real dedicated target
   assert.match(e.message, /--account-slug/);          // non-interactively (the root trigger)
@@ -343,32 +343,32 @@ test('UnverifiedDestinationError is recoverable and directs discover-then-retry,
 // ─── Defect A: identity-aware provenance (slug vs subdomain vs url), no vendor list ───
 
 test('destinationIdentityForms: a host yields both the full host and its first DNS label', () => {
-  assert.deepEqual(destinationIdentityForms('clementine-agent-v2.netlify.app'), ['clementine-agent-v2.netlify.app', 'clementine-agent-v2']);
+  assert.deepEqual(destinationIdentityForms('fixture-agent-site.netlify.app'), ['fixture-agent-site.netlify.app', 'fixture-agent-site']);
   // general across providers — no domain list
   assert.deepEqual(destinationIdentityForms('Foo-Bar.vercel.app'), ['foo-bar.vercel.app', 'foo-bar']);
   assert.deepEqual(destinationIdentityForms('https://my-site.pages.dev/'), ['my-site.pages.dev', 'my-site']);
   // a bare slug or UUID has a single form
-  assert.deepEqual(destinationIdentityForms('clementine-agent-v2'), ['clementine-agent-v2']);
-  assert.deepEqual(destinationIdentityForms('48efadea-de48-42e3-894b-0da7deb3c6f6'), ['48efadea-de48-42e3-894b-0da7deb3c6f6']);
+  assert.deepEqual(destinationIdentityForms('fixture-agent-site'), ['fixture-agent-site']);
+  assert.deepEqual(destinationIdentityForms('00000000-0000-4000-8000-000000000003'), ['00000000-0000-4000-8000-000000000003']);
 });
 
-test('THE 2026-06-21 RECURRENCE: a site created in-session is provenanced when deployed by its subdomain', () => {
-  // Provenance set holds the BARE slug (from `sites:create --name clementine-agent-v2`).
-  const created = new Set(['clementine-agent-v2']);
+test('a site created in-session is provenanced when deployed by its subdomain', () => {
+  // Provenance set holds the BARE fixture slug from sites:create.
+  const created = new Set(['fixture-agent-site']);
   const hasProvenance = (target: string): boolean =>
     destinationIdentityForms(target).some((f) => created.has(f));
   // Deploying to the FULL subdomain must now resolve to the same resource (was a hard block).
-  const cmd = 'cd site && netlify deploy --prod --dir . --site clementine-agent-v2.netlify.app --message "x"';
+  const cmd = 'cd site && netlify deploy --prod --dir . --site fixture-agent-site.netlify.app --message "x"';
   const prov = evaluateDestinationProvenance(cmd, hasProvenance);
   assert.equal(prov.action, 'allow', 'a site created this session must be provenanced even via its .netlify.app subdomain');
 });
 
 test('cross-project clobber STILL blocked: an unrelated site is not provenanced by a different project', () => {
-  const created = new Set(['my-coffee-shop']); // created for the coffee project
+  const created = new Set(['fixture-coffee-shop']); // created for the fixture coffee project
   const hasProvenance = (target: string): boolean =>
     destinationIdentityForms(target).some((f) => created.has(f));
   // A deploy to an UNRELATED law-firm site must still be refused (the original incident).
-  const cmd = 'netlify deploy --prod --dir . --site revill-law-firm.netlify.app';
+  const cmd = 'netlify deploy --prod --dir . --site unrelated-law-site.example';
   const prov = evaluateDestinationProvenance(cmd, hasProvenance);
   assert.equal(prov.action, 'flag');
   assert.equal(prov.hardBlock, true);

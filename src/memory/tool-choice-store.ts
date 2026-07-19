@@ -33,7 +33,7 @@ export type ToolChoiceKind = 'cli' | 'composio' | 'mcp';
 
 /** Fold-3 pin namespace: workflow-step tool pins live in this store under
  *  workflow:<name>:<stepId> intents but are SCOPED OUT of every shared
- *  advertised surface and the fuzzy recall fallback (review wf_8e927519-d43:
+ *  advertised surface and the fuzzy recall fallback (check-first regression review:
  *  pins flooded the chat tool-choice block, evicting genuine chat memories
  *  and leaking workflow run args into unrelated turns). Exact-intent reads
  *  (peekToolChoice) still return them — that is the pin's only door. */

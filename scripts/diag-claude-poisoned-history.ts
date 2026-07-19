@@ -1,9 +1,9 @@
 /**
  * Targeted repro: does a continuation from a DEGENERATE turn-3 decision hang
- * the Claude brain on turn 4? (sess-mqg45an3)
+ * the Claude brain on turn 4?
  *
  * Reconstructs the failing history:
- *   user:      "pull 25 market-leader accounts not contacted in 15 days (sf CLI)"
+ *   user:      "pull 25 priority-account accounts not contacted in 15 days (sf CLI)"
  *   assistant: { reply: ",", nextAction: "awaiting_handoff_result", ... }  ← degenerate
  *   user:      "Continue with the next step of your plan."                  ← harness auto-loop
  * then streams the next model call (same orchestrator shape: outputType + tool)
@@ -37,11 +37,11 @@ const sfQuery = tool({
 
 // The degenerate turn-3 assistant decision, verbatim shape from the DB.
 const DEGENERATE_DECISION = JSON.stringify({
-  summary: 'Querying Salesforce; for market-leader accounts not contacted in 15+ days',
+  summary: 'Querying Salesforce; for priority-account accounts not contacted in 15+ days',
   reply: ',',
   done: false,
   nextAction: 'awaiting_handoff_result',
-  reason: 'Querying Salesforce now that Nate confirmed the criteria.',
+  reason: 'Querying Salesforce now that Alex confirmed the criteria.',
 });
 
 async function main() {
@@ -61,7 +61,7 @@ async function main() {
 
   // Reconstruct the poisoned history as AgentInputItem[].
   const history = [
-    { role: 'user', content: 'Pull 25 of my market-leader accounts not contacted in 15 days. Use the sf CLI.' },
+    { role: 'user', content: 'Pull 25 of my priority-account accounts not contacted in 15 days. Use the sf CLI.' },
     { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: DEGENERATE_DECISION }] },
     { role: 'user', content: 'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.' },
   ];

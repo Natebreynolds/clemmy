@@ -3,9 +3,9 @@
  *
  * The gate benchmark (eval:passk over TRAPS) certifies GATES fire. This
  * certifies a JOB was done CORRECTLY: each fixture in src/runtime/eval/fixtures/
- * is a replayable recording of an end-to-end run, asserted DETERMINISTICALLY for
+ * is a hand-authored synthetic end-to-end scenario, asserted DETERMINISTICALLY for
  * zero external writes · convergence · honest-partial-on-failure · figures
- * grounded to captured tool output. pass^k (ALL k trials pass) is the gate.
+ * grounded to synthetic tool output. pass^k (ALL k trials pass) is the gate.
  *
  * Run: npx tsx scripts/eval-jobs.ts            (informational; exits 0)
  *      npx tsx scripts/eval-jobs.ts --strict   (exits 1 if pass^k < threshold)

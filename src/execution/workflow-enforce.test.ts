@@ -269,7 +269,7 @@ test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
 
 test('checkWorkflowForWrite: validator sees declared sideEffect from typed definitions', () => {
   const result = checkWorkflowForWrite(wf({
-    steps: [{ id: 'send', prompt: 'Send the email summary to Nate.', sideEffect: 'read' }],
+    steps: [{ id: 'send', prompt: 'Send the email summary to Alex.', sideEffect: 'read' }],
   }));
   assert.equal(result.ok, true);
   assert.ok(
@@ -516,7 +516,7 @@ test('workflow mutation contract snapshot records only exact mutating step contr
 });
 
 test('stepIsTestableRead: read step with an external tool surface is testable', () => {
-  // The scorpion scrape step: read intent + a composio/shell surface → test it for real.
+  // The acme scrape step: read intent + a composio/shell surface → test it for real.
   assert.equal(
     stepIsTestableRead({ prompt: 'scrape the Facebook page with Apify', allowedTools: ['composio_*', 'run_shell_command'] }),
     true,

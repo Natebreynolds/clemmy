@@ -589,7 +589,7 @@ export function buildAgentContextPacket(
   // confirm-the-plan / surface-missing-tools / offer-background beat before
   // the work starts. Continuations, questions, and non-chat kinds are null.
   // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
-  // continuation/retry inputs (review wf_2ed83f94 #8) — the beat must only
+  // continuation/retry inputs (turn-control review) — the beat must only
   // ever evaluate a REAL user message, never a substituted one mid-run.
   const preflightDecision = opts?.suppressConfirmBeat
     ? { phase: 'execute', consequential: false, reason: 'ordinary_execution' } as const

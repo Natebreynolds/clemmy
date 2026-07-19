@@ -174,7 +174,7 @@ test('workflow_run queues with normalized URL aliases', async () => {
 
   const result = await workflowRun()({
     name: 'proposal-audit-brief',
-    inputs: JSON.stringify({ website: ' https://www.aldouslaw.com/ ' }),
+    inputs: JSON.stringify({ website: ' https://www.redwood-law.example/ ' }),
   });
   const text = resultText(result);
 
@@ -184,8 +184,8 @@ test('workflow_run queues with normalized URL aliases', async () => {
   const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, files[0]), 'utf-8')) as {
     inputs: Record<string, string>;
   };
-  assert.equal(run.inputs.url, 'https://www.aldouslaw.com/');
-  assert.equal(run.inputs.website, 'https://www.aldouslaw.com/');
+  assert.equal(run.inputs.url, 'https://www.redwood-law.example/');
+  assert.equal(run.inputs.website, 'https://www.redwood-law.example/');
 });
 
 test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it', async () => {
@@ -1122,13 +1122,13 @@ test('workflow_run does not queue duplicate active runs for identical inputs', a
 
   const first = await workflowRun()({
     name: 'proposal-audit-brief',
-    inputs: JSON.stringify({ url: 'https://www.aldouslaw.com/' }),
+    inputs: JSON.stringify({ url: 'https://www.redwood-law.example/' }),
   });
   assert.match(resultText(first), /Queued "/);
 
   const second = await workflowRun()({
     name: 'proposal-audit-brief',
-    inputs: JSON.stringify({ url: 'https://www.aldouslaw.com/' }),
+    inputs: JSON.stringify({ url: 'https://www.redwood-law.example/' }),
   });
   assert.match(resultText(second), /already queued/);
   assert.match(resultText(second), /No duplicate was queued/);
@@ -1161,7 +1161,7 @@ function cliChoice(): ToolChoiceRecord {
     choice: {
       kind: 'cli',
       identifier: 'sf',
-      invocationTemplate: 'sf data query --target-org nathan@scorpion.co --json --query "{{soql}}"',
+      invocationTemplate: 'sf data query --target-org alex@corp.example --json --query "{{soql}}"',
       testedAt: '2026-06-01T00:00:00Z',
     },
     fallbacks: [],
@@ -1328,7 +1328,7 @@ test('draftToDefinition: maps a trace draft to a DISABLED, manual-trigger workfl
 
 test('draftToDefinition + commitAuthoredWorkflow: a promoted draft authors + validates cleanly', () => {
   const draft = traceToWorkflowDraft([
-    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"x.com"}}', callId: 'a' },
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"site.example"}}', callId: 'a' },
     { tool: 'run_shell_command', args: '{"command":"python report.py"}', callId: 'b' },
   ]);
   const def = draftToDefinition('zz-promote-test', draft);
@@ -1355,9 +1355,9 @@ test('commitAuthoredWorkflow applies the shared create readiness gate', () => {
 
 test('draftToDefinition preserves inferred forEach loops and list output contracts', () => {
   const draft = traceToWorkflowDraft([
-    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}', callId: 'a' },
-    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"b.com"}}', callId: 'b' },
-    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"c.com"}}', callId: 'c' },
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"alpha.example"}}', callId: 'a' },
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"beta.example"}}', callId: 'b' },
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"gamma.example"}}', callId: 'c' },
   ]);
   const def = draftToDefinition('Fanout Draft', draft);
 
@@ -1368,13 +1368,13 @@ test('draftToDefinition preserves inferred forEach loops and list output contrac
   assert.deepEqual(def.steps[1].dependsOn, [def.steps[0].id]);
 });
 
-// ─── chat-aware toolkit binding (the scorpion-facebook-trends fix) ──────────
+// ─── chat-aware toolkit binding (the acme-facebook-trends fix) ──────────
 
 test('bindDiscussedToolkitsIntoSteps: binds the scrape step to the discussed TOOL (Apify), not the TARGET (Facebook)', () => {
   const steps: any = [
-    { id: 'fetch', prompt: 'Find the official Facebook page for scorpion.co and verify it.', allowedTools: ['composio_*', 'run_shell_command'] },
+    { id: 'fetch', prompt: 'Find the official Facebook page for corp.example and verify it.', allowedTools: ['composio_*', 'run_shell_command'] },
     { id: 'scrape', prompt: 'Prefer a reliable Apify public Facebook page/posts scraper if configured; otherwise use public web scraping only.', allowedTools: ['composio_*', 'run_shell_command'] },
-    { id: 'notify', prompt: 'Notify Nate with the summary.', allowedTools: ['notify_user'] },
+    { id: 'notify', prompt: 'Notify Alex with the summary.', allowedTools: ['notify_user'] },
   ];
   const discussed = [{ slug: 'apify', name: 'Apify' }, { slug: 'facebook', name: 'Facebook' }];
   const r = bindDiscussedToolkitsIntoSteps(steps, discussed);
@@ -1385,7 +1385,7 @@ test('bindDiscussedToolkitsIntoSteps: binds the scrape step to the discussed TOO
   assert.match(steps[1].prompt, /Do NOT improvise raw HTTP/);
   assert.ok(steps[1].allowedTools.includes('composio_execute_tool') && !steps[1].allowedTools.includes('composio_*'));
   // The find-page step (Facebook = TARGET) is untouched; notify is untouched.
-  assert.equal(steps[0].prompt, 'Find the official Facebook page for scorpion.co and verify it.');
+  assert.equal(steps[0].prompt, 'Find the official Facebook page for corp.example and verify it.');
   assert.equal(steps[2].allowedTools.length, 1);
 });
 

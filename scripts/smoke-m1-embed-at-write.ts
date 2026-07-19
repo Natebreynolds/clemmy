@@ -51,7 +51,7 @@ if (!isEmbeddingsEnabled()) {
 ok('embeddings enabled (real model)');
 
 // User just told Clementine two things this turn.
-const coffee = rememberFact({ kind: 'user', content: 'Nathan takes his coffee with oat milk and no sugar.' });
+const coffee = rememberFact({ kind: 'user', content: 'Alexander takes his coffee with oat milk and no sugar.' });
 const deploy = rememberFact({ kind: 'reference', content: 'The staging deploy runs nightly at 2am via cron.' });
 
 // Before embed-at-write: the just-written facts have NO vectors (semantic recall blind).

@@ -1,7 +1,7 @@
 /**
  * Run: npx tsx --test src/runtime/harness/pending-action-view.test.ts
  *
- * 2026-07-09 sess-mrds80fu: a run_batch propose approval rendered as a bare
+ * Ask-first batch regression: a run_batch propose approval rendered as a bare
  * "Approve: run_batch: propose" — the plan (objective, count, recipients) was
  * in the payload but no pending action existed yet, so the rich card never
  * rendered. The view is now synthesized straight from the plan.
@@ -26,21 +26,21 @@ test('synthesizes a rich view from a run_batch propose plan (no pending_action_i
       tool: 'composio_execute_tool',
       composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
       sideEffect: 'send',
-      objective: 'Send market-leader reactivation emails 11-20',
+      objective: 'Send priority-account reactivation emails 11-20',
       items: [
-        { id: 'ml-11-a@x.com', args: { to_email: 'a@x.com', subject: 'Hi' } },
-        { id: 'ml-12-b@y.com', args: { to_email: 'b@y.com', subject: 'Hi' } },
+        { id: 'ml-11-a@site.example', args: { to_email: 'a@site.example', subject: 'Hi' } },
+        { id: 'ml-12-b@personal.example', args: { to_email: 'b@personal.example', subject: 'Hi' } },
       ],
     },
   });
   assert.ok(view, 'view synthesized from the plan');
   assert.equal(view!.kind, 'external_send');
   assert.equal(view!.toolName, 'run_batch');
-  assert.match(view!.title, /Send market-leader reactivation emails 11-20/);
+  assert.match(view!.title, /Send priority-account reactivation emails 11-20/);
   assert.match(view!.targetSummary, /2 item\(s\)/);
-  assert.match(view!.targetSummary, /ml-11-a@x\.com/);
+  assert.match(view!.targetSummary, /ml-11-a@site\.example/);
   assert.match(view!.risk, /2 irreversible send/);
-  assert.match(view!.preview, /a@x\.com/);
+  assert.match(view!.preview, /a@site\.example/);
 });
 
 test('no plan and no pending_action_id → undefined (unchanged contract)', () => {

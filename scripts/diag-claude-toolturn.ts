@@ -1,7 +1,7 @@
 /**
  * Diagnostic repro for the Claude-brain tool-turn hang.
  *
- * Mirrors the production orchestrator shape that hung (sess-mqg45an3, turn 4):
+ * Mirrors the production orchestrator shape from the tool-turn hang regression:
  *   - Claude OAuth brain (AUTH_MODE=claude_oauth)
  *   - outputType = a Codex-strict-normalized zod object (structured output)
  *   - modelSettings { reasoning.effort, text.verbosity }  (the OpenAI-isms the
@@ -79,7 +79,7 @@ async function main() {
   });
   console.log(`ATTACH_MCP=${ATTACH_MCP}`);
 
-  const input = 'List the exact Names of my market-leader accounts with no open opportunities. Call the tool, then report the names you get back.';
+  const input = 'List the exact Names of my priority-account accounts with no open opportunities. Call the tool, then report the names you get back.';
   console.log(`\n--- streaming run (forces a tool call) ---`);
   const t0 = Date.now();
   const el = () => `${Date.now() - t0}ms`;

@@ -120,7 +120,7 @@ test('G negative: a READ tool whose dispatch throws records NO external_write (o
 
   await withHarnessRunContext(ctx(sid), async () => {
     await shim.listTools();
-    await assert.rejects(() => shim.callTool(namespaced, { target: 'acme.com' }));
+    await assert.rejects(() => shim.callTool(namespaced, { target: 'acme.example' }));
   });
 
   assert.equal(listEvents(sid, { types: ['external_write'] }).length, 0, 'a read never records an external_write');

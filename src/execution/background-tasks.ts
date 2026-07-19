@@ -1766,7 +1766,7 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
       // default copy: the run claims done and DID perform an irreversible
       // external action, but the refuters couldn't verify it. Telling the user
       // "I did NOT ship … re-run" here invites a manual DOUBLE-SEND (review
-      // wf_8e927519-d43). Say check-first instead.
+      // the check-first regression review). Say check-first instead.
       body: blockerType === 'unverified_completion'
         ? [
           `The run reports this as done and it DID perform an irreversible external action — but I could not independently verify the completion.`,

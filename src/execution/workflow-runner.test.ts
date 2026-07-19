@@ -311,7 +311,7 @@ test('reapResolvedParkedRuns terminates a rejected occurrence instead of minting
     sessionId,
     subject: 'Send the daily standup email?',
     tool: 'composio_execute_tool',
-    args: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: '{"to_email":"nathan@example.com"}' },
+    args: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: '{"to_email":"alex@corp.example"}' },
     ttlMs: 60_000,
   });
   const filePath = writeParkedRun(runId, [row.approvalId]);
@@ -2512,10 +2512,10 @@ test('summarizeRunArtifacts: an empty run produces NO artifacts (so the no-op st
 test('summarizeRunArtifacts: dedupes URLs and ignores _meta when counting', () => {
   const steps = [{ id: 's', prompt: 'x' }] as any;
   const art = summarizeRunArtifacts(steps, {
-    s: { _meta: { ok: true }, rows: ['a', 'b'], link: 'see https://x.com and https://x.com again' },
+    s: { _meta: { ok: true }, rows: ['a', 'b'], link: 'see https://site.example and https://site.example again' },
   });
   assert.deepEqual(art.counts, ['rows: 2']);
-  assert.deepEqual(art.urls, ['https://x.com']);
+  assert.deepEqual(art.urls, ['https://site.example']);
 });
 
 test('reapResolvedParkedRuns does NOT re-admit when a watched approval row is missing (no auto-approve on a lost row)', () => {
@@ -2710,7 +2710,7 @@ test('self-heal RSH-1: an edit_contract fix auto-applies (loosens the contract) 
     proposedFix: fix,
     completedStepIds: new Set(['gather']),
     // RSH-2: the real output satisfies the loosened contract → probe passes.
-    rawStepOutputs: { gather: { name: 'Ada', email: 'ada@x.co' } },
+    rawStepOutputs: { gather: { name: 'Ada', email: 'ada@site-alt.example' } },
   });
   assert.ok(out, 'contract heal fired');
   // the workflow's contract was loosened on disk
@@ -2735,7 +2735,7 @@ test('self-heal RSH-3: an edit_input fix auto-applies (rebinds the input) + re-q
   const origId = `${wf}-run`;
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: wf, inputs: { url: 'https://x.co' }, status: 'completed', originSessionId: 'sess-i' }), 'utf-8');
+    JSON.stringify({ id: origId, workflow: wf, inputs: { url: 'https://site-alt.example' }, status: 'completed', originSessionId: 'sess-i' }), 'utf-8');
   const diag = editInputDiagnosis('fetch', '{"url":{"from":"input.url"}}');
   const fix = recordProposedFix(wf, origId, diag as never);
 
@@ -2997,7 +2997,7 @@ test('creationTestVerdict: real data → ok', () => {
   assert.equal(creationTestVerdict('scrape', [{ a: 1 }]).status, 'ok');
 });
 
-test('creationTestVerdict: empty results → empty (the scorpion failure — caught at creation)', () => {
+test('creationTestVerdict: empty results → empty (the acme failure — caught at creation)', () => {
   assert.equal(creationTestVerdict('scrape', null).status, 'empty');
   assert.equal(creationTestVerdict('scrape', '').status, 'empty');
   assert.equal(creationTestVerdict('scrape', '   ').status, 'empty');
@@ -3100,7 +3100,7 @@ test('P0-3 ledger-aware resume: claimed external_write still halts', () => {
 
 test('P0-3 structured mutation resume defers to the exact-call receipt ledger', () => {
   const wf = wfWith([
-    { id: 'send', prompt: '', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@b.co' } }, sideEffect: 'send' },
+    { id: 'send', prompt: '', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@beta-co.example' } }, sideEffect: 'send' },
   ]);
   assert.equal(
     shouldHaltResumeForSideEffect(
@@ -3130,7 +3130,7 @@ test('P0-3 ledger-aware resume stays conservative for legacy/non-harness steps',
 });
 
 test('P0-3 halt reports declared=false when the class was only inferred from prose', () => {
-  // The scorpion-facebook-trends failure mode: no declared sideEffect, prose
+  // The acme-facebook-trends failure mode: no declared sideEffect, prose
   // heuristic guesses write → halt. The message uses declared=false to teach
   // the one-line `sideEffect: read` fix.
   const wf = wfWith([
@@ -3228,7 +3228,7 @@ test('P0-3 a dependsOn-less concurrent workflow still halts on any incomplete mu
 
 test('P0-3 a structured direct mutation may start after restart only under the durable receipt protocol', () => {
   const wf = wfWith([
-    { id: 'send', prompt: '', sideEffect: 'send', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@b.co' } } },
+    { id: 'send', prompt: '', sideEffect: 'send', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@beta-co.example' } } },
   ]);
   assert.equal(
     shouldHaltResumeForSideEffect(
@@ -3255,7 +3255,7 @@ test('Lane B: a legacy crashed forEach SEND parks when the interrupted item has 
 test('Lane B (bug #8 / audit #2.2): stepSendAlreadyFired — a PLAIN step whose send fired is detected, so a transient error does NOT re-run it (no double-send)', () => {
   resetEventLog();
   const runId = 'r-step-dup';
-  const stepId = 'notify_nate';
+  const stepId = 'notify_owner';
   const sid = `workflow:${runId}:${stepId}`;
   // Nothing fired yet → a transient error IS retryable.
   assert.equal(stepSendAlreadyFired(runId, stepId), false, 'no send yet → not claimed');
@@ -3263,11 +3263,11 @@ test('Lane B (bug #8 / audit #2.2): stepSendAlreadyFired — a PLAIN step whose 
   // session id. A later transient model error (e.g. 529 before step_completed)
   // must NOT re-run the step — the guard catches the prior send.
   HarnessSession.create({ id: sid, kind: 'workflow', channel: 'workflow', title: runId, metadata: { source: 'workflow' } });
-  appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'GMAIL_SEND', targets: ['x@y.com'] } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'GMAIL_SEND', targets: ['x@personal.example'] } });
   assert.equal(stepSendAlreadyFired(runId, stepId), true, 'a fired send suppresses the transient retry (no double-send)');
   assert.equal(stepExternalWriteAlreadyClaimed(runId, stepId), true, 'generic write ledger helper sees the same claim');
   // A failure compensation nets it back out → the send did NOT claim → retry ok.
-  appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write_failed', data: { shapeKey: 'GMAIL_SEND', targets: ['x@y.com'] } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write_failed', data: { shapeKey: 'GMAIL_SEND', targets: ['x@personal.example'] } });
   assert.equal(stepSendAlreadyFired(runId, stepId), false, 'a netted failure means the send did not claim → retry allowed');
 });
 

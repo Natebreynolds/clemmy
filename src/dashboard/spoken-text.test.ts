@@ -14,7 +14,7 @@ test('strips emphasis markers but keeps the words', () => {
 });
 
 test('links/images reduce to their text; bare URLs become "the link"', () => {
-  assert.equal(stripMarkdownForSpeech('See [the docs](https://x.com/y) now'), 'See the docs now');
+  assert.equal(stripMarkdownForSpeech('See [the docs](https://site.example/y) now'), 'See the docs now');
   assert.equal(stripMarkdownForSpeech('![logo](https://x/y.png) hi'), 'logo hi');
   assert.equal(stripMarkdownForSpeech('Go to https://example.com/page for more'), 'Go to the link for more');
 });
@@ -44,7 +44,7 @@ test('empty / whitespace / pure-markdown yields no sentences', () => {
 });
 
 test('a markdown-heavy reply becomes clean speakable sentences', () => {
-  const md = '**Done.** I emailed [Jane](mailto:j@x.com). Next: review the `draft`.';
+  const md = '**Done.** I emailed [Jane](mailto:j@site.example). Next: review the `draft`.';
   assert.deepEqual(
     toSpokenSentences(md),
     ['Done.', 'I emailed Jane.', 'Next: review the draft.'],

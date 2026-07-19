@@ -166,7 +166,7 @@ test('exact utility signals cover every memory ref type without touching fact co
 });
 
 test('health reports run conversion and fact-use concentration without join inflation', () => {
-  const a = rememberFact({ kind: 'user', content: 'Nathan prefers concise status updates.' });
+  const a = rememberFact({ kind: 'user', content: 'Alexander prefers concise status updates.' });
   const b = rememberFact({ kind: 'project', content: 'Project Juniper uses a weekly status report.' });
   const now = '2026-07-15T12:00:00.000Z';
   const runA = recordRecallRun({

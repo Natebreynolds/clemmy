@@ -190,27 +190,27 @@ test('refreshConnectedToolkits maps the raw-v3 user_id to ownerUserId', async ()
 
 test('selectToolkitConnection: 3 re-auths of ONE mailbox collapse → freshest ACTIVE (the reported bug)', () => {
   const conn = (connectionId: string, status: string, createdAt: string): ConnectedToolkit =>
-    ({ slug: 'outlook', connectionId, status, accountEmail: 'nathan@scorpion.co', createdAt });
+    ({ slug: 'outlook', connectionId, status, accountEmail: 'alex@corp.example', createdAt });
   const out = selectToolkitConnection('OUTLOOK_LIST_MESSAGES', [
     conn('ca_old', 'ACTIVE', '2026-07-01T00:00:00Z'),
     conn('ca_mid', 'ACTIVE', '2026-07-05T00:00:00Z'),
     conn('ca_new', 'ACTIVE', '2026-07-10T00:00:00Z'),
   ]);
-  assert.deepEqual(out, { kind: 'resolved', connectionId: 'ca_new', identity: 'nathan@scorpion.co' });
+  assert.deepEqual(out, { kind: 'resolved', connectionId: 'ca_new', identity: 'alex@corp.example' });
 });
 
 test('selectToolkitConnection: active-tier beats createdAt (a fresh INITIATED re-auth cannot hijack a working ACTIVE)', () => {
   const out = selectToolkitConnection('OUTLOOK_LIST_MESSAGES', [
-    { slug: 'outlook', connectionId: 'ca_active', status: 'ACTIVE', accountEmail: 'a@x.com', createdAt: '2026-07-01T00:00:00Z' },
-    { slug: 'outlook', connectionId: 'ca_initiated', status: 'INITIATED', accountEmail: 'a@x.com', createdAt: '2026-07-10T00:00:00Z' },
+    { slug: 'outlook', connectionId: 'ca_active', status: 'ACTIVE', accountEmail: 'a@site.example', createdAt: '2026-07-01T00:00:00Z' },
+    { slug: 'outlook', connectionId: 'ca_initiated', status: 'INITIATED', accountEmail: 'a@site.example', createdAt: '2026-07-10T00:00:00Z' },
   ]);
   assert.equal(out.kind === 'resolved' && out.connectionId, 'ca_active');
 });
 
 test('selectToolkitConnection: two DISTINCT mailboxes with no hint → ambiguous (ASK), never a silent pick', () => {
   const out = selectToolkitConnection('OUTLOOK_SEND_EMAIL', [
-    { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@x.com' },
-    { slug: 'outlook', connectionId: 'ca_home', status: 'ACTIVE', accountEmail: 'home@y.com' },
+    { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@site.example' },
+    { slug: 'outlook', connectionId: 'ca_home', status: 'ACTIVE', accountEmail: 'home@personal.example' },
   ]);
   assert.equal(out.kind, 'ambiguous');
   assert.equal(out.kind === 'ambiguous' && out.candidates.length, 2);
@@ -218,16 +218,16 @@ test('selectToolkitConnection: two DISTINCT mailboxes with no hint → ambiguous
 
 test('selectToolkitConnection: identity hint routes to the matching mailbox; a miss is identity-absent (ASK)', () => {
   const conns: ConnectedToolkit[] = [
-    { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@x.com' },
-    { slug: 'outlook', connectionId: 'ca_home', status: 'ACTIVE', accountEmail: 'home@y.com' },
+    { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@site.example' },
+    { slug: 'outlook', connectionId: 'ca_home', status: 'ACTIVE', accountEmail: 'home@personal.example' },
   ];
   assert.deepEqual(
-    selectToolkitConnection('OUTLOOK_SEND_EMAIL', conns, 'HOME@y.com'),
-    { kind: 'resolved', connectionId: 'ca_home', identity: 'home@y.com' },
+    selectToolkitConnection('OUTLOOK_SEND_EMAIL', conns, 'HOME@personal.example'),
+    { kind: 'resolved', connectionId: 'ca_home', identity: 'home@personal.example' },
   );
-  const miss = selectToolkitConnection('OUTLOOK_SEND_EMAIL', conns, 'gone@z.com');
+  const miss = selectToolkitConnection('OUTLOOK_SEND_EMAIL', conns, 'gone@archive.example');
   assert.equal(miss.kind, 'identity-absent');
-  assert.equal(miss.kind === 'identity-absent' && miss.want, 'gone@z.com');
+  assert.equal(miss.kind === 'identity-absent' && miss.want, 'gone@archive.example');
 });
 
 test('selectToolkitConnection: unknown-identity connections are NEVER merged → ambiguous', () => {
@@ -240,20 +240,20 @@ test('selectToolkitConnection: unknown-identity connections are NEVER merged →
 
 test('selectToolkitConnection: all matched connections inactive → defer', () => {
   const out = selectToolkitConnection('OUTLOOK_LIST_MESSAGES', [
-    { slug: 'outlook', connectionId: 'ca_x', status: 'EXPIRED', accountEmail: 'a@x.com' },
-    { slug: 'outlook', connectionId: 'ca_y', status: 'REVOKED', accountEmail: 'a@x.com' },
+    { slug: 'outlook', connectionId: 'ca_x', status: 'EXPIRED', accountEmail: 'a@site.example' },
+    { slug: 'outlook', connectionId: 'ca_y', status: 'REVOKED', accountEmail: 'a@site.example' },
   ]);
   assert.deepEqual(out, { kind: 'defer' });
 });
 
 test('selectToolkitConnection: canonical matcher — underscore toolkit slugs match, bare prefixes do not', () => {
   const oneDrive = selectToolkitConnection('ONE_DRIVE_UPLOAD_FILE', [
-    { slug: 'one_drive', connectionId: 'ca_od', status: 'ACTIVE', accountEmail: 'a@x.com' },
+    { slug: 'one_drive', connectionId: 'ca_od', status: 'ACTIVE', accountEmail: 'a@site.example' },
   ]);
   assert.equal(oneDrive.kind === 'resolved' && oneDrive.connectionId, 'ca_od');
   // A bare `google` connection must NOT match a GOOGLEDRIVE_* tool.
   const noMatch = selectToolkitConnection('GOOGLEDRIVE_DOWNLOAD_FILE', [
-    { slug: 'google', connectionId: 'ca_g', status: 'ACTIVE', accountEmail: 'a@x.com' },
+    { slug: 'google', connectionId: 'ca_g', status: 'ACTIVE', accountEmail: 'a@site.example' },
   ]);
   assert.deepEqual(noMatch, { kind: 'defer' });
 });

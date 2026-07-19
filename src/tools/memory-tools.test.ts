@@ -138,10 +138,10 @@ test('memory_remember creates evidence-backed entities and reuses a person by ex
 
     const first = await handler!({
       kind: 'project',
-      content: 'Dana Smith (dana@acme.com) works at Acme.',
+      content: 'Dana Smith (dana@acme.example) works at Acme.',
       sessionId: 'remember-entity-session-1',
       entities: [
-        { type: 'person', name: 'Dana Smith', aliases: ['Dana'], identifiers: [{ scheme: 'email', value: 'dana@acme.com' }] },
+        { type: 'person', name: 'Dana Smith', aliases: ['Dana'], identifiers: [{ scheme: 'email', value: 'dana@acme.example' }] },
         { type: 'company', name: 'Acme' },
       ],
       relationships: [{ subject: 'Dana Smith', predicate: 'works at', object: 'Acme' }],
@@ -151,10 +151,10 @@ test('memory_remember creates evidence-backed entities and reuses a person by ex
 
     const second = await handler!({
       kind: 'project',
-      content: 'D. Smith (dana@acme.com) leads Project Kite.',
+      content: 'D. Smith (dana@acme.example) leads Project Kite.',
       sessionId: 'remember-entity-session-2',
       entities: [
-        { type: 'person', name: 'D. Smith', aliases: ['Dana Smith'], identifiers: [{ scheme: 'email', value: 'dana@acme.com' }] },
+        { type: 'person', name: 'D. Smith', aliases: ['Dana Smith'], identifiers: [{ scheme: 'email', value: 'dana@acme.example' }] },
         { type: 'project', name: 'Project Kite' },
       ],
       relationships: [{ subject: 'D. Smith', predicate: 'leads', object: 'Project Kite', validFrom: '2026-07-01T00:00:00.000Z' }],
@@ -166,11 +166,11 @@ test('memory_remember creates evidence-backed entities and reuses a person by ex
     const people = db.prepare("SELECT id, canonical_name FROM entities WHERE entity_type = 'person'").all() as Array<{ id: number; canonical_name: string }>;
     assert.equal(people.length, 1, 'the stable email must converge the name variant into one person');
     assert.equal(people[0].canonical_name, 'Dana Smith');
-    assert.equal((db.prepare("SELECT COUNT(*) AS c FROM entity_identifiers WHERE entity_id = ? AND scheme = 'email' AND value_norm = 'dana@acme.com'").get(people[0].id) as { c: number }).c, 1);
+    assert.equal((db.prepare("SELECT COUNT(*) AS c FROM entity_identifiers WHERE entity_id = ? AND scheme = 'email' AND value_norm = 'dana@acme.example'").get(people[0].id) as { c: number }).c, 1);
     assert.equal((db.prepare("SELECT COUNT(*) AS c FROM entity_aliases WHERE entity_id = ? AND alias_lc = 'd. smith'").get(people[0].id) as { c: number }).c, 1);
 
     const facts = db.prepare("SELECT id FROM consolidated_facts WHERE content IN (?, ?) ORDER BY id")
-      .all('Dana Smith (dana@acme.com) works at Acme.', 'D. Smith (dana@acme.com) leads Project Kite.') as Array<{ id: number }>;
+      .all('Dana Smith (dana@acme.example) works at Acme.', 'D. Smith (dana@acme.example) leads Project Kite.') as Array<{ id: number }>;
     assert.equal(facts.length, 2);
     const edges = loadFactEntityEdges(facts.map((fact) => fact.id));
     assert.equal(edges.length, 4);
@@ -201,12 +201,12 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
     assert.ok(handler);
     const response = await handler!({
       kind: 'user',
-      content: 'Nathan Reynolds met Alex at the memory review.',
+      content: 'Alexander Chen met Alex at the memory review.',
       entities: [
-        { type: 'person', name: 'Nathan Reynolds', identifiers: [{ scheme: 'email', value: 'invented@example.com' }] },
+        { type: 'person', name: 'Alexander Chen', identifiers: [{ scheme: 'email', value: 'invented@example.com' }] },
         { type: 'person', name: 'Morgan Jones', identifiers: [{ scheme: 'email', value: 'morgan@example.com' }] },
       ],
-      relationships: [{ subject: 'Nathan Reynolds', predicate: 'knows', object: 'Morgan Jones' }],
+      relationships: [{ subject: 'Alexander Chen', predicate: 'knows', object: 'Morgan Jones' }],
     });
     assert.match(response.content[0].text, /linked 1 canonical entity/);
     assert.match(response.content[0].text, /rejected 2 unsupported annotation/);
@@ -215,7 +215,7 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
     assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entities').get() as { c: number }).c, 1);
     assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entity_identifiers').get() as { c: number }).c, 0);
     assert.equal((db.prepare('SELECT COUNT(*) AS c FROM entity_edges').get() as { c: number }).c, 0);
-    const row = db.prepare("SELECT id FROM entities WHERE canonical_name = 'Nathan Reynolds'").get() as { id: number } | undefined;
+    const row = db.prepare("SELECT id FROM entities WHERE canonical_name = 'Alexander Chen'").get() as { id: number } | undefined;
     assert.ok(row);
   } finally {
     if (previous === undefined) delete process.env.CLEMMY_REMEMBER_RECONCILE;
@@ -308,7 +308,7 @@ test('memory_embed_backfill can backfill durable fact embeddings', async () => {
     },
   });
   try {
-    const fact = rememberFact({ kind: 'user', content: 'Nathan prefers semantic memory checks before recall changes.' });
+    const fact = rememberFact({ kind: 'user', content: 'Alexander prefers semantic memory checks before recall changes.' });
     const handler = registeredToolHandlers().get('memory_embed_backfill');
     assert.ok(handler, 'memory_embed_backfill should be registered');
 

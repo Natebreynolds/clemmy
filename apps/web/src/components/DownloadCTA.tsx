@@ -102,7 +102,7 @@ export function DownloadCTA() {
             View on GitHub
           </a>
           <a
-            href="https://github.com/Natebreynolds/clemmy#run-from-source-development"
+            href="https://github.com/Natebreynolds/clemmy#run-the-daemon-and-cli-from-source"
             target="_blank"
             rel="noreferrer"
             className="inline-flex items-center gap-2 hover:text-[var(--ink-strong)] transition-colors"

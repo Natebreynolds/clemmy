@@ -397,11 +397,11 @@ test('evaluateAppliedProposals: problem gone in post-apply runs → improved; re
   rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
 
   // Run ids embed their mint time.
-  assert.equal(runIdTimestampMs('1783052757607-89c716'), 1783052757607);
-  assert.equal(runIdTimestampMs('sched-1783036811744-b6e45d'), 1783036811744);
+  assert.equal(runIdTimestampMs('1700000000000-run-fixture'), 1700000000000);
+  assert.equal(runIdTimestampMs('sched-1700000060000-scheduled-fixture'), 1700000060000);
   assert.equal(runIdTimestampMs('weird-id'), null);
 
-  const APPLIED_MS = 1_783_000_000_000;
+  const APPLIED_MS = 1_700_000_000_000;
   const before = (n: number) => `${APPLIED_MS - n * 60_000}-aa`;
   const after = (n: number) => `${APPLIED_MS + n * 60_000}-bb`;
   const obs = (workflow: string, runId: string, problems: string[]): StepFailureObservation =>

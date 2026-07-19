@@ -8,14 +8,26 @@ function ignoreAsyncFailure(result: void | Promise<void>): void {
   if (result && typeof result.then === 'function') void result.catch(() => undefined);
 }
 
-export function resizeLiveSurface(size: NotchSurfaceSize): void {
+export async function resizeLiveSurface(
+  size: NotchSurfaceSize,
+  presentation: 'dormant' | 'panel',
+  layoutId: number,
+): Promise<boolean> {
   const resize = window.clementineLive?.resize;
-  if (typeof resize !== 'function') return;
+  // A regular browser preview has no native frame to coordinate. Treat its
+  // viewport as already laid out so the companion remains previewable there.
+  if (typeof resize !== 'function') return true;
   try {
-    ignoreAsyncFailure(resize(size));
+    const result = await resize({ ...size, presentation, layoutId });
+    return Boolean(result
+      && typeof result === 'object'
+      && result.ok === true
+      && result.applied === true
+      && result.layoutId === layoutId);
   } catch {
-    // The browser preview and a newer renderer may temporarily outlive an old
-    // preload during desktop development. The surface must remain usable.
+    // The caller owns a bounded retry loop. Keeping the failure explicit avoids
+    // rendering a panel into a stale 62px native frame.
+    return false;
   }
 }
 

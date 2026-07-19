@@ -61,11 +61,18 @@ import { hasPersistedCodexGrant } from './auth-grant.js';
 import { redactSensitiveText } from './redaction.js';
 import {
   computeClementineLiveGeometry,
-  DEFAULT_CLEMENTINE_LIVE_SIZE,
+  DEFAULT_CLEMENTINE_LIVE_DORMANT_SIZE,
   normalizeClementineLiveSize,
   resolveClementineLiveShortcut,
+  type ClementineLiveLayoutRequest,
+  type ClementineLivePresentation,
   type ClementineLiveSize,
 } from './live-window-geometry.js';
+import {
+  CLEMENTINE_LIVE_WINDOW_INTERACTION_OPTIONS,
+  CLEMENTINE_LIVE_WINDOW_LEVEL,
+  planClementineLivePanelToggle,
+} from './live-window-interaction.js';
 import {
   isExactClementineLiveIpcSender,
   isExactClementineNotchSettingsIpcSender,
@@ -91,6 +98,12 @@ import {
   sanitizeRecallEventForNotch,
   sanitizeRecallStatusForNotch,
 } from './notch-meeting.js';
+import {
+  ClementineNotchClickHelper,
+  resolveNotchClickHelperPath,
+  toDisplayLocalNotchFrame,
+  type NotchClickHelperHealth,
+} from './notch-click-helper.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -142,8 +155,14 @@ let splashWindow: BrowserWindow | null = null;
 let setupWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let clementineLiveWindow: BrowserWindow | null = null;
+let clementineNotchClickHelper: ClementineNotchClickHelper | null = null;
+let clementineNotchClickHelperHealth: NotchClickHelperHealth = 'stopped';
+let clementineNotchClickHelperError: string | null = null;
 let clementineLiveDisplayId: number | null = null;
-let clementineLiveSize: ClementineLiveSize = { ...DEFAULT_CLEMENTINE_LIVE_SIZE };
+const clementineLiveNativeAnchors = new Map<number, { x: number; y: number; topInset: number }>();
+let clementineLiveSize: ClementineLiveSize = { ...DEFAULT_CLEMENTINE_LIVE_DORMANT_SIZE };
+let clementineLivePresentation: ClementineLivePresentation = 'dormant';
+let clementineLiveLastLayoutId = 0;
 let clementineLiveShellInitialized = false;
 type ClementineLiveAvailability = 'loading' | 'ready' | 'unavailable';
 let clementineLiveAvailability: ClementineLiveAvailability = 'unavailable';
@@ -161,6 +180,24 @@ let clementineNotchPreferences: ClementineNotchPreferences = {
 let clementineLiveRegisteredShortcut: string | null = null;
 let clementineLiveShortcutError: string | null = null;
 let clementineLivePendingReveal: 'manual' | 'passive' | null = null;
+let clementineLivePendingRevealPresentation: ClementineLivePresentation | null = null;
+// Voice companion: a dedicated global shortcut reveals the notch and starts a
+// spoken request ("hey, pull up my pipeline") — the notch records, transcribes,
+// and sends the text to Clementine. Separate accelerator from the show/hide
+// toggle so speaking is always one keystroke away.
+const DEFAULT_CLEMENTINE_VOICE_SHORTCUT = 'CommandOrControl+Shift+V';
+let clementineLiveVoiceRegisteredShortcut: string | null = null;
+// Set when the shortcut fires before the renderer is ready; emitted on mount.
+let clementineLivePendingVoice = false;
+// Set when the open/expand shortcut fires before the renderer is ready.
+let clementineLivePendingToggle = false;
+// Native top-edge activations are explicit/idempotent expands. Keeping this
+// separate from shortcut toggles prevents duplicate AppKit/Chromium delivery
+// from immediately collapsing the surface again.
+let clementineLivePendingExpand = false;
+// The current display's menu-bar/notch inset, delivered to the renderer so it can
+// pad its content below the physical notch.
+let clementineLiveLastTopInset = 0;
 let dashboardUrl = '';
 let pendingDashboardUrl = '';
 let dashboardNavigationGeneration = 0;
@@ -258,7 +295,7 @@ function registerClementineLiveShortcut(shortcut: string): boolean {
   }
   let registered = false;
   try {
-    registered = globalShortcut.register(next, () => { toggleClementineLive(); });
+    registered = globalShortcut.register(next, () => { toggleClementineLivePanel(); });
   } catch {
     registered = false;
   }
@@ -273,6 +310,24 @@ function registerClementineLiveShortcut(shortcut: string): boolean {
   if (previous && previous !== next) globalShortcut.unregister(previous);
   rebuildTrayMenu();
   return true;
+}
+
+/** Register the global "start talking" accelerator. Best-effort: a conflict just
+ * leaves voice reachable via the in-notch mic button. */
+function registerClementineVoiceShortcut(): void {
+  const next = DEFAULT_CLEMENTINE_VOICE_SHORTCUT;
+  if (clementineLiveVoiceRegisteredShortcut === next && globalShortcut.isRegistered(next)) return;
+  let registered = false;
+  try {
+    registered = globalShortcut.register(next, () => { startClementineLiveVoice(); });
+  } catch {
+    registered = false;
+  }
+  if (registered) {
+    clementineLiveVoiceRegisteredShortcut = next;
+  } else {
+    console.warn(`[main] Clementine voice shortcut is unavailable: ${next}`);
+  }
 }
 
 interface ClementineLiveShortcutReservation {
@@ -290,7 +345,7 @@ function reserveClementineLiveShortcut(shortcut: string): ClementineLiveShortcut
   }
   let registered = false;
   try {
-    registered = globalShortcut.register(next, () => { toggleClementineLive(); });
+    registered = globalShortcut.register(next, () => { toggleClementineLivePanel(); });
   } catch {
     registered = false;
   }
@@ -316,6 +371,8 @@ function clementineNotchSnapshot() {
       visible: clementineLiveWindow?.isVisible() ?? false,
       shortcutRegistered: Boolean(clementineLiveRegisteredShortcut),
       shortcutError: clementineLiveShortcutError ?? undefined,
+      clickHelper: clementineNotchClickHelperHealth,
+      clickHelperError: clementineNotchClickHelperError ?? undefined,
       canOpenPreview: Boolean(
         clementineNotchPreferences.enabled
         && clementineLiveAvailability === 'ready'
@@ -387,7 +444,10 @@ function updateClementineNotchPreferences(patch: unknown) {
     ensureClementineLiveWindow();
     positionClementineLiveWindow(true);
     if (clementineNotchPreferences.behavior === 'always') {
-      if (!showClementineLive(false)) clementineLivePendingReveal = 'passive';
+      if (!showClementineLive(false)) {
+        clementineLivePendingReveal = 'passive';
+        clementineLivePendingRevealPresentation = 'dormant';
+      }
     }
   }
   rebuildTrayMenu();
@@ -585,6 +645,7 @@ function setClementineLiveAvailability(next: ClementineLiveAvailability): void {
   clementineLiveAvailability = next;
   const win = clementineLiveWindow;
   if (next !== 'ready' && win && !win.isDestroyed() && win.isVisible()) win.hide();
+  syncClementineNotchClickHelper();
   rebuildTrayMenu();
 }
 
@@ -601,11 +662,26 @@ function markClementineLiveRendererReady(
   if (becameReady) {
     setClementineLiveAvailability('ready');
     emitClementineLiveShellState('ready');
+    if (clementineLivePendingVoice) {
+      clementineLivePendingVoice = false;
+      emitClementineLivePreview({ kind: 'start-voice' });
+    }
+    if (clementineLivePendingToggle) {
+      clementineLivePendingToggle = false;
+      emitClementineLivePreview({ kind: 'toggle-expand' });
+    }
+    if (clementineLivePendingExpand) {
+      clementineLivePendingExpand = false;
+      emitClementineLivePreview({ kind: 'expand' });
+    }
+    revealClementineLiveAfterLayout(clementineLivePresentation);
+    // Explicit panel intents are revealed by their acknowledged layout request,
+    // not by readiness itself. With no pending transition, "always" may show
+    // the already-sized dormant surface immediately.
     if (clementineNotchPreferences.enabled
-        && (clementineLivePendingReveal || clementineNotchPreferences.behavior === 'always')) {
-      const activate = clementineLivePendingReveal === 'manual';
-      clementineLivePendingReveal = null;
-      showClementineLive(activate);
+        && !clementineLivePendingReveal
+        && clementineNotchPreferences.behavior === 'always') {
+      showClementineLive(false);
     }
   }
   return true;
@@ -704,18 +780,96 @@ function positionClementineLiveWindow(preferPointer = false): void {
   const win = clementineLiveWindow;
   if (!win || win.isDestroyed()) return;
   const display = resolveClementineLiveDisplay(preferPointer);
-  clementineLiveDisplayId = display.id;
-  const geometry = computeClementineLiveGeometry({
+  const nativeAnchor = clementineLiveNativeAnchors.get(display.id);
+  const computedGeometry = computeClementineLiveGeometry({
     bounds: display.bounds,
     workArea: display.workArea,
     requestedSize: clementineLiveSize,
+    presentation: clementineLivePresentation,
+    topInsetOverride: nativeAnchor?.topInset,
   });
+  const dormantAnchor = clementineLivePresentation === 'dormant' ? nativeAnchor : undefined;
+  const anchoredX = dormantAnchor ? Math.round(display.bounds.x + dormantAnchor.x) : computedGeometry.x;
+  const anchoredY = dormantAnchor ? Math.round(display.bounds.y + dormantAnchor.y) : computedGeometry.y;
+  const geometry = dormantAnchor
+    && anchoredX >= display.bounds.x
+    && anchoredY >= display.bounds.y
+    && anchoredX + computedGeometry.width <= display.bounds.x + display.bounds.width
+    && anchoredY + computedGeometry.height <= display.bounds.y + display.bounds.height
+    ? { ...computedGeometry, x: anchoredX, y: anchoredY }
+    : computedGeometry;
+  if (clementineLiveLastTopInset !== geometry.topInset) {
+    clementineLiveLastTopInset = geometry.topInset;
+    emitClementineLiveShellState('inset');
+  }
+  const cur = win.getBounds();
+  const alreadyPlaced = clementineLiveDisplayId === display.id
+    && cur.x === geometry.x && cur.y === geometry.y
+    && cur.width === geometry.width && cur.height === geometry.height;
+  clementineLiveDisplayId = display.id;
+  if (alreadyPlaced) {
+    syncClementineNotchClickHelper();
+    return;
+  }
+  // macOS notch apps are most reliable when their native window matches the
+  // visible surface and remains interactive for its whole lifetime. Resize the
+  // frame first, then reassert its level and top-edge position last so AppKit
+  // cannot retain a stale/clamped frame from the previous presentation.
   win.setBounds({
     x: geometry.x,
     y: geometry.y,
     width: geometry.width,
     height: geometry.height,
   }, false);
+  win.setAlwaysOnTop(
+    true,
+    CLEMENTINE_LIVE_WINDOW_LEVEL.name,
+    CLEMENTINE_LIVE_WINDOW_LEVEL.relativeLevel,
+  );
+  win.setPosition(geometry.x, geometry.y, false);
+  syncClementineNotchClickHelper();
+}
+
+function syncClementineNotchClickHelper(): void {
+  const helper = clementineNotchClickHelper;
+  const win = clementineLiveWindow;
+  if (!helper || !win || win.isDestroyed()) return;
+  const windowFrame = win.getBounds();
+  const display = screen.getAllDisplays().find((candidate) => candidate.id === clementineLiveDisplayId)
+    ?? screen.getDisplayMatching(windowFrame);
+  // Always give AppKit the dormant target geometry, even while the Electron
+  // panel is expanded. This lets the helper continuously report NSScreen safe
+  // areas without deriving the notch boundary from a 392px panel envelope.
+  const nativeAnchor = clementineLiveNativeAnchors.get(display.id);
+  const dormantGeometry = computeClementineLiveGeometry({
+    bounds: display.bounds,
+    workArea: display.workArea,
+    requestedSize: DEFAULT_CLEMENTINE_LIVE_DORMANT_SIZE,
+    presentation: 'dormant',
+    topInsetOverride: nativeAnchor?.topInset,
+  });
+  const anchoredDormant = nativeAnchor
+    ? {
+      ...dormantGeometry,
+      x: Math.round(display.bounds.x + nativeAnchor.x),
+      y: Math.round(display.bounds.y + nativeAnchor.y),
+    }
+    : dormantGeometry;
+  const globalFrame = anchoredDormant.x >= display.bounds.x
+    && anchoredDormant.y >= display.bounds.y
+    && anchoredDormant.x + anchoredDormant.width <= display.bounds.x + display.bounds.width
+    && anchoredDormant.y + anchoredDormant.height <= display.bounds.y + display.bounds.height
+    ? anchoredDormant
+    : dormantGeometry;
+  helper.configure({
+    enabled: clementineNotchPreferences.enabled
+      && clementineLiveAvailability === 'ready'
+      && win.isVisible()
+      && clementineLivePresentation === 'dormant',
+    state: clementineLivePresentation,
+    displayId: display.id,
+    frame: toDisplayLocalNotchFrame(globalFrame, display.bounds),
+  });
 }
 
 function emitClementineLivePreview(payload: unknown): void {
@@ -731,6 +885,16 @@ function emitClementineLivePreview(payload: unknown): void {
 
 function emitClementineLiveMeetingPresentation(expanded: boolean): void {
   emitClementineLivePreview({ kind: expanded ? 'meeting-expand' : 'meeting-collapse' });
+}
+
+function revealClementineLiveAfterLayout(presentation: ClementineLivePresentation): void {
+  if (!clementineLivePendingReveal
+      || clementineLivePendingRevealPresentation !== presentation
+      || clementineLiveAvailability !== 'ready') return;
+  const activate = clementineLivePendingReveal === 'manual';
+  clementineLivePendingReveal = null;
+  clementineLivePendingRevealPresentation = null;
+  showClementineLive(activate);
 }
 
 function handleClementineLiveRecallEvent(event: Record<string, unknown>): void {
@@ -753,7 +917,10 @@ function handleClementineLiveRecallEvent(event: Record<string, unknown>): void {
     || (safeEvent.type === 'meeting-prompt-required'
       && clementineNotchPreferences.promptForDetectedMeetings);
   if (!shouldReveal) return;
-  if (!showClementineLive(false)) clementineLivePendingReveal = 'passive';
+  if (!clementineLiveWindow?.isVisible()) {
+    clementineLivePendingReveal = 'passive';
+    clementineLivePendingRevealPresentation = 'panel';
+  }
 }
 
 function emitClementineLiveShellState(reason: string): void {
@@ -762,6 +929,7 @@ function emitClementineLiveShellState(reason: string): void {
     reason,
     visible: clementineLiveWindow?.isVisible() ?? false,
     shortcut: effectiveClementineLiveShortcut(),
+    topInset: clementineLiveLastTopInset,
   });
 }
 
@@ -792,7 +960,9 @@ function ensureClementineLiveWindow(resetRetryBudget = true): BrowserWindow | nu
     bounds: display.bounds,
     workArea: display.workArea,
     requestedSize: clementineLiveSize,
+    presentation: clementineLivePresentation,
   });
+  clementineLiveLastTopInset = geometry.topInset;
   const win = new BrowserWindow({
     x: geometry.x,
     y: geometry.y,
@@ -810,7 +980,12 @@ function ensureClementineLiveWindow(resetRetryBudget = true): BrowserWindow | nu
     fullscreenable: false,
     skipTaskbar: true,
     hasShadow: false,
-    acceptFirstMouse: true,
+    // Keep this a normal, focusable BrowserWindow so the dormant dog accepts its
+    // first click. The exact frame is always interactive; there is no large
+    // click-through overlay whose input mode must change while the pointer moves.
+    ...CLEMENTINE_LIVE_WINDOW_INTERACTION_OPTIONS,
+    enableLargerThanScreen: true,
+    hiddenInMissionControl: true,
     title: 'Clementine',
     webPreferences: {
       partition: 'clementine-dashboard',
@@ -823,8 +998,16 @@ function ensureClementineLiveWindow(resetRetryBudget = true): BrowserWindow | nu
   clementineLiveWindow = win;
   clementineLiveAvailability = 'loading';
   guardWindow(win, ['live']);
-  win.setAlwaysOnTop(true, 'floating');
+  // Native notch panels sit just above NSMainMenuWindowLevel. The screen-saver
+  // level can paint over the reserved strip, but macOS may still route clicks to
+  // its menu-bar layer; main-menu + 3 remains above that layer and accepts input.
+  win.setAlwaysOnTop(
+    true,
+    CLEMENTINE_LIVE_WINDOW_LEVEL.name,
+    CLEMENTINE_LIVE_WINDOW_LEVEL.relativeLevel,
+  );
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  win.setIgnoreMouseEvents(false);
   win.on('close', (event) => {
     if (!(app as { isQuitting?: boolean }).isQuitting) {
       event.preventDefault();
@@ -839,10 +1022,12 @@ function ensureClementineLiveWindow(resetRetryBudget = true): BrowserWindow | nu
     }
   });
   win.on('show', () => {
+    syncClementineNotchClickHelper();
     emitClementineLiveShellState('shown');
     rebuildTrayMenu();
   });
   win.on('hide', () => {
+    syncClementineNotchClickHelper();
     emitClementineLiveShellState('dismissed');
     rebuildTrayMenu();
   });
@@ -854,6 +1039,12 @@ function ensureClementineLiveWindow(resetRetryBudget = true): BrowserWindow | nu
       clearClementineLiveRetryTimer();
       clearClementineLiveHandshakeTimer();
     }
+    clementineNotchClickHelper?.configure({
+      enabled: false,
+      state: 'panel',
+      displayId: 0,
+      frame: { x: 0, y: 0, width: 1, height: 1 },
+    });
     rebuildTrayMenu();
   });
   win.webContents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
@@ -882,11 +1073,13 @@ function showClementineLive(activate = true): boolean {
   win.moveTop();
   if (activate) win.focus();
   clementineLivePendingReveal = null;
+  clementineLivePendingRevealPresentation = null;
   return true;
 }
 
 function dismissClementineLive(): boolean {
   clementineLivePendingReveal = null;
+  clementineLivePendingRevealPresentation = null;
   const win = clementineLiveWindow;
   if (!win || win.isDestroyed()) return false;
   if (clementineLiveCaptureRequiresControls()) {
@@ -905,12 +1098,14 @@ function toggleClementineLive(): boolean {
   const win = ensureClementineLiveWindow();
   if (!win || win.isDestroyed()) {
     clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = clementineLiveCaptureRequiresControls() ? 'panel' : clementineLivePresentation;
     return false;
   }
   if (clementineLiveCaptureRequiresControls()) {
     emitClementineLiveMeetingPresentation(true);
     if (showClementineLive(true)) return true;
     clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
     return false;
   }
   if (win.isVisible()) {
@@ -919,7 +1114,95 @@ function toggleClementineLive(): boolean {
   }
   if (showClementineLive()) return true;
   clementineLivePendingReveal = 'manual';
+  clementineLivePendingRevealPresentation = clementineLivePresentation;
   return false;
+}
+
+/** The configurable notch shortcut OPENS (expands) the always-present notch —
+ * it no longer hides the window (the dormant logo stays put). Mirrors clicking
+ * the logo: toggle the panel open/closed. */
+function toggleClementineLivePanel(): boolean {
+  if (!clementineNotchPreferences.enabled) return false;
+  if (clementineLiveCaptureRequiresControls()) return toggleClementineLive();
+  const win = ensureClementineLiveWindow();
+  if (!win || win.isDestroyed()) {
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+    return false;
+  }
+  const plan = planClementineLivePanelToggle({
+    availability: clementineLiveAvailability,
+    visible: win.isVisible(),
+  });
+  if (plan === 'defer') {
+    clementineLivePendingToggle = true;
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+    return false;
+  }
+  if (plan === 'show-and-toggle') {
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+  }
+  clementineLivePendingToggle = false;
+  win.moveTop();
+  emitClementineLivePreview({ kind: 'toggle-expand' });
+  return true;
+}
+
+/** Keep explicit open requests idempotent so settings and deferred shell
+ * intents always converge on an expanded panel instead of toggling twice. */
+function expandClementineLivePanel(): boolean {
+  if (!clementineNotchPreferences.enabled) return false;
+  if (clementineNotchClickHelperHealth === 'degraded') {
+    clementineNotchClickHelper?.retry();
+  }
+  const win = ensureClementineLiveWindow();
+  if (!win || win.isDestroyed()) {
+    clementineLivePendingExpand = true;
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+    return false;
+  }
+  if (clementineLiveAvailability !== 'ready') {
+    clementineLivePendingExpand = true;
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+    return false;
+  }
+  if (!win.isVisible()) {
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+  }
+  clementineLivePendingExpand = false;
+  win.moveTop();
+  win.focus();
+  emitClementineLivePreview({ kind: 'expand' });
+  return true;
+}
+
+function startClementineLiveVoice(): boolean {
+  if (!clementineNotchPreferences.enabled) return false;
+  const win = ensureClementineLiveWindow();
+  // A voice request always needs an activated panel. Arm the reveal even when
+  // the dormant window is already visible so macOS can grant renderer focus for
+  // microphone permission and the acknowledged voice layout opens in place.
+  clementineLivePendingReveal = 'manual';
+  clementineLivePendingRevealPresentation = 'panel';
+  if (!win || win.isDestroyed()) {
+    clementineLivePendingVoice = true;
+    return false;
+  }
+  // Reveal the notch (activated, so the renderer holds focus for the mic prompt)
+  // and tell it to open a voice session. If the surface isn't mounted yet, defer
+  // the signal until the renderer acknowledges readiness.
+  if (clementineLiveAvailability !== 'ready') {
+    clementineLivePendingVoice = true;
+    return false;
+  }
+  clementineLivePendingVoice = false;
+  emitClementineLivePreview({ kind: 'start-voice' });
+  return true;
 }
 
 function openConsoleFromClementineLive(): void {
@@ -933,6 +1216,10 @@ function openConsoleFromClementineLive(): void {
 }
 
 function handleClementineLiveDisplayChange(): void {
+  const currentDisplayIds = new Set(screen.getAllDisplays().map((display) => display.id));
+  for (const displayId of clementineLiveNativeAnchors.keys()) {
+    if (!currentDisplayIds.has(displayId)) clementineLiveNativeAnchors.delete(displayId);
+  }
   if (clementineLiveDisplayId !== null
       && !screen.getAllDisplays().some((display) => display.id === clementineLiveDisplayId)) {
     clementineLiveDisplayId = null;
@@ -943,10 +1230,50 @@ function handleClementineLiveDisplayChange(): void {
 function initializeClementineLiveShell(): void {
   if (process.platform !== 'darwin' || !clementineNotchPreferences.enabled || clementineLiveShellInitialized) return;
   clementineLiveShellInitialized = true;
+  clementineNotchClickHelper = new ClementineNotchClickHelper({
+    executablePath: resolveNotchClickHelperPath({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+    }),
+    onActivate: () => {
+      // A physical click on the dormant Clementine is the voice-first entry
+      // point. The renderer then streams interim dictation and auto-sends after
+      // silence; explicit settings/shortcut opens can still show status.
+      startClementineLiveVoice();
+      const rearmTimer = setTimeout(() => syncClementineNotchClickHelper(), 750);
+      rearmTimer.unref?.();
+    },
+    onHover: (active) => emitClementineLivePreview({ kind: 'native-hover', active }),
+    onHealth: (health, reason) => {
+      clementineNotchClickHelperHealth = health;
+      clementineNotchClickHelperError = health === 'degraded'
+        ? (reason ?? 'The native notch click target is unavailable.')
+        : null;
+      rebuildTrayMenu();
+    },
+    onAnchor: (event) => {
+      const display = screen.getAllDisplays().find((candidate) => candidate.id === event.displayId);
+      if (!display) return;
+      const next = {
+        x: Math.round(event.x),
+        y: Math.round(event.y),
+        topInset: Math.round(event.topInset),
+      };
+      const previous = clementineLiveNativeAnchors.get(event.displayId);
+      if (previous?.x === next.x && previous.y === next.y && previous.topInset === next.topInset) return;
+      clementineLiveNativeAnchors.set(event.displayId, next);
+      if (clementineLiveDisplayId === event.displayId && clementineLivePresentation === 'dormant') {
+        positionClementineLiveWindow();
+      }
+    },
+    onDiagnostic: (message) => console.warn(`[notch-helper] ${message}`),
+  });
+  clementineNotchClickHelper.start();
   screen.on('display-added', handleClementineLiveDisplayChange);
   screen.on('display-removed', handleClementineLiveDisplayChange);
   screen.on('display-metrics-changed', handleClementineLiveDisplayChange);
   registerClementineLiveShortcut(effectiveClementineLiveShortcut());
+  registerClementineVoiceShortcut();
 }
 
 function disposeClementineLiveShell(): void {
@@ -954,12 +1281,18 @@ function disposeClementineLiveShell(): void {
     clementineLiveShellInitialized = false;
     if (clementineLiveRegisteredShortcut) globalShortcut.unregister(clementineLiveRegisteredShortcut);
     clementineLiveRegisteredShortcut = null;
+    if (clementineLiveVoiceRegisteredShortcut) globalShortcut.unregister(clementineLiveVoiceRegisteredShortcut);
+    clementineLiveVoiceRegisteredShortcut = null;
     screen.removeListener('display-added', handleClementineLiveDisplayChange);
     screen.removeListener('display-removed', handleClementineLiveDisplayChange);
     screen.removeListener('display-metrics-changed', handleClementineLiveDisplayChange);
   }
   clearClementineLiveRetryTimer();
   clearClementineLiveHandshakeTimer();
+  clementineNotchClickHelper?.stop();
+  clementineNotchClickHelper = null;
+  clementineNotchClickHelperHealth = 'stopped';
+  clementineNotchClickHelperError = null;
   const win = clementineLiveWindow;
   clementineLiveWindow = null;
   if (win && !win.isDestroyed()) win.destroy();
@@ -968,6 +1301,14 @@ function disposeClementineLiveShell(): void {
   clementineLiveRetryAttempts = 0;
   clementineLiveCurrentMount = null;
   clementineLivePendingReveal = null;
+  clementineLivePendingRevealPresentation = null;
+  clementineLivePendingToggle = false;
+  clementineLivePendingExpand = false;
+  clementineLivePendingVoice = false;
+  clementineLiveNativeAnchors.clear();
+  clementineLiveSize = { ...DEFAULT_CLEMENTINE_LIVE_DORMANT_SIZE };
+  clementineLivePresentation = 'dormant';
+  clementineLiveLastLayoutId = 0;
 }
 
 function assertClementineLiveIpcSender(event: IpcMainInvokeEvent): void {
@@ -1050,18 +1391,25 @@ function safeLiveMeetingActionError(error: unknown, fallback: string): Error {
   return new Error(fallback);
 }
 
-function parseClementineLiveResizeRequest(payload: unknown): ClementineLiveSize {
+function parseClementineLiveResizeRequest(payload: unknown): ClementineLiveLayoutRequest {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error('Clementine Live resize requires width and height');
+    throw new Error('Clementine Live resize requires width, height, presentation, and layoutId');
   }
   const record = payload as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (keys.length !== 2 || keys[0] !== 'height' || keys[1] !== 'width'
+  if (keys.length !== 4 || keys[0] !== 'height' || keys[1] !== 'layoutId'
+      || keys[2] !== 'presentation' || keys[3] !== 'width'
       || typeof record.width !== 'number' || !Number.isFinite(record.width) || record.width <= 0
-      || typeof record.height !== 'number' || !Number.isFinite(record.height) || record.height <= 0) {
+      || typeof record.height !== 'number' || !Number.isFinite(record.height) || record.height <= 0
+      || typeof record.layoutId !== 'number' || !Number.isSafeInteger(record.layoutId) || record.layoutId <= 0
+      || (record.presentation !== 'dormant' && record.presentation !== 'panel')) {
     throw new Error('Invalid Clementine Live resize bounds');
   }
-  return normalizeClementineLiveSize({ width: record.width, height: record.height });
+  return {
+    ...normalizeClementineLiveSize({ width: record.width, height: record.height }),
+    presentation: record.presentation,
+    layoutId: record.layoutId,
+  };
 }
 
 function parseClementineLiveMountAck(payload: unknown): ClementineLiveMountIdentity {
@@ -1318,7 +1666,7 @@ function rebuildTrayMenu(): void {
     : recordingControlsRequired
       ? 'Show Meeting Recording Controls'
       : liveReady
-        ? (clementineLiveWindow?.isVisible() ? 'Hide Clementine' : 'Show Clementine')
+        ? 'Toggle Clementine notch'
         : clementineLiveAvailability === 'loading'
           ? 'Clementine starting…'
           : 'Clementine unavailable';
@@ -1342,8 +1690,8 @@ function rebuildTrayMenu(): void {
       {
         label: liveLabel,
         accelerator: clementineNotchPreferences.enabled ? effectiveClementineLiveShortcut() : undefined,
-        enabled: clementineNotchPreferences.enabled && (recordingControlsRequired || liveReady),
-        click: () => { toggleClementineLive(); },
+        enabled: clementineNotchPreferences.enabled,
+        click: () => { toggleClementineLivePanel(); },
       } as Electron.MenuItemConstructorOptions,
       { type: 'separator' as const },
     ] : []),
@@ -2137,16 +2485,37 @@ ipcMain.handle('clemmy:notch-open', (event: IpcMainInvokeEvent) => {
     return { ok: false, error: 'Turn on Clementine in the notch first.', snapshot: clementineNotchSnapshot() };
   }
   ensureClementineLiveWindow();
-  const visible = showClementineLive();
-  if (!visible) clementineLivePendingReveal = 'manual';
-  return { ok: true, pending: !visible, snapshot: clementineNotchSnapshot() };
+  const expanded = expandClementineLivePanel();
+  if (!expanded) {
+    clementineLivePendingReveal = 'manual';
+    clementineLivePendingRevealPresentation = 'panel';
+  }
+  return { ok: true, pending: !expanded, snapshot: clementineNotchSnapshot() };
 });
 
 ipcMain.handle('clemmy:live-resize', (event: IpcMainInvokeEvent, payload: unknown) => {
   assertClementineLiveIpcSender(event);
-  clementineLiveSize = parseClementineLiveResizeRequest(payload);
+  const layout = parseClementineLiveResizeRequest(payload);
+  if (layout.layoutId < clementineLiveLastLayoutId) {
+    return {
+      ok: true,
+      applied: false,
+      layoutId: layout.layoutId,
+      currentLayoutId: clementineLiveLastLayoutId,
+      bounds: clementineLiveWindow?.getBounds() ?? null,
+    };
+  }
+  clementineLiveLastLayoutId = layout.layoutId;
+  clementineLiveSize = { width: layout.width, height: layout.height };
+  clementineLivePresentation = layout.presentation;
   positionClementineLiveWindow();
-  return { ok: true, bounds: clementineLiveWindow?.getBounds() ?? null };
+  revealClementineLiveAfterLayout(layout.presentation);
+  return {
+    ok: true,
+    applied: true,
+    layoutId: layout.layoutId,
+    bounds: clementineLiveWindow?.getBounds() ?? null,
+  };
 });
 
 ipcMain.handle('clemmy:live-mounted', (event: IpcMainInvokeEvent, payload: unknown) => {
@@ -2159,11 +2528,6 @@ ipcMain.handle('clemmy:live-mounted', (event: IpcMainInvokeEvent, payload: unkno
     && isCurrentClementineLiveMount(senderMount, mount)
     && markClementineLiveRendererReady(win, mount));
   return { ok: ready };
-});
-
-ipcMain.handle('clemmy:live-toggle', (event: IpcMainInvokeEvent) => {
-  assertClementineLiveIpcSender(event);
-  return { ok: true, visible: toggleClementineLive() };
 });
 
 ipcMain.handle('clemmy:live-open-console', (event: IpcMainInvokeEvent) => {

@@ -37,7 +37,7 @@ const SF_CLI = rec(
   'salesforce.cli.query',
   'cli',
   'sf',
-  'sf data query --target-org nathan.reynolds@scorpion.co --json --query "{{soql}}"',
+  'sf data query --target-org alex.chen@corp.example --json --query "{{soql}}"',
   'Run a SOQL query against Salesforce via the sf CLI',
 );
 
@@ -128,10 +128,10 @@ test('precision: broad auto-remembered objective prose cannot bind a summary ste
 
 test('precision: a Salesforce combiner step does not bind sf data query without query intent', () => {
   const count = rec(
-    'salesforce.accounts.count_marketleader_unique_accounts',
+    'salesforce.accounts.count_priority_account_unique_accounts',
     'cli',
     'sf',
-    'sf data query --query "SELECT COUNT(Id) total FROM Account WHERE Owner.Name = \'Nathan Reynolds\'" --json',
+    'sf data query --query "SELECT COUNT(Id) total FROM Account WHERE Owner.Name = \'Alexander Chen\'" --json',
     'Count Salesforce accounts using the sf CLI.',
   );
   const matches = matchToolChoicesForStep(
@@ -143,14 +143,14 @@ test('precision: a Salesforce combiner step does not bind sf data query without 
 
 test('precision: tracker setup mentioning Salesforce columns does not bind sf data query', () => {
   const listAccounts = rec(
-    'salesforce.accounts.market_leader.full_fields.sf_cli',
+    'salesforce.accounts.priority_account.full_fields.sf_cli',
     'cli',
     'sf',
-    'sf data query --query "SELECT Id, Name, Website FROM Account WHERE Market_Leader__c = TRUE" --json',
-    'List Salesforce market leader accounts with the sf CLI.',
+    'sf data query --query "SELECT Id, Name, Website FROM Account WHERE Priority_Account__c = TRUE" --json',
+    'List Salesforce priority account accounts with the sf CLI.',
   );
   const matches = matchToolChoicesForStep(
-    "Find or create the Google Sheets tracker. Locate Nate's tracker sheet for Salesforce market-leader Accounts, ensure Account Id columns exist, read the header row, and build the ordered column list.",
+    "Find or create the Google Sheets tracker. Locate Alex's tracker sheet for Salesforce priority-account Accounts, ensure Account Id columns exist, read the header row, and build the ordered column list.",
     { choices: [listAccounts] },
   );
   assert.equal(matches.length, 0);
@@ -158,21 +158,21 @@ test('precision: tracker setup mentioning Salesforce columns does not bind sf da
 
 test('precision: Salesforce COUNT query does not bind record-selection work', () => {
   const count = rec(
-    'salesforce.accounts.count_marketleader_unique_accounts',
+    'salesforce.accounts.count_priority_account_unique_accounts',
     'cli',
     'sf',
-    "sf data query --query \"SELECT COUNT(Id) total FROM Account WHERE Owner.Name = 'Nathan Reynolds'\" --json",
-    'Count Salesforce market leader accounts.',
+    "sf data query --query \"SELECT COUNT(Id) total FROM Account WHERE Owner.Name = 'Alexander Chen'\" --json",
+    'Count Salesforce priority account accounts.',
   );
   assert.deepEqual(
     matchToolChoicesForStep(
-      'Find candidate Salesforce prospects for Nate. Query Salesforce for Nate-owned Market Leader accounts with websites and contact emails. Return proposed_prospects and existing_airtable_count.',
+      'Find candidate Salesforce prospects for Alex. Query Salesforce for Alex-owned Priority Account accounts with websites and contact emails. Return proposed_prospects and existing_airtable_count.',
       { choices: [count] },
     ),
     [],
   );
 
-  const matches = matchToolChoicesForStep('Count Salesforce accounts owned by Nate and return the total.', { choices: [count] });
+  const matches = matchToolChoicesForStep('Count Salesforce accounts owned by Alex and return the total.', { choices: [count] });
   assert.equal(matches.length, 1);
 });
 
@@ -202,7 +202,7 @@ test('precision: invalid prose-shaped MCP memories are not workflow-bindable', (
     'A prior sequence of local tools, not a native MCP tool name.',
   );
   assert.deepEqual(
-    matchToolChoicesForStep('Write a weekly summary to durable memory and notify Nate.', { choices: [proseMcp] }),
+    matchToolChoicesForStep('Write a weekly summary to durable memory and notify Alex.', { choices: [proseMcp] }),
     [],
   );
 });

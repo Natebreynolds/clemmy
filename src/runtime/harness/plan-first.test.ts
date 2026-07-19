@@ -32,7 +32,7 @@ test('buildPlannerPrompt: priorAnswers naming an existing resource suppresses th
 
 test('buildPlannerPrompt: a sheet URL in the request suppresses the default', () => {
   const prompt = buildPlannerPrompt(
-    'add rows to https://docs.google.com/spreadsheets/d/1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz/edit',
+    'add rows to https://docs.google.com/spreadsheets/d/fixture_google_sheet_0000000002/edit',
     'go ahead',
   );
   assert.doesNotMatch(prompt, /create a NEW Google Sheet/);
@@ -77,7 +77,7 @@ test('shouldUsePlanFirst: fresh multi-system batch work STAYS conversational (no
   // conversational orchestrator, which converses + recalls + plans itself and
   // gates only the irreversible write. The planner-first preflight is opt-in.
   const input =
-    'Find 8 law firm accounts from Salesforce that fit our Market Leader outreach lane. For each one, gather one concrete SEO or web visibility signal, create a local markdown report, then draft Outlook emails for the top 3 with my Chili Piper link.';
+    'Find 8 law firm accounts from Salesforce that fit our Priority Account outreach lane. For each one, gather one concrete SEO or web visibility signal, create a local markdown report, then draft Outlook emails for the top 3 with my Chili Piper link.';
 
   assert.equal(shouldUsePlanFirst({ input, freshSession: true }), false);
 });
@@ -370,24 +370,24 @@ test('shouldUsePlanFirst: local SEO brief runs through the main orchestrator', (
 });
 
 test('buildPlannerPrompt: injects the memory block when memoryContext is provided', () => {
-  const input = 'Pull 10 Salesforce accounts not on the Market Leader list and create Outlook drafts';
+  const input = 'Pull 10 Salesforce accounts not on the Priority Account list and create Outlook drafts';
   const memoryContext =
     'What Clementine already knows (from memory — use this to FILL slots; do NOT ask the user for anything answered here):\n' +
-    '- Market Leader list: salesforce.accounts.nate_market_leaders_stale\n' +
+    '- Priority Account list: salesforce.accounts.owner_priority_accounts_stale\n' +
     '- Outreach template: outlook.email.send standard draft';
   const prompt = buildPlannerPrompt(input, undefined, memoryContext);
 
   assert.match(prompt, /User request:/);
   // The recalled snippet content is injected verbatim.
-  assert.match(prompt, /nate_market_leaders_stale/);
-  assert.match(prompt, /Market Leader list: salesforce\.accounts/);
+  assert.match(prompt, /owner_priority_accounts_stale/);
+  assert.match(prompt, /Priority Account list: salesforce\.accounts/);
   // The planner guidance line must tell it to treat memory as known.
   assert.match(prompt, /treat it as known and put it in the plan/);
   // The injected memory block (with its recalled snippet) comes AFTER the
   // user request. Key off snippet content, not the shared label phrase —
   // the guidance line also contains "What Clementine already knows".
   assert.ok(
-    prompt.indexOf('nate_market_leaders_stale') > prompt.indexOf('User request:'),
+    prompt.indexOf('owner_priority_accounts_stale') > prompt.indexOf('User request:'),
     'memory block should follow the user request',
   );
 });

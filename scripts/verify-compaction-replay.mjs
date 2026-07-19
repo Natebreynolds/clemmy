@@ -6,10 +6,9 @@
  * (deterministic clip) against it, and reports the empirical token
  * shrink. Confirms that the next turn would have fit in budget.
  *
- * Usage:
- *   node scripts/verify-compaction-replay.mjs [session_id]
- *
- * Defaults to the v0.5.9 failing session sess-mphi9vyj-f3537829.
+ * Usage (choose exactly one input source):
+ *   node scripts/verify-compaction-replay.mjs SESSION_ID
+ *   CLEMMY_REPLAY_SESSION_ID=SESSION_ID node scripts/verify-compaction-replay.mjs
  */
 import Database from 'better-sqlite3';
 import os from 'node:os';
@@ -17,8 +16,23 @@ import path from 'node:path';
 import { clipOldToolResults } from '../dist/runtime/harness/compaction.js';
 import { estimateInputTokens } from '../dist/runtime/harness/token-estimator.js';
 
-const sessionId = process.argv[2] || 'sess-mphi9vyj-f3537829';
-const dbPath = path.join(os.homedir(), '.clementine-next', 'state', 'harness.db');
+const cliSessionId = process.argv[2]?.trim() ?? '';
+const envSessionId = process.env.CLEMMY_REPLAY_SESSION_ID?.trim() ?? '';
+const usage = 'Usage: node scripts/verify-compaction-replay.mjs SESSION_ID\n'
+  + '   or: CLEMMY_REPLAY_SESSION_ID=SESSION_ID node scripts/verify-compaction-replay.mjs';
+if (process.argv.length > 3 || (cliSessionId && envSessionId)) {
+  console.error(`Choose exactly one session-id input source.\n${usage}`);
+  process.exit(2);
+}
+const sessionId = cliSessionId || envSessionId;
+if (!/^sess-[a-z0-9][a-z0-9._:-]{2,123}$/i.test(sessionId)) {
+  console.error(`A valid Clementine session ID is required.\n${usage}`);
+  process.exit(2);
+}
+
+const clementineHome = process.env.CLEMENTINE_HOME?.trim()
+  || path.join(os.homedir(), '.clementine-next');
+const dbPath = path.join(clementineHome, 'state', 'harness.db');
 const db = new Database(dbPath, { readonly: true });
 
 const row = db.prepare('SELECT metadata_json FROM sessions WHERE id = ?').get(sessionId);

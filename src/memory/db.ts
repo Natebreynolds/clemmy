@@ -323,7 +323,7 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
     //      pointer-first model — see [[project_brain_architecture]].
     //  (b) New `entities` table — first-class registry of people,
     //      companies, projects the brain knows about. Aliases enable
-    //      cross-source matching ("Marlow" in Outlook = marlow@acme.com).
+    //      cross-source matching ("Marlow" in Outlook = marlow@acme.example).
     //  (c) New `episodic_pointers` table — short labels that point at a
     //      specific tool_outputs row (session_id + call_id), so the
     //      agent can refer to "the pricing convo" and recall fetches
@@ -852,7 +852,7 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
   {
     // v16 — canonical entity identity. The original entities table only
     // deduplicated an exact lower-cased display name, so aliases such as
-    // "Nate" and "Nathan Reynolds" became separate people even when both
+    // "Alex" and "Alexander Chen" became separate people even when both
     // carried the same email address. Sidecar tables preserve every original
     // entity row while adding evidence-aware aliases, stable identifiers, and
     // reversible redirects to a canonical identity.

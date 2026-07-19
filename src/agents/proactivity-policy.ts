@@ -68,7 +68,7 @@ export interface ProactivityPolicy {
 }
 
 /**
- * Hard floor (2026-07-09, sess-mrds80fu): YOLO standing approval must never
+ * Hard floor: YOLO standing approval must never
  * silently authorize a BATCH of irreversible external sends — yolo
  * auto-approved 10 outbound emails while batchConfirmThreshold sat unread.
  * A send-class approval covering at least this many items requires one

@@ -1,34 +1,34 @@
 {
   "version": 1,
-  "capturedAt": "2026-06-23",
-  "note": "SEED gold set for boundary-judge calibration (trust-layer P3). humanLabel = the verdict a human gives: 'pass' = the judge SHOULD allow, 'fail' = the judge SHOULD bounce. Seeded from canonical incidents; the domain owner (Nathan) grows this to ~100 labels across grounding / goal_fidelity / numeric_grounding and re-baselines kappa on a model-version bump. Snapshot-guarded: any edit is a reviewable diff.",
+  "capturedAt": "2026-01-15",
+  "note": "SEED gold set for boundary-judge calibration (trust-layer P3). humanLabel = the verdict a human gives: 'pass' = the judge SHOULD allow, 'fail' = the judge SHOULD bounce. Seeded from synthetic calibration cases; maintainers should grow this to ~100 labels across grounding / goal_fidelity / numeric_grounding and re-baseline kappa on a model-version bump. Snapshot-guarded: any edit is a reviewable diff.",
   "cases": [
     {
       "id": "ng-derived-rounding-pass",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "Organic traffic is approximately 6,461 visits per month.",
-        "sources": [{ "callId": "s1", "tool": "dataforseo", "excerpt": "organic_etv 6460.78" }]
+        "deliverable": "Organic traffic is approximately 4,322 visits per month.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "dataforseo", "excerpt": "organic_etv 4321.67" }]
       },
       "humanLabel": "pass",
-      "provenance": "D'Amore Law dry-run: float->int rounding is grounded"
+      "provenance": "Synthetic calibration: float-to-integer rounding is grounded"
     },
     {
       "id": "ng-fabricated-spend-fail",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "Total ad spend across campaigns was $24.5K this quarter.",
-        "sources": [{ "callId": "s1", "tool": "composio", "excerpt": "Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000." }]
+        "deliverable": "Total ad spend across campaigns was $19K this quarter.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "composio", "excerpt": "Ad spend by campaign: Alpha $3,000; Bravo $2,500; Charlie $1,500. Total $7,000." }]
       },
       "humanLabel": "fail",
-      "provenance": "Fabricated total contradicts the $11,000 campaign sum"
+      "provenance": "Fabricated total contradicts the $7,000 synthetic campaign sum"
     },
     {
       "id": "ng-aggregation-pass",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "Total ad spend was $11,000 across the three campaigns.",
-        "sources": [{ "callId": "s1", "tool": "composio", "excerpt": "spend rows: Alpha 4000, Bravo 4000, Charlie 3000" }]
+        "deliverable": "Total ad spend was $7,000 across the three campaigns.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "composio", "excerpt": "spend rows: Alpha 3000, Bravo 2500, Charlie 1500" }]
       },
       "humanLabel": "pass",
       "provenance": "A total derived by summing the source rows is grounded"
@@ -37,68 +37,68 @@
       "id": "ng-scaled-pass",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "The site saw 12K sessions last month.",
-        "sources": [{ "callId": "s1", "tool": "dataforseo", "excerpt": "sessions: 12000" }]
+        "deliverable": "The site saw 9K sessions last month.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "dataforseo", "excerpt": "sessions: 9000" }]
       },
       "humanLabel": "pass",
-      "provenance": "Unit scaling 12000 -> 12K is grounded"
+      "provenance": "Unit scaling 9000 -> 9K is grounded"
     },
     {
       "id": "ng-percent-fraction-pass",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "Organic traffic grew 18% over the period.",
-        "sources": [{ "callId": "s1", "tool": "dataforseo", "excerpt": "growth_ratio: 0.18" }]
+        "deliverable": "Organic traffic grew 16% over the period.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "dataforseo", "excerpt": "growth_ratio: 0.16" }]
       },
       "humanLabel": "pass",
-      "provenance": "0.18 reported as 18% is grounded"
+      "provenance": "0.16 reported as 16% is grounded"
     },
     {
       "id": "ng-no-source-conversion-fail",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "The conversion rate is a healthy 47%.",
-        "sources": [{ "callId": "s1", "tool": "dataforseo", "excerpt": "organic traffic estimate: 8,000 sessions/mo" }]
+        "deliverable": "The conversion rate is a healthy 41%.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "dataforseo", "excerpt": "organic traffic estimate: 7,200 sessions/mo" }]
       },
       "humanLabel": "fail",
-      "provenance": "47% conversion has no supporting source — not grounded"
+      "provenance": "41% conversion has no supporting source — not grounded"
     },
     {
       "id": "ng-contradicted-keywords-fail",
       "judge": "numeric_grounding",
       "input": {
-        "deliverable": "The domain ranks for 5,000 keywords.",
-        "sources": [{ "callId": "s1", "tool": "dataforseo", "excerpt": "organic_keywords_count 1204" }]
+        "deliverable": "The domain ranks for 3,000 keywords.",
+        "sources": [{ "callId": "fixture_source_1", "tool": "dataforseo", "excerpt": "organic_keywords_count 987" }]
       },
       "humanLabel": "fail",
-      "provenance": "5,000 contradicts the source's 1,204 with no reconciliation"
+      "provenance": "3,000 contradicts the synthetic source's 987 with no reconciliation"
     },
     {
-      "id": "gr-houston-denver-fail",
+      "id": "gr-region-mismatch-fail",
       "judge": "grounding",
       "input": {
-        "payload": "Tool: composio_execute_tool\nOutgoing payload:\n{ to_email: cliff@eleylawfirm.com, subject: Houston workers comp search }",
-        "sources": [{ "callId": "s1", "tool": "run_worker", "excerpt": "Eley Law Firm; verified search term: \"workers compensation lawyer Denver\"; contact cliff@eleylawfirm.com" }]
+        "payload": "Tool: composio_execute_tool\nOutgoing payload:\n{ to_email: recipient@grounding-fixture.example, subject: Region Beta campaign query }",
+        "sources": [{ "callId": "fixture_source_1", "tool": "run_worker", "excerpt": "Example Organization; verified search term: \"Region Alpha campaign query\"; contact recipient@grounding-fixture.example" }]
       },
       "humanLabel": "fail",
-      "provenance": "Eley incident: payload says Houston, the research says Denver"
+      "provenance": "Synthetic contradiction: payload says Region Beta, research says Region Alpha"
     },
     {
-      "id": "gr-consistent-denver-pass",
+      "id": "gr-region-consistent-pass",
       "judge": "grounding",
       "input": {
-        "payload": "Tool: composio_execute_tool\nOutgoing payload:\n{ to_email: cliff@eleylawfirm.com, subject: Denver workers comp gap }",
-        "sources": [{ "callId": "s1", "tool": "run_worker", "excerpt": "Eley Law Firm; verified search term: \"workers compensation lawyer Denver\"" }]
+        "payload": "Tool: composio_execute_tool\nOutgoing payload:\n{ to_email: recipient@grounding-fixture.example, subject: Region Alpha campaign query }",
+        "sources": [{ "callId": "fixture_source_1", "tool": "run_worker", "excerpt": "Example Organization; verified search term: \"Region Alpha campaign query\"" }]
       },
       "humanLabel": "pass",
-      "provenance": "Payload matches the Denver research"
+      "provenance": "Payload matches the synthetic Region Alpha research"
     },
     {
       "id": "gr-generic-greeting-pass",
       "judge": "grounding",
       "input": {
-        "payload": "Tool: composio_execute_tool\nOutgoing payload:\n{ to_email: hi@firm.com, body: Hi there — we help law firms grow with SEO. Would love to chat. }",
-        "sources": [{ "callId": "s1", "tool": "run_worker", "excerpt": "Firm: Acme Law; practice: personal injury" }]
+        "payload": "Tool: composio_execute_tool\nOutgoing payload:\n{ to_email: hi@firm.example, body: Hi there — we help law firms grow with SEO. Would love to chat. }",
+        "sources": [{ "callId": "fixture_source_1", "tool": "run_worker", "excerpt": "Firm: Example Organization; practice: advisory services" }]
       },
       "humanLabel": "pass",
       "provenance": "Generic pitch makes no load-bearing claim about the target — nothing to contradict"

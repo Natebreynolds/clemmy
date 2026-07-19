@@ -76,6 +76,14 @@ function verifyPackagedFile(relativePath, message) {
   return fullPath;
 }
 
+function verifyPackagedPathAbsent(relativePath, message) {
+  const fullPath = path.join(resourcesDir, relativePath);
+  if (existsSync(fullPath)) {
+    throw new Error(`${message}: ${fullPath}`);
+  }
+  console.log(`   ok: absent ${fullPath}`);
+}
+
 function verifyPackagedPeX64(relativePath, message) {
   const fullPath = verifyPackagedFile(relativePath, message);
   assertPeX64(fullPath);
@@ -184,6 +192,10 @@ try {
   verifyPackagedFile(
     path.join('daemon', 'apps', 'console-web', 'dist', 'index.html'),
     'console-web dist is missing from the packaged app',
+  );
+  verifyPackagedPathAbsent(
+    'notch-helper',
+    'macOS-only notch helper leaked into the packaged Windows app',
   );
 } finally {
   runNpm(['rebuild', 'better-sqlite3'], rootDir, { allowFailure: true });

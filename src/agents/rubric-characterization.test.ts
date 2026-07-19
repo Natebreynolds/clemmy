@@ -58,8 +58,10 @@ const GOLDEN = {
   // 2026-07-17 turn-control/skill routing: the typed fresh-turn beat is explicit,
   // matching skills are query-scoped, and the revised wording is shorter than
   // the previous permanent rubric in every provider lane.
-  instructions: { len: 35341, sha16: '672cdc89384c2bdc' },
-  native: { len: 34444, sha16: '2c3f19b5fd6d3399' },
+  // 2026-07-18 public fixture hygiene: the illustrative CRM field was replaced
+  // with a neutral synthetic field name in both flagship prompt variants.
+  instructions: { len: 35347, sha16: '11e2a47feea279ac' },
+  native: { len: 34450, sha16: '995545680f983ce5' },
   claudeBrain: { len: 5601, sha16: '4bb5b0886757e63a' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
   lean: { len: 8860, sha16: 'e3125c66a9a76038' },

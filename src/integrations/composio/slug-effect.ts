@@ -72,7 +72,7 @@ const STATE_NOUN_READ_TOKENS: ReadonlySet<string> = new Set([
  * CREATE/POST endpoint. For every other toolkit, an unambiguous write token
  * wins so mixed actions such as FIND_OR_CREATE cannot bypass mutation
  * controls; a read token is trusted only in ACTION position (fold 2026-07-17,
- * review wf_30a7ce7e-e9c #3/#5: `GMAIL_MARK_AS_READ` must never classify read
+ * Workflow effect-classification review: `GMAIL_MARK_AS_READ` must never classify read
  * — MARK is not a known write verb and READ is a trailing state word — while
  * `TWITTER_GET_POST` must never classify write — POST there is the object).
  * Missing and unfamiliar action names remain conservative writes.

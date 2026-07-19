@@ -926,7 +926,7 @@ function candidateEntityMatchers(index: EntityMatcherIndex, text: string): Entit
 }
 
 /** Do not interpret a token inside an email, URL, domain, or @handle as an
- * entity-name mention ("Acme" inside dana@acme.com is not evidence that the
+ * entity-name mention ("Acme" inside dana@acme.example is not evidence that the
  * sentence discusses the company). Full identifiers are matched separately. */
 function maskIdentifierSpans(text: string): string {
   return text
@@ -1206,7 +1206,7 @@ function resourceNameSpecificEnough(value: string, app?: string, kind?: string):
   if (GENERIC_BACKFILL_RESOURCE_NAMES.has(normalized) || /^\d+$/.test(normalized)) return false;
   const nameTokens = normalized.match(/[a-z0-9]+/g) ?? [];
   // A bare one-word label is too easy to collide with a person, project, or
-  // ordinary noun (for example, an Airtable table named “James” or a generic
+  // ordinary noun (for example, an Airtable table named “FixtureLabel” or a generic
   // Salesforce “Event” object). Keep it inferred unless the label carries an
   // obviously identifying number or filename extension.
   if (nameTokens.length < 2 && !/\d/.test(normalized) && !/\.[a-z0-9]{2,8}$/i.test(normalized)) return false;
@@ -1537,8 +1537,8 @@ function explicitlyStatedRelationship(
     for (const object of objectNames) {
       for (const phrase of phrases) {
         // Deliberately require a direct grammatical shape. This misses some
-        // true relations, but it will not turn "Darrin leads the team at
-        // Scorpion" into the false edge "Darrin leads Scorpion".
+        // true relations, but it will not turn "Taylor leads the team at
+        // Acme" into the false edge "Taylor leads Acme".
         const pattern = new RegExp(
           `\\b${regexEscape(subject)}\\b\\s+(?:(?:currently|now|also|still|is|was)\\s+){0,2}${regexEscape(phrase)}\\s+(?:the\\s+|an?\\s+)?\\b${regexEscape(object)}\\b`,
           'i',

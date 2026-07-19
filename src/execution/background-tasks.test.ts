@@ -533,15 +533,15 @@ test('P0 single ownership: a goal-bound restart parks, then explicit resume reat
   const before = listBackgroundTasks({ includeArchived: true }).length;
 
   const task = createBackgroundTask({
-    title: 'Scorpion Facebook post rundown',
-    prompt: 'pull the last 5 Scorpion Facebook posts and their content',
+    title: 'Acme Facebook post rundown',
+    prompt: 'pull the last 5 Acme Facebook posts and their content',
     source: 'desktop',
   });
   // Bind an ACTIVE goal contract to the task's OWN run session — exactly what a
   // detached / goal-bound background run does (see bindBackgroundRunGoal). This
   // is the "run has its own resume path" signal.
   const goal = createGoalContract({
-    objective: 'pull the last 5 Scorpion Facebook posts and their content',
+    objective: 'pull the last 5 Acme Facebook posts and their content',
     sessionId: task.runSessionId,
     origin: { kind: 'background' },
   });
@@ -786,8 +786,8 @@ test('P2 report-back: desktop task defaults to origin-chat; completion is termin
   const { listQueuedNotificationDeliveries } = await import('../runtime/notifications.js');
 
   const task = createBackgroundTask({
-    title: 'Desktop Scorpion rundown',
-    prompt: 'pull the last 5 Scorpion Facebook posts',
+    title: 'Desktop Acme rundown',
+    prompt: 'pull the last 5 Acme Facebook posts',
     source: 'desktop',
     originSessionId: 'sess-p2-origin',
   });
@@ -944,7 +944,7 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   mkdirSync(workspaceRoot, { recursive: true });
   writeFileSync(path.join(TMP_HOME, '.env'), `WORKSPACE_DIRS=${workspaceRoot}\n`, 'utf-8');
   const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });
-  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the approved Revill prospect list and do not email Casey twice.' } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the approved Example Legal prospect list and do not email Casey twice.' } });
   appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'email_send', targets: ['casey@example.com'] } });
   appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Sent Casey the first email and saved the draft follow-up.' } });
   const task = createBackgroundTask({ title: 'Finish follow-up', prompt: 'finish the follow-up sequence', originSessionId: origin.id, model: 'claude-sonnet-5' });
@@ -965,7 +965,7 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   assert.equal(processed, 1);
   assert.match(workerPromptSeen, /## Origin Session Lineage/);
   assert.match(workerPromptSeen, /session_history/);
-  assert.match(workerPromptSeen, /USER: Use the approved Revill prospect list/);
+  assert.match(workerPromptSeen, /USER: Use the approved Example Legal prospect list/);
   assert.match(workerPromptSeen, /YOU: Sent Casey the first email/);
   assert.match(workerPromptSeen, /ALREADY DONE/);
   assert.match(workerPromptSeen, /email_send/);
@@ -1812,10 +1812,10 @@ test('processBackgroundTasks blocks promise-shaped post-approval completion when
 
 test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
   const task = createBackgroundTask({ title: 'Draft the emails', prompt: 'draft', originSessionId: 'console:home' });
-  const parked = markBackgroundTaskAwaitingInput(task.id, 'q-1', 'Which segment — all leads, or just market-leaders?');
+  const parked = markBackgroundTaskAwaitingInput(task.id, 'q-1', 'Which segment — all leads, or just priority-accounts?');
   assert.equal(parked?.status, 'awaiting_input');
   assert.equal(parked?.pendingQuestionId, 'q-1');
-  assert.match(parked?.pendingQuestion ?? '', /market-leaders/);
+  assert.match(parked?.pendingQuestion ?? '', /priority-accounts/);
 });
 
 test('awaiting-input notifications preserve origin metadata and route Slack report-backs to requester DM', () => {
@@ -1887,9 +1887,9 @@ test('queueBackgroundTaskInputResolution re-queues with the freeform answer', ()
   markBackgroundTaskAwaitingInput(task.id, 'q-2', 'How many?');
   const questionCard = listNotifications(300).find((item) => item.metadata?.questionId === 'q-2');
   assert.equal(questionCard?.read, false, 'question starts as an actionable needs-input card');
-  const resumed = queueBackgroundTaskInputResolution('q-2', 'just my market-leader accounts');
+  const resumed = queueBackgroundTaskInputResolution('q-2', 'just my priority-account accounts');
   assert.equal(resumed?.status, 'pending', 're-queued for the daemon to resume');
-  assert.equal(resumed?.inputResolution?.answer, 'just my market-leader accounts');
+  assert.equal(resumed?.inputResolution?.answer, 'just my priority-account accounts');
   assert.equal(
     listNotifications(300).find((item) => item.metadata?.questionId === 'q-2')?.read,
     true,

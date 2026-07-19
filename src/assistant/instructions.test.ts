@@ -104,7 +104,7 @@ test('case-insensitive match', () => {
 // ── P3 unified scope gate ──────────────────────────────────────────
 
 test('hasScopedLanguage detects possessive/relative markers, ignores plain reads', () => {
-  assert.ok(hasScopedLanguage('show my market-leader accounts'));
+  assert.ok(hasScopedLanguage('show my priority-account accounts'));
   assert.ok(hasScopedLanguage('pull the usual sheet'));
   assert.ok(hasScopedLanguage('do it like last time'));
   assert.ok(!hasScopedLanguage('list all accounts in the org'));
@@ -113,13 +113,13 @@ test('hasScopedLanguage detects possessive/relative markers, ignores plain reads
 
 test('P3 flag off: scoped lookup gets NO directive (today behavior preserved)', () => {
   delete process.env.UNIFIED_SCOPE_GATE;
-  const out = renderActionDisciplineDirective('lookup', 'show my market-leader accounts');
+  const out = renderActionDisciplineDirective('lookup', 'show my priority-account accounts');
   assert.ok(!out.includes('RESOLVE SCOPE'), 'lookup stays bare under flag-off');
 });
 
 test('P3 flag on: scoped lookup GETS the scope directive', () => {
   process.env.UNIFIED_SCOPE_GATE = 'on';
-  const out = renderActionDisciplineDirective('lookup', 'show my market-leader accounts');
+  const out = renderActionDisciplineDirective('lookup', 'show my priority-account accounts');
   assert.ok(out.includes('RESOLVE SCOPE'), 'scoped lookup now resolves scope before querying');
   delete process.env.UNIFIED_SCOPE_GATE;
 });

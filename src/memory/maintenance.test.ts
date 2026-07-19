@@ -62,7 +62,7 @@ test('isAtOrAfterDailyTime: memory self-heal slot catches up after 4:35', () => 
 test('boot identity finalization backs up first, then converges only a stable personal-email duplicate', () => {
   resetMemoryDb();
   const canonical = upsertEntity({
-    type: 'person', name: 'Nathan Reynolds', aliases: ['nathan@example.com'],
+    type: 'person', name: 'Alexander Chen', aliases: ['alex@corp.example'],
   });
   const db = openMemoryDb();
   const now = '2026-07-15T12:00:00.000Z';
@@ -70,13 +70,13 @@ test('boot identity finalization backs up first, then converges only a stable pe
     INSERT INTO entities
       (entity_type, canonical_name, canonical_name_lc, aliases_json,
        first_seen_at, last_seen_at, mention_count)
-    VALUES ('person', 'Nate Reynolds', 'nate reynolds', '[]', ?, ?, 1)
+    VALUES ('person', 'Alex Chen', 'Alex Chen', '[]', ?, ?, 1)
   `).run(now, now).lastInsertRowid);
   db.prepare(`
     INSERT INTO entity_identifiers
       (entity_id, scheme, value, value_norm, confidence,
        evidence_episode_id, source_uri, first_seen_at, last_seen_at)
-    VALUES (?, 'email', 'nathan@example.com', 'nathan@example.com', 0.99,
+    VALUES (?, 'email', 'alex@corp.example', 'alex@corp.example', 0.99,
             NULL, NULL, ?, ?)
   `).run(duplicate, now, now);
   const sharedA = upsertEntity({ type: 'person', name: 'Sales One', aliases: ['sales@example.com'] });

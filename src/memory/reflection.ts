@@ -33,6 +33,7 @@ import {
   reflectionCandidateHash,
   resolveReflectionCandidate,
 } from './reflection-candidates.js';
+import { loadUserProfile } from '../runtime/user-profile.js';
 
 export { upsertEntity } from './entity-identity.js';
 
@@ -315,10 +316,34 @@ function numberInRange(value: unknown, min: number, max: number, fallback: numbe
   return Math.min(max, Math.max(min, parsed));
 }
 
-function normalizeFactKind(value: unknown, text: string): ConsolidatedFactKind {
+function reflectionUserNames(overrides?: readonly string[]): string[] {
+  const candidates = overrides ?? (() => {
+    const profile = loadUserProfile();
+    return [profile.preferredName, profile.displayName, getRuntimeEnv('OWNER_NAME', '')];
+  })();
+  return [...new Set(candidates
+    .filter((name): name is string => typeof name === 'string')
+    .map((name) => name.trim().toLowerCase().replace(/\s+/g, ' '))
+    .filter((name) => name.length > 0 && name !== 'the user'))];
+}
+
+function beginsWithConfiguredUserName(text: string, names: readonly string[]): boolean {
+  const normalized = text.trim().toLowerCase().replace(/[’]/g, "'").replace(/\s+/g, ' ');
+  return names.some((name) => (
+    normalized === name
+    || normalized.startsWith(`${name} `)
+    || normalized.startsWith(`${name}'s `)
+  ));
+}
+
+function normalizeFactKind(
+  value: unknown,
+  text: string,
+  configuredUserNames: readonly string[],
+): ConsolidatedFactKind {
   const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
   if ((FACT_KIND_VALUES as readonly string[]).includes(raw)) return raw as ConsolidatedFactKind;
-  if (/^\s*(user|nathan|the user)\b/i.test(text)) return 'user';
+  if (/^\s*(user|the user)\b/i.test(text) || beginsWithConfiguredUserName(text, configuredUserNames)) return 'user';
   if (/\b(project|repo|workflow|client work|campaign)\b/i.test(text)) return 'project';
   if (/\b(prefers?|dislikes?|liked|feedback|requested|asked that)\b/i.test(text)) return 'feedback';
   return 'reference';
@@ -350,17 +375,18 @@ function parseExtractorJson(value: unknown): unknown | null {
 
 function sanitizeExtractionOutput(
   value: unknown,
-  opts: { withResources?: boolean; withRelationships?: boolean } = {},
+  opts: { withResources?: boolean; withRelationships?: boolean; userNames?: readonly string[] } = {},
 ): Extraction | null {
   const parsed = parseExtractorJson(value);
   if (!isRecord(parsed)) return null;
+  const configuredUserNames = reflectionUserNames(opts.userNames);
 
   const facts = recordArray(parsed.facts)
     .map((fact) => {
       const text = boundedString(fact.text ?? fact.fact ?? fact.content, 500);
       if (!text || text.length < 3) return null;
       return {
-        kind: normalizeFactKind(fact.kind ?? fact.type ?? fact.category, text),
+        kind: normalizeFactKind(fact.kind ?? fact.type ?? fact.category, text, configuredUserNames),
         text,
         importance: numberInRange(fact.importance ?? fact.score ?? fact.poignancy, 1, 10, 3),
       };
@@ -593,7 +619,7 @@ export function _testOnly_setReflectionExtractor(fn: ReflectionExtractorFn | nul
 
 export function _testOnly_sanitizeExtractionOutput(
   value: unknown,
-  opts: { withResources?: boolean; withRelationships?: boolean } = {},
+  opts: { withResources?: boolean; withRelationships?: boolean; userNames?: readonly string[] } = {},
 ): Extraction | null {
   return sanitizeExtractionOutput(value, opts);
 }
@@ -2321,8 +2347,9 @@ export async function consolidateActiveFacts(
       // logically distinct entities (different client/account/table/domain/
       // email) even at high cosine — the SAME guard the paraphrase merge uses
       // (extractAnchors/canMergeEntitySafe from memory-merge.ts). Without it, two
-      // facts differing only by a proper noun ("Revill ranks #3" vs "Aldous ranks
-      // #3", cosine ~0.96) tie on score and the older is erased → wrong-client recall.
+      // facts differing only by a proper noun ("Example Legal ranks #3" vs
+      // "Sample Law ranks #3", cosine ~0.96) can tie on score and erase the
+      // older fact, causing wrong-client recall.
       const anchorsById = new Map<number, EntityAnchors>();
       for (const r of embedded) anchorsById.set(r.id, extractAnchors(r));
       for (let i = 0; i < embedded.length; i += 1) {

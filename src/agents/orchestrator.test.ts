@@ -620,7 +620,7 @@ test('run_worker emits worker_result ok=false when an already-capped item is ref
     turn: 0,
     role: 'system',
     type: 'worker_capped',
-    data: { callId: 'call_old', item: 'Firm A - firma.com' },
+    data: { callId: 'call_old', item: 'Firm A - firm-a.example' },
   });
   const agent = await buildOrchestratorAgent();
   const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
@@ -630,7 +630,7 @@ test('run_worker emits worker_result ok=false when an already-capped item is ref
 
   const packet = {
     objective: 'Research one firm.',
-    item: 'Firm A - firma.com',
+    item: 'Firm A - firm-a.example',
     resolvedTools: 'none needed',
     context: 'Prior worker capped.',
     instructions: 'Do not retry capped work.',
@@ -647,7 +647,7 @@ test('run_worker emits worker_result ok=false when an already-capped item is ref
   assert.match(String(result), /^ERROR:/);
   const results = listEvents(session.id, { types: ['worker_result'] });
   assert.equal(results.length, 1);
-  assert.equal((results[0].data as { item?: string }).item, 'Firm A - firma.com');
+  assert.equal((results[0].data as { item?: string }).item, 'Firm A - firm-a.example');
   assert.equal((results[0].data as { ok?: boolean }).ok, false);
   assert.equal((results[0].data as { toolCallId?: string }).toolCallId, 'call_worker_capped');
   assert.match(String((results[0].data as { reason?: string }).reason), /already exhausted/i);
@@ -739,7 +739,7 @@ test('request_approval auto-resolves local saves so user-initiated memory writes
     ctx: unknown,
     input: { subject: string; reason: string | null; destructive: boolean },
   ) => Promise<boolean>;
-  // The exact production case from sess-mpbpih0u — must NOT pause.
+  // The exact orchestrator-continuation regression shape — must NOT pause.
   assert.equal(
     await needsFn({}, {
       subject: 'Save Salesforce access rule to memory',
@@ -929,7 +929,7 @@ test('request_approval execute opens a slug-scoped plan scope for Outlook draft 
         samples: [
           {
             label: 'Draft',
-            value: 'Scorpion has been the best choice for us.',
+            value: 'Acme has been the best choice for us.',
             secondary: 'To: Pat Dunphy <pdunphy@example.com>',
           },
         ],

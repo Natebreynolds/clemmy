@@ -16,10 +16,10 @@ test('same-origin agent-authored workspace views cannot request media', () => {
   assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/CONSOLE/SPACES/abc/%76iew', origins), false);
 });
 
-test('the Stage 0 Clementine Live surface cannot request media', () => {
-  assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/console/notch', origins), false);
-  assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/console/notch/', origins), false);
-  assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/CONSOLE/%6eotch?voice=1', origins), false);
+test('the trusted Clementine notch may request audio capture', () => {
+  assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/console/notch', origins), true);
+  assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/console/notch/', origins), true);
+  assert.equal(isTrustedDashboardMediaUrl('http://127.0.0.1:43123/CONSOLE/%6eotch?voice=1', origins), true);
 });
 
 test('untrusted origins and malformed URLs fail closed', () => {

@@ -41,7 +41,7 @@ function loadRecord(opts?: VapidStoreOptions): VapidRecord | null {
     if (parsed?.version !== 1 || !parsed.publicKey || !parsed.privateKey) return null;
     return {
       version: 1,
-      subject: parsed.subject ?? 'mailto:noreply@clementine.local',
+      subject: parsed.subject ?? 'mailto:notifications@clementine.example',
       publicKey: parsed.publicKey,
       privateKey: parsed.privateKey,
       createdAt: parsed.createdAt ?? new Date().toISOString(),
@@ -67,7 +67,7 @@ export function getVapidKeys(opts?: VapidStoreOptions): VapidRecord {
   const generated = webPush.generateVAPIDKeys();
   const record: VapidRecord = {
     version: 1,
-    subject: 'mailto:noreply@clementine.local',
+    subject: 'mailto:notifications@clementine.example',
     publicKey: generated.publicKey,
     privateKey: generated.privateKey,
     createdAt: new Date().toISOString(),
@@ -85,7 +85,7 @@ export function _regenerateVapidKeysForTests(opts?: VapidStoreOptions): VapidRec
   const generated = webPush.generateVAPIDKeys();
   const record: VapidRecord = {
     version: 1,
-    subject: 'mailto:noreply@clementine.local',
+    subject: 'mailto:notifications@clementine.example',
     publicKey: generated.publicKey,
     privateKey: generated.privateKey,
     createdAt: new Date().toISOString(),

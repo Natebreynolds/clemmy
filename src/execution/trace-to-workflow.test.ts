@@ -64,9 +64,9 @@ test('traceToWorkflowDraft: filters exploration, keeps actions, chains linearly'
 
 test('traceToWorkflowDraft: N>=3 same-slug calls with one varying arg → REAL forEach (list step + iterating work step)', () => {
   const draft = traceToWorkflowDraft([
-    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}'),
-    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"b.com"}}'),
-    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"c.com"}}'),
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"alpha.example"}}'),
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"beta.example"}}'),
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"gamma.example"}}'),
   ]);
   // Two steps now: an inferred list step + the forEach work step.
   assert.equal(draft.steps.length, 2);
@@ -76,7 +76,7 @@ test('traceToWorkflowDraft: N>=3 same-slug calls with one varying arg → REAL f
   assert.deepEqual(list.allowedTools, []);
   assert.deepEqual(list.output, { type: 'array', min_items: { '': 1 } });
   assert.match(list.prompt, /Return exactly this JSON array/);
-  assert.match(list.prompt, /"a\.com"[\s\S]*"b\.com"[\s\S]*"c\.com"/); // items, in order
+  assert.match(list.prompt, /"alpha\.example"[\s\S]*"beta\.example"[\s\S]*"gamma\.example"/); // items, in order
   // Work step: forEach over the list, depends on it, iterates with {{item}}.
   assert.equal(work.forEach, `{{steps.${list.id}.output}}`);
   assert.deepEqual(work.dependsOn, [list.id]);
@@ -88,8 +88,8 @@ test('traceToWorkflowDraft: N>=3 same-slug calls with one varying arg → REAL f
 
 test('traceToWorkflowDraft: N=2 same-slug calls stay a SINGLE step (below the fan-out threshold)', () => {
   const draft = traceToWorkflowDraft([
-    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}'),
-    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"b.com"}}'),
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"alpha.example"}}'),
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"beta.example"}}'),
   ]);
   assert.equal(draft.steps.length, 1);          // coalesced, not fanned out
   assert.equal(draft.steps[0].observed.calls, 2);
@@ -100,18 +100,18 @@ test('traceToWorkflowDraft: N=2 same-slug calls stay a SINGLE step (below the fa
 
 test('traceToWorkflowDraft: N>=3 with MULTIPLE varying keys → items are objects keyed by the varying fields', () => {
   const draft = traceToWorkflowDraft([
-    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"a@x.com","subject":"Hi A","body":"same"}}'),
-    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"b@x.com","subject":"Hi B","body":"same"}}'),
-    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"c@x.com","subject":"Hi C","body":"same"}}'),
+    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"a@site.example","subject":"Hi A","body":"same"}}'),
+    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"b@site.example","subject":"Hi B","body":"same"}}'),
+    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"c@site.example","subject":"Hi C","body":"same"}}'),
   ]);
   assert.equal(draft.steps.length, 2);
   const [list, work] = draft.steps;
   // `body` is constant → NOT in the items; `subject` + `to` vary → objects.
   const items = JSON.parse(list.prompt.slice(list.prompt.indexOf('[')));
   assert.deepEqual(items, [
-    { subject: 'Hi A', to: 'a@x.com' },
-    { subject: 'Hi B', to: 'b@x.com' },
-    { subject: 'Hi C', to: 'c@x.com' },
+    { subject: 'Hi A', to: 'a@site.example' },
+    { subject: 'Hi B', to: 'b@site.example' },
+    { subject: 'Hi C', to: 'c@site.example' },
   ]);
   // Work step references each varying field via {{item.<key>}}.
   assert.match(work.prompt, /\{\{item\.to\}\}/);

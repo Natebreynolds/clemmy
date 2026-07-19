@@ -1,13 +1,9 @@
 /**
- * Single Tool Registry — STEP 1 (transcription + advisory derivations).
+ * Single Tool Registry.
  *
- * Per TOOL-REGISTRY-PLAN-2026-07-07.md. This file is the ONE place that records,
- * for every built-in tool, which surfaces advertise it and how it is classified.
- * In step 1 it is ADVISORY: nothing here is wired into a live consumer yet. The
- * conformance test (tool-registry.test.ts) asserts that the DERIVATIONS below
- * reproduce every existing hand-maintained list EXACTLY — so this registry is a
- * verified mirror of current truth, and any future drift between a hand list and
- * the registry fails CI.
+ * This file is the one place that records, for every built-in tool, which
+ * surfaces advertise it and how it is classified. The conformance test
+ * (`tool-registry.test.ts`) pins the derived surfaces so drift fails CI.
  *
  * Design constraints carried from the plan's risk list:
  *   - Everything is lazily evaluated: the registry is a self-contained array of

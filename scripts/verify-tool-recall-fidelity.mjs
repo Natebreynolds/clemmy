@@ -648,11 +648,11 @@ async function probeGroundingSearchFindsTarget(mods) {
   const sess = sessionMod.HarnessSession.create({ kind: 'chat', title: 'grounding probe' });
   eventlog.writeToolOutput({
     sessionId: sess.id, callId: 'call_src_1', tool: 'composio_execute_tool',
-    output: JSON.stringify({ contact: { name: 'Dana Eley', email: 'dana.eley@client.example.com', city: 'Denver' } }),
+    output: JSON.stringify({ contact: { name: 'Dana Morgan', email: 'dana.morgan@client.example.com', city: 'Denver' } }),
   });
   eventlog.writeToolOutput({ sessionId: sess.id, callId: 'call_noise_1', tool: 't', output: 'unrelated noise '.repeat(50) });
 
-  const hits = eventlog.searchToolOutputs(sess.id, ['dana.eley@client.example.com']);
+  const hits = eventlog.searchToolOutputs(sess.id, ['dana.morgan@client.example.com']);
   const checks = [
     { ok: hits.length === 1 && hits[0].callId === 'call_src_1', label: `target artifact found exactly (got ${hits.length} hits)` },
     { ok: (hits[0]?.output ?? '').includes('Denver'), label: 'artifact carries the ground-truth fields the judge needs' },

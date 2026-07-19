@@ -27575,7 +27575,7 @@ const CONSOLE_JS = `
       '    </select></div>',
       '    <div><label>DESCRIPTION</label><input type="text" data-f="description" value="' + escMem(v.description || '') + '" /></div>',
       '  </div>',
-      '  <div><label>COMMAND (stdio)</label><input type="text" data-f="command" value="' + escMem(v.command || '') + '" placeholder="e.g. npx @modelcontextprotocol/server-filesystem /Users/me/notes" /></div>',
+      '  <div><label>COMMAND (stdio)</label><input type="text" data-f="command" value="' + escMem(v.command || '') + '" placeholder="e.g. npx @modelcontextprotocol/server-filesystem /Users/example/notes" /></div>',
       '  <div><label>ARGS (space-separated, stdio)</label><input type="text" data-f="args" value="' + escMem(argsStr) + '" placeholder="optional — overrides args from command line" /></div>',
       '  <div><label>URL (http / sse)</label><input type="text" data-f="url" value="' + escMem(v.url || '') + '" placeholder="https://your-mcp-server.example.com/rpc" /></div>',
       '  <div class="buttons">',

@@ -6,7 +6,7 @@ html.clemmy-live-document #root {
 }
 
 .clemmy-live-stage {
-  --clemmy-live-panel: rgba(18, 16, 14, 0.965);
+  --clemmy-live-panel: #070709;
   --clemmy-live-panel-soft: rgba(255, 255, 255, 0.055);
   --clemmy-live-line: rgba(255, 255, 255, 0.1);
   --clemmy-live-line-strong: rgba(255, 255, 255, 0.17);
@@ -22,6 +22,7 @@ html.clemmy-live-document #root {
   position: fixed;
   inset: 0;
   z-index: 999;
+  box-sizing: border-box;
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -31,6 +32,7 @@ html.clemmy-live-document #root {
   min-height: min(var(--clemmy-live-height), 100vh);
   overflow: hidden;
   pointer-events: none;
+  opacity: var(--clemmy-live-layout-opacity, 1);
   color: var(--clemmy-live-text);
   font-family: "Plus Jakarta Sans Variable", ui-sans-serif, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -49,33 +51,89 @@ html.clemmy-live-document #root {
 }
 
 .clemmy-live-collapsed {
+  flex: 0 0 auto;
   width: var(--clemmy-live-width);
-  height: 42px;
-  padding: 0 12px 0 10px;
+  min-width: var(--clemmy-live-width);
+  max-width: var(--clemmy-live-width);
+  height: 34px;
+  padding: 0 12px;
   display: flex;
   align-items: center;
-  gap: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-top: 0;
-  border-radius: 0 0 19px 19px;
-  background:
-    radial-gradient(circle at 20% -40%, rgba(255, 126, 66, 0.18), transparent 58%),
-    linear-gradient(145deg, rgba(27, 23, 20, 0.985), rgba(12, 11, 10, 0.985));
-  box-shadow: 0 5px 13px rgba(0, 0, 0, 0.38), inset 0 -1px rgba(255, 255, 255, 0.025);
+  justify-content: center;
+  gap: 8px;
+  /* No side/top borders and a near-black top: the tab must MERGE with the
+   * physical notch above it (pure black camera housing) and only reveal a soft
+   * rounded bottom edge, so when dormant it reads as the notch itself rather than
+   * a pill. The faint bottom hairline gives the reveal a subtle lip. */
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 0 0 16px 16px;
+  /* Pure black so it merges with the physical notch (no warm/orange tint). */
+  background: linear-gradient(180deg, #000 0%, #050506 62%, #070709 100%);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, 0.5);
   color: var(--clemmy-live-text);
   cursor: pointer;
   pointer-events: auto;
-  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+  transition: background 160ms ease, transform 160ms ease;
 }
 
 .clemmy-live-collapsed:hover {
-  border-color: rgba(255, 140, 82, 0.34);
-  background:
-    radial-gradient(circle at 20% -40%, rgba(255, 126, 66, 0.25), transparent 62%),
-    linear-gradient(145deg, rgba(31, 26, 22, 0.99), rgba(15, 13, 11, 0.99));
+  background: linear-gradient(180deg, #000 0%, #0a0a0c 60%, #0e0e11 100%);
 }
 
-.clemmy-live-collapsed:active { transform: translateY(-1px); }
+.clemmy-live-collapsed:active { transform: translateY(-0.5px); }
+
+/* Dormant: JUST the Clementine logo in a tiny native window beside the physical
+ * notch. The button fills that 62×48 frame, giving macOS one stable hit target;
+ * only the avatar receives hover chrome so the larger target remains invisible. */
+.clemmy-live-dormant {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  width: var(--clemmy-live-width);
+  min-width: var(--clemmy-live-width);
+  max-width: var(--clemmy-live-width);
+  height: var(--clemmy-live-height);
+  min-height: var(--clemmy-live-height);
+  margin-top: 0;
+  transform: none;
+  padding: max(3px, calc((var(--notch-inset, 32px) - 26px) / 2)) 0 0;
+  gap: 0;
+  align-items: flex-start;
+  justify-content: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+}
+.clemmy-live-dormant:hover { background: transparent; }
+.clemmy-live-dormant:active { transform: none; }
+.clemmy-live-dormant .clemmy-live-collapsed-avatar {
+  width: 26px;
+  height: 26px;
+  background: transparent;
+  box-shadow: none;
+  border-radius: 999px;
+  transition: transform 140ms ease;
+}
+/* Hover feedback is a subtle lift on the logo itself — NOT a gray box behind it,
+ * so the icon stays seamless in the menu bar / notch. */
+.clemmy-live-dormant:hover .clemmy-live-collapsed-avatar,
+.clemmy-live-dormant[data-native-hover="true"] .clemmy-live-collapsed-avatar {
+  background: transparent;
+  transform: scale(1.12);
+}
+
+.clemmy-live-collapsed-word {
+  color: var(--clemmy-live-muted);
+  font-size: 11.5px;
+  font-weight: 680;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.clemmy-live-collapsed[data-phase="approval"] .clemmy-live-collapsed-word { color: #f2ce8f; }
+.clemmy-live-collapsed[data-phase="working"] .clemmy-live-collapsed-word { color: #ffcaa6; }
 
 .clemmy-live-collapsed-avatar {
   position: relative;
@@ -101,6 +159,23 @@ html.clemmy-live-document #root {
   background: var(--clemmy-live-green);
   box-shadow: 0 0 7px rgba(118, 213, 150, 0.72);
 }
+
+.clemmy-live-voice-badge {
+  position: absolute;
+  right: -4px;
+  bottom: -3px;
+  width: 13px;
+  height: 13px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid #050506;
+  border-radius: 999px;
+  background: var(--clemmy-live-orange);
+  color: #1d100a;
+  box-shadow: 0 0 8px rgba(255, 122, 61, 0.5);
+}
+
+.clemmy-live-voice-badge svg { width: 7px; height: 7px; stroke-width: 2.8; }
 
 .clemmy-live-collapsed[data-phase="working"] .clemmy-live-collapsed-avatar {
   animation: clemmy-live-readiness-pulse 2.8s ease-in-out infinite;
@@ -177,19 +252,26 @@ html.clemmy-live-document #root {
 .clemmy-live-collapsed > svg { color: #81786d; }
 
 .clemmy-live-island {
+  flex: 0 0 auto;
   width: var(--clemmy-live-width);
-  height: min(calc(var(--clemmy-live-height) - 10px), calc(100vh - 10px));
+  min-width: var(--clemmy-live-width);
+  max-width: var(--clemmy-live-width);
+  /* Span the notch inset at the top (behind the camera) plus the surface height,
+   * and pad the content down by the inset so the header sits just below the notch
+   * while the panel's black fills the notch — it reads as one piece with it. */
+  height: calc(var(--notch-inset, 0px) + var(--clemmy-live-height));
+  padding-top: var(--notch-inset, 0px);
   box-sizing: border-box;
   overflow-x: hidden;
   overflow-y: auto;
   border: 1px solid var(--clemmy-live-line);
   border-top: 0;
   border-radius: 0 0 27px 27px;
-  background:
-    radial-gradient(circle at 8% -8%, rgba(255, 128, 68, 0.16), transparent 32%),
-    radial-gradient(circle at 96% 6%, rgba(255, 204, 150, 0.055), transparent 27%),
-    linear-gradient(150deg, rgba(25, 22, 19, 0.985), var(--clemmy-live-panel));
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.43), inset 0 -1px rgba(255, 255, 255, 0.03);
+  /* Pure black at the top so it is seamless with the physical notch (the inset
+   * strip behind the camera), easing to a near-black panel below. No warm/orange
+   * tint — the surface reads as the notch stretching open. */
+  background: linear-gradient(180deg, #000 0%, #000 var(--notch-inset, 38px), #050506 calc(var(--notch-inset, 38px) + 2px), var(--clemmy-live-panel) 100%);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55), inset 0 -1px rgba(255, 255, 255, 0.025);
   backdrop-filter: blur(26px) saturate(125%);
   -webkit-backdrop-filter: blur(26px) saturate(125%);
   pointer-events: auto;
@@ -200,9 +282,12 @@ html.clemmy-live-document #root {
 
 .clemmy-live-island::-webkit-scrollbar { display: none; }
 
+/* Emerge from the notch: start narrow (≈ notch width) and grow OUT + down, so the
+ * panel reads as the notch stretching open rather than a panel dropping in. */
 @keyframes clemmy-live-arrive {
-  from { opacity: 0; transform: translateY(-8px) scale(0.97); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(-2px) scaleX(0.42) scaleY(0.72); }
+  60% { opacity: 1; }
+  to { opacity: 1; transform: translateY(0) scaleX(1) scaleY(1); }
 }
 
 .clemmy-live-header {
@@ -210,12 +295,18 @@ html.clemmy-live-document #root {
   box-sizing: border-box;
   padding: 8px 11px 8px 13px;
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) auto minmax(102px, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.075);
   background: rgba(0, 0, 0, 0.13);
   -webkit-app-region: drag;
+}
+
+/* Meeting controls retain a centered Recall badge, unlike the two-column task
+ * and voice headers. Scope the third column to that surface only. */
+.clemmy-live-meeting-header {
+  grid-template-columns: minmax(100px, 1fr) auto minmax(72px, 1fr);
 }
 
 .clemmy-live-brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -255,7 +346,27 @@ html.clemmy-live-document #root {
   cursor: pointer;
 }
 .clemmy-live-window-actions button:hover { background: rgba(255, 255, 255, 0.07); color: var(--clemmy-live-text); }
+.clemmy-live-window-actions button:disabled { opacity: 0.45; cursor: default; }
+.clemmy-live-window-actions button:disabled:hover { background: transparent; }
 .clemmy-live-window-actions svg { width: 13px; height: 13px; }
+/* Voice is a primary affordance, not a hidden icon revealed only on hover. */
+.clemmy-live-window-actions .clemmy-live-talk {
+  width: auto;
+  min-width: 58px;
+  padding: 0 9px;
+  display: inline-flex;
+  gap: 5px;
+  border: 1px solid rgba(255, 122, 61, 0.24);
+  background: rgba(255, 122, 61, 0.12);
+  color: #ffb286;
+  font-size: 10.5px;
+  font-weight: 760;
+}
+.clemmy-live-window-actions .clemmy-live-talk:hover {
+  border-color: rgba(255, 122, 61, 0.42);
+  background: rgba(255, 122, 61, 0.19);
+  color: #ffd2b8;
+}
 
 .clemmy-live-content {
   height: calc(100% - 52px);
@@ -271,46 +382,32 @@ html.clemmy-live-document #root {
  * until their text overlaps. Exact-size notch windows never need to scroll. */
 .clemmy-live-content > * { flex-shrink: 0; }
 
-.clemmy-live-state-nav {
-  min-height: 34px;
-  padding: 3px;
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 2px;
-  border: 1px solid rgba(255, 255, 255, 0.065);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.035);
-}
-
-.clemmy-live-state-nav button {
-  height: 28px;
-  padding: 0 3px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--clemmy-live-faint);
-  font-size: 10px;
-  font-weight: 650;
-  cursor: pointer;
-}
-
-.clemmy-live-state-nav button:hover { color: var(--clemmy-live-muted); background: rgba(255, 255, 255, 0.04); }
-.clemmy-live-state-nav button[aria-pressed="true"] { color: #fff7ee; background: rgba(255, 122, 61, 0.16); }
-.clemmy-live-state-nav svg { width: 6px; height: 6px; fill: currentColor; }
-
 .clemmy-live-state-copy {
   position: relative;
   min-height: 56px;
   padding-right: 142px;
   animation: clemmy-live-state-enter 180ms ease-out;
 }
-.clemmy-live-state-copy h1 { margin: 0; color: var(--clemmy-live-text); font-size: 17px; font-weight: 750; line-height: 22px; letter-spacing: -0.015em; }
-.clemmy-live-state-copy h1:focus { outline: none; }
-.clemmy-live-state-copy h1:focus-visible { box-shadow: 0 0 0 2px rgba(255, 160, 105, 0.65); border-radius: 5px; }
+.clemmy-live-state-copy h1 {
+  margin: 0;
+  color: var(--clemmy-live-text);
+  font-size: 17px;
+  font-weight: 750;
+  line-height: 22px;
+  letter-spacing: -0.015em;
+  /* Clamp long run titles to two lines so the card height stays stable and the
+   * primary action row never gets pushed off the bottom of the notch window. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* The heading receives programmatic focus on expand purely so screen readers
+ * announce the new state (the copy is also an aria-live region). It is not an
+ * interactive control, so it draws no focus ring — a full-width box around a
+ * heading read as a text input. Keyboard focus rings still apply to buttons. */
+.clemmy-live-state-copy h1:focus,
+.clemmy-live-state-copy h1:focus-visible { outline: none; box-shadow: none; }
 .clemmy-live-state-copy p { margin: 4px 0 0; color: var(--clemmy-live-muted); font-size: 11px; font-weight: 480; line-height: 16px; }
 
 @keyframes clemmy-live-state-enter {
@@ -337,46 +434,6 @@ html.clemmy-live-document #root {
 }
 .clemmy-live-status-pill svg { width: 12px; height: 12px; }
 .clemmy-live-island[data-phase="approval"] .clemmy-live-status-pill { border-color: rgba(242, 182, 87, 0.27); background: rgba(242, 182, 87, 0.11); color: #f2ce8f; }
-.clemmy-live-island[data-phase="completed"] .clemmy-live-status-pill { border-color: rgba(118, 213, 150, 0.25); background: rgba(118, 213, 150, 0.1); color: #9be5b3; }
-.clemmy-live-island[data-phase="cancelled"] .clemmy-live-status-pill { border-color: rgba(242, 182, 87, 0.25); background: rgba(242, 182, 87, 0.09); color: #f1cd8c; }
-.clemmy-live-island[data-phase="failure"] .clemmy-live-status-pill { border-color: rgba(255, 129, 116, 0.25); background: rgba(255, 129, 116, 0.1); color: #ff9d94; }
-.clemmy-live-island[data-phase="completed"] .clemmy-live-status-pill svg {
-  animation: clemmy-live-completion-pop 420ms cubic-bezier(0.22, 1.2, 0.36, 1);
-}
-
-@keyframes clemmy-live-completion-pop {
-  0% { opacity: 0; transform: scale(0.55) rotate(-8deg); }
-  65% { opacity: 1; transform: scale(1.12) rotate(2deg); }
-  100% { transform: scale(1) rotate(0); }
-}
-
-.clemmy-live-transcript { display: flex; flex-direction: column; gap: 4px; }
-.clemmy-live-transcript > span { display: flex; align-items: baseline; justify-content: space-between; }
-.clemmy-live-transcript strong { color: #eee6da; font-size: 10.5px; font-weight: 700; }
-.clemmy-live-transcript em { color: var(--clemmy-live-faint); font-size: 9.5px; font-style: normal; font-weight: 560; }
-.clemmy-live-transcript textarea {
-  width: 100%;
-  height: 58px;
-  box-sizing: border-box;
-  padding: 8px 10px;
-  resize: none;
-  border: 1px solid rgba(255, 255, 255, 0.095);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.045);
-  color: #f7f0e7;
-  font: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
-  line-height: 16px;
-  caret-color: var(--clemmy-live-orange);
-}
-.clemmy-live-transcript textarea:hover { border-color: rgba(255, 255, 255, 0.15); }
-.clemmy-live-transcript[data-readonly="true"] textarea {
-  border-color: rgba(255, 255, 255, 0.065);
-  background: rgba(255, 255, 255, 0.025);
-  color: #cfc6ba;
-  cursor: default;
-}
 
 .clemmy-live-parent-task {
   min-height: 55px;
@@ -604,6 +661,158 @@ html.clemmy-live-document #root {
   gap: 7px;
   animation: clemmy-live-state-enter 220ms ease-out;
 }
+
+/* ── Voice companion mode ─────────────────────────────────────────────
+ * A balanced utility header keeps close/open (or send) equidistant around the
+ * centered brand. There is no duplicate footer action; content owns the space. */
+.clemmy-live-voice { display: flex; flex-direction: column; text-align: center; }
+.clemmy-live-voice-header {
+  height: 48px;
+  padding: 7px 11px;
+  grid-template-columns: 30px minmax(0, 1fr) 30px;
+  gap: 8px;
+}
+.clemmy-live-voice-brand { justify-self: center; gap: 6px; }
+.clemmy-live-voice-action {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--clemmy-live-faint);
+  cursor: pointer;
+}
+.clemmy-live-voice-action:hover {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--clemmy-live-text);
+}
+.clemmy-live-voice-action svg { width: 13px; height: 13px; }
+.clemmy-live-voice-send {
+  border-color: rgba(255, 122, 61, 0.28);
+  background: rgba(255, 122, 61, 0.14);
+  color: #ffb286;
+}
+.clemmy-live-voice-send:hover {
+  border-color: rgba(255, 122, 61, 0.44);
+  background: rgba(255, 122, 61, 0.21);
+  color: #ffd2b8;
+}
+.clemmy-live-voice-body {
+  flex: 1;
+  min-height: 0;
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 7px;
+}
+/* A small status dot carries the live state — no oversized logo in the body
+ * (the mark already sits small in the header bar). */
+.clemmy-live-voice-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--clemmy-live-orange);
+  box-shadow: 0 0 8px rgba(255, 122, 61, 0.7);
+}
+.clemmy-live-voice-dot.is-recording { animation: clemmy-live-voice-pulse 1.4s ease-in-out infinite; }
+.clemmy-live-voice-dot.is-transcribing,
+.clemmy-live-voice-dot.is-thinking {
+  background: var(--clemmy-live-amber);
+  box-shadow: 0 0 8px rgba(242, 182, 87, 0.6);
+  animation: clemmy-live-voice-pulse 1s ease-in-out infinite;
+}
+.clemmy-live-voice-dot.is-done { background: var(--clemmy-live-green); box-shadow: 0 0 8px rgba(118, 213, 150, 0.6); animation: none; }
+.clemmy-live-voice-dot.is-error { background: var(--clemmy-live-red); box-shadow: 0 0 8px rgba(255, 129, 116, 0.6); animation: none; }
+
+@keyframes clemmy-live-voice-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+/* Live mic-level meter (recording): --lvl is a 0..1 number set per render; the
+ * bars grow with your voice so it's obvious the mic is actually hearing you. */
+.clemmy-live-voice-meter { display: inline-flex; align-items: center; gap: 2px; height: 15px; }
+.clemmy-live-voice-bar {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--clemmy-live-orange);
+  height: calc(3px + var(--lvl, 0) * 11px);
+  transition: height 90ms ease-out;
+}
+.clemmy-live-voice-bar:nth-child(1),
+.clemmy-live-voice-bar:nth-child(5) { height: calc(3px + var(--lvl, 0) * 5px); }
+.clemmy-live-voice-bar:nth-child(2),
+.clemmy-live-voice-bar:nth-child(4) { height: calc(3px + var(--lvl, 0) * 8px); }
+
+.clemmy-live-voice-status {
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: var(--clemmy-live-text);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.clemmy-live-voice-status-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.clemmy-live-voice-transcript {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.clemmy-live-voice-message {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  text-align: left;
+}
+.clemmy-live-voice-message > span {
+  padding-top: 1px;
+  color: var(--clemmy-live-faint);
+  font-size: 9px;
+  font-weight: 760;
+  line-height: 14px;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+.clemmy-live-voice-message[data-speaker="clementine"] > span { color: #ff9f70; }
+.clemmy-live-voice-message p {
+  margin: 0;
+  overflow: hidden;
+  color: var(--clemmy-live-muted);
+  font-size: 11px;
+  font-weight: 540;
+  line-height: 15px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.clemmy-live-voice-message[data-speaker="you"] p {
+  color: var(--clemmy-live-faint);
+  font-style: italic;
+}
+.clemmy-live-voice-error {
+  margin: 0; color: #ffb1a8; font-size: 10.5px; font-weight: 520; line-height: 15px; text-align: center;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
 .clemmy-live-button {
   min-height: 36px;
   padding: 0 11px;
@@ -662,6 +871,17 @@ html.clemmy-live-document #root {
 .clemmy-live-demo-controls svg { width: 10px; height: 10px; }
 
 .clemmy-live-meeting-collapsed {
+  /* `notchMeetingSurfaceSize` describes the visible surface below the hardware
+   * notch. Span the inset as well, matching the expanded island's box model, so
+   * the native panel contains one continuous notch-attached surface instead of
+   * a 34px pill followed by a large transparent hit area. */
+  box-sizing: border-box;
+  height: calc(var(--notch-inset, 0px) + var(--clemmy-live-height));
+  min-height: calc(var(--notch-inset, 0px) + var(--clemmy-live-height));
+  padding-top: var(--notch-inset, 0px);
+  padding-right: 12px;
+  padding-bottom: 0;
+  padding-left: 10px;
   border-color: rgba(255, 129, 116, 0.24);
   background:
     radial-gradient(circle at 20% -40%, rgba(255, 93, 73, 0.2), transparent 58%),
@@ -692,7 +912,6 @@ html.clemmy-live-document #root {
   50% { opacity: 1; transform: scale(1.06); }
 }
 
-.clemmy-live-meeting { height: min(calc(var(--clemmy-live-height) - 8px), calc(100vh - 8px)); }
 .clemmy-live-meeting-banner {
   border-color: rgba(118, 213, 150, 0.25);
   background: rgba(118, 213, 150, 0.09);

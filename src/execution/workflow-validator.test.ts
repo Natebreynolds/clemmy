@@ -18,7 +18,7 @@ test('clean workflow → ok=true, no errors, no warnings', () => {
     description: 'A simple workflow that says hello',
     enabled: true,
     steps: [
-      { id: 'greet', prompt: 'Send Nate a notification saying hello.' },
+      { id: 'greet', prompt: 'Send Alex a notification saying hello.' },
     ],
   };
   const result = validateWorkflowDefinition(wf);
@@ -153,7 +153,7 @@ test('approval without post-approval action → error', () => {
 test('approval WITH post-approval action → ok', () => {
   const result = validateWorkflowDefinition({
     name: 'wf',
-    description: 'Send 10 outreach emails after Nate approves the batch.',
+    description: 'Send 10 outreach emails after Alex approves the batch.',
     steps: [{
       id: 'gated',
       prompt: 'Surface the drafts. Call request_approval with the batch summary. '
@@ -554,7 +554,7 @@ test('tool slug catalog check — unknown slug → warning', () => {
 
 test('REGRESSION: daily-prospect-outreach surface_for_approval prompt is rejected', () => {
   const prompt = `
-    Surface the drafts to Nate with \`notify_user\`. Do NOT call \`OUTLOOK_SEND_EMAIL\` yet — that's gated behind explicit approval.
+    Surface the drafts to Alex with \`notify_user\`. Do NOT call \`OUTLOOK_SEND_EMAIL\` yet — that's gated behind explicit approval.
 
     Format:
     - Title: "Today's 10 prospect drafts ready for review"
@@ -625,7 +625,7 @@ test('snake_case requires_approval is honored too', () => {
 
 // ── Typed-contract template-token checks (P1) ─────────────────────────
 
-test('unrecognized bare token {{url}} is flagged (the revill-audit bug)', () => {
+test('unrecognized bare token {{url}} is flagged (the missing-artifact-audit bug)', () => {
   const result = validateWorkflowDefinition({
     name: 'typo',
     steps: [{ id: 'normalize', prompt: 'Normalize the prospect URL {{url}}.' }],
@@ -841,7 +841,7 @@ test('sideEffect coherence: warns when declared class is weaker than the prompt'
     name: 'side-effect-read-send',
     description: 'Bad side effect declaration.',
     enabled: true,
-    steps: [{ id: 'send', prompt: 'Send the email summary to Nate.', sideEffect: 'read' }],
+    steps: [{ id: 'send', prompt: 'Send the email summary to Alex.', sideEffect: 'read' }],
   });
   assert.ok(readDeclaredSend.warnings.some((w) => /declares sideEffect: read/.test(w) && /SEND/.test(w)), readDeclaredSend.warnings.join('\n'));
 
@@ -854,6 +854,60 @@ test('sideEffect coherence: warns when declared class is weaker than the prompt'
   assert.ok(writeDeclaredSendSnake.warnings.some((w) => /declares sideEffect: write/.test(w) && /SEND/.test(w)), writeDeclaredSendSnake.warnings.join('\n'));
 });
 
+test('sideEffect coherence: configured OWNER_NAME aliases identify direct sends', () => {
+  const originalOwnerName = process.env.OWNER_NAME;
+  process.env.OWNER_NAME = 'Jordan Kim';
+  try {
+    const result = validateWorkflowDefinition({
+      name: 'configured-owner-send',
+      description: 'Deliver a report to the configured user.',
+      enabled: true,
+      steps: [{ id: 'send', prompt: 'Email Jordan the completed report.', sideEffect: 'read' }],
+    });
+    assert.ok(
+      result.warnings.some((warning) => /declares sideEffect: read/.test(warning) && /SEND/.test(warning)),
+      result.warnings.join('\n'),
+    );
+  } finally {
+    if (originalOwnerName === undefined) delete process.env.OWNER_NAME;
+    else process.env.OWNER_NAME = originalOwnerName;
+  }
+});
+
+test('sideEffect coherence: clear imperative sends to external named recipients are SEND', () => {
+  for (const prompt of [
+    'Email Riley the completed report.',
+    'Email Riley Morgan the completed report.',
+    'Send Riley the completed report.',
+    'Message the completed report to Riley.',
+  ]) {
+    const result = validateWorkflowDefinition({
+      name: 'external-named-send',
+      description: 'Deliver a report to an external recipient.',
+      enabled: true,
+      steps: [{ id: 'send', prompt, sideEffect: 'read' }],
+    });
+    assert.ok(
+      result.warnings.some((warning) => /declares sideEffect: read/.test(warning) && /SEND/.test(warning)),
+      `${prompt}: ${result.warnings.join('\n')}`,
+    );
+  }
+});
+
+test('sideEffect coherence: email/message analysis remains read-only', () => {
+  const result = validateWorkflowDefinition({
+    name: 'communication-analysis',
+    description: 'Analyze communication patterns.',
+    enabled: true,
+    steps: [{
+      id: 'analyze',
+      prompt: 'Analyze email trends and message frequency, then summarize the findings.',
+      sideEffect: 'read',
+    }],
+  });
+  assert.ok(!result.warnings.some((warning) => /declares sideEffect/.test(warning)), result.warnings.join('\n'));
+});
+
 test('sideEffect coherence: read-only social post analysis is not mistaken for publishing', () => {
   const result = validateWorkflowDefinition({
     name: 'post-analysis',
@@ -861,7 +915,7 @@ test('sideEffect coherence: read-only social post analysis is not mistaken for p
     enabled: true,
     steps: [{
       id: 'analyze',
-      prompt: 'Scrape recent public posts from the Scorpion Facebook page and analyze the post themes.',
+      prompt: 'Scrape recent public posts from the Acme Facebook page and analyze the post themes.',
       sideEffect: 'read',
     }],
   });

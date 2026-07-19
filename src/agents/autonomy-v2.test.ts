@@ -336,7 +336,7 @@ test('looksLikeToolError: empty string is not an error', () => {
 
 test('looksLikeToolError: ordinary success output is not flagged', () => {
   assert.equal(looksLikeToolError('Notification queued: abc'), false);
-  assert.equal(looksLikeToolError('Remembered #5 (user): Nathan prefers concise replies.'), false);
+  assert.equal(looksLikeToolError('Remembered #5 (user): Alexander prefers concise replies.'), false);
 });
 
 // ---------- chooseFollowUpMinutes ----------

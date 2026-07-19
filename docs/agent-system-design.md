@@ -47,7 +47,7 @@ Each one was patched with a new sentence in `instructions.ts`:
 | --- | --- | --- |
 | "Reply with 'run it'" on a SEO keyword lookup | Asked for approval on a read-only DataForSEO call | Tool tagged `read` → no approval needed, just runs |
 | "I don't have a callable DataForSEO MCP tool exposed" | Introspected its own tool list, didn't find a `dataforseo_*` prefix, claimed unavailable | System prompt enumerated the live tool list explicitly — model wouldn't have needed to guess |
-| `mcp_status` called with `query: "revilllaw.com top 5 keywords"` | Misused the diagnostic — passed user text where a category filter belongs, got 0 matches, concluded server isn't configured | Tool's input schema constrained or the model never had reason to preflight — capability was in the prompt |
+| `mcp_status` called with `query: "evergreen-law.example top 5 keywords"` | Misused the diagnostic — passed user text where a category filter belongs, got 0 matches, concluded server isn't configured | Tool's input schema constrained or the model never had reason to preflight — capability was in the prompt |
 | Re-asked clarification user already answered | Ignored the recent transcript when composing the next gate | Transcript-aware gate suppression in the runtime, not a directive |
 | Hallucinated "filesystem permissions blocked me" on `sf` shell failure | Translated subprocess exit code 1 into vague text | Real error piped verbatim into the next turn so the model has facts |
 | Plowed past plan-scoped approval window | Didn't realize the window had expired | Already structural (plan-scope.ts) — model behavior is downstream of runtime state |
@@ -237,15 +237,15 @@ A YAML catalog of canonical scenarios, run via CI:
 name: "Top keywords lookup via DataForSEO"
 setup:
   mcp_servers: [dataforseo]  # mocked or real
-  user_profile: nathan
+  user_profile: owner
 messages:
   - role: user
-    text: "top 5 ranked keywords for revilllaw.com"
+    text: "top 5 ranked keywords for evergreen-law.example"
 expect:
   tool_calls:
     - name: dataforseo_labs_google_ranked_keywords  # OR serp_*
       args_include:
-        - "revilllaw.com"
+        - "evergreen-law.example"
   no_clarification: true
   no_unsupported_claim: true
   approval_required: false

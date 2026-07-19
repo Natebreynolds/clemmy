@@ -6,7 +6,7 @@ import { formatConstraintEscalation, type ConstraintViolation } from './constrai
     constraint: {
       id: 1,
       kind: 'constraint',
-      content: 'Use scorpion.co email account for all Outlook sends',
+      content: 'Use corp.example email account for all Outlook sends',
       source: {},
       score: 1.0,
       active: true,
@@ -14,7 +14,7 @@ import { formatConstraintEscalation, type ConstraintViolation } from './constrai
       updatedAt: '2026-06-10T00:00:00Z',
       pinned: true,
     },
-    reason: 'Email account "breakthrough@coaching.com" violates constraint requiring "scorpion.co"',
+    reason: 'Email account "legacy@coaching.example" violates constraint requiring "corp.example"',
     toolName: 'composio_execute_tool',
     violatingField: 'from/account',
   };

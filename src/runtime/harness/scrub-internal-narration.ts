@@ -9,7 +9,7 @@
  * reply, e.g. on a fresh thread that triggers cross-session memory recall:
  *
  *   "I checked the active context. The Salesforce prospect request is a new
- *    topic, not the stale Revill audit thread, so I'm not using that focus.
+ *    topic, not the stale Example Legal audit thread, so I'm not using that focus.
  *
  *    To pull the right 25, should I use your usual ... lane, or ...?"
  *

@@ -1,13 +1,13 @@
 /**
  * Host allowlist + same-origin enforcement for the daemon's HTTP surface.
  *
- * The gap this closes is DNS rebinding. An attacker publishes evil.com with a
+ * The gap this closes is DNS rebinding. An attacker publishes evil.example with a
  * very short TTL, gets the victim's browser to load a page from it, then re-answers
  * the next lookup with 127.0.0.1. The browser now believes requests to
- * `http://evil.com:8420` are same-origin with the attacker's page, so it will
+ * `http://evil.example:8420` are same-origin with the attacker's page, so it will
  * happily send them AND let the page read the responses — the same-origin policy
  * is satisfied because the *name* never changed. Those requests reach the daemon
- * carrying `Host: evil.com`.
+ * carrying `Host: evil.example`.
  *
  * Previously the only Host check was requireMobileSurfaceForMobileHost, which
  * asks "is this the configured tunnel hostname?" — an allowlist of exactly one

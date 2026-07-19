@@ -6,7 +6,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-memory-merge';
 process.env.CLEMENTINE_HOME = TEST_HOME;
-const { mergeCanonicalQuality, mergeParaphrases, selectMergeAuditToRevert } = await import('./memory-merge.js');
+const {
+  canMergeEntitySafe,
+  extractAnchors,
+  mergeCanonicalQuality,
+  mergeParaphrases,
+  selectMergeAuditToRevert,
+} = await import('./memory-merge.js');
 type HygieneAuditEntry = import('./hygiene-audit.js').HygieneAuditEntry;
 
 // Test helper: create an in-memory test database
@@ -65,9 +71,38 @@ function createFakeEmbedding(seed: number): Buffer {
   return buffer;
 }
 
+test('extractAnchors discovers unseen organizations and projects from structure', () => {
+  const anchors = extractAnchors({
+    content: [
+      'The Example Legal Group launch brief is ready.',
+      'client: Sample Law Partners;',
+      'project="Orion Migration"',
+      'The weekly client review is tomorrow.',
+    ].join('\n'),
+  });
+
+  assert.deepEqual(
+    anchors.clientNames,
+    new Set(['example legal group', 'sample law partners', 'orion migration']),
+  );
+});
+
+test('canMergeEntitySafe blocks different structurally extracted organizations', () => {
+  const first = extractAnchors({ content: 'Example Legal Group ranks third for the target phrase.' });
+  const second = extractAnchors({ content: 'Sample Law Partners ranks third for the target phrase.' });
+  assert.equal(canMergeEntitySafe(first, second), false);
+});
+
+test('canMergeEntitySafe permits matching generic organization anchors', () => {
+  const first = extractAnchors({ content: 'The Example Legal Group report is complete.' });
+  const second = extractAnchors({ content: 'client: Example Legal Group; report status: complete' });
+  assert.equal(canMergeEntitySafe(first, second), true);
+});
+
 test('canMergeEntitySafe: different table IDs should not merge', () => {
-  // This tests the entity guard logic conceptually
-  // (The actual guard is tested via integration test)
+  const first = extractAnchors({ content: 'Use tblAbc123def456 for this report.' });
+  const second = extractAnchors({ content: 'Use tblDef456ghi789 for this report.' });
+  assert.equal(canMergeEntitySafe(first, second), false);
 });
 
 test('merge canonical quality rewards material utility and ignores passive exposure', () => {

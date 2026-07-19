@@ -65,9 +65,9 @@ test('PlanSchema: accepts authored stages partitioning the criteria', () => {
 
 test('PlanSchema: accepts enumerated externalSends (what the user blesses on approval)', () => {
   const plan = PlanSchema.parse({
-    objective: 'Send personalized outreach to the 8 market-leader firms.',
+    objective: 'Send personalized outreach to the 8 priority-account firms.',
     steps: [{ n: 1, action: 'Send the emails', rationale: 'The ask.', verification: null }],
-    successCriteria: ['8 emails sent from the Scorpion mailbox.'],
+    successCriteria: ['8 emails sent from the Acme mailbox.'],
     stages: null,
     risks: ['Irreversible: emails cannot be unsent.'],
     estimatedComplexity: 'moderate',

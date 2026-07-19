@@ -22,14 +22,14 @@ const {
 const { validateWorkflowDefinition } = await import('./workflow-validator.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
-const INPUTS = { url: 'https://acme.co', region: 'east' };
+const INPUTS = { url: 'https://acme-co.example', region: 'east' };
 const OUTPUTS = { gather: { rows: [{ id: 1 }, { id: 2 }], region: 'west' }, count: 42 };
 
 test('renderCallArgValue: a full-token value resolves to the RAW upstream value (object/array preserved)', () => {
   // exactly one token → raw value kept (not stringified)
   assert.deepEqual(renderCallArgValue('{{steps.gather.output}}', INPUTS, OUTPUTS), { rows: [{ id: 1 }, { id: 2 }], region: 'west' });
   assert.deepEqual(renderCallArgValue('{{steps.gather.output.rows}}', INPUTS, OUTPUTS), [{ id: 1 }, { id: 2 }]);
-  assert.equal(renderCallArgValue('{{input.url}}', INPUTS, OUTPUTS), 'https://acme.co');
+  assert.equal(renderCallArgValue('{{input.url}}', INPUTS, OUTPUTS), 'https://acme-co.example');
   assert.equal(renderCallArgValue('{{project.path}}', INPUTS, OUTPUTS, undefined, {
     requested: 'clementine-next',
     source: 'workflow',
@@ -38,14 +38,14 @@ test('renderCallArgValue: a full-token value resolves to the RAW upstream value 
     type: 'node',
   }), '/Users/tester/Developer/clementine-next');
   // item token
-  assert.equal(renderCallArgValue('{{item.email}}', INPUTS, OUTPUTS, { email: 'a@b.co' }), 'a@b.co');
+  assert.equal(renderCallArgValue('{{item.email}}', INPUTS, OUTPUTS, { email: 'a@beta-co.example' }), 'a@beta-co.example');
   assert.deepEqual(renderCallArgValue('{{item}}', INPUTS, OUTPUTS, { x: 1 }), { x: 1 });
   // unresolved full token → '' (not the literal token)
   assert.equal(renderCallArgValue('{{input.missing}}', INPUTS, OUTPUTS), '');
 });
 
 test('renderCallArgValue: an EMBEDDED token string-renders; non-strings pass through', () => {
-  assert.equal(renderCallArgValue('to: {{input.url}} now', INPUTS, OUTPUTS), 'to: https://acme.co now');
+  assert.equal(renderCallArgValue('to: {{input.url}} now', INPUTS, OUTPUTS), 'to: https://acme-co.example now');
   assert.equal(renderCallArgValue(50, INPUTS, OUTPUTS), 50);
   assert.equal(renderCallArgValue(true, INPUTS, OUTPUTS), true);
 });

@@ -932,7 +932,7 @@ function relevantHarnessApprovalsForContext(input: {
     .filter((row) => approvalRegistry.isActionable(row));
   // Never pull another Discord channel's approval into this chat merely
   // because it is globally pending. But a DM keeps the non-Discord fallback
-  // (restored in the fold — review wf_30a7ce7e-e9c #9): workflow/background
+  // (restored in the fold after the workflow/background recovery review):
   // approvals carry no Discord channelId, and the DM is the user's only
   // Discord surface for seeing and resolving them — dropping the fallback made
   // a parked workflow write invisible and unresolvable until it expired.

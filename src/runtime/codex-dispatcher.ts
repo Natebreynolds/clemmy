@@ -9,7 +9,7 @@
  * and none of the Codex fetch sites set an explicit dispatcher. A
  * Cloudflare edge holding the connection open with no body bytes
  * therefore hung Discord chat indefinitely (verified 2026-05-25 on
- * sess-mplfm14j-f0985a98 — 3+ minutes of silence after `turn_started`).
+ * transport-silence regression — 3+ minutes of silence after `turn_started`).
  *
  * Why a SCOPED dispatcher and not `setGlobalDispatcher`:
  *   MCP servers, tool fetches (firecrawl, dataforseo), and embedding

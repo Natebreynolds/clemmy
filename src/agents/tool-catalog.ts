@@ -1,5 +1,5 @@
 /**
- * Tool catalog + hot-set resolution — Phase 0 of SCHEMA-ON-DEMAND-PLAN-2026-07-07.md.
+ * Tool catalog and schema-on-demand hot-set resolution.
  *
  * The catalog is the compact "name — one-liner" list of EVERY built-in tool,
  * derived 1:1 from TOOL_REGISTRY (the single source of truth). On the Codex

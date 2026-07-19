@@ -67,7 +67,7 @@ test('GATE-SUPERSEDED (2026-07-08): an in-program send is REFUSED before any gat
   let refusals = 0;
   for (let i = 1; i <= 8; i += 1) {
     try {
-      await dispatchCodeModeTool('composio_execute_tool', send(`r${i}@b.com`), sess.id, shared);
+      await dispatchCodeModeTool('composio_execute_tool', send(`r${i}@beta.example`), sess.id, shared);
     } catch (err) {
       if (err instanceof Error && /run_batch/.test(err.message) && /irreversible external send/.test(err.message)) refusals += 1;
     }
@@ -135,7 +135,7 @@ test('SAFETY: with writes OFF, a program cannot reach a mutating tool at all (re
   process.env.CLEMMY_CODE_MODE_WRITES = 'off';
   injectFakes();
   await assert.rejects(
-    () => dispatchCodeModeTool('composio_execute_tool', send('a@b.com'), 'sess-x'),
+    () => dispatchCodeModeTool('composio_execute_tool', send('a@beta.example'), 'sess-x'),
     /writes are disabled|not available/,
   );
   _setCodeModeToolsForTests(null);

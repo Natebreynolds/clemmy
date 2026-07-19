@@ -78,7 +78,7 @@ function needsApprovalUnlessInPlanScope(toolName: string) {
 /**
  * Per-command danger classifier for run_shell_command.
  *
- * Nathan's mental model (2026-05-19): "Clementine has shell access.
+ * Intended interaction model: "Clementine has shell access.
  * Bash is bash. Don't make me approve every `ls` or `sf data query`.
  * Only ask when something destructive is about to happen." That
  * inverts the previous polarity: default AUTO-APPROVE, deny-list the
@@ -279,7 +279,7 @@ function resolveAllowedPath(input: string): string {
   if (!roots.some((root) => isInside(root, resolved))) {
     // List the valid roots IN the error so the agent self-corrects on
     // the first retry instead of guessing again. Before this change,
-    // a bad cwd ("/Users/nate", "/Users/Shared", invented from
+    // a bad cwd ("/Users/example", "/Users/Shared", invented from
     // preferredName) would loop 7-8 times against the same wrong path
     // before the agent finally thought to call workspace_roots.
     // Architectural fix beats a prompt nudge: the failing tool tells

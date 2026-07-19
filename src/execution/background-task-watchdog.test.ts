@@ -116,11 +116,11 @@ test('watchdogAlertIdsFrom indexes existing watchdog alerts so repeat log spam c
     { id: 'bgtask-stalled-terminal_undelivered-x' },
     { id: 'bgtask-escalated-y' },
     { id: 'bgtask-report-replay-z-done' },
-    { id: '1783537566599-background-z-done' },
+    { id: '1700000000000-background-not-watchdog' },
     { id: undefined },
   ]);
   assert.ok(ids.has('bgtask-stalled-terminal_undelivered-x'));
   assert.ok(ids.has('bgtask-escalated-y'));
   assert.ok(ids.has('bgtask-report-replay-z-done'));
-  assert.ok(!ids.has('1783537566599-background-z-done'));
+  assert.ok(!ids.has('1700000000000-background-not-watchdog'));
 });

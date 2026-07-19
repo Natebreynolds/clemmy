@@ -2,7 +2,7 @@
  * Pre-execution constraint checking for tool dispatch.
  *
  * Constraints are hard rules that gate tool execution before dispatch.
- * Example: "Use scorpion.co email account for all Outlook sends"
+ * Example: "Use corp.example email account for all Outlook sends"
  *
  * This guard intercepts high-risk tools (composio_execute_tool, etc.) and
  * checks their args against active constraints before execution. If a
@@ -308,7 +308,7 @@ function checkSingleConstraint(
  * Extracts allowed account from constraint and checks args.from / args.account
  */
 function checkEmailAccountConstraint(args: Record<string, unknown>, constraintContent: string): string | null {
-  // Extract allowed account from constraint (e.g., "nathan.reynolds@scorpion.co")
+  // Extract allowed account from constraint (e.g., "alex.chen@corp.example")
   const emailPattern = /[\w\-\.]+@[\w\-\.]+/;
   const match = constraintContent.match(emailPattern);
   if (!match) return null;

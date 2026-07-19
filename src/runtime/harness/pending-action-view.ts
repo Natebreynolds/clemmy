@@ -62,7 +62,7 @@ export function pendingActionApprovalViewFromArgs(args: unknown): PendingActionA
  * A run_batch `propose` approval fires BEFORE any pending action exists, so
  * there is no queue record to render — which left the approval card with a
  * bare "run_batch: propose" and zero context while the payload carried the
- * full plan (2026-07-09, sess-mrds80fu: an Approve button for 10 outbound
+ * full plan (ask-first batch regression: an Approve button for 10 outbound
  * emails with no recipients, no count, no objective). Synthesize the rich
  * view straight from the plan so the card shows what approval actually means.
  */

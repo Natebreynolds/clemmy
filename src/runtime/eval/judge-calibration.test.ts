@@ -63,7 +63,7 @@ const GOLD_RAW = readFileSync(GOLD_PATH, 'utf8');
 const sha16 = (s: string): string => crypto.createHash('sha256').update(s, 'utf8').digest('hex').slice(0, 16);
 
 // Edit the gold set deliberately? Update these two numbers — the diff IS the review.
-const GOLDEN = { len: 4827, sha16: '302dba7dc6cb6575' };
+const GOLDEN = { len: 5078, sha16: '0daa77354a9b6ed1' };
 
 test('gold set: byte-stable snapshot (a label edit must be an intentional, reviewed diff)', () => {
   assert.equal(GOLD_RAW.length, GOLDEN.len, `gold-set length changed (now ${GOLD_RAW.length})`);

@@ -2,7 +2,7 @@
 /**
  * LIVE smoke — does the Claude chat brain CALL tools instead of NARRATING them?
  *
- * Reproduces the live failure (sess-mql8hb50): "pull 5 salesforce accounts" made
+ * Reproduces the tool-narration regression: "pull 5 salesforce accounts" made
  * ZERO tool calls and the model typed a fake "Tool:run_shell_command / System:
  * tool result is empty" transcript. Runs the real brain N times (narration was
  * intermittent ~50%) and reports, per run: real tool calls vs narration.

@@ -182,7 +182,7 @@ test('shouldDebate: off never, all always; high (v2) reads the USER message + go
     assert.equal(shouldDebate(userTurn('x'.repeat(850))), true, 'long user message');
     // A continuation fires ONLY when the active goal Objective involves an
     // irreversible action — and the ledger's past-tense "sent" must NOT trigger it.
-    assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Send the 8 market-leader outreach emails'))), true, 'continuation + send goal');
+    assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Send the 8 priority-account outreach emails'))), true, 'continuation + send goal');
     assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Research and summarize the market'))), false, 'continuation + non-send goal (ledger "sent" excluded)');
   });
   // Kill-switch reverts to the legacy proxy, which over-fires on packet length.

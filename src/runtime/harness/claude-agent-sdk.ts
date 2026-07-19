@@ -332,8 +332,8 @@ export function withReadFanoutGuard(base: CanUseTool, sessionId: string | undefi
 }
 
 // ── SDK tool profiles — DERIVED from the single tool registry ──────────────────
-// TOOL-REGISTRY-PLAN-2026-07-07.md, step 2: the hand-maintained profile arrays
-// were deleted; membership + nesting now come from deriveSdkProfile(...) over the
+// The hand-maintained profile arrays were deleted; membership + nesting now come
+// from deriveSdkProfile(...) over the
 // registry's `sdkLayer` field. The per-tool rationale that used to live in these
 // comments is now on each registry row. Frozen at module load — tool-registry.ts
 // imports nothing (a leaf), so no import cycle forms; a conformance test still pins

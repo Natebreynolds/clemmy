@@ -1019,7 +1019,7 @@ async function testApprovalPreviewAutoEnrichment() {
 //               and boundaryKind='codex.transport_timeout'. Same shape
 //               as Bug C/I — same Retry/Switch/Stop card.
 //
-// Why this matters: today's hung Salesforce chat (sess-mplfm14j-f0985a98)
+// Why this matters: the long-running Salesforce chat hang regression
 // silently sat for 3+ minutes because undici defaults are 5 min and
 // chat had no wall-clock. With these layers, the same Cloudflare-edge
 // stall fast-fails in 15-30s and the user sees a Retry button.
@@ -1077,7 +1077,7 @@ async function testCodexTransportTimeoutRoutesToF4() {
     type: 'tool_called',
     data: {
       tool: 'sf_query',
-      arguments: '{"q":"SELECT Owner.Name FROM Account WHERE Website=\'swainlawtexas.com\'"}',
+      arguments: '{"q":"SELECT Owner.Name FROM Account WHERE Website=\'prairie-law.example\'"}',
       callId: 'call_sf_test',
     },
   });
@@ -1098,7 +1098,7 @@ async function testCodexTransportTimeoutRoutesToF4() {
   const result = await loop.runTurn({
     agent: { model: 'gpt-5.5' },
     sessionId: sess.id,
-    input: 'who owns the swain law texas account in salesforce',
+    input: 'who owns the Prairie Law account in salesforce',
     runRunner,
     makeRunner: makeRunnerStub,
   });

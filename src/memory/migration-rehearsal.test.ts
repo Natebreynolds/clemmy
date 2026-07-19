@@ -93,7 +93,7 @@ test('migration rehearsal upgrades a consistent copy and leaves a physical v21 s
       INSERT INTO consolidated_facts
         (kind, content, content_hash, score, active, created_at, updated_at,
          importance, pinned, valid_from, confidence)
-      VALUES ('user', 'Nathan prefers concise answers.', 'profile-fact-hash', 1, 1, ?, ?, 7, 1, ?, 1)
+      VALUES ('user', 'Alexander prefers concise answers.', 'profile-fact-hash', 1, 1, ?, ?, 7, 1, ?, 1)
     `).run(now, now, now);
     assert.ok(Number(profileFact.lastInsertRowid) > 0);
     const entity = db.prepare(`

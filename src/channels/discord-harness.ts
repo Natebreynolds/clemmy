@@ -523,7 +523,7 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
     // prior sessions had a clear "currently working on" resource we
     // can extract from their tool calls. This is the automation that
     // prevents the "agent re-discovers and picks the WRONG sheet"
-    // failure mode (sess-mpjbmoez 2026-05-24): without a focus
+    // missing-focus failure mode: without a focus
     // anchor, memory_recall surfaced a similarly-named workflow
     // SKILL.md whose sheet_id was different from the one the user
     // had actually been editing across 5 prior sessions.
@@ -2421,7 +2421,7 @@ export async function runDiscordHarnessConversation(opts: {
   // active, force a flush so the elapsed-time counter in renderBody
   // ticks forward — even if no harness.event fires during that
   // window. Without this, a tool that takes 90 seconds (e.g. the
-  // 84-second `draft_plan` we saw in sess-mpg7ue2d) leaves the
+  // 84-second `draft_plan` seen in the planning-timeout regression) leaves the
   // Discord message frozen at its old timestamp, indistinguishable
   // from a stuck run.
   //
@@ -3101,7 +3101,7 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       // Resource-fingerprint warning: if the approval's args mention a
       // resource id that DOESN'T match the active focus, surface a
       // visible warning so the user can catch a wrong-sheet mutation
-      // before approving. Catches the failure mode from sess-mpjbmoez
+      // before approving. Catches the missing-focus failure mode
       // (2026-05-24) where the agent updated the wrong Google Sheet.
       let mismatchWarning = '';
       try {

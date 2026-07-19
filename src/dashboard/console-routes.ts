@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
+import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
+import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
@@ -306,7 +308,7 @@ import {
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
-import { isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
+import { buildActivitySnapshot, formatElapsed, isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
@@ -534,7 +536,7 @@ Clementine is thoughtful, conversational, and aligned to me.
 ## How to reply
 
 - When making a non-trivial decision, briefly explain WHY before showing the result. Two sentences max. "I checked X first because Y — here's what I found."
-- Acknowledge context: if I'm asking about a project, reference the relevant fact you remember. Don't repeat back at length — just signal continuity ("from the Scorpion thread —").
+- Acknowledge context: if I'm asking about a project, reference the relevant fact you remember. Don't repeat back at length — just signal continuity ("from that project thread —").
 - Tone is professional-warm. Not casual, not robotic.
 - When you're unsure between two paths, surface the tradeoff briefly and ask, instead of guessing.
 `,
@@ -2558,7 +2560,7 @@ function stopExactHarnessAttempt(
       HarnessSession.load(sessionId)?.clearInterruptState({ emitEvent: false });
     } catch { /* the durable kill and approval resolutions remain authoritative */ }
   }
-  // Cascade (restored in the fold — review wf_30a7ce7e-e9c #6): any still-active
+  // Cascade (restored in the fold after the workflow recovery review): any still-active
   // background task this session spawned (or that runs AS this session) dies
   // with the stop. Without this the task row kept polling "Working now" on Home
   // after the user explicitly stopped the chat that owned it (live 2026-07-08
@@ -9235,7 +9237,7 @@ export function registerConsoleRoutes(
         // resource id (sheet, doc, etc.) and the active focus has a
         // resource_ref, surface a warning when they DON'T match.
         // Catches the "agent picked the wrong sheet" failure mode
-        // (sess-mpjbmoez 2026-05-24) at decision time.
+        // in the missing-focus regression at decision time.
         const resourceId = extractResourceIdFromApprovalArgs(r.args);
         const fingerprint = checkResourceMatchesFocus(resourceId);
         const preview = normalizeApprovalPreview(r.args?.preview);
@@ -10619,7 +10621,7 @@ export function registerConsoleRoutes(
             // for this exact session. Without this attribute the user
             // landed on Activity showing "everything" with no anchor to
             // the specific approval that brought them here (the visibility
-            // gap Nathan flagged 2026-05-21).
+            // gap reported during production validation).
             targetSessionId: approval.sessionId,
             // Pass the tool name + args so the EDIT button can render a
             // pre-filled textarea. For composio_execute_tool we surface
@@ -11019,6 +11021,56 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Minimal "what is Clementine doing right now" payload for the desktop notch.
+  // Derives from the shared activity snapshot so the notch, command center,
+  // Slack, and Discord all agree. Fail-open: never 500 — a broken read
+  // degrades to a calm idle pill rather than blanking the notch.
+  app.get('/api/console/live-activity', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const idle = {
+      state: 'idle' as const,
+      title: 'Ready',
+      detail: '',
+      needsYouCount: 0,
+      runningCount: 0,
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      const snap = buildActivitySnapshot();
+      const needsYouCount = snap.counts.needsYou;
+      const running = snap.runningNow;
+      if (needsYouCount > 0) {
+        res.json({
+          state: 'approval',
+          title: 'Needs your OK',
+          detail: `${needsYouCount} waiting`,
+          needsYouCount,
+          runningCount: running.length,
+          updatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      if (running.length > 0) {
+        const top = running[0];
+        const elapsed = formatElapsed(top.elapsedMs);
+        const parts = [top.kind, elapsed].filter(Boolean);
+        if (running.length > 1) parts.push(`+${running.length - 1} more`);
+        res.json({
+          state: 'working',
+          title: top.title || 'Working',
+          detail: parts.join(' · '),
+          needsYouCount,
+          runningCount: running.length,
+          updatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      res.json(idle);
+    } catch {
+      res.json(idle);
+    }
+  });
+
   // Current Focus endpoints — used by the Home tile and the focus
   // chip in the header to view + manage the active focus.
   app.get('/api/console/focus', async (req, res) => {
@@ -11103,7 +11155,7 @@ export function registerConsoleRoutes(
         // autonomy loop logs what it did, not how a user writes a task.
         if (/^(Reasserted|Reconfirmed|Confirmed|Re-pushed|Repushed|Re-escalated|Locked|Reviewed again|Retain (as|only)|Superseded|Explicitly required|Required (that|same|thread-by-thread)|Forced exact|Keep existing step|Reported|Captured|Acknowledged|Tracked|Promoted|Demoted|Closed out|Marked)\b/.test(text)) return true;
         // Lane / gate / closeout / output= jargon.
-        if (/\b(lane-closing|bundled operations|blocker-based closeout|gate line|output=(yes|no)|in-thread artifact|scorpion-live-transcript|proposal-brief-builder|kickoff gate|mirrored-diff)\b/i.test(text)) return true;
+        if (/\b(lane-closing|bundled operations|blocker-based closeout|gate line|output=(yes|no)|in-thread artifact|(?:[a-z0-9]+-)*live-transcript|proposal-brief-builder|kickoff gate|mirrored-diff)\b/i.test(text)) return true;
         const tIdCount = (text.match(/\bT-\d{2,}\b/g) ?? []).length;
         return tIdCount >= 1 || text.length > 180;
       }
@@ -12137,6 +12189,46 @@ export function registerConsoleRoutes(
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Voice companion transcription: the notch records a short spoken request as
+  // 16 kHz mono WAV and POSTs it here. We transcribe it with the ON-DEVICE whisper
+  // model (the same one meetings use — no cloud, plain speech-to-text, NOT realtime
+  // voice) and return the text; the client then sends that text to the normal chat
+  // endpoint so the user's configured brain + tools + gates run. OpenAI whisper-1
+  // is only a fallback when the local runtime isn't ready AND a key is configured.
+  app.post('/api/console/voice/transcribe', express.raw({ type: 'audio/*', limit: '15mb' }), async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const bytes = Buffer.isBuffer(req.body) && req.body.length > 0 ? (req.body as Buffer) : undefined;
+    if (!bytes) { res.status(400).json({ error: 'audio bytes required' }); return; }
+    const tmp = path.join(os.tmpdir(), `clem-voice-${randomBytes(8).toString('hex')}.wav`);
+    try {
+      await fs.promises.writeFile(tmp, bytes);
+      try {
+        const local = await transcribeLocalMeetingAudio({ audioPath: tmp });
+        res.json({ text: (local.text || '').trim(), engine: 'local' });
+        return;
+      } catch (localErr) {
+        // On-device runtime not ready (model/cli missing) — fall back to OpenAI
+        // whisper-1 only if a key exists, else explain how to enable local.
+        if (hasOpenAiKey()) {
+          const result = await transcribeAudio(tmp);
+          if (result.ok) { res.json({ text: result.text.trim(), engine: 'openai' }); return; }
+          res.status(502).json({ error: result.error });
+          return;
+        }
+        res.status(502).json({
+          error: localErr instanceof Error
+            ? `On-device transcription isn't ready: ${localErr.message}`
+            : 'On-device transcription isn\'t ready yet. Open Meetings once to install the local model, or add an OpenAI key.',
+        });
+        return;
+      }
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      await fs.promises.unlink(tmp).catch(() => undefined);
     }
   });
 

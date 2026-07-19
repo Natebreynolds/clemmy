@@ -79,9 +79,9 @@ const SCENARIOS: Scenario[] = [
     desc: 'a single mailbox constraint is found by the enforcement path',
     run: async () => {
       clearFacts();
-      rememberFact({ kind: 'constraint', content: 'Always send Outlook email only from nathan.reynolds@scorpion.co — never the default account.', importance: 9 });
+      rememberFact({ kind: 'constraint', content: 'Always send Outlook email only from alex.chen@corp.example — never the default account.', importance: 9 });
       const hit = findEmailSendConstraint('OUTLOOK_SEND_EMAIL', {});
-      return { ok: !!hit && hit.allowedAccount.includes('scorpion.co'), detail: hit ? `enforced (${hit.allowedAccount})` : 'NOT enforced' };
+      return { ok: !!hit && hit.allowedAccount.includes('corp.example'), detail: hit ? `enforced (${hit.allowedAccount})` : 'NOT enforced' };
     },
   },
   {
@@ -89,10 +89,10 @@ const SCENARIOS: Scenario[] = [
     desc: 'a fact written in one session is still injected in a later render (global memory)',
     run: async () => {
       clearFacts();
-      rememberFact({ kind: 'user', content: 'The user runs a marketing agency called Breakthrough.', importance: 7 });
+      rememberFact({ kind: 'user', content: 'The user runs a marketing agency called Example Agency.', importance: 7 });
       renderHarnessMemoryContext(); // session A
       const ctxB = renderHarnessMemoryContext(); // session B
-      return { ok: ctxB.includes('Breakthrough'), detail: ctxB.includes('Breakthrough') ? 'persists across renders' : 'LOST' };
+      return { ok: ctxB.includes('Example Agency'), detail: ctxB.includes('Example Agency') ? 'persists across renders' : 'LOST' };
     },
   },
   {
@@ -100,11 +100,11 @@ const SCENARIOS: Scenario[] = [
     desc: 'an OLD critical mailbox constraint is still ENFORCED after 24 newer constraints accumulate',
     run: async () => {
       clearFacts();
-      rememberFact({ kind: 'constraint', content: 'CRITICAL: always send Outlook email only from nathan.reynolds@scorpion.co.', importance: 10 });
+      rememberFact({ kind: 'constraint', content: 'CRITICAL: always send Outlook email only from alex.chen@corp.example', importance: 10 });
       await sleep(15); // ensure the critical rule is strictly the oldest by updated_at
       for (let i = 0; i < 24; i += 1) rememberFact({ kind: 'constraint', content: `Minor rule ${i}: prefer the staging table for scratch writes.`, importance: 2 });
       const hit = findEmailSendConstraint('OUTLOOK_SEND_EMAIL', {});
-      return { ok: !!hit && hit.allowedAccount.includes('scorpion.co'), detail: hit ? 'still enforced ✓' : `DROPPED — only the 20 newest of ${listConstraints(9999).length} constraints are enforced` };
+      return { ok: !!hit && hit.allowedAccount.includes('corp.example'), detail: hit ? 'still enforced ✓' : `DROPPED — only the 20 newest of ${listConstraints(9999).length} constraints are enforced` };
     },
   },
   {
@@ -145,7 +145,7 @@ const SCENARIOS: Scenario[] = [
       // The live case: synthetic harness auto-pins and a genuine user rule all at
       // the default importance; the genuine one is older, so a hard newest-12 cap
       // evicted it from the "always apply" block. The char-budgeted render keeps all.
-      const crit = rememberFact({ kind: 'feedback', content: 'GENUINE RULE: send invoices only from billing@acme.co.', importance: 5 });
+      const crit = rememberFact({ kind: 'feedback', content: 'GENUINE RULE: send invoices only from billing@acme-co.example.', importance: 5 });
       setFactPinned(crit.id, true);
       await sleep(15);
       for (let i = 0; i < 19; i += 1) {
@@ -162,12 +162,12 @@ const SCENARIOS: Scenario[] = [
     desc: 'an auto-captured sender rule round-trips all the way to dispatch-gate enforcement',
     run: async () => {
       clearFacts();
-      const cands = extractAutoMemoryCandidates('From now on always send Outlook email from nathan.reynolds@scorpion.co — never the default account.');
+      const cands = extractAutoMemoryCandidates('From now on always send Outlook email from alex.chen@corp.example — never the default account.');
       const c = cands.find((x) => x.kind === 'constraint');
       if (!c) return { ok: false, detail: 'auto-capture did NOT classify the sender rule as a constraint' };
       rememberFact({ kind: 'constraint', content: c.content, importance: 9 });
       const hit = findEmailSendConstraint('OUTLOOK_SEND_EMAIL', {});
-      return { ok: !!hit && hit.allowedAccount.includes('scorpion.co'), detail: hit ? 'auto-capture → enforced ✓' : 'captured but NOT enforced at dispatch' };
+      return { ok: !!hit && hit.allowedAccount.includes('corp.example'), detail: hit ? 'auto-capture → enforced ✓' : 'captured but NOT enforced at dispatch' };
     },
   },
 ];

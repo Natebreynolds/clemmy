@@ -75,7 +75,7 @@ test('applyCanonicalTranscript: swaps streamed segments for canonical, rewrites 
   const canonical = tp.parseTranscriptToSegments(
     [
       {
-        participant: { id: 1, name: 'Nate Reynolds' },
+        participant: { id: 1, name: 'Alex Chen' },
         words: [
           { text: 'okay', start_timestamp: { relative: 0 }, end_timestamp: { relative: 1 } },
           { text: 'everyone', start_timestamp: { relative: 1 }, end_timestamp: { relative: 2 } },
@@ -100,12 +100,12 @@ test('applyCanonicalTranscript: swaps streamed segments for canonical, rewrites 
   assert.equal(applied.record.canonicalStatus, 'ready');
   assert.equal(applied.record.canonicalError, undefined);
   assert.equal(applied.record.segments.length, 2);
-  assert.equal(applied.record.segments[0].speaker, 'Nate Reynolds');
+  assert.equal(applied.record.segments[0].speaker, 'Alex Chen');
   assert.equal(applied.record.segments[1].speaker, 'Jane Smith');
 
   // Artifact rewritten with canonical speakers + source label.
   const canonicalBody = readFileSync(artifactPath, 'utf-8');
-  assert.match(canonicalBody, /Nate Reynolds:/);
+  assert.match(canonicalBody, /Alex Chen:/);
   assert.match(canonicalBody, /Jane Smith:/);
   assert.doesNotMatch(canonicalBody, /Host:/);
   assert.match(canonicalBody, /recall\.ai async transcript \(canonical\)/);

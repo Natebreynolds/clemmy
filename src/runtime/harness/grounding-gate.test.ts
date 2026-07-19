@@ -2,7 +2,7 @@
  * Run: npx tsx --test src/runtime/harness/grounding-gate.test.ts
  *
  * Grounding gate — integrity verification at the irreversible-write
- * boundary (the 2026-06-11 Eley incident class: correct extraction,
+ * boundary (the 2026-06-11 client-data incident class: correct extraction,
  * orchestrator re-wrote drafts in a compacted context, wrong city sent;
  * plus the all-17-recipients double-send).
  */
@@ -41,18 +41,24 @@ test.after(() => {
 test('extractTargetKeys: pulls recipient email + org domain from nested composio args', () => {
   const keys = extractTargetKeys({
     tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    arguments: JSON.stringify({ user_id: 'me', to_email: 'cliff@eleylawfirm.com', to_name: 'Clifford E. Eley', subject: 'x', body: 'y' }),
+    arguments: JSON.stringify({ user_id: 'me', to_email: 'casey@oakridge-law.example', to_name: 'Casey Morgan', subject: 'x', body: 'y' }),
   });
-  assert.ok(keys.includes('cliff@eleylawfirm.com'));
-  assert.ok(keys.includes('eleylawfirm.com'));
-  assert.ok(keys.includes('clifford e. eley'), 'to_name is a target key');
+  assert.ok(keys.includes('casey@oakridge-law.example'));
+  assert.ok(keys.includes('oakridge-law.example'));
+  assert.ok(keys.includes('casey morgan'), 'to_name is a target key');
   assert.ok(!keys.includes('me'), 'user_id placeholder is never a target');
 });
 
 test('extractTargetKeys: generic mail providers are not org identities', () => {
-  const keys = extractTargetKeys({ to_email: 'somebody@gmail.com' });
-  assert.ok(keys.includes('somebody@gmail.com'));
+  const keys = extractTargetKeys({ to_email: 'placeholder@gmail.com' });
+  assert.ok(keys.includes('placeholder@gmail.com'));
   assert.ok(!keys.includes('gmail.com'));
+});
+
+test('extractTargetKeys: reserved example domains remain legitimate organization identities', () => {
+  const keys = extractTargetKeys({ to_email: 'somebody@sample-company.example' });
+  assert.ok(keys.includes('somebody@sample-company.example'));
+  assert.ok(keys.includes('sample-company.example'));
 });
 
 test('extractTargetKeys: no identity → empty (gate stays out of the way)', () => {
@@ -64,7 +70,7 @@ test('extractTargetKeys: no identity → empty (gate stays out of the way)', () 
 test('rankSources: research artifacts outrank send-confirmations and excerpts are clipped', () => {
   const ranked = rankSources([
     { callId: 'c1', tool: 'run_worker', output: 'SUCCESS: sent to cliff, subject "Houston workers comp search"', createdAt: '2026-06-11T22:18:00Z' },
-    { callId: 'c2', tool: 'run_worker', output: `Eley Law Firm; verified search term: "workers compensation lawyer Denver"${'x'.repeat(6000)}`, createdAt: '2026-06-11T21:59:00Z' },
+    { callId: 'c2', tool: 'run_worker', output: `Oakridge Law; verified search term: "workers compensation lawyer Denver"${'x'.repeat(6000)}`, createdAt: '2026-06-11T21:59:00Z' },
   ], { clipChars: 100 });
   assert.equal(ranked[0].callId, 'c2', 'research artifact ranks before the send confirmation');
   assert.ok(ranked[0].excerpt.length < 150, 'excerpt clipped');
@@ -73,10 +79,10 @@ test('rankSources: research artifacts outrank send-confirmations and excerpts ar
 // ─── prompt assembly ──────────────────────────────────────────────
 
 test('buildGroundingPrompt: includes payload, sources, conflict + confirmation rules', () => {
-  const p = buildGroundingPrompt(renderPayloadForJudge('composio_execute_tool', { to: 'a@b.co' }), [
+  const p = buildGroundingPrompt(renderPayloadForJudge('composio_execute_tool', { to: 'a@beta-co.example' }), [
     { callId: 'c2', tool: 'run_worker', excerpt: 'Denver', createdAt: 'now' },
   ]);
-  assert.match(p, /a@b\.co/);
+  assert.match(p, /a@beta-co\.example/);
   assert.match(p, /Denver/);
   assert.match(p, /NOT evidence its content was correct/, 'send confirmations are not ground truth');
   assert.match(p, /CONTRADICT each other/, 'source-conflict rule present');
@@ -84,20 +90,20 @@ test('buildGroundingPrompt: includes payload, sources, conflict + confirmation r
 
 // ─── evaluateGrounding (fail-open + block paths) ──────────────────
 
-test('evaluateGrounding: Eley-shape contradiction blocks; consistent payload allows; no sources fails open', async () => {
+test('evaluateGrounding: client-data contradiction blocks; consistent payload allows; no sources fails open', async () => {
   resetEventLog();
   _resetGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
   // Seed the CORRECT extraction artifact for the target.
   writeToolOutput({
     sessionId: sess.id,
-    callId: 'call_extract_eley',
+    callId: 'call_extract_fixture',
     tool: 'run_worker',
-    output: 'Eley Law Firm; verified search term: "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com',
+    output: 'Oakridge Law; verified search term: "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
   });
   const houstonArgs = {
     tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    arguments: JSON.stringify({ to_email: 'cliff@eleylawfirm.com', subject: 'Houston workers comp search', body: 'Houston searches…' }),
+    arguments: JSON.stringify({ to_email: 'casey@oakridge-law.example', subject: 'Houston workers comp search', body: 'Houston searches…' }),
   };
   // Stubbed judge mimics the integrity verdict.
   _setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
@@ -108,7 +114,7 @@ test('evaluateGrounding: Eley-shape contradiction blocks; consistent payload all
     assert.equal(blocked.action, 'block');
     assert.match(blocked.reason, /Denver/);
     assert.equal(blocked.failureCount, 1);
-    assert.ok(blocked.sourceCallIds.includes('call_extract_eley'));
+    assert.ok(blocked.sourceCallIds.includes('call_extract_fixture'));
 
     // Second failure for the same target escalates the count (→ ask-user wording).
     const blocked2 = await evaluateGrounding(sess.id, 'composio_execute_tool', houstonArgs);
@@ -116,7 +122,7 @@ test('evaluateGrounding: Eley-shape contradiction blocks; consistent payload all
     const err = new GroundingCheckFailedError({ toolName: 'composio_execute_tool', reason: blocked2.reason, targets: blocked2.targets, sourceCallIds: blocked2.sourceCallIds, failureCount: blocked2.failureCount! });
     assert.match(err.message, /ask_user_question/, 'repeated failure instructs a user check-in');
 
-    const denverArgs = { ...houstonArgs, arguments: JSON.stringify({ to_email: 'cliff@eleylawfirm.com', subject: 'Denver comp search gap', body: 'Denver…' }) };
+    const denverArgs = { ...houstonArgs, arguments: JSON.stringify({ to_email: 'casey@oakridge-law.example', subject: 'Denver comp search gap', body: 'Denver…' }) };
     const allowed = await evaluateGrounding(sess.id, 'composio_execute_tool', denverArgs);
     assert.equal(allowed.action, 'allow');
 
@@ -138,10 +144,10 @@ test('evaluateGrounding: judge infra error fails open', async () => {
   resetEventLog();
   _resetGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
-  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'run_worker', output: 'research about target@firm.com' });
+  writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'run_worker', output: 'research about target@firm.example' });
   _setGroundingJudgeForTests(async () => { throw new Error('model down'); });
   try {
-    const r = await evaluateGrounding(sess.id, 'composio_execute_tool', { arguments: JSON.stringify({ to_email: 'target@firm.com' }) });
+    const r = await evaluateGrounding(sess.id, 'composio_execute_tool', { arguments: JSON.stringify({ to_email: 'target@firm.example' }) });
     assert.equal(r.action, 'allow');
     assert.match(r.reason, /fail open/);
   } finally {
@@ -156,12 +162,12 @@ test('detectDuplicateTarget: same shape+target is a HARD duplicate EVERY time �
   const input = {
     sessionId: 's1',
     shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    targets: ['cliff@eleylawfirm.com'],
-    priorWrites: [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['cliff@eleylawfirm.com'] }],
+    targets: ['casey@oakridge-law.example'],
+    priorWrites: [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['casey@oakridge-law.example'] }],
   };
   const first = detectDuplicateTarget(input);
   assert.equal(first.duplicate, true);
-  assert.equal(first.target, 'cliff@eleylawfirm.com');
+  assert.equal(first.target, 'casey@oakridge-law.example');
   // A retry must STILL be a duplicate — the model can no longer self-bypass.
   assert.equal(detectDuplicateTarget(input).duplicate, true, 'retry is still refused — hard wall, not speed bump');
   assert.equal(detectDuplicateTarget(input).duplicate, true, 'and again');
@@ -169,25 +175,25 @@ test('detectDuplicateTarget: same shape+target is a HARD duplicate EVERY time �
 
 test('detectDuplicateTarget: different target or shape is not a duplicate', () => {
   _resetDuplicateStateForTests();
-  const prior = [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['a@x.com'] }];
-  assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['b@y.com'], priorWrites: prior }).duplicate, false);
-  assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@x.com'], priorWrites: prior }).duplicate, false);
-  assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: undefined, targets: ['a@x.com'], priorWrites: prior }).duplicate, false);
+  const prior = [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['a@site.example'] }];
+  assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['b@personal.example'], priorWrites: prior }).duplicate, false);
+  assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@site.example'], priorWrites: prior }).duplicate, false);
+  assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: undefined, targets: ['a@site.example'], priorWrites: prior }).duplicate, false);
 });
 
 test('detectDuplicateTarget: a multi-recipient send trips on ANY recipient already written this session', () => {
   _resetDuplicateStateForTests();
-  const priorWrites = [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['already@x.com'] }];
+  const priorWrites = [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['already@site.example'] }];
   // A multi-recipient send where one recipient was already contacted this session
   // hard-trips on that recipient (a fresh recipient alone would pass).
   const res = detectDuplicateTarget({
     sessionId: 's1',
     shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    targets: ['fresh@y.com', 'already@x.com'],
+    targets: ['fresh@personal.example', 'already@site.example'],
     priorWrites,
   });
   assert.equal(res.duplicate, true);
-  assert.equal(res.target, 'already@x.com');
+  assert.equal(res.target, 'already@site.example');
 });
 
 // ─── Plain-text verdict parser (schema-free; feed fake finalOutput strings) ───

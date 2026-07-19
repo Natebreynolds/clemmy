@@ -107,11 +107,11 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
 });
 
 // ── 2026-06-22 fan-out fix: SDK-lane cap visibility + intent-aware cap ─────────
-// This is the lane Nathan's claude_oauth workers take. Both behaviors gated under
+// This is the lane Alexander's claude_oauth workers take. Both behaviors gated under
 // CLEMMY_WORKER_THRASH_GUARD (default on). Asserted via the injected-run seam.
 
 const researchPacket = {
-  objective: 'analyze one client', item: 'Nova Legal Group — novalegalgroup.com',
+  objective: 'analyze one client', item: 'Northstar Legal — northstar-legal.example',
   resolvedTools: 'dataforseo', context: 'x', instructions: 'x', expectedOutput: 'x',
   intent: 'research',
 };

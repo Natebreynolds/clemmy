@@ -44,7 +44,7 @@ test('parseTunnelList extracts id+name+created_at from the standard output', () 
   const sample = JSON.stringify([
     {
       id: '12345678-1234-1234-1234-1234567890ab',
-      name: 'clem-nathan',
+      name: 'clem-example',
       created_at: '2026-05-01T12:00:00Z',
       connections: [],
     },
@@ -57,7 +57,7 @@ test('parseTunnelList extracts id+name+created_at from the standard output', () 
   const parsed = parseTunnelList(sample);
   assert.equal(parsed.length, 2);
   assert.equal(parsed[0].id, '12345678-1234-1234-1234-1234567890ab');
-  assert.equal(parsed[0].name, 'clem-nathan');
+  assert.equal(parsed[0].name, 'clem-example');
   assert.equal(parsed[1].name, 'staging');
 });
 
@@ -74,13 +74,13 @@ test('parseTunnelList drops rows missing id or name', () => {
 
 test('parseCreatedTunnel reads the standard 2024 cloudflared output', () => {
   const out = [
-    'Tunnel credentials written to /Users/nathan/.cloudflared/12345678-1234-1234-1234-1234567890ab.json.',
-    'Created tunnel clem-nathan with id 12345678-1234-1234-1234-1234567890ab',
+    'Tunnel credentials written to /Users/example/.cloudflared/12345678-1234-1234-1234-1234567890ab.json.',
+    'Created tunnel clem-example with id 12345678-1234-1234-1234-1234567890ab',
   ].join('\n');
   const parsed = parseCreatedTunnel(out);
   assert.ok(parsed);
   assert.equal(parsed!.id, '12345678-1234-1234-1234-1234567890ab');
-  assert.equal(parsed!.credentialsFile, '/Users/nathan/.cloudflared/12345678-1234-1234-1234-1234567890ab.json');
+  assert.equal(parsed!.credentialsFile, '/Users/example/.cloudflared/12345678-1234-1234-1234-1234567890ab.json');
 });
 
 test('parseCreatedTunnel returns null when no UUID is found', () => {
@@ -88,7 +88,7 @@ test('parseCreatedTunnel returns null when no UUID is found', () => {
 });
 
 test('parseCreatedTunnel still works without the credentials line', () => {
-  const out = 'Created tunnel clem-nathan with id abcdef12-3456-7890-abcd-ef1234567890';
+  const out = 'Created tunnel clem-example with id abcdef12-3456-7890-abcd-ef1234567890';
   const parsed = parseCreatedTunnel(out);
   assert.ok(parsed);
   assert.equal(parsed!.id, 'abcdef12-3456-7890-abcd-ef1234567890');

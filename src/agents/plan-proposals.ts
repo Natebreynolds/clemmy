@@ -281,7 +281,7 @@ function sanitizeAppliedInstructionForNotification(value: string): string {
 
   if (/proposal|audit|brief/i.test(value) && /workflow|SKILL\.md|workflows/i.test(value)) {
     text = 'Use the relevant saved proposal workflow for the research and briefing steps.';
-  } else if (/outbound|Scorpion|law[- ]firm|SEO jargon|booking URL/i.test(value)) {
+  } else if (/\b(?:outbound|outreach|prospecting|prospects?|cold[- ]emails?|sales[- ]emails?|email campaigns?|law[- ]firms?|SEO|booking|scheduling links?)\b/i.test(value)) {
     text = 'Use the saved outbound-writing guidance: clear law-firm language, low jargon, and no raw booking URLs unless asked.';
   }
 

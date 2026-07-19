@@ -75,7 +75,7 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
     sessionId: sess.id,
     callId: 'c_extract',
     tool: 'mcp__research__lookup',
-    output: 'Eley Law Firm; verified term "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com',
+    output: 'Oakridge Law; verified term "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
   });
   grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
     ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact says Denver.' }
@@ -90,7 +90,7 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
   const counter = new ToolCallsCounter(100);
   const send = (subject: string) =>
     withHarnessRunContext({ sessionId: sess.id, counter }, () =>
-      shim.callTool('gmail__send_email', { to_email: 'cliff@eleylawfirm.com', subject, body: `${subject} body` }));
+      shim.callTool('gmail__send_email', { to_email: 'casey@oakridge-law.example', subject, body: `${subject} body` }));
 
   try {
     // 1. Corrupted payload (Houston) → grounding soft-blocks BEFORE dispatch.
@@ -112,7 +112,7 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
     // retry (the model can no longer self-bypass into a double-send).
     await assert.rejects(
       () => Promise.resolve(send('Denver comp search gap')),
-      (err: Error) => { assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/); assert.match(err.message, /cliff@eleylawfirm\.com/); return true; },
+      (err: Error) => { assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/); assert.match(err.message, /casey@oakridge-law\.example/); return true; },
     );
     assert.equal(server._calls.length, 1, 'duplicate blocked before dispatch');
     await assert.rejects(() => Promise.resolve(send('Denver comp search gap')), /DUPLICATE_EXTERNAL_WRITE/);
@@ -132,7 +132,7 @@ test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6
   const sess = createSession({ kind: 'chat' });
   writeToolOutput({
     sessionId: sess.id, callId: 'c_extract', tool: 'mcp__research__lookup',
-    output: 'Eley Law Firm; verified term "workers compensation lawyer Denver"; contact cliff@eleylawfirm.com',
+    output: 'Oakridge Law; verified term "workers compensation lawyer Denver"; contact casey@oakridge-law.example',
   });
   grounding._setGroundingJudgeForTests(async (payload) => payload.includes('Houston')
     ? { grounded: false, reason: 'Payload claims Houston; artifact says Denver.' }
@@ -147,7 +147,7 @@ test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6
       shim.callTool('kernel__exec_command', {
         session_id: 's1',
         command: 'curl',
-        args: ['-X', 'POST', 'https://api.example.com/send', '-d', `{"to_email":"cliff@eleylawfirm.com","body":"${city} gap"}`],
+        args: ['-X', 'POST', 'https://api.example.com/send', '-d', `{"to_email":"casey@oakridge-law.example","body":"${city} gap"}`],
       }));
   try {
     // exec_command classifies as `execute` → would normally NOT be approval-blocked
@@ -190,7 +190,7 @@ test('MCP send gets the OUTPUT-GROUNDING gate too — a fabricated figure bounce
   const counter = new ToolCallsCounter(100);
   const send = (body: string) =>
     withHarnessRunContext({ sessionId: sess.id, counter }, () =>
-      shim.callTool('gmail__send_email', { to_email: 'cliff@eleylawfirm.com', subject: 'Q report', body }));
+      shim.callTool('gmail__send_email', { to_email: 'casey@oakridge-law.example', subject: 'Q report', body }));
   try {
     // Fabricated figure → output-grounding soft-blocks BEFORE dispatch.
     await assert.rejects(

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-agent-workflow-step-test-'));
+const ORIGINAL_OWNER_NAME = process.env.OWNER_NAME;
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
 import { test, beforeEach, after } from 'node:test';
@@ -23,6 +24,7 @@ writeFileSync(
 const mod = await import('./claude-agent-workflow-step.js');
 const sdkMod = await import('./claude-agent-sdk.js');
 const { AgentRuntimeCancelledError } = await import('../provider.js');
+const { saveUserProfile } = await import('../user-profile.js');
 const {
   claudeAgentSdkWorkflowStepEnabled,
   claudeWorkflowStepOutputSchema,
@@ -35,6 +37,8 @@ const { ClaudeAgentSdkToolSurfaceError } = sdkMod;
 
 beforeEach(() => {
   setClaudeAgentSdkWorkflowStepRunForTest(null);
+  process.env.OWNER_NAME = '';
+  rmSync(path.join(STATE_DIR, 'user-profile.json'), { force: true });
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP_MAX_TURNS;
   delete process.env.MODEL_ROUTING_MODE;
@@ -45,6 +49,8 @@ beforeEach(() => {
 
 after(() => {
   setClaudeAgentSdkWorkflowStepRunForTest(null);
+  if (ORIGINAL_OWNER_NAME === undefined) delete process.env.OWNER_NAME;
+  else process.env.OWNER_NAME = ORIGINAL_OWNER_NAME;
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -177,7 +183,7 @@ test('requiredLocalMcpToolsForWorkflowStep detects Salesforce CLI and notificati
   const salesforceStep = {
     id: 'main',
     sideEffect: 'send' as const,
-    prompt: 'Use the authenticated Salesforce CLI via run_shell_command: sf data query --query "SELECT Id FROM Event" --json. Notify Nate with the results.',
+    prompt: 'Use the authenticated Salesforce CLI via run_shell_command: sf data query --query "SELECT Id FROM Event" --json. Notify Alex with the results.',
   };
   const tools = requiredLocalMcpToolsForWorkflowStep(salesforceStep, true);
   assert.ok(tools.includes('run_shell_command'));
@@ -185,12 +191,35 @@ test('requiredLocalMcpToolsForWorkflowStep detects Salesforce CLI and notificati
   assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(salesforceStep, false), []);
 });
 
+test('requiredLocalMcpToolsForWorkflowStep routes configured user aliases to notify_user', () => {
+  process.env.OWNER_NAME = 'Jordan Kim';
+  assert.ok(requiredLocalMcpToolsForWorkflowStep({
+    id: 'owner_update',
+    sideEffect: 'send' as const,
+    prompt: 'Send Jordan the completed report.',
+  }, true).includes('notify_user'), 'first-name alias from OWNER_NAME is recognized');
+
+  process.env.OWNER_NAME = '';
+  saveUserProfile({ displayName: 'Taylor Morgan', preferredName: 'Tay' });
+  assert.ok(requiredLocalMcpToolsForWorkflowStep({
+    id: 'profile_update',
+    sideEffect: 'send' as const,
+    prompt: 'Email the completed report to Tay.',
+  }, true).includes('notify_user'), 'preferred profile name is recognized');
+
+  assert.ok(!requiredLocalMcpToolsForWorkflowStep({
+    id: 'external_recipient',
+    sideEffect: 'send' as const,
+    prompt: 'Email the completed report to Riley.',
+  }, true).includes('notify_user'), 'an unrelated named recipient is not treated as the configured user');
+});
+
 test('requiredLocalMcpToolsForWorkflowStep does not promote every allowed tool to a hard requirement', () => {
   const discoveryStep = {
     id: 'find_official_page',
     sideEffect: 'read' as const,
     allowedTools: ['composio_execute_tool', 'composio_search_tools'],
-    prompt: 'Find the official public Facebook page. Expected official page: https://www.facebook.com/scorpion.co unless evidence shows otherwise.',
+    prompt: 'Find the official public Facebook page. Expected official page: https://www.facebook.com/corp.example unless evidence shows otherwise.',
   };
   assert.deepEqual(
     requiredLocalMcpToolsForWorkflowStep(discoveryStep, true),
@@ -312,7 +341,7 @@ test('runClaudeAgentSdkWorkflowStep passes concrete required tools for Salesforc
   const salesforceStep = {
     id: 'main',
     sideEffect: 'send' as const,
-    prompt: 'Use run_shell_command to execute sf data query --query "SELECT Id FROM Event" --json, then notify Nate.',
+    prompt: 'Use run_shell_command to execute sf data query --query "SELECT Id FROM Event" --json, then notify Alex.',
   };
   const result = await runClaudeAgentSdkWorkflowStep({
     step: salesforceStep,
@@ -354,11 +383,11 @@ test('runClaudeAgentSdkWorkflowStep converts missing tool surface into a blocked
   const result = await runClaudeAgentSdkWorkflowStep({
     step: {
       id: 'main',
-      prompt: 'Use run_shell_command to execute sf data query --json, then notify Nate.',
+      prompt: 'Use run_shell_command to execute sf data query --json, then notify Alex.',
       sideEffect: 'send' as const,
     },
     workflowName: 'daily-overdue-salesforce-meetings',
-    prompt: 'Use run_shell_command to execute sf data query --json, then notify Nate.',
+    prompt: 'Use run_shell_command to execute sf data query --json, then notify Alex.',
     modelId: 'claude-opus-4-8',
     sessionId: 'workflow:run-salesforce:main',
     fullLane: true,
@@ -385,7 +414,7 @@ test('runClaudeAgentSdkWorkflowStep RE-THROWS (transient, self-heal) when the MC
   await assert.rejects(
     () => runClaudeAgentSdkWorkflowStep({
       step: { id: 'scrape_and_analyze', prompt: 'Use composio_execute_tool to scrape.', sideEffect: 'read' as const, allowedTools: ['composio_execute_tool'] },
-      workflowName: 'scorpion-facebook-trends',
+      workflowName: 'acme-facebook-trends',
       prompt: 'Use composio_execute_tool to scrape.',
       modelId: 'claude-opus-4-8',
       sessionId: 'workflow:run-fb:scrape_and_analyze',

@@ -3,9 +3,8 @@
  * recover, create, and reconfigure external MCP servers at runtime — WITHOUT
  * ever writing a raw secret. Credentials stay human-only: these tools declare /
  * surface which env keys a server needs (by NAME); the human enters the actual
- * values in the dashboard (Settings → MCP Servers). Design owner: Nathan,
- * 2026-06-27 ("Clementine creates the MCP and then we manually write the
- * credentials in the dashboard").
+ * values in the dashboard (Settings → MCP Servers). Clementine creates the MCP,
+ * then the user enters credentials in the dashboard.
  *
  * Gating (src/agents/tool-taxonomy.ts): mcp_reconnect = read (recovery, no
  * write, no secret) → no approval; mcp_add / mcp_configure = admin → ALWAYS ask

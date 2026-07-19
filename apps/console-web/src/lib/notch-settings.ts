@@ -23,6 +23,8 @@ export interface NotchSettingsSnapshot {
     visible: boolean;
     shortcutRegistered: boolean;
     shortcutError?: string;
+    clickHelper?: 'starting' | 'ready' | 'degraded' | 'stopped';
+    clickHelperError?: string;
     canOpenPreview: boolean;
   };
   meetingCapture?: {

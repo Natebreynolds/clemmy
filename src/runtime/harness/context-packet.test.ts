@@ -167,7 +167,7 @@ test('detectMultiItemIntent marks explicit parallel/same-shape requests', () => 
 test('detectMultiItemIntent FIRES despite an incidental aggregate verb when per-item work is present (live 2026-06-02 regression)', () => {
   // "research … tell me which failed" was wrongly suppressed by "tell me".
   const r = detectMultiItemIntent(
-    'Research these 8 law-firm websites as 8 independent per-item jobs: a.com, b.com — for each return a one-line SEO snapshot. Then tell me which you could not get data for.',
+    'Research these 8 law-firm websites as 8 independent per-item jobs: alpha.example, beta.example — for each return a one-line SEO snapshot. Then tell me which you could not get data for.',
   );
   assert.equal(r.isMultiItem, true, 'a genuine per-item research request must fire even with a trailing "tell me"');
   assert.equal(r.itemCount, 8);
@@ -178,7 +178,7 @@ test('detectMultiItemIntent FIRES despite an incidental aggregate verb when per-
   // Live 2026-06-02 #2: an incidental "<n>-sentence analysis of that firm"
   // must NOT be misread as internal cardinality and suppress a per-firm fan-out.
   const heavy = detectMultiItemIntent(
-    'For each of these 8 law firms, do a full per-firm SEO audit: pull ranked keywords, backlinks, and competitors, then write a 2-3 sentence analysis of that firm’s SEO position. Firms: a.com, b.com.',
+    'For each of these 8 law firms, do a full per-firm SEO audit: pull ranked keywords, backlinks, and competitors, then write a 2-3 sentence analysis of that firm’s SEO position. Firms: alpha.example, beta.example.',
   );
   assert.equal(heavy.isMultiItem, true, '"2-3 sentence analysis of that firm" must not suppress an 8-firm audit');
   assert.equal(heavy.itemCount, 8);

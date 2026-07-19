@@ -16,7 +16,7 @@
 // BOTH the composio execute path (composio-tools.ts, flag-independent of
 // HARNESS_TOOL_BRACKETS) AND the MCP namespace shim (mcp-namespace-shim.ts) so
 // native MCP reads (dataforseo__*/firecrawl__* — the literal read-heavy path in
-// the sess-mpxpl2l9 incident) are finally covered. No HARNESS_TOOL_BRACKETS
+// the MCP namespace regression) are finally covered. No HARNESS_TOOL_BRACKETS
 // dependency.
 //
 // Independence guard (see looksDependentOnPrior): a pure shape counter would

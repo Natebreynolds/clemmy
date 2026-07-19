@@ -112,7 +112,7 @@ export function NotchSettingsCard() {
   const customShortcut = configuredShortcut && !SHORTCUTS.some((shortcut) => shortcut.value === configuredShortcut)
     ? configuredShortcut
     : null;
-  const needsAttention = Boolean(snapshot?.runtime.shortcutError || error);
+  const needsAttention = Boolean(snapshot?.runtime.shortcutError || snapshot?.runtime.clickHelperError || error);
   const meetingCapture = snapshot?.meetingCapture;
   const recallCapability = notchRecallCapability(meetingCapture);
   const recallReady = recallCapability === 'ready';
@@ -128,8 +128,8 @@ export function NotchSettingsCard() {
           : recallNeedsAttention
             ? <StatusPill tone="danger">Recall needs attention</StatusPill>
           : recallReady
-            ? <StatusPill tone="info">Meetings live · tasks preview</StatusPill>
-            : <StatusPill tone="neutral">Task preview</StatusPill>;
+            ? <StatusPill tone="info">Voice · tasks · meetings live</StatusPill>
+            : <StatusPill tone="neutral">Voice · tasks live</StatusPill>;
 
   const capabilityCopy = notchRecallCapabilityCopy(meetingCapture, enabled);
 
@@ -139,7 +139,7 @@ export function NotchSettingsCard() {
         <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-primary-tint"><DogMark size={30} /></span>
         <div className="min-w-0 flex-1">
           <h3 className="text-h3 text-fg">Clementine in the notch</h3>
-          <p className="mt-0.5 text-small text-muted">Open Clementine from anywhere and control detected Recall meetings without leaving your call.</p>
+          <p className="mt-0.5 text-small text-muted">Click the Clementine icon to dictate a request, follow live work, and control detected Recall meetings.</p>
         </div>
         {status}
       </div>
@@ -167,7 +167,7 @@ export function NotchSettingsCard() {
           <div className="divide-y divide-border">
             <SettingRow
               title="Enable Clementine in the notch"
-              description={captureActive ? 'Stop the active meeting recording before turning off the notch.' : 'Keep the surface ready while the Clementine app is running.'}
+              description={captureActive ? 'Stop the active meeting recording before turning off the notch.' : 'Voice is included whenever this is on. Click the dog, choose Talk, or press ⌘ ⇧ V.'}
             >
               <Switch checked={enabled} disabled={Boolean(busy) || captureActive} label="Enable Clementine in the notch" onChange={(value) => void apply('enabled', { enabled: value })} />
             </SettingRow>
@@ -231,7 +231,7 @@ export function NotchSettingsCard() {
 
           <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border pt-4">
             <Button size="sm" onClick={() => void openPreview()} disabled={!enabled || Boolean(busy)}>
-              <MonitorUp className="h-4 w-4" aria-hidden /> {busy === 'open' ? 'Opening…' : captureActive ? 'Open recording controls' : snapshot.runtime.availability === 'loading' ? 'Notch starting…' : snapshot.runtime.availability === 'unavailable' ? 'Retry notch' : 'Open notch'}
+              <MonitorUp className="h-4 w-4" aria-hidden /> {busy === 'open' ? 'Opening…' : captureActive ? 'Open recording controls' : snapshot.runtime.availability === 'loading' ? 'Notch starting…' : snapshot.runtime.availability === 'unavailable' || snapshot.runtime.clickHelper === 'degraded' ? 'Retry notch' : 'Open notch'}
             </Button>
             <Link to="/meetings" className="inline-flex items-center gap-1.5 text-small font-semibold text-primary hover:underline">
               <Video className="h-4 w-4" aria-hidden /> Manage meeting capture
@@ -240,7 +240,7 @@ export function NotchSettingsCard() {
           </div>
 
           <div aria-live="polite" className="mt-3 min-h-5 text-small">
-            {error ? <span className="text-danger" role="alert">{error}</span> : notice ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> {notice}</span> : snapshot.runtime.shortcutError ? <span className="text-danger" role="alert">{snapshot.runtime.shortcutError}</span> : !meetingCapture?.enabled ? <span className="text-muted">Recall detection is off. Turn it on from Meetings to receive meeting prompts.</span> : recallNeedsAttention ? <span className="text-warning">Recall is not ready. Review meeting capture before relying on prompts or recording controls.</span> : null}
+            {error ? <span className="text-danger" role="alert">{error}</span> : notice ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> {notice}</span> : snapshot.runtime.shortcutError ? <span className="text-danger" role="alert">{snapshot.runtime.shortcutError}</span> : snapshot.runtime.clickHelperError ? <span className="text-danger" role="alert">Notch input needs a retry. Open the notch once from Settings to restore it.</span> : !meetingCapture?.enabled ? <span className="text-muted">Recall detection is off. Turn it on from Meetings to receive meeting prompts.</span> : recallNeedsAttention ? <span className="text-warning">Recall is not ready. Review meeting capture before relying on prompts or recording controls.</span> : null}
           </div>
         </>
       )}

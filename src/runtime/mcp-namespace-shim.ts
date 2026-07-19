@@ -61,7 +61,7 @@ const MCP_EAGER_CONNECT_BLOCKING =
 // historically `await ensureConnected(server)` INLINE per server — so a single
 // server still mid-connect (or whose cold handshake is starved by the daemon's
 // synchronous better-sqlite3 work) blocks the ENTIRE turn pre-content until the
-// 30s connect timeout, and the model-stream watchdog then fires (sess-mqg8wdw1:
+// 30s connect timeout, and the model-stream watchdog then fires (MCP prewarm regression:
 // dataforseo "connecting" stalled a Salesforce-CLI turn that never needed it).
 // With this ON, a turn attaches ONLY already-connected servers; not-yet-connected
 // ones are warmed in the BACKGROUND for the next turn and surfaced as the existing
@@ -303,7 +303,7 @@ function isInvalidMcpCallResultValidationError(err: unknown): boolean {
 // Append the global fan-out advisory to a native MCP result when the model is
 // looping the same tool serially for N>=3 distinct items in one turn. This is
 // the ONLY place native MCP calls (dataforseo__*/firecrawl__* — the read-heavy
-// path in the sess-mpxpl2l9 incident) are observable: they go through this shim,
+// path in the MCP namespace regression) are observable: they go through this shim,
 // NOT through wrapToolForHarness, so without this hook they get no behavioral
 // fan-out trigger. sessionId comes from the harness run context, which the loop
 // installs around every turn regardless of HARNESS_TOOL_BRACKETS. Best-effort:
@@ -806,7 +806,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // already connected gets only a SHORT budget to finish its handshake on
         // this turn. A fast/idle server connects within the budget and attaches
         // its real tools immediately (preserves the listTools-connects contract);
-        // a COLD or event-loop-STARVED handshake (the sess-mqg8wdw1 stall) does
+        // a COLD or event-loop-STARVED handshake (the MCP prewarm stall) does
         // NOT block the turn — the connect continues in the BACKGROUND (ready
         // next turn) and we emit the unavailable stub now. Legacy (flag off) and
         // already-connected servers use the full connect path unchanged.
@@ -1085,7 +1085,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // Integrity gates for irreversible MCP SENDS (blind-spot audit #1).
       // Native MCP tools bypass wrapToolForHarness, so a Gmail/Slack/etc. send
       // never got the grounding + duplicate-target protection that composio
-      // sends get — a corrupted/wrong-target send (the Eley/mailbox incident
+      // sends get — a corrupted/wrong-target send (the client-data/mailbox incident
       // class) or a silent double-send sailed straight through. Run the SAME
       // gates here for send-kind tools, reusing the same fail-open functions.
       // Blocks surface as soft tool errors the model recovers from. The

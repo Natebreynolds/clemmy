@@ -31,6 +31,7 @@ import {
   textMentionsDeliverable,
 } from './workflow-deliverable-hints.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { textTargetsConfiguredUserRecipient } from '../runtime/user-profile.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -227,7 +228,18 @@ function checkApprovalCoherence(
 }
 
 const SIDE_EFFECT_SEND_RE =
-  /\b(?:send|sends|sending|deliver|delivers|delivering|dispatch|dispatches|dispatching)\b[\s\S]{0,80}\b(?:e-?mails?|messages?|sms|texts?|invites?|dms?|notifications?|newsletters?|nate|user|client|customer|prospect|recipient|inbox|mailbox)\b|\bnotify(?:ing|ies)?\b[\s\S]{0,80}\b(?:nate|user|client|customer|prospect|recipient|inbox|mailbox|about|with|that)\b|\b(?:email|e-mail|message|dm)\s+(?:nate|the\s+user|a\s+user|users?|clients?|customers?|prospects?|recipients?)\b/i;
+  /\b(?:send|sends|sending|deliver|delivers|delivering|dispatch|dispatches|dispatching)\b[\s\S]{0,80}\b(?:e-?mails?|messages?|sms|texts?|invites?|dms?|notifications?|newsletters?|owner|me|myself|user|client|customer|prospect|recipient|inbox|mailbox)\b|\bnotify(?:ing|ies)?\b[\s\S]{0,80}\b(?:owner|me|myself|user|client|customer|prospect|recipient|inbox|mailbox|about|with|that)\b|\b(?:email|e-mail|message|dm)\s+(?:me|myself|owner|the\s+user|a\s+user|users?|clients?|customers?|prospects?|recipients?)\b/i;
+/**
+ * Clear command-shaped sends to a named recipient. This is deliberately
+ * separate from configured-user routing: an external "Email Riley ..." is a
+ * SEND side effect, but it must not make notify_user a required local tool.
+ * Requiring a command boundary keeps noun phrases such as "analyze email
+ * trends" read-only; sideEffectSignalText strips explicit negations first.
+ */
+const IMPERATIVE_DIRECT_RECIPIENT_SEND_RE =
+  /(?:^[ \t]*(?:[-*]\s+|\d+[.)]\s+)?|[.!?]\s+|\bthen\s+)(?:please\s+)?(?:send|deliver|dispatch|e-?mail|message|dm|notify)\s+[\p{L}][\p{L}\p{M}'’.-]*(?:\s+[\p{L}][\p{L}\p{M}'’.-]*){0,2}?(?=\s+(?:the|a|an|this|that|these|those|with|about)\b|[,.!?]|$)/imu;
+const IMPERATIVE_OBJECT_TO_RECIPIENT_SEND_RE =
+  /(?:^[ \t]*(?:[-*]\s+|\d+[.)]\s+)?|[.!?]\s+|\bthen\s+)(?:please\s+)?(?:send|deliver|dispatch|e-?mail|message|dm|notify)\b[^\n.!?]{0,80}\bto\s+[\p{L}][\p{L}\p{M}'’.-]*(?=\s|[,.!?]|$)/imu;
 const SIDE_EFFECT_PUBLISH_RE =
   /\b(?:publish|publishes|publishing)\b[\s\S]{0,60}\b(?:tweet|tweets|linkedin|slack|twitter|\bx\b|facebook|instagram|blog\s*post|social\s+post|post)\b|\b(?:post|posts|posting)\b[\s\S]{0,30}\b(?:to|on|onto)\s+(?:linkedin|slack|twitter|\bx\b|facebook|instagram|the\s+blog|a\s+blog)\b/i;
 const SIDE_EFFECT_WRITE_RE =
@@ -255,7 +267,13 @@ function declaredSideEffect(step: WorkflowStepShape): 'read' | 'write' | 'send' 
 
 function promptSideEffectClass(prompt: string): 'read' | 'write' | 'send' {
   const signal = sideEffectSignalText(prompt);
-  if (SIDE_EFFECT_SEND_RE.test(signal) || SIDE_EFFECT_PUBLISH_RE.test(signal)) return 'send';
+  if (
+    SIDE_EFFECT_SEND_RE.test(signal)
+    || SIDE_EFFECT_PUBLISH_RE.test(signal)
+    || IMPERATIVE_DIRECT_RECIPIENT_SEND_RE.test(signal)
+    || IMPERATIVE_OBJECT_TO_RECIPIENT_SEND_RE.test(signal)
+    || textTargetsConfiguredUserRecipient(signal)
+  ) return 'send';
   if (SIDE_EFFECT_WRITE_RE.test(signal)) return 'write';
   return 'read';
 }
@@ -327,7 +345,7 @@ function checkStepOutputReferences(
 // The engine only substitutes a fixed set of token shapes. A token that
 // matches NONE of them (e.g. `{{url}}` instead of `{{input.url}}`, or a
 // typo `{{ourput}}`) renders as literal text and silently swallows the
-// value — the exact class that blocked the revill audit. These checks
+// value — the exact class that blocked the missing-artifact audit. These checks
 // surface that at author/validate time. (P1 = report-only; P2 wires
 // validation into create/enable so a broken workflow can't be enabled.)
 

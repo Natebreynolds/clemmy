@@ -57,7 +57,7 @@ test('maybeAutoFocusSession does not pin one-off chat turns', () => {
 test('maybeAutoFocusSession ignores gateway mirror inflation for thread and resource thresholds', () => {
   resetAll();
   const sess = createSession({ kind: 'chat', title: 'single logical sheet lookup' });
-  const spreadsheetId = '1JTqfpx0MbNFg0iC-VG4D5aj7Jt0PNP5zgZURi1Cmxlc';
+  const spreadsheetId = 'fixture_google_sheet_0000000003';
   for (let turn = 1; turn <= 2; turn += 1) {
     appendEvent({
       sessionId: sess.id,
@@ -111,15 +111,15 @@ test('maybeAutoFocusSession ignores gateway mirror inflation for thread and reso
 
 test('maybeAutoFocusSession pins repeated Google Sheet work to the concrete resource', () => {
   resetAll();
-  const sess = createSession({ kind: 'chat', title: 'market leader sheet' });
-  const spreadsheetId = '1JTqfpx0MbNFg0iC-VG4D5aj7Jt0PNP5zgZURi1Cmxlc';
+  const sess = createSession({ kind: 'chat', title: 'priority account sheet' });
+  const spreadsheetId = 'fixture_google_sheet_0000000003';
   for (let turn = 1; turn <= 2; turn += 1) {
     appendEvent({
       sessionId: sess.id,
       turn,
       role: 'system',
       type: 'user_input_received',
-      data: { text: turn === 1 ? 'update the market leader sheet' : 'continue the sheet work' },
+      data: { text: turn === 1 ? 'update the priority account sheet' : 'continue the sheet work' },
     });
     appendEvent({
       sessionId: sess.id,
@@ -138,7 +138,7 @@ test('maybeAutoFocusSession pins repeated Google Sheet work to the concrete reso
 
   const result = maybeAutoFocusSession({
     sessionId: sess.id,
-    summaryHint: { summary: 'Updating the market leader sheet with enriched prospect rows.' },
+    summaryHint: { summary: 'Updating the priority account sheet with enriched prospect rows.' },
   });
 
   assert.ok(result);

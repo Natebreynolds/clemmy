@@ -86,10 +86,10 @@ test('parseWorkflowSource derives runId/stepId/itemKey from a workflow session i
     itemKey: 'acme-corp',
   });
   // an itemKey containing colons is preserved whole (rest re-joined)
-  assert.deepEqual(parseWorkflowSource('workflow:run-9:send:https://x.com/a'), {
+  assert.deepEqual(parseWorkflowSource('workflow:run-9:send:https://site.example/a'), {
     runId: 'run-9',
     stepId: 'send',
-    itemKey: 'https://x.com/a',
+    itemKey: 'https://site.example/a',
   });
 });
 

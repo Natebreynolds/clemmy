@@ -266,7 +266,7 @@ export function buildWorkflowInputClassifierPrompt(
     '- NEW_TOPIC: a clearly different request, unrelated to the inputs the workflow needs.',
     '- ABANDON: the user wants to drop the run ("never mind", "forget it", "cancel that").',
     '',
-    'Bias toward ANSWERS whenever the message plausibly supplies a needed value. Normalize obvious wrappers (e.g. "use https://x.com" → value "https://x.com"). Output nothing but the marker line and any value lines.',
+    'Bias toward ANSWERS whenever the message plausibly supplies a needed value. Normalize obvious wrappers (e.g. "use https://site.example" → value "https://site.example"). Output nothing but the marker line and any value lines.',
   ].join('\n');
 }
 

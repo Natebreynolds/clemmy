@@ -2,12 +2,18 @@
  * Confirm the concurrency hypothesis: DataForSEO works sequentially but fails
  * under the parallel worker fan-out. Fire N calls AT ONCE (Promise.all, like the
  * fan-out) and report each one's status. Read-only.
- * Run: CLEMENTINE_HOME=~/.clementine-next npx tsx scripts/diag-dataforseo-concurrency.ts
+ * Run with at least two positional domains or:
+ * CLEMMY_DATAFORSEO_TARGETS="DOMAIN_A,DOMAIN_B" npx tsx scripts/diag-dataforseo-concurrency.ts
  */
 import { executeComposioTool } from '../src/integrations/composio/client.js';
+import { readLiveDomains } from './lib/live-domain-input.js';
 
 const SLUG = 'DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE';
-const targets = ['ramoslaw.com', 'coloradolaw.net', 'zanerhardenlaw.com', 'adlergiersch.com', 'damorelaw.com'];
+const targets = readLiveDomains({
+  envName: 'CLEMMY_DATAFORSEO_TARGETS',
+  min: 2,
+  usage: 'Usage: npx tsx scripts/diag-dataforseo-concurrency.ts DOMAIN DOMAIN [DOMAIN ...]',
+});
 
 function classify(r: unknown): string {
   const s = typeof r === 'string' ? r : JSON.stringify(r);

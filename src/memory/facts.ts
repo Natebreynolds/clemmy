@@ -874,8 +874,8 @@ export function searchFactsByTextAt(query: string, asOf: string, limit = 5): Con
  * Union recall for the persistent-context "Relevant To Your Request" block
  * (Phase 4 — close the Claude lane's knowledge starvation). FTS keyword hits go
  * FIRST (precision), then semantic hits fill the remaining slots — so a
- * paraphrased request that shares NO tokens with the stored fact ("market leader"
- * vs "Market_Leader__c is true") still recalls it. Deduped by id, FTS-ranked
+ * paraphrased request that shares NO tokens with the stored fact ("priority account"
+ * vs "Priority_Account__c is true") still recalls it. Deduped by id, FTS-ranked
  * first; strictly ADDITIVE to the FTS-only path (never drops a keyword hit).
  * Falls back to pure FTS when embeddings are unavailable. Never throws.
  */

@@ -40,7 +40,7 @@ beforeEach(() => {
 });
 
 test('backupMemoryDb writes a consistent snapshot containing the facts', () => {
-  rememberFact({ kind: 'user', content: 'Nathan prefers concise replies.' });
+  rememberFact({ kind: 'user', content: 'Alexander prefers concise replies.' });
   const result = backupMemoryDb({ retain: 7 });
   assert.ok(result, 'backup returns a result');
   assert.ok(existsSync(result!.backupPath), 'backup file exists on disk');

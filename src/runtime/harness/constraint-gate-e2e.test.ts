@@ -29,7 +29,7 @@ const { findEmailSendConstraint, findOutlookCalendarReadConstraint, checkConstra
 const { verifyOutlookSender, extractMailboxEmails, clearSenderVerificationCache, resolveCompliantSenderConnection } = await import('./sender-verify.js');
 
 const SENDER_RULE =
-  'Email sending constraint: always send email via nathan.reynolds@scorpion.com (Scorpion Outlook mailbox) unless Nate explicitly directs otherwise.';
+  'Email sending constraint: always send email via alex.chen@legacy.example (Acme Outlook mailbox) unless Alex explicitly directs otherwise.';
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -202,14 +202,14 @@ test('rememberFact(kind=constraint) → listConstraints → gate applies to the 
   // The EXACT shape of the 2026-06-11 incident sends.
   const rule = findEmailSendConstraint('OUTLOOK_OUTLOOK_SEND_EMAIL', {
     user_id: 'me',
-    to_email: 'jeff@gnlaw.nyc',
+    to_email: 'jordan@metro-legal.example',
     subject: 'Albany PI search visibility',
     body: '…',
     is_html: false,
     save_to_sent_items: true,
   });
   assert.ok(rule, 'sender rule must apply to an Outlook send');
-  assert.equal(rule?.allowedAccount, 'nathan.reynolds@scorpion.com');
+  assert.equal(rule?.allowedAccount, 'alex.chen@legacy.example');
 
   // Reads and profile lookups are NOT gated (no recursion, no read friction).
   assert.equal(findEmailSendConstraint('OUTLOOK_GET_PROFILE', { user_id: 'me' }), null);
@@ -244,7 +244,7 @@ test('verifyOutlookSender blocks the wrong mailbox and passes the right one', as
   const rule = findEmailSendConstraint('OUTLOOK_OUTLOOK_SEND_EMAIL', { user_id: 'me' });
   assert.ok(rule);
 
-  // Wrong mailbox — the incident: user_id 'me' resolved to breakthroughcoaching.
+  // Wrong mailbox — the incident: user_id 'me' resolved to legacy_coaching.
   clearSenderVerificationCache();
   const wrong = await verifyOutlookSender({
     rule: rule!,
@@ -252,14 +252,14 @@ test('verifyOutlookSender blocks the wrong mailbox and passes the right one', as
     userId: 'me',
     fetchProfile: async () => ({
       successful: true,
-      data: { mail: 'nathan@breakthroughcoaching.ai', userPrincipalName: 'nathan@breakthroughcoaching.ai' },
+      data: { mail: 'alex@corp.example', userPrincipalName: 'alex@corp.example' },
     }),
   });
   assert.equal(wrong.ok, false, 'wrong connected mailbox MUST block the send');
-  assert.match(wrong.message ?? '', /nathan@breakthroughcoaching\.ai/);
-  assert.match(wrong.message ?? '', /nathan\.reynolds@scorpion\.com/);
+  assert.match(wrong.message ?? '', /alex@corp\.example/);
+  assert.match(wrong.message ?? '', /alex\.chen@legacy\.example/);
 
-  // Right mailbox — verified Scorpion account proceeds.
+  // Right mailbox — verified Acme account proceeds.
   clearSenderVerificationCache();
   const right = await verifyOutlookSender({
     rule: rule!,
@@ -267,7 +267,7 @@ test('verifyOutlookSender blocks the wrong mailbox and passes the right one', as
     userId: 'me',
     fetchProfile: async () => ({
       successful: true,
-      data: { mail: 'Nathan.Reynolds@scorpion.com', proxyAddresses: ['SMTP:nathan.reynolds@scorpion.com'] },
+      data: { mail: 'alex.chen@legacy.example', proxyAddresses: ['SMTP:alex.chen@legacy.example'] },
     }),
   });
   assert.equal(right.ok, true, 'verified correct mailbox must pass');
@@ -301,7 +301,7 @@ test('verifyOutlookSender fails CLOSED and caches the profile lookup', async () 
     rule: rule!,
     toolSlug: 'GMAIL_SEND_EMAIL',
     userId: 'me',
-    fetchProfile: async () => ({ successful: true, data: { mail: 'whoever@gmail.com' } }),
+    fetchProfile: async () => ({ successful: true, data: { mail: 'whoever@personal.example' } }),
   });
   assert.equal(gmail.ok, false);
 
@@ -310,7 +310,7 @@ test('verifyOutlookSender fails CLOSED and caches the profile lookup', async () 
   let calls = 0;
   const fetchOnce = async () => {
     calls++;
-    return { successful: true, data: { mail: 'nathan.reynolds@scorpion.com' } };
+    return { successful: true, data: { mail: 'alex.chen@legacy.example' } };
   };
   for (let i = 0; i < 17; i++) {
     const v = await verifyOutlookSender({
@@ -326,10 +326,10 @@ test('verifyOutlookSender fails CLOSED and caches the profile lookup', async () 
 
 test('extractMailboxEmails tolerates wrapper drift', () => {
   assert.deepEqual(
-    extractMailboxEmails({ data: { response_data: { mail: 'A@B.com', proxyAddresses: ['SMTP:a@b.com', 'smtp:alias@b.com'] } } }),
-    ['a@b.com', 'alias@b.com'],
+    extractMailboxEmails({ data: { response_data: { mail: 'A@BETA.EXAMPLE', proxyAddresses: ['SMTP:a@beta.example', 'smtp:alias@beta.example'] } } }),
+    ['a@beta.example', 'alias@beta.example'],
   );
-  assert.deepEqual(extractMailboxEmails({ data: { text: 'profile: someone@x.co' } }), ['someone@x.co']);
+  assert.deepEqual(extractMailboxEmails({ data: { text: 'profile: someone@site-alt.example' } }), ['someone@site-alt.example']);
   assert.deepEqual(extractMailboxEmails(null), []);
 });
 
@@ -340,7 +340,7 @@ test('tool-bound rules: constraints ride with the toolkit they name, globally', 
 
   const banner = renderToolkitConstraintBanner('outlook');
   assert.ok(banner?.includes('STANDING RULES'), 'banner must render for a bound toolkit');
-  assert.ok(banner?.includes('nathan.reynolds@scorpion.com'));
+  assert.ok(banner?.includes('alex.chen@legacy.example'));
 
   // Unrelated toolkits carry NO banner — zero noise where no rule binds.
   assert.equal(renderToolkitConstraintBanner('airtable'), null);
@@ -352,16 +352,16 @@ test('tool-bound rules: constraints ride with the toolkit they name, globally', 
 test('pinned Outlook calendar reads route to the pinned connection only when the intent names the rule label', () => {
   const saved = rememberFact({
     kind: 'constraint',
-    content: 'For Scorpion calendar lookups, use Outlook connection ca_T9pDCuTalAI3 as the Scorpion calendar connection; the other active Outlook connection returned no Scorpion calendar events.',
+    content: 'For Acme calendar lookups, use Outlook connection ca_fixture_primary_calendar as the Acme calendar connection; the other active Outlook connection returned no Acme calendar events.',
   });
   assert.equal(saved.kind, 'constraint');
 
   const routed = findOutlookCalendarReadConstraint(
     'OUTLOOK_GET_CALENDAR_VIEW',
     { start_date_time: '2026-07-02T00:00:00-07:00', end_date_time: '2026-07-03T00:00:00-07:00' },
-    'Can you check my Scorpion calendar for tomorrow?',
+    'Can you check my Acme calendar for tomorrow?',
   );
-  assert.equal(routed?.routeConnectionId, 'ca_T9pDCuTalAI3');
+  assert.equal(routed?.routeConnectionId, 'ca_fixture_primary_calendar');
 
   assert.equal(
     findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'Can you check my calendar for tomorrow?'),
@@ -369,25 +369,25 @@ test('pinned Outlook calendar reads route to the pinned connection only when the
     'generic calendar reads must not collapse to one pinned account',
   );
   assert.equal(
-    findOutlookCalendarReadConstraint('OUTLOOK_CREATE_EVENT', {}, 'Add this to my Scorpion calendar'),
+    findOutlookCalendarReadConstraint('OUTLOOK_CREATE_EVENT', {}, 'Add this to my Acme calendar'),
     null,
     'calendar writes must stay outside the read-route helper',
   );
 
   // The label is data-driven, not hardcoded: a second pinned calendar with a
   // different org name routes independently, and each intent picks ITS rule.
-  const acme = rememberFact({
+  const globex = rememberFact({
     kind: 'constraint',
-    content: 'For Acme calendar lookups, use Outlook connection ca_AcmeRoute0001.',
+    content: 'For Globex calendar lookups, use Outlook connection ca_fixture_secondary_calendar.',
   });
-  assert.equal(acme.kind, 'constraint');
+  assert.equal(globex.kind, 'constraint');
   assert.equal(
-    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'anything on the Acme calendar this week?')?.routeConnectionId,
-    'ca_AcmeRoute0001',
+    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'anything on the Globex calendar this week?')?.routeConnectionId,
+    'ca_fixture_secondary_calendar',
   );
   assert.equal(
-    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'Can you check my Scorpion calendar for tomorrow?')?.routeConnectionId,
-    'ca_T9pDCuTalAI3',
+    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'Can you check my Acme calendar for tomorrow?')?.routeConnectionId,
+    'ca_fixture_primary_calendar',
     'with several pinned calendars the intent must route to the rule it names',
   );
 });
@@ -399,8 +399,8 @@ test('multi-account resolution: routes the send to the constraint-compliant conn
   // Two mailboxes connected ON PURPOSE (scrape both, send from one) — the
   // user's real topology. No explicit connection id on the send.
   const profileByConnection: Record<string, unknown> = {
-    ca_breakthrough: { successful: true, data: { mail: 'nathan@breakthroughcoaching.ai' } },
-    ca_scorpion: { successful: true, data: { mail: 'nathan.reynolds@scorpion.com' } },
+    ca_legacy: { successful: true, data: { mail: 'alex@legacy.example' } },
+    ca_acme: { successful: true, data: { mail: 'alex.chen@legacy.example' } },
     ca_stale: { successful: false, error: 'token expired' },
   };
   const fetchProfile = async (_slug: string, _args: Record<string, unknown>, connectionId?: string) => {
@@ -415,14 +415,14 @@ test('multi-account resolution: routes the send to the constraint-compliant conn
     toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
     userId: 'me',
     connections: [
-      { connectionId: 'ca_breakthrough', status: 'ACTIVE' },
+      { connectionId: 'ca_legacy', status: 'ACTIVE' },
       { connectionId: 'ca_stale', status: 'EXPIRED' },
-      { connectionId: 'ca_scorpion', status: 'ACTIVE' },
+      { connectionId: 'ca_acme', status: 'ACTIVE' },
     ],
     fetchProfile,
   });
   assert.equal(routed.ok, true, 'a compliant connection must let the send proceed');
-  assert.equal(routed.routeConnectionId, 'ca_scorpion', 'send must ROUTE to the verified compliant connection');
+  assert.equal(routed.routeConnectionId, 'ca_acme', 'send must ROUTE to the verified compliant connection');
 
   // Metadata hint (accountEmail) probes the likely match first — but the
   // route is still confirmed by a real profile lookup.
@@ -437,37 +437,37 @@ test('multi-account resolution: routes the send to the constraint-compliant conn
     toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
     userId: 'me',
     connections: [
-      { connectionId: 'ca_breakthrough', status: 'ACTIVE', accountEmail: 'nathan@breakthroughcoaching.ai' },
-      { connectionId: 'ca_scorpion', status: 'ACTIVE', accountEmail: 'Nathan.Reynolds@scorpion.com' },
+      { connectionId: 'ca_legacy', status: 'ACTIVE', accountEmail: 'alex@legacy.example' },
+      { connectionId: 'ca_acme', status: 'ACTIVE', accountEmail: 'alex.chen@legacy.example' },
     ],
     fetchProfile: counted,
   });
-  assert.equal(metaRouted.routeConnectionId, 'ca_scorpion');
-  assert.equal(probes[0], 'ca_scorpion', 'metadata-suggested match must be probed first');
+  assert.equal(metaRouted.routeConnectionId, 'ca_acme');
+  assert.equal(probes[0], 'ca_acme', 'metadata-suggested match must be probed first');
 });
 
 test('multi-account resolution: explicit wrong connection blocks and names the compliant one', async () => {
   const rule = findEmailSendConstraint('OUTLOOK_OUTLOOK_SEND_EMAIL', { user_id: 'me' });
   assert.ok(rule);
   const fetchProfile = async (_slug: string, _args: Record<string, unknown>, connectionId?: string) =>
-    connectionId === 'ca_scorpion'
-      ? { successful: true, data: { mail: 'nathan.reynolds@scorpion.com' } }
-      : { successful: true, data: { mail: 'nathan@breakthroughcoaching.ai' } };
+    connectionId === 'ca_acme'
+      ? { successful: true, data: { mail: 'alex.chen@legacy.example' } }
+      : { successful: true, data: { mail: 'alex@corp.example' } };
 
   clearSenderVerificationCache();
   const blocked = await resolveCompliantSenderConnection({
     rule: rule!,
     toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
     userId: 'me',
-    explicitConnectionId: 'ca_breakthrough',
+    explicitConnectionId: 'ca_legacy',
     connections: [
-      { connectionId: 'ca_breakthrough', status: 'ACTIVE' },
-      { connectionId: 'ca_scorpion', status: 'ACTIVE' },
+      { connectionId: 'ca_legacy', status: 'ACTIVE' },
+      { connectionId: 'ca_acme', status: 'ACTIVE' },
     ],
     fetchProfile,
   });
   assert.equal(blocked.ok, false, 'an explicit non-compliant choice is never silently rerouted');
-  assert.match(blocked.message ?? '', /ca_scorpion/, 'block message must name the compliant connection for one-shot recovery');
+  assert.match(blocked.message ?? '', /ca_acme/, 'block message must name the compliant connection for one-shot recovery');
 
   // No compliant connection anywhere → block listing the inventory.
   clearSenderVerificationCache();
@@ -475,11 +475,11 @@ test('multi-account resolution: explicit wrong connection blocks and names the c
     rule: rule!,
     toolSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
     userId: 'me',
-    connections: [{ connectionId: 'ca_breakthrough', status: 'ACTIVE' }],
+    connections: [{ connectionId: 'ca_legacy', status: 'ACTIVE' }],
     fetchProfile,
   });
   assert.equal(none.ok, false);
-  assert.match(none.message ?? '', /nathan@breakthroughcoaching\.ai/);
+  assert.match(none.message ?? '', /alex@corp\.example/);
 
   // Zero connections → fail closed.
   const empty = await resolveCompliantSenderConnection({

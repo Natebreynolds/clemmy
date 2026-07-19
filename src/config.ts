@@ -391,7 +391,7 @@ const DISCORD_ENABLED_RAW = getEnv('DISCORD_ENABLED', '').toLowerCase();
 // now matches. The legacy gateway path stays as a kill-switch
 // (DISCORD_HARNESS_ENABLED=false) for reversibility until it's deleted
 // post-soak. handleDiscordHarnessMessage (discord-harness.ts, tested) is
-// the path Nathan has run in production.
+// the production-tested path.
 export const DISCORD_HARNESS_ENABLED = !['false', '0', 'no', 'off'].includes(
   getEnv('DISCORD_HARNESS_ENABLED', 'true').toLowerCase(),
 );

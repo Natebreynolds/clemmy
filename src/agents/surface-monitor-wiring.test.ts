@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { scoreMessage, type UnreadMessage } from './inbox-monitor.js';
 import { scoreEvent, type CalEvent } from './calendar-monitor.js';
 
-const msg = (subject: string, preview: string, fromAddress = 'alice@acme.com', fromName = 'Alice'): UnreadMessage =>
+const msg = (subject: string, preview: string, fromAddress = 'alice@acme.example', fromName = 'Alice'): UnreadMessage =>
   ({ id: 'm1', subject, fromName, fromAddress, receivedAt: '', preview });
 
 // ── INBOX ────────────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ test('FIREHOSE SUPPRESSED: a reply-thread-with-? is WATCHed, not surfaced', () =
 
 test('promo + bulk are still hard-excluded (pre-scorer)', () => {
   assert.equal(scoreMessage(msg('50% OFF', 'Huge sale — shop now! Unsubscribe anytime.')).needsYou, false);
-  assert.equal(scoreMessage(msg('Receipt', 'Your order shipped', 'noreply@store.com', 'Store')).needsYou, false);
+  assert.equal(scoreMessage(msg('Receipt', 'Your order shipped', 'noreply@store.example', 'Store')).needsYou, false);
 });
 
 test('every scored message carries a triage decision now (no flag gate)', () => {

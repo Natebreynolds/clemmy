@@ -79,7 +79,7 @@ test('normalizeHostHeader strips ports and IPv6 brackets', () => {
 test('rebinding: an unknown Host name is refused with 421', async () => {
   const app = await startApp();
   try {
-    const res = await rawRequest(app.port, { path: '/api/status', headers: { Host: 'evil.com' } });
+    const res = await rawRequest(app.port, { path: '/api/status', headers: { Host: 'evil.example' } });
     assert.equal(res.status, 421, 'a rebound attacker hostname must not reach the API surface');
   } finally {
     await app.close();
@@ -122,7 +122,7 @@ test('CLEMENTINE_EXTRA_ALLOWED_HOSTS widens the allowlist', () => {
   try {
     assert.equal(isAllowedHost('my-box.lan', { hostname: null }), true);
     assert.equal(isAllowedHost('other.example', { hostname: null }), true);
-    assert.equal(isAllowedHost('evil.com', { hostname: null }), false);
+    assert.equal(isAllowedHost('evil.example', { hostname: null }), false);
   } finally {
     if (prior === undefined) delete process.env.CLEMENTINE_EXTRA_ALLOWED_HOSTS;
     else process.env.CLEMENTINE_EXTRA_ALLOWED_HOSTS = prior;
@@ -134,7 +134,7 @@ test('cross-origin mutation is refused, same-origin passes', async () => {
   try {
     const cross = await rawRequest(app.port, {
       method: 'POST', path: '/api/mutate',
-      headers: { Host: '127.0.0.1', Origin: 'https://evil.com' },
+      headers: { Host: '127.0.0.1', Origin: 'https://evil.example' },
     });
     assert.equal(cross.status, 403);
 

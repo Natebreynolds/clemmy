@@ -88,7 +88,8 @@ test('surfacePlan: renders applied instructions as user-facing context', () => {
     plan: aPlan({
       appliedInstructions: [
         'Never email clients on Fridays (source: feedback)',
-        'Generate a complete Scorpion pre-proposal audit brief workflow exists at `00-System/workflows/proposal-audit-brief/SKILL.md`; use relevant research/briefing steps but omit deploy/notify. (source: workflow memory + SKILL.md)',
+        'Generate a complete Acme pre-proposal audit brief workflow exists at `00-System/workflows/proposal-audit-brief/SKILL.md`; use relevant research/briefing steps but omit deploy/notify. (source: workflow memory + SKILL.md)',
+        'Keep prospect outreach low-jargon and omit raw scheduling links (source: feedback)',
       ],
     }),
     originatingRequest: 'Send the weekly client digest.',
@@ -99,6 +100,7 @@ test('surfacePlan: renders applied instructions as user-facing context', () => {
   assert.match(notif!.body, /Context I will use/);
   assert.match(notif!.body, /Never email clients on Fridays/);
   assert.match(notif!.body, /Use the relevant saved proposal workflow/);
+  assert.match(notif!.body, /saved outbound-writing guidance/);
   assert.doesNotMatch(notif!.body, /Instructions I'm following/);
   assert.doesNotMatch(notif!.body, /source:/i);
   assert.doesNotMatch(notif!.body, /SKILL\.md/);
@@ -292,10 +294,10 @@ test('approve with enumerated sends → opens a GOAL-SCOPED scope blessing exact
   const sessionId = 'sess-sendbound-1';
   const p = surfacePlan({
     plan: aPlan({
-      objective: 'Send personalized outreach to the 8 market-leader firms.',
+      objective: 'Send personalized outreach to the 8 priority-account firms.',
       externalSends: [{ slug: 'OUTLOOK_SEND_EMAIL', summary: 'outreach to 8 firms', count: 8 }],
     }),
-    originatingRequest: 'Send the 8 Scorpion outreach emails.',
+    originatingRequest: 'Send the 8 Acme outreach emails.',
     sessionId,
   });
   const approved = approvePlanProposal(p.id);

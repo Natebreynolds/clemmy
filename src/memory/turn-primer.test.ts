@@ -149,7 +149,7 @@ test('primer emits each canonical ref once and stays within the working-turn bud
 test('primer timeout is bounded and creates no attribution run', { timeout: 30_000 }, async () => {
   _setUnifiedTurnPrimerRecallForTest(async () => await new Promise(() => { /* deliberately stalled */ }));
   const primer = await buildUnifiedTurnPrimer({
-    query: 'market leader accounts', surface: 'automatic_primer', timeoutMs: 25,
+    query: 'priority account accounts', surface: 'automatic_primer', timeoutMs: 25,
   });
   assert.equal(primer.status, 'timeout');
   // The explicit test timeout is the runaway guard. A wall-clock assertion is

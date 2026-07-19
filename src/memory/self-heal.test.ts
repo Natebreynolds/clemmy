@@ -101,7 +101,7 @@ function setEmbedding(id: number, vector: number[]) {
 
 test('runMemorySelfHeal: retires internal-noise facts, keeps real facts, audits, and reverts', async () => {
   const noise = rememberFact({ kind: 'project', content: 'Internal task list result from memory_read', derivedFrom: { tool: 'memory_read', sessionId: 's1' } });
-  const real = rememberFact({ kind: 'project', content: 'The Aldous project uses a generated one-page site.' });
+  const real = rememberFact({ kind: 'project', content: 'The Sample project uses a generated one-page site.' });
 
   const out = await runMemorySelfHeal({ maxApply: 5, nowIso: '2026-07-04T12:00:00.000Z' });
   assert.equal(out.ran, true);
@@ -124,7 +124,7 @@ test('runMemorySelfHeal: retires internal-noise facts, keeps real facts, audits,
 
 test('legacy conversational requests enter review but are never retired automatically', async () => {
   const request = rememberFact({ kind: 'user', content: 'Can you fix the memory graph and show me what changed' });
-  const declarative = rememberFact({ kind: 'user', content: 'Nathan prefers concise progress updates.' });
+  const declarative = rememberFact({ kind: 'user', content: 'Alexander prefers concise progress updates.' });
 
   const candidates = detectMemoryHealCandidates({ persistProposals: true, maxCandidates: 20, nowIso: '2027-07-04T12:00:00.000Z' });
   const fix = candidates.find((candidate) => candidate.kind === 'retire_transient_request' && candidate.targetIds.includes(request.id));
@@ -165,7 +165,7 @@ test('legacy request shape detector excludes durable capture wrappers and proper
   assert.equal(looksLikeLegacyTransientRequest('When writing client updates, use concise outcome-first language.'), false);
   assert.equal(looksLikeLegacyTransientRequest('When meeting Sarah tomorrow, send the draft.'), true);
   assert.equal(looksLikeLegacyTransientRequest('When reviewing this, can you fix the title?'), true);
-  assert.equal(looksLikeLegacyTransientRequest('When Nate says “scorpion email,” it refers to his main Outlook account.'), false);
+  assert.equal(looksLikeLegacyTransientRequest('When Alex says “acme email,” it refers to his main Outlook account.'), false);
   assert.equal(looksLikeLegacyTransientRequest('Will Smith is attached to the Acme project.'), false);
   assert.equal(looksLikeLegacyTransientRequest('Clementine requirement: always ask before deleting a memory.'), false);
 });
@@ -180,7 +180,7 @@ test('legacy transient review scans the complete direct-fact pool beyond the for
   `);
   db.transaction(() => {
     for (let i = 0; i < 5001; i += 1) {
-      insert.run(`Nathan has durable profile attribute number ${i}.`, `self-heal-direct-tail-${i}`, now, now);
+      insert.run(`Alexander has durable profile attribute number ${i}.`, `self-heal-direct-tail-${i}`, now, now);
     }
   })();
   const request = rememberFact({ kind: 'user', content: 'Can you fix the view here because I am not seeing the data' });
@@ -319,11 +319,11 @@ test('preview candidate detection and dry-run do not persist proposals or mutate
 });
 
 test('merge_duplicate: requires judge approval, merges lower-quality duplicate, and can revert', async () => {
-  const keep = rememberFact({ kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.', score: 5, importance: 8 });
-  const drop = rememberFact({ kind: 'project', content: 'The Revill Law Firm SEO report is at revill-lawfirm.com/report.', score: 1, importance: 6 });
-  const companyId = upsertEntity({ type: 'company', name: 'Revill Law Firm' });
+  const keep = rememberFact({ kind: 'project', content: 'Example Legal Group SEO report lives at example-legal.example/report.', score: 5, importance: 8 });
+  const drop = rememberFact({ kind: 'project', content: 'The Example Legal Group SEO report is at example-legal.example/report.', score: 1, importance: 6 });
+  const companyId = upsertEntity({ type: 'company', name: 'Example Legal Group' });
   const report = upsertResourcePointer({
-    app: 'Google Drive', kind: 'file', name: 'Revill SEO Report', providerId: 'revill-report',
+    app: 'Google Drive', kind: 'file', name: 'Example Legal SEO Report', providerId: 'example-legal-report',
   });
   const [dropEvidence] = getFactEvidence(drop.id);
   assert.ok(dropEvidence);
@@ -399,8 +399,8 @@ test('merge_duplicate: requires judge approval, merges lower-quality duplicate, 
 });
 
 test('merge_duplicate probe rejects entity-mismatched facts even with similar embeddings', async () => {
-  const a = rememberFact({ kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.', score: 5 });
-  const b = rememberFact({ kind: 'project', content: 'Aldous Law SEO report lives at aldouslaw.com/report.', score: 1 });
+  const a = rememberFact({ kind: 'project', content: 'Example Legal Group SEO report lives at example-legal.example/report.', score: 5 });
+  const b = rememberFact({ kind: 'project', content: 'Sample Law Partners SEO report lives at sample-law.example/report.', score: 1 });
   setEmbedding(a.id, [1, 0, 0, 0]);
   setEmbedding(b.id, [0.999, 0.001, 0, 0]);
   const fixes = detectMemoryHealCandidates();
@@ -503,12 +503,12 @@ test('fix-family filtering prevents unrelated hygiene candidates from starving d
 test('supersede_stale_fact: only lower-trust derived preference is deactivated', async () => {
   const old = rememberFact({
     kind: 'user',
-    content: 'Nathan prefers Tuesday calls.',
+    content: 'Alexander prefers Tuesday calls.',
     trustLevel: 0.5,
     derivedFrom: { tool: 'calendar_read', sessionId: 's1' },
   });
   ageFact(old.id, 40);
-  const newer = rememberFact({ kind: 'user', content: 'Nathan now prefers Wednesday calls.', trustLevel: 1 });
+  const newer = rememberFact({ kind: 'user', content: 'Alexander now prefers Wednesday calls.', trustLevel: 1 });
 
   const fixes = detectMemoryHealCandidates({ nowIso: '2026-07-04T12:00:00.000Z' });
   const fix = fixes.find((f) => f.kind === 'supersede_stale_fact');
@@ -523,9 +523,9 @@ test('supersede_stale_fact: only lower-trust derived preference is deactivated',
 });
 
 test('supersede_stale_fact: user-vs-user contradictions are not auto candidates', () => {
-  const old = rememberFact({ kind: 'user', content: 'Nathan prefers Tuesday calls.', trustLevel: 1 });
+  const old = rememberFact({ kind: 'user', content: 'Alexander prefers Tuesday calls.', trustLevel: 1 });
   ageFact(old.id, 40);
-  rememberFact({ kind: 'user', content: 'Nathan now prefers Wednesday calls.', trustLevel: 1 });
+  rememberFact({ kind: 'user', content: 'Alexander now prefers Wednesday calls.', trustLevel: 1 });
   assert.equal(detectMemoryHealCandidates().some((f) => f.kind === 'supersede_stale_fact'), false);
 });
 
@@ -547,8 +547,8 @@ test('kill switches and caps are honored', async () => {
 });
 
 test('supersession parser keeps correction subject stable', () => {
-  const p = _memorySelfHealTest.parsePreferenceFact('Actually Nathan now prefers Wednesday calls.');
-  assert.equal(p?.subject, 'nathan');
+  const p = _memorySelfHealTest.parsePreferenceFact('Actually Jordan now prefers Wednesday calls.');
+  assert.equal(p?.subject, 'jordan');
   assert.equal(p?.property, 'preference');
   assert.equal(p?.value, 'wednesday calls');
 });
@@ -574,8 +574,8 @@ test('parseMemoryVetoVerdict: FAILS CLOSED — no marker / empty output → unav
 });
 
 test('applyMemoryFix: an "unavailable" verdict is a FAIL-CLOSED skip (the fix is NOT applied)', async () => {
-  const keep = rememberFact({ kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.', score: 5, importance: 8 });
-  const drop = rememberFact({ kind: 'project', content: 'The Revill Law Firm SEO report is at revill-lawfirm.com/report.', score: 1, importance: 6 });
+  const keep = rememberFact({ kind: 'project', content: 'Example Legal Group SEO report lives at example-legal.example/report.', score: 5, importance: 8 });
+  const drop = rememberFact({ kind: 'project', content: 'The Example Legal Group SEO report is at example-legal.example/report.', score: 1, importance: 6 });
   setEmbedding(keep.id, [1, 0, 0, 0]);
   setEmbedding(drop.id, [0.999, 0.001, 0, 0]);
   const candidates = detectMemoryHealCandidates({ nowIso: '2026-07-08T12:00:00.000Z' });

@@ -67,7 +67,7 @@ test('formatComposioToolOutput stores full oversized JSON before returning a rec
   assert.ok(output.length < full.length, 'model-facing output should be clipped');
   assert.match(output, /recall_tool_result\("call_composio_full"\)/);
   // List payload → the footer now reports the TRUE item count + that recall
-  // returns ALL of them (the scorpion 44→4 fix), not a bare char count.
+  // returns ALL of them (the acme 44→4 fix), not a bare char count.
   assert.match(output, /20 value/);
   assert.match(output, /ALL 20/);
 
@@ -241,7 +241,7 @@ test('applySuppressedComposioConnectionPolicy ignores expired quarantine windows
 test('buildComposioStatusPayload puts usable connections first and does not expose suppressed ids by default', () => {
   const connections = [
     { slug: 'outlook', connectionId: 'ca_personal', status: 'ACTIVE' },
-    { slug: 'outlook', connectionId: 'ca_scorpion', status: 'ACTIVE' },
+    { slug: 'outlook', connectionId: 'ca_acme', status: 'ACTIVE' },
     { slug: 'slack', connectionId: 'ca_old_slack', status: 'EXPIRED' },
   ];
   const suppressed = [
@@ -278,7 +278,7 @@ test('buildComposioStatusPayload puts usable connections first and does not expo
   assert.equal(counts.suppressedByToolkit.outlook, 2);
   assert.deepEqual(
     usable.filter((connection) => connection.slug === 'outlook').map((connection) => connection.connectionId),
-    ['ca_personal', 'ca_scorpion'],
+    ['ca_personal', 'ca_acme'],
   );
   assert.deepEqual(hidden.map((connection) => connection.reason), ['entity-mismatch', 'expired']);
   assert.ok(hidden.every((connection) => connection.connectionId === undefined));
@@ -368,7 +368,7 @@ test('composioFailureProvesNoCommit: prose-only NOT-FOUND is not proof — only 
 });
 
 test('detectComposioFailure: a 5-digit API "Ok" status code (DataForSEO 20000) is NOT a failure', () => {
-  // Live regression (sess-mpzre9m2, 2026-06-04): a SUCCESSFUL DataForSEO call —
+  // Success-payload regression: a SUCCESSFUL DataForSEO call —
   // `successful:true, error:null, data.status_code:20000` ("Ok") — was flagged
   // as a HARD failure because `20000 >= 400`, so the model abandoned a 94KB
   // payload and looped across other endpoints. Must read as success.
@@ -620,7 +620,7 @@ test('auto-remember: a FAILED execute memorizes nothing', async () => {
   noteComposioSearchIntent('sess-auto-2', intent);
   await maybeAutoRememberComposioChoice(
     'OUTLOOK_SEND_EMAIL',
-    { to: 'x@y.com' },
+    { to: 'x@personal.example' },
     { successful: false, error: 'Invalid request data provided' },
     'sess-auto-2',
   );
@@ -860,7 +860,7 @@ test('FIX1.4: kill-switch off → even a transient error gets the legacy hard co
   }
 });
 
-test('formatComposioExecuteOutput: an invalid-offset error redirects to recall, not guessed pagination (scorpion itr2 fix)', () => {
+test('formatComposioExecuteOutput: an invalid-offset error redirects to recall, not guessed pagination (acme itr2 fix)', () => {
   const out = formatComposioExecuteOutput(
     { error: "Invalid offset value: The offset 'itr2' is not valid. The offset must be an opaque token returned in the 'offset' field of a previous list records response.", successful: false },
     { toolName: 'composio_execute_tool', toolSlug: 'AIRTABLE_LIST_RECORDS' },
@@ -963,9 +963,9 @@ test('composio_search_tools: a query with NO confident memory falls through to n
 
 test('auto-remember fires for a BACKGROUND-lane success (lane-agnostic, just a sessionId)', async () => {
   const intent = 'brightdata scrape a public company profile page';
-  const bgSession = 'background:bg-mrbklth2-3e2840';
+  const bgSession = 'background:bg-attribution-fixture';
   noteComposioSearchIntent(bgSession, intent);
-  await maybeAutoRememberComposioChoice('BRIGHTDATA_SCRAPE_AS_MARKDOWN', { url: 'https://x.co' }, { successful: true, data: { markdown: 'hi' } }, bgSession);
+  await maybeAutoRememberComposioChoice('BRIGHTDATA_SCRAPE_AS_MARKDOWN', { url: 'https://site-alt.example' }, { successful: true, data: { markdown: 'hi' } }, bgSession);
   const rec = recallToolChoice(intent);
   assert.equal(rec?.choice?.identifier, 'BRIGHTDATA_SCRAPE_AS_MARKDOWN', 'a background-lane success is remembered too');
 });

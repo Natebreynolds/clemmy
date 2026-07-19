@@ -22,11 +22,11 @@ test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
 
 function queueSingleCall() {
   return queuePendingAction({
-    title: "Judge couldn't verify: c@firm.com",
+    title: "Judge couldn't verify: c@firm.example",
     summary: 'goal-fidelity judge outage — queued for one-tap approval',
     kind: 'external_send',
     toolName: 'composio_execute_tool',
-    payload: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'c@firm.com', subject: 's', body: 'hello' }) },
+    payload: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'c@firm.example', subject: 's', body: 'hello' }) },
     sessionId: 'sess-pae',
     createdBy: 'judge_fail_approval',
   });

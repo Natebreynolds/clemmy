@@ -27,17 +27,17 @@ beforeEach(() => {
 });
 
 test('appendFactRecallTrace records bounded fact metadata for later review', () => {
-  const fact = rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.', importance: 8 });
+  const fact = rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts.', importance: 8 });
   appendFactRecallTrace({
     surface: 'memory_search_facts',
-    query: 'market leader',
+    query: 'priority account',
     facts: [{ fact, reason: 'agent-tool-semantic-search' }],
     nowIso: '2026-07-04T12:00:00.000Z',
   });
 
   const [entry] = readFactRecallTrace(5);
   assert.equal(entry.surface, 'memory_search_facts');
-  assert.equal(entry.query, 'market leader');
+  assert.equal(entry.query, 'priority account');
   assert.equal(entry.facts.length, 1);
   assert.equal(entry.facts[0].id, fact.id);
   assert.equal(entry.facts[0].reason, 'agent-tool-semantic-search');
@@ -47,15 +47,15 @@ test('appendFactRecallTrace records bounded fact metadata for later review', () 
 test('renderFactsForInstructions traces pinned and scored facts with their reasons', () => {
   const pinned = rememberFact({ kind: 'feedback', content: 'Always preserve client source links.', importance: 9 });
   setFactPinned(pinned.id, true);
-  const scored = rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.', importance: 8 });
+  const scored = rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts.', importance: 8 });
 
-  const rendered = renderFactsForInstructions(10, 2600, 'market leader accounts');
+  const rendered = renderFactsForInstructions(10, 2600, 'priority account accounts');
 
   assert.match(rendered, /Always preserve client source links/);
-  assert.match(rendered, /Market_Leader__c/);
+  assert.match(rendered, /Priority_Account__c/);
   const [entry] = readFactRecallTrace(5);
   assert.equal(entry.surface, 'facts_for_instructions');
-  assert.equal(entry.objective, 'market leader accounts');
+  assert.equal(entry.objective, 'priority account accounts');
   assert.equal(entry.mode, 'all');
   assert.equal(entry.includedCount, 2);
   assert.equal(entry.omittedCount, 0);
@@ -65,13 +65,13 @@ test('renderFactsForInstructions traces pinned and scored facts with their reaso
 });
 
 test('renderFactsForInstructions traces only scored facts that survive clipping', () => {
-  const visible = rememberFact({ kind: 'project', content: 'Short visible market leader fact.', importance: 9 });
-  rememberFact({ kind: 'project', content: `Very long market leader detail ${'x'.repeat(1000)}`, importance: 8 });
+  const visible = rememberFact({ kind: 'project', content: 'Short visible priority account fact.', importance: 9 });
+  rememberFact({ kind: 'project', content: `Very long priority account detail ${'x'.repeat(1000)}`, importance: 8 });
 
-  const rendered = renderFactsForInstructions(10, 120, 'market leader');
+  const rendered = renderFactsForInstructions(10, 120, 'priority account');
   const [entry] = readFactRecallTrace(5);
 
-  assert.match(rendered, /Short visible market leader fact/);
+  assert.match(rendered, /Short visible priority account fact/);
   assert.ok(entry.facts.some((f) => f.id === visible.id));
   assert.ok(entry.facts.length < 2, 'clipped-away fact is not recorded as exposed');
   assert.equal(entry.includedCount, 1);

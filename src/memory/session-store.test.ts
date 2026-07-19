@@ -34,14 +34,14 @@ const turn = (role: 'user' | 'assistant', text: string) => ({
 
 test('first user turn auto-titles the session, then never overwrites', () => {
   const store = new SessionStore();
-  store.appendTurn('sess-auto', turn('user', 'Can you draft a follow-up email to the Revill firm?'));
+  store.appendTurn('sess-auto', turn('user', 'Can you draft a follow-up email to the Example Legal Group?'));
   let rec = store.get('sess-auto');
-  assert.equal(rec.title, 'draft a follow-up email to the Revill firm?');
+  assert.equal(rec.title, 'draft a follow-up email to the Example Legal Group?');
 
   // A second user turn must NOT change the title.
   store.appendTurn('sess-auto', turn('user', 'Actually make it shorter'));
   rec = store.get('sess-auto');
-  assert.equal(rec.title, 'draft a follow-up email to the Revill firm?');
+  assert.equal(rec.title, 'draft a follow-up email to the Example Legal Group?');
 });
 
 test('setMeta updates organize fields and bumps updatedAt', () => {

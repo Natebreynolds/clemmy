@@ -30,7 +30,7 @@ const { IDENTITY_FILE, loadMemoryContext } = await import('./vault.js');
 const SEED = [
   '# Identity',
   '',
-  'I am Clementine — Nate\'s executive assistant.',
+  'I am Clementine — Alex\'s executive assistant.',
   '',
   'I keep his work straight across tools.',
   '',
@@ -52,9 +52,9 @@ test('regenerateIdentityMd: default profile (no name set) is a no-op on the file
 
 test('regenerateIdentityMd: populated profile writes auto-section, preserves user content', () => {
   saveUserProfile({
-    displayName: 'Nathan Reynolds',
-    preferredName: 'Nate',
-    role: 'SVP of Sales',
+    displayName: 'Alexander Chen',
+    preferredName: 'Alex',
+    role: 'Product Lead',
     timezone: 'America/Los_Angeles',
     workingDays: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
     workingHoursStart: '08:00',
@@ -75,8 +75,8 @@ test('regenerateIdentityMd: populated profile writes auto-section, preserves use
   // Marker + auto section appended below
   assert.match(body, /AUTO-GENERATED/);
   assert.match(body, /## Working with/);
-  assert.match(body, /\*\*Name:\*\* Nathan Reynolds \(preferred: Nate\)/);
-  assert.match(body, /\*\*Role:\*\* SVP of Sales/);
+  assert.match(body, /\*\*Name:\*\* Alexander Chen \(preferred: Alex\)/);
+  assert.match(body, /\*\*Role:\*\* Product Lead/);
   assert.match(body, /\*\*Timezone:\*\* America\/Los_Angeles/);
   // Weekday helper kicked in
   assert.match(body, /weekdays \(Mon–Fri\)/);
@@ -84,7 +84,7 @@ test('regenerateIdentityMd: populated profile writes auto-section, preserves use
 
   const injectedIdentity = loadMemoryContext().identity ?? '';
   assert.match(injectedIdentity, /I am Clementine/);
-  assert.doesNotMatch(injectedIdentity, /AUTO-GENERATED|## Working with|SVP of Sales/, 'generated profile projection is not duplicated into the prompt');
+  assert.doesNotMatch(injectedIdentity, /AUTO-GENERATED|## Working with|Product Lead/, 'generated profile projection is not duplicated into the prompt');
 });
 
 test('regenerateIdentityMd: idempotent — second call is a no-op', () => {
@@ -100,17 +100,17 @@ test('regenerateIdentityMd: profile change triggers a write', () => {
   assert.equal(result.reason, 'updated');
   const body = readFileSync(IDENTITY_FILE, 'utf-8');
   assert.match(body, /\*\*Role:\*\* Chief Revenue Officer/);
-  assert.doesNotMatch(body, /\*\*Role:\*\* SVP of Sales/);
+  assert.doesNotMatch(body, /\*\*Role:\*\* Product Lead/);
 });
 
 test('regenerateIdentityMd: only preferred name set still renders cleanly', () => {
   // Reset profile to minimal — displayName falls back to default, but
   // preferred name should still produce a Name line.
-  saveUserProfile({ displayName: 'the user', preferredName: 'Nate' });
+  saveUserProfile({ displayName: 'the user', preferredName: 'Alex' });
   const result = regenerateIdentityMd();
   assert.equal(result.written, true);
   const body = readFileSync(IDENTITY_FILE, 'utf-8');
-  assert.match(body, /\*\*Name:\*\* Nate/);
-  // No "the user (preferred: Nate)" silliness
-  assert.doesNotMatch(body, /the user \(preferred: Nate\)/);
+  assert.match(body, /\*\*Name:\*\* Alex/);
+  // No "the user (preferred: Alex)" silliness
+  assert.doesNotMatch(body, /the user \(preferred: Alex\)/);
 });

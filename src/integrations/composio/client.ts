@@ -915,7 +915,7 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           // Identity enrichment: when the listing carries no email (Microsoft
           // tokens expose none), serve the mailbox a profile probe learned for
           // this connection — so same-mailbox re-auths merge and named accounts
-          // ("use my scorpion email") resolve. See identity-cache.ts.
+          // ("use my acme email") resolve. See identity-cache.ts.
           // Also persist the owning entity (raw v3 exposes it; the SDK strips it)
           // so a later v3 outage still pairs the correct owner at dispatch.
           if (connection.ownerUserId) recordConnectionOwner(connection.connectionId, connection.ownerUserId);
@@ -1553,7 +1553,7 @@ export async function listComposioToolkitTools(
  */
 // Successful slug→version resolutions are memoized with a TTL: long enough to
 // make the not-found retry deterministic instead of racing a fresh 5s fetch on
-// the batch's first cold item (sess-mrds80fu: item 1 of 10 died on exactly that
+// the batch's first cold item (ask-first batch regression: item 1 of 10 died on exactly that
 // race), short enough that a composio tool REPUBLISH (new pinned version) heals
 // without a daemon restart. Failures are never cached — the next call re-probes.
 const COMPOSIO_VERSION_TTL_MS = 15 * 60 * 1000;

@@ -187,7 +187,7 @@ export function NotchMeetingSurface({
   return (
     <main className="clemmy-live-stage" style={style} data-testid="clemmy-live-stage">
       <section className="clemmy-live-island clemmy-live-meeting" data-meeting-phase={state.phase} aria-label="Clementine meeting controls">
-        <header className="clemmy-live-header">
+        <header className="clemmy-live-header clemmy-live-meeting-header">
           <div className="clemmy-live-brand"><span aria-hidden><DogMark size={28} className="clemmy-live-dog" /></span><strong>Clementine</strong></div>
           <div className="clemmy-live-preview-banner clemmy-live-meeting-banner" role="status"><Video aria-hidden /><span>Recall meeting</span></div>
           <div className="clemmy-live-window-actions">

@@ -187,7 +187,7 @@ test('P0-3 sideEffect round-trips as side_effect — INCLUDING read', () => {
   const steps = readWorkflow('side-rt')!.data.steps;
   // A declared 'read' MUST survive rewrite. Undeclared ≠ read: undeclared
   // falls back to the prose heuristic, which has misclassified read-only
-  // steps as write and parked them on crash-resume (scorpion-facebook-trends
+  // steps as write and parked them on crash-resume (acme-facebook-trends
   // 2026-06-11). Dropping 'read' on rewrite silently resurrected that trap.
   assert.equal(steps.find((x) => x.id === 'pull')?.sideEffect, 'read');
   assert.equal(steps.find((x) => x.id === 'save')?.sideEffect, 'write');

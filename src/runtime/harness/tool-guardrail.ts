@@ -557,7 +557,7 @@ interface TrackedCall {
   /** Slug-aware live classification (isMutatingCall) persisted at track time so
    *  rehydrate can seed the same-mut count AUTHORITATIVELY — a gateway read is
    *  never folded in, and a gateway WRITE survives a restart (review
-   *  wf_2ed83f94 #9: a mid-runaway restart used to reset the halt counter).
+   *  turn-control review: a mid-runaway restart used to reset the halt counter).
    *  Optional — absent on rows persisted before this field. */
   mutating?: boolean;
   /** Explicit runtime classification. New rows always persist both the effect
@@ -894,7 +894,7 @@ export function evaluateToolCall(
   if (dangerousWrite) {
     const distinctArgsCount = tracker.distinctArgsByMutTool.get(toolName)?.size ?? 0;
     if (distinctArgsCount >= thresholds.sameMutToolHaltAt) {
-      // Approved-batch exemption (review wf_2ed83f94 #4): a user-blessed plan
+      // Approved-batch exemption (turn-control review): a user-blessed plan
       // scope covering this exact call means the distinct writes are the
       // APPROVED WORK, not a runaway — applyMode demotes the halt to warn.
       let scopeApproved = options?.approvedBatch === true;

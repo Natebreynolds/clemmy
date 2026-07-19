@@ -41,11 +41,11 @@ test('cited: a ref token inside a tool-call argument credits too', () => {
 
 test('content: a distinctive identifier from the snippet credits', () => {
   const detected = detectUsedRefs({
-    candidates: [{ type: 'fact', id: '7', snippet: 'The staging cluster lives at staging-eu.example.io port 8443.' }],
-    replyText: 'I pointed the smoke test at staging-eu.example.io and it passed.',
+    candidates: [{ type: 'fact', id: '7', snippet: 'The staging cluster lives at staging-eu.example port 8443.' }],
+    replyText: 'I pointed the smoke test at staging-eu.example and it passed.',
     queryText: 'is staging healthy?',
   });
-  assert.deepEqual(detected, [{ ref: { type: 'fact', id: '7', snippet: 'The staging cluster lives at staging-eu.example.io port 8443.' }, evidence: 'content' }]);
+  assert.deepEqual(detected, [{ ref: { type: 'fact', id: '7', snippet: 'The staging cluster lives at staging-eu.example port 8443.' }, evidence: 'content' }]);
 });
 
 test('content: echoing the user query does NOT credit', () => {

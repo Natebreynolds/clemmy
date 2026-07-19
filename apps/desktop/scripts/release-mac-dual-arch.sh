@@ -121,6 +121,46 @@ verify_console_web_packaged() {
   fi
 }
 
+verify_notch_helper_packaged() {
+  local arch="$1"
+  local expected_arch="$2"
+  local found=""
+  while IFS= read -r app; do
+    local helper="$app/Contents/Resources/notch-helper/ClementineNotchHelper"
+    if [[ -f "$helper" ]]; then
+      found="$helper"
+      echo "   notch click helper present: $helper"
+      [[ -x "$helper" ]] \
+        || { echo "::error::packaged notch helper is not executable: $helper"; exit 1; }
+      [[ "$(file "$helper")" == *"$expected_arch"* ]] \
+        || { echo "::error::notch helper for $arch has the wrong architecture: $(file "$helper")"; exit 1; }
+      /usr/bin/lipo "$helper" -verify_arch arm64 x86_64 \
+        || { echo "::error::packaged notch helper is not universal arm64+x86_64: $helper"; exit 1; }
+      local probe
+      probe="$("$helper" --probe)"
+      NOTCH_HELPER_PROBE="$probe" node --input-type=module -e \
+        'const value=JSON.parse(process.env.NOTCH_HELPER_PROBE); if(value?.type!=="probe"||value?.protocol!==1) process.exit(1)' \
+        || { echo "::error::packaged notch helper failed its protocol probe: $probe"; exit 1; }
+      if is_signed_release; then
+        codesign -v --strict "$helper" \
+          || { echo "::error::packaged notch helper is not validly signed: $helper"; exit 1; }
+        local signature
+        signature="$(codesign -dvvv "$helper" 2>&1)"
+        [[ "$signature" == *"TeamIdentifier=${APPLE_TEAM_ID}"* ]] \
+          || { echo "::error::packaged notch helper has an unexpected signing team: $helper"; exit 1; }
+        [[ "$signature" == *"flags="*"runtime"* ]] \
+          || { echo "::error::packaged notch helper is missing hardened runtime: $helper"; exit 1; }
+      else
+        echo "   notch helper codesign: skipped (unsigned build)"
+      fi
+    fi
+  done < <(find "$DESKTOP_DIR/release" -maxdepth 2 -name "Clementine.app" -type d 2>/dev/null)
+  if [[ -z "$found" ]]; then
+    echo "::error::native notch helper is MISSING from the $arch app — the top-edge dog would not accept clicks"
+    exit 1
+  fi
+}
+
 is_signed_release() {
   [[ "${CSC_IDENTITY_AUTO_DISCOVERY:-}" != "false" && "${APPLE_NOTARIZE_SKIP:-}" != "true" ]]
 }
@@ -331,6 +371,9 @@ build_arch() {
 
   echo "-> Verifying console-web bundle shipped ($arch)"
   verify_console_web_packaged "$arch"
+
+  echo "-> Verifying native notch click helper shipped + signed ($arch)"
+  verify_notch_helper_packaged "$arch" "$expected"
 
   echo "-> Verifying packaged app identity, architecture, and stat-only boot scan ($arch)"
   verify_packaged_app "$arch" "$expected"

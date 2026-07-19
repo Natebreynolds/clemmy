@@ -40,7 +40,7 @@ function seed(slug: string, opts: { view: string; runner?: string }) {
   }
 }
 const GOOD_VIEW = `<html><script>fetch('/api/console/spaces/x/contacts'+'/data').then(r=>r.json()).then(j=>render(j.data.contacts.contacts))</script></html>`;
-const ROWS = 'process.stdout.write(JSON.stringify({contacts:[{name:"Dana",email:"d@x.com"}]}))';
+const ROWS = 'process.stdout.write(JSON.stringify({contacts:[{name:"Dana",email:"d@site.example"}]}))';
 const EMPTY = 'process.stdout.write(JSON.stringify({contacts:[]}))';
 
 async function run(label: string, slug: string, args: Record<string, unknown>) {

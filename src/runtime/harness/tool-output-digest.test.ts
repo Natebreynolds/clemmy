@@ -9,10 +9,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { digestToolOutput, countDominantArray, dominantListCount } from './tool-output-digest.js';
 
-const accounts = Array.from({ length: 47 }, (_, i) => ({
-  Id: `001${i}`,
+const accounts = Array.from({ length: 37 }, (_, i) => ({
+  Id: `fixture-account-${i}`,
   Name: `Account ${i} with a reasonably long name to take up bytes`,
-  Website: `https://example${i}.com`,
+  Website: `https://account-${i}.example`,
   LastActivityDate: i % 3 === 0 ? null : `2026-0${(i % 9) + 1}-10`,
 }));
 
@@ -30,7 +30,7 @@ test('JSON array: shows COMPLETE records (valid JSON), never mid-record', () => 
 
 test('JSON array digest reports the true total, field list, and recovery path', () => {
   const digest = digestToolOutput(JSON.stringify(accounts), { maxChars: 2000, toolName: 'sf', callId: 'call_x1' });
-  assert.match(digest, /array of 47 records/);
+  assert.match(digest, /array of 37 records/);
   assert.match(digest, /Fields: .*Website/);
   assert.match(digest, /tool_output_query\("call_x1"/);
   assert.match(digest, /recall_tool_result\("call_x1"/);
@@ -40,40 +40,40 @@ test('JSON object: shows real CONTENT of nested arrays, not just array(N) shape'
   const obj = { status: 'ok', count: 100, rows: accounts, nested: { a: 1, b: 2 } };
   const digest = digestToolOutput(JSON.stringify(obj), { maxChars: 1500, toolName: 't', callId: 'call_o1' });
   assert.match(digest, /top-level key/);
-  // rows is now EXPANDED to real elements + an accurate "+N more of 47", not collapsed to array(47).
+  // rows is expanded to fixture elements plus an accurate remainder count.
   assert.match(digest, /rows: \[/);
   assert.match(digest, /"Website":"http/); // actual record content is visible
-  assert.match(digest, /more of 47/);
-  assert.doesNotMatch(digest, /rows: array\(47\)/);
+  assert.match(digest, /more of 37/);
+  assert.doesNotMatch(digest, /rows: array\(37\)/);
   assert.match(digest, /tool_output_query\("call_o1"/);
 });
 
 test('Composio envelope: digest surfaces the data payload (tables/ids), not data: object(1 keys)', () => {
-  // The exact shape that broke Airtable: a wrapped result whose payload is the
-  // thing the model needs. The old shape-only digest hid it entirely.
-  const tables = Array.from({ length: 8 }, (_, i) => ({
-    id: `tbl${i}AAAAAAAAAAA`, name: `Prospecting ${i}`,
-    fields: Array.from({ length: 12 }, (_, f) => ({ id: `fld${i}_${f}`, name: 'col' + f, type: 'singleLineText' })),
+  // Synthetic wrapped connector payload: the model needs the nested records,
+  // which the old shape-only digest hid entirely.
+  const tables = Array.from({ length: 6 }, (_, i) => ({
+    id: `fixture-table-${i}`, name: `Fixture Prospecting ${i}`,
+    fields: Array.from({ length: 12 }, (_, f) => ({ id: `fixture-field-${i}-${f}`, name: 'col' + f, type: 'singleLineText' })),
   }));
   const envelope = { data: { tables }, successful: true, error: null, logId: 'log_abc' };
   const digest = digestToolOutput(JSON.stringify(envelope), { maxChars: 2500, toolName: 'composio_execute_tool', callId: 'call_env' });
   assert.doesNotMatch(digest, /data: object\(1 keys\)/); // the old useless output
-  assert.match(digest, /tbl0AAAAAAAAAAA/);               // a real table id is now visible
-  assert.match(digest, /Prospecting 0/);                 // and its name
+  assert.match(digest, /fixture-table-0/);               // a fixture table id is visible
+  assert.match(digest, /Fixture Prospecting 0/);          // and its name
 });
 
 test('deep content leaf: an email body at depth 3+ surfaces its TEXT, not object(N keys) — the shell-dig fix', () => {
-  // The exact Microsoft Graph shape from the 2026-07-09 thrash: the body the user
-  // asked about is nested at data.response_data.body.content (depth 4). The old
+  // Synthetic Microsoft Graph-shaped envelope: the requested body is nested at
+  // data.response_data.body.content (depth 4). The old
   // depth-3 collapse hid it as `body: object(2 keys)`, forcing a shell-dig of the
   // on-disk result. Now its text reaches context directly.
-  const emailBody = 'Hi Nate, thanks for reaching out but we have decided to go another direction with our SEO vendor for now. Best, Ailyn';
+  const emailBody = 'Hello Fixture Recipient, thanks for reaching out. We selected another example vendor. Best, Example Sender';
   const graph = { data: { response_data: {
-    subject: 'Re: Win-back', from: { emailAddress: { address: 'ailyn@galbraith.example' } },
+    subject: 'Re: Fixture follow-up', from: { emailAddress: { address: 'sender@vendor-fixture.example' } },
     body: { contentType: 'html', content: emailBody },
   } } };
   const digest = digestToolOutput(JSON.stringify(graph), { maxChars: 2000, toolName: 'composio_execute_tool', callId: 'call_email' });
-  assert.match(digest, /Hi Nate, thanks for reaching out/, 'the email body text is now visible in-context');
+  assert.match(digest, /Hello Fixture Recipient, thanks for reaching out/, 'the email body text is now visible in-context');
   assert.doesNotMatch(digest, /body: object\(2 keys\)/, 'the useless shape collapse is gone');
 });
 
@@ -102,7 +102,7 @@ test('plain text: head+tail + line/char count, points to recall', () => {
 
 test('no callId: still a digest, but recovery hint is the re-run advice', () => {
   const digest = digestToolOutput(JSON.stringify(accounts), { maxChars: 1500, toolName: 'sf' });
-  assert.match(digest, /array of 47 records/);
+  assert.match(digest, /array of 37 records/);
   assert.match(digest, /narrower scope/);
   assert.doesNotMatch(digest, /tool_output_query/);
 });
@@ -112,7 +112,7 @@ test('Composio search catalog digest preserves exact slugs and compact input fie
     configured: true,
     connectedToolkits: Array.from({ length: 50 }, (_, i) => ({
       toolkit: `toolkit_${i}`,
-      connectionId: `ca_${i}`,
+      connectionId: `fixture-connection-${i}`,
       status: 'ACTIVE',
     })),
     searchedToolkits: ['dataforseo'],
@@ -186,11 +186,11 @@ test('Composio list catalog digest keeps slug index instead of only top-level sh
   assert.doesNotMatch(digest, /top-level key/);
 });
 
-// ─── dominant-list count (the scorpion 44→4 / 'itr2' fix) ──────────────────
+// ─── dominant-list count (synthetic nested-list truncation regression) ──
 
 test('countDominantArray: finds a nested records array (Airtable/composio shape)', () => {
-  const payload = { data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i })) }, error: null, successful: true };
-  assert.deepEqual(countDominantArray(payload), { key: 'records', count: 59 });
+  const payload = { data: { records: Array.from({ length: 61 }, (_, i) => ({ id: i })) }, error: null, successful: true };
+  assert.deepEqual(countDominantArray(payload), { key: 'records', count: 61 });
 });
 
 test('countDominantArray: top-level array + items/results + null for non-lists', () => {
@@ -206,9 +206,9 @@ test('dominantListCount: parses text then counts', () => {
 });
 
 test('digestObject: surfaces the nested records count + recall-returns-all (no pagination)', () => {
-  const big = { data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i, name: 'x'.repeat(80) })) }, error: null, successful: true };
+  const big = { data: { records: Array.from({ length: 61 }, (_, i) => ({ id: i, name: 'x'.repeat(80) })) }, error: null, successful: true };
   const out = digestToolOutput(JSON.stringify(big, null, 2), { maxChars: 1500, toolName: 'composio_execute_tool', callId: 'call_X' });
-  assert.match(out, /Contains 59 records/);
-  assert.match(out, /recall_tool_result returns ALL 59/);
+  assert.match(out, /Contains 61 records/);
+  assert.match(out, /recall_tool_result returns ALL 61/);
   assert.match(out, /no pagination needed/i);
 });

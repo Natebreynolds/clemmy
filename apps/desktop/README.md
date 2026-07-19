@@ -1,211 +1,131 @@
 # Clementine Desktop
 
-The native Electron shell. Wraps the existing Clementine daemon, opens
-the local dashboard as the first-run experience, and brings the agent
-into a normal app surface (tray, notifications, log viewer, restarts).
+`apps/desktop` is Clementine's native Electron shell. It supervises the local daemon, presents the daemon-served console as a desktop app, and owns the operating-system integrations that do not belong in the web renderer.
 
-## Architecture
+For the product overview, installation path, privacy boundaries, and platform status, start with the [root README](../../README.md). Security-sensitive changes must also follow the [security policy](../../SECURITY.md).
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Electron App (this package)                              │
-│   - Main process (src/main.ts)                           │
-│       • Daemon supervisor (spawn / restart / log tail)   │
-│       • Splash window during boot                        │
-│       • Tray icon + menu                                 │
-│       • Native notifications                             │
-│       • IPC bridge (Keychain access via SecretStore)     │
-│   - Preload (src/preload.ts) — narrow window.clemmy API  │
-│   - Renderer = the /console UI served by the daemon       │
-│     served by the daemon                                 │
-└──────────────────────────────────────────────────────────┘
-                          │
-                          ▼ child_process.spawn
-┌──────────────────────────────────────────────────────────┐
-│ Clementine Daemon (../../)                               │
-│   - Discord bot · OpenAI / Codex runtime                 │
-│   - Memory / indexer / autonomy v2                       │
-│   - Background tasks · Composio                          │
-│   - Dashboard API server (http://localhost:8520)         │
-└──────────────────────────────────────────────────────────┘
-                          │
-                          ▼ keytar (lazy-loaded)
-┌──────────────────────────────────────────────────────────┐
-│ SecretStore (../../src/runtime/secrets)                  │
-│   keychain → file → env, never destructive               │
-│   Service name: com.clemmy.desktop.v1                    │
-└──────────────────────────────────────────────────────────┘
+## Responsibilities
+
+The Electron main process owns:
+
+- first-run setup, splash, main, log, and native notch windows;
+- daemon discovery, startup, readiness probing, liveness checks, restart backoff, log capture, and clean shutdown;
+- selection of an available loopback port and propagation of the resulting daemon URL;
+- tray controls, native notifications, global shortcuts, and application updates;
+- narrow, sender-validated IPC bridges for setup, credentials, preferences, permissions, and meeting capture;
+- native media permissions and the Recall Desktop SDK lifecycle;
+- macOS notch positioning, preferences, meeting prompts, and recording controls.
+
+The renderer is the React console served by the daemon. It does not choose a daemon port and should not hardcode a dashboard origin. The supervisor selects an available loopback address, starts the daemon with that configuration, waits for readiness, bootstraps a local dashboard session, and then loads the resulting `/console` URL.
+
+```text
+Electron main process
+├── setup / splash / tray / updater / native windows
+├── daemon supervisor ── child process on a selected loopback URL
+├── validated preload + IPC bridges
+└── native permissions / Recall / macOS notch
+                         │
+                         └── daemon-served React console
 ```
 
-The CLI continues to work unchanged. Advanced users can `npm run service`
-from the parent project; the desktop app is a layer on top, not a
-replacement.
+On macOS, closing the main window leaves the supervised daemon running; quitting Clementine stops the child process after a graceful shutdown window. On Windows and Linux, closing the final window quits the app and stops the child process.
 
-## Run it (dev)
+## Development setup
+
+Use Node.js `>=22.15.0`. Install the root and nested dependencies from the repository root:
 
 ```bash
-cd apps/desktop
-npm install
-npm run dev      # tsx-launched main process for fastest iteration
-# or
-npm run build && npm run start   # compiled-then-electron
+npm ci
+npm --prefix apps/console-web ci
+npm --prefix apps/mobile-web ci
+npm --prefix apps/desktop ci
 ```
 
-The first launch:
-1. Splash window appears.
-2. Daemon child process spawns from `../../` (this repo's parent project).
-3. Supervisor probes the dashboard URL until ready (≤30s).
-4. Main window bootstraps a daemon-local dashboard session, then loads `http://127.0.0.1:PORT/console`.
-5. Tray icon appears with daemon status + quick actions.
-
-Quit via Cmd-Q or tray → Quit Clementine. The supervisor sends SIGTERM
-to the daemon and escalates to SIGKILL after 5s if needed.
-
-## Package for distribution
+Build the daemon and web surfaces before launching the compiled Electron app:
 
 ```bash
-npm run package:mac     # dmg + zip for macOS
-npm run package:dist    # platform-default
+npm run build
+npm run build:console-web
+npm run build:mobile-web
+npm --prefix apps/desktop run build
+npm --prefix apps/desktop start
 ```
 
-The `extraResources` in `package.json` copies the compiled daemon
-(`../../dist`) into the app bundle's Resources directory. The
-supervisor's `locateDaemonProjectRoot()` finds the daemon there
-automatically when running packaged.
+When changing only desktop TypeScript, the normal contributor loop is:
+
+```bash
+npm --prefix apps/desktop run typecheck
+npm --prefix apps/desktop run build
+npm --prefix apps/desktop start
+```
+
+The desktop `build` compiles the main process and both preload entries, then renames the compiled preloads to `.cjs` for Electron. Rebuild whenever a preload or IPC contract changes.
+
+Run the affected tests from the repository root:
+
+```bash
+npm test
+npm run test:release-assets
+```
 
 ## Credentials
 
-The desktop app is the first surface where Keychain becomes the
-canonical secret store. The Phase 1 `SecretStore` abstraction at
-`../../src/runtime/secrets` already handles this:
+Normal credential writes go to:
 
-- Keychain entries use service `com.clemmy.desktop.v1` (versioned —
-  never changes once shipped).
-- `.env` and the file vault remain transparent fallbacks for dev,
-  CLI users, and migration.
-- Reset flow scopes its delete to our service name only — won't
-  corrupt other apps' keychain entries.
-
-A user's "Repair Keychain" / "Reset Credentials" flow lives in the
-Credentials Health panel of the dashboard, which the renderer reaches
-via the standard REST API. IPC is reserved for Keychain operations
-that must happen in the main process (raw secret reads), so the
-renderer never sees them.
-
-## First-run experience
-
-When a user opens Clementine.app for the first time (no credentials,
-no `~/.clementine-next/state/setup-complete.json`), the **setup
-wizard** opens before the daemon ever boots:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│ CLEMENTINE // SETUP                          STEP 1 OF 6  │
-├────────────────────────────────────────────────────────────┤
-│ Step 0  Welcome — what Clementine is, where data lives    │
-│ Step 1  Auth path: OpenAI key · Codex OAuth · Skip        │
-│ Step 2  Discord token (optional)                          │
-│ Step 3  Composio key (optional)                           │
-│ Step 4  Workspace folders (optional)                      │
-│ Step 5  Profile + LAUNCH CLEMENTINE                       │
-└────────────────────────────────────────────────────────────┘
-            │
-            ▼ wizard's "Launch" button writes credentials
-              via SecretStore (keychain or file vault) →
-              workspace paths to ~/.clementine-next/.env →
-              user profile JSON → writes setup-complete.json
-            │
-            ▼ main process launches the daemon, splash window,
-              then the dashboard at /console
+```text
+~/.clementine-next/state/secrets-vault.json
 ```
 
-Subsequent launches skip the wizard and go straight to the dashboard.
-Settings → Credentials in the dashboard handles edits afterward; a
-future "Reset setup" admin action will clear the marker so the
-wizard can run again.
+The file vault is plaintext JSON written atomically. On macOS and other POSIX systems, Clementine writes it with owner-only `0600` permissions. On Windows, it lives in per-user app state and relies on the operating-system profile and ACL boundary. It is **not encrypted at rest**. The runtime reads the file vault first and can fall back to explicitly configured environment variables.
 
-## Credentials path
+macOS Keychain is not the canonical store. Keychain support remains for importing credentials written by older Clementine versions and for explicit repair or reset operations. Passive launch and dashboard health checks avoid Keychain reads so they do not raise unexpected macOS authorization prompts.
 
-Three layers, in priority order:
+Raw credential values must not cross into the dashboard renderer, logs, notifications, or error messages. New credential work should use the existing registry and file-vault abstractions rather than adding another storage path.
 
-1. **Keychain** — service name `com.clemmy.desktop.v1`. Used by the
-   packaged Electron app when keytar is installable. Versioned so a
-   future v2 can coexist for safe rollback.
-2. **File vault** — `~/.clementine-next/state/secrets-vault.json`,
-   0600 perms, atomic writes. Used when keychain isn't available
-   (Linux without Secret Service, dev daemon outside Electron).
-3. **.env** — transparent fallback. NEVER written, NEVER deleted by
-   the app. Dev/CLI users keep working as-is.
+## Notch and meeting capture boundaries
 
-Metadata (which source, last set, last validated, status) is in
-`~/.clementine-next/state/secrets-meta.json` — but the secret values
-themselves NEVER appear there. Tested with an explicit assertion.
+The notch window is a macOS-only surface. It sends dictated requests to the local agent, follows live task and approval status from the shared activity snapshot, and provides native Recall meeting prompts and recording controls.
 
-Recovery flows live in the dashboard's Settings → Credentials block:
+Recall native support is narrower than Clementine desktop support:
 
-- **Repair Keychain** — re-probes keytar, force-reads every known
-  credential. In daemon-only / CLI mode (no keytar) returns a clean
-  "not available" message instead of crashing.
-- **Reset Credentials** — double-confirmed destructive action. Scoped
-  to entries under `com.clemmy.desktop.v1` and the file vault. Never
-  touches `.env`.
+| Platform | Recall Desktop SDK boundary |
+| --- | --- |
+| Apple Silicon macOS | Supported native Recall capture path. |
+| Intel macOS | Clementine runs, but Recall capture is unavailable because Recall's macOS recorder is ARM64-only. |
+| x64 Windows | Recall's native runtime is supported, but the macOS notch and Mac-specific permission flows are not available. |
+| Linux | Native Recall capture is not packaged. |
 
-## Run it (dev)
+Recall capture is optional and uploads media and transcript data to Recall under the user's selected retention policy. Do not describe it as an offline or entirely local recording path. Clementine also has a separate local in-person recording and transcription path; keep the two boundaries distinct in code and copy.
+
+Native capture work must preserve the existing safety properties: platform checks before SDK import, explicit permission state, one authoritative active recording, visible Stop controls, sanitized renderer payloads, and safe shutdown/reconciliation.
+
+## Packaging and releases
+
+Useful package commands are defined in [package.json](package.json):
 
 ```bash
-cd apps/desktop
-npm install
-npm run dev      # tsx-launched main process for fastest iteration
-# or
-npm run build && npm run start   # compiled-then-electron
+# Signed/notarized dual-architecture macOS release flow
+npm --prefix apps/desktop run package:mac
+
+# Local unsigned macOS packaging for controlled smoke testing
+npm --prefix apps/desktop run package:mac:unsigned
+
+# Windows NSIS packaging; run on Windows
+npm --prefix apps/desktop run package:win
 ```
 
-The first launch:
-1. Either the setup wizard window opens (first-run path)
-2. Or the splash → daemon → dashboard sequence kicks off
-3. Tray icon appears with daemon status + quick actions
+macOS production artifacts are signed, notarized, and stapled by the release flow. Windows artifacts may be unsigned unless the Windows signing secrets are configured. Do not place signing identities, account emails, certificate fingerprints, passwords, or encoded certificates in this repository.
 
-Quit via Cmd-Q or tray → Quit Clementine. The supervisor sends SIGTERM
-to the daemon and escalates to SIGKILL after 5s if needed.
+See the [desktop release guide](../../docs/guides/desktop-releases.md) for the supported local and GitHub Actions release workflow.
 
-To re-run the wizard, delete `~/.clementine-next/state/setup-complete.json`
-and reopen the app.
+## Review checklist
 
-## Package for distribution
+Before requesting review for desktop changes, verify the relevant items:
 
-```bash
-npm run package:mac     # dmg + zip for macOS
-npm run package:dist    # platform-default
-```
-
-The `extraResources` in `package.json` copies the compiled daemon
-(`../../dist`) into the app bundle's Resources directory. The
-supervisor's `locateDaemonProjectRoot()` finds the daemon there
-automatically when running packaged.
-
-## Status
-
-Phase 3 — Electron app:
-
-- ✅ Main process + daemon supervisor (spawn, port-pick, readiness-
-     poll, log capture, restart, SIGTERM→SIGKILL on quit)
-- ✅ Splash window during daemon boot
-- ✅ Tray icon with status indicator (programmatically generated
-     SVG → nativeImage, no shipped asset needed)
-- ✅ Tray menu (open console, restart, logs, quit)
-- ✅ Native notifications on daemon restart events
-- ✅ First-run setup wizard window (6 steps: welcome, auth,
-     Discord, Composio, workspaces, profile)
-- ✅ First-run detection — auto-routes new users through setup,
-     existing users straight to dashboard
-- ✅ setup-complete.json marker — wizard runs once
-- ✅ Credentials IPC bridge — main process writes to keychain/file
-     vault; renderer never sees raw values
-- ✅ Workspace + profile bridges — wizard writes to .clementine-next
-     home env / user-profile.json
-- ✅ Auto-generated WEBHOOK_SECRET on first launch when missing
-- ✅ Credentials Health panel in dashboard Settings (live, talks to
-     the daemon's SecretStore via REST; future IPC variant for the
-     packaged build is a polish item)
-- ⏭ DMG signing + notarization for distribution
-- ⏭ Re-run setup admin action in dashboard
+- the daemon starts on a selected loopback URL and the renderer loads without a hardcoded port;
+- first-run and returning-user paths both reach the console;
+- preload APIs remain narrow and IPC senders are validated;
+- active meeting capture cannot lose its visible Stop path;
+- unsupported Recall platforms fail clearly before native SDK loading;
+- no raw secret, meeting identifier, transcript, or local absolute path reaches renderer-facing errors;
+- typecheck, desktop build, focused tests, and applicable release-asset tests pass.

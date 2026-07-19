@@ -797,7 +797,7 @@ export async function getLocalMeetingStatus(sessionIdInput?: string): Promise<{
   // returns what's been heard so far.
   let liveTranscript: LiveTranscriptSnapshot | undefined;
   if (record?.provider === 'local' && record.status === 'recording' && record.audioPath && sessionIdInput) {
-    // ONE whisper at a time on the machine (review wf_612fba66-dd3): while the
+    // ONE whisper at a time on the machine (meeting privacy review): while the
     // batch queue is busy, serve the existing snapshot without kicking a new
     // live pass — the view pauses; the authoritative lane never contends.
     const batchBusy = activeMeetingId !== undefined || queuedMeetingIds.length > 0;

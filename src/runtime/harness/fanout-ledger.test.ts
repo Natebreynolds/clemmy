@@ -12,7 +12,7 @@ test('summarizes done vs failed by callId, lists failed items', () => {
   const sid = 'sess-ledger-1';
   clearLedger(sid);
   recordWorkerResult({ sessionId: sid, callId: 'c1', item: 'Acme LLP', ok: true });
-  recordWorkerResult({ sessionId: sid, callId: 'c2', item: 'Bar Law', ok: true });
+  recordWorkerResult({ sessionId: sid, callId: 'c2', item: 'Maple Law', ok: true });
   recordWorkerResult({ sessionId: sid, callId: 'c3', item: 'Qux Legal', ok: false, reason: 'ERROR: no email' });
   const s = summarizeLedger(sid);
   assert.equal(s.total, 3);
@@ -32,7 +32,7 @@ test('N-item fan-out with one ERROR envelope: reconciliation reports "M of N fai
   const okGate = (text: string): boolean => !/^\s*ERROR:/i.test(text);
   const workers: Array<{ callId: string; item: string; text: string }> = [
     { callId: 'w1', item: 'Acme LLP', text: 'Acme LLP: DA 38, top kw "acme law" pos 4.' },
-    { callId: 'w2', item: 'Bar Law', text: 'ERROR: worker hit its turn cap before finishing this item' },
+    { callId: 'w2', item: 'Maple Law', text: 'ERROR: worker hit its turn cap before finishing this item' },
     { callId: 'w3', item: 'Qux Legal', text: '{"item":"Qux Legal","authority":51,' }, // malformed JSON, still text
   ];
   for (const w of workers) {
@@ -43,7 +43,7 @@ test('N-item fan-out with one ERROR envelope: reconciliation reports "M of N fai
   assert.equal(s.total, 3, 'all three items are accounted for');
   assert.equal(s.done, 2, 'the real answer + the malformed-JSON answer count as done (both ARE text)');
   assert.equal(s.failed, 1);
-  assert.deepEqual(s.failedItems, ['Bar Law'], 'the capped item is reported distinctly, not silently absorbed');
+  assert.deepEqual(s.failedItems, ['Maple Law'], 'the capped item is reported distinctly, not silently absorbed');
   clearLedger(sid);
 });
 

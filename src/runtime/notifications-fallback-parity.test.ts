@@ -128,7 +128,7 @@ function record(metadata?: Record<string, unknown>, silent = false) {
 }
 
 test('no-origin notification fans out to BOTH Discord and Slack fallbacks (parity, de-shadowed)', () => {
-  // Mirrors this morning's scorpion metadata: a run id, but no channel/userId.
+  // Mirrors this morning's acme metadata: a run id, but no channel/userId.
   const dests = getNotificationDestinationsForRecord(
     record({ source: 'notify_user_tool', workflowRunId: 'sched-x' }),
   );

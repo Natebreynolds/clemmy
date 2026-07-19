@@ -1958,7 +1958,7 @@ test('Phase 3: turnContext rides the USER turn (not the cached system append) so
   setClaudeAgentSdkQueryForTest(((params: any) => { capture.call = params; return successQuery('done'); }) as any);
 
   await runClaudeAgentSdk({
-    prompt: 'pull my market leaders',
+    prompt: 'pull my priority accounts',
     sessionId: 'sdk-turn-context',
     modelId: 'claude-sonnet-4-6',
     systemAppend: 'STABLE-SYSTEM-IDENTITY-AND-FACTS',
@@ -1969,7 +1969,7 @@ test('Phase 3: turnContext rides the USER turn (not the cached system append) so
   // Volatile context is in the user turn, clearly framed and BELOW the prior turns.
   assert.match(capture.call.prompt, /\[CURRENT STATE — refreshed THIS turn/);
   assert.match(capture.call.prompt, /## Now\nMonday/);
-  assert.match(capture.call.prompt, /\[Latest message\]\npull my market leaders/);
+  assert.match(capture.call.prompt, /\[Latest message\]\npull my priority accounts/);
   assert.ok(capture.call.prompt.indexOf('CONVERSATION SO FAR') < capture.call.prompt.indexOf('CURRENT STATE'));
   // The stable system append is untouched — it must NOT carry the volatile tail
   // (that's the whole point: a stable prefix the API can cache across turns).

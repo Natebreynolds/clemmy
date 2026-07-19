@@ -36,12 +36,12 @@ test('createFocus: inserts an active row', () => {
   resetMemoryDb();
   const focus = createFocus({
     resourceRef: 'https://docs.google.com/spreadsheets/d/1JTq',
-    title: 'Q2 2026 Market Leader Refresh',
-    summary: 'Editing dropdowns in the Nathan - Legal tab',
+    title: 'Q2 2026 Priority Account Refresh',
+    summary: 'Editing dropdowns in the Alexander - Legal tab',
     resourceKind: 'sheet',
   });
   assert.equal(focus.status, 'active');
-  assert.equal(focus.title, 'Q2 2026 Market Leader Refresh');
+  assert.equal(focus.title, 'Q2 2026 Priority Account Refresh');
   assert.ok(focus.confirm_after > focus.created_at, 'confirm_after must be in the future');
 });
 
@@ -64,8 +64,8 @@ test('createFocus without staleOnCreate is authoritative (not needsConfirm) at b
 
 test('extractNamedResource: URL id, bare long id, and ignores ordinary text', () => {
   assert.equal(
-    extractNamedResource('use https://docs.google.com/spreadsheets/d/1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz/edit'),
-    '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz',
+    extractNamedResource('use https://docs.google.com/spreadsheets/d/fixture_google_sheet_0000000002/edit'),
+    'fixture_google_sheet_0000000002',
   );
   assert.equal(
     extractNamedResource('sheet id 1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P7Q8R9S0T'),

@@ -1,7 +1,7 @@
 // refresh.reference.mjs — REUSABLE reference runner for a Salesforce deal-risk
 // Workspace (skill: salesforce-deal-risk-workspace). Copy to a space's
-// data/refresh.mjs and change ONLY the TEAM_LEAD line. Proven against Darrin
-// Sennott's team (294 deals). READ-ONLY: SELECT queries only — never mutates SF.
+// data/refresh.mjs and change ONLY the TEAM_LEAD line. READ-ONLY: SELECT
+// queries only — never mutates Salesforce.
 //
 // It prints ONE JSON object to stdout: { found, teamLead, team, deals, summary,
 // asOf, pulledAt }. The Workspace runner captures that as the view's data source.
@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process';
 // ── THE ONE THING TO SET ──────────────────────────────────────────────────
 // The rep/team lead to build this for. Matched against active Salesforce Users.
 // Use a distinctive substring of their name (resolved at runtime — never an ID).
-const TEAM_LEAD = 'Darrin Sennott';
+const TEAM_LEAD = 'Example Team Lead';
 // ──────────────────────────────────────────────────────────────────────────
 
 function soql(query) {

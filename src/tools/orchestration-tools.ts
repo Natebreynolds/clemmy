@@ -1104,7 +1104,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // DISABLED and run those steps for real against the tools first (mutating
       // steps are previewed, not executed); it auto-enables on a clean pass, or
       // stays disabled with a one-line fix if a read step returns nothing. This
-      // is what stops a doomed workflow (scorpion: scrape step bound no tool,
+      // is what stops a doomed workflow (acme: scrape step bound no tool,
       // improvised raw HTTP, returned empty, reported success) from being saved
       // live + untested. Pure-LLM / all-mutating workflows skip the gate
       // (nothing real to validate). External-read workflows with missing smoke

@@ -139,7 +139,7 @@ const STANDING_LIST_PHRASE_RE = /\b(?:to|use)\s+(?:this|that|these|those|the fol
 // Enforceable SENDER/account routing rule → kind:'constraint' (the dispatch gate
 // enforces it; rememberFact auto-pins constraints). HIGH PRECISION on purpose:
 // findEmailSendConstraint reads the FIRST email in the rule as the allowed FROM
-// account, so a recipient mention ("email reports@acme.com weekly") must NEVER
+// account, so a recipient mention ("email reports@acme.example weekly") must NEVER
 // classify as a constraint — only an explicit from/use/as/via sender marker on
 // the email qualifies. Default-on; kill-switch CLEMMY_AUTOCAP_CONSTRAINTS=off.
 const SENDER_ACCOUNT_RE = /\b(?:from|as|using|use|via|through)\s+(?:the\s+)?(?:account\s+)?[\w.+-]+@[\w-]+\.[\w.-]+/i;

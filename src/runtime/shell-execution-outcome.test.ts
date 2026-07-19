@@ -21,7 +21,7 @@ test('npx cache permission failure is materialization with provider dispatch not
     stderr: [
       'npm error code EACCES',
       'npm error syscall mkdir',
-      'npm error path /Users/nate/.npm/_cacache/content-v2/sha512/aa',
+      'npm error path /Users/example/.npm/_cacache/content-v2/sha512/aa',
       'npm error Error: EACCES: permission denied, mkdir',
     ].join('\n'),
   });
@@ -39,18 +39,18 @@ test('npx cache permission failure is materialization with provider dispatch not
 
 test('the exact run EEXIST/EACCES npm-cache failure is local materialization, not provider execution', () => {
   const outcome = classifyShellExecutionOutcome({
-    command: 'npx --yes netlify-cli sites:create --name clementine-multi-mode-harness --account-slug nathan-reynolds',
+    command: 'npx --yes netlify-cli sites:create --name clementine-multi-mode-harness --account-slug example-team',
     externalMutation: true,
     exitCode: 1,
     stdout: '',
     stderr: [
       'npm error code EEXIST',
       'npm error syscall rename',
-      'npm error path /Users/nathan.reynolds/.npm/_cacache/tmp/7e49db14',
-      'npm error dest /Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/68f8b4e0fe91de8888b5413e6950311e12ce85f8440d83128d746d7a4bea9f6e27d82fcd00aee09ece29faae2337b4432f33d8dea3eff041a1f671276333',
+      'npm error path /Users/example/.npm/_cacache/tmp/7e49db14',
+      'npm error dest /Users/example/.npm/_cacache/content-v2/sha512/38/ed/68f8b4e0fe91de8888b5413e6950311e12ce85f8440d83128d746d7a4bea9f6e27d82fcd00aee09ece29faae2337b4432f33d8dea3eff041a1f671276333',
       'npm error errno EEXIST',
-      "npm error Invalid response body while trying to fetch https://registry.npmjs.org/gopd: EACCES: permission denied, rename '/Users/nathan.reynolds/.npm/_cacache/tmp/7e49db14' -> '/Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/68f8b4e0fe91de8888b5413e6950311e12ce85f8440d83128d746d7a4bea9f6e27d82fcd00aee09ece29faae2337b4432f33d8dea3eff041a1f671276333'",
-      'npm error File exists: /Users/nathan.reynolds/.npm/_cacache/content-v2/sha512/38/ed/68f8b4e0fe91de8888b5413e6950311e12ce85f8440d83128d746d7a4bea9f6e27d82fcd00aee09ece29faae2337b4432f33d8dea3eff041a1f671276333',
+      "npm error Invalid response body while trying to fetch https://registry.npmjs.org/gopd: EACCES: permission denied, rename '/Users/example/.npm/_cacache/tmp/7e49db14' -> '/Users/example/.npm/_cacache/content-v2/sha512/38/ed/68f8b4e0fe91de8888b5413e6950311e12ce85f8440d83128d746d7a4bea9f6e27d82fcd00aee09ece29faae2337b4432f33d8dea3eff041a1f671276333'",
+      'npm error File exists: /Users/example/.npm/_cacache/content-v2/sha512/38/ed/68f8b4e0fe91de8888b5413e6950311e12ce85f8440d83128d746d7a4bea9f6e27d82fcd00aee09ece29faae2337b4432f33d8dea3eff041a1f671276333',
     ].join('\n'),
   });
   assert.equal(outcome.phase, 'materialize');
@@ -103,7 +103,7 @@ test('authoritative Netlify account rejection uses the provider adapter and prov
 
 test('authoritative Netlify account rejection matches a discovered absolute CLI path', () => {
   const outcome = classifyShellExecutionOutcome({
-    command: '/Users/nathan.reynolds/.nvm/versions/node/v22.22.0/bin/netlify api createSite --data \'{"account_slug":"wrong-team","body":{"name":"clementine-harness"}}\'',
+    command: '/Users/example/.nvm/versions/node/v22.22.0/bin/netlify api createSite --data \'{"account_slug":"wrong-team","body":{"name":"clementine-harness"}}\'',
     externalMutation: true,
     exitCode: 1,
     stdout: '',
@@ -117,7 +117,7 @@ test('authoritative Netlify account rejection matches a discovered absolute CLI 
 
 test('a bare 404 on an account-bound Netlify create remains uncertain without authoritative rejection text', () => {
   const outcome = classifyShellExecutionOutcome({
-    command: '/Users/nathan.reynolds/.nvm/versions/node/v22.22.0/bin/netlify api createSite --data \'{"account_slug":"wrong-team","body":{"name":"clementine-harness"}}\'',
+    command: '/Users/example/.nvm/versions/node/v22.22.0/bin/netlify api createSite --data \'{"account_slug":"wrong-team","body":{"name":"clementine-harness"}}\'',
     externalMutation: true,
     exitCode: 1,
     stdout: '',

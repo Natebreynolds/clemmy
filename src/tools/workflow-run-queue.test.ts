@@ -141,7 +141,7 @@ beforeEach(() => {
 });
 
 test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () => {
-  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
+  const first = queueWorkflowRun('audit-brief', { url: 'https://site.example' });
   assert.equal(first.status, 'queued');
   // Fire-and-forget hand-off wording (A): names the workflow + says background + report-back.
   assert.match(first.message, /Queued "audit-brief"/);
@@ -154,7 +154,7 @@ test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () =>
   };
   assert.equal(record.mutationReceiptProtocolVersion, WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION);
 
-  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
+  const second = queueWorkflowRun('audit-brief', { url: 'https://site.example' });
   assert.equal(second.status, 'duplicate');
   assert.match(second.message, /No duplicate was queued/);
   assert.match(second.message, /running in the background/i);
@@ -405,17 +405,17 @@ test('queueWorkflowRun: a valid dead owner is reclaimed without treating it as c
 });
 
 test('queueWorkflowRun: writes originSessionId when provided (Gap E)', () => {
-  const r = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-1' });
+  const r = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { originSessionId: 'sess-chat-1' });
   assert.equal(r.status, 'queued');
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.equal(rec.originSessionId, 'sess-chat-1');
 });
 
 test('queueWorkflowRun: duplicate attaches the current origin so report-back can still land here', () => {
-  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
+  const first = queueWorkflowRun('audit-brief', { url: 'https://site.example' });
   assert.equal(first.status, 'queued');
 
-  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-dup' });
+  const second = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { originSessionId: 'sess-chat-dup' });
   assert.equal(second.status, 'duplicate');
 
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
@@ -424,10 +424,10 @@ test('queueWorkflowRun: duplicate attaches the current origin so report-back can
 });
 
 test('queueWorkflowRun: duplicate preserves primary origin and adds secondary origin observers', () => {
-  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-a' });
+  const first = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { originSessionId: 'sess-chat-a' });
   assert.equal(first.status, 'queued');
 
-  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-b' });
+  const second = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { originSessionId: 'sess-chat-b' });
   assert.equal(second.status, 'duplicate');
 
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
@@ -435,7 +435,7 @@ test('queueWorkflowRun: duplicate preserves primary origin and adds secondary or
   assert.ok(!('originSessionIds' in rec), 'the runner-owned record remains immutable');
   assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-chat-b']);
 
-  queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-b' });
+  queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { originSessionId: 'sess-chat-b' });
   assert.deepEqual(readWorkflowRunOriginSessionIds(first.id!), ['sess-chat-b'], 'duplicate observer is not repeated');
 });
 
@@ -507,24 +507,24 @@ test('queueWorkflowRun: late observer installation wins its record lock before r
 });
 
 test('queueWorkflowRun: distinct durable trigger receipts each own a run; same receipt retries do not duplicate', () => {
-  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-a' });
+  const first = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: 'receipt-a' });
   assert.equal(first.status, 'queued');
 
-  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-b' });
+  const second = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: 'receipt-b' });
   assert.equal(second.status, 'queued');
 
   assert.equal(readWorkflowTriggerReceiptAcceptance('receipt-a'), first.id);
   assert.equal(readWorkflowTriggerReceiptAcceptance('receipt-b'), second.id);
   assert.equal(runFiles().length, 2, 'distinct events are not silently coalesced merely because mapped inputs match');
 
-  const retry = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-a' });
+  const retry = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: 'receipt-a' });
   assert.equal(retry.status, 'duplicate');
   assert.equal(retry.id, first.id);
   assert.equal(runFiles().length, 2);
 });
 
 test('queueWorkflowRun: v2 trigger acceptance survives normal terminal run-file retention', () => {
-  const queued = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: 'receipt-retained-proof' });
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: 'receipt-retained-proof' });
   assert.equal(queued.status, 'queued');
   unlinkSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`));
   assert.equal(
@@ -536,7 +536,7 @@ test('queueWorkflowRun: v2 trigger acceptance survives normal terminal run-file 
 
 test('queueWorkflowRun: a verified legacy v1 marker is promoted before its run can be reaped', () => {
   const receiptId = 'legacy-v1-receipt';
-  const queued = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { triggerReceiptId: receiptId });
+  const queued = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, { triggerReceiptId: receiptId });
   assert.equal(queued.status, 'queued');
   const markerFile = path.join(
     WORKFLOW_RUNS_DIR,
@@ -553,23 +553,23 @@ test('queueWorkflowRun: a verified legacy v1 marker is promoted before its run c
 });
 
 test('queueWorkflowRun: omits originSessionId when absent for notification-only runs (Gap E)', () => {
-  queueWorkflowRun('audit-brief', { url: 'https://y.com' });
+  queueWorkflowRun('audit-brief', { url: 'https://personal.example' });
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.ok(!('originSessionId' in rec), 'no origin → field is not written (notification-only run)');
 });
 
 test('queueWorkflowRun: source and targetStepId metadata do not collide with full-run dedupe', () => {
-  const full = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
+  const full = queueWorkflowRun('audit-brief', { url: 'https://site.example' });
   assert.equal(full.status, 'queued');
 
-  const stepTry = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, {
+  const stepTry = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, {
     source: 'console',
     targetStepId: 'normalize',
   });
   assert.equal(stepTry.status, 'queued');
   assert.equal(runFiles().length, 2, 'a TRY run is distinct from a full run with the same inputs');
 
-  const duplicateTry = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, {
+  const duplicateTry = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, {
     source: 'console',
     targetStepId: 'normalize',
   });
@@ -601,7 +601,7 @@ test('queueWorkflowRun: dedupe false queues fresh scheduled-style records with a
 });
 
 test('queueWorkflowRun: persists execution optimization recovery intent', () => {
-  const result = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, {
+  const result = queueWorkflowRun('audit-brief', { url: 'https://site.example' }, {
     source: 'board',
     dedupe: false,
     recoveryIntent: {
@@ -741,8 +741,8 @@ test('queueWorkflowRun: step TRY readiness only checks the selected step', () =>
 });
 
 test('queueWorkflowDryRun: writes fresh dry_run records with console metadata', () => {
-  const first = queueWorkflowDryRun('audit-brief', { url: 'https://x.com' }, { source: 'console' });
-  const second = queueWorkflowDryRun('audit-brief', { url: 'https://x.com' }, { source: 'console' });
+  const first = queueWorkflowDryRun('audit-brief', { url: 'https://site.example' }, { source: 'console' });
+  const second = queueWorkflowDryRun('audit-brief', { url: 'https://site.example' }, { source: 'console' });
   assert.equal(first.status, 'queued');
   assert.equal(second.status, 'queued');
   assert.equal(runFiles().length, 2);
@@ -756,7 +756,7 @@ test('queueWorkflowDryRun: writes fresh dry_run records with console metadata', 
 
 test('resumeWorkflowRun: carries originSessionId through to the queued run (Gap E ask-then-resume)', () => {
   writeAuditWorkflow();
-  const result = resumeWorkflowRun('audit-brief', { url: 'https://revill.co.uk' }, { originSessionId: 'sess-chat-2' });
+  const result = resumeWorkflowRun('audit-brief', { url: 'https://evergreen-group.example' }, { originSessionId: 'sess-chat-2' });
   assert.equal(result.status, 'queued');
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.equal(rec.originSessionId, 'sess-chat-2');
@@ -772,7 +772,7 @@ test('resumeWorkflowRun: missing required input → missing_inputs, no queue', (
 
 test('resumeWorkflowRun: all inputs supplied → queues the run', () => {
   writeAuditWorkflow();
-  const result = resumeWorkflowRun('audit-brief', { url: 'https://revill.co.uk' });
+  const result = resumeWorkflowRun('audit-brief', { url: 'https://evergreen-group.example' });
   assert.equal(result.status, 'queued');
   assert.match(result.message, /Queued "audit-brief"/);
   assert.equal(runFiles().length, 1);
@@ -780,20 +780,20 @@ test('resumeWorkflowRun: all inputs supplied → queues the run', () => {
 
 test('resumeWorkflowRun: url alias (website) normalizes to satisfy url', () => {
   writeAuditWorkflow();
-  const result = resumeWorkflowRun('audit-brief', { website: 'https://revill.co.uk' });
+  const result = resumeWorkflowRun('audit-brief', { website: 'https://evergreen-group.example' });
   assert.equal(result.status, 'queued');
   assert.equal(runFiles().length, 1);
 });
 
 test('resumeWorkflowRun: unknown workflow → not_found', () => {
-  const result = resumeWorkflowRun('does-not-exist', { url: 'https://x.com' });
+  const result = resumeWorkflowRun('does-not-exist', { url: 'https://site.example' });
   assert.equal(result.status, 'not_found');
   assert.equal(runFiles().length, 0);
 });
 
 test('resumeWorkflowRun: disabled workflow → disabled', () => {
   writeAuditWorkflow(false);
-  const result = resumeWorkflowRun('audit-brief', { url: 'https://x.com' });
+  const result = resumeWorkflowRun('audit-brief', { url: 'https://site.example' });
   assert.equal(result.status, 'disabled');
   assert.equal(runFiles().length, 0);
 });
@@ -805,7 +805,7 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
   const origId = 'orig-failed-run';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://revill.co.uk' }, status: 'error' }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://evergreen-group.example' }, status: 'error' }),
     'utf-8',
   );
   const rq = requeueWorkflowFromRun(origId);
@@ -823,7 +823,7 @@ test('requeueWorkflowFromRun re-queues a failed run with its original inputs (bu
     });
   assert.equal(queued.length, 1);
   assert.equal(queued[0].workflow, 'audit-brief');
-  assert.equal(queued[0].inputs.url, 'https://revill.co.uk');
+  assert.equal(queued[0].inputs.url, 'https://evergreen-group.example');
   assert.equal(queued[0].status, 'queued');
   assert.equal(queued[0].requeuedFromRunId, origId);
   assert.deepEqual(queued[0].recoveryIntent, {
@@ -840,7 +840,7 @@ test('requeueWorkflowFromRun refuses to overlap a source run that is still execu
   const origId = 'orig-still-running';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'running' }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'running' }),
     'utf-8',
   );
 
@@ -1267,7 +1267,7 @@ test('requeueWorkflowFromRun carries originSessionId from the prior run (re-run 
   const origId = 'orig-with-origin';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed', originSessionId: 'sess-abc' }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed', originSessionId: 'sess-abc' }),
     'utf-8',
   );
   requeueWorkflowFromRun(origId);
@@ -1284,7 +1284,7 @@ test('requeueWorkflowFromRun preserves duplicate observer origins from the prior
   const origId = 'orig-with-multi-origin';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed', originSessionId: 'sess-a', originSessionIds: ['sess-a', 'sess-b'] }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed', originSessionId: 'sess-a', originSessionIds: ['sess-a', 'sess-b'] }),
     'utf-8',
   );
 
@@ -1304,7 +1304,7 @@ test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed for
   const origId = 'orig-partial-failure';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed_with_errors', originSessionId: 'sess-failed-items' }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed_with_errors', originSessionId: 'sess-failed-items' }),
     'utf-8',
   );
   appendWorkflowEvent('audit-brief', origId, { kind: 'step_completed', stepId: 'normalize', output: ['a', 'b', 'c'] });
@@ -1506,7 +1506,7 @@ test('requeueWorkflowFailedItemsFromRun asks for a step when multiple fan-outs f
   const origId = 'orig-multi-failure';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed_with_errors' }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed_with_errors' }),
     'utf-8',
   );
   appendWorkflowEvent('audit-brief', origId, { kind: 'item_failed', stepId: 'blast_one', itemKey: 'a', error: 'a failed' });
@@ -1527,7 +1527,7 @@ test('self-heal lineage: requeue bumps + persists selfHealAttempt (bound counter
   const origId = 'orig-heal';
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
-    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed' }),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://site-alt.example' }, status: 'completed' }),
     'utf-8',
   );
   requeueWorkflowFromRun(origId, { selfHealAttempt: 1 });
@@ -1552,13 +1552,13 @@ test('self-heal lineage: requeue bumps + persists selfHealAttempt (bound counter
 
 test('queueWorkflowRun omits selfHealAttempt when 0/absent', () => {
   writeAuditWorkflow();
-  queueWorkflowRun('audit-brief', { url: 'https://x.co' });
+  queueWorkflowRun('audit-brief', { url: 'https://site-alt.example' });
   const rec = runFiles().map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as Record<string, unknown>)[0];
   assert.equal('selfHealAttempt' in rec, false);
 });
 
 test('queueWorkflowCreationTest: writes a creation_test run record (Part B authoring test)', () => {
-  const r = queueWorkflowCreationTest('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-create' });
+  const r = queueWorkflowCreationTest('audit-brief', { url: 'https://site.example' }, { originSessionId: 'sess-create' });
   assert.equal(r.status, 'queued');
   assert.match(r.message, /creation test/i);
   assert.match(r.message, /DISABLED/);
@@ -1566,14 +1566,14 @@ test('queueWorkflowCreationTest: writes a creation_test run record (Part B autho
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.equal(rec.status, 'creation_test');
   assert.equal(rec.workflow, 'audit-brief');
-  assert.equal(rec.inputs.url, 'https://x.com');
+  assert.equal(rec.inputs.url, 'https://site.example');
   assert.equal(rec.originSessionId, 'sess-create');
   assert.equal(rec.mutationReceiptProtocolVersion, WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION);
 });
 
 test('queueWorkflowCreationTest: does NOT dedupe (each authoring test is fresh)', () => {
-  queueWorkflowCreationTest('audit-brief', { url: 'https://x.com' });
-  queueWorkflowCreationTest('audit-brief', { url: 'https://x.com' });
+  queueWorkflowCreationTest('audit-brief', { url: 'https://site.example' });
+  queueWorkflowCreationTest('audit-brief', { url: 'https://site.example' });
   assert.equal(runFiles().length, 2);
 });
 

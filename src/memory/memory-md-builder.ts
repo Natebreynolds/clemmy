@@ -70,7 +70,7 @@ interface FactSection {
 }
 
 const SECTIONS: FactSection[] = [
-  { kind: 'user',      heading: '## User', description: 'Who Nate is, role, preferences, working style.' },
+  { kind: 'user',      heading: '## User', description: 'Who the user is, role, preferences, working style.' },
   { kind: 'project',   heading: '## Projects', description: 'Active work, requirements, decisions in flight.' },
   { kind: 'feedback',  heading: '## Feedback', description: 'Standing direction on how to behave or what to avoid.' },
   { kind: 'reference', heading: '## References', description: 'External resources, URLs, docs to consult.' },

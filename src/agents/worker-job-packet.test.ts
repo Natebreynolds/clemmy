@@ -7,13 +7,13 @@ import { buildWorkerJobPrompt, WorkerToolInputSchema, workerPacketKey } from './
 
 const validPacket = {
   objective: 'Research one firm and return an SEO summary for the parent batch.',
-  item: 'firm=Revill Law Firm; domain=revilllawfirm.com',
+  item: 'firm=Example Legal Group; domain=example-legal.example',
   resolvedTools: [
     'SEO read: DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
     'Draft write later: OUTLOOK_CREATE_DRAFT',
     'Schema: target:string, location_name:string, language_name:string',
   ].join('\n'),
-  context: 'Use the parent-provided firm/domain and Scorpion outbound memory rules. No other firms are in scope.',
+  context: 'Use the parent-provided firm/domain and Acme outbound memory rules. No other firms are in scope.',
   instructions: 'Read-only SEO research in this worker. Do not send email. Return ERROR if the SEO tool cannot provide data after one retry.',
   expectedOutput: 'JSON object with firm, domain, seoFindings, emailAngle, sources, or final line ERROR: <reason>.',
   intent: null,

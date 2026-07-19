@@ -33,7 +33,7 @@ export interface PluginPermissions {
 }
 
 export interface PluginManifest {
-  /** Reverse-dot id, e.g. "scorpion.salesforce-outbound". */
+  /** Reverse-dot id, e.g. "acme.salesforce-outbound". */
   id: string;
   name: string;
   version: string;

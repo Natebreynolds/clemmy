@@ -173,9 +173,9 @@ export function getActiveObjective(): string | undefined {
 /**
  * Recall objective for a single turn = the CURRENT MESSAGE blended with the
  * active focus. getActiveObjective() alone scopes recall to the focus, so a
- * one-off chat query ("pull MY market-leader accounts") with no matching
+ * one-off chat query ("pull MY priority-account accounts") with no matching
  * focus fell back to global top-N recall and never surfaced the query-
- * relevant fact ("accounts owned by Nathan Reynolds"). Scoping to the
+ * relevant fact ("accounts owned by Alexander Chen"). Scoping to the
  * message fixes that. Same CLEMMY_SCOPED_RECALL flag → off = undefined =
  * today's global recall, byte-for-byte.
  */

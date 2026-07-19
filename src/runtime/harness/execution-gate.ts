@@ -3,7 +3,7 @@
  *
  * Forces Clem to wrap mutating external writes in an execution lane
  * BEFORE the write fires. Rationale (from real failure 2026-05-24,
- * sess-mpk63r99): a multi-step Google Sheets selection wrote 123 cells
+ * execution-gate regression): a multi-step Google Sheets selection wrote 123 cells
  * across two composio_execute_tool calls with no execution wrapping.
  * Audit trail of "why was row 51 dropped?" lived only in a python
  * heredoc in run_shell_command. Mid-session resume would have lost
@@ -20,7 +20,7 @@
  * error; Clem sees the message + the suggested fix (call execution_create
  * first) and the loop continues with that recovery hint.
  *
- * Hard-block design (per Nathan 2026-05-24): a soft warning is
+ * Hard-block design: a soft warning is
  * ignorable; the model can keep writing without wrapping. A hard
  * block forces the audit trail to exist.
  *

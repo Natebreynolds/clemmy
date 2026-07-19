@@ -1,5 +1,5 @@
 /**
- * What DataForSEO tool choice does a WORKER actually receive? Inspect Nathan's
+ * What DataForSEO tool choice does a WORKER actually receive? Inspect Alexander's
  * live tool-choice store + what renderToolChoicesForContext injects for an
  * SEO-pull objective. Read-only.
  * Run: CLEMENTINE_HOME=~/.clementine-next npx tsx scripts/diag-toolchoice.ts

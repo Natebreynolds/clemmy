@@ -4,15 +4,15 @@
  * GOLDEN CORPUS for turn-decision classification. Every fixture below is
  * either a documented live incident or a contract the parser must keep:
  *
- *   - sess-mrcg3mtx (2026-07-08): a LONG draft-quoting answer ("Here's one
- *     example: To: lloyd@…") must parse as the completed reply, never be
+ *   - Long-draft regression: a LONG draft-quoting answer ("Here's one
+ *     example: To: casey@…") must parse as the completed reply, never be
  *     nulled by the announcement heuristic.
- *   - sess-mrchgvkc (2026-07-08): a draft-present reply to the plain-text
+ *   - Draft-contract regression: a draft-present reply to the plain-text
  *     contract directive is FULFILLMENT — deliverable, not a stall.
  *   - Joshua Tree deploy (2026-07-08): a hallucinated tool call rendered as
  *     markdown ("**run_shell_command**" + fence) must stay a punt — the site
  *     was never deployed; that prose must never complete a run.
- *   - bg-mrcg45p1 (2026-07-08): a fake `**Tool: read**` transcript with
+ *   - Fake-tool background regression: a fake `**Tool: read**` transcript with
  *     missing path text must stay a punt — the meeting analysis was never
  *     written even though the background task was marked done.
  *   - "I'll run the Outlook search now." — a TRUE short punt stays a punt.
@@ -44,49 +44,49 @@ const {
 } = await import('./turn-decision.js');
 const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
 
-// ── Live bug 1: sess-mrcg3mtx — long draft-quoting answer must COMPLETE ───────
+// ── Long-draft regression: draft-quoting answer must COMPLETE ────────────────
 
 // The requested email example, quoted verbatim in the reply. Contains
 // "checking" and "I'll" — the verbs that tripped the announcement heuristic
 // live — but is far past the 300-char announcement bound: a real answer.
 const LONG_DRAFT_ANSWER =
-  "Here's one example:\n\nTo: lloyd@example.com\nSubject: Lloyd Baker Injury Attorneys and AI search\n\n" +
-  'Lloyd, your firm already has the kind of reputation most firms want. The piece worth checking now is ' +
+  "Here's one example:\n\nTo: casey@example.com\nSubject: Harbor Law Group and AI search\n\n" +
+  'Casey, your firm already has the kind of reputation most firms want. The piece worth checking now is ' +
   "whether that reputation carries into AI-driven results when clients ask full legal questions. I'll " +
   'include the full report link so you can see where you show up across Google, local search, and the ' +
   'new AI answers surface.\n\nGood to send?';
 
-test('golden sess-mrcg3mtx: long draft-quoting answer parses as completed, never nulled', () => {
+test('long-draft regression: answer parses as completed, never nulled', () => {
   assert.ok(LONG_DRAFT_ANSWER.length > 300, 'fixture must exceed the announcement bound');
   const d = toOrchestratorDecision(LONG_DRAFT_ANSWER);
   assert.ok(d, 'a substantive reply is never a zero-work punt');
   assert.equal(d!.done, true);
   assert.equal(d!.nextAction, 'completed');
-  assert.match(d!.reply ?? '', /lloyd@example\.com/);
+  assert.match(d!.reply ?? '', /casey@example\.com/);
 
   const { kind, decision } = classifyTurnText(LONG_DRAFT_ANSWER, { toolCalls: 0 });
   assert.equal(kind, 'answer');
   assert.match(decision!.reply ?? '', /Good to send\?/);
 });
 
-// ── Live bug 2: sess-mrchgvkc — draft-present contract reply is FULFILLMENT ──
+// ── Draft-contract regression: presented reply is FULFILLMENT ────────────────
 
 // Deliberately inside the 200–300 char window (announcement verbs present) so
 // only the contract exemption saves it — exactly the live failure shape.
 const PRESENTED_DRAFT =
-  'To: lloyd@example.com\nSubject: Quick market visibility question\n\n' +
-  'Lloyd, the piece worth checking now is whether your reputation carries into ' +
+  'To: casey@example.com\nSubject: Quick market visibility question\n\n' +
+  'Casey, the piece worth checking now is whether your reputation carries into ' +
   "AI-driven results. I'll include the full report link so you can see where " +
   'you show up across Google.\n\nGood to send?';
 
-test('golden sess-mrchgvkc: a zero-tool contract reply classifies as answer (fulfillment)', () => {
+test('draft-contract regression: a zero-tool contract reply classifies as answer (fulfillment)', () => {
   const { kind, decision } = classifyTurnText(PRESENTED_DRAFT, { toolCalls: 0, contractTurn: true });
   assert.equal(kind, 'answer', 'compliance with "do not call a tool — reply now" is never a stall');
   assert.equal(decision!.nextAction, 'completed');
   assert.match(decision!.reply ?? '', /Good to send\?/);
 });
 
-test('golden sess-mrchgvkc counterpart: a concrete closing question is preserved without the contract', () => {
+test('draft-contract counterpart: a concrete closing question is preserved without the contract', () => {
   // The question is a conversational deliverable. The loop decides whether it
   // is awaiting input; the announcement detector must not erase it first.
   const { kind, decision } = classifyTurnText(PRESENTED_DRAFT, { toolCalls: 0 });
@@ -262,16 +262,16 @@ test('golden Joshua Tree: "**run_shell_command**" + fence is a fake tool transcr
   assert.equal(decision, null);
 });
 
-test('golden sess-mrcg3mtx shape 2: lead-in sentence + "**Tool Call: run_shell_command**" transcript is still a punt', () => {
+test('long-draft regression shape 2: lead-in sentence + "**Tool Call: run_shell_command**" transcript is still a punt', () => {
   const fake =
     'Let me find the correct file path.\n\n**Tool Call: run_shell_command**\nStatus: Completed\n\nTerminal:\n' +
-    '```\nfind /Users/n/.clementine-next -iname "*market-leader*"\n```';
+    '```\nfind /Users/n/.clementine-next -iname "*priority-account*"\n```';
   assert.equal(toOrchestratorDecision(fake), null, 'a lead-in sentence must not launder a fake transcript');
   const { kind } = classifyTurnText(fake, { toolCalls: 0 });
   assert.equal(kind, 'fake_tool_transcript');
 });
 
-test('golden bg-mrcg45p1: "**Tool: read**" missing-argument transcript is a fake tool transcript', () => {
+test('fake-tool background regression: "**Tool: read**" missing-argument transcript is a fake tool transcript', () => {
   const fake =
     "**Tool: read**\n\n*(No `path` provided in the assistant's tool call — the harness will supply required params.)*";
   assert.equal(toOrchestratorDecision(fake), null, 'missing-argument tool label must not complete the task');
@@ -298,7 +298,7 @@ test('golden true punt: "I\'ll run the Outlook search now." is a punt, decision 
   assert.equal(decision, null);
 });
 
-test('golden bg-mrbqprgv: self-reported no tool access is a punt, not a completed answer', () => {
+test('missing-tool-access regression: self-reported no tool access is a punt, not a completed answer', () => {
   const text =
     'Nothing new - this environment has no tool access (Composio, Google Sheets, DataForSEO, or file I/O are not exposed to me here), so I cannot fetch search volumes, create a Google Sheet, or verify anything.';
   assert.equal(toOrchestratorDecision(text), null);
@@ -344,7 +344,7 @@ test('CONTINUE: marker → continue, internal note is never a user reply', () =>
 test('JSON envelope back-compat: a stringified decision parses identically', () => {
   const envelope = JSON.stringify({
     summary: 'Located the message.',
-    reply: 'Found it — the email from Brooke arrived at 9:14am.',
+    reply: 'Found it — the email from Casey arrived at 10:00am.',
     done: true,
     nextAction: 'completed',
     reason: null,
@@ -352,11 +352,11 @@ test('JSON envelope back-compat: a stringified decision parses identically', () 
   const d = toOrchestratorDecision(envelope);
   assert.ok(d);
   assert.equal(d!.nextAction, 'completed');
-  assert.match(d!.reply ?? '', /9:14am/);
+  assert.match(d!.reply ?? '', /10:00am/);
 
   const { kind, decision } = classifyTurnText(envelope, { toolCalls: 1 });
   assert.equal(kind, 'answer');
-  assert.match(decision!.reply ?? '', /Brooke/);
+  assert.match(decision!.reply ?? '', /Casey/);
 });
 
 test('JSON envelope: awaiting_user_input maps to ask', () => {
@@ -412,7 +412,7 @@ test('a >300-char future-tense real answer is an answer (announcement bound hono
   assert.match(decision!.reply ?? '', /Sunday window/);
 
   // Evidence variants that also must stay answers: work happened this turn, or
-  // the completion reports prior substantive work (2026-06-15 Brooke shape).
+  // the completion reports prior substantive work (synthetic Casey fixture).
   assert.equal(classifyTurnText(longPlan, { toolCalls: 3 }).kind, 'answer');
   assert.equal(classifyTurnText(longPlan, { toolCalls: 0, priorSubstantiveWork: true }).kind, 'answer');
 });
@@ -427,9 +427,9 @@ test('a short zero-tool "Sent the email." completion envelope is a punt unless p
     nextAction: 'completed',
     reason: null,
   });
-  // No tools this turn, no prior work → the false-claim shape (sess-mper69si).
+  // No tools this turn, no prior work → the zero-tool false-claim shape.
   assert.equal(classifyTurnText(envelope, { toolCalls: 0 }).kind, 'punt');
-  // Same text reporting PRIOR real work is a genuine completion (Brooke shape).
+  // Same text reporting PRIOR real work is a genuine completion (Casey fixture).
   assert.equal(classifyTurnText(envelope, { toolCalls: 0, priorSubstantiveWork: true }).kind, 'answer');
   // And with tool calls this turn it is simply an answer.
   assert.equal(classifyTurnText(envelope, { toolCalls: 2 }).kind, 'answer');

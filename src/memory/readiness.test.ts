@@ -164,11 +164,11 @@ function createCurrentFixture(root: string): string {
     INSERT INTO vault_chunks (path, chunk_index, content, mtime) VALUES
       ('/vault/04-Meetings/review.md', 0, 'Meeting transcript', 1);
     INSERT INTO fact_evidence VALUES (2, 'episode-1', 'We reviewed the memory system in person.');
-    INSERT INTO entities VALUES (1, 'person', 'nathan reynolds'), (2, 'company', 'clementine');
+    INSERT INTO entities VALUES (1, 'person', 'Alexander Chen'), (2, 'company', 'clementine');
     INSERT INTO entity_observations VALUES
       (1, 'episode-1', 2, 'meeting://local/review', 'fact_link', 0.95,
        '2026-07-10T01:00:00.000Z', '2026-07-10T01:01:00.000Z');
-    INSERT INTO fact_entities VALUES (2, 1, 'extracted', 'episode-1', 'Nathan reviewed the memory system.');
+    INSERT INTO fact_entities VALUES (2, 1, 'extracted', 'episode-1', 'Alexander reviewed the memory system.');
     INSERT INTO entity_edges VALUES (1, 'works on', 2, '2026-07-10T00:00:00.000Z');
     INSERT INTO entity_edge_evidence VALUES (1, 'works on', 2, 'episode-1');
     INSERT INTO memory_recall_runs VALUES ('recall-1', '2026-07-15T11:00:00.000Z');

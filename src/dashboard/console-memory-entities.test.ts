@@ -108,7 +108,7 @@ test('facts route reports visible and total counts instead of silently clipping'
   rememberFact({ kind: 'reference', content: 'Archive fact two.' });
   const historical = rememberFact({ kind: 'reference', content: 'Archive fact three, now historical.' });
   forgetFact(historical.id);
-  rememberFact({ kind: 'user', content: 'Nathan prefers accurate coverage counts.' });
+  rememberFact({ kind: 'user', content: 'Alexander prefers accurate coverage counts.' });
   const harness = await boot();
   try {
     const response = await fetch(`${harness.url}/api/console/memory/facts?kind=reference&limit=1`);
@@ -138,14 +138,14 @@ test('desktop memory review exposes exact duplicate facts and owner approval pre
     async embed(texts) { return texts.map(() => new Float32Array(4)); },
   });
   const keep = rememberFact({
-    kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.',
+    kind: 'project', content: 'Example Legal Group SEO report lives at example-legal.example/report.',
     score: 5, importance: 8,
   });
   const drop = rememberFact({
-    kind: 'project', content: 'The Revill Law Firm SEO report is at revill-lawfirm.com/report.',
+    kind: 'project', content: 'The Example Legal Group SEO report is at example-legal.example/report.',
     score: 1, importance: 6,
   });
-  rememberFact({ kind: 'user', content: 'Can you resend the Revill report to me today?' });
+  rememberFact({ kind: 'user', content: 'Can you resend the Example Legal report to me today?' });
   const db = openMemoryDb();
   const embed = db.prepare(`
     INSERT OR REPLACE INTO fact_embeddings
@@ -506,8 +506,8 @@ test('entity list searches the full canonical pool and separates grounded from i
     derivedFrom: { sessionId: 'entity-route-other-session', callId: 'entity-route-other-call', tool: 'search' },
   });
   setFactEntityLinks(inferred.id, [danaId], { linkType: 'inferred_text' });
-  const nathanId = upsertEntity({ type: 'person', name: 'Nathan Reynolds' });
-  const dottedNathanId = upsertEntity({ type: 'person', name: 'nathan.reynolds' });
+  const jamieId = upsertEntity({ type: 'person', name: 'Jamie Rivera' });
+  const dottedJamieId = upsertEntity({ type: 'person', name: 'jamie.rivera' });
 
   const authorized = { value: false };
   const harness = await boot(authorized);
@@ -550,22 +550,22 @@ test('entity list searches the full canonical pool and separates grounded from i
       total: number;
       dismissedCount: number;
     };
-    const nathanCandidate = candidates.candidates.find((candidate) =>
-      candidate.entities.some((entity) => entity.id === nathanId)
-      && candidate.entities.some((entity) => entity.id === dottedNathanId));
-    assert.ok(nathanCandidate, 'punctuation-equivalent people reach the review API');
+    const jamieCandidate = candidates.candidates.find((candidate) =>
+      candidate.entities.some((entity) => entity.id === jamieId)
+      && candidate.entities.some((entity) => entity.id === dottedJamieId));
+    assert.ok(jamieCandidate, 'punctuation-equivalent people reach the review API');
 
     const dismissResponse = await fetch(`${harness.url}/api/console/brain/entity-identity/candidates/dismiss`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ entityIds: [nathanId, dottedNathanId], reason: 'route test distinct people' }),
+      body: JSON.stringify({ entityIds: [jamieId, dottedJamieId], reason: 'route test distinct people' }),
     });
     assert.equal(dismissResponse.status, 200);
     const afterDismiss = await (await fetch(`${harness.url}/api/console/brain/entity-identity/candidates?type=person&limit=20`)).json() as {
       candidates: Array<{ entities: Array<{ id: number }> }>;
       dismissedCount: number;
     };
-    assert.ok(!afterDismiss.candidates.some((candidate) => candidate.entities.some((entity) => entity.id === nathanId)));
+    assert.ok(!afterDismiss.candidates.some((candidate) => candidate.entities.some((entity) => entity.id === jamieId)));
     assert.equal(afterDismiss.dismissedCount, 1);
 
     const restoreResponse = await fetch(`${harness.url}/api/console/brain/entity-identity/candidates/restore-dismissed`, { method: 'POST' });

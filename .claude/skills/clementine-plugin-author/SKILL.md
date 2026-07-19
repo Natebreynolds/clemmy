@@ -5,7 +5,7 @@ description: Author, validate, and pack a Clementine plugin cartridge (.clemplug
 
 # Authoring Clementine plugin cartridges
 
-A plugin is a directory (packed as a gzipped tar named `.clemplug`) that materializes onto Clementine's existing shelves. The installer **validates hard** — follow these formats exactly or the install blocks. Full prose guide: `PLUGINS.md` (repo root). Working template: `examples/plugins/coach-starter-pack/` — when in doubt, copy it and edit.
+A plugin is a directory (packed as a gzipped tar named `.clemplug`) that materializes onto Clementine's existing shelves. The installer **validates hard** — follow these formats exactly or the install blocks. Full prose guide: `docs/guides/plugins.md`. Working template: `examples/plugins/coach-starter-pack/` — when in doubt, copy it and edit.
 
 ## Layout (all parts optional except plugin.json)
 

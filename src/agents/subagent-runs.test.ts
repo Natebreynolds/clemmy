@@ -85,22 +85,22 @@ test('findCompletedSubagentOutput returns the most-recent OK output for an item;
   const runId = 'wfrun-resume';
   recordSubagentRun({
     id: 'r1', parentRunId: runId, parentKind: 'session', provider: 'claude', model: 'claude-opus-4-8',
-    task: 'Firm A — firma.com', status: 'ok', output: 'RESULT A: contact found alice@firma.com', startedAt: 't', finishedAt: 't',
+    task: 'Firm A — firm-a.example', status: 'ok', output: 'RESULT A: contact found alice@firm-a.example', startedAt: 't', finishedAt: 't',
   });
   recordSubagentRun({
     id: 'r2', parentRunId: runId, parentKind: 'session', provider: 'codex', model: 'gpt-5.5',
-    task: 'Firm B — firmb.com', status: 'error', output: 'ERROR: no email', startedAt: 't', finishedAt: 't',
+    task: 'Firm B — firm-b.example', status: 'error', output: 'ERROR: no email', startedAt: 't', finishedAt: 't',
   });
 
   // Exact-match retrieval of the completed item's full work-product.
-  assert.equal(findCompletedSubagentOutput(runId, 'Firm A — firma.com'), 'RESULT A: contact found alice@firma.com');
+  assert.equal(findCompletedSubagentOutput(runId, 'Firm A — firm-a.example'), 'RESULT A: contact found alice@firm-a.example');
   // Case/space-folded match (resumed label round-trips, but be robust).
-  assert.equal(findCompletedSubagentOutput(runId, 'firm a — firma.com'), 'RESULT A: contact found alice@firma.com');
+  assert.equal(findCompletedSubagentOutput(runId, 'firm a — firm-a.example'), 'RESULT A: contact found alice@firm-a.example');
   // A FAILED item has no reusable output → null (it must be retried on resume).
-  assert.equal(findCompletedSubagentOutput(runId, 'Firm B — firmb.com'), null);
+  assert.equal(findCompletedSubagentOutput(runId, 'Firm B — firm-b.example'), null);
   // Unknown item / unknown run → null, never a throw.
   assert.equal(findCompletedSubagentOutput(runId, 'Firm Z'), null);
-  assert.equal(findCompletedSubagentOutput('never-existed', 'Firm A — firma.com'), null);
+  assert.equal(findCompletedSubagentOutput('never-existed', 'Firm A — firm-a.example'), null);
 });
 
 test('findCompletedSubagentOutput returns the LATEST ok run when an item completed more than once', () => {
@@ -118,21 +118,21 @@ test('findCompletedSubagentOutput returns the LATEST ok run when an item complet
 
 test('findCompletedSubagentOutput: matches by PACKET KEY so two distinct packets sharing an item label never cross-contaminate (Defect 1)', () => {
   const runId = 'wfrun-multiphase';
-  // Multi-phase over the same entity: research acme.com, then draft outreach for
-  // acme.com — same item label, DIFFERENT packet keys.
+  // Multi-phase over the same entity: research acme.example, then draft outreach for
+  // acme.example — same item label, DIFFERENT packet keys.
   recordSubagentRun({
     id: 'ph1', parentRunId: runId, parentKind: 'session', provider: 'claude', model: 'm',
-    task: 'acme.com', packetKey: 'pk_research', status: 'ok', output: 'RESEARCH: 40 employees, Series B', startedAt: 't', finishedAt: 't',
+    task: 'acme.example', packetKey: 'pk_research', status: 'ok', output: 'RESEARCH: 40 employees, Series B', startedAt: 't', finishedAt: 't',
   });
   recordSubagentRun({
     id: 'ph2', parentRunId: runId, parentKind: 'session', provider: 'claude', model: 'm',
-    task: 'acme.com', packetKey: 'pk_outreach', status: 'ok', output: 'DRAFT EMAIL: Hi Acme team...', startedAt: 't', finishedAt: 't',
+    task: 'acme.example', packetKey: 'pk_outreach', status: 'ok', output: 'DRAFT EMAIL: Hi Acme team...', startedAt: 't', finishedAt: 't',
   });
   // Resuming phase 1 must reuse the RESEARCH output, not the later outreach draft.
-  assert.equal(findCompletedSubagentOutput(runId, 'acme.com', 'pk_research'), 'RESEARCH: 40 employees, Series B');
-  assert.equal(findCompletedSubagentOutput(runId, 'acme.com', 'pk_outreach'), 'DRAFT EMAIL: Hi Acme team...');
+  assert.equal(findCompletedSubagentOutput(runId, 'acme.example', 'pk_research'), 'RESEARCH: 40 employees, Series B');
+  assert.equal(findCompletedSubagentOutput(runId, 'acme.example', 'pk_outreach'), 'DRAFT EMAIL: Hi Acme team...');
   // A packet key with no matching record → null (re-execute), never a wrong-phase reuse.
-  assert.equal(findCompletedSubagentOutput(runId, 'acme.com', 'pk_unknown'), null);
+  assert.equal(findCompletedSubagentOutput(runId, 'acme.example', 'pk_unknown'), null);
 });
 
 test('findCompletedSubagentOutput: an ok run with NO persisted output → null (re-execute, never a placeholder/preview) (F4/Defect 3)', () => {

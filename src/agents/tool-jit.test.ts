@@ -315,7 +315,7 @@ test('NEVER STARVE: a normal-sized toolset is fully exposed even with zero ranke
   // model must keep EVERY tool — never denied a capability it might need.
   await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_BUDGET_TOKENS: undefined }, async () => {
     const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
-    const sel = await selectToolsForTurn({ userInput: 'pull 10 market leader accounts I have not touched', tools: TOOLS, rankFn: zero });
+    const sel = await selectToolsForTurn({ userInput: 'pull 10 priority account accounts I have not touched', tools: TOOLS, rankFn: zero });
     assert.equal(sel.reduced, false, 'a fitting toolset is never pruned');
     assert.equal(sel.exposed.size, TOOLS.length, 'every tool stays available to the model');
     assert.equal(sel.reason, 'within-budget');

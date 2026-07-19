@@ -37,7 +37,7 @@ test('G6: read-only / harmless commands still do NOT require approval (no over-g
     // prospect pull (sf org display && sf data query) parking for approval
     // because `sf org display` was lumped with the org mutations (2026-06-17).
     'sf org display --json',
-    'sf org display --json && sf data query --json --query "SELECT Id, Name FROM Account WHERE Market_Leader__c = TRUE LIMIT 60"',
+    'sf org display --json && sf data query --json --query "SELECT Id, Name FROM Account WHERE Priority_Account__c = TRUE LIMIT 60"',
     'sf data query --query "SELECT Id FROM Contact"',
   ]) {
     assert.equal(shellCommandNeedsApproval(cmd), false, `should NOT gate: ${cmd}`);
@@ -50,7 +50,7 @@ test('G6: Salesforce data/org MUTATIONS still require approval (no under-gating)
     'sf data delete record --sobject Account --record-id 001',
     // `create` was MISSING from the alternation — this exact shape wrote real
     // CRM Tasks with zero approval (proof converse-first, 2026-07-02).
-    "sf data create record --sobject Task --values \"WhatId=006 Subject='Follow up'\" --target-org me@org.com",
+    "sf data create record --sobject Task --values \"WhatId=006 Subject='Follow up'\" --target-org me@org.example",
     'sf data import tree --files data.json',
     'sf org login web',
     'sf org delete scratch --target-org my-org',

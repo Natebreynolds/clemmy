@@ -1676,8 +1676,8 @@ export function workflowReportLaneForOutcome(opts: {
  * `composio_execute_tool`, anything with side effects), the runtime
  * paused, the step returned the ASSISTANT_PAUSED_PLACEHOLDER, and the
  * workflow runner happily moved on with the placeholder as the "step
- * output." Downstream steps got garbage. Observed live in run
- * 1779207370680-18e60f: all 5 steps "completed" but only the final
+ * output." Downstream steps got garbage. In the original regression, all five
+ * steps "completed" but only the final
  * step generated any real work; the rest had no Salesforce data /
  * sheet writes / drafts.
  *
@@ -1861,7 +1861,7 @@ function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRou
   // stay byte-identical. EXCEPT the one broken state: a Codex brain whose
   // OPENAI_MODEL_* slot was repurposed for a BYO model id (e.g. glm-5.2 → Z.ai).
   // There a {} → MODELS.primary fallback would route the step to the BYO endpoint
-  // (the 2026-06-29 scorpion/Apify step silently ran on GLM for exactly this
+  // (the 2026-06-29 acme/Apify step silently ran on GLM for exactly this
   // reason), so steer it to the canonical Codex model. Only fires for codex_oauth
   // with a non-Codex primary; a healthy Codex setup still returns {}.
   if (getActiveAuthMode() === 'codex_oauth' && resolveProvider(MODELS.primary) !== 'codex') {
@@ -2130,7 +2130,7 @@ async function runStepViaHarness(
   // unwind to processOneRunFile. Plain/synthesis propagate directly; forEach
   // preserves the typed reason through its bounded pool and then propagates.
   canPark = false,
-  // Review wf_67792612-cad defect A: forEach ITEM workers must NOT get the
+  // Workflow contract review, defect A: forEach ITEM workers must NOT get the
   // step's AGGREGATE contract (registered or injected) — a single-item worker
   // submitting one object would be refused against an array-of-N contract.
   isItemInvocation = false,
@@ -2803,7 +2803,7 @@ function bindStepContext(
  * verify.path_exists / verify.url_present) BEFORE recording step_completed. A
  * contract failure is a real failure: emit step_failed + throw so the run
  * reports back loudly instead of feeding malformed or fabricated data
- * downstream (the revill "claimed success, no URL" class). A step with NO
+ * downstream (the missing-artifact "claimed success, no URL" class). A step with NO
  * declared contract is unverified — byte-identical to before — so existing
  * workflows are unaffected; the contract IS the per-step opt-in.
  *
@@ -3050,7 +3050,7 @@ function renderWorkflowToolPin(workflowName: string, stepId: string): string {
 
 /** Approval rejection/expiry is a HUMAN decision or a hard gate — control
  *  flow, never a soft failure an optional step may gap past (fold-1 review
- *  wf_8abe1dc0-638). Message text preserved for NON_RETRYABLE_RE + consumers. */
+ *  the workflow retry review). Message text preserved for NON_RETRYABLE_RE + consumers. */
 export class WorkflowStepNotApprovedError extends Error {
   constructor(message: string) { super(message); this.name = 'WorkflowStepNotApprovedError'; }
 }
@@ -3390,7 +3390,7 @@ export function finalizeStepOutput(
       // Classification extracted + fixed (2026-07-14): "is not an array" is a
       // SHAPE problem (Doctor-routable), not upstream emptiness — the old
       // filter told the user "the source returned nothing" over 197KB of real
-      // data (live scorpion-facebook-trends misdiagnosis).
+      // data (live acme-facebook-trends misdiagnosis).
       const isEmptyOnly = classifyContractProblems(result.problems) === 'empty_output';
       const emptyProblems = result.problems.filter(
         (p) => p.startsWith('non_empty:') || p.startsWith('min_items:'),
@@ -5101,7 +5101,7 @@ export function shouldHaltResumeForSideEffect(
   // `declared` distinguishes an explicit sideEffect from a prose-heuristic
   // guess — the halt message uses it to teach the one-line fix when the
   // class was only inferred (inferred read-only steps parking on crash was
-  // the scorpion-facebook-trends failure mode, 2026-06-11).
+  // the acme-facebook-trends failure mode, 2026-06-11).
   if (cls === 'read') return null;
   if (evidence?.mutationReceiptProtected === true) return null;
   // Harness external_write telemetry is useful positive evidence, but its
@@ -6367,7 +6367,7 @@ export function renderGoalFeedback(verdict: GoalValidationResult): string {
 // A REAL smoke test at creation: execute the workflow's READ-ONLY steps for
 // real (in dependency order, forEach capped to the first item) and confirm they
 // return data; PREVIEW (never execute) anything mutating. Catches the
-// scorpion-class failure — a scrape step that returns nothing — at creation,
+// acme-class failure — a scrape step that returns nothing — at creation,
 // before the workflow is trusted, instead of at 7:30am. Reuses executeStepVerified
 // (retry + contract verify) per step; leaves the normal run engine untouched.
 
@@ -6384,7 +6384,7 @@ export interface CreationTestResult {
 /** Verdict for a read-only step's output: did it actually return data? */
 export function creationTestVerdict(stepId: string, out: unknown): CreationTestStepResult {
   // A read-only step that returns NOTHING is a creation-test failure (the
-  // scorpion mode — a scrape/fetch that silently came back empty): null, an
+  // acme mode — a scrape/fetch that silently came back empty): null, an
   // empty/whitespace string, an empty array, or an empty object.
   const empty =
     out == null

@@ -97,6 +97,8 @@ export interface MeetingDetail {
 export const getRecallStatus = () => apiGet<RecallStatus>('/api/console/meetings/recall');
 export const patchRecallSettings = (settings: Partial<RecallSettings>) =>
   api<{ settings: RecallSettings }>('/api/console/meetings/recall/settings', { method: 'PATCH', body: JSON.stringify(settings) });
+export const getLocalMeetingSettings = () =>
+  apiGet<{ settings: LocalMeetingSettings }>('/api/console/meetings/local/settings');
 export const patchLocalMeetingSettings = (settings: Partial<LocalMeetingSettings>) =>
   api<{ settings: LocalMeetingSettings }>('/api/console/meetings/local/settings', { method: 'PATCH', body: JSON.stringify(settings) });
 export const retryLocalMeetingTranscription = (meetingId: string) =>

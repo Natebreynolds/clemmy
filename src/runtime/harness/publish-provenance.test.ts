@@ -25,21 +25,21 @@ function seed(sessionId: string, command: string, result: string): void {
   appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned', data: { tool: 'run_shell_command', callId: 'c1', result } });
 }
 
-const LISTING = `exit_code: 0\n\nstdout:\n[\n  {\n    "id": "f22da5f3-e124-4a15-8f8a-06da10c4f60e",\n    "site_id": "f22da5f3-e124-4a15-8f8a-06da10c4f60e",\n    "name": "salt-and-timber-coffee",\n    "url": "https://salt-and-timber-coffee.netlify.app"\n  }\n]`;
+const LISTING = `exit_code: 0\n\nstdout:\n[\n  {\n    "id": "00000000-0000-4000-8000-000000000005",\n    "site_id": "00000000-0000-4000-8000-000000000005",\n    "name": "fixture-coffee-site",\n    "url": "https://fixture-coffee-site.netlify.app"\n  }\n]`;
 
 test('a failed create whose || list fallback exits 0 confers NO provenance on unrelated listed sites', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   seed(sess.id, 'netlify sites:create --name dust-devil-coffee-co --json || netlify sites:list --json', LISTING);
   const has = buildPublishProvenance(sess.id);
-  assert.equal(has('f22da5f3-e124-4a15-8f8a-06da10c4f60e'), false, 'another task\'s site id must NOT gain provenance from a listing');
-  assert.equal(has('salt-and-timber-coffee'), false, 'another task\'s site name must NOT gain provenance from a listing');
+  assert.equal(has('00000000-0000-4000-8000-000000000005'), false, 'another task\'s site id must NOT gain provenance from a listing');
+  assert.equal(has('fixture-coffee-site'), false, 'another task\'s site name must NOT gain provenance from a listing');
 });
 
 test('a listing that CONTAINS the requested create name provenances only that object', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  const listing = LISTING.replace(/salt-and-timber-coffee/g, 'dust-devil-coffee-co').replace(/f22da5f3-e124-4a15-8f8a-06da10c4f60e/g, 'aaaa1111');
+  const listing = LISTING.replace(/fixture-coffee-site/g, 'dust-devil-coffee-co').replace(/00000000-0000-4000-8000-000000000005/g, 'aaaa1111');
   seed(sess.id, 'netlify sites:create --name dust-devil-coffee-co --json || netlify sites:list --json', listing);
   const has = buildPublishProvenance(sess.id);
   assert.equal(has('dust-devil-coffee-co'), true, 'the requested name matched in the listing IS provenanced');

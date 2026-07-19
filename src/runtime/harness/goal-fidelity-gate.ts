@@ -7,7 +7,7 @@
  * soft-error reroute. The difference is the question:
  *
  *   - GROUNDING asks: is this payload faithful to the SOURCE ARTIFACTS the
- *     agent gathered for this target? (the Eley "Houston→Denver" mutation)
+ *     agent gathered for this target? (the client-data "Houston→Denver" mutation)
  *   - The completion/objective judge asks, AFTER the writes: is the whole
  *     task done?
  *   - GOAL-FIDELITY asks, BEFORE the write: does THIS one outgoing action
@@ -16,12 +16,12 @@
  *
  * The gap this closes: the 2026-06 outbound-emails run that sailed through
  * every existing gate (right mailbox, approved batch, payload internally
- * consistent) yet skipped the scorpion skill's per-firm research — every
+ * consistent) yet skipped the acme skill's per-firm research — every
  * recipient got a byte-identical generic opening. No gate asked "does this
  * honor the loaded skill's per-item step?" This one does.
  *
  * It is GENERAL: it reads the goal and the skill. It hardcodes NO task
- * heuristic ("emails need first names" would be wrong — the scorpion skill
+ * heuristic ("emails need first names" would be wrong — the acme skill
  * bans generic greetings on purpose). It catches "skipped per-firm research"
  * because the SKILL says so, not because of a baked-in email rule.
  *
@@ -65,7 +65,7 @@ export function isGoalFidelityGateEnabled(): boolean {
 
 /** CLEMMY_GOAL_ALIGNMENT_GATE (default on). Widens the goal-fidelity gate to also
  *  judge GOAL ALIGNMENT on an irreversible write when a GOAL is recovered but NO
- *  skill is loaded — the ad-hoc-send gap (2026-06-22 sess-mqplaw0l: a YOLO send
+ *  skill is loaded — the ad-hoc-send gap (a YOLO send regression where
  *  fired with ZERO goal-alignment judging because the skill-less branch
  *  short-circuited to allow; only mechanical guards + the autonomy_note ran).
  *  YOLO still auto-approves; this just makes a cheap cross-family judge vet that

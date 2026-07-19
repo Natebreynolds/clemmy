@@ -26,17 +26,17 @@ const { rememberFact } = await import('../src/memory/facts.js');
 
 // Seed a little learned context so the dynamic blocks aren't empty.
 rememberToolChoice({ intent: 'outlook.send_email', description: 'Send an Outlook email.', choice: { kind: 'composio', identifier: 'OUTLOOK_OUTLOOK_SEND_EMAIL' } });
-try { rememberFact({ kind: 'user', content: 'Nathan owns the Market Leader Salesforce accounts; "my accounts" means owner=Nathan.', importance: 8 }); } catch { /* fact shape best-effort */ }
+try { rememberFact({ kind: 'user', content: 'Alexander owns the Priority Account Salesforce accounts; "my accounts" means owner=Alexander.', importance: 8 }); } catch { /* fact shape best-effort */ }
 
 const ctx = {
   soul: 'Clementine is a sharp, proactive executive assistant. Practical, concise, biased to action.',
   identity: 'I am Clementine — a personal executive assistant paired with one person at a time.',
-  memory: '# Memory\n\n- Nathan prefers terse replies, no bullet bloat.',
+  memory: '# Memory\n\n- Alexander prefers terse replies, no bullet bloat.',
   workingMemory: '# Working Memory\n\n## Focus\nProspecting CRM build.',
 } as never;
 
 const msgA = 'send an outlook email to bob about the proposal';
-const msgB = 'pull my market-leader accounts with no activity in 15 days';
+const msgB = 'pull my priority-account accounts with no activity in 15 days';
 
 function sizes(label: string, tiered: boolean) {
   if (tiered) process.env.CLEMMY_TIERED_CONTEXT = 'on'; else delete process.env.CLEMMY_TIERED_CONTEXT;

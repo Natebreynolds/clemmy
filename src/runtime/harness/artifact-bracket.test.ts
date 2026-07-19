@@ -126,7 +126,7 @@ test('execute wrapper records an exact Google Docs provider read-back but ignore
 test('invoke wrapper records a Netlify getSite shell envelope and never treats status as proof', async () => {
   const sessionId = eventlog.createSession({ kind: 'chat' }).id;
   const runScope = 'run:verify-site';
-  const siteId = 'd554f560-2511-47f2-a658-abc123456789';
+  const siteId = '00000000-0000-4000-8000-000000000001';
   const intent = {
     kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
     title: 'asset-site', createShape: 'NETLIFY_SITE_CREATE',

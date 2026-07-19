@@ -9,7 +9,7 @@ import { applyVoiceGuards, _testOnly_sanitizeVoiceOutput } from './voice-rewrite
 
 test('clean done run can be a warm no-op', () => {
   const out = applyVoiceGuards(
-    { message: 'Hey Nate — inbox is clear, nothing new to triage.', nothingHappened: true },
+    { message: 'Hey Alex — inbox is clear, nothing new to triage.', nothingHappened: true },
     'No qualifying unread Inbox emails were found using the bounded UTC filter window.',
     'done',
   );
@@ -19,7 +19,7 @@ test('clean done run can be a warm no-op', () => {
 
 test('done run that did work is not a no-op', () => {
   const out = applyVoiceGuards(
-    { message: 'Hey Nate — triaged 3 emails, 1 needs your reply.', nothingHappened: false },
+    { message: 'Hey Alex — triaged 3 emails, 1 needs your reply.', nothingHappened: false },
     'Processed 3 messages; 1 flagged.',
     'done',
   );
@@ -29,7 +29,7 @@ test('done run that did work is not a no-op', () => {
 test('blocked lane can NEVER be flagged as a no-op', () => {
   // Even if the model wrongly returns nothingHappened=true, a blocked run delivers.
   const out = applyVoiceGuards(
-    { message: 'Hey Nate — this hit a snag; reply `apply fix abc123` to retry.', nothingHappened: true },
+    { message: 'Hey Alex — this hit a snag; reply `apply fix abc123` to retry.', nothingHappened: true },
     'Step failed: needs approval.',
     'blocked',
   );
@@ -38,7 +38,7 @@ test('blocked lane can NEVER be flagged as a no-op', () => {
 
 test('failed lane can NEVER be flagged as a no-op', () => {
   const out = applyVoiceGuards(
-    { message: 'Hey Nate — the run broke. Reply `apply fix xyz` and I will retry.', nothingHappened: true },
+    { message: 'Hey Alex — the run broke. Reply `apply fix xyz` and I will retry.', nothingHappened: true },
     'Workflow failed: timeout.',
     'failed',
   );
@@ -48,7 +48,7 @@ test('failed lane can NEVER be flagged as a no-op', () => {
 test('failed lane reworded into success vocab falls back to original', () => {
   const original = 'Workflow failed: timeout reaching DataForSEO. Reply `apply fix xyz` to retry.';
   const out = applyVoiceGuards(
-    { message: 'Hey Nate — all set, good to go!', nothingHappened: false },
+    { message: 'Hey Alex — all set, good to go!', nothingHappened: false },
     original,
     'failed',
   );
@@ -71,7 +71,7 @@ test('done lane is allowed to use all-clear vocab', () => {
   // The success-vocab guard only applies to blocked/failed — a real done run
   // SHOULD be able to say "nothing to triage".
   const out = applyVoiceGuards(
-    { message: 'Hey Nate — nothing to triage today, inbox is clean.', nothingHappened: true },
+    { message: 'Hey Alex — nothing to triage today, inbox is clean.', nothingHappened: true },
     'No new emails.',
     'done',
   );
@@ -92,14 +92,14 @@ test('null result falls back to original body', () => {
 });
 
 test('sanitizeVoiceOutput accepts fenced JSON and schema aliases', () => {
-  const out = _testOnly_sanitizeVoiceOutput('```json\n{"text":"Hey Nate — inbox is clear.","nothing_happened":"true"}\n```');
-  assert.deepEqual(out, { message: 'Hey Nate — inbox is clear.', nothingHappened: true });
+  const out = _testOnly_sanitizeVoiceOutput('```json\n{"text":"Hey Alex — inbox is clear.","nothing_happened":"true"}\n```');
+  assert.deepEqual(out, { message: 'Hey Alex — inbox is clear.', nothingHappened: true });
 });
 
 test('sanitizeVoiceOutput treats plain text as a safe non-silent rewrite', () => {
-  const out = _testOnly_sanitizeVoiceOutput('Hey Nate — processed 4 messages and flagged 1 for reply.');
+  const out = _testOnly_sanitizeVoiceOutput('Hey Alex — processed 4 messages and flagged 1 for reply.');
   assert.deepEqual(out, {
-    message: 'Hey Nate — processed 4 messages and flagged 1 for reply.',
+    message: 'Hey Alex — processed 4 messages and flagged 1 for reply.',
     nothingHappened: false,
   });
 });

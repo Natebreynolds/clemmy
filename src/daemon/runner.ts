@@ -832,7 +832,7 @@ function staleApprovalNotificationReason(
   // — UUID-style IDs, NOT in the sqlite registry. Without this branch,
   // the prior call to approvalRegistry.get() returned undefined and the
   // delivery loop silently skipped the notification as 'approval_not_found',
-  // so Nathan never saw Discord buttons for bg-task write_file approvals.
+  // so the user never saw Discord buttons for bg-task write_file approvals.
   try {
     const runtimeApproval = assistant
       .getRuntime()
@@ -1132,7 +1132,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // Every run attempt still 'active' at daemon boot belonged to the dead
   // process — Discord/webhook attempts carry no run id or lease, so the
   // desktop-only foreign-lease sweep never reached them and they showed as
-  // phantom running sessions forever (fold, review wf_30a7ce7e-e9c #7).
+  // phantom running sessions forever (workflow recovery review).
   try {
     const orphanedAttempts = interruptOrphanedRunAttemptsAtBoot();
     if (orphanedAttempts > 0) {
@@ -1503,7 +1503,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }, 5_000).unref?.();
   }
 
-  // MCP pre-warm (sess-mqg8wdw1): connect scoped external MCP servers while the
+  // MCP pre-warm regression: connect scoped external MCP servers while the
   // boot loop is IDLE, so a cold handshake does not race a turn. Default is now
   // scoped/demand-driven: explicit CLEMMY_MCP_PREWARM_SERVERS, otherwise healthy
   // remembered MCP servers, otherwise one configured server only. The legacy

@@ -81,7 +81,7 @@ test('FIX 1 lever: the continuation boilerplate classifies simple→none, but th
   // FIX 1 classifies instead. Mirrors the observed 12-email build: Google
   // Sheets + email/draft + SEO data = 3 domains, read + write.
   const objective =
-    'Build and send outbound Scorpion emails for every market-leader prospect\n'
+    'Build and send outbound Acme emails for every priority-account prospect\n'
     + 'Pull each prospect row from the Google Sheets tracker\n'
     + "Draft a personalized email from each row's SEO ranking and keyword data\n"
     + 'Skip rows with no usable contact and list them';

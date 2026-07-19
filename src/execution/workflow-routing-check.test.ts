@@ -22,7 +22,7 @@ const DESIGN_RULE: RoleBinding[] = [
 const step = (s: Partial<WorkflowStepInput> & { id: string }): WorkflowStepInput => ({ prompt: '', ...s } as WorkflowStepInput);
 const kinds = (steps: WorkflowStepInput[], b = DESIGN_RULE) => analyzeWorkflowRouting({ steps }, b).map((a) => `${a.kind}:${a.stepId}`);
 
-test('silent_intent_no_match: a tag with no matching rule is flagged (scorpion-audit produce intent:"writing")', () => {
+test('silent_intent_no_match: a tag with no matching rule is flagged (acme-audit produce intent:"writing")', () => {
   const a = analyzeWorkflowRouting({ steps: [step({ id: 'produce', prompt: 'compose the brief', intent: 'writing' })] }, DESIGN_RULE);
   assert.equal(a.length, 1);
   assert.equal(a[0].kind, 'silent_intent_no_match');

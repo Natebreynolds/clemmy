@@ -35,7 +35,7 @@ const SCRIPT: Beat[] = [
   { kind: "tool", icon: FileSpreadsheet, label: "google_drive.create", args: "Q4 Planning · /Team Docs", result: "doc_e9f1a8" },
   { kind: "approval", label: "Send email to 7 recipients?" },
   { kind: "heal", text: "gmail.send · 429 rate-limited → diagnosed → backoff 2s → retry" },
-  { kind: "tool", icon: Mail, label: "gmail.send", args: "team@clem.ai · Q4 Planning · 14 actions", result: "sent · msg_3c1d" },
+  { kind: "tool", icon: Mail, label: "gmail.send", args: "team@clementine.example · Q4 Planning · 14 actions", result: "sent · msg_3c1d" },
   { kind: "memory", text: "Wrote: 'Q4 planning shipped 2026-05-20 · 14 actions' → vault/notes" },
   { kind: "outcome", text: "done · goal validated — doc created, 7/7 delivered · spoken into chat" },
   { kind: "reply", text: "Done. Doc in Team Docs, mail sent to all 7. 14 actions assigned and logged." },

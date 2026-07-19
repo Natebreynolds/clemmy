@@ -28,7 +28,7 @@ export const STRUCTURED_OUTPUT_RECOVERY_FALLBACK =
 // demands a user-facing text reply. A turn that receives such a directive and
 // answers with substantive zero-tool text has FULFILLED the contract — running
 // the zero-tool stall detectors against it makes the harness fight its own
-// instruction (observed sess-mrchgvkc 2026-07-08: the model presented the
+// instruction (observed in the draft-contract regression: the model presented the
 // requested email draft three times; STALL_ANNOUNCEMENT_PATTERN matched
 // "checking"/"I'll" INSIDE the quoted email body and the stall banner ate the
 // answer every time). Detection keys on the directive text itself so every
@@ -136,7 +136,7 @@ function decisionFromObject(value: Record<string, unknown>): OrchestratorDecisio
     summary: value.summary,
     // Strip internal context/memory/focus bookkeeping the model sometimes
     // narrates INTO the user-facing reply (e.g. "I checked the active context…
-    // not the stale Revill audit thread"). reply is the answer, not plumbing.
+    // not the stale Example Legal audit thread"). reply is the answer, not plumbing.
     reply: rawReply ? scrubInternalNarration(rawReply) : null,
     done: value.done,
     nextAction: value.nextAction as OrchestratorDecisionShape['nextAction'],
@@ -182,8 +182,8 @@ function deriveDecisionSummary(text: string): string {
 // or gerund is almost always a REAL answer quoting content — an email draft's
 // "the piece worth checking", a report's "I'll include the link". Testing the
 // pattern against unbounded text contradicted the FAIL-OPEN contract below and
-// nulled live answers into the D_decision_unparsed retry thrash (sess-mrcg3mtx
-// 2026-07-08: "Here's one example: To: lloyd@…" — the requested draft — was
+// nulled live answers into the D_decision_unparsed retry thrash (long-draft
+// Regression: "Here's one example: To: casey@…" — the requested draft — was
 // nulled twice, burned 5 minutes of re-runs, and ended in the stall banner
 // instead of the answer).
 const ANNOUNCEMENT_STALL_MAX_CHARS = 300;
@@ -267,7 +267,7 @@ function looksLikeZeroWorkStallText(trimmed: string): boolean {
   // start, followed shortly by a fenced block. Live 2026-07-08: gpt-5.5 ended
   // the Joshua Tree acceptance run by WRITING the netlify deploy invocation as
   // markdown instead of calling the tool; under fail-open that prose completed
-  // the run with the site never deployed. A second live shape (sess-mrcg3mtx)
+  // the run with the site never deployed. A second long-draft regression shape
   // opened with a lead-in sentence ("Let me find the correct file path.")
   // before the fake transcript, so the heading may appear after a short
   // preamble and a status line may sit between heading and fence. Text whose
@@ -405,7 +405,7 @@ export const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|worki
 // (B) Past-tense FALSE CLAIM — "Handed off the exact Outlook action
 //     for execution with the required tool slug and arguments." or
 //     "Searched Outlook and found nothing." The model lies that
-//     work happened. Caught in sess-mper69si-1a163ec1 (2026-05-21)
+//     work happened. Caught in the zero-tool false-claim regression.
 //     after a retry escaped the original future-tense filter.
 //     Strictly WORSE than (A) because the false claim looks like a
 //     real reply and the user trusts it.
@@ -516,7 +516,7 @@ export function evaluateStructuredDecisionStall(opts: {
   // pull now", "I'll pull 25") and deferred it to a phantom next agent. Left
   // alone, the loop REWARDS that by auto-continuing with a bland nudge, inviting
   // another narration turn — turning one CLI call into N slow model round-trips
-  // (observed sess-mqhj058j: a 25-account Salesforce pull that is a single
+  // (observed in the narration-deferral regression: a 25-account Salesforce pull that is a single
   // `sf data query` burned a narration turn + a discover-then-defer turn before
   // executing). Codex acts inline; Claude reaches for the defer enum. Force the
   // real tool action THIS turn instead — reuses the zero-tool retry machinery.
@@ -598,7 +598,7 @@ function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boo
  * True when the SESSION already did substantive (non-probe) tool work in a
  * STRICTLY-PRIOR turn (`event.turn < turn`). Used to suppress the
  * `structured_zero_tool_claim` stall on a genuine completion that reports the
- * result of earlier work (2026-06-15 Brooke email-find: real Outlook searches
+ * result of earlier work (synthetic Casey email-find regression: real mailbox searches
  * in prior turns, then a `done:true` "found nothing" turn was falsely flagged a
  * zero-tool prose claim → 2.5-min thrash → false "unable to make progress").
  * Probe tools (memory/workspace/capability lookups) are EXCLUDED, so "only
@@ -929,11 +929,11 @@ export type TurnTextKind = 'answer' | 'ask' | 'continue' | 'punt' | 'fake_tool_t
  *   - priorSubstantiveWork: the session did real (non-probe) tool work in a
  *     strictly-prior turn — the sessionDidSubstantiveToolWork verdict. Gates
  *     the zero-tool false-claim check exactly as the structured stall does
- *     (2026-06-15 Brooke email-find: a genuine "searched, found nothing"
+ *     (synthetic Casey email-find regression: a genuine "searched, found nothing"
  *     completion reports prior work and is NOT a lie).
  *   - contractTurn: this turn answered a plain-text-contract directive
  *     (isPlainTextContractDirective) — zero-tool substantive text is
- *     FULFILLMENT, never a stall (sess-mrchgvkc).
+ *     FULFILLMENT, never a stall (draft-contract regression).
  *
  * Kinds:
  *   answer               → deliver decision.reply to the user (completed/abandoned)
@@ -998,7 +998,7 @@ export function classifyTurnText(
   // evaluateStructuredDecisionStall, with the eventlog reads replaced by the
   // caller-supplied evidence. Contract turns are exempt: the directive itself
   // forbade tool calls. Bounded to SHORT text (ANNOUNCEMENT_STALL_MAX_CHARS)
-  // per the sess-mrcg3mtx lesson — a LONG reply containing a future-tense verb
+  // per the long-draft regression — a LONG reply containing a future-tense verb
   // is quoting content, not announcing a punt; the unbounded structured check
   // keeps its own event-based prior-work suppression in
   // evaluateStructuredDecisionStall.

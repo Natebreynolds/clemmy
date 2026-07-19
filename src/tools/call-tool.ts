@@ -1,6 +1,5 @@
 /**
- * call_tool — the generic gated dispatcher for the schema-on-demand Codex lane
- * (Phase 1 of SCHEMA-ON-DEMAND-PLAN-2026-07-07.md).
+ * call_tool — the generic gated dispatcher for the schema-on-demand Codex lane.
  *
  * When CLEMMY_CODEX_TOOL_SEARCH is on, most built-in tools leave the first-class
  * schema surface and live only in the catalog text. call_tool is how the model

@@ -4,7 +4,7 @@
  * Pure predicate behind the surgical long-run elevation (#1): a forward-
  * progressing run about to hit the STEP cap auto-elevates instead of pausing
  * for a manual `continue`. Crucially a NO-OP on a long/unlimited (autoContinue)
- * instance — that is the regression guard for Nathan's config.
+ * instance — that is the regression guard for Alexander's config.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -36,7 +36,7 @@ test('elevates a progressing standard run at the step cap', () => {
   assert.equal(shouldElevateOnStepProgress(base), true);
 });
 
-test('NO-OP when autoContinue already on (long/unlimited — Nathan’s config)', () => {
+test('NO-OP when autoContinue already on (long/unlimited — Alexander’s config)', () => {
   // The regression guard: his instance never elevates here because maxSteps is
   // already 1,000,000 and the cap is never approached; even if it were, this
   // returns false.

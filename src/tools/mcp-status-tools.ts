@@ -53,7 +53,7 @@ export function registerMcpStatusTools(server: McpServer): void {
     [
       'Inspect configured external MCP servers available to Clementine.',
       'IMPORTANT: the `query` filter matches against server name / description / env keys — NOT the user\'s natural-language question. Pass a SHORT CATEGORY like "seo", "dataforseo", "browser", "supabase", "email", "web", "hosting" — OR pass no query at all to list every server.',
-      'NEVER pass the user\'s question (e.g. "top keywords for revilllaw.com") as the query. That text will never match a server\'s haystack and you\'ll get a misleading "no matching server" result that makes you wrongly conclude the integration is unavailable.',
+      'NEVER pass the user\'s question (e.g. "top keywords for evergreen-law.example") as the query. That text will never match a server\'s haystack and you\'ll get a misleading "no matching server" result that makes you wrongly conclude the integration is unavailable.',
       'PREFER calling the relevant MCP tool directly over preflighting with mcp_status. mcp_status is only useful when you actually don\'t know whether a server is configured. Once you know a server exists (e.g. DataForSEO), do not re-check before every call — just call the tool.',
       'This checks MCP configuration, not Composio OAuth. They are separate tool sources.',
       'If an enabled server matches and auth env is present, the MCP tools are callable. The actual tool names appear under their bare names (e.g. DataForSEO exposes `serp_organic_live_advanced`, `dataforseo_labs_google_ranked_keywords` — NOT prefixed with the server name).',

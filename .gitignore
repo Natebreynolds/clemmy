@@ -3,11 +3,18 @@ node_modules/
 dist/
 
 # Environment + secrets — NEVER commit
-.env
-.env.local
-.env.production
-.env.development
-.env.*.local
+.env*
+!.env.example
+
+# Signing and provisioning material
+*.pem
+*.p8
+*.p12
+*.pfx
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
 
 # Logs
 *.log
@@ -21,6 +28,7 @@ logs/
 # Build / packaging artifacts
 *.tgz
 release/
+apps/desktop/native/notch-click-helper/.build/
 # Local hot-patch staging copies of the built desktop app (feedback_clemmy_desktop_patch)
 apps/desktop/release-*/
 *.dmg
@@ -39,8 +47,23 @@ apps/desktop/release-*/
 
 # Local scratch dirs
 .firecrawl/
+.codex/
 .tmp/
 tmp/
+/.private/
+/private/
+
+# Local agent state. The checked-in authoring skill under .claude/skills stays
+# tracked; these files are per-user runtime state only.
+.claude/settings.local.json
+.claude/scheduled_tasks.*
+.claude/worktrees/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/agent-registry.json
+.claude/agent-memory-local
+.claude/first-run
+.claude/assistant-daemon-state.json
 
 # Per-user workflow run artifacts (audit CSVs, drafts, prompts) —
 # test scratch, not source to ship.
@@ -49,6 +72,13 @@ runs/
 # Test artifacts
 coverage/
 .nyc_output/
+
+# Local runtime stores and event streams
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.ndjson
 
 # TypeScript build info
 *.tsbuildinfo
@@ -62,7 +92,27 @@ patcheck.tmp
 cvelist
 cvelist-our
 cvelist.diff
-console-home.png
+
+# Root-level captures and dated work products are local review artifacts, not
+# public source. Product imagery belongs under an app's public/build assets and
+# maintained project documentation belongs under docs/.
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+/*-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].md
+/*-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].json
+/*-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].csv
+/*-drafts-*.md
+/*-evidence-*.md
+/*-send-confirmations-*.md
+/client-*
+/outreach-*
+/prospecting-*
+/seo-*
+/workspaces/
+/one-pagers/
+/lunar-audits/
 
 
 # Vendored native runtimes — uv is generated for npm/desktop packages; whisper.cpp is desktop-only. Never commit.

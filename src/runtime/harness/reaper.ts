@@ -97,7 +97,7 @@ export function reapOnce(): approvalRegistry.PendingApprovalRow[] {
   // AND the approval is old enough to be a real orphan, cancel it so
   // the dashboard "NEEDS YOU" surface stops showing it.
   //
-  // Two guards added 2026-05-21 after sess-mpf4pkru where this reaper
+  // Two guards added after the reaper regression where this reaper
   // killed a LIVE workflow_schedule approval that had just been
   // requested in a new turn. Root cause: session.markStatus('completed')
   // fires when a turn ends, but a NEW user message starts another turn

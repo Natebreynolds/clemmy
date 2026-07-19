@@ -217,11 +217,11 @@ test('buildObjectiveJudgePrompt suppresses the evidence line for a zero-tool tur
 test('composeJudgedObjective: bare follow-up gets prior REAL user messages as context', async () => {
   const { composeJudgedObjective } = await import('./objective-judge.js');
   const composed = composeJudgedObjective('just mine please', [
-    'I need to pull 25 market leader accounts new from Salesforce that have not had contact in 15 days, de-dupe against Airtable, then SEO enrichment.',
+    'I need to pull 25 priority account accounts new from Salesforce that have not had contact in 15 days, de-dupe against Airtable, then SEO enrichment.',
     'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
     'You hit a step / time budget on the previous turn and the user has now replied `continue`.\n\nPick up where you left off; do not restart the workflow from scratch.',
   ]);
-  assert.match(composed, /25 market leader accounts/);
+  assert.match(composed, /25 priority account accounts/);
   assert.match(composed, /Current user message .*: just mine please/);
   assert.doesNotMatch(composed, /Continue with the next step/, 'harness drip injections must be filtered');
   assert.doesNotMatch(composed, /step \/ time budget/, 'synthetic continue inputs must be filtered');
@@ -339,7 +339,7 @@ test('parseCriteriaVerdicts: out-of-range and duplicate indices ignored, prose a
   assert.deepEqual(v?.map((x) => x.pass), [true, false]);
 });
 
-// ─── AWAITING verdict + direction-seeking question (2026-07-09 sess-mrds80fu) ───
+// ─── AWAITING verdict + direction-seeking question regression ────────────────
 
 test('parseCompletionVerdict: AWAITING maps to done + awaitingUser (never a bounce)', () => {
   const v = parseCompletionVerdict('AWAITING: Assistant asked whether to send the 55 prepared emails now');
@@ -351,11 +351,11 @@ test('parseCompletionVerdict: AWAITING maps to done + awaitingUser (never a boun
   assert.equal(parseCompletionVerdict('INCOMPLETE: nothing produced')?.awaitingUser, undefined);
 });
 
-test('isDirectionSeekingQuestion: catches the sess-mrds80fu approval question; ignores polite tails', async () => {
+test('isDirectionSeekingQuestion: catches the batch-approval question; ignores polite tails', async () => {
   const { isDirectionSeekingQuestion } = await import('./objective-judge.js');
   // The exact shape that got bounced live: a resume + a go/no-go question.
   assert.equal(isDirectionSeekingQuestion(
-    'Yes — we’re on the 60 market-leader reactivation emails.\n\nDo you want me to pick up by **sending the 55 send-ready emails now**, or review the drafts first?',
+    'Yes — we’re on the 60 priority-account reactivation emails.\n\nDo you want me to pick up by **sending the 55 send-ready emails now**, or review the drafts first?',
   ), true);
   assert.equal(isDirectionSeekingQuestion('Should I send these to the full list or just the top 10?'), true);
   assert.equal(isDirectionSeekingQuestion('Which account should I use for the export?'), true);

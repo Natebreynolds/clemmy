@@ -76,7 +76,7 @@ export function grindGateVerdict(
     /** The caller's recovery skeleton has run_tool_program, so the fanout
      *  refuse-and-steer is actionable. When false the fanout branch is a
      *  silent allow — no deny AND no guardrail_tripped event (review
-     *  wf_2ed83f94 #6: emitting a discarded verdict fills the operator view
+     *  Turn-control review: emitting a discarded verdict fills the operator view
      *  with trips that never happened). */
     honorFanout?: boolean;
   },
@@ -631,7 +631,7 @@ export function recordTurnPreflightDecision(
 }
 
 // NOTE (fold, 2026-07-17): the fail-closed `preflightGateVerdict` tool-boundary
-// gate that lived here was DEMOTED after adversarial review wf_30a7ce7e-e9c
+// gate that lived here was DEMOTED after adversarial workflow review
 // confirmed it failed in both directions — bypassable (delegating carriers
 // dispatch native-MCP writes past it, non-exact acknowledgements skip the
 // envelope, interpreter shell scripts classify as compute) while hard-denying

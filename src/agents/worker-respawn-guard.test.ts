@@ -6,7 +6,7 @@
  * with the same packet just caps again — the observed non-converging loop). This
  * verifies the two pieces deterministically against a REAL eventlog:
  *   (1) normalizeWorkerItemKey collapses the observed label DRIFT
- *       ("…barkerlanelaw.com" vs "…barkerlanelaw.com (Savannah, GA)"), and
+ *       ("…birch-law.example" vs "…birch-law.example (Savannah, GA)"), and
  *   (2) workerItemAlreadyCapped returns true for a drifted re-spawn of a capped
  *       item, false for a fresh item — fail-open by construction.
  */
@@ -30,16 +30,16 @@ test.after(() => {
 });
 
 test('normalizeWorkerItemKey: domain anchor defeats trailing-parenthetical drift', () => {
-  const a = normalizeWorkerItemKey('Howard Barker Lane — barkerlanelaw.com');
-  const b = normalizeWorkerItemKey('Howard Barker Lane — barkerlanelaw.com (Savannah, GA)');
-  assert.equal(a, 'barkerlanelaw.com');
+  const a = normalizeWorkerItemKey('Birch Legal — birch-law.example');
+  const b = normalizeWorkerItemKey('Birch Legal — birch-law.example (Savannah, GA)');
+  assert.equal(a, 'birch-law.example');
   assert.equal(a, b, 'the drifted label normalizes to the same domain key');
 });
 
 test('normalizeWorkerItemKey: case + separator folding when no domain present', () => {
   assert.equal(
-    normalizeWorkerItemKey('Nova Legal  Group'),
-    normalizeWorkerItemKey('nova legal group'),
+    normalizeWorkerItemKey('Northstar Legal Group'),
+    normalizeWorkerItemKey('northstar legal group'),
   );
   assert.equal(normalizeWorkerItemKey(null), '');
   assert.equal(normalizeWorkerItemKey(''), '');
@@ -47,8 +47,8 @@ test('normalizeWorkerItemKey: case + separator folding when no domain present', 
 
 test('distinct domains do NOT collide', () => {
   assert.notEqual(
-    normalizeWorkerItemKey('Firm A — firma.com'),
-    normalizeWorkerItemKey('Firm B — firmb.com'),
+    normalizeWorkerItemKey('Firm A — firm-a.example'),
+    normalizeWorkerItemKey('Firm B — firm-b.example'),
   );
 });
 
@@ -58,7 +58,7 @@ test('workerItemAlreadyCapped: a drifted re-spawn of a capped item is detected; 
   const sid = sess.id;
 
   // No caps yet → nothing is "already capped".
-  assert.equal(workerItemAlreadyCapped(sid, 'Howard Barker Lane — barkerlanelaw.com'), false);
+  assert.equal(workerItemAlreadyCapped(sid, 'Birch Legal — birch-law.example'), false);
 
   // Record the cap exactly as hooks.ts does (type worker_capped, data.item).
   appendEvent({
@@ -66,17 +66,17 @@ test('workerItemAlreadyCapped: a drifted re-spawn of a capped item is detected; 
     turn: 0,
     role: 'system',
     type: 'worker_capped',
-    data: { callId: 'call_x', item: 'Howard Barker Lane — barkerlanelaw.com' },
+    data: { callId: 'call_x', item: 'Birch Legal — birch-law.example' },
   });
 
   // The drifted re-spawn label is refused (matched via the domain key).
   assert.equal(
-    workerItemAlreadyCapped(sid, 'Howard Barker Lane — barkerlanelaw.com (Savannah, GA)'),
+    workerItemAlreadyCapped(sid, 'Birch Legal — birch-law.example (Savannah, GA)'),
     true,
     'drifted re-spawn of a capped item is caught',
   );
   // A genuinely different item is still allowed through.
-  assert.equal(workerItemAlreadyCapped(sid, 'Nova Legal Group — novalegalgroup.com'), false);
+  assert.equal(workerItemAlreadyCapped(sid, 'Northstar Legal — northstar-legal.example'), false);
   // An empty/unknown item key never matches (fail-open, no false refuse).
   assert.equal(workerItemAlreadyCapped(sid, ''), false);
   assert.equal(workerItemAlreadyCapped(sid, null), false);
@@ -86,9 +86,9 @@ test('cap on item A never suppresses a first attempt on item B (item-scoped, not
   resetEventLog();
   const sess = createSession({ kind: 'execution' });
   const sid = sess.id;
-  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_capped', data: { callId: 'c1', item: 'Firm A — firma.com' } });
-  assert.equal(workerItemAlreadyCapped(sid, 'Firm A — firma.com'), true);
-  assert.equal(workerItemAlreadyCapped(sid, 'Firm B — firmb.com'), false, 'B is a first attempt, must be allowed');
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_capped', data: { callId: 'c1', item: 'Firm A — firm-a.example' } });
+  assert.equal(workerItemAlreadyCapped(sid, 'Firm A — firm-a.example'), true);
+  assert.equal(workerItemAlreadyCapped(sid, 'Firm B — firm-b.example'), false, 'B is a first attempt, must be allowed');
 });
 
 // ── Wave 4 Stage 1: durable-resume idempotency ──────────────────────────────
@@ -159,7 +159,7 @@ test('summarizeFanoutCoverage: honest M of N read DIRECTLY from the durable work
   const sess = createSession({ kind: 'execution' });
   const sid = sess.id;
   appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Acme LLP', ok: true, packetKey: 'pk1' } });
-  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Bar Law', ok: true, packetKey: 'pk2' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Maple Law', ok: true, packetKey: 'pk2' } });
   appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Qux Legal', ok: false, reason: 'ERROR: no email', packetKey: 'pk3' } });
 
   const s = summarizeFanoutCoverage(sid);

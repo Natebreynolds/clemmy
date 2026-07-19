@@ -33,8 +33,8 @@ const kinds = (run: string) => readWorkflowEvents(WF, run).map((e) => e.kind);
 test('contract + valid output → verified, step_completed recorded, no throw', () => {
   const run = nextRun();
   const step = { id: 's1', prompt: 'p', output: { type: 'object' as const, required_keys: ['url'] } };
-  const out = finalizeStepOutput(WF, run, step, { url: 'https://x.com', extra: 1 });
-  assert.deepEqual(out, { url: 'https://x.com', extra: 1 });
+  const out = finalizeStepOutput(WF, run, step, { url: 'https://site.example', extra: 1 });
+  assert.deepEqual(out, { url: 'https://site.example', extra: 1 });
   const k = kinds(run);
   assert.ok(k.includes('step_completed'), 'step_completed recorded');
   assert.ok(!k.includes('step_failed'), 'no step_failed');

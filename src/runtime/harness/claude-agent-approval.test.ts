@@ -94,7 +94,7 @@ test('gated permission: sf data create record is a CRM write → requires approv
   const perm = buildGatedToolPermission(sess.id, ['memory_read', 'run_shell_command']) as unknown as Perm;
   const p = perm(
     'mcp__clementine-local__run_shell_command',
-    { command: "sf data create record --sobject Task --values \"Subject='x'\" --target-org me@org.com" },
+    { command: "sf data create record --sobject Task --values \"Subject='x'\" --target-org me@org.example" },
     opts(),
   );
   const approvalId = await waitForPending(sess.id);

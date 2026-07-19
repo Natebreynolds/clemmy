@@ -2150,7 +2150,7 @@ export function interruptForeignRunAttemptLeases(
   // NULL-run_id rows (Discord/webhook attempts carry no external run id) can
   // never match `run_id LIKE ?` — with no prefix requested they must still be
   // sweepable, or a crashed lane leaks permanently-active attempts (fold,
-  // review wf_30a7ce7e-e9c #7).
+  // workflow recovery review).
   const result = openEventLog().prepare(
     `UPDATE run_attempts
         SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
@@ -2162,7 +2162,7 @@ export function interruptForeignRunAttemptLeases(
   return result.changes;
 }
 
-/** DAEMON-BOOT recovery (fold, review wf_30a7ce7e-e9c #7): at daemon startup
+/** DAEMON-BOOT recovery (workflow recovery review): at daemon startup
  * every still-'active' attempt necessarily belonged to the dead process —
  * Discord/webhook attempts carry no run id and no lease, so the desktop-only
  * foreign-lease sweep never reached them and they showed as phantom running

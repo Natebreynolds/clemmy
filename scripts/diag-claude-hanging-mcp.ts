@@ -2,7 +2,7 @@
  * Decisive causation test: does an attached MCP server whose connect() HANGS
  * stall the Claude model call BEFORE it produces any content?
  *
- * Production (sess-mqg45an3, sess-mqg8wdw1): clementine-local + dataforseo were
+ * In the production tool-turn and MCP prewarm regressions, clementine-local + dataforseo were
  * degraded/connecting and every such turn stalled pre-content. Repros with
  * HEALTHY mcp never stalled. This isolates the variable: a hanging MCP server.
  *
@@ -56,7 +56,7 @@ async function main() {
   const t0 = Date.now();
   const el = () => `${Date.now() - t0}ms`;
   let firstEvent = 0;
-  const result = await run(agent, 'Pull my market-leader accounts.', { stream: true });
+  const result = await run(agent, 'Pull my priority-account accounts.', { stream: true });
   const drain = (async () => {
     for await (const event of result as unknown as AsyncIterable<unknown>) {
       if (!firstEvent) { firstEvent = Date.now() - t0; console.log(`  first event at ${firstEvent}ms`); }

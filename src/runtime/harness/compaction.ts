@@ -32,7 +32,7 @@ import { estimateInputTokens } from './token-estimator.js';
  * budget — see brackets.ts:331.
  */
 
-// v0.5.22 — tightened all four numbers after sess-mplmvrqu (2026-05-25)
+// Tightened all four numbers after the plan-timeout regression.
 // hit a 1.4MB Codex request body that consistently SSE-truncated. The
 // previous defaults were tuned for "stop the worst offenders"; the new
 // defaults are tuned for "keep request bodies under Codex's truncation
@@ -54,7 +54,7 @@ const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
 // must NOT fire while there is abundant token headroom — otherwise a multi-tool
 // run (e.g. researching 10 prospects) clips its freshly-fetched results to
 // stubs even at ~12% of budget, throwing away the very data the model needs and
-// forcing recall round-trips (observed sess-mpvujlni 2026-06-01: 14 outputs
+// forcing recall round-trips (the observed regression had 14 outputs
 // clipped at 30K/200K). So the item-count clause only applies once we're at
 // least this fraction of budget; below it, ONLY genuine token pressure
 // (layer1TokenFraction) triggers Layer 1. Token pressure, not item count, is

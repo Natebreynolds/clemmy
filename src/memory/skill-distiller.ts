@@ -350,17 +350,16 @@ export function deriveRecoveryTip(
 // Lane D Phase 2: slot-parameterize concrete IDs so a distilled procedure is
 // reusable across clients/runs, and derive machine-checkable applicability.
 //
-// GLOBAL-ONLY by design: we reuse the entity REGEX CLASSES from memory-merge's
-// extractAnchors (table/app ids, emails, domains) but DELIBERATELY NOT its
-// hardcoded client-name patterns (Revill/Aldous/Scorpion/Market Leader) — those
-// are user-specific and must never be baked into the global distiller (binding:
-// "global, never user-specific").
+// GLOBAL-ONLY by design: we reuse the portable entity classes from
+// memory-merge's extractAnchors (table/app ids, emails, domains), but do not
+// parameterize organization/project names. Those names stay local to the
+// source evidence and must never become a global applicability requirement.
 const SLOT_RULES: Array<{ re: RegExp; slot: string }> = [
   { re: /tbl[a-zA-Z0-9]{12,}/g, slot: 'table_id' },
   { re: /app[a-zA-Z0-9]{12,}/g, slot: 'app_id' },
   // email BEFORE domain so the domain inside an address isn't separately slotted.
   { re: /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g, slot: 'email' },
-  { re: /\b[\w-]+\.(?:com|ai|io|org|net|co\.uk|dev)\b/gi, slot: 'domain' },
+  { re: /\b[\w-]+\.(?:com|ai|io|org|net|co\.uk|dev|example)\b/gi, slot: 'domain' },
 ];
 
 /** Replace concrete global entity ids with {{slot}} placeholders. Pure,

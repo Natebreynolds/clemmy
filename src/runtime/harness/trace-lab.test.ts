@@ -25,12 +25,12 @@ test.after(() => {
 test('buildTraceDetail classifies events, computes metrics, and links tool/approval edges', () => {
   resetEventLog();
   const sess = createSession({ id: 'trace-demo', kind: 'chat', title: 'Trace Demo', objective: 'Send a safe update' });
-  appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send Brooke the update.' } });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send Casey the fixture update.' } });
   appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'reasoning_effort', data: { effort: 'medium', reason: 'external write' } });
-  appendEvent({ sessionId: sess.id, turn: 1, role: 'orchestrator', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'call-send', arguments: '{"to":"brooke@example.com"}' } });
-  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'approval_requested', data: { approvalId: 'apr-1', subject: 'Send Brooke email' } });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'orchestrator', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'call-send', arguments: '{"to":"casey@recipient.example"}' } });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'approval_requested', data: { approvalId: 'apr-1', subject: 'Send Casey fixture email' } });
   appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'approval_resolved', data: { approvalId: 'apr-1', resolution: 'approved' } });
-  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write', data: { tool: 'composio_execute_tool', shapeKey: 'email:send', target: 'brooke@example.com' } });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write', data: { tool: 'composio_execute_tool', shapeKey: 'email:send', target: 'casey@recipient.example' } });
   appendEvent({ sessionId: sess.id, turn: 1, role: 'orchestrator', type: 'tool_returned', data: { tool: 'composio_execute_tool', callId: 'call-send', output: 'sent' } });
   appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Sent.' } });
 
@@ -45,7 +45,7 @@ test('buildTraceDetail classifies events, computes metrics, and links tool/appro
   assert.equal(trace.metrics.externalWrites, 1);
   assert.equal(trace.metrics.modelRoutes, 1);
   assert.equal(trace.replay.riskLevel, 'high');
-  assert.ok(trace.nodes.some((node) => node.category === 'external_write' && node.target === 'brooke@example.com'));
+  assert.ok(trace.nodes.some((node) => node.category === 'external_write' && node.target === 'casey@recipient.example'));
   assert.ok(trace.edges.some((edge) => edge.kind === 'tool_result' && edge.label === 'call-send'));
   assert.ok(trace.edges.some((edge) => edge.kind === 'approval_resolution' && edge.label === 'apr-1'));
 });

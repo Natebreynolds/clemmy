@@ -55,8 +55,8 @@ function setAccounts(items: LoaderItem[]): void {
 
 test('ambiguity → typed block with candidates, ZERO dispatch (reads included)', async () => {
   setAccounts([
-    account('ca_work', 'outlook', 'work@x.com'),
-    account('ca_home', 'outlook', 'home@y.com'),
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
   ]);
   // A READ (not a send): the gateway still blocks — reading the wrong mailbox
   // produces confidently-wrong answers. Returning (not throwing) proves the
@@ -77,43 +77,43 @@ test('ambiguity → typed block with candidates, ZERO dispatch (reads included)'
 
 test('owner routing: a recalled mailbox identity resolves the ambiguity to its live connection', async () => {
   setAccounts([
-    account('ca_work', 'outlook', 'work@x.com'),
-    account('ca_home', 'outlook', 'home@y.com'),
+    account('ca_work', 'outlook', 'work@site.example'),
+    account('ca_home', 'outlook', 'home@personal.example'),
   ]);
   rememberToolChoice({
     intent: 'list unread inbox messages',
-    choice: { kind: 'composio', identifier: 'OUTLOOK_LIST_MESSAGES', accountIdentity: 'home@y.com' },
+    choice: { kind: 'composio', identifier: 'OUTLOOK_LIST_MESSAGES', accountIdentity: 'home@personal.example' },
   });
   const out = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', {}, undefined, {});
   assert.equal(out.ok, true);
   if (out.ok) {
     assert.equal(out.connectionId, 'ca_home');
-    assert.equal(out.identity, 'home@y.com');
-    assert.ok(out.notes.some((n) => n.includes('home@y.com')), 'route note names the remembered mailbox');
+    assert.equal(out.identity, 'home@personal.example');
+    assert.ok(out.notes.some((n) => n.includes('home@personal.example')), 'route note names the remembered mailbox');
   }
 });
 
 test('identity-absent: the remembered mailbox is no longer connected → typed block, never a fallback guess', async () => {
   setAccounts([
-    account('ca_other', 'gmail', 'other@z.com'),
-    account('ca_second', 'gmail', 'second@z.com'),
+    account('ca_other', 'gmail', 'other@archive.example'),
+    account('ca_second', 'gmail', 'second@archive.example'),
   ]);
   rememberToolChoice({
     intent: 'send the weekly gmail digest',
-    choice: { kind: 'composio', identifier: 'GMAIL_SEND_EMAIL', accountIdentity: 'gone@z.com' },
+    choice: { kind: 'composio', identifier: 'GMAIL_SEND_EMAIL', accountIdentity: 'gone@archive.example' },
   });
   const out = await resolveComposioDispatch('GMAIL_SEND_EMAIL', {}, undefined, {});
   assert.equal(out.ok, false);
   if (!out.ok) {
     assert.equal(out.reason, 'identity-absent');
-    assert.match(out.message, /gone@z\.com/);
+    assert.match(out.message, /gone@archive\.example/);
   }
 });
 
 test('single distinct mailbox (duplicate re-auths) resolves to the freshest ACTIVE — no block', async () => {
   setAccounts([
-    { ...account('ca_old', 'airtable', 'me@x.com'), createdAt: '2026-07-01T00:00:00Z' },
-    { ...account('ca_new', 'airtable', 'me@x.com'), createdAt: '2026-07-10T00:00:00Z' },
+    { ...account('ca_old', 'airtable', 'me@site.example'), createdAt: '2026-07-01T00:00:00Z' },
+    { ...account('ca_new', 'airtable', 'me@site.example'), createdAt: '2026-07-10T00:00:00Z' },
   ]);
   const out = await resolveComposioDispatch('AIRTABLE_LIST_RECORDS', {}, undefined, {});
   assert.equal(out.ok, true);
@@ -122,8 +122,8 @@ test('single distinct mailbox (duplicate re-auths) resolves to the freshest ACTI
 
 test('blocked ledger semantics: every gateway block emits guardrail_tripped(composio_gateway) with the reason', async () => {
   setAccounts([
-    account('ca_a', 'slack', 'a@x.com'),
-    account('ca_b', 'slack', 'b@y.com'),
+    account('ca_a', 'slack', 'a@site.example'),
+    account('ca_b', 'slack', 'b@personal.example'),
   ]);
   const sess = createSession({ kind: 'chat' });
   const out = await resolveComposioDispatch('SLACK_SEND_MESSAGE', {}, undefined, { sessionId: sess.id });
@@ -147,56 +147,56 @@ test('breaker is NARROW: fires only when the snapshot confirms zero usable conne
   if (!dead.ok) assert.equal(dead.reason, 'not-connected');
   // The user reconnects (a usable connection appears): the SAME tripped breaker
   // must NOT block — the narrow condition (zero usable) no longer holds.
-  setAccounts([account('ca_notion', 'notion', 'n@x.com')]);
+  setAccounts([account('ca_notion', 'notion', 'n@site.example')]);
   const alive = await resolveComposioDispatch('NOTION_SEARCH_PAGES', {}, undefined, { sessionId: sid });
   assert.equal(alive.ok, true, 'a visible reconnect disarms the breaker without waiting for TTL');
   __gatewayTest__.clearReconnectBreaker(sid, 'NOTION_SEARCH_PAGES');
 });
 
-test('named accounts: "remember this as scorpion" binds pin→name; alias alone then resolves with no ask', async () => {
+test('named accounts: "remember this as acme" binds pin→name; alias alone then resolves with no ask', async () => {
   setAccounts([
-    account('ca_scorpion', 'outlook', 'nate@scorpion.co'),
-    account('ca_personal', 'outlook', 'nate@personal.me'),
+    account('ca_acme', 'outlook', 'alex.chen@corp.example'),
+    account('ca_personal', 'outlook', 'alex.chen@personal.example'),
   ]);
   // The remember gesture: pinned connection + account_alias meta-arg.
   const saved = await resolveComposioDispatch(
     'OUTLOOK_LIST_MESSAGES',
-    { account_alias: 'scorpion' },
-    'ca_scorpion',
+    { account_alias: 'acme' },
+    'ca_acme',
     {},
   );
   assert.equal(saved.ok, true);
   if (saved.ok) {
-    assert.equal(saved.connectionId, 'ca_scorpion');
-    assert.ok(saved.notes.some((n) => n.includes('"scorpion"')), 'confirms the name was saved');
+    assert.equal(saved.connectionId, 'ca_acme');
+    assert.ok(saved.notes.some((n) => n.includes('"acme"')), 'confirms the name was saved');
     assert.ok(!('account_alias' in saved.args), 'meta-arg never reaches the provider');
   }
-  assert.equal(resolveAccountAlias('scorpion', 'outlook')?.email, 'nate@scorpion.co');
+  assert.equal(resolveAccountAlias('acme', 'outlook')?.email, 'alex.chen@corp.example');
 
   // The use gesture: alias alone — resolves through the store, zero ambiguity ask.
   const used = await resolveComposioDispatch(
     'OUTLOOK_LIST_MESSAGES',
-    { account_alias: 'scorpion' },
+    { account_alias: 'acme' },
     undefined,
     {},
   );
   assert.equal(used.ok, true);
   if (used.ok) {
-    assert.equal(used.connectionId, 'ca_scorpion');
-    assert.equal(used.identity, 'nate@scorpion.co');
+    assert.equal(used.connectionId, 'ca_acme');
+    assert.equal(used.identity, 'alex.chen@corp.example');
   }
-  // Fuzzy phrasing still lands ("my scorpion email").
-  const fuzzy = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', { account_alias: 'my scorpion email' }, undefined, {});
+  // Fuzzy phrasing still lands ("my acme email").
+  const fuzzy = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', { account_alias: 'my acme email' }, undefined, {});
   assert.equal(fuzzy.ok, true);
-  if (fuzzy.ok) assert.equal(fuzzy.connectionId, 'ca_scorpion');
+  if (fuzzy.ok) assert.equal(fuzzy.connectionId, 'ca_acme');
 });
 
 test('named accounts survive re-auth: the alias re-attaches by EMAIL to the new connection id', async () => {
-  rememberAccountAlias({ toolkit: 'gmail', label: 'newsletter', email: 'news@brand.com', connectionId: 'ca_old_rotated' });
+  rememberAccountAlias({ toolkit: 'gmail', label: 'newsletter', email: 'news@brand.example', connectionId: 'ca_old_rotated' });
   // Re-auth minted a NEW connection id for the same mailbox; old id is gone.
   setAccounts([
-    account('ca_new_id', 'gmail', 'news@brand.com'),
-    account('ca_other2', 'gmail', 'me@brand.com'),
+    account('ca_new_id', 'gmail', 'news@brand.example'),
+    account('ca_other2', 'gmail', 'me@brand.example'),
   ]);
   const out = await resolveComposioDispatch('GMAIL_FETCH_EMAILS', { account_alias: 'newsletter' }, undefined, {});
   assert.equal(out.ok, true);
@@ -207,8 +207,8 @@ test('identity enrichment: cached probe results merge no-email duplicates so the
   // Two re-auths of ONE mailbox whose listing exposes NO email (the Microsoft
   // case) — unmergeable → would ask. A prior profile probe cached their real
   // mailbox; resolution must now merge them and pick the freshest, no ask.
-  recordIdentityProbe('ca_ms_old', 'nate@scorpion.co');
-  recordIdentityProbe('ca_ms_new', 'nate@scorpion.co');
+  recordIdentityProbe('ca_ms_old', 'alex.chen@corp.example');
+  recordIdentityProbe('ca_ms_new', 'alex.chen@corp.example');
   setAccounts([
     { ...account('ca_ms_old', 'outlook'), createdAt: '2026-07-01T00:00:00Z' },
     { ...account('ca_ms_new', 'outlook'), createdAt: '2026-07-10T00:00:00Z' },
@@ -220,10 +220,10 @@ test('identity enrichment: cached probe results merge no-email duplicates so the
 });
 
 test('the ambiguous ASK teaches the naming gesture and shows saved names', async () => {
-  rememberAccountAlias({ toolkit: 'slack', label: 'work', email: 'ops@corp.com', connectionId: 'ca_slack_work' });
+  rememberAccountAlias({ toolkit: 'slack', label: 'work', email: 'ops@corp.example', connectionId: 'ca_slack_work' });
   setAccounts([
-    account('ca_slack_work', 'slack', 'ops@corp.com'),
-    account('ca_slack_side', 'slack', 'side@indie.dev'),
+    account('ca_slack_work', 'slack', 'ops@corp.example'),
+    account('ca_slack_side', 'slack', 'side@indie.example'),
   ]);
   const out = await resolveComposioDispatch('SLACK_SEND_MESSAGE', {}, undefined, {});
   assert.equal(out.ok, false);
@@ -235,12 +235,12 @@ test('the ambiguous ASK teaches the naming gesture and shows saved names', async
 
 test('send safety net: an irreversible SEND to a multi-account toolkit never resolves to ok with no owner (findings 2,10)', async () => {
   setAccounts([
-    account('ca_a', 'outlook', 'a@x.com'),
-    account('ca_b', 'outlook', 'b@y.com'),
+    account('ca_a', 'outlook', 'a@site.example'),
+    account('ca_b', 'outlook', 'b@personal.example'),
   ]);
   // Two distinct mailboxes, no pin/name/hint, override flag set — a send must be
   // blocked (asked), NEVER dispatched to Composio's default entity.
-  const out = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { sender_override_confirmed: true, to_email: 'x@z.com', subject: 's', body: 'b' }, undefined, {});
+  const out = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { sender_override_confirmed: true, to_email: 'x@archive.example', subject: 's', body: 'b' }, undefined, {});
   assert.equal(out.ok, false, 'send with unresolved owner + multiple accounts must block');
   if (!out.ok) assert.equal(out.reason, 'ambiguous-account');
   // Never returns ok:true with connectionId undefined (the wrong-account send).

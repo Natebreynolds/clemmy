@@ -2,7 +2,7 @@
  * Run: npx tsx --test src/runtime/harness/worker-thrash.test.ts
  *
  * FIX 1.1 — per-worker loop-guard isolation. The 44-attorney batch
- * (sess-mpx56kgj) fanned out 44 workers that all shared ONE loop-guard
+ * The shared-loop-guard regression fanned out 44 workers that all shared ONE loop-guard
  * tracker (workers inherit the parent sessionId via AsyncLocalStorage), so
  * their identical-shape calls aggregated and tripped the guard 72× → the run
  * was cancelled. These tests prove (a) the shared-tracker poison is real and
@@ -36,7 +36,7 @@ test.after(() => {
   }
 });
 
-const MUT_ARGS = { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{"to":"x@y.com"}' };
+const MUT_ARGS = { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{"to":"x@personal.example"}' };
 
 test('shared loop-guard key: identical mutating calls AGGREGATE and trip the block (the 44-worker poison)', () => {
   _resetAllTrackersForTests();

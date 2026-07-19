@@ -11,7 +11,7 @@
  * caller. Returns a structured result; the runner decides how to surface it.
  *
  * North star: "reports back without fail" — a step that claims success but
- * returned no real artifact (the revill "deploy_to_netlify returned blocked,
+ * returned no real artifact (the missing-artifact "deploy_to_netlify returned blocked,
  * no URL" class) is caught as a hard verification failure, not a silent pass.
  */
 import { existsSync } from 'node:fs';
@@ -163,7 +163,7 @@ export function isBlockedStepOutput(output: unknown): boolean {
  * Self-heal move 1 (2026-07-14). Render a step's output contract as a
  * machine-precise prompt block the RUNNER injects into every step prompt —
  * derived from the SAME contract verifyStepOutput gates on, so prompt/contract
- * drift is structurally impossible (the scorpion-facebook-trends class: the
+ * drift is structurally impossible (the acme-facebook-trends class: the
  * authored prompt named different keys than the contract, and the model
  * improvised shapes — green or dead by coin flip).
  */
@@ -203,7 +203,7 @@ export function renderOutputContractSpec(contract: WorkflowStepOutputContract): 
  *  "output_contract" (the step emitted the WRONG SHAPE — diagnosable). The old
  *  in-line filter counted `min_items: X is not an array` as emptiness, which
  *  told the user "the source returned nothing" when 197KB of real data existed
- *  and only the shape was wrong (live scorpion-facebook-trends misdiagnosis). */
+ *  and only the shape was wrong (live acme-facebook-trends misdiagnosis). */
 export function classifyContractProblems(problems: string[]): 'empty_output' | 'output_contract' {
   const emptyOnly = problems.length > 0 && problems.every((p) =>
     (p.startsWith('non_empty:') || p.startsWith('min_items:'))
@@ -213,7 +213,7 @@ export function classifyContractProblems(problems: string[]): 'empty_output' | '
 
 /**
  * Bind a JSON-text output to the contract shape (fence extraction, outer-block
- * pull) — MOVED here from workflow-runner (review wf_67792612-cad defect B) so
+ * pull) — MOVED here from workflow-runner after the workflow contract review so
  * the submission gate and the reduce gate share ONE binding: the submission
  * gate was verifying the RAW value and refusing fenced payloads the reduce
  * gate would have passed. Accepts a parse when it satisfies the contract OR is

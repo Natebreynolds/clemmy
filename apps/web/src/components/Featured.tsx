@@ -784,14 +784,14 @@ function Arrow({ auto, done }: { auto?: boolean; done?: boolean }) {
 
 /* ───── Preview: meeting recording ───── */
 
-type Utterance = { speaker: "N" | "M" | "J"; name: string; text: string };
+type Utterance = { speaker: "R" | "M" | "J"; name: string; text: string };
 type Action = { kind: "todo" | "send" | "note"; text: string };
 
 const UTTERANCES: Utterance[] = [
   { speaker: "M", name: "Maya",   text: "Next quarter we should push the partnership deck to Acme before Friday." },
-  { speaker: "N", name: "Nathan", text: "Agreed. I'll get them a v1 by Thursday EOD." },
+  { speaker: "R", name: "Riley", text: "Agreed. I'll get them a v1 by Thursday EOD." },
   { speaker: "J", name: "Jess",   text: "Should we loop in design earlier this time?" },
-  { speaker: "N", name: "Nathan", text: "Yeah — let's brief Sam on Monday so they can sketch alongside us." },
+  { speaker: "R", name: "Riley", text: "Yeah — let's brief Sam on Monday so they can sketch alongside us." },
 ];
 
 const ACTIONS: Action[] = [
@@ -922,7 +922,7 @@ function MeetingRecording() {
 
 function SpeakerBadge({ speaker }: { speaker: Utterance["speaker"] }) {
   const palette: Record<Utterance["speaker"], string> = {
-    N: "bg-clem-500/20 text-clem-200 ring-clem-400/40",
+    R: "bg-clem-500/20 text-clem-200 ring-clem-400/40",
     M: "bg-violet-500/20 text-violet-200 ring-violet-400/40",
     J: "bg-emerald-500/20 text-emerald-200 ring-emerald-400/40",
   };

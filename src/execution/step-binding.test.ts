@@ -24,8 +24,8 @@ test('no declared inputs still carries dependsOn outputs for STEP CONTEXT', () =
 });
 
 test('conventional resolution: input by its own name', () => {
-  const r = bindStepInputs(step({ url: { type: 'string' } }), { url: 'https://x.com' }, {});
-  assert.equal(r.values.url, 'https://x.com');
+  const r = bindStepInputs(step({ url: { type: 'string' } }), { url: 'https://site.example' }, {});
+  assert.equal(r.values.url, 'https://site.example');
   assert.deepEqual(r.missing, []);
 });
 
@@ -42,8 +42,8 @@ test('default satisfies a missing input (not required)', () => {
 });
 
 test('from: input.<key>', () => {
-  const r = bindStepInputs(step({ site: { from: 'input.url' } }), { url: 'https://x.com' }, {});
-  assert.equal(r.values.site, 'https://x.com');
+  const r = bindStepInputs(step({ site: { from: 'input.url' } }), { url: 'https://site.example' }, {});
+  assert.equal(r.values.site, 'https://site.example');
 });
 
 test('from: steps.<id>.output and nested path', () => {

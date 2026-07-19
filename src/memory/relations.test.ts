@@ -153,9 +153,9 @@ test('resource backfill promotes unique specific names and leaves duplicate name
     app: 'Notion', kind: 'database', providerId: 'client-files-notion', name: 'Client Files',
   });
   const oneWord = upsertResourcePointer({
-    app: 'Airtable', kind: 'table', providerId: 'james-table', name: 'James',
+    app: 'Airtable', kind: 'table', providerId: 'fixture-one-word-label', name: 'FixtureLabel',
   });
-  const content = 'The Q3 Planning folder links to both Client Files resources and the James table.';
+  const content = 'The Q3 Planning folder links to both Client Files resources and the FixtureLabel table.';
   const episode = recordMemoryEpisode({
     kind: 'tool_result', sessionId: 'resource-ground-session', callId: 'resource-ground-call', content,
   });
@@ -331,13 +331,13 @@ test('relationship reconciliation refreshes inferred links but promotes only exa
 });
 
 test('relationship backfill rejects co-occurrence and indirect grammatical objects', () => {
-  const darrin = upsertEntity({ type: 'person', name: 'Darrin Sennott' });
-  const scorpion = upsertEntity({ type: 'company', name: 'Scorpion' });
+  const fixturePerson = upsertEntity({ type: 'person', name: 'Taylor Example' });
+  const acme = upsertEntity({ type: 'company', name: 'Acme' });
   const fact = rememberFact({
     kind: 'project',
-    content: 'Darrin Sennott leads the Account Management team at Scorpion.',
+    content: 'Taylor Example leads the Account Management team at Acme.',
   });
-  setFactEntityLinks(fact.id, [darrin, scorpion]);
+  setFactEntityLinks(fact.id, [fixturePerson, acme]);
   const stats = backfillGroundedEntityRelationships();
   assert.equal(stats.candidates, 0);
   assert.equal(loadEntityEdges().length, 0, 'nearby names are not stored as a guessed edge');

@@ -17,7 +17,7 @@ import { textResult } from './shared.js';
  * "what worked last time for intent X" memory layer.
  *
  * Phase A of the intent-based tool dispatch plan
- * (/Users/nathan.reynolds/.claude/plans/intent-based-tool-dispatch.md).
+ * (/Users/example/.claude/plans/intent-based-tool-dispatch.md).
  *
  * The tools intentionally have terse, prescriptive descriptions: they
  * teach the discipline. Specifically:

@@ -168,7 +168,7 @@ test('detectBlockedSteps: a healthy forEach aggregate is NOT flagged', () => {
 });
 
 test('humanizeStepOutput surfaces human content, not raw JSON', () => {
-  assert.equal(humanizeStepOutput({ notified: true, body: 'Good morning, Nate.' }), 'Good morning, Nate.');
+  assert.equal(humanizeStepOutput({ notified: true, body: 'Good morning, Alex.' }), 'Good morning, Alex.');
   assert.equal(humanizeStepOutput({ summary: 'Scanned 10 emails.' }), 'Scanned 10 emails.');
   assert.match(humanizeStepOutput({ blocked: true, reason: 'drive error' }), /^⚠️ blocked: drive error/);
   assert.equal(humanizeStepOutput('already a string'), 'already a string');
@@ -249,12 +249,12 @@ test('diagnoseWorkflowBlock classifies missing local MCP tools as runtime/manual
   const diagnosis = await diagnoseWorkflowBlock({
     workflow: {
       name: 'daily-overdue-salesforce-meetings',
-      description: 'Notify Nate about overdue Salesforce meetings.',
+      description: 'Notify Alex about overdue Salesforce meetings.',
       enabled: true,
       trigger: { manual: true },
       steps: [{
         id: 'main',
-        prompt: 'Use the Salesforce CLI via run_shell_command, then notify Nate.',
+        prompt: 'Use the Salesforce CLI via run_shell_command, then notify Alex.',
         sideEffect: 'send',
       }],
     } as never,

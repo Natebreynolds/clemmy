@@ -295,7 +295,7 @@ test('buildMeetingChatPrompt requires the full transcript and asks for next acti
   appendRecallTranscriptSegment({
     windowId,
     event: 'transcript.data',
-    speaker: 'Nate',
+    speaker: 'Alex',
     text: 'we need to follow up with the design partner after the onboarding call',
   });
   const { record, artifactPath } = finalizeRecallMeeting({ windowId, platform: 'zoom', title: 'Design partner onboarding' });
@@ -304,7 +304,7 @@ test('buildMeetingChatPrompt requires the full transcript and asks for next acti
   saveRecallMeetingAnalysis(record.id, {
     title: 'Design Partner Onboarding',
     summary: 'Discussed onboarding, follow-up, and several large, long-running matters.',
-    actionItems: [{ text: 'Follow up with the design partner', owner: 'Nate' }],
+    actionItems: [{ text: 'Follow up with the design partner', owner: 'Alex' }],
     generatedAt: new Date().toISOString(),
     source: 'agent',
   });

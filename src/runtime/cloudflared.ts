@@ -295,7 +295,7 @@ export async function listTunnels(opts?: { binary?: string }): Promise<TunnelInf
 /** Exposed for tests. */
 export function parseCreatedTunnel(stdout: string): { id: string; credentialsFile?: string } | null {
   // cloudflared 2024+ prints:
-  //   Tunnel credentials written to /Users/.../.cloudflared/<uuid>.json.
+  //   Tunnel credentials written to /Users/<username>/.cloudflared/<uuid>.json.
   //   Created tunnel <name> with id <uuid>
   const idMatch = stdout.match(/(?:with id|id\s*[:=])\s*([0-9a-fA-F-]{36})/);
   const credsMatch = stdout.match(/credentials\s+written\s+to\s+(\S+\.json)/i);

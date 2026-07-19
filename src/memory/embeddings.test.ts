@@ -53,7 +53,7 @@ test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provi
   try {
     // The hot path: buildTurnMemoryPrimer + primeTurnRecallVector both embed
     // options.input concurrently. Caching the promise collapses them to one call.
-    const [a, b] = await Promise.all([embedQuery('pull my market leaders'), embedQuery('pull my market leaders')]);
+    const [a, b] = await Promise.all([embedQuery('pull my priority accounts'), embedQuery('pull my priority accounts')]);
     assert.ok(a && b);
     assert.equal(calls, 1, 'concurrent identical embeds deduped to a single provider call');
     // A DIFFERENT query is a distinct call.

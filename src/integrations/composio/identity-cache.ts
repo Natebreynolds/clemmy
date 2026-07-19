@@ -3,7 +3,7 @@
  *
  * Composio's account listing often carries NO usable identity for a connection
  * (Microsoft tokens expose no email in the listing), so identity-based
- * resolution can't merge same-mailbox re-auths or honor "use my scorpion
+ * resolution can't merge same-mailbox re-auths or honor "use my acme
  * email" until each connection's REAL mailbox is learned. The gateway learns
  * it once per connection via a pinned profile probe (OUTLOOK_GET_PROFILE etc.)
  * and records it here; the snapshot mapper then serves it as the connection's

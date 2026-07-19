@@ -7,7 +7,7 @@ test('policy compiler recognizes only deterministic dispatch rule families', () 
     'Always send Outlook email via owner@example.com.',
   ).family, 'outlook_sender');
   assert.equal(classifyConstraintEnforcement(
-    'For Scorpion calendar lookups, use Outlook connection ca_abc123.',
+    'For Acme calendar lookups, use Outlook connection ca_abc123.',
   ).family, 'outlook_calendar_route');
   assert.equal(classifyConstraintEnforcement(
     'Always call Salesforce via the local sf CLI, never via the Composio Salesforce toolkit.',

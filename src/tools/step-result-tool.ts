@@ -57,7 +57,7 @@ function contractRefusal(sessionId: string, value: unknown): { refusal: string }
   if (!contract) return { accept: value };
   // Bind exactly like the authoritative reduce gate (fence extraction etc.) and
   // gate on the BOUND value — the raw-value check refused payloads the reduce
-  // gate passed (review wf_67792612-cad defect B). Record the bound value so
+  // gate passed (workflow contract review, defect B). Record the bound value so
   // downstream receives what the gate approved.
   const bound = coerceOutputForContract(value, contract);
   if (isBlockedStepOutput(bound)) return { accept: bound }; // honest blocks bypass shape checks

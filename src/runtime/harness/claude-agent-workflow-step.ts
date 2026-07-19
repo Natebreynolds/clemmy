@@ -4,6 +4,7 @@ import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { recordSubagentRun } from '../../agents/subagent-runs.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
+import { textTargetsConfiguredUserRecipient } from '../user-profile.js';
 import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -89,7 +90,10 @@ export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fu
     out.add('composio_search_tools');
   }
   if (text.includes('composio_list_tools')) out.add('composio_list_tools');
-  if (/\bnotify\b|\bdm\b|\bsend nate\b|\bsend (?:the )?(?:summary|notification|message)\b/.test(text)) {
+  if (
+    /\bnotify\b|\bdm\b|\bsend (?:me|myself|owner|the user)\b|\bsend (?:the )?(?:summary|notification|message)\b/.test(text)
+    || textTargetsConfiguredUserRecipient(text)
+  ) {
     out.add('notify_user');
   }
 

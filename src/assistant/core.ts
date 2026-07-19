@@ -26,7 +26,7 @@ import { renderSessionHistoryForModel } from '../runtime/harness/session-transcr
  * `CONTROLLER_DECISION_WALL_CLOCK_MS`). Chat callers (Discord DM,
  * dashboard) historically passed nothing, so a hung Codex SSE stream
  * had no end-to-end budget and a stalled call could sit indefinitely
- * (verified 2026-05-25 — sess-mplfm14j-f0985a98 hung 3+ minutes).
+ * (verified against the transport-silence regression, which hung for 3+ minutes).
  *
  * 120s is the backstop AFTER the codex-dispatcher transport timeouts
  * (15s headers / 30s body). Most chat-side hangs surface in 15-30s

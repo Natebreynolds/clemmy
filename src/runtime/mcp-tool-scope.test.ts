@@ -58,7 +58,7 @@ test('resolveMcpToolScopeWithContinuity: a bare confirmation inherits the prior 
 
 test('resolveMcpToolScopeWithContinuity: a FRESH-intent turn ignores prior scope (no over-inherit)', () => {
   const scope = resolveMcpToolScopeWithContinuity({
-    userInput: 'run a fresh SEO audit of acme.com',
+    userInput: 'run a fresh SEO audit of acme.example',
     priorUserInputs: ['draft the outlook emails'],
   });
   // Current turn has its own intent → SEO scope, NOT the inherited Outlook one.
@@ -97,14 +97,14 @@ test('resolveMcpToolScope: local/file prompts do not inject external MCP tools',
 });
 
 test('resolveMcpToolScope: a pinned-calendar label + date shorthand is treated as Outlook calendar intent', () => {
-  const scope = resolveMcpToolScope({ userInput: 'Check my scorpion for tomorrow', pinnedCalendarLabels: ['scorpion'] });
+  const scope = resolveMcpToolScope({ userInput: 'Check my acme for tomorrow', pinnedCalendarLabels: ['acme'] });
   assert.ok((scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
   assert.ok((scope.toolPatterns ?? []).includes('calendar'));
   assert.match(scope.reason, /outlook/i);
   assert.ok(!scope.failOpenCandidate);
 
   // No pinned calendars → the shorthand never fires; the turn stays generic.
-  const generic = resolveMcpToolScope({ userInput: 'Check my scorpion for tomorrow' });
+  const generic = resolveMcpToolScope({ userInput: 'Check my acme for tomorrow' });
   assert.ok(!(generic.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
 });
 
@@ -280,7 +280,7 @@ test('resolveMcpToolScope: local SEO follow-ups do not inject DataForSEO', () =>
 test('resolveMcpToolScope: negative fresh-audit instructions suppress DataForSEO for local follow-ups', () => {
   const scope = resolveMcpToolScope({
     userInput:
-      'In this same Scorpion audit thread, append a Compaction replay check 2 section to the local report. Do not run a fresh SEO audit or DataForSEO lookup unless you truly need it.',
+      'In this same Acme audit thread, append a Compaction replay check 2 section to the local report. Do not run a fresh SEO audit or DataForSEO lookup unless you truly need it.',
   });
   assert.equal(scope.allowAll, undefined);
   assert.deepEqual(scope.allowedServerSlugs, []);
@@ -291,7 +291,7 @@ test('resolveMcpToolScope: negative fresh-audit instructions suppress DataForSEO
 test('resolveMcpToolScope: without-running wording suppresses external tools for replay checks', () => {
   const scope = resolveMcpToolScope({
     userInput:
-      'Continue this exact Scorpion audit thread. Without running a fresh SEO audit, DataForSEO lookup, crawl, scrape, or web search, append a new section titled "Compaction replay check 3" to /Users/nathan.reynolds/scorpion-co-seo-audit-2026-05-27.md. In that section, summarize from memory/context: 1. the audit target, 2. the strongest technical SEO issue, 3. the main organic-visibility issue, 4. the file path you updated. Use append mode only.',
+      'Continue this exact Acme audit thread. Without running a fresh SEO audit, DataForSEO lookup, crawl, scrape, or web search, append a new section titled "Compaction replay check 3" to /Users/example/acme-co-seo-audit-2026-05-27.md. In that section, summarize from memory/context: 1. the audit target, 2. the strongest technical SEO issue, 3. the main organic-visibility issue, 4. the file path you updated. Use append mode only.',
   });
   assert.equal(scope.allowAll, undefined);
   assert.deepEqual(scope.allowedServerSlugs, []);
@@ -302,7 +302,7 @@ test('resolveMcpToolScope: without-running wording suppresses external tools for
 test('resolveMcpToolScope: without-running-any wording suppresses comma-list external tools', () => {
   const scope = resolveMcpToolScope({
     userInput:
-      "Continue this exact Scorpion audit thread. Without running any fresh web, DataForSEO, SEO, or external MCP lookups, append a new section titled 'Compaction replay check 5' to /Users/nathan.reynolds/scorpion-co-seo-audit-2026-05-27.md.",
+      "Continue this exact Acme audit thread. Without running any fresh web, DataForSEO, SEO, or external MCP lookups, append a new section titled 'Compaction replay check 5' to /Users/example/acme-co-seo-audit-2026-05-27.md.",
   });
   assert.equal(scope.allowAll, undefined);
   assert.deepEqual(scope.allowedServerSlugs, []);
@@ -347,7 +347,7 @@ test('resolveMcpToolScope: an EXPLICIT negation still suppresses tools even with
 test('resolveMcpToolScope: named external systems override local-context wording', () => {
   const scope = resolveMcpToolScope({
     userInput:
-      'Find 8 law firm accounts from Salesforce that fit our Market Leader lane and have not been touched recently. For each one, gather one concrete SEO signal, then create unsent Outlook drafts. Keep enough state that I can ask follow-up questions after the workflow finishes.',
+      'Find 8 law firm accounts from Salesforce that fit our Priority Account lane and have not been touched recently. For each one, gather one concrete SEO signal, then create unsent Outlook drafts. Keep enough state that I can ask follow-up questions after the workflow finishes.',
   });
   assert.ok(scope.allowedServerSlugs?.includes('salesforce'));
   assert.ok(scope.allowedServerSlugs?.includes('dataforseo'));

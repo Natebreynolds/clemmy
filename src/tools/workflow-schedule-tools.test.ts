@@ -153,7 +153,7 @@ test('a clean research/report schedule is written and may surface gap questions'
     name: 'daily-digest',
     description: 'Summarize overnight signups every morning.',
     cron: '0 8 * * *',
-    instructions: 'Summarize the overnight signups and notify Nate.',
+    instructions: 'Summarize the overnight signups and notify Alex.',
     enabled: true,
     toolCall: null,
     timezone: null,

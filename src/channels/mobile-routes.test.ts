@@ -137,7 +137,7 @@ test('happy path: set PIN, login, whoami, logout', async () => {
     const login = await fetch(`${h.url}/m/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pin: 'TestPin1!', deviceLabel: 'Nathans iPhone' }),
+      body: JSON.stringify({ pin: 'TestPin1!', deviceLabel: 'Test iPhone' }),
     });
     assert.equal(login.status, 200);
     const cookie = extractCookie(login.headers.get('set-cookie'));
@@ -146,7 +146,7 @@ test('happy path: set PIN, login, whoami, logout', async () => {
     const me = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie: cookie! } });
     assert.equal(me.status, 200);
     const meBody = await me.json() as { deviceLabel: string; deviceId: string };
-    assert.equal(meBody.deviceLabel, 'Nathans iPhone');
+    assert.equal(meBody.deviceLabel, 'Test iPhone');
     assert.ok(meBody.deviceId.startsWith('dev-'));
 
     const logout = await fetch(`${h.url}/m/auth/logout`, {

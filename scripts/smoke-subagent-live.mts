@@ -6,9 +6,19 @@
  *   #2 Agents-panel attribution: the fan-out workers are recorded under the workflow
  *      RUN in the subagent-runs store (listSubagentRuns(runId) returns them).
  *
- * Run: CLEMMY_CLAUDE_TOOL_SEARCH=on npx tsx scripts/smoke-subagent-live.mts
+ * Run with one positional domain or:
+ * CLEMMY_SMOKE_DOMAIN="TARGET_DOMAIN" npx tsx scripts/smoke-subagent-live.mts
  */
 process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
+
+import { readLiveDomains } from './lib/live-domain-input.js';
+
+const [targetDomain] = readLiveDomains({
+  envName: 'CLEMMY_SMOKE_DOMAIN',
+  min: 1,
+  max: 1,
+  usage: 'Usage: npx tsx scripts/smoke-subagent-live.mts DOMAIN',
+});
 
 const { createSession } = await import('../src/runtime/harness/eventlog.js');
 const { runClaudeAgentSdkWorkflowStep } = await import('../src/runtime/harness/claude-agent-workflow-step.js');
@@ -33,7 +43,7 @@ const result = await runClaudeAgentSdkWorkflowStep({
   fullLane: true,
   modelId: 'claude-sonnet-4-6',
   prompt: [
-    'Get the top 3 organic Google keywords (US) for stanleysteemer.com via the dataforseo MCP.',
+    `Get the top 3 organic Google keywords (US) for ${targetDomain} via the dataforseo MCP.`,
     'Return { results: [{ domain, keywords }] } and call workflow_step_result once.',
   ].join('\n'),
 });

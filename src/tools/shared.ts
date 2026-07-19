@@ -56,7 +56,7 @@ export const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
  * fidelity (e.g. read_file with an explicit byte budget) can pass a
  * higher maxChars.
  *
- * v0.5.22 — lowered 8000 → 4000 after sess-mplmvrqu (2026-05-25) hit
+ * Lowered 8000 → 4000 after the plan-timeout regression hit
  * a 1.4MB Codex request body that consistently SSE-truncated. Tool
  * returns accumulated unbounded across 31 history items; tighter
  * default keeps long sessions under Codex's request-size cliff.

@@ -560,7 +560,7 @@ test('webhook fire: disabling a workflow stops delivery without deleting its dur
   ]);
   syncWorkflowTriggerRegistry();
 
-  const fired = fireWorkflowWebhook('form-submit', { email: 'a@b.co' });
+  const fired = fireWorkflowWebhook('form-submit', { email: 'a@beta-co.example' });
   assert.equal(fired.length, 1);
   assert.equal(fired[0].status, 'queued');
 
@@ -571,7 +571,7 @@ test('webhook fire: disabling a workflow stops delivery without deleting its dur
   writeFileSync(path.join(dir, 'SKILL.md'), skill, 'utf-8');
   const after = syncWorkflowTriggerRegistry();
   assert.ok(after.removed >= 1, 'workflow trigger disabled');
-  assert.deepEqual(fireWorkflowWebhook('form-submit', { email: 'c@d.co' }), []);
+  assert.deepEqual(fireWorkflowWebhook('form-submit', { email: 'c@delta-co.example' }), []);
   assert.equal(triggerEventRows('on-form-submit').length, 1, 'durable trigger receipt retained while disabled');
 });
 
@@ -681,10 +681,10 @@ test('workflowInputsFromTriggerPayload: binds declared inputs only; `payload` in
     name: 'x', description: '', enabled: true, trigger: {}, steps: [],
     inputs: { url: { type: 'string' as const }, payload: {}, missing: {} },
   };
-  const inputs = workflowInputsFromTriggerPayload(def, { url: 'https://a.co', extra: 'ignored', nested: { no: 1 } });
-  assert.equal(inputs.url, 'https://a.co');
+  const inputs = workflowInputsFromTriggerPayload(def, { url: 'https://alpha-co.example', extra: 'ignored', nested: { no: 1 } });
+  assert.equal(inputs.url, 'https://alpha-co.example');
   assert.equal(typeof inputs.payload, 'string');
-  assert.ok(inputs.payload.includes('https://a.co'));
+  assert.ok(inputs.payload.includes('https://alpha-co.example'));
   assert.equal('missing' in inputs, false);
   assert.equal('extra' in inputs, false);
 });

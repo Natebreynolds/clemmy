@@ -256,8 +256,8 @@ test('repeatable validity preserves true → false → true without duplicate ro
 });
 
 test('manual restore opens a new validity interval and clears stale supersession fields', () => {
-  const old = rememberFact({ kind: 'user', content: 'Nathan prefers Tuesday reviews.', occurredAt: '2025-01-01T00:00:00.000Z' });
-  const replacement = supersedeFact(old.id, { content: 'Nathan prefers Wednesday reviews.', occurredAt: '2025-02-01T00:00:00.000Z' });
+  const old = rememberFact({ kind: 'user', content: 'Alexander prefers Tuesday reviews.', occurredAt: '2025-01-01T00:00:00.000Z' });
+  const replacement = supersedeFact(old.id, { content: 'Alexander prefers Wednesday reviews.', occurredAt: '2025-02-01T00:00:00.000Z' });
   assert.ok(replacement);
   assert.equal(reactivateFact(old.id), true);
   const restored = getFact(old.id)!;

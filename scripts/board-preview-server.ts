@@ -38,12 +38,12 @@ const { registerConsoleRoutes } = await import('../src/dashboard/console-routes.
 const queued = createBackgroundTask({ title: 'Draft Q3 outreach emails for the 12 Birmingham firms', prompt: 'p' });
 createBackgroundTask({ title: 'Compile the weekly SEO movement report', prompt: 'p' });
 
-const running = createBackgroundTask({ title: 'Researching Revill Law local-search footprint', prompt: 'p' });
+const running = createBackgroundTask({ title: 'Researching Example Legal Group local-search footprint', prompt: 'p' });
 markBackgroundTaskRunning(running.id);
-const running2 = createBackgroundTask({ title: 'Building the lunar audit for Aldous & Reeve', prompt: 'p' });
+const running2 = createBackgroundTask({ title: 'Building the lunar audit for Sample Law Partners', prompt: 'p' });
 markBackgroundTaskRunning(running2.id);
 
-const awaiting = createBackgroundTask({ title: 'Send the proposal to cliff@eleylawfirm.com', prompt: 'p' });
+const awaiting = createBackgroundTask({ title: 'Send the proposal to casey@example-legal.example', prompt: 'p' });
 markBackgroundTaskRunning(awaiting.id);
 markBackgroundTaskAwaitingApproval(awaiting.id, 'appr-1', 'Ready to send — approve?');
 

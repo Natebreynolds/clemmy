@@ -5,7 +5,44 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  notch-helper-macos:
+    name: Native notch helper (macOS)
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Typecheck desktop notch integration
+        working-directory: apps/desktop
+        run: npm run typecheck
+
+      - name: Build native notch helper
+        working-directory: apps/desktop
+        run: npm run build:notch-helper
+
+      - name: Probe native notch helper
+        working-directory: apps/desktop
+        run: >-
+          node -e 'const { execFileSync } = require("node:child_process");
+          const helper = "./native/notch-click-helper/.build/ClementineNotchHelper";
+          const probe = JSON.parse(execFileSync(helper, ["--probe"], { encoding: "utf8" }));
+          if (probe.type !== "probe" || probe.protocol !== 1) throw new Error(`Unexpected helper probe: ${JSON.stringify(probe)}`);'
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -18,6 +55,12 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
+
+      - name: Check public repository hygiene
+        run: npm run check:public-hygiene
+
+      - name: Test public repository hygiene gate
+        run: npm run test:public-hygiene
 
       - name: Install dependencies
         run: npm ci

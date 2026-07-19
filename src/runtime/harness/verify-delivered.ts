@@ -49,7 +49,7 @@ export const BLOCKED_TEXT_PATTERNS: RegExp[] = [
   /\bwaiting (on|for) (your|user|the user)\b/i,
   /\bblocked (on|by)\b/i,
   // "Execution 0e30… marked blocked" / "the execution is blocked" — the shape
-  // sess-mrds80fu's honest partial-progress report used; the old patterns only
+  // The ask-first regression's honest partial-progress report used; the old patterns only
   // matched "blocked on/by" and "I'm blocked", so the honesty backstop missed it.
   /\bexecution (?:is |was |remains |marked )?blocked\b/i,
   /\bstatus:\s*blocked\b/i,

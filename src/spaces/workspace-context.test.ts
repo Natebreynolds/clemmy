@@ -18,7 +18,7 @@ const { buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_
 const sdk = await import('../runtime/harness/claude-agent-sdk.js');
 
 test('workspaceSlugFromSessionId parses "space-<slug>" sessions only', () => {
-  assert.equal(workspaceSlugFromSessionId('space-darrin-sennott-deal-risk'), 'darrin-sennott-deal-risk');
+  assert.equal(workspaceSlugFromSessionId('space-example-deal-risk'), 'example-deal-risk');
   assert.equal(workspaceSlugFromSessionId('space-x'), 'x');
   assert.equal(workspaceSlugFromSessionId('sess-mq-abc'), null);
   assert.equal(workspaceSlugFromSessionId('chat'), null);

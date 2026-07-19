@@ -316,7 +316,7 @@ test('falloverBrainModelIds — Claude→Codex→GLM order, excludes current, []
 
 test('falloverBrainModelIds — a repurposed OPENAI_MODEL_PRIMARY (BYO id) cannot knock connected Codex out of the chain', () => {
   writeAuthFiles(); // codex + claude OAuth present
-  // Nathan's real config class: OPENAI_MODEL_PRIMARY repurposed to glm-5.2. The
+  // Alexander's real config class: OPENAI_MODEL_PRIMARY repurposed to glm-5.2. The
   // codex slot used to borrow that id verbatim, resolve to BYO, and get dropped
   // by the mis-route guard — Codex silently vanished from claude→X recovery
   // (observed 2026-07-02: every recovery went straight to glm-5.2).

@@ -53,7 +53,7 @@ test('dispatchCodeModeTool refuses an irreversible SEND even with writes ON — 
   process.env.CLEMMY_CODE_MODE_WRITES = 'on';
   try {
     await assert.rejects(
-      () => dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{"to":"a@b.com"}' }, 'sess'),
+      () => dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{"to":"a@beta.example"}' }, 'sess'),
       /run_batch/,
       'an irreversible send inside code mode must be refused and point at run_batch',
     );

@@ -21,6 +21,51 @@ export interface EntityAnchors {
   emails: Set<string>;
 }
 
+/**
+ * Names are deliberately discovered from structure, never from a customer
+ * allowlist. An explicit label is the strongest signal; title-cased names with
+ * a conventional organization or project suffix are the conservative fallback.
+ * Keeping this generic lets the entity guard protect a newly encountered
+ * organization without teaching Clementine that organization's name in code.
+ */
+const ENTITY_LABEL_RE =
+  /\b(?:client|customer|organization|org|company|firm|account|project)(?:\s+name)?\s*[:=]\s*(?:"([^"\r\n]{1,100})"|'([^'\r\n]{1,100})'|([^;,|\r\n]{1,100}))/gi;
+
+const STRUCTURAL_ENTITY_SUFFIX_RE =
+  /\b(?:The\s+)?[A-Z][A-Za-z0-9&'.-]*(?:\s+(?:[A-Z][A-Za-z0-9&'.-]*|&)){0,5}\s+(?:Law\s+Offices|Law\s+Firm|Legal|Law|L\.?L\.?C\.?|L\.?L\.?P\.?|Incorporated|Inc\.?|Corporation|Corp\.?|Company|Co\.?|Group|Partners?|Associates|Agency|Studio|Labs?|Project|Initiative|Campaign|Program)\b/g;
+
+function normalizeStructuralEntityName(raw: string): string | null {
+  const normalized = raw
+    .trim()
+    .replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '')
+    .replace(/[.!?]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^(?:the|a|an)\s+/i, '')
+    .trim();
+  if (normalized.length < 2 || normalized.length > 100) return null;
+  if (normalized.split(/\s+/).length > 8) return null;
+  if (/[@=]|:\/\//.test(normalized)) return null;
+  // A label followed by prose is not a trustworthy name boundary. Quoted
+  // values and delimiter-terminated values remain supported by ENTITY_LABEL_RE.
+  if (/\b(?:is|are|was|were|has|have|uses|owns|needs|prefers|should|will|can|does|did|lives)\b/i.test(normalized)) {
+    return null;
+  }
+  return normalized.toLowerCase();
+}
+
+function extractStructuralEntityNames(content: string): Set<string> {
+  const names = new Set<string>();
+  for (const match of content.matchAll(ENTITY_LABEL_RE)) {
+    const normalized = normalizeStructuralEntityName(match[1] ?? match[2] ?? match[3] ?? '');
+    if (normalized) names.add(normalized);
+  }
+  for (const match of content.matchAll(STRUCTURAL_ENTITY_SUFFIX_RE)) {
+    const normalized = normalizeStructuralEntityName(match[0]);
+    if (normalized) names.add(normalized);
+  }
+  return names;
+}
+
 interface MergeCluster {
   canonical: Fact;
   merged: Fact[];
@@ -57,22 +102,12 @@ export function extractAnchors(fact: { content: string }): EntityAnchors {
   const accountIds = new Set((content.match(/app[a-zA-Z0-9]{12,}/g) || []).map(s => s.toLowerCase()));
 
   // Domain names (critical for multi-client setups)
-  const domainMatches = content.match(/\b[\w-]+\.(com|ai|io|org|net|co\.uk|dev)\b/gi) || [];
+  const domainMatches = content.match(/\b[\w-]+\.(com|ai|io|org|net|co\.uk|dev|example)\b/gi) || [];
   const domains = new Set(domainMatches.map(s => s.toLowerCase()));
 
-  // Client names (e.g., "Revill Law Firm", "Aldous Law")
-  // This is a conservative set; typically captured from project facts
-  const clientPatterns = [
-    /Revill\s+(?:Law\s+)?Firm/gi,
-    /Aldous\s+(?:Law|Law\s+Firm)?/gi,
-    /Scorpion/gi,
-    /Market\s+Leader/gi,
-  ];
-  const clientNames = new Set<string>();
-  for (const pattern of clientPatterns) {
-    const matches = content.match(pattern) || [];
-    matches.forEach(m => clientNames.add(m.toLowerCase()));
-  }
+  // Organization/project names from explicit labels or conventional suffixes.
+  // Never add customer names here: extraction must generalize to unseen users.
+  const clientNames = extractStructuralEntityNames(content);
 
   // Email addresses (user identity)
   const emailMatches = content.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\b/g) || [];

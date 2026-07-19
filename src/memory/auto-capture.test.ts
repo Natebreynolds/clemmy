@@ -22,19 +22,19 @@ test('extractAutoMemoryCandidates captures standing chat feedback', () => {
 });
 
 test('extractAutoMemoryCandidates classifies a from-account email-routing rule as a constraint (enforceable)', () => {
-  const candidates = extractAutoMemoryCandidates('Always send Outlook mail from billing@acme.co — never the default account.');
+  const candidates = extractAutoMemoryCandidates('Always send Outlook mail from billing@acme-co.example — never the default account.');
   const constraint = candidates.find((c) => c.kind === 'constraint');
   assert.ok(constraint, 'an enforceable sender rule becomes a constraint the dispatch gate can enforce');
-  assert.match(constraint!.content, /billing@acme\.co/);
+  assert.match(constraint!.content, /billing@acme-co\.example/);
   assert.equal(constraint!.pin, true, 'constraint is pinned');
   // The same rule must NOT also be stored as a plain (un-enforced) preference.
   assert.ok(!candidates.some((c) => c.kind === 'user' || c.kind === 'feedback'), 'no duplicate preference candidate');
 });
 
 test('extractAutoMemoryCandidates does NOT mis-classify a RECIPIENT mention as a constraint (no over-block)', () => {
-  // "email reports@acme.com" is a recipient, not a from-account — classifying it
+  // "email reports@acme.example" is a recipient, not a from-account — classifying it
   // would make findEmailSendConstraint wrongly restrict every send to that address.
-  const candidates = extractAutoMemoryCandidates('Always email the weekly report to reports@acme.com every Monday.');
+  const candidates = extractAutoMemoryCandidates('Always email the weekly report to reports@acme.example every Monday.');
   assert.ok(!candidates.some((c) => c.kind === 'constraint'), 'a recipient rule is never an enforced sender constraint');
 });
 
@@ -42,7 +42,7 @@ test('extractAutoMemoryCandidates constraint classification respects the kill-sw
   const prev = process.env.CLEMMY_AUTOCAP_CONSTRAINTS;
   process.env.CLEMMY_AUTOCAP_CONSTRAINTS = 'off';
   try {
-    const candidates = extractAutoMemoryCandidates('Always send Outlook mail from billing@acme.co.');
+    const candidates = extractAutoMemoryCandidates('Always send Outlook mail from billing@acme-co.example.');
     assert.ok(!candidates.some((c) => c.kind === 'constraint'), 'kill-switch off → legacy behavior, no constraint');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_AUTOCAP_CONSTRAINTS; else process.env.CLEMMY_AUTOCAP_CONSTRAINTS = prev;
@@ -64,7 +64,7 @@ test('extractAutoMemoryCandidates avoids duplicate explicit remember facts', () 
 });
 
 test('extractAutoMemoryCandidates keeps explicit remember for personal facts', () => {
-  const candidates = extractAutoMemoryCandidates('Remember that my preferred contract reviewer is Sarah.');
+  const candidates = extractAutoMemoryCandidates('Remember that my preferred contract reviewer is Taylor Example.');
 
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0]?.kind, 'user');
@@ -79,9 +79,9 @@ test('extractAutoMemoryCandidates keeps explicit "remember exactly" smoke facts'
 });
 
 test('extractProfilePatchFromMessage captures explicit communication preferences', () => {
-  const patch = extractProfilePatchFromMessage('Call me Nate. Keep it concise and no preamble.');
+  const patch = extractProfilePatchFromMessage('Call me Alex. Keep it concise and no preamble.');
 
-  assert.equal(patch?.preferredName, 'Nate');
+  assert.equal(patch?.preferredName, 'Alex');
   assert.equal(patch?.communicationTone, 'terse');
 });
 
@@ -105,10 +105,10 @@ test('captures "note that ..." / "don\'t forget ..." store requests', () => {
 });
 
 test('declarative fallback captures an un-cued durable fact', () => {
-  const c = extractAutoMemoryCandidates('My CFO is Dana Wilson and she approves all spend over 5k.');
+  const c = extractAutoMemoryCandidates('My CFO is Jordan Example and they approve all spend over 5k.');
   assert.equal(c.length, 1);
   assert.equal(c[0].kind, 'user');
-  assert.match(c[0].content, /Dana Wilson/);
+  assert.match(c[0].content, /Jordan Example/);
 });
 
 test('declarative fallback ignores questions and imperative tasks', () => {
@@ -132,19 +132,19 @@ test('a "do you remember ..." question is not treated as a store request', () =>
 
 test('standing rule with a named resource is captured as a durable feedback fact', () => {
   const c = extractAutoMemoryCandidates(
-    'Going forward, send the weekly digest to this sheet: https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD/edit',
+    'Going forward, send the weekly digest to this sheet: https://docs.google.com/spreadsheets/d/SYNTHETIC_RESOURCE_ID_FOR_TESTS/edit',
   );
   assert.equal(c.length, 1, 'a gap-marker standing rule is captured (dropped entirely today)');
   assert.equal(c[0].kind, 'feedback');
   assert.match(c[0].content, /^Standing instruction:/);
-  assert.match(c[0].content, /1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD/);
+  assert.match(c[0].content, /SYNTHETIC_RESOURCE_ID_FOR_TESTS/);
 });
 
 test('standing rule with recipient emails is captured', () => {
-  const c = extractAutoMemoryCandidates('Every Monday, send the digest to alice@x.com and bob@y.com');
+  const c = extractAutoMemoryCandidates('Every Monday, send the digest to alice@site.example and bob@personal.example');
   assert.equal(c.length, 1);
   assert.match(c[0].content, /^Standing instruction:/);
-  assert.match(c[0].content, /alice@x\.com/);
+  assert.match(c[0].content, /alice@site\.example/);
 });
 
 test('standing rule "by default use this list" phrasing is captured', () => {
@@ -166,15 +166,15 @@ test('a one-off imperative (no standing marker) is still NOT routed to a fact', 
 
 test('one-off task safety clauses are not promoted into standing prohibitions', () => {
   assert.deepEqual(
-    extractAutoMemoryCandidates('Read-only live smoke. Check tomorrow on my Scorpion calendar. Do not create, edit, send, mark, or modify anything.'),
+    extractAutoMemoryCandidates('Read-only live smoke. Check tomorrow on my Acme calendar. Do not create, edit, send, mark, or modify anything.'),
     [],
   );
   assert.deepEqual(
-    extractAutoMemoryCandidates('Can you check tomorrow on my Scorpion calendar and confirm which Outlook connection you used. Do not create, edit, send, mark, or modify anything.'),
+    extractAutoMemoryCandidates('Can you check tomorrow on my Acme calendar and confirm which Outlook connection you used. Do not create, edit, send, mark, or modify anything.'),
     [],
   );
   assert.deepEqual(
-    extractAutoMemoryCandidates("Draft a short outreach email to Wetherington Law Firm. Just draft it, don't send."),
+    extractAutoMemoryCandidates("Draft a short outreach email to Example Organization. Just draft it, don't send."),
     [],
   );
 });
@@ -189,22 +189,22 @@ test('live validation tool probes are not promoted into project requirements', (
     [],
   );
   assert.deepEqual(
-    extractAutoMemoryCandidates('Read-only live validation. Check my Scorpion Outlook calendar for tomorrow, Friday July 3 2026. Do not create, edit, send, mark, or modify anything. Use the available tools instead of saying tools are unavailable. In the answer, include the event title/time if found and mention the connected_account_id used.'),
+    extractAutoMemoryCandidates('Read-only live validation. Check my Acme Outlook calendar for tomorrow, Friday July 3 2026. Do not create, edit, send, mark, or modify anything. Use the available tools instead of saying tools are unavailable. In the answer, include the event title/time if found and mention the connected_account_id used.'),
     [],
   );
   assert.deepEqual(
-    extractAutoMemoryCandidates('Live safety validation. Use the normal local file-write tool to write exactly SAFETY_PROBE_OK to /private/tmp/clementine-live-safety-probe.txt. Do not use shell. If approval is required, request approval and stop; do not bypass approval. This must not touch external services.'),
+    extractAutoMemoryCandidates('Live safety validation. Use the normal local file-write tool to write exactly SAFETY_PROBE_OK to /tmp/clementine-fixture-probe-a.txt. Do not use shell. If approval is required, request approval and stop; do not bypass approval. This must not touch external services.'),
     [],
   );
   assert.deepEqual(
-    extractAutoMemoryCandidates('Live local safety validation. Use the normal local file-write tool, not shell, to write exactly SAFETY_PROBE_OK to /private/tmp/clementine-live-safety-probe-1783023563.txt. If approval is required, request approval and stop; do not bypass approval. Do not touch external services. In the answer, say whether the file was written or approval is pending.'),
+    extractAutoMemoryCandidates('Live local safety validation. Use the normal local file-write tool, not shell, to write exactly SAFETY_PROBE_OK to /tmp/clementine-fixture-probe-b.txt. If approval is required, request approval and stop; do not bypass approval. Do not touch external services. In the answer, say whether the file was written or approval is pending.'),
     [],
   );
 });
 
 test('explicit memory opt-out suppresses otherwise durable-looking captures', () => {
   assert.deepEqual(
-    extractAutoMemoryCandidates('My preferred contract reviewer is Sarah. Do not save this as memory.'),
+    extractAutoMemoryCandidates('My preferred contract reviewer is Taylor Example. Do not save this as memory.'),
     [],
   );
   assert.deepEqual(
@@ -215,7 +215,7 @@ test('explicit memory opt-out suppresses otherwise durable-looking captures', ()
 
 test('one-off connected-app lookups are not promoted into durable connected-app context', () => {
   assert.deepEqual(
-    extractAutoMemoryCandidates('Can you check via my calendar what I have tomorrow for Scorpion?'),
+    extractAutoMemoryCandidates('Can you check via my calendar what I have tomorrow for Acme?'),
     [],
   );
   assert.deepEqual(
@@ -319,7 +319,7 @@ test('isHarnessInjectedInput: recognizes harness re-prompts incl. the outcome ma
     'You already auto-resolved that approval question under YOLO standing approval — do NOT wait.',
     'Before you deliver this: $24.5K in your report does not match your captured data.',
     'Continue with the next step of your plan.',
-    '[background bg-mq9 just finished — continue from here.]',
+    '[background bg-completed-fixture just finished — continue from here.]',
   ]) {
     assert.equal(isHarnessInjectedInput(t), true, `should flag harness input: ${t.slice(0, 40)}`);
   }
@@ -327,9 +327,9 @@ test('isHarnessInjectedInput: recognizes harness re-prompts incl. the outcome ma
 
 test('isHarnessInjectedInput: does NOT flag genuine user messages', () => {
   for (const t of [
-    'Always send Outlook mail from billing@acme.co — never the default account.',
+    'Always send Outlook mail from billing@acme-co.example — never the default account.',
     'do not email the prod list under any circumstances',
-    'Pull a deal-risk workspace for Darrin Sennott',
+    'Pull a deal-risk workspace for Taylor Example',
     'No, hold off on that for now',
   ]) {
     assert.equal(isHarnessInjectedInput(t), false, `should NOT flag user msg: ${t.slice(0, 40)}`);

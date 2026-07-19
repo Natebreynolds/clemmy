@@ -266,9 +266,9 @@ test('reduceActivity: run_batch renders as ONE live meter row; per-item batchMod
   a = reduceActivity(a, ev('tool_returned', { tool: 'composio_execute_tool', callId: 'c1', batchMode: true, ok: true }));
   assert.equal(a.length, 1, 'batch item events must not create tool rows');
 
-  a = reduceActivity(a, ev('batch_progress', { batchId: 'b1', done: 12, total: 18, failed: 1, itemId: 'lowryinc.com', ok: true }));
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b1', done: 12, total: 18, failed: 1, itemId: 'pine-consulting.example', ok: true }));
   assert.deepEqual(a[0].batch, { done: 12, total: 18, failed: 1 });
-  assert.equal(a[0].detail, 'lowryinc.com');
+  assert.equal(a[0].detail, 'pine-consulting.example');
 
   a = reduceActivity(a, ev('batch_completed', { batchId: 'b1', total: 18, succeeded: 17, failed: 1, halted: false }));
   assert.equal(a[0].status, 'failed', 'any failed item surfaces as a failed batch row');
@@ -278,7 +278,7 @@ test('reduceActivity: run_batch renders as ONE live meter row; per-item batchMod
 test('reduceActivity: a throttled batch_progress flips the meter into backing-off; a normal update clears it', () => {
   let a: ActivityItem[] = [];
   a = reduceActivity(a, ev('batch_started', { batchId: 'b2', items: 10, slug: 'GMAIL_SEND_EMAIL', sideEffect: 'send' }));
-  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 4, total: 10, failed: 0, itemId: 'a@x.com', ok: true }));
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 4, total: 10, failed: 0, itemId: 'a@site.example', ok: true }));
   assert.equal(a[0].batch?.throttled, undefined, 'a normal update has no throttled flag');
 
   // Rate-limit back-off pause: counts unchanged, throttled flips on.
@@ -286,7 +286,7 @@ test('reduceActivity: a throttled batch_progress flips the meter into backing-of
   assert.deepEqual(a[0].batch, { done: 4, total: 10, failed: 0, throttled: true });
 
   // The next real item update clears the throttled flag.
-  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 5, total: 10, failed: 0, itemId: 'b@x.com', ok: true }));
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 5, total: 10, failed: 0, itemId: 'b@site.example', ok: true }));
   assert.deepEqual(a[0].batch, { done: 5, total: 10, failed: 0 });
 });
 
@@ -295,10 +295,10 @@ test('reduceActivity: tool rows carry the salient target and a composio call rea
   a = reduceActivity(a, ev('tool_called', {
     tool: 'composio_execute_tool',
     callId: 'c9',
-    args: JSON.stringify({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: 'paul@lowryinc.com', subject: 'Hi' }) }),
+    args: JSON.stringify({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: 'sam@pine-consulting.example', subject: 'Hi' }) }),
   }));
   assert.equal(a[0].label, 'outlook send email', 'composio calls read as their inner slug');
-  assert.equal(a[0].detail, 'paul@lowryinc.com', 'the salient target is narrated');
+  assert.equal(a[0].detail, 'sam@pine-consulting.example', 'the salient target is narrated');
   assert.ok(typeof a[0].startedAt === 'number');
 
   a = reduceActivity(a, ev('tool_called', { tool: 'dataforseo__serp_organic_live_advanced', callId: 'c10', args: JSON.stringify({ keyword: 'executive coaching' }) }));

@@ -4,9 +4,9 @@
  * Apple's notarytool service.
  *
  * Required environment variables:
- *   APPLE_ID            - the Apple ID email (e.g. natebreynolds@icloud.com)
+ *   APPLE_ID            - the Apple ID email (e.g. developer@example.com)
  *   APPLE_APP_PASSWORD  - an app-specific password from appleid.apple.com
- *   APPLE_TEAM_ID       - the developer Team ID (e.g. 4AR3Y8XD72)
+ *   APPLE_TEAM_ID       - the developer Team ID
  *
  * If APPLE_NOTARIZE_SKIP=true is set, notarization is bypassed
  * (useful for local builds you don't intend to distribute).

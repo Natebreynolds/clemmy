@@ -3,13 +3,13 @@
   "objective": "Summarize a domain's backlink profile — read-only, no changes.",
   "maxToolCalls": 30,
   "events": [
-    { "type": "user_input_received", "role": "user", "data": { "text": "Give me a quick read-only summary of damorelaw.com's backlink profile." } },
-    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "composio_execute_tool", "callId": "c_bl", "arguments": "DATAFORSEO_BACKLINKS_SUMMARY damorelaw.com" } },
-    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "composio_execute_tool", "callId": "c_bl", "output": "ok (status 20000)" } },
-    { "type": "conversation_completed", "role": "Clem", "data": { "reply": "damorelaw.com backlink profile (read-only): 342 referring domains and 5,210 total backlinks, with a spam score of 4%. Nothing was changed.", "summary": "Summarized damorelaw.com backlinks (read-only)." } }
+    { "type": "user_input_received", "role": "user", "data": { "text": "Give me a quick read-only summary of backlinks-fixture.example's backlink profile." } },
+    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "composio_execute_tool", "callId": "fixture_backlinks_query", "arguments": "DATAFORSEO_BACKLINKS_SUMMARY backlinks-fixture.example" } },
+    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "composio_execute_tool", "callId": "fixture_backlinks_query", "output": "ok (status 20000)" } },
+    { "type": "conversation_completed", "role": "Clem", "data": { "reply": "backlinks-fixture.example backlink profile (read-only): 217 referring domains and 3,456 total backlinks, with a spam score of 7%. Nothing was changed.", "summary": "Summarized backlinks-fixture.example backlinks (read-only)." } }
   ],
   "toolOutputs": [
-    { "callId": "c_bl", "tool": "composio_execute_tool", "output": "damorelaw.com backlinks summary: referring_domains 342; backlinks 5210; backlinks_spam_score 4" }
+    { "callId": "fixture_backlinks_query", "tool": "composio_execute_tool", "output": "backlinks-fixture.example backlinks summary: referring_domains 217; backlinks 3456; backlinks_spam_score 7" }
   ],
-  "finalAnswerText": "damorelaw.com backlink profile (read-only): 342 referring domains and 5,210 total backlinks, with a spam score of 4%. Nothing was changed."
+  "finalAnswerText": "backlinks-fixture.example backlink profile (read-only): 217 referring domains and 3,456 total backlinks, with a spam score of 7%. Nothing was changed."
 }

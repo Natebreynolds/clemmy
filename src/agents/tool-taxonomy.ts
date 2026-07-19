@@ -544,7 +544,7 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   // action is already APPROVED (byte-pinned payload). A per-tool interrupt
   // here is the DOUBLE-approval users hit on send batches — one card to
   // propose, a second to approve the queued plan (live 2026-07-09
-  // sess-mrdy6vip: four cards for one 10-email batch). Same class as the
+  // double-approval regression: four cards for one 10-email batch). Same class as the
   // 2026-06-17 double-approval fix above.
   if (input.toolName === 'run_batch') {
     return { needsApproval: false, reason: 'pending-action-owned', kind };

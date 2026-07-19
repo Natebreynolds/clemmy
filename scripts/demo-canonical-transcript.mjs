@@ -68,7 +68,7 @@ function fakeCanonicalPayload(startedAt) {
   // Recall's backend actually transcribed for the full recording.
   return [
     {
-      participant: { id: 1, name: 'Nate Reynolds' },
+      participant: { id: 1, name: 'Alex Chen' },
       words: [
         { text: 'all', start_timestamp: { relative: 12 }, end_timestamp: { relative: 12.4 } },
         { text: 'right', start_timestamp: { relative: 12.4 }, end_timestamp: { relative: 12.7 } },
@@ -111,7 +111,7 @@ function fakeCanonicalPayload(startedAt) {
       ],
     },
     {
-      participant: { id: 1, name: 'Nate Reynolds' },
+      participant: { id: 1, name: 'Alex Chen' },
       words: [
         { text: 'good', start_timestamp: { relative: 25 }, end_timestamp: { relative: 25.3 } },
         { text: 'call', start_timestamp: { relative: 25.3 }, end_timestamp: { relative: 25.6 } },

@@ -1,6 +1,6 @@
 /**
  * Run: npx tsx --test src/runtime/mcp-prewarm.test.ts
- * Pre-warm retry/backoff (sess-mqg8wdw1): a single cold-connect attempt at boot
+ * Pre-warm retry/backoff regression: a single cold-connect attempt at boot
  * can be starved by the daemon's synchronous DB work; the retry loop re-attempts
  * (the gap clears the shim's early connect backoff) until servers connect.
  */

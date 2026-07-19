@@ -68,7 +68,7 @@ This is a ~3–4 week solo effort. The plan is broken into four phases so each i
 
 **Push:** Direct APNs via a `.p8` auth key on the daemon. Daemon hits `https://api.push.apple.com` with a JWT signed by the key. No third-party push relay.
 
-**Distribution:** Ad Hoc — sign with the existing paid Apple Developer account (team `4AR3Y8XD72`), install via Apple Configurator on registered devices (up to 100). No App Store review. Builds don't expire.
+**Distribution:** Ad Hoc — sign with the configured paid Apple Developer account (team `<apple-team-id>`), install via Apple Configurator on registered devices (up to 100). No App Store review. Builds don't expire.
 
 ## Phases
 
@@ -103,7 +103,7 @@ This is a ~3–4 week solo effort. The plan is broken into four phases so each i
 **Setup steps (one-time, no code):**
 1. Install Tailscale on Mac (`brew install --cask tailscale`) + iPhone (App Store).
 2. Sign into both with the same Tailscale account.
-3. Apple Developer portal: register `com.clemmy.mobile` App ID under team `4AR3Y8XD72`.
+3. Apple Developer portal: register `com.clemmy.mobile` App ID under the configured Apple Developer team.
 4. Create iOS Distribution certificate + Ad Hoc provisioning profile, register your iPhone UDID.
 
 ### Phase 2 — Approvals + push notifications (Week 2)

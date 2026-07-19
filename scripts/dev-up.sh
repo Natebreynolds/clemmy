@@ -39,7 +39,7 @@ fi
 # wiping the user's real autonomy settings. The old version overwrote the WHOLE
 # policy with a minimal object, which dropped autoApproveScope — so a user in
 # YOLO ran the dev daemon as 'balanced' and hit approval prompts production never
-# shows (observed live 2026-06-17: a Scorpion email batch asked for a plan that
+# shows (observed live 2026-06-17: a Acme email batch asked for a plan that
 # YOLO would have auto-approved). Merge instead: preserve every real field
 # (autoApproveScope, batchConfirmThreshold, …) and flip ONLY proactivity off.
 POL="$HOME_DIR/state/proactivity-policy.json"
@@ -56,7 +56,7 @@ node -e '
   fs.writeFileSync(dst, JSON.stringify(merged, null, 2) + "\n");
 ' "$POL_SRC" "$POL"
 
-# Discord ON by default so Nathan can test via the Discord surface; DEV_DISCORD=false
+# Discord ON by default so Alexander can test via the Discord surface; DEV_DISCORD=false
 # suppresses it for pure automated smoke runs.
 DEV_DISCORD="${DEV_DISCORD:-true}"
 echo "→ starting dev daemon from source (Discord $DEV_DISCORD, FORK surfaces on, proactivity off)"

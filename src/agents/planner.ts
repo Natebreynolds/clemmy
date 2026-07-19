@@ -126,7 +126,7 @@ export const PlanSchema = z.object({
         'The EXACT send tool name or Composio slug that will execute this send, e.g. "OUTLOOK_SEND_EMAIL" or "GMAIL_SEND_EMAIL". This string is what gets auto-approved within the goal scope, so it must match what you will actually call.',
       ),
       summary: z.string().min(3).describe(
-        'Plain-language description of what/who this send targets, for the user to see and bless — e.g. "personalized outreach to the 8 market-leader firms".',
+        'Plain-language description of what/who this send targets, for the user to see and bless — e.g. "personalized outreach to the 8 priority-account firms".',
       ),
       count: z.number().int().min(1).nullable().describe('How many sends of this shape (e.g. 8). Use null for a single send.'),
     }),

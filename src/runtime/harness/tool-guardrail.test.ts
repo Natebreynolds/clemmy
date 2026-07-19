@@ -349,7 +349,7 @@ test('fanoutBlock: ON → a serialized WRITE is NEVER blocked (sends belong in r
   try {
     let last;
     for (let i = 0; i < 8; i += 1) {
-      last = evaluateToolCall('sess-fb-write', 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `x${i}@y.com` }) });
+      last = evaluateToolCall('sess-fb-write', 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `x${i}@personal.example` }) });
     }
     assert.equal(last?.fanoutBlock, undefined, 'writes route to run_batch — the read-fanout block must never touch them');
   } finally {
@@ -609,7 +609,7 @@ function withRecallNudge<T>(fn: () => T): T {
 test('FIX 2: a CACHE_SAFE read repeated with identical args sets cachedCallId pointing at the prior call', () => {
   withRecallNudge(() => {
     _resetAllTrackersForTests();
-    const args = { query: 'market leaders' };
+    const args = { query: 'priority accounts' };
     evaluateToolCall('sess-cache-1', 'memory_search', args, 'call-A');
     const d2 = evaluateToolCall('sess-cache-1', 'memory_search', args, 'call-B');
     assert.equal(d2.cachedCallId, 'call-A', 'points at the prior identical call');

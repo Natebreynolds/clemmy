@@ -1,7 +1,7 @@
 /**
  * Run: npx tsx --test src/runtime/mcp-namespace-shim.skip-unconnected.test.ts
  *
- * Bounded-connect attach (sess-mqg8wdw1): the Agents SDK awaits the shim's
+ * Bounded-connect attach regression: the Agents SDK awaits the shim's
  * listTools() BEFORE the first model request, and buildFlattenedTools used to
  * `await ensureConnected(server)` with the FULL 30s connect timeout — so one
  * server still mid-connect (or starved by the daemon's synchronous DB work)
