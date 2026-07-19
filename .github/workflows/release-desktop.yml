@@ -228,7 +228,7 @@ jobs:
         run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "$VERSION"
 
       - name: Upload private macOS build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clementine-macos-${{ needs.preflight.outputs.version }}
           path: |
@@ -299,7 +299,7 @@ jobs:
         run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "$VERSION" --platform windows
 
       - name: Upload private Windows build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clementine-windows-${{ needs.preflight.outputs.version }}
           path: |
