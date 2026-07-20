@@ -52,3 +52,23 @@ export function isUnparseableToolCallError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   return /tool call could not be parsed|could not be parsed \(retry also failed\)/i.test(msg);
 }
+
+/**
+ * An AUTH failure on a brain — expired/invalid subscription token, 401/403,
+ * reauth-required. RECOVERABLE by switching to a brain whose auth is valid, so it
+ * must never be treated as terminal. This is THE canonical classifier, shared by
+ * every brain lane (router `FallbackModel`, the chat bridge, AND the workflow
+ * step-boundary fallover) so all three agree on what "auth-expired" means — a
+ * single ~10-day Claude OAuth lapse used to hard-fail whole scheduled workflow
+ * batches because the workflow lane's classifier (isTransientStepError) did NOT
+ * recognize a 401 (a 4xx reads as deterministic), so no brain switch fired.
+ * Lives in this pure leaf (no deps) so the raw-SDK lane can import it without a
+ * cycle. Matches the typed ClaudeAuthError / ClaudeSdkAuthExpiredError by name and
+ * the provider SDKs' message shapes by regex.
+ */
+export function isAuthRecoverableError(err: unknown): boolean {
+  if (err instanceof Error && (err.name === 'ClaudeAuthError' || err.name === 'ClaudeSdkAuthExpiredError')) return true;
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /\b(401|403)\b/.test(msg)
+    || /invalid_grant|refresh token not found or invalid|token (?:is invalid)|expired (?:token|credential|subscription)|(?:token|credential|subscription|session)s? (?:has |have )?expired|re-?authenticat|unauthorized|forbidden|not authenticated/i.test(msg);
+}

@@ -2829,7 +2829,7 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
 // (transient-error.ts) so low-level tool modules (composio-tools) can share it
 // without importing this high-level runner. Imported for internal step-retry
 // use + re-exported for back-compat with existing importers.
-import { isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
+import { isAuthRecoverableError, isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
 export { isTransientStepError };
 
 /**
@@ -3009,7 +3009,11 @@ export async function runWithContractLoop<T>(
 /** Brain-fallover opt-in — shared with the harness's CLEMMY_BRAIN_FALLOVER.
  *  Default off: a step runs on its resolved brain only. */
 function workflowBrainFalloverEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
+  // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) — parity with the router +
+  // chat lanes. A workflow step whose brain is expired/overloaded/hung re-runs on
+  // the next connected brain (canSwitchBrainForStep still blocks re-running a step
+  // that already recorded an external write, so a switch can never double-act).
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 /** Step-boundary cross-provider fallover. Runs the step on its resolved brain
@@ -3098,6 +3102,24 @@ async function executeStepVerified(
   }
 }
 
+/** Does this step failure justify re-running the step on a DIFFERENT connected
+ *  brain? Yes for a transient provider failure (overload/5xx/timeout), an
+ *  unparseable-tool-call (a flaky model stumble a different brain won't
+ *  reproduce), a structural-result error, OR an AUTH-expired brain — all
+ *  recoverable by switching. A real deterministic error (bad input, contract,
+ *  non-auth 4xx) repeats identically on any model, so it fails fast. Auth-expiry
+ *  is the case that reached this gate blind before 2026-07-20: an expired Claude
+ *  token is a 401 that isTransientStepError classifies deterministic, so the whole
+ *  step hard-failed instead of switching to the connected Codex/BYO brain the user
+ *  configured — the exact "why didn't my fallback fire" bug. Named + exported so
+ *  the decision is unit-tested, mirroring the chat lane's isChatBrainFalloverEligible. */
+export function isWorkflowStepBrainFalloverEligible(err: unknown): boolean {
+  return isTransientStepError(err)
+    || isUnparseableToolCallError(err)
+    || isWorkflowStepStructuralResultError(err)
+    || isAuthRecoverableError(err);
+}
+
 async function executeStepVerifiedInner(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -3135,12 +3157,9 @@ async function executeStepVerifiedInner(
       return await runStepVerifiedAttempt(attemptStep, ctx);
     } catch (err) {
       if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
-      // A transient PROVIDER failure OR an unparseable-tool-call (a flaky model
-      // stumble) justifies switching brains; a real deterministic error (bad input,
-      // contract, 4xx) repeats identically on any model — fail fast, don't burn the
-      // whole chain. Parse-failure used to fall over NOWHERE — the workflow lane
-      // died on it (2026-06-29 gap analysis).
-      if (!isTransientStepError(err) && !isUnparseableToolCallError(err) && !isWorkflowStepStructuralResultError(err)) throw err;
+      // A real deterministic error (bad input, contract, 4xx) repeats identically
+      // on any model — fail fast, don't burn the whole chain.
+      if (!isWorkflowStepBrainFalloverEligible(err)) throw err;
       lastErr = err;
     }
   }

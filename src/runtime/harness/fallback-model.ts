@@ -29,6 +29,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import path from 'node:path';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
+import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
@@ -112,17 +113,10 @@ export function isOverloadError(err: unknown): boolean {
  *  ("Overloaded") instead of falling over. 429 (rate_limited) is deliberately
  *  EXCLUDED — that's account-wide quota; switching Claude tiers won't help (the
  *  resilient wrapper backs off + surfaces it). */
-/** An AUTH failure on a brain — expired/invalid subscription token, 401/403,
- *  reauth-required. RECOVERABLE by switching to a brain whose auth is valid, so
- *  it must not be treated as terminal. This is the class that let one ~10-day
- *  Claude OAuth lapse hard-fail whole scheduled batches (07-06 audit). Shared by
- *  the chat + workflow brain lanes (both route through FallbackModel). */
-export function isAuthRecoverableError(err: unknown): boolean {
-  if (err instanceof Error && err.name === 'ClaudeAuthError') return true;
-  const msg = err instanceof Error ? err.message : String(err ?? '');
-  return /\b(401|403)\b/.test(msg)
-    || /invalid_grant|refresh token not found or invalid|token (?:is invalid)|expired (?:token|credential|subscription)|(?:token|credential|subscription|session)s? (?:has |have )?expired|re-?authenticat|unauthorized|forbidden|not authenticated/i.test(msg);
-}
+// The auth-recoverable classifier is the ONE shared definition in the pure leaf
+// transient-error.ts, so the router lane (here), the chat bridge, and the
+// workflow step-boundary fallover all agree. Re-exported for existing callers.
+export { isAuthRecoverableError } from '../../execution/transient-error.js';
 
 // ── Sticky dead-brain registry (2026-07-08) ────────────────────────────────
 // An auth-expired brain does NOT heal by itself — yet the chain re-tried the

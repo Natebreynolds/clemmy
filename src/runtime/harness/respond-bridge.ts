@@ -756,7 +756,11 @@ export async function respondPreferHarness(
 const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
 
 function chatBrainFalloverEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
+  // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) — parity with the router +
+  // workflow lanes. A terminal Claude-brain failure (overload, hang, expired auth)
+  // re-runs the turn on a connected non-Claude brain; the duplicate-send HARD WALL
+  // protects any already-committed external write on the re-run.
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 function recoveryHarnessModelAfterClaudeFailure(): string | undefined {

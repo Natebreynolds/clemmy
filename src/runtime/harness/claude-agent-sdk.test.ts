@@ -31,7 +31,9 @@ const {
   resolveClaudeAgentSdkTrackerScope,
   setClaudeAgentSdkQueryForTest,
   setClaudeAgentSdkReflectionForTest,
+  ClaudeSdkAuthExpiredError,
 } = mod;
+const { isAuthRecoverableError } = await import('../../execution/transient-error.js');
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
 const CLAUDE_AUTH_FILE = path.join(STATE_DIR, 'claude-auth.json');
@@ -1571,6 +1573,29 @@ test('overload AFTER a tool ran is NOT retried (would double-act) — it throws'
   setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return toolThenThrowQuery('API Error: 529 Overloaded'); }) as any);
   await assert.rejects(runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }), /529 Overloaded/);
   assert.equal(calls, 1, 'no retry once a tool executed');
+});
+
+test('an EXPIRED Claude token throws a TYPED, auth-recoverable error (so a caller can switch brains)', async () => {
+  // Regression (2026-07-20): an expired claude_oauth token surfaced as a GENERIC
+  // Error, which no fallover branch acted on — the turn/step hard-failed even with
+  // other brains connected. It must now be a typed ClaudeSdkAuthExpiredError that
+  // the shared isAuthRecoverableError classifies, and NOT be pointlessly retried
+  // (re-running the same dead token can't succeed).
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    calls++;
+    return throwingQuery('Claude Code returned an error result: API Error: 401 Unauthorized — OAuth token has expired. Please re-authenticate.');
+  }) as any);
+  await assert.rejects(
+    runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }),
+    (err: unknown) => {
+      assert.ok(err instanceof ClaudeSdkAuthExpiredError, 'typed as ClaudeSdkAuthExpiredError');
+      assert.equal((err as ClaudeSdkAuthExpiredError).committed, false, 'nothing committed → safe to re-dispatch on another brain');
+      assert.ok(isAuthRecoverableError(err), 'the shared classifier recognizes it as auth-recoverable');
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'a dead token is not retried in-lane');
 });
 
 test('a deterministic (non-overload) error is never retried', async () => {

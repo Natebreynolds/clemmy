@@ -41,7 +41,11 @@ export type BrainProvider = 'codex' | 'claude' | 'byo';
  *  each selected provider owns its request unless the operator opts into a
  *  compatible provider switch. */
 function brainFalloverEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
+  // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off). A connected fallback brain
+  // that only works after setting an undocumented env var is a rollout flag on
+  // validated behavior — cross-brain fallover IS the default now, so an expired /
+  // overloaded / hung brain routes to the next connected one instead of failing.
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 /** First-byte fallover budget — set BELOW the loop's stall watchdog (modelFirstByteStallMs,
  *  default 75s) so a hung provider falls over to the next brain instead of dead-ending. */

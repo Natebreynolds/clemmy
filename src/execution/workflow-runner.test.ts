@@ -79,6 +79,7 @@ const {
   looksLikeWorkflowStepStructuralResultMiss,
   WorkflowStepStructuralResultError,
   isWorkflowStepStructuralResultError,
+  isWorkflowStepBrainFalloverEligible,
   _setWorkflowHarnessLoopImplsForTests,
   publishWorkflowRunTerminalForTest,
 } = await import('./workflow-runner.js');
@@ -2944,6 +2945,20 @@ test('G8: deterministic failures are NOT retried (real bugs fail fast, no loop)'
   const loop = new Error('weird');
   (loop as { cause?: unknown }).cause = loop;
   assert.equal(isTransientStepError(loop), false);
+});
+
+test('step-boundary brain fallover is eligible for an EXPIRED brain, not just transient/parse (2026-07-20)', () => {
+  // The reported bug: a workflow failed because Claude auth expired and did NOT
+  // fall over to a connected brain. An expired token is a 401 → not transient →
+  // the gate rejected it → the step hard-failed. Auth-expiry must now be eligible.
+  assert.equal(isWorkflowStepBrainFalloverEligible(new Error('Claude Code returned an error result: API Error: 401 Unauthorized — OAuth token has expired')), true);
+  assert.equal(isWorkflowStepBrainFalloverEligible(Object.assign(new Error('x'), { name: 'ClaudeSdkAuthExpiredError' })), true);
+  // Still eligible for the pre-existing classes.
+  assert.equal(isWorkflowStepBrainFalloverEligible(new Error('API Error: 529 Overloaded')), true);
+  assert.equal(isWorkflowStepBrainFalloverEligible(new Error("tool call could not be parsed (retry also failed)")), true);
+  // A real deterministic error still fails fast (no brain-chain burn).
+  assert.equal(isWorkflowStepBrainFalloverEligible(new Error('missing required input "url"')), false);
+  assert.equal(isWorkflowStepBrainFalloverEligible(new Error('API Error: 400 Bad Request: invalid schema')), false);
 });
 
 // ── G5: scheduled enabled workflow auto-approves its declarative gate ──────────

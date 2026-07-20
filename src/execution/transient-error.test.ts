@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
+import { isAuthRecoverableError, isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
 
 test('isUnparseableToolCallError: parse-failure is FALLOVER-eligible but NOT same-model retryable', () => {
   const pf = new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed).");
@@ -59,4 +59,32 @@ test('deterministic failures are NOT transient (no thrash)', () => {
 test('undici-style wrapped cause is unwrapped (bounded)', () => {
   const wrapped = Object.assign(new Error('fetch failed'), { cause: Object.assign(new Error('upstream'), { code: 'ECONNRESET' }) });
   assert.equal(isTransientStepError(wrapped), true);
+});
+
+test('isAuthRecoverableError catches exactly what isTransientStepError MISSES — the fallback gap (2026-07-20)', () => {
+  // The bug: an expired Claude token is a 401 — which isTransientStepError
+  // classifies DETERMINISTIC (not retryable), so the workflow lane hard-failed
+  // instead of switching brains. Auth-expiry is recoverable by a DIFFERENT brain,
+  // so it needs its own classifier — and every lane must share this one.
+  const authStrings = [
+    'Claude Code returned an error result: API Error: 401 Unauthorized',
+    'API Error: 403 Forbidden',
+    'OAuth token has expired. Please re-authenticate.',
+    'invalid_grant',
+    'refresh token not found or invalid',
+    'the subscription has expired',
+    'not authenticated',
+  ];
+  for (const m of authStrings) {
+    assert.equal(isAuthRecoverableError(new Error(m)), true, `auth-recoverable: ${m}`);
+    // The whole point: these are NOT transient, so before this classifier existed
+    // the fallover gate rejected them and the step died.
+    assert.equal(isTransientStepError(new Error(m)) && /401|403|expired|invalid_grant|authenticat/i.test(m), false, `not transient: ${m}`);
+  }
+  // Typed brain-auth errors are recognized by NAME (robust to message drift).
+  assert.equal(isAuthRecoverableError(Object.assign(new Error('x'), { name: 'ClaudeAuthError' })), true);
+  assert.equal(isAuthRecoverableError(Object.assign(new Error('x'), { name: 'ClaudeSdkAuthExpiredError' })), true);
+  // NOT auth: an overload or a generic deterministic error must stay out.
+  assert.equal(isAuthRecoverableError(new Error('API Error: 529 Overloaded')), false);
+  assert.equal(isAuthRecoverableError(new Error('missing required field actorId')), false);
 });

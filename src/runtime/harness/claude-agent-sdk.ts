@@ -29,6 +29,7 @@ import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
+import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import {
   killGateVerdict,
@@ -126,6 +127,21 @@ export class ClaudeSdkContextOverflowError extends Error {
   constructor(message: string, readonly committed: boolean) {
     super(message);
     this.name = 'ClaudeSdkContextOverflowError';
+  }
+}
+
+/** The SDK child's Claude credential is EXPIRED/invalid (401/403, OAuth lapse).
+ *  The raw SDK throws this as a generic Error, which no fallover branch would act
+ *  on — so an expired token hard-failed the turn/step even with other brains
+ *  connected. Typed + committed-aware (mirrors ClaudeSdkProviderOverloadError) so
+ *  every lane routes around it: `name` is matched by the shared
+ *  isAuthRecoverableError, and `committed=false` (auth fails before any tool runs)
+ *  tells a caller it is safe to re-dispatch the WHOLE turn/step on another brain. */
+export class ClaudeSdkAuthExpiredError extends Error {
+  readonly authExpired = true;
+  constructor(message: string, readonly committed: boolean) {
+    super(message);
+    this.name = 'ClaudeSdkAuthExpiredError';
   }
 }
 
@@ -2170,6 +2186,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // Give up — surface a TYPED error so a caller that can switch providers
         // re-dispatches when it's safe (committed=false), else surfaces it.
         throw new ClaudeSdkProviderOverloadError(msg, committed);
+      } else if (isAuthRecoverableError(msg)) {
+        // Expired/invalid Claude credential. Retrying the SAME dead token is
+        // pointless, so throw immediately (no in-lane retry) — TYPED so the
+        // caller's cross-brain fallover routes to a brain whose auth is valid,
+        // instead of hard-failing the turn/step with other brains connected.
+        throw new ClaudeSdkAuthExpiredError(msg, toolUses.length > 0 || streamedAny);
       } else if (isContextOverflowMessage(msg)) {
         // Context-window overflow surfaced as a thrown stream error. TYPED so the
         // brain can salvage (committed) or retry once with reduced context.
