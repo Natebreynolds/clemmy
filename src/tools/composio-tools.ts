@@ -22,6 +22,7 @@ import {
   type ConnectedToolkit,
 } from '../integrations/composio/client.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { argsHaveSendTarget } from '../runtime/harness/grounding-gate.js';
 import { recallComposioAccountIdentity } from '../memory/tool-choice-store.js';
 import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter, type JobReceipt } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
@@ -48,7 +49,7 @@ import { checkConstraintViolation, formatConstraintEscalation, findEmailSendCons
 import { resolveCompliantSenderConnection, extractMailboxEmails } from '../runtime/harness/sender-verify.js';
 import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../memory/account-alias-store.js';
 import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
-import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases, isOutlookSendEmailSlug } from './composio-batch-validator.js';
+import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { sessionHasBackgroundOffer } from '../runtime/harness/convergence-steer.js';
@@ -1492,13 +1493,15 @@ export async function resolveComposioDispatch(
   const recipientAlias = applyEmailRecipientAliases(toolSlug, args, getCachedToolSchema(toolSlug));
   args = recipientAlias.args;
   if (recipientAlias.repairs.length > 0) notes.push(...recipientAlias.repairs);
-  // Validate the write: a send with NO resolvable recipient must not silently
-  // dispatch — that is exactly what misroutes to the sender's own mailbox. Block
-  // with an actionable message so the model supplies a recipient and retries,
-  // rather than firing a recipient-less send (heuristic mode skips to_email).
-  if (isOutlookSendEmailSlug(toolSlug) && !('to_email' in args)) {
-    const message = `⚠️ Not sent: this Outlook email has no recipient (no \`to\` / \`to_email\`). I won't dispatch a recipient-less send — with no recipient the provider delivers it to your own mailbox. Supply the recipient email address and retry.`;
-    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', { field: 'to_email', validationReason: 'missing-recipient' });
+  // Validate the write by its EFFECT, not by tool: ANY irreversible send must
+  // carry a resolvable recipient/target. A target-less send can't be validated and
+  // is exactly what misroutes (the provider delivers to the authenticated mailbox),
+  // so ask for the target instead of dispatching blind. Generic across email / chat
+  // / SMS / CRM — no tool names (argsHaveSendTarget reuses the grounding gate's
+  // target-key notion). Runs AFTER recipient normalization so `to`→`to_email` counts.
+  if (isIrreversibleSendSlug(toolSlug) && !argsHaveSendTarget(args)) {
+    const message = `⚠️ Not sent: this send has no resolvable recipient/target in its arguments. I won't dispatch a target-less send — it can't be validated and would misroute (with no target the provider falls back to your own account). Add the recipient/target and retry.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', { field: 'recipient', validationReason: 'missing-send-target' });
     return { ok: false, reason: 'invalid-args', message, toolkit };
   }
 

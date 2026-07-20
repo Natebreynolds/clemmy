@@ -57,6 +57,37 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const TARGET_KEY_RE = /(^|_)(to|to_email|to_name|recipient|recipients|email|contact_id|record_id|lead_id|account_id|channel|phone|to_number)$/i;
 
 /**
+ * Does this call carry a resolvable recipient/TARGET FIELD? Generic on purpose —
+ * anchored on the effect (a send/write needs a target), not on any tool name. A
+ * top-level (or composio-wrapped `arguments`) key whose NAME is a target field and
+ * whose value is present counts. Distinct from extractTargetKeys, which also mines
+ * body text for emails — here we mean the WRITE'S recipient, not a stray address in
+ * the body. Used to validate a send before dispatch: a target-less send can't be
+ * validated and would misroute, so the caller asks for the target instead.
+ */
+export function argsHaveSendTarget(rawArgs: unknown): boolean {
+  const hasTargetField = (obj: Record<string, unknown>): boolean => {
+    for (const [key, value] of Object.entries(obj)) {
+      if (value === null || value === undefined || value === '') continue;
+      if (Array.isArray(value) && value.length === 0) continue;
+      if (TARGET_KEY_RE.test(key)) return true;
+    }
+    return false;
+  };
+  if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) return false;
+  const obj = rawArgs as Record<string, unknown>;
+  if (hasTargetField(obj)) return true;
+  // Composio wrapper: the real args are a JSON string under `arguments`.
+  if (typeof obj.arguments === 'string') {
+    try {
+      const inner = JSON.parse(obj.arguments) as unknown;
+      if (inner && typeof inner === 'object' && !Array.isArray(inner)) return hasTargetField(inner as Record<string, unknown>);
+    } catch { /* not JSON — no nested target */ }
+  }
+  return false;
+}
+
+/**
  * Extract the identity of WHO/WHAT this write targets from the call args.
  * Returns lowercase search terms (emails, domains, names, ids). Pure.
  */

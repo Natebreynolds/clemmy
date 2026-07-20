@@ -262,16 +262,31 @@ test('recipient normalization is CENTRAL: a single-send Outlook email maps `to`-
   }
 });
 
-test('validate-the-write: a recipient-less Outlook send is BLOCKED, never dispatched to the sender mailbox', async () => {
-  // With no `to`/`to_email` there is nothing to validate — dispatching would
-  // misroute to self. The gateway asks for a recipient instead of firing blind.
+test('validate-the-write is EFFECT-anchored (not tool-specific): a target-less send is BLOCKED, never dispatched', async () => {
+  // The validation keys off "is this an irreversible send with no resolvable
+  // target?" — general across every tool, NOT "is this Outlook?". With no target
+  // there is nothing to validate and the provider would misroute to self, so the
+  // gateway asks for a recipient instead of firing blind.
   setAccounts([account('ca_solo', 'outlook', 'me@work.example')]);
-  const out = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { subject: 's', body: 'b' }, undefined, {});
-  assert.equal(out.ok, false, 'a recipient-less send must not dispatch');
-  if (!out.ok) {
-    assert.equal(out.reason, 'invalid-args');
-    assert.match(out.message, /recipient/i);
+  const outlook = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { subject: 's', body: 'b' }, undefined, {});
+  assert.equal(outlook.ok, false, 'a target-less Outlook send must not dispatch');
+  if (!outlook.ok) {
+    assert.equal(outlook.reason, 'invalid-args');
+    assert.match(outlook.message, /recipient|target/i);
   }
+  // SAME logic, a NON-email tool — proves no Outlook/email special-casing: a Slack
+  // send with no `channel` (its target) is blocked by the same effect-anchored rule.
+  setAccounts([account('ca_slack', 'slack', 'me@work.example')]);
+  const slack = await resolveComposioDispatch('SLACK_SEND_MESSAGE', { text: 'hi team' }, undefined, {});
+  assert.equal(slack.ok, false, 'a target-less Slack send is blocked by the same rule (channel is its target)');
+  if (!slack.ok) assert.match(slack.message, /recipient|target/i);
+});
+
+test('validate-the-write does NOT block a legitimate send that HAS a target (no false positive)', async () => {
+  // A send whose target field is present (channel, to, recipient_email, …) passes.
+  setAccounts([account('ca_slack', 'slack', 'me@work.example')]);
+  const out = await resolveComposioDispatch('SLACK_SEND_MESSAGE', { channel: 'C0123', text: 'hi team' }, undefined, {});
+  assert.equal(out.ok, true, 'a send WITH a target dispatches — the rule is target-presence, not a taxonomy wall');
 });
 
 test('identity enrichment does NOT permanently blind a mailbox on a transient probe failure (finding 13)', async () => {
