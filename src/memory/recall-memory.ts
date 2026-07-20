@@ -65,7 +65,10 @@ export interface MemoryRecallContext {
 }
 
 const STOP = new Set(['the', 'and', 'for', 'with', 'from', 'this', 'that', 'what', 'when', 'where', 'how', 'your']);
-const COMPLETE_SET_QUERY_RE = /\b(?:all|every|everyone|everybody|complete|full|whole|entire|list|roster|team|teammates?|members?|people|persons?|folks|staff|group|crew|department|dept|contacts?|recipients?|attendees?|invitees?|emails?|email addresses?)\b/i;
+// NB: no bare "person" — it matches inside "in-person" (a common meeting
+// phrase) and wrongly flips those queries into the complete-set path. "people"
+// covers the roster case.
+const COMPLETE_SET_QUERY_RE = /\b(?:all|every|everyone|everybody|complete|full|whole|entire|list|roster|team|teammates?|members?|people|folks|staff|group|crew|department|contacts?|recipients?|attendees?|invitees?|emails?|email addresses?)\b/i;
 const TEMPORAL_TOPIC_STOP = new Set([
   ...STOP,
   'as', 'of', 'on', 'in', 'at', 'by', 'before', 'during', 'did', 'do', 'does',
