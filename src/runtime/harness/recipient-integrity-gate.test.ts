@@ -9,8 +9,8 @@ const { appendEvent, createSession, resetEventLog, writeToolOutput } = await imp
 const { evaluateRecipientSetIntegrity } = await import('./recipient-integrity-gate.js');
 
 const correct = [
-  'bobby.romano@example.com', 'brett.lorenzini@example.com', 'jake.wright@example.com', 'jarrett.tyus@example.com',
-  'kim.hillman@example.com', 'taylor.saunders@example.com', 'tim.demik@example.com', 'tyler.jorgensen@example.com',
+  'avery.rowan@example.com', 'blair.solis@example.com', 'casey.harbor@example.com', 'devon.quill@example.com',
+  'emery.vale@example.com', 'frankie.moss@example.com', 'gray.linden@example.com', 'harper.wren@example.com',
 ];
 const wrong = [
   ...correct.slice(0, 3),
@@ -74,6 +74,33 @@ test('accepts a complete recipient list stated directly by the user', () => {
   const result = evaluateRecipientSetIntegrity(session.id, outgoing(correct));
   assert.equal(result.action, 'allow');
   assert.match(result.sourceId ?? '', /^user:/);
+});
+
+test('omission advisory: "invite everyone" but a subset flags the dropped recipients (still allow)', () => {
+  const session = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Invite everyone on the team to the sync.' } });
+  addReadSource(session.id, 'sf-roster', 'composio_execute_tool', correct);
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(correct.slice(0, 3)));
+  assert.equal(result.action, 'allow', 'never blocks a legitimate partial send');
+  assert.deepEqual(result.omittedRecipients, correct.slice(3).sort(), 'the dropped 5 are surfaced');
+});
+
+test('omission: explicit exclusion language ("except …") does NOT flag omission', () => {
+  const session = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Invite the whole team except Harper.' } });
+  addReadSource(session.id, 'sf-roster', 'composio_execute_tool', correct);
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(correct.slice(0, 7)));
+  assert.equal(result.action, 'allow');
+  assert.equal(result.omittedRecipients, undefined, 'user signaled the exclusion — no advisory');
+});
+
+test('omission: no complete-set intent means no advisory on a subset', () => {
+  const session = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send it to these three leads.' } });
+  addReadSource(session.id, 'sf-roster', 'composio_execute_tool', correct);
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(correct.slice(0, 3)));
+  assert.equal(result.action, 'allow');
+  assert.equal(result.omittedRecipients, undefined);
 });
 
 test('blocks a recipient set stitched across separate source snippets', () => {

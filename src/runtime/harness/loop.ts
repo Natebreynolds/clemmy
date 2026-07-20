@@ -388,6 +388,19 @@ function turnHasMeaningfulSuccessfulToolEvidence(
   }
 }
 
+/** An explicit user-memory candidate is persisted to the crash-safe intake
+ * ledger before the model answers. That durable receipt is completion evidence
+ * for a terse "Noted." even when the model correctly makes zero tool calls. */
+function turnHasDurableMemoryCaptureEvidence(sessionId: string, turn: number): boolean {
+  try {
+    return listEvents(sessionId, { types: ['memory_signals_captured'] })
+      .some((event) => event.turn === turn
+        && Number((event.data as { queuedCandidateCount?: unknown }).queuedCandidateCount ?? 0) > 0);
+  } catch {
+    return false;
+  }
+}
+
 function safeMaybeAutoFocus(sessionId: string, summaryHint?: unknown): void {
   try {
     maybeAutoFocusSession({ sessionId, summaryHint });
@@ -605,6 +618,31 @@ export function inferTurnPriors(
  * Returns the array of approval IDs (one per interruption) so the
  * caller can include them in the user-facing prompt body.
  */
+/** A human-facing recipient-grounding warning for the approval card, built from
+ *  the `recipient_set_omission_advisory` the recipient gate emitted for this
+ *  send. The 2026-07-19 incident's card said only "1st Team Meet up! — 8
+ *  attendees" and hid the dropped/fabricated recipients, so it was approved
+ *  blind. This makes the omission impossible to miss at the moment of approval.
+ *  Best-effort — never throws, never blocks an approval. */
+export function recipientGroundingNote(sessionId: string, interruption: InterruptionInfo): string | null {
+  try {
+    const events = listEvents(sessionId, { types: ['guardrail_tripped'], desc: true, limit: 12 });
+    const matches = events.filter((e) =>
+      (e.data as { kind?: unknown })?.kind === 'recipient_set_omission_advisory'
+      && ((e.data as { toolName?: unknown })?.toolName === interruption.toolName || !interruption.toolName));
+    const advisory = matches[matches.length - 1];
+    if (!advisory) return null;
+    const omitted = Array.isArray(advisory.data?.omittedRecipients) ? advisory.data.omittedRecipients as string[] : [];
+    const recipients = Array.isArray(advisory.data?.recipients) ? advisory.data.recipients as string[] : [];
+    if (omitted.length === 0) return null;
+    const total = recipients.length + omitted.length;
+    const preview = omitted.slice(0, 5).join(', ') + (omitted.length > 5 ? ', …' : '');
+    return `⚠ Recipients: sending to ${recipients.length} of ${total} on the roster — OMITS ${omitted.length} (${preview}). Confirm this is intentional before approving.`;
+  } catch {
+    return null;
+  }
+}
+
 function registerAndEmitApprovals(
   options: { sessionId: string; turn: number },
   session: HarnessSession,
@@ -621,7 +659,9 @@ function registerAndEmitApprovals(
   const workflowName = typeof metadata.workflowName === 'string' ? metadata.workflowName : null;
   const stepId = typeof metadata.stepId === 'string' ? metadata.stepId : null;
   for (const interruption of interruptions) {
-    const subject = extractApprovalSubject(interruption);
+    const baseSubject = extractApprovalSubject(interruption);
+    const groundingNote = recipientGroundingNote(options.sessionId, interruption);
+    const subject = groundingNote ? `${baseSubject}\n${groundingNote}` : baseSubject;
     let approvalId: string | null = null;
     try {
       const row = approvalRegistry.register({
@@ -2211,6 +2251,10 @@ async function runConversationCore(
     totalToolCalls += turnResult.toolCalls ?? 0;
     meaningfulToolEvidence = meaningfulToolEvidence
       || turnHasMeaningfulSuccessfulToolEvidence(options.sessionId, turnResult.turn, objective);
+    const durableMemoryCaptureEvidence = turnHasDurableMemoryCaptureEvidence(
+      options.sessionId,
+      turnResult.turn,
+    );
 
     // W1a — chat step-boundary brain fallover. A deferred transient model/codex
     // error (infraTransientKind set, ask NOT yet written) → re-attempt on the next
@@ -2347,7 +2391,32 @@ async function runConversationCore(
     // A completed turn MUST hand back an OrchestratorDecision-shaped
     // finalOutput. If it doesn't, treat the conversation as complete
     // (the Orchestrator chose to end without our structured shape).
-    const decision = toOrchestratorDecision(turnResult.finalOutput);
+    let decision = toOrchestratorDecision(turnResult.finalOutput);
+    // A terse completion acknowledgement after verified work is a valid
+    // terminal reply, not an unparseable decision. `parseDecisionText` keeps
+    // bare acknowledgements null so a true ZERO-work "Noted." / "Done." cannot
+    // masquerade as progress. Once this run has durable successful-tool OR
+    // crash-safe memory-intake evidence, retrying the acknowledgement repeats
+    // completed work (live repro: memory_remember ran twice and burned three
+    // model turns after the first write had already succeeded). Preserve the
+    // strict zero-work stall behavior while letting evidence-backed
+    // acknowledgements finish through the ordinary completion/delivery gates.
+    if (
+      !decision
+      && (meaningfulToolEvidence || durableMemoryCaptureEvidence)
+      && typeof turnResult.finalOutput === 'string'
+    ) {
+      const acknowledgement = turnResult.finalOutput.trim();
+      if (/^(?:ok|okay|done|got it|understood|noted|yes|alright|certainly)\.?$/i.test(acknowledgement)) {
+        decision = {
+          summary: acknowledgement,
+          reply: acknowledgement,
+          done: true,
+          nextAction: 'completed',
+          reason: 'durable_work_acknowledged',
+        };
+      }
+    }
     lastDecision = decision ?? lastDecision;
 
     captureWorkflowStepResultTranscript({
@@ -4221,11 +4290,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // synthetic re-prompts, and workflow/execution/agent sessions carry machine
   // input — neither should become durable "user" facts (2026-06-23 pollution).
   // captureInteractionSignals also self-guards harness-injected text.
-  // Deferred off the first-token path (perceived-latency). The extraction plus
-  // its memory_signals_captured append feed FUTURE turns, never this one — facts
-  // consolidate asynchronously through the Mem0 resolver, so no committed row is
-  // read back this turn (which is why the event records the candidate signals,
-  // not row ids). Running it synchronously here only delayed the model dispatch.
+  // Deferred off the first-token path (perceived-latency). The durable intake
+  // ledger is written before the model answers; semantic consolidation may
+  // finish in time for this turn's primer or may feed a future turn. The event
+  // records both proposed signals and durable queued receipts so completion can
+  // distinguish a real memory write from a zero-work acknowledgement.
   // Schedule unconditionally at the top so it still fires exactly once per turn
   // on every exit path (the microtask is already queued before any early
   // return); it runs at the first await (compaction) instead of blocking it.
@@ -4246,6 +4315,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             type: 'memory_signals_captured',
             data: {
               factCount: captured.candidates.length,
+              queuedCandidateCount: captured.queuedCandidateIds?.length ?? 0,
+              episodeId: captured.episodeId ?? null,
               profilePatch: captured.profilePatch ?? null,
               reasons: captured.candidates.map((c) => c.reason),
             },

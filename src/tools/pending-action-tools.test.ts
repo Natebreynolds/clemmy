@@ -30,8 +30,8 @@ after(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 
 test('pending_action_queue refuses a fabricated multi-recipient payload before an approval card exists', async () => {
   const session = createSession({ kind: 'chat' });
-  const correct = ['bobby@example.com', 'brett@example.com', 'jake@example.com'];
-  const outgoing = ['bobby@example.com', 'john@example.com', 'justin@example.com'];
+  const correct = ['avery@example.com', 'blair@example.com', 'casey@example.com'];
+  const outgoing = ['avery@example.com', 'jamie@example.com', 'jules@example.com'];
   writeToolOutput({
     sessionId: session.id,
     callId: 'team-source',
@@ -59,13 +59,13 @@ test('pending_action_queue refuses a fabricated multi-recipient payload before a
   });
 
   assert.match(response.content[0].text, /RECIPIENT_SET_INTEGRITY_FAILED/);
-  assert.match(response.content[0].text, /john@example\.com/);
+  assert.match(response.content[0].text, /jamie@example\.com/);
   assert.equal(listPendingActions({ sessionId: session.id }).length, 0, 'no misleading approval artifact is created');
 });
 
 test('pending_action_queue accepts the exact source-backed recipient set', async () => {
   const session = createSession({ kind: 'chat' });
-  const correct = ['bobby@example.com', 'brett@example.com', 'jake@example.com'];
+  const correct = ['avery@example.com', 'blair@example.com', 'casey@example.com'];
   writeToolOutput({ sessionId: session.id, callId: 'team-source', tool: 'memory_recall_all', output: correct.join(', ') });
   appendEvent({
     sessionId: session.id,

@@ -165,7 +165,7 @@ export async function buildUnifiedTurnPrimer(input: {
   const recallId = createRecallRunId();
   result.recallId = recallId;
   const preamble = '[MEMORY PRIMER]';
-  const useRule = 'Use relevant hits; treat snippets as leads and load a cited source before source-backed output or external writes.';
+  const useRule = 'Use relevant hits: answer directly from a complete evidence-backed FACT for local-memory questions. Treat partial snippets as leads; load a cited source before external writes or when exact requested values are missing.';
   // The [USAGE] mark-used trailer was subtracted 2026-07-16 — usage credit is
   // now attributed in code post-turn (recall-auto-credit.ts). Its budget share
   // goes to the hits themselves.

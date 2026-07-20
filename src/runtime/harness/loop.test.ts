@@ -70,7 +70,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
@@ -3313,6 +3313,73 @@ test('runConversation: stuck_detected fires Signal A when zero tools + generic a
   assert.equal((stuckEvents[0].data as { signal: string }).signal, 'A_zero_tools');
 });
 
+test('runConversation: a generic acknowledgement after successful tool work completes once', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let modelTurns = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    modelTurns += 1;
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'memory_remember' };
+    const details = {
+      toolCall: {
+        callId: `remember-${modelTurns}`,
+        arguments: '{"kind":"project","content":"Falcon codeword is tangerine-osprey-42"}',
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'Remembered (project): Falcon codeword is tangerine-osprey-42', details);
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, 'Noted.');
+    return { history: items, lastResponseId: undefined, finalOutput: 'Noted.' };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Remember the Falcon codeword and just confirm you noted it.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1, 'successful work plus acknowledgement must not self-retry');
+  assert.equal(modelTurns, 1, 'the completed mutation must not be repeated');
+  assert.equal(result.lastDecision?.reply, 'Noted.');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length,
+    0,
+    'tool-backed acknowledgement never enters decision-parse recovery',
+  );
+});
+
+test('runConversation: a generic acknowledgement after durable auto-capture completes without a forced tool', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let modelTurns = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    modelTurns += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: 'Noted.' };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Remember this: my durable harness marker is AUTO-CAPTURE-ACK-42.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const capture = listEventsForConv(sess.id, { types: ['memory_signals_captured'] }).at(-1);
+  assert.ok(Number((capture?.data as { queuedCandidateCount?: number } | undefined)?.queuedCandidateCount ?? 0) > 0);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(modelTurns, 1);
+  assert.equal(result.lastDecision?.reply, 'Noted.');
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['tool_called'] }).length, 0);
+});
+
 test('runConversation: a zero-tool ACKNOWLEDGMENT turn is NOT flagged as a stall', async () => {
   // Success-payload regression: the user gave correction feedback;
   // the model correctly replied "You're right … going forward I'll treat SEO as
@@ -5007,4 +5074,28 @@ test('Stage 4 E2E: kill-switch off — the same over-budget run finishes without
     if (prevSwitch === undefined) delete process.env.CLEMMY_RUN_TOKEN_BUDGET;
     else process.env.CLEMMY_RUN_TOKEN_BUDGET = prevSwitch;
   }
+});
+
+test('recipientGroundingNote surfaces the omission on the approval card, or nothing when clean', () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  // No advisory yet → no note.
+  assert.equal(recipientGroundingNote(session.id, { toolName: 'composio_execute_tool', args: {} } as any), null);
+  // The recipient gate emitted an omission advisory for this send.
+  appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: {
+      kind: 'recipient_set_omission_advisory',
+      toolName: 'composio_execute_tool',
+      recipients: ['a@x.co', 'b@x.co', 'c@x.co'],
+      omittedRecipients: ['d@x.co', 'e@x.co', 'f@x.co', 'g@x.co', 'h@x.co'],
+    },
+  });
+  const note = recipientGroundingNote(session.id, { toolName: 'composio_execute_tool', args: {} } as any);
+  assert.match(note ?? '', /OMITS 5/);
+  assert.match(note ?? '', /3 of 8/);
+  assert.match(note ?? '', /d@x\.co/);
 });

@@ -28,9 +28,10 @@ import { clarifyThenExecute } from './scenarios/clarify-then-execute.js';
 import { workspaceBuild } from './scenarios/workspace-build.js';
 import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
 import { pendingActionGate } from './scenarios/pending-action-gate.js';
+import { completeSetRecall } from './scenarios/complete-set-recall.js';
 import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, clarifyThenExecute, workspaceBuild, teamAgentHandoff, pendingActionGate];
+const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, completeSetRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, clarifyThenExecute, workspaceBuild, teamAgentHandoff, pendingActionGate];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
 function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {

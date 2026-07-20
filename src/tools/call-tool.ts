@@ -44,16 +44,19 @@ const DESCRIPTION = [
  *  imported so this module (imported by the orchestrator) never forms an eval-time
  *  cycle with the runtime tool registry. */
 let schemaCache: Map<string, z.ZodTypeAny> | null = null;
-async function localSchemas(): Promise<Map<string, z.ZodTypeAny>> {
+let optionalKeysCache: Map<string, ReadonlySet<string>> | null = null;
+async function localSchemas(): Promise<{ schemas: Map<string, z.ZodTypeAny>; optionalKeys: Map<string, ReadonlySet<string>> }> {
   if (!schemaCache) {
     try {
-      const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
+      const { getLocalToolSchemas, getLocalToolOptionalKeys } = await import('./local-runtime-tools.js');
       schemaCache = getLocalToolSchemas();
+      optionalKeysCache = getLocalToolOptionalKeys();
     } catch {
       schemaCache = new Map();
+      optionalKeysCache = new Map();
     }
   }
-  return schemaCache;
+  return { schemas: schemaCache, optionalKeys: optionalKeysCache ?? new Map() };
 }
 
 function jsonResult(value: unknown): string {
@@ -153,7 +156,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       }
 
       // 3. Zod-validate BEFORE dispatch — zero side effects on failure.
-      const schema = (await localSchemas()).get(target);
+      const local = await localSchemas();
+      const schema = local.schemas.get(target);
+      let dispatchArgs = args;
       if (schema) {
         const parsed = schema.safeParse(args);
         if (!parsed.success) {
@@ -164,6 +169,14 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
               .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
               .join('; '),
           });
+        }
+        dispatchArgs = parsed.data;
+        if (dispatchArgs && typeof dispatchArgs === 'object' && !Array.isArray(dispatchArgs)) {
+          const strictArgs = { ...(dispatchArgs as Record<string, unknown>) };
+          for (const key of local.optionalKeys.get(target) ?? []) {
+            if (!(key in strictArgs) || strictArgs[key] === undefined) strictArgs[key] = null;
+          }
+          dispatchArgs = strictArgs;
         }
       }
 
@@ -183,7 +196,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // invocation; the fallback only serves direct/unit invocations without a
       // harness run context.
       const counter = harnessRunContextStorage.getStore()?.counter ?? new ToolCallsCounter(1000);
-      const out = await dispatchBatchItemTool(target, args, sessionId, counter);
+      const out = await dispatchBatchItemTool(target, dispatchArgs, sessionId, counter);
 
       // 5. Promote the reached tool into the session hot-set.
       recordToolHit(sessionId, target);
@@ -195,4 +208,5 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
 /** Test-only: reset the memoized local-schema map. */
 export function _resetCallToolSchemaCacheForTest(): void {
   schemaCache = null;
+  optionalKeysCache = null;
 }

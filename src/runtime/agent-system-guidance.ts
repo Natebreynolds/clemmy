@@ -43,7 +43,8 @@ function severityRank(severity: AgentSystemRecommendation['severity']): number {
 function recommendationRelevantToInput(rec: AgentSystemRecommendation, input: string): boolean {
   const text = input.toLowerCase();
   if (rec.kind === 'swarm') {
-    return /\b(agent|agents|swarm|delegate|delegation|review|debate|parallel|worker|fan[- ]?out|specialist|team)\b/.test(text);
+    return /\b(agent|agents|swarm|delegate|delegation|review|debate|parallel|worker|fan[- ]?out|specialist)\b/.test(text)
+      || /\b(?:agent\s+team|team\s+(?:agent|agents|of\s+agents))\b/.test(text);
   }
   return /\b(workflow|automation|automate|retry|replan|rerun|loop|schedule|foreach|for each|failed items?|run)\b/.test(text);
 }
@@ -100,7 +101,10 @@ export function renderAgentSystemGuidance(input: string, sessionKind?: string): 
 
   const { recommendations: all, policy, summary } = loadGuidanceSnapshot();
   const relevant = all.filter((rec) => recommendationRelevantToInput(rec, input));
-  const selected = (relevant.length > 0 ? relevant : all)
+  // Keep the coordination policy available to the deterministic fan-out
+  // governor, but do not inject generic swarm/workflow advice into an unrelated
+  // lookup just because recommendations happen to exist globally.
+  const selected = relevant
     .slice()
     .sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.id.localeCompare(b.id))
     .slice(0, 3);

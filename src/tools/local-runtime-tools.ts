@@ -218,7 +218,36 @@ export function buildScopedLocalToolSearch(allowedNames: ReadonlySet<string>): T
 export function getLocalToolSchemas(): Map<string, z.ZodTypeAny> {
   const map = new Map<string, z.ZodTypeAny>();
   for (const localTool of captureLocalTools()) {
-    map.set(localTool.name, z.object(normalizeShapeForResponses(localTool.parameters)));
+    const strictShape = normalizeShapeForResponses(localTool.parameters);
+    const deferredShape: Record<string, z.ZodTypeAny> = {};
+    for (const [key, raw] of Object.entries(localTool.parameters)) {
+      const normalized = strictShape[key] as z.ZodTypeAny;
+      // Codex first-class schemas must encode optional fields as required +
+      // nullable for strict JSON Schema. args_json is ordinary JSON, though:
+      // models naturally omit optional keys. Preserve null compatibility while
+      // also accepting omission so call_tool does not waste a round trip merely
+      // adding `kind:null` / `includeInactive:false` / `content:""`.
+      deferredShape[key] = (raw as z.ZodTypeAny).safeParse(undefined).success
+        ? normalized.optional()
+        : normalized;
+    }
+    map.set(localTool.name, z.object(deferredShape));
+  }
+  return map;
+}
+
+/** Optional fields in the original MCP-facing shapes. Codex's strict
+ * first-class schema represents these as required+nullable, so deferred
+ * args_json dispatch must materialize an omitted key as null before invoking
+ * that strict inner tool. */
+export function getLocalToolOptionalKeys(): Map<string, ReadonlySet<string>> {
+  const map = new Map<string, ReadonlySet<string>>();
+  for (const localTool of captureLocalTools()) {
+    map.set(localTool.name, new Set(
+      Object.entries(localTool.parameters)
+        .filter(([, raw]) => (raw as z.ZodTypeAny).safeParse(undefined).success)
+        .map(([key]) => key),
+    ));
   }
   return map;
 }

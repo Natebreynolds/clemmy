@@ -106,6 +106,17 @@ const NEGATED_FRESH_EXTERNAL_RE =
   /\b(?:do\s+not|don't|dont|without|no)\s+(?:run|running|rerun|re-running|re-run|perform|performing|do|doing|use|using|call|calling|invoke|invoking|start|starting|trigger|triggering)?\s*(?:any\s+)?(?:a\s+)?(?:fresh|new)?\s*(?:web\s+)?(?:seo\s+)?(?:audit|dataforseo|lookup|lookups|look\s+up|crawl|crawling|scrape|scraping|search|searching|external|external\s+mcp|web\s+search|site\s+check)\b/i;
 const NEGATED_EXTERNAL_WINDOW_RE =
   /\b(?:do\s+not|don't|dont|without|no)\s+[^.!?\n]{0,160}\b(?:fresh|new|dataforseo|external\s+mcp|web\s+search|crawl|crawling|scrape|scraping|search|searching|lookup|lookups|look\s+up|audit)\b/i;
+// A user who explicitly constrains a turn to local memory/context has already
+// made the tool-scope decision. Detect this before keyword families: negative
+// phrases such as "names only, no emails" must never open Outlook merely
+// because OUTLOOK_RE sees the noun "emails". An explicit "except <app>" keeps
+// the escape hatch for intentionally mixed requests.
+const EXPLICIT_LOCAL_ONLY_RE =
+  /\b(?:(?:use|using|consult|read|search|check)\s+only\s+(?:clementine(?:'s)?\s+)?local\s+(?:memory|context|files?)|(?:clementine(?:'s)?\s+)?local\s+(?:memory|context|files?)\s+only)\b/i;
+const EXPLICIT_NO_EXTERNAL_TOOLS_RE =
+  /\b(?:(?:do\s+not|don't|dont|never)\s+(?:call|use|invoke|open|query|contact)\s+(?:any\s+)?external\s+(?:connector|connectors|tool|tools|mcp|service|services)|no\s+external\s+(?:connector|connectors|tool|tools|mcp|service|services))\b/i;
+const EXTERNAL_SCOPE_EXCEPTION_RE =
+  /\b(?:except|other\s+than)\s+(?:for\s+)?(?:salesforce|outlook|gmail|google|github|slack|notion|airtable|an?\s+external)\b/i;
 
 // A turn that CONTINUES the active thread rather than opening a new topic — a
 // bare confirmation / go-ahead / anaphoric follow-up ("let's get them ready",
@@ -195,6 +206,17 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   }
 
   const lower = input.toLowerCase();
+  if (
+    (EXPLICIT_LOCAL_ONLY_RE.test(input) || EXPLICIT_NO_EXTERNAL_TOOLS_RE.test(input))
+    && !EXTERNAL_SCOPE_EXCEPTION_RE.test(input)
+  ) {
+    return {
+      reason: `explicit local-only/no-external-tools instruction: ${lower.slice(0, 120)}`,
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    };
+  }
   const scopes: McpToolScope[] = [];
 
   const isLocalContextFollowup = LOCAL_CONTEXT_FOLLOWUP_RE.test(input);

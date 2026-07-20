@@ -42,6 +42,11 @@ import {
   RecipientSetIntegrityError,
 } from './recipient-integrity-gate.js';
 import {
+  hasToolOutputReference,
+  resolveToolOutputReferences,
+  toolOutputReferenceResolutionEnabled,
+} from './tool-output-reference.js';
+import {
   isGoalFidelityGateEnabled,
   evaluateGoalFidelity,
   extractMessageBody,
@@ -1601,6 +1606,28 @@ export function wrapToolForHarness<T extends WrappableTool>(
         } catch { /* telemetry must never block the deterministic refusal */ }
         throw new RecipientSetIntegrityError({ toolName: tool.name, result: recipientResult });
       }
+      // ADVISORY (never blocks): the send is grounded but OMITS people from a
+      // roster the user asked to include in full — the "dropped 5" half of the
+      // incident. Record it so it is no longer silent and so the approval surface
+      // can show "N of M — missing …" to the human (Phase 2).
+      if ((recipientResult.omittedRecipients?.length ?? 0) > 0) {
+        try {
+          appendEvent({
+            sessionId: ctx.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'guardrail_tripped',
+            data: {
+              kind: 'recipient_set_omission_advisory',
+              action: 'warn',
+              toolName: tool.name,
+              recipients: recipientResult.recipients.slice(0, 25),
+              omittedRecipients: (recipientResult.omittedRecipients ?? []).slice(0, 25),
+              reason: recipientResult.reason,
+            },
+          });
+        } catch { /* advisory only — never affect the send */ }
+      }
     }
     const parallelGates = parallelPreWriteGatesEnabled();
     // CERTIFIED-BATCH item: skip the per-item LLM judges (goal-fidelity +
@@ -2414,6 +2441,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // correlate a future identical call back to this one's tool_outputs row.
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
       const invokeCallId = invokeCall?.callId ?? invokeCall?.id;
+      // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
+      // values from the lossless store BEFORE gates + execution, so a high-stakes
+      // field comes from a trusted source, never model-authored text (the class of
+      // the 2026-07-19 fabricated-recipients incident). No-op for every call
+      // without the syntax (all traffic today). Fail-closed: an unresolvable
+      // reference returns a soft, recoverable error and the tool does NOT run.
+      if (toolOutputReferenceResolutionEnabled() && hasToolOutputReference(parsedInput)) {
+        const refResolution = resolveToolOutputReferences(ctx?.sessionId ?? '', parsedInput);
+        if (refResolution.errors.length > 0) {
+          return JSON.stringify({
+            error: 'reference_resolution_failed',
+            detail: refResolution.errors.join('; '),
+            hint: 'Point $fromToolOutput at a real prior tool result (its call_id + a path to the values), or pass the values directly.',
+          });
+        }
+        parsedInput = refResolution.resolved;
+        input = typeof input === 'string' ? JSON.stringify(refResolution.resolved) : refResolution.resolved;
+      }
       let fanoutNudge: string | undefined;
       let artifact: ArtifactAdmission = {};
       try {
@@ -2570,6 +2615,19 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const originalExecute = tool.execute!;
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
+    // Layer 1 — bind $fromToolOutput references to real store values before gates
+    // + execution (mirror of the invoke path). No-op without the syntax.
+    if (toolOutputReferenceResolutionEnabled() && hasToolOutputReference(input)) {
+      const refResolution = resolveToolOutputReferences(ctx?.sessionId ?? '', input);
+      if (refResolution.errors.length > 0) {
+        return JSON.stringify({
+          error: 'reference_resolution_failed',
+          detail: refResolution.errors.join('; '),
+          hint: 'Point $fromToolOutput at a real prior tool result (its call_id + a path to the values), or pass the values directly.',
+        });
+      }
+      input = refResolution.resolved;
+    }
     let fanoutNudge: string | undefined;
     let artifact: ArtifactAdmission = {};
     try {

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
 import { embedMissingChunks, embedMissingFacts, readEmbeddingStats, readFactEmbeddingStats } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, reviewStandingInstructions, searchFacts, setFactPinned, recordFactImpression } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, reviewStandingInstructions, searchFacts, searchFactsByText, setFactPinned, recordFactImpression } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { recallEverything, formatUnifiedRecall, projectedRecallAnswerability, unifiedHitRecallRef, visibleUnifiedRecallHits } from '../memory/unified-recall.js';
@@ -20,7 +20,7 @@ import type { ConsolidatedFact } from '../memory/facts.js';
 import { openMemoryDb, type EntityType } from '../memory/db.js';
 import { upsertEntity, type EntityIdentifierInput } from '../memory/entity-identity.js';
 import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelationshipOutcome } from '../memory/relations.js';
-import { getFactEvidence } from '../memory/temporal-memory.js';
+import { getFactEvidence, syncMemoryPolicyForFact } from '../memory/temporal-memory.js';
 import { compileWordMatcher } from '../memory/word-match.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { listEvents, recentToolOutputs } from '../runtime/harness/eventlog.js';
@@ -389,6 +389,132 @@ function inferRememberedToolSource(sessionId: string | undefined, content: strin
   }
 }
 
+interface AutoCapturedFactRow {
+  id: number;
+  content: string;
+  pinned: number;
+  source_path: string;
+}
+
+/** Normalize only enough to prove that the model's curated fact is a literal
+ * clause from the auto-captured user turn. This deliberately does not use fuzzy
+ * similarity: failing to merge a paraphrase is safer than retiring a distinct
+ * fact. */
+function groundedMemoryClause(value: string): string {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u2018\u2019\u02bc]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.!?]+$/g, '')
+    .toLowerCase();
+}
+
+/** Words that are FRAMING around a remembered clause (the auto-capture prefix +
+ * common "remember this / just confirm" phrasing + light stopwords), never the
+ * substance of a fact. A residual made only of these is safe boilerplate. */
+const REMEMBER_FRAMING_WORDS = new Set([
+  'user', 'explicitly', 'asked', 'clementine', 'to', 'remember', 'remembering', 'this', 'that',
+  'the', 'a', 'an', 'please', 'kindly', 'note', 'noted', 'make', 'sure', 'dont', 'forget',
+  'just', 'confirm', 'confirmed', 'youve', 'ive', 'it', 'nothing', 'else', 'can', 'could',
+  'would', 'save', 'store', 'keep', 'mind', 'for', 'me', 'us', 'and', 'is', 'are', 'was',
+  'were', 'of', 'on', 'in', 'at', 'my', 'our', 'your', 'so', 'then', 'also', 'okay', 'ok',
+  'thanks', 'thank', 'need', 'want', 'you',
+]);
+
+/** True when `wrapper` is only framing boilerplate wrapped around the EXACT
+ * `clause` — safe to reconcile. If the residual carries any non-framing content
+ * word, the wrapper holds a distinct fact and must stay active. */
+function wrapperIsBoilerplateAround(wrapper: string, clause: string): boolean {
+  const idx = wrapper.indexOf(clause);
+  if (idx < 0) return false;
+  const residual = `${wrapper.slice(0, idx)} ${wrapper.slice(idx + clause.length)}`;
+  const contentTokens = residual
+    .split(/\s+/)
+    .map((token) => token.replace(/[^a-z0-9]/g, ''))
+    .filter((token) => token.length > 0 && !REMEMBER_FRAMING_WORDS.has(token));
+  return contentTokens.length === 0;
+}
+
+/** The explicit user turn is captured defensively before the model runs, while
+ * memory_remember stores the cleaner, typed version the model extracts. When
+ * both paths commit the SAME literal clause, retain the curated row as the one
+ * active fact, transfer the original-turn evidence, and close the wrapper row
+ * as superseded. This removes a two-writer duplicate without sacrificing the
+ * crash-safe auto-capture ledger or using an unsafe semantic guess. */
+export function reconcileAutoCapturedRememberFact(input: {
+  sessionId?: string;
+  factId?: number;
+  content: string;
+}): number {
+  const sessionId = input.sessionId?.trim();
+  if (!sessionId || !input.factId) return 0;
+  const direct = getFact(input.factId);
+  if (!direct?.active) return 0;
+  const clause = groundedMemoryClause(input.content);
+  if (clause.length < 8) return 0;
+
+  const db = openMemoryDb();
+  const candidates = db.prepare(`
+    SELECT id, content, pinned, source_path
+    FROM consolidated_facts
+    WHERE active = 1 AND id <> ? AND source_session_id = ?
+      AND source_path LIKE 'conversation://%/auto-capture%'
+    ORDER BY updated_at DESC
+    LIMIT 20
+  `).all(input.factId, sessionId) as AutoCapturedFactRow[];
+  const matches = candidates.filter((candidate) => {
+    // Merge only when the wrapper is framing BOILERPLATE around the EXACT curated
+    // clause (the auto-capture row stores "Remember this: <clause>. Just confirm…"
+    // around the same fact). Plain containment was a silent-data-loss bug: a
+    // wrapper "<clause> AND <a distinct fact>" would be deactivated, dropping the
+    // only row carrying the distinct fact. If the residual (wrapper minus the
+    // clause) holds ANY non-framing content word, it is a distinct fact — keep it.
+    return wrapperIsBoilerplateAround(groundedMemoryClause(candidate.content), clause);
+  });
+  if (matches.length === 0) return 0;
+
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    for (const match of matches) {
+      // Preserve the exact source-turn episode on the curated fact. The direct
+      // row may also carry system-of-record evidence; INSERT OR IGNORE keeps
+      // both sources without replacing either one.
+      db.prepare(`
+        INSERT OR IGNORE INTO fact_evidence
+          (fact_id, episode_id, excerpt, source_uri, ordinal, created_at)
+        SELECT ?, episode_id, excerpt, source_uri, ordinal, ?
+        FROM fact_evidence WHERE fact_id = ?
+      `).run(input.factId, now, match.id);
+      db.prepare(`
+        UPDATE consolidated_facts
+        SET source_path = COALESCE(source_path, ?),
+            pinned = MAX(pinned, ?), updated_at = ?
+        WHERE id = ?
+      `).run(match.source_path, match.pinned, now, input.factId);
+      db.prepare(`
+        UPDATE consolidated_facts
+        SET active = 0, valid_to = COALESCE(valid_to, ?),
+            superseded_by_fact_id = ?, updated_at = ?
+        WHERE id = ? AND active = 1
+      `).run(direct.validFrom ?? now, input.factId, now, match.id);
+      // Keep the learned-claim audit pointed at the canonical result rather
+      // than an inactive wrapper row.
+      db.prepare(`
+        UPDATE memory_reflection_candidates
+        SET resulting_fact_id = ?,
+            reason = COALESCE(reason, '') || ';reconciled_by_memory_remember'
+        WHERE resulting_fact_id = ?
+      `).run(input.factId, match.id);
+    }
+  });
+  tx();
+  syncMemoryPolicyForFact(input.factId);
+  for (const match of matches) syncMemoryPolicyForFact(match.id);
+  return matches.length;
+}
+
 function formatMemoryFix(fix: ProposedMemoryFix): string {
   const status = fix.status ?? 'pending';
   const ids = fix.targetIds.length > 0 ? ` ids=${fix.targetIds.join(',')}` : '';
@@ -429,9 +555,16 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_read',
-    'Read a key memory file or a vault-relative markdown path.',
+    'Read a durable memory reference (fact:<id> or policy:<id>), a key memory file, or a vault-relative markdown path.',
     { target: z.string().min(1) },
     async ({ target }) => {
+      const durableRef = /^(?:fact|policy):(\d+)$/i.exec(target.trim());
+      if (durableRef) {
+        const id = Number(durableRef[1]);
+        const fact = getFact(id);
+        if (!fact) return textResult(`Not found: ${target}`);
+        return textResult(`[fact:${fact.id}] ${fact.kind}: ${fact.content}`);
+      }
       const resolved = resolveMemoryTarget(target);
       return textResult(readText(resolved, `Not found: ${target}`));
     },
@@ -589,6 +722,11 @@ export function registerMemoryTools(server: McpServer): void {
           },
           { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
         );
+        const reconciledAutoCaptures = reconcileAutoCapturedRememberFact({
+          sessionId: effectiveSessionId,
+          factId: outcome.factId,
+          content,
+        });
         const verb = outcome.action === 'supersede'
           ? 'Superseded the prior fact with'
           : outcome.action === 'reinforce'
@@ -606,7 +744,10 @@ export function registerMemoryTools(server: McpServer): void {
         const warning = graph.incomplete
           ? `\nMEMORY_GRAPH_INCOMPLETE: the durable fact text was saved, but requested structured annotations were not fully grounded (${graph.rejected.slice(0, 4).join('; ')}). Do not claim the complete graph was saved; correct the unsupported annotations or report the limitation.`
           : '';
-        return textResult(`${verb} (${kind}): ${content}${graph.summary}${warning}`);
+        const reconciliation = reconciledAutoCaptures > 0
+          ? ` · reconciled ${reconciledAutoCaptures} auto-captured duplicate${reconciledAutoCaptures === 1 ? '' : 's'}`
+          : '';
+        return textResult(`${verb} (${kind}): ${content}${graph.summary}${reconciliation}${warning}`);
       } catch (err) {
         return textResult(`memory_remember failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -615,27 +756,67 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_list_facts',
-    'List durable facts. Defaults to top active facts by score; set includeInactive=true to see soft-deleted history.',
+    'List durable facts as a JSON array that can be filtered/paged with tool_output_query. For a targeted lookup, ALWAYS pass query instead of listing a large generic page. Defaults to top active facts by score; set includeInactive=true to inspect soft-deleted history.',
     {
       kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]).optional(),
+      query: z.string().min(1).max(500).optional(),
       limit: z.number().int().min(1).max(100).optional(),
       includeInactive: z.boolean().optional(),
     },
-    async ({ kind, limit, includeInactive }) => {
-      const facts = includeInactive
-        ? listAllFacts(limit ?? 25).filter((fact) => !kind || fact.kind === kind)
-        : listActiveFacts({
-            limit: limit ?? 25,
-            kind: kind as (typeof FACT_KINDS)[number] | undefined,
-          });
+    async ({ kind, query, limit, includeInactive }) => {
+      // Targeted lookup is a recovery read, not a catalog dump. Keep its
+      // default small so one relevant fact does not drag 24 weak lexical
+      // matches back into the model; explicit limit still wins.
+      const requestedLimit = limit ?? (query ? 8 : 25);
+      let facts: ConsolidatedFact[];
+      if (query && !includeInactive) {
+        // Pull a wider lexical pool before applying kind so a kind filter cannot
+        // discard the relevant fact merely because another kind filled top-K.
+        facts = searchFactsByText(query, Math.max(requestedLimit, 100))
+          .filter((fact) => !kind || fact.kind === kind)
+          .slice(0, requestedLimit);
+      } else if (query) {
+        // Keep 2+ char tokens so short but real queries ("Q3", "AI", "PT") match.
+        // If everything is sub-2 (punctuation-only), fall back to the whole
+        // normalized query so the branch never silently returns [].
+        const normalizedQuery = query.toLowerCase().trim();
+        const queryTokens = normalizedQuery.split(/[^a-z0-9]+/).filter((token) => token.length >= 2);
+        if (queryTokens.length === 0 && normalizedQuery) queryTokens.push(normalizedQuery);
+        facts = listAllFacts(2_000, kind as (typeof FACT_KINDS)[number] | undefined)
+          .map((fact) => ({
+            fact,
+            matches: queryTokens.reduce((count, token) => count + Number(fact.content.toLowerCase().includes(token)), 0),
+          }))
+          .filter((entry) => entry.matches > 0)
+          .sort((a, b) => b.matches - a.matches || b.fact.updatedAt.localeCompare(a.fact.updatedAt))
+          .slice(0, requestedLimit)
+          .map((entry) => entry.fact);
+      } else {
+        facts = includeInactive
+          ? listAllFacts(requestedLimit, kind as (typeof FACT_KINDS)[number] | undefined)
+          : listActiveFacts({
+              limit: requestedLimit,
+              kind: kind as (typeof FACT_KINDS)[number] | undefined,
+            });
+      }
 
-      if (facts.length === 0) return textResult('No facts recorded yet.');
-
-      const lines = facts.map((fact) => {
-        const flag = fact.active ? '' : ' [inactive]';
-        return `- #${fact.id} ${fact.kind} (${fact.score.toFixed(2)})${flag}: ${fact.content}`;
-      });
-      return textResult(lines.join('\n'));
+      // JSON is deliberate: large outputs are parked by the harness, and the
+      // model can then use tool_output_query to filter records instead of
+      // loading a 20KB plain-text list through recall_tool_result.
+      const body = JSON.stringify(facts.map((fact) => ({
+        id: fact.id,
+        kind: fact.kind,
+        content: fact.content,
+        score: fact.score,
+        active: fact.active,
+        pinned: fact.pinned === true,
+        created_at: fact.createdAt,
+        updated_at: fact.updatedAt,
+      })));
+      // Keep the parked payload valid JSON. The harness applies its own
+      // structure-aware digest at the model boundary; pre-truncating here would
+      // leave an unparsable prefix and defeat tool_output_query.
+      return textResult(body, { maxChars: body.length });
     },
   );
 

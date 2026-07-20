@@ -108,6 +108,7 @@ export function codeModeMandateDirective(opts: {
     '(b) 3+ independent items that each need their own REASONING/discovery (research each firm, judge each doc) → FAN OUT: call `run_worker` ONCE with the complete stable-id items array and shared output contract; the harness runs isolated Workers with bounded concurrency — do NOT grind the items one-by-one in your own context;',
     '(c) several DIFFERENT read-only fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result. run_tool_program is READ-ONLY aggregation with an activity-based deadline — no sends/writes inside it;',
     '(d) a SINGLE read → call the tool directly.',
+    'GROUNDED-VALUE RULE — when a SEND/WRITE carries high-stakes STRUCTURED values (recipient/attendee lists, record ids, amounts) that came from a prior tool RESULT, do NOT retype them — retyping a list is how a value gets invented, dropped, or transposed. Bind them by reference instead: pass `{"$fromToolOutput":{"callId":"<that read\'s call_id>","path":"result.records[*].Email"}}` as the field value and the harness substitutes the EXACT real values before the call (an unresolvable reference fails closed — the send does not run). Retype only values the USER gave you directly.',
   ].join(' ');
   if (opts.fanoutPreferred && opts.multiItem) {
     const n = opts.multiItem.count >= 3 ? `~${opts.multiItem.count}` : 'several';

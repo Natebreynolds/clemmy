@@ -204,10 +204,14 @@ export function registerSessionTools(server: McpServer): void {
     {
       session_id: z.string().min(1),
       max_turns: z.number().int().min(1).max(40).optional(),
-      through_seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+      // Some model transports serialize an omitted optional number as null.
+      // Treat that as "no boundary" instead of failing a read-only continuity
+      // lookup after the model has already done useful work.
+      through_seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullish(),
     },
     async ({ session_id, max_turns, through_seq }) => {
-      const transcript = renderSessionHistoryForModel(session_id, max_turns ?? 12, 12_000, through_seq);
+      const throughSeq = through_seq ?? undefined;
+      const transcript = renderSessionHistoryForModel(session_id, max_turns ?? 12, 12_000, throughSeq);
       if (transcript) return textResult(transcript);
 
       // Fallback: harness sessions (Discord, workflow chat) record their
@@ -219,7 +223,7 @@ export function registerSessionTools(server: McpServer): void {
       // incident — see [[project_session_status_semantics]].)
       try {
         const prefixEvents = listHarnessEvents(session_id, { types: ['cross_session_prefix'] })
-          .filter((event) => through_seq === undefined || event.seq <= through_seq);
+          .filter((event) => throughSeq === undefined || event.seq <= throughSeq);
         if (prefixEvents.length > 0) {
           const lines = prefixEvents.map((e) => {
             const text = (e.data as { text?: unknown })?.text;

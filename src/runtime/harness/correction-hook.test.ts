@@ -113,7 +113,7 @@ test('a wrong-recipient complaint is attributed to the sent payload, not the cor
   setCorrectionJudgeForTest(async () => ({ verdict: 'approve', reason: 'the user clearly reports a bad send' }));
   const fact = rememberFact({
     kind: 'project',
-    content: 'The team is Bobby Romano <bobby@example.com> and Brett Lorenzini <brett@example.com>.',
+    content: 'The team is Avery Rowan <avery@example.com> and Blair Solis <blair@example.com>.',
   });
   seedPriorCredit(fact.id);
   appendEvent({

@@ -197,13 +197,20 @@ export function registerRecallTools(server: McpServer): void {
         const limit = Number.isFinite(input.limit as number) ? Math.min(200, Math.max(1, Math.trunc(input.limit as number))) : 50;
         const page = rows.slice(offset, offset + limit).map(project);
         const header = `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total)`;
-        const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`);
+        // Hand the model the EXACT, copy-paste reference for these values, so a
+        // downstream send binds them by reference instead of retyping (which is
+        // how a value gets invented or dropped). Root array + single projected
+        // field → a precise path.
+        const refPath = fields && fields.length === 1 ? `[*].${fields[0]}` : '[*]';
+        const refHint = `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
       }
 
       if (parsed && typeof parsed === 'object') {
         const projected = project(parsed);
-        const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`);
+        const refHint = `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
+        const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
       }
 

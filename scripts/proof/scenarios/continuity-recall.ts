@@ -6,6 +6,8 @@
  */
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import Database from 'better-sqlite3';
+import path from 'node:path';
 
 const CODEWORD = 'tangerine-osprey-42';
 
@@ -43,15 +45,46 @@ export const continuityRecall: ScenarioDef = {
     checks.push(stormCheck(daemon.log()));
 
     let metrics = null;
+    let decisionParseRetries = -1;
     try {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn2.sessionId);
+      decisionParseRetries = (db.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE session_id = ? AND type = 'stall_retry_attempted'
+          AND json_extract(data_json, '$.signal') = 'D_decision_unparsed'
+      `).get(turn2.sessionId) as { count: number }).count;
       db.close();
     } catch { /* handled below */ }
     checks.push({
       name: 'context injected on turn 2 (primer/history)',
       pass: (metrics?.primerInjectedBytes ?? 0) > 0 || (metrics?.turns ?? 0) >= 2,
       detail: `primer bytes: ${metrics?.primerInjectedBytes ?? 'n/a'}, turns: ${metrics?.turns ?? 'n/a'}`,
+    });
+    checks.push({
+      name: 'no completion-parse retry loop',
+      pass: decisionParseRetries === 0 && (metrics?.turns ?? Number.POSITIVE_INFINITY) <= 4,
+      detail: `decision retries: ${decisionParseRetries}, turn_started events: ${metrics?.turns ?? 'n/a'}`,
+    });
+    checks.push({
+      name: 'remember mutation runs at most once',
+      pass: (metrics?.toolCalls.memory_remember ?? 0) <= 1,
+      detail: `memory_remember calls: ${metrics?.toolCalls.memory_remember ?? 'n/a'}`,
+    });
+
+    let activeCodewordFacts = -1;
+    try {
+      const memoryDb = new Database(path.join(daemon.home, 'state', 'memory.db'), { readonly: true });
+      activeCodewordFacts = (memoryDb.prepare(`
+        SELECT COUNT(*) AS count FROM consolidated_facts
+        WHERE active = 1 AND lower(content) LIKE ?
+      `).get(`%${CODEWORD.toLowerCase()}%`) as { count: number }).count;
+      memoryDb.close();
+    } catch { /* surfaced by the check */ }
+    checks.push({
+      name: 'one active canonical codeword fact',
+      pass: activeCodewordFacts === 1,
+      detail: `active facts containing the codeword: ${activeCodewordFacts}`,
     });
 
     return {
@@ -61,7 +94,14 @@ export const continuityRecall: ScenarioDef = {
         { wallMs: turn2.wallMs, ttftMs: metrics?.latency[1]?.ttftMs ?? metrics?.firstByteMs ?? null },
       ],
       sessionId,
-      metrics: metrics ? { turns: metrics.turns, tokensUsed: metrics.tokensUsed, primerInjectedBytes: metrics.primerInjectedBytes } : undefined,
+      metrics: metrics ? {
+        turns: metrics.turns,
+        tokensUsed: metrics.tokensUsed,
+        primerInjectedBytes: metrics.primerInjectedBytes,
+        memoryRememberCalls: metrics.toolCalls.memory_remember ?? 0,
+        decisionParseRetries,
+        activeCodewordFacts,
+      } : undefined,
     };
   },
 };

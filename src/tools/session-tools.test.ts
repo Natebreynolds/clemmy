@@ -108,6 +108,22 @@ test('session_history through_seq excludes later turns while retaining pre-bound
   assert.doesNotMatch(text, /record:after-handoff-555/);
 });
 
+test('session_history treats a transport-serialized null through_seq as omitted', async () => {
+  const sessionId = 'sess-session-history-null-through-seq';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Null boundary' });
+  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'NULL-BOUNDARY-IS-UNBOUNDED' } });
+
+  const history = registeredToolHandlers().get('session_history');
+  assert.ok(history);
+  const text = resultText(await history!({
+    session_id: sessionId,
+    max_turns: 10,
+    through_seq: null,
+  }));
+
+  assert.match(text, /NULL-BOUNDARY-IS-UNBOUNDED/);
+});
+
 test('session_resume and session_pause prefer harness continuity over same-id legacy ghost', async () => {
   const sessionId = 'sess-session-continuity-harness';
   createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Harness continuity' });

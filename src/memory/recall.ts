@@ -134,7 +134,14 @@ export interface RecallOptions {
   timeZone?: string;
 }
 
-const MEETING_INTENT_RE = /\b(?:meetings?|calls?|recorded|recording|transcripts?|captured?|capture)\b/i;
+const MEETING_INTENT_RE = /\b(?:meetings?|recorded|recording|transcripts?|captured?|capture)\b/i;
+// "call" is also the ordinary tool-dispatch verb ("do not call an external
+// connector"). Treat it as meeting intent only when nearby language makes it
+// a noun/event. Without this distinction, any read-only prompt containing
+// "call" + "today" becomes a temporal-meeting query and filters every normal
+// fact out of recall.
+const CALL_MEETING_INTENT_RE =
+  /\b(?:(?:my|our|the|a|an|last|next|recorded|zoom|teams|meet|google meet|client|customer|sales)\s+calls?|calls?\s+(?:today|tonight|yesterday|with|about|recording|transcript))\b/i;
 const RELATIVE_DATE_RE = /\b(?:today|tonight|yesterday|this\s+(?:morning|afternoon|evening))\b/i;
 const IN_PERSON_RE = /\b(?:in\s*-?\s*person|inperson)(?=$|[^a-z0-9])/i;
 const GENERIC_MEETING_TITLES = new Set(['summary', 'topics', 'participants', 'capture', 'transcript', 'action items']);
@@ -168,7 +175,7 @@ function shiftCalendarDate(parts: { year: number; month: number; day: number }, 
 
 /** Resolve the calendar date named by a meeting query in the user's timezone. */
 export function resolveTemporalMeetingDate(query: string, options: Pick<RecallOptions, 'nowMs' | 'timeZone'> = {}): string | null {
-  if (!MEETING_INTENT_RE.test(query)) return null;
+  if (!MEETING_INTENT_RE.test(query) && !CALL_MEETING_INTENT_RE.test(query)) return null;
   const explicit = query.match(/\b(20\d{2}-\d{2}-\d{2})\b/)?.[1];
   if (explicit) return explicit;
   if (!RELATIVE_DATE_RE.test(query)) return null;
@@ -178,7 +185,7 @@ export function resolveTemporalMeetingDate(query: string, options: Pick<RecallOp
 }
 
 export function isTemporalMeetingQuery(query: string): boolean {
-  return MEETING_INTENT_RE.test(query)
+  return (MEETING_INTENT_RE.test(query) || CALL_MEETING_INTENT_RE.test(query))
     && (RELATIVE_DATE_RE.test(query) || /\b20\d{2}-\d{2}-\d{2}\b/.test(query));
 }
 

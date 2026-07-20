@@ -187,3 +187,19 @@ test('tool_output_query bounds an unfiltered large-object response (no full-payl
   assert.ok(text.length <= 51_000, `response must be bounded, got ${text.length}`);
   assert.match(text, /clipped to 50000 chars/);
 });
+
+test('tool_output_query hands the model the exact copy-paste $fromToolOutput reference for record values', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const records = [{ Email: 'a@x.co' }, { Email: 'b@x.co' }, { Email: 'c@x.co' }];
+  writeToolOutput({ sessionId: sess.id, callId: 'call_roster', tool: 'run_shell_command', output: JSON.stringify(records) });
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_roster', fields: ['Email'] }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /grounded reference/);
+  assert.match(text, /"callId":"call_roster"/);
+  assert.match(text, /"path":"\[\*\]\.Email"/, 'exact copy-paste path for the projected field');
+});

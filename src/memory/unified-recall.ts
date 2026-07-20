@@ -1,5 +1,5 @@
 import { getRuntimeEnv } from '../config.js';
-import { recallMemory, type MemoryEvidenceHit } from './recall-memory.js';
+import { asksForCompleteRecallSet, recallMemory, type MemoryEvidenceHit } from './recall-memory.js';
 import type { RecallCandidateRef } from './recall-usage.js';
 
 /** Backwards-compatible facade over the evidence-backed recall pipeline. */
@@ -42,13 +42,11 @@ function trimSnippet(text: string, max = 240): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-const COMPLETE_SET_QUERY_RE = /\b(?:all|every|complete|full|list|roster|team|teammates?|members?|people|contacts?|recipients?|attendees?|emails?|email addresses?)\b/i;
-
 /** Exact-value/list requests must not receive a prefix that silently drops the
  * tail of a roster. Durable facts are capped at 800 chars, so 1,200 preserves a
  * complete fact while ordinary semantic recall keeps the compact 240-char view. */
 function asksForCompleteSet(objective: string): boolean {
-  return COMPLETE_SET_QUERY_RE.test(objective);
+  return asksForCompleteRecallSet(objective);
 }
 
 export function projectedRecallAnswerability(
@@ -56,7 +54,14 @@ export function projectedRecallAnswerability(
   hits: UnifiedHit[],
 ): UnifiedRecallResult['answerability'] {
   if (!asksForCompleteSet(result.objective) || result.answerability !== 'supported') return result.answerability;
-  const completeSupport = hits.some((hit) => !hit.truncated && (hit.evidence?.length ?? 0) > 0 && hit.score >= 0.45);
+  // Entity/resource stubs can corroborate a roster but cannot contain the full
+  // requested set. Only the long-value durable projection is allowed to certify
+  // that a complete-set answer is present in what the model actually sees.
+  const completeSupport = hits.some((hit) =>
+    (hit.type === 'fact' || hit.type === 'policy')
+    && !hit.truncated
+    && (hit.evidence?.length ?? 0) > 0
+    && hit.score >= 0.45);
   return completeSupport ? 'supported' : (hits.length > 0 ? 'partial' : 'insufficient');
 }
 
@@ -169,7 +174,14 @@ function unifiedPrimerLine(hit: UnifiedHit): string {
   };
   const ref = unifiedHitRecallRef(hit);
   const title = compactText(hit.title, 160);
-  const snippet = compactText(hit.snippet, 360);
+  // Ordinary hits are projected to <=240 chars before this formatter. A
+  // fact/policy snippet longer than 360 therefore signals an exact/complete-set
+  // request, where clipping the tail can silently drop roster members. Preserve
+  // the complete durable value; the outer primer budget still bounds the block.
+  const snippetLimit = (hit.type === 'fact' || hit.type === 'policy') && hit.snippet.length > 360
+    ? 1_200
+    : 360;
+  const snippet = compactText(hit.snippet, snippetLimit);
   // A note ref already is the actionable vault path; repeating the same value as
   // a source URI was one of the largest avoidable primer costs. Keep at most one
   // short, distinct source locator for episode/fact refs that need it.
@@ -187,7 +199,10 @@ export function visibleUnifiedRecallHits(result: UnifiedRecallResult, maxChars =
   let used = unifiedRecallHeader(result).length;
   for (const hit of result.hits) {
     const line = unifiedRecallLine(hit);
-    if (used + line.length + 1 > maxChars) break;
+    // Skip an over-budget hit and keep going — do NOT terminate. A single large
+    // hit must not discard every lower-ranked hit after it (that silently
+    // dropped a roster ranked behind a pinned policy / same-day episode).
+    if (used + line.length + 1 > maxChars) continue;
     visible.push(hit);
     used += line.length + 1;
   }
@@ -201,10 +216,16 @@ export function visibleUnifiedPrimerHits(result: UnifiedRecallResult, maxChars =
   let used = unifiedRecallHeader(result).length;
   for (const hit of result.hits) {
     const line = unifiedPrimerLine(hit);
-    if (used + line.length + 1 > maxChars) break;
+    // Skip-and-continue, not break — one large hit must not discard the rest.
+    if (used + line.length + 1 > maxChars) continue;
     visible.push(hit);
     used += line.length + 1;
   }
+  // Never return an EMPTY primer when recall produced hits: force-include the
+  // top-ranked one even if it alone exceeds the compact budget. The complete-set
+  // boost ranks a durable roster first, so this guarantees the roster reaches
+  // the model instead of being silently dropped (the 2026-07-19 incident).
+  if (visible.length === 0 && result.hits.length > 0) visible.push(result.hits[0]);
   return visible;
 }
 

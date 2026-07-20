@@ -83,6 +83,26 @@ test('memory_mark_used stays subtracted — usage credit is code-level (recall-a
   assert.equal(registeredToolHandlers().get('memory_mark_used'), undefined);
 });
 
+test('memory_read dereferences the fact and policy refs exposed by recall primers', async () => {
+  const stored = rememberFact({
+    kind: 'project',
+    content: 'The Clementine launch crew includes Avery, Jordan, and Morgan.',
+  });
+  const read = registeredToolHandlers().get('memory_read');
+  assert.ok(read);
+
+  const factResult = await read!({ target: `fact:${stored.id}` });
+  assert.equal(
+    factResult.content[0]?.text,
+    `[fact:${stored.id}] project: The Clementine launch crew includes Avery, Jordan, and Morgan.`,
+  );
+
+  const policyResult = await read!({ target: `policy:${stored.id}` });
+  assert.equal(policyResult.content[0]?.text, factResult.content[0]?.text);
+  const missing = await read!({ target: 'fact:999999' });
+  assert.equal(missing.content[0]?.text, 'Not found: fact:999999');
+});
+
 test('convert_to_markdown is exposed in the local MCP catalog', () => {
   assert.ok(LOCAL_MCP_TOOL_NAMES.includes('convert_to_markdown'));
 });
@@ -131,6 +151,71 @@ test('memory_remember rejects one-off task requests but accepts explicit standin
     if (previous === undefined) delete process.env.CLEMMY_REMEMBER_RECONCILE;
     else process.env.CLEMMY_REMEMBER_RECONCILE = previous;
   }
+});
+
+test('memory_remember reconciles the same-turn auto-capture wrapper into one active canonical fact', async () => {
+  const sessionId = 'remember-auto-reconcile-session';
+  const statement = 'The codeword for the Falcon project is "tangerine-osprey-42".';
+  const wrapper = rememberFact({
+    kind: 'user',
+    content: `User explicitly asked Clementine to remember: Remember this: ${statement} Just confirm you've noted it — nothing else.`,
+    sessionId,
+    sourceUri: `conversation://${sessionId}/auto-capture%3Aturn%3A1`,
+  });
+  const unrelated = rememberFact({
+    kind: 'user',
+    content: 'User explicitly asked Clementine to remember: Remember this: the Atlas budget is approved.',
+    sessionId,
+    sourceUri: `conversation://${sessionId}/auto-capture%3Aturn%3A2`,
+  });
+  const handler = registeredToolHandlers().get('memory_remember');
+  assert.ok(handler);
+
+  const response = await handler!({ kind: 'project', content: statement, sessionId });
+  assert.match(response.content[0].text, /reconciled 1 auto-captured duplicate/);
+
+  const db = openMemoryDb();
+  const canonical = db.prepare(`
+    SELECT id, kind, active, source_path FROM consolidated_facts
+    WHERE content = ?
+  `).get(statement) as { id: number; kind: string; active: number; source_path: string | null };
+  const retired = db.prepare(`
+    SELECT active, superseded_by_fact_id FROM consolidated_facts WHERE id = ?
+  `).get(wrapper.id) as { active: number; superseded_by_fact_id: number | null };
+  assert.equal(canonical.kind, 'project', 'the curated memory_remember classification wins');
+  assert.equal(canonical.active, 1);
+  assert.equal(canonical.source_path, `conversation://${sessionId}/auto-capture%3Aturn%3A1`);
+  assert.equal(retired.active, 0);
+  assert.equal(retired.superseded_by_fact_id, canonical.id, 'the wrapper remains as reversible temporal history');
+  assert.equal(getFact(unrelated.id)?.active, true, 'an unrelated same-session auto-capture is untouched');
+  assert.equal(
+    (db.prepare('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1').get() as { c: number }).c,
+    2,
+    'only the canonical Falcon fact and unrelated Atlas fact remain active',
+  );
+});
+
+test('reconcile does NOT retire an auto-capture wrapper that carries a distinct extra fact (no data loss)', async () => {
+  // Regression: containment matching would deactivate a wrapper holding
+  // "<clause> AND <a distinct fact>", silently dropping the distinct fact.
+  const sessionId = 'remember-no-dataloss-session';
+  const wrapper = rememberFact({
+    kind: 'user',
+    content: 'User explicitly asked Clementine to remember: the launch date is March 3 and the venue is the Hilton.',
+    sessionId,
+    sourceUri: `conversation://${sessionId}/auto-capture%3Aturn%3A1`,
+  });
+  const handler = registeredToolHandlers().get('memory_remember');
+  assert.ok(handler);
+  // The model curates only ONE of the two facts.
+  const response = await handler!({ kind: 'project', content: 'the launch date is March 3', sessionId });
+  assert.doesNotMatch(response.content[0].text, /reconciled \d+ auto-captured/);
+  assert.equal(getFact(wrapper.id)?.active, true, 'the wrapper carrying "venue is the Hilton" must remain active');
+  const db = openMemoryDb();
+  const venueStillThere = db.prepare(
+    "SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND lower(content) LIKE '%venue is the hilton%'",
+  ).get() as { c: number };
+  assert.ok(venueStillThere.c >= 1, 'the distinct "venue" fact is not lost');
 });
 
 test('memory_remember creates evidence-backed entities and reuses a person by exact personal email', async () => {
@@ -230,14 +315,14 @@ test('memory_remember rejects unnamed entities and drops identifiers absent from
 
 test('memory_remember inherits the harness session and binds an exact roster to its source tool output', async () => {
   const session = createSession({ kind: 'chat' });
-  const content = 'My team includes Bobby Romano (bobby.romano@example.com) and Brett Lorenzini (brett.lorenzini@example.com).';
+  const content = 'My team includes Avery Rowan (avery.rowan@example.com) and Blair Solis (blair.solis@example.com).';
   writeToolOutput({
     sessionId: session.id,
     callId: 'sf-team-query',
     tool: 'composio_execute_tool',
     output: JSON.stringify({ records: [
-      { name: 'Bobby Romano', email: 'bobby.romano@example.com' },
-      { name: 'Brett Lorenzini', email: 'brett.lorenzini@example.com' },
+      { name: 'Avery Rowan', email: 'avery.rowan@example.com' },
+      { name: 'Blair Solis', email: 'blair.solis@example.com' },
     ] }),
   });
   const handler = registeredToolHandlers().get('memory_remember');
@@ -258,8 +343,8 @@ test('memory_remember inherits the harness session and binds an exact roster to 
   assert.equal(factRow.source_path, `tool://${session.id}/sf-team-query`);
   const evidence = getFactEvidence(factRow.id);
   assert.equal(evidence[0]?.sourceUri, `tool://${session.id}/sf-team-query`);
-  assert.match(evidence[0]?.excerpt ?? '', /bobby\.romano@example\.com/);
-  assert.match(evidence[0]?.excerpt ?? '', /brett\.lorenzini@example\.com/);
+  assert.match(evidence[0]?.excerpt ?? '', /avery\.rowan@example\.com/);
+  assert.match(evidence[0]?.excerpt ?? '', /blair\.solis@example\.com/);
 });
 
 test('memory_remember never treats an external-write confirmation as roster source evidence', async () => {
@@ -324,6 +409,36 @@ test('memory_search_facts records an attribution run with snippets for post-turn
     queryText: 'review date?',
   });
   assert.equal(getFact(fact.id)?.utilityCount, 1);
+});
+
+test('memory_list_facts supports targeted lookup and returns filterable JSON records', async () => {
+  rememberFact({ kind: 'project', content: 'Unrelated launch checklist for the Atlas workspace.' });
+  const roster = rememberFact({
+    kind: 'reference',
+    content: 'Northstar live-proof team includes Avery Rowan, Blair Solis, and Emery Vale.',
+  });
+  const list = registeredToolHandlers().get('memory_list_facts');
+  assert.ok(list);
+
+  const result = await list!({ query: 'Northstar live-proof team', limit: 10, includeInactive: false });
+  const records = JSON.parse(result.content[0].text) as Array<Record<string, unknown>>;
+  assert.ok(Array.isArray(records));
+  assert.equal(records[0]?.id, roster.id);
+  assert.equal(records[0]?.kind, 'reference');
+  assert.match(String(records[0]?.content), /Avery Rowan/);
+  assert.equal(records[0]?.active, true);
+  assert.ok('created_at' in records[0]);
+});
+
+test('memory_list_facts matches short queries like "Q3" instead of returning []', async () => {
+  // Regression: a >=3-char token filter dropped every token of a short query, so
+  // "Q3"/"AI"/"PT" silently returned an empty list even with matching facts.
+  const fact = rememberFact({ kind: 'project', content: 'Q3 pipeline target is 1.4M ARR.' });
+  const list = registeredToolHandlers().get('memory_list_facts');
+  assert.ok(list);
+  const result = await list!({ query: 'Q3', limit: 10, includeInactive: true });
+  const records = JSON.parse(result.content[0].text) as Array<Record<string, unknown>>;
+  assert.ok(records.some((r) => r.id === fact.id), 'the "Q3" fact must be found');
 });
 
 test('memory_self_heal tool lists, applies, and reverts audited memory fixes', async () => {

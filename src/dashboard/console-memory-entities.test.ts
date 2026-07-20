@@ -198,6 +198,7 @@ test('memory health exposes per-claim reflection lifecycle', async () => {
   resetMemoryDb();
   const db = openMemoryDb();
   const now = '2026-07-15T12:00:00.000Z';
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
   recordReflectionCandidate({
     sessionId: 'health-session', callId: 'promoted-call', kind: 'reference',
     text: 'Dana is the Acme billing contact.', importance: 5, now,
@@ -218,8 +219,8 @@ test('memory health exposes per-claim reflection lifecycle', async () => {
   db.prepare(`
     INSERT INTO reflection_pending_extractions
       (session_id, call_id, tool, extraction_json, importance, created_at, expires_at, status)
-    VALUES ('health-session', 'pending-call', 'read_file', '{}', 4, ?, '2026-07-20T00:00:00.000Z', 'pending')
-  `).run(now);
+    VALUES ('health-session', 'pending-call', 'read_file', '{}', 4, ?, ?, 'pending')
+  `).run(now, expiresAt);
 
   const harness = await boot();
   try {

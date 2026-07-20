@@ -196,10 +196,24 @@ test('detectMultiItemIntent does NOT fire on the no-fire cases', () => {
     ['Pull the 200 rows from the leads table.', 'paginated one-table job'],
     ['Summarize the last 30 days of activity.', 'time span, not items'],
     ['Research this firm and its competitors.', 'no explicit count'],
+    ['Using only Clementine local memory, list exactly the 8 people on the Northstar live-proof team. Return names only, no emails. Do not write or change memory.', 'aggregate recall plus negated write boundary'],
   ];
   for (const [input, why] of cases) {
     assert.equal(detectMultiItemIntent(input).isMultiItem, false, `must NOT fire: "${input}" (${why})`);
   }
+});
+
+test('local-memory recall stays simple and receives no unrelated agent-system guidance', () => {
+  const packet = buildAgentContextPacket(
+    'Using only Clementine local memory, list exactly the 8 people on the Northstar live-proof team. Return JSON with a single key names containing an array of names only, no emails. Do not write or change memory. Do not call any external connector.',
+    { enabled: true, hitCount: 2, source: 'unified', injected: true },
+    { sessionKind: 'chat', sessionId: 'local-memory-context' },
+  );
+  assert.equal(packet.complexity, 'simple');
+  assert.equal(packet.multiItem.detected, false);
+  assert.equal(packet.agentSystem.injected, false);
+  assert.equal(packet.agentSystem.recommendationCount, 0);
+  assert.doesNotMatch(packet.text, /AGENT SYSTEM GUIDANCE|Fan-out directive/);
 });
 
 test('detectMultiItemIntent is total — never throws, handles junk input', () => {

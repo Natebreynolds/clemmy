@@ -104,6 +104,31 @@ test('invalid JSON in args_json returns arg_validation with no dispatch', async 
   assert.equal(out.error, 'arg_validation');
 });
 
+test('deferred validation accepts omitted optional keys as well as strict-mode nulls', () => {
+  _resetCallToolSchemaCacheForTest();
+  const schemas = getLocalToolSchemas();
+  const facts = schemas.get('memory_list_facts');
+  const working = schemas.get('working_memory');
+  const recall = schemas.get('memory_recall_all');
+  assert.ok(facts && working && recall);
+  assert.equal(facts!.safeParse({ query: 'Northstar live-proof team', limit: 50 }).success, true);
+  assert.equal(facts!.safeParse({ kind: null, query: 'Northstar live-proof team', limit: 50, includeInactive: false }).success, true);
+  assert.equal(working!.safeParse({ action: 'read' }).success, true);
+  assert.equal(working!.safeParse({ action: 'read', content: null }).success, true);
+  assert.equal(recall!.safeParse({}).success, false, 'genuinely required keys remain required');
+});
+
+test('call_tool materializes omitted optional keys before invoking the real strict inner tool', async () => {
+  _resetCallToolSchemaCacheForTest();
+  const out = String(await invokeCallTool(
+    'sess-optional-inner-dispatch',
+    'memory_list_facts',
+    JSON.stringify({ query: 'Northstar live-proof team', limit: 10 }),
+  ));
+  assert.doesNotMatch(out, /InvalidToolInputError|arg_validation/);
+  assert.ok(Array.isArray(JSON.parse(out)), 'the real inner memory tool completed with valid JSON');
+});
+
 test('gate parity: a mutating inner tool routed through call_tool trips the write boundary (keyed on inner name)', async () => {
   const prev = {
     brackets: process.env.HARNESS_TOOL_BRACKETS,

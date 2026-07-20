@@ -2109,3 +2109,34 @@ test('P0c: kill-switch CLEMMY_JUDGE_FAIL_APPROVAL=off restores plain refusal (no
   assert.equal(r.invoked, 0, 'still refused');
   assert.equal(r.pending.length, 0, 'kill-switch off ⇒ no pending card minted');
 });
+
+test('Layer 1: a $fromToolOutput reference is resolved to REAL store values before the tool runs', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const roster = { result: { records: [{ Email: 'real1@scorpion.co' }, { Email: 'real2@scorpion.co' }] } };
+  writeToolOutput({ sessionId: sess.id, callId: 'call_sf', tool: 'salesforce_query', output: JSON.stringify(roster) });
+
+  let received: any;
+  const wrapped = wrapToolForHarness({ name: 'echo', execute: async (input) => { received = input; return 'ok'; } });
+  const counter = new ToolCallsCounter(10);
+  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({
+    subject: 'Team sync',
+    attendees: { $fromToolOutput: { callId: 'call_sf', path: 'result.records[*].Email' } },
+  }));
+  assert.equal(result, 'ok');
+  assert.deepEqual(received.attendees, ['real1@scorpion.co', 'real2@scorpion.co'], 'the tool got the REAL resolved values, not the reference');
+  assert.equal(received.subject, 'Team sync', 'non-reference fields untouched');
+});
+
+test('Layer 1: an unresolvable reference fails closed — the tool never runs', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  let ran = false;
+  const wrapped = wrapToolForHarness({ name: 'echo', execute: async () => { ran = true; return 'ok'; } });
+  const counter = new ToolCallsCounter(10);
+  const result = await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({
+    to: { $fromToolOutput: { callId: 'call_does_not_exist' } },
+  }));
+  assert.equal(ran, false, 'the send must NOT execute with an unresolved reference');
+  assert.match(String(result), /reference_resolution_failed/);
+});

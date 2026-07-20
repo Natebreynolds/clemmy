@@ -65,6 +65,14 @@ export interface MemoryRecallContext {
 }
 
 const STOP = new Set(['the', 'and', 'for', 'with', 'from', 'this', 'that', 'what', 'when', 'where', 'how', 'your']);
+const COMPLETE_SET_QUERY_RE = /\b(?:all|every|everyone|everybody|complete|full|whole|entire|list|roster|team|teammates?|members?|people|persons?|folks|staff|group|crew|department|dept|contacts?|recipients?|attendees?|invitees?|emails?|email addresses?)\b/i;
+const TEMPORAL_TOPIC_STOP = new Set([
+  ...STOP,
+  'as', 'of', 'on', 'in', 'at', 'by', 'before', 'during', 'did', 'do', 'does',
+  'happen', 'happened', 'activity', 'activities', 'today', 'tonight', 'tomorrow',
+  'yesterday', 'recent', 'recently', 'current', 'currently', 'saved', 'show',
+  'tell', 'identify', 'exact', 'full', 'list', 'local', 'memory',
+]);
 const IN_PERSON_RE = /\b(?:in\s*-?\s*person|inperson)(?=$|[^a-z0-9])/i;
 const INSUFFICIENT_MEETING_CONTENT_RE = /\b(?:transcript too short|untranscribed|contained no discussion|no (?:usable )?(?:discussion|transcript)|recording (?:was )?empty)\b/i;
 const MEETING_TOPIC_INTENT_RE = /\b(?:about|discuss(?:ed|ion)?|cover(?:ed|age)?|summar(?:y|ize|ise)|topics?|decisions?|action items?|takeaways?|what happened)\b/i;
@@ -72,6 +80,59 @@ const clamp = (value: number, low: number, high: number) => Math.max(low, Math.m
 
 function tokens(text: string): Set<string> {
   return new Set((text.toLowerCase().match(/[a-z0-9][a-z0-9._@-]{2,}/g) ?? []).filter((token) => !STOP.has(token)));
+}
+
+/** Shared query-shape signal for exact/list recall. Exported so the projection
+ * layer uses the same definition as ranking and cannot disagree about whether
+ * a clipped roster is a complete answer. */
+export function asksForCompleteRecallSet(text: string): boolean {
+  return COMPLETE_SET_QUERY_RE.test(text);
+}
+
+function looksLikeListBearingText(text: string): boolean {
+  const emails = (text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) ?? []).length;
+  return emails >= 2
+    || /\b(?:roster|team members|members (?:are|include)|recipients? (?:are|include)|attendees? (?:are|include))\b/i.test(text);
+}
+
+function temporalTopicTokens(text: string): Set<string> {
+  return new Set([...tokens(text)].filter((token) => !TEMPORAL_TOPIC_STOP.has(token)));
+}
+
+function hasFastDurableSetCandidate(facts: ConsolidatedFact[], objective: string): boolean {
+  if (!asksForCompleteRecallSet(objective)) return false;
+  // NB: deliberately NOT gated on lexical overlap with the query. A roster is
+  // names + emails; a natural request ("invite everyone to Thursday's sync")
+  // shares ~zero topic tokens with it, so a lexical floor would defeat the whole
+  // purpose (the 2026-07-19 miss). List-bearing + evidence-backed + a
+  // complete-set query shape are the right, sufficient signals.
+  return facts.some((fact) =>
+    (fact.kind === 'project' || fact.kind === 'reference' || fact.kind === 'user')
+    && looksLikeListBearingText(fact.content)
+    && getFactEvidence(fact.id).some((item) =>
+      (item.status === 'available' || item.status === 'partial') && item.excerpt.trim().length > 0));
+}
+
+function preferDurableCompleteSetHits(hits: MemoryEvidenceHit[], objective: string): MemoryEvidenceHit[] {
+  if (!asksForCompleteRecallSet(objective)) return hits;
+  return hits.map((hit) => {
+    // Not gated on query↔fact lexical overlap — see hasFastDurableSetCandidate:
+    // a roster won't lexically resemble an invite verb. List-bearing +
+    // evidence-backed + complete-set query shape are the signals that matter.
+    if (
+      (hit.ref.type !== 'fact' && hit.ref.type !== 'policy')
+      || hit.evidence.length === 0
+      || !looksLikeListBearingText(hit.text)
+    ) return hit;
+    return {
+      ...hit,
+      // A complete, source-backed durable set is the actual answer. Same-day
+      // episodes are corroboration and must not displace it from the bounded
+      // projection merely because their temporal score is 0.97.
+      score: clamp(Math.max(hit.score + 0.30, 0.99), 0, 1),
+      whyRecalled: Array.from(new Set([...hit.whyRecalled, 'complete-set durable fact preferred'])),
+    };
+  });
 }
 
 function overlapScore(queryTokens: Set<string>, text: string): number {
@@ -481,17 +542,30 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const temporalWindow = resolveTemporalQueryWindow(objective, { nowMs, timeZone });
   const searchFactsAsGraphBridge = wanted.has('fact') || depth > 0;
 
+  // Exact/list requests frequently have a complete, source-backed durable fact
+  // already available synchronously. In that case, do not spend the primer's
+  // latency budget embedding the same query or searching the vault before
+  // ranking the fact. The remaining graph/episode passes still corroborate it.
+  const lexicalFacts = searchFactsAsGraphBridge
+    ? (historicalAsOf
+        ? searchFactsByTextAt(objective, historicalAsOf, perStore)
+        : searchFactsByText(objective, perStore))
+    : [];
+  const fastDurableSetCandidate = hasFastDurableSetCandidate(lexicalFacts, objective);
+
   const [semanticFacts, notes] = await Promise.all([
-    searchFactsAsGraphBridge ? findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }).catch(() => []) : Promise.resolve([]),
-    wanted.has('note') ? recallHybrid(objective, { limit: perStore, nowMs, timeZone }).catch(() => []) : Promise.resolve([]),
+    searchFactsAsGraphBridge && !fastDurableSetCandidate
+      ? findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }).catch(() => [])
+      : Promise.resolve([]),
+    wanted.has('note') && !fastDurableSetCandidate
+      ? recallHybrid(objective, { limit: perStore, nowMs, timeZone }).catch(() => [])
+      : Promise.resolve([]),
   ]);
 
   const factIds = new Set<number>();
   if (searchFactsAsGraphBridge) {
     if (wanted.has('fact')) usedStores.add('fact');
-    const lexical = historicalAsOf
-      ? searchFactsByTextAt(objective, historicalAsOf, perStore)
-      : searchFactsByText(objective, perStore);
+    const lexical = lexicalFacts;
     const semanticById = new Map(semanticFacts.map((item, rank) => [item.fact.id, { ...item, rank }]));
     for (const fact of [...semanticFacts.map((item) => item.fact), ...lexical]) {
       if (!isValidAt(fact, asOfMs)) continue;
@@ -709,6 +783,8 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   if (wanted.has('episode')) {
     const db = openMemoryDb();
     const tokenList = Array.from(queryTokens).slice(0, 8);
+    const topicalTokens = temporalWindow ? temporalTopicTokens(objective) : queryTokens;
+    const broadTemporalQuery = Boolean(temporalWindow && topicalTokens.size === 0);
     const lexicalClauses = tokenList.map(() => `LOWER(COALESCE(title, '') || ' ' || COALESCE(source_app, '') || ' ' || evidence_excerpt) LIKE ?`);
     // A temporal meeting query is type-constrained. The previous `1 = 1`
     // temporal widening admitted every episode from that day, allowing an
@@ -736,7 +812,10 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       occurred_at: string; evidence_excerpt: string; status: MemoryEpisodeStatus;
     }>;
     const rankedEpisodes = rows.map((row) => {
-      const lexical = overlapScore(queryTokens, `${row.title ?? ''} ${row.source_app ?? ''} ${row.evidence_excerpt}`);
+      const lexical = overlapScore(
+        temporalWindow && !broadTemporalQuery ? topicalTokens : queryTokens,
+        `${row.title ?? ''} ${row.source_app ?? ''} ${row.evidence_excerpt}`,
+      );
       const occurredAtMs = Date.parse(row.occurred_at);
       const temporalMatch = Boolean(temporalWindow && Number.isFinite(occurredAtMs)
         && occurredAtMs >= temporalWindow.startMs && occurredAtMs <= temporalWindow.endMs);
@@ -746,7 +825,9 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       return { row, lexical, temporalMatch, exactTemporalMeeting };
     }).filter((item) => temporalMeetingDate
       ? item.exactTemporalMeeting
-      : temporalWindow ? item.temporalMatch : item.lexical > 0)
+      : temporalWindow
+        ? item.temporalMatch && (broadTemporalQuery || item.lexical > 0)
+        : item.lexical > 0)
       .sort((a, b) => Number(b.exactTemporalMeeting) - Number(a.exactTemporalMeeting)
         || Number(b.temporalMatch) - Number(a.temporalMatch) || b.lexical - a.lexical)
       .slice(0, perStore);
@@ -756,7 +837,11 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       ref: { type: 'episode', id: row.id },
       title: row.title ?? row.source_app ?? row.kind,
       text: row.evidence_excerpt,
-      score: exactTemporalMeeting ? 0.97 : temporalMatch ? 0.88 + 0.08 * lexical : 0.35 + 0.45 * lexical,
+      score: exactTemporalMeeting
+        ? 0.97
+        : temporalMatch
+          ? broadTemporalQuery ? 0.72 : 0.48 + 0.40 * lexical
+          : 0.35 + 0.45 * lexical,
       confidence: row.status === 'available' ? 0.9 : row.status === 'partial' ? 0.65 : 0.4,
       validFrom: row.occurred_at,
       evidence: [{ episodeId: row.id, excerpt: row.evidence_excerpt, sourceUri: row.source_uri ?? undefined }],
@@ -808,7 +893,8 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   }
 
   const utilityRerank = applyUtilityRerank(Array.from(merged.values()), nowMs);
-  const logicalCandidates = collapseMeetingRepresentations(utilityRerank.hits, logicalMeetingKeys)
+  const completeSetRerank = preferDurableCompleteSetHits(utilityRerank.hits, objective);
+  const logicalCandidates = collapseMeetingRepresentations(completeSetRerank, logicalMeetingKeys)
     .map((hit) => temporalMeetingTopicQuery && hit.whyRecalled.includes('exact temporal match')
       && !meetingContentSupportsTopicAnswer(hit.text)
       ? {

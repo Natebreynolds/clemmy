@@ -161,6 +161,44 @@ export interface BuildOrchestratorAgentOptions {
   allowToolJit?: boolean;
 }
 
+// A turn that explicitly selects Clementine memory ("use only local memory",
+// "remember this", or a recent-conversation recall) needs a much narrower
+// built-in capability surface. Keep every read/recovery hatch that can answer
+// from local memory, but do not pay to serialize unrelated workflow, admin,
+// file-write, or focus-mutation schemas. The implicit forms remain phrase-tight:
+// ordinary memory-ish questions retain the full schema-on-demand catalog.
+const LOCAL_MEMORY_ONLY_BUILTINS = new Set([
+  'focus_get',
+  'memory_list_facts',
+  'memory_read',
+  'memory_recall',
+  'memory_recall_all',
+  'memory_remember',
+  'memory_search',
+  'memory_search_facts',
+  'recall_tool_result',
+  'session_history',
+  'tool_output_query',
+]);
+const LOCAL_MEMORY_ONLY_TURN_RE = /\b(?:(?:use|using|consult|read|search|check)\s+only\s+(?:clementine(?:'s)?\s+)?local\s+memory|local\s+memory\s+only)\b/i;
+const EXPLICIT_MEMORY_STORE_TURN_RE = /^\s*(?:please\s+)?remember\s+(?:this|that|exactly)\b/i;
+const RECENT_CONVERSATION_RECALL_TURN_RE = /\b(?:i|we)\s+(?:told|mentioned|said|shared(?:\s+with)?)\s+you\b[^\n.!?]{0,100}\b(?:a\s+(?:moment|minute)\s+ago|earlier|before|previously|last\s+time)\b/i;
+const NO_MEMORY_WRITE_TURN_RE = /\b(?:do\s+not|don'?t|never)\s+(?:write|change|modify|update)(?:\s+or\s+(?:write|change|modify|update))?\s+(?:to\s+)?(?:my\s+|the\s+|any\s+)?(?:durable\s+|long[- ]term\s+)?memory\b/i;
+
+export function localMemoryBuiltinScope(input: string | null | undefined): Set<string> | null {
+  const text = input?.trim() ?? '';
+  if (!text) return null;
+  const explicitLocalOnly = LOCAL_MEMORY_ONLY_TURN_RE.test(text);
+  const explicitStore = EXPLICIT_MEMORY_STORE_TURN_RE.test(text);
+  const recentConversationRecall = RECENT_CONVERSATION_RECALL_TURN_RE.test(text);
+  if (!explicitLocalOnly && !explicitStore && !recentConversationRecall) return null;
+  const allowed = new Set(LOCAL_MEMORY_ONLY_BUILTINS);
+  if (NO_MEMORY_WRITE_TURN_RE.test(text) || (recentConversationRecall && !explicitStore)) {
+    allowed.delete('memory_remember');
+  }
+  return allowed;
+}
+
 // ---------- internal helpers ----------
 
 /** Intent-routed chat workers (default on). off => run_worker ignores the
@@ -1347,6 +1385,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     seenDiscoveryNames.add(name);
     return true;
   });
+  const localMemoryScope = localMemoryBuiltinScope(options.userInput);
+  const scopedDiscoveryTools = localMemoryScope
+    ? dedupedDiscoveryTools.filter((toolRef) => localMemoryScope.has((toolRef as { name?: string }).name ?? ''))
+    : dedupedDiscoveryTools;
 
   // Phase 1 Tool-RAG: retrieve only the built-in discovery tools this turn plausibly
   // needs (CORE + semantic top-K). Structural tools (planner/approval/question/worker)
@@ -1365,7 +1407,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // session-LRU tool the hot set wanted first-class.
   const searchDecision = resolveToolSearchDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
   const jitDecision = resolveToolJitDecision({ allowLane: options.allowToolJit === true && !searchDecision.active, sessionId: options.sessionId });
-  let jitDiscoveryTools = dedupedDiscoveryTools;
+  let jitDiscoveryTools = scopedDiscoveryTools;
   let jitDropped = 0;
   let jitReason = searchDecision.active ? 'jit-superseded-by-tool-search' : jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
   if (jitDecision.active && typeof options.userInput === 'string' && options.userInput.trim()) {
@@ -1375,7 +1417,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         .join('\n');
       const selection = await selectToolsForTurn({
         userInput: jitQuery,
-        tools: dedupedDiscoveryTools.map((t) => ({
+        tools: scopedDiscoveryTools.map((t) => ({
           name: (t as { name?: string }).name ?? '',
           description: (t as { description?: string }).description ?? '',
         })),
@@ -1383,14 +1425,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       });
       jitReason = selection.reason;
       if (selection.reduced) {
-        jitDiscoveryTools = dedupedDiscoveryTools.filter((t) =>
+        jitDiscoveryTools = scopedDiscoveryTools.filter((t) =>
           selection.exposed.has((t as { name?: string }).name ?? ''),
         );
         jitDropped = selection.droppedCount;
       }
     } catch {
       // JIT selection must never break construction — fall back to the full surface.
-      jitDiscoveryTools = dedupedDiscoveryTools;
+      jitDiscoveryTools = scopedDiscoveryTools;
       jitReason = 'jit-error-fellback';
     }
   }
@@ -1435,7 +1477,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     try {
       const excludes = new Set(options.excludeToolNames ?? []);
       const availableNames = new Set(
-        dedupedDiscoveryTools
+        scopedDiscoveryTools
           .map((toolRef) => (toolRef as { name?: string }).name ?? '')
           .filter(Boolean),
       );
@@ -1455,7 +1497,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       });
       const firstClassNames = new Set(surface.firstClass);
       const deferredNames = new Set(surface.deferred);
-      firstClassDiscovery = dedupedDiscoveryTools
+      firstClassDiscovery = scopedDiscoveryTools
         .filter((t) => firstClassNames.has((t as { name?: string }).name ?? ''))
         // The static tool_search instance searches the entire registry. On the
         // schema-on-demand lane replace it with a turn-scoped instance so every
@@ -1463,7 +1505,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         .map((t) => (t as { name?: string }).name === 'tool_search'
           ? buildScopedLocalToolSearch(deferredNames)
           : t);
-      callTool = buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames, deniedNames: excludes });
+      // Suppress the generic dispatcher ONLY on the local-memory-scoped turn
+      // (memory tools are first-class there; a generic door invites off-scope
+      // calls). Everywhere else keep call_tool even when the deferred set is
+      // empty — it still carries the MCP-namespaced dispatch path and the
+      // first-class-wrap fallback that avoids the not_reachable loop.
+      callTool = localMemoryScope
+        ? null
+        : buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames, deniedNames: excludes });
       const catalogText = buildToolCatalog({ allowedNames: deferredNames });
       searchCatalogCount = catalogText ? catalogText.split('\n').length : 0;
       searchCatalogTokens = Math.round(catalogText.length / 4);
@@ -1487,12 +1536,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const instructions = instructionsTrailer
     ? () => `${baseInstructions()}\n\n${instructionsTrailer}`
     : baseInstructions;
+  const structuralTools = localMemoryScope
+    ? [buildAskUserQuestionTool()]
+    : [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), buildOfferBackgroundTool(), runWorkerTool];
   const assembledTools = [
-    plannerTool,
-    buildRequestApprovalTool(),
-    buildAskUserQuestionTool(),
-    buildOfferBackgroundTool(),
-    runWorkerTool,
+    ...structuralTools,
     ...(callTool ? [callTool] : []),
     ...firstClassDiscovery,
   ];

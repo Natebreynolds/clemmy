@@ -220,6 +220,16 @@ ended_at: 2026-07-14T21:00:00.000Z
     resolveTemporalMeetingDate('What was the inperson meeting I had today about?', { nowMs, timeZone: 'America/Los_Angeles' }),
     '2026-07-14',
   );
+  assert.equal(
+    resolveTemporalMeetingDate('Use local memory. Do not call any external connector. List the team saved today.', { nowMs, timeZone: 'America/Los_Angeles' }),
+    null,
+    'the tool-dispatch verb "call" must not turn ordinary today-memory recall into meeting-only recall',
+  );
+  assert.equal(
+    resolveTemporalMeetingDate('What was my call today about?', { nowMs, timeZone: 'America/Los_Angeles' }),
+    '2026-07-14',
+    'an event-shaped call phrase remains meeting intent',
+  );
 
   const firstQuery = recall('What was the inperson meeting I had today about?', {
     limit: 5,

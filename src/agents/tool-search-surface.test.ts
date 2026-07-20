@@ -19,7 +19,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildOrchestratorAgent } = await import('./orchestrator.js');
+const { buildOrchestratorAgent, localMemoryBuiltinScope } = await import('./orchestrator.js');
 const { createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 // A discovery tool that is NOT in the hot set for a benign query (not TOOL_JIT_MANDATED,
@@ -130,4 +130,50 @@ test('ON: an excluded tool is absent from both first-class and deferred reachabi
   const instr = await renderInstructions(agent);
   const catalog = instr.split('[tool-catalog]')[1] ?? '';
   assert.ok(!catalog.includes(`\n${CATALOG_ONLY_WHEN_ON} —`));
+});
+
+test('explicit local-memory-only turns load a bounded read surface and honor no-memory-write', async () => {
+  const input = 'Using only Clementine local memory, list exactly the 8 people on the Northstar live-proof team. Return names only. Do not write or change memory. Do not call any external connector.';
+  const allowed = localMemoryBuiltinScope(input);
+  assert.ok(allowed);
+  assert.ok(allowed!.has('memory_read'));
+  assert.equal(allowed!.has('memory_remember'), false);
+
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const agent = await withFlag('on', () => buildOrchestratorAgent({
+    sessionId: sess.id,
+    userInput: input,
+    allowToolJit: true,
+  }));
+  const names = namesOf(agent);
+  assert.ok(names.has('memory_read'));
+  assert.ok(names.has('ask_user_question'), 'ambiguity recovery remains available');
+  for (const forbidden of ['memory_remember', 'focus_clear', 'workflow_run', 'run_worker', 'request_approval']) {
+    assert.equal(names.has(forbidden), false, `${forbidden} is outside a read-only local-memory turn`);
+  }
+  const scope = listEvents(sess.id, { types: ['tool_search_scope'] })[0]?.data as { firstClassCount?: number } | undefined;
+  assert.ok((scope?.firstClassCount ?? 999) <= 12, 'the model-facing schema surface stays bounded');
+  const catalog = (await renderInstructions(agent)).split('[tool-catalog]')[1] ?? '';
+  assert.doesNotMatch(catalog, /workflow_run|focus_clear|memory_remember/);
+});
+
+test('explicit remember and recent-conversation recall use the bounded memory surface', () => {
+  const store = localMemoryBuiltinScope(
+    'Remember this: the codeword for the Falcon project is tangerine-osprey-42.',
+  );
+  assert.ok(store?.has('memory_remember'), 'an explicit durable store keeps the write tool');
+  assert.equal(store?.has('workflow_run'), false);
+
+  const recall = localMemoryBuiltinScope(
+    'What was the secret phrase for that bird-themed project I told you about a moment ago?',
+  );
+  assert.ok(recall?.has('memory_recall_all'));
+  assert.equal(recall?.has('memory_remember'), false, 'a recent-conversation lookup is read-only');
+
+  assert.equal(
+    localMemoryBuiltinScope('Can you improve the memory settings screen?'),
+    null,
+    'ordinary memory-ish product work keeps the general tool surface',
+  );
 });

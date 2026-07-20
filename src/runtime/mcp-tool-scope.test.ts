@@ -96,6 +96,24 @@ test('resolveMcpToolScope: local/file prompts do not inject external MCP tools',
   assert.ok(!scope.failOpenCandidate);
 });
 
+test('resolveMcpToolScope: explicit local-memory diagnostics cannot be misread as Outlook intent', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'This is a live diagnostic. Use only Clementine\'s local memory. Do not call any external connector. Identify the eight active people on my team. Return names only, no emails.',
+  });
+  assert.deepEqual(scope.allowedServerSlugs, []);
+  assert.equal(scope.maxTools, 0);
+  assert.ok(!scope.failOpenCandidate);
+  assert.match(scope.reason, /local-only\/no-external-tools/i);
+});
+
+test('resolveMcpToolScope: an explicit external exception remains reachable', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'Do not call any external connector except Salesforce; query the active contacts there.',
+  });
+  assert.ok(scope.allowedServerSlugs?.includes('salesforce'));
+  assert.ok((scope.maxTools ?? 0) > 0);
+});
+
 test('resolveMcpToolScope: a pinned-calendar label + date shorthand is treated as Outlook calendar intent', () => {
   const scope = resolveMcpToolScope({ userInput: 'Check my acme for tomorrow', pinnedCalendarLabels: ['acme'] });
   assert.ok((scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));

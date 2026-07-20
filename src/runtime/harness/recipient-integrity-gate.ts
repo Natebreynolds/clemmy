@@ -1,9 +1,12 @@
 import { getRuntimeEnv } from '../../config.js';
-import { listEvents, recentToolOutputs } from './eventlog.js';
+import { asksForCompleteRecallSet } from '../../memory/recall-memory.js';
 import { extractDuplicateIdentityKeys } from './grounding-gate.js';
+import { gatherTrustedEvidence } from './trusted-evidence.js';
 
 const EMAIL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
-const ECHO_TOOL_RE = /^(?:pending_action_|request_approval|approval_|memory_remember$|execution_|notify_user$)/i;
+// Explicit "leave some out" language — a user who signals exclusion intent must
+// NOT trigger an omission advisory (they meant the subset).
+const EXCLUSION_RE = /\b(?:except|excluding|but\s+not|skip(?:ping)?|without|minus|leave\s+out|leaving\s+out|don'?t\s+include|do\s+not\s+include|exclude|omit)\b/i;
 
 export interface RecipientIntegritySource {
   id: string;
@@ -17,6 +20,11 @@ export interface RecipientIntegrityResult {
   recipients: string[];
   sourceId?: string;
   unsupportedRecipients?: string[];
+  /** ADVISORY (never blocks): the user asked for a complete set but the outgoing
+   *  recipients omit some of a roster that a trusted source holds — the "dropped
+   *  5" half of the 2026-07-19 incident. Surfaced for a human at approval; not a
+   *  refusal, because an intentional partial send is legitimate. */
+  omittedRecipients?: string[];
 }
 
 export function isRecipientIntegrityGateEnabled(): boolean {
@@ -31,36 +39,14 @@ function emailSet(value: unknown): string[] {
     .sort();
 }
 
+/** Recipient view over the shared trusted-evidence ledger: the email set is the
+ *  field extractor; the gather (which outputs count as evidence, echo/effect
+ *  filtering, user messages) is the shared spine, no longer re-derived here. */
 function trustedRecipientSources(sessionId: string): RecipientIntegritySource[] {
   const sources: RecipientIntegritySource[] = [];
-  const events = listEvents(sessionId, { types: ['user_input_received', 'tool_returned'] });
-  for (const event of events) {
-    if (event.type !== 'user_input_received' || event.data.synthetic === true) continue;
-    const text = typeof event.data.text === 'string' ? event.data.text : '';
-    const recipients = emailSet(text);
-    if (recipients.length > 0) sources.push({ id: `user:${event.seq}`, tool: null, recipients });
-  }
-
-  const returnsByCall = new Map<string, { effect?: string; tool?: string | null }>();
-  for (const event of events) {
-    if (event.type !== 'tool_returned') continue;
-    const callId = typeof event.data.callId === 'string' ? event.data.callId : '';
-    if (!callId) continue;
-    returnsByCall.set(callId, {
-      effect: typeof event.data.effect === 'string' ? event.data.effect : undefined,
-      tool: typeof event.data.tool === 'string' ? event.data.tool : null,
-    });
-  }
-  for (const output of recentToolOutputs(sessionId, { limit: 40 })) {
-    const meta = returnsByCall.get(output.callId);
-    const tool = output.tool ?? meta?.tool ?? null;
-    if (ECHO_TOOL_RE.test(tool ?? '')) continue;
-    // Full outputs from writes/sends are confirmations of a payload, not source
-    // authority for that payload. Legacy rows without effect metadata remain
-    // eligible unless their tool is an explicit echo surface above.
-    if (meta?.effect && meta.effect !== 'read' && meta.effect !== 'compute') continue;
-    const recipients = emailSet(output.output);
-    if (recipients.length > 0) sources.push({ id: output.callId, tool, recipients });
+  for (const source of gatherTrustedEvidence(sessionId)) {
+    const recipients = emailSet(source.text);
+    if (recipients.length > 0) sources.push({ id: source.id, tool: source.tool, recipients });
   }
   return sources;
 }
@@ -96,6 +82,22 @@ export function evaluateRecipientSetIntegrity(sessionId: string, rawArgs: unknow
   }
   const covering = sources.find((source) => recipients.every((recipient) => source.recipients.includes(recipient)));
   if (covering) {
+    // Omission advisory (still ALLOW): every outgoing recipient is grounded, but
+    // the covering roster has MORE — and the user asked for a complete set with
+    // no exclusion language. Surface the drop; never block a legitimate subset.
+    const omittedRecipients = covering.recipients.filter((recipient) => !recipients.includes(recipient));
+    if (omittedRecipients.length > 0) {
+      const userTurns = gatherTrustedEvidence(sessionId).filter((s) => s.kind === 'user').map((s) => s.text);
+      if (userTurns.some(asksForCompleteRecallSet) && !userTurns.some((t) => EXCLUSION_RE.test(t))) {
+        return {
+          action: 'allow',
+          reason: `outgoing set omits ${omittedRecipients.length} of ${covering.recipients.length} recipients from a complete roster the user asked for`,
+          recipients,
+          sourceId: covering.id,
+          omittedRecipients,
+        };
+      }
+    }
     return { action: 'allow', reason: 'every outgoing recipient co-occurs in one trusted source', recipients, sourceId: covering.id };
   }
 

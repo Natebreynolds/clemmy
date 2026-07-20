@@ -248,9 +248,9 @@ test('grounded relationships require exact evidence and retries do not inflate r
 });
 
 test('reporting-to grammatical variants ground the canonical reports-to edge', () => {
-  const teammate = upsertEntity({ type: 'person', name: 'Bobby Romano' });
-  const manager = upsertEntity({ type: 'person', name: 'Nathan Reynolds' });
-  const sourceText = 'Bobby Romano is on the active team, reporting directly to Nathan Reynolds.';
+  const teammate = upsertEntity({ type: 'person', name: 'Avery Rowan' });
+  const manager = upsertEntity({ type: 'person', name: 'Jordan Lee' });
+  const sourceText = 'Avery Rowan is on the active team, reporting directly to Jordan Lee.';
   const episode = recordMemoryEpisode({
     kind: 'tool_result',
     sessionId: 's-reporting',

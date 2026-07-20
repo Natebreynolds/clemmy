@@ -179,7 +179,22 @@ test('one-off task safety clauses are not promoted into standing prohibitions', 
   );
 });
 
+test('an explicit no-memory-write boundary suppresses auto-capture for the whole turn', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Using only Clementine local memory, list exactly the 8 people on the Northstar live-proof team. Return JSON with a single key names containing an array of names only, no emails. Do not write or change memory. Do not call any external connector.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Summarize the local roster, but do not modify long-term memory.'),
+    [],
+  );
+});
+
 test('live validation tool probes are not promoted into project requirements', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('This is a live diagnostic. Use only Clementine\'s local memory. Do not call any external connector. Do not write or change memory. Do not send, schedule, create, or modify anything. Identify the eight active people saved today as the Northstar live-proof team.'),
+    [],
+  );
   assert.deepEqual(
     extractAutoMemoryCandidates('Live validation only: do I have Outlook connected right now? Please answer with the usable Outlook connection count and whether calendar tools are available in this session. Do not save this as memory.'),
     [],

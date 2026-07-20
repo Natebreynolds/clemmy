@@ -97,7 +97,9 @@ const CRITICAL_DISK_WARNING_BYTES = 2 * 1024 * 1024 * 1024;
 const STOPWORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'can', 'could', 'do', 'for', 'from',
   'go', 'have', 'help', 'i', 'in', 'into', 'is', 'it', 'me', 'my', 'of', 'on', 'or', 'our',
-  'please', 'that', 'the', 'then', 'this', 'to', 'use', 'we', 'with', 'you',
+  'please', 'that', 'the', 'then', 'this', 'to', 'use', 'using', 'we', 'with', 'you',
+  // Turn-shaping / output-format words are not skill or workflow intent.
+  'clementine', 'exactly', 'json', 'key', 'local', 'not', 'only', 'return', 'single',
 ]);
 
 const DOMAIN_PATTERNS: RegExp[] = [
@@ -126,7 +128,7 @@ const SEQUENCE_RE = /\b(?:then|after that|afterward|before .* then|once .* then|
 
 // Explicit count immediately governing a plural noun: "10 prospects",
 // "44 law firms" (skips up to 3 modifier words, anchors on the plural noun).
-const COUNT_PLURAL_RE = /\b(\d{1,3})\s+(?:[a-z][\w'-]+\s+){0,3}?([a-z][a-z'-]*s)\b/i;
+const COUNT_PLURAL_RE = /\b(\d{1,3})\s+(?:[a-z][\w'-]+\s+){0,3}?((?:people|men|women|children)|[a-z][a-z'-]*s)\b/i;
 // Enumerated list lines (numbered / bulleted), e.g. a pasted firm list.
 const LIST_ITEM_RE = /^[ \t]*(?:\d+[.)]|[-*•–])\s+\S/gim;
 // Aggregate / single-collection RETRIEVAL verbs — a paginated read of one
@@ -159,6 +161,15 @@ const NON_ITEM_NOUNS = new Set([
   'options', 'ideas', 'examples', 'reasons', 'tips', 'ways', 'jokes', 'suggestions', 'names',
   'questions', 'thoughts', 'steps', 'versions', 'things', 'ones', 'others',
 ]);
+const COUNT_CONNECTOR_WORDS = new Set(['a', 'an', 'and', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'with']);
+
+/** Boundaries such as "do not write memory" are not positive work signals,
+ *  and negative nouns such as "no emails" must not open a domain or fan-out. */
+function positiveActionSignalText(text: string): string {
+  return text
+    .replace(/\b(?:do\s+not|don'?t|never|without)\b[^.!?\n]*/gi, ' ')
+    .replace(/\bno\s+(?:emails?|external\s+(?:connector|connectors|tool|tools|mcp|service|services)|writes?|changes?)\b/gi, ' ');
+}
 
 const NO_MULTI_ITEM: MultiItemIntent = Object.freeze({
   isMultiItem: false,
@@ -178,6 +189,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
   try {
     const text = (typeof input === 'string' ? input : '').trim();
     if (text.length < 4) return NO_MULTI_ITEM;
+    const actionText = positiveActionSignalText(text);
 
     // 1. Cardinality — an enumerated list, or an explicit count + plural noun.
     const listMatches = text.match(LIST_ITEM_RE);
@@ -202,6 +214,11 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
         const n = Number.parseInt(m[1], 10);
         const noun = m[2].toLowerCase();
         if (!Number.isFinite(n) || n < 3 || n > 500 || NON_ITEM_NOUNS.has(noun)) continue;
+        // "8 people on James" used to bind the proper name "James" as the
+        // plural noun. A connector between the count and candidate noun proves
+        // the noun is not actually governed by that count.
+        const modifiers = m[0].trim().split(/\s+/).slice(1, -1).map((word) => word.toLowerCase());
+        if (modifiers.some((word) => COUNT_CONNECTOR_WORDS.has(word))) continue;
         if (!firstValid) firstValid = { n, noun };
         if (MARKED_PREFIX_RE.test(text.slice(Math.max(0, m.index - 16), m.index))) {
           lastMarked = { n, noun };
@@ -217,15 +234,15 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
 
     // 2. Per-item work verb — there must be real per-item tool work, not just
     //    a quantity ("3 options" already filtered above as a non-item noun).
-    const explicitParallelRequest = EXPLICIT_PARALLEL_RE.test(text);
-    const sameShapeWork = READ_RE.test(text) || WRITE_RE.test(text) || explicitParallelRequest;
+    const explicitParallelRequest = EXPLICIT_PARALLEL_RE.test(actionText);
+    const sameShapeWork = READ_RE.test(actionText) || WRITE_RE.test(actionText) || explicitParallelRequest;
     if (!sameShapeWork) return NO_MULTI_ITEM;
 
     // 3. Zero-regression guards — each resolves ambiguity to NOT multi-item.
     // Aggregate-retrieval ("show/list/tell me …") suppresses ONLY when the
     // request is retrieval-only; a genuine per-item work verb (research/
     // enrich/draft/…) means an incidental aggregate phrase shouldn't block.
-    if (AGGREGATE_RETRIEVAL_RE.test(text) && !DEEP_WORK_RE.test(text)) return NO_MULTI_ITEM; // single-collection read
+    if (AGGREGATE_RETRIEVAL_RE.test(actionText) && !DEEP_WORK_RE.test(actionText)) return NO_MULTI_ITEM; // single-collection read
     if (INTERNAL_OWNER_RE.test(text)) return NO_MULTI_ITEM; // internal cardinality
     const hasDistinct = enumerated || DISTINCT_MARKER_RE.test(text);
     if (SEQUENCE_RE.test(text) && !hasDistinct) return NO_MULTI_ITEM; // A->B->C chain
@@ -334,16 +351,23 @@ function clip(text: string, max: number): string {
 
 function tokens(text: string): string[] {
   // Canonical tokenizer with this matcher's general-English stopword policy.
-  return tokenize(text, { minLen: 3, stopwords: STOPWORDS });
+  return tokenize(positiveActionSignalText(text), { minLen: 3, stopwords: STOPWORDS });
+}
+
+function explicitlyNamesCandidate(input: string, name: string): boolean {
+  const inputTokens = new Set(tokens(input));
+  const nameTokens = tokens(name);
+  return nameTokens.length > 0 && nameTokens.every((token) => inputTokens.has(token));
 }
 
 function classifyComplexity(input: string): AgentContextPacket['complexity'] {
   const text = input.trim();
-  const domains = DOMAIN_PATTERNS.reduce((count, pattern) => count + (pattern.test(text) ? 1 : 0), 0);
-  const hasRead = READ_RE.test(text);
-  const hasWrite = WRITE_RE.test(text);
-  const hasBatch = BATCH_RE.test(text);
-  const hasSequence = SEQUENCE_RE.test(text);
+  const actionText = positiveActionSignalText(text);
+  const domains = DOMAIN_PATTERNS.reduce((count, pattern) => count + (pattern.test(actionText) ? 1 : 0), 0);
+  const hasRead = READ_RE.test(actionText);
+  const hasWrite = WRITE_RE.test(actionText);
+  const hasBatch = BATCH_RE.test(actionText);
+  const hasSequence = SEQUENCE_RE.test(actionText);
   if (domains >= 3 && (hasRead || hasWrite)) return 'complex';
   if (domains >= 2 && hasRead && hasWrite) return 'complex';
   if (domains >= 2 && hasBatch && hasSequence) return 'complex';
@@ -385,11 +409,15 @@ function rankSkills(input: string): RankedContextCandidate[] {
           description: clip(description || '(no description)', 180),
           score,
           reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
+          matchCount: matched.length,
         };
       })
-      .filter((candidate) => candidate.score > 0)
+      .filter((candidate) => candidate.score >= 8 && (
+        candidate.matchCount >= 2 || explicitlyNamesCandidate(input, candidate.name)
+      ))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
-      .slice(0, MAX_CANDIDATES);
+      .slice(0, MAX_CANDIDATES)
+      .map(({ matchCount: _matchCount, ...candidate }) => candidate);
   } catch {
     return [];
   }
@@ -427,11 +455,15 @@ function rankWorkflows(input: string): RankedContextCandidate[] {
           description: `${data.enabled === false ? '[disabled] ' : ''}${clip(description || '(no description)', 200)}`,
           score: data.enabled === false ? Math.max(0, score - 2) : score,
           reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
+          matchCount: matched.length,
         };
       })
-      .filter((candidate) => candidate.score > 0)
+      .filter((candidate) => candidate.score >= 8 && (
+        candidate.matchCount >= 2 || explicitlyNamesCandidate(input, candidate.name)
+      ))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
-      .slice(0, MAX_CANDIDATES);
+      .slice(0, MAX_CANDIDATES)
+      .map(({ matchCount: _matchCount, ...candidate }) => candidate);
   } catch {
     return [];
   }

@@ -25,7 +25,8 @@ const { upsertResourcePointer } = await import('./source-map.js');
 // eslint-disable-next-line import/first
 const { rememberToolChoice } = await import('./tool-choice-store.js');
 // eslint-disable-next-line import/first
-const { recallEverything, formatUnifiedRecall, projectedRecallAnswerability, visibleUnifiedRecallHits } = await import('./unified-recall.js');
+const { recallEverything, formatUnifiedRecall, formatUnifiedPrimer, projectedRecallAnswerability, visibleUnifiedRecallHits, visibleUnifiedPrimerHits } = await import('./unified-recall.js');
+const { asksForCompleteRecallSet } = await import('./recall-memory.js');
 // eslint-disable-next-line import/first
 const { recallMemory, recallUtilityBonus } = await import('./recall-memory.js');
 // eslint-disable-next-line import/first
@@ -95,6 +96,56 @@ test('visibleUnifiedRecallHits excludes candidates clipped from the bounded tool
   assert.doesNotMatch(formatUnifiedRecall({ ...result, hits: visible }, firstOnlyLimit), /ref fact:2/);
 });
 
+test('asksForCompleteRecallSet triggers for natural invite phrasings the incident used', () => {
+  for (const q of [
+    'invite everyone to the sync',
+    'send it to the whole group',
+    'get that to the entire team',
+    'email everybody on the crew',
+    'all hands — send the invite',
+    "who's on James's team?",
+  ]) assert.equal(asksForCompleteRecallSet(q), true, `should trigger: ${q}`);
+  // A plainly single-target ask must not trigger.
+  assert.equal(asksForCompleteRecallSet('what is the deal amount for Acme?'), false);
+});
+
+test('visibleUnifiedRecallHits skips an over-budget hit instead of dropping every hit after it', () => {
+  // Regression (2026-07-19): a `break` terminated projection on the first
+  // over-budget hit, so a roster ranked behind a large hit was silently dropped.
+  const result = {
+    objective: 'roster',
+    recallId: 'mr-skip',
+    perStore: { fact: 3 },
+    answerability: 'supported' as const,
+    hits: [
+      { type: 'fact' as const, ref: '1', title: 'Big', snippet: 'A'.repeat(600), score: 1 },
+      { type: 'fact' as const, ref: '2', title: 'Small roster', snippet: 'x@y.co, z@y.co', score: 0.9 },
+      { type: 'fact' as const, ref: '3', title: 'Tiny', snippet: 'ok', score: 0.8 },
+    ],
+  };
+  // Budget fits the header + the two small hits, but NOT the 600-char hit #1.
+  const budget = formatUnifiedRecall({ ...result, hits: [result.hits[1], result.hits[2]] }).length + 5;
+  const visible = visibleUnifiedRecallHits(result, budget).map((h) => h.ref);
+  assert.ok(visible.includes('2'), 'the roster after the big hit must NOT be dropped');
+  assert.ok(!visible.includes('1'), 'the over-budget hit is skipped');
+});
+
+test('visibleUnifiedPrimerHits force-includes the top hit rather than returning an empty primer', () => {
+  // A single roster hit larger than the compact primer budget must still reach
+  // the model — an empty primer is what let the invite go out without the roster.
+  const result = {
+    objective: 'invite everyone',
+    recallId: 'mr-force',
+    perStore: { fact: 1 },
+    answerability: 'supported' as const,
+    hits: [
+      { type: 'fact' as const, ref: '7', title: 'Team roster', snippet: 'a@co, b@co, c@co, d@co, e@co, f@co, g@co, h@co'.repeat(6), score: 0.99 },
+    ],
+  };
+  const visible = visibleUnifiedPrimerHits(result, 40); // absurdly small budget
+  assert.deepEqual(visible.map((h) => h.ref), ['7'], 'roster is force-included, not dropped');
+});
+
 test('complete-set answerability follows the visible projection, not a clipped stored hit', () => {
   const result = {
     objective: 'list all team members and emails',
@@ -111,45 +162,80 @@ test('complete-set answerability follows the visible projection, not a clipped s
   }];
   assert.equal(projectedRecallAnswerability(result, clipped), 'partial');
   assert.equal(projectedRecallAnswerability(result, [{ ...clipped[0], truncated: false }]), 'supported');
+  assert.equal(projectedRecallAnswerability(result, [{
+    ...clipped[0], type: 'entity', truncated: false, snippet: 'person · mentioned 8×',
+  }]), 'partial', 'an entity stub cannot certify a complete roster');
 });
 
 test('complete team recall preserves every name and email instead of returning a supported prefix', async () => {
   const roster = [
-    ['Bobby Romano', 'bobby.romano@example.com'],
-    ['Brett Lorenzini', 'brett.lorenzini@example.com'],
-    ['Jake Wright', 'jake.wright@example.com'],
-    ['Jarrett Tyus', 'jarrett.tyus@example.com'],
-    ['Kim Hillman', 'kim.hillman@example.com'],
-    ['Taylor Saunders', 'taylor.saunders@example.com'],
-    ['Tim Demik', 'tim.demik@example.com'],
-    ['Tyler Jorgensen', 'tyler.jorgensen@example.com'],
+    ['Avery Rowan', 'avery.rowan@example.com'],
+    ['Blair Solis', 'blair.solis@example.com'],
+    ['Casey Harbor', 'casey.harbor@example.com'],
+    ['Devon Quill', 'devon.quill@example.com'],
+    ['Emery Vale', 'emery.vale@example.com'],
+    ['Frankie Moss', 'frankie.moss@example.com'],
+    ['Gray Linden', 'gray.linden@example.com'],
+    ['Harper Wren', 'harper.wren@example.com'],
   ] as const;
   const content = `My complete Northstar team roster is: ${roster.map(([name, email]) => `${name} <${email}>`).join('; ')}.`;
-  const fact = rememberFact({ kind: 'project', content });
+  const fact = rememberFact({ kind: 'project', content, occurredAt: '2026-07-19T16:59:00.000Z' });
   const episode = recordMemoryEpisode({
     kind: 'tool_result',
     title: 'Northstar Salesforce roster',
     sourceApp: 'Salesforce',
     sourceUri: 'tool://sess-roster/sf-query',
+    occurredAt: '2026-07-19T17:00:00.000Z',
     content,
   });
   linkFactEvidence({ factId: fact.id, episodeId: episode.id, excerpt: content, sourceUri: episode.source_uri });
 
-  const result = await recallEverything('List all people and emails on my complete Northstar team roster', {
-    stores: ['fact'],
-    limit: 5,
+  // Reproduce the live failure shape: "saved today" widened episode recall to
+  // everything from the day, and those fixed-score snippets displaced the full
+  // durable roster from the bounded 4KB result.
+  for (let i = 0; i < 24; i += 1) {
+    recordMemoryEpisode({
+      kind: 'tool_result',
+      title: `Unrelated same-day activity ${i}`,
+      sourceApp: 'Local test',
+      occurredAt: `2026-07-19T18:${String(i).padStart(2, '0')}:00.000Z`,
+      content: `Unrelated project activity ${i} completed today with no Northstar roster details.`,
+    });
+  }
+  recordMemoryEpisode({
+    kind: 'user_turn',
+    title: 'Diagnostic prompt echo',
+    sourceApp: 'Clementine',
+    occurredAt: '2026-07-19T19:00:00.000Z',
+    content: 'Diagnostic request: list all people and emails on the complete Northstar team roster, but this echo contains no roster values.',
+  });
+
+  const result = await recallEverything('List all people and emails on my complete Northstar team roster saved today', {
+    limit: 20,
+    now: '2026-07-19T23:59:59.999Z',
   });
   const rendered = formatUnifiedRecall(result, 4_000);
+  const primer = formatUnifiedPrimer(result, 1_800);
   assert.equal(result.answerability, 'supported');
+  assert.equal(result.hits[0]?.type, 'fact', 'the complete durable set must precede same-day episode noise');
   for (const [name, email] of roster) {
     assert.match(rendered, new RegExp(name.replace(/ /g, '\\s+')));
     assert.match(rendered, new RegExp(email.replace(/\./g, '\\.')));
+    assert.match(primer, new RegExp(name.replace(/ /g, '\\s+')));
+    assert.match(primer, new RegExp(email.replace(/\./g, '\\.')));
   }
   assert.equal(result.hits.find((hit) => hit.ref === String(fact.id))?.truncated, false);
+
+  const verbose = await recallEverything(
+    'Using only Clementine local memory, list exactly the 8 people on the complete Northstar team. Return JSON names only, no emails. Do not write or change memory. Do not call any external connector.',
+    { limit: 20, now: '2026-07-19T23:59:59.999Z' },
+  );
+  assert.equal(verbose.answerability, 'supported');
+  assert.equal(verbose.hits[0]?.type, 'fact', 'output/safety clauses must not dilute the complete roster out of the primer');
 });
 
 test('graph-expanded people with identical compact bodies remain distinct by title', async () => {
-  const names = ['Bobby Romano', 'Brett Lorenzini', 'Jake Wright', 'Jarrett Tyus', 'Kim Hillman', 'Taylor Saunders', 'Tim Demik', 'Tyler Jorgensen'];
+  const names = ['Avery Rowan', 'Blair Solis', 'Casey Harbor', 'Devon Quill', 'Emery Vale', 'Frankie Moss', 'Gray Linden', 'Harper Wren'];
   const people = names.map((name) => upsertEntity({ type: 'person', name }));
   const fact = rememberFact({ kind: 'project', content: 'Northstar-cipher is the current eight-person team roster.' });
   setFactEntityLinks(fact.id, people, { linkType: 'stored' });
