@@ -769,3 +769,49 @@ test('stored graph traversal respects fact validity for historical entity querie
   assert.ok(result.hits.some((hit) => hit.ref.type === 'fact' && hit.ref.id === String(old.id)));
   assert.ok(!result.hits.some((hit) => hit.ref.type === 'fact' && hit.ref.id === String(current!.id)));
 });
+
+test('a complete-set query keyword never suppresses vault recall that holds the real answer (fail-unsafe fix)', async () => {
+  // Regression (2026-07-19 → v1.20 line): a `hasFastDurableSetCandidate`
+  // fast-path SKIPPED semantic + vault recall whenever a complete-set QUERY WORD
+  // ("team", "whole", "group", "everyone"…) matched while a list-bearing,
+  // evidence-backed durable fact happened to exist. That is FAIL-UNSAFE: a false
+  // keyword match didn't merely mis-rank, it *lost the answer* — the vault note
+  // that actually answered the question was never searched. The fix runs recall
+  // ALWAYS and merely BOOSTS the durable set (preferDurableCompleteSetHits).
+  //
+  // Setup reproduces the trap precisely: (a) a list-bearing (3-email) evidence-
+  // backed roster fact — the thing that flipped fastDurableSetCandidate true —
+  // and (b) a vault note holding the real answer to a complete-set-shaped query
+  // whose answer the roster does NOT contain.
+  const rosterContent = 'Northstar team roster: Avery <avery@x.co>; Blair <blair@x.co>; Casey <casey@x.co>.';
+  const rosterFact = rememberFact({ kind: 'project', content: rosterContent });
+  const episode = recordMemoryEpisode({
+    kind: 'tool_result',
+    title: 'Northstar roster export',
+    sourceApp: 'Salesforce',
+    sourceUri: 'tool://sess-roster/export',
+    occurredAt: '2026-07-19T17:00:00.000Z',
+    content: rosterContent,
+  });
+  linkFactEvidence({ factId: rosterFact.id, episodeId: episode.id, excerpt: rosterContent, sourceUri: episode.source_uri });
+
+  const notePath = '/vault/projects/q3-planning.md';
+  const noteBody = 'Q3 planning review: the whole team decided to freeze the budget and delay the new hire plan.';
+  openMemoryDb().prepare(`
+    INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash)
+    VALUES (?, 0, ?, ?, ?, ?, ?)
+  `).run(notePath, noteBody, 'Q3 planning review', Date.now(), Buffer.byteLength(noteBody), 'q3-planning-hash');
+
+  // Query trips asksForCompleteRecallSet ("whole", "team") AND lexically matches
+  // the vault note — the roster fact cannot answer it. Under the old skip the
+  // note was never retrieved.
+  const query = 'What did the whole team decide about the Q3 budget in the planning review?';
+  assert.equal(asksForCompleteRecallSet(query), true, 'query must trip the complete-set keyword to exercise the old skip');
+
+  const result = await recallMemory(query, { limit: 20 });
+  const noteHit = result.hits.find((hit) => hit.ref.type === 'note' && hit.ref.id === notePath);
+  assert.ok(noteHit, 'the vault note holding the real answer must survive a complete-set keyword query');
+  // Strip FTS highlight brackets ([term]) before matching the answer phrase.
+  const noteText = (noteHit?.text ?? '').replace(/[[\]]/g, '');
+  assert.match(noteText, /freeze the budget/, 'the answering content is present, not suppressed');
+});

@@ -986,6 +986,42 @@ test('Claude dispatch telemetry carries exact unified-primer refs and recall id'
   ]);
 });
 
+test('the shared post-turn seam FIRES on the Claude brain lane (auto-credit runs at runtime, not just wired)', async () => {
+  // #1 verification — the durable stand-in for a live both-SDK check. loop.test
+  // covers the Codex lane's post-turn firing; this drives the REAL brain entry
+  // (respondViaClaudeAgentSdkBrain) and proves runPostTurnHooks actually ran and
+  // credited demonstrable recall use — the seam is live on this lane, not merely
+  // present in source (which correction-parity.test guards statically).
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const sourceUri = '/vault/04-Meetings/2026-07-19-meridian-review.md';
+  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
+    objective: query,
+    answerability: 'supported',
+    diagnostics: { candidates: 2, stores: ['note'], elapsedMs: 4 },
+    perStore: { vault: 1 },
+    hits: [{
+      type: 'vault', ref: sourceUri, title: 'Meridian review',
+      snippet: 'Quarterly reliability review of the Meridian-7 launch.',
+      score: 0.96, confidence: 0.94, whyRecalled: ['exact temporal match'],
+      evidence: [{ episodeId: `note:${sourceUri}`, excerpt: 'Quarterly reliability review of the Meridian-7 launch.', sourceUri }],
+    }],
+  }));
+  // Reply echoes distinctive words from the recalled snippet ("Meridian-7",
+  // "reliability", "launch") that are absent from the query → a 'content' credit.
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'The Meridian-7 launch reliability review is on track.', sessionId: 'sdk', model: 'claude', toolUses: [],
+  }));
+
+  const sid = 'brain-post-turn-seam-fires';
+  await respondViaClaudeAgentSdkBrain('home', { message: 'What did we cover?', sessionId: sid });
+
+  const credit = listEvents(sid, { types: ['recall_auto_credit'] });
+  assert.equal(credit.length, 1, 'the post-turn seam ran auto-credit on the brain lane');
+  const refs = (credit[0].data.runs as Array<{ refs: Array<{ ref: string }> }>).flatMap((r) => r.refs.map((x) => x.ref));
+  assert.ok(refs.includes(`note:${sourceUri}`), 'the demonstrably-used recalled note was credited');
+});
+
 test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
   // Guards the kill-switch path: with CLEMMY_TOOL_JIT=off the brain must not reduce
   // the tool surface (no mcpToolAllowlist → MCP server advertises every tool).

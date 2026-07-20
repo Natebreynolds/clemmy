@@ -4,8 +4,7 @@ import { buildPlannerAgent, sanitizePlanOutput, type Plan } from '../../agents/p
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
-import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
-import { safeDetectCorrection } from './correction-hook.js';
+import { runPostTurnHooks } from './post-turn.js';
 import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
@@ -489,28 +488,15 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       },
     });
 
-    // Negative half of the credit loop — BEFORE auto-credit (parity across lanes).
-    safeDetectCorrection({ sessionId: input.sessionId, turn: 0, userInput: input.input });
-    // Post-plan memory credit: a primed memory that shows up in the drafted
-    // plan (a filled slot, an id, a constraint) demonstrably earned its recall.
-    try {
-      const credited = autoCreditRecallRuns({
-        recallIds: [memoryRecallId],
-        replyText: JSON.stringify(plan),
-        queryText: input.input,
-      });
-      if (credited.length > 0) {
-        appendEvent({
-          sessionId: input.sessionId, turn: 0, role: 'system', type: 'recall_auto_credit',
-          data: {
-            runs: credited.map((o) => ({
-              recallId: o.recallId,
-              refs: o.credited.map((d) => ({ ref: `${d.ref.type}:${d.ref.id}`, evidence: d.evidence })),
-            })),
-          },
-        });
-      }
-    } catch { /* crediting is bookkeeping; it must never break planning */ }
+    // Post-turn hooks (correction + auto-credit) via the ONE shared spine.
+    runPostTurnHooks({
+      sessionId: input.sessionId,
+      turn: 0,
+      userInput: input.input,
+      recallIds: [memoryRecallId],
+      replyText: JSON.stringify(plan),
+      queryText: input.input,
+    });
 
     if (plan.needsUserInput.length > 0) {
       // Plan-continuity: persist the ASKING plan so the user's next message

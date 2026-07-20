@@ -18,8 +18,7 @@ import { isTemporalMeetingQuery } from '../../memory/recall.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
-import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
-import { safeDetectCorrection } from './correction-hook.js';
+import { runPostTurnHooks } from './post-turn.js';
 import { runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
 import {
   appendTerminalEventOnce,
@@ -2101,30 +2100,16 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     } catch { /* working-memory observability must never affect delivery */ }
   }
-  // Negative half of the credit loop — BEFORE auto-credit so the prior turn's
-  // credited facts are the ones we read (parity with loop.ts / plan-first.ts).
-  safeDetectCorrection({ sessionId, turn: 0, userInput: request.message });
-  // Post-turn memory credit: match this turn's primer recall run against the
-  // reply + tool-use record and credit demonstrable use (code-level
-  // replacement for the never-called memory_mark_used prompt rule).
-  try {
-    const credited = autoCreditRecallRuns({
-      recallIds: [renderedTurnContext.memoryPrimer.recallId],
-      replyText: text,
-      toolArgTexts: result.toolUses,
-    });
-    if (credited.length > 0) {
-      appendEvent({
-        sessionId, turn: 0, role: 'system', type: 'recall_auto_credit',
-        data: {
-          runs: credited.map((o) => ({
-            recallId: o.recallId,
-            refs: o.credited.map((d) => ({ ref: `${d.ref.type}:${d.ref.id}`, evidence: d.evidence })),
-          })),
-        },
-      });
-    }
-  } catch { /* crediting is bookkeeping; it must never break the turn */ }
+  // Post-turn hooks (correction detection then auto-credit) via the ONE shared
+  // spine — identical on every brain lane. New post-turn behavior wires there.
+  runPostTurnHooks({
+    sessionId,
+    turn: 0,
+    userInput: request.message,
+    recallIds: [renderedTurnContext.memoryPrimer.recallId],
+    replyText: text,
+    toolArgTexts: result.toolUses,
+  });
   return {
     text,
     sessionId,

@@ -102,20 +102,6 @@ function temporalTopicTokens(text: string): Set<string> {
   return new Set([...tokens(text)].filter((token) => !TEMPORAL_TOPIC_STOP.has(token)));
 }
 
-function hasFastDurableSetCandidate(facts: ConsolidatedFact[], objective: string): boolean {
-  if (!asksForCompleteRecallSet(objective)) return false;
-  // NB: deliberately NOT gated on lexical overlap with the query. A roster is
-  // names + emails; a natural request ("invite everyone to Thursday's sync")
-  // shares ~zero topic tokens with it, so a lexical floor would defeat the whole
-  // purpose (the 2026-07-19 miss). List-bearing + evidence-backed + a
-  // complete-set query shape are the right, sufficient signals.
-  return facts.some((fact) =>
-    (fact.kind === 'project' || fact.kind === 'reference' || fact.kind === 'user')
-    && looksLikeListBearingText(fact.content)
-    && getFactEvidence(fact.id).some((item) =>
-      (item.status === 'available' || item.status === 'partial') && item.excerpt.trim().length > 0));
-}
-
 function preferDurableCompleteSetHits(hits: MemoryEvidenceHit[], objective: string): MemoryEvidenceHit[] {
   if (!asksForCompleteRecallSet(objective)) return hits;
   return hits.map((hit) => {
@@ -545,22 +531,25 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const temporalWindow = resolveTemporalQueryWindow(objective, { nowMs, timeZone });
   const searchFactsAsGraphBridge = wanted.has('fact') || depth > 0;
 
-  // Exact/list requests frequently have a complete, source-backed durable fact
-  // already available synchronously. In that case, do not spend the primer's
-  // latency budget embedding the same query or searching the vault before
-  // ranking the fact. The remaining graph/episode passes still corroborate it.
+  // Always run the full recall (lexical + semantic + vault). A durable
+  // complete-set fact is PREFERRED downstream by preferDurableCompleteSetHits
+  // (a bounded score boost), never by SKIPPING the other passes. The old
+  // fast-path skipped semantic + vault whenever a complete-set QUERY-WORD matched
+  // a list-bearing fact — so a false-positive keyword match ("what did the group
+  // discuss") suppressed the vault meeting note and lost the answer (fail-unsafe).
+  // Boosting instead of skipping keeps the durable set on top without dropping
+  // any retrieval path.
   const lexicalFacts = searchFactsAsGraphBridge
     ? (historicalAsOf
         ? searchFactsByTextAt(objective, historicalAsOf, perStore)
         : searchFactsByText(objective, perStore))
     : [];
-  const fastDurableSetCandidate = hasFastDurableSetCandidate(lexicalFacts, objective);
 
   const [semanticFacts, notes] = await Promise.all([
-    searchFactsAsGraphBridge && !fastDurableSetCandidate
+    searchFactsAsGraphBridge
       ? findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }).catch(() => [])
       : Promise.resolve([]),
-    wanted.has('note') && !fastDurableSetCandidate
+    wanted.has('note')
       ? recallHybrid(objective, { limit: perStore, nowMs, timeZone }).catch(() => [])
       : Promise.resolve([]),
   ]);

@@ -92,8 +92,8 @@ import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
-import { autoCreditRecallRuns, extractFunctionCallArgTexts } from '../../memory/recall-auto-credit.js';
-import { safeDetectCorrection } from './correction-hook.js';
+import { extractFunctionCallArgTexts } from '../../memory/recall-auto-credit.js';
+import { runPostTurnHooks } from './post-turn.js';
 import {
   budgetLine,
   checkRunTokenWindow,
@@ -414,40 +414,6 @@ function safeMaybeAutoFocus(sessionId: string, summaryHint?: unknown): void {
  *  tool-recorded) against what the turn actually produced and credit
  *  demonstrable use. Replaces the never-called memory_mark_used prompt rule
  *  with code. Best-effort — crediting must never fail the turn. */
-function safeAutoCreditRecall(input: {
-  sessionId: string;
-  turn: number;
-  recallIds: Array<string | null | undefined>;
-  finalOutput: unknown;
-  newHistoryItems: unknown[];
-}): void {
-  try {
-    const replyText = typeof input.finalOutput === 'string'
-      ? input.finalOutput
-      : (() => { try { return JSON.stringify(input.finalOutput) ?? ''; } catch { return ''; } })();
-    const outcomes = autoCreditRecallRuns({
-      recallIds: input.recallIds,
-      replyText,
-      toolArgTexts: extractFunctionCallArgTexts(input.newHistoryItems),
-    });
-    if (outcomes.length === 0) return;
-    safeAppend({
-      sessionId: input.sessionId,
-      turn: input.turn,
-      role: 'system',
-      type: 'recall_auto_credit',
-      data: {
-        runs: outcomes.map((o) => ({
-          recallId: o.recallId,
-          refs: o.credited.map((d) => ({ ref: `${d.ref.type}:${d.ref.id}`, evidence: d.evidence })),
-        })),
-      },
-    });
-  } catch (err) {
-    console.warn('[harness] recall auto-credit failed', err instanceof Error ? err.message : err);
-  }
-}
-
 function itemText(value: unknown): string {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) {
@@ -5049,16 +5015,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       },
     });
     safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
-    // Negative half of the credit loop — must run BEFORE auto-credit so the
-    // prior turn's credited facts are the ones we read.
-    safeDetectCorrection({ sessionId: options.sessionId, turn, userInput: options.authoritativeUserInput ?? options.input });
-    safeAutoCreditRecall({
+    // Post-turn hooks (correction detection then auto-credit) via the ONE shared
+    // spine — identical on every brain lane. New post-turn behavior wires there.
+    runPostTurnHooks({
       sessionId: options.sessionId,
       turn,
+      userInput: options.authoritativeUserInput ?? options.input,
       recallIds: [turnMemoryPrimer.recallId, ...(harnessCtx?.turnRecallRunIds ?? [])],
-      finalOutput: outcome.finalOutput,
+      replyText: typeof outcome.finalOutput === 'string'
+        ? outcome.finalOutput
+        : (() => { try { return JSON.stringify(outcome.finalOutput) ?? ''; } catch { return ''; } })(),
       // Defensive: stubbed/degraded runners can hand back a non-array history.
-      newHistoryItems: Array.isArray(outcome.history) ? outcome.history.slice(items.length) : [],
+      toolArgTexts: extractFunctionCallArgTexts(Array.isArray(outcome.history) ? outcome.history.slice(items.length) : []),
     });
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
@@ -5463,14 +5431,19 @@ export async function resumePendingApproval(
     // A resumed turn has no memory primer; credit only tool-recorded recall
     // runs. The resumed state's full history stands in for "this turn's"
     // items — any run credited here was recorded during the resume itself.
-    // (No correction detection here: an approval-resume carries no new user
-    // message to correct the prior answer.)
-    safeAutoCreditRecall({
+    // Through the SAME shared seam as the normal path, with correction detection
+    // opted out (an approval-resume carries no new user message to correct the
+    // prior answer) — so any future post-turn hook reaches the resume path too.
+    runPostTurnHooks({
       sessionId: options.sessionId,
       turn,
+      userInput: undefined,
+      detectCorrection: false,
       recallIds: resumeCtx?.turnRecallRunIds ?? [],
-      finalOutput: outcome.finalOutput,
-      newHistoryItems: Array.isArray(outcome.history) ? outcome.history : [],
+      replyText: typeof outcome.finalOutput === 'string'
+        ? outcome.finalOutput
+        : (() => { try { return JSON.stringify(outcome.finalOutput) ?? ''; } catch { return ''; } })(),
+      toolArgTexts: extractFunctionCallArgTexts(Array.isArray(outcome.history) ? outcome.history : []),
     });
     // Chat sessions stay 'active' between turns (inherently multi-turn).
     // Workflow / execution / agent sessions normally flip to 'completed'
