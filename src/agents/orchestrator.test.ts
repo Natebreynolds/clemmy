@@ -1223,3 +1223,22 @@ test('OrchestratorDecision: nextAction enum covers the harness states the loop e
     );
   }
 });
+
+test('isCommitSafeWorkerFallover: overload + auth-expiry fall over ONLY when uncommitted (2026-07-20 worker-lane auth fix)', async () => {
+  const { isCommitSafeWorkerFallover } = await import('./orchestrator.js');
+  const { ClaudeSdkProviderOverloadError, ClaudeSdkAuthExpiredError } = await import('../runtime/harness/claude-agent-sdk.js');
+
+  // Overload: eligible only pre-commit (a committed overload is salvaged by the SDK lane).
+  assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkProviderOverloadError('529 overloaded', false)), true, 'uncommitted overload → fall over');
+  assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkProviderOverloadError('529 overloaded', true)), false, 'committed overload → never re-run (double-act)');
+
+  // Auth-expiry: the release-day addition — an expired worker token switches brains,
+  // but a committed one must not be blindly re-driven.
+  assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkAuthExpiredError('401 token expired', false)), true, 'uncommitted auth-expiry → fall over to a connected brain');
+  assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkAuthExpiredError('401 token expired', true)), false, 'committed auth-expiry → never re-run');
+
+  // Unrelated / untyped errors never qualify — commit state is unknown, so the
+  // guard stays conservative (no blind re-run of a possibly-committed item).
+  assert.equal(isCommitSafeWorkerFallover(new Error('missing required field actorId')), false);
+  assert.equal(isCommitSafeWorkerFallover(new Error('some generic 500')), false);
+});

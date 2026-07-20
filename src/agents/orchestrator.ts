@@ -52,7 +52,7 @@ import {
 } from '../runtime/harness/guardrails.js';
 import { DEFAULT_MAX_TURNS, harnessRunContextStorage, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
-import { ClaudeSdkProviderOverloadError } from '../runtime/harness/claude-agent-sdk.js';
+import { ClaudeSdkProviderOverloadError, ClaudeSdkAuthExpiredError } from '../runtime/harness/claude-agent-sdk.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
@@ -207,11 +207,28 @@ function workerIntentRoutingEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_INTENT_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
-/** Optional cross-provider worker fallover (shares the brain-fallover switch):
- *  a Claude SDK worker that overloads before committing re-runs
- *  the item on the next connected brain. */
+/** Cross-provider worker fallover (shares the brain-fallover switch): a Claude SDK
+ *  worker that overloads OR whose auth expired BEFORE committing re-runs the item on
+ *  the next connected brain. Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) —
+ *  parity with the router, chat, and workflow lanes (2026-07-20: this lane was left
+ *  default-off when the others were flipped, so a configured fallback brain never
+ *  engaged for fan-out workers). falloverBrainModelIds returns [] when no other brain
+ *  is connected, so a single-brain user is an automatic no-op. */
 function workerBrainFalloverEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/** Commit-safe worker cross-brain fallover eligibility. ONLY the typed,
+ *  committed-aware brain errors qualify — a committed external write must never be
+ *  blindly re-driven on another brain (mirror of the chat lane's
+ *  isChatBrainFalloverEligible and the step lane's canSwitchBrainForStep). Auth-expiry
+ *  is committed=false by construction (auth fails before any tool runs), so an expired
+ *  Claude worker token switches to the connected Codex/BYO brain instead of hard-failing
+ *  the item — the worker-lane twin of the 2026-07-20 router/workflow auth-aware fix. */
+export function isCommitSafeWorkerFallover(err: unknown): boolean {
+  if (err instanceof ClaudeSdkProviderOverloadError) return !err.committed;
+  if (err instanceof ClaudeSdkAuthExpiredError) return !err.committed;
+  return false;
 }
 
 interface ChatWorkerModelRoute {
@@ -1262,12 +1279,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           recordWorkerSubagent(sdkResult.text ?? '', sdkResult.model ?? workerModel);
           return await reduceReturn(sdkResult.text ?? '');
         } catch (err) {
-          // Claude SDK worker overloaded BEFORE committing anything (no tool ran,
-          // nothing streamed) → fall THIS item over to the nested worker lane on
-          // the next brain (Codex→GLM via RouterModelProvider, which handles any
-          // further hop). committed=true → rethrow (a re-run could double-act).
-          // Kill-switch CLEMMY_BRAIN_FALLOVER.
-          const next = (workerBrainFalloverEnabled() && err instanceof ClaudeSdkProviderOverloadError && !err.committed)
+          // Claude SDK worker overloaded OR its auth expired BEFORE committing
+          // anything (no tool ran, nothing streamed) → fall THIS item over to the
+          // nested worker lane on the next brain (Codex→GLM via RouterModelProvider,
+          // which handles any further hop). committed=true → rethrow (a re-run could
+          // double-act). Kill-switch CLEMMY_BRAIN_FALLOVER.
+          const next = (workerBrainFalloverEnabled() && isCommitSafeWorkerFallover(err))
             ? falloverBrainModelIds('claude')[0]
             : undefined;
           if (!next) {
@@ -1322,6 +1339,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (/missing credentials|no default model provider|api key|apikey|unauthorized|invalid_grant|token_revoked|sign-?in expired/i.test(reason)) {
           return `ERROR: worker for "${input.item}" failed before starting: ${reason} `
             + 'PARALLEL FAN-OUT IS UNAVAILABLE this run (worker model backend has no usable credentials — this will fail identically for every item). '
+            + 'Do NOT call run_worker again this turn. Process the remaining items inline instead, and TELL THE USER in your reply that parallel fan-out was unavailable (and why).';
+        }
+        // Rate-limit / quota exhaustion on the worker BACKEND (e.g. an out-of-tokens
+        // Codex/BYO worker model whose own transparent retries are spent) — every
+        // sibling on the same backend hits it identically, so a re-fan-out just
+        // re-thrashes. Degrade to sequential on the ORCHESTRATOR's brain (which may be
+        // a different, healthy provider; if it's the same exhausted brain, the chat
+        // lane's model.rate_limited fallover takes over one level up — a Codex 429 /
+        // usage-limit classifies model.rate_limited, already fallover-eligible). Accurate
+        // wording (NOT "no credentials") so the user hears "rate-limited", not "signed out".
+        if (/rate.?limit|too many requests|quota|insufficient_quota|out of (?:tokens|quota|credits)|overloaded|resource_exhausted/i.test(reason)) {
+          return `ERROR: worker for "${input.item}" failed before starting: ${reason} `
+            + 'PARALLEL FAN-OUT IS UNAVAILABLE this run (worker model backend is rate-limited / out of quota — this will fail identically for every item). '
             + 'Do NOT call run_worker again this turn. Process the remaining items inline instead, and TELL THE USER in your reply that parallel fan-out was unavailable (and why).';
         }
         throw err;
