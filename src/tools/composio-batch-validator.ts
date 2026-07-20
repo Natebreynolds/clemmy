@@ -79,11 +79,11 @@ function schemaPropertyFields(schema?: Record<string, unknown> | null): Set<stri
   return properties ? new Set(Object.keys(properties)) : null;
 }
 
-function isOutlookSendEmailSlug(toolSlug: string): boolean {
+export function isOutlookSendEmailSlug(toolSlug: string): boolean {
   return /^OUTLOOK(?:_|$).*SEND.*EMAIL$/i.test(toolSlug);
 }
 
-function applyEmailRecipientAliases(
+export function applyEmailRecipientAliases(
   toolSlug: string,
   args: Record<string, unknown>,
   schema?: Record<string, unknown> | null,

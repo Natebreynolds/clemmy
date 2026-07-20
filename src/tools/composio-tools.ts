@@ -48,7 +48,7 @@ import { checkConstraintViolation, formatConstraintEscalation, findEmailSendCons
 import { resolveCompliantSenderConnection, extractMailboxEmails } from '../runtime/harness/sender-verify.js';
 import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../memory/account-alias-store.js';
 import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
-import { validateComposioArgs, formatBatchValidationError } from './composio-batch-validator.js';
+import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases, isOutlookSendEmailSlug } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { sessionHasBackgroundOffer } from '../runtime/harness/convergence-steer.js';
@@ -1480,6 +1480,26 @@ export async function resolveComposioDispatch(
         candidates: candidates.map((c) => ({ email: c.email, connectionId: c.connectionId })),
       };
     }
+  }
+
+  // Recipient normalization — CENTRAL for EVERY send lane (chat single-send,
+  // workflow exact-call, batch, background — all resolve through here). The model's
+  // natural `to` is mapped onto the provider's required `to_email`. This used to run
+  // ONLY on the batch item path, so a single-send Outlook email dispatched with no
+  // recognized recipient key and Graph fell back to the authenticated mailbox —
+  // sending to the SENDER'S OWN address (2026-07-20 live incident: "sent 0 of 20,
+  // misrouting every recipient as your own address"). One step here, not per-lane.
+  const recipientAlias = applyEmailRecipientAliases(toolSlug, args, getCachedToolSchema(toolSlug));
+  args = recipientAlias.args;
+  if (recipientAlias.repairs.length > 0) notes.push(...recipientAlias.repairs);
+  // Validate the write: a send with NO resolvable recipient must not silently
+  // dispatch — that is exactly what misroutes to the sender's own mailbox. Block
+  // with an actionable message so the model supplies a recipient and retries,
+  // rather than firing a recipient-less send (heuristic mode skips to_email).
+  if (isOutlookSendEmailSlug(toolSlug) && !('to_email' in args)) {
+    const message = `⚠️ Not sent: this Outlook email has no recipient (no \`to\` / \`to_email\`). I won't dispatch a recipient-less send — with no recipient the provider delivers it to your own mailbox. Supply the recipient email address and retry.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', { field: 'to_email', validationReason: 'missing-recipient' });
+    return { ok: false, reason: 'invalid-args', message, toolkit };
   }
 
   // Arg validation — provably-incomplete args never dispatch (any path).

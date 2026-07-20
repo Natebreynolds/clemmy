@@ -247,6 +247,33 @@ test('send safety net: an irreversible SEND to a multi-account toolkit never res
   if (out.ok) assert.notEqual(out.connectionId, undefined);
 });
 
+test('recipient normalization is CENTRAL: a single-send Outlook email maps `to`->`to_email` on the dispatch path (2026-07-20 misroute fix)', async () => {
+  // The live incident: the model passed the natural `to`, but only the BATCH lane
+  // mapped it onto the provider-required `to_email`. The single-send lane skipped
+  // that, so Graph got no recognized recipient and delivered to the sender's own
+  // mailbox ("sent 0 of 20, misrouting every recipient as your own address"). The
+  // fix centralizes the alias in resolveComposioDispatch — every lane, one step.
+  setAccounts([account('ca_solo', 'outlook', 'me@work.example')]);
+  const out = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { to: 'client@firm.example', subject: 's', body: 'b' }, undefined, {});
+  assert.equal(out.ok, true, 'a single-account send resolves');
+  if (out.ok) {
+    assert.equal(out.args.to_email, 'client@firm.example', '`to` is mapped onto `to_email` so Graph does NOT fall back to the sender mailbox');
+    assert.ok(!('to' in out.args), 'the raw `to` alias is consumed once mapped');
+  }
+});
+
+test('validate-the-write: a recipient-less Outlook send is BLOCKED, never dispatched to the sender mailbox', async () => {
+  // With no `to`/`to_email` there is nothing to validate — dispatching would
+  // misroute to self. The gateway asks for a recipient instead of firing blind.
+  setAccounts([account('ca_solo', 'outlook', 'me@work.example')]);
+  const out = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { subject: 's', body: 'b' }, undefined, {});
+  assert.equal(out.ok, false, 'a recipient-less send must not dispatch');
+  if (!out.ok) {
+    assert.equal(out.reason, 'invalid-args');
+    assert.match(out.message, /recipient/i);
+  }
+});
+
 test('identity enrichment does NOT permanently blind a mailbox on a transient probe failure (finding 13)', async () => {
   setAccounts([
     account('ca_ms1', 'outlook'), // no email in listing
