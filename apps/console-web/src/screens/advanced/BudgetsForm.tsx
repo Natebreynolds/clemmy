@@ -14,7 +14,7 @@ import { cn } from '@/lib/cn';
 const PRESETS: { key: NonNullable<BudgetSettings['preset']>; label: string; desc: string }[] = [
   { key: 'standard', label: 'Standard', desc: '40 steps · 120 min · pauses to check in' },
   { key: 'long', label: 'Long', desc: '160 steps · 8 hrs · keeps going' },
-  { key: 'unlimited', label: 'Unlimited', desc: 'No time cap · very high ceilings · supervised' },
+  { key: 'unlimited', label: 'Unlimited', desc: 'No time cap · very high ceilings · auto-continues unattended' },
 ];
 
 export function BudgetsForm() {
@@ -28,7 +28,7 @@ export function BudgetsForm() {
     // Live values are nested under runtimeBudget.settings (snapshot shape).
     const b = settings.data?.runtimeBudget?.settings;
     if (b && !form) {
-      setForm({ preset: b.preset, maxConversationSteps: b.maxConversationSteps, maxConversationWallMinutes: b.maxConversationWallMinutes, maxTurns: b.maxTurns, toolCallsPerTurn: b.toolCallsPerTurn, maxParallelWorkers: b.maxParallelWorkers, checkInMinutes: b.checkInMinutes, autoContinueOnLimit: b.autoContinueOnLimit });
+      setForm({ preset: b.preset, maxConversationSteps: b.maxConversationSteps, maxConversationWallMinutes: b.maxConversationWallMinutes, maxTurns: b.maxTurns, toolCallsPerTurn: b.toolCallsPerTurn, maxParallelWorkers: b.maxParallelWorkers, checkInMinutes: b.checkInMinutes, autoContinueOnLimit: b.autoContinueOnLimit, maxRunTokens: b.maxRunTokens });
     }
   }, [settings.data, form]);
 
@@ -44,7 +44,7 @@ export function BudgetsForm() {
     if (!form) return;
     setSaving(true);
     try {
-      await patchBudget({ maxConversationSteps: form.maxConversationSteps, maxConversationWallMinutes: form.maxConversationWallMinutes, maxTurns: form.maxTurns, toolCallsPerTurn: form.toolCallsPerTurn, maxParallelWorkers: form.maxParallelWorkers, checkInMinutes: form.checkInMinutes, autoContinueOnLimit: form.autoContinueOnLimit });
+      await patchBudget({ maxConversationSteps: form.maxConversationSteps, maxConversationWallMinutes: form.maxConversationWallMinutes, maxTurns: form.maxTurns, toolCallsPerTurn: form.toolCallsPerTurn, maxParallelWorkers: form.maxParallelWorkers, checkInMinutes: form.checkInMinutes, autoContinueOnLimit: form.autoContinueOnLimit, maxRunTokens: form.maxRunTokens });
       setSaved(true);
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } finally { setSaving(false); }
@@ -79,7 +79,8 @@ export function BudgetsForm() {
             <Field label="Max turns" hint="Conversation turns before pausing.">{(id) => <Input id={id} type="number" min={1} value={form.maxTurns ?? ''} onChange={(e) => set('maxTurns', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Tool calls per turn" hint="Cap within a single turn.">{(id) => <Input id={id} type="number" min={1} value={form.toolCallsPerTurn ?? ''} onChange={(e) => set('toolCallsPerTurn', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Max parallel work" hint="How many items Clementine works at once when she fans a big job into a swarm. Higher = faster on 100-item jobs; lower = gentler on rate limits.">{(id) => <Input id={id} type="number" min={1} max={64} value={form.maxParallelWorkers ?? ''} onChange={(e) => set('maxParallelWorkers', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
-            <Field label="Check in every (minutes)">{(id) => <Input id={id} type="number" min={1} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
+            <Field label="Max tokens (whole run)" hint="Cumulative uncached tokens a single run may spend before it pauses. 0 = no token cap (the preset default is high). The real backstop for a runaway job that keeps calling models.">{(id) => <Input id={id} type="number" min={0} value={form.maxRunTokens ?? ''} onChange={(e) => set('maxRunTokens', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
+            <Field label="Run-loop check-in (minutes)" hint="How often a long RUN posts a progress heartbeat. (Separate from the proactive check-in cadence under Autonomy.)">{(id) => <Input id={id} type="number" min={1} max={240} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
           </div>
           {typeof form.maxConversationSteps === 'number' && form.maxConversationSteps < 20 && (
             <p className="mb-3 text-small text-warning">Heads up: {form.maxConversationSteps} steps is low — a multi-step task may stop before it finishes. Raise it (or turn on auto-continue) for big jobs.</p>

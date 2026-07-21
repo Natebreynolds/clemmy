@@ -63,14 +63,21 @@ export function AutonomyForm() {
             <Field label="Approvals" hint="Irreversible sends (email/calls/posts) are always validated and confirmed — this only controls reversible / local work.">{(id) => (
               <Select
                 id={id}
-                value={form.autoApproveScope === 'strict' || form.autoApproveScope === 'balanced' ? 'strict' : 'yolo'}
+                value={form.autoApproveScope === 'strict' || form.autoApproveScope === 'balanced' ? 'strict'
+                  : form.autoApproveScope === 'workspace' ? 'workspace' : 'yolo'}
                 onChange={(e) => set('autoApproveScope', e.target.value as Policy['autoApproveScope'])}
               >
                 <option value="yolo">Autonomous — run without asking (recommended)</option>
                 <option value="strict">Supervised — ask before any change</option>
+                {/* Legacy power-user scope: shown ONLY when it's the stored value,
+                    so it round-trips truthfully instead of silently reading as
+                    Autonomous and getting rewritten to yolo on the next save. */}
+                {form.autoApproveScope === 'workspace' && (
+                  <option value="workspace">Workspace — auto-approve inside your workspace folders (legacy)</option>
+                )}
               </Select>
             )}</Field>
-            <Field label="Check in every (minutes)">{(id) => <Input id={id} type="number" min={1} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', Number(e.target.value))} />}</Field>
+            <Field label="Proactive check-in (minutes)" hint="How often Clementine proactively checks in / starts helpful work on its own. (Separate from the run-loop heartbeat under Run limits.)">{(id) => <Input id={id} type="number" min={1} max={60} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', Number(e.target.value))} />}</Field>
           </div>
 
           <h3 className="mb-1 mt-4 text-h3 text-fg">Quiet hours</h3>

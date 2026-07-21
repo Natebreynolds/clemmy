@@ -22,6 +22,7 @@ export interface BudgetSettings {
   maxParallelWorkers?: number;
   checkInMinutes?: number;
   autoContinueOnLimit?: boolean;
+  maxRunTokens?: number;
 }
 
 export interface Policy {

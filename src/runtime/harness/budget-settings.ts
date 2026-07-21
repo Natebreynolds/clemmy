@@ -190,8 +190,16 @@ export function getHarnessBudgetSnapshot(): {
 }
 
 export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBudgetSettings, unknown>>): HarnessBudgetRuntime {
-  const requestedPreset = typeof input.preset === 'string' ? presetFromEnv(input.preset) : getHarnessBudgetSettings().preset;
-  const base = PRESETS[requestedPreset];
+  const current = getHarnessBudgetSettings();
+  const requestedPreset = typeof input.preset === 'string' ? presetFromEnv(input.preset) : current.preset;
+  // UI-correctness defect 1 (2026-07-21 audit): the fallback for an OMITTED
+  // field must be the currently-STORED value, NOT the preset default —
+  // otherwise a partial save (the Run-limits form never sends maxRunTokens)
+  // silently wipes any value set elsewhere (e.g. a run-token ceiling set from
+  // chat). Only a deliberate PRESET SWITCH resets omitted fields to that
+  // preset's defaults (the user asked for the preset's shape).
+  const presetChanged = requestedPreset !== current.preset;
+  const base = presetChanged ? PRESETS[requestedPreset] : current;
   const next: HarnessBudgetSettings = {
     preset: requestedPreset,
     maxConversationSteps: clampNumber(input.maxConversationSteps, base.maxConversationSteps, 1, 1_000_000),

@@ -510,7 +510,10 @@ export function sourceLabel(kind: BoardSourceKind): string {
   switch (kind) {
     case 'background': return 'Task';
     case 'workflow': return 'Workflow';
-    case 'execution': return 'Goal';
+    // Execution-store items are TRACKED long-running work, NOT the goal-
+    // contracts shown on the Goals screen — "Goal" here collided with that
+    // screen (two stores, two lifecycles, same word). 2026-07-21 UI audit.
+    case 'execution': return 'Tracked';
     case 'run': return 'Run';
     case 'approval': return 'Approval';
   }
