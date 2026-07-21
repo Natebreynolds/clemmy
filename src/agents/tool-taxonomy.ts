@@ -178,6 +178,11 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
  * intentional.
  */
 const ALWAYS_READ = new Set<string>([
+  // Deterministic local table algebra (2026-07-21): pure computation over
+  // rows already fetched; its only side channel is a transient staged spill
+  // file. Never needs approval — reconciliation is the middle of every
+  // employee loop and must not stop the run.
+  'table_ops',
   'workspace_roots',
   'workspace_list',
   'workspace_info',

@@ -18,6 +18,7 @@ import { registerAutonomyActionTools } from './autonomy-action-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerWorkerTools } from './worker-tools.js';
 import { registerWorkflowStateTools } from './workflow-state-tools.js';
+import { registerTableOpsTools } from './table-ops-tools.js';
 import { registerBatchTools } from './batch-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerProfileTools } from './profile-tools.js';
@@ -216,6 +217,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerBackgroundTaskTools(server);
   registerWorkerTools(server);
   registerWorkflowStateTools(server);
+  registerTableOpsTools(server);
   registerBatchTools(server);
   registerAutonomyActionTools(server);
   registerExecutionTools(server);

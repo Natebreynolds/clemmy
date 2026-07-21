@@ -251,6 +251,12 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'workflow_run_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'idempotent', description: 'Check workflow runs.' },
   { name: 'workflow_schedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Schedule a workflow to fire on a cron expression.' },
   { name: 'workflow_set_enabled', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Approve or disable a workflow.' },
+  // Data-operation primitive (2026-07-21 capability audit #1): deterministic
+  // reconcile/transform — the "spreadsheet brain". Pure read-class compute
+  // (its only write is a transient staged spill file). Available everywhere
+  // including workflow-step/worker/code-mode: reconciliation is the middle of
+  // the employee loop and must never require a bigger lane.
+  { name: 'table_ops', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Deterministic table algebra over lists/sheets: diff, intersect, join, dedupe, aggregate, select — sourced from inline rows, a prior tool call id (full parked output), or a staged file.' },
   // Employee-memory primitive (2026-07-21): durable cross-RUN state. Core +
   // available in the workflow-step/worker lanes — that's exactly where the
   // amnesia lived (an hourly scrape re-processed the same items every run).
