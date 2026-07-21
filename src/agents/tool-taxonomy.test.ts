@@ -488,3 +488,30 @@ test('decideToolApproval: run_batch never takes the per-tool interrupt — appro
   const execute = decideToolApproval({ toolName: 'run_batch', args: { action: 'execute', pending_action_id: 'pa-1' } });
   assert.equal(execute.needsApproval, false, 'execute self-refuses unless the pending action is APPROVED');
 });
+
+test('write-validation guard: tonight\'s new tools never open an ungated external-write path (2026-07-21)', () => {
+  // A tool that classifies as "send" is treated as an IRREVERSIBLE external
+  // write (gated + recipient-validated). The capability primitives added this
+  // session must stay LOCAL — read-class, or a local reversible "write" like
+  // memory_remember — never "send". This is the regression guard for the
+  // original write-path-validation mandate: a future edit that flips one of
+  // these to an external send would light this test up.
+  const expected: Record<string, 'read' | 'write'> = {
+    table_ops: 'read',
+    file_query: 'read',
+    time_slots: 'read',
+    extract_structured: 'read',
+    produce_document: 'write', // local file under BASE_DIR/files, reversible
+    workflow_state: 'write',   // local durable state, like memory_remember
+  };
+  for (const [tool, kind] of Object.entries(expected)) {
+    const actual = classifyTool(tool);
+    assert.notEqual(actual, 'send', `${tool} must NEVER classify as an irreversible send`);
+    assert.notEqual(actual, 'admin', `${tool} must not require admin approval`);
+    assert.equal(actual, kind, `${tool} classification drifted`);
+  }
+  // The local writers stay pinned to write (not read) so Supervised posture
+  // still surfaces them, but they can never become sends.
+  assert.equal(classifyTool('produce_document'), 'write');
+  assert.equal(classifyTool('workflow_state'), 'write');
+});
