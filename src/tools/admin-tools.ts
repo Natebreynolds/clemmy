@@ -7,31 +7,15 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   BASE_DIR,
-  TIMERS_FILE,
   ensureDir,
   listWorkspaceProjects,
   textResult,
 } from './shared.js';
+import { readTimers, writeTimers } from '../runtime/timers.js';
 
-interface TimerEntry {
-  id: string;
-  message: string;
-  fireAt: number;
-  createdAt: number;
-}
-
-function readTimers(): TimerEntry[] {
-  if (!existsSync(TIMERS_FILE)) return [];
-  try {
-    return JSON.parse(readFileSync(TIMERS_FILE, 'utf-8')) as TimerEntry[];
-  } catch {
-    return [];
-  }
-}
-
-function writeTimers(timers: TimerEntry[]): void {
-  writeFileSync(TIMERS_FILE, JSON.stringify(timers, null, 2), 'utf-8');
-}
+// Timer store moved to src/runtime/timers.ts (2026-07-20): set_timer used to be
+// WRITE-ONLY — no consumer ever fired what this tool wrote, so every reminder
+// was silently lost. The daemon's fireDueTimers tick is the other half now.
 
 function resolveHomePath(input: string): string {
   return path.resolve(input.startsWith('~') ? input.replace('~', os.homedir()) : input);
@@ -113,7 +97,7 @@ export function registerAdminTools(server: McpServer): void {
       });
       writeTimers(timers);
 
-      return textResult(`Timer set for ${minutes} minute${minutes === 1 ? '' : 's'} from now: "${message}"`);
+      return textResult(`Timer set for ${minutes} minute${minutes === 1 ? '' : 's'} from now: "${message}" — it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).`);
     },
   );
 

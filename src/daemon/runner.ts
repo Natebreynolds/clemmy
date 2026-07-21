@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import matter from 'gray-matter';
@@ -29,8 +29,9 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { fireDueTimers } from '../runtime/timers.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
+import { processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
@@ -116,6 +117,11 @@ interface DaemonState {
   // existing dedup map would prevent re-firing within the same minute,
   // and there's nothing to detect "scheduled but never ran" otherwise.
   lastHealthyTickAt?: string;
+  // Cron catch-up pointer (2026-07-20): the last wall-clock minute this
+  // daemon evaluated cron schedules against. Absent on first boot (no
+  // spurious backfill). Drives scheduleCatchupWindow so sleep/downtime
+  // occurrences fire late-but-never-lost, collapsed to one run per job.
+  lastCronEvaluatedAtMs?: number;
   // Brain Phase 2: nightly recursive-reflection day-stamp (YYYY-MM-DD,
   // local). Set after a successful run so we fire exactly once per
   // local day even across daemon restarts.
@@ -197,7 +203,22 @@ function loadState(): DaemonState {
   }
   try {
     return JSON.parse(readFileSync(STATE_FILE, 'utf-8')) as DaemonState;
-  } catch {
+  } catch (err) {
+    // Notify-don't-swallow (2026-07-20 schedules audit G4): a corrupt state
+    // file silently disabled missed-run detection (lastHealthyTickAt gone) and
+    // reset every cron dedupe/catch-up pointer. The fresh state below keeps
+    // the daemon running; the user learns their schedule safety net reset.
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'daemon state file corrupt — starting from fresh state');
+    try {
+      addNotification({
+        id: `daemon-state-corrupt-${new Date().toISOString().slice(0, 10)}`,
+        kind: 'system',
+        title: 'Daemon state file was corrupt',
+        body: 'The scheduling state file could not be read, so missed-run detection and cron catch-up pointers were reset. Recent scheduled runs may fire again once or missed ones may not be detected — check Console → Crons if anything looks off.',
+        createdAt: new Date().toISOString(),
+        read: false,
+      });
+    } catch { /* best-effort; the log line stands */ }
     return { lastCronRunByMinute: {} };
   }
 }
@@ -268,7 +289,22 @@ function loadCronJobs(): CronJobRecord[] {
   try {
     const parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
     return Array.isArray(parsed.data.jobs) ? (parsed.data.jobs as CronJobRecord[]) : [];
-  } catch {
+  } catch (err) {
+    // Notify-don't-swallow (2026-07-20 schedules audit G3): a corrupt CRON.md
+    // used to silently return [] — EVERY recurring commitment vanished with
+    // zero signal (and the boot-time missed-run scan, which also calls this,
+    // reported "0 missed" too). Daily-bucketed id keeps this to one nag/day.
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'CRON.md is unreadable — no cron jobs will fire until it is fixed');
+    try {
+      addNotification({
+        id: `cron-file-corrupt-${new Date().toISOString().slice(0, 10)}`,
+        kind: 'cron',
+        title: 'CRON.md is unreadable — scheduled jobs are NOT running',
+        body: 'The cron file could not be parsed, so none of your recurring jobs will fire until it is fixed. Open Console → Crons (or fix the YAML frontmatter in CRON.md) to restore them.',
+        createdAt: new Date().toISOString(),
+        read: false,
+      });
+    } catch { /* best-effort; the log line stands */ }
     return [];
   }
 }
@@ -583,24 +619,65 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   }
 }
 
+/** The minute-keys in `window` where `schedule` fires and hasn't already been
+ *  deduped. Pure + exported for tests — the collapse rule (fire ONCE on the
+ *  LATEST key, report the rest as missed) lives in processCronSchedules. */
+export function cronMatchedKeysInWindow(
+  schedule: string,
+  window: Date[],
+  lastFiredKey: string | undefined,
+): string[] {
+  const matched: string[] = [];
+  for (const minute of window) {
+    if (!cronMatches(schedule, minute)) continue;
+    const key = currentMinuteKey(minute);
+    if (lastFiredKey !== key) matched.push(key);
+  }
+  return matched;
+}
+
 async function processCronSchedules(assistant: ClementineAssistant, state: DaemonState): Promise<void> {
   const now = new Date();
-  const minuteKey = currentMinuteKey(now);
+  // Sleep/downtime catch-up (2026-07-20, attorney-bar schedules audit G2):
+  // this loop used to match ONLY `now`, so a laptop asleep at fire time
+  // silently skipped the occurrence — the boot-time missed-run scan never
+  // covers sleep (the process stays resident) and it only NOTIFIES anyway.
+  // Reuse the workflow scheduler's tested primitive: evaluate every minute
+  // since the last tick (24h cap), collapse a job's N missed matches into
+  // ONE run on the LATEST minute, and tell the user what was caught up.
+  const window = scheduleCatchupWindow(state.lastCronEvaluatedAtMs, now.getTime());
   const jobs = loadCronJobs();
 
   for (const job of jobs) {
     if (job.enabled === false) continue;
-    if (!cronMatches(job.schedule, now)) continue;
-    if (state.lastCronRunByMinute[job.name] === minuteKey) continue;
+    const matchedKeys = cronMatchedKeysInWindow(job.schedule, window, state.lastCronRunByMinute[job.name]);
+    if (matchedKeys.length === 0) continue;
+    const latestKey = matchedKeys[matchedKeys.length - 1];
+    const missed = matchedKeys.length - 1;
     // In-memory dedup BEFORE await so a follow-up tick within the
     // same minute doesn't re-fire. Persist AFTER successful run so a
     // crash mid-job leaves the disk state clean — the boot-time
     // missed-run scan will see the gap and surface it instead of
     // silently treating it as "ran."
-    state.lastCronRunByMinute[job.name] = minuteKey;
+    state.lastCronRunByMinute[job.name] = latestKey;
+    if (missed > 0) {
+      try {
+        addNotification({
+          id: `cron-catchup-${job.name}-${latestKey}`,
+          kind: 'cron',
+          title: `Catching up: ${job.name}`,
+          body: `"${job.name}" missed ${missed} scheduled ${missed === 1 ? 'run' : 'runs'} while the app was closed or your Mac was asleep. Running it once now to catch up.`,
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: { cronJob: job.name, missed, firedMinuteKey: latestKey },
+        });
+      } catch { /* the catch-up run below is the substance; the notice is best-effort */ }
+    }
     await runCronJob(assistant, job, 'schedule');
     saveState(state);
   }
+  state.lastCronEvaluatedAtMs = now.getTime();
+  saveState(state);
 }
 
 // Surfaces critical setup gaps as one-per-day notifications at daemon
@@ -764,16 +841,33 @@ async function processCronTriggers(assistant: ClementineAssistant): Promise<void
   const jobs = loadCronJobs();
   for (const file of readdirSync(CRON_TRIGGERS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(CRON_TRIGGERS_DIR, file);
+    // Notify-don't-swallow (2026-07-20 schedules audit G5): the old shape
+    // rmSync'd the trigger in a `finally` even when it never ran — a typo'd
+    // jobName or corrupt JSON silently consumed the user's explicit "run this
+    // now". Unknown job → tell the user; unreadable file → quarantine the
+    // bytes; only a trigger that RAN (or was told why it can't) is deleted.
     try {
       const payload = JSON.parse(readFileSync(filePath, 'utf-8')) as { jobName?: string };
       const job = jobs.find((entry) => entry.name === payload.jobName);
       if (job) {
         await runCronJob(assistant, job, 'trigger');
+      } else {
+        try {
+          addNotification({
+            id: `cron-trigger-unknown-${String(payload.jobName ?? file)}-${new Date().toISOString().slice(0, 10)}`,
+            kind: 'cron',
+            title: `Trigger ignored: no cron job named "${String(payload.jobName ?? '(missing jobName)')}"`,
+            body: 'A manual trigger referenced a cron job that does not exist (renamed or deleted?). Nothing was run. Check the job name in Console → Crons and re-trigger.',
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { triggerFile: file, jobName: payload.jobName ?? null },
+          });
+        } catch { /* best-effort */ }
       }
-    } catch (error) {
-      logger.warn({ err: error, file }, 'Failed to process cron trigger');
-    } finally {
       rmSync(filePath, { force: true });
+    } catch (error) {
+      logger.warn({ err: error, file }, 'Failed to process cron trigger — quarantining');
+      try { renameSync(filePath, `${filePath}.corrupt`); } catch { rmSync(filePath, { force: true }); }
     }
   }
 }
@@ -1614,6 +1708,10 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     setDaemonRuntimePhase('daemon.loop.tick', { tickCount });
     await withDaemonRuntimePhase('daemon.loop.cron_schedules', { tickCount }, () => processCronSchedules(assistant, state));
     await withDaemonRuntimePhase('daemon.loop.cron_triggers', { tickCount }, () => processCronTriggers(assistant));
+    // set_timer reminders (2026-07-20): fire everything past-due. Durable
+    // due-compare (fireAt <= now) → survives restart AND laptop sleep — the
+    // tool used to be WRITE-ONLY (no consumer; every reminder silently lost).
+    await withDaemonRuntimePhase('daemon.loop.timers', { tickCount }, async () => { fireDueTimers(); });
     // Match workflows with trigger.schedule against the wall clock and
     // enqueue runs. processWorkflowRuns (below) then drains the queue.
     await withDaemonRuntimePhase('daemon.loop.workflow_schedules', { tickCount }, () => processWorkflowSchedules());

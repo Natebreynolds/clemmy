@@ -306,6 +306,11 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         { err: err instanceof Error ? err.message : String(err), workflow: wf.name },
         'Failed to enqueue scheduled workflow run',
       );
+      // Notify-don't-swallow (2026-07-20 schedules audit G6): a persistently
+      // failing enqueue (builder error, disk issue) used to skip occurrences
+      // with a log line only — the user's recurring commitment silently
+      // stopped happening. Daily-bucketed so a broken workflow nags once/day.
+      emitEnqueueFailureNotice(wf.name, err);
     }
   }
 
@@ -353,6 +358,35 @@ function countActiveRunsFor(workflowName: string): { pending: number; parked: nu
 /** Daily-bucketed system notification so the user knows their schedule
  *  is firing faster than the workflow can finish. We import lazily to
  *  avoid a runtime cycle (notifications → maintenance → scheduler). */
+/** A scheduled occurrence that failed to ENQUEUE is a silently-skipped
+ *  commitment — surface it (daily-bucketed per workflow). */
+function emitEnqueueFailureNotice(workflowName: string, err: unknown): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { addNotification, getNotification } = require('../runtime/notifications.js') as {
+      addNotification: (n: Record<string, unknown>) => void;
+      getNotification: (id: string) => unknown;
+    };
+    const dayKey = new Date().toISOString().slice(0, 10);
+    const id = `system-workflow-enqueue-failed-${workflowName}-${dayKey}`;
+    if (getNotification(id)) return;
+    addNotification({
+      id,
+      kind: 'workflow',
+      title: `Scheduled run of "${workflowName}" could not start`,
+      body: `The schedule fired but the run failed to enqueue: ${err instanceof Error ? err.message : String(err)}. This occurrence was SKIPPED and will keep skipping until the cause is fixed — open the workflow in Console to check it.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { errorCategory: 'workflow_enqueue_failed', workflow: workflowName },
+    });
+  } catch (noticeErr) {
+    logger.warn(
+      { err: noticeErr instanceof Error ? noticeErr.message : String(noticeErr), workflow: workflowName },
+      'Failed to emit enqueue-failure notice (best-effort, ignored)',
+    );
+  }
+}
+
 function emitQueueBackpressureNotice(workflowName: string, pending: number): void {
   try {
     // Lazy require — avoids hoisting and any chance of a startup cycle.
