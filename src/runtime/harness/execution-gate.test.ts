@@ -310,3 +310,50 @@ test('MissingExecutionWrapError: message handles missing slug gracefully', () =>
   // No double parens / weird formatting when slug is absent
   assert.ok(!err.message.includes('()'));
 });
+
+// ─── Cross-provider write-path coverage sweep (2026-07-21) ────────────────
+// The measurable form of "any possible write goes through validation": a broad
+// corpus of real send slugs across every common provider MUST gate, and the
+// adjacent reversible writes/reads/drafts MUST NOT over-gate. Found + fixed a
+// real hole in this sweep: ZOOM_CREATE_MEETING (MEETING was not a comm-object).
+test('coverage sweep: irreversible sends across all common providers gate', () => {
+  const mustGate = [
+    // Email
+    'GMAIL_SEND_EMAIL', 'OUTLOOK_SEND_EMAIL', 'OUTLOOK_SEND_DRAFT', 'SENDGRID_SEND_MAIL', 'HUBSPOT_SEND_EMAIL',
+    'GMAIL_REPLY_TO_THREAD', 'OUTLOOK_FORWARD_MAIL',
+    // Chat / messaging
+    'SLACK_CHAT_POST_MESSAGE', 'MICROSOFT_TEAMS_SEND_CHANNEL_MESSAGE', 'DISCORD_SEND_MESSAGE',
+    'WHATSAPP_SEND_MESSAGE', 'TELEGRAM_SEND_MESSAGE', 'TWILIO_CREATE_MESSAGE',
+    // Social
+    'LINKEDIN_CREATE_POST', 'TWITTER_CREATE_TWEET', 'X_POST_TWEET', 'FACEBOOK_CREATE_POST',
+    'INSTAGRAM_CREATE_POST', 'REDDIT_SUBMIT_POST',
+    // Voice
+    'VAPI_CREATE_CALL', 'TWILIO_MAKE_OUTBOUND_CALL',
+    // Calendar / meetings (the hole this sweep fixed)
+    'GOOGLECALENDAR_CREATE_EVENT', 'OUTLOOK_CREATE_EVENT', 'GOOGLECALENDAR_RESPOND_TO_EVENT',
+    'ZOOM_CREATE_MEETING', 'MICROSOFT_TEAMS_CREATE_MEETING',
+  ];
+  for (const slug of mustGate) {
+    assert.equal(isIrreversibleSendSlug(slug), true, `${slug} MUST be gated as an irreversible send`);
+  }
+});
+
+test('coverage sweep: reversible writes / drafts / reads never over-gate', () => {
+  const mustNotGate = [
+    // Drafts (composed, not dispatched)
+    'GMAIL_CREATE_DRAFT', 'OUTLOOK_CREATE_REPLY_DRAFT', 'OUTLOOK_CREATE_REPLY_ALL_DRAFT',
+    // Reversible record/doc writes
+    'SALESFORCE_CREATE_RECORD', 'HUBSPOT_CREATE_CONTACT', 'NOTION_CREATE_PAGE', 'AIRTABLE_CREATE_RECORD',
+    'GOOGLESHEETS_BATCH_UPDATE', 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', 'GOOGLEDRIVE_CREATE_FILE',
+    // Metadata ops (labels/reactions — reversible, must not read as sends)
+    'GMAIL_ADD_LABEL_TO_EMAIL', 'SLACK_ADD_REACTION_TO_A_MESSAGE',
+    // Reads
+    'GMAIL_LIST_MESSAGES', 'SLACK_LIST_CHANNELS', 'ZOOM_LIST_MEETINGS', 'LINKEDIN_GET_PROFILE',
+    'VAPI_GET_CALL', 'OPENAI_CREATE_CHAT_COMPLETION',
+    // Meeting reads/edits (adjacent to the gated CREATE_MEETING)
+    'ZOOM_GET_MEETING', 'ZOOM_UPDATE_MEETING', 'ZOOM_DELETE_MEETING',
+  ];
+  for (const slug of mustNotGate) {
+    assert.equal(isIrreversibleSendSlug(slug), false, `${slug} must NOT over-gate (reversible/read/draft)`);
+  }
+});

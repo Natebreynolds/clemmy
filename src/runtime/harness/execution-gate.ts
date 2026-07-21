@@ -147,6 +147,12 @@ const COMM_OBJECTS: ReadonlySet<string> = new Set([
   'MESSAGE', 'MESSAGES', 'EMAIL', 'EMAILS', 'MAIL', 'SMS', 'CALL', 'POST', 'POSTS',
   'TWEET', 'INVITE', 'INVITES', 'INVITATION', 'REPLY',
   'DM', 'NOTIFICATION', 'ANNOUNCEMENT', 'EVENT',
+  // MEETING: ZOOM_CREATE_MEETING / TEAMS_CREATE_MEETING dispatch invites to
+  // attendees — the same external-notify action as a calendar EVENT, which
+  // already gates. Only CREATE/MAKE gate (LIST/GET/UPDATE/DELETE_MEETING are
+  // not dispatch verbs), so this catches the send-invite case without
+  // over-gating meeting reads/edits (2026-07-21 write-path coverage sweep).
+  'MEETING', 'MEETINGS',
   // NOTE: 'CHAT' and 'COMMENT' were removed — they over-gated reversible calls
   // (OPENAI_CREATE_CHAT_COMPLETION is an LLM read; *_CREATE_COMMENT on a doc/
   // record is internal + deletable). SLACK_CHAT_POST_MESSAGE stays caught via
