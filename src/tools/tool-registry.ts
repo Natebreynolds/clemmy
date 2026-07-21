@@ -251,6 +251,12 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'workflow_run_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'idempotent', description: 'Check workflow runs.' },
   { name: 'workflow_schedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Schedule a workflow to fire on a cron expression.' },
   { name: 'workflow_set_enabled', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Approve or disable a workflow.' },
+  // Employee-memory primitive (2026-07-21): durable cross-RUN state. Core +
+  // available in the workflow-step/worker lanes — that's exactly where the
+  // amnesia lived (an hourly scrape re-processed the same items every run).
+  // sdkLayer read-only mirrors memory_remember: a LOCAL durable write is
+  // allowed even on the read-only step lane (it mutates nothing external).
+  { name: 'workflow_state', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', description: 'Durable per-workflow memory across runs: watermarks/cursors + a processed-item ledger (filter_unprocessed / mark_processed) so recurring runs never redo work.' },
   { name: 'workflow_unschedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Disable a scheduled workflow so it stops firing, without deleting it.' },
   { name: 'workflow_update', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], description: 'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synt…' },
   { name: 'working_memory', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', description: 'Read, append, replace, or clear the working-memory scratchpad.' },

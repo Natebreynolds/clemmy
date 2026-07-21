@@ -5,6 +5,7 @@ import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { recordSubagentRun } from '../../agents/subagent-runs.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { textTargetsConfiguredUserRecipient } from '../user-profile.js';
+import { workflowStateSummaryLine } from '../../execution/workflow-run-state.js';
 import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -137,7 +138,20 @@ export function renderClaudeAgentWorkflowStepSystemAppend(args: {
     `Step id: ${step.id}`,
     step.intent ? `Step intent: ${step.intent}` : '',
     step.usesSkill ? `Declared skill: ${step.usesSkill}` : '',
+    // Employee-memory priming (2026-07-21): when durable cross-run state
+    // exists for this workflow, tell the step up front — otherwise a recurring
+    // run rediscovers (or forgets to check) the processed-ledger and redoes
+    // prior runs' work. Rendered ONLY when state exists (lean by default).
+    safeWorkflowStateLine(workflowName),
   ].filter(Boolean).join('\n');
+}
+
+function safeWorkflowStateLine(workflowName: string): string {
+  try {
+    return workflowStateSummaryLine(workflowName) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 export function claudeWorkflowStepOutputSchema(): Record<string, unknown> {
