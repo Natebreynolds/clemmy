@@ -2662,7 +2662,20 @@ async function runConversationCore(
       // (Historically this also covered a handoff target becoming the final
       // agent; sub-agents are tools now, but the fallback summary still gives
       // the UI something to render instead of just "complete".)
-      const fallbackSummary = extractFallbackSummary(turnResult.finalOutput);
+      let fallbackSummary = extractFallbackSummary(turnResult.finalOutput);
+      // ALWAYS REPORT BACK: a structure-less / unparseable completion that still did
+      // real work reports WHAT it did, not a blank "(Finished without a written
+      // reply.)". Only fills a genuinely empty fallback, and only from THIS request's
+      // external_write events.
+      if (!fallbackSummary || !fallbackSummary.trim()) {
+        try {
+          const report = synthesizeWorkReport(
+            listEvents(options.sessionId, { types: ['external_write'] })
+              .filter((w) => !activeSourceUserSeq || w.seq > activeSourceUserSeq),
+          );
+          if (report) fallbackSummary = report;
+        } catch { /* fail-open to the original fallback */ }
+      }
 
       // Stall detection: the sub-agent took zero tool calls AND emitted
       // a short generic acknowledgement ("Continuing.", "OK.", "Done.").
@@ -5736,11 +5749,25 @@ async function runConversationFromResumeCore(opts: {
       // actual reply the model produced.
       const hasReply = decision?.reply && decision.reply.trim();
       const isCompletedAction = decision?.nextAction === 'completed';
+      // ALWAYS REPORT BACK (resume variant): a completed turn with no reply but real
+      // work done reports what it did instead of the bare fallback.
+      const resumeWorkReport = (!hasReply && isCompletedAction)
+        ? (() => {
+            try {
+              return synthesizeWorkReport(
+                listEvents(opts.sessionId, { types: ['external_write'] })
+                  .filter((w) => !activeSourceUserSeq || w.seq > activeSourceUserSeq),
+              );
+            } catch { return null; }
+          })()
+        : null;
       const userVisibleSummary = hasReply
         ? decision!.reply!
-        : isCompletedAction
-          ? MISSING_REPLY_USER_FALLBACK
-          : decision?.summary;
+        : resumeWorkReport
+          ? resumeWorkReport
+          : isCompletedAction
+            ? MISSING_REPLY_USER_FALLBACK
+            : decision?.summary;
 
       // Honest-completion backstop (resume variant): a blocked/error-stub or
       // promise-shaped final reply converts to the honest awaiting_user_input.
