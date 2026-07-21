@@ -35,6 +35,13 @@ const {
 } = mod;
 const { isAuthRecoverableError } = await import('../../execution/transient-error.js');
 
+// The default posture is now 'yolo' (Autonomous, 2026-07-20) which auto-approves
+// reversible/local + CRM writes. The park-mode / approval-gate tests below verify
+// the GATE holds mutating actions for approval, so pin the Supervised posture.
+// Irreversible sends are held regardless of posture.
+const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+saveProactivityPolicy({ autoApproveScope: 'strict' });
+
 const STATE_DIR = path.join(TMP_HOME, 'state');
 const CLAUDE_AUTH_FILE = path.join(STATE_DIR, 'claude-auth.json');
 mkdirSync(STATE_DIR, { recursive: true });

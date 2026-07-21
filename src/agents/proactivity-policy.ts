@@ -20,19 +20,23 @@ export type ProactivityMode = 'watch' | 'balanced' | 'hands_on';
  *               root check on run_shell_command + write_file so the
  *               agent can act anywhere the user can.
  */
-// Autonomy dial. Governs execution approvals (evaluateAutoApprove).
-// Conversational clarify / plan / act is owned by the main orchestrator;
-// this value is passed as context, but no longer routes ordinary ambiguity
-// through a separate plan-first gate. User-facing names:
-// strict=Careful, balanced=Balanced (default), yolo=YOLO. 'workspace'
-// stays a power-user execution option.
-//   - strict/Careful : nothing auto-approves without a plan scope.
-//   - balanced       : execution behaves like strict (plan scope still
-//                       required for shell/file writes — see
-//                       evaluateAutoApprove).
-//   - yolo/YOLO      : auto-approve everything (the hard catastrophic
-//                       denylist in assertCommandAllowed + 'admin' tools
-//                       still always confirm).
+// Autonomy dial. Governs execution approvals for REVERSIBLE/local work
+// (evaluateAutoApprove). It does NOT govern the real trust boundary: an
+// IRREVERSIBLE external send/post/call is ALWAYS held at the execution gate
+// regardless of this value (evaluateAutoApprove line ~357), backed by the
+// effect-anchored recipient validation, the batch-send floor, and the
+// catastrophic-command denylist. Those are the always-on safety net.
+//
+// TWO user-facing postures (2026-07-20 simplification — the old four confused
+// users; strict and balanced were IDENTICAL on execution, so people just picked
+// YOLO):
+//   - 'yolo'  → "Autonomous" (DEFAULT). Reversible/local work runs without asking;
+//               irreversible sends still surface + are validated. Matches how people
+//               actually use it, made safe by the always-on send gate.
+//   - 'strict'→ "Supervised". Mutating shell/file writes need an explicit plan/approval.
+// Legacy values still ACCEPTED for back-compat: 'balanced' is treated as Supervised
+// (it always behaved identically to strict); 'workspace' stays a power-user option
+// (auto-approve inside WORKSPACE_DIRS).
 export type AutoApproveScope = 'strict' | 'balanced' | 'workspace' | 'yolo';
 
 export interface ProactivityPolicy {
@@ -96,7 +100,10 @@ const POLICY_FILE = path.join(BASE_DIR, 'state', 'proactivity-policy.json');
 export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   enabled: true,
   mode: 'balanced',
-  autoApproveScope: 'balanced',
+  // Autonomous by default (2026-07-20): reversible/local work runs without asking;
+  // irreversible sends stay gated + validated. The old 'balanced' default was
+  // identical to 'strict' (cautious) so users flipped to YOLO anyway.
+  autoApproveScope: 'yolo',
   checkInMinutes: 3,
   briefCadenceMinutes: 60,
   defaultLongTaskMinutes: 90,

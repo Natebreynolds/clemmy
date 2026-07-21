@@ -122,10 +122,10 @@ test('Autonomy section: YOLO auto-runs reversible work but preserves one irrever
   }
 });
 
-test('Autonomy section: balanced (default) renders NO autonomy line (byte-identical common case)', () => {
+test('Autonomy section: legacy "balanced" renders the Supervised line (== strict; two-posture model)', () => {
   saveProactivityPolicy({ autoApproveScope: 'balanced' });
   const context = renderHarnessMemoryContext();
-  assert.doesNotMatch(context, /## Autonomy/);
+  assert.match(context, /Supervised/);
 });
 
 test('stable context carries compact skill discovery while the volatile query gets only relevant skills', () => {

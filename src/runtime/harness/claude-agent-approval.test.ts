@@ -14,6 +14,16 @@ const { createSession, listEvents } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const { buildGatedToolPermission } = await import('./claude-agent-approval.js');
 
+// These tests exercise the approval-GATE MACHINERY (register → await →
+// allow/deny, park mode, replay safety). Their precondition is "this action
+// requires approval." The default posture is now 'yolo' (Autonomous, 2026-07-20)
+// which auto-approves reversible/local + CRM writes, so pin the Supervised
+// posture ('strict') to keep a destructive shell / CRM write held for approval.
+// (This reproduces the pre-2026-07-20 default, when 'balanced' == strict on the
+// execution gate.) Irreversible sends are held regardless of posture.
+const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+saveProactivityPolicy({ autoApproveScope: 'strict' });
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const opts = (): unknown => ({ signal: new AbortController().signal, toolUseID: 't' });
 type Perm = (name: string, input: Record<string, unknown>, o: unknown) => Promise<{ behavior: string; message?: string; updatedInput?: Record<string, unknown>; interrupt?: boolean }>;

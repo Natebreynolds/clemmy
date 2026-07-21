@@ -60,12 +60,14 @@ export function AutonomyForm() {
                 <option value="hands_on">Hands-on — drive forward</option>
               </Select>
             )}</Field>
-            <Field label="Auto-approve scope" hint="What Clementine can do without asking.">{(id) => (
-              <Select id={id} value={form.autoApproveScope ?? 'strict'} onChange={(e) => set('autoApproveScope', e.target.value as Policy['autoApproveScope'])}>
-                <option value="strict">Strict — ask before any action</option>
-                <option value="balanced">Balanced</option>
-                <option value="workspace">Workspace — auto inside your folders</option>
-                <option value="yolo">YOLO — auto except protected sends</option>
+            <Field label="Approvals" hint="Irreversible sends (email/calls/posts) are always validated and confirmed — this only controls reversible / local work.">{(id) => (
+              <Select
+                id={id}
+                value={form.autoApproveScope === 'strict' || form.autoApproveScope === 'balanced' ? 'strict' : 'yolo'}
+                onChange={(e) => set('autoApproveScope', e.target.value as Policy['autoApproveScope'])}
+              >
+                <option value="yolo">Autonomous — run without asking (recommended)</option>
+                <option value="strict">Supervised — ask before any change</option>
               </Select>
             )}</Field>
             <Field label="Check in every (minutes)">{(id) => <Input id={id} type="number" min={1} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', Number(e.target.value))} />}</Field>

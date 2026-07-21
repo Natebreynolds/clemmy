@@ -660,6 +660,10 @@ test('Orchestrator has NO handoffs in Phase 3 (single-agent architecture)', asyn
 });
 
 test('request_approval triggers the SDK interrupt for external/destructive actions', async () => {
+  // Supervised posture: the default is now 'yolo' (Autonomous, 2026-07-20) which
+  // auto-approves reversible external writes (e.g. a Salesforce create). This test
+  // asserts the request_approval gate FLAGS those actions, so pin Supervised.
+  saveProactivityPolicy({ autoApproveScope: 'strict' });
   const t = buildRequestApprovalTool();
   assert.equal(t.name, 'request_approval');
   const needsFn = t.needsApproval as unknown as (

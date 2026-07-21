@@ -56,8 +56,9 @@ function section(title: string, body: string | undefined | null): string {
  * always-blocking ask_user_question) for actions she's already been told to do.
  * Telling her the posture is true state she lacked, not a prompt-hope rule.
  *
- * `balanced` (the default the static instructions already assume) renders
- * nothing, so the common case is byte-identical and the block stays lean.
+ * Two postures: 'yolo' → Autonomous (the DEFAULT since 2026-07-20) renders the
+ * standing-approval line; 'strict'/'balanced' → Supervised. 'workspace' stays the
+ * power-user line. An unknown value renders nothing (lean).
  */
 export function renderAutonomy(): string {
   try {
@@ -72,10 +73,11 @@ export function renderAutonomy(): string {
     if (scope === 'workspace') {
       return 'Workspace — actions on files/paths inside the user\'s workspace are pre-approved. Proceed on those without asking; still confirm before reaching outside the workspace or making irreversible external writes.';
     }
-    if (scope === 'strict') {
-      return 'Careful — get an explicit plan/approval from the user (request_approval) before any mutating or external-write action.';
+    if (scope === 'strict' || scope === 'balanced') {
+      // Supervised (legacy 'balanced' was identical to 'strict' on execution).
+      return 'Supervised — get an explicit plan/approval from the user (request_approval) before any mutating or external-write action.';
     }
-    return ''; // balanced: the assumed default; no extra line needed
+    return '';
   } catch {
     return '';
   }
