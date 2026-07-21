@@ -22,6 +22,7 @@ import { registerTableOpsTools } from './table-ops-tools.js';
 import { registerDocumentProduceTools } from './document-produce-tools.js';
 import { registerFileQueryTools } from './file-query-tools.js';
 import { registerTimeSlotsTools } from './time-slots-tools.js';
+import { registerExtractStructuredTools } from './extract-structured-tools.js';
 import { registerBatchTools } from './batch-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerProfileTools } from './profile-tools.js';
@@ -224,6 +225,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerDocumentProduceTools(server);
   registerFileQueryTools(server);
   registerTimeSlotsTools(server);
+  registerExtractStructuredTools(server);
   registerBatchTools(server);
   registerAutonomyActionTools(server);
   registerExecutionTools(server);

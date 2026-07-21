@@ -265,6 +265,11 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // Large-input retrieval (2026-07-21 capability audit #2 v1): deterministic
   // chunk-and-retrieve over big files (auto-converted) and parked outputs.
   { name: 'file_query', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Query a big document or prior tool output for relevant passages (heading-aware chunks, deterministic ranking) instead of reading a byte-clipped preview.' },
+  // Structured extraction (2026-07-21 capability audit #3): schema-guided
+  // NL→payload with deterministic validation. Uses a model internally (the
+  // boundary-judge routing) but mutates nothing — read-class; the CREATE that
+  // consumes the payload stays gated as always.
+  { name: 'extract_structured', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Extract validated structured data from text/files/tool outputs against a JSON Schema or a cached Composio action schema — required fields verified, never invented.' },
   // Mutual availability (2026-07-21 capability audit #6): pure interval
   // algebra over attendee busy windows fetched via the calendar actions.
   { name: 'time_slots', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Compute mutual free meeting slots from attendees\' busy intervals — exact interval algebra with working-hours/duration constraints.' },

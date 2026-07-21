@@ -187,6 +187,10 @@ const ALWAYS_READ = new Set<string>([
   // compute, same rationale as table_ops.
   'file_query',
   'time_slots',
+  // Schema-guided extraction (2026-07-21): model-assisted but mutates
+  // nothing — the gated CREATE that consumes the payload is where approval
+  // lives.
+  'extract_structured',
   'workspace_roots',
   'workspace_list',
   'workspace_info',
