@@ -34,10 +34,12 @@ export type ProactivityMode = 'watch' | 'balanced' | 'hands_on';
 //               irreversible sends still surface + are validated. Matches how people
 //               actually use it, made safe by the always-on send gate.
 //   - 'strict'→ "Supervised". Mutating shell/file writes need an explicit plan/approval.
-// Legacy values still ACCEPTED for back-compat: 'balanced' is treated as Supervised
-// (it always behaved identically to strict); 'workspace' stays a power-user option
-// (auto-approve inside WORKSPACE_DIRS).
-export type AutoApproveScope = 'strict' | 'balanced' | 'workspace' | 'yolo';
+// The setting is a clean binary — Auto-approve ('yolo') vs Approve ('strict').
+// Legacy stored values are coerced on read (normalizeAutoApproveScope): the old
+// 'balanced' → 'strict' (it always behaved identically). 'workspace' survives as
+// a hidden power-user option (auto-approve inside WORKSPACE_DIRS) but is no longer
+// offered in the UI.
+export type AutoApproveScope = 'strict' | 'workspace' | 'yolo';
 
 export interface ProactivityPolicy {
   enabled: boolean;
@@ -154,9 +156,13 @@ function normalizeMode(value: unknown): ProactivityMode {
 }
 
 function normalizeAutoApproveScope(value: unknown): AutoApproveScope {
-  return value === 'workspace' || value === 'yolo' || value === 'strict' || value === 'balanced'
-    ? value
-    : 'balanced';
+  // The binary + the one surviving legacy value.
+  if (value === 'yolo' || value === 'strict' || value === 'workspace') return value;
+  // Legacy 'balanced' always behaved identically to strict — coerce it.
+  if (value === 'balanced') return 'strict';
+  // Unknown / corrupt field → fail safe to Supervised (a fresh install gets the
+  // 'yolo' default from DEFAULT_PROACTIVITY_POLICY, not this fallback).
+  return 'strict';
 }
 
 function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {

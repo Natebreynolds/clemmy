@@ -364,7 +364,7 @@ export function evaluateAutoApprove(input: {
   sessionId: string | undefined;
   toolName: string;
   args?: unknown;
-  scope: 'strict' | 'balanced' | 'workspace' | 'yolo';
+  scope: 'strict' | 'workspace' | 'yolo';
   insideWorkspace: boolean;
   /** 'send' applies the goal-scoped send lock; anything else is 'other'. */
   kindHint?: 'send' | 'other';
@@ -397,10 +397,10 @@ export function evaluateAutoApprove(input: {
       return { autoApproved: true, reason: 'workspace-policy' };
     }
   }
-  // 'balanced' and 'strict' are identical on the EXECUTION gate: a
-  // mutating shell/file write still needs an active plan scope. Balanced's
-  // looseness lives on the CONVERSATION side (plan-first clarify depth),
-  // not in extra execution auto-approval. Keeps execution conservative.
+  // 'strict' (Approve) defers entirely to plan-scope on the EXECUTION gate: a
+  // mutating shell/file write still needs an active plan scope. (Legacy
+  // 'balanced' coerced to 'strict' on read — same behavior.) Keeps execution
+  // conservative.
   return { autoApproved: false, reason: 'denied' };
 }
 
