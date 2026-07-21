@@ -202,3 +202,66 @@ test('ref parsing preserves ids that contain colons', () => {
   assert.equal(parseRecallRef('unknown:1'), null);
   assert.equal(parseRecallRef('fact:'), null);
 });
+
+// ---------------------------------------------------------------------------
+// Attorney-bar M2 (2026-07-20): explicit user corrections are distinguished
+// from generic not-useful marks and HARD-exclude a fresh-corrected fact.
+// ---------------------------------------------------------------------------
+const { recordCorrectionSignal } = await import('./correction-detector.js');
+const { correctionExcludesFromRecall } = await import('./recall-memory.js');
+
+test('M2: an explicit correction signal is counted separately and hard-excludes the fact from recall', () => {
+  const fact = rememberFact({ kind: 'user', content: "The client's email is old@wrong.example" });
+  const ref = { type: 'fact' as const, id: String(fact.id) };
+
+  // Before any correction: no exclusion.
+  let signal = readRecallRefUtilitySignals([ref]).get(`fact:${fact.id}`);
+  assert.equal(correctionExcludesFromRecall(signal), false);
+
+  const rec = recordCorrectionSignal({
+    objective: 'correction: no, her email is new@right.example',
+    refs: [ref],
+    detail: 'auto:correction',
+  });
+  assert.equal(rec.ok, true);
+
+  signal = readRecallRefUtilitySignals([ref]).get(`fact:${fact.id}`);
+  assert.ok(signal);
+  assert.equal(signal!.corrections, 1, 'explicit corrections counted apart from generic not-useful');
+  assert.ok(signal!.lastCorrectedAt, 'correction recency recorded');
+  assert.equal(correctionExcludesFromRecall(signal), true, 'a freshly corrected fact must not feed another action');
+});
+
+test('M2: a GENERIC not-useful mark never hard-excludes (demotion only)', () => {
+  const fact = rememberFact({ kind: 'project', content: 'Quarterly report cadence is monthly.' });
+  const ref = { type: 'fact' as const, id: String(fact.id) };
+  const run = recordRecallRun({ objective: 'x', surface: 'test', answerability: 'supported', candidateRefs: [ref] });
+  recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`], outcome: 'not_useful', detail: 'ranked low' });
+  const signal = readRecallRefUtilitySignals([ref]).get(`fact:${fact.id}`);
+  assert.equal(signal!.corrections, 0);
+  assert.equal(correctionExcludesFromRecall(signal), false, 'generic feedback keeps the bounded demotion path');
+});
+
+test('M2: a PROVEN-useful fact is not blacked out by a single stray correction', () => {
+  const fact = rememberFact({ kind: 'user', content: 'Standing check-in is Mondays 9am.' });
+  const ref = { type: 'fact' as const, id: String(fact.id) };
+  for (let i = 0; i < 2; i++) {
+    const run = recordRecallRun({ objective: `q${i}`, surface: 'test', answerability: 'supported', candidateRefs: [ref] });
+    recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`], outcome: 'used' });
+  }
+  recordCorrectionSignal({ objective: 'correction: hmm not that', refs: [ref], detail: 'auto:correction' });
+  const signal = readRecallRefUtilitySignals([ref]).get(`fact:${fact.id}`);
+  assert.equal(signal!.corrections, 1);
+  assert.equal(signal!.used, 2);
+  assert.equal(correctionExcludesFromRecall(signal), false, 'corrections must OUTNUMBER proven uses to exclude');
+});
+
+test('M2: the exclusion window closes — an old correction falls back to demotion', () => {
+  const fact = rememberFact({ kind: 'user', content: 'Old address fact.' });
+  const ref = { type: 'fact' as const, id: String(fact.id) };
+  const old = new Date(Date.now() - 20 * 24 * 60 * 60_000).toISOString();
+  recordCorrectionSignal({ objective: 'correction: moved', refs: [ref], detail: 'auto:correction', nowIso: old });
+  const signal = readRecallRefUtilitySignals([ref]).get(`fact:${fact.id}`);
+  assert.equal(signal!.corrections, 1);
+  assert.equal(correctionExcludesFromRecall(signal), false, 'a spurious correction self-heals after the window');
+});

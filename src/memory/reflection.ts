@@ -820,6 +820,13 @@ interface ConflictDecision {
   target_id?: number | null;
   rewrite?: string;
   reason?: string;
+  /** Attorney-bar M1 (2026-07-20): this ADD is a FAIL-OPEN fallback (resolver
+   *  unavailable / errored / unparseable), NOT a considered decision — the
+   *  conflict is still live. The caller records it durably so the nightly
+   *  retry re-resolves it once a resolver is available; without this marker
+   *  the old wrong fact stayed active + recallable next to its correction
+   *  forever whenever the boundary judge was down. */
+  unresolved?: boolean;
 }
 
 function sanitizeConflictDecision(value: unknown): ConflictDecision | null {
@@ -859,7 +866,7 @@ export async function resolveConflict(
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
   const model = getReflectorModel();
-  if (!model) return { decision: 'ADD' };
+  if (!model) return { decision: 'ADD', unresolved: true };
   try {
     const agent = new Agent({
       name: 'Memory Conflict Resolver',
@@ -885,11 +892,12 @@ export async function resolveConflict(
     ].join('\n');
     const result = await runner.run(agent, prompt);
     const final = (result as { finalOutput?: unknown }).finalOutput;
-    return sanitizeConflictDecision(final) ?? { decision: 'ADD' };
+    return sanitizeConflictDecision(final) ?? { decision: 'ADD', unresolved: true };
   } catch {
     // Conservative: on any failure, ADD. Better to have a duplicate
-    // than to lose a real fact.
-    return { decision: 'ADD' };
+    // than to lose a real fact — but flag it so the retry queue
+    // re-resolves the conflict instead of leaving it live forever.
+    return { decision: 'ADD', unresolved: true };
   }
 }
 
@@ -1316,6 +1324,15 @@ async function consolidateFactInner(
   out.factId = added.id;
   out.written = 1;
   out.importanceAdded += candidate.importance ?? 0;
+  // M1 (2026-07-20): a fail-open ADD leaves the conflict LIVE (both
+  // contradictory facts active + recallable). Record it durably so the
+  // nightly retry re-resolves once a resolver is available. Best-effort.
+  if (decision.decision === 'ADD' && decision.unresolved && similar.length > 0) {
+    try {
+      const { recordUnresolvedConflict } = await import('./conflict-retry.js');
+      recordUnresolvedConflict({ candidateFactId: added.id, similarFactIds: similar.map((f) => f.id) });
+    } catch { /* the queue is a safety net; the ADD itself already stands */ }
+  }
   return out;
 }
 

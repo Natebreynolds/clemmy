@@ -529,6 +529,31 @@ export function updateFact(
 /** Temporal UPDATE: preserve the old claim, add the new claim, and connect the
  * validity chain. Used by conflict resolution and user edits; metadata-only
  * maintenance can continue to use updateFact. */
+/** Mark an existing fact superseded BY another EXISTING fact — no new row.
+ *  The conflict-retry path needs this: the "replacement" was already added by
+ *  a fail-open ADD, so supersedeFact (which mints a new row) would create a
+ *  third copy. Same active=0 + valid_to + superseded_by chain as supersedeFact,
+ *  so recall's active=1 gate hides the loser identically. Refuses self-links,
+ *  missing rows, and pinned targets (pinned = standing instruction; only the
+ *  full resolver path with user authority may rewrite those). */
+export function markFactSupersededBy(id: number, byFactId: number): boolean {
+  if (!Number.isInteger(id) || !Number.isInteger(byFactId) || id === byFactId) return false;
+  const db = openMemoryDb();
+  const target = db.prepare('SELECT id, pinned, active FROM consolidated_facts WHERE id = ?')
+    .get(id) as { id: number; pinned: number; active: number } | undefined;
+  const winner = db.prepare('SELECT id, active FROM consolidated_facts WHERE id = ?')
+    .get(byFactId) as { id: number; active: number } | undefined;
+  if (!target || !winner || !target.active || !winner.active || target.pinned) return false;
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE consolidated_facts
+    SET active = 0, valid_to = ?, superseded_by_fact_id = ?, updated_at = ?
+    WHERE id = ? AND active = 1
+  `).run(now, byFactId, now, id);
+  syncMemoryPolicyForFact(byFactId);
+  return true;
+}
+
 export function supersedeFact(
   id: number,
   input: Omit<RememberInput, 'kind'> & { content: string },

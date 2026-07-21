@@ -334,6 +334,26 @@ export function recallUtilityBonus(
   return clamp(reliability * (0.06 * frequency + recency), 0, 0.08);
 }
 
+/** Attorney-bar M2 (2026-07-20): how long an explicit user correction HARD-
+ *  excludes a fact from recall. Within this window a corrected-but-not-yet-
+ *  superseded fact cannot resurface into an action (the bounded -0.12 demotion
+ *  could not guarantee that); the window is finite so a SPURIOUS correction
+ *  self-heals with time, while a real one gets superseded by reflection/
+ *  self-heal long before the window closes. */
+const CORRECTION_EXCLUSION_WINDOW_MS = 14 * 24 * 60 * 60_000;
+
+/** Recently corrected more than proven useful → recall must not surface it. */
+export function correctionExcludesFromRecall(
+  signal: RecallRefUtilitySignal | undefined,
+  nowMs = Date.now(),
+): boolean {
+  if (!signal || signal.corrections <= 0) return false;
+  if (signal.corrections <= signal.used) return false; // proven-useful facts need supersession, not a stray-correction blackout
+  const correctedAt = signal.lastCorrectedAt ? Date.parse(signal.lastCorrectedAt) : Number.NaN;
+  if (!Number.isFinite(correctedAt)) return false;
+  return nowMs - correctedAt <= CORRECTION_EXCLUSION_WINDOW_MS;
+}
+
 function applyUtilityRerank(
   hits: MemoryEvidenceHit[],
   nowMs: number,
@@ -343,7 +363,15 @@ function applyUtilityRerank(
     id: String(hit.ref.id),
   })));
   let adjusted = 0;
-  const reranked = hits.map((hit) => {
+  const survivors = hits.filter((hit) => {
+    const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
+    if (correctionExcludesFromRecall(signal, nowMs)) {
+      adjusted += 1;
+      return false; // the user said this is wrong — it must not feed another action
+    }
+    return true;
+  });
+  const reranked = survivors.map((hit) => {
     const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
     const bonus = recallUtilityBonus(signal, nowMs);
     if (bonus === 0 || !signal) return hit;

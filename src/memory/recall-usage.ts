@@ -54,6 +54,12 @@ export interface RecallRefUtilitySignal {
   used: number;
   notUseful: number;
   lastUsedAt: string | null;
+  /** EXPLICIT user-correction outcomes (detail 'auto:correction*') — a strict
+   *  subset of notUseful. Distinguished so recall can HARD-exclude recently
+   *  corrected facts (attorney-bar M2) while generic not-useful marks stay a
+   *  bounded demotion. */
+  corrections: number;
+  lastCorrectedAt: string | null;
 }
 
 const REF_TYPE_SET = new Set<string>(RECALL_REF_TYPES);
@@ -99,7 +105,9 @@ export function readRecallRefUtilitySignals(
       SELECT ref_type, ref_id,
              COUNT(DISTINCT CASE WHEN outcome = 'used' THEN recall_id END) AS used,
              COUNT(DISTINCT CASE WHEN outcome = 'not_useful' THEN recall_id END) AS not_useful,
-             MAX(CASE WHEN outcome = 'used' THEN recorded_at END) AS last_used_at
+             MAX(CASE WHEN outcome = 'used' THEN recorded_at END) AS last_used_at,
+             COUNT(DISTINCT CASE WHEN outcome = 'not_useful' AND detail LIKE 'auto:correction%' THEN recall_id END) AS corrections,
+             MAX(CASE WHEN outcome = 'not_useful' AND detail LIKE 'auto:correction%' THEN recorded_at END) AS last_corrected_at
       FROM memory_recall_uses
       WHERE ${predicates}
       GROUP BY ref_type, ref_id
@@ -109,6 +117,8 @@ export function readRecallRefUtilitySignals(
       used: number;
       not_useful: number;
       last_used_at: string | null;
+      corrections: number;
+      last_corrected_at: string | null;
     }>;
     return new Map(rows.map((row) => [
       serializeRecallRef({ type: row.ref_type, id: row.ref_id }),
@@ -116,6 +126,8 @@ export function readRecallRefUtilitySignals(
         used: Number(row.used ?? 0),
         notUseful: Number(row.not_useful ?? 0),
         lastUsedAt: row.last_used_at ?? null,
+        corrections: Number(row.corrections ?? 0),
+        lastCorrectedAt: row.last_corrected_at ?? null,
       },
     ]));
   } catch {

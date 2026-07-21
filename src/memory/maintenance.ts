@@ -858,6 +858,19 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       } catch (err) {
         logger.warn({ err }, 'memory self-heal nightly job failed');
       }
+      // M1 (2026-07-20): re-resolve conflicts that fail-open ADDed while the
+      // resolver was unavailable — the stale fact stays recallable until this
+      // (or the correction-exclusion window) retires it. Same nightly slot as
+      // self-heal; bounded, reversible, best-effort.
+      try {
+        const { retryPendingMemoryConflicts } = await import('./conflict-retry.js');
+        const retried = await retryPendingMemoryConflicts();
+        if (retried.scanned > 0) {
+          logger.info(retried, 'pending memory-conflict retry completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'pending memory-conflict retry failed');
+      }
     }
   }
 
