@@ -871,6 +871,16 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       } catch (err) {
         logger.warn({ err }, 'pending memory-conflict retry failed');
       }
+      // File-pipeline staging hygiene (2026-07-21): tool-downloaded files are
+      // transient handoffs — prune past the TTL so hourly attachment
+      // workflows can't grow the disk unbounded.
+      try {
+        const { pruneComposioFilesDir } = await import('../integrations/composio/files-prune.js');
+        const { pruned } = pruneComposioFilesDir();
+        if (pruned > 0) logger.info({ pruned }, 'staged tool files pruned');
+      } catch (err) {
+        logger.warn({ err }, 'staged-file prune failed');
+      }
     }
   }
 

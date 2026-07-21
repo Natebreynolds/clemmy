@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Composio } from '@composio/core';
 import { BASE_DIR } from '../../config.js';
@@ -467,11 +468,44 @@ function humanize(slug: string): string {
     .join(' ');
 }
 
+/** Staging directory for the file pipeline: tool downloads land here (the
+ *  execute response carries the local filePath) and auto-uploads may read from
+ *  here or anywhere under home (the SDK's sensitive-path denylist — .ssh,
+ *  .aws, .env*, key files — still refuses credentials, and every upload rides
+ *  the normal external-write gates). */
+export function composioFilesDir(): string {
+  return path.join(BASE_DIR, 'files');
+}
+
+/** Kill-switch: CLEMMY_COMPOSIO_FILES=off restores the legacy no-file client. */
+function composioFilePipelineEnabled(): boolean {
+  return (process.env.CLEMMY_COMPOSIO_FILES ?? 'on').trim().toLowerCase() !== 'off';
+}
+
 export function getComposio(): Composio | null {
   if (singleton) return singleton;
   const apiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!apiKey) return null;
-  singleton = new Composio({ apiKey });
+  // File pipeline (2026-07-21, employee-basic capability wave): without these
+  // flags a downloaded attachment surfaced only as an S3 URL (or a base64 blob
+  // the digest tier truncates) and file_uploadable params could not read local
+  // paths — "move this file from Outlook to Drive", the most basic employee
+  // action, had no working path. With them, the SDK downloads file outputs to
+  // our staging dir and returns the LOCAL filePath in the tool result, and
+  // upload params accept a local path (allowlist + credential denylist).
+  if (composioFilePipelineEnabled()) {
+    const filesDir = composioFilesDir();
+    try { mkdirSync(filesDir, { recursive: true }); } catch { /* the SDK falls back to ~/.composio/files */ }
+    singleton = new Composio({
+      apiKey,
+      dangerouslyAllowAutoUploadDownloadFiles: true,
+      fileDownloadDir: filesDir,
+      fileUploadDirs: [filesDir, os.homedir()],
+      // sensitiveFileUploadProtection stays default ON.
+    });
+  } else {
+    singleton = new Composio({ apiKey });
+  }
   installAbortAwareFetch(singleton);
   return singleton;
 }

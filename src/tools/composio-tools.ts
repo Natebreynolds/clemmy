@@ -2269,7 +2269,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
 
   const composio_execute_tool = tool({
     name: 'composio_execute_tool',
-    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Never invent slugs — always call `composio_search_tools` first with a plain-English query, then pass the returned slug here. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy.',
+    description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Never invent slugs — always call `composio_search_tools` first with a plain-English query, then pass the returned slug here. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy. FILES: actions that return files (attachment/export downloads) save them locally and include the local `filePath` in the result — pass that exact path onward; file-input params (uploads, attachments) accept a local file path string, so download→upload flows (e.g. Outlook attachment → Drive) chain the returned filePath directly.',
     parameters: z.object(COMPOSIO_EXECUTE_TOOL_PARAMS),
     // Taxonomy reads `tool_slug` from args to decide read-vs-send, so
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses
