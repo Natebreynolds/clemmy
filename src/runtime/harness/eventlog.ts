@@ -103,6 +103,11 @@ export const EVENT_TYPES = [
   // SDK brain auto-continued past a per-query max-turns budget instead of parking
   // on "say continue" (F1). Carries the attempt # and whether it's still limited.
   'sdk_auto_continue',
+  // Stage 4 fan-out slice (2026-07-20): the active run token window {baseline,
+  // ceiling}, recorded at window open by BOTH lanes so run_worker — which runs
+  // in the SDK-brain MCP child, a separate process — can refuse to spawn past
+  // an exhausted ceiling. Latest event wins.
+  'run_token_window',
   // SDK local-MCP startup guard retried because the required local tool surface
   // was empty or no init message arrived before the startup budget.
   'sdk_tool_surface_retry',

@@ -19,7 +19,8 @@ import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { runPostTurnHooks } from './post-turn.js';
-import { runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
+import { recordRunTokenWindow, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from './run-token-budget.js';
+import { getHarnessBudgetSettings } from './budget-settings.js';
 import {
   appendTerminalEventOnce,
   beginRunAttempt,
@@ -1537,19 +1538,42 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // would double-act, e.g. re-send emails); (B) if nothing committed → ONE fresh
   // retry (a fresh query() usually re-derives a clean tool call). Kill-switch
   // CLEMMY_CLAUDE_SDK_SALVAGE. Healthy turns are byte-identical.
-  // Stage 4 — the SDK-brain lane's slice of the run token budget: when the
-  // caller (the background drain) threads a ceiling+baseline, exhaustion
-  // stops the INTERNAL auto-continue chain and surfaces as a budget park
-  // instead of silently burning past the window (review F2).
+  // Stage 4 — the SDK-brain lane's slice of the run token budget. An explicit
+  // caller ceiling+baseline (the background drain) wins; with NO override the
+  // ceiling falls back to the budget preset and the window self-baselines at
+  // turn entry — the same semantics as the harness loop (loop.ts
+  // resolveRunTokenCeiling + openRunTokenWindow). Before 2026-07-20 the
+  // foreground DEFAULT brain had no fallback (ceiling 0 = unmetered) while
+  // every other lane was bounded. An explicit 0 stays "unlimited" (the
+  // workflow lane's advisory-only contract). Exhaustion stops the INTERNAL
+  // auto-continue chain and surfaces as a budget park instead of silently
+  // burning past the window (review F2).
+  const budgetCeiling = ((): number => {
+    try {
+      return resolveRunTokenCeiling({ override: request.maxRunTokens, budget: getHarnessBudgetSettings() });
+    } catch { return 0; }
+  })();
+  const budgetBaseline = ((): number => {
+    try {
+      if (typeof request.runTokenBaseline === 'number' && Number.isFinite(request.runTokenBaseline) && request.runTokenBaseline >= 0) {
+        return request.runTokenBaseline;
+      }
+      // Self-baseline: only THIS turn's chain counts — a long-lived session
+      // must never park on its own lifetime history.
+      return getSessionTokensUsed(sessionId);
+    } catch { return 0; }
+  })();
   const budgetWindowExhausted = (): boolean => {
     try {
       if (!runTokenBudgetEnforcementEnabled()) return false;
-      const ceiling = typeof request.maxRunTokens === 'number' ? request.maxRunTokens : 0;
-      if (ceiling <= 0) return false;
-      const baseline = typeof request.runTokenBaseline === 'number' ? request.runTokenBaseline : 0;
-      return getSessionTokensUsed(sessionId) - baseline >= ceiling;
+      if (budgetCeiling <= 0) return false;
+      return getSessionTokensUsed(sessionId) - budgetBaseline >= budgetCeiling;
     } catch { return false; }
   };
+  // Durable window record: run_worker runs in the SDK-brain MCP child (a
+  // separate process), so the fan-out slice of this ceiling is enforced via
+  // the eventlog, not shared memory. No-op when unlimited/off.
+  recordRunTokenWindow({ sessionId, baseline: budgetBaseline, ceiling: budgetCeiling, warned: new Set() });
   const runWithSalvage = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult> => {
     try {
       return await runClaudeAgentSdkImpl(opts);

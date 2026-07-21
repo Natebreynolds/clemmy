@@ -157,3 +157,21 @@ test('kill-switch: CLEMMY_MODEL_STREAM_STALL_MS=0 disables the watchdog', async 
     process.env.CLEMMY_MODEL_STREAM_STALL_MS = '300';
   }
 });
+
+test('G4 (2026-07-20): a kill lands MID-STREAM on a tool-less turn — no waiting for the next boundary', async () => {
+  // Steady events keep the stall watchdog satisfied (gap 200ms < 300ms window),
+  // so ONLY the kill poll can stop this turn. Before the fix, a kill during a
+  // long tool-less reasoning stretch waited for the next tool call / step
+  // boundary; the Claude SDK lane already polled per stream message.
+  const { createSession, requestKill } = await import('./eventlog.js');
+  const sess = createSession({ kind: 'chat' });
+  requestKill(sess.id, 'user hit stop');
+  const result = makeStreamResult({ events: 40, gapMs: 200 }); // ~8s of healthy streaming
+  const started = Date.now();
+  await assert.rejects(
+    __defaultRunRunner(runnerFor(result), {} as never, [], { context: { sessionId: sess.id } } as never),
+    (err: unknown) => err instanceof Error && err.name === 'KillRequested',
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 4_000, `kill honored mid-stream in ~1 poll tick, not at the turn boundary (took ${elapsed}ms)`);
+});

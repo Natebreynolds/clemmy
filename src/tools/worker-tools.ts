@@ -7,6 +7,7 @@ import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeI
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
+import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/model-route-metrics.js';
@@ -172,6 +173,17 @@ export function registerWorkerTools(server: McpServer): void {
           return textResult(msg);
         }
       } catch { /* fail-open */ }
+
+      // Stage 4 fan-out slice: never SPAWN past an exhausted run token window.
+      // This runs in the SDK-brain MCP child, so the parent's window arrives via
+      // the durable run_token_window record, not shared memory. A refusal (not a
+      // kill) — the item routes into the honest N-of-M partial path. Fail-open.
+      const fanoutBudget = fanoutBudgetStatus(sessionId);
+      if (fanoutBudget?.exceeded) {
+        const msg = `ERROR: worker for "${input.item}" was NOT started — this run's token budget is exhausted (${formatTokens(fanoutBudget.usedWindow)}/${formatTokens(fanoutBudget.ceiling)} uncached tokens used). Report this item as not-attempted; the user can say "continue" to open a fresh budget window.`;
+        recordResult(false, firstLine(msg));
+        return textResult(msg);
+      }
 
       const route = resolveSdkBrainWorker(input.intent || undefined);
       const workerModel = route.modelId;

@@ -27,6 +27,7 @@ import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope }
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
@@ -52,7 +53,7 @@ import {
 } from '../runtime/harness/guardrails.js';
 import { DEFAULT_MAX_TURNS, harnessRunContextStorage, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
-import { ClaudeSdkProviderOverloadError, ClaudeSdkAuthExpiredError } from '../runtime/harness/claude-agent-sdk.js';
+import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
@@ -218,17 +219,28 @@ function workerBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-/** Commit-safe worker cross-brain fallover eligibility. ONLY the typed,
- *  committed-aware brain errors qualify — a committed external write must never be
- *  blindly re-driven on another brain (mirror of the chat lane's
- *  isChatBrainFalloverEligible and the step lane's canSwitchBrainForStep). Auth-expiry
- *  is committed=false by construction (auth fails before any tool runs), so an expired
- *  Claude worker token switches to the connected Codex/BYO brain instead of hard-failing
- *  the item — the worker-lane twin of the 2026-07-20 router/workflow auth-aware fix. */
+/** Commit-safe worker cross-brain fallover eligibility — mirror of the chat lane's
+ *  isChatBrainFalloverEligible (respond-bridge.ts). Eligibility ladder:
+ *  1. NEVER an intentional stop (user cancel / kill / abort) — not a brain failure.
+ *  2. Any typed committed-aware error trusts its flag: committed=true → refuse (a
+ *     committed external write must never be blindly re-driven on another brain);
+ *     committed=false → eligible (auth-expiry is committed=false by construction:
+ *     auth fails before any tool runs — the worker-lane twin of the 2026-07-20
+ *     router/workflow auth-aware fix).
+ *  3. Any OTHER terminal Error (5xx, transport timeout, rate-limit, SDK internal
+ *     throw) is eligible — the worker fallover re-runs the item in the SAME parent
+ *     session, so the duplicate-send HARD WALL (brackets.ts, durable external_write
+ *     events) blocks any re-send of an already-committed irreversible write, exactly
+ *     the property that justifies the chat lane's broad eligibility. Before
+ *     2026-07-20 only overload + auth-expiry qualified here, so a commit-safe 5xx
+ *     hard-failed the item while every other lane fell over. */
 export function isCommitSafeWorkerFallover(err: unknown): boolean {
-  if (err instanceof ClaudeSdkProviderOverloadError) return !err.committed;
-  if (err instanceof ClaudeSdkAuthExpiredError) return !err.committed;
-  return false;
+  if (err instanceof AgentRuntimeCancelledError) return false;
+  const name = err instanceof Error ? err.name : '';
+  if (/cancel|kill|abort/i.test(name)) return false;
+  const committed = (err as { committed?: unknown } | null | undefined)?.committed;
+  if (typeof committed === 'boolean') return !committed;
+  return err instanceof Error;
 }
 
 interface ChatWorkerModelRoute {
@@ -1237,6 +1249,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // guard; workerItemAlreadyCapped is fail-open so it can never block fan-out.
       if (workerThrashGuardEnabled() && sessionId && workerItemAlreadyCapped(sessionId, input.item)) {
         const message = `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
+        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
+        return message;
+      }
+      // Stage 4 fan-out slice: never SPAWN past an exhausted run token window.
+      // The parent loop parks honestly at its own boundary, but a single turn
+      // fanning out N workers re-checks nothing between spawns — this durable
+      // pre-spawn check is that boundary. Refusal (not a kill): the item routes
+      // into the honest N-of-M partial path; idempotent reuse above stays free.
+      const fanoutBudget = sessionId ? fanoutBudgetStatus(sessionId) : null;
+      if (fanoutBudget?.exceeded) {
+        const message = `ERROR: worker for "${input.item}" was NOT started — this run's token budget is exhausted (${formatTokens(fanoutBudget.usedWindow)}/${formatTokens(fanoutBudget.ceiling)} uncached tokens used). Report this item as not-attempted; the user can say "continue" to open a fresh budget window.`;
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
       }

@@ -100,6 +100,7 @@ import {
   checkRunTokenWindow,
   formatTokens,
   openRunTokenWindow,
+  recordRunTokenWindow,
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
@@ -2001,6 +2002,9 @@ async function runConversationCore(
         baseline: options.runTokenBaseline,
       })
     : null;
+  // Durable window record: lets run_worker (any lane, any process) refuse to
+  // spawn past this run's ceiling — the fan-out slice of the budget.
+  if (tokenWindow) recordRunTokenWindow(tokenWindow);
 
   // A parked self-driving goal stops self-resumption; any turn that reaches
   // here is external re-engagement (a user reply or an outcome relay), which
@@ -5588,6 +5592,8 @@ async function runConversationFromResumeCore(opts: {
   const tokenWindow = tokenBudgetOn
     ? openRunTokenWindow({ sessionId: opts.sessionId, ceiling: resumeTokenCeiling })
     : null;
+  // Same durable fan-out record as the primary loop (resume twin).
+  if (tokenWindow) recordRunTokenWindow(tokenWindow);
 
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
@@ -7188,9 +7194,37 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       // pending work — an unref'd timer could let a bare process exit before
       // the stall fires. It self-clears on drain completion or stall.
     });
-    void drain.finally(() => { if (stallTimer) clearInterval(stallTimer); }).catch(() => { /* surfaced via race */ });
+    // Mid-stream kill responsiveness (2026-07-20 control-plane audit G4): the
+    // kill switch was observed only pre-turn, at tool entry, and at step
+    // boundaries — a long TOOL-LESS reasoning stretch ignored it until the next
+    // boundary (the Claude SDK lane polls per stream message; this lane did
+    // not). Poll the switch while the stream drains; on kill, release the
+    // stream (the stall watchdog's proven cancel path — never a sync abort
+    // mid-iteration, which is how Gemini CLI's loop detector crashed their CLI)
+    // and reject with KillRequested so handleRunError lands the existing clean
+    // 'killed' status. Cleanup rides the same drain lifecycle as the stall
+    // timer. Best-effort: a poll failure must never break a healthy stream.
+    let killTimer: ReturnType<typeof setInterval> | undefined;
+    const killWatch = new Promise<never>((_, reject) => {
+      const killSessionId = (opts as unknown as { context?: { sessionId?: string } })?.context?.sessionId;
+      if (!iterable || !killSessionId) return;
+      killTimer = setInterval(() => {
+        try {
+          const target = getActiveRunAttempt(killSessionId) ?? undefined;
+          if (isKillRequested(killSessionId, target)) {
+            if (killTimer) clearInterval(killTimer);
+            try { (myResult as unknown as { cancel?: () => void }).cancel?.(); } catch { /* best-effort */ }
+            reject(new KillRequested(killSessionId));
+          }
+        } catch { /* kill poll is best-effort */ }
+      }, 1000);
+    });
+    void drain.finally(() => {
+      if (stallTimer) clearInterval(stallTimer);
+      if (killTimer) clearInterval(killTimer);
+    }).catch(() => { /* surfaced via race */ });
     try {
-      await Promise.race([drain, watchdog]);
+      await Promise.race([drain, watchdog, killWatch]);
       recoveryStreamText = attemptStreamText;
       break; // turn drained successfully
     } catch (err) {

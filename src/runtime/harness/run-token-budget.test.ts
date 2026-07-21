@@ -23,8 +23,10 @@ const {
   budgetLine,
   budgetLineFor,
   checkRunTokenWindow,
+  fanoutBudgetStatus,
   formatTokens,
   openRunTokenWindow,
+  recordRunTokenWindow,
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } = await import('./run-token-budget.js');
@@ -208,4 +210,42 @@ test('budgetLineFor: the single renderer for raw window parts (drain check-ins)'
   assert.equal(budgetLineFor(sess, 0, 0), null, 'no ceiling ⇒ no line');
   process.env.CLEMMY_RUN_TOKEN_BUDGET = 'off';
   assert.equal(budgetLineFor(sess, 0, 10_000_000), null, 'kill-switch off ⇒ no line');
+});
+
+// ---------------------------------------------------------------------------
+// Fan-out slice (2026-07-20 G2): the durable window record + pre-spawn check
+// ---------------------------------------------------------------------------
+
+test('recordRunTokenWindow + fanoutBudgetStatus: run_worker sees the window across a process boundary (latest wins)', () => {
+  const sess = freshSession();
+  assert.equal(fanoutBudgetStatus(sess), null, 'no window recorded ⇒ no check (fail-open)');
+
+  accrueSessionTokens(sess, 5_000); // pre-run history must NOT count
+  recordRunTokenWindow({ sessionId: sess, baseline: getSessionTokensUsed(sess), ceiling: 1_000, warned: new Set() });
+  let status = fanoutBudgetStatus(sess);
+  assert.ok(status, 'recorded window is readable back from the eventlog');
+  assert.equal(status?.exceeded, false, 'fresh window: nothing spent yet');
+
+  accrueSessionTokens(sess, 999);
+  assert.equal(fanoutBudgetStatus(sess)?.exceeded, false, 'under the ceiling: spawns still allowed');
+  accrueSessionTokens(sess, 1);
+  assert.equal(fanoutBudgetStatus(sess)?.exceeded, true, 'at the ceiling: refuse further spawns');
+
+  // A NEW window (next turn / user continue) self-baselines past the old spend —
+  // latest record wins, so fan-out un-parks structurally with the run.
+  recordRunTokenWindow({ sessionId: sess, baseline: getSessionTokensUsed(sess), ceiling: 1_000, warned: new Set() });
+  status = fanoutBudgetStatus(sess);
+  assert.equal(status?.exceeded, false, 'fresh window on the same session: spawns allowed again');
+});
+
+test('fanoutBudgetStatus honors the kill-switch and unlimited windows', () => {
+  const sess = freshSession();
+  recordRunTokenWindow({ sessionId: sess, baseline: 0, ceiling: 0, warned: new Set() });
+  assert.equal(fanoutBudgetStatus(sess), null, 'unlimited window is never recorded ⇒ no check');
+
+  recordRunTokenWindow({ sessionId: sess, baseline: 0, ceiling: 100, warned: new Set() });
+  accrueSessionTokens(sess, 200);
+  assert.equal(fanoutBudgetStatus(sess)?.exceeded, true);
+  process.env.CLEMMY_RUN_TOKEN_BUDGET = 'off';
+  assert.equal(fanoutBudgetStatus(sess), null, 'enforcement off ⇒ fan-out check disappears too');
 });

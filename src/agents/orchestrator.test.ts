@@ -1228,21 +1228,38 @@ test('OrchestratorDecision: nextAction enum covers the harness states the loop e
   }
 });
 
-test('isCommitSafeWorkerFallover: overload + auth-expiry fall over ONLY when uncommitted (2026-07-20 worker-lane auth fix)', async () => {
+test('isCommitSafeWorkerFallover: mirrors the chat-lane eligibility ladder (2026-07-20 parity widening)', async () => {
   const { isCommitSafeWorkerFallover } = await import('./orchestrator.js');
   const { ClaudeSdkProviderOverloadError, ClaudeSdkAuthExpiredError } = await import('../runtime/harness/claude-agent-sdk.js');
+  const { AgentRuntimeCancelledError } = await import('../runtime/provider.js');
 
-  // Overload: eligible only pre-commit (a committed overload is salvaged by the SDK lane).
+  // Typed committed-aware errors trust their flag: eligible only pre-commit
+  // (a committed overload is salvaged by the SDK lane; a committed anything
+  // must never be blindly re-driven — double-act).
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkProviderOverloadError('529 overloaded', false)), true, 'uncommitted overload → fall over');
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkProviderOverloadError('529 overloaded', true)), false, 'committed overload → never re-run (double-act)');
-
-  // Auth-expiry: the release-day addition — an expired worker token switches brains,
-  // but a committed one must not be blindly re-driven.
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkAuthExpiredError('401 token expired', false)), true, 'uncommitted auth-expiry → fall over to a connected brain');
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkAuthExpiredError('401 token expired', true)), false, 'committed auth-expiry → never re-run');
+  // The generic committed=true guard covers FUTURE typed errors too, not just
+  // the two named classes.
+  const committedish = Object.assign(new Error('flaky thing'), { committed: true });
+  assert.equal(isCommitSafeWorkerFallover(committedish), false, 'ANY error carrying committed=true → never re-run');
 
-  // Unrelated / untyped errors never qualify — commit state is unknown, so the
-  // guard stays conservative (no blind re-run of a possibly-committed item).
-  assert.equal(isCommitSafeWorkerFallover(new Error('missing required field actorId')), false);
-  assert.equal(isCommitSafeWorkerFallover(new Error('some generic 500')), false);
+  // Generic terminal errors (5xx, timeout, SDK throw) ARE eligible — parity
+  // with isChatBrainFalloverEligible: the re-run happens in the SAME parent
+  // session, so the duplicate-send hard wall blocks a re-send of any committed
+  // irreversible write. Before 2026-07-20 these hard-failed the item while
+  // every other lane fell over.
+  assert.equal(isCommitSafeWorkerFallover(new Error('some generic 500')), true, 'generic terminal error → fall over (dup-send wall protects the re-run)');
+  assert.equal(isCommitSafeWorkerFallover(new Error('missing required field actorId')), true);
+
+  // NEVER an intentional stop: a user cancel/kill is not a brain failure.
+  assert.equal(isCommitSafeWorkerFallover(new AgentRuntimeCancelledError('cancelled')), false, 'user cancel → never fall over');
+  const killShaped = new Error('session x has a pending kill request');
+  killShaped.name = 'KillRequested';
+  assert.equal(isCommitSafeWorkerFallover(killShaped), false, 'kill-shaped error name → never fall over');
+
+  // Non-Error junk stays ineligible.
+  assert.equal(isCommitSafeWorkerFallover('string error'), false);
+  assert.equal(isCommitSafeWorkerFallover(undefined), false);
 });

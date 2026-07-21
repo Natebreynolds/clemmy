@@ -22,7 +22,7 @@
  *   kill-switchable behavior conditionally — the Stage-3 lesson).
  */
 import { getRuntimeEnv } from '../../config.js';
-import { getSessionTokensUsed } from './eventlog.js';
+import { appendEvent, getSessionTokensUsed, listEvents } from './eventlog.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
 
 export function runTokenBudgetEnforcementEnabled(): boolean {
@@ -95,6 +95,39 @@ export function checkRunTokenWindow(window: RunTokenWindow): RunTokenStatus {
     }
   }
   return { usedWindow, usedLifetime, ceiling: window.ceiling, fraction, exceeded: usedWindow >= window.ceiling, crossedThreshold };
+}
+
+/** Durably record the active window so consumers in OTHER processes (the
+ *  SDK-brain MCP child's run_worker) can enforce the same ceiling — an
+ *  AsyncLocalStorage context cannot cross that boundary. One small event per
+ *  window open (per turn/run start); latest wins. No-op when enforcement is
+ *  off or the window is unlimited (conditional-surface rule). */
+export function recordRunTokenWindow(window: RunTokenWindow): void {
+  if (!runTokenBudgetEnforcementEnabled() || window.ceiling <= 0) return;
+  try {
+    appendEvent({
+      sessionId: window.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'run_token_window',
+      data: { baseline: window.baseline, ceiling: window.ceiling },
+    });
+  } catch { /* the durable record is best-effort — never blocks the run */ }
+}
+
+/** Fan-out slice of the run budget: the CURRENT window's status from the
+ *  durable record, for pre-spawn checks in run_worker (both lanes). Returns
+ *  null (= no check) when enforcement is off, no window was recorded, or the
+ *  read fails — metering must never block fan-out (fail-open). */
+export function fanoutBudgetStatus(sessionId: string): RunTokenStatus | null {
+  try {
+    if (!sessionId || !runTokenBudgetEnforcementEnabled()) return null;
+    const rows = listEvents(sessionId, { types: ['run_token_window'] });
+    const latest = rows[rows.length - 1]?.data as { baseline?: number; ceiling?: number } | undefined;
+    if (!latest || typeof latest.ceiling !== 'number' || latest.ceiling <= 0) return null;
+    const baseline = typeof latest.baseline === 'number' && latest.baseline >= 0 ? latest.baseline : 0;
+    return checkRunTokenWindow({ sessionId, baseline, ceiling: latest.ceiling, warned: new Set() });
+  } catch { return null; }
 }
 
 export function formatTokens(n: number): string {

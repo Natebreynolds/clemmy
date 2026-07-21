@@ -30,6 +30,7 @@ const {
   partitionClaudeAgentSdkJitSurface,
 } = brain;
 const {
+  accrueSessionTokens,
   appendEvent,
   beginRunAttempt,
   claimHarnessChatRequest,
@@ -1490,6 +1491,56 @@ test('F1: no forward progress (0 tool calls) does NOT auto-continue — still pa
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'x', sessionId: 'brain-autocont-noprog' });
   assert.equal(calls, 1, 'a limit-hit with NO tool progress must not auto-continue (anti-loop)');
   assert.match(res.text, /Say "continue"/);
+});
+
+test('Stage 4 G1: the FOREGROUND brain inherits the preset run-token ceiling — exhaustion stops auto-continue', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.HARNESS_MAX_RUN_TOKENS = '1000';
+  try {
+    createSession({ id: 'brain-budget-fg', kind: 'chat', title: 'b' });
+    accrueSessionTokens('brain-budget-fg', 50_000); // prior session history: behind the self-baseline
+    let calls = 0;
+    setClaudeAgentSdkBrainRunForTest(async () => {
+      calls += 1;
+      accrueSessionTokens('brain-budget-fg', 2_000); // this turn burns past the 1k preset ceiling
+      return { text: 'partial', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: true };
+    });
+    const res = await respondViaClaudeAgentSdkBrain('home', { message: 'big fan-out', sessionId: 'brain-budget-fg' });
+    // Before 2026-07-20 the foreground DEFAULT brain never resolved a ceiling
+    // (request.maxRunTokens ?? 0 = unmetered) — only the background drain was
+    // bounded. Now the preset governs and the chain parks honestly.
+    assert.equal(calls, 1, 'window exhausted → NO auto-continue');
+    assert.equal(res.stoppedReason, 'token-budget');
+    assert.ok(
+      listEvents('brain-budget-fg').some((e) => (e as { type?: string }).type === 'run_token_window'),
+      'durable window recorded so run_worker (MCP child) can enforce the fan-out slice',
+    );
+  } finally {
+    delete process.env.HARNESS_MAX_RUN_TOKENS;
+  }
+});
+
+test('Stage 4 G1: session HISTORY never counts against the foreground window (self-baseline)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.HARNESS_MAX_RUN_TOKENS = '1000';
+  try {
+    createSession({ id: 'brain-budget-hist', kind: 'chat', title: 'b' });
+    accrueSessionTokens('brain-budget-hist', 50_000); // a long-lived session, way past any ceiling
+    let calls = 0;
+    setClaudeAgentSdkBrainRunForTest(async () => {
+      calls += 1;
+      accrueSessionTokens('brain-budget-hist', 100); // modest spend this turn — well under the ceiling
+      if (calls === 1) return { text: 'partial', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: true };
+      return { text: 'done', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false };
+    });
+    const res = await respondViaClaudeAgentSdkBrain('home', { message: 'small task', sessionId: 'brain-budget-hist' });
+    assert.equal(calls, 2, 'history behind the baseline: the chain continues normally');
+    assert.equal(res.stoppedReason, 'success');
+  } finally {
+    delete process.env.HARNESS_MAX_RUN_TOKENS;
+  }
 });
 
 test('H2: a skill loaded before the turn cap is RE-INJECTED into the auto-continue (not dropped)', async () => {
