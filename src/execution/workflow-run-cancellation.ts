@@ -62,6 +62,12 @@ const TERMINAL_STATUSES = new Set<WorkflowRunTerminalStatus>([
   'creation_test',
 ]);
 
+/** A run in one of the terminal states — nothing to cancel/cleanup. Exported
+ *  for the workflow-lifecycle cleanup (delete/disable) and tests. */
+export function isTerminalWorkflowRunStatus(status: unknown): boolean {
+  return typeof status === 'string' && TERMINAL_STATUSES.has(status as WorkflowRunTerminalStatus);
+}
+
 let beforeCancellationLockForTests: (() => void) | undefined;
 
 /** Deterministic seam: runs after the optimistic route read and before the

@@ -144,3 +144,34 @@ test('an invalid already-cancelled envelope is left unchanged without installing
   assert.equal(workflowRunCancellationRequested(runId), false);
   assert.equal(readFileSync(file, 'utf-8'), before);
 });
+
+// Break-scenario C: the lifecycle-cleanup predicate + boundary contract that
+// delete/disable rely on to stop in-flight runs (console-routes glue).
+const { isTerminalWorkflowRunStatus } = await import('./workflow-run-cancellation.js');
+
+test('isTerminalWorkflowRunStatus: only genuinely-finished states are terminal', () => {
+  for (const s of ['completed', 'completed_with_errors', 'error', 'failed', 'cancelled', 'dry_run', 'creation_test']) {
+    assert.equal(isTerminalWorkflowRunStatus(s), true, `${s} is terminal`);
+  }
+  for (const s of ['running', 'queued', 'pending', 'parked', undefined, null, 'weird']) {
+    assert.equal(isTerminalWorkflowRunStatus(s), false, `${String(s)} is NOT terminal — a lifecycle cleanup must cancel it`);
+  }
+});
+
+test('delete/disable cleanup: a non-terminal run cancels at the boundary; an already-terminal one is left alone', () => {
+  const live = writeRun('lifecycle-live', { status: 'running', workflow: 'wf-x' });
+  const done = writeRun('lifecycle-done', { status: 'completed', workflow: 'wf-x' });
+
+  // The cleanup only calls cancelWorkflowRunAtBoundary on non-terminal runs.
+  assert.equal(isTerminalWorkflowRunStatus('running'), false);
+  const r1 = cancelWorkflowRunAtBoundary({ runId: 'lifecycle-live', reason: 'Workflow was deleted; its in-flight run was cancelled.', source: 'workflow-lifecycle-cleanup', expectedWorkflow: 'wf-x' });
+  assert.equal(r1.status, 'cancelled');
+  assert.equal(JSON.parse(readFileSync(live, 'utf-8')).status, 'cancelled');
+
+  // A completed run is skipped by the predicate; if cancel were called anyway
+  // it would report already_terminal (the race-safe path).
+  assert.equal(isTerminalWorkflowRunStatus('completed'), true);
+  const r2 = cancelWorkflowRunAtBoundary({ runId: 'lifecycle-done', reason: 'x', source: 'workflow-lifecycle-cleanup', expectedWorkflow: 'wf-x' });
+  assert.equal(r2.status, 'already_terminal');
+  assert.equal(JSON.parse(readFileSync(done, 'utf-8')).status, 'completed', 'a finished run is never rewritten');
+});

@@ -5644,9 +5644,38 @@ export function reapResolvedParkedRuns(): void {
     const run = readRunRecord(filePath);
     if (!run || run.status !== 'parked' || !run.parked) continue;
     const watched = run.parked.parkedSteps.flatMap((s) => s.approvalIds).filter((id) => id.trim().length > 0);
-    if (watched.length === 0) continue; // malformed parked checkpoint; watchdog should surface it
+    // Orphaned-park terminalization (2026-07-21 break-scenario C / audit A4
+    // hole 2): a parked run whose checkpoint is MALFORMED (no watched approval
+    // ids) or whose approval registry row is GONE can never resolve — the
+    // reaper used to skip it FOREVER, leaving it "parked" on the board with no
+    // path to terminal and no report-back. It must never auto-APPROVE by
+    // absence (that would cross the side-effect boundary on a lost row), but
+    // after a generous grace past the 24h approval TTL it is provably dead:
+    // terminalize it as failed at the shared boundary so the board reflects
+    // reality and the origin chat gets an honest report. Fresh orphans (a
+    // transient registry read miss) stay parked until the grace elapses.
+    const parkedAtMs = Date.parse(run.parked.parkedAt ?? '');
+    const orphanGraceMs = 26 * 60 * 60_000; // 24h TTL + 2h margin
+    const parkedTooLong = Number.isFinite(parkedAtMs) && Date.now() - parkedAtMs > orphanGraceMs;
+    if (watched.length === 0) {
+      if (parkedTooLong) {
+        try {
+          cancelWorkflowRunAtBoundary({ runId: run.id, reason: 'Parked run had a malformed approval checkpoint and could never resume — closed as failed after the approval grace period.', source: 'orphaned-park-reaper' });
+        } catch { /* best-effort; watchdog still surfaces it */ }
+      }
+      continue;
+    }
     const rows = watched.map((id) => approvalsById.get(id));
-    if (rows.some((row) => !row)) continue; // lost registry row: never auto-approve by absence
+    if (rows.some((row) => !row)) {
+      // Lost registry row: never auto-approve by absence. Terminalize only
+      // once the run is provably dead (past the grace) — never approve.
+      if (parkedTooLong) {
+        try {
+          cancelWorkflowRunAtBoundary({ runId: run.id, reason: 'The approval this run was parked on no longer exists (expired/reaped) and could never resume — closed as failed after the grace period. The protected action was NOT performed.', source: 'orphaned-park-reaper' });
+        } catch { /* best-effort */ }
+      }
+      continue;
+    }
     if (rows.some((row) => row?.status === 'pending')) continue; // still waiting on a human
 
     // A non-approved decision is terminal for THIS workflow occurrence. The

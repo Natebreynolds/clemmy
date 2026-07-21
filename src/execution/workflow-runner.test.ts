@@ -361,6 +361,61 @@ test('reapResolvedParkedRuns terminates an expired occurrence instead of retryin
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
 
+// Break-scenario C / audit A4 hole 2: orphaned parked runs must terminalize,
+// not sit "parked" forever.
+function writeBackdatedParkedRun(runId: string, approvalIds: string[], parkedAgoMs: number): string {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(filePath, JSON.stringify({
+    id: runId,
+    workflow: 'Orphan WF',
+    status: 'parked',
+    parked: {
+      parkedSteps: [{ stepId: 'send_step', kind: 'gate', approvalIds }],
+      parkedAt: new Date(Date.now() - parkedAgoMs).toISOString(),
+    },
+  }, null, 2), 'utf-8');
+  return filePath;
+}
+
+test('reapResolvedParkedRuns terminalizes a MALFORMED parked checkpoint after the grace (was skipped forever)', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  // No watched approval ids at all — the malformed-checkpoint class.
+  const fresh = writeBackdatedParkedRun('orphan-malformed-fresh', [], 60_000);
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(fresh), 'parked', 'a FRESH malformed park is left alone (transient); only aged ones die');
+
+  const aged = writeBackdatedParkedRun('orphan-malformed-aged', [], 27 * 60 * 60_000);
+  reapResolvedParkedRuns();
+  const rec = JSON.parse(readFileSync(aged, 'utf-8')) as Record<string, unknown>;
+  assert.equal(rec.status, 'cancelled', 'an aged malformed park is terminalized, not orphaned forever');
+  assert.equal(rec.parked, undefined);
+  assert.match(String(rec.error), /malformed approval checkpoint/i);
+
+  rmSync(fresh, { force: true });
+  rmSync(aged, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
+test('reapResolvedParkedRuns terminalizes a LOST registry row after the grace — but NEVER auto-approves', () => {
+  process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+  // A watched approval id that does not exist in the registry (reaped/lost).
+  const aged = writeBackdatedParkedRun('orphan-lostrow-aged', ['approval-that-was-reaped'], 27 * 60 * 60_000);
+  reapResolvedParkedRuns();
+  const rec = JSON.parse(readFileSync(aged, 'utf-8')) as Record<string, unknown>;
+  assert.equal(rec.status, 'cancelled', 'a lost-row park past grace is closed as failed');
+  assert.match(String(rec.error), /no longer exists|not performed/i, 'closed as failed — the protected action was NOT performed');
+  assert.equal(/\b(approved|sent)\b/i.test(String(rec.error ?? '')), false, 'absence must NEVER read as approval');
+
+  const fresh = writeBackdatedParkedRun('orphan-lostrow-fresh', ['approval-reaped-2'], 60_000);
+  reapResolvedParkedRuns();
+  assert.equal(statusOf(fresh), 'parked', 'a fresh lost-row park stays parked (a transient registry miss must not kill a live park)');
+
+  rmSync(aged, { force: true });
+  rmSync(fresh, { force: true });
+  delete process.env.WORKFLOW_APPROVAL_PARKING;
+});
+
 test('reapResolvedParkedRuns marks the Activity run as resumed when approval clears', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
   const runId = 'park-test-activity';

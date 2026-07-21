@@ -412,7 +412,7 @@ import {
   type QueueWorkflowRunRecoveryIntentInput,
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
-import { cancelWorkflowRunAtBoundary } from '../execution/workflow-run-cancellation.js';
+import { cancelWorkflowRunAtBoundary, isTerminalWorkflowRunStatus } from '../execution/workflow-run-cancellation.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -4904,13 +4904,38 @@ export function registerConsoleRoutes(
     });
   });
 
+  // Break-scenario C (2026-07-21): deleting or disabling a workflow that has
+  // pending/parked/running occurrences used to leave those runs ORPHANED —
+  // the reaper only terminalizes runs whose workflow still exists to report
+  // back through, so a deleted-workflow run sat "parked/queued" forever, and
+  // a disabled workflow's in-flight run kept going as if nothing changed.
+  // Cancel every non-terminal run of this workflow at the shared boundary
+  // (race-safe: a completion that wins first reads already_terminal). Returns
+  // how many were stopped. Best-effort — a cancel failure never blocks the
+  // delete/disable itself.
+  function cancelInFlightRunsForWorkflow(workflowName: string, reason: string): number {
+    let cancelled = 0;
+    try {
+      for (const run of readWorkflowRunRecords()) {
+        if (run.workflow !== workflowName) continue;
+        if (isTerminalWorkflowRunStatus(run.status)) continue;
+        try {
+          const result = cancelWorkflowRunAtBoundary({ runId: run.id, reason, source: 'workflow-lifecycle-cleanup', expectedWorkflow: workflowName });
+          if (result.status === 'cancelled') cancelled += 1;
+        } catch { /* one bad run must not block the rest */ }
+      }
+    } catch { /* the run dir read is best-effort */ }
+    return cancelled;
+  }
+
   app.delete('/api/console/workflows/:name', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const cancelledRuns = cancelInFlightRunsForWorkflow(entry.data.name, `Workflow "${entry.data.name}" was deleted; its in-flight run was cancelled.`);
     deleteWorkflowAndSyncTriggers(entry.name);
-    res.json({ deleted: true });
+    res.json({ deleted: true, ...(cancelledRuns > 0 ? { cancelledRuns } : {}) });
   });
 
   app.post('/api/console/workflows/:name/set-enabled', (req, res) => {
@@ -4964,8 +4989,9 @@ export function registerConsoleRoutes(
       res.json({ updated: true, enabled: true, repairs: prep.repairs });
       return;
     }
+    const cancelledOnDisable = cancelInFlightRunsForWorkflow(entry.data.name, `Workflow "${entry.data.name}" was disabled; its in-flight run was cancelled.`);
     writeWorkflowAndSyncTriggers(entry.name, { ...entry.data, enabled: false });
-    res.json({ updated: true, enabled: false });
+    res.json({ updated: true, enabled: false, ...(cancelledOnDisable > 0 ? { cancelledRuns: cancelledOnDisable } : {}) });
   });
 
   app.post('/api/console/workflows/:name/validate', (req, res) => {
