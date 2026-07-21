@@ -14,6 +14,7 @@ import {
   autoRepairWorkflowDefinition,
   prepareWorkflowForWrite,
   stepLooksMutating,
+  classifyStepSideEffect,
   workflowStepMutationReceiptContract,
   buildWorkflowMutationContractSnapshot,
   isWorkflowMutationContractSnapshot,
@@ -33,6 +34,19 @@ function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
     ...overrides,
   } as WorkflowDefinition;
 }
+
+test('classifyStepSideEffect: a draft-creation slug is a write — a stale `send` label cannot fabricate a send (2026-07-20 draft trap)', () => {
+  // The user's incident: an outreach step switched to draft-only mode but its OLD
+  // metadata still carried sideEffect: 'send', so the step classified as an external
+  // SEND and the workflow stayed stuck DISABLED. A non-send slug is a write no matter
+  // the label — the slug is authoritative for what the tool actually does.
+  assert.equal(classifyStepSideEffect({ call: { tool: 'OUTLOOK_CREATE_DRAFT' }, sideEffect: 'send' }), 'write');
+  assert.equal(classifyStepSideEffect({ call: { tool: 'OUTLOOK_CREATE_DRAFT' } }), 'write');
+  // A REAL send slug is still authoritative — a declared `read` cannot hide it.
+  assert.equal(classifyStepSideEffect({ call: { tool: 'OUTLOOK_SEND_EMAIL' }, sideEffect: 'read' }), 'send');
+  // A declared class can still STRENGTHEN a read-slug call to write (unchanged).
+  assert.equal(classifyStepSideEffect({ call: { tool: 'composio_gmail_search' }, sideEffect: 'write' }), 'write');
+});
 
 test('checkWorkflowForWrite: a clean manual workflow validates ok', () => {
   const result = checkWorkflowForWrite(wf());

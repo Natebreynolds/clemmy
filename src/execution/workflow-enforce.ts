@@ -191,7 +191,13 @@ export function classifyStepSideEffect(step: {
   if (step.call?.tool) {
     const callClass = structuredCallSideEffectClass(step.call, step.sideEffect);
     if (callClass === 'send') return 'send';
-    if (callClass === 'write') return step.sideEffect === 'send' ? 'send' : 'write';
+    // A NON-send slug (e.g. *_CREATE_DRAFT) is a `write` — a stale `sideEffect: send`
+    // label must NOT fabricate it back into a send. That trapped a draft-only step
+    // (switched to draft mode but carrying old send metadata) as an "external send",
+    // leaving the workflow stuck DISABLED (2026-07-20). The slug is authoritative for
+    // what the tool actually does; a label can strengthen read→write elsewhere, but
+    // it can never invent a send the action doesn't perform.
+    if (callClass === 'write') return 'write';
   }
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
   if (step.call?.tool) return structuredCallSideEffectClass(step.call, step.sideEffect);
