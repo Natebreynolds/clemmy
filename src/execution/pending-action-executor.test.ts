@@ -17,8 +17,19 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { queuePendingAction, markPendingActionApprovalResolved, getPendingAction } = await import('../runtime/harness/pending-actions.js');
 const { executeApprovedPendingActionCall } = await import('./pending-action-executor.js');
+const { createSession } = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
+
+/** B4 (2026-07-20): human-consent claims are VERIFIED against the registry, so
+ *  these tests mint REAL approved cards (a fabricated id would be refuted). */
+function realApprovedCardId(subject: string): string {
+  const sess = createSession({ kind: 'chat' });
+  const card = approvalRegistry.register({ sessionId: sess.id, subject, tool: 'composio_execute_tool', args: {} });
+  approvalRegistry.resolve(card.approvalId, 'approved', 'test');
+  return card.approvalId;
+}
 
 function queueSingleCall() {
   return queuePendingAction({
@@ -36,7 +47,7 @@ test('approved single-call executes the EXACT stored payload via the dispatcher'
   const record = queueSingleCall();
   // Human card consent (I1): an external_send executes only on a real card
   // decision — grant-invariants.test.ts pins the policy-consent refusal.
-  markPendingActionApprovalResolved(record.id, 'approved', 'apr-single-1');
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('single call'));
 
   const dispatched: Array<{ toolName: string; payload: unknown; certifiedBatch: unknown }> = [];
   const res = await executeApprovedPendingActionCall(record.id, {
@@ -73,7 +84,7 @@ test('a run_batch pending action defers to the run_batch executor', async () => 
   });
   // Human card consent — this test is about the run_batch deferral, and an
   // irreversible send without human consent is now refused before it (I1).
-  markPendingActionApprovalResolved(record.id, 'approved', 'apr-batch-defer');
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('batch defer'));
   let fired = false;
   const res = await executeApprovedPendingActionCall(record.id, { dispatch: async () => { fired = true; return 'x'; } });
   assert.equal(res.status, 'skipped');

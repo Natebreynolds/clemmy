@@ -61,10 +61,16 @@ test('EXHIBIT A replay: a POLICY-approved irreversible send is inert at every ex
 
 test('I1 counterpart: a HUMAN card decision arms the same action', async () => {
   const record = queueSendAction();
-  markPendingActionApprovalResolved(record.id, 'approved', 'apr-human-1');
+  // B4 (2026-07-20): the human claim is VERIFIED against the registry — this
+  // test now mints a REAL approved card (a fabricated id is refuted to policy).
+  const registryMod = await import('./approval-registry.js');
+  const cardSess = createSession({ kind: 'chat' });
+  const card = registryMod.register({ sessionId: cardSess.id, subject: 'send', tool: 'composio_execute_tool', args: {} });
+  registryMod.resolve(card.approvalId, 'approved', 'test');
+  markPendingActionApprovalResolved(record.id, 'approved', card.approvalId);
   const after = getPendingAction(record.id);
   assert.equal(after?.approvedBy, 'human');
-  assert.deepEqual(after?.approvalEvidence, { kind: 'card', approvalId: 'apr-human-1' });
+  assert.deepEqual(after?.approvalEvidence, { kind: 'card', approvalId: card.approvalId });
 
   let dispatched = 0;
   const result = await executeApprovedPendingActionCall(record.id, {

@@ -34,6 +34,7 @@ import { openEventLog } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
 import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
 import { linkPendingActionApproval, markPendingActionApprovalResolved } from './pending-actions.js';
+import { appendAuditRecord } from '../audit-ledger.js';
 
 /**
  * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
@@ -475,6 +476,21 @@ export function resolve(
   } catch {
     // Pending-action status is auxiliary; never break approval resolution.
   }
+  // Durable audit mirror (2026-07-20 attorney-bar B3): resolutions are
+  // ledgered from THIS canonical seam (not the eventlog mirror) so every
+  // surface's resolve — desktop, Discord, reaper — is captured exactly once.
+  try {
+    appendAuditRecord({
+      at: publicRow.resolvedAt ?? new Date().toISOString(),
+      kind: 'approval_resolved',
+      sessionId: publicRow.sessionId,
+      approvalId: publicRow.approvalId,
+      subject: publicRow.subject,
+      tool: publicRow.tool,
+      resolution: publicRow.resolution,
+      resolvedBy: publicRow.resolver ?? null,
+    });
+  } catch { /* the ledger never blocks resolution */ }
   emitResolved(publicRow);
   return { ok: true, row: publicRow };
 }

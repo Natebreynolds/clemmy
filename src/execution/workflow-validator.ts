@@ -441,10 +441,15 @@ export function checkCallNode(
   if (!slug) return { errors, warnings }; // CALL-1 owns the missing-tool error
   const isLocal = knownToolNames?.has(slug) ?? false;
   const isComposio = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(slug);
-  const isCx = /^cx_[a-z][a-z0-9_]*$/.test(slug);
-  if (!isLocal && !isComposio && !isCx) {
+  // Tool identifiers come in several families (Composio SCREAMING_SNAKE, cx_
+  // aliases, local MCP names, lowercase CLI-discovered tools) — the hard
+  // error targets only what can't be ANY identifier: prose, whitespace,
+  // sentence-shaped hallucinations. A single identifier token always passes
+  // shape and falls through to the evidence-based checks below.
+  const isIdentifierToken = /^[A-Za-z][A-Za-z0-9_.:-]*$/.test(slug);
+  if (!isLocal && !isIdentifierToken) {
     errors.push(
-      `Step "${step.id ?? '?'}" call.tool "${slug}" is not a valid tool reference — expected a Composio slug (e.g. GMAIL_SEND_EMAIL), a cx_ alias, or a known local tool. This step would fail at dispatch on every run.`,
+      `Step "${step.id ?? '?'}" call.tool "${slug}" is not a valid tool reference — expected a single tool identifier (e.g. GMAIL_SEND_EMAIL, cx_gmail_send_email, run_shell_command), not prose. This step would fail at dispatch on every run.`,
     );
     return { errors, warnings };
   }

@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../../config.js';
 import { actionBus } from '../action-bus.js';
 import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
+import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -1413,6 +1414,22 @@ export function appendEvent(input: AppendEventInput): EventRow {
   tx();
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   const event = rowToEvent(row);
+  // Durable audit mirror (2026-07-20 attorney-bar B3): trust-relevant events
+  // are cascade-DELETED with their session at the 14-day reap — the ledger
+  // copy under BASE_DIR/audit/ survives GC so "who did Clem write to, when,
+  // under whose approval" stays reconstructable. One seam covers every lane.
+  if (AUDIT_MIRRORED_EVENT_TYPES.has(input.type)) {
+    try {
+      appendAuditRecord({
+        at: event.createdAt,
+        kind: input.type,
+        sessionId: input.sessionId,
+        seq: event.seq,
+        turn: input.turn,
+        ...(input.data && typeof input.data === 'object' ? input.data : {}),
+      });
+    } catch { /* the ledger never blocks the event write */ }
+  }
   return publishPersistedEvent(event);
 }
 
