@@ -20,6 +20,7 @@ const {
   harnessSurfaceEnabled,
   hasReusableRecordedUserInput,
   isChatBrainFalloverEligible,
+  synthesizeCompletedWorkReport,
   _setBridgeImplsForTests,
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
@@ -973,4 +974,25 @@ test('parse-exhaustion recovery is GATED on external writes — a run that commi
   const res2 = await respondViaHarness('webhook', { message: 'update the account', sessionId: sessionId2 });
   assert.equal(calls2, 2, 'clean dead turn still gets the recovery hop');
   assert.match(res2.text, /recovered cleanly/);
+});
+
+test('always-reports-back: synthesizeCompletedWorkReport describes external writes when the model emitted no reply', () => {
+  resetEventLog();
+  const sessionId = 'report-back-session';
+  createSession({ id: sessionId, kind: 'chat', title: 'report back' });
+  // Two real writes committed this turn, then a structure-less completion.
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'AIRTABLE_CREATE_RECORD', toolName: 'composio_execute_tool', targets: [] } });
+
+  const report = synthesizeCompletedWorkReport(sessionId, 0);
+  assert.ok(report, 'a report is produced when writes exist and the reply is empty');
+  assert.match(report!, /here's what I did/i);
+  assert.match(report!, /Sent a message to casey@example\.com/);
+  assert.match(report!, /Created a record/);
+
+  // Effect-anchored + general: a Slack send and a draft-creation read correctly, no tool names leak.
+  assert.doesNotMatch(report!, /OUTLOOK|AIRTABLE|composio/i);
+
+  // Nothing durable to report → null (a pure ack is not force-reported).
+  assert.equal(synthesizeCompletedWorkReport(sessionId, 2), null);
 });

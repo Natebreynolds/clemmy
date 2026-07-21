@@ -54,6 +54,7 @@ import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
+import { synthesizeWorkReport } from './work-report.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
@@ -3379,11 +3380,26 @@ async function runConversationCore(
       // prompt instead of leaking the internal summary into the chat bubble.
       const hasReply = decision.reply && decision.reply.trim();
       const isCompletedAction = decision.nextAction === 'completed';
+      // ALWAYS REPORT BACK: a completed turn with NO reply but real work done gets an
+      // honest synthesized report of what happened (from this request's external_write
+      // events) instead of the bare "(Finished without a written reply.)" fallback.
+      const missingReplyWorkReport = (!hasReply && isCompletedAction)
+        ? (() => {
+            try {
+              return synthesizeWorkReport(
+                listEvents(options.sessionId, { types: ['external_write'] })
+                  .filter((w) => !activeSourceUserSeq || w.seq > activeSourceUserSeq),
+              );
+            } catch { return null; }
+          })()
+        : null;
       const baseSummary = hasReply
         ? decision.reply!
-        : isCompletedAction
-          ? MISSING_REPLY_USER_FALLBACK
-          : decision.summary;
+        : missingReplyWorkReport
+          ? missingReplyWorkReport
+          : isCompletedAction
+            ? MISSING_REPLY_USER_FALLBACK
+            : decision.summary;
       // Goal contract: criteria still unmet after the attempt budget — the
       // user must SEE that, never a silent clean-looking completion. The
       // output-grounding advisory (an unverifiable figure) rides the same rail.
