@@ -5,6 +5,7 @@ import { getRuntimeEnv } from '../config.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { latestEventAtForSessionPrefix } from '../runtime/harness/eventlog.js';
+import { cancelWorkflowRunAtBoundary } from './workflow-run-cancellation.js';
 import {
   attemptWorkflowRunReportBack,
   workflowRunReportBackNeedsRetry,
@@ -366,6 +367,23 @@ function parkedStallMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PARKED_STALL_MS;
 }
 
+/** Escalation window (2026-07-20, workflow twin of the bg-task watchdog's
+ *  2026-07-08 escalation): a run "running" with ZERO step activity past this
+ *  long is dead — the 15-min step wall-clock, turn caps, and stream watchdogs
+ *  have all had 4x their window. Cancel it at the boundary instead of warning
+ *  forever (the alert-only watchdog warned live zombies for days). Completed
+ *  steps stay cached, so a resume never duplicates work. Override
+ *  CLEMMY_WORKFLOW_ESCALATE_MS; CLEMMY_WORKFLOW_ESCALATE=off restores
+ *  observe-only. */
+const DEFAULT_WORKFLOW_ESCALATE_AFTER_MS = 60 * 60_000;
+function workflowEscalationEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKFLOW_ESCALATE', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+function workflowEscalateAfterMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WORKFLOW_ESCALATE_MS', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WORKFLOW_ESCALATE_AFTER_MS;
+}
+
 /** Reason-specific alert copy for a stalled run. */
 function watchdogAlert(run: StalledRun, minutes: number): { title: string; body: string } {
   if (run.reason === 'running_silent') {
@@ -469,6 +487,42 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
   const surfaced: string[] = [];
   for (const run of stalled) {
     const minutes = Math.max(1, Math.round(run.ageMs / 60_000));
+    // ESCALATE, don't observe forever (2026-07-20, mirrors the bg-task
+    // watchdog): a run silent past the escalation window gets actually
+    // CANCELLED at the boundary — the same linearized transition the
+    // dashboard cancel uses, so a completion racing in wins cleanly
+    // (already_terminal → fall through to the plain alert). Narrow by
+    // design: running_silent only — queued runs are a drain problem and
+    // parked runs are waiting on a human, where cancelling destroys state
+    // a person may still act on. Checked BEFORE the alert-dedupe skip:
+    // by escalation time the 10-min alert already exists and would
+    // otherwise short-circuit this run forever.
+    if (workflowEscalationEnabled() && run.reason === 'running_silent' && run.ageMs >= workflowEscalateAfterMs()) {
+      try {
+        const cancellation = cancelWorkflowRunAtBoundary({
+          runId: run.id,
+          reason: `Watchdog: "running" with zero step activity for ${minutes}m — cancelled so the run stops pretending to work. Completed steps stay cached; re-run resumes from them.`,
+          source: 'workflow-watchdog-escalation',
+        });
+        if (cancellation.status === 'cancelled' || cancellation.status === 'already_cancelled') {
+          const escalationId = `workflow-escalated-${run.id}`;
+          if (!existingAlertIds.has(escalationId)) {
+            addNotification({
+              id: escalationId,
+              kind: 'workflow',
+              title: `Stopped a dead workflow run: ${run.workflow}`,
+              body: `Run ${run.id} was "running" with zero activity for ${minutes}m — I cancelled it so it stops pretending to work. Completed steps stay cached; re-run it from Tasks and it resumes from them.`,
+              createdAt: new Date(now).toISOString(),
+              read: false,
+              metadata: { workflow: run.workflow, runId: run.id, escalated: true, ageMs: run.ageMs },
+            });
+            existingAlertIds.add(escalationId);
+            surfaced.push(run.id);
+          }
+          continue; // terminated — no per-tick stalled alert for it anymore
+        }
+      } catch { /* cancel failed — fall through to the plain alert */ }
+    }
     const alert = watchdogAlert(run, minutes);
     const alertId = run.reason === 'terminal_unnotified'
       ? `workflow-stalled-terminal-${run.id}`
