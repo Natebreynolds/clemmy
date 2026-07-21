@@ -2594,33 +2594,31 @@ export function registerConsoleRoutes(
     interruptForeignRunAttemptLeases(HARNESS_CHAT_LEASE_OWNER, { runIdPrefix: 'desktop:' });
   } catch { /* eventlog startup recovery is best-effort; request-time TTL still applies */ }
 
-  // Renders the legacy inlined-HTML console only when explicitly requested.
-  // The renderer is intentionally lazy-loaded because it is a large inline
-  // HTML module and should not sit on the normal React console startup path.
-  const serveLegacyConsole = async (req: Request, res: Response): Promise<void> => {
+  // Missing-bundle /console fallback (2026-07-21: the 1.35 MB legacy inlined-
+  // HTML renderer + its /console-legacy route were DELETED — it was a second,
+  // stale UI truth surface). The React SPA bundle is guaranteed shipped
+  // (prepack builds it; package.json ships apps/console-web/dist), so this
+  // fallback only fires on a genuinely broken build. It now serves a small
+  // honest error page telling the operator to rebuild — not a stale second UI.
+  const serveConsoleBundleMissing = (req: Request, res: Response): void => {
     if (!isAuthorized(req)) {
       res.status(401).send('Unauthorized');
       return;
     }
-    const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    try {
-      const { renderConsoleHtml } = await import('./console.js');
-      res.type('html').send(renderConsoleHtml(queryToken));
-    } catch (err) {
-      res.status(500).type('text').send(err instanceof Error ? err.message : String(err));
-    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(503).type('html').send(
+      '<!doctype html><meta charset="utf-8"><title>Console not built</title>'
+      + '<div style="font-family:-apple-system,sans-serif;max-width:34em;margin:4em auto;padding:0 1.5em;line-height:1.5;color:#111">'
+      + '<h1 style="font-size:1.3rem">Console UI isn’t built</h1>'
+      + '<p>The desktop console (apps/console-web) bundle is missing, so there’s nothing to serve at <code>/console</code>. '
+      + 'This should never happen in a packaged build. Rebuild it with:</p>'
+      + '<pre style="background:#f5f5f5;padding:1em;border-radius:6px">npm run build:console-web</pre>'
+      + '<p>All <code>/api/*</code> endpoints are unaffected — chat, workflows, and automation keep running.</p>'
+      + '</div>',
+    );
   };
-  // /console-legacy removed 2026-07-21 (UI audit): it was an always-reachable
-  // SECOND UI truth surface (the 1.35 MB legacy renderer) that could show
-  // stale state diverging from the SPA — "correct at all times" wants exactly
-  // ONE truth surface. The legacy renderer stays ONLY as the /console fallback
-  // for a genuinely missing SPA bundle (a broken build must still serve
-  // something), never as a user-navigable route.
   if (opts?.serveLegacyAtRoot ?? true) {
-    app.get('/console', serveLegacyConsole);
+    app.get('/console', serveConsoleBundleMissing);
   }
 
   // Read-only multi-agent workspace API (roster, canMessage graph, comms,

@@ -19,7 +19,6 @@ process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
-const { renderConsoleHtml } = await import('./console.js');
 const {
   SKILLS_DIR,
   reconcileDistilledSkillDuplicates,
@@ -113,10 +112,5 @@ test('executable catalogs hide retired aliases and management labels them', asyn
     await harness.close();
   }
 });
-
-test('legacy Skills management UI labels aliases retired and suppresses their update action', () => {
-  const html = renderConsoleHtml('test-token');
-  assert.match(html, /skill-retired-badge/);
-  assert.match(html, /RETIRED →/);
-  assert.match(html, /const updateBtn = !retired && updateAvailable/);
-});
+// The 'legacy Skills management UI' renderConsoleHtml test was removed
+// 2026-07-21 with console.ts (that surface is the React SPA now).
