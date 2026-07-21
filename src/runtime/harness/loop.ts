@@ -104,6 +104,7 @@ import {
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
+import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import { backgroundOfferEnabled, effectiveTurnObjective } from './turn-control.js';
 import {
   getArtifactRootForSourceUserSeq,
@@ -7153,6 +7154,25 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     let lastEventAt = Date.now();
     let yieldedContent = false;
     let attemptStreamText = '';
+    // Content-chanting advisory (2026-07-20): the one runaway class nothing
+    // else here sees — same text repeating with no tool calls (grind ladder
+    // blind) while still streaming (stall watchdog blind). Advisory ONLY.
+    const chantDetector = contentChantDetectionEnabled() ? new ContentChantDetector() : null;
+    const chantSessionId = (opts as unknown as { context?: { sessionId?: string } })?.context?.sessionId;
+    const feedChantDetector = (delta: string): void => {
+      const trip = chantDetector?.feed(delta);
+      if (!trip || !chantSessionId) return;
+      try {
+        appendEvent({
+          sessionId: chantSessionId,
+          turn: 0,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: { kind: 'content_chanting', action: 'advisory', repeats: trip.repeats, chunkPreview: trip.chunk.slice(0, 50) },
+        });
+      } catch { /* advisory telemetry must never break the stream */ }
+      console.warn(`[harness] content chanting detected (advisory): a ${trip.chunk.length}-char chunk repeated ${trip.repeats}x`);
+    };
     const drain = (async () => {
       if (iterable) {
         for await (const event of myResult as unknown as AsyncIterable<unknown>) {
@@ -7164,6 +7184,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
           }
           if (onChunk && myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
             attemptStreamText += ev.data.delta;
+            feedChantDetector(ev.data.delta);
             try {
               await onChunk(ev.data.delta);
             } catch {
@@ -7171,6 +7192,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
             }
           } else if (myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
             attemptStreamText += ev.data.delta;
+            feedChantDetector(ev.data.delta);
           }
         }
       }

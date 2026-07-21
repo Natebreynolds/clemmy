@@ -55,6 +55,7 @@ import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-ev
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import { resolveToolSurface } from './tool-surface.js';
+import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import {
   artifactIntentForTool,
   artifactObjectiveForRunScope,
@@ -1815,6 +1816,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // below still tracks only user-visible chunks (onDelta delivered), because
   // first-byte overload retry is unsafe only after visible output or tool work.
   let streamedText = '';
+  // Content-chanting advisory (2026-07-20): one detector per query run.
+  const chantDetector = contentChantDetectionEnabled() ? new ContentChantDetector() : null;
   // Some Claude Code SDK versions surface a turn-budget stop NOT as a clean
   // `result` message (subtype error_max_turns) but as a THROWN stream error
   // ("Claude Code returned an error result: Reached maximum number of turns (N)").
@@ -1980,6 +1983,20 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         const delta = extractTextDelta(message);
         if (delta) {
           streamedText += delta;
+          // Content-chanting advisory (2026-07-20) — same detector as the
+          // harness lane; a trip emits telemetry once, never halts the stream.
+          const chantTrip = chantDetector?.feed(delta);
+          if (chantTrip && options.sessionId) {
+            try {
+              appendEvent({
+                sessionId: options.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: { kind: 'content_chanting', action: 'advisory', repeats: chantTrip.repeats, chunkPreview: chantTrip.chunk.slice(0, 50) },
+              });
+            } catch { /* advisory telemetry must never break the stream */ }
+          }
           if (options.onDelta) {
             streamedAny = true;
             try { await options.onDelta(delta); } catch { /* a delta-sink error must never break the run */ }
