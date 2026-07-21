@@ -4,8 +4,10 @@
  * SPA-fallback pattern in src/channels/mobile-routes.ts.
  *
  * Registered in webhook.ts *before* registerConsoleRoutes so, when the
- * flag is on, this answers GET /console (and client deep-links) while the
- * legacy string console stays reachable at /console-legacy. The
+ * flag is on, this answers GET /console (and client deep-links). The legacy
+ * string renderer is no longer a navigable route (the /console-legacy path
+ * was removed 2026-07-21 so there is exactly ONE UI truth surface); it
+ * survives only as the /console fallback for a missing SPA bundle. The
  * /console/vendor/* and /console/icon.png routes registered by
  * registerConsoleRoutes are left untouched — the fallback here defers to
  * them via next(). All /api/* handlers are unchanged; the SPA is a pure
@@ -20,10 +22,10 @@ import { PKG_DIR, getRuntimeEnv } from '../config.js';
 
 /** True when the new React console should serve at /console.
  *
- * DEFAULT ON: the new console ships to everyone. The legacy console
- * remains served at /console-legacy regardless, and this is a kill-switch:
- * set CLEMENTINE_CONSOLE_NEXT to 0 / false / off / no (in
- * ~/.clementine-next/.env or the process env) to fall back to the legacy
+ * DEFAULT ON: the new console ships to everyone. The legacy renderer is
+ * kept only as the missing-bundle /console fallback (no navigable route).
+ * This is a kill-switch: set CLEMENTINE_CONSOLE_NEXT to 0 / false / off /
+ * no (in ~/.clementine-next/.env or the process env) to fall back to the legacy
  * console at /console. Reads process env AND ~/.clementine-next/.env via
  * getRuntimeEnv so it works however the daemon was launched. */
 export function isConsoleNextEnabled(): boolean {

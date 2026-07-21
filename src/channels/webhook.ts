@@ -1754,10 +1754,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     res.redirect(302, query ? `${url.pathname}?${query}` : url.pathname);
   });
   // New React/Vite console (apps/console-web), behind a flag. When on
-  // and built, it answers GET /console; the legacy string console stays
-  // reachable at /console-legacy. Registered *before* the legacy routes
-  // so its /console handler wins. If the flag is off — or the bundle
-  // isn't built — /console falls through to the legacy renderer.
+  // and built, it answers GET /console. Registered *before* the legacy
+  // routes so its /console handler wins. If the flag is off — or the
+  // bundle isn't built — /console falls through to the legacy renderer
+  // (the only remaining use of it; the /console-legacy route was removed
+  // 2026-07-21 so there is a single UI truth surface).
   const consoleNext = isConsoleNextEnabled();
   // Workspaces ("Spaces") — agent-authored interactive surfaces. MUST register
   // BEFORE the console SPA: its /console/* deep-link fallback would otherwise

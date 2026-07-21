@@ -2613,7 +2613,12 @@ export function registerConsoleRoutes(
       res.status(500).type('text').send(err instanceof Error ? err.message : String(err));
     }
   };
-  app.get('/console-legacy', serveLegacyConsole);
+  // /console-legacy removed 2026-07-21 (UI audit): it was an always-reachable
+  // SECOND UI truth surface (the 1.35 MB legacy renderer) that could show
+  // stale state diverging from the SPA — "correct at all times" wants exactly
+  // ONE truth surface. The legacy renderer stays ONLY as the /console fallback
+  // for a genuinely missing SPA bundle (a broken build must still serve
+  // something), never as a user-navigable route.
   if (opts?.serveLegacyAtRoot ?? true) {
     app.get('/console', serveLegacyConsole);
   }
