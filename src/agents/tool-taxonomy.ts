@@ -183,6 +183,10 @@ const ALWAYS_READ = new Set<string>([
   // file. Never needs approval — reconciliation is the middle of every
   // employee loop and must not stop the run.
   'table_ops',
+  // Deterministic retrieval + interval algebra (2026-07-21): pure local
+  // compute, same rationale as table_ops.
+  'file_query',
+  'time_slots',
   'workspace_roots',
   'workspace_list',
   'workspace_info',

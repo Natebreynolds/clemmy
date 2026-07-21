@@ -257,6 +257,17 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // including workflow-step/worker/code-mode: reconciliation is the middle of
   // the employee loop and must never require a bigger lane.
   { name: 'table_ops', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Deterministic table algebra over lists/sheets: diff, intersect, join, dedupe, aggregate, select — sourced from inline rows, a prior tool call id (full parked output), or a staged file.' },
+  // Document production (2026-07-21 capability audit #4): render→PDF/DOCX +
+  // template merge. A local reversible file write (the artifact chains into
+  // uploads via the file pipeline); the SEND of that artifact stays gated at
+  // the send tool as always.
+  { name: 'produce_document', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', description: 'Produce a real PDF/DOCX/HTML file from markdown or HTML with {{var}} template merge — returns a local filePath that chains into uploads/attachments.' },
+  // Large-input retrieval (2026-07-21 capability audit #2 v1): deterministic
+  // chunk-and-retrieve over big files (auto-converted) and parked outputs.
+  { name: 'file_query', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Query a big document or prior tool output for relevant passages (heading-aware chunks, deterministic ranking) instead of reading a byte-clipped preview.' },
+  // Mutual availability (2026-07-21 capability audit #6): pure interval
+  // algebra over attendee busy windows fetched via the calendar actions.
+  { name: 'time_slots', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'workflow-step', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', loopClass: 'idempotent', description: 'Compute mutual free meeting slots from attendees\' busy intervals — exact interval algebra with working-hours/duration constraints.' },
   // Employee-memory primitive (2026-07-21): durable cross-RUN state. Core +
   // available in the workflow-step/worker lanes — that's exactly where the
   // amnesia lived (an hourly scrape re-processed the same items every run).

@@ -28,6 +28,9 @@ import { registerPendingActionTools } from './pending-action-tools.js';
 import { registerStepResultTool } from './step-result-tool.js';
 import { registerWorkflowStateTools } from './workflow-state-tools.js';
 import { registerTableOpsTools } from './table-ops-tools.js';
+import { registerDocumentProduceTools } from './document-produce-tools.js';
+import { registerFileQueryTools } from './file-query-tools.js';
+import { registerTimeSlotsTools } from './time-slots-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
@@ -119,6 +122,9 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerStepResultTool(server);
   registerWorkflowStateTools(server);
   registerTableOpsTools(server);
+  registerDocumentProduceTools(server);
+  registerFileQueryTools(server);
+  registerTimeSlotsTools(server);
 
   // NOTE (2026-06-11 audit): the former `pause_for_user_approval` tool was
   // DELETED here. It was a broken duplicate of the real HITL path — it created
