@@ -108,6 +108,11 @@ export const EVENT_TYPES = [
   // in the SDK-brain MCP child, a separate process — can refuse to spawn past
   // an exhausted ceiling. Latest event wins.
   'run_token_window',
+  // Fail-closed approval park (2026-07-20): the chat/worker WAIT gate hit its
+  // hold ceiling with the card still pending — the turn ended honestly and the
+  // durable card stayed resumable. {approvalId, tool, subject}. Read by
+  // chat-approval-resume to auto-resume the session on a later approval.
+  'approval_parked',
   // SDK local-MCP startup guard retried because the required local tool surface
   // was empty or no init message arrived before the startup budget.
   'sdk_tool_surface_retry',

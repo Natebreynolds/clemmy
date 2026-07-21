@@ -184,3 +184,68 @@ test('workflow park mode treats rejected and expired exact decisions as terminal
 test.after(() => {
   rmSync(TMP, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Fail-closed approval park (2026-07-20): the WAIT gate stops pinning a live
+// turn on an unanswered card — it parks honestly and resumes on approval.
+// ---------------------------------------------------------------------------
+
+test('WAIT gate parks after the hold ceiling: honest deny, card stays pending + durable marker', async () => {
+  process.env.CLEMMY_APPROVAL_WAIT_PARK_MS = '60';
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const perm = buildGatedToolPermission(sess.id, ['memory_read']) as unknown as Perm;
+    const started = Date.now();
+    const res = await perm('mcp__clementine-local__run_shell_command', { command: 'git push origin main' }, opts());
+    assert.equal(res.behavior, 'deny');
+    assert.match(res.message ?? '', /PARKED/, 'the model is told to wrap up and report, not retry');
+    assert.equal(res.interrupt, undefined ?? res.interrupt, 'no interrupt — the model finishes the turn honestly');
+    assert.ok(Date.now() - started < 5_000, 'parks at the ceiling, not the 24h TTL');
+    const pending = approvalRegistry.listPending({ sessionId: sess.id });
+    assert.equal(pending.length, 1, 'the card SURVIVES the park — still actionable');
+    const parkedEvents = listEvents(sess.id, { types: ['approval_parked'] });
+    assert.equal(parkedEvents.length, 1, 'durable approval_parked marker for the resume listener');
+    assert.equal((parkedEvents[0].data as { approvalId?: string }).approvalId, pending[0].approvalId);
+  } finally {
+    delete process.env.CLEMMY_APPROVAL_WAIT_PARK_MS;
+  }
+});
+
+test('approve-after-park: the SAME payload re-runs on the existing grant without re-asking', async () => {
+  process.env.CLEMMY_APPROVAL_WAIT_PARK_MS = '60';
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const perm = buildGatedToolPermission(sess.id, ['memory_read']) as unknown as Perm;
+    const args = { command: 'git push origin main' };
+    const parked = await perm('mcp__clementine-local__run_shell_command', args, opts());
+    assert.match(parked.message ?? '', /PARKED/);
+    const [card] = approvalRegistry.listPending({ sessionId: sess.id });
+    approvalRegistry.resolve(card.approvalId, 'approved', 'test-late-approve');
+    // The resume turn re-issues the identical call: one-shot claim → allow, no new card.
+    const resumed = await perm('mcp__clementine-local__run_shell_command', args, opts());
+    assert.equal(resumed.behavior, 'allow', 'the human already approved this exact payload');
+    assert.deepEqual(resumed.updatedInput, args);
+    assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 0, 'no second card minted');
+    // The grant is ONE-shot: a third identical call must re-ask, not silently re-send.
+    process.env.CLEMMY_APPROVAL_WAIT_PARK_MS = '60';
+    const third = await perm('mcp__clementine-local__run_shell_command', args, opts());
+    assert.equal(third.behavior, 'deny', 'consumed grant never auto-fires a duplicate');
+    assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 1, 'a fresh card re-asks the human');
+  } finally {
+    delete process.env.CLEMMY_APPROVAL_WAIT_PARK_MS;
+  }
+});
+
+test('re-park on the SAME still-pending card: no duplicate cards across turns', async () => {
+  process.env.CLEMMY_APPROVAL_WAIT_PARK_MS = '60';
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const perm = buildGatedToolPermission(sess.id, ['memory_read']) as unknown as Perm;
+    const args = { command: 'git push origin main' };
+    await perm('mcp__clementine-local__run_shell_command', args, opts());
+    await perm('mcp__clementine-local__run_shell_command', args, opts()); // next turn retries
+    assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 1, 'one card, reused');
+  } finally {
+    delete process.env.CLEMMY_APPROVAL_WAIT_PARK_MS;
+  }
+});

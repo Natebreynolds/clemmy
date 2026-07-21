@@ -1273,6 +1273,28 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     );
   }
 
+  // Chat approval auto-resume (fail-closed park, 2026-07-20): when a WAIT-gate
+  // approval that PARKED (hold ceiling hit, turn ended honestly) is later
+  // APPROVED, re-drive the session through the normal respond spine so the
+  // approved action actually runs — "I approved it and nothing happened" is a
+  // trust break. Same injected-dispatcher shape as restart-recovery's resume.
+  try {
+    const { startChatApprovalResume } = await import('../runtime/harness/chat-approval-resume.js');
+    startChatApprovalResume(async (sessionId, directive) => {
+      await respondPreferHarness('background', {
+        sessionId,
+        channel: 'daemon',
+        message: directive,
+        model: MODELS.primary,
+      }, (req) => assistant.respond(req));
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Chat approval auto-resume failed to start (parked approvals will need a manual "continue")',
+    );
+  }
+
   // Warm the CLI-discovery cache in the background so the first agent
   // call to local_cli_list and the first dashboard render of the Local
   // CLIs card don't pay the full $PATH-walk-and-probe cost (5–30s on a

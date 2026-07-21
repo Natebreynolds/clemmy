@@ -130,7 +130,23 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-type Resolution = 'approved' | 'rejected' | 'expired' | 'aborted';
+type Resolution = 'approved' | 'rejected' | 'expired' | 'aborted' | 'park_timeout';
+
+/** Hold ceiling for the chat/worker WAIT gate (fail-closed park, 2026-07-20).
+ *  The card TTL is 24h, and `wait` mode used to hold the live SDK child + the
+ *  open turn for that whole window when nobody answered — an autonomous run
+ *  blocked on an unseen card was indistinguishable from a hang. After this
+ *  long still-pending, the wait converts into an honest PARK: the tool is
+ *  denied with a "waiting on your approval" message (the model wraps up and
+ *  reports), the card stays durable + RESUMABLE, and chat-approval-resume
+ *  re-drives the session when the card is approved. 0/off restores the
+ *  legacy TTL-bounded hold. */
+export function approvalWaitParkMs(): number {
+  const raw = (process.env.CLEMMY_APPROVAL_WAIT_PARK_MS ?? '').trim().toLowerCase();
+  if (raw === '0' || raw === 'off') return 0;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 10 * 60_000;
+}
 
 export type ClaudeAgentApprovalBoundaryState = 'pending' | 'rejected' | 'expired' | 'cancelled';
 
@@ -174,8 +190,9 @@ export function workflowApprovalResumeKey(
   return `claude-workflow-tool-v1:${digest}`;
 }
 
-async function awaitApproval(approvalId: string, signal?: AbortSignal): Promise<Resolution> {
+async function awaitApproval(approvalId: string, signal?: AbortSignal, parkAfterMs = 0): Promise<Resolution> {
   const interval = pollMs();
+  const startedAt = Date.now();
   for (;;) {
     if (signal?.aborted) return 'aborted';
     const row = approvalRegistry.get(approvalId);
@@ -183,6 +200,7 @@ async function awaitApproval(approvalId: string, signal?: AbortSignal): Promise<
     if (row.status === 'resolved') return row.resolution === 'approved' ? 'approved' : 'rejected';
     if (row.status === 'expired' || row.status === 'cancelled') return 'expired';
     if (isExpired(row)) return 'expired';
+    if (parkAfterMs > 0 && Date.now() - startedAt >= parkAfterMs) return 'park_timeout';
     await sleep(interval, signal);
   }
 }
@@ -311,9 +329,28 @@ export function buildGatedToolPermission(
         } as PermissionResult;
       }
 
-      const row = approvalRegistry.register({ sessionId, subject, tool: bare, args });
-      approvalId = row.approvalId;
-      surfaceApproval(sessionId, approvalId, bare, args, subject);
+      // WAIT gate (chat/worker): the card is durable + RESUMABLE (2026-07-20).
+      // A prior resumable decision binds this exact payload FIRST — the
+      // approve-after-park resume path re-runs the tool with identical args
+      // and must proceed on the human's existing one-shot grant instead of
+      // re-asking. 'pending' reuses the already-surfaced card (a parked wait
+      // from an earlier turn — fresh hold window, no duplicate card). Every
+      // other prior state (none/rejected/expired/cancelled/consumed) registers
+      // a fresh card, preserving the legacy re-ask semantics for a genuinely
+      // new attempt: only registerResumable's pending-dedupe and the approved
+      // one-shot claim change behavior, never the human's right to be asked.
+      const resumeKey = workflowApprovalResumeKey(sessionId, bare, args);
+      const prior = approvalRegistry.claimResumableApproval(resumeKey);
+      if (prior.state === 'approved') {
+        return { behavior: 'allow', updatedInput: args } as PermissionResult;
+      }
+      if (prior.state === 'pending') {
+        approvalId = prior.row.approvalId;
+      } else {
+        const registered = approvalRegistry.registerResumable({ sessionId, subject, tool: bare, args, resumeKey });
+        approvalId = registered.row.approvalId;
+        if (registered.created) surfaceApproval(sessionId, approvalId, bare, args, subject);
+      }
     } catch (err) {
       return {
         behavior: 'deny',
@@ -322,8 +359,31 @@ export function buildGatedToolPermission(
       } as PermissionResult;
     }
 
-    const decision = await awaitApproval(approvalId, options?.signal);
+    const decision = await awaitApproval(approvalId, options?.signal, approvalWaitParkMs());
     if (decision === 'approved') return { behavior: 'allow', updatedInput: args } as PermissionResult;
+    if (decision === 'park_timeout') {
+      // Fail-closed park: durable marker so chat-approval-resume can re-drive
+      // this session when the card is approved later; the card itself stays
+      // pending (the 24h reaper still owns final expiry + its notification).
+      try {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'approval_parked',
+          data: { approvalId, tool: bare, subject: approvalSubject(bare, args) },
+        });
+      } catch { /* the marker is best-effort; the deny below is still honest */ }
+      return {
+        behavior: 'deny',
+        message:
+          'PARKED — this action still needs the user\'s approval and they have not answered yet. '
+          + 'Do NOT retry it now and do NOT treat it as done. Finish anything that does not depend on it, '
+          + 'then tell the user exactly what is waiting on their approval; the moment they approve the card, '
+          + 'the task resumes and this exact payload will go through without re-asking.',
+        interrupt: false,
+      } as PermissionResult;
+    }
     const message =
       decision === 'rejected' ? 'You rejected this action, so it was not run.'
       : decision === 'expired' ? 'The approval request expired before it was answered.'
