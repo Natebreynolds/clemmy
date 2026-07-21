@@ -280,6 +280,26 @@ test('evaluateAutoApprove: yolo = auto regardless of workspace', () => {
   assert.equal(d2.reason, 'yolo-policy');
 });
 
+test('evaluateAutoApprove: the load-bearing invariant — an IRREVERSIBLE SEND is never auto-approved even under Autonomous, but a reversible draft is', () => {
+  // This is the property the whole trust model rests on: Autonomous (yolo) is
+  // the DEFAULT, so an irreversible external send MUST still be held for a
+  // human at the gate, while a reversible draft/write flows freely.
+  const send = evaluateAutoApprove({ sessionId: 'sess-inv-send', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_SEND_EMAIL' }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(send.autoApproved, false, 'an irreversible send is HELD under Autonomous — the core guarantee');
+
+  const draft = evaluateAutoApprove({ sessionId: 'sess-inv-draft', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_CREATE_DRAFT' }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(draft.autoApproved, true, 'a reversible draft auto-approves — it is not an irreversible send');
+
+  // The meeting-invite hole fixed in the 2026-07-21 write-path sweep: a
+  // meeting CREATE dispatches invites, so it must be held too.
+  const meeting = evaluateAutoApprove({ sessionId: 'sess-inv-mtg', toolName: 'composio_execute_tool', args: { tool_slug: 'ZOOM_CREATE_MEETING' }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(meeting.autoApproved, false, 'a meeting-invite create is held under Autonomous');
+
+  // And the cx_ dynamic-tool lane resolves to the same gate.
+  const cxSend = evaluateAutoApprove({ sessionId: 'sess-inv-cx', toolName: 'cx_gmail_send_email', scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(cxSend.autoApproved, false, 'a cx_ send is held identically to the broker send');
+});
+
 test('evaluateAutoApprove: plan-scope wins over policy reason when both fire', () => {
   openPlanScope({ sessionId: 'sess-both', planProposalId: 'plan-2', approvedPlanObjective: 'both' });
   const d = evaluateAutoApprove({ sessionId: 'sess-both', toolName: 'run_shell_command', scope: 'yolo', insideWorkspace: true });
