@@ -6793,7 +6793,11 @@ function handleRunError(
         err = BoundaryError.from(err, {
           kind: 'model.unknown',
           retryable: true,
-          userMessage: 'The model backend hit an unexpected error.',
+          // Carry the status + the provider's own words: an opaque "unexpected
+          // error" hides exactly the detail (e.g. Moonshot's "assistant message
+          // must not be empty") that lets a user report — or us diagnose — the
+          // real failure from a screenshot.
+          userMessage: `The model backend hit an unexpected error (HTTP ${cls.status}): ${clip(message, 160)}`,
         });
       }
     } catch { /* classification is best-effort — fall through to normal handling */ }

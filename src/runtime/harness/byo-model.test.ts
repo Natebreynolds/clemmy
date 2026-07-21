@@ -90,6 +90,32 @@ test('relax: json_schema + TOOLS with the kill-switch OFF keeps the legacy json_
   }
 });
 
+test('relax: empty assistant messages are normalized (Moonshot 400s on them)', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'go' },
+      // tool-call-only turn: strict backends reject content '' → must become null
+      { role: 'assistant', content: '', tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 't1', content: 'result' },
+      // dead/aborted turn: carries nothing → dropped entirely
+      { role: 'assistant', content: '' },
+      { role: 'assistant', content: null },
+      { role: 'assistant', content: [] },
+      { role: 'user', content: 'next' },
+      // non-empty assistant messages pass through untouched
+      { role: 'assistant', content: 'a real reply' },
+    ],
+  }) as { messages: Array<Record<string, unknown>> };
+  const toolTurn = out.messages.find((m) => Array.isArray(m.tool_calls));
+  assert.ok(toolTurn, 'tool-call turn survives');
+  assert.equal(toolTurn!.content, null, 'tool-call turn content coerced to null');
+  const assistants = out.messages.filter((m) => m.role === 'assistant');
+  assert.equal(assistants.length, 2, 'bare empty assistant messages dropped');
+  assert.equal(assistants[1]!.content, 'a real reply');
+  assert.equal(out.messages.filter((m) => m.role === 'user').length, 2, 'other roles untouched');
+});
+
 test('relax: json_schema WITHOUT tools still downgrades to json_object (no behavior change)', () => {
   const out = relaxRequestForCompatBackend({
     messages: [{ role: 'system', content: 'sys' }],

@@ -132,6 +132,26 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   // GLM (Z.ai): drive its `thinking` switch from the (now-stripped) effort tier.
   applyGlmThinking(next, requestedEffort);
 
+  // Strict compat backends (Moonshot/Kimi) reject ANY assistant message with
+  // empty content: `400 Invalid request: the message at position N with role
+  // 'assistant' must not be empty`. An empty assistant message enters the
+  // transcript from a tool-call-only turn (content '' beside tool_calls) or an
+  // aborted/dead turn (no content at all) — and because it REPLAYS with the
+  // history, every retry in that session fails identically. Normalize outbound:
+  // a tool-call turn carries `content: null` (the OpenAI-compat convention —
+  // content is optional when tool_calls is present); a bare empty assistant
+  // message carries nothing at all, so drop it.
+  if (Array.isArray(next.messages)) {
+    next.messages = (next.messages as Array<Record<string, unknown>>).flatMap((m) => {
+      if (m?.role !== 'assistant') return [m];
+      const empty = m.content == null || m.content === ''
+        || (Array.isArray(m.content) && (m.content as unknown[]).length === 0);
+      if (!empty) return [m];
+      const hasToolCalls = Array.isArray(m.tool_calls) && (m.tool_calls as unknown[]).length > 0;
+      return hasToolCalls ? [{ ...m, content: null }] : [];
+    });
+  }
+
   // Restore legacy (dynamic-first) order in system message(s) — a BYO backend
   // never caches via breakpoints, so its wire stays BYTE-IDENTICAL to pre-parity.
   if (Array.isArray(next.messages)) {
