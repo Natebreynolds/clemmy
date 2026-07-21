@@ -19,6 +19,7 @@ import {
 } from './relations.js';
 import { getResourcePointersByIds, listAllResourcePointers, type ResourcePointer } from './source-map.js';
 import { matchToolChoicesForStep } from './tool-choice-store.js';
+import { extractAnchors, type EntityAnchors } from './memory-merge.js';
 import { getFactEvidence, listMemoryPolicies } from './temporal-memory.js';
 import {
   readRecallRefUtilitySignals,
@@ -354,20 +355,83 @@ export function correctionExcludesFromRecall(
   return nowMs - correctedAt <= CORRECTION_EXCLUSION_WINDOW_MS;
 }
 
+/** Account/matter scoped recall (2026-07-21) — the memory-audit gap that most
+ *  threatens the "trusted employee" bar: recall had NO account filter, so a
+ *  fact learned in Client A's context could surface while acting for Client B
+ *  (a cross-client leak). This reuses the SAME battle-tested entity-anchor
+ *  conflict logic the merge path uses to refuse combining different clients'
+ *  facts (extractAnchors + canMergeEntitySafe).
+ *
+ *  It fires ONLY when the active request carries a SPECIFIC client/account/
+ *  domain anchor AND a candidate fact carries a CONFLICTING one — i.e. the
+ *  request is clearly about Client A and the fact is clearly about Client B.
+ *  General (anchor-less) requests are a no-op (byte-identical recall), and
+ *  anchor-less or same-client facts are never excluded, so shared/general
+ *  knowledge always surfaces. Kill-switch CLEMMY_ACCOUNT_SCOPED_RECALL=off. */
+export function accountScopedRecallEnabled(): boolean {
+  const v = (process.env.CLEMMY_ACCOUNT_SCOPED_RECALL ?? 'on').trim().toLowerCase();
+  return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
+}
+
+/** True when `activeAnchors` names a specific client/account/domain to scope by. */
+export function activeContextHasAccountScope(activeAnchors: EntityAnchors): boolean {
+  return activeAnchors.accountIds.size > 0 || activeAnchors.domains.size > 0 || activeAnchors.clientNames.size > 0;
+}
+
+/** Disjoint iff both sets are non-empty and share nothing — the "different
+ *  entity" signal. Empty on either side = compatible (no conflict). */
+function disjointNonEmpty<T>(a: Set<T>, b: Set<T>): boolean {
+  if (a.size === 0 || b.size === 0) return false;
+  for (const x of a) if (b.has(x)) return false;
+  return true;
+}
+
+/** A candidate fact that belongs to a DIFFERENT CLIENT than the active request
+ *  must not surface for this one. Keyed on ACCOUNT-level identity only
+ *  (account id / domain / client name) — deliberately NOT emails or table ids:
+ *  a different CONTACT or a different TABLE within the SAME client is still
+ *  relevant (canMergeEntitySafe conflates person/data conflicts with account
+ *  conflicts, which is right for merging but too strict for recall scoping).
+ *  Fail-open on any error (recall must never break). */
+export function accountScopeExcludesFromRecall(activeAnchors: EntityAnchors, factText: string): boolean {
+  try {
+    if (!accountScopedRecallEnabled()) return false;
+    if (!activeContextHasAccountScope(activeAnchors)) return false; // general request → no scoping
+    const f = extractAnchors({ content: factText });
+    return (
+      disjointNonEmpty(activeAnchors.accountIds, f.accountIds)
+      || disjointNonEmpty(activeAnchors.domains, f.domains)
+      || disjointNonEmpty(activeAnchors.clientNames, f.clientNames)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function applyUtilityRerank(
   hits: MemoryEvidenceHit[],
   nowMs: number,
+  objective?: string,
 ): { hits: MemoryEvidenceHit[]; adjusted: number } {
   const signals = readRecallRefUtilitySignals(hits.map((hit) => ({
     type: hit.ref.type,
     id: String(hit.ref.id),
   })));
+  // Account/matter scope: extract the active request's client/account anchor
+  // ONCE. Only facts of a DIFFERENT client are excluded (see
+  // accountScopeExcludesFromRecall); a no-op when the request names no client.
+  const activeAnchors = objective ? extractAnchors({ content: objective }) : null;
+  const accountScoped = Boolean(activeAnchors && accountScopedRecallEnabled() && activeContextHasAccountScope(activeAnchors));
   let adjusted = 0;
   const survivors = hits.filter((hit) => {
     const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
     if (correctionExcludesFromRecall(signal, nowMs)) {
       adjusted += 1;
       return false; // the user said this is wrong — it must not feed another action
+    }
+    if (accountScoped && activeAnchors && accountScopeExcludesFromRecall(activeAnchors, hit.text)) {
+      adjusted += 1;
+      return false; // a different client's fact must not surface for this one
     }
     return true;
   });
@@ -912,7 +976,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     }));
   }
 
-  const utilityRerank = applyUtilityRerank(Array.from(merged.values()), nowMs);
+  const utilityRerank = applyUtilityRerank(Array.from(merged.values()), nowMs, objective);
   const completeSetRerank = preferDurableCompleteSetHits(utilityRerank.hits, objective);
   const logicalCandidates = collapseMeetingRepresentations(completeSetRerank, logicalMeetingKeys)
     .map((hit) => temporalMeetingTopicQuery && hit.whyRecalled.includes('exact temporal match')
