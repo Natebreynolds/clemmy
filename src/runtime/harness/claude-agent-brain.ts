@@ -2134,6 +2134,28 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     replyText: text,
     toolArgTexts: result.toolUses,
   });
+  // Autonomous learning parity (2026-07-21): the orchestrator lane distills a
+  // reusable skill on goal satisfaction (loop.ts) and workflows distill on
+  // completion — but the DEFAULT Claude SDK brain lane did NOT, so Clementine
+  // learned on Codex/BYO + workflows but not on her own default brain (an
+  // "ever-learning across all models" asymmetry). Fire the SAME distiller on a
+  // successful multi-tool chat turn here. Draft-only + novelty/dedup gated
+  // INSIDE the distiller (the model call only runs for a genuinely novel
+  // multi-system success; trivial/repeat turns short-circuit cheaply), and
+  // fully detached so it never touches the delivery path. NOT reinforcement —
+  // that stays keyed to validated goal success on the orchestrator lane.
+  if (stoppedReason === 'success' && result.toolUses.length >= 2 && getSession(sessionId)?.kind === 'chat') {
+    void (async () => {
+      try {
+        const { distillSkillFromSession } = await import('../../memory/skill-distiller.js');
+        await distillSkillFromSession(sessionId, {
+          objective: turnObjective,
+          evidence: text.slice(0, 4000),
+          origin: { kind: 'chat', sourceId: sessionId },
+        });
+      } catch { /* self-evolving is best-effort — never affects the turn */ }
+    })();
+  }
   return {
     text,
     sessionId,
