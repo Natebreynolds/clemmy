@@ -37,3 +37,24 @@ test('truncates a long recipient list', () => {
   const many = Array.from({ length: 8 }, (_, i) => `p${i}@x.com`);
   assert.match(describeExternalWrite('OUTLOOK_SEND_EMAIL', 'composio', many), /\(\+3 more\)/);
 });
+
+import { synthesizeTurnReport } from './work-report.js';
+import { resetEventLog, createSession, appendEvent } from './eventlog.js';
+
+test('synthesizeTurnReport: writes → write report; tools-only → honest tool note; nothing → null', () => {
+  resetEventLog();
+  const sid = 'turn-report-session';
+  createSession({ id: sid, kind: 'chat', title: 't' });
+  // Nothing yet → null (a total non-response → caller shows "send again").
+  assert.equal(synthesizeTurnReport(sid, 0), null);
+  // Meaningful tool call, no writes → honest "I ran a tool but didn't summarize".
+  appendEvent({ sessionId: sid, turn: 1, role: 'agent', type: 'tool_called', data: { tool: 'web_search', accounting: 'top_level' } });
+  const toolReport = synthesizeTurnReport(sid, 0);
+  assert.ok(toolReport, 'a tools-only turn still reports back');
+  assert.match(toolReport!, /ran 1 tool/i);
+  assert.match(toolReport!, /didn't compose a written summary/i);
+  // A write outranks the tool note.
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@b.com'] } });
+  const writeReport = synthesizeTurnReport(sid, 0);
+  assert.match(writeReport!, /Sent a message to a@b\.com/);
+});

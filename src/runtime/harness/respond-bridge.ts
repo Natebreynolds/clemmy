@@ -64,7 +64,7 @@ import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
-import { synthesizeWorkReport } from './work-report.js';
+import { synthesizeTurnReport } from './work-report.js';
 import { nonFilterableToolExcludes } from './tool-policy.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import pino from 'pino';
@@ -387,18 +387,15 @@ function awaitingQuestionText(sessionId: string): string | null {
 }
 
 /**
- * ALWAYS REPORT BACK. When a turn does real work (external writes) but the model
- * emits no reply text, synthesize an honest report from the run's external_write
- * events so the user always learns what happened. Thin wrapper over the shared
- * synthesizer (also used at the loop's terminal-reply choke point). Returns null when
- * there is nothing durable to report (a pure ack).
+ * ALWAYS REPORT BACK. When a turn did real work (writes, or at least meaningful tool
+ * calls) but the model emitted no reply text, synthesize an honest report so the user
+ * always learns what happened. Thin wrapper over the shared synthesizer (also used at
+ * the loop's terminal-reply choke points). `afterSeq` scopes to this request's events.
+ * Returns null only for a TOTAL non-response (no writes, no tools) — the caller then
+ * shows the genuine "send that again" fallback.
  */
-export function synthesizeCompletedWorkReport(sessionId: string, sinceExternalWriteCount: number): string | null {
-  try {
-    return synthesizeWorkReport(listEvents(sessionId, { types: ['external_write'] }).slice(sinceExternalWriteCount));
-  } catch {
-    return null;
-  }
+export function synthesizeCompletedWorkReport(sessionId: string, afterSeq?: number): string | null {
+  return synthesizeTurnReport(sessionId, afterSeq);
 }
 
 export async function respondViaHarness(
@@ -589,7 +586,7 @@ export async function respondViaHarness(
           // ALWAYS REPORT BACK: if the model produced no reply text but the turn
           // committed real work, synthesize an honest report of what it did rather
           // than shipping "(no reply produced)".
-          text: replyText || synthesizeCompletedWorkReport(sessionId, extWritesBeforeRun) || '(no reply produced)',
+          text: replyText || synthesizeCompletedWorkReport(sessionId, sourceUserEvent.seq) || '(no reply produced)',
           sessionId,
           stoppedReason: 'success',
           turnsUsed: result.lastTurn,

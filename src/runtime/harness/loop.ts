@@ -54,7 +54,7 @@ import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
-import { synthesizeWorkReport } from './work-report.js';
+import { synthesizeTurnReport } from './work-report.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
@@ -2669,10 +2669,7 @@ async function runConversationCore(
       // external_write events.
       if (!fallbackSummary || !fallbackSummary.trim()) {
         try {
-          const report = synthesizeWorkReport(
-            listEvents(options.sessionId, { types: ['external_write'] })
-              .filter((w) => !activeSourceUserSeq || w.seq > activeSourceUserSeq),
-          );
+          const report = synthesizeTurnReport(options.sessionId, activeSourceUserSeq);
           if (report) fallbackSummary = report;
         } catch { /* fail-open to the original fallback */ }
       }
@@ -3397,14 +3394,7 @@ async function runConversationCore(
       // honest synthesized report of what happened (from this request's external_write
       // events) instead of the bare "(Finished without a written reply.)" fallback.
       const missingReplyWorkReport = (!hasReply && isCompletedAction)
-        ? (() => {
-            try {
-              return synthesizeWorkReport(
-                listEvents(options.sessionId, { types: ['external_write'] })
-                  .filter((w) => !activeSourceUserSeq || w.seq > activeSourceUserSeq),
-              );
-            } catch { return null; }
-          })()
+        ? (() => { try { return synthesizeTurnReport(options.sessionId, activeSourceUserSeq); } catch { return null; } })()
         : null;
       const baseSummary = hasReply
         ? decision.reply!
@@ -5752,14 +5742,7 @@ async function runConversationFromResumeCore(opts: {
       // ALWAYS REPORT BACK (resume variant): a completed turn with no reply but real
       // work done reports what it did instead of the bare fallback.
       const resumeWorkReport = (!hasReply && isCompletedAction)
-        ? (() => {
-            try {
-              return synthesizeWorkReport(
-                listEvents(opts.sessionId, { types: ['external_write'] })
-                  .filter((w) => !activeSourceUserSeq || w.seq > activeSourceUserSeq),
-              );
-            } catch { return null; }
-          })()
+        ? (() => { try { return synthesizeTurnReport(opts.sessionId, activeSourceUserSeq); } catch { return null; } })()
         : null;
       const userVisibleSummary = hasReply
         ? decision!.reply!

@@ -9,7 +9,8 @@
  * SMS, CRM, files — anything. A pure ack (no writes) reports nothing (returns null),
  * so we don't fabricate a report where there is genuinely nothing to say.
  */
-import type { EventRow } from './eventlog.js';
+import { listEvents, type EventRow } from './eventlog.js';
+import { isToolSurfaceProbeTool } from './tool-evidence.js';
 
 /** Humanize ONE recorded external write into a report line. */
 export function describeExternalWrite(shapeKey: string | undefined, toolName: string, targets: string[]): string {
@@ -45,4 +46,36 @@ export function synthesizeWorkReport(writes: readonly EventRow[]): string | null
   }
   if (lines.length === 0) return null;
   return `I finished — here's what I did this turn:\n${lines.join('\n')}`;
+}
+
+/**
+ * The best available report for a turn that produced NO reply text, from the durable
+ * event log. Order: (1) irreversible WRITES → describe them; (2) else meaningful
+ * (non-probe) TOOL work → an honest "I did the lookups but didn't summarize" note;
+ * (3) else null → the caller's genuine-non-response fallback ("send that again").
+ * So "no reply" only ever surfaces when the model did LITERALLY nothing — every turn
+ * that touched the outside world reports what it touched. `afterSeq` scopes to the
+ * current request's events (writes/tool_calls with seq > afterSeq).
+ */
+export function synthesizeTurnReport(sessionId: string, afterSeq?: number): string | null {
+  let events: readonly EventRow[];
+  try {
+    events = listEvents(sessionId);
+  } catch {
+    return null;
+  }
+  const inScope = (e: EventRow): boolean => afterSeq == null || e.seq > afterSeq;
+
+  const writeReport = synthesizeWorkReport(events.filter((e) => e.type === 'external_write' && inScope(e)));
+  if (writeReport) return writeReport;
+
+  const meaningfulToolCalls = events.filter((e) => {
+    if (e.type !== 'tool_called' || !inScope(e)) return false;
+    const name = (e.data as { tool?: unknown }).tool;
+    return typeof name === 'string' && name.length > 0 && !isToolSurfaceProbeTool(name);
+  }).length;
+  if (meaningfulToolCalls === 0) return null;
+
+  return `I worked on that — I ran ${meaningfulToolCalls} tool${meaningfulToolCalls === 1 ? '' : 's'} but didn't compose a written summary. `
+    + 'Ask me to summarize what I found, or resend and I\'ll retry.';
 }
