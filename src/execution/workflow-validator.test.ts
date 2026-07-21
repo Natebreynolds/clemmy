@@ -1083,3 +1083,57 @@ test('steps.X.output via transitive dependency → ok', () => {
   });
   assert.ok(!result.errors.some((e) => /steps\.a\.output/.test(e)));
 });
+
+// ---------------------------------------------------------------------------
+// CALL-3 (2026-07-20 attorney-bar audit A1): the "internal builder error"
+// class — a call node that saves green and fails on first dispatch.
+// ---------------------------------------------------------------------------
+import { checkCallNode } from './workflow-validator.js';
+import { rememberToolSchema, resetToolSchemaCache } from '../tools/composio-schema-cache.js';
+
+test('CALL-3: a malformed call.tool is a hard ERROR (deterministic evidence)', () => {
+  const bad = checkCallNode({ id: 's1', call: { tool: 'send the email please', args: {} } }, undefined);
+  assert.equal(bad.errors.length, 1);
+  assert.match(bad.errors[0], /not a valid tool reference/);
+  const empty = checkCallNode({ id: 's1', call: { tool: '', args: {} } }, undefined);
+  assert.deepEqual(empty.errors, [], 'CALL-1 owns the missing-tool error');
+});
+
+test('CALL-3: missing required args vs the REAL cached schema is a hard ERROR', () => {
+  resetToolSchemaCache();
+  rememberToolSchema('GMAIL_SEND_EMAIL', { type: 'object', required: ['recipient_email', 'body'], properties: {} });
+  try {
+    const bad = checkCallNode({ id: 's1', call: { tool: 'GMAIL_SEND_EMAIL', args: { body: 'hi' } } }, undefined);
+    assert.equal(bad.errors.length, 1);
+    assert.match(bad.errors[0], /recipient_email/);
+    const good = checkCallNode({ id: 's1', call: { tool: 'GMAIL_SEND_EMAIL', args: { recipient_email: '{{item.email}}', body: 'hi' } } }, undefined);
+    assert.deepEqual(good.errors, [], 'templated args count as present — presence-only check');
+  } finally {
+    resetToolSchemaCache();
+  }
+});
+
+test('CALL-3: an unverifiable Composio slug only WARNS (fail-open when the cache has no evidence)', () => {
+  resetToolSchemaCache();
+  const res = checkCallNode({ id: 's1', call: { tool: 'GMAIL_SEND_MAIL_TYPO', args: {} } }, new Set(['memory_read']));
+  assert.deepEqual(res.errors, [], 'absence of evidence never hard-blocks');
+  assert.equal(res.warnings.length, 1);
+  assert.match(res.warnings[0], /can't be verified/);
+});
+
+test('CALL-3: a known local tool passes clean; cx_ aliases pass shape', () => {
+  const local = checkCallNode({ id: 's1', call: { tool: 'run_shell_command', args: {} } }, new Set(['run_shell_command']));
+  assert.deepEqual([local.errors, local.warnings], [[], []]);
+  const cx = checkCallNode({ id: 's1', call: { tool: 'cx_gmail_send_email', args: {} } }, undefined);
+  assert.deepEqual(cx.errors, []);
+});
+
+test('CALL-3 is wired into validateWorkflowDefinition (the agent save path)', () => {
+  resetToolSchemaCache();
+  const def = {
+    name: 'call3-wire', description: 'x', trigger: {},
+    steps: [{ id: 'a', prompt: 'do it', call: { tool: 'total nonsense slug', args: {} } }],
+  } as unknown as WorkflowFrontmatter;
+  const res = validateWorkflowDefinition(def, {});
+  assert.ok(res.errors.some((e) => /not a valid tool reference/.test(e)), 'the builder-error class is now un-saveable');
+});

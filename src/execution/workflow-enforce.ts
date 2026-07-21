@@ -1,6 +1,7 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
 import { stepLooksMultiItemWithoutForEach, validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
@@ -750,7 +751,18 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
   } catch {
     rememberedToolChoices = undefined;
   }
-  const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices });
+  // Attorney-bar audit A1 (2026-07-20): the agent's save path used to pass no
+  // knownToolNames, silently disabling the slug catalog check that the desktop
+  // save path had — so a hallucinated tool reference shipped green and failed
+  // on first fire ("internal builder error"). Best-effort: a catalog read
+  // error never blocks a write.
+  let knownToolNames: Set<string> | undefined;
+  try {
+    knownToolNames = new Set(LOCAL_MCP_TOOL_NAMES as readonly string[]);
+  } catch {
+    knownToolNames = undefined;
+  }
+  const result = validateWorkflowDefinition(toFrontmatter(def), { rememberedToolChoices, knownToolNames });
   const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def)];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);

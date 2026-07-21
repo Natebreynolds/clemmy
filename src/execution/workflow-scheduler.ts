@@ -6,6 +6,12 @@ import { listWorkflows } from '../memory/workflow-store.js';
 import { reapRunEventDir } from './workflow-events.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+// Static import (2026-07-20): the old lazy `require('../runtime/notifications.js')`
+// was DEAD CODE in this "type":"module" package — require is undefined in ESM,
+// so the backpressure, catch-up, and enqueue-failure notices silently fell into
+// their catch blocks and NEVER reached the user. No cycle: notifications
+// imports nothing from execution/.
+import { addNotification, getNotification } from '../runtime/notifications.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import {
   readWorkflowRunRecordUnlocked,
@@ -362,11 +368,6 @@ function countActiveRunsFor(workflowName: string): { pending: number; parked: nu
  *  commitment — surface it (daily-bucketed per workflow). */
 function emitEnqueueFailureNotice(workflowName: string, err: unknown): void {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { addNotification, getNotification } = require('../runtime/notifications.js') as {
-      addNotification: (n: Record<string, unknown>) => void;
-      getNotification: (id: string) => unknown;
-    };
     const dayKey = new Date().toISOString().slice(0, 10);
     const id = `system-workflow-enqueue-failed-${workflowName}-${dayKey}`;
     if (getNotification(id)) return;
@@ -389,12 +390,6 @@ function emitEnqueueFailureNotice(workflowName: string, err: unknown): void {
 
 function emitQueueBackpressureNotice(workflowName: string, pending: number): void {
   try {
-    // Lazy require — avoids hoisting and any chance of a startup cycle.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { addNotification, getNotification } = require('../runtime/notifications.js') as {
-      addNotification: (n: Record<string, unknown>) => void;
-      getNotification: (id: string) => unknown;
-    };
     const dayKey = new Date().toISOString().slice(0, 10);
     const id = `system-workflow-backpressure-${workflowName}-${dayKey}`;
     if (getNotification(id)) return;
@@ -420,11 +415,6 @@ function emitQueueBackpressureNotice(workflowName: string, pending: number): voi
  *  schedule is never silent (reports-back). Daily-bucketed per workflow. */
 function emitCatchupNotice(workflowName: string, missed: number, firedMinuteKey: string): void {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { addNotification, getNotification } = require('../runtime/notifications.js') as {
-      addNotification: (n: Record<string, unknown>) => void;
-      getNotification: (id: string) => unknown;
-    };
     const dayKey = new Date().toISOString().slice(0, 10);
     const id = `system-workflow-catchup-${workflowName}-${dayKey}`;
     if (getNotification(id)) return;

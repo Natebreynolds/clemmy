@@ -69,7 +69,7 @@ test('approval and result transitions update status without losing history', () 
   assert.ok((done?.history.length ?? 0) >= 4);
 });
 
-test('human approval provenance cannot be downgraded by later policy bookkeeping', () => {
+test('human approval provenance cannot be downgraded by later policy bookkeeping', async () => {
   const record = pending.queuePendingAction({
     title: 'Send approved proof',
     summary: 'Send after a real card decision.',
@@ -78,7 +78,16 @@ test('human approval provenance cannot be downgraded by later policy bookkeeping
     payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
   });
 
-  pending.markPendingActionApprovalResolved(record.id, 'approved', 'apr-human');
+  // B4 (2026-07-20): the inferred human claim is now VERIFIED against the
+  // registry, so this test uses a REAL approved card (a fabricated id would
+  // correctly be refuted to policy — see the B4 tests below).
+  const { createSession } = await import('./eventlog.js');
+  const registryMod = await import('./approval-registry.js');
+  const sess = createSession({ kind: 'chat' });
+  const card = registryMod.register({ sessionId: sess.id, subject: 'send proof', tool: 'composio_execute_tool', args: {} });
+  registryMod.resolve(card.approvalId, 'approved', 'test');
+
+  pending.markPendingActionApprovalResolved(record.id, 'approved', card.approvalId);
   pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
     by: 'policy',
     evidence: { kind: 'policy', scope: 'yolo' },
@@ -86,8 +95,8 @@ test('human approval provenance cannot be downgraded by later policy bookkeeping
 
   const approved = pending.getPendingAction(record.id);
   assert.equal(approved?.approvedBy, 'human');
-  assert.deepEqual(approved?.approvalEvidence, { kind: 'card', approvalId: 'apr-human' });
-  assert.equal(approved?.approvalId, 'apr-human');
+  assert.deepEqual(approved?.approvalEvidence, { kind: 'card', approvalId: card.approvalId });
+  assert.equal(approved?.approvalId, card.approvalId);
 });
 
 test('parsePendingActionPayloadJson rejects malformed JSON with a corrective message', () => {
@@ -95,4 +104,79 @@ test('parsePendingActionPayloadJson rejects malformed JSON with a corrective mes
     () => pending.parsePendingActionPayloadJson('{bad json'),
     /payloadJson must be valid JSON/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// THE-GRANT hardening (2026-07-20 audit B4): inferred human consent is
+// VERIFIED against the registry — a dangling/rejected approvalId can never
+// read back as human consent.
+// ---------------------------------------------------------------------------
+import { writeFileSync, mkdirSync } from 'node:fs';
+const approvalRegistry = await import('./approval-registry.js');
+const { PENDING_ACTIONS_DIR } = pending;
+
+function writeLegacyRecord(id: string, approvalId: string | null): void {
+  mkdirSync(PENDING_ACTIONS_DIR, { recursive: true });
+  // A pre-consent-fields record: status approved, approvalId present, but NO
+  // approvedBy/approvalEvidence — the legacy shape the inference covers.
+  writeFileSync(path.join(PENDING_ACTIONS_DIR, `${id}.json`), JSON.stringify({
+    id,
+    title: 'legacy send',
+    summary: 's',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { x: 1 },
+    payloadHash: 'h',
+    idempotencyKey: 'k',
+    targetSummary: 't',
+    preview: 'p',
+    risk: 'r',
+    rollback: 'r',
+    sessionId: null,
+    createdBy: 'test',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    status: 'approved',
+    approvalId,
+    resultSummary: null,
+    history: [],
+  }, null, 2));
+}
+
+test('B4: a DANGLING approvalId reads back as policy consent (inert for sends), never human', () => {
+  writeLegacyRecord('pa_dangling', 'approval-that-never-existed');
+  const record = pending.getPendingAction('pa_dangling');
+  assert.ok(record);
+  assert.equal(record!.approvedBy, 'policy', 'unverifiable consent claim is refuted');
+  assert.deepEqual(record!.approvalEvidence, { kind: 'policy', scope: 'unverified-card:approval-that-never-existed' });
+});
+
+test('B4: a REJECTED card reads back as policy consent, never human', async () => {
+  const { createSession } = await import('./eventlog.js');
+  const sess = createSession({ kind: 'chat' });
+  const row = approvalRegistry.register({ sessionId: sess.id, subject: 'send x', tool: 't', args: {} });
+  approvalRegistry.resolve(row.approvalId, 'rejected', 'test');
+  writeLegacyRecord('pa_rejected', row.approvalId);
+  const record = pending.getPendingAction('pa_rejected');
+  assert.equal(record!.approvedBy, 'policy', 'a rejected card is not consent');
+});
+
+test('B4: a genuinely APPROVED card verifies and reads back as human consent', async () => {
+  const { createSession } = await import('./eventlog.js');
+  const sess = createSession({ kind: 'chat' });
+  const row = approvalRegistry.register({ sessionId: sess.id, subject: 'send y', tool: 't', args: {} });
+  approvalRegistry.resolve(row.approvalId, 'approved', 'test');
+  writeLegacyRecord('pa_real', row.approvalId);
+  const record = pending.getPendingAction('pa_real');
+  assert.equal(record!.approvedBy, 'human', 'a verified card keeps its human claim');
+  assert.deepEqual(record!.approvalEvidence, { kind: 'card', approvalId: row.approvalId });
+});
+
+test('B4: markPendingActionApprovalResolved refutes an unverifiable card id at mint time', () => {
+  const queued = pending.queuePendingAction({
+    title: 'x', summary: 'x', kind: 'external_send', toolName: 't',
+    targetSummary: 't', preview: 'p', risk: 'r', rollback: 'r', payload: {},
+  });
+  const updated = pending.markPendingActionApprovalResolved(queued.id, 'approved', 'no-such-card');
+  assert.equal(updated!.approvedBy, 'policy', 'an approved resolution with a dangling card id cannot claim human');
 });

@@ -2,6 +2,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
+// Deliberate ESM cycle (approval-registry imports this module): bindings are
+// only touched inside verifyApprovedCard at call time, never at module eval.
+import * as approvalRegistryForVerify from './approval-registry.js';
 
 export const PENDING_ACTIONS_DIR = path.join(BASE_DIR, 'pending-actions');
 
@@ -123,18 +126,59 @@ function writeRecord(record: PendingActionRecord): PendingActionRecord {
   return record;
 }
 
+/** THE-GRANT hardening (2026-07-20 audit B4): does this approvalId resolve to
+ *  a REAL card that was RESOLVED APPROVED? 'refuted' = the card is missing,
+ *  pending, rejected, expired, or cancelled — a consent claim built on it is
+ *  invalid. 'unavailable' = the registry could not be read (transient) — the
+ *  caller decides fail direction. */
+type CardConsentVerification = 'verified' | 'refuted' | 'unavailable';
+function verifyApprovedCard(approvalId: string): CardConsentVerification {
+  try {
+    // approval-registry imports this module, so this is an ESM import CYCLE —
+    // safe because the namespace binding is only dereferenced at CALL time
+    // (function declarations are hoisted by then), never at module eval.
+    // NOTE: a lazy `require()` does NOT work here — this package is
+    // "type":"module", so require is undefined at runtime and the catch would
+    // silently fail-open (exactly how the first cut of this fix died in tests).
+    const row = approvalRegistryForVerify.get(approvalId);
+    if (!row) return 'refuted';
+    return row.status === 'resolved' && row.resolution === 'approved' ? 'verified' : 'refuted';
+  } catch {
+    return 'unavailable';
+  }
+}
+
+/** Consent inferred from a card id, VERIFIED against the registry. A refuted
+ *  id reads as 'policy' — which the executor gate makes inert for irreversible
+ *  sends (GRANT INVARIANT I1), surfacing an honest "needs your approval card"
+ *  instead of executing on a dangling string. Transient registry unavailability
+ *  fails OPEN to the claim (a read hiccup must not rebrand a real approval). */
+function inferCardConsent(approvalId: string): { by: PendingActionApprovedBy; evidence: PendingActionApprovalEvidence } {
+  return verifyApprovedCard(approvalId) === 'refuted'
+    ? { by: 'policy', evidence: { kind: 'policy', scope: `unverified-card:${approvalId}` } }
+    : { by: 'human', evidence: { kind: 'card', approvalId } };
+}
+
 function safeReadRecord(file: string): PendingActionRecord | null {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf-8')) as PendingActionRecord;
     if (!parsed || typeof parsed.id !== 'string') return null;
     // Back-compat defaulting (THE-GRANT R-compat): records written before the
-    // consent fields existed. A real card resolution always linked approvalId,
-    // so approved+approvalId reads as human consent; approved without one was
-    // a policy/auto path.
+    // consent fields existed. Audit B4 (2026-07-20): the old inference minted
+    // 'human' from ANY present approvalId string with no existence/approval
+    // check — a dangling or rejected id read back as verified human consent
+    // and the executor honored it. Now the inferred claim is VERIFIED against
+    // the registry; refuted ids read as 'policy' (inert for sends).
     if (parsed.approvedBy === undefined || parsed.approvedBy === null) {
       if (parsed.status === 'approved' || parsed.status === 'executed') {
-        parsed.approvedBy = parsed.approvalId ? 'human' : 'policy';
-        parsed.approvalEvidence = parsed.approvalId ? { kind: 'card', approvalId: parsed.approvalId } : null;
+        if (parsed.approvalId) {
+          const consent = inferCardConsent(parsed.approvalId);
+          parsed.approvedBy = consent.by;
+          parsed.approvalEvidence = consent.evidence;
+        } else {
+          parsed.approvedBy = 'policy';
+          parsed.approvalEvidence = null;
+        }
       } else {
         parsed.approvedBy = null;
         parsed.approvalEvidence = parsed.approvalEvidence ?? null;
@@ -287,10 +331,12 @@ export function markPendingActionApprovalResolved(
   // Consent provenance (THE-GRANT R1, Phase-1 form): a resolution that carries
   // a real approvalId is a human card decision; anything else must declare
   // itself. The policy path (orchestrator auto-approve) passes an explicit
-  // 'policy' consent — it can never claim 'human'.
+  // 'policy' consent — it can never claim 'human'. Audit B4 (2026-07-20): the
+  // inferred human claim is now VERIFIED against the registry (a dangling or
+  // non-approved id reads as 'policy', inert for irreversible sends).
   const resolvedConsent = resolution === 'approved'
     ? consent ?? (approvalId
-      ? { by: 'human' as const, evidence: { kind: 'card' as const, approvalId } }
+      ? inferCardConsent(approvalId)
       : { by: 'policy' as const, evidence: { kind: 'policy' as const, scope: 'unspecified' } })
     : undefined;
   return updatePendingAction(id, status, {

@@ -22,6 +22,8 @@
  * surface as soft signals the user can override.
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
+import { getCachedToolSchema } from '../tools/composio-schema-cache.js';
+import { validateArgsAgainstSchema } from '../tools/composio-batch-validator.js';
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { validateCronExpression } from '../shared/cron.js';
@@ -424,6 +426,46 @@ function checkImplicitCommonInputDeclarations(
 // from the prompt. Check them against a provided catalog set. Unknown
 // slugs become warnings (not errors) — we don't have a complete catalog
 // of every possible composio slug at validation time.
+
+/** CALL-3: save-time validation of a structured call node's tool + args.
+ *  A call node dispatches DIRECTLY (no LLM to self-correct a bad slug), so a
+ *  wrong tool reference is a guaranteed runtime failure — the "internal
+ *  builder error" a user only discovers on first fire. Exported for tests. */
+export function checkCallNode(
+  step: { id?: string; call?: { tool?: unknown; args?: unknown } | null },
+  knownToolNames: Set<string> | undefined,
+): { errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const slug = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
+  if (!slug) return { errors, warnings }; // CALL-1 owns the missing-tool error
+  const isLocal = knownToolNames?.has(slug) ?? false;
+  const isComposio = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(slug);
+  const isCx = /^cx_[a-z][a-z0-9_]*$/.test(slug);
+  if (!isLocal && !isComposio && !isCx) {
+    errors.push(
+      `Step "${step.id ?? '?'}" call.tool "${slug}" is not a valid tool reference — expected a Composio slug (e.g. GMAIL_SEND_EMAIL), a cx_ alias, or a known local tool. This step would fail at dispatch on every run.`,
+    );
+    return { errors, warnings };
+  }
+  const schema = getCachedToolSchema(slug);
+  if (schema) {
+    const args = step.call && typeof step.call.args === 'object' && step.call.args !== null && !Array.isArray(step.call.args)
+      ? (step.call.args as Record<string, unknown>)
+      : {};
+    const argError = validateArgsAgainstSchema(slug, args, schema);
+    if (argError) {
+      errors.push(
+        `Step "${step.id ?? '?'}" call to ${slug} is missing required argument(s): ${argError.field} — verified against the tool's real schema. The run would fail at dispatch; add the missing arg(s) or template them from an upstream step.`,
+      );
+    }
+  } else if (isComposio && !isLocal) {
+    warnings.push(
+      `Step "${step.id ?? '?'}" call.tool "${slug}" can't be verified against the tool catalog right now — confirm it exists (composio_search_tools shows the real slug + required args) before relying on it; a wrong slug fails on first fire.`,
+    );
+  }
+  return { errors, warnings };
+}
 
 function checkToolSlugs(
   stepId: string,
@@ -914,6 +956,18 @@ export function validateWorkflowDefinition(
     // Tool slug catalog check → warnings only (catalog may be partial)
     for (const issue of checkToolSlugs(step.id, step.prompt, opts.knownToolNames)) {
       warnings.push(issue);
+    }
+
+    // CALL-3 (2026-07-20 attorney-bar audit A1): the "internal builder error"
+    // class — a call node that saves green but fails at first dispatch. Layered
+    // by evidence strength: deterministic evidence ERRORS (malformed slug
+    // shape; missing required args verified against the tool's REAL cached
+    // schema), absence of evidence only WARNS (the schema cache is fail-open
+    // by design — it may make validation more precise, never more aggressive).
+    {
+      const callIssues = checkCallNode(step, opts.knownToolNames);
+      errors.push(...callIssues.errors);
+      warnings.push(...callIssues.warnings);
     }
 
     const missingSkill = checkSkillReference(step, opts.installedSkillNames);
