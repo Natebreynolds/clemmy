@@ -122,10 +122,35 @@ export interface StandingGrant {
   revokedAt?: string;
 }
 
+/**
+ * A scoped send-trust grant (2026-07-21): the ONE bounded way an irreversible
+ * send auto-proceeds without a card. Unlike a StandingGrant (which is refused
+ * for sends), a send-trust grant carries a NARROW recipient scope — the user's
+ * own team domain, a named client, specific addresses — and a send auto-approves
+ * only when EVERY recipient falls inside it AND the count is under the floor.
+ * Zero grants → the held-send default is untouched. Revocable; audited.
+ */
+export interface SendTrustGrant {
+  id: string;
+  grantedAt: string;
+  note?: string;
+  revokedAt?: string;
+  /** Recipient email domains (bare, lowercased) — e.g. "breakthroughcoaching.ai". */
+  domains?: string[];
+  /** Exact recipient addresses / chat handles (lowercased). */
+  recipients?: string[];
+  /** Optional tool/toolkit prefix this grant is limited to (e.g. "googlecalendar", "outlook"). */
+  toolkits?: string[];
+  /** Per-send recipient ceiling for THIS grant (still capped by the global floor). */
+  maxRecipients?: number;
+}
+
 interface ScopesFile {
   scopes: Record<string, PlanScope>; // keyed by sessionId
   /** Standing grants, keyed by toolName (B2). */
   grants?: Record<string, StandingGrant>;
+  /** Scoped send-trust grants (2026-07-21). */
+  sendTrust?: SendTrustGrant[];
   version: 'v1';
 }
 
@@ -332,7 +357,7 @@ function extractComposioSlug(args: unknown): string | undefined {
  */
 export interface AutoApproveDecision {
   autoApproved: boolean;
-  reason: 'plan-scope' | 'workspace-policy' | 'yolo-policy' | 'denied';
+  reason: 'plan-scope' | 'workspace-policy' | 'yolo-policy' | 'send-trust' | 'denied';
 }
 
 export function evaluateAutoApprove(input: {
@@ -346,6 +371,16 @@ export function evaluateAutoApprove(input: {
 }): AutoApproveDecision {
   if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args, input.kindHint)) {
     return { autoApproved: true, reason: 'plan-scope' };
+  }
+  // Scoped send-trust: the ONE bounded way an irreversible send skips the card.
+  // The user granted a narrow recipient scope and EVERY recipient of THIS send
+  // falls inside it (and under the mass-send floor). Applies regardless of
+  // posture, like a standing grant — it IS the user's explicit consent, scoped;
+  // revocable; the returned reason lands in the audit trail. Fail-closed inside
+  // matchesSendTrust, so an unparseable or mass send falls through to the card.
+  if (isIrreversibleSendAction(input.toolName, input.args, input.kindHint)
+    && matchesSendTrust(input.toolName, input.args)) {
+    return { autoApproved: true, reason: 'send-trust' };
   }
   // YOLO / workspace blanket policies NEVER auto-approve an IRREVERSIBLE send
   // (Hole C, 2026-07-09): the batch path already carved this out (brackets
@@ -494,6 +529,141 @@ export function listActiveScopes(): PlanScope[] {
   const file = readAll();
   const now = Date.now();
   return Object.values(file.scopes).filter((s) => !s.closedAt && Date.parse(s.expiresAt) > now);
+}
+
+// ─── Scoped send-trust (2026-07-21) ──────────────────────────────────────────
+// The bounded relaxation of the held-send invariant. A send auto-approves ONLY
+// when the user granted a NARROW recipient scope and EVERY recipient falls
+// inside a live grant (and under the mass-send floor). Fail-closed: a send whose
+// recipients can't be extracted never matches. Over-extraction only ever causes
+// MORE holding (safe) — the full-args email scan makes under-extraction of an
+// email recipient essentially impossible, and non-email recipients (a phone
+// call, an unlisted channel) fail closed unless explicitly granted. Zero grants
+// → behaviour is byte-identical to the always-ask default. Never touches the
+// batch/mass-send path: a fan-out over the floor still asks.
+
+/** Hard ceiling no grant can exceed — a send to more than this many recipients
+ *  ALWAYS asks, grant or not. The mass-send floor. */
+export const SEND_TRUST_MAX_RECIPIENTS = 20;
+
+function sendTrustEnabled(): boolean {
+  return (process.env.CLEMMY_SEND_TRUST || 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Grant scoped send-trust. Refuses an UNSCOPED grant (no domain and no
+ * recipient) — the whole point is a narrow, named boundary, never "trust all
+ * sends". `maxRecipients` is clamped to the global floor. Returns the grant, or
+ * null if refused.
+ */
+export function grantSendTrust(scope: {
+  domains?: string[];
+  recipients?: string[];
+  toolkits?: string[];
+  maxRecipients?: number;
+  note?: string;
+}): SendTrustGrant | null {
+  if (!sendTrustEnabled()) return null;
+  const domains = (scope.domains ?? []).map((d) => d.trim().toLowerCase().replace(/^@/, '')).filter(Boolean);
+  const recipients = (scope.recipients ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean);
+  const toolkits = (scope.toolkits ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean);
+  // An unscoped send-trust ("trust everything") is refused by design.
+  if (domains.length === 0 && recipients.length === 0) return null;
+  const max = scope.maxRecipients !== undefined
+    ? Math.max(1, Math.min(SEND_TRUST_MAX_RECIPIENTS, Math.floor(scope.maxRecipients)))
+    : undefined;
+  const grant: SendTrustGrant = {
+    id: randomUUID(),
+    grantedAt: new Date().toISOString(),
+    note: scope.note?.trim() || undefined,
+    domains: domains.length ? domains : undefined,
+    recipients: recipients.length ? recipients : undefined,
+    toolkits: toolkits.length ? toolkits : undefined,
+    maxRecipients: max,
+  };
+  const file = readAll();
+  file.sendTrust = file.sendTrust ?? [];
+  file.sendTrust.push(grant);
+  writeAll(file);
+  logger.info({ id: grant.id, domains, recipients, toolkits, maxRecipients: max }, 'send-trust grant added');
+  return grant;
+}
+
+/** Revoke a send-trust grant (soft — keeps the row with revokedAt for audit). */
+export function revokeSendTrust(id: string): boolean {
+  const file = readAll();
+  const grant = file.sendTrust?.find((g) => g.id === id);
+  if (!grant || grant.revokedAt) return false;
+  grant.revokedAt = new Date().toISOString();
+  writeAll(file);
+  logger.info({ id }, 'send-trust grant revoked');
+  return true;
+}
+
+export function listSendTrustGrants(): SendTrustGrant[] {
+  const file = readAll();
+  return (file.sendTrust ?? []).filter((g) => !g.revokedAt);
+}
+
+/**
+ * Best-effort recipient extraction from a send's args. Scans EVERY string in the
+ * args tree for email addresses (so a recipient can't hide in a nested/aliased
+ * field), plus chat-style handles under recipient/channel-ish keys. Lowercased.
+ * An empty result forces the caller to fail closed.
+ */
+export function extractSendTargets(args: unknown): { emails: string[]; handles: string[] } {
+  const emails = new Set<string>();
+  const handles = new Set<string>();
+  const emailRe = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+  const visit = (v: unknown, key?: string): void => {
+    if (v == null) return;
+    if (typeof v === 'string') {
+      const found = v.match(emailRe);
+      if (found) { found.forEach((e) => emails.add(e.toLowerCase())); return; }
+      // A bare handle under a recipient/channel-ish key (Slack #channel, @user).
+      if (key && /channel|recipient|handle|^to$|^to_|_to$/i.test(key)) {
+        const h = v.trim().toLowerCase();
+        if (h && /^[#@]?[a-z0-9._-]+$/i.test(h)) handles.add(h);
+      }
+      return;
+    }
+    if (typeof v !== 'object') return;
+    if (Array.isArray(v)) { v.forEach((x) => visit(x, key)); return; }
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) visit(val, k);
+  };
+  let parsed: unknown = args;
+  if (typeof args === 'string') { try { parsed = JSON.parse(args); } catch { /* scan the raw string */ } }
+  visit(parsed);
+  return { emails: [...emails], handles: [...handles] };
+}
+
+function inferToolkit(toolName: string, args: unknown): string {
+  return (extractComposioSlug(args) ?? toolName).toLowerCase();
+}
+
+/**
+ * Does a live send-trust grant cover THIS send? True only when every extracted
+ * recipient is inside one grant's scope and the count is under the floor.
+ */
+export function matchesSendTrust(toolName: string, args: unknown): boolean {
+  if (!sendTrustEnabled()) return false;
+  const grants = listSendTrustGrants();
+  if (grants.length === 0) return false;
+  const { emails, handles } = extractSendTargets(args);
+  const targetCount = emails.length + handles.length;
+  if (targetCount === 0) return false; // fail-closed: no verifiable recipient
+  if (targetCount > SEND_TRUST_MAX_RECIPIENTS) return false; // mass-send floor
+  const toolkit = inferToolkit(toolName, args);
+  for (const g of grants) {
+    if (g.maxRecipients !== undefined && targetCount > g.maxRecipients) continue;
+    if (g.toolkits && g.toolkits.length > 0 && !g.toolkits.some((t) => toolkit.includes(t))) continue;
+    const domains = g.domains ?? [];
+    const recipients = g.recipients ?? [];
+    const emailCovered = (e: string) => recipients.includes(e) || domains.includes(e.split('@')[1] ?? '');
+    const handleCovered = (h: string) => recipients.includes(h) || recipients.includes(h.replace(/^[#@]/, ''));
+    if (emails.every(emailCovered) && handles.every(handleCovered)) return true;
+  }
+  return false;
 }
 
 export function listAllScopes(): PlanScope[] {

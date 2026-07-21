@@ -248,6 +248,7 @@ import { PlanSchema } from '../agents/planner.js';
 import {
   closePlanScope, listActiveScopes, listAllScopes,
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
+  grantSendTrust, revokeSendTrust, listSendTrustGrants, SEND_TRUST_MAX_RECIPIENTS,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import {
@@ -8645,6 +8646,44 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const ok = revokeStandingApproval(req.params.toolName);
     if (!ok) { res.status(404).json({ error: 'no live grant for that tool' }); return; }
+    res.json({ revoked: true });
+  });
+
+  // ─── Scoped send-trust (2026-07-21) ──────────────────────────────
+  // The bounded way to cut approval clicks toward autonomy: pre-trust a NARROW
+  // recipient scope so matching irreversible sends auto-proceed (and still land
+  // in the audit trail). An unscoped grant is refused server-side; the mass-send
+  // floor is surfaced so the UI can label it.
+  app.get('/api/console/send-trust', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ grants: listSendTrustGrants(), maxRecipients: SEND_TRUST_MAX_RECIPIENTS });
+  });
+
+  app.post('/api/console/send-trust', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const toList = (v: unknown): string[] =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string')
+      : typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+    const grant = grantSendTrust({
+      domains: toList(body.domains),
+      recipients: toList(body.recipients),
+      toolkits: toList(body.toolkits),
+      maxRecipients: typeof body.maxRecipients === 'number' ? body.maxRecipients : undefined,
+      note: typeof body.note === 'string' ? body.note : undefined,
+    });
+    if (!grant) {
+      res.status(400).json({ error: 'a send-trust grant needs at least one recipient domain or address — an unscoped "trust everything" is not allowed' });
+      return;
+    }
+    res.json({ grant });
+  });
+
+  app.delete('/api/console/send-trust/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const ok = revokeSendTrust(req.params.id);
+    if (!ok) { res.status(404).json({ error: 'no live send-trust grant with that id' }); return; }
     res.json({ revoked: true });
   });
 

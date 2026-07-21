@@ -9,6 +9,73 @@ import { Switch } from '@/components/ui/Switch';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getSettings, patchPolicy, type Policy } from '@/lib/settings';
+import { listSendTrust, addSendTrust, revokeSendTrust } from '@/lib/settings';
+
+/**
+ * Trusted send recipients — the ONE bounded way to cut approval clicks toward
+ * full autonomy. A send auto-proceeds only when EVERY recipient is in a trusted
+ * domain/address here; anything else (an out-of-scope cc, a mass-send, a new
+ * channel) still asks. Managed here by the human so there's no self-grant path.
+ */
+function SendTrustPanel() {
+  const qc = useQueryClient();
+  const grants = usePoll(['send-trust'], listSendTrust, 0);
+  const [value, setValue] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = () => void qc.invalidateQueries({ queryKey: ['send-trust'] });
+
+  const add = async () => {
+    const raw = value.trim().toLowerCase();
+    if (!raw) return;
+    // A token with an @ before a dot is an exact address; otherwise treat it as
+    // a recipient domain ("acme.com" or "@acme.com").
+    const isAddress = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw);
+    setBusy(true); setError(null);
+    try {
+      await addSendTrust(isAddress ? { recipients: [raw], note: note.trim() || undefined } : { domains: [raw.replace(/^@/, '')], note: note.trim() || undefined });
+      setValue(''); setNote(''); refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not add — enter a recipient domain or a full email address.');
+    } finally { setBusy(false); }
+  };
+  const remove = async (id: string) => { try { await revokeSendTrust(id); } finally { refresh(); } };
+
+  const rows = grants.data?.grants ?? [];
+  const max = grants.data?.maxRecipients ?? 20;
+
+  return (
+    <div className="mt-5">
+      <h3 className="mb-1 text-h3 text-fg">Trusted send recipients</h3>
+      <p className="mb-3 text-caption text-muted">
+        Sends where <em>every</em> recipient is trusted go out without asking. Anything else still waits for you —
+        including a send to more than {max} people, which always asks. Revoke any time; every auto-send is still logged.
+      </p>
+      {rows.length > 0 && (
+        <div className="mb-3 space-y-1.5">
+          {rows.map((g) => (
+            <div key={g.id} className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3 py-2">
+              <Check className="h-4 w-4 shrink-0 text-success" aria-hidden />
+              <span className="min-w-0 flex-1 truncate text-body text-fg">
+                {(g.domains ?? []).map((d) => `@${d}`).concat(g.recipients ?? []).join(', ')}
+                {g.toolkits?.length ? <span className="text-muted"> · {g.toolkits.join(', ')}</span> : null}
+                {g.note ? <span className="text-faint"> — {g.note}</span> : null}
+              </span>
+              <button type="button" onClick={() => remove(g.id)} className="shrink-0 text-caption text-danger hover:underline cursor-pointer">Revoke</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end">
+        <Field label="Domain or email">{(id) => <Input id={id} placeholder="acme.com or ceo@acme.com" value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }} />}</Field>
+        <Field label="Note (optional)">{(id) => <Input id={id} placeholder="my team" value={note} onChange={(e) => setNote(e.target.value)} />}</Field>
+        <Button variant="secondary" onClick={add} disabled={busy || !value.trim()}>{busy ? 'Adding…' : 'Trust'}</Button>
+      </div>
+      {error && <div className="mt-1 text-caption text-danger">{error}</div>}
+    </div>
+  );
+}
 
 function ToggleRow({ label, desc, checked, onChange }: { label: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -60,18 +127,18 @@ export function AutonomyForm() {
                 <option value="hands_on">Hands-on — drive forward</option>
               </Select>
             )}</Field>
-            <Field label="Approvals" hint="Irreversible sends (email/calls/posts) are always validated and confirmed — this only controls reversible / local work.">{(id) => (
+            <Field label="Approvals" hint="Auto-approve: Clem plans, confirms once, then completes the task — including the sends that plan named and anyone you trust below. A send she didn't plan, a blast to many people, or an untrusted recipient still checks with you. Approve: she confirms before every change.">{(id) => (
               <Select
                 id={id}
                 value={form.autoApproveScope === 'strict' || form.autoApproveScope === 'balanced' ? 'strict'
                   : form.autoApproveScope === 'workspace' ? 'workspace' : 'yolo'}
                 onChange={(e) => set('autoApproveScope', e.target.value as Policy['autoApproveScope'])}
               >
-                <option value="yolo">Autonomous — run without asking (recommended)</option>
-                <option value="strict">Supervised — ask before any change</option>
+                <option value="yolo">Auto-approve — approve the plan once, then Clem runs it (recommended)</option>
+                <option value="strict">Approve — check with me before each change</option>
                 {/* Legacy power-user scope: shown ONLY when it's the stored value,
                     so it round-trips truthfully instead of silently reading as
-                    Autonomous and getting rewritten to yolo on the next save. */}
+                    Auto-approve and getting rewritten to yolo on the next save. */}
                 {form.autoApproveScope === 'workspace' && (
                   <option value="workspace">Workspace — auto-approve inside your workspace folders (legacy)</option>
                 )}
@@ -88,6 +155,8 @@ export function AutonomyForm() {
               <Field label="To">{(id) => <Input id={id} type="time" value={form.quietHoursEnd ?? ''} onChange={(e) => set('quietHoursEnd', e.target.value)} />}</Field>
             </div>
           )}
+
+          <SendTrustPanel />
 
           <h3 className="mb-2 mt-4 text-h3 text-fg">What Clementine is allowed to do</h3>
           <ToggleRow label="Use connected apps" desc="Gmail, Calendar, Slack, etc." checked={!!form.allowComposioActions} onChange={(v) => set('allowComposioActions', v)} />
