@@ -397,6 +397,76 @@ function appendCapturedOutput(current: string, chunk: string): string {
   return `${next.slice(0, MAX_COMMAND_CAPTURE_CHARS)}\n...[capture stopped after ${MAX_COMMAND_CAPTURE_CHARS} chars]`;
 }
 
+/**
+ * Protected own-stores guard (2026-07-21, break-scenario audit A): a
+ * perfectly reasonable agentic task — "clean up my disk", "tidy old files" —
+ * can emit `rm -rf ~/.clementine/state` or `find ~/.clementine -mtime +30
+ * -delete`, and under the Autonomous default a write-class shell command
+ * auto-approves. The old denylist only caught `rm -rf /` / `~`; FILE-level
+ * destruction of Clementine's own memory, event log, audit ledger, secrets,
+ * and backups sailed through (SQL mutation of memory.db was guarded; unlink
+ * was not). Hermes-style protected paths, effect-anchored: a DESTRUCTIVE
+ * file verb referencing a critical own-store path is refused outright —
+ * reads/inspection stay untouched, and the rest of BASE_DIR (vault, files,
+ * meeting outputs) stays writable. Pure + exported for tests.
+ */
+const DESTRUCTIVE_FILE_VERB = /\b(rm|rmdir|unlink|shred|srm|truncate)\b|\bfind\b[^\n;|&]*-delete\b|\bmv\b[^\n;|&]*\s(\/dev\/null|\/tmp)\b/i;
+const PROTECTED_STORE_REF = new RegExp(
+  [
+    // The HOME ROOT itself (`rm -rf ~/.clementine`, `find ~/.clementine
+    // -delete`): a bare home reference — optionally `/` or `/*` — with no
+    // deeper subpath. Deeper refs fall through to the specific patterns
+    // below, so deleting a single vault note or staged file stays legal.
+    String.raw`[~$\w.-]*\.clementine(?:-next)?\/?\*?(?=["'\s;|&)]|$)`,
+    // The state dir (memory.db, harness.db, secrets vault, notifications,
+    // workflow-state, backups live under it) — any reference at all.
+    String.raw`[~$\w./-]*\.clementine[\w./-]*\/state\b`,
+    // The durable audit ledger.
+    String.raw`[~$\w./-]*\.clementine[\w./-]*\/audit\b`,
+    // Workflow definitions + cron config (deleting these via shell bypasses
+    // the delete-at-boundary cleanup and the user's own tools).
+    String.raw`[~$\w./-]*\.clementine[\w./-]*\/workflows\b`,
+    String.raw`[~$\w./-]*\.clementine[\w./-]*\/cron\b`,
+    // Named stores wherever referenced.
+    String.raw`\bmemory\.db\b`,
+    String.raw`\bharness\.db\b`,
+    String.raw`\bsecrets-vault\.json\b`,
+    String.raw`\.timers\.json\b`,
+    String.raw`\.clementine[\w./-]*\/\.env\b`,
+  ].join('|'),
+  'i',
+);
+
+export function shellDestroysOwnStores(rawCommand: unknown): boolean {
+  if (typeof rawCommand !== 'string') return false;
+  return DESTRUCTIVE_FILE_VERB.test(rawCommand) && PROTECTED_STORE_REF.test(rawCommand);
+}
+
+/** write_file twin of the shell guard: a RESOLVED target path inside the
+ *  protected own-store set. Pure + exported for tests. */
+export function writeTargetsProtectedOwnStore(resolvedPath: string): boolean {
+  const base = path.resolve(BASE_DIR);
+  const target = path.resolve(resolvedPath);
+  const rel = path.relative(base, target);
+  const inBase = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  if (inBase) {
+    const top = rel.split(path.sep)[0];
+    if (top === 'state' || top === 'audit') return true;
+    if (rel === '.env' || rel === '.timers.json') return true;
+  }
+  const name = path.basename(target).toLowerCase();
+  return name === 'memory.db' || name === 'harness.db' || name === 'secrets-vault.json';
+}
+
+function assertOwnStoresProtected(command: string): void {
+  if (shellDestroysOwnStores(command)) {
+    throw new Error(
+      "Command denied: it would delete or destroy Clementine's own data stores (memory, event log, audit ledger, secrets, workflow definitions, or their backups). "
+      + 'These are protected from shell-level destruction. For storage hygiene use the built-in maintenance/self-heal paths, or ask the user to remove files manually.',
+    );
+  }
+}
+
 function assertCommandAllowed(command: string): void {
   const normalized = command.toLowerCase().replace(/\s+/g, ' ').trim();
   const denied = [
@@ -768,6 +838,7 @@ class ShellCommandExecutionError extends Error {
 
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
+  assertOwnStoresProtected(command);
   const stubMessage = developerToolStubBlockMessage(command);
   const externalMutation = classifyShellNetworkMutation(command).isNetworkMutation;
   if (stubMessage) {
@@ -1091,6 +1162,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       const mode = input.append === true ? 'append'
         : input.append === false ? 'overwrite'
         : (input.mode ?? 'create');
+      // Protected own-stores (2026-07-21): write_file must not clobber the
+      // databases/secrets that every other guard depends on. Path-resolved
+      // check (the shell guard's regex twin).
+      if (writeTargetsProtectedOwnStore(filePath)) {
+        return `Refused to write ${filePath}: Clementine's own data stores (state databases, audit ledger, secrets) are protected from direct file writes. Use the purpose-built tools (memory_*, workflow_*, settings) instead.`;
+      }
       mkdirSync(path.dirname(filePath), { recursive: true });
       const exists = existsSync(filePath);
       if (exists && !statSync(filePath).isFile()) return `Refused to write ${filePath}: target exists and is not a file.`;

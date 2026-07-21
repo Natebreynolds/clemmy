@@ -363,3 +363,45 @@ test('shellMutatesMemoryStore: blocks SQL mutation of the facts store, allows re
   assert.equal(shellMutatesMemoryStore("echo hello && ls -la"), false);
   assert.equal(shellMutatesMemoryStore(undefined), false);
 });
+
+// ---------------------------------------------------------------------------
+// Protected own-stores (2026-07-21 break-scenario A): "clean up my disk" must
+// never be able to destroy Clementine's own memory/eventlog/audit/secrets.
+// ---------------------------------------------------------------------------
+// Dynamic imports — this file sets CLEMENTINE_HOME before loading modules;
+// a static import here would hoist above that and freeze config to the REAL
+// home (it broke the workspace-notice tests exactly that way).
+const { shellDestroysOwnStores, writeTargetsProtectedOwnStore } = await import('./computer-tools.js');
+const { BASE_DIR } = await import('../config.js');
+
+test('shell guard: destructive verbs against own stores are refused; reads and normal cleanup pass', () => {
+  // The disk-cleanup class that used to sail through:
+  assert.equal(shellDestroysOwnStores('rm -rf ~/.clementine/state'), true);
+  assert.equal(shellDestroysOwnStores('rm ~/.clementine/state/memory.db'), true);
+  assert.equal(shellDestroysOwnStores('rm -rf ~/.clementine'), true, 'the WHOLE home is the biggest single miss of the old denylist');
+  assert.equal(shellDestroysOwnStores('rm -rf ~/.clementine-next/*'), true);
+  assert.equal(shellDestroysOwnStores('find ~/.clementine -mtime +30 -delete'), true, 'a home-root sweep with -delete is destruction');
+  assert.equal(shellDestroysOwnStores('rm ~/.clementine/vault/old-note.md'), false, 'deleting one vault note stays legal');
+  assert.equal(shellDestroysOwnStores('rm ~/.clementine/files/stale.pdf'), false, 'staging cleanup stays legal');
+  assert.equal(shellDestroysOwnStores('find ~/.clementine/state -mtime +30 -delete'), true);
+  assert.equal(shellDestroysOwnStores('rm -rf /Users/x/.clementine-next/audit'), true);
+  assert.equal(shellDestroysOwnStores('shred memory.db'), true);
+  assert.equal(shellDestroysOwnStores('rm ~/.clementine/workflows/lead-gen.md'), true, 'workflow defs delete via proper tools, not shell');
+  // Legitimate operations stay open:
+  assert.equal(shellDestroysOwnStores('ls -la ~/.clementine/state'), false, 'inspection untouched');
+  assert.equal(shellDestroysOwnStores('sqlite3 ~/.clementine/state/harness.db "SELECT count(*) FROM events"'), false, 'reads untouched');
+  assert.equal(shellDestroysOwnStores('rm -rf ./node_modules'), false, 'normal workspace cleanup untouched');
+  assert.equal(shellDestroysOwnStores('rm /tmp/scratch.txt'), false);
+  assert.equal(shellDestroysOwnStores('cp ~/.clementine/state/memory.db /tmp/backup.db'), false, 'copying OUT is fine');
+});
+
+test('write_file guard: resolved paths into state/audit/secrets are refused; vault/files stay writable', () => {
+  assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, 'state', 'memory.db')), true);
+  assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, 'state', 'anything.json')), true, 'the whole state dir is the blast zone');
+  assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, 'audit', 'audit-2026-07.jsonl')), true);
+  assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, '.env')), true);
+  assert.equal(writeTargetsProtectedOwnStore('/anywhere/else/memory.db'), true, 'named stores protected regardless of location');
+  assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, 'vault', 'notes.md')), false, 'the vault stays writable');
+  assert.equal(writeTargetsProtectedOwnStore(path.join(BASE_DIR, 'files', 'documents', 'letter.pdf')), false, 'file pipeline stays writable');
+  assert.equal(writeTargetsProtectedOwnStore('/tmp/report.md'), false);
+});
