@@ -523,7 +523,9 @@ export function Automate() {
             : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {wf.map((w) => {
                   const tone = statusTone(w.lastRunStatus ?? undefined);
-                  const canRun = !w.certification || w.certification.canRun;
+                  const isBroken = w.health?.status === 'broken';
+                  const brokenSteps = w.health?.issues.map((i) => i.stepId).join(', ');
+                  const canRun = (!w.certification || w.certification.canRun) && !isBroken;
                   return (
                     <Card key={w.name} className="flex flex-col p-5">
                       <div className="mb-2 flex items-start justify-between gap-3">
@@ -535,6 +537,11 @@ export function Automate() {
                       <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
                       <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
                       <div className="mb-3 flex flex-wrap items-center gap-2">
+                        {isBroken && (
+                          <StatusPill tone="danger" title={`Step(s) ${brokenSteps} reference a tool that no longer exists — this workflow will fail on its next run. Open it to fix or remove the step.`}>
+                            Broken — tool missing
+                          </StatusPill>
+                        )}
                         {w.lastRunStatus && <StatusPill tone={tone.tone}>{tone.label}</StatusPill>}
                         {(w.lastRunFailedItemCount ?? 0) > 0 && <StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill>}
                         {(w.trigger?.schedule || w.triggerSchedule) && <span className="inline-flex items-center gap-1 text-caption text-faint"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>}

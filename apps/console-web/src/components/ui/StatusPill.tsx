@@ -28,15 +28,18 @@ export function StatusPill({
   children,
   icon,
   className,
+  title,
 }: {
   tone: Tone;
   children: React.ReactNode;
   icon?: LucideIcon;
   className?: string;
+  title?: string;
 }) {
   const Icon = icon ?? toneIcon[tone];
   return (
     <span
+      title={title}
       className={cn(
         'inline-flex items-center gap-1.5 rounded-sm px-2 py-0.5 text-caption font-semibold',
         toneClass[tone],

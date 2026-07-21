@@ -159,10 +159,16 @@ export interface WorkflowResourceBindingReport {
   proposals: WorkflowResourceBindingProposal[];
 }
 
+export interface WorkflowHealth {
+  status: 'ok' | 'broken' | 'unknown';
+  issues: Array<{ stepId: string; kind: string; detail: string }>;
+}
+
 export interface WorkflowRow {
   name: string;
   description?: string;
   enabled?: boolean;
+  health?: WorkflowHealth;
   triggerSchedule?: string | null;
   trigger?: { schedule?: string; timezone?: string; manual?: boolean };
   stepCount?: number;

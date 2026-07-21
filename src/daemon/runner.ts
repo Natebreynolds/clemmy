@@ -69,8 +69,10 @@ import {
   CRON_FILE,
 } from '../memory/vault.js';
 import {
+  listWorkflows,
   migrateLegacyWorkflowsOnce,
 } from '../memory/workflow-store.js';
+import { checkWorkflowHealth } from '../execution/workflow-health.js';
 import {
   CRON_PROGRESS_DIR,
   CRON_RUNS_DIR,
@@ -687,6 +689,32 @@ async function processCronSchedules(assistant: ClementineAssistant, state: Daemo
 // next login to the dashboard, not when they go investigate why no
 // notifications have arrived. Each issue uses a daily-bucketed id so
 // addNotification's dedup keeps the noise down.
+/** One-per-day-per-workflow notification for an ENABLED workflow whose
+ *  structured call node references a tool that no longer exists in the
+ *  registry — it would fail on its next scheduled fire. Best-effort. */
+function reportBrokenWorkflowsOnBoot(): void {
+  try {
+    const dayKey = new Date().toISOString().slice(0, 10);
+    for (const entry of listWorkflows()) {
+      if (!entry.data.enabled) continue;
+      const health = checkWorkflowHealth(entry.data);
+      if (health.status !== 'broken') continue;
+      const steps = health.issues.map((i) => i.stepId).join(', ');
+      addNotification({
+        id: `workflow-broken-${entry.name}-${dayKey}`,
+        kind: 'workflow',
+        title: `Workflow "${entry.data.name}" can't run — a tool it uses no longer exists`,
+        body: `Step(s) ${steps} reference a tool that isn't in the current catalog (renamed, removed, or a hallucinated slug). This workflow will FAIL on its next scheduled run. Open it in Console → Workflows and fix or remove the step.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: entry.data.name, brokenSteps: health.issues.map((i) => i.stepId) },
+      });
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'broken-workflow boot sweep failed');
+  }
+}
+
 function reportBootSetupIssues(): void {
   const dayKey = new Date().toISOString().slice(0, 10);
   const issues: Array<{ slug: string; title: string; body: string }> = [];
@@ -1167,6 +1195,11 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // missing auth / broken config when they open the dashboard, not
   // when they go looking for a missing notification.
   reportBootSetupIssues();
+  // Stale-workflow sweep (2026-07-21 break-scenario B): an ENABLED workflow
+  // whose structured call references a since-killed/renamed tool would fire
+  // on schedule and fail — surface it once so it's fixed before the next
+  // occurrence, not discovered as a silent miss.
+  reportBrokenWorkflowsOnBoot();
   // Migration-safe identity finalization: the schema upgrade preserves every
   // historical row, then this backup-first step redirects only people sharing
   // an exact non-generic personal email. This makes identity readiness true on

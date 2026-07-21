@@ -84,6 +84,7 @@ import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
+import { checkWorkflowHealth } from '../execution/workflow-health.js';
 import {
   applyWorkflowTriggerPatch,
   buildWorkflowTrigger,
@@ -4187,6 +4188,7 @@ export function registerConsoleRoutes(
           goal: entry.data.goal ?? null,
           allowedTools: entry.data.allowedTools ?? null,
           whenToUse: entry.data.whenToUse ?? null,
+          health: checkWorkflowHealth(entry.data),
           lastRunStatus: lastRun ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status) : null,
           lastRunNeedsAttention: lastRun?.needsAttention === true || undefined,
           lastRunId: lastRun?.id ?? null,
