@@ -39,3 +39,12 @@ test('local_cli_list without a filter returns fast guidance when no cached scan 
 test.after(() => {
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
 });
+
+test('shellOutputLooksInteractive: prompt-shaped failures detected, clean output ignored', async () => {
+  const { shellOutputLooksInteractive } = await import('./computer-tools.js');
+  const { equal } = await import('node:assert/strict');
+  equal(shellOutputLooksInteractive(13, '? Team: (Use arrow keys)\n\u276f Breakthrough coaching', ''), true);
+  equal(shellOutputLooksInteractive(1, '', 'Overwrite existing file? [y/N]'), true);
+  equal(shellOutputLooksInteractive(0, '? Team: (Use arrow keys)', ''), false, 'a zero exit never steers');
+  equal(shellOutputLooksInteractive(1, 'normal build error: module not found', ''), false);
+});

@@ -770,6 +770,13 @@ export interface HarnessRunContext {
    *  judges (goal-fidelity, output-grounding) are redundant latency, not safety,
    *  and are skipped. Every DETERMINISTIC gate still runs (see the write boundary). */
   certifiedBatch?: { batchId: string; payloadHash: string };
+  /** This tool call is ONE ITEM of a batch-runner plan (certified or not).
+   *  Batch items never claim artifact slots: the batch lane is the sanctioned
+   *  multi-item primitive with its own per-item ledger — N same-kind creates
+   *  in one plan would deadlock the single-deliverable slot model, and claim
+   *  admission's scope side effects tripped the execution gate on uncertified
+   *  plans (2026-07-22). */
+  batchItem?: boolean;
   /** This tool call originates INSIDE a code-mode program (clem.<tool> dispatch).
    *  The deterministic read-fanout block must never fire here — a program's
    *  batched reads ARE the sanctioned execution the block steers the model toward;
@@ -2337,6 +2344,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
   ): { dispatch?: ArtifactDispatch; deny?: string } => {
     const sessionId = ctx?.sessionId;
     if (!sessionId) return {};
+    // Batch items (certified or not) never claim artifact slots: the batch
+    // lane is the sanctioned multi-item primitive with its own per-item
+    // ledger — N same-kind creates in one plan would fight over the single
+    // deliverable slot and deadlock item 2+ (2026-07-22, surfaced live by
+    // the generic classifier).
+    if (ctx.certifiedBatch || ctx.batchItem) return {};
     const rawIntent = artifactIntentForTool(tool.name, parsedInput);
     if (!rawIntent) return {};
     const attemptScopeId = guardrailScopeKey(ctx);

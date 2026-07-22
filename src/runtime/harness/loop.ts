@@ -108,7 +108,10 @@ import { ContentChantDetector, contentChantDetectionEnabled } from './content-ch
 import { backgroundOfferEnabled, effectiveTurnObjective } from './turn-control.js';
 import {
   getArtifactRootForSourceUserSeq,
+  latestPendingArtifactRootForSession,
   listRunArtifacts,
+  partitionSupersededPendingClaims,
+  releaseClaimedArtifact,
   listUnverifiedRunArtifacts,
   resolveArtifactRunScopeId,
   type RunArtifact,
@@ -225,6 +228,16 @@ function parkForPendingStandardArtifacts(input: {
 }): RunConversationResult | null {
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
   if (!state || state.pending.length === 0) return null;
+  // A dead mid-flight claim superseded by a VERIFIED same-kind sibling (the
+  // sanctioned verification-retry re-create) is released instead of parking
+  // the session forever — the verified sibling is the deliverable.
+  const partition = partitionSupersededPendingClaims(state);
+  const supersededIds = new Set(partition.superseded.map((a) => a.id));
+  for (const dead of partition.superseded) {
+    try { releaseClaimedArtifact(dead.id); } catch { /* stays pending fail-closed */ }
+  }
+  if (partition.stillPending.length === 0) return null;
+  state.pending = state.pending.filter((a) => !supersededIds.has(a.id));
   const exactResources = state.pending.map((artifact) => ({
     artifactId: artifact.id,
     kind: artifact.kind,
@@ -2031,6 +2044,36 @@ async function runConversationCore(
     || sessionHasBackgroundOffer(options.sessionId);
   if (resolvingClarification) {
     nextInput = `${CONVERGENCE_STEER}\n\n${options.input}`;
+  }
+  // Artifact-park retry MUST verify (2026-07-22 Netlify incident): a session
+  // parked on unresolved provider creates that receives a retry-shaped reply
+  // used to run a plain turn — the model re-emitted the park message with ZERO
+  // tool calls, an infinite retry loop. Rewrite the retry into a structured
+  // verification directive carrying the exact pending claims, so the turn
+  // CHECKS provider state (read-only) instead of re-narrating uncertainty.
+  if (/^\/?\s*retry\s*\.?$/i.test(options.input.trim())) {
+    // The parked claims live under a PRIOR turn's artifact root — the fresh
+    // "retry" reply's own seq can never resolve them. Find the latest root
+    // with unverified claims directly.
+    const pendingRoot = latestPendingArtifactRootForSession(options.sessionId);
+    const artifactState = pendingRoot
+      ? standardArtifactTerminalState(options.sessionId, pendingRoot.sourceUserSeq)
+      : null;
+    if (artifactState && artifactState.pending.length > 0) {
+      const claims = artifactState.pending.map((a) =>
+        `- artifactId ${a.id}: ${a.kind} on ${a.provider}${a.resourceId ? ` (resourceId ${a.resourceId})` : ' (no resource id captured — the create may have died mid-flight)'}${a.uri ? ` uri=${a.uri}` : ''}`).join('\n');
+      nextInput = [
+        'ARTIFACT VERIFICATION RETRY — do not re-narrate the uncertainty; RESOLVE it with tools now.',
+        `Unresolved provider create claim${artifactState.pending.length === 1 ? '' : 's'}:`,
+        claims,
+        'Using READ-ONLY tools (list/fetch on the provider — never a create):',
+        '1. Check whether the resource actually exists (search by its intended name/id).',
+        '2. If it EXISTS: report the exact resource id/URL and continue the original task from it — do NOT create a replacement.',
+        '3. If it does NOT exist: say so explicitly with the evidence (e.g. the list result), then create it ONCE with the same intended parameters — the prior attempt provably never landed.',
+        'After verifying, record the truth with the artifact_claim_resolve tool: resolution="bind" with the exact resourceId you read back when it exists, or resolution="absent" when a listing proves it was never created — THEN continue (bind → use the existing resource; absent → create once).',
+        'If the provider cannot be read at all, say exactly which check failed so the user can verify manually.',
+      ].join('\n');
+    }
   }
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
@@ -5160,8 +5203,33 @@ export async function resumePendingApproval(
 
   const blob = session.loadInterruptState();
   if (!blob) {
-    // Session isn't paused — nothing to resume. Caller can decide to
-    // treat the prompt as a fresh user turn instead.
+    // Session isn't paused — no RunState to resume (typically a daemon restart
+    // dropped the interrupt blob). Before degenerating to a fresh turn (which
+    // would RE-COMPOSE the payload and mint a new approval — the approve→re-ask
+    // treadmill), replay the session's approved unconsumed action verbatim and
+    // stage the result so the next turn continues from it. Fail-open no-op when
+    // there is nothing to replay.
+    if (options.decision === 'approve' || options.decision === 'approve_with_edits') {
+      try {
+        const { replayApprovedActionForSession, renderApprovedReplayNote } = await import('../../execution/approval-replay.js');
+        const replayOutcome = await replayApprovedActionForSession(options.sessionId);
+        if (replayOutcome) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: 0,
+            role: 'user',
+            type: 'user_input_received',
+            data: {
+              text: renderApprovedReplayNote(replayOutcome),
+              synthetic: true,
+              source: 'approval-replay',
+              approvalId: replayOutcome.approvalId,
+            },
+          });
+        }
+      } catch { /* replay is best-effort; the caller's fresh turn remains the fallback */ }
+    }
+    // Caller can decide to treat the prompt as a fresh user turn instead.
     return { sessionId: options.sessionId, turn: 0, status: 'completed' };
   }
 

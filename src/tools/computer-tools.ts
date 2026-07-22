@@ -836,6 +836,15 @@ class ShellCommandExecutionError extends Error {
   }
 }
 
+/** Pure predicate: a non-zero exit whose output carries an interactive-prompt
+ * shape (inquirer pickers, y/N confirms). Deterministic steer target — in this
+ * non-TTY shell such prompts hang or kill the CLI mid-action (2026-07-22
+ * netlify sites:create team picker, exit 13 mid-create). */
+export function shellOutputLooksInteractive(exitCode: number, stdout: string, stderr: string): boolean {
+  if (exitCode === 0) return false;
+  return /\(Use arrow keys\)|\u276f|\? +[A-Z][^\n]*[:?] *(\(| |$)|\[y\/N\]|press enter to/i.test(`${stdout}\n${stderr}`);
+}
+
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<ShellCommandResult> {
   assertCommandAllowed(command);
   assertOwnStoresProtected(command);
@@ -902,10 +911,20 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
       settled = true;
       clearTimeout(timeout);
       const annotated = annotateShellStderr(stderr, command);
+      // Interactive-prompt detection (2026-07-22 Netlify deploy incident): a
+      // CLI that opens an interactive picker ("? Team: Use arrow keys") in this
+      // non-TTY shell hangs or dies mid-action (netlify sites:create exited 13
+      // halfway through a create, leaving the outcome uncertain). The prompt
+      // shape is deterministic — steer the retry to non-interactive flags
+      // instead of letting the model puzzle over an opaque crash.
+      const promptShaped = shellOutputLooksInteractive(code ?? 0, stdout, stderr);
+      const interactiveHint = promptShaped
+        ? '\n\n[non-interactive shell] This CLI opened an INTERACTIVE prompt, which cannot work here (no TTY — prompts hang or crash mid-action, and a mutating command may have PARTIALLY completed; verify before retrying). Re-run non-interactively: pass the answers as explicit flags/args (e.g. --account-slug/--site/--team, --yes/--force/--json), or prefix with CI=1 to make the CLI fail fast instead of prompting.'
+        : '';
       const output = [
         `exit_code: ${code ?? 0}`,
         stdout ? `stdout:\n${stdout}` : '',
-        annotated ? `stderr:\n${annotated}` : '',
+        annotated ? `stderr:\n${annotated}${interactiveHint}` : interactiveHint.trim() ? interactiveHint.trim() : '',
       ].filter(Boolean).join('\n\n');
       resolve({
         text: output || `exit_code: ${code ?? 0}`,
