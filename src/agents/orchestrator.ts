@@ -38,12 +38,13 @@ import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { buildWorkerJobPrompt, resolveWorkerMaxTurns, workerPacketKey, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
-import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolInputSchema, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
+import { runBoundedPool } from '../execution/bounded-pool.js';
+import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
 import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
-import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
@@ -1017,9 +1018,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     return Number.isFinite(n) && n >= 2 ? n : 8;
   })();
   const runWorkerToolDescription = [
-      'Spawn a stateless Worker on ONE item using a structured parent-planned job packet. Call this MULTIPLE TIMES IN PARALLEL when you have N independent items to process (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
-      'Each worker call gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
-      'Input: a structured packet for ONE item. You must include the item identifier, exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the item should use a user-configured worker category such as design, writing, research, code, or analysis.',
+      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` in ONE call — the harness runs them as a bounded parallel pool (wall time ≈ slowest item) with an honest per-item ledger (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
+      'Each worker gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
+      'Input: one packet (objective, resolvedTools, context, instructions, expectedOutput) that applies to every item, plus `items` (the full list) or `item` (a single identifier). You must include exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the items should use a user-configured worker category such as design, writing, research, code, or analysis.',
       'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
       'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
@@ -1036,17 +1037,98 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const runWorkerTool = tool({
     name: 'run_worker',
     description: runWorkerToolDescription,
-    parameters: WorkerToolInputSchema,
+    parameters: WorkerToolCallSchema,
     strict: true,
-    execute: async (params, runContext, details) => {
+    execute: async (callParams, runContext, details) => {
+      const call = callParams as WorkerToolCall;
+      const callItems = workerCallItems(call);
+      if (!callItems || callItems.length === 0) {
+        return 'ERROR: run_worker needs `item` (one identifier) or `items` (the full list for a parallel batch).';
+      }
+      const knownDeadSig = fanoutUniformFailure(extractSessionId(runContext) ?? '');
+      if (knownDeadSig) {
+        return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
+      }
+      const { items: _batch, ...packetBase } = call;
+      if (callItems.length > 1) {
+        // Deterministic batch (2026-07-21): the harness owns the parallelism so
+        // a brain that would have serialized N run_worker calls no longer pays
+        // N× wall time. Per-item worker slots keep provider throttling honest;
+        // per-item callId suffixes keep tool_outputs/reduce-tier rows distinct.
+        const outs: Array<string | null> = new Array(callItems.length).fill(null);
+        await runBoundedPool(
+          callItems.map((item, index) => ({ item, index })),
+          Math.min(callItems.length, 16),
+          async ({ item, index }) => {
+            const perDetails = details?.toolCall?.callId
+              ? { ...details, toolCall: { ...details.toolCall, callId: `${details.toolCall.callId}-i${index}` } }
+              : details;
+            try {
+              outs[index] = String(await runOneOrchestratorWorker(
+                { ...packetBase, item } as WorkerToolInput, runContext, perDetails,
+              ) ?? '');
+            } catch (err) {
+              outs[index] = `ERROR: worker for "${item}" failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
+            }
+          },
+        );
+        const rendered = callItems.map((item, index) => {
+          const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
+          return { item, text, failed: workerResultIndicatesFailure(text) };
+        });
+        const failedItems = rendered.filter((r) => r.failed);
+        const memoSessionId = extractSessionId(runContext) ?? '';
+        if (failedItems.length === 0 && memoSessionId) clearFanoutUniformFailure(memoSessionId);
+        const uniform = failedItems.length === rendered.length ? uniformFailureSignature(failedItems.map((f) => f.text)) : null;
+        // Self-heal: uniform "unknown model" = the endpoint's real catalog
+        // speaking — memo the dead id and invite an immediate retry (see
+        // worker-tools.ts twin).
+        if (uniform && looksLikeUnknownModelError(uniform)) {
+          const deadModel = resolveRoleModel('worker', call.intent || undefined).modelId;
+          markByoModelNotServed(deadModel);
+          const healed = repairByoRoutedModelId(deadModel);
+          if (healed !== deadModel) {
+            return `Batch failed: ALL ${rendered.length} workers died because the configured worker model "${deadModel}" is not served by the BYO endpoint. It has been AUTO-CORRECTED to "${healed}" — call run_worker again NOW with the same items; it will dispatch on the corrected model.`;
+          }
+        }
+        if (uniform && memoSessionId) {
+          markFanoutUniformFailure(memoSessionId, uniform);
+          // Abort = coverage boundary: the items transfer to inline execution
+          // and must not count against fan-out coverage (see worker-tools.ts).
+          try {
+            appendEvent({ sessionId: memoSessionId, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { reason: 'uniform_failure_abort', signature: uniform } });
+          } catch { /* best-effort */ }
+        }
+        const header = failedItems.length === 0
+          ? `Batch complete: ${rendered.length}/${rendered.length} items succeeded.`
+          : uniform
+            ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
+            : `Batch finished with FAILURES: ${rendered.length - failedItems.length}/${rendered.length} succeeded; FAILED items: ${failedItems.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
+        return [header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n');
+      }
+      return runOneOrchestratorWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput, runContext, details);
+    },
+  }) as Tool<RuntimeContextValue>;
+
+  const runOneOrchestratorWorker = async (
+    params: WorkerToolInput,
+    // Same loosely-typed pair the @openai/agents execute callback receives —
+    // threaded through unchanged for the single-item path and per-item for a batch.
+    runContext: any,
+    details: any,
+  ) => {
+    {
       const input = params as WorkerToolInput;
       // Wave 4 Stage 1: packet key for durable-resume idempotency (see below).
       const packetKey = workerPacketKey(input);
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
-      const workerModel = route.model ?? resolveRoleModel('worker').modelId;
+      let workerModel = route.model ?? resolveRoleModel('worker').modelId;
       const workerProvider = resolveEffectiveProviderForModel(workerModel);
+      // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
+      // the backend's real primary id (no-op for owned ids / non-byo providers).
+      if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
       // P6: throttle concurrent worker fan-out per session so N parallel run_worker
       // calls can't open N provider calls at once and storm a rate limit. Bounds BOTH
       // worker lanes (this wraps before the route branch). Released in the finally.
@@ -1166,7 +1248,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         data: { model?: string | null; toolUses?: string[]; tokens?: number } = {},
       ): void => {
         const text = typeof output === 'string' ? output : String(output ?? '');
-        const ok = !/^\s*ERROR:/i.test(text);
+        const ok = !workerResultIndicatesFailure(text);
         appendWorkerResult({
           item: input.item,
           ok,
@@ -1193,7 +1275,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           const parentRunId = ctx?.workflowRunId || sessionId;
           if (!parentRunId) return;
           const text = outputText ?? '';
-          const ok = !/^\s*ERROR:/i.test(text);
+          const ok = !workerResultIndicatesFailure(text);
           const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(text);
           const model = ranModel || workerModel;
           const provider = resolveEffectiveProviderForModel(model);
@@ -1290,7 +1372,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // worker returns an "ERROR:" envelope NORMALLY (the same signal the
           // in-memory honest-partial ledger reads), so the durable coverage map
           // must agree or it would over-report success after a restart.
-          const workerOk = !/^\s*ERROR:/i.test(sdkResult.text ?? '');
+          const workerOk = !workerResultIndicatesFailure(sdkResult.text);
           appendWorkerResult({
             item: input.item,
             ok: workerOk,
@@ -1337,7 +1419,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         }
       }
       if (route.trace) appendWorkerRoute(route.trace);
-      const workerForCall = route.model ? worker.clone({ model: route.model }) : worker;
+      // Dispatch with the REPAIRED model id — cloning with route.model (or the
+      // build-time default) bypassed repairByoRoutedModelId, so telemetry showed
+      // the repair while the actual provider call still 400'd (live 2026-07-22,
+      // 12/12 workers dead on gpt-5.4 -> z.ai).
+      const workerForCall = worker.clone({ model: workerModel });
       // Intent-aware cap on the nested lane too (non-Claude worker setups). asTool
       // captures runOptions at BUILD time, so rebuild per-call with the resolved
       // cap rather than reusing the build-time-baked runWorkerAsToolOptions.
@@ -1382,8 +1468,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       } finally {
         releaseWorkerSlot();
       }
-    },
-  }) as Tool<RuntimeContextValue>;
+    }
+  };
 
   // Read-only Composio discovery tool. Surfaces `composio_search_tools`
   // (and only that) directly on the Orchestrator so it can resolve

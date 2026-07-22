@@ -383,6 +383,8 @@ test('run_worker requires a structured parent-planned job packet', async () => {
   assert.ok(runWorker, 'expected run_worker on orchestrator surface');
   assert.match(runWorker.description ?? '', /structured parent-planned job packet/);
   assert.match(runWorker.description ?? '', /exact resolved tool slugs/);
+  // 2026-07-21 deterministic fan-out: `items` (nullable) joined the packet and
+  // `item` became nullable — strict mode keeps both in `required` with null types.
   assert.deepEqual(runWorker.parameters?.required, [
     'objective',
     'item',
@@ -391,10 +393,12 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'instructions',
     'expectedOutput',
     'intent',
+    'items',
   ]);
   assert.equal(runWorker.parameters?.additionalProperties, false);
   assert.ok(runWorker.parameters?.properties?.resolvedTools);
   assert.ok(runWorker.parameters?.properties?.intent);
+  assert.ok(runWorker.parameters?.properties?.items);
   assert.equal(Object.hasOwn(runWorker.parameters?.properties ?? {}, 'input'), false);
 });
 

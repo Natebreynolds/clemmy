@@ -60,11 +60,16 @@ const GOLDEN = {
   // the previous permanent rubric in every provider lane.
   // 2026-07-18 public fixture hygiene: the illustrative CRM field was replaced
   // with a neutral synthetic field name in both flagship prompt variants.
-  instructions: { len: 35347, sha16: '11e2a47feea279ac' },
-  native: { len: 34450, sha16: '995545680f983ce5' },
-  claudeBrain: { len: 5601, sha16: '4bb5b0886757e63a' },
+  // 2026-07-22 fan-out batch contract: "waves of up to 8" replaced with the
+  // run_worker `items` batch (harness-pooled, full list in ONE call) in all
+  // three fan-out clauses — the old wording contradicted the new deterministic
+  // pool; EXECUTION WRAP's hardcoded slug-verb list replaced with "the harness
+  // classifies mutating slugs" (the classifier is code, the list was drift-prone).
+  instructions: { len: 35459, sha16: '1114f8bf919b39d6' },
+  native: { len: 34562, sha16: '6dfbc0eabc7e4379' },
+  claudeBrain: { len: 5648, sha16: '3970f8cb7bbe12a1' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8860, sha16: 'e3125c66a9a76038' },
+  lean: { len: 8954, sha16: 'c863620a7b578733' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

@@ -87,3 +87,28 @@ export function workerAlreadyCompletedForPacket(sessionId: string, packetKey: st
     return false;
   }
 }
+
+// ── Fan-out uniform-failure memo (2026-07-22) ────────────────────────────────
+// After a batch where EVERY item died with one signature, further run_worker
+// spawns in the session are futile until something changes — refuse them fast
+// with the inline-pivot directive instead of burning another round. TTL'd (the
+// operator may fix the worker model mid-session) and cleared by any worker
+// success.
+const FANOUT_FAILURE_TTL_MS = 10 * 60_000;
+const fanoutUniformFailures = new Map<string, { signature: string; until: number }>();
+
+export function markFanoutUniformFailure(sessionId: string, signature: string): void {
+  if (!sessionId || !signature) return;
+  fanoutUniformFailures.set(sessionId, { signature, until: Date.now() + FANOUT_FAILURE_TTL_MS });
+}
+
+export function fanoutUniformFailure(sessionId: string): string | null {
+  const entry = fanoutUniformFailures.get(sessionId);
+  if (!entry) return null;
+  if (Date.now() >= entry.until) { fanoutUniformFailures.delete(sessionId); return null; }
+  return entry.signature;
+}
+
+export function clearFanoutUniformFailure(sessionId: string): void {
+  fanoutUniformFailures.delete(sessionId);
+}
