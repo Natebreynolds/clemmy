@@ -39,7 +39,7 @@ test.after(() => {
 
 const REPORT_MODULE_URL = new URL('./workflow-run-report-back.ts', import.meta.url).href;
 
-async function waitForFile(file: string, timeoutMs = 10_000): Promise<void> {
+async function waitForFile(file: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(file)) {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);

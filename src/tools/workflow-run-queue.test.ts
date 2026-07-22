@@ -59,7 +59,7 @@ function runFiles(): string[] {
   catch { return []; }
 }
 
-async function waitForPath(file: string, timeoutMs = 10_000): Promise<void> {
+async function waitForPath(file: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(file)) {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}`);

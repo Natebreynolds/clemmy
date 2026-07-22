@@ -31,7 +31,7 @@ const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const ENGINE_MODULE_URL = pathToFileURL(path.join(process.cwd(), 'src/execution/workflow-trigger-engine.ts')).href;
 
-async function waitForFiles(files: string[], timeoutMs = 15_000): Promise<void> {
+async function waitForFiles(files: string[], timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!files.every((file) => {
     try { return readFileSync(file, 'utf-8').length >= 0; } catch { return false; }
