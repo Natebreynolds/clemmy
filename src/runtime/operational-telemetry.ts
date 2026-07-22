@@ -323,6 +323,22 @@ export function recordOperationalEvent(
   return event;
 }
 
+/**
+ * Retention sweep (2026-07-22 legacy audit): operational_events was the
+ * highest-volume UNBOUNDED store — one row per tool call / workflow node /
+ * memory tick, with no reaper. Telemetry value decays fast; keep a bounded
+ * observability window (default 30 days), mirroring reapStaleToolOutputs.
+ */
+export function reapStaleOperationalEvents(maxAgeDays = 30): number {
+  try {
+    const db = openOperationalTelemetryDb();
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    return db.prepare('DELETE FROM operational_events WHERE ts < ?').run(cutoff).changes;
+  } catch {
+    return 0; // retention is best-effort observability hygiene
+  }
+}
+
 export function listOperationalEvents(
   options: ListOperationalEventsOptions = {},
   db: Database.Database = openOperationalTelemetryDb(),

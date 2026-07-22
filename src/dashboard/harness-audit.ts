@@ -2,7 +2,7 @@ import { listWorkflows } from '../memory/workflow-store.js';
 import { validateWorkflowDefinition, type WorkflowFrontmatter } from '../execution/workflow-validator.js';
 import { collectDiagnostics } from './diagnostics.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
-import { listActiveScopes, listStandingGrants } from '../agents/plan-scope.js';
+import { listActiveScopes, listStandingGrants, listSendTrustGrants } from '../agents/plan-scope.js';
 import { loadTeamAgents } from '../tools/shared.js';
 import { listWorkflowPatterns } from '../memory/workflow-pattern-store.js';
 import { listRuns } from '../runtime/run-events.js';
@@ -178,6 +178,7 @@ function buildApprovalChecks(): HarnessAuditCheck[] {
   const policy = getProactivityPolicySnapshot().policy;
   const activeScopes = listActiveScopes();
   const standingGrants = listStandingGrants();
+  const sendTrustGrants = listSendTrustGrants();
   let pending = 0;
   let stalePending = 0;
   try {
@@ -225,6 +226,15 @@ function buildApprovalChecks(): HarnessAuditCheck[] {
       standingGrants.length > 0
         ? `${standingGrants.length} durable grant(s) can auto-approve read/write-class tools.`
         : 'No durable standing grants.',
+      'medium',
+    ),
+    check(
+      'send-trust',
+      'Scoped send-trust',
+      sendTrustGrants.length > 0 ? 'warn' : 'pass',
+      sendTrustGrants.length > 0
+        ? `${sendTrustGrants.length} send-trust grant(s) can auto-send to specific trusted recipients (mass-sends still ask). Review the scopes are still intentional.`
+        : 'No send-trust grants — every irreversible send is held for approval.',
       'medium',
     ),
   ];

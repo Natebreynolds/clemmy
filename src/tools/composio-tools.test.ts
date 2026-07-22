@@ -998,3 +998,68 @@ test('executionIntentForSession: no session / no search falls back to the slug s
   assert.equal(executionIntentForSession('sess-never-searched', 'GMAIL_SEND_EMAIL'), 'gmail send email');
   assert.equal(executionIntentForSession(undefined, ''), 'composio_execute');
 });
+
+test('uniform-empty streak: 3 same-slug empty reads append the query-shape advisory; a real result resets it', async () => {
+  const { runComposioExecuteForTest, composioResultLooksEmpty } = await import('./composio-tools.js');
+  const { equal, ok, doesNotMatch, match } = await import('node:assert/strict');
+
+  equal(composioResultLooksEmpty({ data: { items: [] } }), true);
+  equal(composioResultLooksEmpty({ data: { data: { items: [] } } }), true);
+  equal(composioResultLooksEmpty({ data: { html: '<html>real content</html>' } }), false);
+  equal(composioResultLooksEmpty({}), false);
+
+  const emptyExec = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
+  const fullExec = (async () => ({ data: { items: [{ ad: 'PI attorneys near you' }] }, error: null, successful: true })) as never;
+
+  const first = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-a' }, emptyExec);
+  doesNotMatch(first, /empty-result advisory/);
+  const second = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-b' }, emptyExec);
+  doesNotMatch(second, /empty-result advisory/);
+  const third = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-c' }, emptyExec);
+  match(third, /empty-result advisory/);
+  match(third, /unverified \(tool returned empty\)/);
+
+  // A genuinely non-empty result resets the streak.
+  const real = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-d' }, fullExec);
+  doesNotMatch(real, /empty-result advisory/);
+  const afterReset = await runComposioExecuteForTest('APIFY_GET_DATASET_ITEMS', { q: 'firm-e' }, emptyExec);
+  doesNotMatch(afterReset, /empty-result advisory/);
+  ok(true);
+});
+
+test('data-quality checkpoint: an autonomous run with hollow reads is confronted before its first write; second attempt proceeds', async () => {
+  const { runComposioExecuteForTestInSession, resetDataQualityForTest } = await import('./composio-tools.js');
+  const { match, doesNotMatch } = await import('node:assert/strict');
+  resetDataQualityForTest();
+  try {
+    const emptyExec = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
+    const writeExec = (async () => ({ data: { id: 'appNEW123' }, error: null, successful: true })) as never;
+    const sid = 'background:bg-checkpoint-test';
+
+    // Three hollow reads build the ledger (read slug — retried internally is fine).
+    for (const q of ['a', 'b', 'c']) {
+      await runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, sid);
+    }
+
+    // First WRITE attempt: deferred with the evidence + the real-assistant fork.
+    const first = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
+    match(first, /DATA-QUALITY CHECKPOINT/);
+    match(first, /APIFY_GET_DATASET_ITEMS: 3\/3 reads returned empty/);
+    match(first, /ask_user_question/);
+
+    // Deliberate second attempt proceeds (autonomy redirected, never dead-ended).
+    const second = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
+    doesNotMatch(second, /DATA-QUALITY CHECKPOINT/);
+    match(second, /appNEW123/);
+
+    // Foreground chat sessions are untouched.
+    resetDataQualityForTest();
+    for (const q of ['a', 'b', 'c']) {
+      await runComposioExecuteForTestInSession('APIFY_GET_DATASET_ITEMS', { q }, emptyExec, 'sess-desktop-foreground');
+    }
+    const fg = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, 'sess-desktop-foreground');
+    doesNotMatch(fg, /DATA-QUALITY CHECKPOINT/);
+  } finally {
+    resetDataQualityForTest();
+  }
+});

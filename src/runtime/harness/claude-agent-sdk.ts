@@ -1619,7 +1619,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               } catch { /* economy enforcement must not depend on telemetry */ }
             }
             if (economy.interrupt) {
-              ceilingState.stopped = economy.message;
+              // `stopped` becomes the user-visible reply when the turn ends
+              // (partialLimitText). The economy's message is a MODEL-facing
+              // directive ("do not make another exploratory call") — leaking
+              // it verbatim into the chat reads as broken internal steering
+              // (live 2026-07-21). Latch first-person user text instead; the
+              // model still receives the directive via the deny message below.
+              ceilingState.stopped =
+                'I stopped myself after using up my tool budget for this reply while still exploring — '
+                + 'rather than keep burning calls, I held on to what I\'ve already gathered. '
+                + 'Say "continue" and I\'ll finish from that evidence, or hand this to a background task for the rest.';
               ceilingState.stoppedKind = 'loop';
             }
             return {

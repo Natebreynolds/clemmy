@@ -375,6 +375,30 @@ export function sumUsageTokensForSource(source: string, date: Date = new Date())
 }
 
 /**
+ * The honest per-source split. `totalTokens` is dominated by CACHED prompt
+ * re-reads on long agentic runs (live 2026-07-22: a 6-minute Sonnet run showed
+ * 7.45M "total" of which 93% was cache hits and only ~53K was real output) —
+ * showing the raw total reads as alarming spend. UI surfaces should headline
+ * `uncachedInput + output` (what the run actually consumed) with the total as
+ * secondary context.
+ */
+export function sumUsageSplitForSource(
+  source: string,
+  date: Date = new Date(),
+): { total: number; cachedInput: number; uncachedInput: number; output: number } {
+  const split = { total: 0, cachedInput: 0, uncachedInput: 0, output: 0 };
+  for (const ev of readUsageEventsForDate(date)) {
+    if (ev.source !== source) continue;
+    split.total += ev.totalTokens;
+    const cached = ev.cachedInputTokens ?? 0;
+    split.cachedInput += cached;
+    split.uncachedInput += Math.max(0, (ev.inputTokens ?? 0) - cached);
+    split.output += ev.outputTokens ?? 0;
+  }
+  return split;
+}
+
+/**
  * Total tokens recorded across an entire workflow run (all its steps) on a date,
  * using the derived `runId` join key. Leverages the S2 join so the run-level
  * STATE record can report "this whole goal attempt cost N tokens" without

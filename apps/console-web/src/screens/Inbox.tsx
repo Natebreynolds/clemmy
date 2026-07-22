@@ -37,6 +37,12 @@ export function Inbox() {
   const initialTab: Tab = tabParam === 'notifications' || tabParam === 'activity' ? 'notifications' : 'needs';
   const [tab, setTab] = useState<Tab>(initialTab);
   const [selected, setSelected] = useState<string | null>(searchParams.get('select'));
+  // Multi-select for bulk approve/reject — the "manage in the board" ask: clear
+  // several held sends in one click instead of one card at a time. Each still
+  // resolves through the same per-row decideApproval (kind routing + resume
+  // side effects preserved), so bulk changes nothing about WHAT gets approved.
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   // Re-apply when the deep link changes while the screen stays mounted
   // (e.g. Home card → Inbox already open in the router tree).
   useEffect(() => {
@@ -58,6 +64,9 @@ export function Inbox() {
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
   const needsCount = approvalRows.length + attentionRows.length;
+  // Count only checked IDs that still exist in the live list — resolved cards
+  // drop out on the next poll and must not keep inflating the bulk-action count.
+  const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
   const hasRows = (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
 
@@ -66,6 +75,30 @@ export function Inbox() {
   const onDecide = async (id: string, decision: 'approve' | 'reject') => {
     const row = approvalRows.find((a) => a.approvalId === id);
     try { await decideApproval(id, decision, { kind: row?.kind }); } finally { invalidate('approvals', 'approvals-count', 'command-center'); }
+  };
+  const toggleChecked = (id: string) => setChecked((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const onBulkDecide = async (decision: 'approve' | 'reject') => {
+    // Snapshot the target rows before any await — approvalRows re-polls and the
+    // resolved cards drop out from under us mid-loop otherwise.
+    const targets = approvalRows.filter((a) => checked.has(a.approvalId));
+    if (targets.length === 0) return;
+    setBulkBusy(true);
+    try {
+      // Sequential, not Promise.all: a rejected send that resumes a run must not
+      // race a sibling on the same session; one-at-a-time matches the single-card
+      // path exactly and keeps the resume/queue state machine deterministic.
+      for (const row of targets) {
+        try { await decideApproval(row.approvalId, decision, { kind: row.kind }); } catch { /* skip the failures, resolve the rest */ }
+      }
+    } finally {
+      setChecked(new Set());
+      setBulkBusy(false);
+      invalidate('approvals', 'approvals-count', 'command-center');
+    }
   };
   const onCancelStale = async () => {
     try { await cancelStaleApprovals(); } finally { invalidate('approvals', 'approvals-count'); }
@@ -130,8 +163,34 @@ export function Inbox() {
             ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
             : (
               <>
+                {approvalRows.length > 1 && (
+                  <div className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2">
+                    <input type="checkbox" aria-label="Select all approvals"
+                      className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
+                      checked={checkedCount === approvalRows.length}
+                      ref={(el) => { if (el) el.indeterminate = checkedCount > 0 && checkedCount < approvalRows.length; }}
+                      onChange={() => setChecked(checkedCount === approvalRows.length ? new Set() : new Set(approvalRows.map((a) => a.approvalId)))} />
+                    {checkedCount > 0 ? (
+                      <>
+                        <span className="text-body text-fg">{checkedCount} selected</span>
+                        <div className="ml-auto flex gap-2">
+                          <Button size="sm" disabled={bulkBusy} onClick={() => onBulkDecide('approve')}>
+                            <Check className="h-4 w-4" aria-hidden /> Approve {checkedCount}
+                          </Button>
+                          <Button size="sm" variant="secondary" disabled={bulkBusy} onClick={() => onBulkDecide('reject')}>
+                            <X className="h-4 w-4" aria-hidden /> Reject {checkedCount}
+                          </Button>
+                        </div>
+                      </>
+                    ) : (
+                      <span className="text-body text-muted">Select to approve or reject in bulk</span>
+                    )}
+                  </div>
+                )}
                 {approvalRows.map((a) => (
                   <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
+                    checked={checked.has(a.approvalId)}
+                    onToggleCheck={() => toggleChecked(a.approvalId)}
                     onSelect={() => setSelected(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
                     onReject={() => onDecide(a.approvalId, 'reject')} />
@@ -185,18 +244,24 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
   );
 }
 
-function ApprovalCard({ row, selected, onSelect, onApprove, onReject }: {
-  row: ApprovalRow; selected: boolean; onSelect: () => void; onApprove: () => void; onReject: () => void;
+function ApprovalCard({ row, selected, checked, onToggleCheck, onSelect, onApprove, onReject }: {
+  row: ApprovalRow; selected: boolean; checked: boolean; onToggleCheck: () => void;
+  onSelect: () => void; onApprove: () => void; onReject: () => void;
 }) {
   const queued = row.pendingAction;
   return (
     <div className={cn('rounded-md border px-3.5 py-3 transition-colors',
       selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
-      <button type="button" onClick={onSelect} className="flex w-full items-start gap-3 text-left cursor-pointer">
-        <StatusPill tone="warning">{queued ? 'Ready' : 'Approve'}</StatusPill>
-        <span className="min-w-0 flex-1 text-body text-fg">{queued ? queued.title : row.subject}</span>
-        <span className="shrink-0 text-caption text-faint">{relativeTime(row.requestedAt)}</span>
-      </button>
+      <div className="flex w-full items-start gap-3">
+        <input type="checkbox" aria-label="Select for bulk action"
+          className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary"
+          checked={checked} onChange={onToggleCheck} onClick={(e) => e.stopPropagation()} />
+        <button type="button" onClick={onSelect} className="flex min-w-0 flex-1 items-start gap-3 text-left cursor-pointer">
+          <StatusPill tone="warning">{queued ? 'Ready' : 'Approve'}</StatusPill>
+          <span className="min-w-0 flex-1 text-body text-fg">{queued ? queued.title : row.subject}</span>
+          <span className="shrink-0 text-caption text-faint">{relativeTime(row.requestedAt)}</span>
+        </button>
+      </div>
       {queued && (
         <div className="mt-1 truncate text-caption text-muted">
           {queued.toolName} · {queued.targetSummary || queued.kind} · hash {queued.payloadHash}

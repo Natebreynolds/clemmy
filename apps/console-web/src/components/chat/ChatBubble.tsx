@@ -113,12 +113,15 @@ export function ChatBubble({
   onApprove,
   onReject,
   onBackground,
+  traceHref,
 }: {
   message: ChatMessage;
   onApprove: () => void;
   onReject: () => void;
   /** Detach THIS running turn to a durable background task (shown while thinking). */
   onBackground?: () => void;
+  /** Deep link to this session's card/trace on the Tasks board. */
+  traceHref?: string;
 }) {
   const isUser = message.role === 'user';
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
@@ -198,7 +201,7 @@ export function ChatBubble({
               GLM) with status — shown while working AND kept (collapsed) after. Falls
               back to the single rolling line only before any activity has arrived. */}
           {message.activity && message.activity.length > 0 ? (
-            <TurnActivity items={message.activity} live={thinking} />
+            <TurnActivity items={message.activity} live={thinking} traceHref={traceHref} />
           ) : (
             thinking && message.text && message.progress && (
               <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">

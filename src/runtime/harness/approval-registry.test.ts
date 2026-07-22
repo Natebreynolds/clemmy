@@ -222,3 +222,42 @@ test('resumable approval registration dedupes and an approved grant is claimed e
   const replay = reg.claimResumableApproval(input.resumeKey);
   assert.equal(replay.state, 'consumed', 'the exact approved payload cannot reuse the grant twice');
 });
+
+test('claimApprovedUnconsumedForSession: one-shot session claim for replay-supported tools only', () => {
+  const session = createSession({ id: 'sess-session-claim', kind: 'workflow' });
+  const row = reg.register({
+    sessionId: session.id,
+    subject: 'Run SLACK_SEND_MESSAGE?',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'SLACK_SEND_MESSAGE', arguments: '{"channel":"C1","markdown_text":"hi"}' },
+    resumeKey: 'claude-workflow-tool-v1:session-claim-a',
+  });
+
+  // Pending rows are never claimable — nothing may cross the boundary early.
+  assert.equal(reg.claimApprovedUnconsumedForSession(session.id, { tools: ['composio_execute_tool'] }), null);
+
+  reg.resolve(row.approvalId, 'approved', 'unit-test-human');
+
+  // Tool filter: an unsupported tool list claims nothing.
+  assert.equal(reg.claimApprovedUnconsumedForSession(session.id, { tools: ['run_shell_command'] }), null);
+
+  const claimed = reg.claimApprovedUnconsumedForSession(session.id, { tools: ['composio_execute_tool'] });
+  assert.ok(claimed, 'the approved row is claimable exactly once');
+  assert.equal(claimed?.approvalId, row.approvalId);
+  assert.ok(claimed?.consumedAt, 'the claim durably consumes the grant');
+
+  // Second claim: nothing left (a racing duplicate re-admission cannot double-send).
+  assert.equal(reg.claimApprovedUnconsumedForSession(session.id, { tools: ['composio_execute_tool'] }), null);
+});
+
+test('claimApprovedUnconsumedForSession: rejected rows stay terminal and unclaimed', () => {
+  const session = createSession({ id: 'sess-session-claim-rej', kind: 'workflow' });
+  const row = reg.register({
+    sessionId: session.id,
+    subject: 'Run SLACK_SEND_MESSAGE?',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'SLACK_SEND_MESSAGE', arguments: '{}' },
+  });
+  reg.resolve(row.approvalId, 'rejected', 'unit-test-human');
+  assert.equal(reg.claimApprovedUnconsumedForSession(session.id, { tools: ['composio_execute_tool'] }), null);
+});

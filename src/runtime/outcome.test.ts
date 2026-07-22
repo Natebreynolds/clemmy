@@ -225,3 +225,71 @@ test('deliverOutcome: an active goal on the origin session gets a ledger line', 
     `expected a workflow-outcome ledger line, got ${JSON.stringify(ledger)}`,
   );
 });
+
+test('proactive report on a BUSY chat defers durably, then fires once idle', async () => {
+  const { processDeferredProactiveReports, setProactiveReportFireForTest } = await import('./outcome.js');
+  const { readFileSync, writeFileSync } = await import('node:fs');
+  const queueFile = path.join(TMP_HOME, 'state', 'deferred-proactive-reports.json');
+
+  createSession({ id: 'sess-defer', kind: 'chat' });
+  // A fresh (non-synthetic) event makes the session look mid-conversation.
+  appendEvent({ sessionId: 'sess-defer', turn: 0, role: 'user', type: 'user_input_received', data: { text: 'hi' } });
+
+  const fired: string[] = [];
+  setProactiveReportFireForTest(async (sessionId, outcome) => { fired.push(`${sessionId}:${outcome.status}`); });
+  try {
+    deliverOutcome(
+      { status: 'done', detail: 'verification passed' },
+      ctx({ originSessionId: 'sess-defer', sourceId: 'wf-defer-1', sourceLabel: 'workflow run', proactiveTurn: true }),
+    );
+    // maybeScheduleProactiveReport is fire-and-forget; give it a beat to enqueue.
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(fired.length, 0, 'busy chat must not speak immediately');
+    const queued = JSON.parse(readFileSync(queueFile, 'utf8'));
+    assert.equal(queued.length, 1, 'deferred entry is durably queued');
+    assert.equal(queued[0].sessionId, 'sess-defer');
+    assert.equal(queued[0].ctx.sourceId, 'wf-defer-1');
+
+    // Still busy → tick keeps it queued (attempts increments).
+    await processDeferredProactiveReports();
+    assert.equal(fired.length, 0);
+    assert.equal(JSON.parse(readFileSync(queueFile, 'utf8')).length, 1);
+
+    // Simulate idleness by backdating the entry's session activity: rewrite the
+    // gate input by aging the queue entry is not possible, so instead wait via
+    // the injected clock — here we fake idle by clearing recent events through
+    // a fresh session with no events.
+    const entries = JSON.parse(readFileSync(queueFile, 'utf8'));
+    createSession({ id: 'sess-defer-idle', kind: 'chat' });
+    entries[0].sessionId = 'sess-defer-idle';
+    writeFileSync(queueFile, JSON.stringify(entries));
+    await processDeferredProactiveReports();
+    assert.deepEqual(fired, ['sess-defer-idle:done'], 'fires exactly once when the chat is idle');
+    assert.equal(JSON.parse(readFileSync(queueFile, 'utf8')).length, 0, 'queue drained after firing');
+  } finally {
+    setProactiveReportFireForTest(null);
+  }
+});
+
+test('a deferred proactive report past the age bound is dropped, not spoken', async () => {
+  const { processDeferredProactiveReports, setProactiveReportFireForTest } = await import('./outcome.js');
+  const { writeFileSync, readFileSync } = await import('node:fs');
+  const queueFile = path.join(TMP_HOME, 'state', 'deferred-proactive-reports.json');
+  createSession({ id: 'sess-defer-old', kind: 'chat' });
+  writeFileSync(queueFile, JSON.stringify([{
+    sessionId: 'sess-defer-old',
+    outcome: { status: 'done', detail: 'stale' },
+    ctx: { sourceLabel: 'workflow run', sourceId: 'wf-old' },
+    createdAt: new Date(Date.now() - 31 * 60_000).toISOString(),
+    attempts: 5,
+  }]));
+  const fired: string[] = [];
+  setProactiveReportFireForTest(async (sessionId) => { fired.push(sessionId); });
+  try {
+    await processDeferredProactiveReports();
+    assert.equal(fired.length, 0, 'aged-out entry never speaks');
+    assert.equal(JSON.parse(readFileSync(queueFile, 'utf8')).length, 0, 'aged-out entry is dropped');
+  } finally {
+    setProactiveReportFireForTest(null);
+  }
+});

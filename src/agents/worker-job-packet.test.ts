@@ -83,3 +83,52 @@ test('workerPacketKey: length-prefixing defeats the field-boundary collision (ad
   const p2 = { ...validPacket, objective: 'Summarize the company', item: 'Acme Corp' };
   assert.notEqual(workerPacketKey(p1), workerPacketKey(p2), 'field boundaries are unambiguous');
 });
+
+test('workerCallItems filters junk item strings and template placeholders', async () => {
+  const { workerCallItems } = await import('./worker-job-packet.js');
+  const { deepEqual, equal } = await import('node:assert/strict');
+  deepEqual(workerCallItems({ item: 'null', items: ['Firm A', 'Firm B'] }), ['Firm A', 'Firm B']);
+  deepEqual(workerCallItems({ item: 'Firm C', items: ['undefined', 'Firm A'] }), ['Firm C', 'Firm A']);
+  equal(workerCallItems({ item: 'none', items: null }), null);
+  // Unresolved template placeholders never become work items (live 2026-07-22:
+  // a worker ran for the literal "{{single site host}}").
+  deepEqual(workerCallItems({ item: '{{single site host}}', items: ['stripe.com', '<site>', '${HOST}', '%TARGET%', 'linear.app'] }), ['stripe.com', 'linear.app']);
+  equal(workerCallItems({ item: '{{company}}', items: null }), null);
+  // Legit values that merely CONTAIN braces/angles survive.
+  deepEqual(workerCallItems({ item: 'Bolt<new> Inc', items: null }), ['Bolt<new> Inc']);
+});
+
+test('workerResultIndicatesFailure catches unprefixed runner errors and hollow output', async () => {
+  const { workerResultIndicatesFailure } = await import('./worker-job-packet.js');
+  const { equal } = await import('node:assert/strict');
+  equal(workerResultIndicatesFailure('ERROR: worker failed'), true);
+  equal(workerResultIndicatesFailure('An error occurred while running the tool. Please try again. Error: Error: 400 Unknown Model, please check the model code.'), true);
+  equal(workerResultIndicatesFailure(''), true);
+  equal(workerResultIndicatesFailure('   '), true);
+  equal(workerResultIndicatesFailure('Attorney: Jane Roe, (555) 123-4567'), false);
+});
+
+test('uniformFailureSignature: identical infra failures collapse to one signature; diverse failures do not', async () => {
+  const { uniformFailureSignature, workerFailureSignature } = await import('./worker-job-packet.js');
+  const { equal, ok } = await import('node:assert/strict');
+  const a = 'ERROR: worker for "Cursor" failed: 400 Unknown Model, please check the model code.';
+  const b = 'ERROR: worker for "Replit" failed: 400 Unknown Model, please check the model code.';
+  const sig = uniformFailureSignature([a, b]);
+  ok(sig, 'identical failure class detected across items');
+  equal(workerFailureSignature(a), workerFailureSignature(b));
+  // Diverse failures never collapse.
+  equal(uniformFailureSignature([a, 'ERROR: worker for "Bolt" failed: timeout after 120s']), null);
+  // A single item is never "uniform".
+  equal(uniformFailureSignature([a]), null);
+});
+
+test('fanout uniform-failure memo refuses futile respawns and clears on success', async () => {
+  const { markFanoutUniformFailure, fanoutUniformFailure, clearFanoutUniformFailure } = await import('./worker-respawn-guard.js');
+  const { equal, ok } = await import('node:assert/strict');
+  clearFanoutUniformFailure('sess-uf');
+  equal(fanoutUniformFailure('sess-uf'), null);
+  markFanoutUniformFailure('sess-uf', 'error: <n> unknown model');
+  ok(fanoutUniformFailure('sess-uf'));
+  clearFanoutUniformFailure('sess-uf');
+  equal(fanoutUniformFailure('sess-uf'), null);
+});

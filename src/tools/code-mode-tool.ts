@@ -522,7 +522,7 @@ function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   };
 }
 
-async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }): Promise<unknown> {
+async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean): Promise<unknown> {
   const real = (await realToolsByName()).get(method);
   if (!real || typeof real.invoke !== 'function') {
     throw new Error(`code-mode: unknown tool "${method}"`);
@@ -565,6 +565,7 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
       counter: counter ?? new ToolCallsCounter(1000),
       codeMode: true,
       ...(certifiedBatch ? { certifiedBatch } : {}),
+      ...(batchItem ? { batchItem: true } : {}),
     }, () =>
       wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
     ),
@@ -582,7 +583,7 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
  *  MCP reads — without this, the block would refuse the very program it
  *  demanded (the shim mount is where discrete native-MCP serial reads are
  *  refused as of 2026-07-12). `certifiedBatch` rides along for the batch lane. */
-async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }): Promise<unknown> {
+async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean): Promise<unknown> {
   const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
   const shim = getOrCreateExternalMcpServers() as unknown as {
     listTools?: () => Promise<unknown>;
@@ -602,6 +603,7 @@ async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId:
       counter: counter ?? new ToolCallsCounter(1000),
       codeMode: true,
       ...(certifiedBatch ? { certifiedBatch } : {}),
+      ...(batchItem ? { batchItem: true } : {}),
     },
     () => shim.callTool(method, argObj),
   );
@@ -629,8 +631,8 @@ export async function dispatchBatchItemTool(
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
-      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch)
-      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch);
+      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch, true)
+      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch, true);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }

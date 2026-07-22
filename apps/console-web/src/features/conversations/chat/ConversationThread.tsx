@@ -90,6 +90,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               message={m}
               onApprove={() => chat.send({ text: 'approve', attachmentIds: [], attachmentNames: [] })}
               onReject={() => chat.send({ text: 'not now', attachmentIds: [], attachmentNames: [] })}
+              traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
           ))}
           <div ref={bottomRef} />

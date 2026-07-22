@@ -114,6 +114,8 @@ export interface CheckInRecord {
   urgency: CheckInUrgency;
   contextExecutionId?: string;
   contextSummary?: string;
+  /** The parked background task this question belongs to — see CreateCheckInInput. */
+  linkedTaskId?: string;
   status: CheckInStatus;
   askedAt: string;
   answeredAt?: string;
@@ -156,6 +158,11 @@ export interface CreateCheckInInput {
   urgency?: CheckInUrgency;
   contextExecutionId?: string;
   contextSummary?: string;
+  /** The parked background task this question belongs to (2026-07-22 store
+   *  unification): stamping the correlation at WRITE time is what lets an
+   *  answer through EITHER store resume the task — the missing link that
+   *  caused the answered-check-in/duplicate-task incident. */
+  linkedTaskId?: string;
 }
 
 /**
@@ -176,6 +183,7 @@ export function createCheckIn(input: CreateCheckInInput): CheckInRecord {
     urgency: input.urgency ?? 'normal',
     contextExecutionId: input.contextExecutionId,
     contextSummary: input.contextSummary?.slice(0, 600),
+    linkedTaskId: input.linkedTaskId,
     status: 'open',
     askedAt: new Date().toISOString(),
   };
@@ -290,6 +298,23 @@ export function answerCheckIn(id: string, answer: string): CheckInRecord | null 
   atomicWriteCheckIn(updated);
 
   enqueueAnswerInbox(updated);
+
+  // Store unification (2026-07-22): a check-in linked to a parked background
+  // task resumes THAT task with the same answer — answering the check-in copy
+  // used to resolve only this store, so the task sat awaiting_input forever
+  // and the agent's next cycle spawned a duplicate. Lazy import avoids a
+  // module cycle; idempotent (queue no-ops unless the task is still parked).
+  if (updated.linkedTaskId) {
+    void (async () => {
+      try {
+        const { getBackgroundTask, queueBackgroundTaskInputResolution } = await import('../execution/background-tasks.js');
+        const task = getBackgroundTask(updated.linkedTaskId as string);
+        if (task?.status === 'awaiting_input' && task.pendingQuestionId) {
+          queueBackgroundTaskInputResolution(task.pendingQuestionId, updated.answer ?? '');
+        }
+      } catch { /* the check-in answer is recorded regardless; the origin-chat bridge remains the fallback */ }
+    })();
+  }
 
   addNotification({
     id: `${Date.now()}-checkin-${id}-answered`,

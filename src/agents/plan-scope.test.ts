@@ -33,6 +33,12 @@ const {
   revokeStandingApproval,
   isStandingGranted,
   listStandingGrants,
+  grantSendTrust,
+  revokeSendTrust,
+  listSendTrustGrants,
+  matchesSendTrust,
+  extractSendTargets,
+  SEND_TRUST_MAX_RECIPIENTS,
 } = await import('./plan-scope.js');
 
 const SCOPES_FILE = path.join(TEST_HOME, 'state', 'plan-scopes.json');
@@ -298,6 +304,98 @@ test('evaluateAutoApprove: the load-bearing invariant — an IRREVERSIBLE SEND i
   // And the cx_ dynamic-tool lane resolves to the same gate.
   const cxSend = evaluateAutoApprove({ sessionId: 'sess-inv-cx', toolName: 'cx_gmail_send_email', scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
   assert.equal(cxSend.autoApproved, false, 'a cx_ send is held identically to the broker send');
+});
+
+// ─── Scoped send-trust (2026-07-21) ──────────────────────────────────────────
+
+test('send-trust: the invariant HOLDS with zero grants — an irreversible send is still held under Autonomous', () => {
+  // The whole safety story: with no grants the behaviour is byte-identical to
+  // the always-ask default. matchesSendTrust must be false, the send held.
+  assert.equal(listSendTrustGrants().length, 0);
+  const send = evaluateAutoApprove({ sessionId: 's-zero', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'a@client.com' } }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(send.autoApproved, false, 'no grants → held');
+});
+
+test('send-trust: refuses an UNSCOPED grant (no domain, no recipient)', () => {
+  assert.equal(grantSendTrust({ note: 'trust everything' }), null, 'an unscoped send-trust is refused by design');
+  assert.equal(grantSendTrust({ domains: [], recipients: [] }), null);
+  assert.equal(listSendTrustGrants().length, 0);
+});
+
+test('send-trust: a domain-scoped grant auto-approves a send where EVERY recipient is in-domain', () => {
+  grantSendTrust({ domains: ['breakthroughcoaching.ai'], note: 'my team' });
+  const d = evaluateAutoApprove({
+    sessionId: 's-dom', toolName: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'nathan@breakthroughcoaching.ai', cc: 'sam@breakthroughcoaching.ai' } },
+    scope: 'yolo', insideWorkspace: false, kindHint: 'send',
+  });
+  assert.equal(d.autoApproved, true, 'all recipients in the trusted domain → auto');
+  assert.equal(d.reason, 'send-trust', 'audit trail records send-trust as the reason');
+});
+
+test('send-trust: a MIXED send (one recipient OUT of scope) is still held', () => {
+  grantSendTrust({ domains: ['breakthroughcoaching.ai'] });
+  const d = evaluateAutoApprove({
+    sessionId: 's-mix', toolName: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'nathan@breakthroughcoaching.ai', cc: 'outsider@rival.com' } },
+    scope: 'yolo', insideWorkspace: false, kindHint: 'send',
+  });
+  assert.equal(d.autoApproved, false, 'one out-of-scope recipient → the whole send is held');
+});
+
+test('send-trust: an exact-recipient grant matches only that address', () => {
+  grantSendTrust({ recipients: ['ceo@partner.com'] });
+  const hit = evaluateAutoApprove({ sessionId: 's-r1', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'ceo@partner.com' } }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(hit.autoApproved, true);
+  const miss = evaluateAutoApprove({ sessionId: 's-r2', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'intern@partner.com' } }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(miss.autoApproved, false, 'a different address at the same host is NOT covered by an exact-recipient grant');
+});
+
+test('send-trust: the mass-send floor overrides any grant', () => {
+  grantSendTrust({ domains: ['breakthroughcoaching.ai'] });
+  const many = Array.from({ length: SEND_TRUST_MAX_RECIPIENTS + 1 }, (_, i) => `u${i}@breakthroughcoaching.ai`).join(',');
+  const d = evaluateAutoApprove({ sessionId: 's-mass', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: many } }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(d.autoApproved, false, `a send over ${SEND_TRUST_MAX_RECIPIENTS} recipients always asks, even all-in-domain`);
+});
+
+test('send-trust: fail-closed when no recipient can be extracted', () => {
+  grantSendTrust({ domains: ['breakthroughcoaching.ai'] });
+  // A send-shaped call with no parseable recipient (e.g. a call with only a
+  // phone number in an unrecognised field) must NOT match — hold it.
+  assert.equal(matchesSendTrust('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { subject: 'hi' } }), false);
+});
+
+test('send-trust: a revoked grant no longer matches', () => {
+  const g = grantSendTrust({ domains: ['breakthroughcoaching.ai'] })!;
+  assert.equal(matchesSendTrust('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'x@breakthroughcoaching.ai' } }), true);
+  assert.equal(revokeSendTrust(g.id), true);
+  assert.equal(matchesSendTrust('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'x@breakthroughcoaching.ai' } }), false, 'revoked → held again');
+});
+
+test('send-trust: a toolkit-scoped grant only matches its toolkit', () => {
+  grantSendTrust({ domains: ['breakthroughcoaching.ai'], toolkits: ['googlecalendar'] });
+  const cal = evaluateAutoApprove({ sessionId: 's-tk1', toolName: 'composio_execute_tool', args: { tool_slug: 'GOOGLECALENDAR_CREATE_EVENT', arguments: { attendees: [{ email: 'x@breakthroughcoaching.ai' }] } }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(cal.autoApproved, true, 'calendar send matches the googlecalendar-scoped grant');
+  const mail = evaluateAutoApprove({ sessionId: 's-tk2', toolName: 'composio_execute_tool', args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'x@breakthroughcoaching.ai' } }, scope: 'yolo', insideWorkspace: false, kindHint: 'send' });
+  assert.equal(mail.autoApproved, false, 'a gmail send does NOT match a googlecalendar-only grant');
+});
+
+test('send-trust: kill-switch off disables all matching', () => {
+  const prev = process.env.CLEMMY_SEND_TRUST;
+  grantSendTrust({ domains: ['breakthroughcoaching.ai'] });
+  process.env.CLEMMY_SEND_TRUST = 'off';
+  try {
+    assert.equal(matchesSendTrust('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'x@breakthroughcoaching.ai' } }), false, 'kill-switch off → nothing matches');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_SEND_TRUST; else process.env.CLEMMY_SEND_TRUST = prev;
+  }
+});
+
+test('send-trust: extractSendTargets finds emails anywhere and handles under recipient keys', () => {
+  const t = extractSendTargets({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'A@Foo.com', body: 'cc bob@bar.io in the notes' } });
+  assert.deepEqual(t.emails.sort(), ['a@foo.com', 'bob@bar.io'], 'lowercased, deduped, found even inside a body string (over-extraction is fail-safe)');
+  const s = extractSendTargets({ tool_slug: 'SLACK_SEND_MESSAGE', arguments: { channel: '#general' } });
+  assert.deepEqual(s.handles, ['#general']);
 });
 
 test('evaluateAutoApprove: plan-scope wins over policy reason when both fire', () => {

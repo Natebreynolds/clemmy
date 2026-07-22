@@ -184,6 +184,51 @@ export function resolveEffectiveProviderForModel(
 }
 
 /**
+ * all_in routing classifies ANY model id as 'byo' once a default BYO backend
+ * is configured — including ids no BYO provider actually serves (e.g. the
+ * gpt-* worker default). The backend then 400s "Unknown Model" and every
+ * worker routed there dies (live 2026-07-22: 5/5 workers DOA). When a
+ * byo-routed id has no owning provider, substitute the default BYO backend's
+ * primary id so the call lands on a model the provider actually has.
+ */
+// Ids the BYO backend has PROVEN it does not serve (a 400 "unknown model"
+// class response). Config cannot know this up front — the legacy shim lists
+// the shared worker slot as "offered" because aggregator endpoints (Together,
+// OpenRouter) genuinely serve foreign ids, while single-family endpoints
+// (z.ai) 400 on them. The provider's own rejection is the truth; learn it
+// once and translate thereafter (live 2026-07-22: gpt-5.4 → z.ai, 17 dead
+// workers across two tests before this memo existed).
+const byoNotServedIds = new Set<string>();
+
+export function markByoModelNotServed(modelId: string): void {
+  const id = (modelId || '').trim();
+  if (id) byoNotServedIds.add(id);
+}
+
+export function isByoModelNotServed(modelId: string): boolean {
+  return byoNotServedIds.has((modelId || '').trim());
+}
+
+export function clearByoNotServedForTest(): void {
+  byoNotServedIds.clear();
+}
+
+/** True when an error text is the provider's unknown-model rejection class. */
+export function looksLikeUnknownModelError(text: string | null | undefined): boolean {
+  return /unknown model|model not (?:found|exist|supported)|no such model|invalid model(?: code| id)?|does not exist.{0,20}model/i.test(text ?? '');
+}
+
+export function repairByoRoutedModelId(modelId: string): string {
+  const id = (modelId || '').trim();
+  if (!id) return id;
+  if (!isByoModelNotServed(id) && configuredByoProvidersForModel(id).length > 0) return id;
+  const cfg = getByoBackendConfig();
+  const primary = cfg.configured && cfg.primaryId ? cfg.primaryId : id;
+  // Never "repair" to another known-dead id.
+  return isByoModelNotServed(primary) ? id : primary;
+}
+
+/**
  * Resolve a model id -> the backend config of the provider that OWNS it.
  * Duplicate exact owners fail closed until persisted identity is provider-
  * qualified. When exactly one provider exists it owns everything (preserves

@@ -35,6 +35,7 @@ import { registerExtractStructuredTools } from './extract-structured-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
+import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerToolSearchTool } from './tool-search-tool.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
@@ -148,6 +149,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   // Schema-on-demand discovery entry — read-only catalog search
   // (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
   registerToolSearchTool(server);
+  registerArtifactClaimTools(server);
   registerCapabilityTools(server);
   registerHarnessStatusTools(server);
   registerCliTools(server);

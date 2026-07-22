@@ -25,7 +25,7 @@ import {
   countStrongEntityIdentifierCollisionGroups,
   type EntityIdentifierReconciliationResult,
 } from './entity-identity.js';
-import { reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
+import { reapStaleChatCancellations, reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
 import {
   reapStuckRecallRecordings,
   loadRecallMeetingSettings,
@@ -644,6 +644,21 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     // grow unbounded. Active/paused sessions are kept so the user can resume.
     try {
       const deletedSessions = reapStaleSessions();
+      // 2026-07-22 legacy-audit retention sweeps: the three stores the
+      // session-cascade reap cannot bound (FK-less tombstones + the two
+      // standalone metric DBs).
+      try {
+        const staleCancellations = reapStaleChatCancellations();
+        const { reapStaleOperationalEvents } = await import('../runtime/operational-telemetry.js');
+        const staleOpEvents = reapStaleOperationalEvents();
+        const { reapStaleModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
+        const staleRouteRows = reapStaleModelRouteMetrics();
+        if (staleCancellations > 0 || staleOpEvents > 0 || staleRouteRows > 0) {
+          logger.info({ staleCancellations, staleOpEvents, staleRouteRows }, 'retention sweep tick');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'retention sweep tick failed');
+      }
       if (deletedSessions > 0) {
         logger.info({ deletedSessions }, 'sessions reaper tick');
       }
@@ -667,6 +682,19 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       if (expiredPending > 0) logger.info({ expiredPending }, 'pending reflection evidence expired');
     } catch (err) {
       logger.warn({ err }, 'pending reflection reaper tick failed');
+    }
+    // Replay reflections that FAILED while the extractor was down (quota /
+    // outage). The raw tool output survives in tool_outputs for 14 days, so an
+    // extractor outage delays learning instead of deleting it. Bounded per
+    // receipt; no-ops while the extractor is in its backoff window.
+    try {
+      const { replayFailedReflections } = await import('./reflection.js');
+      const replayed = await replayFailedReflections();
+      if (replayed.replayed > 0 || replayed.rawGone > 0) {
+        logger.info(replayed, 'failed-reflection replay tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'failed-reflection replay tick failed');
     }
     try {
       const expiredRecallRuns = reapExpiredUnusedRecallRuns();

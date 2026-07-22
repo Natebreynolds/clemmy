@@ -716,3 +716,187 @@ test('synthetic retry replay permits one Google Doc and one asset container desp
     [['google_doc', 'bound'], ['site', 'bound']],
   );
 });
+
+test('partitionSupersededPendingClaims: a dead mid-flight claim is superseded only by a VERIFIED same-kind sibling', async () => {
+  const { partitionSupersededPendingClaims } = await import('./artifact-ledger.js');
+  const { deepEqual, equal } = await import('node:assert/strict');
+
+  const dead = { id: 'a-dead', kind: 'site', provider: 'netlify', resourceId: null };
+  const verifiedSibling = { id: 'a-new', kind: 'site', provider: 'netlify', resourceId: 'site-123' };
+  const unrelatedPending = { id: 'a-doc', kind: 'document', provider: 'airtable', resourceId: null };
+
+  // Verified sibling present → the dead claim is superseded; the unrelated one is not.
+  const out = partitionSupersededPendingClaims({
+    artifacts: [dead, verifiedSibling, unrelatedPending],
+    pending: [dead, unrelatedPending],
+  });
+  deepEqual(out.superseded.map((a) => a.id), ['a-dead']);
+  deepEqual(out.stillPending.map((a) => a.id), ['a-doc']);
+
+  // No verified sibling → nothing superseded (fail-closed).
+  const none = partitionSupersededPendingClaims({ artifacts: [dead], pending: [dead] });
+  equal(none.superseded.length, 0);
+  equal(none.stillPending.length, 1);
+
+  // A claim WITH a resourceId is never superseded — it can verify itself.
+  const withId = { id: 'a-hasid', kind: 'site', provider: 'netlify', resourceId: 'site-999' };
+  const keep = partitionSupersededPendingClaims({ artifacts: [withId, verifiedSibling], pending: [withId] });
+  equal(keep.superseded.length, 0);
+
+  // A PENDING sibling (even with a resourceId) supersedes nothing.
+  const pendingSibling = { id: 'a-pend', kind: 'site', provider: 'netlify', resourceId: 'site-777' };
+  const noPendHelp = partitionSupersededPendingClaims({
+    artifacts: [dead, pendingSibling],
+    pending: [dead, pendingSibling],
+  });
+  equal(noPendHelp.superseded.length, 0);
+});
+
+test('resolveUncertainArtifactClaim: bind and absent free a jailed uncertain claim; bound claims are untouchable', async () => {
+  const { resolveUncertainArtifactClaim, claimArtifactSlot } = await import('./artifact-ledger.js');
+  const { openEventLog, createSession } = await import('./eventlog.js');
+  const { equal, ok } = await import('node:assert/strict');
+  const session = createSession({ id: 'sess-uncertain-claim', kind: 'chat' });
+  const db = openEventLog();
+
+  const mkClaim = (id: string, status: string): void => {
+    db.prepare(`
+      INSERT INTO run_artifacts (id, session_id, run_scope_id, slot_key, kind, provider, status, create_shape, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'site', 'Netlify', ?, 'test-shape', datetime('now'), datetime('now'))
+    `).run(id, session.id, 'scope-1', `slot-${id}`, status);
+  };
+  mkClaim('art-uncertain-1', 'uncertain');
+  mkClaim('art-uncertain-2', 'uncertain');
+  mkClaim('art-bound-1', 'bound');
+
+  // bind: attaches the id and verifies.
+  const bound = resolveUncertainArtifactClaim(session.id, 'art-uncertain-1', { kind: 'bind', resourceId: 'site-abc123' });
+  equal(bound.ok, true);
+  const row = db.prepare('SELECT status, resource_id, binding_verified_at FROM run_artifacts WHERE id = ?').get('art-uncertain-1') as { status: string; resource_id: string; binding_verified_at: string | null };
+  equal(row.status, 'bound');
+  equal(row.resource_id, 'site-abc123');
+  ok(row.binding_verified_at, 'bind marks the claim verified');
+
+  // absent: releases the claim entirely.
+  equal(resolveUncertainArtifactClaim(session.id, 'art-uncertain-2', { kind: 'absent' }).ok, true);
+  equal(db.prepare('SELECT COUNT(*) AS n FROM run_artifacts WHERE id = ?').get('art-uncertain-2') as unknown as { n: number } | undefined && (db.prepare('SELECT COUNT(*) AS n FROM run_artifacts WHERE id = ?').get('art-uncertain-2') as { n: number }).n, 0);
+
+  // an already-bound claim is untouchable.
+  equal(resolveUncertainArtifactClaim(session.id, 'art-bound-1', { kind: 'absent' }).ok, false);
+  // wrong session is refused.
+  equal(resolveUncertainArtifactClaim('sess-other', 'art-uncertain-1', { kind: 'absent' }).ok, false);
+  void claimArtifactSlot;
+});
+
+test('effect-anchored generic classifier: any CLI create and any root provider create claim; item-level creates never do', async () => {
+  const { artifactIntentForTool, extractArtifactResource } = await import('./artifact-ledger.js');
+  const { equal, ok } = await import('node:assert/strict');
+
+  // ANY installed CLI with a create-verb subcommand claims — no product list.
+  const supabase = artifactIntentForTool('run_shell_command', { command: 'supabase projects:create my-landing' });
+  equal(supabase?.kind, 'resource'); equal(supabase?.provider, 'supabase'); equal(supabase?.title, 'my-landing');
+  // Deploy/publish target EXISTING resources — deliberately NOT claimed
+  // (that ambiguity belongs to the duplicate-write wall, not the slot model).
+  equal(artifactIntentForTool('run_shell_command', { command: 'vercel deploy --prod' }), null);
+  const gh = artifactIntentForTool('run_shell_command', { command: 'CI=1 npx --yes gh repo create acme-site --public' });
+  equal(gh?.provider, 'gh'); equal(gh?.title, 'acme-site');
+  const wrangler = artifactIntentForTool('run_shell_command', { command: 'wrangler init worker-thing' });
+  equal(wrangler?.provider, 'wrangler');
+  // Reads and plumbing commands never claim.
+  equal(artifactIntentForTool('run_shell_command', { command: 'gh repo list' }), null);
+  equal(artifactIntentForTool('run_shell_command', { command: 'git checkout -b create-fix' }), null);
+  equal(artifactIntentForTool('run_shell_command', { command: 'echo create' }), null);
+
+  // Root provider create (no parent reference) claims with a derived label…
+  const base = artifactIntentForTool('composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_BASE', arguments: '{"name":"PI Intel"}' });
+  equal(base?.kind, 'resource'); equal(base?.provider, 'airtable'); equal(base?.title, 'PI Intel');
+  // …item-level creates (parent-container reference) never claim.
+  equal(artifactIntentForTool('composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"baseId":"appX","name":"row"}' }), null);
+  equal(artifactIntentForTool('composio_execute_tool', { tool_slug: 'TRELLO_CREATE_CARD', arguments: '{"name":"c","board_id":"b1"}' }), null);
+
+  // Account-scoping ids (workspaceId) do NOT demote a root deliverable —
+  // an Airtable base created in a workspace claims (live 2026-07-22 gap).
+  const atBase = artifactIntentForTool('composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_BASE', arguments: '{"name":"AI Tooling Intel","workspaceId":"wspX"}' });
+  equal(atBase?.kind, 'resource'); equal(atBase?.provider, 'airtable');
+
+  // Local first-class tools NEVER claim — session bookkeeping is not a
+  // provider resource (live 2026-07-22: execution_create claimed and would
+  // have parked the run on a phantom artifact).
+  equal(artifactIntentForTool('execution_create', { title: 'Deploy intel pipeline', objective: 'x' }), null);
+  equal(artifactIntentForTool('workflow_create', { name: 'daily-brief' }), null);
+  // …but namespaced MCP creates DO (external surface).
+  const linear = artifactIntentForTool('mcp__linear__create_project', { name: 'Q3 Launch' });
+  equal(linear?.kind, 'resource'); equal(linear?.provider, 'linear');
+
+  // Existing precise branches keep their richer kinds (regression).
+  const netlify = artifactIntentForTool('run_shell_command', { command: 'netlify sites:create --name harness-viz' });
+  equal(netlify?.kind, 'site'); equal(netlify?.provider, 'Netlify');
+
+  // Generic extraction proves success from id/url evidence.
+  const bound = extractArtifactResource(
+    { kind: 'resource', provider: 'vercel', slotKey: 'resource:primary', createShape: 'CLI_VERCEL_DEPLOY' },
+    JSON.stringify({ id: 'prj_123', url: 'https://my-landing.vercel.app' }),
+  );
+  equal(bound?.resourceId, 'prj_123');
+  ok(bound?.uri?.includes('vercel.app'));
+});
+
+test('a uniform-failure abort boundary excludes dead pre-abort rounds from fan-out coverage', async () => {
+  const { summarizeFanoutCoverage } = await import('./fanout-ledger.js');
+  const session = eventlog.createSession({ id: 'sess-fanout-abort-boundary', kind: 'chat' });
+  for (const item of ['a', 'b', 'c']) {
+    eventlog.appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'worker_result', data: { item, ok: false, lane: 'orchestrator' } });
+  }
+  assert.equal(summarizeFanoutCoverage(session.id).failed, 3, 'pre-boundary the dead round blocks');
+  eventlog.appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { reason: 'uniform_failure_abort' } });
+  const after = summarizeFanoutCoverage(session.id);
+  assert.equal(after.total, 0);
+  assert.equal(after.failed, 0);
+});
+
+test('retention sweeps: stale rows reaped, fresh rows kept (cancellations / telemetry / route metrics)', async () => {
+  const { reapStaleChatCancellations, openEventLog } = await import('./eventlog.js');
+  const { reapStaleOperationalEvents, recordOperationalEvent, openOperationalTelemetryDb } = await import('../operational-telemetry.js');
+  const { reapStaleModelRouteMetrics, recordModelRouteDecision, openModelRouteMetricsDb } = await import('../model-route-metrics.js');
+  const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+
+  const hdb = openEventLog();
+  hdb.prepare('INSERT OR REPLACE INTO harness_chat_request_cancellations (request_id, requested_at, reason) VALUES (?, ?, ?)')
+    .run('req-old-1', old, 'test');
+  hdb.prepare('INSERT OR REPLACE INTO harness_chat_request_cancellations (request_id, requested_at, reason) VALUES (?, ?, ?)')
+    .run('req-new-1', new Date().toISOString(), 'test');
+  assert.ok(reapStaleChatCancellations() >= 1);
+  assert.equal((hdb.prepare("SELECT COUNT(*) AS n FROM harness_chat_request_cancellations WHERE request_id='req-new-1'").get() as { n: number }).n, 1);
+
+  recordOperationalEvent({ source: 'harness', type: 'worker_queued', payload: { probe: true } });
+  openOperationalTelemetryDb().prepare('UPDATE operational_events SET ts = ? WHERE 1=1 AND ts > ?').run(old, old);
+  assert.ok(reapStaleOperationalEvents() >= 1, 'aged telemetry rows reaped');
+
+  recordModelRouteDecision({ role: 'worker', resolvedModel: 'glm-5.2', provider: 'byo', source: 'default', reason: {} });
+  openModelRouteMetricsDb().prepare('UPDATE model_route_decisions SET created_at = ?').run(old);
+  assert.ok(reapStaleModelRouteMetrics() >= 1, 'aged route decisions reaped');
+});
+
+test('question-store unification: answering the check-in copy resumes the linked task; task-side answers close the check-in', async () => {
+  const { createCheckIn, answerCheckIn, getCheckIn, listOpenCheckIns } = await import('../../agents/check-ins.js');
+  const { createBackgroundTask, markBackgroundTaskAwaitingInput, getBackgroundTask, queueBackgroundTaskInputResolution } = await import('../../execution/background-tasks.js');
+  const origin = eventlog.createSession({ id: 'sess-qstore-unify', kind: 'chat' });
+
+  // Direction 1: check-in answer resumes the task.
+  const task = createBackgroundTask({ title: 'Q-store unify A', prompt: 'x', originSessionId: origin.id });
+  markBackgroundTaskAwaitingInput(task.id, 'q-unify-a', 'Which region?');
+  const checkIn = createCheckIn({ agentSlug: 'clementine', question: 'Which region should I use?', linkedTaskId: task.id });
+  answerCheckIn(checkIn.id, 'US-West');
+  await new Promise((r) => setTimeout(r, 120)); // the bridge is fire-and-forget
+  assert.equal(getBackgroundTask(task.id)?.status, 'pending', 'check-in answer queued the task continuation');
+  assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'US-West');
+
+  // Direction 2: task-side answer closes the linked check-in copy.
+  const task2 = createBackgroundTask({ title: 'Q-store unify B', prompt: 'y', originSessionId: origin.id });
+  markBackgroundTaskAwaitingInput(task2.id, 'q-unify-b', 'Which workspace?');
+  const checkIn2 = createCheckIn({ agentSlug: 'clementine', question: 'Which workspace?', linkedTaskId: task2.id });
+  queueBackgroundTaskInputResolution('q-unify-b', 'wspX');
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(getCheckIn(checkIn2.id)?.status, 'closed', 'the ghost question was closed');
+  assert.ok(!listOpenCheckIns().some((c) => c.id === checkIn2.id));
+});

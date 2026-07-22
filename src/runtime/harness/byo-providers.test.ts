@@ -265,3 +265,49 @@ test('normalizeModelsList: garbage / bad ids → [] without throwing', () => {
   // ids with illegal chars (space) are dropped by cleanId
   assert.deepEqual(normalizeModelsList([{ id: 'bad id' }, { id: 'good-id' }]), [{ id: 'good-id', label: undefined }]);
 });
+
+test('repairByoRoutedModelId: an unowned byo-routed id repairs to the default backend primary; owned ids pass through', async () => {
+  const { repairByoRoutedModelId } = await import('./byo-providers.js');
+  const { equal } = await import('node:assert/strict');
+  const prev = { url: process.env.BYO_MODEL_BASE_URL, id: process.env.BYO_MODEL_ID, key: process.env.BYO_MODEL_API_KEY };
+  process.env.BYO_MODEL_BASE_URL = 'https://api.example.test/v1';
+  process.env.BYO_MODEL_ID = 'glm-5.2';
+  process.env.BYO_MODEL_API_KEY = 'test-key';
+  try {
+    equal(repairByoRoutedModelId('gpt-5.4'), 'glm-5.2', 'unowned id repairs to the backend primary');
+    equal(repairByoRoutedModelId('glm-5.2'), 'glm-5.2', 'owned id passes through');
+    equal(repairByoRoutedModelId(''), '', 'empty id is untouched');
+  } finally {
+    if (prev.url === undefined) delete process.env.BYO_MODEL_BASE_URL; else process.env.BYO_MODEL_BASE_URL = prev.url;
+    if (prev.id === undefined) delete process.env.BYO_MODEL_ID; else process.env.BYO_MODEL_ID = prev.id;
+    if (prev.key === undefined) delete process.env.BYO_MODEL_API_KEY; else process.env.BYO_MODEL_API_KEY = prev.key;
+  }
+});
+
+test('not-served memo: the provider 400 teaches the catalog; repair then translates an "owned" id', async () => {
+  const { repairByoRoutedModelId, markByoModelNotServed, clearByoNotServedForTest, looksLikeUnknownModelError } = await import('./byo-providers.js');
+  const { equal } = await import('node:assert/strict');
+  const prev = { url: process.env.BYO_MODEL_BASE_URL, id: process.env.BYO_MODEL_ID, key: process.env.BYO_MODEL_API_KEY, worker: process.env.OPENAI_MODEL_WORKER, mode: process.env.MODEL_ROUTING_MODE };
+  process.env.BYO_MODEL_BASE_URL = 'https://api.example.test/v1';
+  process.env.BYO_MODEL_ID = 'glm-5.2';
+  process.env.BYO_MODEL_API_KEY = 'test-key';
+  process.env.OPENAI_MODEL_WORKER = 'gpt-5.4';
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  clearByoNotServedForTest();
+  try {
+    // all_in synthesis lists the worker id as "offered" → repair no-ops…
+    equal(repairByoRoutedModelId('gpt-5.4'), 'gpt-5.4');
+    // …until the provider itself rejects it.
+    equal(looksLikeUnknownModelError('400 Unknown Model, please check the model code.'), true);
+    markByoModelNotServed('gpt-5.4');
+    equal(repairByoRoutedModelId('gpt-5.4'), 'glm-5.2', 'the provider rejection overrides synthesized ownership');
+    // Never repair to another known-dead id.
+    markByoModelNotServed('glm-5.2');
+    equal(repairByoRoutedModelId('gpt-5.4'), 'gpt-5.4');
+  } finally {
+    clearByoNotServedForTest();
+    for (const [k, v] of Object.entries({ BYO_MODEL_BASE_URL: prev.url, BYO_MODEL_ID: prev.id, BYO_MODEL_API_KEY: prev.key, OPENAI_MODEL_WORKER: prev.worker, MODEL_ROUTING_MODE: prev.mode })) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});

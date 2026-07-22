@@ -64,8 +64,8 @@ export interface ArtifactResource {
 }
 
 export interface ArtifactVerificationIntent {
-  kind: Extract<ArtifactKind, 'google_doc' | 'site'>;
-  provider: 'Google Docs' | 'Netlify';
+  kind: ArtifactKind;
+  provider: string;
   /** Exact provider id requested by the read-back call. A title, list query,
    * ambient cwd, or URL-only probe is deliberately insufficient. */
   resourceId: string;
@@ -445,9 +445,116 @@ export function artifactIntentForTool(toolName: string, rawArgs: unknown): Artif
         createShape: 'NETLIFY_SITE_CREATE',
       };
     }
+    // GENERIC CLI create (2026-07-22 restructure — effect-anchored, no product
+    // whitelist): ANY installed CLI running a create-verb subcommand claims a
+    // generic artifact, so a mid-flight death on vercel/gh/wrangler/aws/…
+    // gets the same uncertainty protection + recovery chain Netlify does. The
+    // provider label is DERIVED from the executable, never enumerated.
+    const generic = genericCliCreateIntent(command);
+    if (generic) return generic;
+    return null;
+  }
+
+  // GENERIC provider create (composio slugs / MCP tools): a create-verb shape
+  // whose args carry a name/title identity and NO parent-container reference is
+  // a root deliverable (AIRTABLE_CREATE_BASE, VERCEL_CREATE_PROJECT, …). Item-
+  // level creates (records, rows, messages, comments) always reference their
+  // parent container in args and are deliberately NOT claimed — they belong to
+  // batches and the duplicate-send wall, not the one-deliverable slot model.
+  // The generic branch applies ONLY to EXTERNAL surfaces — a composio slug or a
+  // namespaced MCP tool. Local first-class tools (execution_create, focus_set,
+  // workflow authoring, memory ops) are session bookkeeping, not provider
+  // resources: claiming one parks the run on an "unresolved artifact" that
+  // never existed outside the harness (live 2026-07-22, execution_create).
+  const externalSurface = toolTail(toolName) === 'composio_execute_tool'
+    || toolName === 'composio_execute_tool'
+    || /__/.test(toolName);
+  if (externalSurface && /(?:^|_)(CREATE|PROVISION|REGISTER)(?:_|$)/.test(upper)) {
+    const title = stringField(args, ['title', 'name', 'display_name', 'displayName', 'label', 'slug']);
+    if (title && !argsReferenceParentContainer(args) && !createsStructuralSubPart(upper)) {
+      return {
+        kind: 'resource',
+        provider: providerLabelFromShape(shape),
+        slotKey: explicitSlot(args, 'resource'),
+        title,
+        createShape: upper,
+      };
+    }
   }
 
   return null;
+}
+
+/** Creates of structural SUB-PARTS live inside an existing deliverable and are
+ * re-inspectable through it — they are not session deliverables. This is a
+ * vocabulary of parts applied uniformly to EVERY provider (unlike a provider
+ * whitelist, it boxes no CLI/toolkit out of the ledger). */
+const STRUCTURAL_SUB_PART_RE = /(?:^|_)(TAB|HEADER|FOOTER|FOOTNOTE|COMMENT|ROW|RECORD|RECORDS|FIELD|COLUMN|CELL|CARD|ITEM|LABEL|TAG|WEBHOOK|KEY|TOKEN|SECRET|MEMBER|REACTION|REMINDER|EVENT|MESSAGE)S?(?:_|$)/;
+
+function createsStructuralSubPart(upperShape: string): boolean {
+  const afterVerb = upperShape.split(/(?:^|_)(?:CREATE|PROVISION|REGISTER)(?:_|$)/)[1] ?? '';
+  return STRUCTURAL_SUB_PART_RE.test(`_${afterVerb}_`) || STRUCTURAL_SUB_PART_RE.test(upperShape.slice(upperShape.indexOf('CREATE')));
+}
+
+/** Args that point INTO an existing container mark an item-level create. The
+ * check is structural (any *_id/parent-ish key besides account routing), not a
+ * noun list — AIRTABLE_CREATE_BASE has none; AIRTABLE_CREATE_RECORDS carries
+ * baseId; SLACK_SEND has channel. */
+function argsReferenceParentContainer(args: unknown): boolean {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+  for (const key of Object.keys(args as Record<string, unknown>)) {
+    const k = key.toLowerCase();
+    if (k === 'connected_account_id' || k === 'connectedaccountid' || k === 'user_id' || k === 'userid') continue;
+    // NOTE: workspace/org/team/account ids are ACCOUNT-SCOPING, not content
+    // parents — a base/project created "in a workspace" is still a root
+    // deliverable (live 2026-07-22: AIRTABLE_CREATE_BASE requires workspaceId
+    // and silently skipped claiming). Only content containers count.
+    if (/(^|_)(parent|base|table|board|channel|thread|folder|project|repo|doc|document|site|list)_?id$/.test(k)) return true;
+    if (k === 'parent' || k === 'channel') return true;
+  }
+  return false;
+}
+
+/** "VERCEL_CREATE_PROJECT" → "vercel"; "mcp__linear__create_issue" → "linear". */
+function providerLabelFromShape(shape: string): string {
+  const mcp = shape.match(/^mcp__([^_]+(?:_[^_]+)*?)__/i)?.[1];
+  if (mcp) return mcp.toLowerCase();
+  const head = shape.replace(/^CX_/i, '').split('_')[0] ?? shape;
+  return head.toLowerCase() || 'provider';
+}
+
+const CLI_CREATE_VERB_RE = /^(create|init|new|provision|register)$|^[a-z]+s?:create$/i;
+
+/** Effect-anchored CLI create detection: `<cli> [sub] <create-verb> …` for ANY
+ * executable. Reads the identity from common naming flags or the first bare
+ * argument after the verb; fails closed to the primary slot when absent. */
+function genericCliCreateIntent(command: string): ArtifactIntent | null {
+  const cleaned = command.trim();
+  if (!cleaned) return null;
+  // First pipeline segment only — a create buried mid-pipeline is not the
+  // command's primary effect claim.
+  const segment = cleaned.split(/[|;&]/)[0].trim();
+  const tokens = segment.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return null;
+  let idx = 0;
+  // Skip env assignments and runners (CI=1 npx --yes <cli> …).
+  while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) idx += 1;
+  if (tokens[idx] === 'npx') { idx += 1; while (idx < tokens.length && tokens[idx].startsWith('-')) idx += 1; }
+  const cli = (tokens[idx] ?? '').replace(/^.*\//, '').replace(/@.*$/, '');
+  if (!cli || /^(bash|sh|zsh|node|python3?|cat|echo|curl|wget|git)$/.test(cli)) return null;
+  const rest = tokens.slice(idx + 1);
+  const verbIndex = rest.findIndex((t) => CLI_CREATE_VERB_RE.test(t));
+  if (verbIndex === -1) return null;
+  const nameFlag = segment.match(/--(?:name|title|site|project|repo|app)[= ]+(?:["']([^"']+)["']|([^\s"']+))/i);
+  const bareArg = rest.slice(verbIndex + 1).find((t) => !t.startsWith('-') && !/^["']?\$/.test(t));
+  const title = nameFlag?.[1] ?? nameFlag?.[2] ?? bareArg?.replace(/^["']|["']$/g, '');
+  return {
+    kind: 'resource',
+    provider: cli.toLowerCase(),
+    slotKey: `resource:primary`,
+    title: title && !title.startsWith('$') ? title : undefined,
+    createShape: `CLI_${cli.toUpperCase()}_${(rest[verbIndex] ?? 'CREATE').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`,
+  };
 }
 
 export function getRunArtifact(sessionId: string, slotKey: string, runScopeId = sessionId): RunArtifact | null {
@@ -717,6 +824,33 @@ export function getArtifactRootForSourceUserSeq(
     : null;
 }
 
+/**
+ * The session's most recent artifact root that still carries UNVERIFIED
+ * claims — how a NEW turn (e.g. the user's "retry" reply to an artifact park)
+ * finds the claims a PRIOR turn parked on. Scope roots are keyed per
+ * source-user-seq, so the fresh reply's own seq never resolves them
+ * (2026-07-22 Netlify retry loop: the verification directive silently
+ * no-opped and the park message replayed verbatim forever).
+ */
+export function latestPendingArtifactRootForSession(
+  sessionId: string,
+): { rootScopeId: string; sourceUserSeq: number } | null {
+  ensureSchema();
+  const rows = openEventLog().prepare(`
+    SELECT DISTINCT s.root_scope_id, s.source_user_seq
+      FROM artifact_source_roots s
+     WHERE s.session_id = ?
+     ORDER BY s.source_user_seq DESC
+     LIMIT 8
+  `).all(sessionId) as Array<{ root_scope_id: string; source_user_seq: number }>;
+  for (const row of rows) {
+    if (listUnverifiedRunArtifacts(sessionId, row.root_scope_id).length > 0) {
+      return { rootScopeId: row.root_scope_id, sourceUserSeq: row.source_user_seq };
+    }
+  }
+  return null;
+}
+
 export function artifactObjectiveForRunScope(sessionId: string, rootScopeId: string): string {
   ensureSchema();
   const row = openEventLog().prepare(`
@@ -899,6 +1033,79 @@ export function markClaimedArtifactUncertain(
     expectedSourceCallId ?? null,
   );
   return result.changes === 1 ? getRunArtifactById(artifactId) : null;
+}
+
+/**
+ * Resolve an UNCERTAIN/PENDING claim from a human-sanctioned verification
+ * retry (2026-07-22 Netlify jail): a create that died mid-flight leaves a
+ * claim status 'uncertain' — releaseClaimedArtifact only deletes 'pending'
+ * and binding needs the create's own callback, so the claim was permanently
+ * unresolvable even after the model FOUND the real resource. This is the
+ * standard lane's explicit repair boundary:
+ *  - bind: attach the verified provider resource (evidence-checked by the
+ *    calling tool — the resourceId must appear in this session's tool
+ *    outputs) and mark it verified.
+ *  - absent: delete the claim — the provider was read and the resource
+ *    provably does not exist; the duplicate wall still backstops the redo.
+ */
+export function resolveUncertainArtifactClaim(
+  sessionId: string,
+  artifactId: string,
+  resolution: { kind: 'bind'; resourceId: string; uri?: string } | { kind: 'absent' },
+): { ok: boolean; reason?: string } {
+  ensureSchema();
+  const db = openEventLog();
+  const row = db.prepare(
+    'SELECT id, status FROM run_artifacts WHERE id = ? AND session_id = ?',
+  ).get(artifactId, sessionId) as { id: string; status: string } | undefined;
+  if (!row) return { ok: false, reason: 'no such claim in this session' };
+  if (row.status === 'bound') return { ok: false, reason: 'claim is already bound' };
+  if (row.status !== 'pending' && row.status !== 'uncertain') {
+    return { ok: false, reason: `claim status ${row.status} is not resolvable` };
+  }
+  const now = new Date().toISOString();
+  if (resolution.kind === 'bind') {
+    const changes = db.prepare(`
+      UPDATE run_artifacts
+         SET status = 'bound',
+             resource_id = ?,
+             uri = COALESCE(?, uri),
+             binding_verified_at = ?,
+             updated_at = ?
+       WHERE id = ? AND session_id = ? AND status IN ('pending', 'uncertain')
+    `).run(resolution.resourceId, resolution.uri ?? null, now, now, artifactId, sessionId).changes;
+    return changes === 1 ? { ok: true } : { ok: false, reason: 'claim changed concurrently' };
+  }
+  const changes = db.prepare(`
+    DELETE FROM run_artifacts
+     WHERE id = ? AND session_id = ? AND status IN ('pending', 'uncertain')
+  `).run(artifactId, sessionId).changes;
+  return changes === 1 ? { ok: true } : { ok: false, reason: 'claim changed concurrently' };
+}
+
+/**
+ * Partition pending claims into superseded-vs-still-pending (2026-07-22
+ * Netlify retry loop). A claim whose create died mid-flight (NO resourceId)
+ * can never self-verify — it parked its session forever, even after a
+ * sanctioned verification-retry successfully re-created the resource. When a
+ * VERIFIED sibling of the same kind+provider exists in the scope, the dead
+ * claim is provably replaced by the intentional re-create: releasing it cannot
+ * hide a duplicate, because the verified sibling IS the deliverable the park
+ * was protecting. Pure — the caller performs the release.
+ */
+export function partitionSupersededPendingClaims(input: {
+  artifacts: Array<{ id: string; kind: string; provider: string; resourceId?: string | null }>;
+  pending: Array<{ id: string; kind: string; provider: string; resourceId?: string | null }>;
+}): { stillPending: typeof input.pending; superseded: typeof input.pending } {
+  const pendingIds = new Set(input.pending.map((a) => a.id));
+  const verifiedKinds = new Set(
+    input.artifacts
+      .filter((a) => !pendingIds.has(a.id) && a.resourceId)
+      .map((a) => `${a.kind}::${a.provider}`),
+  );
+  const superseded = input.pending.filter((a) => !a.resourceId && verifiedKinds.has(`${a.kind}::${a.provider}`));
+  const supersededIds = new Set(superseded.map((a) => a.id));
+  return { stillPending: input.pending.filter((a) => !supersededIds.has(a.id)), superseded };
 }
 
 export function releaseClaimedArtifact(
@@ -1108,7 +1315,15 @@ export function extractArtifactResource(intent: ArtifactIntent, output: unknown)
     const uri = walkForKey(parsed, new Set(['url', 'uri', 'ssl_url', 'sslurl', 'deploy_url']));
     return resourceId || uri ? { resourceId, uri, title: commonTitle ?? intent.title } : null;
   }
-  return null;
+  // Generic kinds (the effect-anchored classifier): any stable id-shaped key or
+  // canonical URL in the provider result proves the create landed — the same
+  // evidence a human would read. Without this branch every generic claim
+  // settled 'uncertain' even on SUCCESS, turning the broadened classifier into
+  // a park factory instead of a safety net.
+  const resourceId = walkForKey(parsed, new Set(['id', 'resource_id', 'resourceid', 'uid', 'uuid']));
+  const uri = walkForKey(parsed, new Set(['url', 'uri', 'html_url', 'web_url', 'link', 'permalink']))
+    ?? (typeof output === 'string' ? output.match(/https?:\/\/[^\s"')\]]+/i)?.[0] : undefined);
+  return resourceId || uri ? { resourceId, uri, title: commonTitle ?? intent.title } : null;
 }
 
 export function artifactReuseMessage(artifact: RunArtifact): string {

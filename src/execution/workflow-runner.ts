@@ -2254,13 +2254,26 @@ async function runStepViaHarness(
     };
     if (stepModel && claudeAgentSdkWorkflowStepEnabled(stepModel) && workflowStepCanRunOnClaudeAgentSdk(step)) {
       const fullLane = workflowStepUsesFullClaudeLane(step);
+      // Approved-payload replay (2026-07-21): a re-admitted parked step re-runs
+      // the model, which RE-COMPOSES its payload — the exact-payload resume key
+      // then never matches the grant and a fresh approval mints forever (the
+      // approve→re-ask treadmill). Claim the session's approved unconsumed
+      // action and execute the APPROVED bytes first; the model finishes the
+      // step from the result instead of re-proposing the action. Fail-open:
+      // with nothing to replay this is a no-op.
+      let approvedReplayNote = '';
+      try {
+        const { replayApprovedActionForSession, renderApprovedReplayNote } = await import('./approval-replay.js');
+        const replayOutcome = await replayApprovedActionForSession(realSessionId);
+        if (replayOutcome) approvedReplayNote = `\n\n${renderApprovedReplayNote(replayOutcome)}`;
+      } catch { /* replay is best-effort; worst case the step re-asks */ }
       let sdkResult;
       try {
         sdkResult = await runClaudeAgentSdkWorkflowStep({
           step,
           workflowName,
           runId: workflowRunId, // attribute this step's fan-out to the workflow run
-          prompt: message,
+          prompt: approvedReplayNote ? `${message}${approvedReplayNote}` : message,
           modelId: stepModel,
           // Every SDK profile receives the real child session + exact source,
           // including read-only steps. Kill observation is a control-plane

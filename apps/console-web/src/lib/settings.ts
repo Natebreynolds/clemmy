@@ -1,4 +1,23 @@
-import { apiGet, api } from './api';
+import { apiGet, apiPost, apiDelete, api } from './api';
+
+// ─── Scoped send-trust ───────────────────────────────────────────────────────
+// Pre-trust a narrow recipient scope so matching irreversible sends auto-proceed
+// (mass-sends still ask; every out-of-scope recipient holds the whole send).
+export interface SendTrustGrant {
+  id: string;
+  grantedAt: string;
+  note?: string;
+  domains?: string[];
+  recipients?: string[];
+  toolkits?: string[];
+  maxRecipients?: number;
+}
+export const listSendTrust = () =>
+  apiGet<{ grants: SendTrustGrant[]; maxRecipients: number }>('/api/console/send-trust');
+export const addSendTrust = (body: { domains?: string[]; recipients?: string[]; toolkits?: string[]; maxRecipients?: number; note?: string }) =>
+  apiPost<{ grant: SendTrustGrant }>('/api/console/send-trust', body);
+export const revokeSendTrust = (id: string) =>
+  apiDelete<{ revoked: boolean }>(`/api/console/send-trust/${encodeURIComponent(id)}`);
 
 export interface UserProfile {
   displayName?: string;

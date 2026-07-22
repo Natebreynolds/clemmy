@@ -23,7 +23,8 @@ import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
-import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
+import { resolveBoundaryJudge, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
+import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { upsertEntity } from './entity-identity.js';
 import { compileWordMatcher } from './word-match.js';
@@ -271,16 +272,20 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
   return lines.join('\n');
 }
 
-function getReflectorModel() {
+function getReflectorRoute(): ReturnType<typeof resolveBoundaryJudge> | null {
   try {
     // Bind the extractor to a concrete model on the active brain's provider.
     // A bare gpt-* string is resolved by the process-global Agents provider and
     // silently sent Claude/BYO turns through Codex credentials.
-    return resolveBoundaryJudge().model;
+    return resolveBoundaryJudge();
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection model route unavailable');
     return null;
   }
+}
+
+function getReflectorModel() {
+  return getReflectorRoute()?.model ?? null;
 }
 
 export function _testOnly_reflectorRoute(): { modelId: string; provider: string; transport: string } | null {
@@ -753,10 +758,104 @@ export function readReflectionReplayHealth(now = new Date().toISOString()): Refl
   };
 }
 
+/** Bounded replay of FAILED reflection receipts. A receipt fails when the
+ *  extractor was down (quota/outage) — the learning content itself is intact
+ *  in the harness `tool_outputs` store (same (session_id, call_id) key,
+ *  14-day TTL). This drain re-runs those extractions once the extractor is
+ *  available again, so a provider outage delays learning instead of deleting
+ *  it. Bounded per receipt by `attempts` (claimReflectionReceipt increments
+ *  on every re-claim); raw-expired receipts are marked terminal so they stop
+ *  being scanned. Called from the memory maintenance loop. */
+const REFLECTION_REPLAY_MAX_ATTEMPTS = 4;
+
+export async function replayFailedReflections(
+  limit = 8,
+): Promise<{ scanned: number; replayed: number; rawGone: number }> {
+  const summary = { scanned: 0, replayed: 0, rawGone: 0 };
+  if (!reflectionExtractorAvailable()) return summary;
+  const db = openMemoryDb();
+  const rows = db.prepare(`
+    SELECT session_id, call_id, attempts
+    FROM memory_reflection_receipts
+    WHERE status = 'failed' AND attempts < ?
+    ORDER BY last_attempt_at ASC
+    LIMIT ?
+  `).all(REFLECTION_REPLAY_MAX_ATTEMPTS, Math.max(1, limit)) as Array<{
+    session_id: string; call_id: string; attempts: number;
+  }>;
+  if (rows.length === 0) return summary;
+  const { getToolOutput } = await import('../runtime/harness/eventlog.js');
+  for (const row of rows) {
+    summary.scanned += 1;
+    let raw: { output: string; tool: string | null } | null = null;
+    try {
+      raw = getToolOutput(row.session_id, row.call_id) as { output: string; tool: string | null } | null;
+    } catch { /* eventlog unavailable this tick — leave the receipt for later */ }
+    if (!raw?.output) {
+      // The raw outlived neither the outage nor the TTL — nothing left to
+      // learn from. Terminalize so the drain stops re-scanning it.
+      db.prepare(`
+        UPDATE memory_reflection_receipts
+        SET attempts = ?, last_error = 'raw_expired'
+        WHERE session_id = ? AND call_id = ? AND status = 'failed'
+      `).run(REFLECTION_REPLAY_MAX_ATTEMPTS, row.session_id, row.call_id);
+      summary.rawGone += 1;
+      continue;
+    }
+    try {
+      await reflectOnToolReturn({
+        sessionId: row.session_id,
+        callId: row.call_id,
+        tool: raw.tool ?? 'unknown_tool',
+        output: raw.output,
+      });
+      summary.replayed += 1;
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), sessionId: row.session_id, callId: row.call_id },
+        'failed-reflection replay errored (will retry within attempt bound)',
+      );
+    }
+    // The extractor pausing mid-drain means every remaining row would fail
+    // the same way — stop this pass immediately.
+    if (!reflectionExtractorAvailable()) break;
+  }
+  return summary;
+}
+
+/** While set, the extractor is in a provider-backoff window: every attempt
+ *  would hit the same quota/outage, so calls return null immediately instead
+ *  of grinding the provider every few seconds (live 2026-07-21: 111 failed
+ *  extractions re-fired ~16s apart against a quota that self-reported a
+ *  multi-day reset). Cleared by the deadline passing; capped so a long reset
+ *  hint still re-probes within the half hour. */
+let extractorPausedUntil = 0;
+const EXTRACTOR_PAUSE_DEFAULT_MS = 5 * 60_000;
+const EXTRACTOR_PAUSE_MAX_MS = 30 * 60_000;
+
+export function reflectionExtractorAvailable(): boolean {
+  return Date.now() >= extractorPausedUntil;
+}
+
+export function setReflectionExtractorPauseForTest(untilMs: number | null): void {
+  extractorPausedUntil = untilMs ?? 0;
+}
+
+/** Codex quota errors carry the reset in the JSON body (`resets_in_seconds`),
+ *  not a Retry-After header — honor it when present. */
+function quotaResetHintMs(err: unknown): number | undefined {
+  const text = `${(err as { message?: unknown })?.message ?? ''} ${(err as { bodyText?: unknown })?.bodyText ?? ''}`;
+  const match = /resets_in_seconds\\?"?\s*[:=]\s*(\d+)/.exec(text);
+  if (!match) return undefined;
+  const secs = Number(match[1]);
+  return Number.isFinite(secs) && secs > 0 ? secs * 1000 : undefined;
+}
+
 async function runExtractor(serialized: string): Promise<Extraction | null> {
   if (extractorOverrideForTest) return extractorOverrideForTest(serialized);
-  const model = getReflectorModel();
-  if (!model) return null;
+  if (!reflectionExtractorAvailable()) return null;
+  const route = getReflectorRoute();
+  if (!route) return null;
   // Source-map: when on, ask the extractor for `resources` too (named
   // locations). Flag-off keeps the schema + prompt byte-identical to today.
   const withResources = isSourceMapEnabled();
@@ -768,12 +867,12 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
   if (withRelationships) {
     instructions = buildExtractorPreamble(withResources, true);
   }
-  try {
-    // Keep the model contract in the prompt, but do NOT bind SDK outputType
-    // here. Reflection is best-effort memory capture: a missing optional
-    // resource field or an enum synonym should cost one entry, not the entire
-    // extraction pass. Clementine-owned sanitization below preserves the signal
-    // and drops only fields/entries that cannot be made meaningful.
+  // Keep the model contract in the prompt, but do NOT bind SDK outputType
+  // here. Reflection is best-effort memory capture: a missing optional
+  // resource field or an enum synonym should cost one entry, not the entire
+  // extraction pass. Clementine-owned sanitization below preserves the signal
+  // and drops only fields/entries that cannot be made meaningful.
+  const attempt = async (model: NonNullable<ReturnType<typeof getReflectorModel>>): Promise<Extraction | null> => {
     const agent = new Agent({
       name: 'Reflection Extractor',
       model,
@@ -783,8 +882,45 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
     const result = await runner.run(agent, serialized);
     const final = (result as { finalOutput?: unknown }).finalOutput;
     return sanitizeExtractionOutput(final, { withResources, withRelationships });
+  };
+  if (!route.model) return null;
+  try {
+    return await attempt(route.model);
   } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection extractor failed');
+    const cls = classifyModelError(err);
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), kind: cls.kind },
+      'reflection extractor failed',
+    );
+    if (!cls.retryable) return null;
+    // Quota/auth/transient on the primary judge family — memory must not stop
+    // learning because ONE provider is out of quota. Try the other family once
+    // (same cross-family judge routing every boundary judge uses).
+    try {
+      const hedge = resolveBoundaryJudgeHedge(route);
+      if (hedge?.model) {
+        const out = await attempt(hedge.model);
+        logger.info(
+          { from: route.judgeFamily, to: hedge.judgeFamily },
+          'reflection extractor fell over to the alternate judge family',
+        );
+        return out;
+      }
+    } catch (hedgeErr) {
+      logger.warn(
+        { err: hedgeErr instanceof Error ? hedgeErr.message : String(hedgeErr) },
+        'reflection extractor hedge attempt failed too',
+      );
+    }
+    // No working family right now: honor the provider's reset hint and stop
+    // grinding. The failed-receipt replay drain re-runs these once the pause
+    // lifts, from the durable raw in tool_outputs.
+    const pauseMs = Math.min(
+      quotaResetHintMs(err) ?? cls.retryAfterMs ?? EXTRACTOR_PAUSE_DEFAULT_MS,
+      EXTRACTOR_PAUSE_MAX_MS,
+    );
+    extractorPausedUntil = Date.now() + pauseMs;
+    logger.warn({ pauseMs, kind: cls.kind }, 'reflection extractor paused — provider backoff window');
     return null;
   }
 }

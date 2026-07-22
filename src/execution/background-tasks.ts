@@ -51,6 +51,7 @@ import { budgetLineFor, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
+import { classifyModelError } from '../runtime/harness/resilient-model.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -136,6 +137,13 @@ export interface BackgroundTaskRecord {
   modelRouteKind?: string;
   modelTransport?: string;
   modelRouteFalloverFrom?: string;
+  /** A brain-infrastructure outage (429/529/quota) is a property of the
+   *  PROVIDER, not the task — when the routing mode leaves no brain to fall
+   *  over to (all_in isolation), the task waits it out and retries instead of
+   *  terminal-failing (live 2026-07-22: an approved send died as "failed" on a
+   *  BYO 429). Bounded: attempts caps the requeues; notBefore holds the drain
+   *  off until the limit plausibly cleared. */
+  transientRetry?: { attempts: number; notBefore: string; lastError: string };
   maxMinutes: number;
   /** Stage 4 — optional per-task run token budget (UNCACHED tokens, soft
    *  ceiling; parks awaiting_continue when the window is exhausted). Absent
@@ -1482,9 +1490,13 @@ function enqueueBackgroundTaskOutcomeTurn(
       title: task.title,
       statusHint: `background_task_status('${task.id}')`,
       maxDetailChars: RESULT_TRUNCATE_CHARS,
-      // A clarifying question must surface in the chat NOW (not wait for the
-      // user's next unrelated message) so they can answer it.
-      proactiveTurn: outcome === 'needs_input',
+      // Every terminal outcome (and a clarifying question) surfaces in the
+      // chat NOW instead of waiting for the user's next unrelated message —
+      // desktop has no other visible delivery lane for a finished background
+      // task (2026-07-21; Slack/Discord additionally get the notification
+      // fan-out, desktop does not). The idle gate + defer queue in outcome.ts
+      // keep this from colliding with a mid-conversation turn.
+      proactiveTurn: true,
     },
   );
 }
@@ -2620,6 +2632,34 @@ export function _setBackgroundTaskApprovalDispatchCheckHookForTests(fn: (() => v
   backgroundTaskApprovalDispatchCheckHookForTests = fn;
 }
 
+/** Bounded requeues per task for brain-infrastructure outages. A task that hits
+ *  the cap fails honestly — 4 separate provider outages deserve a human eye. */
+export const TRANSIENT_BRAIN_RETRY_CAP = 3;
+
+/** True when a drain-level error is a BRAIN availability problem (rate limit /
+ *  overload / quota), not a defect in the work. Duck-types status-carrying
+ *  errors via classifyModelError; falls back to a TIGHT message test because
+ *  resume paths often re-throw the provider text as a bare Error. Deliberately
+ *  excludes generic transport/5xx shapes so a genuine bug cannot requeue-loop. */
+export function isTransientBrainError(error: unknown): boolean {
+  try {
+    const cls = classifyModelError(error);
+    if (cls.kind === 'model.rate_limited' || cls.kind === 'model.overloaded') return true;
+  } catch { /* classification is best-effort */ }
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b(429|529)\b|rate.?limit|overloaded|usage.?limit|quota (?:exceeded|reached)/i.test(message);
+}
+
+export function transientRetryDelayMs(error: unknown, attempts: number): number {
+  try {
+    const retryAfterMs = classifyModelError(error).retryAfterMs;
+    if (typeof retryAfterMs === 'number' && retryAfterMs > 0) {
+      return Math.min(retryAfterMs + 5_000, 30 * 60_000);
+    }
+  } catch { /* fall through to the schedule */ }
+  return [2 * 60_000, 5 * 60_000, 10 * 60_000][Math.min(attempts, 3) - 1] ?? 10 * 60_000;
+}
+
 export function queueBackgroundTaskApprovalResolution(approvalId: string, approved: boolean): BackgroundTaskRecord | null {
   const task = getBackgroundTaskByApprovalId(approvalId);
   if (!task || task.status !== 'awaiting_approval') return null;
@@ -2675,6 +2715,19 @@ export function queueBackgroundTaskInputResolution(questionId: string, answer: s
     lastCheckInMessage: `Answer received for ${questionId}; queued daemon continuation.`,
   });
   if (updated) {
+    // Store unification (2026-07-22): the answer arriving through the TASK
+    // side closes any open check-in copy of the same question, so the
+    // "Questions for you" panel never shows a ghost the user already answered.
+    void (async () => {
+      try {
+        const { listOpenCheckIns, closeCheckIn } = await import('../agents/check-ins.js');
+        for (const checkIn of listOpenCheckIns()) {
+          if ((checkIn as { linkedTaskId?: string }).linkedTaskId === updated.id) {
+            closeCheckIn(checkIn.id, 'Answered via the task — question resolved.');
+          }
+        }
+      } catch { /* cross-store cleanup is best-effort */ }
+    })();
     addNotification({
       id: `${Date.now()}-background-${updated.id}-input-resolution-queued`,
       kind: 'execution',
@@ -2889,7 +2942,9 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
     const requestedLimit = typeof limit === 'number' ? limit : policy.maxConcurrentBackgroundTasks;
     const effectiveLimit = Math.max(1, Math.min(requestedLimit, policy.maxConcurrentBackgroundTasks));
     const progressCheckInMinMs = getBackgroundCheckInMs(policy);
-    const pending = listBackgroundTasks({ status: 'pending' }).slice(0, effectiveLimit);
+    const pending = listBackgroundTasks({ status: 'pending' })
+      .filter((t) => !t.transientRetry || Date.parse(t.transientRetry.notBefore) <= Date.now())
+      .slice(0, effectiveLimit);
     let processed = 0;
 
 	  for (const queued of pending) {
@@ -3071,7 +3126,15 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          );
 	        }
 	        task = latestAtApprovalDispatch;
-	        const result = await assistant.getRuntime().resolveApproval(resolution.approvalId, resolution.approved);
+	        // Registry-first: a harness-lane approval lives in the sqlite registry,
+	        // which the legacy runtime store never sees (live 2026-07-22: board
+	        // approve → "Approval not found" → task failed, row still pending).
+	        const { resolveDrainApproval } = await import('./approval-drain.js');
+	        const result = await resolveDrainApproval({
+	          approvalId: resolution.approvalId,
+	          approved: resolution.approved,
+	          legacyResolve: () => assistant.getRuntime().resolveApproval(resolution.approvalId, resolution.approved),
+	        });
         if (heartbeatTimer) clearInterval(heartbeatTimer);
 
         if (!resolution.approved) {
@@ -3305,6 +3368,28 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      const message = error instanceof Error ? error.message : String(error);
 	      const latestTask = getBackgroundTask(task.id);
 	      const cancelled = error instanceof AgentRuntimeCancelledError || latestTask?.status === 'cancelling';
+	      if (!cancelled && isTransientBrainError(error)) {
+	        const attempts = (latestTask?.transientRetry?.attempts ?? 0) + 1;
+	        if (attempts <= TRANSIENT_BRAIN_RETRY_CAP) {
+	          const delayMs = transientRetryDelayMs(error, attempts);
+	          const notBefore = new Date(Date.now() + delayMs).toISOString();
+	          const requeued = updateBackgroundTaskWhere(task.id, (t) => t.status === 'running', {
+	            status: 'pending',
+	            transientRetry: { attempts, notBefore, lastError: clean(message, 400) },
+	            lastCheckInAt: nowIso(),
+	            lastCheckInMessage: `Brain provider unavailable (${clean(message, 120)}); retrying automatically in ~${Math.round(delayMs / 60000)} min (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP}).`,
+	          });
+	          if (requeued) {
+	            finishRun(run.id, {
+	              status: 'failed',
+	              message: `Brain provider unavailable; task requeued (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP}, retry after ${notBefore}).`,
+	              error: message,
+	            });
+	            logger.warn({ taskId: task.id, attempts, notBefore, err: message }, 'Background task hit a transient brain outage; requeued instead of failing');
+	            continue;
+	          }
+	        }
+	      }
 	      markBackgroundTaskFailed(
 	        task.id,
 	        cancelled ? latestTask?.cancellationReason ?? 'Cancelled by user.' : message,

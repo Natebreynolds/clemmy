@@ -530,6 +530,7 @@ export interface ApprovalDecision {
     | 'plan-scope'
     | 'workspace-policy'
     | 'yolo-policy'
+    | 'send-trust'
     | 'strict-policy'
     | 'pending-action-owned'
     | 'unknown';
@@ -616,6 +617,7 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
       decision.reason === 'plan-scope' ? 'plan-scope'
       : decision.reason === 'workspace-policy' ? 'workspace-policy'
       : decision.reason === 'yolo-policy' ? 'yolo-policy'
+      : decision.reason === 'send-trust' ? 'send-trust'
       : 'unknown';
     return { needsApproval: false, reason, kind };
   }

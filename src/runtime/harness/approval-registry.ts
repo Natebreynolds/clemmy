@@ -330,6 +330,52 @@ export function claimResumableApproval(resumeKey: string): ResumableApprovalClai
 }
 
 /**
+ * Claim the newest resolved-approved, unconsumed approval for a SESSION,
+ * restricted to replay-supported tools. This is the re-admission twin of
+ * `claimResumableApproval`: that one matches by exact-payload hash, which a
+ * re-run model that re-composes its payload can never reproduce (the 2026-07-21
+ * approve→re-ask treadmill: 3 approvals granted, 0 consumed, nothing sent).
+ * On re-admission the runner claims the APPROVED payload itself and replays it
+ * verbatim — same atomic one-shot consume, so a racing duplicate re-admission
+ * can never double-execute, and rejected/expired rows are never touched.
+ */
+export function claimApprovedUnconsumedForSession(
+  sessionId: string,
+  opts: { tools: string[] },
+): PendingApprovalRow | null {
+  if (opts.tools.length === 0) return null;
+  const db = openEventLog();
+  const placeholders = opts.tools.map(() => '?').join(',');
+  const claim = db.transaction((): PendingApprovalRow | null => {
+    const row = db.prepare(`
+      SELECT * FROM pending_approvals
+       WHERE session_id = ?
+         AND status = 'resolved'
+         AND resolution = 'approved'
+         AND consumed_at IS NULL
+         AND tool IN (${placeholders})
+       ORDER BY resolved_at DESC, rowid DESC
+       LIMIT 1
+    `).get(sessionId, ...opts.tools) as ApprovalSqlRow | undefined;
+    if (!row) return null;
+    const current = rowToPublic(row);
+    const changes = db.prepare(`
+      UPDATE pending_approvals
+         SET consumed_at = ?
+       WHERE approval_id = ?
+         AND status = 'resolved'
+         AND resolution = 'approved'
+         AND consumed_at IS NULL
+    `).run(new Date().toISOString(), current.approvalId).changes;
+    if (changes !== 1) return null;
+    const claimed = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(current.approvalId) as ApprovalSqlRow;
+    return rowToPublic(claimed);
+  });
+  return claim();
+}
+
+/**
  * Look up an approval by ID. Returns undefined when not found.
  */
 export function get(approvalId: string): PendingApprovalRow | undefined {

@@ -126,3 +126,38 @@ test('multi-item and explicitly deep work retain larger bounded rails', () => {
     { kind: 'deep', softLimit: 14, hardLimit: 24 },
   );
 });
+
+test('long/unlimited budget presets lift the economy limits to the per-turn tool budget', () => {
+  // unlimited (64/turn): hard stop aligns with the user's ceiling, steer at 60%.
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'Research these 20 firms', multiItem: true,
+      budget: { preset: 'unlimited', toolCallsPerTurn: 64 },
+    }),
+    { kind: 'multi_item', softLimit: 38, hardLimit: 64 },
+  );
+  // long (80/turn) on the tightest class.
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'create the report and send it',
+      budget: { preset: 'long', toolCallsPerTurn: 80 },
+    }),
+    { kind: 'single_deliverable', softLimit: 48, hardLimit: 80 },
+  );
+  // standard keeps the tight text-shape limits — no lift.
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'Research these 20 firms', multiItem: true,
+      budget: { preset: 'standard', toolCallsPerTurn: 40 },
+    }),
+    { kind: 'multi_item', softLimit: 16, hardLimit: 28 },
+  );
+  // lift never lowers: a preset ceiling below the classified hard limit is ignored.
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'Research these 20 firms', multiItem: true,
+      budget: { preset: 'unlimited', toolCallsPerTurn: 12 },
+    }),
+    { kind: 'multi_item', softLimit: 16, hardLimit: 28 },
+  );
+});

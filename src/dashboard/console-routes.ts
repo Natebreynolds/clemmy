@@ -248,6 +248,7 @@ import { PlanSchema } from '../agents/planner.js';
 import {
   closePlanScope, listActiveScopes, listAllScopes,
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
+  grantSendTrust, revokeSendTrust, listSendTrustGrants, SEND_TRUST_MAX_RECIPIENTS,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import {
@@ -8648,6 +8649,44 @@ export function registerConsoleRoutes(
     res.json({ revoked: true });
   });
 
+  // ─── Scoped send-trust (2026-07-21) ──────────────────────────────
+  // The bounded way to cut approval clicks toward autonomy: pre-trust a NARROW
+  // recipient scope so matching irreversible sends auto-proceed (and still land
+  // in the audit trail). An unscoped grant is refused server-side; the mass-send
+  // floor is surfaced so the UI can label it.
+  app.get('/api/console/send-trust', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ grants: listSendTrustGrants(), maxRecipients: SEND_TRUST_MAX_RECIPIENTS });
+  });
+
+  app.post('/api/console/send-trust', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const toList = (v: unknown): string[] =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string')
+      : typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+    const grant = grantSendTrust({
+      domains: toList(body.domains),
+      recipients: toList(body.recipients),
+      toolkits: toList(body.toolkits),
+      maxRecipients: typeof body.maxRecipients === 'number' ? body.maxRecipients : undefined,
+      note: typeof body.note === 'string' ? body.note : undefined,
+    });
+    if (!grant) {
+      res.status(400).json({ error: 'a send-trust grant needs at least one recipient domain or address — an unscoped "trust everything" is not allowed' });
+      return;
+    }
+    res.json({ grant });
+  });
+
+  app.delete('/api/console/send-trust/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const ok = revokeSendTrust(req.params.id);
+    if (!ok) { res.status(404).json({ error: 'no live send-trust grant with that id' }); return; }
+    res.json({ revoked: true });
+  });
+
   // ─── MCP servers (manageable from the Integrations Hub) ────────
   //
   // Two sources merge into one list:
@@ -9411,15 +9450,25 @@ export function registerConsoleRoutes(
       // 2026-07-08). detail.toolCallCount comes straight from the harness log.
       const toolCallCount = detail?.toolCallCount ?? 0;
       let tokensUsed: number | undefined;
+      let tokensReal: number | undefined;
+      let tokensCached: number | undefined;
       try {
-        const { sumUsageTokensForSource } = await import('../runtime/usage-log.js');
-        const total = sumUsageTokensForSource(task.runSessionId);
-        if (total > 0) tokensUsed = total;
+        const { sumUsageSplitForSource } = await import('../runtime/usage-log.js');
+        const split = sumUsageSplitForSource(task.runSessionId);
+        if (split.total > 0) {
+          tokensUsed = split.total;
+          // The honest headline: what the run actually consumed. The raw total
+          // is ~90% cached prompt re-reads on long runs and reads as alarming.
+          tokensReal = split.uncachedInput + split.output;
+          tokensCached = split.cachedInput;
+        }
       } catch { /* usage log is best-effort observability */ }
       const vitals = {
         ...(elapsedMs !== undefined ? { elapsedMs } : {}),
         toolCallCount,
         ...(tokensUsed !== undefined ? { tokensUsed } : {}),
+        ...(tokensReal !== undefined ? { tokensReal } : {}),
+        ...(tokensCached !== undefined ? { tokensCached } : {}),
         running: !task.completedAt,
       };
       // Resolved report-back target: the task's explicit target, or the default
@@ -9621,7 +9670,11 @@ export function registerConsoleRoutes(
           title: task.title,
           column,
           status: task.status,
-          progressHint: task.lastCheckInMessage || (terminal && task.error ? task.error : '') || '',
+          // A parked question is the single most actionable thing a card can
+          // say — surface it verbatim over generic check-in chatter.
+          progressHint: (task.status === 'awaiting_input' && task.pendingQuestion
+            ? `Waiting on you: ${task.pendingQuestion.slice(0, 240)}`
+            : '') || task.lastCheckInMessage || (terminal && task.error ? task.error : '') || '',
           sessionId: task.runSessionId,
           ageMs: ageMs(task.updatedAt),
           updatedAt: task.updatedAt,
@@ -9635,6 +9688,8 @@ export function registerConsoleRoutes(
           archived: task.archived || undefined,
           raw: {
             pendingApprovalId: task.pendingApprovalId,
+            pendingQuestion: task.pendingQuestion,
+            pendingQuestionId: task.pendingQuestionId,
             error: task.error,
             resultPreview: task.result?.slice(0, 600),
             source: task.source,
@@ -9960,6 +10015,24 @@ export function registerConsoleRoutes(
         const resumed = resumeBackgroundTask(id);
         if (!resumed) { res.status(409).json({ ok: false, reason: 'Task could not be resumed.' }); return; }
         res.json({ ok: true, task: resumed });
+        return;
+      }
+      if (action === 'answer') {
+        // Interact-in-place (2026-07-22): answer a parked task's question right
+        // from its Tasks-board drawer — same resume machinery as the chat
+        // bridges (queueBackgroundTaskInputResolution), so the board, chat,
+        // Home, Discord, and Slack are all equivalent answer surfaces.
+        const answer = typeof (req.body as { answer?: unknown })?.answer === 'string'
+          ? (req.body as { answer: string }).answer.trim()
+          : '';
+        if (!answer) { res.status(400).json({ ok: false, reason: 'answer required' }); return; }
+        if (task.status !== 'awaiting_input' || !task.pendingQuestionId) {
+          res.status(409).json({ ok: false, reason: `Task is not waiting on a question (status: ${task.status}).` });
+          return;
+        }
+        const queued = queueBackgroundTaskInputResolution(task.pendingQuestionId, answer);
+        if (!queued) { res.status(409).json({ ok: false, reason: 'The question was already answered.' }); return; }
+        res.json({ ok: true, task: queued });
         return;
       }
       if (action === 'archive') {
@@ -12371,6 +12444,40 @@ export function registerConsoleRoutes(
     if (priorReceipt && requestedSessionId && priorReceipt.sessionId !== requestedSessionId) {
       res.status(409).json({ error: 'client request id belongs to a different session' });
       return;
+    }
+    // Background needs_input round-trip (2026-07-22): the SAME bridge home-chat
+    // and Discord already have, previously missing from THIS endpoint — the one
+    // the desktop conversation window uses. Without it, answering a parked
+    // task's question in a conversation went to the orchestrator model, which
+    // improvised (live: answered the autonomy check-in store — a dead end for
+    // background tasks — then dispatched a DUPLICATE task while the original
+    // sat parked forever). Only fires while exactly ONE task from this chat is
+    // parked on a question, so the mis-route window stays narrow.
+    if (requestedSessionId && input) {
+      const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
+      if (parkedTask?.pendingQuestionId) {
+        queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, input);
+        const ackText = `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`;
+        try {
+          appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: input } });
+          appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'assistant', type: 'conversation_completed', data: { reply: ackText, summary: ackText } });
+        } catch { /* the resume is queued regardless; the ack render is best-effort */ }
+        res.json({ sessionId: requestedSessionId, status: 'completed', reply: ackText, routedToBackgroundTask: parkedTask.id });
+        return;
+      }
+      if (/^\/?(continue|resume|keep going)$/i.test(input)) {
+        const continueTask = findSoleAwaitingContinueTaskForOrigin(requestedSessionId);
+        if (continueTask) {
+          queueBackgroundTaskContinue(continueTask.id);
+          const ackText = `Continuing background task "${continueTask.title}". It will report back here when it's done.`;
+          try {
+            appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: input } });
+            appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'assistant', type: 'conversation_completed', data: { reply: ackText, summary: ackText } });
+          } catch { /* best-effort ack */ }
+          res.json({ sessionId: requestedSessionId, status: 'completed', reply: ackText, routedToBackgroundTask: continueTask.id });
+          return;
+        }
+      }
     }
     if (getHarnessChatCancellation(requestIdentity.requestId)) {
       res.status(409).json({

@@ -582,3 +582,58 @@ test('desktop Stop requires and latches only the exact active attempt', async ()
     await harness.close();
   }
 });
+
+test('conversation reply while ONE background task is parked routes as its answer — no model turn, no duplicate task', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => {
+      brainCalls += 1;
+      return { text: 'model must not run for a parked-task answer', sessionId: 'none', stoppedReason: 'success' };
+    }) as never,
+  });
+  const { createBackgroundTask, markBackgroundTaskAwaitingInput } = await import('../execution/background-tasks.js');
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-bridge-answer', kind: 'chat' });
+    const task = createBackgroundTask({
+      title: 'Pipeline needing a workspace id',
+      prompt: 'Build the Airtable base.',
+      originSessionId: session.id,
+    });
+    markBackgroundTaskAwaitingInput(task.id, 'q-workspace-1', 'Which Airtable workspace should I use?');
+
+    const res = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input: 'Use workspace wspTEST123 please.',
+        sessionId: session.id,
+        clientRequestId: 'bridge-answer-request-1',
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { status: string; routedToBackgroundTask?: string; reply?: string };
+    assert.equal(body.routedToBackgroundTask, task.id, 'the reply routed to the parked task, not the model');
+    assert.match(body.reply ?? '', /passed that to your background task/i);
+    assert.equal(brainCalls, 0, 'no orchestrator turn ran (the improvise-then-duplicate path is closed)');
+
+    const resumed = getBackgroundTask(task.id);
+    assert.equal(resumed?.status, 'pending', 'the task left awaiting_input and queued its continuation');
+    assert.equal(resumed?.inputResolution?.answer, 'Use workspace wspTEST123 please.');
+    assert.equal(
+      listBackgroundTasks().filter((t) => t.originSessionId === session.id).length,
+      1,
+      'no duplicate task was created for this conversation',
+    );
+
+    // The conversation renders the round-trip: the user's answer + the ack.
+    const events = listEvents(session.id);
+    assert.ok(events.some((e) => e.type === 'user_input_received' && String((e.data as { text?: string }).text).includes('wspTEST123')));
+    assert.ok(events.some((e) => e.type === 'conversation_completed'));
+  } finally {
+    await harness.close();
+  }
+});

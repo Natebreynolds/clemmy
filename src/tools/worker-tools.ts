@@ -1,9 +1,10 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WorkerToolInputSchema, workerPacketKey, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { runBoundedPool } from '../execution/bounded-pool.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
-import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
+import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
@@ -12,7 +13,7 @@ import { getToolOutputContext } from '../runtime/harness/tool-output-context.js'
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/model-route-metrics.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
-import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -107,20 +108,91 @@ export function registerWorkerTools(server: McpServer): void {
   server.tool(
     'run_worker',
     [
-      'Spawn a stateless Worker on ONE item using a structured parent-planned job packet. Call this MULTIPLE TIMES IN PARALLEL when you have N independent items to process (scrape, classify, summarize, fetch, transform, create/enrich N records).',
+      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` — the harness runs them as one bounded parallel pool (wall time ≈ slowest item) with an honest per-item ledger. A single item may use `item` instead.',
       'Each worker runs in its own isolated context — keeps YOUR context from ballooning over many items, and runs the work concurrently instead of one-at-a-time (which blows your turn budget).',
-      'Pass a structured packet for ONE item: the item identifier, exact resolved tool slugs, source facts/context, instructions, and expected output shape. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
+      'The packet (objective, resolvedTools, context, instructions, expectedOutput) applies to every item. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
       'When to use: 3+ independent items of the same kind. Aggregate the tight results the workers return.',
       'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never report a batch complete if any worker returned ERROR; report exactly which items succeeded and which failed.',
     ].join(' '),
-    WorkerToolInputSchema.shape,
-    async (params) => {
+    WorkerToolCallSchema.shape,
+    async (callParams) => {
       if (!enabled()) return textResult('run_worker is disabled (CLEMMY_SDK_BRAIN_RUN_WORKER=off).');
+      const call = callParams as WorkerToolCall;
+      const callItems = workerCallItems(call);
+      if (!callItems || callItems.length === 0) {
+        return textResult('ERROR: run_worker needs `item` (one identifier) or `items` (the full list for a parallel batch).');
+      }
+      const { items: _batch, ...packetBase } = call;
+      if (callItems.length > 1) {
+        // Deterministic batch: the harness owns the parallelism (bounded pool;
+        // real provider throttling stays with the per-item worker slots), so a
+        // brain that would have serialized N calls no longer pays N× wall time.
+        const outs: Array<string | null> = new Array(callItems.length).fill(null);
+        await runBoundedPool(
+          callItems.map((item, index) => ({ input: { ...packetBase, item } as WorkerToolInput, index })),
+          Math.min(callItems.length, 16),
+          async ({ input: perItem, index }) => {
+            try {
+              const out = await runOneWorker(perItem);
+              outs[index] = String((out as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '');
+            } catch (err) {
+              outs[index] = `ERROR: worker for "${perItem.item}" failed: ${firstLine(err)}`;
+            }
+          },
+        );
+        const rendered = callItems.map((item, index) => {
+          const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
+          return { item, text, failed: workerResultIndicatesFailure(text) };
+        });
+        const failed = rendered.filter((r) => r.failed);
+        const sessionIdForMemo = getToolOutputContext()?.sessionId ?? '';
+        if (failed.length === 0 && sessionIdForMemo) clearFanoutUniformFailure(sessionIdForMemo);
+        const uniform = failed.length === rendered.length ? uniformFailureSignature(failed.map((f) => f.text)) : null;
+        // Self-heal: a uniform "unknown model" rejection is the BYO endpoint
+        // teaching us its real catalog — memo the dead id so the repair
+        // translates it, and invite an IMMEDIATE retry instead of declaring
+        // fan-out down (one failed round maximum).
+        if (uniform && looksLikeUnknownModelError(uniform)) {
+          const deadRoute = resolveSdkBrainWorker(call.intent || undefined);
+          markByoModelNotServed(deadRoute.modelId);
+          const healed = repairByoRoutedModelId(deadRoute.modelId);
+          if (healed !== deadRoute.modelId) {
+            return textResult(`Batch failed: ALL ${rendered.length} workers died because the configured worker model "${deadRoute.modelId}" is not served by the BYO endpoint. It has been AUTO-CORRECTED to "${healed}" — call run_worker again NOW with the same items; it will dispatch on the corrected model.`);
+          }
+        }
+        if (uniform && sessionIdForMemo) {
+          markFanoutUniformFailure(sessionIdForMemo, uniform);
+          // The abort transfers these items to INLINE execution — they are no
+          // longer worker items, so they must not count against fan-out
+          // coverage (live 2026-07-22: a perfectly delivered run was stamped
+          // blocked on "0/12" from its dead pre-abort rounds). The ledger
+          // already scopes coverage to the latest boundary.
+          try {
+            appendEvent({ sessionId: sessionIdForMemo, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { reason: 'uniform_failure_abort', signature: uniform } });
+          } catch { /* coverage boundary is best-effort */ }
+        }
+        const header = failed.length === 0
+          ? `Batch complete: ${rendered.length}/${rendered.length} items succeeded.`
+          : uniform
+            ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
+            : `Batch finished with FAILURES: ${rendered.length - failed.length}/${rendered.length} succeeded; FAILED items: ${failed.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
+        return textResult([header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n'));
+      }
+      return runOneWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput);
+    },
+  );
+
+  const runOneWorker = async (params: WorkerToolInput) => {
+    {
       const input = params as WorkerToolInput;
       const sessionId = getToolOutputContext()?.sessionId;
       if (!sessionId) {
         return textResult('ERROR: run_worker needs a live session context. Do this item inline instead.');
+      }
+      const knownDead = fanoutUniformFailure(sessionId);
+      if (knownDead) {
+        return textResult(`ERROR: worker for "${input.item}" was NOT started — parallel fan-out already failed uniformly this run (${knownDead}). Process this item inline; workers stay refused until the underlying failure changes.`);
       }
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       // Wave 4 Stage 1: packet key identifies this exact job so a resumed run can
@@ -186,7 +258,7 @@ export function registerWorkerTools(server: McpServer): void {
       }
 
       const route = resolveSdkBrainWorker(input.intent || undefined);
-      const workerModel = route.modelId;
+      let workerModel = route.modelId;
       const transport = route.claudeLane ? 'claude_agent_sdk' : 'cross_provider';
       // Visible warning when a configured non-Claude worker model is IGNORED
       // (CLEMMY_SDK_BRAIN_CROSS_WORKER=off) — replaces today's silent fallback so
@@ -211,6 +283,9 @@ export function registerWorkerTools(server: McpServer): void {
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
       // worker_queued fires only when this worker actually has to wait for a slot.
       const workerProvider = resolveEffectiveProviderForModel(workerModel);
+      // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
+      // the backend's real primary id (no-op for owned ids / non-byo providers).
+      if (workerProvider === 'byo' && !route.claudeLane) workerModel = repairByoRoutedModelId(workerModel);
       const release = await acquireWorkerSlot(sessionId, (info) => {
         try {
           recordOperationalEvent({
@@ -263,7 +338,7 @@ export function registerWorkerTools(server: McpServer): void {
               const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
               return runCrossProviderWorker(input, workerModel, sessionId, sourceUserSeq);
             })();
-        const ok = !/^\s*ERROR:/i.test(result.text ?? '');
+        const ok = !workerResultIndicatesFailure(result.text);
         // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
         // hooks.ts worker_capped emit only fires in the nested lane — so the
         // respawn guard was DEAD in this default-on lane (the non-converging
@@ -366,6 +441,6 @@ export function registerWorkerTools(server: McpServer): void {
       } finally {
         release();
       }
-    },
-  );
+    }
+  };
 }

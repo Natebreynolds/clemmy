@@ -36,6 +36,105 @@ export const WorkerToolInputSchema = z.object({
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
 
 /**
+ * The run_worker CALL schema: one packet that covers either ONE item (`item`)
+ * or a deterministic parallel batch (`items`). The batch form exists because
+ * "call this tool N times in parallel" is a prompt-level contract some brains
+ * never honor — they serialize the calls and a 5-item fan-out takes 5× wall
+ * time (live 2026-07-21). With `items`, the harness runs the pool itself:
+ * wall time ≈ the slowest item, regardless of which brain is driving.
+ */
+export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
+  item: z
+    .string()
+    .min(1)
+    .nullable()
+    .optional()
+    .describe('The single item to process: id, name, domain, row, record, URL, or other concrete identifier. Omit when passing `items`.'),
+  items: z
+    .array(z.string().min(1))
+    .max(64)
+    .nullable()
+    .optional()
+    .describe('PREFERRED for 2+ independent same-shape items: the full list of item identifiers. The harness runs them as one bounded parallel pool (wall time ≈ slowest item) with a per-item honest ledger — no need to call run_worker once per item.'),
+});
+
+export type WorkerToolCall = z.infer<typeof WorkerToolCallSchema>;
+
+/** A model can serialize an absent item as the LITERAL string "null" (the
+ *  connected_account_id:"null" Apify class) — or pass an UNRESOLVED TEMPLATE
+ *  placeholder ("{{single site host}}", "<site>", "${HOST}") straight from its
+ *  own prompt scaffolding (live 2026-07-22: a kimi fan-out ran a worker for
+ *  the literal item "{{single site host}}"). Both waste a slot, pollute the
+ *  coverage ledger, and produce nonsense results. Shapes, not word lists:
+ *  absent-value literals + anything that is ENTIRELY a template placeholder. */
+const JUNK_ITEM_RE = /^(null|undefined|none|n\/a|nil|tbd|todo|placeholder)$/i;
+const TEMPLATE_PLACEHOLDER_RE = /^(\{\{.*\}\}|<[^<>]+>|\$\{.*\}|%[A-Z_]+%)$/;
+
+function isJunkWorkerItem(item: string): boolean {
+  return JUNK_ITEM_RE.test(item) || TEMPLATE_PLACEHOLDER_RE.test(item);
+}
+
+/** Normalize a run_worker call into its per-item list. Returns null when the
+ *  call names no work at all. */
+export function workerCallItems(call: Pick<WorkerToolCall, 'item' | 'items'>): string[] | null {
+  const items = (call.items ?? []).map((i) => i.trim()).filter((i) => i && !isJunkWorkerItem(i));
+  if (items.length > 0) {
+    // `item` alongside `items` is treated as part of the batch when novel —
+    // dropping it silently would lose work the model asked for.
+    const single = call.item?.trim();
+    if (single && !isJunkWorkerItem(single) && !items.includes(single)) items.unshift(single);
+    return [...new Set(items)];
+  }
+  const single = call.item?.trim();
+  return single && !isJunkWorkerItem(single) ? [single] : null;
+}
+
+/**
+ * Normalized failure signature for uniform-failure detection: strip ids,
+ * numbers, and item names so "worker for X failed: 400 Unknown Model" and
+ * "worker for Y failed: 400 Unknown Model" collapse to one signature. Pure.
+ */
+export function workerFailureSignature(text: string | null | undefined): string {
+  const firstLine = (text ?? '').trim().split('\n')[0] ?? '';
+  return firstLine
+    .toLowerCase()
+    .replace(/"[^"]*"/g, '"…"')
+    .replace(/\b[a-f0-9-]{12,}\b/gi, '<id>')
+    .replace(/\d+/g, '<n>')
+    .slice(0, 200);
+}
+
+/**
+ * When EVERY item of a multi-item fan-out fails with the SAME signature, the
+ * failure is infrastructural (dead worker model, missing credentials, provider
+ * outage) — retrying more workers is pure waste (live 2026-07-22: two full
+ * rounds, 12 dead workers, ~8 wasted minutes before the model pivoted inline).
+ * Returns the shared signature, or null when failures are absent or diverse.
+ */
+export function uniformFailureSignature(texts: Array<string | null | undefined>): string | null {
+  if (texts.length < 2) return null;
+  const signatures = texts.map(workerFailureSignature);
+  const first = signatures[0];
+  if (!first) return null;
+  return signatures.every((s) => s === first) ? first : null;
+}
+
+/**
+ * True when a worker's returned text indicates the item FAILED. The historical
+ * gate was only the "ERROR:" prefix, but a tool error thrown inside the
+ * @openai/agents runner surfaces as "An error occurred while running the
+ * tool…" with no prefix — live 2026-07-22, five workers died on a provider
+ * 400 and were all counted ok (a no-hollow-done violation). Hollow/empty
+ * output is failure for the same reason.
+ */
+export function workerResultIndicatesFailure(text: string | null | undefined): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return true;
+  if (/^\s*ERROR:/i.test(t)) return true;
+  return /an error occurred while running the tool/i.test(t);
+}
+
+/**
  * Stable, deterministic key identifying THIS worker's exact job packet — used by
  * the durable-resume idempotency guard (worker-respawn-guard.ts) so a worker that
  * already completed successfully in an interrupted run is NOT re-executed (and its
