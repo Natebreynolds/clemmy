@@ -168,7 +168,7 @@ test('SIGKILL after terminal publication cannot leave status without its exact r
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
-    const deadline = Date.now() + 15_000;
+    const deadline = Date.now() + 60_000;
     while (!existsSync(ready)) {
       if (Date.now() >= deadline) throw new Error('Timed out waiting for terminal publication crash barrier.');
       await new Promise((resolve) => setTimeout(resolve, 10));

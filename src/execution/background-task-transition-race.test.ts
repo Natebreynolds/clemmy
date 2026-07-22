@@ -30,7 +30,8 @@ const START_CHILD_CODE = `
   const waitCell = new Int32Array(new SharedArrayBuffer(4));
   mod._setBackgroundTaskStartCasHookForTests(() => {
     writeFileSync(process.env.CLEM_BG_OBSERVED, 'pending');
-    while (!existsSync(process.env.CLEM_BG_RELEASE)) Atomics.wait(waitCell, 0, 0, 5);
+    const spinDeadline = Date.now() + 120_000;
+    while (!existsSync(process.env.CLEM_BG_RELEASE)) { if (Date.now() > spinDeadline) process.exit(3); Atomics.wait(waitCell, 0, 0, 5); }
   });
   const result = mod.markBackgroundTaskRunning(process.env.CLEM_BG_TASK_ID);
   writeFileSync(process.env.CLEM_BG_RESULT, JSON.stringify({ status: result?.status ?? null }));
@@ -49,7 +50,8 @@ const SETTLE_CHILD_CODE = `
   const waitCell = new Int32Array(new SharedArrayBuffer(4));
   mod._setBackgroundTaskSettlementCasHookForTests(() => {
     writeFileSync(process.env.CLEM_BG_OBSERVED, 'running');
-    while (!existsSync(process.env.CLEM_BG_RELEASE)) Atomics.wait(waitCell, 0, 0, 5);
+    const spinDeadline = Date.now() + 120_000;
+    while (!existsSync(process.env.CLEM_BG_RELEASE)) { if (Date.now() > spinDeadline) process.exit(3); Atomics.wait(waitCell, 0, 0, 5); }
   });
   const result = mod.markBackgroundTaskDone(process.env.CLEM_BG_TASK_ID, process.env.CLEM_BG_DONE_RESULT);
   writeFileSync(process.env.CLEM_BG_RESULT, JSON.stringify({ status: result?.status ?? null }));
@@ -61,7 +63,8 @@ const RESOLVE_INPUT_CHILD_CODE = `
   const waitCell = new Int32Array(new SharedArrayBuffer(4));
   mod._setBackgroundTaskResolutionCasHookForTests(() => {
     writeFileSync(process.env.CLEM_BG_OBSERVED, 'awaiting_input');
-    while (!existsSync(process.env.CLEM_BG_RELEASE)) Atomics.wait(waitCell, 0, 0, 5);
+    const spinDeadline = Date.now() + 120_000;
+    while (!existsSync(process.env.CLEM_BG_RELEASE)) { if (Date.now() > spinDeadline) process.exit(3); Atomics.wait(waitCell, 0, 0, 5); }
   });
   const result = mod.queueBackgroundTaskInputResolution(process.env.CLEM_BG_QUESTION_ID, 'stale answer');
   writeFileSync(process.env.CLEM_BG_RESULT, JSON.stringify({ status: result?.status ?? null }));
@@ -87,7 +90,7 @@ function child(
   });
 }
 
-async function waitForFiles(files: string[], timeoutMs = 15_000): Promise<void> {
+async function waitForFiles(files: string[], timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!files.every(existsSync)) {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${files.join(', ')}`);

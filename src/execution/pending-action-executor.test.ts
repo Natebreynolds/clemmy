@@ -91,3 +91,27 @@ test('a run_batch pending action defers to the run_batch executor', async () => 
   assert.equal(fired, false, 'run_batch is not fired by the single-call executor');
   assert.match(res.resultSummary, /run_batch action=execute/);
 });
+
+test('a gate-refused dispatch is recorded FAILED, never executed (2026-07-22 false-success class)', async () => {
+  const { dispatchOutputIndicatesRefusal } = await import('./pending-action-executor.js');
+  // The live shape: constraint block RETURNED as a string, provider never called.
+  const record = queueSingleCall();
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('blocked call'));
+  const res = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-pae',
+    dispatch: async () => '[provider-dispatch:not-started:constraint]\n🛑 SEND BLOCKED — standing sender constraint enforced. Nothing was sent.',
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 'failed');
+  assert.match(res.resultSummary, /refused/i);
+  assert.equal(getPendingAction(record.id)?.status, 'failed', 'the durable record tells the truth');
+  assert.match(getPendingAction(record.id)?.resultSummary ?? '', /SEND BLOCKED|refused/i);
+
+  // Classifier boundaries: genuine results never match; refusal shapes always do.
+  assert.equal(dispatchOutputIndicatesRefusal('{"successful": true, "data": {"message": "Email sent successfully."}}'), false);
+  assert.equal(dispatchOutputIndicatesRefusal('OK sent'), false);
+  assert.equal(dispatchOutputIndicatesRefusal('Tool call refused by harness: DUPLICATE_EXTERNAL_WRITE (REFUSED): already sent'), true);
+  assert.equal(dispatchOutputIndicatesRefusal('[provider-dispatch:not-started:execution_wrap]'), true);
+  // A provider message that merely MENTIONS a block deep in content stays success.
+  assert.equal(dispatchOutputIndicatesRefusal('{"data": {"text": "' + 'x'.repeat(700) + ' SEND BLOCKED — standing sender constraint"}}'), false);
+});

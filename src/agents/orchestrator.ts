@@ -46,6 +46,7 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from './worker-model-fallover.js';
+import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
@@ -1359,6 +1360,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // guard; workerItemAlreadyCapped is fail-open so it can never block fan-out.
       if (workerThrashGuardEnabled() && sessionId && workerItemAlreadyCapped(sessionId, input.item)) {
         const message = `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
+        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
+        return message;
+      }
+      // Dev-only forced 429 (CLEMMY_FAULT_INJECT_WORKER_MODEL): prove the
+      // worker-model fallover loop live — the injected failure is the ONLY fake
+      // part; uniform detection, bench, auto-switch, and the healthy re-batch
+      // all run for real. Inert in production (env unset).
+      if (faultInjectWorkerModel() === workerModel) {
+        const message = injectedWorkerRateLimitText(input.item, workerModel);
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
       }

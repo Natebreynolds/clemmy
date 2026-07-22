@@ -571,3 +571,25 @@ test('route policy: an explicit user binding ALWAYS beats the learned policy', a
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();
 });
+
+test('CONTRACT: an explicit durable worker binding WINS over MODEL_ROUTING_MODE=off (user autonomy)', () => {
+  // Blessed 2026-07-22: `off` disables AUTOMATIC BYO routing, but a user's
+  // explicit rule ("use kimi for workers") is user intent and must be honored
+  // in every mode — the user owns designation; modes only set defaults.
+  // Live-proven: codex-lane battery ran workers on the bound kimi-k3 with
+  // mode=off (brain gpt-5.6-luna). An audit that "fixes" this into
+  // mode-wins-over-binding is a regression, not a cleanup.
+  withEnv({
+    AUTH_MODE: 'codex_oauth',
+    MODEL_ROUTING_MODE: undefined, // unset ⇒ 'off', the default
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'kimi-k3',
+    OPENAI_MODEL_WORKER: undefined,
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'kimi-k3', scope: 'durable', source: 'settings' }]),
+  }, () => {
+    const r = resolveRoleModel('worker');
+    assert.equal(r.modelId, 'kimi-k3', 'explicit binding routes the worker to BYO even in off mode');
+    assert.equal(r.source, 'settings');
+  });
+});
