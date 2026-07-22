@@ -51,8 +51,12 @@ test('synthesizeTurnReport: writes → write report; tools-only → honest tool 
   appendEvent({ sessionId: sid, turn: 1, role: 'agent', type: 'tool_called', data: { tool: 'web_search', accounting: 'top_level' } });
   const toolReport = synthesizeTurnReport(sid, 0);
   assert.ok(toolReport, 'a tools-only turn still reports back');
-  assert.match(toolReport!, /ran 1 tool/i);
-  assert.match(toolReport!, /didn't compose a written summary/i);
+  // Activity DIGEST, never a confession (2026-07-22): the user gets the tool
+  // activity by name and a one-word path to the findings — never "resend".
+  assert.match(toolReport!, /1 call/i);
+  assert.match(toolReport!, /web search/i);
+  assert.match(toolReport!, /say .summarize./i);
+  assert.doesNotMatch(toolReport!, /resend/i);
   // A write outranks the tool note.
   appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@b.com'] } });
   const writeReport = synthesizeTurnReport(sid, 0);

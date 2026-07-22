@@ -293,3 +293,23 @@ test('a deferred proactive report past the age bound is dropped, not spoken', as
     setProactiveReportFireForTest(null);
   }
 });
+
+test('a needs_input outcome FIRES into a busy chat — a blocking question never defers (2026-07-22 stranded-user class)', async () => {
+  const { setProactiveReportFireForTest } = await import('./outcome.js');
+  createSession({ id: 'sess-question-busy', kind: 'chat' });
+  // Mid-conversation: a fresh user event inside the idle window.
+  appendEvent({ sessionId: 'sess-question-busy', turn: 0, role: 'user', type: 'user_input_received', data: { text: 'hey how is it going' } });
+
+  const fired: string[] = [];
+  setProactiveReportFireForTest(async (sessionId, outcome) => { fired.push(`${sessionId}:${outcome.status}`); });
+  try {
+    deliverOutcome(
+      { status: 'needs_input', detail: 'Which report marks a Market Leader?' },
+      ctx({ originSessionId: 'sess-question-busy', sourceId: 'bg-q1', sourceLabel: 'background task', proactiveTurn: true }),
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    assert.deepEqual(fired, ['sess-question-busy:needs_input'], 'the question interrupts — it IS the conversation now');
+  } finally {
+    setProactiveReportFireForTest(null);
+  }
+});

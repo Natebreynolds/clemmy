@@ -5,6 +5,7 @@ import { getToolOutputContext } from '../runtime/harness/tool-output-context.js'
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
+import { maybeSelfServeBounce } from '../agents/self-serve-gate.js';
 import { surfacePlan } from '../agents/plan-proposals.js';
 import { PlanSchema, type Plan } from '../agents/planner.js';
 import { textResult } from './shared.js';
@@ -155,6 +156,18 @@ export function registerAutonomyActionTools(server: McpServer): void {
       if (!quality.ok) {
         return textResult(`Question rejected: ${quality.reason}`);
       }
+      // Self-serve-first (v2.2.2): a pointer-shaped ask against a connected
+      // toolkit bounces ONCE with a derive-first steer; the second ask always
+      // goes through. Fail-open — any lookup/classification error asks as-is.
+      try {
+        const askSessionId = getToolOutputContext()?.sessionId ?? '';
+        const { listUsableConnectedToolkits } = await import('../integrations/composio/client.js');
+        const slugs = (await listUsableConnectedToolkits()).map((c) => c.slug);
+        const bounceDecision = maybeSelfServeBounce({ sessionId: askSessionId, question, connectedToolkitSlugs: slugs });
+        if (bounceDecision.bounce && bounceDecision.steer) {
+          return textResult(`Question deferred: ${bounceDecision.steer}`);
+        }
+      } catch { /* fail-open: the ask proceeds */ }
       try {
         // A question asked from inside a background run belongs to that task —
         // stamp the correlation so answering the check-in resumes it.
