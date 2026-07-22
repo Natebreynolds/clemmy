@@ -96,7 +96,8 @@
     "proof:claude": "tsx scripts/proof/run-proof.ts --brain claude",
     "proof:codex": "tsx scripts/proof/run-proof.ts --brain codex",
     "proof:glm": "tsx scripts/proof/run-proof.ts --brain glm",
-    "proof:selftest": "tsx --test 'scripts/proof/*.test.ts'"
+    "proof:selftest": "tsx --test 'scripts/proof/*.test.ts'",
+    "journeys": "tsx --test src/journeys/*.test.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",
