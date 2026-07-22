@@ -14,6 +14,7 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/model-route-metrics.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from '../agents/worker-model-fallover.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -161,6 +162,21 @@ export function registerWorkerTools(server: McpServer): void {
             return textResult(`Batch failed: ALL ${rendered.length} workers died because the configured worker model "${deadRoute.modelId}" is not served by the BYO endpoint. It has been AUTO-CORRECTED to "${healed}" — call run_worker again NOW with the same items; it will dispatch on the corrected model.`);
           }
         }
+        // Fleet resilience twin of the unknown-model heal: a uniform rate limit
+        // benches the routed model and invites an immediate retry on the next
+        // healthy candidate (spawn-time selection above does the switch).
+        if (uniform && workerFailureLooksRateLimited(uniform)) {
+          const benchedRoute = resolveSdkBrainWorker(call.intent || undefined);
+          markWorkerModelCoolingDown(benchedRoute.modelId);
+          const next = pickWorkerModelWithFallover([
+            benchedRoute.modelId,
+            resolveSdkBrainWorker(undefined).modelId,
+            getClaudeBrainModel(),
+          ]);
+          if (next.falloverFrom) {
+            return textResult(`Batch failed: ALL ${rendered.length} workers hit a rate limit on worker model "${benchedRoute.modelId}". It is benched for a cooldown and fan-out has AUTO-SWITCHED to "${next.model}" — call run_worker again NOW with the same items; they will dispatch on the healthy model.`);
+          }
+        }
         if (uniform && sessionIdForMemo) {
           markFanoutUniformFailure(sessionIdForMemo, uniform);
           // The abort transfers these items to INLINE execution — they are no
@@ -282,10 +298,26 @@ export function registerWorkerTools(server: McpServer): void {
       }
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
       // worker_queued fires only when this worker actually has to wait for a slot.
-      const workerProvider = resolveEffectiveProviderForModel(workerModel);
+      let workerProvider = resolveEffectiveProviderForModel(workerModel);
       // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
       // the backend's real primary id (no-op for owned ids / non-byo providers).
       if (workerProvider === 'byo' && !route.claudeLane) workerModel = repairByoRoutedModelId(workerModel);
+      // Fleet resilience: skip a rate-limit-benched worker model at spawn time
+      // (routed → default worker binding → Claude brain). Cross-lane pick only
+      // applies off the pure-Claude lane; the Claude lane's own model is already
+      // the last-resort candidate.
+      if (!route.claudeLane) {
+        const pick = pickWorkerModelWithFallover([
+          workerModel,
+          resolveSdkBrainWorker(undefined).modelId,
+          getClaudeBrainModel(),
+        ]);
+        if (pick.falloverFrom) {
+          workerModel = pick.model;
+          workerProvider = resolveEffectiveProviderForModel(workerModel);
+          if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
+        }
+      }
       const release = await acquireWorkerSlot(sessionId, (info) => {
         try {
           recordOperationalEvent({

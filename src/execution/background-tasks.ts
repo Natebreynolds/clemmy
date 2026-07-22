@@ -1644,6 +1644,33 @@ export function markBackgroundTaskDone(
     // context so Clementine resumes from it, not just a notification.
     enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
     emitBackgroundTaskOperational('background_task_finished', updated, { status: 'done' });
+    // Learning loop (DREAM): distill this run's SHAPE — real tools used,
+    // fan-out width, wall time — into the strategy store so the next similar
+    // objective plans from a proven approach. Deterministic trace summary,
+    // fire-and-forget; a failure here never touches the done path.
+    void (async () => {
+      try {
+        const { openEventLog } = await import('../runtime/harness/eventlog.js');
+        const { recordRunStrategy } = await import('../memory/run-strategy-store.js');
+        const db = openEventLog();
+        const META_TOOLS = new Set([
+          'tool_choice_recall', 'recall_tool_result', 'tool_output_query', 'composio_search_tools',
+          'composio_list_tools', 'local_cli_list', 'execution_list', 'execution_create',
+          'execution_update_step', 'execution_complete', 'pending_action_queue', 'request_approval',
+        ]);
+        const toolRows = db.prepare(
+          'SELECT tool, COUNT(*) AS n FROM tool_outputs WHERE session_id = ? GROUP BY tool ORDER BY n DESC LIMIT 24',
+        ).all(updated.runSessionId) as Array<{ tool: string | null; n: number }>;
+        const toolsUsed = toolRows.map((r) => r.tool ?? '').filter((t) => t && !META_TOOLS.has(t));
+        const workerCount = (db.prepare(
+          "SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND type = 'worker_result'",
+        ).get(updated.runSessionId) as { n: number } | undefined)?.n ?? 0;
+        const durationMs = updated.startedAt && updated.completedAt
+          ? Math.max(0, Date.parse(updated.completedAt) - Date.parse(updated.startedAt))
+          : 0;
+        recordRunStrategy({ objective: updated.title || updated.prompt, toolsUsed, workerCount, durationMs });
+      } catch { /* strategy capture is best-effort */ }
+    })();
   }
   return updated;
 }
