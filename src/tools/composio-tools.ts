@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
@@ -1564,6 +1564,114 @@ export async function dispatchComposioTool(
   }
 }
 
+// Uniform-empty advisory (2026-07-22 Phoenix intel audit): 14 Apify calls all
+// returned `{"items": []}` (successful:true) and the model reported "no Google
+// Ads found" as a market finding for 5 heavy advertisers — tool silence
+// presented as truth. N same-slug reads returning empty across DIFFERENT
+// inputs is a QUERY-SHAPE signal, not a finding. Advisory only (guardrails
+// inform, never override): the appended note steers the model to re-check the
+// query and to label unverifiable absence honestly.
+const emptyResultStreaks = new Map<string, number>();
+
+export function composioResultLooksEmpty(result: unknown): boolean {
+  const data = (result as { data?: unknown } | null)?.data;
+  if (data == null) return false; // no data envelope ≠ an empty result
+  const inner = (data as { data?: unknown }).data ?? data;
+  if (inner == null) return true;
+  if (Array.isArray(inner)) return inner.length === 0;
+  if (typeof inner === 'object') {
+    const values = Object.values(inner as Record<string, unknown>);
+    if (values.length === 0) return true;
+    return values.every((v) => v == null || (Array.isArray(v) && v.length === 0));
+  }
+  return false;
+}
+
+const EMPTY_STREAK_ADVISORY_AT = 3;
+
+// Per-session data-quality ledger (2026-07-22, "real assistant" checkpoint):
+// every read records empty-vs-total per slug, so at the WRITE boundary an
+// autonomous run can be confronted with its own evidence ("Apify: 14/14
+// empty") instead of shipping a deliverable with hollow columns.
+interface SlugQuality { empty: number; total: number }
+const dataQualityLedgers = new Map<string, Map<string, SlugQuality>>();
+const dataQualityCheckpointFired = new Set<string>();
+
+function recordDataQualityRead(sessionId: string | undefined, toolSlug: string, empty: boolean): void {
+  if (!sessionId) return;
+  let ledger = dataQualityLedgers.get(sessionId);
+  if (!ledger) { ledger = new Map(); dataQualityLedgers.set(sessionId, ledger); }
+  const entry = ledger.get(toolSlug) ?? { empty: 0, total: 0 };
+  entry.total += 1;
+  if (empty) entry.empty += 1;
+  ledger.set(toolSlug, entry);
+}
+
+/** Slugs whose reads came back mostly empty in this session — the evidence a
+ *  checkpoint confronts the model with. */
+function hollowDimensions(sessionId: string | undefined): Array<{ slug: string; empty: number; total: number }> {
+  const ledger = sessionId ? dataQualityLedgers.get(sessionId) : undefined;
+  if (!ledger) return [];
+  const hollow: Array<{ slug: string; empty: number; total: number }> = [];
+  for (const [slug, q] of ledger) {
+    if (q.empty >= EMPTY_STREAK_ADVISORY_AT && q.empty / q.total >= 0.5) hollow.push({ slug, ...q });
+  }
+  return hollow;
+}
+
+function dataQualityCheckpointEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_DATA_QUALITY_CHECKPOINT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/**
+ * The write-boundary checkpoint for AUTONOMOUS (background) runs. When the
+ * run's own ledger shows a hollow data dimension, the FIRST external write is
+ * deferred with the evidence and the real-assistant fork: fix the queries, or
+ * check in with findings + options and get the user's blessing. Fires ONCE per
+ * session — a repeated write attempt proceeds (with an honest-labeling note),
+ * so autonomy is redirected, never dead-ended (guardrails inform, don't
+ * override). Kill-switch CLEMMY_DATA_QUALITY_CHECKPOINT.
+ */
+function dataQualityWriteCheckpoint(sessionId: string | undefined, toolSlug: string): string | null {
+  if (!dataQualityCheckpointEnabled()) return null;
+  if (!sessionId || !sessionId.startsWith('background:')) return null;
+  if (composioSlugIsReadOnly(toolSlug)) return null;
+  const hollow = hollowDimensions(sessionId);
+  if (hollow.length === 0) return null;
+  if (dataQualityCheckpointFired.has(sessionId)) return null;
+  dataQualityCheckpointFired.add(sessionId);
+  const evidence = hollow.map((h) => `${h.slug}: ${h.empty}/${h.total} reads returned empty`).join('; ');
+  return [
+    `DATA-QUALITY CHECKPOINT — this ${toolSlug} write was NOT executed yet.`,
+    `Your own read ledger for this run shows hollow data: ${evidence}. Uniform emptiness usually means the query shape was wrong, not that every subject genuinely has nothing — writing it out would ship a deliverable with false negatives.`,
+    'Do ONE of the following before writing:',
+    '1. Fix the source: retry the empty data source with an alternate query shape (different identifier form, head terms instead of long-tails, corrected actor input). If the retry returns real data, redo the affected parts and then write.',
+    '2. Check in: use ask_user_question to show the user what you found, what came back empty, and 2-3 concrete options (retry differently / proceed with the gap labeled unverified / drop that dimension) — then follow their answer.',
+    'If you retry this exact write again it WILL proceed — in that case every hollow dimension must be explicitly labeled "unverified (tool returned empty)" in the written data, never presented as a confirmed negative.',
+  ].join('\n');
+}
+
+/** Test-only: reset checkpoint + ledger state between cases. */
+export function resetDataQualityForTest(): void {
+  dataQualityLedgers.clear();
+  dataQualityCheckpointFired.clear();
+  emptyResultStreaks.clear();
+}
+
+function emptyStreakAdvisory(sessionId: string | undefined, toolSlug: string, result: unknown): string {
+  const key = `${sessionId ?? 'nosession'}::${toolSlug}`;
+  const empty = composioResultLooksEmpty(result);
+  if (composioSlugIsReadOnly(toolSlug)) recordDataQualityRead(sessionId, toolSlug, empty);
+  if (!empty) {
+    emptyResultStreaks.delete(key);
+    return '';
+  }
+  const streak = (emptyResultStreaks.get(key) ?? 0) + 1;
+  emptyResultStreaks.set(key, streak);
+  if (streak < EMPTY_STREAK_ADVISORY_AT) return '';
+  return `\n\n[empty-result advisory] ${streak} consecutive ${toolSlug} calls in this session returned EMPTY results across different inputs. Uniform emptiness usually means the query shape is wrong (wrong parameter form, wrong identifier, wrong actor input) — not that every subject genuinely has nothing. Re-check the tool schema or try an alternate query form before reporting absence; if you still report it, label it "unverified (tool returned empty)" rather than a confirmed negative.`;
+}
+
 async function runComposioExecute(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -1599,6 +1707,13 @@ async function runComposioExecute(
   const effectiveConnectionId = resolved.connectionId;
   let accountRouteNote = resolved.notes.join('\n');
   const gate = { routeConnectedAccountId: resolved.senderVerified ? resolved.connectionId : undefined };
+
+  // Real-assistant checkpoint: an autonomous run whose reads came back hollow
+  // is confronted with its own ledger BEFORE its first external write, instead
+  // of shipping false negatives (2026-07-22 Phoenix Airtable audit). Fires
+  // once; a deliberate second attempt proceeds.
+  const checkpoint = dataQualityWriteCheckpoint(runSid, toolSlug);
+  if (checkpoint) return checkpoint;
 
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of
@@ -1636,6 +1751,7 @@ async function runComposioExecute(
       } else {
         // F2: a genuine success proves the toolkit is reachable again → reset.
         clearReconnectBreaker(sid, toolSlug);
+        output += emptyStreakAdvisory(sid, toolSlug, result);
       }
       try {
         recordExecution({
@@ -1829,6 +1945,23 @@ export function runComposioExecuteForTest(
     delay: async () => {},
     skipGateway: true,
   });
+}
+
+/** Test twin that pins the run-context session — for behaviors keyed on the
+ *  session lane (data-quality checkpoint, per-session ledgers). */
+export function runComposioExecuteForTestInSession(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  execute: typeof executeComposioTool,
+  sessionId: string,
+): Promise<string> {
+  return runComposioExecute(
+    toolSlug,
+    args,
+    undefined,
+    { toolName: 'composio_execute_tool', toolSlug, context: { context: { sessionId } } as never },
+    { execute, delay: async () => {}, skipGateway: true },
+  );
 }
 
 function parseArgumentsJson(value: string | null | undefined): Record<string, unknown> {
