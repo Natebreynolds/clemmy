@@ -9,8 +9,11 @@
  *    `workflow:<suffix>` sessions), so they poll the run-events endpoint.
  */
 import { useEffect, useMemo, useState } from 'react';
-import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Users, GitBranch, RefreshCw, Layers, Upload, Play, Send, Save } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, GitBranch, RefreshCw, Layers, Upload, Play, Send, Save, MessageSquare } from 'lucide-react';
 import { runHarnessStream, humanHarnessText } from '@/lib/chat';
+import { reduceActivity, type ActivityItem } from '@/lib/useChat';
+import { TurnActivity } from '@/components/chat/TurnActivity';
 import { apiGet } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
@@ -21,6 +24,7 @@ import { Input, Select } from '@/components/ui/Field';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
 import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
 import {
+  answerBackgroundTaskQuestion,
   boardTraceSinceSeq,
   canStopCanonicalRunFromDrawer,
   cardTone,
@@ -49,21 +53,20 @@ interface TraceRow {
 }
 
 const HARNESS_MILESTONES: Record<string, { label: string; icon: typeof Radio; tone: TraceRow['tone'] }> = {
+  // Tools / workers / batches are deliberately ABSENT here: they render once,
+  // in the shared TurnActivity strip (the same component chat uses), so the
+  // drawer and the chat describe the run in ONE visual language instead of two
+  // parallel vocabularies (2026-07-22 consolidation). This list is lifecycle
+  // only — the things TurnActivity does not carry.
   session_started: { label: 'Started', icon: Cpu, tone: 'muted' },
   model_started: { label: 'Thinking', icon: Cpu, tone: 'live' },
   turn_started: { label: 'Turn started', icon: Dot, tone: 'muted' },
   step_started: { label: 'Step', icon: Dot, tone: 'live' },
-  tool_called: { label: 'Tool call', icon: Wrench, tone: 'live' },
-  tool_started: { label: 'Tool call', icon: Wrench, tone: 'live' },
-  tool_returned: { label: 'Tool result', icon: CheckCircle2, tone: 'success' },
   approval_requested: { label: 'Needs approval', icon: Hand, tone: 'warning' },
   awaiting_user_input: { label: 'Waiting on you', icon: Hand, tone: 'warning' },
   guardrail_tripped: { label: 'Guardrail', icon: AlertCircle, tone: 'warning' },
   run_failed: { label: 'Failed', icon: AlertCircle, tone: 'danger' },
   conversation_completed: { label: 'Completed', icon: CheckCircle2, tone: 'success' },
-  // Swarm + long-run milestones (already in the SSE pipe — just unmapped).
-  worker_result: { label: 'Worker finished', icon: Users, tone: 'success' },
-  worker_capped: { label: 'Worker hit turn cap', icon: Users, tone: 'warning' },
   brain_fallover: { label: 'Switched brain', icon: GitBranch, tone: 'warning' },
   sdk_auto_continue: { label: 'Auto-continued', icon: RefreshCw, tone: 'muted' },
   sdk_compact_boundary: { label: 'Compacted context', icon: Layers, tone: 'muted' },
@@ -275,6 +278,10 @@ export function LiveTraceDrawer({
   const [targetType, setTargetType] = useState<BackgroundReportBackTargetType>('slack_user');
   const [targetId, setTargetId] = useState('');
   const [targetThreadTs, setTargetThreadTs] = useState('');
+  // Interact-in-place: answer a parked question right here in the drawer.
+  const [answerDraft, setAnswerDraft] = useState('');
+  const [answerState, setAnswerState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [answerError, setAnswerError] = useState('');
   const [targetKey, setTargetKey] = useState('');
   const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [channelKey, setChannelKey] = useState('');
@@ -482,6 +489,13 @@ export function LiveTraceDrawer({
     return () => { alive = false; clearInterval(timer); };
   }, [isWorkflow, card.raw.workflowName, card.raw.workflowSlug, card.raw.runId]);
 
+  // The SAME fold chat uses — tools/workers/batches render once, in the shared
+  // TurnActivity component, instead of through a second parallel reducer.
+  const harnessActivity = useMemo(
+    () => (isWorkflow ? [] : rawHarness.reduce((acc, ev) => reduceActivity(acc, ev), [] as ActivityItem[])),
+    [isWorkflow, rawHarness],
+  );
+
   const rows: TraceRow[] = isWorkflow
     ? rawWorkflow.flatMap((ev, i) => {
         const kind = String(ev.kind ?? '');
@@ -534,6 +548,15 @@ export function LiveTraceDrawer({
               <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
             </div>
             <h3 className="mt-1.5 truncate text-h3 text-fg">{card.title}</h3>
+            {card.sessionId && !isWorkflow && (
+              <Link
+                to={`/chat/${encodeURIComponent(card.sessionId)}`}
+                className="mt-1 inline-flex items-center gap-1 text-caption text-faint transition-colors hover:text-muted"
+              >
+                <MessageSquare className="h-3 w-3" aria-hidden />
+                Open conversation
+              </Link>
+            )}
           </div>
           <button onClick={onClose} className="shrink-0 rounded-sm p-1.5 text-muted hover:bg-hover hover:text-fg" aria-label="Close">
             <X className="h-4 w-4" />
@@ -556,6 +579,54 @@ export function LiveTraceDrawer({
             )}
           </div>
         </div>
+
+        {isBackground && (taskDetail?.task.status === 'awaiting_input' || card.status === 'awaiting_input') && (
+          <div className="border-b border-warning/40 bg-warning-tint px-5 py-4">
+            <div className="flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-warning">
+              <Hand className="h-3.5 w-3.5" aria-hidden />
+              Waiting on you
+            </div>
+            <p className="mt-1.5 whitespace-pre-wrap text-body text-fg">
+              {taskDetail?.task.pendingQuestion || (card.raw as { pendingQuestion?: string }).pendingQuestion || 'This task asked a question — answer below to resume it.'}
+            </p>
+            {answerState === 'sent' ? (
+              <p className="mt-2 text-small text-success">Answer sent — the task is resuming and will report back when done.</p>
+            ) : (
+              <form
+                className="mt-2.5 flex flex-col gap-2"
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const answer = answerDraft.trim();
+                  if (!answer || answerState === 'sending') return;
+                  setAnswerState('sending');
+                  setAnswerError('');
+                  try {
+                    const out = await answerBackgroundTaskQuestion(card.id, answer);
+                    if (out.ok) { setAnswerState('sent'); setAnswerDraft(''); }
+                    else { setAnswerState('error'); setAnswerError(out.reason || 'The answer could not be delivered.'); }
+                  } catch (err) {
+                    setAnswerState('error');
+                    setAnswerError(err instanceof Error ? err.message : 'The answer could not be delivered.');
+                  }
+                }}
+              >
+                <textarea
+                  value={answerDraft}
+                  onChange={(e) => setAnswerDraft(e.target.value)}
+                  rows={2}
+                  placeholder="Type your answer — the task resumes with it immediately."
+                  className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg placeholder:text-faint focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+                <div className="flex items-center gap-2">
+                  <Button size="sm" type="submit" disabled={!answerDraft.trim() || answerState === 'sending'}>
+                    <Send className="h-3.5 w-3.5" aria-hidden /> {answerState === 'sending' ? 'Sending…' : 'Answer & resume'}
+                  </Button>
+                  {answerState === 'error' && <span className="text-caption text-danger">{answerError}</span>}
+                </div>
+              </form>
+            )}
+          </div>
+        )}
 
         {isBackground && (
           <div className="border-b border-border px-5 py-4">
@@ -593,7 +664,13 @@ export function LiveTraceDrawer({
                   />
                   <CockpitMetric label="Tool calls" value={String(taskDetail.vitals?.toolCallCount ?? taskDetail.detail.toolEvents.length)} />
                   {taskDetail.vitals?.tokensUsed !== undefined && (
-                    <CockpitMetric label="Tokens" value={formatTokens(taskDetail.vitals.tokensUsed)} />
+                    <CockpitMetric
+                      label="Tokens"
+                      value={formatTokens(taskDetail.vitals.tokensReal ?? taskDetail.vitals.tokensUsed)}
+                      hint={taskDetail.vitals.tokensReal !== undefined && taskDetail.vitals.tokensCached
+                        ? `+${formatTokens(taskDetail.vitals.tokensCached)} cached`
+                        : undefined}
+                    />
                   )}
                   <CockpitMetric
                     label="Report back"
@@ -770,23 +847,30 @@ export function LiveTraceDrawer({
                   />
                 )}
               </>
-            ) : rows.length === 0 ? (
+            ) : rows.length === 0 && harnessActivity.length === 0 ? (
               <p className="text-body text-faint">No milestones yet — the trace streams in as the agent works.</p>
             ) : (
-              <ol className="space-y-2.5">
-                {rows.map((r) => {
-                  const Icon = r.icon;
-                  return (
-                    <li key={r.key} className="flex items-start gap-2.5">
-                      <Icon className={cn('mt-0.5 h-4 w-4 shrink-0', toneText[r.tone])} />
-                      <div className="min-w-0">
-                        <span className="text-body font-medium text-fg">{r.label}</span>
-                        {r.detail && <span className="ml-2 text-body text-muted">{r.detail}</span>}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ol>
+              <>
+                {harnessActivity.length > 0 && (
+                  <div className="mb-3 rounded-md border border-border/60 px-3 pb-2">
+                    <TurnActivity items={harnessActivity} live={card.column === 'running'} />
+                  </div>
+                )}
+                <ol className="space-y-2.5">
+                  {rows.map((r) => {
+                    const Icon = r.icon;
+                    return (
+                      <li key={r.key} className="flex items-start gap-2.5">
+                        <Icon className={cn('mt-0.5 h-4 w-4 shrink-0', toneText[r.tone])} />
+                        <div className="min-w-0">
+                          <span className="text-body font-medium text-fg">{r.label}</span>
+                          {r.detail && <span className="ml-2 text-body text-muted">{r.detail}</span>}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </>
             )
           ) : (
             <pre className="whitespace-pre-wrap break-words rounded-sm bg-canvas p-3 text-caption text-muted">
@@ -808,14 +892,17 @@ export function LiveTraceDrawer({
   );
 }
 
-function CockpitMetric({ label, value, live }: { label: string; value: string; live?: boolean }) {
+function CockpitMetric({ label, value, live, hint }: { label: string; value: string; live?: boolean; hint?: string }) {
   return (
     <div className="min-w-0 rounded-md border border-border px-3 py-2">
       <div className="flex items-center gap-1 text-caption font-semibold text-faint">
         {live && <Radio className="h-3 w-3 shrink-0 animate-breathe text-primary" />}
         {label}
       </div>
-      <div className="mt-0.5 truncate text-small text-fg">{value}</div>
+      <div className="mt-0.5 truncate text-small text-fg">
+        {value}
+        {hint && <span className="ml-1 text-caption text-faint">{hint}</span>}
+      </div>
     </div>
   );
 }

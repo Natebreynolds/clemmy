@@ -8,7 +8,8 @@
  * a one-line summary you can expand.
  */
 import { useEffect, useState } from 'react';
-import { Wrench, Users, Check, X, Zap } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Wrench, Users, Check, X, Zap, ArrowUpRight } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
 
@@ -74,7 +75,14 @@ function BatchRow({ a, now, live }: { a: ActivityItem; now: number; live: boolea
   );
 }
 
-export function TurnActivity({ items, live }: { items: ActivityItem[]; live: boolean }) {
+export function TurnActivity({ items, live, traceHref }: {
+  items: ActivityItem[];
+  live: boolean;
+  /** Deep link to this run's card on the Tasks board (the ONE expanded live-run
+   *  view). The inline strip is the compact summary of the SAME run — this link
+   *  is the seam that keeps the two surfaces from reading as duplicates. */
+  traceHref?: string;
+}) {
   const [open, setOpen] = useState(false);
   // Tick once a second while anything is live-running so elapsed timers and the
   // header stay honest; completely quiescent (no interval) otherwise.
@@ -112,15 +120,28 @@ export function TurnActivity({ items, live }: { items: ActivityItem[]; live: boo
 
   return (
     <div className="mt-2.5 border-t border-border/60 pt-2">
-      {agents.length > 0 && (
+      {(agents.length > 0 || traceHref) && (
         <div className="mb-1.5 flex items-center gap-1.5 text-caption text-muted">
-          <Users className="h-3.5 w-3.5" aria-hidden />
-          <span>{live && runningAgents > 0 ? `${runningAgents} agent${runningAgents > 1 ? 's' : ''} working` : `${agents.length} agent${agents.length > 1 ? 's' : ''}`}</span>
-          <span className="flex -space-x-1">
-            {agents.slice(0, 6).map((a) => (
-              <span key={a.id} className="h-2.5 w-2.5 rounded-full ring-1 ring-surface" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
-            ))}
-          </span>
+          {agents.length > 0 && (
+            <>
+              <Users className="h-3.5 w-3.5" aria-hidden />
+              <span>{live && runningAgents > 0 ? `${runningAgents} agent${runningAgents > 1 ? 's' : ''} working` : `${agents.length} agent${agents.length > 1 ? 's' : ''}`}</span>
+              <span className="flex -space-x-1">
+                {agents.slice(0, 6).map((a) => (
+                  <span key={a.id} className="h-2.5 w-2.5 rounded-full ring-1 ring-surface" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
+                ))}
+              </span>
+            </>
+          )}
+          {traceHref && (
+            <Link
+              to={traceHref}
+              className="ml-auto flex items-center gap-0.5 text-caption text-faint transition-colors hover:text-muted"
+            >
+              Full trace
+              <ArrowUpRight className="h-3 w-3" aria-hidden />
+            </Link>
+          )}
         </div>
       )}
       <ul className="flex max-h-52 flex-col gap-1 overflow-y-auto">

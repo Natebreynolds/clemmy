@@ -171,6 +171,10 @@ export interface BackgroundTaskDetail {
     toolCallCount: number;
     /** Model tokens attributed to the run session today (undefined when unknown). */
     tokensUsed?: number;
+    /** Honest spend: uncached input + output. tokensUsed is dominated by cached
+     *  prompt re-reads on long runs and reads as ~10-100× the real volume. */
+    tokensReal?: number;
+    tokensCached?: number;
     /** Whether the task is still running (drives the live-ticking timer). */
     running: boolean;
   };
@@ -453,6 +457,16 @@ export function rejectReason(card: BoardCard, target: BoardColumnId): string {
 
 export type BoardActionIntent = 'cancel' | 'resume' | 'promote' | 'archive' | 'restore';
 export type BoardButtonIntent = BoardActionIntent | 'approve' | 'reject' | 'retry_failed_items' | 'resume_safe';
+
+/** Answer a parked task's clarifying question from the board drawer — the same
+ *  resume machinery as the chat/Home/Discord/Slack bridges, making the Tasks
+ *  board a first-class answer surface (interact-in-place, 2026-07-22). */
+export async function answerBackgroundTaskQuestion(taskId: string, answer: string): Promise<{ ok: boolean; reason?: string }> {
+  return await apiPost<{ ok: boolean; reason?: string }>(
+    `/api/console/board/background/${encodeURIComponent(taskId)}/answer`,
+    { answer },
+  );
+}
 
 export async function runBoardAction(card: BoardCard, intent: BoardButtonIntent): Promise<{ ok: boolean; reason?: string }> {
   try {
