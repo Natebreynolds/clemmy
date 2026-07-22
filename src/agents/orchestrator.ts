@@ -1,7 +1,7 @@
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
-import { getRuntimeEnv } from '../config.js';
+import { getRuntimeEnv, MODELS } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
@@ -45,6 +45,7 @@ import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from './worker-model-fallover.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
@@ -1091,6 +1092,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             return `Batch failed: ALL ${rendered.length} workers died because the configured worker model "${deadModel}" is not served by the BYO endpoint. It has been AUTO-CORRECTED to "${healed}" — call run_worker again NOW with the same items; it will dispatch on the corrected model.`;
           }
         }
+        // Fleet resilience twin of the unknown-model heal: a uniform RATE LIMIT
+        // benches the routed model for a cooldown and invites an immediate
+        // retry, which spawn-time selection will route to the next healthy
+        // candidate — instead of declaring fan-out down for a transient 429.
+        if (uniform && workerFailureLooksRateLimited(uniform)) {
+          const benched = resolveRoleModel('worker', call.intent || undefined).modelId;
+          markWorkerModelCoolingDown(benched);
+          const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, MODELS.primary]);
+          if (next.falloverFrom) {
+            return `Batch failed: ALL ${rendered.length} workers hit a rate limit on worker model "${benched}". It is benched for a cooldown and fan-out has AUTO-SWITCHED to "${next.model}" — call run_worker again NOW with the same items; they will dispatch on the healthy model.`;
+          }
+        }
         if (uniform && memoSessionId) {
           markFanoutUniformFailure(memoSessionId, uniform);
           // Abort = coverage boundary: the items transfer to inline execution
@@ -1125,10 +1138,25 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       let workerModel = route.model ?? resolveRoleModel('worker').modelId;
-      const workerProvider = resolveEffectiveProviderForModel(workerModel);
+      let workerProvider = resolveEffectiveProviderForModel(workerModel);
       // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
       // the backend's real primary id (no-op for owned ids / non-byo providers).
       if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
+      // Fleet resilience: a rate-limited worker model is benched for a cooldown
+      // window — route this item to the next healthy candidate instead of
+      // burning a slot on a known-429 model. Chain stays inside the models this
+      // session already legitimately uses (routed → default worker binding →
+      // session primary), so provider-isolation promises hold.
+      const workerPick = pickWorkerModelWithFallover([
+        workerModel,
+        resolveRoleModel('worker').modelId,
+        MODELS.primary,
+      ]);
+      if (workerPick.falloverFrom) {
+        workerModel = workerPick.model;
+        workerProvider = resolveEffectiveProviderForModel(workerModel);
+        if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
+      }
       // P6: throttle concurrent worker fan-out per session so N parallel run_worker
       // calls can't open N provider calls at once and storm a rate limit. Bounds BOTH
       // worker lanes (this wraps before the route branch). Released in the finally.
