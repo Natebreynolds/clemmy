@@ -81,9 +81,38 @@ function argsIntentText(args: Record<string, unknown>): string {
  * to VERIFY the actual connected mailbox before the send leaves — pattern
  * matching alone cannot know which account `user_id: 'me'` resolves to.
  */
+/** Addressing-field keys that carry recipients. Key-scoped on purpose: an email
+ *  address merely MENTIONED in a message body ("contact bob@x.com") must not
+ *  make a chat post look like an email send. */
+const RECIPIENT_KEY_RE = /^(to|cc|bcc|to_recipients?|cc_recipients?|bcc_recipients?|recipients?|to_emails?|recipient_emails?|to_address(es)?|from|from_email|reply_to)$/i;
+const EMAIL_LITERAL_RE = /[\w\-.+]+@[\w\-.]+\.[a-z]{2,}/i;
+const EMAILISH_SLUG_RE = /MAIL|EMAIL|OUTLOOK|SMTP|MESSAGE_SEND_AS/i;
+
+function argsAddressEmailRecipients(args: Record<string, unknown>): boolean {
+  try {
+    for (const [key, value] of Object.entries(args)) {
+      if (!RECIPIENT_KEY_RE.test(key)) continue;
+      const text = typeof value === 'string' ? value : JSON.stringify(value ?? '');
+      if (EMAIL_LITERAL_RE.test(text)) return true;
+    }
+  } catch { /* unreadable args → not provably an email send */ }
+  return false;
+}
+
+/** Effect-anchored: is this send in the EMAIL family — the only channel a
+ *  MAILBOX-identity constraint can govern? True for email-ish slugs (Outlook/
+ *  Gmail/mail providers) or any send whose ADDRESSING fields carry real email
+ *  addresses. A Slack/Discord/Teams channel post has neither and can never
+ *  violate a mailbox rule (live 2026-07-22: the Scorpion-mailbox constraint
+ *  blocked SLACK_SEND_MESSAGE — the user's Slack workflow failed on a rule
+ *  about which OUTLOOK account to send email from). */
+export function isEmailFamilySend(toolSlug: string, args: Record<string, unknown>): boolean {
+  return EMAILISH_SLUG_RE.test(toolSlug) || argsAddressEmailRecipients(args);
+}
+
 export function findEmailSendConstraint(
   toolSlug: string,
-  _args: Record<string, unknown>,
+  args: Record<string, unknown>,
 ): EmailSendConstraint | null {
   try {
     // Unify send detection on the single canonical chokepoint predicate: this
@@ -91,6 +120,9 @@ export function findEmailSendConstraint(
     // — the pre-fix hole) and SEND_DRAFT, while correctly leaving reversible
     // CREATE_*_DRAFT ungated (a draft is not a send).
     if (!isIrreversibleSendSlug(toolSlug)) return null;
+    // A mailbox-identity constraint governs EMAIL sends only — out-of-family
+    // sends (Slack/Discord/SMS/…) cannot violate it and are out of scope.
+    if (!isEmailFamilySend(toolSlug, args)) return null;
     for (const constraint of listDispatchConstraints()) {
       const content = constraint.content.toLowerCase();
       if (!content.includes('email') && !content.includes('mail')) continue;
