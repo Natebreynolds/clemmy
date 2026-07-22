@@ -15,6 +15,7 @@ import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/mo
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from '../agents/worker-model-fallover.js';
+import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -317,6 +318,12 @@ export function registerWorkerTools(server: McpServer): void {
           workerProvider = resolveEffectiveProviderForModel(workerModel);
           if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
         }
+      }
+      // Dev-only forced 429 (CLEMMY_FAULT_INJECT_WORKER_MODEL) — SDK-lane twin
+      // of the orchestrator hook: only the failure is fake; bench, auto-switch,
+      // and the healthy re-batch run for real. Inert in production.
+      if (faultInjectWorkerModel() === workerModel) {
+        return textResult(injectedWorkerRateLimitText(input.item, workerModel));
       }
       const release = await acquireWorkerSlot(sessionId, (info) => {
         try {

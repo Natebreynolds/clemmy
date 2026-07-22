@@ -18,6 +18,24 @@ export function faultInjectTargetBrain(): string | null {
   return v || null;
 }
 
+/**
+ * Dev-only deterministic 429 for live-testing WORKER-MODEL fallover:
+ * `CLEMMY_FAULT_INJECT_WORKER_MODEL=<modelId>` makes any worker routed to that
+ * exact model id fail with a rate-limit-shaped result BEFORE dispatch. Once
+ * fallover benches the model and reroutes, the substitute model no longer
+ * matches and workers run for real — so everything downstream of the injected
+ * 429 (uniform detection, bench, auto-switch, healthy re-batch) is exercised
+ * live. Inert unless the env names a model.
+ */
+export function faultInjectWorkerModel(): string | null {
+  const v = (getRuntimeEnv('CLEMMY_FAULT_INJECT_WORKER_MODEL', '') || '').trim();
+  return v || null;
+}
+
+export function injectedWorkerRateLimitText(item: string, modelId: string): string {
+  return `ERROR: worker for "${item}" failed: 429 Rate limit reached for requests on ${modelId} (injected fault — CLEMMY_FAULT_INJECT_WORKER_MODEL, dev only)`;
+}
+
 export function maybeWrapWithFaultInjection(model: Model, provider: string): Model {
   const target = faultInjectTargetBrain();
   if (!target || target !== provider) return model;
