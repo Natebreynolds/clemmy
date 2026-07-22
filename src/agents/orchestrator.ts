@@ -46,6 +46,7 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from './worker-model-fallover.js';
+import { maybeFanoutAlignmentBounce, maybeBounceMassExecution } from './fanout-alignment-gate.js';
 import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -54,7 +55,7 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { DEFAULT_MAX_TURNS, harnessRunContextStorage, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
+import { DEFAULT_MAX_TURNS, harnessRunContextStorage, wrapToolForHarness, workerThrashGuardEnabled, withHarnessRunContext, ToolCallsCounter, defaultToolCallsPerTurn, type WrappableTool } from '../runtime/harness/brackets.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
@@ -302,7 +303,7 @@ export function userChoiceToolUseBehavior(
     if (result.type !== 'function_output') continue;
     const rawName = result.tool.name ?? '';
     const bare = bareTerminalToolName(rawName);
-    if (bare !== 'ask_user_question' && bare !== 'offer_background') continue;
+    if (bare !== 'ask_user_question') continue;
     const output = stringifyToolOutput(result.output);
     if (!terminalToolShouldHalt(rawName, output)) continue;
     return { isFinalOutput: true as const, isInterrupted: undefined, finalOutput: output };
@@ -695,41 +696,9 @@ export function buildAskUserQuestionTool() {
   });
 }
 
-const offerBackgroundParams = z.object({
-  objective: z.string().min(4).describe('The agreed task you are offering to run — one line, e.g. "scrape 100 net-new Salesforce accounts".'),
-});
-
-/** The canonical, consistent "run it in the background / hold / now" offer. A
- *  structured beat (not free-form prose) so the choice is always the same and
- *  routes cleanly. Mirrors ask_user_question's halt: posts the choice + pauses
- *  for the reply, which the model routes next turn. */
-export function buildOfferBackgroundTool() {
-  return tool({
-    name: 'offer_background',
-    description:
-      'Offer to run an AGREED multi-step or longer task in the BACKGROUND — call this AFTER you and the user have aligned on what to do, INSTEAD of grinding it out in the foreground and blocking the chat. It posts a 3-way choice and pauses for the reply. On their answer next turn: "Run it in the background" → call dispatch_background_task (the run is goal-bound and reports back HERE); "Hold it for later" → call hold_task_for_later; "Do it now here" → just do it in the chat. Do NOT use this for a quick task, a pure question, or a read-only lookup. After calling it, STOP this turn — do not also start the work.',
-    parameters: offerBackgroundParams,
-    execute: async (args, runContext) => {
-      const sessionId = extractSessionId(runContext);
-      const question = `Want me to run "${args.objective}" in the background and report back here when it's done, hold it for later, or just do it now here?`;
-      const options = ['Run it in the background', 'Hold it for later', 'Do it now here'];
-      if (sessionId) {
-        appendEvent({
-          sessionId,
-          turn: extractTurn(runContext),
-          role: 'Clem',
-          type: 'awaiting_user_input',
-          data: { question, options, source: 'offer_background' },
-        });
-      }
-      return (
-        `Offer posted (background / hold / now) for "${args.objective}". STOP now — on the user's pick next turn: `
-        + '"Run it in the background" → dispatch_background_task; "Hold it for later" → hold_task_for_later; '
-        + '"Do it now here" → do it in the chat. Do NOT start the work this turn.'
-      );
-    },
-  });
-}
+// offer_background was STRIPPED 2026-07-22 (subtraction): backgrounding is now
+// the desktop button + a plain prose ask; dispatch_background_task and
+// hold_task_for_later remain the capabilities. See v2.2.2 charter item 13.
 
 // ---------- orchestrator factory ----------
 
@@ -1047,6 +1016,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (!callItems || callItems.length === 0) {
         return 'ERROR: run_worker needs `item` (one identifier) or `items` (the full list for a parallel batch).';
       }
+      // First-contact mass fan-out earns ONE alignment beat (fail-open,
+      // one-shot; see fanout-alignment-gate.ts — live 2026-07-22).
+      const armedBounce = maybeBounceMassExecution(extractSessionId(runContext) ?? undefined);
+      if (armedBounce.bounce && armedBounce.steer) return armedBounce.steer;
+      const alignmentBounce = maybeFanoutAlignmentBounce({ sessionId: extractSessionId(runContext) ?? undefined, itemCount: callItems.length });
+      if (alignmentBounce.bounce && alignmentBounce.steer) return alignmentBounce.steer;
       const knownDeadSig = fanoutUniformFailure(extractSessionId(runContext) ?? '');
       if (knownDeadSig) {
         return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
@@ -1097,7 +1072,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // benches the routed model for a cooldown and invites an immediate
         // retry, which spawn-time selection will route to the next healthy
         // candidate — instead of declaring fan-out down for a transient 429.
-        if (uniform && workerFailureLooksRateLimited(uniform)) {
+        // Classify on RAW texts, never the normalized signature — normalization
+        // rewrites "429" to "<n>" and blinded this branch to real Moonshot 429s
+        // (live 2026-07-22: 30/30 workers died rate-limited, no bench, no switch).
+        if (uniform && (workerFailureLooksRateLimited(uniform) || failedItems.some((f) => workerFailureLooksRateLimited(f.text)))) {
           const benched = resolveRoleModel('worker', call.intent || undefined).modelId;
           markWorkerModelCoolingDown(benched);
           const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, MODELS.primary]);
@@ -1123,6 +1101,37 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       return runOneOrchestratorWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput, runContext, details);
     },
   }) as Tool<RuntimeContextValue>;
+
+  // Per-worker tool-call budget (2026-07-22 live: 30 nested workers SHARED the
+  // parent turn's counter — the first ~23 items drained it and the last 7 had
+  // their scrapes refused with "tool-call limit exceeded". The SDK lane already
+  // gives each worker its own generous counter (sub-agents.ts); this is the
+  // orchestrator-lane twin). The counter bounds a single runaway worker; the
+  // real limits remain per-worker maxTurns, the pool cap, and the run token
+  // budget. Parent context fields (sessionId, sourceUserSeq) carry through.
+  let workerBudgetScopeSeq = 0;
+  const invokeWorkerWithOwnBudget = async (
+    nestedTool: { invoke: (ctx: any, payload: string, det: any) => Promise<unknown> },
+    ctx: any,
+    payload: string,
+    det: any,
+    maxTurnsForItem: number,
+  ): Promise<unknown> => {
+    const parent = harnessRunContextStorage.getStore();
+    const sessionId = parent?.sessionId ?? extractSessionId(ctx) ?? '';
+    const counter = new ToolCallsCounter(Math.max(defaultToolCallsPerTurn(), maxTurnsForItem * 4));
+    return withHarnessRunContext(
+      {
+        sessionId,
+        counter,
+        ...(parent?.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
+        ...(workerThrashGuardEnabled()
+          ? { guardrailScopeId: `${sessionId}::wkr:${Date.now()}-${(workerBudgetScopeSeq = (workerBudgetScopeSeq + 1) % 1_000_000)}` }
+          : {}),
+      },
+      () => nestedTool.invoke(ctx, payload, det),
+    );
+  };
 
   const runOneOrchestratorWorker = async (
     params: WorkerToolInput,
@@ -1445,7 +1454,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             : runWorkerAsToolOptions;
           if (!runContext) throw new Error('run_worker requires an SDK run context');
           try {
-            const output = await worker.clone({ model: next.modelId }).asTool(fbOptions).invoke(runContext, JSON.stringify(input), details);
+            const output = await invokeWorkerWithOwnBudget(worker.clone({ model: next.modelId }).asTool(fbOptions), runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
             appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
             return await reduceReturn(output);
@@ -1471,7 +1480,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const nestedWorkerTool = workerForCall.asTool(nestedAsToolOptions);
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       try {
-        const output = await nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
+        const output = await invokeWorkerWithOwnBudget(nestedWorkerTool, runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
         appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), route.model ?? workerModel);
         return await reduceReturn(output);
@@ -1715,7 +1724,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     : baseInstructions;
   const structuralTools = localMemoryScope
     ? [buildAskUserQuestionTool()]
-    : [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), buildOfferBackgroundTool(), runWorkerTool];
+    : [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool];
   const assembledTools = [
     ...structuralTools,
     ...(callTool ? [callTool] : []),

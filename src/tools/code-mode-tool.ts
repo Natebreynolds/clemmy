@@ -17,6 +17,7 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/eventlog.js';
@@ -764,6 +765,10 @@ export function buildCodeModeTool() {
     }),
     execute: async ({ program }: { program: string }) => {
       const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? '';
+      // First-contact plan beat (armed at the policy classifier) — the
+      // code-mode program door (2026-07-22 acceptance run took this path).
+      const alignmentBounce = maybeBounceMassExecution(sessionId);
+      if (alignmentBounce.bounce && alignmentBounce.steer) return alignmentBounce.steer;
       const result = await runCodeModeForSession(program, sessionId);
       if (result.ok) {
         return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}${codeModeDistillReSteer(result)}`;

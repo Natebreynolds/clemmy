@@ -55,6 +55,7 @@ import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, 
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { synthesizeTurnReport } from './work-report.js';
+import { armFirstContactBeat } from '../../agents/fanout-alignment-gate.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
@@ -3566,6 +3567,31 @@ async function runConversationCore(
         nextInput = 'You already auto-resolved that approval question under YOLO standing approval — do NOT wait for the user. Proceed with your best default and keep going until the work is done, then report what you did.';
         continue;
       }
+      // Self-serve-first (v2.2.2): a pointer-shaped ask against a connected
+      // toolkit bounces ONCE with a derive-first steer (same gate as the
+      // ask_user_question tool; shared one-shot state). Fail-open: any error
+      // or a repeat ask delivers the question as before.
+      try {
+        const askText = decision.reply || decision.summary || '';
+        const { maybeSelfServeBounce } = await import('../../agents/self-serve-gate.js');
+        const { listUsableConnectedToolkits } = await import('../../integrations/composio/client.js');
+        const bounceDecision = maybeSelfServeBounce({
+          sessionId: options.sessionId,
+          question: askText,
+          connectedToolkitSlugs: (await listUsableConnectedToolkits()).map((c) => c.slug),
+        });
+        if (bounceDecision.bounce && bounceDecision.steer) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'heartbeat',
+            data: { kind: 'self_serve_bounce', toolkit: bounceDecision.toolkit, message: 'Pointer-shaped ask bounced once with a derive-first steer.' },
+          });
+          nextInput = bounceDecision.steer;
+          continue;
+        }
+      } catch { /* fail-open: deliver the ask */ }
       // DELIVER the question (review/live fix 2026-06-14). The model can ask a
       // clarifying question two ways: (a) call the ask_user_question TOOL — which
       // emits an awaiting_user_input EVENT every surface renders; or (b) just set
@@ -3872,7 +3898,7 @@ async function runConversationCore(
       if (isForegroundChat && !sessionHasBackgroundOffer(options.sessionId)) {
         backgroundOfferNudged = true;
         bgOfferNudge =
-          ' NOTE: you have already done substantial work on this in the foreground and it is taking a while. If finishing it will take more than a step or two, call `offer_background` NOW with the objective — tell the user plainly that this is a longer task and you can keep working on it in the background and post updates as it goes (it shows up in Tasks), instead of making them watch here — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
+          ' NOTE: you have already done substantial work on this in the foreground and it is taking a while. If finishing it will take more than a step or two, tell the user plainly in ONE sentence that this is a longer task you can keep working on in the background (it shows up in Tasks) and ASK if they want that — on their yes next turn call dispatch_background_task with the agreed objective — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
       }
     }
     // WATCHER: (a) inject a resolved drift steer from the check that ran in the
@@ -4810,6 +4836,24 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     },
   });
   if (contextPacket.multiItem.detected) {
+    // First-contact plan beat: a fresh chat session whose FIRST turn already
+    // classifies as mass/multi-item work gets ONE conversational beat before
+    // mass execution — armed here (the classification every path crosses),
+    // bounced at the first mass-execution tool call (run_worker / run_batch /
+    // run_tool_program), so research stays free and the plan is informed.
+    // (2026-07-22: a 30-item run went straight to completion through the
+    // code-mode door with zero conversation; the run_worker-only gate was
+    // vacuous by path choice.)
+    try {
+      const userMessageCount = listEvents(options.sessionId, { types: ['user_input_received'] })
+        .filter((e) => !(e.data as { synthetic?: boolean } | undefined)?.synthetic).length;
+      armFirstContactBeat({
+        sessionId: options.sessionId,
+        sessionKind: session.sessionRow.kind,
+        itemCount: contextPacket.multiItem.itemCount ?? 0,
+        userMessageCount,
+      });
+    } catch { /* fail-open */ }
     const policy = contextPacket.agentSystem.policy;
     safeAppend({
       sessionId: options.sessionId,
@@ -5890,6 +5934,23 @@ async function runConversationFromResumeCore(opts: {
     // above. The guard restores TS's non-null narrowing for the handlers below.
     if (!decision) break;
     if (decision.nextAction === 'awaiting_user_input') {
+      // Self-serve-first bounce (resume-path twin of the runConversation gate;
+      // shared one-shot state, fail-open). See the primary site for rationale.
+      try {
+        const askText = decision.reply || decision.summary || '';
+        const { maybeSelfServeBounce } = await import('../../agents/self-serve-gate.js');
+        const { listUsableConnectedToolkits } = await import('../../integrations/composio/client.js');
+        const bounceDecision = maybeSelfServeBounce({
+          sessionId: opts.sessionId,
+          question: askText,
+          connectedToolkitSlugs: (await listUsableConnectedToolkits()).map((c) => c.slug),
+        });
+        if (bounceDecision.bounce && bounceDecision.steer) {
+          resumeContinuationInput = bounceDecision.steer;
+          lastDecision = decision;
+          continue;
+        }
+      } catch { /* fail-open: deliver the ask */ }
       // Loop reconciliation (resume variant): same YOLO "never stuck" guard as
       // runConversation. If this turn's ask auto-resolved under YOLO standing
       // approval (autonomy_note, no halting event), fall through to run the next
