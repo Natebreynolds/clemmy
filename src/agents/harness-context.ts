@@ -31,6 +31,7 @@ import { getRuntimeEnv } from '../config.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
+import { renderRunStrategiesForContext } from '../memory/run-strategy-store.js';
 import { renderEstablishedDestinationsForContext } from '../runtime/harness/published-destinations.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
@@ -223,6 +224,13 @@ export function renderLearnedBlocks(objective?: string): { recentlyLearned: stri
   } catch {
     toolChoices = '';
   }
+  // Learning loop (DREAM): proven run SHAPES ride the same block as proven
+  // tool picks — a strategy is the level above a tool choice. Additive: no
+  // matching strategy → '' → identical context to before this existed.
+  try {
+    const strategies = section('Proven Run Strategies', renderRunStrategiesForContext(objective));
+    if (strategies) toolChoices = [toolChoices, strategies].filter(Boolean).join('\n\n');
+  } catch { /* strategy recall is best-effort */ }
   // Established deploy targets for the project under active focus — the AGENT
   // side of the destination gate↔recall unification (2026-06-21): surface WHERE
   // this project deploys so the agent updates the same site explicitly instead
