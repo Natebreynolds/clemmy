@@ -180,13 +180,21 @@ test('withJudgeHedge: fast primary wins, hedge never fires (zero extra cost on t
 
 test('withJudgeHedge: slow primary → hedge fires at the delay and its verdict wins', async () => {
   const { withJudgeHedge } = await import('./judge-family.js');
-  const slow = () => new Promise<string>((resolve) => { setTimeout(() => resolve('late'), 500); });
-  const t0 = Date.now();
-  const r = await withJudgeHedge(slow, async () => 'hedge-verdict', { hedgeDelayMs: 20, timeoutMs: 1000 });
+  // Deterministic: the primary NEVER resolves until released, so "did not wait
+  // out the slow primary" is provable by state, not by racing a wall-clock
+  // margin (the old <400ms assertion lost to a slow CI runner and failed a
+  // release gate, 2026-07-22).
+  let releasePrimary!: () => void;
+  let primaryResolved = false;
+  const slow = () => new Promise<string>((resolve) => {
+    releasePrimary = () => { primaryResolved = true; resolve('late'); };
+  });
+  const r = await withJudgeHedge(slow, async () => 'hedge-verdict', { hedgeDelayMs: 20, timeoutMs: 5000 });
   assert.equal(r.value, 'hedge-verdict');
   assert.equal(r.winner, 'hedge');
   assert.equal(r.hedgeFired, true);
-  assert.ok(Date.now() - t0 < 400, 'did not wait out the slow primary');
+  assert.equal(primaryResolved, false, 'hedge won while the primary was still pending');
+  releasePrimary();
 });
 
 test('withJudgeHedge: primary dies before the delay → hedge starts immediately (no dead air)', async () => {
