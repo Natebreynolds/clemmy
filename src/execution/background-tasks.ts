@@ -39,7 +39,7 @@ import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { resetFanoutWindow, sweepFanoutReduce } from '../runtime/harness/fanout-reduce.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered, type BlockerType } from '../runtime/harness/verify-delivered.js';
-import { verifyFanoutItems, fanoutItemVerifyEnabled } from '../runtime/harness/fanout-item-verify.js';
+import { verifyFanoutItems, fanoutItemVerifyEnabled, verifyInlineRecovery } from '../runtime/harness/fanout-item-verify.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -52,6 +52,8 @@ import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
+import { recordRunStrategy } from '../memory/run-strategy-store.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -1604,6 +1606,28 @@ function prepareWorkerSettlementForCas(id: string): boolean {
   return true;
 }
 
+/** Tools that are plumbing, not strategy — a run's SHAPE is its real work. */
+const STRATEGY_META_TOOLS = new Set([
+  'tool_choice_recall', 'recall_tool_result', 'tool_output_query', 'composio_search_tools',
+  'composio_list_tools', 'local_cli_list', 'execution_list', 'execution_create',
+  'execution_update_step', 'execution_complete', 'pending_action_queue', 'request_approval',
+]);
+
+function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
+  const db = openEventLog();
+  const toolRows = db.prepare(
+    'SELECT tool, COUNT(*) AS n FROM tool_outputs WHERE session_id = ? GROUP BY tool ORDER BY n DESC LIMIT 24',
+  ).all(updated.runSessionId) as Array<{ tool: string | null; n: number }>;
+  const toolsUsed = toolRows.map((r) => r.tool ?? '').filter((t) => t && !STRATEGY_META_TOOLS.has(t));
+  const workerCount = (db.prepare(
+    "SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND type = 'worker_result'",
+  ).get(updated.runSessionId) as { n: number } | undefined)?.n ?? 0;
+  const durationMs = updated.startedAt && updated.completedAt
+    ? Math.max(0, Date.parse(updated.completedAt) - Date.parse(updated.startedAt))
+    : 0;
+  recordRunStrategy({ objective: updated.title || updated.prompt, toolsUsed, workerCount, durationMs });
+}
+
 export function markBackgroundTaskDone(
   id: string,
   result: string,
@@ -1646,31 +1670,14 @@ export function markBackgroundTaskDone(
     emitBackgroundTaskOperational('background_task_finished', updated, { status: 'done' });
     // Learning loop (DREAM): distill this run's SHAPE — real tools used,
     // fan-out width, wall time — into the strategy store so the next similar
-    // objective plans from a proven approach. Deterministic trace summary,
-    // fire-and-forget; a failure here never touches the done path.
-    void (async () => {
-      try {
-        const { openEventLog } = await import('../runtime/harness/eventlog.js');
-        const { recordRunStrategy } = await import('../memory/run-strategy-store.js');
-        const db = openEventLog();
-        const META_TOOLS = new Set([
-          'tool_choice_recall', 'recall_tool_result', 'tool_output_query', 'composio_search_tools',
-          'composio_list_tools', 'local_cli_list', 'execution_list', 'execution_create',
-          'execution_update_step', 'execution_complete', 'pending_action_queue', 'request_approval',
-        ]);
-        const toolRows = db.prepare(
-          'SELECT tool, COUNT(*) AS n FROM tool_outputs WHERE session_id = ? GROUP BY tool ORDER BY n DESC LIMIT 24',
-        ).all(updated.runSessionId) as Array<{ tool: string | null; n: number }>;
-        const toolsUsed = toolRows.map((r) => r.tool ?? '').filter((t) => t && !META_TOOLS.has(t));
-        const workerCount = (db.prepare(
-          "SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND type = 'worker_result'",
-        ).get(updated.runSessionId) as { n: number } | undefined)?.n ?? 0;
-        const durationMs = updated.startedAt && updated.completedAt
-          ? Math.max(0, Date.parse(updated.completedAt) - Date.parse(updated.startedAt))
-          : 0;
-        recordRunStrategy({ objective: updated.title || updated.prompt, toolsUsed, workerCount, durationMs });
-      } catch { /* strategy capture is best-effort */ }
-    })();
+    // objective plans from a proven approach. Deterministic trace summary.
+    // SYNCHRONOUS on purpose: an async wrapper here left pending microtasks
+    // that kept short-lived processes alive after their main script ended
+    // (2026-07-22: every child-spawning test family hung on it). All the work
+    // is sync (sqlite + fs), so there is nothing to await.
+    try {
+      captureRunStrategyFromTrace(updated);
+    } catch { /* strategy capture is best-effort */ }
   }
   return updated;
 }
@@ -2028,7 +2035,23 @@ async function verifyBackgroundTaskDelivery(
     }
   }
 
-  const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+  let coverageBlock = fanoutCoverageBlock(task.runSessionId);
+  // Inline-recovery promotion (v2.2.1): the brain may have closed failed items
+  // INLINE after their workers died — the ledger cannot see that (live
+  // 2026-07-22: a complete 3-firm deliverable stamped blocked on its 2
+  // pre-recovery worker failures). Judge each failed item against the final
+  // deliverable; ALL confirmed → durable ok:true promotions flip coverage and
+  // the run proceeds to the probes/judge below (belt and braces — promotion
+  // alone never grants done). Fail-closed: any doubt and the block stands.
+  if (coverageBlock) {
+    try {
+      const cov = summarizeFanoutCoverage(task.runSessionId);
+      const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId)) || task.prompt || task.title;
+      if (await verifyInlineRecovery(task.runSessionId, objective, cov.failedItems, finalText)) {
+        coverageBlock = null;
+      }
+    } catch { /* fail-closed: the block stands */ }
+  }
   // Fan-out coverage is AUTHORITATIVE: if any worker failed (a raw ERROR: from
   // Stage 1, or a Stage-2-confirmed hollow output just recorded above), the run is
   // a partial and MUST NOT report a hollow "done" — per the run_worker contract
