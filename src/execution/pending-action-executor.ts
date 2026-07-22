@@ -36,6 +36,20 @@ export type ApprovedCallDispatch = (
 const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, certifiedBatch) =>
   dispatchBatchItemTool(toolName, payload, sessionId, new ToolCallsCounter(50), certifiedBatch);
 
+/** Pure: does a dispatch RETURN read as a pre-provider refusal? Effect-anchored
+ *  markers only — the harness's own gate/guard refusal shapes, all of which
+ *  mean "the provider was never called": the [provider-dispatch:not-started:*]
+ *  envelope, the standing-constraint block banner, and harness refusal
+ *  prefixes (EXECUTION_WRAP_REQUIRED / DUPLICATE_EXTERNAL_WRITE / "Tool call
+ *  refused by harness"). Genuine provider results never carry these. */
+export function dispatchOutputIndicatesRefusal(text: string): boolean {
+  const head = (text ?? '').slice(0, 600);
+  return /\[provider-dispatch:not-started:/i.test(head)
+    || /SEND BLOCKED — standing sender constraint/i.test(head)
+    || /Tool call refused by harness/i.test(head)
+    || /^\s*ERROR: dispatch blocked/i.test(head);
+}
+
 export async function executeApprovedPendingActionCall(
   id: string,
   opts: { sessionId?: string; dispatch?: ApprovedCallDispatch } = {},
@@ -65,7 +79,19 @@ export async function executeApprovedPendingActionCall(
       batchId: record.id,
       payloadHash: record.payloadHash,
     });
-    const preview = (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400);
+    const outText = typeof out === 'string' ? out : JSON.stringify(out ?? '');
+    // A gate/guard refusal comes back as a RETURNED STRING, not a throw — the
+    // provider was never called. Recording that as 'executed' is a false
+    // success (live 2026-07-22: a constraint-blocked Slack send was stamped
+    // executed with the block buried in resultSummary, and the brain told the
+    // user it posted). Classify refusal-shaped returns as FAILED so the
+    // record, the card, and the brain all see the truth.
+    if (dispatchOutputIndicatesRefusal(outText)) {
+      const reason = outText.slice(0, 400);
+      const updated = recordPendingActionResult(record.id, 'failed', `Dispatch refused before the provider was called: ${reason}`.slice(0, 4000));
+      return { ok: false, status: 'failed', resultSummary: `Dispatch of ${record.toolName} was refused: ${reason}`, record: updated ?? getPendingAction(id) };
+    }
+    const preview = outText.slice(0, 400);
     const updated = recordPendingActionResult(record.id, 'executed', `Executed the approved ${record.toolName} call. ${preview}`.slice(0, 4000));
     return { ok: true, status: 'executed', resultSummary: `Executed ${record.toolName} for pending action ${record.id}.`, record: updated ?? getPendingAction(id) };
   } catch (err) {
