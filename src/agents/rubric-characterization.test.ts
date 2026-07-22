@@ -65,11 +65,14 @@ const GOLDEN = {
   // three fan-out clauses — the old wording contradicted the new deterministic
   // pool; EXECUTION WRAP's hardcoded slug-verb list replaced with "the harness
   // classifies mutating slugs" (the classifier is code, the list was drift-prone).
-  instructions: { len: 35459, sha16: '1114f8bf919b39d6' },
-  native: { len: 34562, sha16: '6dfbc0eabc7e4379' },
-  claudeBrain: { len: 5648, sha16: '3970f8cb7bbe12a1' },
+  // 2026-07-22 (late): offer_background ceremony STRIPPED (subtraction) — the
+  // structured offer tool is gone; the rubric teaches the same choice as ONE
+  // plain prose sentence routed to dispatch_background_task / hold_task_for_later.
+  instructions: { len: 35096, sha16: 'fa00926fa888ce11' },
+  native: { len: 34199, sha16: '597ee33073d5dce5' },
+  claudeBrain: { len: 5614, sha16: '9ffb25ab1369e5b2' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8954, sha16: 'c863620a7b578733' },
+  lean: { len: 8920, sha16: 'bbe1323683bfc95e' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

@@ -908,7 +908,7 @@ test('post-clarification long Composio receipt cannot inject a second background
   assert.match(output, /run-clarified-1/);
 
   const normal = formatComposioBudgetExceededOutput(receipt, '{}');
-  assert.match(normal, /offer_background \/ dispatch_background_task/);
+  assert.match(normal, /ask the user, then dispatch_background_task/);
 });
 
 // ─── Discovery-tax: composio_search_tools consults tool-choice memory FIRST ────

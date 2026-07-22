@@ -669,7 +669,7 @@ export function effectiveTurnObjective(
 export const BACKGROUND_OFFER_TEXT =
   '[background offer] This is turning into a long run while the user waits in the foreground. '
   + 'If finishing needs more than a step or two, offer the user a background handoff NOW: '
-  + 'if the `offer_background` tool is available to you, call it with a one-line summary of the remaining work; '
+  + 'ask the user in ONE plain sentence whether to move the remaining work to the background (then call dispatch_background_task on their yes); '
   + 'otherwise END your reply by asking whether to (a) run the rest in the background, (b) hold it for later, or (c) keep going here. '
   + 'Then STOP and wait — do not keep grinding in the foreground. '
   + 'If you are genuinely a step or two from done, just finish; do not offer.';

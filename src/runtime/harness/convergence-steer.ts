@@ -25,6 +25,9 @@ export function convergenceSteerEnabled(): boolean {
  * share the `awaiting_user_input` transport event.
  */
 const NON_CLARIFICATION_SOURCES = new Set([
+  // LEGACY SOURCE TAG: the offer_background TOOL was stripped 2026-07-22, but
+  // historical awaiting events carry this source and a background-routing
+  // choice must never be misread as a clarification answer.
   'offer_background',
   'stall_recovery',
   'infra_error_recovery',
@@ -45,7 +48,7 @@ export function sessionHasBackgroundOffer(sessionId?: string): boolean {
   if (!sessionId) return false;
   try {
     return listEvents(sessionId, { types: ['awaiting_user_input'] })
-      .some((event) => event.data.source === 'offer_background');
+      .some((event) => event.data.source === 'offer_background') /* legacy events only — tool stripped 2026-07-22 */;
   } catch {
     return false;
   }

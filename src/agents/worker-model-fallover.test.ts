@@ -46,3 +46,13 @@ test('cooldown honors retry-after with cushion, caps at 30min, never shortens', 
   markWorkerModelCoolingDown('m', 1); // ~5s effective — smaller than the existing 30min
   assert.equal(isWorkerModelCoolingDown('m'), true, 'bench survives the shorter racer');
 });
+
+test('REAL Moonshot 429 text classifies rate-limited RAW, even though normalization eats the code', async () => {
+  const { workerFailureSignature } = await import('./worker-job-packet.js');
+  const real = 'An error occurred while running the tool. Please try again. Error: Error: 429 Your account org-47cdcfa64dec44539bf5fc1343e676a0 has exceeded its request limit.';
+  // The live blinding: the normalized signature loses the literal 429…
+  const normalized = workerFailureSignature(real);
+  assert.doesNotMatch(normalized, /429/, 'normalization rewrites the status code');
+  // …so the branch must classify on the RAW text, which stays detectable.
+  assert.equal(workerFailureLooksRateLimited(real), true);
+});

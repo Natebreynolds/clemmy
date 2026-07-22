@@ -277,7 +277,15 @@ function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: 
       const { listEvents } = await import('./harness/eventlog.js');
       const recentEvents = listEvents(sessionId, { limit: 20, desc: true });
       const ageMs = proactiveReportLastEventAgeMs(recentEvents, ctx);
-      if (!shouldProactivelyReport(hs.sessionRow.kind, ageMs)) {
+      // A needs_input outcome is a BLOCKING QUESTION, not a report — the
+      // idle gate exists so finished-work reports don't interrupt, but a
+      // question IS the conversation now. Deferring it strands the user
+      // staring at "waiting for your input" with no question in the chat
+      // (live 2026-07-22: a user chatted "how is it going" while his own
+      // parked question sat in the defer queue). Chat origins fire the
+      // question immediately, busy or not.
+      const blockingQuestion = outcome.status === 'needs_input' && hs.sessionRow.kind === 'chat';
+      if (!blockingQuestion && !shouldProactivelyReport(hs.sessionRow.kind, ageMs)) {
         // A non-chat origin never speaks — skip for good. A BUSY chat must
         // not be skipped: quick runs routinely finish inside the 60s window
         // after their own dispatch, which made every desktop report-back

@@ -69,13 +69,26 @@ export function synthesizeTurnReport(sessionId: string, afterSeq?: number): stri
   const writeReport = synthesizeWorkReport(events.filter((e) => e.type === 'external_write' && inScope(e)));
   if (writeReport) return writeReport;
 
-  const meaningfulToolCalls = events.filter((e) => {
-    if (e.type !== 'tool_called' || !inScope(e)) return false;
+  const toolCounts = new Map<string, number>();
+  for (const e of events) {
+    if (e.type !== 'tool_called' || !inScope(e)) continue;
     const name = (e.data as { tool?: unknown }).tool;
-    return typeof name === 'string' && name.length > 0 && !isToolSurfaceProbeTool(name);
-  }).length;
-  if (meaningfulToolCalls === 0) return null;
+    if (typeof name !== 'string' || name.length === 0 || isToolSurfaceProbeTool(name)) continue;
+    toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1);
+  }
+  if (toolCounts.size === 0) return null;
 
-  return `I worked on that — I ran ${meaningfulToolCalls} tool${meaningfulToolCalls === 1 ? '' : 's'} but didn't compose a written summary. `
-    + 'Ask me to summarize what I found, or resend and I\'ll retry.';
+  // An ACTIVITY DIGEST, never a confession. The old text here ("I ran 8 tools
+  // but didn't compose a written summary. Ask me to summarize… or resend")
+  // put the retry burden on the USER — surfaced raw in a live session
+  // (2026-07-22) after the user had already nudged the run repeatedly. The
+  // user should get information first; a re-ask is never the remedy we offer.
+  const digest = [...toolCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([name, n]) => `${name.replace(/_/g, ' ')}${n > 1 ? ` ×${n}` : ''}`)
+    .join(', ');
+  const total = [...toolCounts.values()].reduce((a, b) => a + b, 0);
+  return `I finished the work but didn't write it up. Activity this turn (${total} call${total === 1 ? '' : 's'}): ${digest}. `
+    + "The results are saved — say “summarize” and I'll write up what I found.";
 }

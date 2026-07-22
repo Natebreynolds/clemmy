@@ -17,7 +17,6 @@ const TOOL_SURFACE_PROBE_TOOLS = new Set([
 const CONTROL_ONLY_TOOLS = new Set([
   'ask_user_question',
   'request_approval',
-  'offer_background',
   'dispatch_background_task',
   'hold_task_for_later',
   'resume_held_task',

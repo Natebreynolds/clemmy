@@ -16,6 +16,7 @@ import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from '../agents/worker-model-fallover.js';
 import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
+import { maybeFanoutAlignmentBounce, maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -125,6 +126,12 @@ export function registerWorkerTools(server: McpServer): void {
       if (!callItems || callItems.length === 0) {
         return textResult('ERROR: run_worker needs `item` (one identifier) or `items` (the full list for a parallel batch).');
       }
+      // First-contact mass fan-out earns ONE alignment beat (SDK-lane twin;
+      // fail-open, one-shot — see fanout-alignment-gate.ts).
+      const armedBounce = maybeBounceMassExecution(getToolOutputContext()?.sessionId);
+      if (armedBounce.bounce && armedBounce.steer) return textResult(armedBounce.steer);
+      const alignmentBounce = maybeFanoutAlignmentBounce({ sessionId: getToolOutputContext()?.sessionId, itemCount: callItems.length });
+      if (alignmentBounce.bounce && alignmentBounce.steer) return textResult(alignmentBounce.steer);
       const { items: _batch, ...packetBase } = call;
       if (callItems.length > 1) {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
@@ -166,7 +173,9 @@ export function registerWorkerTools(server: McpServer): void {
         // Fleet resilience twin of the unknown-model heal: a uniform rate limit
         // benches the routed model and invites an immediate retry on the next
         // healthy candidate (spawn-time selection above does the switch).
-        if (uniform && workerFailureLooksRateLimited(uniform)) {
+        // RAW texts, not the normalized signature (429 → <n> blinding; see
+        // orchestrator twin, live 2026-07-22).
+        if (uniform && (workerFailureLooksRateLimited(uniform) || failed.some((f) => workerFailureLooksRateLimited(f.text)))) {
           const benchedRoute = resolveSdkBrainWorker(call.intent || undefined);
           markWorkerModelCoolingDown(benchedRoute.modelId);
           const next = pickWorkerModelWithFallover([
