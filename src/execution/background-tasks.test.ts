@@ -2154,3 +2154,23 @@ test('selfResumeDecision (Stage 4): budgetExhausted parks unconditionally — be
   // Absent/false ⇒ unchanged Wave-3 behavior.
   assert.deepEqual(selfResumeDecision({ ...base, budgetExhausted: false }), { needJudge: true, reason: 'progress check required' });
 });
+
+test('transient brain outages classify for requeue; work defects do not', async () => {
+  const { isTransientBrainError, transientRetryDelayMs, TRANSIENT_BRAIN_RETRY_CAP } = await import('./background-tasks.js');
+  // The live 2026-07-22 shape: a bare Error carrying only the provider text.
+  assert.equal(isTransientBrainError(new Error('429 Rate limit reached for requests')), true);
+  assert.equal(isTransientBrainError(new Error('Provider overloaded, try again later')), true);
+  assert.equal(isTransientBrainError(new Error('usage_limit_reached')), true);
+  assert.equal(isTransientBrainError(Object.assign(new Error('x'), { status: 529 })), true);
+  // Defects in the work must terminal-fail, never requeue-loop.
+  assert.equal(isTransientBrainError(new Error('TypeError: cannot read properties of undefined')), false);
+  assert.equal(isTransientBrainError(new Error('Background task lost approval dispatch authority')), false);
+  assert.equal(isTransientBrainError(new Error('fetch failed')), false, 'generic transport stays terminal at drain level');
+  // Backoff: bounded schedule, retry-after honored with a cushion, capped at 30min.
+  assert.equal(transientRetryDelayMs(new Error('429'), 1), 2 * 60_000);
+  assert.equal(transientRetryDelayMs(new Error('429'), 3), 10 * 60_000);
+  assert.equal(transientRetryDelayMs(new Error('429'), 99), 10 * 60_000);
+  const withRetryAfter = Object.assign(new Error('429'), { status: 429, responseHeaders: { 'retry-after': '60' } });
+  assert.equal(transientRetryDelayMs(withRetryAfter, 1), 65_000);
+  assert.equal(TRANSIENT_BRAIN_RETRY_CAP, 3);
+});

@@ -156,7 +156,11 @@ export function registerAutonomyActionTools(server: McpServer): void {
         return textResult(`Question rejected: ${quality.reason}`);
       }
       try {
-        const record = createCheckIn({ agentSlug, question, urgency, contextExecutionId, contextSummary });
+        // A question asked from inside a background run belongs to that task —
+        // stamp the correlation so answering the check-in resumes it.
+        const runSessionId = getToolOutputContext()?.sessionId ?? '';
+        const linkedTaskId = runSessionId.startsWith('background:') ? runSessionId.slice('background:'.length) : undefined;
+        const record = createCheckIn({ agentSlug, question, urgency, contextExecutionId, contextSummary, linkedTaskId });
         return textResult(`Check-in created: ${record.id}. The user has been notified; you'll see their answer in your next cycle's inbox.`);
       } catch (err) {
         return textResult(`ask_user_question failed: ${err instanceof Error ? err.message : String(err)}`);
