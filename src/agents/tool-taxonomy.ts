@@ -277,9 +277,6 @@ const ALWAYS_READ = new Set<string>([
   // The QUESTION itself isn't the approval gate; the AGENT's response
   // to the user's answer might be, and that's a separate tool call.
   'ask_user_question',
-  // offer_background just posts the run-in-bg/hold/now choice and pauses — a
-  // question, no side effect; never needs approval.
-  'offer_background',
   // draft_plan / share_plan / propose_check_in_template / surface_plan — planning
   // surfaces, agent-internal. Not network mutations.
   'draft_plan',

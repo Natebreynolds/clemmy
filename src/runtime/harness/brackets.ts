@@ -2312,14 +2312,31 @@ export function wrapToolForHarness<T extends WrappableTool>(
         ) {
           bgOfferNudge =
             '[background offer] You have already made several tool calls on this in the foreground while the user waits. '
-            + 'If finishing will take more than a step or two, call `offer_background` now with the objective so they can move it to the background (or hold it for later) — then STOP. '
+            + 'If finishing will take more than a step or two, ASK the user in one plain sentence whether to move it to the background (dispatch_background_task on their yes) or hold it for later — then STOP. '
             + 'If you are nearly done (a step or two left), just finish; do not offer.';
         }
       } catch { /* advisory only — never block the tool */ }
     }
+    // WORKER FINISH WINDOW (2026-07-22): a worker one call from its ceiling
+    // gets a wrap-up notice ON this result instead of a guillotine on the
+    // next — productive partial work lands as an honest partial answer
+    // rather than evaporating into a bare cap error ("I would hate to waste
+    // anything if a worker was actually being productive"). Worker scopes
+    // only (`::wkr:` / `::sdkx:`); the interactive lane has its own economy.
+    let workerFinishNudge: string | undefined;
+    if (
+      ctx.guardrailScopeId
+      && /::(wkr|sdkx):/.test(ctx.guardrailScopeId)
+      && ctx.counter.calls >= ctx.counter.limit - 1
+    ) {
+      workerFinishNudge =
+        '[finish window] That was your LAST free tool call for this item — further calls will be refused. '
+        + 'Return your best result NOW as your final answer. A partial result with honest gaps beats nothing: '
+        + 'include everything you gathered, and mark anything missing with an "ERROR: <what is missing>" line.';
+    }
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
-    const nudges = [fanoutNudge, cacheNudge, bgOfferNudge].filter(Boolean);
+    const nudges = [fanoutNudge, cacheNudge, bgOfferNudge, workerFinishNudge].filter(Boolean);
     return nudges.length > 0 ? nudges.join('\n\n') : undefined;
   };
 

@@ -1004,7 +1004,7 @@ export function formatComposioBudgetExceededOutput(
   context?: unknown,
 ): string {
   if (!backgroundOfferSuppressedForContext(context)) {
-    return `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
+    return `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (ask the user, then dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
   }
   return `${asyncReceiptBanner(receipt)}\n\nThis is the existing LONG-running job from the direction the user just clarified. Continue from this receipt and its job id; do not add another background-choice gate, do not restart or re-invoke the job, and do not fire back-to-back polls.\n\n${output}`;
 }

@@ -2262,7 +2262,7 @@ test('spine: the FIRST auto-continue of a long chat run carries the background o
   assert.equal(calls, 3);
   assert.match(res.text, /All batches done/);
   assert.match(prompts[1], /\[background offer\]/, 'first auto-continue carries the offer');
-  assert.match(prompts[1], /offer_background/, 'steers to the terminal tool');
+  assert.match(prompts[1], /dispatch_background_task on their yes/, 'steers to the prose ask routed to dispatch (ceremony stripped 2026-07-22)');
   assert.doesNotMatch(prompts[2], /\[background offer\]/, 'one-shot — never repeated');
   const nudgeEvent = listEvents('brain-bg-offer').find(
     (e) => (e as { type?: string }).type === 'heartbeat'

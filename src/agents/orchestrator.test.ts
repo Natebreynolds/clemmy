@@ -35,7 +35,6 @@ const {
   OrchestratorDecisionSchema,
   buildRequestApprovalTool,
   buildAskUserQuestionTool,
-  buildOfferBackgroundTool,
   recentPriorUserInputsForScope,
   ORCHESTRATOR_INSTRUCTIONS,
   orchestratorInternalsForTest,
@@ -184,7 +183,8 @@ test('Orchestrator: user-choice tools terminate only when they really pause', as
     { type: 'function_output', tool: { name }, output },
   ]);
   assert.equal(result('ask_user_question', 'Question posted: Which environment? Awaiting user reply.').isFinalOutput, true);
-  assert.equal(result('offer_background', 'Offer posted. STOP now.').isFinalOutput, true);
+  // offer_background stripped 2026-07-22 — a stray tool with that name no longer halts.
+  assert.equal(result('offer_background', 'Offer posted. STOP now.').isFinalOutput, false);
   assert.equal(
     result('ask_user_question', formatAutoResolvedAskUserQuestionOutput('Proceed now.')).isFinalOutput,
     false,
@@ -898,7 +898,7 @@ test('request_approval mints policy provenance only on a true YOLO auto-approval
 // than a raw execute. Tests drive the tool via invoke with a JSON
 // args string, matching what the Runner does during a real run.
 async function invokeFunctionTool(
-  t: ReturnType<typeof buildRequestApprovalTool> | ReturnType<typeof buildAskUserQuestionTool> | ReturnType<typeof buildOfferBackgroundTool>,
+  t: ReturnType<typeof buildRequestApprovalTool> | ReturnType<typeof buildAskUserQuestionTool>,
   args: Record<string, unknown>,
   ctx: { sessionId?: string; turn?: number },
 ): Promise<string> {
@@ -910,27 +910,8 @@ async function invokeFunctionTool(
   return typeof result === 'string' ? result : JSON.stringify(result);
 }
 
-test('offer_background posts the 3-way choice as awaiting_user_input and tells the model to STOP', async () => {
-  resetEventLog();
-  const sess = createSession({ kind: 'chat' });
-  const t = buildOfferBackgroundTool();
-  const result = await invokeFunctionTool(
-    t,
-    { objective: 'scrape 100 net-new Salesforce accounts' },
-    { sessionId: sess.id, turn: 2 },
-  );
-  // Guidance routes the three picks + says STOP.
-  assert.match(result, /dispatch_background_task/);
-  assert.match(result, /hold_task_for_later/);
-  assert.match(result, /STOP/);
-  // Emits one awaiting_user_input with the canonical 3 options + source marker.
-  const asks = listEvents(sess.id, { types: ['awaiting_user_input'] });
-  assert.equal(asks.length, 1);
-  const data = asks[0].data as { question?: string; options?: string[]; source?: string };
-  assert.equal(data.source, 'offer_background');
-  assert.deepEqual(data.options, ['Run it in the background', 'Hold it for later', 'Do it now here']);
-  assert.match(data.question ?? '', /scrape 100 net-new Salesforce accounts/);
-});
+// offer_background ceremony stripped 2026-07-22 — backgrounding is the desktop
+// button + a plain prose ask routed to dispatch_background_task (charter item 13).
 
 test('request_approval execute returns an "approved" acknowledgement after resume', async () => {
   // execute() only runs after the user approves — at that point the

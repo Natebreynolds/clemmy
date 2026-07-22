@@ -113,7 +113,6 @@ const BACKGROUND_INTENT_TOOLS: ReadonlySet<string> = new Set([
   'dispatch_background_task',
   'background_task_status',
   'background_tasks_recent',
-  'offer_background',
 ]);
 
 function looksLikeBackgroundDispatchIntent(query: string): boolean {

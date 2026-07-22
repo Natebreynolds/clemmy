@@ -1,7 +1,6 @@
 /** Tools that intentionally hand control back to the user or background runner. */
 const TERMINAL_TOOL_NAMES = new Set([
   'ask_user_question',
-  'offer_background',
   'dispatch_background_task',
 ]);
 

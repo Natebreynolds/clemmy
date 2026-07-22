@@ -1874,7 +1874,7 @@ test('Inc A2: background-offer nudge appends once after the tool-call floor in a
     const res = (await withHarnessRunContext(ctx, async () => wrapped.execute!({}))) as string;
     assert.match(res, /tool-output/, 'real tool output preserved');
     assert.match(res, /\[background offer\]/, 'crossing the 6-call floor appends the offer nudge');
-    assert.match(res, /offer_background/, 'nudge names the tool to call');
+    assert.match(res, /dispatch_background_task on their yes/, 'nudge teaches the prose ask (ceremony stripped 2026-07-22)');
     // At most once per runTurn (same ctx → flag set).
     const res2 = (await withHarnessRunContext(ctx, async () => wrapped.execute!({}))) as string;
     assert.doesNotMatch(res2, /\[background offer\]/, 'nudge fires at most once per runTurn');
