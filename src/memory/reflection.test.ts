@@ -1493,3 +1493,86 @@ test('consolidateFact: oversized resolver rewrite falls back to candidate text',
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });
+
+test('replayFailedReflections re-runs failed receipts from durable tool_outputs raw', async () => {
+  resetMemoryDb();
+  const { replayFailedReflections, setReflectionExtractorPauseForTest } = await import('./reflection.js');
+  const { writeToolOutput, createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  let extractorCalls = 0;
+  const input = {
+    sessionId: 'sess-replay-drain',
+    callId: 'call-replay-drain',
+    tool: 'composio_execute_tool',
+    output: 'durable connector output worth learning from '.repeat(40),
+  };
+  try {
+    setReflectionExtractorPauseForTest(null);
+    // Seed the durable raw exactly as the harness does at tool return.
+    try { createHarnessSession({ id: input.sessionId, kind: 'chat' }); } catch { /* may exist */ }
+    writeToolOutput({ sessionId: input.sessionId, callId: input.callId, tool: input.tool, output: input.output });
+    // First pass fails (extractor down) → failed receipt.
+    _testOnly_setReflectionExtractor(async () => { extractorCalls += 1; return null; });
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'extractor_failed');
+    assert.equal(readReflectionReplayHealth().failed, 1);
+
+    // Extractor recovers → the maintenance drain replays it to completion.
+    _testOnly_setReflectionExtractor(async () => { extractorCalls += 1; return { facts: [], entities: [], pointers: [] }; });
+    const result = await replayFailedReflections();
+    assert.equal(result.scanned, 1);
+    assert.equal(result.replayed, 1);
+    assert.equal(result.rawGone, 0);
+    assert.equal(extractorCalls, 2);
+    assert.equal(readReflectionReplayHealth().failed, 0, 'the failed receipt was recovered');
+    assert.equal(readReflectionReplayHealth().completed, 1);
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    setReflectionExtractorPauseForTest(null);
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+  }
+});
+
+test('replayFailedReflections terminalizes receipts whose raw has expired', async () => {
+  resetMemoryDb();
+  const { replayFailedReflections, setReflectionExtractorPauseForTest } = await import('./reflection.js');
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  const input = {
+    sessionId: 'sess-replay-gone',
+    callId: 'call-replay-gone',
+    tool: 'composio_execute_tool',
+    output: 'output that will not be durably stored '.repeat(40),
+  };
+  try {
+    setReflectionExtractorPauseForTest(null);
+    let calls = 0;
+    _testOnly_setReflectionExtractor(async () => { calls += 1; return null; });
+    assert.equal((await reflectOnToolReturn(input)).skipped, 'extractor_failed');
+    // No tool_outputs row was written → the drain terminalizes, never replays.
+    _testOnly_setReflectionExtractor(async () => { calls += 1; return { facts: [], entities: [], pointers: [] }; });
+    const result = await replayFailedReflections();
+    assert.equal(result.rawGone, 1);
+    assert.equal(result.replayed, 0);
+    assert.equal(calls, 1, 'no extractor call without raw input');
+    const again = await replayFailedReflections();
+    assert.equal(again.scanned, 0, 'terminalized receipt is not rescanned');
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    setReflectionExtractorPauseForTest(null);
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+  }
+});
+
+test('the extractor backoff window short-circuits both reflection and the replay drain', async () => {
+  resetMemoryDb();
+  const { replayFailedReflections, setReflectionExtractorPauseForTest, reflectionExtractorAvailable } = await import('./reflection.js');
+  try {
+    setReflectionExtractorPauseForTest(Date.now() + 60_000);
+    assert.equal(reflectionExtractorAvailable(), false);
+    const result = await replayFailedReflections();
+    assert.deepEqual(result, { scanned: 0, replayed: 0, rawGone: 0 }, 'drain no-ops during the pause');
+  } finally {
+    setReflectionExtractorPauseForTest(null);
+  }
+});

@@ -986,6 +986,13 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    // session_locks was left as a knowing vestige by the 2026-07-09 subtraction
+    // (withSessionLock removed; CREATE kept "inert"). The 2026-07-22 legacy
+    // sweep confirmed zero readers/writers remain — close the loop.
+    version: 13,
+    sql: 'DROP TABLE IF EXISTS session_locks;',
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -2723,6 +2730,22 @@ export function recentToolOutputs(
  * Returns the number of rows deleted. Operator-overridable via
  * `CLEMMY_TOOL_OUTPUT_TTL_DAYS` env (clamped to [1, 365]).
  */
+/**
+ * Age sweep for harness_chat_request_cancellations (2026-07-22 legacy audit):
+ * deliberately FK-less (a Stop can precede its session), so the session-cascade
+ * reap that bounds the rest of harness.db misses it. Tombstones older than the
+ * session-retention window can never match a live replay.
+ */
+export function reapStaleChatCancellations(maxAgeDays = 14): number {
+  try {
+    const db = openEventLog();
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    return db.prepare('DELETE FROM harness_chat_request_cancellations WHERE requested_at < ?').run(cutoff).changes;
+  } catch {
+    return 0;
+  }
+}
+
 export function reapStaleToolOutputs(maxAgeDays?: number): number {
   const env = process.env.CLEMMY_TOOL_OUTPUT_TTL_DAYS;
   const ttl = maxAgeDays ?? (env ? Math.max(1, Math.min(365, Number(env))) : 14);

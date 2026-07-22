@@ -1938,7 +1938,11 @@ test('logical-run economy enters finish phase and interrupts repeated exploratio
   assert.equal(result.selfStopped, true, 'finish-phase refusal is terminal, never auto-continued');
   assert.equal(state.allowed, 2);
   assert.equal(state.attempts, 5, 'three ignored finish steers end the run');
-  assert.match(result.text, /finish-phase steer was ignored/i);
+  // The user-visible reply is first-person and actionable — the internal
+  // finish-phase steer directive must never leak into the chat (2026-07-21).
+  assert.match(result.text, /stopped myself/i);
+  assert.match(result.text, /continue/i);
+  assert.doesNotMatch(result.text, /finish-phase steer/i);
   const trips = eventlog.listEvents('sdk-tool-economy', { types: ['guardrail_tripped'] });
   assert.equal(trips.filter((event) => String(event.data.kind).startsWith('tool_economy_')).length, 3);
 });

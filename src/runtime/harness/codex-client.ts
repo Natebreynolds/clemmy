@@ -138,6 +138,13 @@ export interface ConfigureResult {
 }
 
 function automaticBrainFallbackEnabled(): boolean {
+  // DELIBERATELY default OFF, unlike the turn-level fallover gates (which
+  // default on): this site governs BOOT-TIME silent provider substitution —
+  // switching the user's configured brain to another provider without asking.
+  // That must fail closed (pinned by codex-client.test.ts "fails closed by
+  // default"). Same env key, two semantics; a 2026-07-22 audit mistook this
+  // for drift. Follow-up: split the configure-time gate onto its own key so
+  // one flag stops carrying both meanings.
   return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
 }
 

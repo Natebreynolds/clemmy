@@ -300,6 +300,42 @@ export function isBrainAuthDead(label: string): boolean {
   return true;
 }
 
+/** Rate-limit cooldown (2026-07-21): a brain that just 429'd (quota/limit)
+ *  will 429 again for every call until the provider window resets — yet each
+ *  new call re-ran the full retry ladder before falling over (~15s tax per
+ *  worker call; observed 26× in one run on a rate-limited kimi-k3 worker
+ *  role). Unlike auth-dead (sticky, needs the user) this is a short
+ *  self-healing pause that honors the provider's retry hint when present,
+ *  so calls route straight to the fallover brain during the window. */
+const rateLimitedBrains = new Map<string, { until: number }>();
+const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 60_000;
+const RATE_LIMIT_MAX_COOLDOWN_MS = 10 * 60_000;
+
+export function markBrainRateLimited(label: string, err: unknown): void {
+  const cls = err instanceof BoundaryError
+    ? { kind: err.kind, retryAfterMs: undefined as number | undefined }
+    : classifyModelError(err);
+  if (cls.kind !== 'model.rate_limited') return;
+  const pauseMs = Math.min(cls.retryAfterMs ?? RATE_LIMIT_DEFAULT_COOLDOWN_MS, RATE_LIMIT_MAX_COOLDOWN_MS);
+  const until = Date.now() + pauseMs;
+  const existing = rateLimitedBrains.get(label);
+  if (!existing || until > existing.until) {
+    rateLimitedBrains.set(label, { until });
+    logger.warn({ brain: label, pauseMs }, 'brain rate-limited — routing around it until the window resets');
+  }
+}
+
+export function isBrainRateLimited(label: string): boolean {
+  const entry = rateLimitedBrains.get(label);
+  if (!entry) return false;
+  if (Date.now() >= entry.until) { rateLimitedBrains.delete(label); return false; }
+  return true;
+}
+
+export function clearRateLimitedBrainsForTest(): void {
+  rateLimitedBrains.clear();
+}
+
 function silentFailureReason(err: unknown): string | null {
   if (err instanceof FirstByteTimeoutError) return 'first-byte-timeout';
   const kind = normalizedModelFailureReason(err);
@@ -416,7 +452,7 @@ export class FallbackModel implements Model {
     if (compatible.length === 0) {
       throw new Error('fallback chain has no provider compatible with this request');
     }
-    const alive = compatible.filter((t) => !isBrainAuthDead(t.label) && !isBrainSilenced(t.label));
+    const alive = compatible.filter((t) => !isBrainAuthDead(t.label) && !isBrainSilenced(t.label) && !isBrainRateLimited(t.label));
     return alive.length > 0 ? alive : compatible;
   }
 
@@ -449,6 +485,7 @@ export class FallbackModel implements Model {
         cleanup(true); // release a hung request
         this.markIfAuthDead(chain, i, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
+        markBrainRateLimited(chain[i].label, err);
         if (this.isFalloverReason(err) && !isLast) {
           this.logFallover(chain, i, err);
           continue;
@@ -488,6 +525,7 @@ export class FallbackModel implements Model {
         cleanup(true); // release a hung brain
         this.markIfAuthDead(chain, i, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
+        markBrainRateLimited(chain[i].label, err);
         // Switch only if NOTHING reached the Runner yet (else we'd duplicate a
         // partially-streamed reply) and a next brain exists.
         if (!yieldedAny && this.isFalloverReason(err) && !isLast) {

@@ -327,6 +327,22 @@ export function recordModelRouteOutcome(
   }
 }
 
+/**
+ * Retention sweep (2026-07-22 legacy audit): decisions/outcomes grew unbounded
+ * — one row per routing call, never deleted. Rows older than the policy
+ * window are dead weight once the nightly policy rebuild has consumed them.
+ * Outcomes cascade off decisions.
+ */
+export function reapStaleModelRouteMetrics(maxAgeDays = 30): number {
+  try {
+    const db = openModelRouteMetricsDb();
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    return db.prepare('DELETE FROM model_route_decisions WHERE created_at < ?').run(cutoff).changes;
+  } catch {
+    return 0; // retention is best-effort hygiene
+  }
+}
+
 export function withModelRouteMetrics(model: Model, context: ModelRouteMetricsContext): Model {
   return new ModelRouteMetricsModel(model, context);
 }

@@ -67,19 +67,44 @@ export function interactiveToolEconomyPolicy(input: {
   message: string;
   priorMessages?: readonly string[];
   multiItem?: boolean;
+  /** The session's harness budget. On the `long`/`unlimited` presets the
+   *  user explicitly bought a higher per-turn tool budget; the economy's
+   *  text-shape limits must never hard-stop BELOW that ceiling (a guardrail
+   *  informs, it does not override an explicit setting). `standard` keeps
+   *  the tight text-shape limits unchanged. */
+  budget?: { preset: 'standard' | 'long' | 'unlimited'; toolCallsPerTurn: number };
 }): ToolEconomyPolicy {
   const text = [input.message, ...(input.priorMessages ?? []).slice(0, 4)].join('\n');
-  if (input.multiItem || MULTI_ITEM_RE.test(text)) {
-    // A multi-item chat should normally fan out or dispatch one approved batch.
-    // Keep extra headroom for resolving that structure, without restoring the
-    // old 300-call foreground runway.
-    return { kind: 'multi_item', softLimit: 16, hardLimit: 28 };
+  const classified = ((): ToolEconomyPolicy => {
+    if (input.multiItem || MULTI_ITEM_RE.test(text)) {
+      // A multi-item chat should normally fan out or dispatch one approved batch.
+      // Keep extra headroom for resolving that structure, without restoring the
+      // old 300-call foreground runway.
+      return { kind: 'multi_item', softLimit: 16, hardLimit: 28 };
+    }
+    if (DEEP_RE.test(text)) return { kind: 'deep', softLimit: 14, hardLimit: 24 };
+    if (SINGLE_DELIVERABLE_RE.test(text) && EXECUTION_RE.test(text)) {
+      return { kind: 'single_deliverable', softLimit: 10, hardLimit: 15 };
+    }
+    return { kind: 'interactive', softLimit: 12, hardLimit: 20 };
+  })();
+  const budget = input.budget;
+  if (
+    budget
+    && (budget.preset === 'long' || budget.preset === 'unlimited')
+    && Number.isFinite(budget.toolCallsPerTurn)
+    && budget.toolCallsPerTurn > classified.hardLimit
+  ) {
+    // Lift, never lower: the finish-phase steer still starts early enough to
+    // matter (60% of the ceiling), but the hard stop aligns with the per-turn
+    // budget the user chose instead of firing at a quarter of it.
+    return {
+      kind: classified.kind,
+      softLimit: Math.max(classified.softLimit, Math.floor(budget.toolCallsPerTurn * 0.6)),
+      hardLimit: budget.toolCallsPerTurn,
+    };
   }
-  if (DEEP_RE.test(text)) return { kind: 'deep', softLimit: 14, hardLimit: 24 };
-  if (SINGLE_DELIVERABLE_RE.test(text) && EXECUTION_RE.test(text)) {
-    return { kind: 'single_deliverable', softLimit: 10, hardLimit: 15 };
-  }
-  return { kind: 'interactive', softLimit: 12, hardLimit: 20 };
+  return classified;
 }
 
 export function createToolEconomyState(policy: ToolEconomyPolicy): ToolEconomyState {

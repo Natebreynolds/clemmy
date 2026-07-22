@@ -457,3 +457,28 @@ test('sticky auth-dead: the LAST brain failing with auth is marked too (next req
     reviveDeadBrains();
   }
 });
+
+test('rate-limit memo: a 429-marked brain is skipped on the NEXT call (no retry ladder tax)', async () => {
+  const { clearRateLimitedBrainsForTest, isBrainRateLimited } = await import('./fallback-model.js');
+  clearRateLimitedBrainsForTest();
+  try {
+    let limitedCalls = 0;
+    let healthyCalls = 0;
+    const limited = model({ getStreamedResponse: async function* () { limitedCalls++; throw rateLimited(); } });
+    const healthy = model({ getStreamedResponse: async function* () { healthyCalls++; yield { type: 'output_text_delta', delta: 'ok' } as any; } });
+    const chain = withModelFallback([target('kimi', limited), target('codex', healthy)], { falloverOn429: true });
+
+    // Call 1: kimi 429s, falls over, and gets memo'd.
+    await collect(chain.getStreamedResponse(req()));
+    assert.equal(limitedCalls, 1);
+    assert.equal(healthyCalls, 1);
+    assert.equal(isBrainRateLimited('kimi'), true, 'the 429 brain is in its cooldown window');
+
+    // Call 2: kimi is skipped entirely — straight to the healthy brain.
+    await collect(chain.getStreamedResponse(req()));
+    assert.equal(limitedCalls, 1, 'no second attempt against the known-limited brain');
+    assert.equal(healthyCalls, 2);
+  } finally {
+    clearRateLimitedBrainsForTest();
+  }
+});

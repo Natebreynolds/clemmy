@@ -113,7 +113,7 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    12,
+    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
   );
   resetEventLog();
 });
@@ -157,7 +157,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    12,
+    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
   );
   resetEventLog();
 });
@@ -261,7 +261,7 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
   ]) assert.ok(columns.has(name), name);
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    12,
+    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
   );
   resetEventLog();
 });
@@ -328,7 +328,7 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    12,
+    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
   );
   resetEventLog();
 });

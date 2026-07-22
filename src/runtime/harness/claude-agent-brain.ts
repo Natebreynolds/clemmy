@@ -1457,10 +1457,19 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     if (surface === 'background' || surface === 'cron' || !interactiveToolEconomyEnabled()) return undefined;
     let multiItem = false;
     try { multiItem = detectMultiItemIntent(turnObjective).isMultiItem; } catch { /* policy falls back to text shape */ }
+    // The economy must respect the user's chosen budget preset: on long/
+    // unlimited the hard stop lifts to the preset's per-turn tool budget
+    // (a user who set 64 calls/turn must never be hard-stopped at 16).
+    let economyBudget: { preset: 'standard' | 'long' | 'unlimited'; toolCallsPerTurn: number } | undefined;
+    try {
+      const budget = getHarnessBudgetSettings();
+      economyBudget = { preset: budget.preset, toolCallsPerTurn: budget.toolCallsPerTurn };
+    } catch { /* text-shape limits remain the fallback */ }
     return createToolEconomyState(interactiveToolEconomyPolicy({
       message: turnObjective,
       priorMessages: priorTurns.filter((turn) => turn.who === 'user').map((turn) => turn.text),
       multiItem,
+      budget: economyBudget,
     }));
   })();
   const runOptions = {

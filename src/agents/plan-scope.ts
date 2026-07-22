@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 
@@ -449,7 +449,9 @@ export function summarizeToolArgs(toolName: string, input: unknown): string {
 // ─── Standing grants (B2) ────────────────────────────────────────────────────
 
 function standingGrantsEnabled(): boolean {
-  return (process.env.CLEMMY_STANDING_GRANTS || 'on').toLowerCase() !== 'off';
+  // getRuntimeEnv (not raw process.env) so live BASE_DIR/.env overrides and the
+  // desktop dev-flags panel reach this switch like every sibling flag.
+  return (getRuntimeEnv('CLEMMY_STANDING_GRANTS', 'on') || 'on').toLowerCase() !== 'off';
 }
 
 /**
@@ -547,7 +549,7 @@ export function listActiveScopes(): PlanScope[] {
 export const SEND_TRUST_MAX_RECIPIENTS = 20;
 
 function sendTrustEnabled(): boolean {
-  return (process.env.CLEMMY_SEND_TRUST || 'on').toLowerCase() !== 'off';
+  return (getRuntimeEnv('CLEMMY_SEND_TRUST', 'on') || 'on').toLowerCase() !== 'off';
 }
 
 /**

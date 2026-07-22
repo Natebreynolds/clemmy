@@ -66,6 +66,7 @@ export async function runSetupWizard(): Promise<number> {
   const codexAvailability = getCodexBootstrapAvailability();
   const defaultAuthMode = codexAvailability.available ? 'codex_oauth' : 'api_key';
   const existingAuthMode = existing.AUTH_MODE === 'codex_oauth' ? 'codex_oauth'
+    : existing.AUTH_MODE === 'claude_oauth' ? 'claude_oauth'
     : existing.AUTH_MODE === 'api_key' ? 'api_key'
     : defaultAuthMode;
 
