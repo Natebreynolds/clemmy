@@ -17,10 +17,13 @@
  * outcome for the same source id, so a parked background task can still report
  * completion after the user answers.
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
 import { appendEvent, getSession as getHarnessSession, listEvents, type EventRow } from './harness/eventlog.js';
 import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine-next.outcome' });
@@ -274,59 +277,26 @@ function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: 
       const { listEvents } = await import('./harness/eventlog.js');
       const recentEvents = listEvents(sessionId, { limit: 20, desc: true });
       const ageMs = proactiveReportLastEventAgeMs(recentEvents, ctx);
-      if (!shouldProactivelyReport(hs.sessionRow.kind, ageMs)) return;
-      const [{ runConversation }, { buildOrchestratorAgent }, { buildChatFalloverWiring }] = await Promise.all([
-        import('./harness/loop.js'),
-        import('../agents/orchestrator.js'),
-        import('./harness/respond-bridge.js'),
-      ]);
-      // If the origin session has an active goal, this finished sub-work may
-      // unblock it — tell the model to continue the goal rather than just
-      // narrate. This is the EVENT-DRIVEN half of self-resumption (the
-      // heartbeat in goal-resume.ts is the fallback for stalls/sleep).
-      let goalObjective = '';
-      try {
-        const { getActiveGoalForSession } = await import('../agents/plan-proposals.js');
-        const goal = getActiveGoalForSession(sessionId);
-        if (goal) {
-          const plan = goal.approvedPlan ?? goal.plan;
-          goalObjective = plan.objective ?? '';
+      if (!shouldProactivelyReport(hs.sessionRow.kind, ageMs)) {
+        // A non-chat origin never speaks — skip for good. A BUSY chat must
+        // not be skipped: quick runs routinely finish inside the 60s window
+        // after their own dispatch, which made every desktop report-back
+        // silently vanish (live 2026-07-21). Defer and re-check until idle.
+        if (hs.sessionRow.kind === 'chat' && proactiveReportDeferEnabled()) {
+          enqueueDeferredProactiveReport(sessionId, outcome, ctx);
+          logger.info(
+            { sourceId: ctx.sourceId, sessionId, ageMs, status: outcome.status },
+            'proactive report deferred — origin chat is mid-conversation; will speak once idle',
+          );
+        } else {
+          logger.info(
+            { sourceId: ctx.sourceId, sessionId, kind: hs.sessionRow.kind, status: outcome.status },
+            'proactive report skipped (non-chat origin; passive staging remains)',
+          );
         }
-      } catch { /* goal read is best-effort */ }
-      const directive = renderProactiveOutcomeDirective(outcome, ctx, goalObjective);
-      const agent = await buildOrchestratorAgent({ userInput: directive, sessionId });
-      // W1c — the report-back already runs on the DEFAULT brain (= the origin
-      // chat's brain, since no model override). Give it the same chat
-      // step-boundary fallover as a normal chat turn so a transient on that
-      // brain doesn't drop the report. Best-effort; absent = today's behavior.
-      const fallover = buildChatFalloverWiring({ userInput: directive, sessionId, buildAgent: buildOrchestratorAgent });
-      // Record the machine directive as a SYNTHETIC user turn (same flags the
-      // passive outcome turn above carries) so the desktop transcript never
-      // shows "Relay the outcome to the user NOW…" as if the user typed it —
-      // the user-facing read paths skip data.synthetic. The model still
-      // receives the directive via runConversation's `input`; passing
-      // reuseRecordedUserInput stops the loop from re-logging it as a plain
-      // (un-flagged) user turn. Best-effort — the surrounding catch covers it.
-      appendEvent({
-        sessionId,
-        turn: 0,
-        role: 'user',
-        type: 'user_input_received',
-        data: {
-          text: directive,
-          synthetic: true,
-          source: 'outcome',
-          sourceLabel: ctx.sourceLabel,
-          sourceId: ctx.sourceId,
-          status: outcome.status,
-        },
-      });
-      await runConversation({
-        agent, sessionId, input: directive, judgeCompletion: false,
-        reuseRecordedUserInput: true,
-        falloverModelIds: fallover.falloverModelIds,
-        rebuildAgentForBrain: fallover.rebuildAgentForBrain,
-      });
+        return;
+      }
+      await fireProactiveReportTurnImpl(sessionId, outcome, ctx);
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId },
@@ -334,6 +304,174 @@ function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: 
       );
     }
   })();
+}
+
+async function fireProactiveReportTurn(sessionId: string, outcome: Outcome, ctx: DeliverContext): Promise<void> {
+  const [{ runConversation }, { buildOrchestratorAgent }, { buildChatFalloverWiring }] = await Promise.all([
+    import('./harness/loop.js'),
+    import('../agents/orchestrator.js'),
+    import('./harness/respond-bridge.js'),
+  ]);
+  // If the origin session has an active goal, this finished sub-work may
+  // unblock it — tell the model to continue the goal rather than just
+  // narrate. This is the EVENT-DRIVEN half of self-resumption (the
+  // heartbeat in goal-resume.ts is the fallback for stalls/sleep).
+  let goalObjective = '';
+  try {
+    const { getActiveGoalForSession } = await import('../agents/plan-proposals.js');
+    const goal = getActiveGoalForSession(sessionId);
+    if (goal) {
+      const plan = goal.approvedPlan ?? goal.plan;
+      goalObjective = plan.objective ?? '';
+    }
+  } catch { /* goal read is best-effort */ }
+  const directive = renderProactiveOutcomeDirective(outcome, ctx, goalObjective);
+  const agent = await buildOrchestratorAgent({ userInput: directive, sessionId });
+  // W1c — the report-back already runs on the DEFAULT brain (= the origin
+  // chat's brain, since no model override). Give it the same chat
+  // step-boundary fallover as a normal chat turn so a transient on that
+  // brain doesn't drop the report. Best-effort; absent = today's behavior.
+  const fallover = buildChatFalloverWiring({ userInput: directive, sessionId, buildAgent: buildOrchestratorAgent });
+  // Record the machine directive as a SYNTHETIC user turn (same flags the
+  // passive outcome turn above carries) so the desktop transcript never
+  // shows "Relay the outcome to the user NOW…" as if the user typed it —
+  // the user-facing read paths skip data.synthetic. The model still
+  // receives the directive via runConversation's `input`; passing
+  // reuseRecordedUserInput stops the loop from re-logging it as a plain
+  // (un-flagged) user turn. Best-effort — the surrounding catch covers it.
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: directive,
+      synthetic: true,
+      source: 'outcome',
+      sourceLabel: ctx.sourceLabel,
+      sourceId: ctx.sourceId,
+      status: outcome.status,
+    },
+  });
+  await runConversation({
+    agent, sessionId, input: directive, judgeCompletion: false,
+    reuseRecordedUserInput: true,
+    falloverModelIds: fallover.falloverModelIds,
+    rebuildAgentForBrain: fallover.rebuildAgentForBrain,
+  });
+}
+
+let fireProactiveReportTurnImpl: typeof fireProactiveReportTurn = fireProactiveReportTurn;
+export function setProactiveReportFireForTest(fn: typeof fireProactiveReportTurn | null): void {
+  fireProactiveReportTurnImpl = fn ?? fireProactiveReportTurn;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred proactive reports (2026-07-21): a proactive report that finds its
+// origin chat mid-conversation is DEFERRED (durable, restart-safe) and re-fired
+// by the daemon tick once the chat goes idle — never silently skipped. The
+// passive staged turn above remains the guaranteed baseline either way; this
+// queue only upgrades delivery from "on your next message" to "spoken now".
+// Same durable-due-marker pattern as goal-resume.ts (no bare setTimeout).
+
+interface DeferredProactiveReport {
+  sessionId: string;
+  outcome: Outcome;
+  ctx: Omit<DeliverContext, 'proactiveTurn'>;
+  createdAt: string;
+  attempts: number;
+}
+
+const DEFERRED_REPORTS_FILE = path.join(BASE_DIR, 'state', 'deferred-proactive-reports.json');
+/** Past this age the user has plainly moved on — the passive turn covers it. */
+const DEFERRED_REPORT_MAX_AGE_MS = 30 * 60_000;
+
+function proactiveReportDeferEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_PROACTIVE_REPORT_DEFER', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+function loadDeferredReports(): DeferredProactiveReport[] {
+  try {
+    const raw = fs.readFileSync(DEFERRED_REPORTS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((e) => e && typeof e.sessionId === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDeferredReports(entries: DeferredProactiveReport[]): void {
+  try {
+    fs.mkdirSync(path.dirname(DEFERRED_REPORTS_FILE), { recursive: true });
+    fs.writeFileSync(DEFERRED_REPORTS_FILE, JSON.stringify(entries, null, 1));
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err }, 'deferred proactive report save failed');
+  }
+}
+
+function enqueueDeferredProactiveReport(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
+  try {
+    const { proactiveTurn: _drop, ...serializableCtx } = ctx;
+    const entries = loadDeferredReports().filter(
+      // One live deferral per source: a newer outcome for the same work replaces
+      // the older one (a needs_input superseded by done must not speak twice).
+      (e) => !(e.sessionId === sessionId && e.ctx.sourceLabel === ctx.sourceLabel && e.ctx.sourceId === ctx.sourceId),
+    );
+    entries.push({ sessionId, outcome, ctx: serializableCtx, createdAt: new Date().toISOString(), attempts: 0 });
+    saveDeferredReports(entries);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId }, 'deferred proactive report enqueue failed');
+  }
+}
+
+/**
+ * Daemon tick: fire every deferred proactive report whose origin chat has gone
+ * idle; drop entries past the age bound (the passive turn already covers them).
+ * At-most-once per entry: an entry is removed from the queue before its turn
+ * runs, so a crash mid-turn costs the upgrade, never a duplicate.
+ */
+export async function processDeferredProactiveReports(): Promise<void> {
+  if (!proactiveReportDeferEnabled()) return;
+  const entries = loadDeferredReports();
+  if (entries.length === 0) return;
+  const keep: DeferredProactiveReport[] = [];
+  const fire: DeferredProactiveReport[] = [];
+  for (const entry of entries) {
+    const ageMs = Date.now() - Date.parse(entry.createdAt);
+    if (!Number.isFinite(ageMs) || ageMs > DEFERRED_REPORT_MAX_AGE_MS) {
+      logger.info(
+        { sourceId: entry.ctx.sourceId, sessionId: entry.sessionId, attempts: entry.attempts },
+        'deferred proactive report aged out (passive staging already delivered it)',
+      );
+      continue;
+    }
+    try {
+      const hs = HarnessSession.load(entry.sessionId);
+      if (!hs) continue;
+      const recentEvents = listEvents(entry.sessionId, { limit: 20, desc: true });
+      const idleAgeMs = proactiveReportLastEventAgeMs(recentEvents, entry.ctx);
+      if (shouldProactivelyReport(hs.sessionRow.kind, idleAgeMs)) fire.push(entry);
+      else if (hs.sessionRow.kind === 'chat') keep.push({ ...entry, attempts: entry.attempts + 1 });
+      // non-chat: drop silently — it can never qualify.
+    } catch {
+      keep.push({ ...entry, attempts: entry.attempts + 1 });
+    }
+  }
+  saveDeferredReports(keep);
+  for (const entry of fire) {
+    try {
+      logger.info(
+        { sourceId: entry.ctx.sourceId, sessionId: entry.sessionId, attempts: entry.attempts },
+        'deferred proactive report firing — origin chat is idle now',
+      );
+      await fireProactiveReportTurnImpl(entry.sessionId, entry.outcome, { ...entry.ctx, proactiveTurn: true });
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : err, sourceId: entry.ctx.sourceId },
+        'deferred proactive report turn failed (passive staging remains)',
+      );
+    }
+  }
 }
 
 /**

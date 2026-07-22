@@ -1491,6 +1491,22 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   setImmediate(drainBackgroundTasks);
   const backgroundTimer = setInterval(drainBackgroundTasks, 15_000);
   backgroundTimer.unref?.();
+  // Deferred proactive report-backs: a completion whose origin chat was
+  // mid-conversation waits durably; this tick speaks it once the chat idles
+  // (outcome.ts owns the queue + idle gate; entry removal is at-most-once).
+  const drainDeferredProactiveReports = () => {
+    withDaemonRuntimePhase('daemon.timer.deferred_proactive_reports', {}, async () => {
+      const { processDeferredProactiveReports } = await import('../runtime/outcome.js');
+      await processDeferredProactiveReports();
+    }).catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Deferred proactive report tick failed',
+      );
+    });
+  };
+  const deferredReportTimer = setInterval(drainDeferredProactiveReports, 20_000);
+  deferredReportTimer.unref?.();
   // Wire the immediate-drain kick: a freshly enqueued task (dispatch_background_task,
   // chat/mobile/discord auto-promotion) drains NOW instead of waiting for the 15s
   // tick, so it fires + turns RUNNING + becomes expandable right away. Single-flight
