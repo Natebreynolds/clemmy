@@ -497,7 +497,7 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
 
 /** A local clem tool: route through wrapToolForHarness (the full bracket gate
  *  battery) under the shared run-context, exactly as before. */
-function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
+export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   NonNullable<ReturnType<typeof harnessRunContextStorage.getStore>>,
   | 'sourceUserSeq'
   | 'behaviorScopeId'
@@ -517,7 +517,13 @@ function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     ...(parent.behaviorScopeId ? { behaviorScopeId: parent.behaviorScopeId } : {}),
     ...(parent.guardrailScopeId ? { guardrailScopeId: parent.guardrailScopeId } : {}),
     ...(parent.suppressBackgroundOffer ? { suppressBackgroundOffer: true } : {}),
-    ...(parent.recallBudget ? { recallBudget: parent.recallBudget } : {}),
+    // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
+    // protects the MODEL's context window, but a program-internal recall never
+    // enters model context — only the program's clipped output does. Inheriting
+    // it capped a 100-item resume at 3 recalls; calls 4+ returned the budget
+    // error, the program JSON.parsed it, and 60 accounts of good banked data
+    // were declared "malformed" — triggering a full wasteful re-scrape. Program
+    // recalls stay bounded by the tool-call counter and program timeout.
     ...(parent.defaultTimeoutMs ? { defaultTimeoutMs: parent.defaultTimeoutMs } : {}),
     ...(parent.turnRecallRunIds ? { turnRecallRunIds: parent.turnRecallRunIds } : {}),
   };

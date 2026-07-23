@@ -203,3 +203,16 @@ test('tool_output_query hands the model the exact copy-paste $fromToolOutput ref
   assert.match(text, /"callId":"call_roster"/);
   assert.match(text, /"path":"\[\*\]\.Email"/, 'exact copy-paste path for the projected field');
 });
+
+test('budget exhaustion is unmistakably an ERROR string, never parseable-looking data', async () => {
+  // 4th call against a 3-call budget: the message must self-identify as an
+  // error so a program that JSON.parses results can never mistake it for a
+  // corrupt record (live 2026-07-24 "malformed data" misdiagnosis).
+  const budget = new RecallBudget(1, 60_000);
+  assert.equal(budget.consume(100), null, 'first call fits');
+  const err = budget.consume(100);
+  assert.ok(err, 'second call exhausts');
+  // The recall tool prefixes this with "ERROR: " — pin the contract there via
+  // the returned message shape used by the tool handler.
+  assert.match(`ERROR: ${err}`, /^ERROR: recall budget exhausted/);
+});
