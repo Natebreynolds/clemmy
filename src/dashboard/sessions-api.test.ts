@@ -392,3 +392,18 @@ test('session detail attaches pending approval cards and drops resolved ones', a
   const after = getUnifiedSessionDetail(`harness:${origin.id}`);
   assert.equal(after!.turns.filter((t) => t.approval).length, 0, 'resolved approvals attach no card');
 });
+
+test('raw report-back titles heal at read time; synthetic first turns derive human titles', () => {
+  // Already-persisted raw title (clipped mid-head, pre-fix data).
+  store.appendTurn('chat-rawtitle', turn('user', 'anything'));
+  store.setMeta('chat-rawtitle', { title: '[background task bg-mr440n9u-e1340' });
+
+  // No stored title; the first user turn is the synthetic report-back.
+  store.appendTurn('chat-synthetic', turn('user', '[workflow run 1781852780491-3f66 completed] Daily standup email\n\nSent to Nate.\n\n(This ran in the background and just finished — continue from here.)'));
+
+  const sessions = buildUnifiedSessionList();
+  const healed = sessions.find((s) => s.id === 'desktop:chat-rawtitle');
+  assert.equal(healed?.title, 'Background task', 'stored raw title heals without migration');
+  const synthetic = sessions.find((s) => s.id === 'desktop:chat-synthetic');
+  assert.equal(synthetic?.title, 'Workflow run: Daily standup email', 'synthetic turn derives a human title');
+});
