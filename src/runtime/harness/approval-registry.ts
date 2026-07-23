@@ -376,6 +376,39 @@ export function claimApprovedUnconsumedForSession(
 }
 
 /**
+ * S2 (gate audit 2026-07-23): does this session hold a HUMAN-approved consent
+ * that covers RE-sending to `target`, granted AFTER the prior send? Read-only
+ * (never consumes). The time scope is the contract: the ORIGINAL batch
+ * approval predates the first send and therefore can never authorize a
+ * duplicate — only a FRESH approval naming the same target does.
+ */
+export function hasApprovedResendConsent(
+  sessionId: string,
+  target: string,
+  priorSendAtIso: string | undefined,
+): boolean {
+  const needle = target.trim().toLowerCase();
+  if (!needle) return false;
+  try {
+    const db = openEventLog();
+    const rows = db.prepare(`
+      SELECT subject, args_json, resolved_at FROM pending_approvals
+       WHERE session_id = ?
+         AND status = 'resolved'
+         AND resolution = 'approved'
+       ORDER BY resolved_at DESC
+       LIMIT 25
+    `).all(sessionId) as Array<{ subject: string | null; args_json: string | null; resolved_at: string | null }>;
+    for (const row of rows) {
+      if (priorSendAtIso && (!row.resolved_at || row.resolved_at <= priorSendAtIso)) continue;
+      const haystack = `${row.subject ?? ''}\n${row.args_json ?? ''}`.toLowerCase();
+      if (haystack.includes(needle)) return true;
+    }
+  } catch { /* fail toward the wall — no consent found */ }
+  return false;
+}
+
+/**
  * Look up an approval by ID. Returns undefined when not found.
  */
 export function get(approvalId: string): PendingApprovalRow | undefined {

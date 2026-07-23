@@ -66,6 +66,7 @@ import { listEntityIdentityConflicts } from '../memory/entity-identity.js';
 import { consolidateFact, readReflectionReplayHealth } from '../memory/reflection.js';
 import { readReflectionCandidateHealth } from '../memory/reflection-candidates.js';
 import { promoteReflectionCandidateById, rejectReflectionCandidateClusterById } from '../memory/candidate-review.js';
+import { approveIdentityProposal, listIdentityProposals, rejectIdentityProposal } from '../memory/identity-evolution.js';
 import { composeCuratedMemory, IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, splitCuratedMemory, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { resolveWorkingMemoryForConsole } from '../memory/working-memory.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
@@ -73,6 +74,7 @@ import {
   listWorkflows,
   readWorkflow,
   clampGoalMaxAttempts,
+  workflowOrigin,
   type WorkflowDefinition,
   type WorkflowGoal,
 } from '../memory/workflow-store.js';
@@ -276,10 +278,11 @@ import {
   listReportBackChannelOptions,
   staleTaskKind,
   truncateResultBody,
+  deriveTaskTitle,
 } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
-import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
+import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
@@ -1767,6 +1770,11 @@ function summarizeGoal(record: PlanProposal): Record<string, unknown> {
     id: record.id,
     status: record.status,
     objective: plan.objective,
+    // Short human headline for list rows. The objective is the VALIDATION
+    // contract (the checker consumes it verbatim) — background goals bound
+    // from a raw prompt carry the whole prompt there, which is correct for
+    // checking and unreadable as a card title.
+    title: deriveTaskTitle(plan.objective),
     successCriteria: plan.successCriteria ?? [],
     steps: plan.steps ?? [],
     risks: plan.risks ?? [],
@@ -1802,9 +1810,26 @@ function summarizeGoal(record: PlanProposal): Record<string, unknown> {
 }
 
 function buildGoalsPayload(filter: string | undefined): Record<string, unknown> {
-  const all = listPlanProposals({ status: 'all' })
+  const raw = listPlanProposals({ status: 'all' })
     .filter(isGoalContract)
     .sort((a, b) => goalUpdatedAt(b).localeCompare(goalUpdatedAt(a)));
+  // One card per background objective. Recurring dispatches bind a fresh
+  // validation goal EVERY run (by design — completion checking needs it), but
+  // the screen showed each of them: the same workflow appeared ~7 times. Keep
+  // the newest record per cleaned objective, preferring an active one over any
+  // terminal duplicate. Chat/workflow goals pass through untouched.
+  const seenBackground = new Map<string, PlanProposal>();
+  const all: PlanProposal[] = [];
+  for (const goal of raw) {
+    if (goal.origin?.kind !== 'background') { all.push(goal); continue; }
+    const key = deriveTaskTitle((goal.approvedPlan ?? goal.plan).objective).toLowerCase();
+    const kept = seenBackground.get(key);
+    if (!kept) { seenBackground.set(key, goal); all.push(goal); continue; }
+    if (kept.status !== 'active' && goal.status === 'active') {
+      all[all.indexOf(kept)] = goal;
+      seenBackground.set(key, goal);
+    }
+  }
   const goals = all.filter((goal) => {
     if (filter === 'active') return goal.status === 'active' && !goal.parked;
     if (filter === 'parked') return goal.status === 'active' && Boolean(goal.parked);
@@ -4173,6 +4198,7 @@ export function registerConsoleRoutes(
         if (!latestRunByWorkflow.has(run.workflow)) latestRunByWorkflow.set(run.workflow, run);
       }
       const items = listWorkflows()
+        .filter((entry) => workflowOrigin(entry.data) !== 'dev')
         .sort((a, b) => a.data.name.localeCompare(b.data.name))
         .map((entry) => {
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
@@ -4216,7 +4242,9 @@ export function registerConsoleRoutes(
   app.get('/api/console/workflows/home', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const workflows = listWorkflows().sort((a, b) => a.data.name.localeCompare(b.data.name));
+      const workflows = listWorkflows()
+        .filter((entry) => workflowOrigin(entry.data) !== 'dev')
+        .sort((a, b) => a.data.name.localeCompare(b.data.name));
       const runRecords = readWorkflowRunRecords();
       const pending = listPendingRuns();
       const workflowNameBySlug = new Map(workflows.map((entry) => [entry.name, entry.data.name]));
@@ -6673,6 +6701,41 @@ export function registerConsoleRoutes(
         fs.writeFileSync(def.filePath, content.trimEnd() + (content.trim() ? '\n' : ''), 'utf-8');
       }
       res.json({ file: readContextFile(def) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Curated-identity evolution proposals: drafted by the maintenance
+  // distiller, applied ONLY through the approve route below (which is
+  // staleness-checked — a manual curated edit after drafting supersedes
+  // the proposal instead of being clobbered).
+  app.get('/api/console/context/identity-proposals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ proposals: listIdentityProposals() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/context/identity-proposals/:id/approve', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = approveIdentityProposal(String(req.params.id));
+      if (result.reason === 'not-found') { res.status(404).json({ error: 'unknown proposal' }); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/context/identity-proposals/:id/reject', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const rejected = rejectIdentityProposal(String(req.params.id));
+      if (!rejected) { res.status(404).json({ error: 'unknown or non-pending proposal' }); return; }
+      res.json({ rejected: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -9803,13 +9866,29 @@ export function registerConsoleRoutes(
 
       // 3) Legacy run records — CLI/gateway/workflow runs without a canonical
       //    attempt. Drop background-backed and canonical-session duplicates.
+      //    Terminal needs-attention runs used to pin the Needs-You column
+      //    forever with an empty actions array (Inbox said 3 while the board
+      //    said 20). A run needing review holds the column only while it is
+      //    still its workflow's latest word — a newer run supersedes it into
+      //    Done (amber status preserved) — and every surviving one carries
+      //    `archive` so the column can actually be cleared.
+      const latestRunIdByTitle = new Map<string, string>();
       for (const run of legacyRuns) {
+        if (run.source === 'workflow' && !run.archived && !latestRunIdByTitle.has(run.title)) {
+          latestRunIdByTitle.set(run.title, run.id); // legacyRuns is newest-first
+        }
+      }
+      for (const run of legacyRuns) {
+        if (run.archived) continue;
         if (run.id.startsWith('run-bg-')) continue; // background task's own run record
         if (canonicalHarnessSessionIds.has(run.sessionId)) continue;
         const needsAttention = run.needsAttention === true;
         if (run.pendingApprovalId) coveredApprovalIds.add(run.pendingApprovalId);
+        const terminal = !['queued', 'received', 'running', 'awaiting_approval'].includes(run.status);
+        const superseded = needsAttention && terminal && run.source === 'workflow'
+          && latestRunIdByTitle.get(run.title) !== run.id;
         const column: BoardColumnId =
-          needsAttention ? 'needs_you'
+          needsAttention ? (superseded ? 'done' : 'needs_you')
             : run.status === 'queued' || run.status === 'received' ? 'queued'
               : run.status === 'running' ? 'running'
               : run.status === 'awaiting_approval' ? 'needs_you'
@@ -9824,6 +9903,7 @@ export function registerConsoleRoutes(
         const actions = run.pendingApprovalId
           ? ['approve', 'reject', ...(live && !needsAttention ? ['cancel'] : [])]
           : (live && !needsAttention ? ['cancel'] : []);
+        if (needsAttention && terminal) actions.push('archive');
         cards.push({
           id: run.id,
           sourceKind: 'run',
@@ -10180,6 +10260,20 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // Clear a terminal needs-attention run card from the board. The record is
+  // kept (archived flag), only the board projection drops it.
+  app.post('/api/console/board/run/:id/archive', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = getRun(req.params.id);
+    if (!run) { res.status(404).json({ ok: false, reason: 'run not found' }); return; }
+    if (['queued', 'received', 'running', 'awaiting_approval'].includes(run.status)) {
+      res.status(409).json({ ok: false, reason: 'this run is still live — cancel it instead' });
+      return;
+    }
+    archiveRun(run.id);
+    res.json({ ok: true });
   });
 
   app.post('/api/console/board/approval/:id/:decision', async (req, res) => {

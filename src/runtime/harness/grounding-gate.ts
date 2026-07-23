@@ -40,6 +40,7 @@
  * gates irreversible writes.
  */
 import { getRuntimeEnv } from '../../config.js';
+import { hasApprovedResendConsent } from './approval-registry.js';
 import { searchToolOutputs } from './eventlog.js';
 
 // ─────────────────────────────────────────────────────────────────
@@ -424,20 +425,33 @@ export interface DuplicateCheckInput {
   sessionId: string;
   shapeKey: string | undefined;
   targets: string[];
-  /** Prior external_write events' (shapeKey, targets) for this session. */
-  priorWrites: Array<{ shapeKey?: string; targets?: string[] }>;
+  /** Prior external_write events' (shapeKey, targets[, at]) for this session. */
+  priorWrites: Array<{ shapeKey?: string; targets?: string[]; at?: string }>;
 }
 
 /** Pure + STATELESS: does this write hit a (shape, target) pair already written this
  *  session? Every hit is a HARD duplicate — there is no warn-then-pass. */
-export function detectDuplicateTarget(input: DuplicateCheckInput): { duplicate: boolean; target?: string } {
+export function detectDuplicateTarget(input: DuplicateCheckInput): { duplicate: boolean; target?: string; priorAt?: string } {
   if (!input.shapeKey || input.targets.length === 0) return { duplicate: false };
   for (const target of input.targets) {
-    if (input.priorWrites.some((w) => w.shapeKey === input.shapeKey && (w.targets ?? []).includes(target))) {
-      return { duplicate: true, target };
-    }
+    const prior = input.priorWrites.find((w) => w.shapeKey === input.shapeKey && (w.targets ?? []).includes(target));
+    if (prior) return { duplicate: true, target, priorAt: prior.at };
   }
   return { duplicate: false };
+}
+
+/**
+ * S2 (gate audit 2026-07-23): the wall's own error text always promised
+ * "if the user explicitly asked to send a SECOND time, confirm first" — but
+ * nothing honored that confirmation: under strict posture the user could
+ * approve the re-send card and the wall refused anyway. A FRESH human
+ * approval naming this target, resolved AFTER the prior send, is the consent
+ * artifact — effect-anchored, no text matching of user turns. Fail-closed:
+ * registry unreadable or no matching row → the wall stands.
+ */
+export function duplicateResendConsented(sessionId: string, target: string | undefined, priorAt: string | undefined): boolean {
+  if (!target) return false;
+  return hasApprovedResendConsent(sessionId, target, priorAt);
 }
 
 export class DuplicateExternalWriteError extends Error {
@@ -448,7 +462,7 @@ export class DuplicateExternalWriteError extends Error {
       `DUPLICATE_EXTERNAL_WRITE (REFUSED): this session ALREADY sent a ${opts.shapeKey ?? opts.toolName} to ${opts.target}, and that send SUCCEEDED. ` +
         'This duplicate is REFUSED to prevent a double-send — retrying will be refused again, so do NOT retry. ' +
         'An approved batch is NOT standing permission to contact the same target twice, and a prior turn that errored AFTER sending was NOT a failed send. ' +
-        'If the user EXPLICITLY asked to contact this target a SECOND time, confirm via ask_user_question first; otherwise STOP and tell the user exactly what already went out.',
+        'If the user EXPLICITLY wants this target contacted a SECOND time, request the send so a fresh approval card is raised — a card the user approves AFTER the prior send authorizes the resend and this wall will honor it. Otherwise STOP and tell the user exactly what already went out.',
     );
     this.name = 'DuplicateExternalWriteError';
     this.toolName = opts.toolName;

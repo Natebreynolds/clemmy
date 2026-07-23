@@ -12,16 +12,19 @@ import {
 } from '@/lib/connect';
 
 /**
- * Guided "Connect Slack" panel — two-way chat via a Slack app in Socket Mode.
- * Five steps: create from manifest → install → paste 2 tokens → set member ID
- * → live status. The generic credential cards for slack_bot_token /
- * slack_app_token also auto-render in "Keys & accounts" as a fallback; this
- * panel adds the manifest + ordering + restart guidance that make it easy.
+ * Guided "Connect Slack" row — two-way chat via a Slack app in Socket Mode.
+ * Renders as ONE compact row (icon · status pill · Set up/Details); the
+ * five-step wizard (create from manifest → install → paste 2 tokens → set
+ * member ID → live status) expands only on demand. The generic credential
+ * cards for slack_bot_token / slack_app_token also auto-render in "Keys &
+ * accounts" as a fallback; the wizard adds the manifest + ordering + restart
+ * guidance that make it easy.
  */
 export function SlackConnect() {
   const qc = useQueryClient();
   const status = usePoll(['slack-status'], getSlackStatus, 15000);
   const creds = usePoll(['credentials'], getCredentials, 20000);
+  const [open, setOpen] = useState(false);
 
   const rows = normalizeCredentialRows(creds.data?.rows);
   const botRow = rows.find((r) => r.name === 'slack_bot_token');
@@ -46,17 +49,21 @@ export function SlackConnect() {
         : <StatusPill tone="neutral">Not set up</StatusPill>;
 
   return (
-    <section className="mb-8">
-      <div className="mb-3 flex items-center gap-2.5">
-        <Slack className="h-5 w-5 text-primary" aria-hidden />
-        <div className="flex-1">
-          <h3 className="text-h3 text-fg">Connect Slack</h3>
-          <p className="text-small text-muted">Two-way chat in Slack (DMs + @mentions). ~2 minutes, no public URL needed.</p>
+    <Card className="px-4 py-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <Slack className="h-5 w-5 shrink-0 text-primary" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="text-body font-medium text-fg">Slack</div>
+          <div className="truncate text-caption text-faint">Two-way chat (DMs + @mentions). ~2 minutes, no public URL needed.</div>
         </div>
         {pill}
+        <Button size="sm" variant={connected ? 'ghost' : 'secondary'} onClick={() => setOpen((v) => !v)}>
+          {open ? 'Hide' : connected ? 'Details' : 'Set up'}
+        </Button>
       </div>
 
-      <Card className="space-y-5 p-4">
+      {open && (
+      <div className="mt-4 space-y-5 border-t border-border pt-4">
         <Step n={1} title="Create the app from our manifest" done={bothSet}>
           <p className="mb-2 text-caption text-faint">
             Open Slack’s app builder, choose <strong>From a manifest</strong>, pick your workspace, and paste this:
@@ -101,8 +108,9 @@ export function SlackConnect() {
                 : 'Finish steps 1–3 to connect.'}
           </p>
         </Step>
-      </Card>
-    </section>
+      </div>
+      )}
+    </Card>
   );
 }
 

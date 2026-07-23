@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, Activity, GitBranch, Send, Wrench, Gauge, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, type LucideIcon } from 'lucide-react';
+import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Switch } from '@/components/ui/Switch';
-import { StatusPill, type Tone } from '@/components/ui/StatusPill';
+import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -14,298 +14,18 @@ import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
 import { WorkflowDrawer } from '@/components/automate/WorkflowDrawer';
 import { cn } from '@/lib/cn';
-import { certificationTone, workflowCertificationCounts, workflowPrimaryAction } from '@/lib/workflowCertification';
+import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
   checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
   listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
   type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
 } from '@/lib/automate';
-import {
-  getAgentSystemMetrics,
-  type AgentSystemRecommendation,
-  type AgentSystemTrendSnapshot,
-  type CoordinationPolicySnapshot,
-  type LoopInterventionSnapshot,
-  type LoopIssueCause,
-  type WorkflowLearningSnapshot,
-} from '@/lib/advanced';
+import { getAgentSystemMetrics } from '@/lib/advanced';
 
-type Tab = 'workflows' | 'schedules' | 'skills';
+type Tab = 'workflows' | 'skills';
+type WorkflowFilter = 'all' | 'scheduled' | 'manual';
 
-function recommendationTone(severity: AgentSystemRecommendation['severity']): Tone {
-  if (severity === 'critical') return 'danger';
-  if (severity === 'warn') return 'warning';
-  return 'info';
-}
-
-function interventionTone(status: LoopInterventionSnapshot['status']): Tone {
-  if (status === 'productive') return 'success';
-  if (status === 'watch') return 'warning';
-  if (status === 'thrashing') return 'danger';
-  return 'neutral';
-}
-
-function learningTone(status: WorkflowLearningSnapshot['status']): Tone {
-  if (status === 'compounding') return 'success';
-  if (status === 'watch') return 'warning';
-  if (status === 'stale') return 'danger';
-  return 'neutral';
-}
-
-function coordinationTone(status: CoordinationPolicySnapshot['status']): Tone {
-  if (status === 'expand') return 'success';
-  if (status === 'repair' || status === 'constrain') return 'danger';
-  if (status === 'learn') return 'info';
-  return 'warning';
-}
-
-function fanoutPostureTone(posture: CoordinationPolicySnapshot['fanoutPosture']): Tone {
-  if (posture === 'allow') return 'success';
-  if (posture === 'soft') return 'info';
-  if (posture === 'constrain') return 'warning';
-  return 'danger';
-}
-
-function trendTone(status: AgentSystemTrendSnapshot['status']): Tone {
-  if (status === 'improving') return 'success';
-  if (status === 'regressing') return 'danger';
-  if (status === 'stable') return 'warning';
-  return 'neutral';
-}
-
-function LoopGuidance({
-  recommendations,
-  issueCauses,
-  interventions,
-  learning,
-  coordination,
-  trend,
-}: {
-  recommendations: AgentSystemRecommendation[];
-  issueCauses: LoopIssueCause[];
-  interventions?: LoopInterventionSnapshot;
-  learning?: WorkflowLearningSnapshot;
-  coordination?: CoordinationPolicySnapshot;
-  trend?: AgentSystemTrendSnapshot;
-}) {
-  // Collapsed by default: this is OPERATOR diagnostics (health scores, repair
-  // loops, retry pressure) — useful, but it must not be the first thing a user
-  // wades through to reach their workflows. One quiet summary line, expandable.
-  const [open, setOpen] = useState(false);
-  if (recommendations.length === 0 && issueCauses.length === 0 && !interventions && !learning && !coordination && !trend) return null;
-  const attention = (coordination ? 1 : 0) + issueCauses.length + recommendations.length;
-  if (!open) {
-    return (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="mb-5 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-left transition-colors hover:bg-subtle cursor-pointer"
-      >
-        <Zap className="h-3.5 w-3.5 shrink-0 text-faint" aria-hidden />
-        <span className="text-caption font-semibold uppercase tracking-wide text-faint">System health</span>
-        {trend && (
-          <StatusPill tone={trendTone(trend.status)}>
-            {trend.status}{trend.recent.length > 0 ? ` · ${trend.recent[trend.recent.length - 1]?.healthScore}/100` : ''}
-          </StatusPill>
-        )}
-        <span className="min-w-0 flex-1 truncate text-caption text-muted">
-          {attention > 0 ? `${attention} thing${attention === 1 ? '' : 's'} worth a look` : 'All quiet'}
-        </span>
-        <span className="shrink-0 text-caption text-faint">details</span>
-      </button>
-    );
-  }
-  return (
-    <Card className="mb-5 p-4">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
-          <Zap className="h-3.5 w-3.5" aria-hidden /> System health
-        </div>
-        <button type="button" onClick={() => setOpen(false)} className="text-caption text-faint transition-colors hover:text-muted cursor-pointer">hide</button>
-      </div>
-      {trend && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Agent-system trend</div>
-              <p className="mt-1 text-small text-muted">{trend.recommendation}</p>
-            </div>
-            <StatusPill tone={trendTone(trend.status)}>
-              {trend.status}{trend.recent.length > 0 ? ` · ${trend.recent[trend.recent.length - 1]?.healthScore}/100` : ''}
-            </StatusPill>
-          </div>
-          <div className="flex flex-wrap gap-2 text-caption">
-            {trend.signals.slice(0, 4).map((signal) => (
-              <span key={signal} className="rounded-full bg-subtle px-2 py-0.5 text-muted">{signal}</span>
-            ))}
-          </div>
-        </div>
-      )}
-      {coordination && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Coordination policy</div>
-              <p className="mt-1 text-small text-muted">{coordination.nextAction}</p>
-            </div>
-            <StatusPill tone={coordinationTone(coordination.status)}>
-              {coordination.mode} · {coordination.confidence}/100
-            </StatusPill>
-            <StatusPill tone={fanoutPostureTone(coordination.fanoutPosture)}>
-              fanout {coordination.fanoutPosture}
-            </StatusPill>
-            <StatusPill tone={coordination.recommendedWorkerWaveSize >= 8 ? 'success' : coordination.recommendedWorkerWaveSize > 0 ? 'info' : 'danger'}>
-              wave {coordination.recommendedWorkerWaveSize}
-            </StatusPill>
-          </div>
-          {coordination.guardrails.length > 0 && (
-            <div className="flex flex-wrap gap-2 text-caption">
-              {coordination.guardrails.slice(0, 3).map((guardrail) => (
-                <span key={guardrail} className="rounded-full bg-warning-tint px-2 py-0.5 text-warning">{guardrail}</span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      {interventions && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Intervention effectiveness</div>
-              <p className="mt-1 text-small text-muted">{interventions.recommendation}</p>
-            </div>
-            <StatusPill tone={interventionTone(interventions.status)}>
-              {interventions.score}/100 · {interventions.status}
-            </StatusPill>
-          </div>
-          <div className="grid gap-2 md:grid-cols-4">
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Retry pressure</div>
-              <div className="text-small font-semibold text-fg">{interventions.retryPressurePct}%</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Self-heal clean</div>
-              <div className="text-small font-semibold text-fg">{interventions.selfHeal.clean}/{interventions.selfHeal.runs}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Goal satisfied</div>
-              <div className="text-small font-semibold text-fg">{interventions.goalRepursuit.satisfied}/{interventions.goalRepursuit.runs}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Failed items</div>
-              <div className="text-small font-semibold text-fg">{interventions.forEachRecovery.failed}</div>
-            </div>
-          </div>
-          {(interventions.risks.length > 0 || interventions.strengths.length > 0) && (
-            <div className="mt-2 flex flex-wrap gap-2 text-caption">
-              {interventions.risks.slice(0, 3).map((risk) => (
-                <span key={risk} className="rounded-full bg-warning-tint px-2 py-0.5 text-warning">{risk}</span>
-              ))}
-              {interventions.strengths.slice(0, 2).map((strength) => (
-                <span key={strength} className="rounded-full bg-success-tint px-2 py-0.5 text-success">{strength}</span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      {learning && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Workflow learning</div>
-              <p className="mt-1 text-small text-muted">{learning.recommendation}</p>
-            </div>
-            <StatusPill tone={learningTone(learning.status)}>
-              {learning.recallHitRatePct}% recall · {learning.status}
-            </StatusPill>
-          </div>
-          <div className="grid gap-2 md:grid-cols-4">
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Patterns</div>
-              <div className="text-small font-semibold text-fg">{learning.patternCount}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Clean samples</div>
-              <div className="text-small font-semibold text-fg">{learning.totalCleanPatternRuns}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Recall hits</div>
-              <div className="text-small font-semibold text-fg">{learning.recallHits}/{learning.recentRecallSamples}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Remembered</div>
-              <div className="text-small font-semibold text-fg">{learning.remembers}</div>
-            </div>
-          </div>
-          {learning.topPatterns.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-2 text-caption">
-              {learning.topPatterns.slice(0, 3).map((pattern) => (
-                <span key={pattern.workflowSlug} className="rounded-full bg-info-tint px-2 py-0.5 text-info" title={`${pattern.stepCount} steps · ${pattern.toolCount} tools`}>
-                  {pattern.workflowName} · {pattern.successCount}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      {issueCauses.length > 0 && (
-        <div className="mb-3 grid gap-2 lg:grid-cols-3">
-          {issueCauses.slice(0, 3).map((cause) => (
-            <div key={cause.key} className="rounded-md border border-border bg-subtle p-3">
-              <div className="mb-1 flex items-center justify-between gap-2">
-                <span className="truncate text-small font-semibold text-fg" title={cause.label}>{cause.label}</span>
-                <StatusPill tone="warning">{cause.count}</StatusPill>
-              </div>
-              <p className="truncate text-caption text-faint" title={cause.sources.join(', ')}>
-                {cause.sources.join(', ')}
-              </p>
-            </div>
-          ))}
-        </div>
-      )}
-      {recommendations.length > 0 && (
-        <div className="grid gap-3 lg:grid-cols-2">
-          {recommendations.slice(0, 4).map((rec) => (
-            <div key={rec.id} className="rounded-md border border-border bg-surface p-3">
-              <div className="mb-1 flex flex-wrap items-center gap-2">
-                <StatusPill tone={recommendationTone(rec.severity)}>{rec.target}</StatusPill>
-                <span className="text-small font-semibold text-fg">{rec.title}</span>
-              </div>
-              <p className="text-small text-muted">{rec.detail}</p>
-              <p className="mt-1 text-caption text-faint">{rec.action}</p>
-              <Link
-                to={rec.href}
-                className="mt-2 inline-flex h-9 items-center justify-center gap-2 rounded-md px-3 text-small font-semibold text-muted transition-colors duration-fast hover:bg-hover hover:text-fg"
-              >
-                {rec.cta}
-                <ArrowRight className="h-3.5 w-3.5" aria-hidden />
-              </Link>
-            </div>
-          ))}
-        </div>
-      )}
-    </Card>
-  );
-}
-
-function engineToneClasses(tone: Tone) {
-  switch (tone) {
-    case 'success': return 'border-success/30 bg-success-tint text-success';
-    case 'info': return 'border-info/30 bg-info-tint text-info';
-    case 'warning': return 'border-warning/30 bg-warning-tint text-warning';
-    case 'danger': return 'border-danger/30 bg-danger-tint text-danger';
-    case 'live': return 'border-primary/30 bg-primary-tint text-primary';
-    case 'neutral': return 'border-border bg-surface text-muted';
-  }
-}
-
-function dryRunTone(verdict?: string): Tone {
-  if (verdict === 'ready') return 'success';
-  if (verdict === 'needs_inputs') return 'warning';
-  if (verdict === 'blocked') return 'danger';
-  return 'neutral';
-}
 
 function relativeRunTime(iso?: string | null): string {
   if (!iso) return '';
@@ -333,70 +53,11 @@ function goalObjective(goal: string | null): string | null {
   return (header >= 0 ? lines[header + 1] : lines.find((line) => !line.startsWith('#'))) ?? null;
 }
 
-function WorkflowEngineStrip({ workflow, onOpen }: { workflow: WorkflowRow; onOpen: () => void }) {
-  const cert = workflow.certification;
-  if (!cert) return null;
-  const counts = workflowCertificationCounts(cert);
-  const resourceCount = workflow.resourceCount ?? Object.keys(workflow.resources ?? {}).length;
-  const resourceTone: Tone = counts.resourceGaps > 0 ? 'info' : resourceCount > 0 ? 'success' : 'neutral';
-  const missingTone: Tone = counts.missingInputs > 0 ? 'warning' : 'success';
-  const authorTone: Tone = counts.blockers > 0 ? 'danger' : counts.readinessGaps > 0 ? 'info' : 'success';
-  const effectTone: Tone = counts.sends > 0 ? 'warning' : counts.writes > 0 ? 'info' : 'success';
-  const phases: Array<{ label: string; value: string; tone: Tone; Icon: LucideIcon }> = [
-    { label: 'Bindings', value: counts.resourceGaps > 0 ? `${counts.resourceGaps} needed` : resourceCount > 0 ? `${resourceCount} bound` : 'none', tone: resourceTone, Icon: Puzzle },
-    { label: 'Inputs', value: counts.missingInputs > 0 ? `${counts.missingInputs} missing` : 'set', tone: missingTone, Icon: Gauge },
-    { label: 'Plan', value: `${counts.waves} wave${counts.waves === 1 ? '' : 's'}`, tone: authorTone, Icon: GitBranch },
-    { label: 'Dry-run', value: cert.dryRun?.verdict?.replace('_', ' ') ?? 'unknown', tone: dryRunTone(cert.dryRun?.verdict), Icon: Activity },
-    { label: 'Tools', value: counts.tools > 0 ? `${counts.tools} linked` : 'local', tone: counts.blockers > 0 ? 'danger' : 'success', Icon: Wrench },
-    { label: 'Effects', value: `${counts.sends + counts.writes} external`, tone: effectTone, Icon: Send },
-  ];
-
-  return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="mb-3 w-full rounded-md border border-border bg-subtle p-3 text-left transition-colors hover:border-primary cursor-pointer"
-    >
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        <StatusPill tone={certificationTone(cert.state)}>{cert.label}</StatusPill>
-        {cert.executionMode && cert.executionMode !== 'empty' && (
-          <span title="Steps that run as code (a direct tool call or script) are free every run; AI steps carry the reasoning cost.">
-            <StatusPill tone={cert.executionMode === 'agentless' ? 'success' : cert.executionMode === 'agent' ? 'warning' : 'info'}>
-              {cert.executionMode === 'agentless' ? '⚡ runs as code · no AI cost'
-                : cert.executionMode === 'agent' ? 'AI every step'
-                : `${cert.dryRun?.codeSteps ?? 0}/${cert.dryRun?.stepCount ?? 0} steps as code`}
-            </StatusPill>
-          </span>
-        )}
-        {(cert.codifyCandidateCount ?? 0) > 0 && (
-          <span title={`Token savings on the table — these mechanical steps could run as free code:\n${(cert.codifyCandidates ?? []).map((c) => `• ${c.stepId}${c.tool ? ` (${c.tool})` : ''}`).join('\n')}`}>
-            <StatusPill tone="info">💡 {cert.codifyCandidateCount} step{cert.codifyCandidateCount === 1 ? '' : 's'} could be free code</StatusPill>
-          </span>
-        )}
-        <span className="text-caption text-faint">{counts.parallelWaves}/{counts.waves} parallel waves</span>
-        {resourceCount > 0 && <span className="text-caption text-faint">{resourceCount} resources</span>}
-        <span className="text-caption text-faint">{counts.tools} tools</span>
-        {(counts.sends + counts.writes) > 0 && <span className="text-caption text-faint">{counts.sends + counts.writes} external effects</span>}
-      </div>
-      <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 xl:grid-cols-6">
-        {phases.map(({ label, value, tone, Icon }) => (
-          <div key={label} className={cn('min-w-0 rounded-sm border px-2 py-1.5', engineToneClasses(tone))}>
-            <div className="flex items-center gap-1">
-              <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-              <span className="truncate text-caption font-semibold">{label}</span>
-            </div>
-            <div className="truncate text-caption opacity-80">{value}</div>
-          </div>
-        ))}
-      </div>
-    </button>
-  );
-}
-
 export function Automate() {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('workflows');
+  const [filter, setFilter] = useState<WorkflowFilter>('all');
 
   const workflows = usePoll(['workflows'], listWorkflows, 10000);
   const skills = usePoll(['skills'], listSkills, 15000, { enabled: tab === 'skills' });
@@ -412,16 +73,17 @@ export function Automate() {
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
   const wf = workflows.data?.workflows ?? [];
-  // "Schedules" = workflows that run on a schedule. (Legacy CRON.md crons
-  // were migrated to workflows; the cron file is empty now.)
-  const scheduled = wf.filter((w) => w.triggerSchedule || w.trigger?.schedule);
+  // The old Schedules tab duplicated these same cards; a schedule is now a
+  // property of the workflow (meta line + filter chip), not a second surface.
+  const isScheduled = (w: WorkflowRow) => Boolean(w.triggerSchedule || w.trigger?.schedule);
+  const visibleWf = filter === 'all' ? wf : wf.filter((w) => (filter === 'scheduled' ? isScheduled(w) : !isScheduled(w)));
   const sk = skills.data?.skills ?? [];
-  const loopRecommendations = (systemQ.data?.recommendations ?? []).filter((rec) => rec.kind === 'loop');
-  const loopIssueCauses = systemQ.data?.loops.issueCauses ?? [];
-  const loopInterventions = systemQ.data?.loops.interventions;
-  const workflowLearning = systemQ.data?.loops.learning;
-  const coordination = systemQ.data?.coordination;
-  const trend = systemQ.data?.trend;
+  // The old operator-telemetry panel ("repair-loop 94/100", "fanout block",
+  // "19/100 thrashing") lives in Advanced → Evolution, which renders this same
+  // metrics feed in full. Automate shows one plain sentence, and only when
+  // something actually needs a human.
+  const repairCount = (systemQ.data?.recommendations ?? [])
+    .filter((rec) => rec.kind === 'loop' && (rec.severity === 'warn' || rec.severity === 'critical')).length;
 
   const run = async (name: string) => {
     setBusyName(name); setNotice(null);
@@ -473,14 +135,13 @@ export function Automate() {
 
   const tabs: { key: Tab; label: string; icon: typeof Zap }[] = [
     { key: 'workflows', label: 'Workflows', icon: Zap },
-    { key: 'schedules', label: 'Schedules', icon: Clock },
     { key: 'skills', label: 'Skills', icon: Puzzle },
   ];
 
   return (
     <Page
       title="Automate"
-      subtitle="Workflows, schedules, and skills"
+      subtitle="Workflows and skills"
       actions={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>}
     >
       <div className="mb-5 flex gap-1 border-b border-border">
@@ -504,15 +165,17 @@ export function Automate() {
         </p>
       )}
 
-      {tab !== 'skills' && (
-        <LoopGuidance
-          recommendations={loopRecommendations}
-          issueCauses={loopIssueCauses}
-          interventions={loopInterventions}
-          learning={workflowLearning}
-          coordination={coordination}
-          trend={trend}
-        />
+      {tab === 'workflows' && repairCount > 0 && (
+        <Link
+          to="/advanced/evolution"
+          className="mb-4 flex items-center gap-2 rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-small text-warning transition-colors hover:border-warning"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1">
+            {repairCount} thing{repairCount === 1 ? '' : 's'} need{repairCount === 1 ? 's' : ''} repair — details in Advanced
+          </span>
+          <ArrowRight className="h-4 w-4 shrink-0" aria-hidden />
+        </Link>
       )}
 
       {tab === 'workflows' && (
@@ -520,98 +183,83 @@ export function Automate() {
           ? <CardGridSkeleton />
           : wf.length === 0
             ? <EmptyState title="Let's automate something" description="Tell me a task you do often and I'll set it up for you." action={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
-            : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {wf.map((w) => {
-                  const tone = statusTone(w.lastRunStatus ?? undefined);
-                  const isBroken = w.health?.status === 'broken';
-                  const brokenSteps = w.health?.issues.map((i) => i.stepId).join(', ');
-                  const canRun = (!w.certification || w.certification.canRun) && !isBroken;
-                  return (
-                    <Card key={w.name} className="flex flex-col p-5">
-                      <div className="mb-2 flex items-start justify-between gap-3">
-                        <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
-                          {w.name}
-                        </button>
-                        <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
-                      </div>
-                      <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
-                      <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
-                      <div className="mb-3 flex flex-wrap items-center gap-2">
-                        {isBroken && (
-                          <StatusPill tone="danger" title={`Step(s) ${brokenSteps} reference a tool that no longer exists — this workflow will fail on its next run. Open it to fix or remove the step.`}>
-                            Broken — tool missing
-                          </StatusPill>
-                        )}
-                        {w.lastRunStatus && <StatusPill tone={tone.tone}>{tone.label}</StatusPill>}
-                        {(w.lastRunFailedItemCount ?? 0) > 0 && <StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill>}
-                        {(w.trigger?.schedule || w.triggerSchedule) && <span className="inline-flex items-center gap-1 text-caption text-faint"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>}
-                        {typeof w.stepCount === 'number' && <span className="text-caption text-faint">{w.stepCount} steps</span>}
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" disabled={busyName === w.name || !canRun} title={!canRun ? w.certification?.summary : undefined} onClick={() => run(w.name)}>
-                          {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
-                        </Button>
-                        {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
-                          <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
-                            {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
-                          </Button>
-                        )}
-                        {w.lastRunId && (
-                          <Button size="sm" variant="ghost" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })}>
-                            <FileText className="h-4 w-4" aria-hidden /> View run
-                          </Button>
-                        )}
-                        <Button size="sm" variant={canRun ? 'ghost' : 'secondary'} onClick={() => setOpenWf(w.name)}>{canRun ? 'Open' : workflowPrimaryAction(w.certification)}</Button>
-                      </div>
-                    </Card>
-                  );
-                })}
-              </div>
-      )}
-
-      {tab === 'schedules' && (
-        workflows.isLoading
-          ? <CardGridSkeleton />
-          : scheduled.length === 0
-            ? <EmptyState title="No schedules yet" description="Recurring jobs (like a morning briefing) show up here. Ask Clementine to set one up." action={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
-            : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {scheduled.map((w) => {
-                  const canRun = !w.certification || w.certification.canRun;
-                  return (
-                    <Card key={w.name} className="flex flex-col p-5">
-                      <div className="mb-2 flex items-start justify-between gap-3">
-                        <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">{w.name}</button>
-                        <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
-                      </div>
-                      <div className="mb-3 flex items-center gap-1.5 text-body text-primary">
-                        <Clock className="h-4 w-4" aria-hidden />
-                        <span>{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>
-                      </div>
-                      <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
-                      {(w.lastRunFailedItemCount ?? 0) > 0 && (
-                        <div className="mb-3"><StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill></div>
-                      )}
-                      {w.description && <p className="mb-3 line-clamp-2 flex-1 text-small text-muted">{w.description}</p>}
-                      <div className="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" disabled={busyName === w.name || !canRun} title={!canRun ? w.certification?.summary : undefined} onClick={() => run(w.name)}>
-                          {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run now
-                        </Button>
-                        {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
-                          <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
-                            {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
-                          </Button>
-                        )}
-                        {w.lastRunId && (
-                          <Button size="sm" variant="ghost" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })}>
-                            <FileText className="h-4 w-4" aria-hidden /> View run
-                          </Button>
-                        )}
-                        <Button size="sm" variant={canRun ? 'ghost' : 'secondary'} onClick={() => setOpenWf(w.name)}>{canRun ? 'Open' : workflowPrimaryAction(w.certification)}</Button>
-                      </div>
-                    </Card>
-                  );
-                })}
-              </div>
+            : (
+              <>
+                <div className="mb-4 flex flex-wrap gap-1.5">
+                  {([['all', 'All'], ['scheduled', 'Scheduled'], ['manual', 'Manual']] as Array<[WorkflowFilter, string]>).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setFilter(key)}
+                      className={cn('rounded-full border px-3 py-1 text-small font-medium transition-colors cursor-pointer',
+                        filter === key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {visibleWf.length === 0
+                  ? <EmptyState title={filter === 'scheduled' ? 'No scheduled workflows' : 'No manual workflows'} description="Ask Clementine to set one up." />
+                  : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    {visibleWf.map((w) => {
+                      const isBroken = w.health?.status === 'broken';
+                      const canRun = (!w.certification || w.certification.canRun) && !isBroken;
+                      const status = workflowCardStatus(w);
+                      const schedule = w.trigger?.schedule || w.triggerSchedule;
+                      const lastRunAgo = relativeRunTime(w.lastRunAt);
+                      return (
+                        <Card key={w.name} className="flex flex-col p-5">
+                          <div className="mb-2 flex items-start justify-between gap-3">
+                            <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
+                              {w.name}
+                            </button>
+                            <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
+                          </div>
+                          <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
+                          <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                            {status && (
+                              // A pill about the last run opens that run; anything else opens the workflow.
+                              <button
+                                type="button"
+                                title={status.detail}
+                                onClick={() => (status.aboutLastRun && w.lastRunId ? setOpenRun({ workflow: w.name, runId: w.lastRunId }) : setOpenWf(w.name))}
+                                className="cursor-pointer"
+                              >
+                                <StatusPill tone={status.tone}>{status.label}</StatusPill>
+                              </button>
+                            )}
+                            <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
+                              {typeof w.stepCount === 'number' && <span>{w.stepCount} step{w.stepCount === 1 ? '' : 's'}</span>}
+                              {schedule && <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(schedule, w.trigger?.timezone)}</span>}
+                              {w.lastRunId && lastRunAgo && (
+                                <button type="button" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })} className="cursor-pointer underline-offset-2 hover:text-fg hover:underline">
+                                  last run {lastRunAgo}
+                                </button>
+                              )}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {canRun ? (
+                              <Button size="sm" variant="secondary" disabled={busyName === w.name} onClick={() => run(w.name)}>
+                                {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
+                              </Button>
+                            ) : (
+                              <Button size="sm" variant="secondary" title={w.certification?.summary} onClick={() => setOpenWf(w.name)}>
+                                {workflowPrimaryAction(w.certification)}
+                              </Button>
+                            )}
+                            {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
+                              <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
+                                {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
+                              </Button>
+                            )}
+                          </div>
+                        </Card>
+                      );
+                    })}
+                  </div>}
+              </>
+            )
       )}
 
       {tab === 'skills' && (

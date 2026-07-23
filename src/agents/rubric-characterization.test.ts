@@ -68,8 +68,8 @@ const GOLDEN = {
   // 2026-07-22 (late): offer_background ceremony STRIPPED (subtraction) — the
   // structured offer tool is gone; the rubric teaches the same choice as ONE
   // plain prose sentence routed to dispatch_background_task / hold_task_for_later.
-  instructions: { len: 35096, sha16: 'fa00926fa888ce11' },
-  native: { len: 34199, sha16: '597ee33073d5dce5' },
+  instructions: { len: 35596, sha16: '18777b53a8bf4fab' },
+  native: { len: 34699, sha16: 'b2312271cefe4da8' },
   claudeBrain: { len: 5614, sha16: '9ffb25ab1369e5b2' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
   lean: { len: 8920, sha16: 'bbe1323683bfc95e' },

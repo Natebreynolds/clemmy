@@ -17,9 +17,8 @@
  *   ambiguous — several comparable matches → ask the user which one.
  *   none      — nothing close → don't guess; do the task ad-hoc / list options.
  *
- * It also backs the soft run-guard: free-text recent-message blobs are scored
- * against a specific workflow so a resolver-confirmed run isn't re-blocked as
- * "unrequested" (see workflow-run-guard.ts + orchestration-tools.ts).
+ * (The old workflow-run-guard consumer was deleted 2026-07-23 — effect-layer
+ * approval gates carry that protection now.)
  */
 
 import { tokenize } from '../shared/workflow-scoring.js';

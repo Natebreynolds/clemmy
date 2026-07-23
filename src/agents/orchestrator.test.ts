@@ -153,16 +153,17 @@ test('Orchestrator is built with explicit modelSettings so the SDK honors per-tu
 
 test('Orchestrator carries the harness guardrails', async () => {
   const agent = await buildOrchestratorAgent();
-  // SDK normalises into <kind>GuardrailDefinitions; we just confirm
-  // each registry guardrail name shows up.
+  // SDK normalises into <kind>GuardrailDefinitions. The interactive INPUT
+  // rail is EMPTY by design (gate audit S3, 2026-07-23): policy_violation was
+  // the last user-text keyword matcher — autonomy flags are enforced by
+  // stripping tools in the autonomy lane, and chat sends are approval-gated.
   const inputNames = (agent.inputGuardrails ?? []).map((g) =>
     (g as { name?: string }).name,
   );
   const outputNames = (agent.outputGuardrails ?? []).map((g) =>
     (g as { name?: string }).name,
   );
-  assert.ok(inputNames.includes('policy_violation'));
-  assert.ok(!inputNames.includes('missing_capability'));
+  assert.equal(inputNames.length, 0);
   assert.ok(outputNames.includes('secret_leak'));
 });
 

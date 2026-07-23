@@ -35,11 +35,34 @@ function LinkRow({ title, desc, to }: { title: string; desc: string; to: string 
   );
 }
 
+// Anchor jump-nav for the long single-page scroll — no router change, each
+// section keeps its component; the ids live on lightweight wrapper divs.
+const SECTIONS: { id: string; label: string }[] = [
+  { id: 'appearance', label: 'Appearance' },
+  { id: 'notch', label: 'Notch' },
+  { id: 'profile', label: 'Profile' },
+  { id: 'notifications', label: 'Notifications' },
+  { id: 'models', label: 'Models' },
+  { id: 'developer', label: 'Developer' },
+];
+
 export function Settings() {
   const { choice, setChoice } = useTheme();
   return (
     <Page title="Settings" subtitle="Personalize Clementine and manage how it works" width="reading">
+      <nav className="sticky top-0 z-10 -mx-1 mb-4 flex flex-wrap gap-1.5 bg-canvas/95 px-1 py-2 backdrop-blur">
+        {SECTIONS.map((s) => (
+          <a
+            key={s.id}
+            href={`#${s.id}`}
+            className="rounded-full border border-border px-3 py-1 text-small font-medium text-muted transition-colors hover:text-fg"
+          >
+            {s.label}
+          </a>
+        ))}
+      </nav>
       <div className="space-y-4">
+        <div id="appearance" className="scroll-mt-16">
         <Card className="p-5">
           <h3 className="mb-1 text-h3 text-fg">Appearance</h3>
           <p className="mb-4 text-small text-muted">Clementine opens in a warm light theme by default.</p>
@@ -58,20 +81,22 @@ export function Settings() {
             })}
           </div>
         </Card>
+        </div>
 
-        <NotchSettingsCard />
+        <div id="notch" className="scroll-mt-16"><NotchSettingsCard /></div>
 
-        <ProfileForm />
+        <div id="profile" className="scroll-mt-16">
+          <ProfileForm />
+          <div className="mt-4"><StartupDoctorCard /></div>
+        </div>
 
-        <StartupDoctorCard />
+        <div id="notifications" className="scroll-mt-16"><NotificationsEditor /></div>
 
-        <NotificationsEditor />
-
-        <ModelsRoutingSection />
+        <div id="models" className="scroll-mt-16"><ModelsRoutingSection /></div>
 
         <LinkRow title="Connections & API keys" desc="Composio apps, stored keys, and MCP servers. (Codex & Claude sign-in are in Models & routing above.)" to="/connect" />
 
-        <DeveloperModeCard />
+        <div id="developer" className="scroll-mt-16"><DeveloperModeCard /></div>
       </div>
     </Page>
   );

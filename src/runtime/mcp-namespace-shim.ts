@@ -10,6 +10,7 @@ import {
   isGroundingGateEnabled,
   evaluateGrounding,
   detectDuplicateTarget,
+  duplicateResendConsented,
   extractDuplicateIdentityKeys,
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
@@ -1154,7 +1155,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           const dupTargets = extractDuplicateIdentityKeys(args ?? {});
           if (dupTargets.length > 0) {
             const priorWrites = listEvents(integritySessionId, { types: ['external_write'] })
-              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+              .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
             const failures = listEvents(integritySessionId, { types: ['external_write_failed'] })
               .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
             for (const failure of failures) {
@@ -1164,7 +1165,9 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               if (idx >= 0) priorWrites.splice(idx, 1);
             }
             const dup = detectDuplicateTarget({ sessionId: integritySessionId, shapeKey: integrityShapeKey, targets: dupTargets, priorWrites });
-            if (dup.duplicate) {
+            // S2: a FRESH human approval naming this target (resolved after
+            // the prior send) authorizes exactly this resend.
+            if (dup.duplicate && !duplicateResendConsented(integritySessionId, dup.target, dup.priorAt)) {
               throw new DuplicateExternalWriteError({ toolName, shapeKey: integrityShapeKey, target: dup.target ?? 'unknown' });
             }
           }

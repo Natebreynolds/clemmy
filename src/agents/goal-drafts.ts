@@ -77,14 +77,25 @@ export function getGoalDraft(id: string): GoalDraftRecord | null {
   }
 }
 
+/** A pending draft nobody touched for this long is stale — auto-dismiss so the
+ *  "Drafts to review" section never accumulates weeks-old asks. */
+const DRAFT_PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 export function listGoalDrafts(filter: { status?: GoalDraftStatus | 'all'; limit?: number } = {}): GoalDraftRecord[] {
   ensureDir();
   const wanted = filter.status ?? 'pending';
   const out: GoalDraftRecord[] = [];
+  const now = Date.now();
   for (const entry of readdirSync(GOAL_DRAFTS_DIR)) {
     if (!entry.endsWith('.json')) continue;
     try {
-      const record = JSON.parse(readFileSync(path.join(GOAL_DRAFTS_DIR, entry), 'utf-8')) as GoalDraftRecord;
+      let record = JSON.parse(readFileSync(path.join(GOAL_DRAFTS_DIR, entry), 'utf-8')) as GoalDraftRecord;
+      if (record.status === 'pending') {
+        const touched = Date.parse(record.updatedAt ?? record.createdAt);
+        if (Number.isFinite(touched) && now - touched > DRAFT_PENDING_TTL_MS) {
+          record = dismissGoalDraft(record.id, 'expired — untouched for 7 days') ?? record;
+        }
+      }
       if (wanted !== 'all' && record.status !== wanted) continue;
       out.push(record);
     } catch { /* ignore malformed drafts */ }

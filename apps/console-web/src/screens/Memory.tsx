@@ -18,7 +18,7 @@ import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
   listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
-  getBrainHealth, getMemoryHealth, getToolRecall, listEntities, getSourceMap, fileBasename, FACT_KINDS,
+  getBrainHealth, getMemoryHealth, listEntities, getSourceMap, fileBasename, FACT_KINDS,
   listEntityIdentityConflicts, listEntityDuplicateCandidates, dismissEntityDuplicateCandidate,
   restoreDismissedEntityDuplicateCandidates, mergeEntityIdentity,
   getEntityMemory,
@@ -27,35 +27,35 @@ import {
   restoreFact, updateFact, reconcileMemoryEvidence, reconcileMemoryRelationships,
   getMemoryReadiness, listReflectionCandidates,
   listMemoryEpisodes, promoteMemoryEpisodeCandidate, rejectMemoryEpisodeCandidate,
-  type Fact, type ContextFile, type Entity, type ToolRecallRecord, type ImportScan, type ImportBatch, type MemoryHit,
+  listIdentityProposals, approveIdentityProposal, rejectIdentityProposal, type IdentityProposal,
+  type Fact, type ContextFile, type Entity, type ImportScan, type ImportBatch, type MemoryHit,
   type EntityIdentityConflict, type EntityDuplicateCandidate, type EntityMemoryDetail,
   type MemoryReviewCandidate, type MemoryReadinessReport, type MemoryReadinessCheck,
   type MemoryEpisode, type MemoryEpisodeKind, type MemoryEpisodeStatus,
 } from '@/lib/memory';
 import { memoryAssuranceView, memoryClaimTemporalStatus } from '@/lib/memory-assurance';
 
-type Tab = 'tiers' | 'overview' | 'facts' | 'episodes' | 'entities' | 'procedures' | 'sources' | 'you' | 'import';
+type Tab = 'overview' | 'facts' | 'episodes' | 'entities' | 'sources';
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
 
 export function Memory() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>('tiers');
+  const [tab, setTab] = useState<Tab>('overview');
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
   const search = useQuery({ queryKey: ['mem-search', debouncedQ], queryFn: () => searchMemory(debouncedQ), enabled: debouncedQ.length >= 2, staleTime: 30_000 });
   const searching = debouncedQ.length >= 2;
 
+  // Five tabs, one row. Short-term & Long-term merged into Overview; Import
+  // lives on Sources; profile/goals cards live on Sources (core context);
+  // Tool recall is operator telemetry → Advanced → Tools.
   const tabs: { key: Tab; label: string; icon: typeof Search }[] = [
-    { key: 'tiers', label: 'Short-term & Long-term', icon: Brain },
-    { key: 'overview', label: 'Overview', icon: Network },
+    { key: 'overview', label: 'Overview', icon: Brain },
     { key: 'facts', label: 'Facts', icon: BookOpen },
     { key: 'episodes', label: 'Timeline', icon: History },
     { key: 'entities', label: 'People & things', icon: Users },
-    { key: 'procedures', label: 'Tool recall', icon: Wrench },
     { key: 'sources', label: 'Sources', icon: FileText },
-    { key: 'you', label: 'You & goals', icon: User },
-    { key: 'import', label: 'Import', icon: Download },
   ];
 
   return (
@@ -83,28 +83,30 @@ export function Memory() {
               );
             })}
           </div>
-          {tab === 'tiers' && <TiersTab onNavigate={setTab} />}
           {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
           {tab === 'facts' && <FactsTab qc={qc} />}
           {tab === 'episodes' && <EpisodesTab />}
           {tab === 'entities' && <EntitiesTab />}
-          {tab === 'procedures' && <ProceduresTab />}
-          {tab === 'sources' && <SourcesTab onNavigate={setTab} />}
-          {tab === 'you' && <YouTab qc={qc} />}
-          {tab === 'import' && <ImportTab qc={qc} />}
+          {tab === 'sources' && <SourcesTab qc={qc} onNavigate={setTab} />}
         </>
       )}
     </Page>
   );
 }
 
-// ─────────── Short-term & Long-term: the tier model, made legible ───────────
-function TiersTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
+// ─────────── Overview: short-term/long-term hero + review queue + graph ───────────
+// (Formerly two tabs — "Short-term & Long-term" and "Overview" — that showed the
+// same counts twice. Deep diagnostics live behind ONE fold at the bottom.)
+function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
   const ctx = usePoll(['context'], getContext, 20000);
   const health = usePoll(['brain-health'], getBrainHealth, 30000);
+  const memHealth = usePoll(['memory-health'], getMemoryHealth, 30000);
+  const readiness = usePoll(['memory-readiness'], getMemoryReadiness, 30000);
   const files = usePoll(['memory-files'], getMemoryFiles, 60000);
   const h = health.data ?? {};
   const workingMem = (ctx.data?.files ?? []).find((f) => f.key === 'working_memory');
+  const assurance = readiness.data ? memoryAssuranceView(readiness.data) : null;
+  const firstIssue = readiness.data?.checks.find((c) => c.status === 'fail') ?? readiness.data?.checks.find((c) => c.status !== 'pass');
 
   const longTerm: { label: string; value?: number; sub: string; tab: Tab; icon: typeof Database }[] = [
     { label: 'Facts', value: h.activeFacts, sub: `${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned`, tab: 'facts', icon: BookOpen },
@@ -148,49 +150,9 @@ function TiersTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
               );
             })}
           </div>
-          <button type="button" onClick={() => onNavigate('overview')}
-            className="mt-3 inline-flex items-center gap-1 text-small font-medium text-primary hover:underline cursor-pointer">
-            See the full knowledge graph <ArrowRight className="h-3.5 w-3.5" aria-hidden />
-          </button>
         </section>
       </div>
-    </div>
-  );
-}
 
-// ─────────── Overview: the knowledge graph as the focal point + stats ───────────
-function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
-  const health = usePoll(['brain-health'], getBrainHealth, 30000);
-  const memHealth = usePoll(['memory-health'], getMemoryHealth, 30000);
-  const readiness = usePoll(['memory-readiness'], getMemoryReadiness, 30000);
-  const files = usePoll(['memory-files'], getMemoryFiles, 60000);
-  const sources = usePoll(['source-map'], getSourceMap, 60000);
-  const h = health.data ?? {};
-  const relationships = memHealth.data?.reliability?.relationships;
-  const stats = [
-    { label: 'Facts', value: h.activeFacts, sub: `${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned` },
-    { label: 'People & things', value: h.entitiesTotal, sub: `${h.entitiesPerson ?? 0} people · ${h.entitiesCompany ?? 0} orgs` },
-    { label: 'Knowledge files', value: files.data?.files?.length, sub: 'indexed & searchable' },
-    { label: 'Source episodes', value: h.memoryEpisodesTotal, sub: `${h.memoryEpisodesRecent ?? 0} recent · ${h.recordedMeetingsTotal ?? 0} meetings` },
-    { label: 'Data sources', value: sources.data?.count, sub: 'places data lives' },
-    {
-      label: 'Evidence links',
-      value: relationships?.factEvidence,
-      sub: 'claims ↔ durable episodes',
-    },
-  ];
-  return (
-    <div className="space-y-5">
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-        {stats.map((s) => (
-          <Card key={s.label} className="p-4">
-            <div className="text-h2 text-fg">{typeof s.value === 'number' ? s.value.toLocaleString() : '—'}</div>
-            <div className="text-small font-medium text-fg">{s.label}</div>
-            <div className="mt-0.5 text-caption text-faint">{s.sub}</div>
-          </Card>
-        ))}
-      </div>
-      <MemoryAssurancePanel report={readiness.data} loading={readiness.isLoading} />
       <MemoryReviewQueue
         health={memHealth.data}
         readiness={readiness.data}
@@ -200,12 +162,29 @@ function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
           void readiness.refetch();
         }}
       />
-      <RecallHealthStrip health={memHealth.data} />
-      <GraphTruthCoverage health={memHealth.data} readiness={readiness.data} />
+
+      {/* One plain sentence when a safeguard needs a human; the full audit
+          panel (pass counts, schema versions) lives in the diagnostics fold. */}
+      {assurance && assurance.tone !== 'success' && (
+        <div className="flex items-center gap-2 rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-small text-warning">
+          <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1">{firstIssue ? firstIssue.summary : assurance.detail} — details under Memory diagnostics below.</span>
+        </div>
+      )}
+
       <div>
         <p className="mb-2 text-small text-muted">Explore stored memory truth first. Text matches and semantic similarity are optional, labeled overlays.</p>
         <MemoryGraphContainer height={540} />
       </div>
+
+      <details className="rounded-lg border border-border bg-surface p-4">
+        <summary className="cursor-pointer text-body font-medium text-fg">Memory diagnostics</summary>
+        <div className="mt-4 space-y-4">
+          <MemoryAssurancePanel report={readiness.data} loading={readiness.isLoading} />
+          <RecallHealthStrip health={memHealth.data} />
+          <GraphTruthCoverage health={memHealth.data} readiness={readiness.data} />
+        </div>
+      </details>
     </div>
   );
 }
@@ -673,55 +652,61 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
       setResolvingReview('');
     }
   };
+  // The classifier already labeled every one of these "likely conversational
+  // request" — asking for N individual clicks was the clutter. One sweep,
+  // one confirm, still reversible from memory history. Pages through the
+  // queue so the sweep covers the whole backlog, not just the visible 25.
+  const transientTotal = reviews.data?.byKind.retire_transient_request ?? 0;
+  const bulkForgetRequests = async () => {
+    if (!window.confirm(`Forget all ${transientTotal} conversational requests currently waiting for review?\n\nOnly items classified as chat requests are touched — possible duplicates stay for individual review. Reversible from memory history.`)) return;
+    setResolvingReview('bulk');
+    try {
+      for (let page = 0; page < 40; page += 1) {
+        const batch = await listMemoryReviewCandidates(25);
+        const transient = batch.candidates.filter((c) => c.kind === 'retire_transient_request');
+        if (transient.length === 0) break;
+        for (const candidate of transient) await applyMemoryReviewCandidate(candidate.id);
+      }
+      await Promise.all([reviews.refetch(), facts.refetch()]);
+      void qc.invalidateQueries({ queryKey: ['facts'] });
+    } finally {
+      setResolvingReview('');
+    }
+  };
   return (
     <>
-      {(learning.data?.health.total ?? 0) > 0 && <Card className="mb-4 p-4">
-        <details>
-          <summary className="cursor-pointer list-none">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <div className="flex items-center gap-2 text-body font-medium text-fg"><History className="h-4 w-4 text-primary" aria-hidden /> Learning decisions</div>
-                <p className="mt-1 text-small text-muted">See every proposed claim—not only what survived into Facts—and how repeats were consolidated.</p>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <StatusPill tone="success">{learning.data?.health.promoted ?? 0} promoted</StatusPill>
-                <StatusPill tone="neutral">{learning.data?.health.rejected ?? 0} filtered</StatusPill>
-                {(learning.data?.health.pending ?? 0) > 0 && <StatusPill tone="warning">{learning.data?.health.pending ?? 0} pending</StatusPill>}
-                {(learning.data?.health.retrying ?? 0) > 0 && <StatusPill tone="warning">{learning.data?.health.retrying ?? 0} replaying</StatusPill>}
-                {(learning.data?.health.expired ?? 0) > 0 && <StatusPill tone="neutral">{learning.data?.health.expired ?? 0} expired</StatusPill>}
-              </div>
-            </div>
-          </summary>
-          <div className="mt-3 space-y-2 border-t border-border pt-3">
-            {learning.data?.candidates.slice(0, 16).map((candidate) => {
-              const tone = candidate.status === 'promoted' ? 'success' : candidate.status === 'pending' ? 'warning' : 'neutral';
-              return <div key={candidate.id} className="rounded-lg border border-border bg-surface p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <StatusPill tone={tone}>{candidate.status}</StatusPill>
-                  <StatusPill tone="neutral">{candidate.kind}</StatusPill>
-                  <StatusPill tone="neutral">{candidate.sourceType === 'auto_capture' ? 'user turn' : candidate.sourceType.replace(/_/g, ' ')}</StatusPill>
-                  <span className="text-caption text-faint">importance {candidate.importance}/10</span>
-                  <span className="ml-auto text-caption text-faint">{shortDate(candidate.occurredAt ?? candidate.createdAt)}{candidate.sourceApp ? ` · ${candidate.sourceApp}` : ''}</span>
-                </div>
-                <p className="mt-2 text-small text-fg">{candidate.text}</p>
-                <p className="mt-1 text-caption text-faint">
-                  {candidate.intakeReason ? `Captured because ${candidate.intakeReason}. ` : ''}
-                  {candidate.reason ? candidate.reason.replace(/[_:]/g, ' ') : candidate.attemptCount > 0 ? `queued replay attempt ${candidate.attemptCount}` : 'awaiting consolidation'}
-                  {candidate.resultingFactId != null ? ` · canonical fact #${candidate.resultingFactId}` : ''}
-                </p>
-                {candidate.lastError && <p className="mt-1 rounded border border-warning/30 bg-warning/5 p-2 text-caption text-muted">Replay is safe and pending: {candidate.lastError}{candidate.nextAttemptAt ? ` · retry ${shortDate(candidate.nextAttemptAt)}` : ''}</p>}
-                {candidate.resultingFactContent && candidate.resultingFactContent !== candidate.text && <p className="mt-1 rounded bg-subtle p-2 text-caption text-muted">Consolidated as: {candidate.resultingFactContent}</p>}
-              </div>;
-            })}
-            {(learning.data?.candidates.length ?? 0) > 16 && <p className="text-caption text-faint">Showing the 16 latest of {learning.data?.health.total} decisions.</p>}
-          </div>
-        </details>
-      </Card>}
-      {(reviews.data?.candidates.length ?? 0) > 0 && <Card className="mb-4 border-warning/40 bg-warning/5 p-4">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {([{ key: 'all', label: 'All' }, ...FACT_KINDS] as { key: Fact['kind'] | 'all'; label: string }[]).map((k) => (
+          <button key={k.key} type="button" onClick={() => setKind(k.key)}
+            className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', kind === k.key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{k.label}</button>
+        ))}
+        <button type="button" onClick={() => setShowForgotten((value) => !value)}
+          className={cn('ml-auto inline-flex items-center gap-1 rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', showForgotten ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>
+          <History className="h-3.5 w-3.5" aria-hidden /> {showForgotten ? 'Showing history' : 'Show history'}
+        </button>
+        {facts.data && <span className="basis-full text-caption text-faint sm:ml-auto sm:basis-auto">
+          Showing {facts.data.visible} of {facts.data.total} {showForgotten ? 'current and historical' : 'current'} facts{facts.data.visible < facts.data.total ? ' · use memory search for the full archive' : ''}
+        </span>}
+      </div>
+      <div className="mb-4 flex flex-wrap gap-2">
+        <Input value={draft} onChange={(e) => { setDraft(e.target.value); setAddResult(''); }} placeholder="Tell Clementine something to remember…" aria-label="New fact" className="min-w-48 flex-1" onKeyDown={(e) => { if (e.key === 'Enter') void add(); }} />
+        <Select value={draftKind} onChange={(e) => setDraftKind(e.target.value as Fact['kind'])} aria-label="Fact type" className="w-40">{FACT_KINDS.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}</Select>
+        <Button onClick={add} disabled={!draft.trim()}><Plus className="h-4 w-4" aria-hidden /> Remember</Button>
+        {addResult && <p className="basis-full text-caption text-muted"><CheckCircle2 className="mr-1 inline h-3.5 w-3.5 text-success" aria-hidden />{addResult}</p>}
+      </div>
+      {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
+        : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
+          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} />)}</div>}
+      {(reviews.data?.candidates.length ?? 0) > 0 && <Card className="mt-4 border-warning/40 bg-warning/5 p-4">
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <div className="text-body font-medium text-fg">Memory review</div>
           {(reviews.data?.byKind.merge_duplicate ?? 0) > 0 && <StatusPill tone="warning">{reviews.data?.byKind.merge_duplicate} possible duplicate{reviews.data?.byKind.merge_duplicate === 1 ? '' : 's'}</StatusPill>}
-          {(reviews.data?.byKind.retire_transient_request ?? 0) > 0 && <StatusPill tone="neutral">{reviews.data?.byKind.retire_transient_request} chat request{reviews.data?.byKind.retire_transient_request === 1 ? '' : 's'}</StatusPill>}
+          {transientTotal > 0 && <StatusPill tone="neutral">{transientTotal} chat request{transientTotal === 1 ? '' : 's'}</StatusPill>}
+          {transientTotal > 1 && (
+            <Button size="sm" variant="secondary" className="ml-auto" disabled={Boolean(resolvingReview)} onClick={() => void bulkForgetRequests()}>
+              <Trash2 className="h-3.5 w-3.5" aria-hidden /> {resolvingReview === 'bulk' ? 'Sweeping…' : `Forget all ${transientTotal} chat requests`}
+            </Button>
+          )}
         </div>
         <p className="mb-3 text-small text-muted">Potential duplicates and older chat requests wait here. Clementine never merges or removes durable knowledge without showing you the exact facts first.</p>
         <div className="space-y-2">
@@ -764,37 +749,59 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
                 <p className="text-small text-fg">{fact?.content ?? candidate.evidence}</p>
                 <p className="mt-1 text-caption text-faint">Likely conversational request · review only · reversible</p>
               </div>
+              {/* Keep leads; Forget is quiet — the destructive action should
+                  never be the loudest thing on the row. */}
               <div className="flex shrink-0 gap-2">
-                <Button size="sm" variant="danger" disabled={Boolean(resolvingReview)} onClick={() => void resolveReview(candidate, 'apply')}><Trash2 className="h-3.5 w-3.5" aria-hidden /> Forget request</Button>
                 <Button size="sm" variant="secondary" disabled={Boolean(resolvingReview)} onClick={() => void resolveReview(candidate, 'dismiss')}><CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> Keep as fact</Button>
+                <Button size="sm" variant="ghost" className="text-danger" disabled={Boolean(resolvingReview)} onClick={() => void resolveReview(candidate, 'apply')}><Trash2 className="h-3.5 w-3.5" aria-hidden /> Forget</Button>
               </div>
             </div>;
           })}
         </div>
         {(reviews.data?.total ?? 0) > 8 && <p className="mt-2 text-caption text-faint">Showing 8 of {reviews.data?.total} candidates. Duplicate and request reviews are interleaved so neither queue can hide the other.</p>}
       </Card>}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        {([{ key: 'all', label: 'All' }, ...FACT_KINDS] as { key: Fact['kind'] | 'all'; label: string }[]).map((k) => (
-          <button key={k.key} type="button" onClick={() => setKind(k.key)}
-            className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', kind === k.key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{k.label}</button>
-        ))}
-        <button type="button" onClick={() => setShowForgotten((value) => !value)}
-          className={cn('ml-auto inline-flex items-center gap-1 rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', showForgotten ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>
-          <History className="h-3.5 w-3.5" aria-hidden /> {showForgotten ? 'Showing history' : 'Show history'}
-        </button>
-        {facts.data && <span className="basis-full text-caption text-faint sm:ml-auto sm:basis-auto">
-          Showing {facts.data.visible} of {facts.data.total} {showForgotten ? 'current and historical' : 'current'} facts{facts.data.visible < facts.data.total ? ' · use memory search for the full archive' : ''}
-        </span>}
-      </div>
-      <div className="mb-4 flex flex-wrap gap-2">
-        <Input value={draft} onChange={(e) => { setDraft(e.target.value); setAddResult(''); }} placeholder="Tell Clementine something to remember…" aria-label="New fact" className="min-w-48 flex-1" onKeyDown={(e) => { if (e.key === 'Enter') void add(); }} />
-        <Select value={draftKind} onChange={(e) => setDraftKind(e.target.value as Fact['kind'])} aria-label="Fact type" className="w-40">{FACT_KINDS.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}</Select>
-        <Button onClick={add} disabled={!draft.trim()}><Plus className="h-4 w-4" aria-hidden /> Remember</Button>
-        {addResult && <p className="basis-full text-caption text-muted"><CheckCircle2 className="mr-1 inline h-3.5 w-3.5 text-success" aria-hidden />{addResult}</p>}
-      </div>
-      {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
-        : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
-          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} />)}</div>}
+      {(learning.data?.health.total ?? 0) > 0 && <Card className="mt-4 p-4">
+        <details>
+          <summary className="cursor-pointer list-none">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-body font-medium text-fg"><History className="h-4 w-4 text-primary" aria-hidden /> Learning decisions</div>
+                <p className="mt-1 text-small text-muted">See every proposed claim—not only what survived into Facts—and how repeats were consolidated.</p>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                <StatusPill tone="success">{learning.data?.health.promoted ?? 0} promoted</StatusPill>
+                <StatusPill tone="neutral">{learning.data?.health.rejected ?? 0} filtered</StatusPill>
+                {(learning.data?.health.pending ?? 0) > 0 && <StatusPill tone="warning">{learning.data?.health.pending ?? 0} pending</StatusPill>}
+                {(learning.data?.health.retrying ?? 0) > 0 && <StatusPill tone="warning">{learning.data?.health.retrying ?? 0} replaying</StatusPill>}
+                {(learning.data?.health.expired ?? 0) > 0 && <StatusPill tone="neutral">{learning.data?.health.expired ?? 0} expired</StatusPill>}
+              </div>
+            </div>
+          </summary>
+          <div className="mt-3 space-y-2 border-t border-border pt-3">
+            {learning.data?.candidates.slice(0, 16).map((candidate) => {
+              const tone = candidate.status === 'promoted' ? 'success' : candidate.status === 'pending' ? 'warning' : 'neutral';
+              return <div key={candidate.id} className="rounded-lg border border-border bg-surface p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <StatusPill tone={tone}>{candidate.status}</StatusPill>
+                  <StatusPill tone="neutral">{candidate.kind}</StatusPill>
+                  <StatusPill tone="neutral">{candidate.sourceType === 'auto_capture' ? 'user turn' : candidate.sourceType.replace(/_/g, ' ')}</StatusPill>
+                  <span className="text-caption text-faint">importance {candidate.importance}/10</span>
+                  <span className="ml-auto text-caption text-faint">{shortDate(candidate.occurredAt ?? candidate.createdAt)}{candidate.sourceApp ? ` · ${candidate.sourceApp}` : ''}</span>
+                </div>
+                <p className="mt-2 text-small text-fg">{candidate.text}</p>
+                <p className="mt-1 text-caption text-faint">
+                  {candidate.intakeReason ? `Captured because ${candidate.intakeReason}. ` : ''}
+                  {candidate.reason ? candidate.reason.replace(/[_:]/g, ' ') : candidate.attemptCount > 0 ? `queued replay attempt ${candidate.attemptCount}` : 'awaiting consolidation'}
+                  {candidate.resultingFactId != null ? ` · canonical fact #${candidate.resultingFactId}` : ''}
+                </p>
+                {candidate.lastError && <p className="mt-1 rounded border border-warning/30 bg-warning/5 p-2 text-caption text-muted">Replay is safe and pending: {candidate.lastError}{candidate.nextAttemptAt ? ` · retry ${shortDate(candidate.nextAttemptAt)}` : ''}</p>}
+                {candidate.resultingFactContent && candidate.resultingFactContent !== candidate.text && <p className="mt-1 rounded bg-subtle p-2 text-caption text-muted">Consolidated as: {candidate.resultingFactContent}</p>}
+              </div>;
+            })}
+            {(learning.data?.candidates.length ?? 0) > 16 && <p className="text-caption text-faint">Showing the 16 latest of {learning.data?.health.total} decisions.</p>}
+          </div>
+        </details>
+      </Card>}
     </>
   );
 }
@@ -1149,6 +1156,26 @@ function EntitiesTab() {
   };
   return (
     <>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {ENTITY_TYPES.map((t) => (
+          <button key={t} type="button" onClick={() => setType(t)}
+            className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', type === t ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{ENTITY_PLURAL[t] ?? t}</button>
+        ))}
+        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search all identities…" aria-label="Search all identities" className="ml-auto w-56" />
+      </div>
+      {entities.isLoading ? <div className="grid gap-2 sm:grid-cols-2">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-14 w-full" />)}</div>
+        : rows.length === 0 ? <Card><EmptyState title="Nothing here yet" description="People, companies, and projects Clementine learns about will appear here." /></Card>
+          : <>
+              <p className="mb-2 text-small text-muted">
+                {rows.length} of {(entities.data?.total ?? rows.length).toLocaleString()} matching canonical identities
+                {(type !== 'all' || debouncedQ) ? ` · ${(entities.data?.allTotal ?? 0).toLocaleString()} total` : ''}
+                {' · '}{(entities.data?.redirectedTotal ?? 0).toLocaleString()} identity records safely combined.
+              </p>
+              {selectedId != null && <EntityMemoryPanel entityId={selectedId} onClose={() => setSelectedId(null)} />}
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {rows.map((e) => <EntityCard key={e.id} entity={e} selected={String(e.id) === String(selectedId)} onOpen={() => setSelectedId(e.id)} />)}
+              </div>
+            </>}
       {otherIdentityConflicts.length > 0 && (
         <Card className="mb-4 border-warning/40 bg-warning/5 p-4">
           <div className="mb-1 text-body font-medium text-fg">Other identity conflicts</div>
@@ -1216,26 +1243,6 @@ function EntitiesTab() {
           </div>
         </Card>
       )}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        {ENTITY_TYPES.map((t) => (
-          <button key={t} type="button" onClick={() => setType(t)}
-            className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', type === t ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{ENTITY_PLURAL[t] ?? t}</button>
-        ))}
-        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search all identities…" aria-label="Search all identities" className="ml-auto w-56" />
-      </div>
-      {entities.isLoading ? <div className="grid gap-2 sm:grid-cols-2">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-14 w-full" />)}</div>
-        : rows.length === 0 ? <Card><EmptyState title="Nothing here yet" description="People, companies, and projects Clementine learns about will appear here." /></Card>
-          : <>
-              <p className="mb-2 text-small text-muted">
-                {rows.length} of {(entities.data?.total ?? rows.length).toLocaleString()} matching canonical identities
-                {(type !== 'all' || debouncedQ) ? ` · ${(entities.data?.allTotal ?? 0).toLocaleString()} total` : ''}
-                {' · '}{(entities.data?.redirectedTotal ?? 0).toLocaleString()} identity records safely combined.
-              </p>
-              {selectedId != null && <EntityMemoryPanel entityId={selectedId} onClose={() => setSelectedId(null)} />}
-              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {rows.map((e) => <EntityCard key={e.id} entity={e} selected={String(e.id) === String(selectedId)} onOpen={() => setSelectedId(e.id)} />)}
-              </div>
-            </>}
     </>
   );
 }
@@ -1430,92 +1437,59 @@ function EntityMemoryDetailPanel({ detail, onClose }: { detail: EntityMemoryDeta
 // inspectable only by hand-reading .md files — the strongest ever-learning
 // signal, now auditable: which tool proved out for an intent, its success
 // rate, and what fell back.
-function ProceduresTab() {
-  const recall = usePoll(['tool-recall'], getToolRecall, 30000);
-  const rows = recall.data?.records ?? [];
-  return (
-    <>
-      <p className="mb-3 text-small text-muted">Reusable tool procedures, with every phrasing kept as an alias instead of a duplicate memory. Outcomes belong to the procedure actually used; impressions are shown separately.</p>
-      {recall.data && rows.length > 0 && (
-        <div className="mb-3 flex flex-wrap gap-2 text-caption text-muted">
-          <span className="rounded-full border border-border bg-surface px-2.5 py-1">{recall.data.count} canonical procedures</span>
-          <span className="rounded-full border border-border bg-surface px-2.5 py-1">{recall.data.aliasCount ?? rows.length} intent aliases</span>
-          {(recall.data.collapsedAliases ?? 0) > 0 && <span className="rounded-full border border-success/30 bg-success/10 px-2.5 py-1 text-success">{recall.data.collapsedAliases} duplicates collapsed</span>}
-          {(recall.data.quarantinedAliases ?? 0) > 0 && <span className="rounded-full border border-warning/30 bg-warning/10 px-2.5 py-1 text-warning">{recall.data.quarantinedAliases} noisy aliases quarantined</span>}
-        </div>
-      )}
-      {recall.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
-        : rows.length === 0 ? <Card><EmptyState title="No learned procedures yet" description="As Clementine proves out which tool handles a kind of task, it lands here so she doesn't rediscover it next time." /></Card>
-          : <div className="space-y-2">{rows.map((r) => <ProcedureCard key={r.procedureId ?? r.intent} rec={r} />)}</div>}
-    </>
-  );
-}
-
-function ProcedureCard({ rec }: { rec: ToolRecallRecord }) {
-  const c = rec.choice;
-  const score = typeof c?.score === 'number' ? Math.round(c.score * 100) : null;
-  const success = c?.successCount ?? 0;
-  const failure = c?.failureCount ?? 0;
-  const aliases = rec.aliases ?? [];
-  const quarantined = aliases.filter((alias) => alias.status === 'quarantined').length;
-  return (
-    <Card className="p-3.5">
-      <div className="flex items-start gap-3">
-        <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{rec.intent}</span>
-            {c ? <StatusPill tone="neutral">{c.kind}</StatusPill> : <StatusPill tone="warning">needs rediscovery</StatusPill>}
-            {score != null && <span className="shrink-0 text-caption text-faint">{score}%</span>}
-          </div>
-          {c && <p className="mt-0.5 font-mono text-small text-muted">→ {c.identifier}</p>}
-          {rec.description && <p className="mt-0.5 text-small text-muted">{rec.description}</p>}
-          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
-            {(success > 0 || failure > 0) && (
-              <span className="inline-flex items-center gap-2">
-                <span className="inline-flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden />{success}</span>
-                <span className="inline-flex items-center gap-1"><XCircle className="h-3.5 w-3.5 text-warning" aria-hidden />{failure}</span>
-              </span>
-            )}
-            {rec.fallbacks.length > 0 && <span>{rec.fallbacks.length} fallback{rec.fallbacks.length === 1 ? '' : 's'} tried</span>}
-            {aliases.length > 0 && <span>{aliases.length} intent alias{aliases.length === 1 ? '' : 'es'}</span>}
-            {(rec.evidenceCount ?? 0) > 0 && <span>{rec.evidenceCount} evidence event{rec.evidenceCount === 1 ? '' : 's'}</span>}
-            {(rec.impressionCount ?? 0) > 0 && <span>{rec.impressionCount} impression{rec.impressionCount === 1 ? '' : 's'} (not rank)</span>}
-            {quarantined > 0 && <span className="text-warning">{quarantined} quarantined alias{quarantined === 1 ? '' : 'es'}</span>}
-          </div>
-          {aliases.length > 1 && (
-            <details className="mt-2 text-caption text-muted">
-              <summary className="cursor-pointer select-none">Show intent aliases</summary>
-              <div className="mt-1.5 space-y-1 rounded-md bg-subtle p-2">
-                {aliases.map((alias) => (
-                  <div key={`${alias.status}:${alias.intent}`} className="flex items-start gap-2">
-                    <StatusPill tone={alias.status === 'active' ? 'success' : alias.status === 'quarantined' ? 'warning' : 'neutral'}>{alias.status}</StatusPill>
-                    <span className="min-w-0 break-words">{alias.intent}</span>
-                    <span className="ml-auto shrink-0 text-faint">{alias.source.replace(/_/g, ' ')}</span>
-                  </div>
-                ))}
-              </div>
-            </details>
-          )}
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-function SourcesTab({ onNavigate }: { onNavigate?: (tab: Tab) => void }) {
+function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>; onNavigate?: (tab: Tab) => void }) {
   const ctx = usePoll(['context'], getContext, 30000);
   const files = usePoll(['memory-files'], getMemoryFiles, 30000);
   const sources = usePoll(['source-map'], getSourceMap, 30000);
   const coreFiles = ctx.data?.files ?? [];
   const vault = files.data?.files ?? [];
   const pointers = sources.data?.pointers ?? [];
+  const profile = ctx.data?.profile ?? {};
+  const goals = ctx.data?.goals ?? [];
+  const [goalTitle, setGoalTitle] = useState('');
+  const [goalDesc, setGoalDesc] = useState('');
+  const addContextGoal = async () => {
+    if (!goalTitle.trim() || !goalDesc.trim()) return;
+    try { await addGoal(goalTitle.trim(), goalDesc.trim()); setGoalTitle(''); setGoalDesc(''); }
+    finally { void qc.invalidateQueries({ queryKey: ['context'] }); }
+  };
   return (
     <div className="space-y-6">
       <section>
         <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><BookOpen className="h-5 w-5 text-primary" aria-hidden /> Core context</h3>
         <p className="mb-3 text-small text-muted">The notes Clementine reads on every turn — her personality, who you are, and what to keep in mind. This is the seeded memory you can shape.</p>
+        <IdentityProposalReview qc={qc} />
         {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : <div className="space-y-2">{coreFiles.map((f) => <ContextFileCard key={f.key} file={f} onNavigate={onNavigate} />)}</div>}
+        {/* Profile + standing goals ARE core context — they used to be their own
+            "You & goals" tab, but they read on every turn like the files above. */}
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <Card className="p-5">
+            <div className="mb-3 flex items-center gap-2"><User className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Profile</h3></div>
+            {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : (
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-2.5">
+                <ProfileItem label="Name" value={profile.preferredName || profile.displayName} />
+                <ProfileItem label="Role" value={profile.role} />
+                <ProfileItem label="Timezone" value={profile.timezone} />
+                <ProfileItem label="Tone" value={profile.communicationTone} />
+              </dl>
+            )}
+            <p className="mt-3 text-small text-muted">Wrong name or details? Fix them in <Link to="/settings" className="text-primary hover:underline">Settings → Profile</Link>.</p>
+          </Card>
+          <Card className="p-5">
+            <div className="mb-3 flex items-center gap-2"><Target className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Standing goals</h3></div>
+            {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : goals.length === 0 ? <p className="text-body text-muted">No standing goals yet. Tell Clementine what you're working toward.</p>
+              : <ul className="space-y-2.5">{goals.map((g, i) => (
+                  <li key={g.id || i} className="flex items-start gap-2.5"><span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden /><div><div className="text-body font-medium text-fg">{g.title || g.objective || 'Goal'}</div>{g.description && <div className="text-small text-muted">{g.description}</div>}</div></li>
+                ))}</ul>}
+            <div className="mt-4 space-y-2 border-t border-border pt-4">
+              <Input value={goalTitle} onChange={(e) => setGoalTitle(e.target.value)} placeholder="New goal (e.g. Grow SEO pipeline)" aria-label="Goal title" />
+              <div className="flex gap-2">
+                <Input value={goalDesc} onChange={(e) => setGoalDesc(e.target.value)} placeholder="What does success look like?" aria-label="Goal description" className="flex-1" />
+                <Button size="sm" onClick={addContextGoal} disabled={!goalTitle.trim() || !goalDesc.trim()}><Plus className="h-4 w-4" aria-hidden /> Add</Button>
+              </div>
+            </div>
+          </Card>
+        </div>
       </section>
 
       {pointers.length > 0 && (
@@ -1551,6 +1525,64 @@ function SourcesTab({ onNavigate }: { onNavigate?: (tab: Tab) => void }) {
               ))}
             </div>}
       </section>
+
+      {/* Import is an action on Sources, not a top-level destination. */}
+      <details className="rounded-lg border border-border bg-surface p-4">
+        <summary className="flex cursor-pointer items-center gap-2 text-h3 text-fg"><Download className="h-5 w-5 text-primary" aria-hidden /> Import another agent's memory</summary>
+        <div className="mt-4"><ImportTab qc={qc} /></div>
+      </details>
+    </div>
+  );
+}
+
+/** Pending curated-identity update drafted from learned facts. Renders
+ *  nothing when the queue is empty (the common case), so the Core
+ *  context section stays byte-identical for users with no proposal. */
+function IdentityProposalReview({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
+  const proposals = usePoll(['identity-proposals'], listIdentityProposals, 60000);
+  const [resolving, setResolving] = useState('');
+  const pending = (proposals.data?.proposals ?? []).filter((p) => p.status === 'pending');
+  if (pending.length === 0) return null;
+  const resolve = async (proposal: IdentityProposal, action: 'approve' | 'reject') => {
+    setResolving(proposal.id);
+    try {
+      if (action === 'approve') await approveIdentityProposal(proposal.id);
+      else await rejectIdentityProposal(proposal.id);
+    } finally {
+      setResolving('');
+      void proposals.refetch();
+      void qc.invalidateQueries({ queryKey: ['context'] });
+    }
+  };
+  return (
+    <div className="mb-3 space-y-2">
+      {pending.map((p) => (
+        <Card key={p.id} className="border-primary/30 bg-primary/5 p-4">
+          <div className="flex items-center gap-2">
+            <Pencil className="h-4 w-4 shrink-0 text-primary" aria-hidden />
+            <span className="flex-1 text-body font-medium text-fg">
+              Suggested update to {p.target === 'identity' ? 'Identity' : 'Personality'}
+            </span>
+            <StatusPill tone="neutral">from learned facts</StatusPill>
+          </div>
+          <p className="mt-1.5 text-small text-muted">{p.rationale}</p>
+          <details className="mt-2 text-small">
+            <summary className="cursor-pointer text-primary">Compare current and proposed</summary>
+            <div className="mt-2 grid gap-2 lg:grid-cols-2">
+              <div className="rounded bg-subtle p-3"><div className="mb-1 text-caption font-medium text-faint">Current</div><pre className="whitespace-pre-wrap font-sans text-small text-muted">{p.currentText}</pre></div>
+              <div className="rounded bg-subtle p-3"><div className="mb-1 text-caption font-medium text-faint">Proposed</div><pre className="whitespace-pre-wrap font-sans text-small text-fg">{p.proposedText}</pre></div>
+            </div>
+          </details>
+          <div className="mt-3 flex gap-2">
+            <Button size="sm" disabled={Boolean(resolving)} onClick={() => void resolve(p, 'approve')}>
+              <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> {resolving === p.id ? 'Applying…' : 'Approve'}
+            </Button>
+            <Button size="sm" variant="secondary" disabled={Boolean(resolving)} onClick={() => void resolve(p, 'reject')}>
+              <XCircle className="h-3.5 w-3.5" aria-hidden /> Dismiss
+            </Button>
+          </div>
+        </Card>
+      ))}
     </div>
   );
 }
@@ -1588,46 +1620,6 @@ function ContextFileCard({ file, onNavigate }: { file: ContextFile; onNavigate?:
         </button>
       )}
     </Card>
-  );
-}
-
-// ─────────── You & goals ───────────
-function YouTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
-  const ctx = usePoll(['context'], getContext, 20000);
-  const profile = ctx.data?.profile ?? {};
-  const goals = ctx.data?.goals ?? [];
-  const [goalTitle, setGoalTitle] = useState('');
-  const [goalDesc, setGoalDesc] = useState('');
-  const add = async () => { if (!goalTitle.trim() || !goalDesc.trim()) return; try { await addGoal(goalTitle.trim(), goalDesc.trim()); setGoalTitle(''); setGoalDesc(''); } finally { void qc.invalidateQueries({ queryKey: ['context'] }); } };
-  return (
-    <div className="grid gap-4 lg:grid-cols-2">
-      <Card className="p-5">
-        <div className="mb-3 flex items-center gap-2"><User className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Profile</h3></div>
-        {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : (
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-2.5">
-            <ProfileItem label="Name" value={profile.preferredName || profile.displayName} />
-            <ProfileItem label="Role" value={profile.role} />
-            <ProfileItem label="Timezone" value={profile.timezone} />
-            <ProfileItem label="Tone" value={profile.communicationTone} />
-          </dl>
-        )}
-        <p className="mt-3 text-small text-muted">Wrong name or details? Fix them in <Link to="/settings" className="text-primary hover:underline">Settings → Profile</Link>.</p>
-      </Card>
-      <Card className="p-5">
-        <div className="mb-3 flex items-center gap-2"><Target className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Your goals</h3></div>
-        {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : goals.length === 0 ? <p className="text-body text-muted">No goals yet. Tell Clementine what you're working toward.</p>
-          : <ul className="space-y-2.5">{goals.map((g, i) => (
-              <li key={g.id || i} className="flex items-start gap-2.5"><span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden /><div><div className="text-body font-medium text-fg">{g.title || g.objective || 'Goal'}</div>{g.description && <div className="text-small text-muted">{g.description}</div>}</div></li>
-            ))}</ul>}
-        <div className="mt-4 space-y-2 border-t border-border pt-4">
-          <Input value={goalTitle} onChange={(e) => setGoalTitle(e.target.value)} placeholder="New goal (e.g. Grow SEO pipeline)" aria-label="Goal title" />
-          <div className="flex gap-2">
-            <Input value={goalDesc} onChange={(e) => setGoalDesc(e.target.value)} placeholder="What does success look like?" aria-label="Goal description" className="flex-1" />
-            <Button size="sm" onClick={add} disabled={!goalTitle.trim() || !goalDesc.trim()}><Plus className="h-4 w-4" aria-hidden /> Add</Button>
-          </div>
-        </div>
-      </Card>
-    </div>
   );
 }
 

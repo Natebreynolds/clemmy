@@ -13,7 +13,7 @@
  *   4. preferred name only (no display name) renders correctly;
  *   5. weekday helpers — "Mon..Fri" renders as "weekdays (Mon–Fri)".
  */
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -25,6 +25,8 @@ process.env.CLEMENTINE_HOME = TMP;
 const { regenerateIdentityMd } = await import('./identity-md-builder.js');
 const { saveUserProfile } = await import('../runtime/user-profile.js');
 const { IDENTITY_FILE, loadMemoryContext } = await import('./vault.js');
+const { rememberFact, setFactPinned, recordFactUtility } = await import('./facts.js');
+const { openMemoryDb } = await import('./db.js');
 
 // Seed a starter IDENTITY.md so we have user-curated content to preserve.
 const SEED = [
@@ -113,4 +115,71 @@ test('regenerateIdentityMd: only preferred name set still renders cleanly', () =
   assert.match(body, /\*\*Name:\*\* Alex/);
   // No "the user (preferred: Alex)" silliness
   assert.doesNotMatch(body, /the user \(preferred: Alex\)/);
+});
+
+// ── "Learned about you" section — durable kind:'user' facts ──────────
+
+test('learned section: fresh unpinned fact inside the hygiene window is excluded', () => {
+  rememberFact({ kind: 'user', content: 'User preference: Prefers async updates over meetings' });
+  const result = regenerateIdentityMd();
+  // Fact exists but is not yet durable → auto section is unchanged.
+  assert.equal(result.written, false);
+  assert.equal(result.reason, 'unchanged');
+  const body = readFileSync(IDENTITY_FILE, 'utf-8');
+  assert.doesNotMatch(body, /## Learned about you/);
+});
+
+test('learned section: pinned fact renders with the capture prefix stripped', () => {
+  const fact = rememberFact({ kind: 'user', content: 'User preference: Prefers async updates over meetings' });
+  setFactPinned(fact.id, true);
+  const result = regenerateIdentityMd();
+  assert.equal(result.written, true);
+  const body = readFileSync(IDENTITY_FILE, 'utf-8');
+  assert.match(body, /## Learned about you/);
+  assert.match(body, /- Prefers async updates over meetings/);
+  assert.doesNotMatch(body, /User preference:/);
+  // Profile half still renders alongside the learned half.
+  assert.match(body, /## Working with/);
+  // Prompt injection contract unchanged: only the curated half is injected.
+  const injectedIdentity = loadMemoryContext().identity ?? '';
+  assert.doesNotMatch(injectedIdentity, /Learned about you|Prefers async updates/);
+});
+
+test('learned section: utility-credited fact counts as durable', () => {
+  const fact = rememberFact({ kind: 'user', content: 'Reviews drafts on Sunday evenings' });
+  recordFactUtility(fact.id);
+  const result = regenerateIdentityMd();
+  assert.equal(result.written, true);
+  assert.match(readFileSync(IDENTITY_FILE, 'utf-8'), /- Reviews drafts on Sunday evenings/);
+});
+
+test('learned section: fact older than the hygiene window counts as durable', () => {
+  const fact = rememberFact({ kind: 'user', content: 'Prefers Slack over email for internal chatter' });
+  const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+  openMemoryDb().prepare('UPDATE consolidated_facts SET created_at = ? WHERE id = ?').run(fourDaysAgo, fact.id);
+  const result = regenerateIdentityMd();
+  assert.equal(result.written, true);
+  assert.match(readFileSync(IDENTITY_FILE, 'utf-8'), /- Prefers Slack over email for internal chatter/);
+});
+
+test('learned section: non-user kinds never render, even pinned', () => {
+  const fact = rememberFact({ kind: 'project', content: 'The staging deploy runs from the release branch' });
+  setFactPinned(fact.id, true);
+  regenerateIdentityMd();
+  assert.doesNotMatch(readFileSync(IDENTITY_FILE, 'utf-8'), /staging deploy/);
+});
+
+test('learned section: durable facts alone (default profile) still produce the auto block', () => {
+  // Wipe the saved profile → loadUserProfile returns defaults, which
+  // fail the profile gate. Durable facts must carry the write alone.
+  rmSync(path.join(TMP, 'state', 'user-profile.json'));
+  const result = regenerateIdentityMd();
+  assert.equal(result.written, true);
+  const body = readFileSync(IDENTITY_FILE, 'utf-8');
+  assert.match(body, /## Learned about you/);
+  assert.match(body, /- Prefers async updates over meetings/);
+  // No profile fields set → no "Working with" half.
+  assert.doesNotMatch(body, /## Working with/);
+  // Curated half still preserved verbatim.
+  assert.match(body, /I am Clementine/);
 });

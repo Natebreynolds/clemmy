@@ -1,9 +1,9 @@
 /**
  * Canonical text-matching primitives for workflow discovery.
  *
- * Three matchers score a user's words against saved workflows — fuzzy
- * name resolution (workflow-resolve), the per-turn "Likely workflows"
- * ranking (context-packet), and the hard run-guard (workflow-run-guard).
+ * Matchers score a user's words against saved workflows — fuzzy
+ * name resolution (workflow-resolve) and the per-turn "Likely workflows"
+ * ranking (context-packet). (The run-guard consumer was deleted 2026-07-23.)
  * Each had its own copy of the same tokenizer loop and (in one case) a
  * stemmer. This module is the single home for those primitives so the
  * matchers can't silently drift in how they split/normalize text.

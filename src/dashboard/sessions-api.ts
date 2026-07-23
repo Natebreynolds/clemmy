@@ -24,7 +24,7 @@ import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js'
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
-import { deriveTitle } from '../memory/derive-title.js';
+import { deriveTitle, humanizeReportBackTitle } from '../memory/derive-title.js';
 import type {
   SessionRecord,
   SessionOrigin,
@@ -109,7 +109,11 @@ function metaTags(meta: Record<string, unknown> | undefined): string[] {
 
 function summarizeDesktop(record: SessionRecord): UnifiedSessionSummary {
   const firstUser = record.turns.find((t) => t.role === 'user');
-  const title = record.title
+  // Heal already-persisted raw report-back titles ("[background task bg-… ")
+  // at read time — no migration; new sessions never store them (deriveTitle
+  // humanizes the synthetic turn up front).
+  const storedTitle = record.title ? (humanizeReportBackTitle(record.title) ?? record.title) : '';
+  const title = storedTitle
     || (firstUser ? deriveTitle(firstUser.text, 'New chat') : 'New chat');
   return {
     id: `${DESKTOP_PREFIX}${record.id}`,

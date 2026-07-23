@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   createChatClientRequestId,
   postChat,
@@ -10,7 +10,7 @@ import {
   humanHarnessText,
   type StreamHandle,
 } from './chat';
-import { type ApiError } from './api';
+import { apiGet, type ApiError } from './api';
 import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
@@ -467,6 +467,54 @@ export function useChat(options?: UseChatOptions) {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
   }, []);
 
+  // ── Idle report-back inbox (v2.3.1) ──────────────────────────────────────
+  // THE desktop gap (live, repeatedly): a workflow/background run finishes and
+  // delivers its report-back turn into this session server-side, but an OPEN
+  // IDLE chat never re-reads its transcript (no focus-refetch, no detail
+  // poll), so Discord/Slack got reports while the desktop chat sat silent
+  // until reopened. While idle, poll the session's event replay endpoint and
+  // surface what background work delivered:
+  //   · proactive report-backs (assistant turns whose paired user event is
+  //     synthetic source:'outcome' — never the user's own turns, which the
+  //     live stream already rendered)
+  //   · A2 approval cards (approval_requested, deduped by approvalId)
+  //   · blocking questions (awaiting_user_input on a synthetic-outcome turn)
+  // Watermark arms on the first poll (history is the reopen path's job) and
+  // only advances, so nothing renders twice. Busy turns pause the poll — the
+  // run's own stream owns the conversation then.
+  const inboxSeqRef = useRef(0);
+  const inboxSyntheticTurnsRef = useRef(new Set<number>());
+  useEffect(() => {
+    if (busy) return;
+    let stopped = false;
+    const tick = async () => {
+      const sid = sessionIdRef.current;
+      if (!sid || stopped) return;
+      try {
+        const out = await apiGet<{ latestSeq: number; events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }> }>(
+          `/api/sessions/${encodeURIComponent(sid)}/events/recent?sinceSeq=${inboxSeqRef.current}&limit=200`,
+        );
+        if (stopped) return;
+        if (inboxSeqRef.current === 0) { inboxSeqRef.current = out.latestSeq || 1; return; }
+        if (!out.events.length) return;
+        const additions = inboxAdditionsFromEvents(out.events, inboxSyntheticTurnsRef.current);
+        inboxSeqRef.current = Math.max(inboxSeqRef.current, out.latestSeq);
+        if (additions.length) {
+          setMessages((prev) => {
+            const seenIds = new Set(prev.map((m) => m.id));
+            const seenApprovals = new Set(prev.map((m) => m.approval?.approvalId).filter(Boolean));
+            const fresh = additions.filter((m) => !seenIds.has(m.id)
+              && (!m.approval?.approvalId || !seenApprovals.has(m.approval.approvalId)));
+            return fresh.length ? [...prev, ...fresh] : prev;
+          });
+        }
+      } catch { /* transient poll failure — next tick retries; reopen remains the floor */ }
+    };
+    void tick();
+    const timer = window.setInterval(() => { void tick(); }, 5000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [busy]);
+
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent) => {
     const d = (ev.data ?? {}) as Record<string, unknown>;
     if (ev.type === 'stream_token') {
@@ -741,4 +789,47 @@ export function useChat(options?: UseChatOptions) {
   }, []);
 
   return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef };
+}
+
+
+/** Pure fold for the idle report-back inbox: which chat messages do these
+ *  freshly-polled session events add? Mutates `syntheticTurns` (the running
+ *  set of turns whose user event is a synthetic outcome delivery) so pairing
+ *  survives batch splits. Exported for tests. */
+export function inboxAdditionsFromEvents(
+  events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }>,
+  syntheticTurns: Set<number>,
+): ChatMessage[] {
+  for (const ev of events) {
+    const d = ev.data ?? {};
+    if (ev.type === 'user_input_received' && d.synthetic === true && d.source === 'outcome') {
+      syntheticTurns.add(ev.turn);
+    }
+  }
+  const additions: ChatMessage[] = [];
+  for (const ev of events) {
+    const d = ev.data ?? {};
+    if (ev.type === 'conversation_completed' && syntheticTurns.has(ev.turn)) {
+      const text = humanHarnessText((d.reply ?? d.summary) as string | undefined, '');
+      if (text) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text, status: 'complete' });
+    } else if (ev.type === 'awaiting_user_input' && syntheticTurns.has(ev.turn)) {
+      const q = typeof d.question === 'string' ? d.question : '';
+      if (q) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text: q, status: 'awaiting-reply' });
+    } else if (ev.type === 'approval_requested') {
+      const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
+      additions.push({
+        id: `inbox-${ev.seq}`,
+        role: 'assistant',
+        text: '',
+        status: 'awaiting-approval',
+        approval: {
+          subject: String(d.subject ?? d.tool ?? 'this action'),
+          reason: typeof d.reason === 'string' ? d.reason : undefined,
+          approvalId,
+          pendingAction: pendingActionFromEvent(d.pendingAction),
+        },
+      });
+    }
+  }
+  return additions;
 }

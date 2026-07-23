@@ -308,3 +308,37 @@ Do the core work.
   const roundTripped = readWorkflow('gap-test');
   assert.equal(roundTripped?.data.steps.find((s) => s.id === 'enrich')?.optional, true, 'optional survives write + re-read');
 });
+
+test('origin: dev round-trips and workflowOrigin classifies smoke names without it', async () => {
+  const { workflowOrigin } = await import('./workflow-store.js');
+
+  writeWorkflow('origin-dev', {
+    name: 'origin-dev',
+    description: 'dev-origin round-trip',
+    enabled: true,
+    trigger: { manual: true },
+    origin: 'dev',
+    steps: [{ id: 's1', prompt: 'noop' }],
+  });
+  const dev = readWorkflow('origin-dev');
+  assert.equal(dev?.data.origin, 'dev', 'stamped origin survives write + re-read');
+  assert.equal(workflowOrigin(dev!.data), 'dev');
+  assert.match(readFileSync(dev!.filePath, 'utf-8'), /^origin: dev$/m, 'origin persisted in frontmatter');
+
+  writeWorkflow('origin-user', {
+    name: 'origin-user',
+    description: 'user workflow stays unstamped',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 's1', prompt: 'noop' }],
+  });
+  const user = readWorkflow('origin-user');
+  assert.equal(user?.data.origin, undefined, 'absent origin stays unwritten');
+  assert.equal(workflowOrigin(user!.data), 'user');
+  assert.doesNotMatch(readFileSync(user!.filePath, 'utf-8'), /^origin:/m);
+
+  // Pre-existing smoke records without the field fall back to the name pattern.
+  assert.equal(workflowOrigin({ name: 'clem-smoke-flow-12345' }), 'dev');
+  assert.equal(workflowOrigin({ name: 'devsmoke-chain' }), 'dev');
+  assert.equal(workflowOrigin({ name: 'daily-standup-email' }), 'user');
+});

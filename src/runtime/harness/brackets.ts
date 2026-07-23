@@ -33,6 +33,7 @@ import {
   extractDuplicateIdentityKeys,
   evaluateGrounding,
   detectDuplicateTarget,
+  duplicateResendConsented,
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
 } from './grounding-gate.js';
@@ -1684,13 +1685,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
           let priorWrites: Array<{ shapeKey?: string; targets?: string[] }> = [];
           try {
             priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
-              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+              .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
             // Net out demonstrably-failed dispatches (external_write_failed
             // compensation events, emitted post-invoke): each failure cancels
             // ONE matching prior, so a corrected retry after a schema
             // rejection is not a "duplicate" of a send that never happened.
             const failures = listEvents(ctx.sessionId, { types: ['external_write_failed'] })
-              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+              .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
             for (const failure of failures) {
               const failTargets = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
               const idx = priorWrites.findIndex((w) =>
@@ -1710,7 +1711,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 data: { kind: 'duplicate_external_write', toolName: tool.name, shapeKey: shape.shapeKey ?? null, target: dup.target ?? null },
               });
             } catch { /* telemetry write must never block */ }
-            throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: shape.shapeKey, target: dup.target ?? 'unknown' });
+            // S2: a FRESH human approval naming this target (resolved after the
+            // prior send) authorizes exactly this resend — the wall honors it.
+            if (!duplicateResendConsented(ctx.sessionId, dup.target, dup.priorAt)) {
+              throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: shape.shapeKey, target: dup.target ?? 'unknown' });
+            }
           }
           // Grounding: verify the payload against this target's own
           // session artifacts via an independent fast judge. A CERTIFIED batch
@@ -2016,9 +2021,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
             let priorWrites: Array<{ shapeKey?: string; targets?: string[] }> = [];
             try {
               priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
-                .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+                .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
               const failures = listEvents(ctx.sessionId, { types: ['external_write_failed'] })
-                .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
+                .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
               for (const failure of failures) {
                 const ft = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
                 const idx = priorWrites.findIndex((w) => w.shapeKey === failure.shapeKey
@@ -2028,7 +2033,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
             } catch { /* fail toward not-a-duplicate */ }
             const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: mutation.shapeKey, targets: dupTargets, priorWrites });
             if (dup.duplicate) {
-              throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: mutation.shapeKey, target: dup.target ?? 'unknown' });
+              // S2: a FRESH human approval naming this target (resolved after the
+              // prior send) authorizes exactly this resend — the wall honors it.
+              if (!duplicateResendConsented(ctx.sessionId, dup.target, dup.priorAt)) {
+                throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: mutation.shapeKey, target: dup.target ?? 'unknown' });
+              }
             }
           }
           const verdict = await evaluateGrounding(ctx.sessionId, tool.name, command);

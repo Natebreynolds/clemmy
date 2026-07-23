@@ -744,6 +744,7 @@ export function supersedePlanProposal(id: string, replacedBy?: string): PlanProp
 
 /** Idle TTL for chat-origin goals: no activity for this long → expired. */
 const GOAL_IDLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const GOAL_BACKGROUND_IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // background runs are minutes-long; 7d idle = orphaned
 /** Terminal goal records (satisfied/expired) older than this are purged. */
 const GOAL_TERMINAL_PURGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 /** Default validation-attempt ceiling before the loop escalates. */
@@ -1410,6 +1411,9 @@ export interface GoalReapStats {
  *    note so unfinished work never vanishes silently; an untouched goal
  *    sweeps silently.
  *  - workflow-origin goals are EXEMPT — they live and die with their run.
+ *  - background-origin ACTIVE goals expire after 7 idle days (their runs are
+ *    minutes-long; longer silence means the run died without resolving), with
+ *    no inbox note — the task's own report-back already covered the outcome.
  *  - terminal goal records (satisfied/expired) older than 7 days are purged.
  *    Only goal-lifecycle statuses are touched; pending/approved/rejected/
  *    superseded proposals keep their existing behavior untouched.
@@ -1419,13 +1423,20 @@ export function reapExpiredGoals(now: Date = new Date()): GoalReapStats {
   for (const p of listPlanProposals({ status: 'all' })) {
     if (p.status === 'active') {
       const originKind = p.origin?.kind ?? 'chat';
-      if (originKind === 'workflow' || originKind === 'background') continue; // run-owned: lifetime is the task wall-clock, not chat idleness
+      if (originKind === 'workflow') continue; // run-owned: lifetime is the task wall-clock, not chat idleness
+      // Background goals are run-owned too, but a task that crashed without
+      // resolving its goal used to leave it active FOREVER (the Goals screen
+      // accumulated one per run). Tasks are wall-clock capped at minutes, so a
+      // week of silence means the run is long gone — expire, don't exempt.
+      const ttl = originKind === 'background' ? GOAL_BACKGROUND_IDLE_TTL_MS : GOAL_IDLE_TTL_MS;
       const last = Date.parse(p.lastActivityAt ?? p.proposedAt);
-      if (!Number.isFinite(last) || now.getTime() - last < GOAL_IDLE_TTL_MS) continue;
+      if (!Number.isFinite(last) || now.getTime() - last < ttl) continue;
       const wasMidFlight = (p.attempt ?? 0) > 0 || (p.progressLedger?.length ?? 0) > 0;
-      expireGoal(p.id, 'idle past 24h TTL');
+      expireGoal(p.id, originKind === 'background' ? 'background run long gone — idle past 7d TTL' : 'idle past 24h TTL');
       stats.expired += 1;
-      if (wasMidFlight) {
+      // No notification for orphaned background goals — the task itself
+      // already reported its outcome (or its failure) through report-back.
+      if (wasMidFlight && originKind !== 'background') {
         addNotification({
           id: `${Date.now()}-goal-expired-${p.id}`,
           kind: 'system',

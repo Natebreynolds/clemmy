@@ -91,7 +91,7 @@ function WorkflowEnginePanel({
   return (
     <section className="mt-5">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-h3 text-fg">Engine</h3>
+        <h3 className="text-h3 text-fg">Readiness</h3>
         <StatusPill tone={certificationTone(certification.state)}>{certification.label}</StatusPill>
       </div>
       <div className="rounded-md border border-border bg-subtle p-3">

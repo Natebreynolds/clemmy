@@ -19,7 +19,7 @@ export const PRIMARY_NAV: NavDest[] = [
   { path: '/inbox', label: 'Inbox', icon: Inbox, hint: 'Approvals, activity & notifications' },
   { path: '/tasks', label: 'Tasks', icon: ListChecks, hint: 'Live board of everything Clementine is working on' },
   { path: '/goals', label: 'Goals', icon: Goal, hint: 'Long-running outcomes and self-drive' },
-  { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows, schedules & skills' },
+  { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
   { path: '/workspaces', label: 'Workspaces', icon: LayoutDashboard, hint: 'Live surfaces Clementine built for you' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },

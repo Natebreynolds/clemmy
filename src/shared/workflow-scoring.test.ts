@@ -1,8 +1,8 @@
 /**
  * Run: npx tsx --test src/shared/workflow-scoring.test.ts
  *
- * Canonical tokenizer/stemmer. The three matchers that consume it
- * (workflow-resolve, context-packet, workflow-run-guard) have their own
+ * Canonical tokenizer/stemmer. The matchers that consume it
+ * (workflow-resolve, context-packet) have their own
  * 39 tests that act as the characterization safety net; these pin the
  * primitive itself.
  */

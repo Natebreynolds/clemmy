@@ -205,6 +205,8 @@ function DeliveryDoctor({
   onRefresh: () => void;
   onRunAcceptance: () => void;
 }) {
+  // Receipts are an audit trail, not a dashboard — one line by default.
+  const [showAllReceipts, setShowAllReceipts] = useState(false);
   if (loading && !data) return <Skeleton className="mb-5 h-44 w-full" />;
   if (!data) return null;
 
@@ -274,22 +276,33 @@ function DeliveryDoctor({
         {data.recentReceipts.length === 0 ? (
           <div className="rounded-md border border-border px-3 py-3 text-small text-muted">No delivery attempts yet.</div>
         ) : (
-          <ul className="space-y-2">
-            {data.recentReceipts.slice(0, 5).map((receipt) => (
-              <li key={receipt.id} className="rounded-md border border-border px-3 py-2.5">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-small font-medium text-fg">{receipt.title}</div>
-                    <div className="truncate text-caption text-faint">{receipt.targetSummary} · {formatTime(receipt.deliveredAt ?? receipt.createdAt)}</div>
+          <>
+            <ul className="space-y-2">
+              {data.recentReceipts.slice(0, showAllReceipts ? 5 : 1).map((receipt) => (
+                <li key={receipt.id} className="rounded-md border border-border px-3 py-2.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-small font-medium text-fg">{receipt.title}</div>
+                      <div className="truncate text-caption text-faint">{receipt.targetSummary} · {formatTime(receipt.deliveredAt ?? receipt.createdAt)}</div>
+                    </div>
+                    <StatusPill tone={receiptTone(receipt)} icon={receiptIcon(receipt)}>
+                      {receipt.status}
+                    </StatusPill>
                   </div>
-                  <StatusPill tone={receiptTone(receipt)} icon={receiptIcon(receipt)}>
-                    {receipt.status}
-                  </StatusPill>
-                </div>
-                {receipt.deliveryError && <div className="mt-2 truncate text-caption text-danger">{receipt.deliveryError}</div>}
-              </li>
-            ))}
-          </ul>
+                  {receipt.deliveryError && <div className="mt-2 truncate text-caption text-danger">{receipt.deliveryError}</div>}
+                </li>
+              ))}
+            </ul>
+            {data.recentReceipts.length > 1 && (
+              <button
+                type="button"
+                onClick={() => setShowAllReceipts((v) => !v)}
+                className="mt-2 text-caption font-semibold text-primary hover:underline cursor-pointer"
+              >
+                {showAllReceipts ? 'Show fewer' : `Show recent (${Math.min(data.recentReceipts.length, 5)})`}
+              </button>
+            )}
+          </>
         )}
       </div>
     </div>

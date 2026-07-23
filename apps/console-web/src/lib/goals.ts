@@ -32,10 +32,12 @@ export interface GoalSummary {
   id: string;
   status: GoalStatus;
   objective: string;
+  /** Short human headline; objective is the full validation contract. */
+  title?: string;
   successCriteria: string[];
   steps: GoalStep[];
   risks: string[];
-  origin: { kind: 'chat' | 'workflow'; runId?: string; stepId?: string } | null;
+  origin: { kind: 'chat' | 'workflow' | 'background'; runId?: string; stepId?: string } | null;
   sessionId: string | null;
   channel: string | null;
   createdAt: string;

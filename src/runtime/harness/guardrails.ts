@@ -241,9 +241,16 @@ export const secretLeakGuardrail: OutputGuardrail = {
 // harness ("no hardcoded tool lists"). CLI availability is surfaced to the
 // planner via the $PATH-scan `local_cli_list` / `local_cli_probe` tools
 // instead, so any CLI the user has installed is usable without code changes.
-export const harnessInputGuardrails: InputGuardrail[] = [
-  policyViolationGuardrail,
-];
+// S3 (gate audit 2026-07-23): policyViolationGuardrail was REMOVED from the
+// interactive rail. It keyword-matched USER text (send|post|email|…) to
+// hard-refuse whole turns — the last surviving text-matching gate, and it
+// enforced AUTONOMY policy flags against a user who is present in chat, where
+// every irreversible send is approval-gated anyway (asking in person IS the
+// consent path). The flags stay enforced where they mean something: the
+// autonomy lane strips composio/computer tools via filterToolsByPolicy, so
+// unattended cycles physically lack the tools. The guardrail function remains
+// exported for that lane's optional reuse + tests.
+export const harnessInputGuardrails: InputGuardrail[] = [];
 
 // Typed as OutputGuardrail<any>[] so any agent (text-output or
 // structured-output) can attach this registry directly. The secret

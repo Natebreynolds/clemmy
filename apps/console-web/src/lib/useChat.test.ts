@@ -411,3 +411,40 @@ test('reduceActivity preserves explicit BYO identity for provider-shaped model I
   }));
   assert.equal(claudeShaped[0].provider, 'byo');
 });
+
+// ── Idle report-back inbox (v2.3.1): THE desktop gap — reports reached
+// Discord/Slack but an open idle desktop chat never showed them. The pure
+// fold decides what freshly-polled session events add to the thread. ──
+test('idle inbox: a proactive report-back renders; the user\'s own turns never re-render', async () => {
+  const { inboxAdditionsFromEvents } = await import('./useChat');
+  const syntheticTurns = new Set<number>();
+  const additions = inboxAdditionsFromEvents([
+    // A normal turn the live stream already rendered — must add NOTHING.
+    { seq: 10, turn: 3, type: 'user_input_received', data: { text: 'run the update' } },
+    { seq: 11, turn: 3, type: 'conversation_completed', data: { reply: 'Queued — will report back.' } },
+    // The report-back: synthetic outcome user event + the relayed assistant turn.
+    { seq: 20, turn: 0, type: 'user_input_received', data: { text: '[workflow run wf-1 completed] …', synthetic: true, source: 'outcome' } },
+    { seq: 21, turn: 0, type: 'conversation_completed', data: { reply: 'Your slack update posted — 1 message to #team. ✅' } },
+  ], syntheticTurns);
+  assert.equal(additions.length, 1);
+  assert.equal(additions[0].status, 'complete');
+  assert.match(additions[0].text, /slack update posted/);
+});
+
+test('idle inbox: approval cards and blocking questions surface; pairing survives batch splits', async () => {
+  const { inboxAdditionsFromEvents } = await import('./useChat');
+  const syntheticTurns = new Set<number>();
+  // Batch 1 carries only the synthetic user event…
+  assert.equal(inboxAdditionsFromEvents([
+    { seq: 30, turn: 7, type: 'user_input_received', data: { text: 'x', synthetic: true, source: 'outcome' } },
+  ], syntheticTurns).length, 0);
+  // …batch 2 carries the question + an A2 card; both render.
+  const additions = inboxAdditionsFromEvents([
+    { seq: 31, turn: 7, type: 'awaiting_user_input', data: { question: 'Which channel should the digest go to?' } },
+    { seq: 32, turn: 0, type: 'approval_requested', data: { subject: 'Post the EOD update', approvalId: 'apr-inbox-1' } },
+  ], syntheticTurns);
+  assert.equal(additions.length, 2);
+  assert.equal(additions[0].status, 'awaiting-reply');
+  assert.equal(additions[1].status, 'awaiting-approval');
+  assert.equal(additions[1].approval?.approvalId, 'apr-inbox-1');
+});

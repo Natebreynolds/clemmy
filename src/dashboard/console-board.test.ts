@@ -670,10 +670,70 @@ test('GET /api/console/board keeps completed workflow runs that need attention i
     assert.equal(card!.sourceKind, 'run');
     assert.equal(card!.column, 'needs_you');
     assert.equal(card!.status, 'needs_attention');
-    assert.deepEqual(card!.actions, []);
+    // Needs-attention cards must never be action-less dead ends — archive
+    // lets the user clear the column once they've reviewed.
+    assert.deepEqual(card!.actions, ['archive']);
     assert.equal(card!.raw?.needsAttention, true);
     assert.match(card!.progressHint ?? '', /target was not confirmed/);
   } finally {
+    await h.close();
+  }
+});
+
+test('a newer run supersedes a needs-attention card into Done; archive clears it; live runs refuse archive', async () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const title = 'Workflow: supersede me';
+  const stale = startRun({
+    id: 'wf-supersede-old',
+    sessionId: 'workflow:wf-supersede-old',
+    channel: 'workflow',
+    source: 'workflow',
+    title,
+    message: 'first attempt',
+  });
+  finishRun(stale.id, { status: 'completed', message: 'needs review', needsAttention: true });
+  await sleep(10); // distinct updatedAt so newest-first ordering is deterministic
+  const fresh = startRun({
+    id: 'wf-supersede-new',
+    sessionId: 'workflow:wf-supersede-new',
+    channel: 'workflow',
+    source: 'workflow',
+    title,
+    message: 'second attempt',
+  });
+  finishRun(fresh.id, { status: 'completed', message: 'clean run' });
+  const live = startRun({
+    id: 'wf-supersede-live',
+    sessionId: 'workflow:wf-supersede-live',
+    channel: 'workflow',
+    source: 'workflow',
+    title: 'Workflow: still going',
+    message: 'in flight',
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    const body = await res.json() as { cards: Array<BoardCard> };
+    const staleCard = body.cards.find((c) => c.id === stale.id);
+    assert.ok(staleCard, 'superseded card still visible');
+    assert.equal(staleCard!.column, 'done', 'a newer run supersedes needs_you → done');
+    assert.equal(staleCard!.status, 'needs_attention', 'amber status is preserved');
+    assert.ok(staleCard!.actions.includes('archive'));
+
+    // A live run refuses archive (cancel is the right verb there).
+    const liveRes = await fetch(`${h.url}/api/console/board/run/${live.id}/archive`, { method: 'POST' });
+    assert.equal(liveRes.status, 409);
+
+    // Archiving the reviewed card drops it from the board; the record survives.
+    const archiveRes = await fetch(`${h.url}/api/console/board/run/${stale.id}/archive`, { method: 'POST' });
+    assert.equal(archiveRes.status, 200);
+    const after = await fetch(`${h.url}/api/console/board`);
+    const afterBody = await after.json() as { cards: Array<BoardCard> };
+    assert.equal(afterBody.cards.find((c) => c.id === stale.id), undefined, 'archived card is off the board');
+    assert.ok(afterBody.cards.find((c) => c.id === fresh.id), 'the fresh run is unaffected');
+  } finally {
+    finishRun(live.id, { status: 'cancelled', message: 'test cleanup' });
     await h.close();
   }
 });

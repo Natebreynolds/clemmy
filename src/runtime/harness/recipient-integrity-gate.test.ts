@@ -103,12 +103,26 @@ test('omission: no complete-set intent means no advisory on a subset', () => {
   assert.equal(result.omittedRecipients, undefined);
 });
 
-test('blocks a recipient set stitched across separate source snippets', () => {
+// S1 (gate audit 2026-07-23): FLIPPED from block to allow. Recipients drawn
+// from two separate reads are each individually grounded — refusing the union
+// hard-blocked user-confirmed multi-source batches (the workflow-run-guard
+// failure shape: the confirmation was invisible to the gate). Fabrication
+// protection lives in the no-trusted-source block below, which stays.
+test('union coverage: a set assembled from two trusted reads is ALLOWED', () => {
   const session = createSession({ kind: 'chat' });
   addReadSource(session.id, 'half-a', 'composio_execute_tool', correct.slice(0, 4));
   addReadSource(session.id, 'half-b', 'composio_execute_tool', correct.slice(4));
   const result = evaluateRecipientSetIntegrity(session.id, outgoing(correct));
+  assert.equal(result.action, 'allow');
+  assert.match(result.reason, /union coverage/);
+});
+
+test('fabrication still blocks: an address in NO trusted source refuses the batch', () => {
+  const session = createSession({ kind: 'chat' });
+  addReadSource(session.id, 'half-a', 'composio_execute_tool', correct.slice(0, 4));
+  addReadSource(session.id, 'half-b', 'composio_execute_tool', correct.slice(4, 7));
+  const stitched = [...correct.slice(0, 7), 'phantom@nowhere.example'];
+  const result = evaluateRecipientSetIntegrity(session.id, outgoing(stitched));
   assert.equal(result.action, 'block');
-  assert.deepEqual(result.unsupportedRecipients, []);
-  assert.match(result.reason, /separate artifacts/);
+  assert.deepEqual(result.unsupportedRecipients, ['phantom@nowhere.example']);
 });

@@ -1469,3 +1469,53 @@ test('workflow_get notes a deterministic step whose runner file is missing (does
   const text = resultText(await workflowGet()({ name: 'Det Missing Test' }));
   assert.match(text, /runner data:.*missing/i, 'flags the missing script rather than throwing');
 });
+
+// ─── Cross-turn confirmation journey (the 2026-07-23 live incident, pinned at
+// the handler seam) ─────────────────────────────────────────────────────────
+// The deleted workflow-run-guard refused a user-CONFIRMED run: the assistant
+// proposed "team-activity-slack-updates" BY NAME, the user said "yes please",
+// and the guard grepped only USER text for the slug. Its handler wiring was
+// never tested with session context, so the refusal path was unreachable in
+// tests and seven weeks of green trees hid it. These tests run the REAL
+// handler inside withToolOutputContext over a REAL session carrying the real
+// conversation — if anyone reintroduces a conversation-text gate on the run
+// path, they fail.
+const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+const { createSession: createJourneySession, appendEvent: appendJourneyEvent } = await import('../runtime/harness/eventlog.js');
+
+function writeSlackUpdatesWorkflow(): void {
+  writeWorkflow('team-activity-slack-updates', {
+    name: 'team-activity-slack-updates',
+    description: 'Post the daily team activity update to Slack.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'post_update', prompt: 'Compose and post the team activity update.' }],
+  });
+}
+
+test('journey: assistant proposes by name → user says "yes please" → the run QUEUES', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'confirmation journey' });
+  appendJourneyEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'can we run the slack activiy update please' } });
+  appendJourneyEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { question: 'Should I run the team-activity-slack-updates workflow now?' } });
+  appendJourneyEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'yes please' } });
+
+  const result = await withToolOutputContext({ sessionId: session.id, callId: 'journey-confirm-1' }, () =>
+    workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  const text = resultText(result);
+  assert.match(text, /Queued "team-activity-slack-updates"/, `confirmed run must queue, got: ${text.slice(0, 200)}`);
+});
+
+// Note: the informed confirm-ONCE beat lives at the BRAIN level (clem-rubric
+// WORKFLOW MATCHING) — by the time the brain calls workflow_run the user has
+// already confirmed, so the TOOL must queue without re-gating on phrasing.
+test('journey: a clear paraphrase with a typo queues directly — no name-confirmation quiz', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'paraphrase journey' });
+  appendJourneyEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'can we run the slack activiy update please' } });
+
+  const result = await withToolOutputContext({ sessionId: session.id, callId: 'journey-confirm-2' }, () =>
+    workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  const text = resultText(result);
+  assert.match(text, /Queued "team-activity-slack-updates"/, `paraphrased ask must queue, got: ${text.slice(0, 200)}`);
+});

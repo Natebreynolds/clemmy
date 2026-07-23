@@ -224,12 +224,13 @@ test('scanSecrets: previews are truncated to 12 chars', () => {
   assert.equal(m!.preview.length, 13); // 12 chars + ellipsis
 });
 
-test('harness registries are populated', () => {
-  // missingCapabilityGuardrail was removed from the wired list 2026-05-19
-  // (intent-based dispatch plan, Phase 0): hardcoded CLI allowlists
-  // conflict with the global-harness/no-curated-tool-lists principle.
-  // The guardrail itself still exists and is unit-testable; it's just
-  // not in the harness's input-guardrail registry.
-  assert.equal(harnessInputGuardrails.length, 1);
+test('harness guardrail registries: no input text-matching, secret scan stays', () => {
+  // missingCapabilityGuardrail was unwired 2026-05-19 (no curated tool lists)
+  // and policyViolationGuardrail 2026-07-23 (gate audit S3: the last
+  // user-text keyword matcher; autonomy flags are enforced by stripping the
+  // tools in the autonomy lane, and chat sends are approval-gated). The
+  // interactive input rail is EMPTY by design — pinning it so a future
+  // text-matching gate can't quietly ride in.
+  assert.equal(harnessInputGuardrails.length, 0);
   assert.equal(harnessOutputGuardrails.length, 1);
 });

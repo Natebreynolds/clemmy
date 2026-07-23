@@ -37,11 +37,12 @@ export function TopBar({
         {sidebarCollapsed ? <PanelLeft className="h-5 w-5" aria-hidden /> : <PanelLeftClose className="h-5 w-5" aria-hidden />}
       </Button>
 
-      <h1 className="truncate text-h3 font-semibold text-fg">{title}</h1>
+      <h1 className="shrink truncate text-h3 font-semibold text-fg">{title}</h1>
 
       <ModelStatusChips />
 
-      <div className="ml-auto flex items-center gap-1.5">
+      {/* shrink-0: the controls on the right must never clip, whatever grows on the left */}
+      <div className="ml-auto flex shrink-0 items-center gap-1.5">
         <button
           type="button"
           onClick={openPalette}
