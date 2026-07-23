@@ -361,15 +361,26 @@ jobs:
             exit 1
           fi
 
-          # A release is "latest" only when its tag is the highest stable SemVer
-          # in the repository. An older workflow finishing later therefore cannot
-          # replace a newer stable release as latest.
+          # A release is "latest" when its tag is the highest stable SemVer among
+          # PUBLISHED releases (including itself, about to publish). Comparing
+          # against repository TAGS stranded the marker during a rapid release
+          # train (2026-07-23): every build published while an even newer tag
+          # already existed, so every one set latest=false and desktop updaters
+          # (which resolve /releases/latest) never saw v2.5.1-v2.5.4. An older
+          # workflow finishing later still cannot steal latest from a newer
+          # published release; a newer TAG whose build was cancelled or is still
+          # running no longer blocks the best available build from being latest.
           newest_stable_tag="$(node <<'NODE'
           const { execFileSync } = require('node:child_process');
           const stable = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-          const tags = execFileSync('git', ['tag', '--list', 'v*'], { encoding: 'utf8' })
-            .split(/\r?\n/)
-            .filter(Boolean)
+          const published = execFileSync('gh', [
+            'release', 'list', '--limit', '100',
+            '--json', 'tagName,isDraft,isPrerelease',
+          ], { encoding: 'utf8' });
+          const tags = JSON.parse(published)
+            .filter((r) => !r.isDraft && !r.isPrerelease)
+            .map((r) => r.tagName)
+            .concat(process.env.RELEASE_TAG ?? [])
             .map((tag) => ({ tag, match: tag.match(stable) }))
             .filter(({ match }) => match)
             .sort((a, b) => {
