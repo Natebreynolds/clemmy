@@ -510,6 +510,9 @@ export async function runBoardAction(card: BoardCard, intent: BoardButtonIntent)
     if (card.sourceKind === 'run' && intent === 'cancel') {
       return await apiPost<{ ok: boolean; reason?: string }>(`/api/console/board/run/${encodeURIComponent(card.id)}/cancel`);
     }
+    if (card.sourceKind === 'run' && intent === 'archive') {
+      return await apiPost<{ ok: boolean; reason?: string }>(`/api/console/board/run/${encodeURIComponent(card.id)}/archive`);
+    }
     if (card.sourceKind === 'workflow' && intent === 'cancel' && card.raw.runId) {
       const workflowName = card.raw.workflowSlug || card.raw.workflowName || card.title;
       return await apiPost<{ ok: boolean; reason?: string }>(

@@ -280,7 +280,7 @@ import {
 } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
-import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
+import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
@@ -9807,13 +9807,29 @@ export function registerConsoleRoutes(
 
       // 3) Legacy run records — CLI/gateway/workflow runs without a canonical
       //    attempt. Drop background-backed and canonical-session duplicates.
+      //    Terminal needs-attention runs used to pin the Needs-You column
+      //    forever with an empty actions array (Inbox said 3 while the board
+      //    said 20). A run needing review holds the column only while it is
+      //    still its workflow's latest word — a newer run supersedes it into
+      //    Done (amber status preserved) — and every surviving one carries
+      //    `archive` so the column can actually be cleared.
+      const latestRunIdByTitle = new Map<string, string>();
       for (const run of legacyRuns) {
+        if (run.source === 'workflow' && !run.archived && !latestRunIdByTitle.has(run.title)) {
+          latestRunIdByTitle.set(run.title, run.id); // legacyRuns is newest-first
+        }
+      }
+      for (const run of legacyRuns) {
+        if (run.archived) continue;
         if (run.id.startsWith('run-bg-')) continue; // background task's own run record
         if (canonicalHarnessSessionIds.has(run.sessionId)) continue;
         const needsAttention = run.needsAttention === true;
         if (run.pendingApprovalId) coveredApprovalIds.add(run.pendingApprovalId);
+        const terminal = !['queued', 'received', 'running', 'awaiting_approval'].includes(run.status);
+        const superseded = needsAttention && terminal && run.source === 'workflow'
+          && latestRunIdByTitle.get(run.title) !== run.id;
         const column: BoardColumnId =
-          needsAttention ? 'needs_you'
+          needsAttention ? (superseded ? 'done' : 'needs_you')
             : run.status === 'queued' || run.status === 'received' ? 'queued'
               : run.status === 'running' ? 'running'
               : run.status === 'awaiting_approval' ? 'needs_you'
@@ -9828,6 +9844,7 @@ export function registerConsoleRoutes(
         const actions = run.pendingApprovalId
           ? ['approve', 'reject', ...(live && !needsAttention ? ['cancel'] : [])]
           : (live && !needsAttention ? ['cancel'] : []);
+        if (needsAttention && terminal) actions.push('archive');
         cards.push({
           id: run.id,
           sourceKind: 'run',
@@ -10184,6 +10201,20 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // Clear a terminal needs-attention run card from the board. The record is
+  // kept (archived flag), only the board projection drops it.
+  app.post('/api/console/board/run/:id/archive', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = getRun(req.params.id);
+    if (!run) { res.status(404).json({ ok: false, reason: 'run not found' }); return; }
+    if (['queued', 'received', 'running', 'awaiting_approval'].includes(run.status)) {
+      res.status(409).json({ ok: false, reason: 'this run is still live — cancel it instead' });
+      return;
+    }
+    archiveRun(run.id);
+    res.json({ ok: true });
   });
 
   app.post('/api/console/board/approval/:id/:decision', async (req, res) => {

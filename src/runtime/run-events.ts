@@ -44,6 +44,8 @@ export interface RunRecord {
   outputPreview?: string;
   /** Terminal run completed mechanically but still needs human review/action. */
   needsAttention?: boolean;
+  /** Hidden from the Tasks board (user cleared it). Recoverable — the record stays. */
+  archived?: boolean;
   events: RunEvent[];
 }
 
@@ -240,6 +242,18 @@ export function finishRun(
 
 export function getRun(id: string): RunRecord | undefined {
   return loadRuns().find((run) => run.id === id);
+}
+
+/** Hide a run from the Tasks board without deleting its record. */
+export function archiveRun(id: string): boolean {
+  const runs = loadRuns();
+  const run = runs.find((r) => r.id === id);
+  if (!run) return false;
+  if (!run.archived) {
+    run.archived = true;
+    saveRuns(runs);
+  }
+  return true;
 }
 
 export function listRuns(limit = 30): RunRecord[] {
