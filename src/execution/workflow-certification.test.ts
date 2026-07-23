@@ -47,15 +47,37 @@ test('disabled workflow without external read is ready to enable', () => {
   assert.deepEqual(cert.nextActions, ['enable_workflow', 'review_contract_advisories']);
 });
 
-test('readiness gaps take priority before enable or run', () => {
+// F2 (live 2026-07-23): FLIPPED — readiness gaps no longer capture the state
+// or gate the capability bits (the old needs_info state was EXITLESS: toggle
+// refused, creation test refused, and "answer readiness questions" had no
+// surface). Gaps ride the advisory rail alongside the state's real action.
+test('readiness gaps are advisories — they never block enable or the creation test', () => {
   const cert = certifyWorkflow(def({
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
   }));
 
-  assert.equal(cert.state, 'needs_info');
-  assert.equal(cert.canEnableDirectly, false);
-  assert.equal(cert.readinessGaps.length > 0, true);
-  assert.ok(cert.nextActions.includes('answer_readiness_questions'));
+  assert.notEqual(cert.state, 'needs_info');
+  assert.equal(cert.readinessGaps.length > 0, true, 'the questions still surface');
+  assert.ok(cert.nextActions.includes('answer_readiness_questions'), 'advisory action rides along');
+  assert.ok(
+    cert.canEnableDirectly || cert.canQueueCreationTest || cert.canRun,
+    `at least one real exit exists, got state=${cert.state}`,
+  );
+});
+
+// F1 (live 2026-07-23): a step with a DECLARED side_effect: read must never
+// trip the send-audience readiness question, whatever its prose says — the
+// negation-blind regex read "this report is NEVER emailed, posted, or
+// published" as a send and locked a clean read-only workflow.
+test('declared-read step with sendy prose raises no send-audience gap', () => {
+  const cert = certifyWorkflow(def({
+    steps: [{
+      id: 'synthesize_report',
+      prompt: 'Publish a read-only report. This report has NO recipient — it is never emailed, posted, pushed, or published anywhere; it delivers messages to nobody.',
+      sideEffect: 'read',
+    } as never],
+  }));
+  assert.equal(cert.readinessGaps.length, 0, `no gaps expected, got: ${JSON.stringify(cert.readinessGaps)}`);
 });
 
 test('required resource bindings block before lifecycle actions', () => {

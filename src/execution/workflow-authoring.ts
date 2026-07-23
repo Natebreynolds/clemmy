@@ -424,9 +424,17 @@ export function prepareWorkflowUpdateForWrite(
 export function prepareWorkflowEnableForWrite(def: WorkflowDefinition): WorkflowPreparedWrite {
   const prep = prepareWorkflowForWrite({ ...def, enabled: true });
   if (!prep.ok) return preparedFromWrite(prep, 'invalid', prep.def);
+  // F2 (live 2026-07-23, guardrails-inform-not-override): readiness gaps are
+  // authoring QUESTIONS, not enable walls. The old 'readiness_gaps' hold
+  // force-disabled the workflow at BOTH enable choke points (console toggle +
+  // chat workflow_set_enabled) while the only offered exit — "answer the
+  // readiness questions" — had no surface, so a clean dry-run workflow was
+  // permanently un-enableable. Enabling now proceeds; the questions ride
+  // along as advisories for the drawer/chat to surface. Validation failures
+  // still refuse ('invalid'), and creation/update flows still ask the
+  // questions conversationally at authoring time.
   const gaps = analyzeWorkflowGaps(prep.def);
-  if (gaps.length > 0) return preparedFromWrite(prep, 'readiness_gaps', { ...prep.def, enabled: false }, gaps);
-  return preparedFromWrite(prep, 'ready', { ...prep.def, enabled: true });
+  return preparedFromWrite(prep, 'ready', { ...prep.def, enabled: true }, gaps);
 }
 
 export function normalizeWorkflowInputs(input: unknown): Record<string, WorkflowInputDef> | undefined {
