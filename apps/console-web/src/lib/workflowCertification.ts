@@ -91,6 +91,51 @@ export function certPrimaryAction(cert?: WorkflowCertification | null): CertPrim
   return { action, label: certificationActionLabel(action), kind, tone: certificationTone(cert?.state) };
 }
 
+export interface WorkflowCardStatus {
+  tone: Tone;
+  label: string;
+  /** Longer explanation for a hover title. */
+  detail?: string;
+  /** True when the pill describes the LAST RUN (clicking it should open the run). */
+  aboutLastRun?: boolean;
+}
+
+/**
+ * The ONE status pill a workflow card shows — or null when there is nothing
+ * worth saying (enabled, certified, last run fine). Priority: broken >
+ * certification-not-ready > last-run trouble > running. Everything else lives
+ * in the drawer's Readiness panel, not on the card.
+ */
+export function workflowCardStatus(w: {
+  health?: { status: string; issues: Array<{ stepId: string }> };
+  certification?: WorkflowCertification | null;
+  lastRunStatus?: string | null;
+  lastRunNeedsAttention?: boolean;
+  lastRunFailedItemCount?: number;
+}): WorkflowCardStatus | null {
+  if (w.health?.status === 'broken') {
+    const steps = w.health.issues.map((i) => i.stepId).join(', ');
+    return {
+      tone: 'danger',
+      label: 'Broken — tool missing',
+      detail: `Step(s) ${steps} reference a tool that no longer exists — this workflow will fail on its next run. Open it to fix or remove the step.`,
+    };
+  }
+  const cert = w.certification;
+  if (cert && !cert.canRun) {
+    return { tone: certificationTone(cert.state), label: cert.label, detail: cert.summary };
+  }
+  const s = (w.lastRunStatus ?? '').toLowerCase();
+  if (s === 'failed' || s === 'error') return { tone: 'danger', label: 'Last run failed', aboutLastRun: true };
+  if (s === 'needs_attention' || w.lastRunNeedsAttention) return { tone: 'warning', label: 'Needs attention', aboutLastRun: true };
+  if ((w.lastRunFailedItemCount ?? 0) > 0) {
+    const n = w.lastRunFailedItemCount ?? 0;
+    return { tone: 'warning', label: `${n} failed item${n === 1 ? '' : 's'}`, aboutLastRun: true };
+  }
+  if (['running', 'active', 'in_progress'].includes(s)) return { tone: 'live', label: 'Running now', aboutLastRun: true };
+  return null;
+}
+
 export function workflowPrimaryAction(cert?: WorkflowCertification | null): string {
   switch (cert?.state) {
     case 'blocked': return 'Fix';

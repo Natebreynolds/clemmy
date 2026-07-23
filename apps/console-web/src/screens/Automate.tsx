@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, Activity, GitBranch, Send, Wrench, Gauge, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, type LucideIcon } from 'lucide-react';
+import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -14,7 +14,7 @@ import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
 import { WorkflowDrawer } from '@/components/automate/WorkflowDrawer';
 import { cn } from '@/lib/cn';
-import { certificationTone, workflowCertificationCounts, workflowPrimaryAction } from '@/lib/workflowCertification';
+import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
   checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
   listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
@@ -31,7 +31,8 @@ import {
   type WorkflowLearningSnapshot,
 } from '@/lib/advanced';
 
-type Tab = 'workflows' | 'schedules' | 'skills';
+type Tab = 'workflows' | 'skills';
+type WorkflowFilter = 'all' | 'scheduled' | 'manual';
 
 function recommendationTone(severity: AgentSystemRecommendation['severity']): Tone {
   if (severity === 'critical') return 'danger';
@@ -289,24 +290,6 @@ function LoopGuidance({
   );
 }
 
-function engineToneClasses(tone: Tone) {
-  switch (tone) {
-    case 'success': return 'border-success/30 bg-success-tint text-success';
-    case 'info': return 'border-info/30 bg-info-tint text-info';
-    case 'warning': return 'border-warning/30 bg-warning-tint text-warning';
-    case 'danger': return 'border-danger/30 bg-danger-tint text-danger';
-    case 'live': return 'border-primary/30 bg-primary-tint text-primary';
-    case 'neutral': return 'border-border bg-surface text-muted';
-  }
-}
-
-function dryRunTone(verdict?: string): Tone {
-  if (verdict === 'ready') return 'success';
-  if (verdict === 'needs_inputs') return 'warning';
-  if (verdict === 'blocked') return 'danger';
-  return 'neutral';
-}
-
 function relativeRunTime(iso?: string | null): string {
   if (!iso) return '';
   const t = Date.parse(iso);
@@ -333,70 +316,11 @@ function goalObjective(goal: string | null): string | null {
   return (header >= 0 ? lines[header + 1] : lines.find((line) => !line.startsWith('#'))) ?? null;
 }
 
-function WorkflowEngineStrip({ workflow, onOpen }: { workflow: WorkflowRow; onOpen: () => void }) {
-  const cert = workflow.certification;
-  if (!cert) return null;
-  const counts = workflowCertificationCounts(cert);
-  const resourceCount = workflow.resourceCount ?? Object.keys(workflow.resources ?? {}).length;
-  const resourceTone: Tone = counts.resourceGaps > 0 ? 'info' : resourceCount > 0 ? 'success' : 'neutral';
-  const missingTone: Tone = counts.missingInputs > 0 ? 'warning' : 'success';
-  const authorTone: Tone = counts.blockers > 0 ? 'danger' : counts.readinessGaps > 0 ? 'info' : 'success';
-  const effectTone: Tone = counts.sends > 0 ? 'warning' : counts.writes > 0 ? 'info' : 'success';
-  const phases: Array<{ label: string; value: string; tone: Tone; Icon: LucideIcon }> = [
-    { label: 'Bindings', value: counts.resourceGaps > 0 ? `${counts.resourceGaps} needed` : resourceCount > 0 ? `${resourceCount} bound` : 'none', tone: resourceTone, Icon: Puzzle },
-    { label: 'Inputs', value: counts.missingInputs > 0 ? `${counts.missingInputs} missing` : 'set', tone: missingTone, Icon: Gauge },
-    { label: 'Plan', value: `${counts.waves} wave${counts.waves === 1 ? '' : 's'}`, tone: authorTone, Icon: GitBranch },
-    { label: 'Dry-run', value: cert.dryRun?.verdict?.replace('_', ' ') ?? 'unknown', tone: dryRunTone(cert.dryRun?.verdict), Icon: Activity },
-    { label: 'Tools', value: counts.tools > 0 ? `${counts.tools} linked` : 'local', tone: counts.blockers > 0 ? 'danger' : 'success', Icon: Wrench },
-    { label: 'Effects', value: `${counts.sends + counts.writes} external`, tone: effectTone, Icon: Send },
-  ];
-
-  return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="mb-3 w-full rounded-md border border-border bg-subtle p-3 text-left transition-colors hover:border-primary cursor-pointer"
-    >
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        <StatusPill tone={certificationTone(cert.state)}>{cert.label}</StatusPill>
-        {cert.executionMode && cert.executionMode !== 'empty' && (
-          <span title="Steps that run as code (a direct tool call or script) are free every run; AI steps carry the reasoning cost.">
-            <StatusPill tone={cert.executionMode === 'agentless' ? 'success' : cert.executionMode === 'agent' ? 'warning' : 'info'}>
-              {cert.executionMode === 'agentless' ? '⚡ runs as code · no AI cost'
-                : cert.executionMode === 'agent' ? 'AI every step'
-                : `${cert.dryRun?.codeSteps ?? 0}/${cert.dryRun?.stepCount ?? 0} steps as code`}
-            </StatusPill>
-          </span>
-        )}
-        {(cert.codifyCandidateCount ?? 0) > 0 && (
-          <span title={`Token savings on the table — these mechanical steps could run as free code:\n${(cert.codifyCandidates ?? []).map((c) => `• ${c.stepId}${c.tool ? ` (${c.tool})` : ''}`).join('\n')}`}>
-            <StatusPill tone="info">💡 {cert.codifyCandidateCount} step{cert.codifyCandidateCount === 1 ? '' : 's'} could be free code</StatusPill>
-          </span>
-        )}
-        <span className="text-caption text-faint">{counts.parallelWaves}/{counts.waves} parallel waves</span>
-        {resourceCount > 0 && <span className="text-caption text-faint">{resourceCount} resources</span>}
-        <span className="text-caption text-faint">{counts.tools} tools</span>
-        {(counts.sends + counts.writes) > 0 && <span className="text-caption text-faint">{counts.sends + counts.writes} external effects</span>}
-      </div>
-      <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 xl:grid-cols-6">
-        {phases.map(({ label, value, tone, Icon }) => (
-          <div key={label} className={cn('min-w-0 rounded-sm border px-2 py-1.5', engineToneClasses(tone))}>
-            <div className="flex items-center gap-1">
-              <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-              <span className="truncate text-caption font-semibold">{label}</span>
-            </div>
-            <div className="truncate text-caption opacity-80">{value}</div>
-          </div>
-        ))}
-      </div>
-    </button>
-  );
-}
-
 export function Automate() {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('workflows');
+  const [filter, setFilter] = useState<WorkflowFilter>('all');
 
   const workflows = usePoll(['workflows'], listWorkflows, 10000);
   const skills = usePoll(['skills'], listSkills, 15000, { enabled: tab === 'skills' });
@@ -412,9 +336,10 @@ export function Automate() {
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
   const wf = workflows.data?.workflows ?? [];
-  // "Schedules" = workflows that run on a schedule. (Legacy CRON.md crons
-  // were migrated to workflows; the cron file is empty now.)
-  const scheduled = wf.filter((w) => w.triggerSchedule || w.trigger?.schedule);
+  // The old Schedules tab duplicated these same cards; a schedule is now a
+  // property of the workflow (meta line + filter chip), not a second surface.
+  const isScheduled = (w: WorkflowRow) => Boolean(w.triggerSchedule || w.trigger?.schedule);
+  const visibleWf = filter === 'all' ? wf : wf.filter((w) => (filter === 'scheduled' ? isScheduled(w) : !isScheduled(w)));
   const sk = skills.data?.skills ?? [];
   const loopRecommendations = (systemQ.data?.recommendations ?? []).filter((rec) => rec.kind === 'loop');
   const loopIssueCauses = systemQ.data?.loops.issueCauses ?? [];
@@ -473,14 +398,13 @@ export function Automate() {
 
   const tabs: { key: Tab; label: string; icon: typeof Zap }[] = [
     { key: 'workflows', label: 'Workflows', icon: Zap },
-    { key: 'schedules', label: 'Schedules', icon: Clock },
     { key: 'skills', label: 'Skills', icon: Puzzle },
   ];
 
   return (
     <Page
       title="Automate"
-      subtitle="Workflows, schedules, and skills"
+      subtitle="Workflows and skills"
       actions={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>}
     >
       <div className="mb-5 flex gap-1 border-b border-border">
@@ -520,98 +444,83 @@ export function Automate() {
           ? <CardGridSkeleton />
           : wf.length === 0
             ? <EmptyState title="Let's automate something" description="Tell me a task you do often and I'll set it up for you." action={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
-            : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {wf.map((w) => {
-                  const tone = statusTone(w.lastRunStatus ?? undefined);
-                  const isBroken = w.health?.status === 'broken';
-                  const brokenSteps = w.health?.issues.map((i) => i.stepId).join(', ');
-                  const canRun = (!w.certification || w.certification.canRun) && !isBroken;
-                  return (
-                    <Card key={w.name} className="flex flex-col p-5">
-                      <div className="mb-2 flex items-start justify-between gap-3">
-                        <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
-                          {w.name}
-                        </button>
-                        <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
-                      </div>
-                      <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
-                      <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
-                      <div className="mb-3 flex flex-wrap items-center gap-2">
-                        {isBroken && (
-                          <StatusPill tone="danger" title={`Step(s) ${brokenSteps} reference a tool that no longer exists — this workflow will fail on its next run. Open it to fix or remove the step.`}>
-                            Broken — tool missing
-                          </StatusPill>
-                        )}
-                        {w.lastRunStatus && <StatusPill tone={tone.tone}>{tone.label}</StatusPill>}
-                        {(w.lastRunFailedItemCount ?? 0) > 0 && <StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill>}
-                        {(w.trigger?.schedule || w.triggerSchedule) && <span className="inline-flex items-center gap-1 text-caption text-faint"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>}
-                        {typeof w.stepCount === 'number' && <span className="text-caption text-faint">{w.stepCount} steps</span>}
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" disabled={busyName === w.name || !canRun} title={!canRun ? w.certification?.summary : undefined} onClick={() => run(w.name)}>
-                          {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
-                        </Button>
-                        {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
-                          <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
-                            {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
-                          </Button>
-                        )}
-                        {w.lastRunId && (
-                          <Button size="sm" variant="ghost" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })}>
-                            <FileText className="h-4 w-4" aria-hidden /> View run
-                          </Button>
-                        )}
-                        <Button size="sm" variant={canRun ? 'ghost' : 'secondary'} onClick={() => setOpenWf(w.name)}>{canRun ? 'Open' : workflowPrimaryAction(w.certification)}</Button>
-                      </div>
-                    </Card>
-                  );
-                })}
-              </div>
-      )}
-
-      {tab === 'schedules' && (
-        workflows.isLoading
-          ? <CardGridSkeleton />
-          : scheduled.length === 0
-            ? <EmptyState title="No schedules yet" description="Recurring jobs (like a morning briefing) show up here. Ask Clementine to set one up." action={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
-            : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {scheduled.map((w) => {
-                  const canRun = !w.certification || w.certification.canRun;
-                  return (
-                    <Card key={w.name} className="flex flex-col p-5">
-                      <div className="mb-2 flex items-start justify-between gap-3">
-                        <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">{w.name}</button>
-                        <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
-                      </div>
-                      <div className="mb-3 flex items-center gap-1.5 text-body text-primary">
-                        <Clock className="h-4 w-4" aria-hidden />
-                        <span>{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>
-                      </div>
-                      <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
-                      {(w.lastRunFailedItemCount ?? 0) > 0 && (
-                        <div className="mb-3"><StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill></div>
-                      )}
-                      {w.description && <p className="mb-3 line-clamp-2 flex-1 text-small text-muted">{w.description}</p>}
-                      <div className="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" disabled={busyName === w.name || !canRun} title={!canRun ? w.certification?.summary : undefined} onClick={() => run(w.name)}>
-                          {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run now
-                        </Button>
-                        {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
-                          <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
-                            {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
-                          </Button>
-                        )}
-                        {w.lastRunId && (
-                          <Button size="sm" variant="ghost" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })}>
-                            <FileText className="h-4 w-4" aria-hidden /> View run
-                          </Button>
-                        )}
-                        <Button size="sm" variant={canRun ? 'ghost' : 'secondary'} onClick={() => setOpenWf(w.name)}>{canRun ? 'Open' : workflowPrimaryAction(w.certification)}</Button>
-                      </div>
-                    </Card>
-                  );
-                })}
-              </div>
+            : (
+              <>
+                <div className="mb-4 flex flex-wrap gap-1.5">
+                  {([['all', 'All'], ['scheduled', 'Scheduled'], ['manual', 'Manual']] as Array<[WorkflowFilter, string]>).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setFilter(key)}
+                      className={cn('rounded-full border px-3 py-1 text-small font-medium transition-colors cursor-pointer',
+                        filter === key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {visibleWf.length === 0
+                  ? <EmptyState title={filter === 'scheduled' ? 'No scheduled workflows' : 'No manual workflows'} description="Ask Clementine to set one up." />
+                  : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    {visibleWf.map((w) => {
+                      const isBroken = w.health?.status === 'broken';
+                      const canRun = (!w.certification || w.certification.canRun) && !isBroken;
+                      const status = workflowCardStatus(w);
+                      const schedule = w.trigger?.schedule || w.triggerSchedule;
+                      const lastRunAgo = relativeRunTime(w.lastRunAt);
+                      return (
+                        <Card key={w.name} className="flex flex-col p-5">
+                          <div className="mb-2 flex items-start justify-between gap-3">
+                            <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
+                              {w.name}
+                            </button>
+                            <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
+                          </div>
+                          <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
+                          <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                            {status && (
+                              // A pill about the last run opens that run; anything else opens the workflow.
+                              <button
+                                type="button"
+                                title={status.detail}
+                                onClick={() => (status.aboutLastRun && w.lastRunId ? setOpenRun({ workflow: w.name, runId: w.lastRunId }) : setOpenWf(w.name))}
+                                className="cursor-pointer"
+                              >
+                                <StatusPill tone={status.tone}>{status.label}</StatusPill>
+                              </button>
+                            )}
+                            <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
+                              {typeof w.stepCount === 'number' && <span>{w.stepCount} step{w.stepCount === 1 ? '' : 's'}</span>}
+                              {schedule && <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(schedule, w.trigger?.timezone)}</span>}
+                              {w.lastRunId && lastRunAgo && (
+                                <button type="button" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })} className="cursor-pointer underline-offset-2 hover:text-fg hover:underline">
+                                  last run {lastRunAgo}
+                                </button>
+                              )}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {canRun ? (
+                              <Button size="sm" variant="secondary" disabled={busyName === w.name} onClick={() => run(w.name)}>
+                                {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
+                              </Button>
+                            ) : (
+                              <Button size="sm" variant="secondary" title={w.certification?.summary} onClick={() => setOpenWf(w.name)}>
+                                {workflowPrimaryAction(w.certification)}
+                              </Button>
+                            )}
+                            {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
+                              <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
+                                {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
+                              </Button>
+                            )}
+                          </div>
+                        </Card>
+                      );
+                    })}
+                  </div>}
+              </>
+            )
       )}
 
       {tab === 'skills' && (

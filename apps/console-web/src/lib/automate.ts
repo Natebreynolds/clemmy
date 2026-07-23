@@ -178,6 +178,7 @@ export interface WorkflowRow {
   lastRunId?: string | null;
   lastRunFailedItemCount?: number;
   lastRunFailedItemStepIds?: string[];
+  lastRunAt?: string | null;
   certification?: WorkflowCertification;
   resources?: Record<string, WorkflowResourceBinding>;
 }
