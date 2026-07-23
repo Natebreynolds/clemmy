@@ -67,7 +67,11 @@ export function Connect() {
   const snap = toolkits.data;
   const connected = connectedToolkits(snap);
   const results = searchToolkits(snap, appQuery);
-  const credentialRows = normalizeCredentialRows(creds.data?.rows);
+  // The refresh token is internal plumbing of the SAME sign-in as the access
+  // token — two cards for one credential confused every walkthrough. One
+  // "Codex sign-in" row represents the pair; storage keeps both entries.
+  const credentialRows = normalizeCredentialRows(creds.data?.rows)
+    .filter((row) => row.name !== 'codex_oauth_refresh_token');
   const descriptors = creds.data?.descriptors ?? {};
   const discordAllowedUsers = creds.data?.discordAllowedUsers ?? '';
   const codexSignedIn = Boolean(creds.data?.auth?.codexOauthPresent);
@@ -202,10 +206,10 @@ export function Connect() {
         )}
       </Section>
 
-      {/* Keys & accounts */}
+      {/* Keys & accounts — uniform single-line rows, not an uneven card grid */}
       <Section icon={KeyRound} title="Keys & accounts" subtitle="API keys and sign-ins Clementine uses">
         {creds.isLoading ? <TileSkeleton /> : (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="space-y-2">
             {credentialRows.length === 0 && <Card className="p-4 text-body text-muted">Nothing configured yet.</Card>}
             {credentialRows.map((row, i) => (
               <CredentialCard key={row.name || i} row={row} descriptor={descriptors[row.name ?? '']}
@@ -315,7 +319,9 @@ function AccountRow({ slug, conn, onDisconnect, onSaveLabel }: {
   onSaveLabel?: (slug: string, connectionId: string, email: string | null | undefined, label: string) => Promise<void>;
 }) {
   const id = conn.id ?? conn.connectionId ?? '';
-  const who = conn.accountEmail || conn.accountName || `${id.slice(0, 10)}…`;
+  // Never show a raw ca_… connection id as the account's name — that's
+  // Composio plumbing. The id stays reachable via the hover title.
+  const who = conn.accountEmail || conn.accountName || conn.userLabel || 'Unlabeled account';
   const needsReconnect = conn.needsReconnect === true || (conn.status ?? '').toUpperCase() === 'NEEDS_RECONNECT';
   const [editing, setEditing] = useState(false);
   const [label, setLabel] = useState(conn.userLabel ?? '');
@@ -338,7 +344,7 @@ function AccountRow({ slug, conn, onDisconnect, onSaveLabel }: {
       <Mail className={cn('h-3.5 w-3.5 shrink-0', needsReconnect ? 'text-warning' : 'text-faint')} aria-hidden />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
-          <span className="truncate text-small text-fg">{who}</span>
+          <span className="truncate text-small text-fg" title={id}>{who}</span>
           {needsReconnect && <StatusPill tone="warning">Reconnect</StatusPill>}
         </div>
         {editing ? (
@@ -449,8 +455,14 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
   const [value, setValue] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const label = prettyName(name);
+  // One row stands in for the whole managed OAuth pair (see the list filter).
+  const codexRow = name === 'codex_oauth_access_token';
+  const label = codexRow ? 'Codex sign-in' : prettyName(name);
+  const description = codexRow
+    ? 'Signed in with your OpenAI subscription — managed in Settings → Models & routing.'
+    : descriptor?.description;
   const showDiscordOwner = discordAllowedUsers !== undefined;
+  const [ownerOpen, setOwnerOpen] = useState(false);
 
   const save = async () => {
     if (!value.trim() || !name) return;
@@ -461,12 +473,17 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
   };
 
   return (
-    <Card className="p-4">
+    <Card className="px-4 py-3">
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
-          <div className="truncate text-body font-medium text-fg" title={descriptor?.description}>{label}</div>
-          {descriptor?.description && <div className="truncate text-caption text-faint" title={descriptor.description}>{descriptor.description}</div>}
+          <div className="truncate text-body font-medium text-fg" title={description}>{label}</div>
+          {description && <div className="truncate text-caption text-faint" title={description}>{description}</div>}
         </div>
+        {showDiscordOwner && !editing && (
+          <button type="button" onClick={() => setOwnerOpen((v) => !v)} className="shrink-0 text-caption text-primary hover:underline cursor-pointer">
+            {discordAllowedUsers?.trim() ? 'Bot owner' : 'Set bot owner'}
+          </button>
+        )}
         <StatusPill tone={connected ? 'success' : required ? 'warning' : 'neutral'}>
           {connected ? 'Connected' : managed ? 'Sign in needed' : required ? 'Action needed' : 'Optional'}
         </StatusPill>
@@ -482,8 +499,8 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
         </div>
       )}
       {error && <p className="mt-2 text-caption text-danger">{error}</p>}
-      {name === 'codex_oauth_access_token' && <CodexReauth signedIn={connected} onDone={onSaved} />}
-      {showDiscordOwner && <DiscordOwnerField initial={discordAllowedUsers ?? ''} onSaved={onSaved} />}
+      {codexRow && !connected && <CodexReauth signedIn={connected} onDone={onSaved} />}
+      {showDiscordOwner && ownerOpen && <DiscordOwnerField initial={discordAllowedUsers ?? ''} onSaved={onSaved} />}
     </Card>
   );
 }
