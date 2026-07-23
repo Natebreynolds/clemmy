@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink } from 'lucide-react';
+import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
@@ -67,11 +67,13 @@ export function Connect() {
   const snap = toolkits.data;
   const connected = connectedToolkits(snap);
   const results = searchToolkits(snap, appQuery);
-  // The refresh token is internal plumbing of the SAME sign-in as the access
-  // token — two cards for one credential confused every walkthrough. One
-  // "Codex sign-in" row represents the pair; storage keeps both entries.
+  // Internal plumbing never renders as a user row: the Codex refresh token is
+  // half of the SAME sign-in as the access token (one "Codex sign-in" row
+  // represents the pair; storage keeps both), and the webhook secret is the
+  // console's own auth — editing it here would only log the user out.
+  const HIDDEN_CREDENTIAL_ROWS = new Set(['codex_oauth_refresh_token', 'webhook_secret']);
   const credentialRows = normalizeCredentialRows(creds.data?.rows)
-    .filter((row) => row.name !== 'codex_oauth_refresh_token');
+    .filter((row) => !HIDDEN_CREDENTIAL_ROWS.has(row.name ?? ''));
   const descriptors = creds.data?.descriptors ?? {};
   const discordAllowedUsers = creds.data?.discordAllowedUsers ?? '';
   const codexSignedIn = Boolean(creds.data?.auth?.codexOauthPresent);
@@ -221,8 +223,15 @@ export function Connect() {
         )}
       </Section>
 
-      {/* Slack — guided two-way chat setup (manifest + 2 tokens) */}
-      <SlackConnect />
+      {/* Talk to Clementine — the channels where you chat with her, grouped
+          in one place: Slack (compact wizard row) + your phone. Discord is a
+          single token — it stays a row in Keys & accounts above. */}
+      <Section icon={MessageCircle} title="Talk to Clementine" subtitle="Chat channels — Slack and your phone. (Discord: set its token in Keys & accounts.)">
+        <div className="space-y-3">
+          <SlackConnect />
+          <MobilePanel />
+        </div>
+      </Section>
 
       {/* Plugins — content cartridges (skills + workflows + MCP bundles) */}
       <PluginsPanel />
@@ -238,9 +247,6 @@ export function Connect() {
 
       {/* Projects & folders */}
       <ProjectsPanel />
-
-      {/* Mobile */}
-      <MobilePanel />
     </Page>
   );
 }
