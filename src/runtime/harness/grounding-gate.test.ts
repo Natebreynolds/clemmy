@@ -225,3 +225,47 @@ test('parseGroundingVerdict: reason is clamped in code, never validated', () => 
   assert.equal(v?.grounded, true);
   assert.equal(v!.reason.length, 400);
 });
+
+// ── S2 (gate audit 2026-07-23): the duplicate wall honors FRESH human consent ──
+// The wall's error always promised "confirm a second send with the user" but
+// nothing honored it — under strict posture the user could approve the
+// re-send card and still be refused. A fresh approved approval NAMING the
+// target, resolved AFTER the prior send, authorizes the resend. The ORIGINAL
+// batch approval (resolved before the first send) can never double.
+test('duplicate wall: fresh approval after the prior send authorizes the resend', async () => {
+  const { detectDuplicateTarget, duplicateResendConsented } = await import('./grounding-gate.js');
+  const reg = await import('./approval-registry.js');
+  const sess = createSession({ kind: 'chat' });
+  const target = 'casey@example.com';
+  const priorSendAt = '2026-07-23T01:00:00.000Z';
+  const dup = detectDuplicateTarget({
+    sessionId: sess.id,
+    shapeKey: 'email_send',
+    targets: [target],
+    priorWrites: [{ shapeKey: 'email_send', targets: [target], at: priorSendAt }],
+  });
+  assert.equal(dup.duplicate, true);
+  assert.equal(dup.priorAt, priorSendAt);
+
+  // No approval at all → the wall stands.
+  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt), false);
+
+  // Fresh approval naming the target, resolved after the prior send → consented.
+  const row = reg.register({
+    sessionId: sess.id,
+    subject: `Send a follow-up email to ${target} (second send, user-requested)`,
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', to: target },
+    ttlMs: 60_000,
+  });
+  reg.resolve(row.approvalId, 'approved', 's2-test');
+  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt), true);
+
+  // The same approval cannot authorize a send that happened AFTER it resolved
+  // (i.e. it is the ORIGINAL batch approval for a later duplicate).
+  const futurePrior = new Date(Date.now() + 60_000).toISOString();
+  assert.equal(duplicateResendConsented(sess.id, target, futurePrior), false);
+
+  // And it never covers a different target.
+  assert.equal(duplicateResendConsented(sess.id, 'other@example.com', dup.priorAt), false);
+});

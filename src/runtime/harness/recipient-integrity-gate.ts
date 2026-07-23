@@ -103,13 +103,27 @@ export function evaluateRecipientSetIntegrity(sessionId: string, rawArgs: unknow
 
   const seen = new Set(sources.flatMap((source) => source.recipients));
   const unsupportedRecipients = recipients.filter((recipient) => !seen.has(recipient));
+  if (unsupportedRecipients.length > 0) {
+    return {
+      action: 'block',
+      reason: `${unsupportedRecipients.length} outgoing recipient(s) do not appear in any trusted source`,
+      recipients,
+      unsupportedRecipients,
+    };
+  }
+  // S1 (gate audit 2026-07-23): UNION coverage ALLOWS. Every outgoing
+  // recipient is individually grounded in a trusted source — they just came
+  // from more than one read (two Airtable queries, a report + a thread). The
+  // old single-source co-occurrence rule hard-refused exactly the flow a user
+  // had confirmed ("yes, send to all of them" over an assembled list), with
+  // the confirmation invisible to the gate — the workflow-run-guard failure
+  // shape. Anti-fabrication stays intact above: an address in NO trusted
+  // source still blocks. Whether the assembled COMBINATION is right is what
+  // the approval card review + grounding judge exist for.
   return {
-    action: 'block',
-    reason: unsupportedRecipients.length > 0
-      ? `${unsupportedRecipients.length} outgoing recipient(s) do not appear in any trusted source`
-      : 'the recipients appear only across separate artifacts; no authoritative complete set supports this batch',
+    action: 'allow',
+    reason: `every outgoing recipient is grounded across ${sources.length} trusted sources (union coverage)`,
     recipients,
-    unsupportedRecipients,
   };
 }
 
