@@ -149,7 +149,7 @@ test('step edits sync event triggers after writing the workflow', () => {
   assert.equal(fired[0].status, 'queued');
 });
 
-test('step edits that introduce readiness gaps save the workflow disabled', () => {
+test('step edits that introduce readiness gaps keep the workflow ENABLED', () => {
   writeWorkflow('gap-edit-wf', {
     name: 'gap-edit-wf',
     description: 'gap edit test',
@@ -166,6 +166,8 @@ test('step edits that introduce readiness gaps save the workflow disabled', () =
     { nowIso: NOW },
   );
   assert.equal(edited.ok, true, edited.message);
-  assert.match(edited.message, /stayed DISABLED/);
-  assert.equal(readWorkflow('gap-edit-wf')!.data.enabled, false);
+  // F2 (2026-07-23): FLIPPED — a step edit that introduces readiness
+  // questions keeps the workflow enabled; the questions ride as advisories.
+  assert.doesNotMatch(edited.message, /stayed DISABLED/);
+  assert.equal(readWorkflow('gap-edit-wf')!.data.enabled, true);
 });

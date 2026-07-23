@@ -324,7 +324,7 @@ test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the pr
   assert.equal(revertWorkflowFix(applied.backupId!).ok, false);
 });
 
-test('applyProposedFix saves enabled workflows disabled when a fix introduces readiness gaps', () => {
+test('applyProposedFix keeps enabled workflows ENABLED when a fix introduces readiness gaps', () => {
   writeWorkflow('diagnosis-readiness-wf', {
     name: 'diagnosis-readiness-wf', description: 'readiness regression', enabled: true, trigger: { manual: true },
     steps: [{ id: 'main', prompt: 'Summarize the prospect list.' }],
@@ -345,9 +345,12 @@ test('applyProposedFix saves enabled workflows disabled when a fix introduces re
 
   const applied = applyProposedFix(fix.id);
   assert.equal(applied.ok, true, applied.message);
-  assert.match(applied.message, /stayed DISABLED/i);
+  // F2 (2026-07-23): FLIPPED — a doctor fix that introduces readiness
+  // questions no longer silently disables the workflow; questions are
+  // advisories, and any genuinely new send parks at the runtime gate.
+  assert.doesNotMatch(applied.message, /stayed DISABLED/i);
   const saved = readWorkflow('diagnosis-readiness-wf')!.data;
-  assert.equal(saved.enabled, false);
+  assert.equal(saved.enabled, true);
   assert.equal(saved.steps[0].prompt, 'Send the emails to the outside prospect list.');
 });
 
