@@ -93,6 +93,28 @@ export function extractResourceIdIndex(text: string): string {
  * `recall_tool_result`. Without call context it falls back to a plain
  * truncation marker, which is the best a detached MCP/dev path can do.
  */
+// ─── Scrape-head densifier (live 2026-07-23, 120-account visibility run) ───
+// Scraped-page markdown reaches the model as a clipped head — and the head was
+// junk-dense: image markdown, data: URI blobs, asset links, and bare-URL nav
+// lines burned the budget while the useful content sat below the cut (the
+// model went back via recall_tool_result 44× in one run). The STORED payload
+// stays raw (recall fidelity); only the model-visible head is computed from a
+// densified view, and only when the text is provably scrape-shaped.
+const MD_IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
+const DATA_URI_RE = /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]{64,}/g;
+const BARE_URL_LINE_RE = /^\s*\[?https?:\/\/\S+\]?\s*$/;
+
+export function densifyMarkdownForModelHead(text: string): string {
+  const imageCount = (text.match(MD_IMAGE_RE) ?? []).length;
+  const hasDataUri = DATA_URI_RE.test(text);
+  if (imageCount < 3 && !hasDataUri) return text; // not scrape-shaped — untouched
+  const stripped = text
+    .replace(MD_IMAGE_RE, '')
+    .replace(DATA_URI_RE, '[data-uri removed]');
+  const lines = stripped.split('\n').filter((line) => !BARE_URL_LINE_RE.test(line));
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
 export function formatRecallableToolText(
   text: string,
   options: RecallableToolTextOptions = {},
@@ -112,7 +134,7 @@ export function formatRecallableToolText(
   const toolName = options.toolName ?? active?.toolName ?? 'tool';
 
   if (!sessionId || !callId) {
-    return withIndex(truncateToolText(text, maxChars));
+    return withIndex(truncateToolText(densifyMarkdownForModelHead(text), maxChars));
   }
 
   try {
@@ -130,5 +152,8 @@ export function formatRecallableToolText(
   // mid-content cut with a structure-aware digest so the model never sees
   // a JSON array severed mid-record — it gets complete records + the true
   // total + how to pull any slice (tool_output_query / recall_tool_result).
-  return withIndex(digestToolOutput(text, { maxChars, toolName, callId }));
+  // The head is computed from the DENSIFIED view for scrape-shaped payloads
+  // (raw storage above is untouched) so the clipped budget carries content,
+  // not image links and nav junk.
+  return withIndex(digestToolOutput(densifyMarkdownForModelHead(text), { maxChars, toolName, callId }));
 }

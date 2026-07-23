@@ -16,7 +16,7 @@ import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from '../agents/worker-model-fallover.js';
 import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
-import { maybeFanoutAlignmentBounce, maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
+import { maybeFanoutAlignmentBounce, maybeBounceMassExecution, maybeHeavyPerItemToolAdvisory } from '../agents/fanout-alignment-gate.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -151,6 +151,12 @@ export function registerWorkerTools(server: McpServer): void {
       if (armedBounce.bounce && armedBounce.steer) return textResult(armedBounce.steer);
       const alignmentBounce = maybeFanoutAlignmentBounce({ sessionId: getToolOutputContext()?.sessionId, itemCount: callItems.length });
       if (alignmentBounce.bounce && alignmentBounce.steer) return textResult(alignmentBounce.steer);
+      // Advisory-only cost note for browser-per-item fan-outs (live 2026-07-23).
+      const heavyAdvisory = maybeHeavyPerItemToolAdvisory(
+        getToolOutputContext()?.sessionId,
+        callItems.length,
+        JSON.stringify(call),
+      );
       const { items: _batch, ...packetBase } = call;
       if (callItems.length > 1) {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
@@ -222,7 +228,7 @@ export function registerWorkerTools(server: McpServer): void {
           : uniform
             ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
             : `Batch finished with FAILURES: ${rendered.length - failed.length}/${rendered.length} succeeded; FAILED items: ${failed.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
-        return textResult([header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n'));
+        return textResult([...(heavyAdvisory ? [heavyAdvisory] : []), header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n'));
       }
       return runOneWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput);
     },

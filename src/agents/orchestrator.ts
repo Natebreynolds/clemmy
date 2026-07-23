@@ -46,7 +46,7 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from './worker-model-fallover.js';
-import { maybeFanoutAlignmentBounce, maybeBounceMassExecution } from './fanout-alignment-gate.js';
+import { maybeFanoutAlignmentBounce, maybeBounceMassExecution, maybeHeavyPerItemToolAdvisory } from './fanout-alignment-gate.js';
 import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -1022,6 +1022,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (armedBounce.bounce && armedBounce.steer) return armedBounce.steer;
       const alignmentBounce = maybeFanoutAlignmentBounce({ sessionId: extractSessionId(runContext) ?? undefined, itemCount: callItems.length });
       if (alignmentBounce.bounce && alignmentBounce.steer) return alignmentBounce.steer;
+      // Advisory-only cost note for browser-per-item fan-outs (live 2026-07-23).
+      const heavyAdvisory = maybeHeavyPerItemToolAdvisory(
+        extractSessionId(runContext) ?? undefined,
+        callItems.length,
+        JSON.stringify(call),
+      );
       const knownDeadSig = fanoutUniformFailure(extractSessionId(runContext) ?? '');
       if (knownDeadSig) {
         return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
@@ -1096,7 +1102,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           : uniform
             ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
             : `Batch finished with FAILURES: ${rendered.length - failedItems.length}/${rendered.length} succeeded; FAILED items: ${failedItems.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
-        return [header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n');
+        return [...(heavyAdvisory ? [heavyAdvisory] : []), header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n');
       }
       return runOneOrchestratorWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput, runContext, details);
     },
