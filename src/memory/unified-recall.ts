@@ -3,7 +3,7 @@ import { asksForCompleteRecallSet, recallMemory, type MemoryEvidenceHit } from '
 import type { RecallCandidateRef } from './recall-usage.js';
 
 /** Backwards-compatible facade over the evidence-backed recall pipeline. */
-export type UnifiedHitType = 'fact' | 'vault' | 'entity' | 'resource' | 'episode' | 'policy' | 'tool-recall';
+export type UnifiedHitType = 'fact' | 'vault' | 'entity' | 'resource' | 'episode' | 'policy' | 'tool-recall' | 'deliverable';
 
 export interface UnifiedHit {
   type: UnifiedHitType;
@@ -76,7 +76,7 @@ function legacyType(hit: MemoryEvidenceHit): UnifiedHitType {
   return hit.ref.type;
 }
 
-function recallStore(type: UnifiedHitType): 'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure' {
+function recallStore(type: UnifiedHitType): 'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure' | 'deliverable' {
   if (type === 'vault') return 'note';
   if (type === 'tool-recall') return 'procedure';
   return type;
@@ -152,7 +152,7 @@ function unifiedRecallHeader(result: UnifiedRecallResult): string {
 
 function unifiedRecallLine(hit: UnifiedHit): string {
   const label: Record<UnifiedHitType, string> = {
-    fact: 'FACT', vault: 'NOTE', entity: 'WHO/WHAT', resource: 'WHERE', episode: 'EPISODE', policy: 'POLICY', 'tool-recall': 'HOW',
+    fact: 'FACT', vault: 'NOTE', entity: 'WHO/WHAT', resource: 'WHERE', episode: 'EPISODE', policy: 'POLICY', 'tool-recall': 'HOW', deliverable: 'YOUR WORK LIVES AT',
   };
   const evidence = hit.evidence?.length ? ` [${hit.evidence.length} source${hit.evidence.length === 1 ? '' : 's'}]` : '';
   const sourceUris = [...new Set((hit.evidence ?? []).map((item) => item.sourceUri).filter((uri): uri is string => Boolean(uri)))].slice(0, 2);
@@ -170,7 +170,7 @@ function compactText(value: string | undefined, maxChars: number): string {
 
 function unifiedPrimerLine(hit: UnifiedHit): string {
   const label: Record<UnifiedHitType, string> = {
-    fact: 'FACT', vault: 'NOTE', entity: 'WHO/WHAT', resource: 'WHERE', episode: 'EPISODE', policy: 'POLICY', 'tool-recall': 'HOW',
+    fact: 'FACT', vault: 'NOTE', entity: 'WHO/WHAT', resource: 'WHERE', episode: 'EPISODE', policy: 'POLICY', 'tool-recall': 'HOW', deliverable: 'YOUR WORK LIVES AT',
   };
   const ref = unifiedHitRecallRef(hit);
   const title = compactText(hit.title, 160);

@@ -1458,6 +1458,31 @@ export function appendEvent(input: AppendEventInput): EventRow {
       });
     } catch { /* the ledger never blocks the event write */ }
   }
+  // Deliverable index tee (2026-07-23): every lane's external writes flow
+  // through THIS seam, so one tee gives "where did I put the user's work"
+  // durable memory (memory.db — it must survive an evidence-store wipe; see
+  // deliverable-index.ts). Fire-and-forget: the memory write never blocks or
+  // fails the event append.
+  if (input.type === 'external_write') {
+    const d = (input.data ?? {}) as { shapeKey?: unknown; targets?: unknown };
+    const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : undefined;
+    const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
+    if (targets.length > 0) {
+      let why = '';
+      try {
+        const sess = db.prepare('SELECT title FROM sessions WHERE id = ?').get(input.sessionId) as { title?: string } | undefined;
+        why = sess?.title ?? '';
+      } catch { /* title enrichment only */ }
+      void import('../../memory/deliverable-index.js')
+        .then(({ recordDeliverable, deliverableKindForShape }) => {
+          const kind = deliverableKindForShape(shapeKey);
+          for (const target of targets.slice(0, 25)) {
+            recordDeliverable({ kind, target, title: shapeKey ?? kind, why, sessionId: input.sessionId, lane: 'external' });
+          }
+        })
+        .catch(() => { /* best-effort */ });
+    }
+  }
   return publishPersistedEvent(event);
 }
 
