@@ -32,6 +32,6 @@ test('draftGoalFromNotes keeps weak notes usable and flags missing inputs', () =
   assert.ok(draft.successCriteria.length >= 3);
   assert.ok(draft.nextActions.length >= 3);
   assert.ok(draft.risks.length >= 1);
-  assert.ok(draft.missingInputs.includes('Target metric, baseline, or success threshold'));
-  assert.ok(draft.missingInputs.includes('Deadline or review cadence'));
+  assert.ok(draft.missingInputs.includes('Add a success metric'));
+  assert.ok(draft.missingInputs.includes('Add a deadline'));
 });

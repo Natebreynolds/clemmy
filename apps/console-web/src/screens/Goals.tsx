@@ -90,7 +90,7 @@ function GoalCard({
             {goal.origin?.kind === 'workflow' && <StatusPill tone="neutral">Workflow</StatusPill>}
             {goal.parked && <StatusPill tone="warning">{goal.parked.reason.replace(/_/g, ' ')}</StatusPill>}
           </div>
-          <h3 className="mt-3 text-title-sm font-semibold text-fg">{goal.objective}</h3>
+          <h3 className="mt-3 text-title-sm font-semibold text-fg" title={goal.objective}>{goal.title || goal.objective}</h3>
           <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-caption text-muted">
             <span>Updated {shortDate(goal.updatedAt)}</span>
             {goal.nextResumeAt && <span>Next resume {shortDate(goal.nextResumeAt)}</span>}
@@ -99,31 +99,34 @@ function GoalCard({
           </div>
         </div>
         <div className="flex w-full flex-wrap gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
-          {goal.status === 'active' && (
+          {/* Only the transitions that make sense for the goal's current state —
+              all four buttons on every row was half the screen's clutter. */}
+          {goal.status === 'active' && goal.parked && (
             <>
-              {goal.selfDriving ? (
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'disable')}>
-                  {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <CirclePause className="h-4 w-4" aria-hidden />} Hold
-                </Button>
-              ) : (
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'enable')}>
-                  {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RotateCw className="h-4 w-4" aria-hidden />} Self-drive
-                </Button>
-              )}
-              {goal.parked ? (
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'unpark')}>
-                  <Play className="h-4 w-4" aria-hidden /> Resume
-                </Button>
-              ) : (
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'park')}>
-                  <Pause className="h-4 w-4" aria-hidden /> Pause
-                </Button>
-              )}
-              <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'satisfy')}>
-                <CheckCircle2 className="h-4 w-4" aria-hidden /> Done
+              <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'unpark')}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Resume
               </Button>
               <Button variant="ghost" size="sm" disabled={busy} onClick={() => onAction(goal, 'expire')}>
                 <XCircle className="h-4 w-4" aria-hidden /> Stop
+              </Button>
+            </>
+          )}
+          {goal.status === 'active' && !goal.parked && (
+            <>
+              {goal.selfDriving ? (
+                <Button variant="ghost" size="sm" disabled={busy} onClick={() => onAction(goal, 'disable')}>
+                  <CirclePause className="h-4 w-4" aria-hidden /> Hold
+                </Button>
+              ) : (
+                <Button variant="ghost" size="sm" disabled={busy} onClick={() => onAction(goal, 'enable')}>
+                  <RotateCw className="h-4 w-4" aria-hidden /> Self-drive
+                </Button>
+              )}
+              <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'park')}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Pause className="h-4 w-4" aria-hidden />} Pause
+              </Button>
+              <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAction(goal, 'satisfy')}>
+                <CheckCircle2 className="h-4 w-4" aria-hidden /> Done
               </Button>
             </>
           )}

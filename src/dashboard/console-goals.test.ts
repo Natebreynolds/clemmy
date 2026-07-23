@@ -222,3 +222,23 @@ test('console goal drafts API persists reviewable drafts and creates goals from 
     await h.close();
   }
 });
+
+test('goals payload collapses duplicate background-run goals and adds a clean title', async () => {
+  const { bindBackgroundRunGoal } = await import('../agents/plan-proposals.js');
+  const objective = 'this fully autonomously in the background: research the top prospects and report back';
+  const first = bindBackgroundRunGoal(`background:dedup-a-${Date.now()}`, { objective });
+  const second = bindBackgroundRunGoal(`background:dedup-b-${Date.now()}`, { objective });
+  assert.ok(first && second, 'both per-run validation goals bound (checking contract intact)');
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/goals`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { goals: Array<GoalRow & { title?: string }> };
+    const matches = body.goals.filter((g) => g.objective === objective);
+    assert.equal(matches.length, 1, 'one card per objective, not one per run');
+    assert.equal(matches[0].title, 'Research the top prospects and report back', 'headline is cleaned, objective stays verbatim');
+  } finally {
+    await h.close();
+  }
+});

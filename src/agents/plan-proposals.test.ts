@@ -446,3 +446,26 @@ test('holdTaskForLater: invalid input (short objective / no session) → null', 
   assert.equal(holdTaskForLater({ objective: 'no', sessionId: 'sess-x' }), null);
   assert.equal(holdTaskForLater({ objective: 'a valid long objective', sessionId: '' }), null);
 });
+
+test('reaper: orphaned background goals expire after 7 idle days; workflow goals stay exempt', async () => {
+  const { reapExpiredGoals, ensureWorkflowRunGoal, getPlanProposal: getP } = await import('./plan-proposals.js');
+  const bg = bindBackgroundRunGoal(`background:reap-${Date.now()}`, {
+    objective: 'a long-running background objective that its task never resolved',
+  });
+  assert.ok(bg, 'background goal bound');
+  const wf = ensureWorkflowRunGoal({
+    workflowName: `reap-exempt-${Date.now()}`,
+    runId: 'run-1',
+    objective: 'workflow pinned objective lives with its run',
+  });
+  assert.ok(wf, 'workflow goal bound');
+
+  // 6 idle days: the background goal survives (runs can legitimately be slow to close out).
+  reapExpiredGoals(new Date(Date.now() + 6 * 24 * 60 * 60 * 1000));
+  assert.equal(getP(bg!.id)?.status, 'active', 'background goal survives under the 7d TTL');
+
+  // 8 idle days: the run is long gone — background expires, workflow does not.
+  reapExpiredGoals(new Date(Date.now() + 8 * 24 * 60 * 60 * 1000));
+  assert.equal(getP(bg!.id)?.status, 'expired', 'orphaned background goal expired');
+  assert.equal(getP(wf!.id)?.status, 'active', 'workflow goal still exempt');
+});

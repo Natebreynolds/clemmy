@@ -67,3 +67,21 @@ test('dismissGoalDraft resolves a pending draft without creating a goal', () => 
   assert.equal(dismissed?.resolvedReason, 'not needed');
   assert.equal(dismissGoalDraft(record.id), null);
 });
+
+test('a pending draft untouched for 7+ days auto-dismisses on listing', async () => {
+  const { readFileSync, writeFileSync } = await import('node:fs');
+  const record = surfaceGoalDraftFromNotes({ notes: 'Goal: something stale nobody reviewed for weeks.', notify: false });
+
+  // Backdate the stored record past the 7-day pending TTL.
+  const file = path.join(TMP_HOME, 'state', 'goal-drafts', `${record.id}.json`);
+  const stored = JSON.parse(readFileSync(file, 'utf-8'));
+  const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+  stored.createdAt = old;
+  stored.updatedAt = old;
+  writeFileSync(file, JSON.stringify(stored));
+
+  const pending = listGoalDrafts({ status: 'pending' });
+  assert.equal(pending.find((d) => d.id === record.id), undefined, 'stale draft no longer pending');
+  assert.equal(getGoalDraft(record.id)?.status, 'dismissed', 'auto-dismissed, not deleted');
+  assert.match(getGoalDraft(record.id)?.resolvedReason ?? '', /expired/);
+});

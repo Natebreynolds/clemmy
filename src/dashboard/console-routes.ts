@@ -277,6 +277,7 @@ import {
   listReportBackChannelOptions,
   staleTaskKind,
   truncateResultBody,
+  deriveTaskTitle,
 } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
@@ -1768,6 +1769,11 @@ function summarizeGoal(record: PlanProposal): Record<string, unknown> {
     id: record.id,
     status: record.status,
     objective: plan.objective,
+    // Short human headline for list rows. The objective is the VALIDATION
+    // contract (the checker consumes it verbatim) — background goals bound
+    // from a raw prompt carry the whole prompt there, which is correct for
+    // checking and unreadable as a card title.
+    title: deriveTaskTitle(plan.objective),
     successCriteria: plan.successCriteria ?? [],
     steps: plan.steps ?? [],
     risks: plan.risks ?? [],
@@ -1803,9 +1809,26 @@ function summarizeGoal(record: PlanProposal): Record<string, unknown> {
 }
 
 function buildGoalsPayload(filter: string | undefined): Record<string, unknown> {
-  const all = listPlanProposals({ status: 'all' })
+  const raw = listPlanProposals({ status: 'all' })
     .filter(isGoalContract)
     .sort((a, b) => goalUpdatedAt(b).localeCompare(goalUpdatedAt(a)));
+  // One card per background objective. Recurring dispatches bind a fresh
+  // validation goal EVERY run (by design — completion checking needs it), but
+  // the screen showed each of them: the same workflow appeared ~7 times. Keep
+  // the newest record per cleaned objective, preferring an active one over any
+  // terminal duplicate. Chat/workflow goals pass through untouched.
+  const seenBackground = new Map<string, PlanProposal>();
+  const all: PlanProposal[] = [];
+  for (const goal of raw) {
+    if (goal.origin?.kind !== 'background') { all.push(goal); continue; }
+    const key = deriveTaskTitle((goal.approvedPlan ?? goal.plan).objective).toLowerCase();
+    const kept = seenBackground.get(key);
+    if (!kept) { seenBackground.set(key, goal); all.push(goal); continue; }
+    if (kept.status !== 'active' && goal.status === 'active') {
+      all[all.indexOf(kept)] = goal;
+      seenBackground.set(key, goal);
+    }
+  }
   const goals = all.filter((goal) => {
     if (filter === 'active') return goal.status === 'active' && !goal.parked;
     if (filter === 'parked') return goal.status === 'active' && Boolean(goal.parked);

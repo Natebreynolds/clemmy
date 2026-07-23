@@ -118,12 +118,15 @@ function ensureMinimum(values: string[], fallback: string[], limit: number, min:
 }
 
 function buildMissingInputs(notes: string): string[] {
+  // Plain language — these render as chips on the Goals screen for a user,
+  // not an operator ("Target metric, baseline, or success threshold" read as
+  // internal jargon in the 2026-07-22 UI audit).
   const haystack = notes;
   const missing: string[] = [];
-  if (!METRIC_RE.test(haystack)) missing.push('Target metric, baseline, or success threshold');
-  if (!TIMEBOX_RE.test(haystack)) missing.push('Deadline or review cadence');
-  if (!ACCESS_RE.test(haystack)) missing.push('Required accounts, data sources, or workspace access');
-  if (!APPROVAL_RE.test(haystack)) missing.push('Human review or approval rules');
+  if (!METRIC_RE.test(haystack)) missing.push('Add a success metric');
+  if (!TIMEBOX_RE.test(haystack)) missing.push('Add a deadline');
+  if (!ACCESS_RE.test(haystack)) missing.push('Name the accounts or data it needs');
+  if (!APPROVAL_RE.test(haystack)) missing.push('Say what needs your approval');
   return missing.slice(0, 4);
 }
 
