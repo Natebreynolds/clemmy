@@ -334,14 +334,14 @@ jobs:
           fetch-depth: 0
 
       - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: clementine-macos-${{ needs.preflight.outputs.version }}
           path: release-assets
 
       - name: Download Windows artifacts
         if: ${{ needs.release-windows.result == 'success' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: clementine-windows-${{ needs.preflight.outputs.version }}
           path: release-assets
