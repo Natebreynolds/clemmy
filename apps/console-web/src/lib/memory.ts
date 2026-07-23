@@ -232,6 +232,28 @@ export const addFact = (content: string, kind: Fact['kind'] = 'user') =>
 export const addGoal = (title: string, description: string, priority: 'high' | 'medium' | 'low' = 'medium') =>
   apiPost('/api/console/context/goals', { title, description, priority });
 
+/** A drafted update to the curated Identity/Personality text, awaiting the
+ *  owner's approval. Approval applies it; a manual edit after drafting
+ *  supersedes it server-side instead of being overwritten. */
+export interface IdentityProposal {
+  id: string;
+  target: 'identity' | 'soul';
+  currentText: string;
+  proposedText: string;
+  rationale: string;
+  status: 'pending' | 'approved' | 'rejected' | 'superseded';
+  createdAt: string;
+}
+
+export const listIdentityProposals = () =>
+  apiGet<{ proposals: IdentityProposal[] }>('/api/console/context/identity-proposals');
+
+export const approveIdentityProposal = (id: string) =>
+  apiPost<{ applied: boolean; reason: string }>(`/api/console/context/identity-proposals/${encodeURIComponent(id)}/approve`, {});
+
+export const rejectIdentityProposal = (id: string) =>
+  apiPost<{ rejected: boolean }>(`/api/console/context/identity-proposals/${encodeURIComponent(id)}/reject`, {});
+
 export interface BrainHealth {
   activeFacts?: number; derivedFacts?: number; directFacts?: number; avgImportance?: number;
   entitiesTotal?: number; entitiesPerson?: number; entitiesCompany?: number; entitiesProject?: number; entitiesPlace?: number; entitiesThing?: number;

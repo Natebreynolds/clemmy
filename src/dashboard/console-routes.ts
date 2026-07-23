@@ -66,6 +66,7 @@ import { listEntityIdentityConflicts } from '../memory/entity-identity.js';
 import { consolidateFact, readReflectionReplayHealth } from '../memory/reflection.js';
 import { readReflectionCandidateHealth } from '../memory/reflection-candidates.js';
 import { promoteReflectionCandidateById, rejectReflectionCandidateClusterById } from '../memory/candidate-review.js';
+import { approveIdentityProposal, listIdentityProposals, rejectIdentityProposal } from '../memory/identity-evolution.js';
 import { composeCuratedMemory, IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, splitCuratedMemory, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { resolveWorkingMemoryForConsole } from '../memory/working-memory.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
@@ -6700,6 +6701,41 @@ export function registerConsoleRoutes(
         fs.writeFileSync(def.filePath, content.trimEnd() + (content.trim() ? '\n' : ''), 'utf-8');
       }
       res.json({ file: readContextFile(def) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Curated-identity evolution proposals: drafted by the maintenance
+  // distiller, applied ONLY through the approve route below (which is
+  // staleness-checked — a manual curated edit after drafting supersedes
+  // the proposal instead of being clobbered).
+  app.get('/api/console/context/identity-proposals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ proposals: listIdentityProposals() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/context/identity-proposals/:id/approve', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = approveIdentityProposal(String(req.params.id));
+      if (result.reason === 'not-found') { res.status(404).json({ error: 'unknown proposal' }); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/context/identity-proposals/:id/reject', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const rejected = rejectIdentityProposal(String(req.params.id));
+      if (!rejected) { res.status(404).json({ error: 'unknown or non-pending proposal' }); return; }
+      res.json({ rejected: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

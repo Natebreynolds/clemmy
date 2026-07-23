@@ -92,8 +92,10 @@ const LEARNED_MIN_AGE_MS = 72 * 60 * 60 * 1000;
 
 /** True when a fact has earned a place in the identity file: the user
  *  pinned it, recall actually used it, or it survived the capture-
- *  hygiene window without being superseded or deactivated. */
-function isDurableUserFact(fact: ConsolidatedFact, nowMs: number): boolean {
+ *  hygiene window without being superseded or deactivated. Exported as
+ *  the shared durability contract for identity-evolution's evidence
+ *  selection. */
+export function isDurableUserFact(fact: ConsolidatedFact, nowMs: number): boolean {
   if (fact.pinned) return true;
   if ((fact.utilityCount ?? 0) > 0) return true;
   const createdMs = Date.parse(fact.createdAt);

@@ -27,6 +27,7 @@ import {
   restoreFact, updateFact, reconcileMemoryEvidence, reconcileMemoryRelationships,
   getMemoryReadiness, listReflectionCandidates,
   listMemoryEpisodes, promoteMemoryEpisodeCandidate, rejectMemoryEpisodeCandidate,
+  listIdentityProposals, approveIdentityProposal, rejectIdentityProposal, type IdentityProposal,
   type Fact, type ContextFile, type Entity, type ImportScan, type ImportBatch, type MemoryHit,
   type EntityIdentityConflict, type EntityDuplicateCandidate, type EntityMemoryDetail,
   type MemoryReviewCandidate, type MemoryReadinessReport, type MemoryReadinessCheck,
@@ -1457,6 +1458,7 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
       <section>
         <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><BookOpen className="h-5 w-5 text-primary" aria-hidden /> Core context</h3>
         <p className="mb-3 text-small text-muted">The notes Clementine reads on every turn — her personality, who you are, and what to keep in mind. This is the seeded memory you can shape.</p>
+        <IdentityProposalReview qc={qc} />
         {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : <div className="space-y-2">{coreFiles.map((f) => <ContextFileCard key={f.key} file={f} onNavigate={onNavigate} />)}</div>}
         {/* Profile + standing goals ARE core context — they used to be their own
             "You & goals" tab, but they read on every turn like the files above. */}
@@ -1529,6 +1531,58 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
         <summary className="flex cursor-pointer items-center gap-2 text-h3 text-fg"><Download className="h-5 w-5 text-primary" aria-hidden /> Import another agent's memory</summary>
         <div className="mt-4"><ImportTab qc={qc} /></div>
       </details>
+    </div>
+  );
+}
+
+/** Pending curated-identity update drafted from learned facts. Renders
+ *  nothing when the queue is empty (the common case), so the Core
+ *  context section stays byte-identical for users with no proposal. */
+function IdentityProposalReview({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
+  const proposals = usePoll(['identity-proposals'], listIdentityProposals, 60000);
+  const [resolving, setResolving] = useState('');
+  const pending = (proposals.data?.proposals ?? []).filter((p) => p.status === 'pending');
+  if (pending.length === 0) return null;
+  const resolve = async (proposal: IdentityProposal, action: 'approve' | 'reject') => {
+    setResolving(proposal.id);
+    try {
+      if (action === 'approve') await approveIdentityProposal(proposal.id);
+      else await rejectIdentityProposal(proposal.id);
+    } finally {
+      setResolving('');
+      void proposals.refetch();
+      void qc.invalidateQueries({ queryKey: ['context'] });
+    }
+  };
+  return (
+    <div className="mb-3 space-y-2">
+      {pending.map((p) => (
+        <Card key={p.id} className="border-primary/30 bg-primary/5 p-4">
+          <div className="flex items-center gap-2">
+            <Pencil className="h-4 w-4 shrink-0 text-primary" aria-hidden />
+            <span className="flex-1 text-body font-medium text-fg">
+              Suggested update to {p.target === 'identity' ? 'Identity' : 'Personality'}
+            </span>
+            <StatusPill tone="neutral">from learned facts</StatusPill>
+          </div>
+          <p className="mt-1.5 text-small text-muted">{p.rationale}</p>
+          <details className="mt-2 text-small">
+            <summary className="cursor-pointer text-primary">Compare current and proposed</summary>
+            <div className="mt-2 grid gap-2 lg:grid-cols-2">
+              <div className="rounded bg-subtle p-3"><div className="mb-1 text-caption font-medium text-faint">Current</div><pre className="whitespace-pre-wrap font-sans text-small text-muted">{p.currentText}</pre></div>
+              <div className="rounded bg-subtle p-3"><div className="mb-1 text-caption font-medium text-faint">Proposed</div><pre className="whitespace-pre-wrap font-sans text-small text-fg">{p.proposedText}</pre></div>
+            </div>
+          </details>
+          <div className="mt-3 flex gap-2">
+            <Button size="sm" disabled={Boolean(resolving)} onClick={() => void resolve(p, 'approve')}>
+              <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> {resolving === p.id ? 'Applying…' : 'Approve'}
+            </Button>
+            <Button size="sm" variant="secondary" disabled={Boolean(resolving)} onClick={() => void resolve(p, 'reject')}>
+              <XCircle className="h-3.5 w-3.5" aria-hidden /> Dismiss
+            </Button>
+          </div>
+        </Card>
+      ))}
     </div>
   );
 }

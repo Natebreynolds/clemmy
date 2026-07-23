@@ -8,6 +8,7 @@ import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapSta
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
+import { tickIdentityEvolution } from './identity-evolution.js';
 import { reapStaleWorkingMemory } from './working-memory.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
@@ -819,6 +820,14 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // flighted; detection only.
   if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
     runSkillUpdatePoll('cadence');
+  }
+
+  // Curated-identity evolution — ~24h check; the module's own 7-day +
+  // new-evidence gates do the real pacing. PROPOSAL ONLY: it drafts a
+  // pending suggestion for the owner to review; only an explicit
+  // approval ever writes IDENTITY.md/SOUL.md curated text.
+  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
+    await tickIdentityEvolution();
   }
 
   // Explicit nightly fire at 3:00 AM local. Independent of the periodic
