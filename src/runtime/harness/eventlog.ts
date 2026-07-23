@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../../config.js';
@@ -1036,8 +1037,28 @@ export function closeEventLog(): void {
   }
 }
 
-/** Test-only: drop the DB file so the next open starts fresh. */
+/** Test-only: drop the DB file so the next open starts fresh.
+ *
+ * DESTRUCTIVE-STORE GUARD (2026-07-23): the live home's harness.db was found
+ * recreated with ALL session history gone — one un-isolated script importing
+ * this function is enough (same class as the memory.db wipe that produced the
+ * isolate-CLEMENTINE_HOME rule). A reset now REFUSES unless the resolved DB
+ * path lives under the OS temp dir (every test pins CLEMENTINE_HOME to a
+ * mkdtemp home) or the caller explicitly sets CLEMMY_ALLOW_EVENTLOG_RESET=1.
+ * Protecting the store at the API, not by convention. */
 export function resetEventLog(): void {
+  const tmpRoot = os.tmpdir();
+  const resolved = path.resolve(HARNESS_DB_PATH);
+  const allowed = resolved.startsWith(path.resolve(tmpRoot) + path.sep)
+    || resolved.startsWith('/tmp/')
+    || resolved.startsWith('/private/tmp/')
+    || process.env.CLEMMY_ALLOW_EVENTLOG_RESET === '1';
+  if (!allowed) {
+    throw new Error(
+      `resetEventLog REFUSED: ${resolved} is not under a temp home. This deletes ALL session history. `
+      + 'Point CLEMENTINE_HOME at a mkdtemp directory first (or set CLEMMY_ALLOW_EVENTLOG_RESET=1 if you truly mean it).',
+    );
+  }
   closeEventLog();
   for (const suffix of ['', '-wal', '-shm']) {
     const file = HARNESS_DB_PATH + suffix;

@@ -1230,3 +1230,14 @@ test('writeToolOutput still tail-truncates + marks beyond the cap (backstop)', (
   assert.equal(row.contentBytes, TOOL_OUTPUT_MAX_BYTES + overBy, 'original byte count preserved for the header');
   assert.equal(row.output.length, TOOL_OUTPUT_MAX_BYTES, 'stored body clamped to the cap');
 });
+
+// Destructive-store guard (2026-07-23): the live home's harness.db was found
+// recreated with all history gone — resetEventLog deletes the real DB when a
+// script forgets to isolate CLEMENTINE_HOME. Temp homes (every test) reset
+// fine; anything else refuses at the API.
+test('resetEventLog works under a temp home (this test) and the guard text names the escape hatch', () => {
+  // This suite's CLEMENTINE_HOME is a mkdtemp dir — reset must succeed.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  assert.ok(sess.id, 'DB recreates cleanly after a permitted reset');
+});
