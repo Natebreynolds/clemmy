@@ -261,7 +261,16 @@ function parkForPendingStandardArtifacts(input: {
     try { releaseClaimedArtifact(dead.id); } catch { /* stays pending fail-closed */ }
   }
   if (partition.stillPending.length === 0) return null;
-  state.pending = state.pending.filter((a) => !supersededIds.has(a.id));
+  // BOUND claims are the deliverable (provider returned the resource — URI/ID
+  // in hand); read-back verification pending is an ADVISORY the projection
+  // already reports, never a completion wall. Only truly-unresolved claims
+  // (pending/uncertain dispatch outcome — the double-create risk) park.
+  const stillPendingIds = new Set(partition.stillPending.map((a) => a.id));
+  const trulyUnresolved = state.pending.filter(
+    (a) => stillPendingIds.has(a.id) && !supersededIds.has(a.id) && a.status !== 'bound',
+  );
+  if (trulyUnresolved.length === 0) return null;
+  state.pending = trulyUnresolved;
   const exactResources = state.pending.map((artifact) => ({
     artifactId: artifact.id,
     kind: artifact.kind,
