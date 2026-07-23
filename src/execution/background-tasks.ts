@@ -2068,12 +2068,19 @@ export function probeObjectiveForTask(
  *  session deliverable — is not a completion. Deterministic, zero-LLM. */
 const ARTIFACT_INTENT_RE =
   /\b(?:write|create|build|save|put|produce|generate|make|draft)\b[\s\S]{0,60}\b(?:sheet|spreadsheet|workbook|google doc|document|docs?|file|\.md|csv|report|deck|slide)/i;
+// Destination-cued draft promises ("draft 20 emails IN OUTLOOK", "create
+// replies in my drafts folder") also commit to an external artifact. A bare
+// "draft me some emails" is deliberately NOT gated — text-form drafts returned
+// in the report-back are a legitimate deliverable with no external evidence.
+const EXTERNAL_DRAFT_INTENT_RE =
+  /\b(?:draft|create|prepare|write|make)\b[^.\n]{0,60}\b(?:emails?|messages?|repl(?:y|ies)|follow[- ]?ups?)\b[^.\n]{0,80}\b(?:in|into)\s+(?:outlook|gmail|my\s+drafts|the\s+drafts?\s+folder|drafts?\s+folder|salesforce|hubspot)/i;
 
 export function completionLacksDeliverableEvidence(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt'>,
 ): boolean {
   try {
-    if (!ARTIFACT_INTENT_RE.test(task.prompt ?? '')) return false;
+    const prompt = task.prompt ?? '';
+    if (!ARTIFACT_INTENT_RE.test(prompt) && !EXTERNAL_DRAFT_INTENT_RE.test(prompt)) return false;
     if (listRunArtifacts(task.runSessionId).length > 0) return false;
     const writes = listHarnessEventsForRefute(task.runSessionId, { types: ['external_write'], limit: 1 });
     if (writes.length > 0) return false;
@@ -3074,6 +3081,12 @@ async function finishWorkerRun(
         outputPreview: response.text,
       });
       clearLedger(task.runSessionId);
+      emitBackgroundTaskCheckIn(reAnchored, {
+        title: `Self-correcting: ${reAnchored.title}`,
+        body: 'The run concluded without producing its promised deliverable — I caught it and am continuing the original objective now. No action needed.',
+        runId: run.id,
+        metadata: { status: 'reanchored' },
+      });
       logger.warn({ taskId: task.id }, 'Artifact-less completion — objective-re-anchored continuation queued');
       return;
     }
@@ -3379,6 +3392,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
               status: 'awaiting_approval',
               message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
               outputPreview: result.text,
+            });
+            emitBackgroundTaskCheckIn(reAnchored, {
+              title: `Self-correcting: ${reAnchored.title}`,
+              body: 'The run concluded without producing its promised deliverable — I caught it and am continuing the original objective now. No action needed.',
+              runId: run.id,
+              metadata: { status: 'reanchored', approvalId: resolution.approvalId },
             });
             logger.warn({ taskId: task.id, approvalId: resolution.approvalId }, 'Artifact-less completion after approval — objective-re-anchored continuation queued');
             continue;
