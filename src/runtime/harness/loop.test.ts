@@ -5390,3 +5390,71 @@ test('an empty completion floors to visible text — the client never has to inv
     assert.ok(!String(visible).includes('(Done.)'), 'no parenthetical scaffolding');
   }
 });
+
+// Robust-tool-call audit (2026-07-24): a shape-match must never kill a
+// legitimate answer. Two classes the judge now rules on with tailored
+// guidance; deterministic bypasses stay for genuine lies.
+
+test('stall judge: an instructional "show me the command" answer is judged, not killed as a fake transcript', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeCalls = 0;
+  _setStallJudgeForTests(async () => { judgeCalls += 1; return 'deliver'; });
+  try {
+    const instructional = 'Here’s the exact command you’d run:\n\n**run_shell_command**\n```\nsf data query --query "SELECT Id, Name FROM Account LIMIT 15"\n```\nSwap the LIMIT for your batch size.';
+    const runner = scriptedRunner([{ finalOutput: instructional }]);
+    const result = await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'can you show me the command you would run for the salesforce pull',
+      makeRunner: makeRunnerStub, runRunner: runner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(judgeCalls, 1, 'instructional transcript goes to the judge');
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.ok(completed.some((e) => /sf data query/.test(String((e.data as { reply?: string }).reply ?? ''))), 'the command answer is delivered');
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});
+
+test('stall judge: an honest "integration not connected" report is judged and deliverable; judge stall keeps the retry', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeCalls = 0;
+  _setStallJudgeForTests(async () => { judgeCalls += 1; return 'deliver'; });
+  try {
+    const honestGap = 'I can’t pull those accounts because there are no Salesforce tools connected in this run — connect Salesforce in the Connections screen and I’ll run the pull immediately after.';
+    const runner = scriptedRunner([{ finalOutput: honestGap }]);
+    const result = await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'pull the 15 prospects from salesforce',
+      makeRunner: makeRunnerStub, runRunner: runner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(judgeCalls, 1, 'the tool-unavailable claim is judged, not auto-condemned');
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.ok(completed.some((e) => /Connections screen/.test(String((e.data as { reply?: string }).reply ?? ''))), 'the honest gap report reaches the user');
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});
+
+test('stall judge: a fake transcript on a NON-instructional ask keeps the deterministic bypass (no judge)', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeCalls = 0;
+  _setStallJudgeForTests(async () => { judgeCalls += 1; return 'deliver'; });
+  try {
+    const fake = '**run_shell_command**\n```\nsf data query --query "SELECT Id FROM Account"\n```';
+    const runner = scriptedRunner([{ finalOutput: fake }]);
+    await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'pull the accounts and put them in the sheet',
+      makeRunner: makeRunnerStub, runRunner: runner,
+    });
+    assert.equal(judgeCalls, 0, 'a lying transcript on a do-the-work ask is never judge-eligible');
+    assert.ok(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length >= 1);
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});

@@ -2607,6 +2607,45 @@ async function runConversationCore(
         })
       : undefined;
     if (structuredStallInfo) {
+      // STALL JUDGE, structured-path twin (2026-07-24 robust-tool-call audit):
+      // a structured tool-unavailable claim may be TRUE (a specific integration
+      // genuinely unconnected) — honest-gap vs lie is semantic. Same
+      // delivery-only authority and fallbacks as the unparsed site.
+      if (
+        stallRetriesUsed === 0 &&
+        stallIsJudgeAmbiguous(structuredStallInfo, { userInput: String(options.input ?? '') })
+      ) {
+        const structuredReplyText = (decision?.reply ?? decision?.summary ?? '').trim();
+        if (structuredReplyText.length >= 40) {
+          const judgedStructured = await judgeAmbiguousStallReply({
+            userInput: String(options.input ?? ''),
+            replyText: structuredReplyText,
+          });
+          if (judgedStructured === 'deliver') {
+            lastDecision = { summary: structuredReplyText.slice(0, 200), reply: structuredReplyText, done: true, nextAction: 'completed', reason: null };
+            return finalizeStandardConversation({
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              turn: turnResult.turn,
+              eventData: {
+                steps: stepIndex,
+                reason: 'stall_judge_delivered',
+                summary: structuredReplyText.slice(0, 200),
+                reply: structuredReplyText,
+                delivered: true,
+                stallDetail: { signal: structuredStallInfo.signal, ...structuredStallInfo.detail },
+              },
+              result: {
+                sessionId: options.sessionId,
+                status: 'completed',
+                steps: stepIndex,
+                lastDecision,
+                lastTurn,
+              },
+            });
+          }
+        }
+      }
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -2920,7 +2959,7 @@ async function runConversationCore(
         // through the unchanged retry → recovery-turn → human-floor chain.
         if (
           stallRetriesUsed === 0 &&
-          stallIsJudgeAmbiguous(stallInfo) &&
+          stallIsJudgeAmbiguous(stallInfo, { userInput: String(options.input ?? '') }) &&
           typeof turnResult.finalOutput === 'string' &&
           turnResult.finalOutput.trim().length >= 40
         ) {

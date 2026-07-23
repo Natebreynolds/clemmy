@@ -39,7 +39,9 @@ const INSTRUCTIONS = [
   'You will see the user\'s message and the assistant\'s reply. The assistant made ZERO tool calls this turn.',
   'Decide which one this reply is:',
   '- "reply": a complete conversational response the user should read now. This includes answers, acknowledgments, plans presented for discussion, questions back to the user, requests for material only the user can provide, and content presented for review.',
+  '  Also "reply": showing or explaining a command/query/snippet the user ASKED to see (even when formatted like a tool invocation), and honestly reporting that a SPECIFIC named external service or integration is not connected, with what the user can do about it.',
   '- "punt": the assistant announced, promised, or claimed tool work it should have performed itself THIS turn, and produced nothing the user can act on.',
+  '  Also "punt": claiming its own general tool access is missing or asking the user to "resend in a tool-enabled run" — the harness guarantees general tools are attached.',
   'The bar for "punt" is high: if a reasonable person would read the text as the assistant talking WITH them rather than stalling, it is a "reply".',
   'Answer with STRICT JSON only: {"verdict":"reply"} or {"verdict":"punt"}. No other text.',
 ].join('\n');
@@ -88,14 +90,35 @@ export async function judgeAmbiguousStallReply(opts: { userInput: string; replyT
   }
 }
 
-/** The ambiguous slot: A_zero_tools stalls with no deterministic-bad marker.
- *  Detected-bad shapes carry a `kind` (tool_unavailable_self_report,
- *  structured_* …) or the fakeToolTranscript flag; the announcement and
- *  short-generic branches — the prose-shape guesses — carry neither. */
-export function stallIsJudgeAmbiguous(stallInfo: { signal: string; detail?: Record<string, unknown> }): boolean {
+/** The user explicitly asked to SEE a command/query/snippet — an answer that
+ *  looks like a tool invocation is instructional content, not a hallucinated
+ *  transcript. Closed vocabulary on the USER's ask (like a command), not open
+ *  prose matching. */
+const INSTRUCTIONAL_ASK_RE =
+  /\b(?:show|give|send|write|paste|share)\s+(?:me\s+)?(?:the|that|an?|your)?\s*(?:command|query|soql|sql|snippet|code|script|invocation|curl)\b|\bwhat(?:'s| is)\s+the\s+(?:command|query|soql|sql)\b|\bhow\s+(?:do|would)\s+(?:i|you)\s+(?:run|call|invoke|write)\b/i;
+
+/** The ambiguous slot: A_zero_tools stalls the judge may overturn toward
+ *  delivery. Three cases (2026-07-24, widened after the robust-tool-call
+ *  audit — a shape-match must never kill a legitimate answer):
+ *  1. No deterministic-bad marker (announcement / short-generic guesses).
+ *  2. Tool-unavailable claims — the claim may be TRUE (a specific integration
+ *     genuinely unconnected); honest-gap vs lie is semantic, so the judge
+ *     rules with tailored guidance either way.
+ *  3. Fake-transcript flags ONLY when the user explicitly asked to SEE the
+ *     command — instructional answers legitimately look like invocations.
+ *     A non-instructional ask keeps the deterministic bypass (a lying
+ *     transcript is a harness-owned fact). */
+export function stallIsJudgeAmbiguous(
+  stallInfo: { signal: string; detail?: Record<string, unknown> },
+  opts: { userInput?: string } = {},
+): boolean {
   if (stallInfo.signal !== 'A_zero_tools') return false;
   const detail = stallInfo.detail ?? {};
-  if (typeof detail.kind === 'string' && detail.kind.length > 0) return false;
-  if (detail.fakeToolTranscript === true) return false;
+  const kind = typeof detail.kind === 'string' ? detail.kind : '';
+  if (detail.fakeToolTranscript === true) {
+    return INSTRUCTIONAL_ASK_RE.test(opts.userInput ?? '');
+  }
+  if (kind === 'tool_unavailable_self_report' || kind === 'structured_tool_unavailable') return true;
+  if (kind.length > 0) return false;
   return true;
 }
