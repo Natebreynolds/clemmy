@@ -1716,11 +1716,10 @@ test('standard lane parks unresolved provider artifacts and carries exact pendin
       title: 'Standard lane report',
       createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
     } as const;
+    // F-artifact (2026-07-23): the claim stays UNBOUND — dispatch outcome
+    // genuinely unknown. (A BOUND claim is now the deliverable and completes
+    // green; see the bound-completion test below.)
     artifactLedger.claimArtifactSlot(sess.id, intent, 'create-standard-doc', rootScopeId);
-    artifactLedger.bindArtifactSlot(sess.id, intent.slotKey, {
-      resourceId: documentId,
-      uri: `https://docs.google.com/document/d/${documentId}/edit`,
-    }, 'create-standard-doc', rootScopeId);
     return {
       history: items,
       lastResponseId: undefined,
@@ -1756,13 +1755,57 @@ test('standard lane parks unresolved provider artifacts and carries exact pendin
   };
   assert.equal(verification.status, 'pending');
   assert.equal(verification.pending, 1);
-  assert.deepEqual(verification.artifacts?.map((artifact) => ({
-    resourceId: artifact.resourceId,
-    status: artifact.status,
-  })), [{ resourceId: documentId, status: 'pending' }]);
+  assert.equal(verification.artifacts?.[0]?.status, 'pending');
   const ask = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1)!;
   assert.equal(ask.data.source, 'artifact_verification_pending');
-  assert.match(String(ask.data.question), /same resource ID/i);
+  assert.match(String(ask.data.question), /unresolved|cannot honestly confirm/i);
+});
+
+// F-artifact (live 2026-07-23, the owner's own acceptance run): a BOUND claim
+// — provider returned the resource, URI recorded, VALUES_UPDATE already
+// writing to it — parked the run behind an unanswerable "reply retry" loop.
+// Bound = deliverable: the run completes green; read-back verification rides
+// as an advisory, never a wall.
+test('standard lane completes green when the provider create is BOUND', async () => {
+  resetEventLog();
+  artifactLedger._resetArtifactLedgerForTests();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const sheetUri = 'https://docs.google.com/spreadsheets/d/16NwxaMKd3pqT3K0/edit';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
+    const rootScopeId = artifactLedger.resolveArtifactRunScopeId(sess.id, `${sess.id}::turn:1`, source.seq);
+    const intent = {
+      kind: 'google_sheet',
+      provider: 'Google Sheets',
+      slotKey: 'google_sheet:primary',
+      title: 'Firm Outreach Drafts — Jul 23',
+      createShape: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    } as const;
+    artifactLedger.claimArtifactSlot(sess.id, intent, 'create-sheet', rootScopeId);
+    artifactLedger.bindArtifactSlot(sess.id, intent.slotKey, { uri: sheetUri }, 'create-sheet', rootScopeId);
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Sheet created with all 20 drafts.',
+        reply: `Done — all 20 drafts are in the sheet: ${sheetUri}`,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'put 20 firm outreach drafts in a google sheet',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed', 'a bound create never parks the completion');
+  const asks = listEvents(sess.id, { types: ['awaiting_user_input'] })
+    .filter((e) => e.data.source === 'artifact_verification_pending');
+  assert.equal(asks.length, 0, 'no unanswerable retry check-in');
 });
 
 test('standard artifact pause lineage is inherited only by the immediate reply', async () => {

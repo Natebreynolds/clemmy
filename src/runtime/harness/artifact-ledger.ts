@@ -585,6 +585,20 @@ export function listUnverifiedRunArtifacts(sessionId: string, runScopeId?: strin
   );
 }
 
+/** TRULY unresolved create claims — dispatch outcome unknown ('pending' /
+ *  'uncertain'). A 'bound' claim is NOT in this set even when read-back
+ *  verification hasn't run: the provider returned the resource (URI/ID in
+ *  hand), so the deliverable exists — verification is an advisory, never a
+ *  completion wall (live 2026-07-23: a successfully created Google Sheet —
+ *  its VALUES_UPDATE already writing to it — parked the run behind an
+ *  unanswerable "reply retry" loop that the standard lane has no machinery
+ *  to satisfy). Double-create protection keys on THIS set. */
+export function listUnresolvedCreateClaims(sessionId: string, runScopeId?: string): RunArtifact[] {
+  return listRunArtifacts(sessionId, runScopeId).filter(
+    (artifact) => artifact.status !== 'bound',
+  );
+}
+
 interface ArtifactRunScopeRow {
   session_id: string;
   attempt_scope_id: string;

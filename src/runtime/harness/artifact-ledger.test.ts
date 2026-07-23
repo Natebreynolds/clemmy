@@ -900,3 +900,29 @@ test('question-store unification: answering the check-in copy resumes the linked
   assert.equal(getCheckIn(checkIn2.id)?.status, 'closed', 'the ghost question was closed');
   assert.ok(!listOpenCheckIns().some((c) => c.id === checkIn2.id));
 });
+
+// Live 2026-07-23: a successfully created Google Sheet (bound, URI in hand,
+// VALUES_UPDATE already writing to it) parked the run behind "the create
+// attempt is unresolved… reply retry" — an unanswerable loop, since the
+// standard lane has no verification machinery. A BOUND claim is the
+// deliverable; only truly-unresolved dispatch outcomes (pending/uncertain)
+// belong in the double-create park set.
+test('bound-but-unverified claims are deliverable — only pending/uncertain park', () => {
+  const sid = session();
+  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+    tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    arguments: JSON.stringify({ title: 'Firm Outreach Drafts — Jul 23' }),
+  })!;
+  const claim = ledger.claimArtifactSlot(sid, intent, 'call-sheet-1');
+  assert.equal(claim.acquired, true);
+
+  // Outcome unknown → truly unresolved → in the park set.
+  assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 1);
+
+  // The provider responded: bound with a URI (read-back verification NOT run).
+  ledger.bindArtifactSlot(sid, intent.slotKey, {
+    uri: 'https://docs.google.com/spreadsheets/d/16NwxaMKd3pqT3K0/edit',
+  }, 'call-sheet-1');
+  assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 0, 'bound = deliverable, never parks');
+  assert.equal(ledger.listUnverifiedRunArtifacts(sid).length, 1, 'verification advisory still reports it');
+});
