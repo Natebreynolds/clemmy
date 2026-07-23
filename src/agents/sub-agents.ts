@@ -1,6 +1,9 @@
 import { Agent, Runner, MaxTurnsExceededError } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../config.js';
+import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
+import { buildCallTool } from '../tools/call-tool.js';
+import { buildToolCatalog } from './tool-catalog.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from './workflow-step-agent.js';
@@ -118,9 +121,53 @@ function filterToolsForWorker<T extends { name?: string }>(tools: T[]): T[] {
   );
 }
 
+/** Worker schema-on-demand (2026-07-23, kill-switched): every worker carried
+ *  the FULL ~140-tool schema surface — the dominant token multiplier on
+ *  fan-outs (~15k schema tokens × 122 workers on the live 120-account run).
+ *  With slim tools on, the high-frequency worker core stays first-class and
+ *  EVERY other tool remains reachable by name through call_tool (identical
+ *  gate battery, schema-validated, self-correcting) plus a name catalog in
+ *  the instructions — capability parity BY CONSTRUCTION, schemas on demand.
+ *  Same engine the orchestrator's Codex lane has run in production since
+ *  v1.3.0. CLEMMY_WORKER_SLIM_TOOLS=off restores the full surface. */
+const WORKER_ALWAYS_LOADED = new Set([
+  'composio_execute_tool', 'composio_search_tools', 'run_shell_command',
+  'read_file', 'write_file', 'list_files', 'recall_tool_result',
+  'tool_output_query', 'skill_read', 'skill_list',
+]);
+
+function workerSlimToolsEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKER_SLIM_TOOLS', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
 export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; model?: string; workerInput?: WorkerToolInput } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
+  let tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
+  let workerCatalogBlock = '';
+  if (workerSlimToolsEnabled()) {
+    const names = tools.map((t) => (t as { name?: string }).name ?? '').filter(Boolean);
+    const surface = resolveToolSurface({
+      surface: 'worker',
+      lane: 'worker',
+      availableNames: names,
+      alwaysLoadedNames: WORKER_ALWAYS_LOADED,
+      deferralEnabled: true,
+      reason: 'worker schema-on-demand',
+    });
+    const firstClassNames = new Set(surface.firstClass);
+    const deferredNames = new Set(surface.deferred);
+    if (deferredNames.size > 0) {
+      tools = tools.filter((t) => firstClassNames.has((t as { name?: string }).name ?? ''));
+      tools.push(buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames }) as Tool<RuntimeContextValue>);
+      const catalog = buildToolCatalog({ allowedNames: deferredNames });
+      workerCatalogBlock = [
+        '',
+        '## Additional tools (callable via call_tool)',
+        'You HAVE access to every tool below — invoke one with call_tool(name, args_json). They are omitted from your first-class schemas only to keep your context lean.',
+        catalog,
+      ].join('\n');
+    }
+  }
   const externalMcpScope = options.mcpToolScope ?? (options.workerInput
     ? externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
     : null);
@@ -141,6 +188,7 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
       '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',
       'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
     ].join('\n\n');
+  const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}`;
   return new Agent<RuntimeContextValue>({
     name: 'Worker',
     handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
@@ -153,12 +201,12 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
       try {
         const pin = getGoalPinForDelegation(sessionIdFromRunContext(runContext) ?? '');
         if (pin) {
-          return `${baseInstructions}\n\n## Pinned Goal (from the session that started this work — work toward EXACTLY this; do NOT re-discover or substitute a different target)\n${pin}`;
+          return `${instructionsWithCatalog}\n\n## Pinned Goal (from the session that started this work — work toward EXACTLY this; do NOT re-discover or substitute a different target)\n${pin}`;
         }
       } catch {
         // best-effort enrichment; never break worker construction.
       }
-      return baseInstructions;
+      return instructionsWithCatalog;
     },
     // Worker = delegated grunt-work labor. The role→model registry resolves the
     // worker model (a UI/chat binding wins; else the provider-derived default,
