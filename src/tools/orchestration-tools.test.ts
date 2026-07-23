@@ -828,7 +828,12 @@ test('workflow_set_enabled proceeds past readiness gaps and surfaces the questio
   assert.match(text, /approved \(enabled\)|creation test|Queued/i);
 });
 
-test('workflow_update saves enabled workflows DISABLED when readiness gaps are introduced', async () => {
+// F2 (live 2026-07-23): FLIPPED — an edit that introduces readiness
+// questions no longer silently disables an ENABLED workflow (the user's flow
+// is enable → test → edit; the flip-to-disabled hit the same exitless
+// readiness hold). Questions surface as advisories; a genuinely new send
+// still parks at the RUNTIME approval gate before anything fires.
+test('workflow_update keeps enabled workflows ENABLED when readiness gaps are introduced', async () => {
   writeWorkflow('gapful-update-wf', {
     name: 'gapful-update-wf',
     description: 'Draft internal notes.',
@@ -842,9 +847,8 @@ test('workflow_update saves enabled workflows DISABLED when readiness gaps are i
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
   });
   const text = resultText(result);
-  assert.match(text, /stayed DISABLED/);
-  assert.match(text, /readiness gap test/i);
-  assert.equal(readWorkflow('gapful-update-wf')!.data.enabled, false);
+  assert.doesNotMatch(text, /stayed DISABLED/);
+  assert.equal(readWorkflow('gapful-update-wf')!.data.enabled, true, 'the edit never silently disables');
 });
 
 test('workflow lifecycle routes create/update/enable/run through shared workflow paths', async () => {

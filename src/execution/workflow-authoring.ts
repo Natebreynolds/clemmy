@@ -412,13 +412,15 @@ export function prepareWorkflowUpdateForWrite(
   const extra = { ...portability, codifyNotes: compiled.codifyNotes };
   const allowInvalidDisabled = opts.allowInvalidDisabled ?? true;
   if ((!allowInvalidDisabled || prep.def.enabled) && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);
-  if (prep.def.enabled) {
-    const gaps = analyzeWorkflowGaps(prep.def);
-    if (gaps.length > 0) {
-      return preparedFromWrite(prep, 'readiness_gaps', { ...prep.def, enabled: false }, gaps, extra);
-    }
-  }
-  return preparedFromWrite(prep, 'ready', prep.def, [], extra);
+  // F2 (live 2026-07-23): an edit that introduces readiness QUESTIONS no
+  // longer force-disables an ENABLED workflow — the user's stated flow is
+  // "turn it on, test it, make edits", and a silent flip-to-disabled with the
+  // dead readiness hold was the same exitless wall as the enable path. The
+  // questions ride along as advisories; genuinely new sends introduced by an
+  // edit still hit the RUNTIME approval gates (park + card) — the effect
+  // layer is the protection, not authoring-time disabling.
+  const gaps = prep.def.enabled ? analyzeWorkflowGaps(prep.def) : [];
+  return preparedFromWrite(prep, 'ready', prep.def, gaps, extra);
 }
 
 export function prepareWorkflowEnableForWrite(def: WorkflowDefinition): WorkflowPreparedWrite {
