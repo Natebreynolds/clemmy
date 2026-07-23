@@ -138,7 +138,7 @@ import {
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
-import { looksLikeDispatchHandoffReply, steerTurnReplySalvage } from './turn-decision.js';
+import { looksLikeDispatchHandoffReply, steerTurnReplySalvage, textAwaitsUserMaterial, recoverySummaryReplyIsDeliverable } from './turn-decision.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
@@ -1619,6 +1619,31 @@ function userVisibleStepDecision(
   };
 }
 
+/** Stall-recovery summary directive (2026-07-23). When stall retries exhaust,
+ *  the user must NEVER see harness meta-language ("the model produced text
+ *  without taking action — retry, switch approach, or stop?"). Before any
+ *  user-facing fallback, spend ONE turn asking the model to write the reply
+ *  the user should actually see. The "do not call another tool … reply to the
+ *  user now" phrasing engages the plain-text-contract exemption, so a
+ *  compliant zero-tool reply cannot re-trip the stall detector. */
+function buildStallRecoverySummaryMessage(userInput: string): string {
+  const anchor = userInput.trim().slice(0, 400);
+  return [
+    'Your previous turns did not produce a reply that could be delivered.',
+    'Do not call another tool. Reply to the user now, in plain words:',
+    'briefly say where you are with their request, share anything useful you already have,',
+    'and if you genuinely need something from them, end with ONE concrete question.',
+    'Never mention tools, retries, or internal errors.',
+    anchor ? `Their message was: "${anchor}"` : '',
+  ].filter(Boolean).join(' ');
+}
+
+/** The absolute floor when even the recovery summary failed: plain language,
+ *  anchored to the user's ask, no tri-choice jargon. */
+const STALL_FLOOR_QUESTION =
+  "Something on my side kept that reply from coming together. Say “continue” and I'll pick it back up fresh — or rephrase what you'd like and I'll start from there.";
+const STALL_FLOOR_OPTIONS = ['Continue', 'Start over'];
+
 function buildMissingReplyRetryMessage(decision: OrchestratorDecisionShape, path: 'conversation' | 'resume'): string {
   const internal = JSON.stringify((decision.summary ?? '').slice(0, 700));
   return [
@@ -2127,6 +2152,12 @@ async function runConversationCore(
   // runConversation() call starts from zero.
   let stallRetriesUsed = 0;
   let missingReplyRetriesUsed = 0;
+  // One-shot recovery-summary turn after stall retries exhaust (2026-07-23):
+  // ask the model for the user-facing reply before ANY meta-failure fallback.
+  let stallRecoverySummaryUsed = false;
+  // True only for the single turn running the recovery directive — its reply
+  // gets vetted (recoverySummaryReplyIsDeliverable) before contract delivery.
+  let stallRecoveryTurnActive = false;
 
   // Independent objective-completion judge (Hermes-style). Only for interactive
   // chat callers (opt-in). The judge catches the model declaring "done" before
@@ -2593,6 +2624,22 @@ async function runConversationCore(
         nextInput = `${buildStallRetryMessage(options.sessionId, structuredStallInfo)} The tool surface is available in this run; do not ask the user to resend a tool-enabled message. Pick the needed local, shell, web, memory, or external-service tool and call it now.`;
         continue;
       }
+      // Recovery-summary turn (2026-07-23): before ANY user-facing fallback,
+      // spend one turn asking the model for the reply the user should see.
+      // The contract phrasing makes a compliant zero-tool reply deliverable.
+      if (!stallRecoverySummaryUsed) {
+        stallRecoverySummaryUsed = true;
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'stall_retry_attempted',
+          data: { signal: structuredStallInfo.signal, attempt: 'recovery_summary', maxRetries: MAX_STALL_RETRIES },
+        });
+        nextInput = buildStallRecoverySummaryMessage(String(options.input ?? ''));
+        stallRecoveryTurnActive = true;
+        continue;
+      }
       const askUserEnabled =
         (getRuntimeEnv('HARNESS_STALL_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
       if (askUserEnabled) {
@@ -2602,9 +2649,8 @@ async function runConversationCore(
           role: 'Clem',
           type: 'awaiting_user_input',
           data: {
-            question:
-              "I've been unable to make progress because the model claimed tools were unavailable instead of using them. Should I retry, switch approach, or stop here?",
-            options: ['Retry', 'Switch approach', 'Stop'],
+            question: STALL_FLOOR_QUESTION,
+            options: STALL_FLOOR_OPTIONS,
             source: 'stall_recovery',
             signal: structuredStallInfo.signal,
           },
@@ -2614,7 +2660,7 @@ async function runConversationCore(
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
           steps: stepIndex,
-          summary: "I've been unable to make progress because the model claimed tools were unavailable instead of using them. Should I retry, switch approach, or stop here?",
+          summary: STALL_FLOOR_QUESTION,
         });
         return {
           sessionId: options.sessionId,
@@ -2669,9 +2715,18 @@ async function runConversationCore(
       // "unable to make progress" banner. In the draft-present regression, the
       // correct reply was produced and discarded three times. A short generic ack ("OK.")
       // is NOT compliance — it still falls through to the stall machinery.
+      // Consume the recovery-turn marker for THIS turn only (set when the
+      // exhaustion path issued the recovery directive last iteration).
+      const recoveryTurnNow = stallRecoveryTurnActive;
+      stallRecoveryTurnActive = false;
       if (plainTextContractTurn && (turnResult.toolCalls ?? 0) === 0 && typeof turnResult.finalOutput === 'string') {
         const contractReply = turnResult.finalOutput.trim();
-        if (contractReply && (contractReply.length > 60 || !STALL_OUTPUT_PATTERN.test(contractReply))) {
+        // Recovery-turn vet (2026-07-23): a false action claim or detected-bad
+        // shape must not launder through the recovery directive — it falls
+        // through to the stall machinery and reaches the human floor instead.
+        if (recoveryTurnNow && !recoverySummaryReplyIsDeliverable(contractReply, { sessionId: options.sessionId, turn: turnResult.turn })) {
+          // fall through — no delivery
+        } else if (contractReply && (contractReply.length > 60 || !STALL_OUTPUT_PATTERN.test(contractReply))) {
           // Synthesize the decision for the RETURN-VALUE lane (2026-07-13): every
           // salvage here completes with decision===null, so lastDecision was
           // undefined and respondViaHarness (respond-bridge.ts) built its reply
@@ -2942,6 +2997,37 @@ async function runConversationCore(
         // and a whitespace-normalized prefix match against the prior attempt's
         // recorded rawOutput (so an answer that CHANGED between attempts —
         // i.e. the retry actually moved something — still asks the user).
+        // SALVAGE, shape 3 (live 2026-07-23 on v2.5.5): the reply hands the
+        // turn back to the user for material only THEY can provide ("send the
+        // copy when you have it", "paste it here"). Retrying cannot succeed —
+        // the promised work is gated on user input — so deliver the reply.
+        // Belt to the detector-side suppression in evaluateProgress.
+        if (stallInfo.signal === 'A_zero_tools') {
+          const awaitText = typeof turnResult.finalOutput === 'string' ? turnResult.finalOutput.trim() : '';
+          if (awaitText.length >= 40 && textAwaitsUserMaterial(awaitText)) {
+            lastDecision = { summary: awaitText.slice(0, 200), reply: awaitText, done: true, nextAction: 'completed', reason: null };
+            return finalizeStandardConversation({
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              turn: turnResult.turn,
+              eventData: {
+                steps: stepIndex,
+                reason: 'awaits_user_material_salvaged',
+                summary: awaitText.slice(0, 200),
+                reply: awaitText,
+                delivered: true,
+                stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
+              },
+              result: {
+                sessionId: options.sessionId,
+                status: 'completed',
+                steps: stepIndex,
+                lastDecision,
+                lastTurn,
+              },
+            });
+          }
+        }
         if (stallInfo.signal === 'A_zero_tools') {
           const finalText = typeof turnResult.finalOutput === 'string' ? turnResult.finalOutput.trim() : '';
           const priorRaw = latestStallRetryRawOutput(options.sessionId);
@@ -2973,6 +3059,22 @@ async function runConversationCore(
             });
           }
         }
+        // Recovery-summary turn (2026-07-23): same contract as the structured
+        // site — the user never sees harness meta-language while one model
+        // turn can still produce the real reply.
+        if (!stallRecoverySummaryUsed) {
+          stallRecoverySummaryUsed = true;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'stall_retry_attempted',
+            data: { signal: stallInfo?.signal ?? null, attempt: 'recovery_summary', maxRetries: MAX_STALL_RETRIES },
+          });
+          nextInput = buildStallRecoverySummaryMessage(String(options.input ?? ''));
+          stallRecoveryTurnActive = true;
+          continue;
+        }
         const askUserEnabled =
           (getRuntimeEnv('HARNESS_STALL_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
         if (askUserEnabled) {
@@ -2982,9 +3084,8 @@ async function runConversationCore(
             role: 'Clem',
             type: 'awaiting_user_input',
             data: {
-              question:
-                "I've been unable to make progress on this — the model produced text without taking action twice in a row. Should I retry, switch approach, or stop here?",
-              options: ['Retry', 'Switch approach', 'Stop'],
+              question: STALL_FLOOR_QUESTION,
+              options: STALL_FLOOR_OPTIONS,
               source: 'stall_recovery',
               signal: stallInfo?.signal ?? null,
             },
@@ -2994,7 +3095,7 @@ async function runConversationCore(
             sourceUserSeq: activeSourceUserSeq,
             turn: turnResult.turn,
             steps: stepIndex,
-            summary: "I've been unable to make progress on this — the model produced text without taking action twice in a row. Should I retry, switch approach, or stop here?",
+            summary: STALL_FLOOR_QUESTION,
           });
           return {
             sessionId: options.sessionId,
