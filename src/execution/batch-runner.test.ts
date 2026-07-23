@@ -22,7 +22,9 @@ delete process.env.ANTHROPIC_API_KEY;
 // eslint-disable-next-line import/first
 const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
 // eslint-disable-next-line import/first
-const { validateBatchPlan, prepareBatchPlanForExecution, runBatchPlan, certifyBatchPlan, parseBatchCertificationVerdict, formatBatchLedger, readBatchLedger, _setBatchSleepForTests, _setCertifyJudgeForTests } = await import('./batch-runner.js');
+const { validateBatchPlan, prepareBatchPlanForExecution, runBatchPlan, certifyBatchPlan, parseBatchCertificationVerdict, formatBatchLedger, readBatchLedger, _setBatchSleepForTests, _setCertifyJudgeForTests, _setCertifyChainForTests } = await import('./batch-runner.js');
+// eslint-disable-next-line import/first
+const { getJudgeChainFallovers, resetJudgeChainFalloversForTests } = await import('../runtime/harness/judge-family.js');
 // eslint-disable-next-line import/first
 const { rememberToolSchema, resetToolSchemaCache } = await import('../tools/composio-schema-cache.js');
 
@@ -155,15 +157,18 @@ test('runBatchPlan: a composio polite-failure result counts as a FAILED item, no
   assert.equal(ledger.succeeded, 0);
 });
 
-test('certifyBatchPlan: judge unreachable → write/send fail CLOSED, read proceeds advisory', async () => {
-  // Deterministic "unreachable" judge: every attempt throws (the dev machine's
-  // real OAuth logins would otherwise make this a live model call).
+test('certifyBatchPlan (J1 kill-switch OFF): judge unreachable → write/send fail CLOSED, read advisory (today\'s behavior)', async () => {
+  // CLEMMY_JUDGE_CHAIN=off restores the pre-J1 single-lane path: one resolved
+  // judge, ONE retry on a blip, then terminal fail-closed for write/send.
+  const prevChain = process.env.CLEMMY_JUDGE_CHAIN;
+  process.env.CLEMMY_JUDGE_CHAIN = 'off';
   let attempts = 0;
   _setCertifyJudgeForTests(async () => { attempts += 1; throw new Error('provider unreachable (test)'); });
   try {
     const items = [{ id: 'a', args: { x: 1 } }];
     const send = await certifyBatchPlan({ tool: 'composio_execute_tool', composioSlug: 'S', sideEffect: 'send', objective: 'send things without a judge available', items });
     assert.equal(send.allow, false, 'send plan must refuse when the judge cannot run');
+    assert.equal(send.judgeUnavailable ?? false, false, 'kill-switch off never parks — it fails closed');
     assert.match(send.reason, /fail-closed/);
     assert.equal(attempts, 2, 'one retry before fail-closed');
     const read = await certifyBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'read things without a judge available', items });
@@ -171,6 +176,62 @@ test('certifyBatchPlan: judge unreachable → write/send fail CLOSED, read proce
     assert.equal(read.judged, false);
   } finally {
     _setCertifyJudgeForTests(null);
+    if (prevChain === undefined) delete process.env.CLEMMY_JUDGE_CHAIN;
+    else process.env.CLEMMY_JUDGE_CHAIN = prevChain;
+  }
+});
+
+test('certifyBatchPlan (J1 chain fallover): first lane 429s → second lane returns the verdict, one fallover recorded', async () => {
+  // A 2-family chain injected so the fallover runs without live provider logins.
+  const codexLane = { model: {}, modelId: 'gpt-5.4-mini', judgeFamily: 'codex', brainFamily: 'codex', transport: 'codex_responses', selfJudge: true } as never;
+  const claudeLane = { model: {}, modelId: 'claude-haiku-4-5', judgeFamily: 'claude', brainFamily: 'codex', transport: 'claude_subscription', selfJudge: false } as never;
+  _setCertifyChainForTests(() => [codexLane, claudeLane]);
+  resetJudgeChainFalloversForTests();
+  let call = 0;
+  _setCertifyJudgeForTests(async (member) => {
+    call += 1;
+    if (member && (member as { judgeFamily?: string }).judgeFamily === 'codex') {
+      // The live incident's exact shape: Codex plan-quota exhaustion (429).
+      throw Object.assign(new Error('Codex 429 usage_limit_reached'), { statusCode: 429 });
+    }
+    return { allow: true, reason: 'claude lane verified the payloads', concerns: [], judged: true };
+  });
+  try {
+    const verdict = await certifyBatchPlan({ tool: 'composio_execute_tool', composioSlug: 'S', sideEffect: 'send', objective: 'send batch across a chain fallover', items: [{ id: 'a', args: { x: 1 } }] });
+    assert.equal(verdict.allow, true, 'the second (Claude) lane produced a real ALLOW verdict');
+    assert.equal(verdict.judged, true);
+    assert.equal(verdict.judgeUnavailable ?? false, false, 'a verdict was obtained — not judge-unavailable');
+    assert.equal(call, 2, 'both lanes were attempted (429 lane, then the survivor)');
+    const fallovers = getJudgeChainFallovers();
+    assert.equal(fallovers.length, 1, 'exactly one chain-fallover event recorded');
+    assert.equal(fallovers[0].fromFamily, 'codex');
+    assert.equal(fallovers[0].toFamily, 'claude');
+    assert.equal(fallovers[0].transient, true, '429 usage_limit is a transient provider shape');
+  } finally {
+    _setCertifyJudgeForTests(null);
+    _setCertifyChainForTests(null);
+    resetJudgeChainFalloversForTests();
+  }
+});
+
+test('certifyBatchPlan (J1 chain exhausted): send → judgeUnavailable (park, NOT terminal); reversible read → proceeds unverified', async () => {
+  // Every lane throws a transient shape → the chain exhausts with no verdict.
+  const codexLane = { model: {}, modelId: 'gpt-5.4-mini', judgeFamily: 'codex', brainFamily: 'codex', transport: 'codex_responses', selfJudge: true } as never;
+  const claudeLane = { model: {}, modelId: 'claude-haiku-4-5', judgeFamily: 'claude', brainFamily: 'codex', transport: 'claude_subscription', selfJudge: false } as never;
+  _setCertifyChainForTests(() => [codexLane, claudeLane]);
+  _setCertifyJudgeForTests(async () => { throw Object.assign(new Error('429 usage_limit_reached'), { statusCode: 429 }); });
+  try {
+    const send = await certifyBatchPlan({ tool: 'composio_execute_tool', composioSlug: 'S', sideEffect: 'send', objective: 'send with an exhausted judge chain', items: [{ id: 'a', args: { x: 1 } }] });
+    assert.equal(send.judgeUnavailable, true, 'send parks to a human — never terminal fail-closed under J1');
+    assert.equal(send.allow, false, 'the certifier itself cannot allow — the human is the fallback judge');
+    assert.doesNotMatch(send.reason, /fail-closed/, 'the park reason is not a terminal fail-closed refusal');
+    const read = await certifyBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'read with an exhausted judge chain', items: [{ id: 'a', args: { x: 1 } }] });
+    assert.equal(read.allow, true, 'reversible read proceeds');
+    assert.equal(read.judgeUnavailable, true);
+    assert.match(read.reason, /unverified \(judge unavailable\)/, 'labeled unverified, riding the advisory-labeling style');
+  } finally {
+    _setCertifyJudgeForTests(null);
+    _setCertifyChainForTests(null);
   }
 });
 

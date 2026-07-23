@@ -111,16 +111,25 @@ export function registerBatchTools(server: McpServer): void {
             ? ` Harness normalized ${prepared.repairs.length} batch item shape(s) before certification.`
             : '';
           const cert = await certifyBatchPlan(planForExecution);
-          if (!cert.allow) {
+          // A REAL denial (the judge RAN and flagged the payloads) is terminal —
+          // fix + re-propose. But a judge that could NOT run (chain exhausted /
+          // single-provider with no acceptable judge) must NOT strand the batch:
+          // cert.judgeUnavailable routes it to the human as the fallback judge
+          // (send/write → approval card; read → proceed, labeled unverified).
+          if (!cert.allow && !cert.judgeUnavailable) {
             return textResult(
               `Plan REFUSED by certification: ${cert.reason}`
               + (cert.concerns.length ? `\nConcerns:\n${cert.concerns.map((c) => `- ${c}`).join('\n')}` : '')
               + '\nFix the payloads and re-propose; do NOT retry the identical plan.',
             );
           }
+          const unverified = cert.judgeUnavailable === true;
           if (planForExecution.sideEffect === 'read') {
             const ledger = await runBatchPlan(planForExecution, sessionId);
-            return textResult(`Certified (${cert.reason || 'ok'}).${repairNote} Executed.\n${formatBatchLedger(ledger)}`);
+            const label = unverified
+              ? `Unverified (judge unavailable — ${cert.reason}).`
+              : `Certified (${cert.reason || 'ok'}).`;
+            return textResult(`${label}${repairNote} Executed.\n${formatBatchLedger(ledger)}`);
           }
           // Kind anchors on the SLUG, not only the model-declared sideEffect —
           // an OUTLOOK_*_SEND_* plan labeled 'write' must still queue as an
@@ -129,21 +138,30 @@ export function registerBatchTools(server: McpServer): void {
           const { isIrreversibleSendSlug } = await import('../runtime/harness/confirm-first-gate.js');
           const slugIsSend = typeof planForExecution.composioSlug === 'string'
             && isIrreversibleSendSlug(planForExecution.composioSlug);
+          const certNote = unverified
+            ? `I can't independently verify this batch right now (${cert.reason}) — your approval IS the verification.`
+            : `Certification: ${cert.reason || 'allowed'}`;
           const record = queuePendingAction({
-            title: `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
-            summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. Certification: ${cert.reason || 'allowed'}${repairNote}`,
+            title: unverified
+              ? `Review & approve (unverified) — batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 60)}`
+              : `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
+            summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. ${certNote}${repairNote}`,
             kind: planForExecution.sideEffect === 'send' || slugIsSend ? 'external_send' : 'external_write',
             toolName: 'run_batch',
             payload: planForExecution,
             targetSummary: `${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,
             preview: JSON.stringify(planForExecution.items[0]?.args ?? {}).slice(0, 400),
-            risk: `Executes ${planForExecution.items.length} ${planForExecution.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`,
+            risk: `Executes ${planForExecution.items.length} ${planForExecution.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`
+              + (unverified ? ' NOTE: automated certification was unavailable — this batch was not machine-verified, so review the payloads before approving.' : ''),
             rollback: planForExecution.sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
             sessionId,
             createdBy: 'run_batch',
           });
           return textResult(
-            `Certified (${cert.reason || 'allowed'}).${repairNote} Queued for approval as pending action ${record.id} (${planForExecution.items.length} ${planForExecution.sideEffect} item(s)). `
+            (unverified
+              ? `I couldn't independently verify this batch (${cert.reason}). Rather than block it, I've queued it for YOUR review — the human is the fallback judge.${repairNote} `
+              : `Certified (${cert.reason || 'allowed'}).${repairNote} `)
+            + `Queued for approval as pending action ${record.id} (${planForExecution.items.length} ${planForExecution.sideEffect} item(s)). `
             + `Once it is APPROVED, call run_batch action=execute pending_action_id=${record.id}. Do not execute items yourself.`,
           );
         }

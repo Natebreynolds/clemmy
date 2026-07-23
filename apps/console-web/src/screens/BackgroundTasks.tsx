@@ -128,7 +128,7 @@ export function BackgroundTasks() {
       if (reason) flash({ tone: 'danger', text: reason });
       return; // snap-back is automatic — we never moved the card
     }
-    const verb = intent === 'cancel' ? 'Cancelling' : intent === 'resume' ? 'Resuming' : 'Starting';
+    const verb = intent === 'cancel' ? 'Cancelling' : intent === 'resume' ? 'Resuming' : intent === 'approve' ? 'Approving' : 'Starting';
     flash({ tone: 'success', text: `${verb} “${card.title}”…` });
     const res = await runBoardAction(card, intent);
     if (!res.ok) flash({ tone: 'danger', text: res.reason || 'That action didn’t go through.' });
@@ -167,7 +167,7 @@ export function BackgroundTasks() {
   return (
     <Page
       title="Tasks"
-      subtitle="Everything Clementine is working on — drag to cancel or start, click a card to watch it live."
+      subtitle="Everything Clementine is working on — drag a waiting card to Running to approve it, drag to Done to cancel, click to watch live."
       actions={(
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" onClick={() => void board.refetch()}>Refresh</Button>

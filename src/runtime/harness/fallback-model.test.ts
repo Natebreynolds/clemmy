@@ -1,4 +1,4 @@
-import { after, test } from 'node:test';
+import { after, test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -29,6 +29,14 @@ function model(impl: Partial<Model>): Model {
 }
 function target(label: string, m: Model): FallbackTarget { return { label, getModel: () => m }; }
 async function collect(it: AsyncIterable<unknown>): Promise<unknown[]> { const o: unknown[] = []; for await (const e of it) o.push(e); return o; }
+
+beforeEach(async () => {
+  // The cooldown memo is module-global; tests reuse brain labels, so a bench
+  // earned in one case must never leak into the next (surfaced 2026-07-22 when
+  // OVERLOADED joined the memo and test 7's opus bench rerouted test 8).
+  const { clearRateLimitedBrainsForTest } = await import('./fallback-model.js');
+  clearRateLimitedBrainsForTest();
+});
 
 test('isOverloadError: 529 yes, 429 no, BoundaryError(model.overloaded) yes', () => {
   assert.equal(isOverloadError({ statusCode: 529 }), true);
@@ -481,4 +489,16 @@ test('rate-limit memo: a 429-marked brain is skipped on the NEXT call (no retry 
   } finally {
     clearRateLimitedBrainsForTest();
   }
+});
+
+test('L2 (v2.3.0): an OVERLOADED brain joins the cooldown memo — the 529-storm class', async () => {
+  const { markBrainRateLimited, isBrainRateLimited } = await import('./fallback-model.js');
+  const { BoundaryError } = await import('../boundary-error.js');
+  const overloaded = BoundaryError.from(new Error('529 overloaded'), { kind: 'model.overloaded', retryable: true, userMessage: 'x' });
+  markBrainRateLimited('claude-storm-test', overloaded);
+  assert.equal(isBrainRateLimited('claude-storm-test'), true, 'overloaded benches like a rate limit');
+  // Non-transient kinds never bench via this memo.
+  const parseErr = BoundaryError.from(new Error('bad json'), { kind: 'model.invalid_output', retryable: false, userMessage: 'x' });
+  markBrainRateLimited('claude-clean-test', parseErr);
+  assert.equal(isBrainRateLimited('claude-clean-test'), false);
 });

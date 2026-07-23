@@ -201,6 +201,14 @@ export async function deliverNotificationToDestination(
   notification: NotificationRecord,
   destination: NotificationDestination,
 ): Promise<void> {
+  if (destination.type === 'desktop') {
+    // The durable notification store lives ON this machine — reaching it IS
+    // desktop delivery; the app shell toasts loud unread records from its own
+    // poll. This leg exists so loud notifications always resolve at least one
+    // destination (never "deferred: no destinations", live 2026-07-22) and so
+    // the delivery ledger records the surface.
+    return;
+  }
   if (destination.type === 'web_push') {
     if (!destination.pushEndpoint || !destination.pushP256dh || !destination.pushAuth) {
       throw new Error('web_push destination is missing endpoint / keys.');

@@ -24,7 +24,7 @@ export interface WorkflowRunAdvisory {
   note: string;
 }
 
-export type WorkflowStepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'failed' | 'skipped';
+export type WorkflowStepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'failed' | 'skipped' | 'awaiting_approval';
 
 export interface WorkflowRunStep {
   stepId: string;
@@ -221,6 +221,9 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
       case 'step_started':
         s.status = 'running';
         s.startedAt = t;
+        // A re-run (resume after approval / retry attempt) must not keep
+        // showing the previous attempt's error or park copy while running.
+        s.error = '';
         break;
       case 'step_completed': {
         // A step that finalized as BLOCKED ({blocked:true,reason}) is NOT a
@@ -239,11 +242,24 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
         if (num(meta.costUsd) !== undefined) s.costUsd = num(meta.costUsd);
         break;
       }
-      case 'step_failed':
-        s.status = 'failed';
-        s.finishedAt = t;
-        s.error = str(ev.error);
+      case 'step_failed': {
+        // Park ≠ failure: the runner logs ParkRunSignal as step_failed BY
+        // CONTRACT (reaper re-admission keys on the durable event), so the
+        // reclassification lives here. Match the tagged meta.reason first,
+        // then the stable park message for events written before the tag.
+        const failMsg = str(ev.error);
+        const parked = meta.reason === 'parked_on_approval' || /parked on approval/i.test(failMsg);
+        if (parked) {
+          s.status = 'awaiting_approval';
+          s.finishedAt = t;
+          s.error = 'Waiting for your approval — the run resumes automatically once you decide.';
+        } else {
+          s.status = 'failed';
+          s.finishedAt = t;
+          s.error = failMsg;
+        }
         break;
+      }
       case 'step_skipped':
         s.status = 'skipped';
         s.finishedAt = t;

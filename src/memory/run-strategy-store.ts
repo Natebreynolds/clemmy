@@ -23,6 +23,10 @@ export interface RunStrategyRecord {
   toolsUsed: string[];
   workerCount: number;
   durationMs: number;
+  /** WHERE the deliverable went (file path / sheet / mailbox target) — so a
+   *  later session's "find those 30 emails we drafted" answers from memory
+   *  instead of guessing at mailboxes (live 2026-07-23). */
+  deliverable?: string;
   createdAt: string;
   uses: number;
   lastUsedAt?: string;
@@ -85,6 +89,7 @@ export interface RecordRunStrategyInput {
   toolsUsed: string[];
   workerCount: number;
   durationMs: number;
+  deliverable?: string;
 }
 
 /** Record a successful run's shape. Near-duplicate objectives (≥0.8 keyword
@@ -103,6 +108,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     existing.toolsUsed = toolsUsed;
     existing.workerCount = input.workerCount;
     existing.durationMs = input.durationMs;
+    if (input.deliverable?.trim()) existing.deliverable = input.deliverable.trim().slice(0, 240);
     existing.uses += 1;
     existing.lastUsedAt = now;
     writeStore(file);
@@ -115,6 +121,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     toolsUsed,
     workerCount: Math.max(0, Math.round(input.workerCount)),
     durationMs: Math.max(0, Math.round(input.durationMs)),
+    ...(input.deliverable?.trim() ? { deliverable: input.deliverable.trim().slice(0, 240) } : {}),
     createdAt: now,
     uses: 1,
   };
@@ -130,7 +137,8 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
 function renderOne(s: RunStrategyRecord): string {
   const minutes = Math.max(1, Math.round(s.durationMs / 60_000));
   const shape = s.workerCount >= 2 ? `fan-out ${s.workerCount} workers` : 'single-threaded';
-  return `- A similar past run ("${s.objective}") succeeded with: ${s.toolsUsed.join(', ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}.`;
+  const produced = s.deliverable ? ` → produced ${s.deliverable}` : '';
+  return `- A similar past run ("${s.objective}") succeeded with: ${s.toolsUsed.join(', ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}${produced}.`;
 }
 
 /** Render the top-matching strategies for an objective, or '' when nothing

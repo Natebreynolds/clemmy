@@ -34,7 +34,7 @@ export function clearSelfServeBouncesForTest(): void {
  *      marks an account as a Market Leader?" (2026-07-22, same user session:
  *      both were answered by the model itself in ~7 tool calls once nudged). */
 const POINTER_PROVIDE_RE = /\b(?:can you (?:send|share|provide|paste|give)|please (?:send|share|provide|paste|give)|send me|share (?:the|a|your)|give me|paste|provide (?:the|a|your)|what(?:'s| is) the)\b[^.?!]{0,80}\b(?:link|url|id\b|ids\b|report|export|file|spreadsheet|sheet|list|csv|dashboard)/i;
-const POINTER_IDENTIFY_RE = /\b(?:which|what|where)\b[^.?!]{0,100}\b(?:field|report|view|column|dashboard|record type|list view|flag|property|label)\b/i;
+const POINTER_IDENTIFY_RE = /\b(?:which|what|where)\b[^.?!]{0,100}\b(?:field|report|view|column|dashboard|record type|list view|flag|property|label|mailbox|inbox|folder|account)\b/i;
 const POINTER_REQUEST_RE = new RegExp(`(?:${POINTER_PROVIDE_RE.source})|(?:${POINTER_IDENTIFY_RE.source})`, 'i');
 
 /** …and toolkit-domain words that tie the pointer to a queryable system. The
@@ -45,8 +45,8 @@ const TOOLKIT_ALIASES: Record<string, RegExp> = {
   hubspot: /hubspot|crm|deal|contact|account/i,
   googlesheets: /sheet|spreadsheet|tab\b|row/i,
   airtable: /airtable|base\b|table\b|record/i,
-  outlook: /outlook|email|inbox|mail\b/i,
-  gmail: /gmail|email|inbox|mail\b/i,
+  outlook: /outlook|email|inbox|mailbox|drafts?\b|mail\b/i,
+  gmail: /gmail|email|inbox|mailbox|drafts?\b|mail\b/i,
   slack: /slack|channel|thread/i,
   notion: /notion|page\b|database/i,
 };

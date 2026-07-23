@@ -53,3 +53,16 @@ test('near-duplicate objectives accumulate evidence instead of new rows', () => 
 test('runs that used no real tools teach nothing', () => {
   assert.equal(recordRunStrategy({ objective: 'idle chat about weather', toolsUsed: [], workerCount: 0, durationMs: 1000 }), null);
 });
+
+test('deliverable memory: recall answers "where did we put it" (the 2026-07-23 mailbox-guess class)', async () => {
+  const rec = recordRunStrategy({
+    objective: 'Write 30 personalized AI-search emails for market leader accounts',
+    toolsUsed: ['composio_execute_tool', 'write_file'],
+    workerCount: 0,
+    durationMs: 8 * 60_000,
+    deliverable: '/Users/nathan.reynolds/Desktop/ML-30-AI-Search-Drafts.md',
+  });
+  assert.ok(rec);
+  const hit = renderRunStrategiesForContext('find those 30 emails we drafted for market leaders');
+  assert.match(hit, /→ produced \/Users\/nathan\.reynolds\/Desktop\/ML-30-AI-Search-Drafts\.md/);
+});

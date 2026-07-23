@@ -39,44 +39,29 @@ const assistantStub = {
   },
 } as never;
 
-test('no-destination notification jobs stay queued but back off noisy retries', async () => {
+test('U5 (v2.3.0): a LOUD notification with nothing configured resolves the desktop leg and DELIVERS', async () => {
   addNotification({
-    id: 'unroutable-1',
+    id: 'loud-desktop-1',
     kind: 'system',
-    title: 'Unroutable test notification',
-    body: 'No external destinations are configured.',
+    title: 'Loud with no external destinations',
+    body: 'The desktop leg is the guaranteed surface.',
     createdAt: new Date().toISOString(),
     read: false,
   });
-
   await processNotificationDeliveries(assistantStub);
-
-  const firstQueue = listQueuedNotificationDeliveries();
-  assert.equal(firstQueue.length, 1, 'the original notification stays queued for future destinations');
-  assert.equal(firstQueue[0].notificationId, 'unroutable-1');
-  const firstRetryAt = firstQueue[0].nextAttemptAtByDestination?.__no_destinations__;
-  assert.ok(firstRetryAt, 'queue records a no-destination retry timestamp');
-  assert.ok(Date.parse(firstRetryAt) > Date.now(), 'retry timestamp is in the future');
-  assert.match(getNotification('unroutable-1')?.deliveryError ?? '', /no notification destinations/i);
-
-  const setupWarning = listNotifications(50)
-    .find((item) => item.metadata?.errorCategory === 'no_destinations');
-  assert.equal(setupWarning?.silent, true, 'setup warning is dashboard-only');
   assert.equal(
-    listQueuedNotificationDeliveries().some((job) => job.notificationId === setupWarning?.id),
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === 'loud-desktop-1'),
     false,
-    'setup warning does not enqueue another unroutable delivery job',
+    'the loud record delivered via the desktop leg — never deferred (the 2026-07-22 stuck-jobs class)',
   );
+  assert.doesNotMatch(getNotification('loud-desktop-1')?.deliveryError ?? '', /no notification destinations/i);
+});
 
-  await processNotificationDeliveries(assistantStub);
-  const secondQueue = listQueuedNotificationDeliveries();
-  assert.equal(secondQueue.length, 1);
-  assert.equal(
-    secondQueue[0].nextAttemptAtByDestination?.__no_destinations__,
-    firstRetryAt,
-    'a second immediate tick keeps the same backoff instead of re-prompting',
-  );
-
+// The no-destination backoff machinery has NO reachable case post-U5: loud
+// records always resolve the desktop leg and deliver; silent records are
+// dashboard-only and never enqueue delivery jobs. Only the legacy-record
+// cleanup below still matters (queues written by pre-U5 versions).
+test('legacy no-destination setup warnings are cleaned from the delivery queue', async () => {
   addNotification({
     id: 'legacy-no-destinations-warning',
     kind: 'system',

@@ -1492,7 +1492,18 @@ function hasUserFacingReply(decision: OrchestratorDecisionShape | null | undefin
 }
 
 function isCompletedWithoutUserFacingReply(decision: OrchestratorDecisionShape | null | undefined): boolean {
-  return Boolean(decision && decision.nextAction === 'completed' && !hasUserFacingReply(decision));
+  // L1 (v2.3.0): ANY final decision lacking a user-facing reply earns the one
+  // self-retry — not just the 'completed' shape. Live 2026-07-22: a done-shaped
+  // turn with a non-completed nextAction skipped the retry entirely and the
+  // user got the fallback after repeatedly nudging the run. Non-final shapes
+  // (awaiting_handoff_result, awaiting_user_input — the question IS the reply)
+  // still never retry.
+  if (!decision || hasUserFacingReply(decision)) return false;
+  if (decision.nextAction === 'completed') return true;
+  // 'abandoned' is the give-up shape — a final with no reply, exactly the case
+  // to retry. Every awaiting_* action is a REAL pause (the question/approval
+  // card IS the user-facing artifact) and must never be retried into noise.
+  return Boolean(decision.done) && decision.nextAction === 'abandoned';
 }
 
 function hasCapturedWorkflowStepResult(sessionId: string): boolean {

@@ -315,7 +315,12 @@ export function markBrainRateLimited(label: string, err: unknown): void {
   const cls = err instanceof BoundaryError
     ? { kind: err.kind, retryAfterMs: undefined as number | undefined }
     : classifyModelError(err);
-  if (cls.kind !== 'model.rate_limited') return;
+  // OVERLOADED joins the memo (v2.3.0 L2): a 529-storm behaves exactly like a
+  // rate limit — the provider will refuse for a window — yet only rate_limited
+  // was memo'd, so every call re-paid the full retry ladder on the overloaded
+  // brain before falling over (live 2026-07-22: 486 fallovers/40min on an
+  // Anthropic overload, ~15s tax per call).
+  if (cls.kind !== 'model.rate_limited' && cls.kind !== 'model.overloaded') return;
   const pauseMs = Math.min(cls.retryAfterMs ?? RATE_LIMIT_DEFAULT_COOLDOWN_MS, RATE_LIMIT_MAX_COOLDOWN_MS);
   const until = Date.now() + pauseMs;
   const existing = rateLimitedBrains.get(label);

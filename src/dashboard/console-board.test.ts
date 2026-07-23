@@ -2641,3 +2641,30 @@ test('workflow failed-item recovery endpoints list and requeue only final failed
     await h.close();
   }
 });
+
+test('U1: a finished origin-chat attempt collapses into its background task card — one pipeline, one card', async () => {
+  const { createSession, beginRunAttempt, finishRunAttempt } = await import('../runtime/harness/eventlog.js');
+  // Origin chat session with a FINISHED attempt (the handoff turn)…
+  createSession({ id: 'sess-origin-collapse', kind: 'chat', title: 'origin chat' });
+  const att = beginRunAttempt('sess-origin-collapse', { runId: 'run-origin-1' });
+  finishRunAttempt(att, 'completed');
+  // …whose pipeline continued as a background task.
+  const task = createBackgroundTask({ title: 'collapse pipeline task', prompt: 'p', originSessionId: 'sess-origin-collapse' });
+  markBackgroundTaskRunning(task.id);
+  // Control: a finished attempt on an UNRELATED session stays on the board.
+  createSession({ id: 'sess-unrelated-chat', kind: 'chat', title: 'unrelated chat' });
+  const att2 = beginRunAttempt('sess-unrelated-chat', { runId: 'run-unrelated-1' });
+  finishRunAttempt(att2, 'completed');
+
+  const { url, close } = await boot();
+  try {
+    const res = await fetch(`${url}/api/console/board`);
+    const body = await res.json() as { cards: Array<{ id: string; sourceKind?: string; sessionId?: string }> };
+    const ids = body.cards.map((c) => c.id);
+    assert.ok(ids.includes(task.id), 'the background task card is present');
+    assert.ok(!ids.includes(`harness:${att.attemptId}`), 'the finished origin attempt card is collapsed into the task');
+    assert.ok(ids.includes(`harness:${att2.attemptId}`), 'an unrelated finished attempt still shows');
+  } finally {
+    await close();
+  }
+});

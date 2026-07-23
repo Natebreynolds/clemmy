@@ -11,7 +11,7 @@ import {
   type StreamHandle,
 } from './chat';
 import { type ApiError } from './api';
-import { humanToolLabel, salientArgDetail } from './toolLabels';
+import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
 // Re-exported for callers that historically imported it from here.
@@ -25,7 +25,7 @@ export type MessageStatus =
  *  batch meter, or a trust check (judge verdict / watcher steer). */
 export interface ActivityItem {
   id: string;
-  kind: 'tool' | 'agent' | 'batch' | 'check';
+  kind: 'tool' | 'agent' | 'batch' | 'check' | 'event';
   label: string;
   detail?: string;
   provider?: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
@@ -35,6 +35,12 @@ export interface ActivityItem {
   /** kind 'batch' only: live meter state from authoritative batch_progress events.
    *  `throttled` flips true while the runner is backing off a provider rate-limit. */
   batch?: { done: number; total: number; failed: number; throttled?: boolean };
+  /** kind 'event' only: a plain-human milestone row (an external write, a
+   *  code-mode program, or — in the board drawer's unified feed — a lifecycle
+   *  beat). `variant` picks the icon; `tone` its color. `status` is left set for
+   *  the shared spinner/✓/✗ but the event icon is driven by `tone`. */
+  variant?: 'write' | 'program' | 'lifecycle';
+  tone?: 'success' | 'danger' | 'warning' | 'live' | 'muted';
 }
 
 export interface ChatMessage {
@@ -287,13 +293,25 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       if (!item) return prev;
       const id = `a-${item}`;
       const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      const reason = typeof d.reason === 'string' ? d.reason.trim() : '';
+      // Plain-human default: "<item> ✓" or "<item> ✗ — <short reason>". The model
+      // id is power-user detail (demoted behind the drawer's "details" toggle).
       if (prev.some((a) => a.kind === 'agent' && a.id === id)) {
         return prev.map((a) => (a.kind === 'agent' && a.id === id
-          ? { ...a, status, ...(model ? { detail: model, provider: providerFor(d, model) } : {}) }
+          ? {
+              ...a,
+              status,
+              // Keep the worker_started label (it carries the role); on failure
+              // append the short reason so "<item> ✗ <reason>" reads by default.
+              ...(status === 'failed' && reason ? { label: `${a.label} — ${reason.slice(0, 80)}` } : {}),
+              ...(model ? { detail: model, provider: providerFor(d, model) } : {}),
+            }
           : a));
       }
       const role = typeof d.role === 'string' ? d.role : '';
-      return [...prev, { id, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status }];
+      const base = role ? `${role}: ${item}` : item;
+      const label = status === 'failed' && reason ? `${base} — ${reason.slice(0, 80)}` : base;
+      return [...prev, { id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status }];
     }
     case 'worker_capped':
       return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));
@@ -319,6 +337,46 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const steer = typeof d.steer === 'string' ? d.steer : '';
       const detail = [miss, steer && steer !== miss ? steer : ''].filter(Boolean).join(' → ');
       return [...prev, { id: `w${prev.length}`, kind: 'check', label: 'Watcher steered', ...(detail ? { detail } : {}), status: 'done' }];
+    }
+    // Real effects on the outside world — the plain-human "Sent a message to …",
+    // "Created a record", "Saved a file" rows. Phrasing mirrors the server's
+    // describeExternalWrite (work-report.ts) so chat, the drawer feed, and the
+    // report-back message all speak in ONE vocabulary. A failed/orphaned write
+    // is the same line with an honest tail.
+    case 'external_write':
+    case 'external_write_failed':
+    case 'external_write_orphaned': {
+      const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : '';
+      const writeTool = typeof d.toolName === 'string' ? d.toolName : tool;
+      const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
+      const base = describeExternalWrite(shapeKey, writeTool, targets);
+      const failed = ev.type === 'external_write_failed';
+      const orphaned = ev.type === 'external_write_orphaned';
+      const key = callId || shapeKey || writeTool || `${prev.length}`;
+      return [...prev, {
+        id: `x-${ev.type}-${key}`,
+        kind: 'event',
+        variant: 'write',
+        label: failed ? `${base} — failed` : orphaned ? `${base} — timed out, may have landed` : base,
+        status: failed ? 'failed' : 'done',
+        tone: failed ? 'danger' : orphaned ? 'warning' : 'success',
+      }];
+    }
+    // ONE row per code-mode program: "Ran a batch program (N tool calls)". The
+    // per-call plumbing stays inside the sandbox — the user sees the outcome, not
+    // the machinery.
+    case 'codemode_program_summary': {
+      const rpc = typeof d.rpcCalls === 'number' ? d.rpcCalls : 0;
+      const ok = d.ok !== false;
+      const label = `Ran a batch program (${rpc} tool call${rpc === 1 ? '' : 's'})`;
+      return [...prev, {
+        id: `cm-${prev.length}`,
+        kind: 'event',
+        variant: 'program',
+        label: ok ? label : `${label} — didn't finish`,
+        status: ok ? 'done' : 'failed',
+        tone: ok ? 'muted' : 'danger',
+      }];
     }
     default:
       return prev;
@@ -359,7 +417,7 @@ function progressLabel(ev: HarnessEvent): string | null {
   }
 }
 
-function pendingActionFromEvent(value: unknown): PendingActionApprovalView | undefined {
+export function pendingActionFromEvent(value: unknown): PendingActionApprovalView | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Partial<PendingActionApprovalView>;
   if (typeof record.id !== 'string' || !record.id) return undefined;

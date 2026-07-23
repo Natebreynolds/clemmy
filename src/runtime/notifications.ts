@@ -131,7 +131,7 @@ export interface NotificationRecord {
 export interface NotificationDestination {
   id: string;
   name: string;
-  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'slack_webhook' | 'slack_channel' | 'slack_user' | 'web_push';
+  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'slack_webhook' | 'slack_channel' | 'slack_user' | 'web_push' | 'desktop';
   url?: string;
   channelId?: string;
   threadTs?: string;
@@ -706,6 +706,20 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
     }
     return [];
   }
+  // U5 (v2.3.0): the DESKTOP is always a valid loud surface — the durable
+  // notification store lives on this machine, and the app shell toasts it.
+  // With no other destination configured, loud notifications previously
+  // resolved to [] and deferred forever ("No notification destinations
+  // resolved", 9 stuck jobs live 2026-07-22 on two machines).
+  const desktopDestination: NotificationDestination[] = notification.silent
+    ? []
+    : [{
+        id: 'derived-desktop',
+        name: 'Desktop app',
+        type: 'desktop',
+        enabled: true,
+        createdAt: notification.createdAt,
+      }];
   const configured = listNotificationDestinations().filter((entry) => entry.enabled);
   const explicitDiscordUserId = typeof metadata.discordUserId === 'string' ? metadata.discordUserId : '';
   const explicitDiscordChannelId = typeof metadata.discordChannelId === 'string' ? metadata.discordChannelId : '';
@@ -818,6 +832,10 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
       createdAt: notification.createdAt,
     });
   }
+  // The desktop leg rides ALONGSIDE whatever else routed (parity: the same
+  // report that pings Slack/Discord also toasts the desktop) — and when
+  // nothing else is configured it is the guaranteed non-empty destination.
+  combined.push(...desktopDestination);
 
   return combined.filter((destination, index) =>
     combined.findIndex((entry) => entry.id === destination.id) === index,

@@ -88,6 +88,7 @@ import {
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { normalizeRouteDiagnostics, routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import { countDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { buildWorkflowStepAgent } from '../agents/workflow-step-agent.js';
@@ -569,6 +570,29 @@ export interface QueuedRunRecord {
    * has the idempotent passive outcome turn. */
   reportBack?: WorkflowRunReportBackEnvelope;
   reportBackRetry?: WorkflowRunReportBackRetryState;
+}
+
+/**
+ * A2 (v2.3.0): when a workflow run parks on approval, put the ACTIONABLE CARD
+ * in the origin chat — not just prose. The chat surface folds
+ * `approval_requested` events into the approve/execute card; without this
+ * event the user got text telling them to hunt the approval down elsewhere
+ * while sitting in the very conversation that asked for the work (live
+ * 2026-07-23). Same stable data shape as the loop's canonical emit; the chat
+ * patches one assistant turn per approvalId, so re-parks dedupe naturally.
+ * Best-effort by contract: the prose needs_input turn remains the baseline.
+ */
+export function emitParkedApprovalCardToOriginChat(input: {
+  originSessionId: string;
+  approvalId: string | undefined;
+  workflowName: string;
+  runId: string;
+}): boolean {
+  return emitApprovalRequestedCard({
+    sessionId: input.originSessionId,
+    approvalId: input.approvalId,
+    extra: { workflowName: input.workflowName, runId: input.runId },
+  });
 }
 
 function workflowRunOriginSessionIds(run: Pick<QueuedRunRecord, 'id' | 'originSessionId' | 'originSessionIds'>): string[] {
@@ -4153,10 +4177,15 @@ export async function executeStep(
         );
       }
     } catch (err) {
+      // B (v2.3.0): a park is logged as step_failed BY CONTRACT (the reaper's
+      // re-admission path depends on the durable event kind — "a logged
+      // failure means 'parked', not 'crashed'"). Tag WHY so the UI can render
+      // it as "waiting for your approval" instead of a red FAILED row.
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_failed',
         stepId: step.id,
         error: err instanceof Error ? err.message : String(err),
+        ...(err instanceof ParkRunSignal ? { meta: { reason: 'parked_on_approval' } } : {}),
       });
       throw err;
     }
@@ -7681,6 +7710,12 @@ async function processOneRunFile(
         // that parks on several gates over its life gets one turn per gate.
         for (const originSessionId of workflowRunOriginSessionIds(run)) {
           const gateKey = approvalIds[0] ?? error.parkedSteps[0]?.stepId ?? 'gate';
+          emitParkedApprovalCardToOriginChat({
+            originSessionId,
+            approvalId: approvalIds[0],
+            workflowName: workflow.data.name,
+            runId: run.id,
+          });
           deliverOutcome(
             {
               status: 'needs_input',

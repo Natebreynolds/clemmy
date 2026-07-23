@@ -290,6 +290,68 @@ test('reduceActivity: a throttled batch_progress flips the meter into backing-of
   assert.deepEqual(a[0].batch, { done: 5, total: 10, failed: 0 });
 });
 
+test('reduceActivity: external_write folds into a plain-human effect row, mirroring the server phrasing', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('external_write', { shapeKey: 'GMAIL_SEND_EMAIL', toolName: 'gmail_send_email', targets: ['paul@example.com'], callId: 'w1' }));
+  assert.equal(a.length, 1);
+  assert.equal(a[0].kind, 'event');
+  assert.equal(a[0].variant, 'write');
+  assert.equal(a[0].label, 'Sent a message to paul@example.com');
+  assert.equal(a[0].status, 'done');
+  assert.equal(a[0].tone, 'success');
+
+  // A create shape reads as a record; targets beyond 3 collapse to a "+N more".
+  a = reduceActivity(a, ev('external_write', { shapeKey: 'HUBSPOT_CREATE_CONTACT', targets: ['a', 'b', 'c', 'd', 'e'], callId: 'w2' }));
+  assert.equal(a[1].label, 'Created a record to a, b, c (+2 more)');
+});
+
+test('reduceActivity: a failed / orphaned external write reads honestly (danger / warning)', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('external_write_failed', { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['x@y.example'], callId: 'f1' }));
+  assert.equal(a[0].status, 'failed');
+  assert.equal(a[0].tone, 'danger');
+  assert.match(a[0].label, /Sent a message to x@y\.example — failed/);
+
+  a = reduceActivity(a, ev('external_write_orphaned', { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['z@y.example'], callId: 'o1' }));
+  assert.equal(a[1].tone, 'warning');
+  assert.match(a[1].label, /timed out, may have landed/);
+});
+
+test('reduceActivity: codemode_program_summary folds into ONE "ran a batch program" row', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('codemode_program_summary', { ok: true, rpcCalls: 12 }));
+  assert.equal(a.length, 1);
+  assert.equal(a[0].kind, 'event');
+  assert.equal(a[0].variant, 'program');
+  assert.equal(a[0].label, 'Ran a batch program (12 tool calls)');
+
+  a = reduceActivity(a, ev('codemode_program_summary', { ok: false, rpcCalls: 1 }));
+  assert.equal(a[1].label, 'Ran a batch program (1 tool call) — didn\'t finish');
+  assert.equal(a[1].status, 'failed');
+});
+
+test('reduceActivity: worker results count K of N and keep the item name as the plain-human default', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('worker_started', { item: 'morganandmorgan.com', role: 'scraper', model: 'claude-opus-4-8' }));
+  a = reduceActivity(a, ev('worker_started', { item: 'joeexotic.com', role: 'scraper', model: 'claude-opus-4-8' }));
+  a = reduceActivity(a, ev('worker_result', { item: 'morganandmorgan.com', ok: true, model: 'claude-opus-4-8' }));
+  a = reduceActivity(a, ev('worker_result', { item: 'joeexotic.com', ok: false, reason: '403 blocked', model: 'claude-opus-4-8' }));
+
+  const agents = a.filter((x) => x.kind === 'agent');
+  assert.equal(agents.length, 2, 'two distinct fan-out items → two agent rows');
+  const done = agents.filter((x) => x.status !== 'running').length;
+  assert.equal(done, 2, 'both resolved → 2 of 2 done');
+
+  // Plain-human default: the item name (with role) leads; the failure reason is
+  // appended to the label so "<item> ✗ <reason>" reads without opening details.
+  assert.equal(agents[0].label, 'scraper: morganandmorgan.com');
+  assert.equal(agents[0].status, 'done');
+  assert.equal(agents[1].label, 'scraper: joeexotic.com — 403 blocked');
+  assert.equal(agents[1].status, 'failed');
+  // The model id is demoted to detail (hidden unless the drawer's Details toggle).
+  assert.equal(agents[0].detail, 'claude-opus-4-8');
+});
+
 test('reduceActivity: tool rows carry the salient target and a composio call reads as its slug', () => {
   let a: ActivityItem[] = [];
   a = reduceActivity(a, ev('tool_called', {

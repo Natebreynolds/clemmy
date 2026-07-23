@@ -43,6 +43,7 @@ import { verifyFanoutItems, fanoutItemVerifyEnabled, verifyInlineRecovery } from
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
@@ -52,6 +53,7 @@ import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
+import { capacityAdvice } from '../runtime/harness/capacity-advisor.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { recordRunStrategy } from '../memory/run-strategy-store.js';
 
@@ -1128,12 +1130,31 @@ function recordBackgroundTaskRoute(
   return updated;
 }
 
+/** Derive a clean human title from a raw prompt/title. Live 2026-07-22: board
+ *  cards read "this fully autonomously in the background: research these 6…"
+ *  and "Great. Now in the background: take the 3…" — raw directive scaffolding
+ *  stored verbatim. Strip the scaffolding iteratively, keep the first
+ *  objective clause, cap the length. Already-clean titles pass through. */
+export function deriveTaskTitle(raw: string): string {
+  let t = (raw ?? '').replace(/\s+/g, ' ').trim();
+  const LEAD = /^(?:okay[,.!]?\s+|ok[,.!]?\s+|great[,.!]?\s*(?:now)?\s*|new task:\s*|task:\s*|background task:\s*|run\s+this\s+|please[:,]?\s*|let'?s\s+try\s+this[,.!]?\s*|this\s+fully\s+autonomously(?:\s+in\s+the\s+background)?[:,]?\s*|(?:in|to)\s+the\s+background[:,]?\s*|i\s+(?:want|need)\s+you\s+to\s+|can\s+you\s+|now\s+)/i;
+  for (let i = 0; i < 8; i += 1) {
+    const next = t.replace(LEAD, '');
+    if (next === t) break;
+    t = next;
+  }
+  t = (t.split(/(?<=[.!?])\s+/)[0] ?? t).trim();
+  if (t.length > 72) t = `${t.slice(0, 71).trimEnd()}…`;
+  if (!t) return 'Background task';
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
   const createdAt = nowIso();
   const id = makeTaskId(new Date(createdAt));
   const task: BackgroundTaskRecord = {
     id,
-    title: clean(input.title || input.prompt, 120) || 'Background task',
+    title: deriveTaskTitle(clean(input.title || input.prompt, 200)),
     prompt: input.prompt.trim(),
     status: 'pending',
     originSessionId: input.originSessionId,
@@ -1625,7 +1646,21 @@ function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
   const durationMs = updated.startedAt && updated.completedAt
     ? Math.max(0, Date.parse(updated.completedAt) - Date.parse(updated.startedAt))
     : 0;
-  recordRunStrategy({ objective: updated.title || updated.prompt, toolsUsed, workerCount, durationMs });
+  // WHERE the deliverable went: the latest external_write's first target(s)
+  // (file path, sheet, mailbox). Without this a later session cannot answer
+  // "find those 30 emails we drafted" and guesses at mailboxes (2026-07-23).
+  let deliverable: string | undefined;
+  try {
+    const writeRow = db.prepare(
+      "SELECT data_json FROM events WHERE session_id = ? AND type = 'external_write' ORDER BY seq DESC LIMIT 1",
+    ).get(updated.runSessionId) as { data_json?: string } | undefined;
+    if (writeRow?.data_json) {
+      const data = JSON.parse(writeRow.data_json) as { targets?: unknown };
+      const targets = Array.isArray(data.targets) ? data.targets.filter((t): t is string => typeof t === 'string') : [];
+      if (targets.length > 0) deliverable = targets.slice(0, 2).join(', ');
+    }
+  } catch { /* deliverable capture is best-effort */ }
+  recordRunStrategy({ objective: updated.title || updated.prompt, toolsUsed, workerCount, durationMs, deliverable });
 }
 
 export function markBackgroundTaskDone(
@@ -1742,6 +1777,23 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
         approvalId,
       },
     });
+    // A2 (v2.3.0): the ACTIONABLE CARD lands in the chat that asked for the
+    // work — same gap-fix as the workflow-runner park. A notification alone
+    // left the user hunting the board while sitting in the origin
+    // conversation (live 2026-07-23). Best-effort; the notification above
+    // stays the baseline.
+    if (updated.originSessionId) {
+      emitApprovalRequestedCard({
+        sessionId: updated.originSessionId,
+        approvalId,
+        extra: { taskId: updated.id, taskTitle: updated.title },
+      });
+      enqueueBackgroundTaskOutcomeTurn(
+        updated,
+        'needs_input',
+        `Task ${updated.id} is paused on an approval — approve on the card above (or the Tasks board) and it resumes automatically.`,
+      );
+    }
   }
   return updated;
 }
@@ -3419,6 +3471,18 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      const latestTask = getBackgroundTask(task.id);
 	      const cancelled = error instanceof AgentRuntimeCancelledError || latestTask?.status === 'cancelling';
 	      if (!cancelled && isTransientBrainError(error)) {
+	        // L3 (v2.3.0) capacity advisor: a PLAN-LIMIT shape (weekly/unknown
+	        // reset — the $20-plan case) makes bounded requeues futile; fail
+	        // once, honestly, in the user's language with the guided fix. The
+	        // card's Resume button is the "retry now". Short-reset shapes keep
+	        // the automatic requeue, with the same plain-words check-in.
+	        const advice = capacityAdvice({ reason: message, preparedNote: 'The work done so far is saved.' });
+	        if (advice.shape === 'plan_limit') {
+	          markBackgroundTaskFailed(task.id, advice.copy, 'failed');
+	          finishRun(run.id, { status: 'failed', message: advice.copy, error: message });
+	          logger.warn({ taskId: task.id, err: message }, 'Background task stopped on a plan-limit capacity shape; advisor surfaced');
+	          continue;
+	        }
 	        const attempts = (latestTask?.transientRetry?.attempts ?? 0) + 1;
 	        if (attempts <= TRANSIENT_BRAIN_RETRY_CAP) {
 	          const delayMs = transientRetryDelayMs(error, attempts);
@@ -3427,7 +3491,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	            status: 'pending',
 	            transientRetry: { attempts, notBefore, lastError: clean(message, 400) },
 	            lastCheckInAt: nowIso(),
-	            lastCheckInMessage: `Brain provider unavailable (${clean(message, 120)}); retrying automatically in ~${Math.round(delayMs / 60000)} min (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP}).`,
+	            lastCheckInMessage: capacityAdvice({ reason: message, retryAtIso: notBefore }).copy + ` (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP})`,
 	          });
 	          if (requeued) {
 	            finishRun(run.id, {

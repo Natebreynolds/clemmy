@@ -279,28 +279,30 @@ test('withTimeout does not fire while isPaused() returns true', async () => {
 });
 
 test('withTimeout fires once isPaused() returns false', async () => {
-  // Work outlives the test — only the timeout can settle withTimeout.
-  // Flip isPaused → false after one re-arm window so the next tick fires.
-  const work = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 500));
-  let paused = true;
-  const flipTimer = setTimeout(() => { paused = false; }, 25);
-  try {
-    await assert.rejects(
-      () => withTimeout(work, 15, 'parked_then_unparked', {
-        isPaused: () => paused,
-        pauseRecheckMs: 15,
-      }),
-      (err: unknown) => {
-        assert.ok(err instanceof ToolTimeout);
-        assert.equal(err.toolName, 'parked_then_unparked');
-        return true;
-      },
-    );
-  } finally {
-    clearTimeout(flipTimer);
-  }
-  // Let the late work settle so the timer doesn't leak past the test.
-  await work;
+  // DETERMINISTIC (sweep-flake fix 2026-07-23): the work must NEVER settle on
+  // its own — a wall-clock work timer (the old 500ms shape) could win under
+  // event-loop starvation in a full sweep, turning the expected rejection
+  // into a resolve ("Missing expected rejection"). Only the test settles the
+  // work, after the rejection has been observed.
+  let releaseWork!: (v: string) => void;
+  const work = new Promise<string>((resolve) => { releaseWork = resolve; });
+  // Unpause after the first re-arm has been scheduled: the first tick sees
+  // paused=true (re-arm path), every later tick sees false and must reject —
+  // load can only delay the ticks, never reorder this.
+  let ticks = 0;
+  await assert.rejects(
+    () => withTimeout(work, 5, 'parked_then_unparked', {
+      isPaused: () => { ticks += 1; return ticks <= 1; },
+      pauseRecheckMs: 5,
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof ToolTimeout);
+      assert.equal(err.toolName, 'parked_then_unparked');
+      return true;
+    },
+  );
+  assert.ok(ticks >= 2, 'the paused tick re-armed before the firing tick');
+  releaseWork('late'); // drain — nothing observes this settle
 });
 
 // ─── withTimeout onTimeout hook (S3 abort) ──────────────────────────────────
@@ -308,13 +310,16 @@ test('withTimeout fires once isPaused() returns false', async () => {
 // never on the pause-defer re-arm path.
 
 test('withTimeout onTimeout: fires exactly once on a real timeout', async () => {
-  const slow = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 500));
+  // Never-settling work (same sweep-flake fix as above): only the timeout can
+  // win, at any machine load.
+  let releaseSlow!: (v: string) => void;
+  const slow = new Promise<string>((resolve) => { releaseSlow = resolve; });
   let calls = 0;
   await assert.rejects(
-    () => withTimeout(slow, 15, 'aborter', { onTimeout: () => { calls += 1; } }),
+    () => withTimeout(slow, 5, 'aborter', { onTimeout: () => { calls += 1; } }),
     (err: unknown) => err instanceof ToolTimeout,
   );
-  await slow; // drain
+  releaseSlow('late'); // drain
   assert.equal(calls, 1, 'onTimeout fired once on timeout');
 });
 

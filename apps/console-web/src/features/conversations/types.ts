@@ -22,6 +22,14 @@ export interface Turn {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  /** A still-pending approval attached by the server so a reopened chat
+   *  renders the actionable card (A2, v2.3.0). */
+  approval?: {
+    subject: string;
+    reason?: string;
+    approvalId: string;
+    pendingAction?: unknown;
+  };
 }
 
 export interface ContinueHint {

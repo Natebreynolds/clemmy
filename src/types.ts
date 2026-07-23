@@ -147,6 +147,15 @@ export interface UnifiedSessionTurn {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  /** A2 (v2.3.0): a STILL-PENDING approval attached to this turn, so a
+   *  reopened chat renders the actionable approve/execute card — not just
+   *  the prose that told the user a card exists somewhere else. */
+  approval?: {
+    subject: string;
+    reason?: string;
+    approvalId: string;
+    pendingAction?: unknown;
+  };
 }
 
 export interface SessionAutoBrief {

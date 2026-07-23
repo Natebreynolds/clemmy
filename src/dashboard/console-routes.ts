@@ -249,6 +249,7 @@ import {
   closePlanScope, listActiveScopes, listAllScopes,
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
   grantSendTrust, revokeSendTrust, listSendTrustGrants, SEND_TRUST_MAX_RECIPIENTS,
+  grantSendTrustFromApprovedAction,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import {
@@ -279,7 +280,7 @@ import {
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
-import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
 import {
@@ -349,6 +350,8 @@ import {
   pendingActionApprovalViewFromArgs,
   type PendingActionApprovalView,
 } from '../runtime/harness/pending-action-view.js';
+import { getPendingAction, markPendingActionApprovalResolved } from '../runtime/harness/pending-actions.js';
+import { executeApprovedPendingActionCall } from '../execution/pending-action-executor.js';
 import {
   listOperationalEvents,
   isOperationalEventType,
@@ -9672,9 +9675,16 @@ export function registerConsoleRoutes(
           status: task.status,
           // A parked question is the single most actionable thing a card can
           // say — surface it verbatim over generic check-in chatter.
+          // Terminal cards must tell terminal truth — a done card carrying a
+          // stale "is still running" lastCheckInMessage is a lie (live
+          // 2026-07-22). Waiting-question > terminal truth > live check-in.
           progressHint: (task.status === 'awaiting_input' && task.pendingQuestion
             ? `Waiting on you: ${task.pendingQuestion.slice(0, 240)}`
-            : '') || task.lastCheckInMessage || (terminal && task.error ? task.error : '') || '',
+            : '')
+            || (terminal
+              ? (task.error || (task.status === 'done' ? 'Completed.' : ''))
+              : task.lastCheckInMessage)
+            || '',
           sessionId: task.runSessionId,
           ageMs: ageMs(task.updatedAt),
           updatedAt: task.updatedAt,
@@ -9693,6 +9703,7 @@ export function registerConsoleRoutes(
             error: task.error,
             resultPreview: task.result?.slice(0, 600),
             source: task.source,
+            originSessionId: task.originSessionId,
             modelRoute: task.effectiveModel || task.modelProvider || task.modelRouteKind || task.modelTransport || task.modelRouteFalloverFrom
               ? {
                   requestedModel: task.requestedModel,
@@ -9976,6 +9987,22 @@ export function registerConsoleRoutes(
         });
       }
 
+      // U1 (v2.3.0): one pipeline = one card. A background task's ORIGIN chat
+      // attempt is the same pipeline — its FINISHED attempt card (the handoff
+      // turn) duplicates the task card (live 2026-07-22: bg row + completed
+      // harness:attempt row rendered as two cards for one job). Live and
+      // needs-you attempt cards are genuinely separate and stay.
+      const bgOriginSessions = new Set(
+        cards
+          .filter((c) => c.sourceKind === 'background')
+          .map((c) => (c.raw as { originSessionId?: string } | undefined)?.originSessionId)
+          .filter((v): v is string => Boolean(v)),
+      );
+      const pipelineCollapsed = cards.filter(
+        (c) => !(c.sourceKind === 'run' && c.column === 'done' && bgOriginSessions.has(c.sessionId ?? '')),
+      );
+      cards.length = 0;
+      cards.push(...pipelineCollapsed);
       cards.sort((a, b) => a.ageMs - b.ageMs);
       // Live columns are naturally bounded; Done is not (every task ever is
       // terminal eventually). Cap it to the most-recent 40 so the payload and
@@ -10164,6 +10191,22 @@ export function registerConsoleRoutes(
       return;
     }
     const approved = decision === 'approve';
+    // C (v2.3.0) grant-at-card, board/drag surface: the explicit opt-in rides
+    // the approve gesture and derives a NARROW grant (these recipients, this
+    // toolkit) from the approval's own stored args — before the branchy
+    // resolve paths below, so every approve route (queued background task,
+    // stale resolve, live resume) honors the same opt-in. Fail-closed when no
+    // recipients are extractable; the response reports what was stored.
+    let trustGrantId: string | null = null;
+    if (approved && req.body?.alwaysAllow === true) {
+      try {
+        const row = approvalRegistry.get(id);
+        if (row) {
+          const g = grantSendTrustFromApprovedAction(row.tool ?? 'send', row.args, `always-allow from board: ${row.subject}`.slice(0, 120));
+          trustGrantId = g?.id ?? null;
+        }
+      } catch { /* trust grant is additive — never block the decision */ }
+    }
 
     try {
       // Background tasks park the SDK run and need a queued continuation; a
@@ -10174,6 +10217,7 @@ export function registerConsoleRoutes(
           ok: true,
           approvalId: id,
           status: approved ? 'approved' : 'rejected',
+          ...(trustGrantId ? { trustGrantId } : {}),
           queuedTaskId: queued.id,
           sessionId: queued.runSessionId,
           message: `Queued background task continuation: ${queued.id}.`,
@@ -10202,6 +10246,7 @@ export function registerConsoleRoutes(
           res.json({
             ok: true,
             approval: result.row,
+            ...(trustGrantId ? { trustGrantId } : {}),
             status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
             message: `${approved ? 'Approved' : 'Rejected'} ${id}.`,
           });
@@ -10219,6 +10264,7 @@ export function registerConsoleRoutes(
 
         const sessionId = existing.sessionId;
         res.status(202).json({
+          ...(trustGrantId ? { trustGrantId } : {}),
           ok: true,
           approval: result.row,
           sessionId,
@@ -10255,7 +10301,74 @@ export function registerConsoleRoutes(
       }
 
       const result = await assistant.getRuntime().resolveApproval(id, approved);
-      res.json({ ok: true, ...result });
+      res.json({ ok: true, ...(trustGrantId ? { trustGrantId } : {}), ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Execute-button truth (U3). The desktop chat's pending-action card used to
+  // flip to "Submitted" client-side the moment Execute was clicked, with no
+  // server round-trip — so a brain that narrated "posted" but never sent left
+  // the card lying (live 2026-07-22). These two routes make the card's state
+  // come from the DURABLE record: approve-execute resolves the human card and
+  // fires the exact stored call server-side, returning the real outcome; the
+  // GET refreshes a card from the record's truth.
+  app.get('/api/console/pending-actions/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const record = getPendingAction(req.params.id);
+    if (!record) { res.status(404).json({ ok: false, reason: 'pending action not found' }); return; }
+    res.json({ ok: true, status: record.status, resultSummary: record.resultSummary });
+  });
+
+  app.post('/api/console/pending-actions/:id/approve-execute', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = req.params.id;
+    const approvalId = typeof req.body?.approvalId === 'string' && req.body.approvalId.trim()
+      ? req.body.approvalId.trim()
+      : null;
+    try {
+      const record = getPendingAction(id);
+      if (!record) { res.status(404).json({ ok: false, reason: 'pending action not found' }); return; }
+      // Resolving the card IS the human decision (GRANT INVARIANT I1). Resolve
+      // only a still-pending row; an already-resolved card is fine to execute
+      // against, and a resolve failure is surfaced rather than swallowed.
+      if (approvalId) {
+        const row = approvalRegistry.get(approvalId);
+        if (row && row.status === 'pending') {
+          const resolved = approvalRegistry.resolve(approvalId, 'approved', 'desktop-chat-card');
+          if (!resolved.ok) {
+            res.status(409).json({ ok: false, reason: resolved.reason ?? 'could not resolve approval' });
+            return;
+          }
+        }
+        // The registry listener flips the linked pending action to approved only
+        // when the card args carry its id; mark explicitly so the human-consent
+        // 'approved' state is reached before execution regardless of that back-link.
+        if (getPendingAction(id)?.status !== 'approved') {
+          markPendingActionApprovalResolved(id, 'approved', approvalId);
+        }
+      }
+      // C (v2.3.0) grant-at-card: an explicit opt-in on the approve click
+      // derives a NARROW send-trust grant (these recipients, this toolkit)
+      // from the approved action itself, so the next identical send skips the
+      // card. Fail-closed: no extractable recipients → no grant, and we tell
+      // the caller so the UI never claims trust that wasn't stored.
+      const alwaysAllow = req.body?.alwaysAllow === true;
+      const trustGrant = alwaysAllow
+        ? grantSendTrustFromApprovedAction(record.toolName, record.payload, `always-allow from card: ${record.title}`.slice(0, 120))
+        : null;
+      const exec = await executeApprovedPendingActionCall(id, { sessionId: record.sessionId ?? undefined });
+      const out = exec.record ?? getPendingAction(id);
+      res.json({
+        ok: exec.ok,
+        status: exec.status,
+        resultSummary: exec.resultSummary,
+        ...(alwaysAllow ? { trustGranted: Boolean(trustGrant), trustGrantId: trustGrant?.id ?? null } : {}),
+        record: out
+          ? { id: out.id, status: out.status, resultSummary: out.resultSummary, payloadHash: out.payloadHash }
+          : null,
+      });
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }
@@ -10568,6 +10681,34 @@ export function registerConsoleRoutes(
    * supersede (no negative-feedback signal), check-in template proposals
    * reject. Approvals are deliberately NOT dismissable — decide those.
    */
+  // U5 (v2.3.0): the desktop shell's toast poll. Loud unread notifications
+  // newer than the shell's watermark — the app shows native toasts and marks
+  // read on click. The durable store is the source of truth; this endpoint is
+  // just the pull surface for the always-valid `desktop` destination leg.
+  app.get('/api/console/notifications/desktop-pending', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const since = typeof req.query.since === 'string' ? Date.parse(req.query.since) : NaN;
+      const items = listNotifications(50)
+        .filter((n) => !n.silent && !n.read)
+        .filter((n) => !Number.isFinite(since) || Date.parse(n.createdAt) > since)
+        .slice(0, 5)
+        .map((n) => ({ id: n.id, title: n.title, body: (n.body || '').slice(0, 300), createdAt: n.createdAt, kind: n.kind }));
+      res.json({ items, now: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  app.post('/api/console/notifications/:id/read', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      markNotificationRead(String(req.params.id));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/inbox/dismiss', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const kind = typeof req.body?.kind === 'string' ? req.body.kind : '';
@@ -11024,7 +11165,53 @@ export function registerConsoleRoutes(
       // Notifications LEAD (they hold the real report-backs), then the
       // task/exec/run completions; deduped by title, capped for the rail.
       const recentMerged = dedupeByTitle([...notifRecent, ...recentCompleted], 8);
-      const needsYouMerged = [...needsYou, ...notifNeedsYou];
+      // U1 (v2.3.0): one pipeline = one banner. Four stacked rows for one run
+      // (approval + needs-attention + two working-now) collapse by pipeline
+      // key: runId, else the runId/taskId parsed from the session id, else
+      // workflow name. The needs-you card is primary (approvals lead by list
+      // order); subsumed working rows become its meta subline.
+      const ccPipelineKey = (item: Record<string, unknown>): string | null => {
+        const runId = String(item.runId ?? '').trim();
+        if (runId) return `run:${runId}`;
+        const sess = String(item.targetSessionId ?? item.sessionId ?? '').trim();
+        if (sess.startsWith('workflow:')) {
+          const part = sess.split(':')[1];
+          if (part) return `run:${part}`;
+        }
+        if (sess.startsWith('background:')) return `bg:${sess.slice('background:'.length)}`;
+        const wf = String(item.workflowName ?? '').trim();
+        if (wf) return `wf:${wf}`;
+        return sess ? `sess:${sess}` : null;
+      };
+      const needsYouRaw = [...needsYou, ...notifNeedsYou];
+      const needsSeen = new Map<string, Record<string, unknown>>();
+      const needsYouMerged: typeof needsYouRaw = [];
+      for (const item of needsYouRaw) {
+        const key = ccPipelineKey(item as Record<string, unknown>);
+        if (key && needsSeen.has(key)) continue; // approval-first by list order
+        if (key) needsSeen.set(key, item as Record<string, unknown>);
+        needsYouMerged.push(item);
+      }
+      const workSeen = new Set<string>();
+      const workingNowCollapsed: typeof workingNow = [];
+      for (const item of workingNow) {
+        const key = ccPipelineKey(item as Record<string, unknown>);
+        if (key && needsSeen.has(key)) {
+          // Fold into the needs-you card's meta instead of a second banner.
+          const owner = needsSeen.get(key)!;
+          const subline = String((item as { title?: unknown }).title ?? '').trim();
+          if (subline) {
+            const prior = String(owner.meta ?? '').trim();
+            owner.meta = prior ? `${prior} · ${subline}` : `Working: ${subline}`;
+          }
+          continue;
+        }
+        if (key && workSeen.has(key)) continue;
+        if (key) workSeen.add(key);
+        workingNowCollapsed.push(item);
+      }
+      workingNow.length = 0;
+      workingNow.push(...workingNowCollapsed);
 
       const credentialRows = credentialHealth
         .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'browser_use_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))

@@ -5,7 +5,9 @@ import {
   boardTraceSinceSeq,
   canStopCanonicalRunFromDrawer,
   findBoardCardForRun,
+  intentForDrop,
   reconcileOpenBoardCard,
+  rejectReason,
   type BoardCard,
 } from './board';
 
@@ -144,4 +146,27 @@ test('the trace drawer offers Stop only for a canonical run with a safe projecte
     'background controls remain in the task cockpit');
   assert.equal(canStopCanonicalRunFromDrawer({ ...canonical, sourceKind: 'approval' }), false,
     'approval controls remain unchanged');
+});
+
+// D (v2.3.0): dragging a waiting card into Running IS the approval gesture
+// (Nathan, 2026-07-23: "park those in task as queued and I can simply drag
+// them over"). The drag maps to the same server-gated approve action as the
+// card button — and a card WITHOUT an approvable action still snaps back with
+// a reason instead of silently approving anything.
+test('drag Needs You → Running approves a parked card; non-approvable cards snap back', () => {
+  const parked = card({
+    id: 'run-parked', column: 'needs_you', status: 'awaiting_approval',
+    actions: ['approve', 'reject', 'cancel'], approvalId: 'apr-123',
+  });
+  assert.equal(intentForDrop(parked, 'running'), 'approve');
+  assert.equal(intentForDrop(parked, 'done'), 'cancel');
+
+  const noAction = card({ id: 'run-stuck', column: 'needs_you', status: 'awaiting_approval', actions: [] });
+  assert.equal(intentForDrop(noAction, 'running'), null);
+  assert.match(rejectReason(noAction, 'running'), /Approve button/);
+
+  // resume/promote still win first for continue-style cards — approve only
+  // fires when the card actually carries an approvable action.
+  const resumable = card({ id: 'bg-1', column: 'needs_you', status: 'awaiting_continue', actions: ['resume', 'cancel'] });
+  assert.equal(intentForDrop(resumable, 'running'), 'resume');
 });
