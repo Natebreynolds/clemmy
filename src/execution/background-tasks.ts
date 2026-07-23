@@ -3264,6 +3264,18 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           continue;
         }
 
+        if (result.awaitingInputQuestion) {
+          const questionId = `bgq-${task.id}-${Date.now().toString(36)}`;
+          const parkedOnInput = markBackgroundTaskAwaitingInput(task.id, questionId, result.awaitingInputQuestion);
+          if (!acceptApprovalTransition(parkedOnInput, 'awaiting_input', result.text)) continue;
+          finishRun(run.id, {
+            status: 'awaiting_approval', // run-record paused state (the task status is 'awaiting_input')
+            message: `Background task ${task.id} needs input after approval ${resolution.approvalId}: ${result.awaitingInputQuestion.slice(0, 200)}`,
+            outputPreview: result.text,
+          });
+          logger.info({ taskId: task.id, approvalId: resolution.approvalId, questionId }, 'Background task awaiting input after approval continuation');
+          continue;
+        }
         const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {
           const blocked = markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text, postApprovalOutcome.blockerType);

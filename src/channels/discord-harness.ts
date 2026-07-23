@@ -36,6 +36,7 @@ import {
   type SessionRow,
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import {
@@ -1357,6 +1358,22 @@ export async function tryHandleHarnessApprovalReply(opts: {
         return true;
       }
 
+      // Background tasks park the SDK run and need a QUEUED continuation — a
+      // direct registry resolve strands the task at awaiting_approval forever
+      // (live 2026-07-23: the owner approved apr-cunr from Discord in 23s and
+      // the 120-account run sat stranded for 10+ minutes). Same branch the
+      // Tasks-board route has had since the P0 parking wave.
+      const queuedTask = intent.decision === 'approve' || intent.decision === 'reject'
+        ? queueBackgroundTaskApprovalResolution(row.approvalId, intent.decision === 'approve')
+        : null;
+      if (queuedTask) {
+        try {
+          await opts.transport.sendInitial(
+            `🍊 ${intent.decision === 'approve' ? 'approved' : 'rejected'} \`${row.approvalId}\` — ${row.subject}. Task ${queuedTask.id} resumes now and will report back when done.`,
+          );
+        } catch { /* transport is best-effort */ }
+        return true;
+      }
       const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
       const result = approvalRegistry.resolve(row.approvalId, resolution, `${channel}-user`);
       try {
@@ -1383,6 +1400,22 @@ export async function tryHandleHarnessApprovalReply(opts: {
           allowDetachedNonDiscord: true,
           channel,
         });
+        return true;
+      }
+      // Background tasks park the SDK run and need a QUEUED continuation — a
+      // direct registry resolve strands the task at awaiting_approval forever
+      // (live 2026-07-23: the owner approved apr-cunr from Discord in 23s and
+      // the 120-account run sat stranded for 10+ minutes). Same branch the
+      // Tasks-board route has had since the P0 parking wave.
+      const queuedTask = intent.decision === 'approve' || intent.decision === 'reject'
+        ? queueBackgroundTaskApprovalResolution(row.approvalId, intent.decision === 'approve')
+        : null;
+      if (queuedTask) {
+        try {
+          await opts.transport.sendInitial(
+            `🍊 ${intent.decision === 'approve' ? 'approved' : 'rejected'} \`${row.approvalId}\` — ${row.subject}. Task ${queuedTask.id} resumes now and will report back when done.`,
+          );
+        } catch { /* transport is best-effort */ }
         return true;
       }
       const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';

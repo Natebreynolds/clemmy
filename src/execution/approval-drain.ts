@@ -76,11 +76,19 @@ export async function resolveDrainApproval(opts: {
   const nextApprovalId = result.status === 'awaiting_approval'
     ? registry.listPending({ sessionId: row.sessionId }).at(-1)?.approvalId
     : undefined;
+  // A resume that ends AWAITING USER INPUT is neither done nor blocked — the
+  // settle must park the task on the question, never mark it done-with-empty
+  // (live 2026-07-23: the resumed 120-account run hit the artifact ask and
+  // was stamped done with an empty result 6s after resuming).
+  const awaitingInputQuestion = result.status === 'awaiting_user_input'
+    ? (result.lastDecision?.reply ?? result.lastDecision?.summary ?? 'The resumed run needs your input to continue.')
+    : undefined;
   return {
     approvalId: opts.approvalId,
     status: 'approved',
     text: result.lastDecision?.reply ?? result.lastDecision?.summary ?? '',
     sessionId: row.sessionId,
     nextApprovalId,
+    ...(awaitingInputQuestion ? { awaitingInputQuestion } : {}),
   };
 }

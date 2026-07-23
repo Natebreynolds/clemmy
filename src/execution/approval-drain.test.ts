@@ -106,3 +106,25 @@ test('resume failure propagates as a throw (drain marks the task failed)', async
     /brain unreachable/,
   );
 });
+
+// Live 2026-07-23: the approval-resume ended AWAITING USER INPUT (the artifact
+// ask) and the settle stamped the task done-with-empty 6s after resuming. The
+// drain result must surface the question so the settle parks the task on it.
+test('a resume ending awaiting_user_input surfaces the question instead of a bare approved', async () => {
+  const result = await resolveDrainApproval({
+    approvalId: 'apr-input-1',
+    approved: true,
+    legacyResolve: async () => { throw new Error('legacy must not run'); },
+    registryForTest: {
+      get: () => ({ sessionId: 'sess-x', status: 'resolved', resolution: 'approved' }),
+      resolve: () => ({ ok: true }),
+      listPending: () => [],
+    },
+    resumeForTest: async () => ({
+      status: 'awaiting_user_input',
+      lastDecision: { reply: 'The artifact create attempt is unresolved — retry or stop?' },
+    }),
+  });
+  assert.equal(result.status, 'approved');
+  assert.match(result.awaitingInputQuestion ?? '', /unresolved/);
+});
