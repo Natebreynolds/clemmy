@@ -115,31 +115,66 @@ test('Worker instructions honor parent-planned packets and one retry', async () 
   assert.match(instructions, /Return a single line starting with "ERROR:"/);
 });
 
-test('Worker gets the full native surface minus only recursion/meta vectors (blocklist, not allowlist)', async () => {
-  // Regression guard for the 2026-06-01 ungating: the worker surface used to
-  // be a hard 20-name allowlist, so a worker dispatched to use a native tool
-  // it wasn't pre-listed for couldn't see it ("the reader isn't exposed").
-  // It's now a BLOCKLIST: full native surface minus recursion/meta/collision
-  // vectors. Assert (a) the recovery + work tools are present, (b) a tool that
-  // was NOT on the old allowlist is now reachable, (c) the blocked vectors stay
-  // out.
+test('Worker capability is the full native surface minus only recursion/meta vectors — schemas may tier, reach may not', async () => {
+  // 2026-06-01 ungating (allowlist → blocklist) + 2026-07-23 schema-on-demand:
+  // the worker's REACHABLE capability stays the full native surface minus
+  // recursion/meta/collision vectors. Slim mode tiers SCHEMA EXPOSURE only —
+  // deferred tools remain callable through call_tool + the catalog. Assert on
+  // the union of first-class names and the catalog-taught reachable set.
   const worker = await buildWorkerAgent();
-  const toolNames = new Set(
+  const firstClass = new Set(
     ((worker as unknown as { tools?: Array<{ name?: string }> }).tools ?? []).map((t) => t.name),
   );
+  const instructions = (worker as unknown as { instructions?: unknown }).instructions;
+  const rendered = typeof instructions === 'function'
+    ? String((instructions as (rc: unknown) => string)({ context: {} }))
+    : String(instructions ?? '');
+  const reachable = (name: string): boolean => firstClass.has(name) || rendered.includes(name);
 
-  // Recovery + core work tools the worker must have.
-  for (const must of ['recall_tool_result', 'tool_output_query', 'workspace_artifact_query', 'composio_execute_tool', 'read_file', 'run_shell_command']) {
-    assert.ok(toolNames.has(must), `worker must have ${must}`);
+  // Recovery + core work tools stay FIRST-CLASS (the high-frequency set).
+  for (const must of ['recall_tool_result', 'tool_output_query', 'composio_execute_tool', 'read_file', 'run_shell_command']) {
+    assert.ok(firstClass.has(must), `worker must have ${must} first-class`);
   }
 
-  // Previously-gated native tools that are now reachable (proves un-gating).
-  for (const nowReachable of ['execution_list', 'task_list']) {
-    assert.ok(toolNames.has(nowReachable), `worker should now reach ${nowReachable}`);
+  // Previously-gated native tools remain REACHABLE (first-class or catalog).
+  for (const nowReachable of ['workspace_artifact_query', 'execution_list', 'task_list']) {
+    assert.ok(reachable(nowReachable), `worker should reach ${nowReachable}`);
   }
 
-  // Recursion / meta / collision vectors that MUST stay blocked.
+  // Recursion / meta / collision vectors stay out of BOTH tiers.
   for (const blocked of ['run_worker', 'workflow_run', 'workflow_create', 'add_cron_job', 'create_tool', 'ask_user_question', 'notify_user']) {
-    assert.ok(!toolNames.has(blocked), `worker must NOT have ${blocked}`);
+    assert.ok(!firstClass.has(blocked), `worker must NOT have ${blocked} first-class`);
+    assert.ok(!rendered.split('call_tool')[1]?.includes(`\n${blocked} `), `worker catalog must NOT offer ${blocked}`);
+  }
+});
+
+// Worker schema-on-demand (2026-07-23): every worker used to carry the full
+// ~140-tool schema surface — the dominant token multiplier on fan-outs
+// (~15k schema tokens × 122 workers on the live 120-account run). Slim mode
+// keeps the high-frequency core first-class and routes everything else via
+// call_tool (identical gate battery) + a name catalog — capability parity by
+// construction. Kill-switch pins both directions.
+test('worker slim tools: small first-class surface + call_tool escape hatch; kill-switch restores full', async () => {
+  const slim = await buildWorkerAgent();
+  const slimTools = (slim as { tools?: Array<{ name?: string }> }).tools ?? [];
+  const slimNames = new Set(slimTools.map((t) => t.name));
+  assert.ok(slimTools.length <= 16, `slim surface stays small, got ${slimTools.length}`);
+  assert.ok(slimNames.has('call_tool'), 'the universal dispatcher rides first-class');
+  for (const core of ['composio_execute_tool', 'run_shell_command', 'write_file', 'recall_tool_result', 'tool_output_query']) {
+    assert.ok(slimNames.has(core), `${core} stays first-class`);
+  }
+  const instructions = (slim as { instructions?: unknown }).instructions;
+  const rendered = typeof instructions === 'function'
+    ? String((instructions as (rc: unknown) => string)({ context: {} }))
+    : String(instructions ?? '');
+  assert.match(rendered, /call_tool\(name, args_json\)/, 'catalog block teaches the escape hatch');
+
+  process.env.CLEMMY_WORKER_SLIM_TOOLS = 'off';
+  try {
+    const full = await buildWorkerAgent();
+    const fullTools = (full as { tools?: Array<{ name?: string }> }).tools ?? [];
+    assert.ok(fullTools.length > 60, `kill-switch restores the full surface, got ${fullTools.length}`);
+  } finally {
+    delete process.env.CLEMMY_WORKER_SLIM_TOOLS;
   }
 });
