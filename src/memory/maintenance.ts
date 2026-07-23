@@ -609,11 +609,10 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     // No-op if the rendered auto section matches what's already on
     // disk, so this is safe to fire every 30 min even on quiet days.
     tickMemoryMdRefresh();
-    // IDENTITY.md auto section is driven by the user_profile, which
-    // changes far less often than facts — but it's cheap to check and
-    // the no-op path is fast (one stat + one string compare), so we
-    // ride along on the same cadence rather than introducing a new
-    // multiplier.
+    // IDENTITY.md auto section is driven by the user_profile plus
+    // durable kind:'user' facts. The no-op path stays fast (one indexed
+    // fact query + one string compare), so we ride along on the same
+    // cadence rather than introducing a new multiplier.
     tickIdentityMdRefresh();
   }
 

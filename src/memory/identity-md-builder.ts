@@ -1,12 +1,16 @@
 /**
- * Auto-generated "Working with" section for IDENTITY.md.
+ * Auto-generated "Working with" + "Learned about you" sections for
+ * IDENTITY.md.
  *
  * Background: IDENTITY.md ships with a seeded default explaining who
  * Clementine is (set by init-home.ts on first install). What's missing
  * is the OTHER half of the relationship — who Clementine is working
- * WITH. The user_profile already captures name, role, timezone,
- * communication preferences; we just weren't exposing it in a stable
- * human-readable spot for the agent's per-turn prompt.
+ * WITH, and what she has learned about them since. The user_profile
+ * captures name, role, timezone, communication preferences; the facts
+ * store accumulates durable kind:'user' preferences from every
+ * conversation. Neither was visible in this file, so for users who
+ * never opened Settings, IDENTITY.md stayed byte-identical to the
+ * install seed forever.
  *
  * Two-section design mirrors memory-md-builder.ts:
  *
@@ -17,8 +21,16 @@
  *
  *   ## Working with
  *   - Name: Alex Chen (preferred: Alex)
- *   - Role: Product Lead
  *   - ...
+ *
+ *   ## Learned about you
+ *   - Prefers async updates over meetings
+ *   - ...
+ *
+ * The learned section is a file/UI projection only: vault.ts injects
+ * just the user-curated half into prompts, and these same facts already
+ * reach the prompt through fact recall — rendering them here must not
+ * create a second prompt channel.
  *
  * Same refresh tick as MEMORY.md (every ~30min). No-op when content
  * unchanged. Atomic write via tmp + rename.
@@ -29,6 +41,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import { IDENTITY_FILE } from './vault.js';
+import { listActiveFacts, type ConsolidatedFact } from './facts.js';
 import { loadUserProfile, type UserProfile } from '../runtime/user-profile.js';
 
 const logger = pino({ name: 'clementine-next.memory.identity-builder' });
@@ -69,19 +82,62 @@ function formatWorkingHours(start?: string, end?: string): string | undefined {
   return start ?? end;
 }
 
+/** Max learned bullets rendered — the section is a highlight reel, not
+ *  a fact-store dump; the full store stays browsable in the Memory UI. */
+const LEARNED_MAX_ROWS = 10;
+/** A fresh unpinned, never-used fact must survive this long before it
+ *  counts as durable — gives the hygiene/correction loops a window to
+ *  kill mis-captures before they show up in IDENTITY.md. */
+const LEARNED_MIN_AGE_MS = 72 * 60 * 60 * 1000;
+
+/** True when a fact has earned a place in the identity file: the user
+ *  pinned it, recall actually used it, or it survived the capture-
+ *  hygiene window without being superseded or deactivated. */
+function isDurableUserFact(fact: ConsolidatedFact, nowMs: number): boolean {
+  if (fact.pinned) return true;
+  if ((fact.utilityCount ?? 0) > 0) return true;
+  const createdMs = Date.parse(fact.createdAt);
+  return Number.isFinite(createdMs) && nowMs - createdMs >= LEARNED_MIN_AGE_MS;
+}
+
+/** Durable kind:'user' facts, Stanford-ranked so importance + recency
+ *  pick the visible rows. DB errors degrade to an empty list — a facts
+ *  hiccup must never block the profile half of the refresh. */
+function selectDurableUserFacts(now: Date): ConsolidatedFact[] {
+  try {
+    return listActiveFacts({ kind: 'user', ranking: 'stanford', limit: 40 })
+      .filter((fact) => isDurableUserFact(fact, now.getTime()))
+      .slice(0, LEARNED_MAX_ROWS);
+  } catch (err) {
+    logger.warn({ err }, 'learned-section fact query failed; rendering without it');
+    return [];
+  }
+}
+
+function renderLearnedRows(facts: ConsolidatedFact[]): string[] {
+  const rows: string[] = [];
+  for (const fact of facts) {
+    // auto-capture stamps a routing prefix on captured preferences;
+    // it's noise in a human-readable identity file.
+    const body = compact(fact.content.replace(/^User preference:\s*/i, ''));
+    if (body) rows.push(`- ${body}`);
+  }
+  return rows;
+}
+
 /**
  * Render the auto section body (without the marker — caller adds it).
- * Returns null when the profile has nothing worth emitting so we don't
- * write a meaningless block. "Worth emitting" means at least one
- * field BEYOND the seeded defaults — displayName=='the user' alone
- * doesn't count, and the default communication tone/formality/
- * urgency settings shouldn't trigger an emit either (those are
- * present on every fresh install).
+ * Returns null when neither the profile nor the facts store has
+ * anything worth emitting so we don't write a meaningless block.
+ * "Worth emitting" means at least one profile field BEYOND the seeded
+ * defaults — displayName=='the user' alone doesn't count, and the
+ * default communication tone/formality/urgency settings shouldn't
+ * trigger an emit either (those are present on every fresh install) —
+ * or at least one durable learned fact about the user.
  */
 function renderAutoSection(profile: UserProfile, now: Date): string | null {
-  // Gate: at least one identity-meaningful field must be set before
-  // we even render. Several profile fields have non-empty DEFAULTS on
-  // every fresh install (tone='balanced', formality='professional',
+  // Gate: several profile fields have non-empty DEFAULTS on every
+  // fresh install (tone='balanced', formality='professional',
   // urgencyTolerance='normal', workingDays=Mon..Fri), so they DON'T
   // count toward the gate — otherwise we'd auto-write the section
   // for users who haven't filled in any actual identity info.
@@ -94,35 +150,41 @@ function renderAutoSection(profile: UserProfile, now: Date): string | null {
     || profile.workingHoursEnd
     || (profile.preferredChannels && profile.preferredChannels.length > 0)
   );
-  if (!hasIdentityField) return null;
+  const learnedRows = renderLearnedRows(selectDurableUserFacts(now));
+  if (!hasIdentityField && learnedRows.length === 0) return null;
 
   const lines: string[] = [
     '',
-    `_Auto-regenerated ${now.toISOString()} from \`user-profile.json\` · edit your profile in Settings to update this._`,
+    `_Auto-regenerated ${now.toISOString()} from your profile and confirmed memory · edit your profile in Settings or curate facts in Memory._`,
     '_The user-curated section above is preserved verbatim._',
-    '',
-    '## Working with',
   ];
 
-  // Order: identity → timing → style. Each row is "- **Label:** value"
-  // and we omit rows whose value is undefined/empty rather than printing
-  // a noisy "- Field: (not set)" line.
-  const rows: Array<[string, string | undefined]> = [
-    ['Name', formatName(profile)],
-    ['Role', compact(profile.role)],
-    ['Timezone', compact(profile.timezone)],
-    ['Working days', formatWorkingDays(profile.workingDays)],
-    ['Working hours', formatWorkingHours(profile.workingHoursStart, profile.workingHoursEnd)],
-    ['Communication tone', compact(profile.communicationTone)],
-    ['Formality', compact(profile.formality)],
-    ['Urgency tolerance', compact(profile.urgencyTolerance)],
-    ['Preferred channels', profile.preferredChannels && profile.preferredChannels.length > 0
-      ? profile.preferredChannels.join(', ')
-      : undefined],
-    ['Notes', compact(profile.notes, 400)],
-  ];
-  for (const [label, value] of rows) {
-    if (value && value !== 'the user') lines.push(`- **${label}:** ${value}`);
+  if (hasIdentityField) {
+    lines.push('', '## Working with');
+    // Order: identity → timing → style. Each row is "- **Label:** value"
+    // and we omit rows whose value is undefined/empty rather than printing
+    // a noisy "- Field: (not set)" line.
+    const rows: Array<[string, string | undefined]> = [
+      ['Name', formatName(profile)],
+      ['Role', compact(profile.role)],
+      ['Timezone', compact(profile.timezone)],
+      ['Working days', formatWorkingDays(profile.workingDays)],
+      ['Working hours', formatWorkingHours(profile.workingHoursStart, profile.workingHoursEnd)],
+      ['Communication tone', compact(profile.communicationTone)],
+      ['Formality', compact(profile.formality)],
+      ['Urgency tolerance', compact(profile.urgencyTolerance)],
+      ['Preferred channels', profile.preferredChannels && profile.preferredChannels.length > 0
+        ? profile.preferredChannels.join(', ')
+        : undefined],
+      ['Notes', compact(profile.notes, 400)],
+    ];
+    for (const [label, value] of rows) {
+      if (value && value !== 'the user') lines.push(`- **${label}:** ${value}`);
+    }
+  }
+
+  if (learnedRows.length > 0) {
+    lines.push('', '## Learned about you', ...learnedRows);
   }
   lines.push('');
 
@@ -165,8 +227,9 @@ export function regenerateIdentityMd(): RegenerateIdentityMdResult {
   const { userPart, hadMarker } = splitAtMarker(existing);
 
   const autoBody = renderAutoSection(profile, new Date());
-  // Profile has nothing useful — keep whatever's on disk (likely just
-  // the seeded default). Don't write a marker + empty body.
+  // Neither the profile nor the facts store has anything useful — keep
+  // whatever's on disk (likely just the seeded default). Don't write a
+  // marker + empty body. Reason keeps its historical name.
   if (autoBody === null) {
     return { written: false, reason: 'no-profile', hadMarker, autoSectionChars: 0 };
   }
