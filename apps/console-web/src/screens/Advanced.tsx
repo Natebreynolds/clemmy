@@ -15,6 +15,7 @@ import { EvolutionView } from './advanced/EvolutionView';
 import { ObservabilityView } from './advanced/ObservabilityView';
 import { TraceLabView } from './advanced/TraceLabView';
 import { DeveloperFlags } from './advanced/DeveloperFlags';
+import { ToolRecallSection } from './advanced/ToolRecallSection';
 
 function Usage() {
   const usage = usePoll(['usage'], getUsage, 15000);
@@ -101,6 +102,7 @@ function Tools() {
           ))}
         </div>
       )}
+      <ToolRecallSection />
     </Page>
   );
 }
