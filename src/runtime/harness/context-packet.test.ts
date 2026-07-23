@@ -392,3 +392,34 @@ test('packet keeps the static line for a single-item / no-count request', () => 
   assert.equal(packet.multiItem.detected, false);
   assert.match(packet.text, /Parallelism reminder:/);
 });
+
+// Provider-access facts (live 2026-07-24): a run filesystem-hunted for an
+// OpenAI key that does not exist instead of using the OAuth lane it had.
+test('context packet states provider-access facts: no raw key -> OAuth-lane-only + BYO labels + no-search directive', async () => {
+  const { buildAgentContextPacket } = await import('./context-packet.js');
+  const prevKey = process.env.OPENAI_API_KEY;
+  const prevByo = process.env.BYO_PROVIDERS;
+  delete process.env.OPENAI_API_KEY;
+  process.env.BYO_PROVIDERS = JSON.stringify([
+    { id: 'together-ai', label: 'Together AI' },
+    { id: 'moonshot', label: 'Moonshot (Kimi)' },
+  ]);
+  try {
+    const packet = buildAgentContextPacket('check chatgpt visibility for 120 accounts and build a sheet', {
+      enabled: false, hitCount: 0, injected: false,
+    } as never, { sessionKind: 'chat' });
+    assert.match(packet.text, /OAuth model lane ONLY — no raw API key exists/);
+    assert.match(packet.text, /Together AI, Moonshot \(Kimi\)/);
+    assert.match(packet.text, /do NOT search the filesystem/);
+
+    process.env.OPENAI_API_KEY = 'sk-test-shape-only';
+    const withKey = buildAgentContextPacket('same ask again', {
+      enabled: false, hitCount: 0, injected: false,
+    } as never, { sessionKind: 'chat' });
+    assert.match(withKey.text, /raw API key configured/);
+    assert.ok(!withKey.text.includes('sk-test-shape-only'), 'key VALUES never appear in context');
+  } finally {
+    if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+    if (prevByo === undefined) delete process.env.BYO_PROVIDERS; else process.env.BYO_PROVIDERS = prevByo;
+  }
+});

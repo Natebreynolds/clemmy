@@ -5365,3 +5365,28 @@ test('stall judge: detected-bad shapes never consult the judge (deterministic st
     _setStallJudgeForTests(null);
   }
 });
+
+// Placeholder extinction, server floor (live 2026-07-24): completions with
+// nothing visible rendered "(Done.)" / "(Finished without a written reply.)"
+// in a real conversation. finalizeStandardConversation is the chokepoint —
+// an empty completion floors to the turn report or the honest fallback.
+test('an empty completion floors to visible text — the client never has to invent scaffolding', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // A parsed decision whose reply AND summary are empty (the live shape-1
+  // event: {"steps":1,"reply":null,"delivered":true}).
+  const emptyDecision = JSON.stringify({ summary: '', reply: '', done: true, nextAction: 'completed', reason: null });
+  const runner = scriptedRunner([{ finalOutput: emptyDecision }]);
+  await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'approve',
+    makeRunner: makeRunnerStub, runRunner: runner,
+  });
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.ok(completed.length >= 1);
+  for (const e of completed) {
+    const d = e.data as { reply?: string | null; summary?: string | null };
+    const visible = (typeof d.reply === 'string' && d.reply.trim()) || (typeof d.summary === 'string' && d.summary.trim());
+    assert.ok(visible, `every completion carries visible text: ${JSON.stringify(e.data).slice(0, 120)}`);
+    assert.ok(!String(visible).includes('(Done.)'), 'no parenthetical scaffolding');
+  }
+});

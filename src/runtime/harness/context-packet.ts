@@ -558,6 +558,38 @@ function harnessCapabilityHealthWarnings(limit = 3): string[] {
   }
 }
 
+/** Provider-access facts (live 2026-07-24): a run burned half an hour
+ *  filesystem-hunting for an OpenAI API key that does not exist, asked the
+ *  user for it twice, and never proposed the lane it already had (the OAuth
+ *  model). The harness KNOWS these facts — state them up front. Names and
+ *  presence only; never values. */
+function providerAccessLine(): string {
+  try {
+    const hasRawOpenAI = Boolean((process.env.OPENAI_API_KEY ?? '').trim());
+    let byoLabels: string[] = [];
+    try {
+      const raw = (process.env.BYO_PROVIDERS ?? '').trim();
+      if (raw) {
+        byoLabels = (JSON.parse(raw) as Array<{ label?: string; id?: string }>)
+          .map((p) => p.label || p.id || '')
+          .filter(Boolean);
+      }
+    } catch { /* unparseable BYO list — omit labels */ }
+    const openaiPart = hasRawOpenAI
+      ? 'OpenAI: raw API key configured (OPENAI_API_KEY) plus the connected OAuth model lane'
+      : 'OpenAI: connected OAuth model lane ONLY — no raw API key exists on this machine';
+    const byoPart = byoLabels.length ? `BYO model providers: ${byoLabels.join(', ')}` : 'BYO model providers: none';
+    return [
+      'Provider access (harness facts — do NOT search the filesystem, vault, or env for API keys):',
+      `${openaiPart}. ${byoPart}.`,
+      'If a task seems to need a missing credential, say so plainly and propose the closest available lane',
+      '(e.g. run model checks through the connected OAuth model) instead of searching or repeatedly asking.',
+    ].join(' ');
+  } catch {
+    return '';
+  }
+}
+
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
@@ -663,6 +695,7 @@ export function buildAgentContextPacket(
     focus,
     memoryLine,
     `External MCP scope: ${toolScope.allowAll ? 'all external tools allowed' : `${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''}`} (${toolScope.reason}).`,
+    providerAccessLine(),
     ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),
     // Pre-flight error library: the freshest distilled lessons for the skills
     // this turn will likely use — surfaced BEFORE acting so a known mistake

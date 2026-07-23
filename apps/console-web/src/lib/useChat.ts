@@ -531,8 +531,13 @@ export function useChat(options?: UseChatOptions) {
       if (reason === 'plan_first' && planProposalId) {
         patch(assistantId, { text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined });
       } else {
+        // Placeholder extinction (2026-07-24): the server now floors empty
+        // completions with a turn report or honest fallback; anything that
+        // still arrives empty gets a HUMAN line, never "(Done.)" scaffolding.
         patch(assistantId, {
-          text: text || (reason === 'no_structured_output' ? '(Finished without a written reply.)' : '(Done.)'),
+          text: text || (reason === 'no_structured_output'
+            ? 'That step finished but my reply didn’t come through — say “continue” and I’ll pick it right back up.'
+            : 'Done.'),
           status: awaitingContinue ? 'stopped' : 'complete',
           progress: undefined,
         });

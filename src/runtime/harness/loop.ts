@@ -357,15 +357,29 @@ function finalizeStandardConversation(input: {
   });
   if (parked) return parked;
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  const dataOut: Record<string, unknown> = {
+    ...input.eventData,
+    ...(state ? artifactVerificationProjection(state) : {}),
+  };
+  // PLACEHOLDER EXTINCTION (live 2026-07-24): completions with nothing visible
+  // rendered "(Done.)" / "(Finished without a written reply.)" in a real
+  // conversation. A completion either reports its actual work (turn report) or
+  // says something human — the client must never have to invent scaffolding.
+  const hasVisibleText =
+    (typeof dataOut.reply === 'string' && dataOut.reply.trim().length > 0) ||
+    (typeof dataOut.summary === 'string' && dataOut.summary.trim().length > 0);
+  if (!hasVisibleText) {
+    let floor: string | null = null;
+    try { floor = synthesizeTurnReport(input.sessionId, input.sourceUserSeq); } catch { floor = null; }
+    dataOut.summary = (floor && floor.trim()) || MISSING_REPLY_USER_FALLBACK;
+    dataOut.missingReply = true;
+  }
   safeAppend({
     sessionId: input.sessionId,
     turn: input.turn,
     role: 'system',
     type: 'conversation_completed',
-    data: {
-      ...input.eventData,
-      ...(state ? artifactVerificationProjection(state) : {}),
-    },
+    data: dataOut,
   });
   return input.result;
 }
