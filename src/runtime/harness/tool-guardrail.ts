@@ -26,6 +26,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { slugHasAffirmativeWriteVerb } from '../../integrations/composio/slug-effect.js';
 import pino from 'pino';
 import { readGuardrailState, writeGuardrailState } from './eventlog.js';
 import {
@@ -633,6 +634,82 @@ function canonicalize(value: unknown): unknown {
  * registers the call into the session tracker so future calls see
  * accurate counts.
  */
+// ─── Result-change awareness (polling vs looping, live 2026-07-23) ─────────
+// The exact-args advisory claimed "keeps returning the same result" without
+// ever checking a result: a batch-scrape STATUS POLL (identical args, payload
+// completed:36→58→73→…) drew 8 escalating "you are provably stuck" advisories
+// while making perfect progress — context burned, and the model taught to
+// distrust the guardrail. Brackets records a fingerprint of each successful
+// result post-invoke; two most-recent differing fingerprints for a signature
+// = a PROGRESSING POLL, and the non-mutating loop advisory stands down.
+// Mutating calls never get this exemption. In-memory only (a restart just
+// loses one comparison); bounded.
+const recentOutputFps = new Map<string, string[]>();
+const MAX_OUTPUT_FP_ENTRIES = 2_000;
+
+function outputFpKey(scopeId: string, signature: string): string {
+  return `${scopeId}::${signature}`;
+}
+
+function fingerprintToolResult(result: unknown): string {
+  let text: string;
+  try {
+    text = typeof result === 'string' ? result : JSON.stringify(result) ?? String(result);
+  } catch {
+    text = String(result);
+  }
+  const slice = text.slice(0, 8_192);
+  let h = 0;
+  for (let i = 0; i < slice.length; i++) h = (h * 31 + slice.charCodeAt(i)) | 0;
+  return `${slice.length}:${h}`;
+}
+
+/** Record a successful tool result for loop-vs-poll discrimination. Called
+ *  from the brackets invoke tap; best-effort by contract. */
+export function noteGuardrailToolResult(
+  scopeId: string | undefined,
+  toolName: string,
+  args: unknown,
+  result: unknown,
+): void {
+  if (!scopeId) return;
+  try {
+    const key = outputFpKey(scopeId, hashToolCall(toolName, args));
+    const fps = recentOutputFps.get(key) ?? [];
+    fps.push(fingerprintToolResult(result));
+    while (fps.length > 2) fps.shift();
+    recentOutputFps.delete(key);
+    recentOutputFps.set(key, fps);
+    while (recentOutputFps.size > MAX_OUTPUT_FP_ENTRIES) {
+      const oldest = recentOutputFps.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      recentOutputFps.delete(oldest);
+    }
+  } catch { /* discrimination is advisory-only */ }
+}
+
+function pollExemptSlugEvidence(toolName: string, args: unknown): boolean {
+  // Composio slugs whose action carries NO affirmative write verb
+  // (FIRECRAWL_BATCH_STATUS classifies as a conservative write because a
+  // final STATUS can be a state noun) are eligible for the poll exemption —
+  // the ADVISORY stands down, while the mutating hard-stop backstop above is
+  // untouched. An affirmative write verb (SEND/CREATE/UPDATE…) never exempts.
+  if (toolName !== 'composio_execute_tool') return false;
+  try {
+    const a = args as { tool_slug?: unknown; toolSlug?: unknown } | null;
+    const slug = typeof a?.tool_slug === 'string' ? a.tool_slug
+      : typeof a?.toolSlug === 'string' ? a.toolSlug : '';
+    return slug !== '' && !slugHasAffirmativeWriteVerb(slug);
+  } catch {
+    return false;
+  }
+}
+
+function identicalCallResultsAreChanging(scopeId: string, signature: string): boolean {
+  const fps = recentOutputFps.get(outputFpKey(scopeId, signature));
+  return Boolean(fps && fps.length === 2 && fps[0] !== fps[1]);
+}
+
 export function evaluateToolCall(
   trackerScopeId: string | undefined,
   toolName: string,
@@ -850,6 +927,29 @@ export function evaluateToolCall(
       // escalate/halt enforcement) wins: a fanout-keyed READ over threshold gets
       // the soft, recoverable refusal instead of a hard turn-kill (2026-07-12).
       ...(fanoutBlock ? { fanoutBlock } : {}),
+    };
+  }
+  // Polling, not looping: a non-mutating identical-args repeat whose RESULTS
+  // keep changing is legitimate progress — no advisory (see the result-change
+  // block above).
+  if (
+    (!isMut || pollExemptSlugEvidence(toolName, args))
+    && exactCount >= thresholds.exactArgsWarnAt
+    && trackerScopeId
+    && identicalCallResultsAreChanging(trackerScopeId, signature)
+  ) {
+    return {
+      action: 'allow',
+      signature,
+      toolName,
+      reason: 'identical-args repeat with CHANGING results — a progressing poll, not a loop',
+      rule: 'allowed',
+      count: exactCount,
+      mutating: isMut,
+      effect: classified.effect,
+      dangerousWrite,
+      ...(fanoutNudge ? { fanoutNudge } : {}),
+      ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
     };
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {

@@ -298,6 +298,9 @@ export interface ApprovalResolutionResult {
   text: string;
   sessionId: string;
   nextApprovalId?: string;
+  /** Set when the post-approval resume ended AWAITING USER INPUT — the settle
+   *  must park the task on this question, never mark it done (2026-07-23). */
+  awaitingInputQuestion?: string;
 }
 
 export interface PlanStep {

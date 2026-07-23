@@ -12,7 +12,7 @@ import {
 } from '../shell-execution-outcome.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
-import { evaluateToolCall, applyMode } from './tool-guardrail.js';
+import { evaluateToolCall, applyMode, noteGuardrailToolResult } from './tool-guardrail.js';
 import { normalizeWorkerOutput } from '../../agents/worker-output.js';
 import { getRuntimeEnv } from '../../config.js';
 import { sessionHasBackgroundOffer } from './convergence-steer.js';
@@ -2562,6 +2562,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
         compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
         recordPublishIfSucceeded(tool.name, parsedInput, result, shellOutcome);
         creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
+        // Poll-vs-loop discrimination: record the result fingerprint so the
+        // exact-args guardrail can tell a progressing status poll from a
+        // genuine loop (live 2026-07-23).
+        if (ctx) { try { noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, result); } catch { /* advisory */ } }
         return result;
       }, (err) => {
         const shellOutcome = tool.name === 'run_shell_command'

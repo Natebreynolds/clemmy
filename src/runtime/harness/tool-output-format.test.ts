@@ -21,7 +21,7 @@ const {
   createSession,
   getToolOutput,
 } = await import('./eventlog.js');
-const { formatRecallableToolText, extractResourceIdIndex } = await import('./tool-output-format.js');
+const { formatRecallableToolText, extractResourceIdIndex, densifyMarkdownForModelHead } = await import('./tool-output-format.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
 const { textResult } = await import('../../tools/shared.js');
 
@@ -128,4 +128,31 @@ test('formatRecallableToolText prepends the id index when a large resource-list 
   assert.match(out, /IDs available in this result/);
   assert.match(out, /tbl0 = Table 0/);
   assert.match(out, /tbl7 = Table 7/); // survives even though the body is clipped
+});
+
+// Scrape-head densifier (live 2026-07-23): the clipped model head of a
+// scrape-shaped payload must carry CONTENT, not image markdown / data-URI
+// blobs / bare-URL nav lines. Non-scrape text is byte-identical.
+test('densifyMarkdownForModelHead strips scrape junk, leaves normal text alone', () => {
+  const scrape = [
+    '![](https://assets.example.com/logo-71f9f7038a26ec24.svg)',
+    '![banner](https://cdn.example.com/banner.webp)',
+    '![](data:image/png;base64,' + 'A'.repeat(120) + ')',
+    'https://example.com/nav-link',
+    '# Jacksonville Divorce & Family Law Attorney',
+    '',
+    '',
+    '',
+    'Education, collaboration and efficiency are the cornerstones of my practice.',
+  ].join('\n');
+  const dense = densifyMarkdownForModelHead(scrape);
+  assert.ok(!dense.includes('!['), 'image markdown removed');
+  assert.ok(!dense.includes('base64,AAAA'), 'data uri removed');
+  assert.ok(!dense.includes('https://example.com/nav-link'), 'bare-url nav line removed');
+  assert.match(dense, /Jacksonville Divorce/);
+  assert.match(dense, /cornerstones of my practice/);
+  assert.ok(!/\n{3,}/.test(dense), 'blank runs collapsed');
+
+  const normal = 'A report with one image ![x](https://a.b/c.png) and prose.';
+  assert.equal(densifyMarkdownForModelHead(normal), normal, 'sub-threshold text untouched');
 });

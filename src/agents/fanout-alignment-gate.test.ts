@@ -88,3 +88,20 @@ test('armed flow: policy classifier arms, ANY execution door bounces once, resea
   armFirstContactBeat({ sessionId: 'sess-armed-4', sessionKind: 'workflow', itemCount: 30, userMessageCount: 1 });
   assert.equal(maybeBounceMassExecution('sess-armed-4').bounce, false);
 });
+
+// Heavy per-item tool advisory (live 2026-07-23): a 120-account run planned a
+// browser session PER ITEM; only a mid-run human steer saved the budget.
+// Advisory-only: it never blocks, fires once per session, and only for large
+// fan-outs whose packet names browser/screenshot-class tools.
+test('browser-per-item fan-outs draw ONE cost advisory; cheap or small fan-outs draw none', async () => {
+  const { maybeHeavyPerItemToolAdvisory, _resetHeavyAdvisoryForTests } = await import('./fanout-alignment-gate.js');
+  _resetHeavyAdvisoryForTests();
+  const packet = JSON.stringify({ objective: 'capture each firm homepage', instructions: 'use browser_harness_run to screenshot each site', items: [] });
+  const first = maybeHeavyPerItemToolAdvisory('sess-heavy', 120, packet);
+  assert.ok(first && /cost advisory/.test(first), 'large browser fan-out advises');
+  assert.match(first!, /batch scrape API|reused browser session/);
+  assert.equal(maybeHeavyPerItemToolAdvisory('sess-heavy', 120, packet), null, 'one advisory per session');
+  _resetHeavyAdvisoryForTests();
+  assert.equal(maybeHeavyPerItemToolAdvisory('sess-heavy', 5, packet), null, 'small fan-outs are fine');
+  assert.equal(maybeHeavyPerItemToolAdvisory('sess-heavy', 120, JSON.stringify({ instructions: 'composio scrape each site' })), null, 'cheap per-item tools draw nothing');
+});
