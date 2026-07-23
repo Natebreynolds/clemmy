@@ -11,7 +11,7 @@ import { appendEvent } from '../runtime/harness/eventlog.js';
 import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
-import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/model-route-metrics.js';
+import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from '../agents/worker-model-fallover.js';
@@ -64,6 +64,12 @@ export interface SdkBrainWorkerRoute {
   /** Set when a non-Claude worker model was CONFIGURED but ignored (kill-switch
    *  off) — surfaced as a visible telemetry warning instead of a silent fallback. */
   ignoredNonClaudeModel?: string;
+  /** WHY this model: the resolution source, mapped to the decision enum, so the
+   *  route-metrics decision row attributes learned-policy picks honestly
+   *  (parity with the orchestrator lane's trace mapping). */
+  source?: ModelRouteDecisionSource;
+  /** Evidence behind a source='policy' pick — rides into the decision reason. */
+  policy?: { score: number; defaultScore: number; sampleCount: number; policyVersion: number };
 }
 
 /** PURE lane-decision (no config/connectivity reads) so every branch is
@@ -72,15 +78,17 @@ export interface SdkBrainWorkerRoute {
  *  the ignored model surfaced. No resolvable model ⇒ the Claude brain fallback. */
 export function pickSdkBrainWorkerLane(
   resolvedId: string | undefined,
-  opts: { crossEnabled: boolean; claudeBrainModel: string; resolvedProvider?: ModelProviderClass },
+  opts: { crossEnabled: boolean; claudeBrainModel: string; resolvedProvider?: ModelProviderClass; resolvedSource?: ModelRouteDecisionSource },
 ): SdkBrainWorkerRoute {
   const isClaude = Boolean(resolvedId && opts.resolvedProvider === 'claude');
-  if (isClaude) return { modelId: resolvedId as string, claudeLane: true };
-  if (resolvedId && opts.crossEnabled) return { modelId: resolvedId, claudeLane: false };
-  // Kill-switch off, or no resolvable model ⇒ today's Claude-only fallback.
+  if (isClaude) return { modelId: resolvedId as string, claudeLane: true, source: opts.resolvedSource ?? 'default' };
+  if (resolvedId && opts.crossEnabled) return { modelId: resolvedId, claudeLane: false, source: opts.resolvedSource ?? 'default' };
+  // Kill-switch off (the resolved model was IGNORED ⇒ this run is a fallback),
+  // or no resolvable model ⇒ today's Claude-only fallback is simply the default.
   return {
     modelId: opts.claudeBrainModel,
     claudeLane: true,
+    source: resolvedId && !isClaude ? 'fallback' : 'default',
     ...(resolvedId && !isClaude ? { ignoredNonClaudeModel: resolvedId } : {}),
   };
 }
@@ -90,16 +98,27 @@ export function pickSdkBrainWorkerLane(
 export function resolveSdkBrainWorker(intent?: string): SdkBrainWorkerRoute {
   let resolvedId: string | undefined;
   let resolvedProvider: ModelProviderClass | undefined;
+  let resolvedSource: ModelRouteDecisionSource | undefined;
+  let resolvedPolicy: SdkBrainWorkerRoute['policy'];
   try {
     const resolved = resolveRoleModel('worker', intent);
     resolvedId = resolved.modelId;
     resolvedProvider = resolved.provider;
+    // Map the resolution source onto the decision enum (same collapse the
+    // orchestrator lane applies to its trace): explicit binding kinds → 'binding'.
+    resolvedSource = resolved.source === 'policy' ? 'policy' : resolved.source === 'default' ? 'default' : 'binding';
+    resolvedPolicy = resolved.policy;
   } catch { /* fall through to the Claude brain model */ }
-  return pickSdkBrainWorkerLane(resolvedId, {
+  const route = pickSdkBrainWorkerLane(resolvedId, {
     crossEnabled: sdkBrainCrossWorkerEnabled(),
     claudeBrainModel: getClaudeBrainModel(),
     resolvedProvider,
+    resolvedSource,
   });
+  // The policy evidence only describes the model the policy picked — attach it
+  // only when that exact model is what the route runs.
+  if (resolvedPolicy && route.source === 'policy' && route.modelId === resolvedId) route.policy = resolvedPolicy;
+  return route;
 }
 
 const firstLine = (v: unknown): string => {
@@ -316,6 +335,7 @@ export function registerWorkerTools(server: McpServer): void {
       // (routed → default worker binding → Claude brain). Cross-lane pick only
       // applies off the pure-Claude lane; the Claude lane's own model is already
       // the last-resort candidate.
+      let benchFalloverFrom: string | undefined;
       if (!route.claudeLane) {
         const pick = pickWorkerModelWithFallover([
           workerModel,
@@ -323,6 +343,7 @@ export function registerWorkerTools(server: McpServer): void {
           getClaudeBrainModel(),
         ]);
         if (pick.falloverFrom) {
+          benchFalloverFrom = pick.falloverFrom;
           workerModel = pick.model;
           workerProvider = resolveEffectiveProviderForModel(workerModel);
           if (workerProvider === 'byo') workerModel = repairByoRoutedModelId(workerModel);
@@ -365,8 +386,16 @@ export function registerWorkerTools(server: McpServer): void {
         intent: input.intent || undefined,
         resolvedModel: workerModel,
         provider: workerProvider,
-        source: 'default',
-        reason: { lane: 'sdk_brain', item: input.item },
+        // Bench fallover swapped the model after resolution ⇒ the run is a
+        // fallback; otherwise attribute the resolution honestly (policy picks
+        // must show up as policy — the learning loop's own evidence trail).
+        source: benchFalloverFrom ? 'fallback' : route.source ?? 'default',
+        reason: {
+          lane: 'sdk_brain',
+          item: input.item,
+          ...(route.policy ? { policy: route.policy } : {}),
+          ...(benchFalloverFrom ? { falloverFrom: benchFalloverFrom } : {}),
+        },
       });
       // Live-visibility: announce the agent STARTING (the chat/board render it as a
       // running specialist immediately, not only when worker_result lands). Cheap,

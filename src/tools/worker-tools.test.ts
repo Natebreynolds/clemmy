@@ -25,22 +25,22 @@ const BRAIN = 'claude-opus-4-8';
 // ── pickSdkBrainWorkerLane: the pure lane decision (deterministic, no connectivity)
 test('a Claude worker role runs on the Claude SDK lane (honors "workers = Sonnet 5")', () => {
   const r = pickSdkBrainWorkerLane('claude-sonnet-5', { crossEnabled: true, claudeBrainModel: BRAIN, resolvedProvider: 'claude' });
-  assert.deepEqual(r, { modelId: 'claude-sonnet-5', claudeLane: true });
+  assert.deepEqual(r, { modelId: 'claude-sonnet-5', claudeLane: true, source: 'default' });
 });
 
 test('a NON-Claude worker role runs on the CROSS-PROVIDER lane when enabled (the parity fix)', () => {
   const r = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: true, claudeBrainModel: BRAIN, resolvedProvider: 'codex' });
-  assert.deepEqual(r, { modelId: 'gpt-5.4-mini', claudeLane: false });
+  assert.deepEqual(r, { modelId: 'gpt-5.4-mini', claudeLane: false, source: 'default' });
 });
 
 test('a NON-Claude worker role reverts to the Claude brain when the kill-switch is off (ignored model surfaced)', () => {
   const r = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: false, claudeBrainModel: BRAIN, resolvedProvider: 'codex' });
-  assert.deepEqual(r, { modelId: BRAIN, claudeLane: true, ignoredNonClaudeModel: 'gpt-5.4-mini' });
+  assert.deepEqual(r, { modelId: BRAIN, claudeLane: true, source: 'fallback', ignoredNonClaudeModel: 'gpt-5.4-mini' });
 });
 
 test('an unset worker role falls open to the Claude brain on the Claude SDK lane (no ignored-model warning)', () => {
   const r = pickSdkBrainWorkerLane(undefined, { crossEnabled: true, claudeBrainModel: BRAIN });
-  assert.deepEqual(r, { modelId: BRAIN, claudeLane: true });
+  assert.deepEqual(r, { modelId: BRAIN, claudeLane: true, source: 'default' });
 });
 
 test('a Claude-shaped BYO worker stays on the cross-provider lane', () => {
@@ -49,7 +49,18 @@ test('a Claude-shaped BYO worker stays on the cross-provider lane', () => {
     claudeBrainModel: BRAIN,
     resolvedProvider: 'byo',
   });
-  assert.deepEqual(r, { modelId: 'claude-custom', claudeLane: false });
+  assert.deepEqual(r, { modelId: 'claude-custom', claudeLane: false, source: 'default' });
+});
+
+test('the resolution source rides through the lane pick (policy picks stay attributed as policy)', () => {
+  const claude = pickSdkBrainWorkerLane('claude-sonnet-5', { crossEnabled: true, claudeBrainModel: BRAIN, resolvedProvider: 'claude', resolvedSource: 'policy' });
+  assert.equal(claude.source, 'policy');
+  const cross = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: true, claudeBrainModel: BRAIN, resolvedProvider: 'codex', resolvedSource: 'binding' });
+  assert.equal(cross.source, 'binding');
+  // A policy-resolved model that the kill-switch then IGNORES ran as a fallback,
+  // not a policy pick — the decision row must not credit the policy.
+  const ignored = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: false, claudeBrainModel: BRAIN, resolvedProvider: 'codex', resolvedSource: 'policy' });
+  assert.equal(ignored.source, 'fallback');
 });
 
 // ── sdkBrainCrossWorkerEnabled: default-ON kill-switch, reverts on off/0/false
