@@ -6,7 +6,7 @@ import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Switch } from '@/components/ui/Switch';
-import { StatusPill, type Tone } from '@/components/ui/StatusPill';
+import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -21,274 +21,11 @@ import {
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
   type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
 } from '@/lib/automate';
-import {
-  getAgentSystemMetrics,
-  type AgentSystemRecommendation,
-  type AgentSystemTrendSnapshot,
-  type CoordinationPolicySnapshot,
-  type LoopInterventionSnapshot,
-  type LoopIssueCause,
-  type WorkflowLearningSnapshot,
-} from '@/lib/advanced';
+import { getAgentSystemMetrics } from '@/lib/advanced';
 
 type Tab = 'workflows' | 'skills';
 type WorkflowFilter = 'all' | 'scheduled' | 'manual';
 
-function recommendationTone(severity: AgentSystemRecommendation['severity']): Tone {
-  if (severity === 'critical') return 'danger';
-  if (severity === 'warn') return 'warning';
-  return 'info';
-}
-
-function interventionTone(status: LoopInterventionSnapshot['status']): Tone {
-  if (status === 'productive') return 'success';
-  if (status === 'watch') return 'warning';
-  if (status === 'thrashing') return 'danger';
-  return 'neutral';
-}
-
-function learningTone(status: WorkflowLearningSnapshot['status']): Tone {
-  if (status === 'compounding') return 'success';
-  if (status === 'watch') return 'warning';
-  if (status === 'stale') return 'danger';
-  return 'neutral';
-}
-
-function coordinationTone(status: CoordinationPolicySnapshot['status']): Tone {
-  if (status === 'expand') return 'success';
-  if (status === 'repair' || status === 'constrain') return 'danger';
-  if (status === 'learn') return 'info';
-  return 'warning';
-}
-
-function fanoutPostureTone(posture: CoordinationPolicySnapshot['fanoutPosture']): Tone {
-  if (posture === 'allow') return 'success';
-  if (posture === 'soft') return 'info';
-  if (posture === 'constrain') return 'warning';
-  return 'danger';
-}
-
-function trendTone(status: AgentSystemTrendSnapshot['status']): Tone {
-  if (status === 'improving') return 'success';
-  if (status === 'regressing') return 'danger';
-  if (status === 'stable') return 'warning';
-  return 'neutral';
-}
-
-function LoopGuidance({
-  recommendations,
-  issueCauses,
-  interventions,
-  learning,
-  coordination,
-  trend,
-}: {
-  recommendations: AgentSystemRecommendation[];
-  issueCauses: LoopIssueCause[];
-  interventions?: LoopInterventionSnapshot;
-  learning?: WorkflowLearningSnapshot;
-  coordination?: CoordinationPolicySnapshot;
-  trend?: AgentSystemTrendSnapshot;
-}) {
-  // Collapsed by default: this is OPERATOR diagnostics (health scores, repair
-  // loops, retry pressure) — useful, but it must not be the first thing a user
-  // wades through to reach their workflows. One quiet summary line, expandable.
-  const [open, setOpen] = useState(false);
-  if (recommendations.length === 0 && issueCauses.length === 0 && !interventions && !learning && !coordination && !trend) return null;
-  const attention = (coordination ? 1 : 0) + issueCauses.length + recommendations.length;
-  if (!open) {
-    return (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="mb-5 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-left transition-colors hover:bg-subtle cursor-pointer"
-      >
-        <Zap className="h-3.5 w-3.5 shrink-0 text-faint" aria-hidden />
-        <span className="text-caption font-semibold uppercase tracking-wide text-faint">System health</span>
-        {trend && (
-          <StatusPill tone={trendTone(trend.status)}>
-            {trend.status}{trend.recent.length > 0 ? ` · ${trend.recent[trend.recent.length - 1]?.healthScore}/100` : ''}
-          </StatusPill>
-        )}
-        <span className="min-w-0 flex-1 truncate text-caption text-muted">
-          {attention > 0 ? `${attention} thing${attention === 1 ? '' : 's'} worth a look` : 'All quiet'}
-        </span>
-        <span className="shrink-0 text-caption text-faint">details</span>
-      </button>
-    );
-  }
-  return (
-    <Card className="mb-5 p-4">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
-          <Zap className="h-3.5 w-3.5" aria-hidden /> System health
-        </div>
-        <button type="button" onClick={() => setOpen(false)} className="text-caption text-faint transition-colors hover:text-muted cursor-pointer">hide</button>
-      </div>
-      {trend && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Agent-system trend</div>
-              <p className="mt-1 text-small text-muted">{trend.recommendation}</p>
-            </div>
-            <StatusPill tone={trendTone(trend.status)}>
-              {trend.status}{trend.recent.length > 0 ? ` · ${trend.recent[trend.recent.length - 1]?.healthScore}/100` : ''}
-            </StatusPill>
-          </div>
-          <div className="flex flex-wrap gap-2 text-caption">
-            {trend.signals.slice(0, 4).map((signal) => (
-              <span key={signal} className="rounded-full bg-subtle px-2 py-0.5 text-muted">{signal}</span>
-            ))}
-          </div>
-        </div>
-      )}
-      {coordination && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Coordination policy</div>
-              <p className="mt-1 text-small text-muted">{coordination.nextAction}</p>
-            </div>
-            <StatusPill tone={coordinationTone(coordination.status)}>
-              {coordination.mode} · {coordination.confidence}/100
-            </StatusPill>
-            <StatusPill tone={fanoutPostureTone(coordination.fanoutPosture)}>
-              fanout {coordination.fanoutPosture}
-            </StatusPill>
-            <StatusPill tone={coordination.recommendedWorkerWaveSize >= 8 ? 'success' : coordination.recommendedWorkerWaveSize > 0 ? 'info' : 'danger'}>
-              wave {coordination.recommendedWorkerWaveSize}
-            </StatusPill>
-          </div>
-          {coordination.guardrails.length > 0 && (
-            <div className="flex flex-wrap gap-2 text-caption">
-              {coordination.guardrails.slice(0, 3).map((guardrail) => (
-                <span key={guardrail} className="rounded-full bg-warning-tint px-2 py-0.5 text-warning">{guardrail}</span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      {interventions && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Intervention effectiveness</div>
-              <p className="mt-1 text-small text-muted">{interventions.recommendation}</p>
-            </div>
-            <StatusPill tone={interventionTone(interventions.status)}>
-              {interventions.score}/100 · {interventions.status}
-            </StatusPill>
-          </div>
-          <div className="grid gap-2 md:grid-cols-4">
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Retry pressure</div>
-              <div className="text-small font-semibold text-fg">{interventions.retryPressurePct}%</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Self-heal clean</div>
-              <div className="text-small font-semibold text-fg">{interventions.selfHeal.clean}/{interventions.selfHeal.runs}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Goal satisfied</div>
-              <div className="text-small font-semibold text-fg">{interventions.goalRepursuit.satisfied}/{interventions.goalRepursuit.runs}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Failed items</div>
-              <div className="text-small font-semibold text-fg">{interventions.forEachRecovery.failed}</div>
-            </div>
-          </div>
-          {(interventions.risks.length > 0 || interventions.strengths.length > 0) && (
-            <div className="mt-2 flex flex-wrap gap-2 text-caption">
-              {interventions.risks.slice(0, 3).map((risk) => (
-                <span key={risk} className="rounded-full bg-warning-tint px-2 py-0.5 text-warning">{risk}</span>
-              ))}
-              {interventions.strengths.slice(0, 2).map((strength) => (
-                <span key={strength} className="rounded-full bg-success-tint px-2 py-0.5 text-success">{strength}</span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      {learning && (
-        <div className="mb-3 rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-small font-semibold text-fg">Workflow learning</div>
-              <p className="mt-1 text-small text-muted">{learning.recommendation}</p>
-            </div>
-            <StatusPill tone={learningTone(learning.status)}>
-              {learning.recallHitRatePct}% recall · {learning.status}
-            </StatusPill>
-          </div>
-          <div className="grid gap-2 md:grid-cols-4">
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Patterns</div>
-              <div className="text-small font-semibold text-fg">{learning.patternCount}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Clean samples</div>
-              <div className="text-small font-semibold text-fg">{learning.totalCleanPatternRuns}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Recall hits</div>
-              <div className="text-small font-semibold text-fg">{learning.recallHits}/{learning.recentRecallSamples}</div>
-            </div>
-            <div className="rounded-md bg-subtle p-2">
-              <div className="text-caption text-faint">Remembered</div>
-              <div className="text-small font-semibold text-fg">{learning.remembers}</div>
-            </div>
-          </div>
-          {learning.topPatterns.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-2 text-caption">
-              {learning.topPatterns.slice(0, 3).map((pattern) => (
-                <span key={pattern.workflowSlug} className="rounded-full bg-info-tint px-2 py-0.5 text-info" title={`${pattern.stepCount} steps · ${pattern.toolCount} tools`}>
-                  {pattern.workflowName} · {pattern.successCount}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      {issueCauses.length > 0 && (
-        <div className="mb-3 grid gap-2 lg:grid-cols-3">
-          {issueCauses.slice(0, 3).map((cause) => (
-            <div key={cause.key} className="rounded-md border border-border bg-subtle p-3">
-              <div className="mb-1 flex items-center justify-between gap-2">
-                <span className="truncate text-small font-semibold text-fg" title={cause.label}>{cause.label}</span>
-                <StatusPill tone="warning">{cause.count}</StatusPill>
-              </div>
-              <p className="truncate text-caption text-faint" title={cause.sources.join(', ')}>
-                {cause.sources.join(', ')}
-              </p>
-            </div>
-          ))}
-        </div>
-      )}
-      {recommendations.length > 0 && (
-        <div className="grid gap-3 lg:grid-cols-2">
-          {recommendations.slice(0, 4).map((rec) => (
-            <div key={rec.id} className="rounded-md border border-border bg-surface p-3">
-              <div className="mb-1 flex flex-wrap items-center gap-2">
-                <StatusPill tone={recommendationTone(rec.severity)}>{rec.target}</StatusPill>
-                <span className="text-small font-semibold text-fg">{rec.title}</span>
-              </div>
-              <p className="text-small text-muted">{rec.detail}</p>
-              <p className="mt-1 text-caption text-faint">{rec.action}</p>
-              <Link
-                to={rec.href}
-                className="mt-2 inline-flex h-9 items-center justify-center gap-2 rounded-md px-3 text-small font-semibold text-muted transition-colors duration-fast hover:bg-hover hover:text-fg"
-              >
-                {rec.cta}
-                <ArrowRight className="h-3.5 w-3.5" aria-hidden />
-              </Link>
-            </div>
-          ))}
-        </div>
-      )}
-    </Card>
-  );
-}
 
 function relativeRunTime(iso?: string | null): string {
   if (!iso) return '';
@@ -341,12 +78,12 @@ export function Automate() {
   const isScheduled = (w: WorkflowRow) => Boolean(w.triggerSchedule || w.trigger?.schedule);
   const visibleWf = filter === 'all' ? wf : wf.filter((w) => (filter === 'scheduled' ? isScheduled(w) : !isScheduled(w)));
   const sk = skills.data?.skills ?? [];
-  const loopRecommendations = (systemQ.data?.recommendations ?? []).filter((rec) => rec.kind === 'loop');
-  const loopIssueCauses = systemQ.data?.loops.issueCauses ?? [];
-  const loopInterventions = systemQ.data?.loops.interventions;
-  const workflowLearning = systemQ.data?.loops.learning;
-  const coordination = systemQ.data?.coordination;
-  const trend = systemQ.data?.trend;
+  // The old operator-telemetry panel ("repair-loop 94/100", "fanout block",
+  // "19/100 thrashing") lives in Advanced → Evolution, which renders this same
+  // metrics feed in full. Automate shows one plain sentence, and only when
+  // something actually needs a human.
+  const repairCount = (systemQ.data?.recommendations ?? [])
+    .filter((rec) => rec.kind === 'loop' && (rec.severity === 'warn' || rec.severity === 'critical')).length;
 
   const run = async (name: string) => {
     setBusyName(name); setNotice(null);
@@ -428,15 +165,17 @@ export function Automate() {
         </p>
       )}
 
-      {tab !== 'skills' && (
-        <LoopGuidance
-          recommendations={loopRecommendations}
-          issueCauses={loopIssueCauses}
-          interventions={loopInterventions}
-          learning={workflowLearning}
-          coordination={coordination}
-          trend={trend}
-        />
+      {tab === 'workflows' && repairCount > 0 && (
+        <Link
+          to="/advanced/evolution"
+          className="mb-4 flex items-center gap-2 rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-small text-warning transition-colors hover:border-warning"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1">
+            {repairCount} thing{repairCount === 1 ? '' : 's'} need{repairCount === 1 ? 's' : ''} repair — details in Advanced
+          </span>
+          <ArrowRight className="h-4 w-4 shrink-0" aria-hidden />
+        </Link>
       )}
 
       {tab === 'workflows' && (
