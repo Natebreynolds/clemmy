@@ -126,3 +126,14 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
 export function composioSlugIsReadOnly(slug: string | null | undefined): boolean {
   return classifyComposioSlugEffect(slug) === 'read';
 }
+
+/** Does the slug carry an AFFIRMATIVE write verb (SEND/CREATE/UPDATE/…)?
+ *  Narrower than composioSlugEffectEvidence === 'write': the trailing
+ *  state-noun rule conservatively classifies GMAIL_MARK_AS_READ and
+ *  FIRECRAWL_BATCH_STATUS as writes for the APPROVAL gates, but the
+ *  loop-guardrail's poll exemption (advisory realm only) needs the stricter
+ *  question — is there a real write verb here at all. */
+export function slugHasAffirmativeWriteVerb(slug: string | null | undefined): boolean {
+  const tokens = actionTokens(String(slug ?? '').trim().toUpperCase());
+  return tokens.some((token) => WRITE_ACTIONS.has(token) && !AMBIGUOUS_OBJECT_TOKENS.has(token));
+}

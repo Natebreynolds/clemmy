@@ -21,6 +21,7 @@ import {
   buildFanoutRecoveryMessage,
   _peekTracker,
   _resetAllTrackersForTests,
+  noteGuardrailToolResult,
   resetTracker,
 } from './tool-guardrail.js';
 
@@ -911,4 +912,34 @@ test('window cap: tracker bounded by recentWindowSize env (default 100)', () => 
     evaluateToolCall('sess-cap', 'memory_search', { q: `unique-${i}` });
   }
   assert.equal(_peekTracker('sess-cap').recentCount, 100);
+});
+
+// Poll-vs-loop (live 2026-07-23): a batch-scrape STATUS POLL — identical args,
+// results changing every call (completed: 36→58→73→…) — drew 8 escalating
+// "you are provably stuck" advisories. Changing results = progressing poll →
+// stand down; identical results = genuine loop → advisories fire as before.
+// Mutating calls never get the exemption.
+test('identical-args READ repeats with changing results are a poll, not a loop', () => {
+  const scope = 'sess-poll-discrimination';
+  _resetAllTrackersForTests();
+  const args = { tool_slug: 'FIRECRAWL_BATCH_STATUS', jobId: 'job-1' };
+  let lastAction = '';
+  for (let i = 1; i <= 9; i++) {
+    const d = evaluateToolCall(scope, 'composio_execute_tool', args, `poll-${i}`);
+    lastAction = d.action;
+    // Simulate the brackets tap: each poll returns a DIFFERENT payload.
+    noteGuardrailToolResult(scope, 'composio_execute_tool', args, JSON.stringify({ completed: i * 12, data: [] }));
+  }
+  assert.equal(lastAction, 'allow', `changing results never draw the loop advisory, got ${lastAction}`);
+
+  // Same shape but with IDENTICAL results → the loop advisories fire.
+  _resetAllTrackersForTests();
+  const stuckArgs = { tool_slug: 'SOME_READ', q: 'same' };
+  let sawAdvisory = false;
+  for (let i = 1; i <= 9; i++) {
+    const d = evaluateToolCall(scope, 'composio_execute_tool', stuckArgs, `stuck-${i}`);
+    if (d.action !== 'allow') sawAdvisory = true;
+    noteGuardrailToolResult(scope, 'composio_execute_tool', stuckArgs, '{"error":"not found"}');
+  }
+  assert.equal(sawAdvisory, true, 'identical results still draw the loop advisory');
 });
