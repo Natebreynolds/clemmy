@@ -607,6 +607,49 @@ export function listSendTrustGrants(): SendTrustGrant[] {
   return (file.sendTrust ?? []).filter((g) => !g.revokedAt);
 }
 
+/** Every send-trust grant, INCLUDING revoked ones. Trust-graduation reads this
+ *  to disqualify a candidate scope the user has since revoked (a revocation is
+ *  a pullback of trust that must not be re-proposed on stale evidence). The live
+ *  auto-approve path uses listSendTrustGrants (non-revoked) — this is audit-only. */
+export function listAllSendTrustGrants(): SendTrustGrant[] {
+  return readAll().sendTrust ?? [];
+}
+
+/**
+ * Does a LIVE (non-revoked) send-trust grant already cover this exact
+ * recipient/domain/toolkit scope? Same matching semantics as matchesSendTrust,
+ * but evaluated against a known scope (not a live call's extracted args) so the
+ * graduation proposer can skip suggesting what the user already granted. A scope
+ * is covered when some single grant covers every recipient AND every domain in
+ * it, honoring that grant's toolkit narrowing.
+ */
+export function isSendTrustScopeCovered(scope: {
+  recipients?: string[];
+  domains?: string[];
+  toolkits?: string[];
+}): boolean {
+  if (!sendTrustEnabled()) return false;
+  const grants = listSendTrustGrants();
+  if (grants.length === 0) return false;
+  const recipients = (scope.recipients ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean);
+  const domains = (scope.domains ?? []).map((d) => d.trim().toLowerCase().replace(/^@/, '')).filter(Boolean);
+  const toolkit = (scope.toolkits ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean)[0] ?? '';
+  if (recipients.length === 0 && domains.length === 0) return false;
+  for (const g of grants) {
+    if (g.toolkits && g.toolkits.length > 0) {
+      if (!toolkit || !g.toolkits.some((t) => toolkit.includes(t))) continue;
+    }
+    const gDomains = g.domains ?? [];
+    const gRecipients = g.recipients ?? [];
+    const recipCovered = recipients.every((e) => (
+      gRecipients.includes(e) || gDomains.includes(e.split('@')[1] ?? '')
+    ));
+    const domainCovered = domains.every((d) => gDomains.includes(d));
+    if (recipCovered && domainCovered) return true;
+  }
+  return false;
+}
+
 /**
  * Best-effort recipient extraction from a send's args. Scans EVERY string in the
  * args tree for email addresses (so a recipient can't hide in a nested/aliased
@@ -639,7 +682,7 @@ export function extractSendTargets(args: unknown): { emails: string[]; handles: 
   return { emails: [...emails], handles: [...handles] };
 }
 
-function inferToolkit(toolName: string, args: unknown): string {
+export function inferToolkit(toolName: string, args: unknown): string {
   return (extractComposioSlug(args) ?? toolName).toLowerCase();
 }
 

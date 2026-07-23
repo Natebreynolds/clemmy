@@ -72,6 +72,26 @@ export const decideApproval = (
 
 export const cancelStaleApprovals = () => apiPost('/api/console/approvals/cancel-stale');
 
+export interface TrustProposalRow {
+  id: string;
+  toolkits: string[];
+  recipients: string[];
+  domains?: string[];
+  maxRecipients: number;
+  rationale: string;
+  status: string;
+  createdAt: string;
+  evidence: { cleanSendCount: number; distinctDays: number; firstAt: string; lastAt: string };
+}
+
+/** Send-trust suggestions Clem proposes after a stable run of clean approved
+ *  sends — the desktop half of the desktop↔Discord parity. */
+export const listTrustProposals = () =>
+  apiGet<{ proposals: TrustProposalRow[] }>('/api/console/trust-proposals?status=pending');
+
+export const decideTrustProposal = (id: string, decision: 'approve' | 'decline') =>
+  apiPost(`/api/console/trust-proposals/${encodeURIComponent(id)}/${decision}`);
+
 export const listRuns = (limit = 40) => apiGet<{ runs: RunRow[] }>(`/api/runs?limit=${limit}`);
 
 // 300 matches the command-center feed window — Home "Needs you" cards can
