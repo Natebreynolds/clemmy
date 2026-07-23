@@ -144,7 +144,7 @@ export function Inbox() {
               {t.label}
               {t.count > 0 && (
                 <span className={cn('rounded-full px-1.5 text-caption font-bold', active ? 'bg-primary text-primary-fg' : 'bg-subtle text-muted')}>
-                  {t.count}
+                  {t.count > 99 ? '99+' : t.count}
                 </span>
               )}
             </button>

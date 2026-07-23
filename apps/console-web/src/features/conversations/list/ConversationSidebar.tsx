@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Search, Plus, Archive, X, PanelLeftClose } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -37,7 +37,15 @@ export function ConversationSidebar({ onCollapse }: { onCollapse?: () => void } 
   );
 
   const { data, isLoading } = useSessions(filters);
-  const sessions = data?.sessions ?? [];
+  // Hide empty desktop shells ("t" · "No messages yet") unless it's the one
+  // currently open (a just-created chat must stay visible while you type).
+  // Harness rows always report turnCount 0 — never filter those.
+  const { pathname } = useLocation();
+  const activeId = decodeURIComponent(pathname.match(/^\/chat\/([^/]+)/)?.[1] ?? '');
+  const sessions = useMemo(
+    () => (data?.sessions ?? []).filter((s) => !(s.store === 'desktop' && s.turnCount === 0 && s.id !== activeId)),
+    [data, activeId],
+  );
   const groups = useMemo(() => groupSessions(sessions, Date.now()), [sessions]);
   const tags = useMemo(() => collectTags(sessions), [sessions]);
 
