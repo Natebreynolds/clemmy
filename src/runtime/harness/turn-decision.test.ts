@@ -612,3 +612,56 @@ test('dispatch-handoff reply: mandated fire-and-forget phrasing is recognized', 
   assert.equal(looksLikeDispatchHandoffReply('I cannot run tools this turn because there are no tools available, but it will report back when it finishes.'), false);
   assert.equal(looksLikeDispatchHandoffReply('**workflow_run**\n```json\n{"name":"x"}\n```\nIt will report back when it finishes.'), false, 'hallucinated transcript never salvages');
 });
+
+// STEER-TURN salvage (live 2026-07-23): both goldens are verbatim from a real
+// user's transcript where the stall machinery answered an ack/steer with
+// "I've been unable to make progress — retry, switch approach, or stop?".
+test('steer salvage: ack and continuation turns deliver the prose, work asks fall through', async () => {
+  const { steerTurnReplySalvage } = await import('./turn-decision.js');
+  const statusReply = 'The video/personal-brand campaign is still progressing through the final draft build across the contact set.';
+  const ackReply = "Got it — locked in: for batch draft work I'll go straight to the direct verified draft run using your contacts and video, skipping the background batch setup.";
+
+  // Golden 1: instruction/ack turn — prose accepted regardless of background state.
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'Okay well done, from now on. always take this path ok?',
+    finalOutput: ackReply,
+    hasActiveBackgroundWork: false,
+  }), ackReply);
+
+  // Golden 2: continuation nudge with this chat's dispatched run in flight.
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'Well done, keep pushing through',
+    finalOutput: statusReply,
+    hasActiveBackgroundWork: true,
+  }), statusReply);
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'Well done you got this, keep it going',
+    finalOutput: statusReply,
+    hasActiveBackgroundWork: true,
+  }), statusReply);
+
+  // A continuation nudge with NO background work is a real work ask — stall
+  // machinery keeps it.
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'keep going',
+    finalOutput: statusReply,
+    hasActiveBackgroundWork: false,
+  }), null);
+  // A real work request never salvages, whatever the reply looks like.
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'send the emails to the prospect list now please',
+    finalOutput: statusReply,
+    hasActiveBackgroundWork: true,
+  }), null);
+  // Detected-bad and contentless replies never salvage.
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'Well done, keep pushing through',
+    finalOutput: 'Continuing.',
+    hasActiveBackgroundWork: true,
+  }), null);
+  assert.equal(steerTurnReplySalvage({
+    userInput: 'okay great',
+    finalOutput: 'I cannot run tools this turn because there are no tools available in this environment for me to use right now.',
+    hasActiveBackgroundWork: false,
+  }), null);
+});

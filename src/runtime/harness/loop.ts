@@ -138,7 +138,7 @@ import {
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
-import { looksLikeDispatchHandoffReply } from './turn-decision.js';
+import { looksLikeDispatchHandoffReply, steerTurnReplySalvage } from './turn-decision.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
@@ -157,17 +157,18 @@ import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from
  *  Effect-evidence for the dispatch-handoff reply salvage below; the tool
  *  result may still be a refusal, but a queued-or-refused dispatch is a REAL
  *  action either way — the reply narrates it, so it is never a zero-work punt. */
-const DISPATCHING_TOOL_NAMES = new Set(['workflow_run']);
-function turnDispatchedBackgroundRun(sessionId: string, turn: number): boolean {
+const DISPATCHING_TOOL_NAMES = new Set(['workflow_run', 'dispatch_background_task']);
+const DISPATCHING_CALL_TOOL_RE = /"name"\s*:\s*"(?:workflow_run|dispatch_background_task)"/;
+function turnDispatchedBackgroundRun(sessionId: string, turn?: number): boolean {
   try {
-    const calls = listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 80 })
-      .filter((e) => e.turn === turn);
+    const calls = listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 200 })
+      .filter((e) => turn === undefined || e.turn === turn);
     for (const e of calls) {
       const d = e.data as { tool?: unknown; arguments?: unknown };
       const tool = typeof d.tool === 'string' ? d.tool : '';
       if (DISPATCHING_TOOL_NAMES.has(tool)) return true;
       if (tool === 'call_tool' && typeof d.arguments === 'string'
-        && /"name"\s*:\s*"workflow_run"/.test(d.arguments)) return true;
+        && DISPATCHING_CALL_TOOL_RE.test(d.arguments)) return true;
     }
   } catch { /* evidence read is best-effort; absent = no salvage */ }
   return false;
@@ -2798,6 +2799,40 @@ async function runConversationCore(
       // (Recent Errors panel, future Tier 3) can show stall patterns
       // distinct from generic conversation_completed.
       if (stallInfo) {
+        // STEER-TURN salvage (live 2026-07-23): "always take this path ok?"
+        // and "keep pushing through" (while this chat's dispatched background
+        // run was in flight) both rode the stall machinery into "I've been
+        // unable to make progress — retry, switch approach, or stop?". For an
+        // ack/steer user turn, the model's substantive prose IS the answer —
+        // deliver it; never the meta-failure ask. Detected-bad shapes and
+        // real work asks fall through to the normal stall handling.
+        const steerReply = steerTurnReplySalvage({
+          userInput: String(options.input ?? ''),
+          finalOutput: turnResult.finalOutput,
+          hasActiveBackgroundWork: turnDispatchedBackgroundRun(options.sessionId),
+        });
+        if (steerReply) {
+          lastDecision = { summary: steerReply.slice(0, 200), reply: steerReply, done: true, nextAction: 'completed', reason: 'steer_turn_reply' };
+          return finalizeStandardConversation({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+            turn: turnResult.turn,
+            eventData: {
+              steps: stepIndex,
+              reason: 'steer_turn_reply',
+              summary: steerReply.slice(0, 200),
+              reply: steerReply,
+              delivered: true,
+            },
+            result: {
+              sessionId: options.sessionId,
+              status: 'completed',
+              steps: stepIndex,
+              lastDecision,
+              lastTurn,
+            },
+          });
+        }
         safeAppend({
           sessionId: options.sessionId,
           turn: turnResult.turn,
