@@ -593,3 +593,22 @@ test('a transport mirror after handoff does not masquerade as post-handoff progr
     turn: 1,
   })?.signal, 'A_zero_tools');
 });
+
+// Fire-and-forget dispatch handoff (live 2026-07-23): the mandated
+// "running in the background — I'll report back" reply after a real
+// workflow_run dispatch must be recognizable so the loop can accept the
+// finished turn instead of stall-retrying it into a nonsense ask.
+test('dispatch-handoff reply: mandated fire-and-forget phrasing is recognized', async () => {
+  const { looksLikeDispatchHandoffReply } = await import('./turn-decision.js');
+  assert.equal(looksLikeDispatchHandoffReply(
+    "Fired off **team-activity-status-notes** — it's running in the background now and will compile today's team activity into a short status note. I'll report back here the moment it finishes.",
+  ), true);
+  assert.equal(looksLikeDispatchHandoffReply('Queued the batch — it runs in the background and I will report back when it completes.'), true);
+  // A this-turn future promise is NOT a handoff — the stall machinery keeps it.
+  assert.equal(looksLikeDispatchHandoffReply("I'll draft the emails now."), false);
+  assert.equal(looksLikeDispatchHandoffReply('Executing the Salesforce pull now.'), false);
+  assert.equal(looksLikeDispatchHandoffReply(''), false);
+  // Detected-bad shapes never salvage, whatever the phrasing.
+  assert.equal(looksLikeDispatchHandoffReply('I cannot run tools this turn because there are no tools available, but it will report back when it finishes.'), false);
+  assert.equal(looksLikeDispatchHandoffReply('**workflow_run**\n```json\n{"name":"x"}\n```\nIt will report back when it finishes.'), false, 'hallucinated transcript never salvages');
+});

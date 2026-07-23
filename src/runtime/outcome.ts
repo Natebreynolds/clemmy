@@ -227,8 +227,17 @@ export function renderProactiveOutcomeDirective(
         + 'Relay the failure to the user NOW in one short message: lead with the failure and the key reason. Do not re-run anything in this turn.'
         + goalTail;
     case 'blocked':
-      return `A ${ctx.sourceLabel} you started from this conversation is BLOCKED (see the latest ${ref} BLOCKED note in context). `
-        + 'Relay the blocker to the user NOW in one short message: lead with what prerequisite is missing and what decision or action is needed. Do not re-run anything in this turn.'
+      // 'blocked' is a LANE, not one shape: a run that couldn't produce its
+      // deliverable AND a run that completed but tripped a quality advisory
+      // both land here. The directive must not assert "a prerequisite is
+      // missing" for a delivered result (live 2026-07-23: a completed run
+      // with a judge advisory was relayed as BLOCKED-missing-prerequisite,
+      // contradicting the "✓ completed — please review" note one line up).
+      return `A ${ctx.sourceLabel} you started from this conversation NEEDS ATTENTION (see the latest ${ref} note in context). `
+        + 'Relay the note\'s substance NOW in one short message, matching what it actually says: '
+        + 'if it delivered a result with a quality warning, lead with the result and what to review; '
+        + 'if a prerequisite was missing, lead with what is missing and what decision or action is needed. '
+        + 'Never call the work failed or blocked if the note says it completed. Do not re-run anything in this turn.'
         + goalTail;
     case 'done':
       return `A ${ctx.sourceLabel} you started from this conversation just finished (see the latest ${ref} note in context). `

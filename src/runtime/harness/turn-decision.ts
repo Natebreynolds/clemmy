@@ -944,6 +944,29 @@ export type TurnTextKind = 'answer' | 'ask' | 'continue' | 'punt' | 'fake_tool_t
  *                          deliverable (Joshua Tree deploy, 2026-07-08)
  *   empty                → nothing usable (empty / recovery sentinel)
  */
+/**
+ * Fire-and-forget DISPATCH HANDOFF reply (live 2026-07-23, GLM lane): the turn
+ * queued a background job (workflow_run et al) and replied exactly as the
+ * rubric mandates — "Fired off X — it's running in the background, I'll report
+ * back when it finishes." The announcement-stall heuristic is text-only, so
+ * this REQUIRED reply nulled to punt, the loop retried a FINISHED turn
+ * (D_decision_unparsed), the honest zero-tool "already done" follow-up tripped
+ * A_zero_tools, and the chain escalated to a nonsense "Should I retry?" ask.
+ * A future-tense promise is only a punt when the future work is THIS turn's;
+ * here the future work belongs to the dispatched run's own report-back.
+ * Callers must pair this with REAL dispatch evidence (a dispatch tool call in
+ * this turn) — text alone never triggers the salvage.
+ */
+const DISPATCH_HANDOFF_SIGNAL_PATTERN =
+  /\b(?:in the background|report back|when it (?:finishes|completes|is done)|once it (?:finishes|completes|is done)|will (?:deliver|post|share) (?:its|the) (?:outcome|result|status))\b/i;
+export function looksLikeDispatchHandoffReply(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (looksLikeToolUnavailableSelfReport(trimmed)) return false;
+  if (looksLikeHallucinatedToolTranscript(trimmed)) return false;
+  return DISPATCH_HANDOFF_SIGNAL_PATTERN.test(trimmed);
+}
+
 export function classifyTurnText(
   text: string,
   evidence: { toolCalls: number; priorSubstantiveWork?: boolean; contractTurn?: boolean },

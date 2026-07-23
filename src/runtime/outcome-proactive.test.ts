@@ -88,3 +88,19 @@ test('proactive report idle age still blocks on a recent real user event', () =>
   assert.equal(age, 5_000);
   assert.equal(shouldProactivelyReport('chat', age), false);
 });
+
+// Live 2026-07-23: a COMPLETED run with a quality advisory was relayed with
+// the blocked-lane directive claiming "a prerequisite is missing" — flatly
+// contradicting the "✓ completed — please review" note delivered one line up.
+// The blocked-lane directive must be evidence-based, never assert a missing
+// prerequisite, and must forbid calling delivered work failed/blocked.
+test('blocked-lane directive matches the note instead of asserting a missing prerequisite', () => {
+  const directive = renderProactiveOutcomeDirective(
+    { status: 'blocked' },
+    { sourceLabel: 'workflow run', sourceId: 'run-123' },
+  );
+  assert.match(directive, /NEEDS ATTENTION/);
+  assert.match(directive, /matching what it actually says/);
+  assert.match(directive, /Never call the work failed or blocked if the note says it completed/);
+  assert.doesNotMatch(directive, /is BLOCKED \(see/);
+});

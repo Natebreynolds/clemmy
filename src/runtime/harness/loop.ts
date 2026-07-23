@@ -138,6 +138,7 @@ import {
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
+import { looksLikeDispatchHandoffReply } from './turn-decision.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
@@ -151,6 +152,27 @@ import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from
  * is observability, not load-bearing for the run's logical outcome —
  * losing one event entry is preferable to crashing the daemon.
  */
+/** True when THIS turn placed a fire-and-forget background dispatch (a
+ *  workflow_run call — direct, batch, or through the call_tool multiplexer).
+ *  Effect-evidence for the dispatch-handoff reply salvage below; the tool
+ *  result may still be a refusal, but a queued-or-refused dispatch is a REAL
+ *  action either way — the reply narrates it, so it is never a zero-work punt. */
+const DISPATCHING_TOOL_NAMES = new Set(['workflow_run']);
+function turnDispatchedBackgroundRun(sessionId: string, turn: number): boolean {
+  try {
+    const calls = listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 80 })
+      .filter((e) => e.turn === turn);
+    for (const e of calls) {
+      const d = e.data as { tool?: unknown; arguments?: unknown };
+      const tool = typeof d.tool === 'string' ? d.tool : '';
+      if (DISPATCHING_TOOL_NAMES.has(tool)) return true;
+      if (tool === 'call_tool' && typeof d.arguments === 'string'
+        && /"name"\s*:\s*"workflow_run"/.test(d.arguments)) return true;
+    }
+  } catch { /* evidence read is best-effort; absent = no salvage */ }
+  return false;
+}
+
 function safeAppend(input: AppendEventInput): void {
   try {
     appendEvent(input);
@@ -2443,6 +2465,30 @@ async function runConversationCore(
           reason: 'durable_work_acknowledged',
         };
       }
+    }
+    // Fire-and-forget dispatch handoff (live 2026-07-23): the turn queued a
+    // background run (workflow_run) and replied exactly as the rubric mandates
+    // ("running in the background — I'll report back"). The text-only
+    // announcement heuristic nulls that REQUIRED reply as a punt, which sent a
+    // FINISHED turn into D_decision_unparsed → A_zero_tools → a nonsense
+    // "Should I retry?" ask. Both anchors must hold: a real dispatch tool call
+    // THIS turn (effect) + the handoff phrasing (text). "I'll draft it next"
+    // after partial work matches neither and still retries.
+    if (
+      !decision
+      && (turnResult.toolCalls ?? 0) > 0
+      && typeof turnResult.finalOutput === 'string'
+      && looksLikeDispatchHandoffReply(turnResult.finalOutput)
+      && turnDispatchedBackgroundRun(options.sessionId, turnResult.turn)
+    ) {
+      const handoffReply = turnResult.finalOutput.trim();
+      decision = {
+        summary: handoffReply.slice(0, 200),
+        reply: handoffReply,
+        done: true,
+        nextAction: 'completed',
+        reason: 'dispatch_handoff_reply',
+      };
     }
     lastDecision = decision ?? lastDecision;
 

@@ -73,12 +73,7 @@ import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { listEvents, getSession } from '../runtime/harness/eventlog.js';
 import {
-  unrequestedWorkflowRunMessage,
-  workflowExplicitlyRequested,
-} from './workflow-run-guard.js';
-import {
   resolveWorkflowName,
-  textRefersToWorkflow,
   workflowNamesEqual,
   type ResolverEntry,
 } from './workflow-resolve.js';
@@ -1338,58 +1333,17 @@ export function registerOrchestrationTools(server: McpServer): void {
       const canonicalName = workflow.data.name;
       if (!workflow.data.enabled) return textResult(`Workflow "${canonicalName}" is disabled.`);
 
-      // Soft boundary guard (2026-05-31 incident): do NOT silently auto-run a
-      // workflow the user did not explicitly name in their recent request.
-      // Scheduled/cron runs do not pass through this tool (they are driven by
-      // the daemon runner), so this is naturally chat/agent-scoped. When there
-      // is no session context (internal/test/non-chat caller) we SKIP the guard
-      // and allow the run — that no-context skip is also what keeps the
-      // existing orchestration-tools tests green.
-      const guardCtx = getToolOutputContext();
-      if (guardCtx?.sessionId) {
-        let recentUserText = '';
-        try {
-          const inputEvents = listEvents(guardCtx.sessionId, {
-            types: ['user_input_received'],
-            desc: true,
-            limit: 5,
-          });
-          recentUserText = inputEvents
-            .map((event) => {
-              const data = event.data as { text?: unknown };
-              // The canonical user-message text lives in data.text (see
-              // session.ts / plan-first.ts append sites; discord-harness.ts
-              // reads data.text). Fall back to stringifying the whole data
-              // object so a future field rename can't silently no-op the guard.
-              return typeof data?.text === 'string' ? data.text : JSON.stringify(event.data ?? {});
-            })
-            .join('\n');
-        } catch {
-          // Event-log read failure must not block a legitimate run.
-          recentUserText = '';
-        }
-
-        // Use the workflow store name + directory basename as slug variants.
-        // Take only the basename of dir (never the full absolute path) so an
-        // unrelated path segment can't produce a spurious "explicitly
-        // requested" match.
-        const slugCandidates = [workflow.name, path.basename(workflow.dir)].filter(
-          (value): value is string => typeof value === 'string' && value.length > 0,
-        );
-        // The user "explicitly requested" this workflow if their recent text
-        // names it directly OR resolves to it by matching name (so a confirmed
-        // fuzzy run — "kick off my prospecting flow" → Morning Prospect Prep —
-        // isn't re-blocked as unrequested). A request that clearly points at a
-        // DIFFERENT workflow (or none) still fails the guard.
-        const thisEntry: ResolverEntry = { name: canonicalName, slug: path.basename(workflow.dir) };
-        if (
-          recentUserText.trim() !== '' &&
-          !workflowExplicitlyRequested(canonicalName, slugCandidates, recentUserText) &&
-          !textRefersToWorkflow(recentUserText, thisEntry, resolverEntries)
-        ) {
-          return textResult(unrequestedWorkflowRunMessage(canonicalName));
-        }
-      }
+      // The old name-literal "unrequested workflow" guard was DELETED here
+      // (2026-07-23, Nathan): it refused a user-confirmed run because the slug
+      // only appeared in the assistant's own question, and it manufactured a
+      // robotic name-confirmation beat before every chat-triggered run. The
+      // protection it aimed at (a silently-invoked workflow heading toward an
+      // external write, 2026-05-31) is carried by the EFFECT layer now: every
+      // irreversible send inside a run hits the approval gates and parks a
+      // card in the origin chat. Constrain effects, not methods.
+      // Session context still matters for ask-then-resume pending inputs and
+      // the origin-session report-back below; absent for internal callers.
+      const toolCtx = getToolOutputContext();
 
       let parsedInputs: Record<string, string>;
       try {
@@ -1416,12 +1370,12 @@ export function registerOrchestrationTools(server: McpServer): void {
         // model-directed retry message that the strict-mode schema could not
         // satisfy — the call that drove the 84× / 3-min hang. No session context
         // (tests / internal callers) → keep the deterministic rejection.
-        if (guardCtx?.sessionId) {
+        if (toolCtx?.sessionId) {
           surfaceWorkflowPendingInputs({
             workflowName: canonicalName,
             requiredInputs: missing,
             providedInputs: normalizedInputs,
-            sessionId: guardCtx.sessionId,
+            sessionId: toolCtx.sessionId,
             originatingRequest: `Run the "${canonicalName}" workflow`,
           });
           const inputList = missing.map((key) => `\`${key}\``).join(', ');
@@ -1439,10 +1393,10 @@ export function registerOrchestrationTools(server: McpServer): void {
 
       // Gap E: carry the triggering chat session so the run re-enters it on a
       // terminal state (in-context report-back, in ADDITION to the global
-      // notification). guardCtx is the agent's tool-output context resolved
+      // notification). toolCtx is the agent's tool-output context resolved
       // above; absent for non-chat callers → notification-only.
       return textResult(
-        queueWorkflowRun(canonicalName, normalizedInputs, { originSessionId: guardCtx?.sessionId }).message,
+        queueWorkflowRun(canonicalName, normalizedInputs, { originSessionId: toolCtx?.sessionId }).message,
       );
     },
   );
