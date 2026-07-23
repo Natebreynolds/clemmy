@@ -665,3 +665,54 @@ test('steer salvage: ack and continuation turns deliver the prose, work asks fal
     hasActiveBackgroundWork: false,
   }), null);
 });
+
+// ---------------------------------------------------------------------------
+// Awaits-user-material suppression (live 2026-07-23 on v2.5.5): after "Ill
+// give you the email copy when you are ready", TWO perfect replies were
+// swallowed by the announcement-stall detector and the user got "unable to
+// make progress". The promised work is contingent on material only the user
+// can provide — retrying cannot succeed; the text IS the deliverable.
+// ---------------------------------------------------------------------------
+
+test('awaits-user-material: both live swallowed replies are recognized, verbatim', async () => {
+  const { textAwaitsUserMaterial } = await import('./turn-decision.js');
+  assert.equal(textAwaitsUserMaterial(
+    'Perfect—send the copy when you have it. I’ll use it to finish the 120 tailored drafts in the workbook.',
+  ), true);
+  assert.equal(textAwaitsUserMaterial(
+    'I’m ready for the copy. Paste it here and I’ll apply it across the completed 120-account workbook.',
+  ), true);
+});
+
+test('awaits-user-material: evaluateProgress does NOT stall the live replies; real punts still stall', async () => {
+  const { evaluateProgress, textAwaitsUserMaterial } = await import('./turn-decision.js');
+  const live1 = 'Perfect—send the copy when you have it. I’ll use it to finish the 120 tailored drafts in the workbook.';
+  const live2 = 'I’m ready for the copy. Paste it here and I’ll apply it across the completed 120-account workbook.';
+  for (const text of [live1, live2]) {
+    const stall = evaluateProgress({ finalOutput: text, toolCalls: 0, sessionId: 'sess-awaits-none' });
+    assert.equal(stall, undefined, `no stall for: ${text.slice(0, 40)}`);
+  }
+
+  // The announcement-punt class stays a stall — promised work the model could
+  // do RIGHT NOW with tools, no user material involved.
+  for (const punt of [
+    'On it — running the Salesforce pull now.',
+    'Executing the Salesforce pull now — I’ll fetch 15 contacts and report back shortly.',
+    'I’ll pull the 25 accounts and get started on the workbook right away.',
+  ]) {
+    assert.equal(textAwaitsUserMaterial(punt), false, `not user-material: ${punt.slice(0, 40)}`);
+    const stall = evaluateProgress({ finalOutput: punt, toolCalls: 0, sessionId: 'sess-awaits-punt' });
+    assert.ok(stall, `still stalls: ${punt.slice(0, 40)}`);
+    assert.equal(stall?.signal, 'A_zero_tools');
+  }
+
+  // Deferring to phantom TOOL output is not user material either.
+  assert.equal(textAwaitsUserMaterial('Waiting for the query results to come back, then I’ll compile the report.'), false);
+
+  // Detected-bad shapes keep their own handling even with contingency prose:
+  // a recognized tool-unavailable self-report is never softened into an
+  // awaiting-user reply (phrasing chosen to match the detector's vocabulary).
+  assert.equal(textAwaitsUserMaterial(
+    "I can't fetch the announcement because there are no tools in this run - send the copy when you have it.",
+  ), false);
+});

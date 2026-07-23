@@ -3788,9 +3788,11 @@ test('runConversation: stall retry that ALSO stalls falls through to sub_agent_s
   });
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.equal(completed[0].data.reason, 'sub_agent_stalled');
-  // Retry was attempted once before giving up.
+  // Retry attempted once, then the recovery-summary turn (2026-07-23) — whose
+  // repeated punt is vetted and rejected — then the terminal.
   const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
-  assert.equal(retryEvents.length, 1);
+  assert.equal(retryEvents.length, 2);
+  assert.equal((retryEvents[1].data as { attempt?: unknown }).attempt, 'recovery_summary');
 });
 
 test('runConversation: structured false tool-unavailable decision is retried', async () => {
@@ -4385,9 +4387,11 @@ test('runConversation: a zero-tool text reply to the draft-present directive is 
   });
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  const delivered = completed.find((e) => (e.data as { reason?: string }).reason === 'plain_text_contract_fulfilled');
-  assert.ok(delivered, 'the compliant draft reply is delivered as fulfillment of the plain-text contract');
-  assert.match(String((delivered!.data as { reply?: string }).reply ?? ''), /ready for your review/);
+  // 2026-07-23: "ready for your review" is awaits-user-material, so the draft
+  // now delivers on the FIRST turn (no stall, no retries) — the plain-text
+  // contract path remains the backstop for shapes the suppressor misses.
+  const delivered = completed.find((e) => /ready for your review/.test(String((e.data as { reply?: string }).reply ?? '')));
+  assert.ok(delivered, 'the compliant draft reply is delivered');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
 });
 
@@ -4454,9 +4458,11 @@ test('runConversation: a substantive answer repeated identically across stall re
   });
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  const salvaged = completed.find((e) => (e.data as { reason?: string }).reason === 'stall_consistent_reply_salvaged');
-  assert.ok(salvaged, 'the consistent substantive reply is salvaged and delivered');
-  assert.match(String((salvaged!.data as { reply?: string }).reply ?? ''), /ready for your review/);
+  // 2026-07-23: the awaits-user-material suppressor now delivers this reply on
+  // the FIRST turn — zero retries burned. The consistent-repeat salvage stays
+  // as the backstop for substantive answers with no user-material cue.
+  const salvaged = completed.find((e) => /ready for your review/.test(String((e.data as { reply?: string }).reply ?? '')));
+  assert.ok(salvaged, 'the consistent substantive reply is delivered');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
 });
 
@@ -5193,4 +5199,88 @@ test('L1 (v2.3.0): a DONE decision with a non-completed action and no reply ALSO
   assert.match(inputs.at(-1) ?? '', /NO visible answer/, 'the self-retry fired');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
   assert.equal(completed.data.summary, 'All 29 drafts are in your Outlook drafts folder.');
+});
+
+// ---------------------------------------------------------------------------
+// Stall recovery must NEVER speak harness meta-language to the user
+// (live 2026-07-23 on v2.5.5: "the model produced text without taking action
+// twice in a row. Should I retry, switch approach, or stop here?" reached a
+// real planning conversation). Contract: retries exhaust → ONE recovery turn
+// asks the model for the user-facing reply → only if THAT fails, a plain
+// human floor with no jargon and no tri-choice.
+// ---------------------------------------------------------------------------
+
+const RECOVERY_SUMMARY_REPLY =
+  'I was partway through pulling the prospect list for your team and hit a wall reading the Salesforce results. ' +
+  'I have the first 15 accounts identified so far. Want me to keep going with those while we sort the rest?';
+
+test('runConversation: exhausted stall retries trigger ONE recovery-summary turn whose reply is DELIVERED', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // Mirror the live incident: the session had REAL prior tool work (Outlook
+  // searches) before the stall — so a summary recounting progress is honest
+  // and passes the recovery vet.
+  appendEvent({
+    sessionId: sess.id, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', toolSlug: 'OUTLOOK_GET_MAIL_DELTA', args: '{}' },
+  });
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    calls += 1;
+    const input = JSON.stringify(items);
+    // The recovery directive is recognizable by its contract phrasing.
+    const isRecoveryTurn = /do not call another tool/i.test(input) && /where you are/i.test(input);
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: isRecoveryTurn ? RECOVERY_SUMMARY_REPLY : 'Continuing.',
+    };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'find 15 prospects for my team in salesforce',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.ok(
+    completed.some((e) => /first 15 accounts identified/.test(String((e.data as { reply?: string }).reply ?? ''))),
+    'the recovery summary IS the delivered reply',
+  );
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no meta-failure ask');
+  const recoveryAttempts = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] })
+    .filter((e) => (e.data as { attempt?: unknown }).attempt === 'recovery_summary');
+  assert.equal(recoveryAttempts.length, 1, 'exactly one recovery-summary turn');
+});
+
+test('runConversation: when even the recovery turn fails, the floor is HUMAN language — no jargon, no tri-choice', async () => {
+  resetEventLog();
+  // This file pins HARNESS_STALL_ASK_USER=off; restore the production default
+  // for the floor path (same idiom as the execute-button truth test above).
+  const prev = process.env.HARNESS_STALL_ASK_USER;
+  process.env.HARNESS_STALL_ASK_USER = 'on';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runRunner: RunRunnerFn = async (_r, _a, items) => ({
+      history: items, lastResponseId: undefined, finalOutput: 'Continuing.',
+    });
+    const result = await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'find 15 prospects for my team in salesforce',
+      makeRunner: makeRunnerStub, runRunner,
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+    assert.equal(asks.length, 1);
+    const q = String((asks[0].data as { question?: string }).question ?? '');
+    assert.match(q, /pick it back up fresh/, 'floor is the plain-language ask');
+    for (const banned of ['unable to make progress', 'the model', 'switch approach', 'retry', 'tool']) {
+      assert.ok(!q.toLowerCase().includes(banned), `floor never says "${banned}"`);
+    }
+    const opts = (asks[0].data as { options?: string[] }).options ?? [];
+    assert.deepEqual(opts, ['Continue', 'Start over'], 'options are human actions, not harness verbs');
+    const recoveryAttempts = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] })
+      .filter((e) => (e.data as { attempt?: unknown }).attempt === 'recovery_summary');
+    assert.equal(recoveryAttempts.length, 1, 'the recovery turn was spent before the floor');
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_STALL_ASK_USER; else process.env.HARNESS_STALL_ASK_USER = prev;
+  }
 });

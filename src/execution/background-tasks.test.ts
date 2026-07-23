@@ -2302,6 +2302,7 @@ test('objective re-anchor: first artifact-less completion auto-continues ONCE wi
     assert.equal(after?.status, 'pending', 'NOT phantom-done — re-queued');
     assert.ok(after?.deliverableContinueQueuedAt, 'one-shot guard stamped');
     assert.ok(after?.continueResolution, 'continuation queued');
+    assert.match(after?.lastCheckInMessage ?? '', /caught it and am continuing/, 'self-correction is visible to the user');
     assert.match(after?.result ?? '', /deliverable does not exist yet/, 'corrective note is the continuation note the model will see');
 
     // Second pass: the continuation runs and AGAIN produces no evidence →
@@ -2340,4 +2341,25 @@ test('objective re-anchor: first artifact-less completion auto-continues ONCE wi
   } finally {
     _setBackgroundDeliveryJudgeForTests(null);
   }
+});
+
+test('tripwire widening: destination-cued draft promises are gated; bare text-draft asks are not', async () => {
+  const { completionLacksDeliverableEvidence } = await import('./background-tasks.js');
+  const bare = createSession({ kind: 'execution', title: 'tripwire-drafts' });
+
+  // External destination named -> the promise is an external artifact.
+  assert.equal(completionLacksDeliverableEvidence({
+    runSessionId: bare.id,
+    prompt: 'in the background: draft 20 outreach emails in outlook for my reps',
+  }), true);
+  assert.equal(completionLacksDeliverableEvidence({
+    runSessionId: bare.id,
+    prompt: 'prepare replies in my drafts folder for every unanswered thread',
+  }), true);
+
+  // No destination -> text-form drafts in the report-back are legitimate.
+  assert.equal(completionLacksDeliverableEvidence({
+    runSessionId: bare.id,
+    prompt: 'draft me some emails for the top accounts',
+  }), false);
 });

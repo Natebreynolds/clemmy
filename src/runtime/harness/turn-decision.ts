@@ -251,7 +251,61 @@ function decisionClosesWithQuestion(decision: OrchestratorDecisionShape): boolea
   return textClosesWithDeliverableQuestion(visible);
 }
 
+/** The reply hands the turn BACK to the user for material only they can
+ *  provide ("send the copy when you have it", "paste it here", "ready for
+ *  your template"). The announced future work is contingent on that input, so
+ *  a stall retry CANNOT succeed — zero tools is the correct shape and the
+ *  text IS the deliverable. Live 2026-07-23 on v2.5.5: "Ill give you the
+ *  email copy when you are ready" was answered twice with exactly this shape
+ *  and both replies were swallowed into "unable to make progress". */
+const AWAITS_USER_MATERIAL_RE = new RegExp(
+  [
+    // Imperative asking the user to hand something over.
+    /\b(?:send|paste|share|drop|upload|forward|provide|give)\b[^.!?\n]{0,60}\b(?:here|over|to me|my way|when you|once you|whenever you)/.source,
+    // Contingency clause on the user's future provision/readiness.
+    /\bwhen(?:ever)?\s+you(?:['’]re| are| have|['’]ve|\s+(?:have|get|send|share|find|locate))\b/.source,
+    /\bonce\s+you(?:['’]ve|\s+(?:have|send|share|provide|get|paste|drop|approve))\b/.source,
+    // Explicit readiness for user-sourced material (NOT "waiting for the
+    // results" — deferring to phantom tool output must still stall).
+    /\b(?:ready|waiting)\s+(?:for|on)\s+your\b/.source,
+    /\bready\s+for\s+the\s+(?:copy|template|file|doc(?:ument)?|text|content|details|info(?:rmation)?|email|list)\b/.source,
+  ].join('|'),
+  'i',
+);
+
+export function textAwaitsUserMaterial(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length < 20) return false;
+  // Detected-bad shapes keep their own handling regardless of contingency prose.
+  if (looksLikeHallucinatedToolTranscript(trimmed)) return false;
+  if (looksLikeToolUnavailableSelfReport(trimmed)) return false;
+  return AWAITS_USER_MATERIAL_RE.test(trimmed);
+}
+
+/** Vet for the stall-recovery summary turn (2026-07-23): the recovery reply
+ *  is delivered ONLY when it is a genuine user-facing summary. Detected-bad
+ *  shapes stay rejected, and an ACTION CLAIM in a session with zero
+ *  substantive tool work is a lie the recovery turn must not launder — with
+ *  real prior work, a summary recounting it is exactly what was asked for. */
+export function recoverySummaryReplyIsDeliverable(
+  text: string,
+  opts: { sessionId?: string; turn?: number } = {},
+): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) return false;
+  if (looksLikeHallucinatedToolTranscript(trimmed)) return false;
+  if (looksLikeToolUnavailableSelfReport(trimmed)) return false;
+  if (
+    trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
+    STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
+    !(opts.sessionId && sessionDidSubstantiveToolWork(opts.sessionId, opts.turn ?? Number.MAX_SAFE_INTEGER))
+  ) return false;
+  return true;
+}
+
 function looksLikeZeroWorkStallText(trimmed: string): boolean {
+  if (textAwaitsUserMaterial(trimmed)) return false;
   if (trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) return true;
   if (
     trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
@@ -550,6 +604,7 @@ export function evaluateStructuredDecisionStall(opts: {
     STALL_ANNOUNCEMENT_PATTERN.test(combined) &&
     !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined) &&
     !decisionClosesWithQuestion(decision) &&
+    !textAwaitsUserMaterial(combined) &&
     // Not a false "zero-tool claim" when the model is REPORTING a genuine
     // completion (done:true) whose work was done in PRIOR turns — a
     // "searched, found nothing" answer makes no NEW tool call but isn't a lie.
@@ -747,7 +802,8 @@ export function evaluateProgress(opts: {
       trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
       STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
       !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed) &&
-      !textClosesWithDeliverableQuestion(trimmed)
+      !textClosesWithDeliverableQuestion(trimmed) &&
+      !textAwaitsUserMaterial(trimmed)
     ) {
       return {
         signal: 'A_zero_tools',
