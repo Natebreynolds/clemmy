@@ -13183,7 +13183,9 @@ export function registerConsoleRoutes(
         // the RAW `input` (not attachment-folded `turnInput`) so dropped-file
         // contents can't trip it; the FULL `turnInput` is what the worker receives.
         // Skips approval-resume, a session paused on approval, and /goal runs.
-        if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input)) {
+        // Space sessions stay foreground unless the background lane is named
+        // explicitly — the user is watching the workspace being edited.
+        if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input, { sessionId })) {
           const task = enqueueDurableChatTask({
             message: turnInput,
             sessionId,

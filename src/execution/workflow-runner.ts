@@ -19,6 +19,7 @@ import {
   appendEvent as appendHarnessEvent,
   beginRunAttempt,
   finishRunAttempt,
+  getSession as getHarnessSession,
   isKillRequested,
   listEvents as listHarnessEvents,
   preserveCurrentKillAndClearStale,
@@ -582,6 +583,20 @@ export interface QueuedRunRecord {
  * patches one assistant turn per approvalId, so re-parks dedupe naturally.
  * Best-effort by contract: the prose needs_input turn remains the baseline.
  */
+/** Discord/Slack render the approval NOTIFICATION CARD in the origin channel
+ *  via the fan-out, so the park's proactive "reply approve apr-x" prose there
+ *  is a duplicate (live 2026-07-23: two approval messages for one decision).
+ *  Desktop keeps the relay — its card folds into the same conversation.
+ *  Exported for tests. */
+export function originChannelRendersOwnApprovalCard(originSessionId: string): boolean {
+  try {
+    const channel = getHarnessSession(originSessionId)?.channel ?? '';
+    return channel === 'discord' || channel === 'slack';
+  } catch {
+    return false; // default: relay — a missing session must not silence the prose
+  }
+}
+
 export function emitParkedApprovalCardToOriginChat(input: {
   originSessionId: string;
   approvalId: string | undefined;
@@ -7716,6 +7731,14 @@ async function processOneRunFile(
             workflowName: workflow.data.name,
             runId: run.id,
           });
+          // Discord/Slack origins get the approval NOTIFICATION CARD in the
+          // same channel via the fan-out above — firing the proactive
+          // "reply approve apr-x" prose there too produced two approval
+          // messages for one decision (live 2026-07-23). The prose relay is
+          // for surfaces where the card folds into the SAME conversation
+          // (desktop); channel origins keep the passive staging (context for
+          // their next turn) + the channel card.
+          const channelHasOwnApprovalCard = originChannelRendersOwnApprovalCard(originSessionId);
           deliverOutcome(
             {
               status: 'needs_input',
@@ -7729,7 +7752,7 @@ async function processOneRunFile(
               sourceId: `${run.id}#parked-${gateKey}`,
               title: workflow.data.name,
               statusHint: `workflow_run_status run_id="${run.id}"`,
-              proactiveTurn: true,
+              proactiveTurn: !channelHasOwnApprovalCard,
             },
           );
         }

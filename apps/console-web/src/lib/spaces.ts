@@ -174,6 +174,18 @@ export function gapQuestions(notes: SpaceNote[]): GapQuestion[] {
     .map((g) => ({ question: g.question, why: typeof g.why === 'string' ? g.why : undefined }));
 }
 
+/** The data feeds whose LATEST refresh failed. The audit trail is append-only
+ *  and edit loops execute every intermediate save, so historical error entries
+ *  are normal — a feed that errored mid-edit and refreshed clean afterward is
+ *  healthy and must not keep showing a dead error in the banner. */
+export function latestRefreshFailures(audit: SpaceAudit[]): SpaceAudit[] {
+  const latestByPath = new Map<string, SpaceAudit>();
+  for (const a of audit) {
+    if (a.method === 'REFRESH') latestByPath.set(a.path, a);
+  }
+  return [...latestByPath.values()].filter((a) => a.outcome === 'error').slice(0, 3);
+}
+
 /** Absolute URL the daemon serves the view at (same-origin → cookie-authed). */
 export const spaceViewUrl = (id: string) => `/console/spaces/${encodeURIComponent(id)}/view`;
 

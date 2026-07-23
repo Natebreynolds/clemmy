@@ -3650,3 +3650,19 @@ test('A2: parking emits the actionable approval card into the origin chat', () =
   }), false);
   assert.equal(listEvents(origin, { types: ['approval_requested'] }).length, 1, 'failed emits add nothing');
 });
+
+// Discord double-card (live 2026-07-23): a workflow fired FROM Discord that
+// parked on approval produced TWO approval messages in the channel — the
+// notification card (fan-out) + the proactive "reply approve apr-x" prose
+// relay. Channel origins with their own approval cards suppress the prose
+// (passive staging remains); desktop keeps the relay (its card folds inline).
+// Pinned at the channel-classification level the park block consults.
+test('park relay: discord/slack origins suppress the proactive prose, desktop keeps it', async () => {
+  const { originChannelRendersOwnApprovalCard } = await import('./workflow-runner.js');
+  for (const [channel, suppressed] of [['desktop', false], ['discord', true], ['slack', true]] as const) {
+    const s = HarnessSession.create({ id: `park-relay-${channel}`, kind: 'chat', channel, title: 'relay test', metadata: {} });
+    assert.equal(originChannelRendersOwnApprovalCard(s.id), suppressed, `${channel} origin`);
+  }
+  // Unknown session → default to relaying (never silence the prose blindly).
+  assert.equal(originChannelRendersOwnApprovalCard('sess-does-not-exist'), false);
+});

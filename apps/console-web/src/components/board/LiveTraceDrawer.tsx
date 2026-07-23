@@ -76,6 +76,13 @@ function lifecycleDetail(ev: HarnessEvent): string {
   const d = (ev.data ?? {}) as Record<string, unknown>;
   if (ev.type === 'step_started') return typeof d.title === 'string' ? d.title : '';
   if (ev.type === 'conversation_completed' || ev.type === 'run_failed') return '';
+  if (ev.type === 'guardrail_tripped') {
+    // Say WHAT tripped and whether it mattered — a bare "Guardrail" row reads
+    // as something going wrong when most trips are advisory warnings.
+    const reason = typeof d.reason === 'string' ? d.reason : (typeof d.rule === 'string' ? d.rule : '');
+    const action = d.action === 'warn' ? 'advisory' : (typeof d.action === 'string' ? d.action : '');
+    return [action, reason].filter(Boolean).join(' — ').slice(0, 140);
+  }
   return humanHarnessText(d, '').slice(0, 140);
 }
 
