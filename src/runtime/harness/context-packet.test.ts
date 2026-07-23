@@ -408,7 +408,7 @@ test('context packet states provider-access facts: no raw key -> OAuth-lane-only
     const packet = buildAgentContextPacket('check chatgpt visibility for 120 accounts and build a sheet', {
       enabled: false, hitCount: 0, injected: false,
     } as never, { sessionKind: 'chat' });
-    assert.match(packet.text, /OAuth model lane ONLY — no raw API key exists/);
+    assert.match(packet.text, /OAuth model lane ONLY — no raw API key is configured/);
     assert.match(packet.text, /Together AI, Moonshot \(Kimi\)/);
     assert.match(packet.text, /do NOT search the filesystem/);
 
@@ -418,6 +418,26 @@ test('context packet states provider-access facts: no raw key -> OAuth-lane-only
     } as never, { sessionKind: 'chat' });
     assert.match(withKey.text, /raw API key configured/);
     assert.ok(!withKey.text.includes('sk-test-shape-only'), 'key VALUES never appear in context');
+
+    // Live 2026-07-24: the key lived in the SECRETS VAULT (embeddings/voice)
+    // while the env was empty — an env-only check stated a falsehood. The
+    // card must read the real accessor (vault first).
+    delete process.env.OPENAI_API_KEY;
+    const { writeFileSync: writeVault, mkdirSync: mkVault } = await import('node:fs');
+    const vaultDir = path.join(process.env.CLEMENTINE_HOME ?? '', 'state');
+    mkVault(vaultDir, { recursive: true });
+    const vaultPath = path.join(vaultDir, 'secrets-vault.json');
+    writeVault(vaultPath, JSON.stringify({ version: 'v1', entries: { openai_api_key: 'sk-vault-shape-only' } }), 'utf-8');
+    try {
+      const vaultBacked = buildAgentContextPacket('same ask once more', {
+        enabled: false, hitCount: 0, injected: false,
+      } as never, { sessionKind: 'chat' });
+      assert.match(vaultBacked.text, /raw API key configured/, 'vault-held key is KNOWN to the card');
+      assert.ok(!vaultBacked.text.includes('sk-vault-shape-only'), 'vault key VALUES never appear in context');
+    } finally {
+      const { rmSync: rmVault } = await import('node:fs');
+      try { rmVault(vaultPath); } catch { /* best effort */ }
+    }
   } finally {
     if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
     if (prevByo === undefined) delete process.env.BYO_PROVIDERS; else process.env.BYO_PROVIDERS = prevByo;

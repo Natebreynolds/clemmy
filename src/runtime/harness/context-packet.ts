@@ -1,6 +1,6 @@
 import { existsSync, statfsSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR } from '../../config.js';
+import { BASE_DIR, getOpenAiApiKey } from '../../config.js';
 import { getFocusSnapshot } from '../../memory/focus.js';
 import { listActiveSkills } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
@@ -565,7 +565,10 @@ function harnessCapabilityHealthWarnings(limit = 3): string[] {
  *  presence only; never values. */
 function providerAccessLine(): string {
   try {
-    const hasRawOpenAI = Boolean((process.env.OPENAI_API_KEY ?? '').trim());
+    // The REAL accessor (secrets vault first, then env) — live 2026-07-24 the
+    // key existed in the secrets vault for embeddings/voice while an env-only
+    // check (and the model's filesystem hunt through the NOTES vault) said no.
+    const hasRawOpenAI = Boolean(getOpenAiApiKey().trim());
     let byoLabels: string[] = [];
     try {
       const raw = (process.env.BYO_PROVIDERS ?? '').trim();
@@ -576,8 +579,8 @@ function providerAccessLine(): string {
       }
     } catch { /* unparseable BYO list — omit labels */ }
     const openaiPart = hasRawOpenAI
-      ? 'OpenAI: raw API key configured (OPENAI_API_KEY) plus the connected OAuth model lane'
-      : 'OpenAI: connected OAuth model lane ONLY — no raw API key exists on this machine';
+      ? 'OpenAI: raw API key configured (harness secret store — reachable through harness config, NEVER print or export it) plus the connected OAuth model lane'
+      : 'OpenAI: connected OAuth model lane ONLY — no raw API key is configured';
     const byoPart = byoLabels.length ? `BYO model providers: ${byoLabels.join(', ')}` : 'BYO model providers: none';
     return [
       'Provider access (harness facts — do NOT search the filesystem, vault, or env for API keys):',
