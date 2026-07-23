@@ -815,3 +815,27 @@ test('a complete-set query keyword never suppresses vault recall that holds the 
   const noteText = (noteHit?.text ?? '').replace(/[[\]]/g, '');
   assert.match(noteText, /freeze the budget/, 'the answering content is present, not suppressed');
 });
+
+// Deliverable store rides the unified spine (2026-07-23): "where did I put
+// the user's work" surfaces in the FIRST-TURN primer before any tool
+// grinding — the live incident query must recall the drafted md file.
+test('unified recall surfaces deliverables with the YOUR WORK LIVES AT label', async () => {
+  const { recordDeliverable } = await import('./deliverable-index.js');
+  const { writeFileSync } = await import('node:fs');
+  const path = await import('node:path');
+  const draftsPath = path.join(process.env.CLEMENTINE_HOME!, 'ML-30-AI-Search-Drafts.md');
+  writeFileSync(draftsPath, '# Market Leader Outreach — 30 Drafts\n', 'utf-8');
+  recordDeliverable({
+    kind: 'file',
+    target: draftsPath,
+    why: 'Market Leader outreach — 30 personalized AI-search email drafts for review',
+    lane: 'local',
+  });
+  const result = await recallEverything('find those emails we crafted for the market leader outreach');
+  const hit = result.hits.find((h) => h.type === 'deliverable');
+  assert.ok(hit, `deliverable hit present, got types: ${result.hits.map((h) => h.type).join(', ')}`);
+  assert.match(hit!.snippet, /ML-30-AI-Search-Drafts\.md/);
+  const primer = formatUnifiedPrimer(result);
+  assert.match(primer, /YOUR WORK LIVES AT/);
+  assert.match(primer, /ML-30-AI-Search-Drafts\.md/);
+});

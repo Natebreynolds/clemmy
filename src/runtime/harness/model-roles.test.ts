@@ -458,9 +458,12 @@ test('route policy: empty policy table ⇒ resolveRoleModel is byte-identical to
 
 test('route policy: a measured winner overrides the default with source=policy; kill-switch restores static', async () => {
   const { resetModelRouteMetricsForTest, recordModelRouteDecision, recordModelRouteOutcome } = await import('../model-route-metrics.js');
-  const { runRoutePolicyJob, clearRoutePolicyCache } = await import('./route-policy.js');
+  const { runRoutePolicyJob, clearRoutePolicyCache, setRoutePolicySamplerForTest } = await import('./route-policy.js');
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();
+  // Thompson is default-on: pin the posterior draw to the Beta mean so the
+  // wiring assertion is deterministic (the clear winner still wins).
+  setRoutePolicySamplerForTest((a, b) => a / (a + b));
 
   const NOW = new Date('2026-07-01T12:00:00.000Z');
   const seed = (model: string, n: number, successRate: number): void => {
@@ -503,15 +506,17 @@ test('route policy: a measured winner overrides the default with source=policy; 
       assert.equal(off.modelId, staticDefault);
     });
   });
+  setRoutePolicySamplerForTest(null);
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();
 });
 
 test('route policy reports declared gpt-shaped all_in winners as BYO', async () => {
   const { resetModelRouteMetricsForTest, recordModelRouteDecision, recordModelRouteOutcome } = await import('../model-route-metrics.js');
-  const { runRoutePolicyJob, clearRoutePolicyCache } = await import('./route-policy.js');
+  const { runRoutePolicyJob, clearRoutePolicyCache, setRoutePolicySamplerForTest } = await import('./route-policy.js');
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();
+  setRoutePolicySamplerForTest((a, b) => a / (a + b));
   const now = new Date('2026-07-02T12:00:00.000Z');
   withEnv({
     AUTH_MODE: 'api_key',
@@ -539,6 +544,7 @@ test('route policy reports declared gpt-shaped all_in winners as BYO', async () 
     assert.equal(resolved.modelId, 'gpt-4o');
     assert.equal(resolved.provider, 'byo');
   });
+  setRoutePolicySamplerForTest(null);
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();
 });

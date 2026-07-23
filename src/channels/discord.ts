@@ -84,6 +84,7 @@ import { buildDiscordInstallUrl } from './discord-install.js';
 import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
 import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
+import { approveTrustProposal, declineTrustProposal, getTrustProposal } from '../agents/trust-graduation.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { cancelBackgroundTask, queueBackgroundTaskApprovalResolution, listBackgroundTasks } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
@@ -1122,6 +1123,21 @@ function buildCheckInActions(checkInId: string) {
   ];
 }
 
+function buildTrustProposalActions(trustProposalId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:trust-approve:${trustProposalId}`)
+        .setLabel('Approve')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:trust-decline:${trustProposalId}`)
+        .setLabel('Decline')
+        .setStyle(ButtonStyle.Danger),
+    ),
+  ];
+}
+
 /**
  * Resolve which ActionRow to attach to an outbound notification, based
  * on the notification's metadata. The notification queue tags
@@ -1144,6 +1160,12 @@ export function buildActionsForNotification(metadata: Record<string, unknown> | 
     const draft = getGoalDraft(goalDraftId);
     if (!draft || draft.status !== 'pending') return undefined;
     return buildGoalDraftActions(goalDraftId);
+  }
+  const trustProposalId = typeof metadata.trustProposalId === 'string' ? metadata.trustProposalId : undefined;
+  if (trustProposalId) {
+    const proposal = getTrustProposal(trustProposalId);
+    if (!proposal || proposal.status !== 'pending') return undefined;
+    return buildTrustProposalActions(trustProposalId);
   }
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) return buildApprovalActions(approvalId);
@@ -2560,6 +2582,34 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
           ),
         );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (action === 'trust-approve' || action === 'trust-decline') {
+      const proposal = getTrustProposal(targetId);
+      if (!proposal) {
+        await interaction.reply({ content: `Send-trust suggestion \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      if (proposal.status !== 'pending') {
+        await collapseApprovalCard(interaction, 'already-resolved', `suggestion is already ${proposal.status}`);
+        return;
+      }
+      // The SAME module functions the desktop routes call — one code path,
+      // desktop↔Discord parity. Approve is the sole grant path.
+      const result = action === 'trust-approve'
+        ? approveTrustProposal(targetId, 'discord')
+        : declineTrustProposal(targetId, 'discord');
+      if (action === 'trust-approve') {
+        const detail = result.reason === 'approved'
+          ? `granted send-trust ${result.grantId ? `\`${result.grantId}\`` : ''}`.trim()
+          : result.reason === 'superseded'
+            ? 'already covered — nothing granted'
+            : 'could not grant';
+        await collapseApprovalCard(interaction, result.reason === 'approved' ? 'approved' : 'already-resolved', detail);
+      } else {
+        await collapseApprovalCard(interaction, 'rejected', 'declined — nothing granted');
+      }
       return;
     }
 

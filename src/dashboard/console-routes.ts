@@ -253,6 +253,12 @@ import {
   grantSendTrust, revokeSendTrust, listSendTrustGrants, SEND_TRUST_MAX_RECIPIENTS,
   grantSendTrustFromApprovedAction,
 } from '../agents/plan-scope.js';
+import {
+  listTrustProposals,
+  getTrustProposal,
+  approveTrustProposal,
+  declineTrustProposal,
+} from '../agents/trust-graduation.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import {
   archiveBackgroundTask,
@@ -8751,6 +8757,52 @@ export function registerConsoleRoutes(
     const ok = revokeSendTrust(req.params.id);
     if (!ok) { res.status(404).json({ error: 'no live send-trust grant with that id' }); return; }
     res.json({ revoked: true });
+  });
+
+  // ─── Trust-graduation proposals ──────────────────────────────────
+  // Clem observes a stable pattern of clean approved sends and PROPOSES a
+  // scoped send-trust grant. Approve is the ONLY apply path (calls
+  // grantSendTrust); decline grants nothing. Same module functions back the
+  // Discord one-tap buttons — one code path, desktop↔Discord parity.
+  app.get('/api/console/trust-proposals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const wanted = (status === 'pending' || status === 'approved' || status === 'declined'
+      || status === 'superseded' || status === 'expired') ? status : 'pending';
+    try {
+      res.json({ proposals: listTrustProposals(wanted) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/trust-proposals/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const p = getTrustProposal(req.params.id);
+    if (!p) { res.status(404).json({ error: 'proposal not found' }); return; }
+    res.json({ proposal: p });
+  });
+
+  app.post('/api/console/trust-proposals/:id/approve', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = approveTrustProposal(req.params.id, 'desktop');
+      if (result.reason === 'not-found') { res.status(404).json({ error: 'proposal not found' }); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/trust-proposals/:id/decline', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = declineTrustProposal(req.params.id, 'desktop');
+      if (result.reason === 'not-found') { res.status(404).json({ error: 'proposal not found' }); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // ─── MCP servers (manageable from the Integrations Hub) ────────

@@ -20,7 +20,7 @@ import {
 import { isConvertibleExtension } from '../runtime/markitdown.js';
 import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
-import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { callIdFromToolDetails, getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { classifyShellNetworkMutation, expandLiteralShellCommands } from '../runtime/harness/destination-gate.js';
 import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
 import { SPACES_DIR, isValidSpaceSlug, spaceStore } from '../spaces/store.js';
@@ -215,6 +215,27 @@ export function needsApprovalForWriteFile() {
     if (inputTargetsSensitivePath('write_file', input)) return true;
     return base(runContext, input);
   };
+}
+
+/** Deliverable index tee (2026-07-23): a successfully written file IS a
+ *  deliverable — record where it lives in durable memory (memory.db) so a
+ *  later "find those drafts we made" recalls the path instead of grinding
+ *  through mailbox searches. write_file emits no external_write event (local
+ *  effect), so it needs its own tee. Fire-and-forget by contract. */
+function teeFileDeliverable(filePath: string): void {
+  try {
+    const ctx = getToolOutputContext();
+    void import('../memory/deliverable-index.js')
+      .then(async ({ recordDeliverable }) => {
+        let why = '';
+        try {
+          const { getSession } = await import('../runtime/harness/eventlog.js');
+          why = (ctx?.sessionId ? getSession(ctx.sessionId)?.title : '') ?? '';
+        } catch { /* title enrichment only */ }
+        recordDeliverable({ kind: 'file', target: filePath, why, sessionId: ctx?.sessionId ?? null, lane: 'local' });
+      })
+      .catch(() => { /* best-effort */ });
+  } catch { /* never affect the write result */ }
 }
 
 const MAX_COMMAND_CAPTURE_CHARS = 200_000;
@@ -1195,6 +1216,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       if (mode === 'append') {
         const needsBoundary = exists && statSync(filePath).size > 0 && !readFileSync(filePath, 'utf-8').endsWith('\n');
         appendFileSync(filePath, `${needsBoundary ? '\n' : ''}${content}`, 'utf-8');
+        teeFileDeliverable(filePath);
         const notice = workspaceAuthoringNotice(filePath);
         return [`Appended ${filePath} (${input.content.length} chars).`, notice].filter(Boolean).join('\n\n');
       }
@@ -1212,6 +1234,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       }
 
       writeFileSync(filePath, content, 'utf-8');
+      teeFileDeliverable(filePath);
       const notice = workspaceAuthoringNotice(filePath);
       return [`${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`, notice].filter(Boolean).join('\n\n');
     },

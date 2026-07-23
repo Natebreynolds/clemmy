@@ -9,6 +9,7 @@ import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickIdentityEvolution } from './identity-evolution.js';
+import { tickTrustGraduation } from '../agents/trust-graduation.js';
 import { reapStaleWorkingMemory } from './working-memory.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
@@ -828,6 +829,13 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // approval ever writes IDENTITY.md/SOUL.md curated text.
   if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
     await tickIdentityEvolution();
+  }
+
+  // Trust graduation — ~24h check for a stable pattern of clean approved
+  // sends. PROPOSAL ONLY: it drafts a pending send-trust suggestion for the
+  // owner; only an explicit approval ever calls grantSendTrust. Never throws.
+  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
+    tickTrustGraduation();
   }
 
   // Explicit nightly fire at 3:00 AM local. Independent of the periodic

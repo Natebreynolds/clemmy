@@ -1,4 +1,5 @@
 import { openMemoryDb, type MemoryEpisodeStatus } from './db.js';
+import { renderDeliverableHit, searchDeliverables } from './deliverable-index.js';
 import {
   findSimilarFactsScored,
   getFact,
@@ -32,7 +33,8 @@ export type MemoryRef =
   | { type: 'entity'; id: number }
   | { type: 'resource'; id: number }
   | { type: 'episode'; id: string }
-  | { type: 'note' | 'procedure' | 'policy'; id: string };
+  | { type: 'note' | 'procedure' | 'policy'; id: string }
+  | { type: 'deliverable'; id: string };
 
 export interface MemoryEvidenceHit {
   ref: MemoryRef;
@@ -57,7 +59,7 @@ export interface MemoryRecallContext {
   perStore?: number;
   graphDepth?: 0 | 1 | 2;
   asOf?: string;
-  stores?: Array<'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure'>;
+  stores?: Array<'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure' | 'deliverable'>;
   resourceMinOverlap?: number;
   /** Deterministic clock override for relative temporal queries. */
   now?: string;
@@ -606,7 +608,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const limit = clamp(context.limit ?? 12, 1, 50);
   const perStore = clamp(context.perStore ?? Math.max(8, limit), 1, 30);
   const depth = context.graphDepth ?? 1;
-  const wanted = new Set(context.stores ?? ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure']);
+  const wanted = new Set(context.stores ?? ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure', 'deliverable']);
   const usedStores = new Set<string>();
   const merged = new Map<string, MemoryEvidenceHit>();
   const logicalMeetingKeys = new Map<string, string>();
@@ -807,6 +809,29 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   }
 
   for (const resource of getResourcePointersByIds(Array.from(resourceIds))) resourceById.set(resource.id, resource);
+  // Deliverable index (2026-07-23): "where did I put the user's work" — files
+  // written, drafts created, sheets updated, captured at the effect boundary
+  // across every lane. Surfacing it here puts the answer in the FIRST-TURN
+  // primer, before any tool grinding ("find those emails we drafted" → the
+  // Desktop .md path, verified against the live filesystem). Advisory context
+  // like every other store — never a gate.
+  if (wanted.has('deliverable')) {
+    usedStores.add('deliverable');
+    for (const d of searchDeliverables(objective, perStore)) {
+      const gone = d.kind === 'file' && d.stillExists === false;
+      const hit: MemoryEvidenceHit = {
+        ref: { type: 'deliverable', id: `${d.kind}:${d.target}` },
+        title: `Deliverable: ${d.title}`,
+        text: renderDeliverableHit(d),
+        score: gone ? Math.min(d.score, 0.4) : Math.min(0.95, 0.55 + d.score * 0.4),
+        confidence: gone ? 0.4 : 0.9,
+        evidence: [],
+        whyRecalled: [`deliverable index (${d.kind}${gone ? ', file missing' : ''})`],
+      };
+      mergeHit(merged, hit);
+    }
+  }
+
   if (wanted.has('resource')) {
     for (const resource of Array.from(resourceById.values()).slice(0, perStore * 3)) {
       const supportingEdges = factResourceEdges.filter((edge) => edge.resourceId === resource.id);

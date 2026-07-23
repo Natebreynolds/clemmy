@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../../config.js';
@@ -1036,8 +1037,28 @@ export function closeEventLog(): void {
   }
 }
 
-/** Test-only: drop the DB file so the next open starts fresh. */
+/** Test-only: drop the DB file so the next open starts fresh.
+ *
+ * DESTRUCTIVE-STORE GUARD (2026-07-23): the live home's harness.db was found
+ * recreated with ALL session history gone — one un-isolated script importing
+ * this function is enough (same class as the memory.db wipe that produced the
+ * isolate-CLEMENTINE_HOME rule). A reset now REFUSES unless the resolved DB
+ * path lives under the OS temp dir (every test pins CLEMENTINE_HOME to a
+ * mkdtemp home) or the caller explicitly sets CLEMMY_ALLOW_EVENTLOG_RESET=1.
+ * Protecting the store at the API, not by convention. */
 export function resetEventLog(): void {
+  const tmpRoot = os.tmpdir();
+  const resolved = path.resolve(HARNESS_DB_PATH);
+  const allowed = resolved.startsWith(path.resolve(tmpRoot) + path.sep)
+    || resolved.startsWith('/tmp/')
+    || resolved.startsWith('/private/tmp/')
+    || process.env.CLEMMY_ALLOW_EVENTLOG_RESET === '1';
+  if (!allowed) {
+    throw new Error(
+      `resetEventLog REFUSED: ${resolved} is not under a temp home. This deletes ALL session history. `
+      + 'Point CLEMENTINE_HOME at a mkdtemp directory first (or set CLEMMY_ALLOW_EVENTLOG_RESET=1 if you truly mean it).',
+    );
+  }
   closeEventLog();
   for (const suffix of ['', '-wal', '-shm']) {
     const file = HARNESS_DB_PATH + suffix;
@@ -1436,6 +1457,31 @@ export function appendEvent(input: AppendEventInput): EventRow {
         ...(input.data && typeof input.data === 'object' ? input.data : {}),
       });
     } catch { /* the ledger never blocks the event write */ }
+  }
+  // Deliverable index tee (2026-07-23): every lane's external writes flow
+  // through THIS seam, so one tee gives "where did I put the user's work"
+  // durable memory (memory.db — it must survive an evidence-store wipe; see
+  // deliverable-index.ts). Fire-and-forget: the memory write never blocks or
+  // fails the event append.
+  if (input.type === 'external_write') {
+    const d = (input.data ?? {}) as { shapeKey?: unknown; targets?: unknown };
+    const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : undefined;
+    const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
+    if (targets.length > 0) {
+      let why = '';
+      try {
+        const sess = db.prepare('SELECT title FROM sessions WHERE id = ?').get(input.sessionId) as { title?: string } | undefined;
+        why = sess?.title ?? '';
+      } catch { /* title enrichment only */ }
+      void import('../../memory/deliverable-index.js')
+        .then(({ recordDeliverable, deliverableKindForShape }) => {
+          const kind = deliverableKindForShape(shapeKey);
+          for (const target of targets.slice(0, 25)) {
+            recordDeliverable({ kind, target, title: shapeKey ?? kind, why, sessionId: input.sessionId, lane: 'external' });
+          }
+        })
+        .catch(() => { /* best-effort */ });
+    }
   }
   return publishPersistedEvent(event);
 }

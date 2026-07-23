@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { openMemoryDb } from './db.js';
 
-export const RECALL_REF_TYPES = ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure'] as const;
+export const RECALL_REF_TYPES = ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure', 'deliverable'] as const;
 export type RecallRefType = (typeof RECALL_REF_TYPES)[number];
 
 export interface RecallCandidateRef {

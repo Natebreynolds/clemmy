@@ -13,8 +13,9 @@ import { linkify } from '@/lib/linkify';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
   listNotifications, markNotificationRead, retryNotification,
+  listTrustProposals, decideTrustProposal,
   relativeTime, notifTone, notifFailed,
-  type ApprovalRow, type NotificationRow,
+  type ApprovalRow, type NotificationRow, type TrustProposalRow,
 } from '@/lib/inbox';
 
 /** Client mirror of the backend's needs-attention rule (runtime/notifications.ts)
@@ -55,15 +56,17 @@ export function Inbox() {
 
   const approvals = usePoll(['approvals'], listApprovals, 6000);
   const notifications = usePoll(['notifications'], listNotifications, 8000);
+  const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
 
   const approvalRows = approvals.data?.approvals ?? [];
   const notifRows = notifications.data?.notifications ?? [];
+  const trustRows = trustProposals.data?.proposals ?? [];
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
   // beside approvals (and leave once read); everything else stays in Notifications.
   const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
-  const needsCount = approvalRows.length + attentionRows.length;
+  const needsCount = approvalRows.length + attentionRows.length + trustRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
@@ -103,6 +106,9 @@ export function Inbox() {
   const onCancelStale = async () => {
     try { await cancelStaleApprovals(); } finally { invalidate('approvals', 'approvals-count'); }
   };
+  const onDecideTrust = async (id: string, decision: 'approve' | 'decline') => {
+    try { await decideTrustProposal(id, decision); } finally { invalidate('trust-proposals', 'approvals-count', 'command-center'); }
+  };
   const onRead = async (id: string) => { try { await markNotificationRead(id); } finally { invalidate('notifications'); } };
   const onRetry = async (id: string) => { try { await retryNotification(id); } finally { invalidate('notifications'); } };
 
@@ -115,7 +121,7 @@ export function Inbox() {
   const selNotif = notifRows.find((n) => n.id === selected);
 
   const loading =
-    (tab === 'needs' && (approvals.isLoading || notifications.isLoading)) ||
+    (tab === 'needs' && (approvals.isLoading || notifications.isLoading || trustProposals.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
 
   return (
@@ -195,6 +201,11 @@ export function Inbox() {
                     onApprove={() => onDecide(a.approvalId, 'approve')}
                     onReject={() => onDecide(a.approvalId, 'reject')} />
                 ))}
+                {trustRows.map((p) => (
+                  <TrustProposalCard key={p.id} row={p}
+                    onApprove={() => onDecideTrust(p.id, 'approve')}
+                    onDecline={() => onDecideTrust(p.id, 'decline')} />
+                ))}
                 {attentionRows.map((n) => (
                   <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
                     title={n.title || n.body || 'Needs attention'} meta={relativeTime(n.createdAt)}
@@ -273,6 +284,32 @@ function ApprovalCard({ row, selected, checked, onToggleCheck, onSelect, onAppro
           {queued ? 'Execute' : 'Approve'}
         </Button>
         <Button size="sm" variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
+      </div>
+    </div>
+  );
+}
+
+function TrustProposalCard({ row, onApprove, onDecline }: {
+  row: TrustProposalRow; onApprove: () => void; onDecline: () => void;
+}) {
+  const scope = [
+    ...row.recipients,
+    ...(row.domains ?? []).map((d) => `anyone @${d}`),
+  ].join(', ');
+  return (
+    <div className="rounded-md border border-primary/40 bg-primary-tint/40 px-3.5 py-3">
+      <div className="flex w-full items-start gap-3">
+        <StatusPill tone="live">Suggestion</StatusPill>
+        <span className="min-w-0 flex-1 text-body text-fg">Send-trust: {scope}</span>
+        <span className="shrink-0 text-caption text-faint">{relativeTime(row.createdAt)}</span>
+      </div>
+      <div className="mt-1 text-caption text-muted">{row.rationale}</div>
+      <div className="mt-1 text-caption text-faint">
+        {row.evidence.cleanSendCount} clean sends over {row.evidence.distinctDays} days · via {row.toolkits.join(', ')}
+      </div>
+      <div className="mt-2.5 flex gap-2">
+        <Button size="sm" onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> Approve</Button>
+        <Button size="sm" variant="secondary" onClick={onDecline}><X className="h-4 w-4" aria-hidden /> Decline</Button>
       </div>
     </div>
   );
