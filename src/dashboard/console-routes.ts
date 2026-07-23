@@ -73,6 +73,7 @@ import {
   listWorkflows,
   readWorkflow,
   clampGoalMaxAttempts,
+  workflowOrigin,
   type WorkflowDefinition,
   type WorkflowGoal,
 } from '../memory/workflow-store.js';
@@ -4173,6 +4174,7 @@ export function registerConsoleRoutes(
         if (!latestRunByWorkflow.has(run.workflow)) latestRunByWorkflow.set(run.workflow, run);
       }
       const items = listWorkflows()
+        .filter((entry) => workflowOrigin(entry.data) !== 'dev')
         .sort((a, b) => a.data.name.localeCompare(b.data.name))
         .map((entry) => {
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
@@ -4216,7 +4218,9 @@ export function registerConsoleRoutes(
   app.get('/api/console/workflows/home', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const workflows = listWorkflows().sort((a, b) => a.data.name.localeCompare(b.data.name));
+      const workflows = listWorkflows()
+        .filter((entry) => workflowOrigin(entry.data) !== 'dev')
+        .sort((a, b) => a.data.name.localeCompare(b.data.name));
       const runRecords = readWorkflowRunRecords();
       const pending = listPendingRuns();
       const workflowNameBySlug = new Map(workflows.map((entry) => [entry.name, entry.data.name]));

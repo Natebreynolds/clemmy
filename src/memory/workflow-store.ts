@@ -426,6 +426,9 @@ export interface WorkflowDefinition {
   allowSends?: boolean;
   /** Run-level pinned goal — external validation + bounded re-pursuit. */
   goal?: WorkflowGoal;
+  /** Who this workflow is for. 'dev' = created by smoke/creation tests —
+   *  hidden from every user-facing surface. Absent = 'user'. */
+  origin?: 'user' | 'dev';
 }
 
 /** What the on-disk loader returns. */
@@ -580,6 +583,20 @@ function parseBody(body: string): ParsedBody {
 }
 
 /** Clamp a run-goal's attempt ceiling: 1..3 total runs, default 2. */
+/** Name patterns for smoke workflows created before the `origin` field existed
+ *  (and by brain-driven creation tests that go through workflow_create, which
+ *  cannot stamp frontmatter). Kept narrow — these prefixes are only ever
+ *  minted by our own smoke scripts. */
+const DEV_WORKFLOW_NAME_PATTERNS = [/^clem-smoke-flow-/, /^devsmoke-/];
+
+/** Effective origin of a workflow: the stamped `origin` field wins, then the
+ *  smoke-name fallback, else 'user'. Every user-facing listing should hide
+ *  'dev' workflows. */
+export function workflowOrigin(def: Pick<WorkflowDefinition, 'name' | 'origin'>): 'user' | 'dev' {
+  if (def.origin === 'dev') return 'dev';
+  return DEV_WORKFLOW_NAME_PATTERNS.some((re) => re.test(def.name)) ? 'dev' : 'user';
+}
+
 export function clampGoalMaxAttempts(raw: unknown): number {
   const n = typeof raw === 'number' && Number.isFinite(raw) ? Math.floor(raw) : 2;
   return Math.max(1, Math.min(3, n));
@@ -764,6 +781,7 @@ if (step.optional === true || (step as Record<string, unknown>).optional === 'tr
       // the default-true case stays unwritten so legacy files are byte-identical.
       ...(data.allow_sends === false || data.allowSends === false ? { allowSends: false } : {}),
       ...(goal ? { goal } : {}),
+      ...(data.origin === 'dev' ? { origin: 'dev' as const } : {}),
     };
   } catch {
     return null;
@@ -925,6 +943,8 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (def.synthesis?.prompt) frontmatter.synthesis = def.synthesis;
   // Only the strict (non-default) setting is persisted — see the parse side.
   if (def.allowSends === false) frontmatter.allow_sends = false;
+  // Only 'dev' is persisted — absent means 'user', keeping legacy files byte-identical.
+  if (def.origin === 'dev') frontmatter.origin = 'dev';
   if (def.goal?.objective) {
     const goal: Record<string, unknown> = { objective: def.goal.objective };
     if (def.goal.successCriteria && def.goal.successCriteria.length > 0) goal.success_criteria = def.goal.successCriteria;
