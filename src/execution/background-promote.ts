@@ -21,7 +21,7 @@
  * narrower than "complex" so ordinary builds, questions, and one-off lookups
  * do not disappear into the background.
  */
-import { MODELS } from '../config.js';
+import { getRuntimeEnv, MODELS } from '../config.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import { createBackgroundTask, listBackgroundTasks, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskRecord } from './background-tasks.js';
@@ -559,4 +559,73 @@ export function renderDurableTaskQueued(task: Pick<BackgroundTaskRecord, 'id' | 
     `On it — I've started "${task.title}" as a background task, so it keeps running even if you close this window or I restart.`,
     `I'll report back right here the moment it's done (or if it gets stuck), and you can watch it live on the Tasks board.`,
   ].join(' ');
+}
+
+// ─── Long-task approach beat (live 2026-07-23) ──────────────────────────────
+// The owner fired a 90-minute, 120-account pipeline and the agent dispatched
+// it to the background with zero planning conversation — every design flaw
+// surfaced DURING the run instead of before it ("The agent should have
+// planned that out with me and said here's the approach I would take").
+// One beat, then autonomy: the FIRST background-shaped ask in a session gets
+// the model's approach (phases, tools, what gets produced) and a one-word
+// go; the go dispatches the ORIGINAL ask verbatim. Adjustments fall through
+// to normal conversation, where the agreed plan dispatches via
+// dispatch_background_task (the already-designed path). In-memory one-shot
+// per session (a daemon restart re-beats at most once); kill-switch
+// CLEMMY_LONGTASK_APPROACH_BEAT=off restores instant dispatch.
+const approachBeatPending = new Map<string, string>();
+const approachBeatShown = new Set<string>();
+
+const APPROACH_GO_RE = /^(?:go|yes|yep|yeah|ok(?:ay)?|sounds good|do it|run it|ship it|proceed|approved?|go ahead|lets? go|start(?: it)?)\b/i;
+const APPROACH_BLOCKER_RE = /\b(no|not|don'?t|stop|wait|hold|instead|but|change|adjust|except|actually)\b/i;
+
+function approachBeatEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_LONGTASK_APPROACH_BEAT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+export const LONG_TASK_APPROACH_STEER = [
+  '',
+  '[long-task approach beat] This request is about to become a LONG background run. Do NOT start the work and do NOT dispatch anything this turn.',
+  "Reply with your approach first, like a colleague would: the phases you'll run, the tools/data each phase uses, what gets produced at the end, and anything expensive or uncertain (call those out plainly).",
+  'Keep it under ~8 lines. End with exactly: Reply **go** and I\'ll run it to completion in the background.',
+].join('\n');
+
+export type LongTaskApproachAction =
+  | { action: 'beat'; steer: string }
+  | { action: 'dispatch'; message: string }
+  | { action: 'none' };
+
+export function longTaskApproachGate(
+  sessionId: string | undefined,
+  message: string,
+  isDurableShaped: () => boolean,
+): LongTaskApproachAction {
+  try {
+    if (!approachBeatEnabled() || !sessionId) {
+      return isDurableShaped() ? { action: 'dispatch', message } : { action: 'none' };
+    }
+    const pending = approachBeatPending.get(sessionId);
+    if (pending) {
+      approachBeatPending.delete(sessionId);
+      const reply = message.trim();
+      if (reply.length <= 80 && APPROACH_GO_RE.test(reply) && !APPROACH_BLOCKER_RE.test(reply)) {
+        return { action: 'dispatch', message: pending };
+      }
+      // The user adjusted — normal conversation takes over; the agreed plan
+      // dispatches via dispatch_background_task when ready.
+      return { action: 'none' };
+    }
+    if (!isDurableShaped()) return { action: 'none' };
+    if (approachBeatShown.has(sessionId)) return { action: 'dispatch', message };
+    approachBeatShown.add(sessionId);
+    approachBeatPending.set(sessionId, message);
+    return { action: 'beat', steer: LONG_TASK_APPROACH_STEER };
+  } catch {
+    return isDurableShaped() ? { action: 'dispatch', message } : { action: 'none' };
+  }
+}
+
+export function _resetLongTaskApproachGateForTests(): void {
+  approachBeatPending.clear();
+  approachBeatShown.clear();
 }

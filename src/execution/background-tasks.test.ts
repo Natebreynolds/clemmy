@@ -1367,6 +1367,12 @@ test('processBackgroundTasks lets a verified final deliverable override partial 
           ok: false,
           reason: 'ERROR: worker failed after parent recovered the data',
         });
+        // Deliverable-evidence bar (2026-07-23): the claim is backed by an
+        // actual write in the run session, so the override rule still applies.
+        appendEvent({
+          sessionId: task.runSessionId, turn: 1, role: 'assistant', type: 'tool_called',
+          data: { tool: 'write_file', args: { path: 'comparison.md' } },
+        });
         return {
           text: 'Done. Deliverable: comparison.md. Verified all 10 tools and all required sections.',
           sessionId: request.sessionId,
@@ -1752,13 +1758,26 @@ test('processBackgroundTasks blocks promise-shaped completion when the delivery 
       },
     };
 
+    // Pass 1 (2026-07-23 contract): an artifact-committed prompt whose first
+    // completion has zero deliverable evidence earns ONE objective-re-anchored
+    // continuation instead of a terminal block.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const processed = await processBackgroundTasks(stubAssistant as any, 1);
     assert.equal(processed, 1);
-    assert.equal(judgeCalls, 1, 'promise-shaped unattended completion must be judged');
+    assert.equal(getBackgroundTask(task.id)?.status, 'pending', 'first artifact-less completion re-anchors, not blocks');
+
+    // Pass 2: the continuation still produces only a promise with ZERO
+    // deliverable evidence — the deterministic tripwire blocks it before the
+    // judge is even consulted (deterministic-over-LLM). Promise text is NEVER
+    // trusted as done; the judge lane still governs evidence-backed claims
+    // (see the post-approval judge test below).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const processed2 = await processBackgroundTasks(stubAssistant as any, 1);
+    assert.equal(processed2, 1);
+    assert.equal(judgeCalls, 0, 'zero-evidence completion blocks deterministically, no judge spend');
     const updated = getBackgroundTask(task.id);
     assert.equal(updated?.status, 'blocked');
-    assert.match(updated?.error ?? '', /no verifiable sheet/);
+    assert.match(updated?.error ?? '', /promised an external deliverable/);
   } finally {
     _setBackgroundDeliveryJudgeForTests(null);
   }
@@ -2225,4 +2244,100 @@ test('awaiting-approval park emits the approval card into the origin chat', asyn
   const task2 = createBackgroundTask({ title: 'No-row park', prompt: 'x', originSessionId: origin.id });
   assert.equal(markBackgroundTaskAwaitingApproval(task2.id, 'apr-no-such-row', 'r')?.status, 'awaiting_approval');
   assert.equal(listEvents(origin.id).filter((e) => e.type === 'approval_requested').length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Deliverable-evidence tripwire + objective re-anchor (live 2026-07-23: a run
+// concluded "Completed — loaded roster, confirmed access" TWICE and was
+// stamped done with the promised Google Sheet never produced).
+// ---------------------------------------------------------------------------
+
+test('tripwire: artifact-committed prompt with zero evidence trips; any evidence clears it', async () => {
+  const { completionLacksDeliverableEvidence } = await import('./background-tasks.js');
+  const artifactPrompt = 'fully autonomously: check 120 accounts and put the results in a google sheet, one tab per rep';
+
+  const bare = createSession({ kind: 'execution', title: 'tripwire-bare' });
+  assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: artifactPrompt }), true);
+
+  // Non-artifact prompts never trip regardless of evidence.
+  assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: 'summarize my unread email' }), false);
+
+  // An external_write clears it.
+  const written = createSession({ kind: 'execution', title: 'tripwire-write' });
+  appendEvent({
+    sessionId: written.id, turn: 1, role: 'system', type: 'external_write',
+    data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['spreadsheet:abc'] },
+  });
+  assert.equal(completionLacksDeliverableEvidence({ runSessionId: written.id, prompt: artifactPrompt }), false);
+
+  // A local write_file call clears it too (the deliverable may be a file).
+  const filed = createSession({ kind: 'execution', title: 'tripwire-file' });
+  appendEvent({
+    sessionId: filed.id, turn: 1, role: 'assistant', type: 'tool_called',
+    data: { tool: 'write_file', args: { path: 'report.md' } },
+  });
+  assert.equal(completionLacksDeliverableEvidence({ runSessionId: filed.id, prompt: artifactPrompt }), false);
+});
+
+test('objective re-anchor: first artifact-less completion auto-continues ONCE with the note in front; repeat blocks honestly', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Build the outreach sheet',
+    prompt: 'in the background: create a google sheet with the 120-account outreach list, one row per account',
+  });
+  _setBackgroundDeliveryJudgeForTests(async () => ({ done: true }));
+  const phantom = '## Completed\n- Loaded the account roster\n- Confirmed Salesforce and Sheets access';
+
+  try {
+    // First pass: worker "completes" with setup-only text and zero evidence.
+    const processed = await processBackgroundTasks({
+      getRuntime() { return {}; },
+      async respond() {
+        return { text: phantom, stoppedReason: 'success' as const };
+      },
+    } as any, 1);
+    assert.equal(processed, 1);
+
+    const after = getBackgroundTask(task.id);
+    assert.equal(after?.status, 'pending', 'NOT phantom-done — re-queued');
+    assert.ok(after?.deliverableContinueQueuedAt, 'one-shot guard stamped');
+    assert.ok(after?.continueResolution, 'continuation queued');
+    assert.match(after?.result ?? '', /deliverable does not exist yet/, 'corrective note is the continuation note the model will see');
+
+    // Second pass: the continuation runs and AGAIN produces no evidence →
+    // the one-shot guard falls through to verify → blocked, never done.
+    let sawNote = false;
+    const processed2 = await processBackgroundTasks({
+      getRuntime() { return {}; },
+      async respond(req: { message?: string }) {
+        sawNote = /deliverable does not exist yet/.test(req?.message ?? '');
+        return { text: phantom, stoppedReason: 'success' as const };
+      },
+    } as any, 1);
+    assert.equal(processed2, 1);
+    assert.equal(sawNote, true, 'the re-anchor note reached the worker prompt');
+    const settled = getBackgroundTask(task.id);
+    assert.equal(settled?.status, 'blocked', 'second artifact-less completion blocks honestly');
+    assert.match(settled?.error ?? '', /promised an external deliverable/);
+
+    // The evidence-present direction: same shape of task, but the run writes.
+    const good = createBackgroundTask({
+      title: 'Build the small sheet',
+      prompt: 'create a google sheet with this quarter summary',
+    });
+    const processed3 = await processBackgroundTasks({
+      getRuntime() { return {}; },
+      async respond() {
+        appendEvent({
+          sessionId: good.runSessionId, turn: 1, role: 'system', type: 'external_write',
+          data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['spreadsheet:q-summary'] },
+        });
+        return { text: 'Done — sheet written: https://docs.google.com/spreadsheets/d/q-summary', stoppedReason: 'success' as const };
+      },
+    } as any, 1);
+    assert.equal(processed3, 1);
+    assert.equal(getBackgroundTask(good.id)?.status, 'done', 'evidence-backed completion still lands done in one pass');
+  } finally {
+    _setBackgroundDeliveryJudgeForTests(null);
+  }
 });

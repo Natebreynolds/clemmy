@@ -37,6 +37,7 @@ import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
+import { listRunArtifacts } from '../runtime/harness/artifact-ledger.js';
 import { resetFanoutWindow, sweepFanoutReduce } from '../runtime/harness/fanout-reduce.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered, type BlockerType } from '../runtime/harness/verify-delivered.js';
 import { verifyFanoutItems, fanoutItemVerifyEnabled, verifyInlineRecovery } from '../runtime/harness/fanout-item-verify.js';
@@ -162,6 +163,10 @@ export interface BackgroundTaskRecord {
   resultPath?: string;
   error?: string;
   pendingApprovalId?: string;
+  /** One-shot guard: set when the settle auto-queued a continuation because a
+   *  completion lacked deliverable evidence (2026-07-23). A second artifact-less
+   *  completion blocks honestly instead of looping. */
+  deliverableContinueQueuedAt?: string;
   approvalResolution?: {
     approvalId: string;
     approved: boolean;
@@ -2055,6 +2060,31 @@ export function probeObjectiveForTask(
   return task.prompt || task.title || '';
 }
 
+/** Deliverable-evidence tripwire (live 2026-07-23): a resumed run concluded
+ *  "## Completed — loaded the roster, confirmed access" TWICE and was stamped
+ *  done, with the actual deliverable (a Google Sheet) never produced. When
+ *  the task's own prompt commits to an external artifact, a completion with
+ *  ZERO evidence of one — no artifact-ledger claim, no external_write, no
+ *  session deliverable — is not a completion. Deterministic, zero-LLM. */
+const ARTIFACT_INTENT_RE =
+  /\b(?:write|create|build|save|put|produce|generate|make|draft)\b[\s\S]{0,60}\b(?:sheet|spreadsheet|workbook|google doc|document|docs?|file|\.md|csv|report|deck|slide)/i;
+
+export function completionLacksDeliverableEvidence(
+  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt'>,
+): boolean {
+  try {
+    if (!ARTIFACT_INTENT_RE.test(task.prompt ?? '')) return false;
+    if (listRunArtifacts(task.runSessionId).length > 0) return false;
+    const writes = listHarnessEventsForRefute(task.runSessionId, { types: ['external_write'], limit: 1 });
+    if (writes.length > 0) return false;
+    const calls = listHarnessEventsForRefute(task.runSessionId, { types: ['tool_called'], desc: true, limit: 200 });
+    if (calls.some((e) => (e.data as { tool?: unknown }).tool === 'write_file')) return false;
+    return true;
+  } catch {
+    return false; // evidence read failure must never block an honest done
+  }
+}
+
 async function verifyBackgroundTaskDelivery(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title'>,
   finalText: string,
@@ -2062,6 +2092,13 @@ async function verifyBackgroundTaskDelivery(
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType }> {
   const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
+  if (completionLacksDeliverableEvidence(task)) {
+    return {
+      outcome: 'blocked',
+      reason: 'Completion claimed, but the task promised an external deliverable and the run shows no evidence of one (no artifact, no external write, no file written).',
+      blockerType: 'unknown',
+    };
+  }
 
   // Stage 3: close out the reduce tier before verification — reduce any
   // full-but-unstarted shard a crash left behind and let in-flight shard
@@ -3008,6 +3045,39 @@ async function finishWorkerRun(
     logger.warn({ taskId: task.id, reason }, 'Background task paused awaiting continue (not done)');
     return;
   }
+  // Objective re-anchor, normal completion path (same contract as the approval
+  // settle above): a first artifact-less completion on an artifact-committed
+  // task earns ONE auto-queued continuation with the objective re-pinned; the
+  // verify below blocks honestly on repeat.
+  if (completionLacksDeliverableEvidence(task) && !task.deliverableContinueQueuedAt) {
+    const reAnchored = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
+      status: 'pending',
+      deliverableContinueQueuedAt: nowIso(),
+      result: [
+        'CONTINUATION NOTE (auto): the reply below concluded after setup/preamble only — the promised deliverable does not exist yet.',
+        'Continue the ORIGINAL objective to completion now, and do not conclude until the deliverable exists.',
+        '',
+        (response.text ?? '').slice(0, 4_000),
+      ].join('\n'),
+      continueResolution: {
+        queuedAt: nowIso(),
+        reason: 'Completion lacked deliverable evidence; objective re-anchored.',
+        auto: true,
+      },
+      lastCheckInAt: nowIso(),
+      lastCheckInMessage: 'Completion lacked deliverable evidence; auto-queued one objective-re-anchored continuation.',
+    });
+    if (reAnchored) {
+      finishRun(run.id, {
+        status: 'awaiting_approval',
+        message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
+        outputPreview: response.text,
+      });
+      clearLedger(task.runSessionId);
+      logger.warn({ taskId: task.id }, 'Artifact-less completion — objective-re-anchored continuation queued');
+      return;
+    }
+  }
   const outcome = await verifyBackgroundTaskDelivery(task, response.text, response.stoppedReason);
   // Verification may take long enough for a stop request to arrive. Re-read
   // durable task state after the await so a late-but-valid cancellation cannot
@@ -3275,6 +3345,44 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           });
           logger.info({ taskId: task.id, approvalId: resolution.approvalId, questionId }, 'Background task awaiting input after approval continuation');
           continue;
+        }
+        // Objective re-anchor (live 2026-07-23, twice in one night): a resumed
+        // run concluded after SETUP ONLY ("loaded roster, confirmed access")
+        // with the promised artifact never produced. When the completion lacks
+        // deliverable evidence, re-queue ONE continuation that re-pins the
+        // FULL original objective — the exact manual intervention the owner's
+        // runs needed, automated. A second artifact-less completion falls
+        // through to the verify below and blocks honestly.
+        if (completionLacksDeliverableEvidence(task) && !task.deliverableContinueQueuedAt) {
+          // The continue prompt renders task.result as the "continuation note"
+          // (it wins over continueResolution.reason), so the corrective framing
+          // lives THERE — guaranteed in front of the model on the next turn.
+          const reAnchored = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
+            status: 'pending',
+            deliverableContinueQueuedAt: nowIso(),
+            result: [
+              'CONTINUATION NOTE (auto): the reply below concluded after setup/preamble only — the promised deliverable does not exist yet.',
+              'Continue the ORIGINAL objective to completion now, and do not conclude until the deliverable exists.',
+              '',
+              (result.text ?? '').slice(0, 4_000),
+            ].join('\n'),
+            continueResolution: {
+              queuedAt: nowIso(),
+              reason: 'Completion lacked deliverable evidence; objective re-anchored.',
+              auto: true,
+            },
+            lastCheckInAt: nowIso(),
+            lastCheckInMessage: 'Completion lacked deliverable evidence; auto-queued one objective-re-anchored continuation.',
+          });
+          if (reAnchored) {
+            finishRun(run.id, {
+              status: 'awaiting_approval',
+              message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
+              outputPreview: result.text,
+            });
+            logger.warn({ taskId: task.id, approvalId: resolution.approvalId }, 'Artifact-less completion after approval — objective-re-anchored continuation queued');
+            continue;
+          }
         }
         const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {

@@ -286,7 +286,7 @@ import {
   truncateResultBody,
   deriveTaskTitle,
 } from '../execution/background-tasks.js';
-import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
+import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground, longTaskApproachGate } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
@@ -13185,9 +13185,18 @@ export function registerConsoleRoutes(
         // Skips approval-resume, a session paused on approval, and /goal runs.
         // Space sessions stay foreground unless the background lane is named
         // explicitly — the user is watching the workspace being edited.
-        if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input, { sessionId })) {
+        const approachGate = (!intent && !isPausedOnApproval && !goalRunInput)
+          ? longTaskApproachGate(sessionId, turnInput, () => shouldPromoteToDurable(input, { sessionId }))
+          : { action: 'none' as const };
+        if (approachGate.action === 'beat') {
+          // Long-task approach beat (2026-07-23): plan WITH the user first —
+          // the model presents its approach this turn; the user's "go"
+          // dispatches the original ask on the next turn.
+          turnInput = `${turnInput}${approachGate.steer}`;
+        }
+        if (approachGate.action === 'dispatch') {
           const task = enqueueDurableChatTask({
-            message: turnInput,
+            message: approachGate.message,
             sessionId,
             channel: 'desktop',
             source: 'desktop',

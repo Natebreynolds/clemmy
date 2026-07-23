@@ -436,3 +436,44 @@ test('handoff objective prefers focus/session-title over a conversational uttera
     'the conversational utterance never becomes the task name',
   );
 });
+
+// Long-task approach beat (live 2026-07-23): a 90-minute, 120-account pipeline
+// was dispatched with zero planning conversation — every design flaw surfaced
+// mid-run. One beat, then autonomy.
+test('approach beat: first long ask gets the plan beat, "go" dispatches the ORIGINAL ask', async () => {
+  const { longTaskApproachGate, _resetLongTaskApproachGateForTests, LONG_TASK_APPROACH_STEER } = await import('./background-promote.js');
+  _resetLongTaskApproachGateForTests();
+  const ask = 'fully autonomously in the background please: build my 120-account outreach sheet with contacts and drafts';
+
+  const first = longTaskApproachGate('sess-beat-1', ask, () => true);
+  assert.equal(first.action, 'beat');
+  assert.match((first as { steer: string }).steer, /approach/i);
+  assert.match(LONG_TASK_APPROACH_STEER, /Do NOT start the work/);
+
+  // "go" dispatches the original ask verbatim.
+  const go = longTaskApproachGate('sess-beat-1', 'go', () => false);
+  assert.equal(go.action, 'dispatch');
+  assert.equal((go as { message: string }).message, ask);
+
+  // Later long asks in the SAME session dispatch directly (one beat per session).
+  const second = longTaskApproachGate('sess-beat-1', 'background: another big job', () => true);
+  assert.equal(second.action, 'dispatch');
+});
+
+test('approach beat: an adjustment falls through to conversation; kill-switch restores instant dispatch', async () => {
+  const { longTaskApproachGate, _resetLongTaskApproachGateForTests } = await import('./background-promote.js');
+  _resetLongTaskApproachGateForTests();
+  const ask = 'in the background: enrich 200 accounts and build the report';
+  assert.equal(longTaskApproachGate('sess-beat-2', ask, () => true).action, 'beat');
+  const adjusted = longTaskApproachGate('sess-beat-2', 'actually change phase 2 to use the batch API and skip screenshots', () => false);
+  assert.equal(adjusted.action, 'none', 'adjustments hand off to normal conversation');
+
+  process.env.CLEMMY_LONGTASK_APPROACH_BEAT = 'off';
+  try {
+    _resetLongTaskApproachGateForTests();
+    const direct = longTaskApproachGate('sess-beat-3', ask, () => true);
+    assert.equal(direct.action, 'dispatch');
+  } finally {
+    delete process.env.CLEMMY_LONGTASK_APPROACH_BEAT;
+  }
+});

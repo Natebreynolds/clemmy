@@ -43,6 +43,7 @@ import {
   enqueueDurableChatTask,
   renderDurableTaskQueued,
   shouldPromoteToDurable,
+  longTaskApproachGate,
   detectBackgroundItIntent,
   detachRunningTurnToBackground,
   isBackgroundHandoffApprovalBlocked,
@@ -2576,9 +2577,17 @@ export async function runDiscordHarnessConversation(opts: {
       // Decide on the RAW text (not folded attachments); enqueue the FULL
       // `prompt`. Skip when the session is paused on an approval so a stray
       // durable phrase can't orphan an in-flight gated workflow.
-      if (!goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel) && shouldPromoteToDurable(rawPromptForIntent)) {
+      const discordApproachGate = (!goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel))
+        ? longTaskApproachGate(session.id, prompt, () => shouldPromoteToDurable(rawPromptForIntent))
+        : { action: 'none' as const };
+      if (discordApproachGate.action === 'beat') {
+        // Long-task approach beat (parity with desktop, 2026-07-23): the model
+        // presents its approach this turn; "go" dispatches next turn.
+        prompt = `${prompt}${discordApproachGate.steer}`;
+      }
+      if (discordApproachGate.action === 'dispatch') {
         const task = enqueueDurableChatTask({
-          message: prompt,
+          message: discordApproachGate.message,
           sessionId: session.id,
           channel: channelLabel,
           source: channel as 'discord' | 'slack',
