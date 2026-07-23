@@ -34,6 +34,7 @@ const {
   isStandingGranted,
   listStandingGrants,
   grantSendTrust,
+  grantSendTrustFromApprovedAction,
   revokeSendTrust,
   listSendTrustGrants,
   matchesSendTrust,
@@ -520,4 +521,28 @@ test('CLEMMY_STANDING_GRANTS=off makes grants inert', () => {
     delete process.env.CLEMMY_STANDING_GRANTS;
     revokeStandingApproval('write_file');
   }
+});
+
+// C (v2.3.0) grant-at-card: the "always allow" opt-in on an approval card
+// derives its scope from the approved action ITSELF — exactly these
+// recipients on exactly this toolkit — so the next identical send skips the
+// card while anything broader still asks. No extractable recipient → no
+// grant (fail-closed, same rule as matchesSendTrust).
+test('grant-at-card: an approved send grants trust for its own recipients + toolkit only', () => {
+  const args = { tool_slug: 'SLACK_SEND_MESSAGE', channel: '#clawde-and-order', text: 'daily update' };
+  const grant = grantSendTrustFromApprovedAction('composio_execute_tool', args, 'test grant');
+  assert.ok(grant, 'a send with a verifiable recipient grants');
+  assert.deepEqual(grant!.recipients, ['#clawde-and-order']);
+  assert.ok(grant!.toolkits?.[0].includes('slack_send_message'));
+
+  // The identical send is now trusted…
+  assert.equal(matchesSendTrust('composio_execute_tool', args), true);
+  // …but a different channel or a different toolkit still asks.
+  assert.equal(matchesSendTrust('composio_execute_tool', { tool_slug: 'SLACK_SEND_MESSAGE', channel: '#general', text: 'hi' }), false);
+  assert.equal(matchesSendTrust('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', to: 'stranger@example.com' }), false);
+});
+
+test('grant-at-card: no verifiable recipient → no grant (fail-closed)', () => {
+  assert.equal(grantSendTrustFromApprovedAction('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', body: 'hello' }), null);
+  assert.equal(grantSendTrustFromApprovedAction('some_tool', undefined), null);
 });

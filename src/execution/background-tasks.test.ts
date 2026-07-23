@@ -2174,3 +2174,55 @@ test('transient brain outages classify for requeue; work defects do not', async 
   assert.equal(transientRetryDelayMs(withRetryAfter, 1), 65_000);
   assert.equal(TRANSIENT_BRAIN_RETRY_CAP, 3);
 });
+
+test('deriveTaskTitle: the three live raw-strip sightings come out clean; clean titles pass through', async () => {
+  const { deriveTaskTitle } = await import('./background-tasks.js');
+  assert.equal(
+    deriveTaskTitle('this fully autonomously in the background: research these 6 personal injury law firm websites and build me a comparison table (firm name, practice areas). The sites: a.com...'),
+    'Research these 6 personal injury law firm websites and build me a compa…',
+  );
+  assert.match(deriveTaskTitle('Great. Now in the background: take the 3 most useful findings from that comparison and email them to nathan@x.com as a short bulleted summary titled PI Firm Research Summary.'), /^Take the 3 most useful findings/);
+  assert.match(deriveTaskTitle('Okay lets try this, I want you to get 30 of my market leaders not touched in 15 days from the report from salesforce, market leaders not touched in 15 days, in my name.'), /^Get 30 of my market leaders/);
+  // Clean titles untouched (modulo capitalization) and length-capped.
+  assert.equal(deriveTaskTitle('Analyze meeting transcript: Legal Directors Meeting'), 'Analyze meeting transcript: Legal Directors Meeting');
+  // Live 2026-07-23 edge: "…in the background please: research…" left "Please:".
+  assert.match(deriveTaskTitle('Okay lets try this, run this in the background please: research 4 of my market leader accounts from the salesforce report'), /^Research 4 of my market leader accounts/);
+  assert.equal(deriveTaskTitle(''), 'Background task');
+  assert.ok(deriveTaskTitle('x'.repeat(200)).length <= 72);
+});
+
+// A2 (v2.3.0), background lane: a task that parks on approval must land the
+// ACTIONABLE approval card (an `approval_requested` event the chat folds into
+// the approve/execute card) in its ORIGIN chat — a notification alone left
+// the user hunting the Tasks board from inside the very conversation that
+// asked for the work (live 2026-07-23).
+test('awaiting-approval park emits the approval card into the origin chat', async () => {
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'A2 bg origin' });
+  const task = createBackgroundTask({
+    title: 'Send the weekly digest',
+    prompt: 'send the weekly digest to the team',
+    originSessionId: origin.id,
+  });
+  const row = approvalRegistry.register({
+    sessionId: origin.id,
+    subject: 'Send the weekly digest to team@breakthroughcoaching.ai',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', to: 'team@breakthroughcoaching.ai' },
+    ttlMs: 60_000,
+  });
+  const parked = markBackgroundTaskAwaitingApproval(task.id, row.approvalId, 'Digest drafted; needs your approval to send.');
+  assert.equal(parked?.status, 'awaiting_approval');
+  const cards = listEvents(origin.id).filter((e) => e.type === 'approval_requested');
+  assert.equal(cards.length, 1, 'the actionable card landed in the origin chat');
+  const d = cards[0].data as Record<string, unknown>;
+  assert.equal(d.approvalId, row.approvalId);
+  assert.equal(d.subject, 'Send the weekly digest to team@breakthroughcoaching.ai');
+  assert.equal(d.taskId, task.id);
+
+  // A park with an unknown approval id (registry write failed) still parks the
+  // task and adds the notification — it just can't render a card.
+  const task2 = createBackgroundTask({ title: 'No-row park', prompt: 'x', originSessionId: origin.id });
+  assert.equal(markBackgroundTaskAwaitingApproval(task2.id, 'apr-no-such-row', 'r')?.status, 'awaiting_approval');
+  assert.equal(listEvents(origin.id).filter((e) => e.type === 'approval_requested').length, 1);
+});

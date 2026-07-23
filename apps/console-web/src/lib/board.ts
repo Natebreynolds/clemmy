@@ -436,11 +436,16 @@ export function runQueueRef(card: BoardCard): { slug: string; runId: string } | 
  * cancel → done, resume/promote → running. The card's server-computed
  * `actions` allowlist is the source of truth.
  */
-export function intentForDrop(card: BoardCard, target: BoardColumnId): 'cancel' | 'resume' | 'promote' | null {
+export function intentForDrop(card: BoardCard, target: BoardColumnId): 'cancel' | 'resume' | 'promote' | 'approve' | null {
   if (target === card.column) return null; // no-op (in-column reorder is Phase 2)
   if (target === 'done' && card.actions.includes('cancel')) return 'cancel';
   if (target === 'running' && card.actions.includes('promote')) return 'promote';
   if (target === 'running' && card.actions.includes('resume')) return 'resume';
+  // Drag Needs You → Running IS the approval gesture (Nathan, 2026-07-23:
+  // "park those in task as queued and I can simply drag them over"). Same
+  // server endpoint + gating as the card's Approve button — a drag can never
+  // reach anything the button couldn't.
+  if (target === 'running' && card.actions.includes('approve')) return 'approve';
   return null;
 }
 
@@ -448,7 +453,7 @@ export function intentForDrop(card: BoardCard, target: BoardColumnId): 'cancel' 
 export function rejectReason(card: BoardCard, target: BoardColumnId): string {
   if (target === card.column) return '';
   if (target === 'done') return 'This card can’t be cancelled.';
-  if (card.status === 'awaiting_approval') return 'Approve from the card to continue — a drag can’t grant approval.';
+  if (card.status === 'awaiting_approval') return 'This one needs the card’s Approve button — open it to review first.';
   if (card.status === 'awaiting_input') return 'Answer in the originating chat, or use Cancel to clear this task.';
   if (card.status === 'awaiting_continue') return 'Move it to Running to continue the background task.';
   if (target === 'running') return 'Nothing to start or resume here.';

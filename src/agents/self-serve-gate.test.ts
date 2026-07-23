@@ -63,3 +63,9 @@ test('the SECOND live shape bounces: identify-the-schema-pointer ("which field o
   assert.equal(classifySelfServeBounce('Which of the two drafts reads better for a first touch?', ['salesforce']).bounce, false);
   assert.equal(classifySelfServeBounce('Which contact should I address the email to, the CEO or the founder?', ['salesforce']).bounce, false);
 });
+
+test('the mailbox-guess shape bounces: "which mailbox should I check" is self-servable', () => {
+  const d = classifySelfServeBounce('Which mailbox should I check for the 30 drafts: Scorpion or Breakthrough Coaching?', ['outlook']);
+  assert.equal(d.bounce, true);
+  assert.equal(d.toolkit, 'outlook');
+});

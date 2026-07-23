@@ -668,6 +668,29 @@ export function matchesSendTrust(toolName: string, args: unknown): boolean {
   return false;
 }
 
+/**
+ * C (v2.3.0) — grant-at-card: derive a NARROW send-trust grant from the very
+ * action the user just approved, so the next identical send auto-proceeds
+ * instead of raising another card ("I am in full autonomy — a card shouldn't
+ * be needed", 2026-07-23). Scope = exactly the recipients this action targets
+ * on exactly this toolkit; no recipients extractable → no grant (fail-closed,
+ * same rule as matchesSendTrust). Every grant stays revocable + audited.
+ */
+export function grantSendTrustFromApprovedAction(
+  toolName: string,
+  args: unknown,
+  note?: string,
+): SendTrustGrant | null {
+  const { emails, handles } = extractSendTargets(args);
+  const recipients = [...emails, ...handles];
+  if (recipients.length === 0) return null;
+  return grantSendTrust({
+    recipients,
+    toolkits: [inferToolkit(toolName, args)],
+    note: note ?? `always-allow granted from an approved ${toolName} card`,
+  });
+}
+
 export function listAllScopes(): PlanScope[] {
   const file = readAll();
   return Object.values(file.scopes).sort((a, b) => b.openedAt.localeCompare(a.openedAt));

@@ -5099,3 +5099,55 @@ test('recipientGroundingNote surfaces the omission on the approval card, or noth
   assert.match(note ?? '', /3 of 8/);
   assert.match(note ?? '', /d@x\.co/);
 });
+
+test('L1 (v2.3.0): a DONE decision with a non-completed action and no reply ALSO earns the self-retry', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
+  const inputs: string[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const last = items.at(-1) as { content?: string } | undefined;
+    inputs.push(String(last?.content ?? ''));
+    calls += 1;
+    if (calls === 1) {
+      // The live 2026-07-22 shape: done stands, action isn't 'completed', no
+      // user-facing reply — pre-fix this skipped the retry and surfaced the
+      // fallback after the user had already nudged the run repeatedly.
+      return {
+        history: items as never,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: 'Ran 8 tools; internal ledger only.',
+          reply: null,
+          done: true,
+          nextAction: 'abandoned',
+          reason: null,
+        },
+      } as never;
+    }
+    return {
+      history: items as never,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'All drafts recovered and placed.',
+        reply: 'All 29 drafts are in your Outlook drafts folder.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'drop them in my drafts',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.match(inputs.at(-1) ?? '', /NO visible answer/, 'the self-retry fired');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.summary, 'All 29 drafts are in your Outlook drafts folder.');
+});

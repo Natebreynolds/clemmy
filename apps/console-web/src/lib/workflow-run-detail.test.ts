@@ -188,3 +188,46 @@ test('advisoryLabel knows the watcher steer slug; runs without cockpit events fo
   assert.deepEqual(detail.verdicts, []);
   assert.deepEqual(detail.watcherSteers, []);
 });
+
+// B (v2.3.0): a park is durably logged as step_failed (reaper re-admission
+// contract) but must NOT render as a red FAILED row — the live 2026-07-23
+// screenshot showed "post_slack FAILED: Workflow run parked on approval"
+// while the run was simply waiting for the user. Both the tagged meta and the
+// bare legacy message reclassify to awaiting_approval with friendly copy.
+test('park-on-approval step_failed reclassifies to awaiting_approval, real failures stay failed', () => {
+  const events: Ev[] = [
+    { t: '2026-07-04T00:00:00.000Z', kind: 'run_started' },
+    { t: '2026-07-04T00:00:01.000Z', kind: 'step_started', stepId: 'post_slack' },
+    {
+      t: '2026-07-04T00:00:02.000Z', kind: 'step_failed', stepId: 'post_slack',
+      error: 'Workflow run parked on approval.', meta: { reason: 'parked_on_approval' },
+    },
+    { t: '2026-07-04T00:00:03.000Z', kind: 'step_started', stepId: 'legacy_park' },
+    // Pre-tag event shape: message only, no meta.
+    { t: '2026-07-04T00:00:04.000Z', kind: 'step_failed', stepId: 'legacy_park', error: 'Workflow run parked on approval.' },
+    { t: '2026-07-04T00:00:05.000Z', kind: 'step_started', stepId: 'broken' },
+    { t: '2026-07-04T00:00:06.000Z', kind: 'step_failed', stepId: 'broken', error: 'model refused' },
+  ];
+  const detail = buildWorkflowRunDetail(events);
+  const byId = Object.fromEntries(detail.steps.map((s) => [s.stepId, s]));
+  assert.equal(byId.post_slack.status, 'awaiting_approval');
+  assert.match(byId.post_slack.error ?? '', /Waiting for your approval/);
+  assert.equal(byId.legacy_park.status, 'awaiting_approval');
+  assert.equal(byId.broken.status, 'failed');
+  assert.equal(byId.broken.error, 'model refused');
+});
+
+// Resume-after-approve: the SAME step re-running must overwrite the parked
+// presentation (running → done), never stick at awaiting_approval.
+test('a parked step that resumes and completes ends done, not awaiting_approval', () => {
+  const events: Ev[] = [
+    { t: '2026-07-04T00:00:01.000Z', kind: 'step_started', stepId: 'send' },
+    { t: '2026-07-04T00:00:02.000Z', kind: 'step_failed', stepId: 'send', error: 'Workflow run parked on approval.' },
+    { t: '2026-07-04T00:01:00.000Z', kind: 'step_started', stepId: 'send' },
+    { t: '2026-07-04T00:01:05.000Z', kind: 'step_completed', stepId: 'send', output: 'posted' },
+  ];
+  const detail = buildWorkflowRunDetail(events);
+  assert.equal(detail.steps.length, 1);
+  assert.equal(detail.steps[0].status, 'done');
+  assert.equal(detail.steps[0].output, 'posted');
+});

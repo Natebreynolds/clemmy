@@ -16,6 +16,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
+import { classifyModelError } from './resilient-model.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 
 /** Subscription OAuth access tokens start with this prefix; an api03 API key is
@@ -378,4 +379,78 @@ export function chooseBoundaryJudgeFamily(
   if (brainFamily !== 'claude' && haveClaude) return { provider: 'claude', modelId: boundaryClaudeJudgeModel() };
   if (brainFamily !== 'codex' && haveCodex) return { provider: 'codex', modelId: boundaryCodexJudgeModel() };
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Judge CHAIN resilience (J1).
+//
+// A single boundary/certifier judge lane fails CLOSED when its one provider is
+// down — the live incident: a send-batch certifier that only knew one Codex lane
+// hit `Codex 429 usage_limit_reached`, retried the SAME exhausted provider, and
+// terminal-blocked 30 prepared payloads. The fix is a CHAIN: preferred
+// cross-family judge → the other connected family's cheap judge → a downshifted
+// same-family lane, tried in order, falling THROUGH to the next member on a
+// transient provider failure instead of failing the verdict. When the whole
+// chain is exhausted the CALLER decides policy (park-to-human for an irreversible
+// send; proceed-unverified for reversible work) — a missing judge never
+// terminal-blocks. Kill-switch CLEMMY_JUDGE_CHAIN=off restores the single lane.
+// ─────────────────────────────────────────────────────────────────
+
+/** Kill-switch. off ⇒ the certifier/boundary judge runs its single resolved lane
+ *  with the pre-chain retry-once + fail-closed semantics (byte-identical to
+ *  before J1). Default on. */
+export function judgeChainEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_JUDGE_CHAIN', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/** True when a thrown judge error is a TRANSIENT provider shape — a rate-limit /
+ *  plan-quota exhaustion (429/403/400 body marker), an overload (529), or a 5xx /
+ *  transport drop — i.e. "this provider is momentarily unusable; try another
+ *  family" rather than "the verdict itself is bad". Reuses the wire-neutral
+ *  classifier so the quota-text detection (usage_limit_reached etc.) is shared
+ *  with the model-call retry path. */
+export function isTransientJudgeError(err: unknown): boolean {
+  try {
+    const kind = classifyModelError(err).kind;
+    return kind === 'model.rate_limited'
+      || kind === 'model.overloaded'
+      || kind === 'model.http_5xx'
+      || kind === 'model.transport_timeout';
+  } catch {
+    return false;
+  }
+}
+
+/** One recorded hop where a judge lane fell over to the next chain member. */
+export interface JudgeChainFalloverEvent {
+  fromFamily: ModelProviderClass;
+  toFamily: ModelProviderClass;
+  /** Truncated failure message that triggered the fallover. */
+  reason: string;
+  /** true ⇒ a transient provider shape (the designed trigger); false ⇒ a
+   *  non-transient failure (bad verdict / unknown error) that still advanced
+   *  because another family was available. */
+  transient: boolean;
+  lane: JudgeMetricLane;
+  at: string;
+}
+
+const CHAIN_FALLOVER_CAP = 200;
+const judgeChainFallovers: JudgeChainFalloverEvent[] = [];
+
+/** Record a chain-fallover hop (bounded ring buffer — last-N observability, plus
+ *  a deterministic seam the fallover tests assert against). */
+export function recordJudgeChainFallover(ev: Omit<JudgeChainFalloverEvent, 'at'>): void {
+  judgeChainFallovers.push({ ...ev, at: new Date().toISOString() });
+  if (judgeChainFallovers.length > CHAIN_FALLOVER_CAP) {
+    judgeChainFallovers.splice(0, judgeChainFallovers.length - CHAIN_FALLOVER_CAP);
+  }
+}
+
+export function getJudgeChainFallovers(): readonly JudgeChainFalloverEvent[] {
+  return judgeChainFallovers;
+}
+
+export function resetJudgeChainFalloversForTests(): void {
+  judgeChainFallovers.length = 0;
 }

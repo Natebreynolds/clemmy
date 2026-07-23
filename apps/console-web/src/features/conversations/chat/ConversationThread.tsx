@@ -4,7 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
-import { useChat, type ChatMessage } from '@/lib/useChat';
+import { useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/lib/cn';
@@ -18,12 +18,31 @@ import { ReadOnlyNotice } from './ReadOnlyNotice';
 
 let seedSeq = 0;
 function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((t) => ({
-    id: `h${++seedSeq}`,
-    role: t.role,
-    text: t.text,
-    status: t.role === 'assistant' ? 'complete' : undefined,
-  }));
+  return turns.map((t) => {
+    // A2 (v2.3.0): a still-pending approval the server attached renders as
+    // the real actionable card on reopen — not just the prose that pointed
+    // at a card somewhere else.
+    if (t.role === 'assistant' && t.approval) {
+      return {
+        id: `h${++seedSeq}`,
+        role: t.role,
+        text: t.text,
+        status: 'awaiting-approval' as const,
+        approval: {
+          subject: t.approval.subject,
+          reason: t.approval.reason,
+          approvalId: t.approval.approvalId,
+          pendingAction: pendingActionFromEvent(t.approval.pendingAction),
+        },
+      };
+    }
+    return {
+      id: `h${++seedSeq}`,
+      role: t.role,
+      text: t.text,
+      status: t.role === 'assistant' ? ('complete' as const) : undefined,
+    };
+  });
 }
 
 function Header({ session }: { session: Session }) {

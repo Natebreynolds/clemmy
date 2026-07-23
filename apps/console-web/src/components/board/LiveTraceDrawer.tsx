@@ -8,12 +8,12 @@
  *  - workflow cards can't use that pipe (their steps run under per-step
  *    `workflow:<suffix>` sessions), so they poll the run-events endpoint.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, GitBranch, RefreshCw, Layers, Upload, Play, Send, Save, MessageSquare } from 'lucide-react';
+import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Play, Send, Save, MessageSquare } from 'lucide-react';
 import { runHarnessStream, humanHarnessText } from '@/lib/chat';
 import { reduceActivity, type ActivityItem } from '@/lib/useChat';
-import { TurnActivity } from '@/components/chat/TurnActivity';
+import { LiveFeed } from '@/components/chat/ActivityFeed';
 import { apiGet } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
@@ -52,27 +52,54 @@ interface TraceRow {
   tone: 'live' | 'success' | 'danger' | 'warning' | 'muted';
 }
 
-const HARNESS_MILESTONES: Record<string, { label: string; icon: typeof Radio; tone: TraceRow['tone'] }> = {
-  // Tools / workers / batches are deliberately ABSENT here: they render once,
-  // in the shared TurnActivity strip (the same component chat uses), so the
-  // drawer and the chat describe the run in ONE visual language instead of two
-  // parallel vocabularies (2026-07-22 consolidation). This list is lifecycle
-  // only — the things TurnActivity does not carry.
-  session_started: { label: 'Started', icon: Cpu, tone: 'muted' },
-  model_started: { label: 'Thinking', icon: Cpu, tone: 'live' },
-  turn_started: { label: 'Turn started', icon: Dot, tone: 'muted' },
-  step_started: { label: 'Step', icon: Dot, tone: 'live' },
-  approval_requested: { label: 'Needs approval', icon: Hand, tone: 'warning' },
-  awaiting_user_input: { label: 'Waiting on you', icon: Hand, tone: 'warning' },
-  guardrail_tripped: { label: 'Guardrail', icon: AlertCircle, tone: 'warning' },
-  run_failed: { label: 'Failed', icon: AlertCircle, tone: 'danger' },
-  conversation_completed: { label: 'Completed', icon: CheckCircle2, tone: 'success' },
-  brain_fallover: { label: 'Switched brain', icon: GitBranch, tone: 'warning' },
-  sdk_auto_continue: { label: 'Auto-continued', icon: RefreshCw, tone: 'muted' },
-  sdk_compact_boundary: { label: 'Compacted context', icon: Layers, tone: 'muted' },
-  external_write: { label: 'External write', icon: Upload, tone: 'live' },
-  external_write_orphaned: { label: 'Write timed out — may have landed', icon: AlertCircle, tone: 'warning' },
+// Lifecycle beats the shared fold (reduceActivity) does NOT carry — tools,
+// workers, batches, external writes, and code-mode programs all fold into the
+// unified feed already, so this map is ONLY the run-lifecycle rows the feed
+// interleaves around them (Started / Step / Needs approval / Completed / …). One
+// visual language: the drawer and chat describe a run through the same rows.
+const LIFECYCLE: Record<string, { label: string; tone: NonNullable<ActivityItem['tone']> }> = {
+  session_started: { label: 'Started', tone: 'muted' },
+  step_started: { label: 'Step', tone: 'live' },
+  approval_requested: { label: 'Needs approval', tone: 'warning' },
+  awaiting_user_input: { label: 'Waiting on you', tone: 'warning' },
+  guardrail_tripped: { label: 'Guardrail', tone: 'warning' },
+  brain_fallover: { label: 'Switched brain', tone: 'warning' },
+  sdk_compact_boundary: { label: 'Compacted context', tone: 'muted' },
+  sdk_auto_continue: { label: 'Auto-continued', tone: 'muted' },
+  run_failed: { label: 'Failed', tone: 'danger' },
+  conversation_completed: { label: 'Completed', tone: 'success' },
 };
+
+/** The plain-human detail for a lifecycle row (a step title, else the event's
+ *  own summary text; suppressed where a fuller surface already shows it). */
+function lifecycleDetail(ev: HarnessEvent): string {
+  const d = (ev.data ?? {}) as Record<string, unknown>;
+  if (ev.type === 'step_started') return typeof d.title === 'string' ? d.title : '';
+  if (ev.type === 'conversation_completed' || ev.type === 'run_failed') return '';
+  return humanHarnessText(d, '').slice(0, 140);
+}
+
+/** The drawer's unified feed fold: the SAME reduceActivity chat uses (tools,
+ *  workers, batches, external writes, code-mode programs) PLUS the lifecycle
+ *  beats above, interleaved in one chronological ActivityItem[] stream. An event
+ *  reduceActivity already consumed never double-emits (we only add a lifecycle
+ *  row when the shared fold left the list unchanged). */
+function reduceFeed(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
+  const next = reduceActivity(prev, ev);
+  if (next !== prev) return next;
+  const m = LIFECYCLE[ev.type];
+  if (!m) return prev;
+  const detail = lifecycleDetail(ev);
+  return [...prev, {
+    id: `l-${ev.seq}`,
+    kind: 'event',
+    variant: 'lifecycle',
+    label: m.label,
+    tone: m.tone,
+    status: m.tone === 'danger' ? 'failed' : 'done',
+    ...(detail ? { detail } : {}),
+  }];
+}
 
 const WORKFLOW_MILESTONES: Record<string, { label: string; icon: typeof Radio; tone: TraceRow['tone'] }> = {
   run_started: { label: 'Run started', icon: Cpu, tone: 'muted' },
@@ -91,40 +118,6 @@ const WORKFLOW_MILESTONES: Record<string, { label: string; icon: typeof Radio; t
   run_failed: { label: 'Failed', icon: AlertCircle, tone: 'danger' },
   run_cancelled: { label: 'Cancelled', icon: X, tone: 'muted' },
 };
-
-const toneText: Record<TraceRow['tone'], string> = {
-  live: 'text-primary',
-  success: 'text-success',
-  danger: 'text-danger',
-  warning: 'text-warning',
-  muted: 'text-faint',
-};
-
-function toolName(data?: Record<string, unknown>): string {
-  if (!data) return '';
-  const n = (data.tool ?? data.name ?? data.toolName) as unknown;
-  return typeof n === 'string' ? n : '';
-}
-
-/** One canonical verdict row for both event stores (harness eventlog `data`,
- *  workflow event `meta` — same field vocabulary via the T3-B4 verdict door). */
-function verdictTraceRow(key: string, d: Record<string, unknown>, time?: string | number): TraceRow {
-  const pass = d.pass === true;
-  const failedOpen = d.failedOpen === true;
-  const door = String(d.door ?? 'judge').replace(/_/g, ' ');
-  const scorecard = typeof d.criteriaMet === 'number' && typeof d.criteriaTotal === 'number'
-    ? ` · ${d.criteriaMet}/${d.criteriaTotal} criteria`
-    : '';
-  const reason = typeof d.reason === 'string' ? d.reason : '';
-  return {
-    key,
-    icon: pass && !failedOpen ? CheckCircle2 : AlertCircle,
-    label: failedOpen ? `Verdict (${door}): accepted — judge unavailable` : pass ? `Verdict (${door}): passed` : `Verdict (${door}): not passed`,
-    detail: `${reason}${scorecard}`.slice(0, 140),
-    ...(time !== undefined ? { time } : {}),
-    tone: pass && !failedOpen ? 'success' : 'warning',
-  };
-}
 
 function workflowDetail(ev: Record<string, unknown>): string {
   const kind = String(ev.kind ?? '');
@@ -274,6 +267,9 @@ export function LiveTraceDrawer({
   const [rawHarness, setRawHarness] = useState<HarnessEvent[]>([]);
   const [rawWorkflow, setRawWorkflow] = useState<Array<Record<string, unknown>>>([]);
   const [showRaw, setShowRaw] = useState(false);
+  // Power-user detail (per-worker model ids, raw tool/delivery grids) is demoted
+  // behind this one toggle — the plain-human feed is the default view.
+  const [showDetails, setShowDetails] = useState(false);
   const [current, setCurrent] = useState<string>(card.progressHint || '');
   const [targetType, setTargetType] = useState<BackgroundReportBackTargetType>('slack_user');
   const [targetId, setTargetId] = useState('');
@@ -489,49 +485,31 @@ export function LiveTraceDrawer({
     return () => { alive = false; clearInterval(timer); };
   }, [isWorkflow, card.raw.workflowName, card.raw.workflowSlug, card.raw.runId]);
 
-  // The SAME fold chat uses — tools/workers/batches render once, in the shared
-  // TurnActivity component, instead of through a second parallel reducer.
-  const harnessActivity = useMemo(
-    () => (isWorkflow ? [] : rawHarness.reduce((acc, ev) => reduceActivity(acc, ev), [] as ActivityItem[])),
+  // ONE chronological feed for background/run cards: the same reduceActivity chat
+  // uses (tools, workers, batch meters, external-write effects, code-mode
+  // programs) interleaved with the run's lifecycle beats — newest at the bottom,
+  // rendered by the shared LiveFeed. Workflow cards keep their structured detail.
+  const feed = useMemo(
+    () => (isWorkflow ? [] : rawHarness.reduce(reduceFeed, [] as ActivityItem[])),
     [isWorkflow, rawHarness],
   );
 
-  const rows: TraceRow[] = isWorkflow
-    ? rawWorkflow.flatMap((ev, i) => {
-        const kind = String(ev.kind ?? '');
-        // Verdict door + watcher steers: data-dependent tone/label, so they get
-        // bespoke rows instead of a static milestone entry.
-        const meta = (ev.meta && typeof ev.meta === 'object' && !Array.isArray(ev.meta) ? ev.meta : {}) as Record<string, unknown>;
-        if (kind === 'verdict_recorded') {
-          return [verdictTraceRow(`wf-${i}`, meta, ev.t as string)];
-        }
-        if (kind === 'step_advisory' && meta.reason === 'watcher_steer') {
-          const detail = [meta.miss, meta.steer].filter((x) => typeof x === 'string' && x).join(' → ').slice(0, 140);
-          return [{ key: `wf-${i}`, icon: Radio, label: 'Watcher steered', detail, time: ev.t as string, tone: 'live' as const }];
-        }
-        const m = WORKFLOW_MILESTONES[kind];
-        if (!m) return [];
-        const detail = workflowDetail(ev);
-        return [{ key: `wf-${i}`, icon: m.icon, label: m.label, detail, time: ev.t as string, tone: m.tone }];
-      })
-    : rawHarness.flatMap((ev) => {
-        const data = (ev.data ?? {}) as Record<string, unknown>;
-        if (ev.type === 'verdict_recorded') {
-          return [verdictTraceRow(`h-${ev.seq}`, data, ev.createdAt)];
-        }
-        if (ev.type === 'heartbeat' && data.kind === 'watcher_steer') {
-          const detail = [data.miss, data.steer].filter((x) => typeof x === 'string' && x).join(' → ').slice(0, 140);
-          return [{ key: `h-${ev.seq}`, icon: Radio, label: 'Watcher steered', detail, time: ev.createdAt, tone: 'live' as const }];
-        }
-        const m = HARNESS_MILESTONES[ev.type];
-        if (!m) return [];
-        const tName = toolName(ev.data);
-        // Hide the brain's own bookkeeping ("reflection end", tool-choice scoring)
-        // — those aren't actions the user asked for.
-        if (ev.type.startsWith('tool') && isHousekeepingTool(tName)) return [];
-        const detail = ev.type.startsWith('tool') ? humanToolLabel(tName) : humanHarnessText(ev.data, '').slice(0, 140);
-        return [{ key: `h-${ev.seq}`, icon: m.icon, label: m.label, detail, time: ev.createdAt, tone: m.tone }];
-      });
+  // Keep the feed pinned to the newest row while the run is live — unless the
+  // user has scrolled up to read/interact (standard chat-feed behavior). The
+  // whole panel-below-header is ONE scroll region, so we pin that container.
+  const feedRunning = card.column === 'running';
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinnedRef = useRef(true);
+  const onFeedScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 56;
+  };
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || isWorkflow || showRaw || !pinnedRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [feed.length, isWorkflow, showRaw]);
 
   const tone = cardTone(card);
   const taskResult = taskDetail?.task.resultFull ?? taskDetail?.task.result ?? '';
@@ -628,6 +606,11 @@ export function LiveTraceDrawer({
           </div>
         )}
 
+        {/* Everything below the fixed header/current/answer bars is ONE scroll
+            region — the cockpit and the live feed share it, so the panel scrolls
+            as a whole (no more inner scrollers fighting a squeezed feed) and can
+            stay pinned to the newest row while live. */}
+        <div ref={scrollRef} onScroll={onFeedScroll} className="min-h-0 flex-1 overflow-y-auto">
         {isBackground && (
           <div className="border-b border-border px-5 py-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -781,50 +764,55 @@ export function LiveTraceDrawer({
                   </div>
                 )}
 
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div>
-                    <div className="mb-1 text-small font-semibold text-fg">Tools</div>
-                    {(() => {
-                      // Hide the brain's own bookkeeping (reflection, tool-choice
-                      // scoring); show real tools humanized like the chat strip.
-                      const realTools = taskDetail.detail.toolEvents.filter((e) => !isHousekeepingTool(e.toolName));
-                      if (realTools.length === 0) {
-                        return <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No tool events.</div>;
-                      }
-                      return (
+                {/* Raw tool + delivery grids are power-user detail — the live
+                    feed already narrates the same work in plain human. Behind the
+                    footer "Details" toggle so the default view stays calm. */}
+                {showDetails && (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div>
+                      <div className="mb-1 text-small font-semibold text-fg">Tools</div>
+                      {(() => {
+                        // Hide the brain's own bookkeeping (reflection, tool-choice
+                        // scoring); show real tools humanized like the chat strip.
+                        const realTools = taskDetail.detail.toolEvents.filter((e) => !isHousekeepingTool(e.toolName));
+                        if (realTools.length === 0) {
+                          return <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No tool events.</div>;
+                        }
+                        return (
+                          <ul className="space-y-1.5">
+                            {realTools.slice(-5).map((event) => (
+                              <li key={`${event.at}-${event.toolName}-${event.phase ?? ''}`} className="rounded-md border border-border px-2.5 py-2 text-caption">
+                                <div className="truncate font-semibold text-fg">{humanToolLabel(event.toolName, event.argsSummary)}</div>
+                                <div className="truncate text-faint">{event.errorMessage ?? (salientArgDetail(event.argsSummary) || event.outcome || formatTime(event.at))}</div>
+                              </li>
+                            ))}
+                          </ul>
+                        );
+                      })()}
+                    </div>
+                    <div>
+                      <div className="mb-1 text-small font-semibold text-fg">Delivery</div>
+                      {taskDetail.detail.notifications.length === 0 ? (
+                        <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No notifications.</div>
+                      ) : (
                         <ul className="space-y-1.5">
-                          {realTools.slice(-5).map((event) => (
-                            <li key={`${event.at}-${event.toolName}-${event.phase ?? ''}`} className="rounded-md border border-border px-2.5 py-2 text-caption">
-                              <div className="truncate font-semibold text-fg">{humanToolLabel(event.toolName, event.argsSummary)}</div>
-                              <div className="truncate text-faint">{event.errorMessage ?? (salientArgDetail(event.argsSummary) || event.outcome || formatTime(event.at))}</div>
-                            </li>
-                          ))}
+                          {taskDetail.detail.notifications.slice(-5).map((notification) => {
+                            const dv = deliveryView(notification);
+                            return (
+                              <li key={notification.id} className="rounded-md border border-border px-2.5 py-2 text-caption">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="min-w-0 truncate font-semibold text-fg">{notification.title}</div>
+                                  <StatusPill tone={dv.tone}>{dv.label}</StatusPill>
+                                </div>
+                                <div className="truncate text-faint">{dv.detail}</div>
+                              </li>
+                            );
+                          })}
                         </ul>
-                      );
-                    })()}
+                      )}
+                    </div>
                   </div>
-                  <div>
-                    <div className="mb-1 text-small font-semibold text-fg">Delivery</div>
-                    {taskDetail.detail.notifications.length === 0 ? (
-                      <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No notifications.</div>
-                    ) : (
-                      <ul className="space-y-1.5">
-                        {taskDetail.detail.notifications.slice(-5).map((notification) => {
-                          const dv = deliveryView(notification);
-                          return (
-                            <li key={notification.id} className="rounded-md border border-border px-2.5 py-2 text-caption">
-                              <div className="flex items-center justify-between gap-2">
-                                <div className="min-w-0 truncate font-semibold text-fg">{notification.title}</div>
-                                <StatusPill tone={dv.tone}>{dv.label}</StatusPill>
-                              </div>
-                              <div className="truncate text-faint">{dv.detail}</div>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    )}
-                  </div>
-                </div>
+                )}
               </div>
             ) : (
               <p className="text-body text-danger">Task details unavailable.</p>
@@ -832,60 +820,44 @@ export function LiveTraceDrawer({
           </div>
         )}
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-          {!showRaw ? (
-            isWorkflow ? (
-              // Workflow runs get the structured, step-grouped detail (timeline +
-              // attempts + advisories + summary + per-step tokens) — the flat
-              // milestone list above can't express a finished run's depth.
-              <>
-                <WorkflowRunDetail events={rawWorkflow} />
-                {(card.raw.workflowSlug || card.raw.workflowName) && card.raw.runId && (
-                  <RunAgentsPanel
-                    slug={String(card.raw.workflowSlug || card.raw.workflowName)}
-                    runId={String(card.raw.runId)}
-                  />
-                )}
-              </>
-            ) : rows.length === 0 && harnessActivity.length === 0 ? (
-              <p className="text-body text-faint">No milestones yet — the trace streams in as the agent works.</p>
-            ) : (
-              <>
-                {harnessActivity.length > 0 && (
-                  <div className="mb-3 rounded-md border border-border/60 px-3 pb-2">
-                    <TurnActivity items={harnessActivity} live={card.column === 'running'} />
-                  </div>
-                )}
-                <ol className="space-y-2.5">
-                  {rows.map((r) => {
-                    const Icon = r.icon;
-                    return (
-                      <li key={r.key} className="flex items-start gap-2.5">
-                        <Icon className={cn('mt-0.5 h-4 w-4 shrink-0', toneText[r.tone])} />
-                        <div className="min-w-0">
-                          <span className="text-body font-medium text-fg">{r.label}</span>
-                          {r.detail && <span className="ml-2 text-body text-muted">{r.detail}</span>}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ol>
-              </>
-            )
-          ) : (
+        <div className="px-5 py-4">
+          {showRaw ? (
             <pre className="whitespace-pre-wrap break-words rounded-sm bg-canvas p-3 text-caption text-muted">
               {JSON.stringify(isWorkflow ? rawWorkflow : rawHarness, null, 2)}
             </pre>
+          ) : isWorkflow ? (
+            // Workflow runs get the structured, step-grouped detail (timeline +
+            // attempts + advisories + summary + per-step tokens) — the flat feed
+            // can't express a finished run's depth.
+            <>
+              <WorkflowRunDetail events={rawWorkflow} />
+              {(card.raw.workflowSlug || card.raw.workflowName) && card.raw.runId && (
+                <RunAgentsPanel
+                  slug={String(card.raw.workflowSlug || card.raw.workflowName)}
+                  runId={String(card.raw.runId)}
+                />
+              )}
+            </>
+          ) : (
+            <LiveFeed items={feed} live={feedRunning} showDetails={showDetails} />
           )}
         </div>
+        </div>
 
-        <footer className="flex items-center justify-between border-t border-border px-5 py-3">
+        <footer className="flex items-center justify-between gap-4 border-t border-border px-5 py-3">
           <span className="text-caption text-faint">
             {isWorkflow ? `${rawWorkflow.length} events · polling` : traceSessionId ? `${rawHarness.length} events · live` : 'No live session'}
           </span>
-          <button onClick={() => setShowRaw((v) => !v)} className="text-caption font-semibold text-primary hover:underline">
-            {showRaw ? 'Show timeline' : 'Show raw events'}
-          </button>
+          <div className="flex items-center gap-4">
+            {!isWorkflow && !showRaw && (
+              <button onClick={() => setShowDetails((v) => !v)} className="text-caption font-semibold text-muted transition-colors hover:text-fg">
+                {showDetails ? 'Hide details' : 'Details'}
+              </button>
+            )}
+            <button onClick={() => setShowRaw((v) => !v)} className="text-caption font-semibold text-primary hover:underline">
+              {showRaw ? 'Show timeline' : 'Show raw events'}
+            </button>
+          </div>
         </footer>
       </div>
     </div>

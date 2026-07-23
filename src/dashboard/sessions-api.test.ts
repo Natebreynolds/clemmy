@@ -359,3 +359,36 @@ test('delete on a collapsed workflow run archives every step session', () => {
   assert.equal(buildUnifiedSessionList({ source: 'workflow' }).some((s) => s.title === 'Delete Flow'), false);
   assert.equal(buildUnifiedSessionList({ source: 'workflow', includeArchived: true }).filter((s) => s.title === 'Delete Flow').length, 1);
 });
+
+// A2 (v2.3.0): a reopened chat must render a STILL-PENDING approval as the
+// actionable card. The server attaches it as a synthetic assistant turn;
+// resolved approvals attach nothing (no zombie cards).
+test('session detail attaches pending approval cards and drops resolved ones', async () => {
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'A2 reopen' });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'post the eod update' } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: { reply: 'Queued — needs your approval.' } });
+  const row = approvalRegistry.register({
+    sessionId: origin.id,
+    subject: 'Post the EOD update to #team',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'SLACK_SEND_MESSAGE', channel: '#team' },
+    ttlMs: 60_000,
+  });
+  appendEvent({
+    sessionId: origin.id, turn: 0, role: 'Clem', type: 'approval_requested',
+    data: { tool: 'composio_execute_tool', subject: 'Post the EOD update to #team', approvalId: row.approvalId },
+  });
+
+  const detail = getUnifiedSessionDetail(`harness:${origin.id}`);
+  assert.ok(detail);
+  const cardTurns = detail!.turns.filter((t) => t.approval);
+  assert.equal(cardTurns.length, 1, 'one pending approval card turn');
+  assert.equal(cardTurns[0].approval!.approvalId, row.approvalId);
+  assert.equal(cardTurns[0].approval!.subject, 'Post the EOD update to #team');
+
+  // Resolve → the card disappears from subsequent reopens.
+  approvalRegistry.resolve(row.approvalId, 'approved', 'a2-reopen-test');
+  const after = getUnifiedSessionDetail(`harness:${origin.id}`);
+  assert.equal(after!.turns.filter((t) => t.approval).length, 0, 'resolved approvals attach no card');
+});

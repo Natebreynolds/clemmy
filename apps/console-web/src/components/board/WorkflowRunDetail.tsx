@@ -10,7 +10,7 @@
  * Presentational only — all folding lives in lib/workflow-run-detail.ts.
  */
 import { useMemo } from 'react';
-import { CheckCircle2, AlertCircle, AlertTriangle, Radio, Circle, MinusCircle, Package } from 'lucide-react';
+import { CheckCircle2, AlertCircle, AlertTriangle, Radio, Circle, MinusCircle, Package, PauseCircle } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import {
@@ -28,6 +28,7 @@ const STEP_TONE: Record<WorkflowStepStatus, Tone> = {
   running: 'live',
   skipped: 'neutral',
   pending: 'neutral',
+  awaiting_approval: 'warning',
 };
 
 const STEP_ICON = {
@@ -37,6 +38,7 @@ const STEP_ICON = {
   running: Radio,
   skipped: MinusCircle,
   pending: Circle,
+  awaiting_approval: PauseCircle,
 } as const;
 
 function formatDuration(ms?: number): string {
@@ -165,7 +167,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
       className={cn(
         'rounded-md border border-border border-l-2 px-3 py-2',
         step.status === 'done' && 'border-l-success',
-        step.status === 'blocked' && 'border-l-warning',
+        (step.status === 'blocked' || step.status === 'awaiting_approval') && 'border-l-warning',
         step.status === 'failed' && 'border-l-danger',
         step.status === 'running' && 'border-l-primary',
         (step.status === 'skipped' || step.status === 'pending') && 'border-l-border',
@@ -184,7 +186,9 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
           aria-hidden
         />
         <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">{step.stepId}</span>
-        <span className="text-caption uppercase tracking-wide text-faint">{step.status}</span>
+        <span className="text-caption uppercase tracking-wide text-faint">
+          {step.status === 'awaiting_approval' ? 'needs your approval' : step.status}
+        </span>
         {dur && <span className="text-caption tabular-nums text-faint">{dur}</span>}
         {costBits && <span className="text-caption tabular-nums text-primary">{costBits}</span>}
         {step.retries > 0 && (
@@ -209,7 +213,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
         <div
           className={cn(
             'mt-1.5 whitespace-pre-wrap break-words rounded-sm border px-2 py-1.5 text-caption',
-            step.status === 'blocked'
+            step.status === 'blocked' || step.status === 'awaiting_approval'
               ? 'border-warning/40 bg-warning-tint text-warning'
               : 'border-danger/40 bg-danger-tint text-danger',
           )}

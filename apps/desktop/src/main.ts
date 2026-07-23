@@ -106,6 +106,12 @@ import {
   toDisplayLocalNotchFrame,
   type NotchClickHelperHealth,
 } from './notch-click-helper.js';
+import {
+  advanceWatermark,
+  parseDesktopPendingResponse,
+  planDesktopToasts,
+  type DesktopPendingNotification,
+} from './desktop-toast-queue.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -1873,6 +1879,7 @@ function buildUpdaterMenuItems(): Electron.MenuItemConstructorOptions[] {
 async function prepareForQuit(): Promise<void> {
   if (quitPrepared || quitPreparing) return;
   quitPreparing = true;
+  stopDesktopNotificationPoll();
   disposeClementineLiveShell();
   disposeAutoUpdater();
   await recallCapture?.prepareForShutdown().catch((error) => {
@@ -1907,6 +1914,7 @@ function clearUpdateInstallIntent(): void {
 
 async function prepareForUpdateInstall(): Promise<void> {
   markUpdateInstallIntent();
+  stopDesktopNotificationPoll();
   disposeClementineLiveShell();
   await recallCapture?.prepareForShutdown().catch((error) => {
     console.error('[recall] failed to prepare meeting capture before update shutdown:', error instanceof Error ? error.message : error);
@@ -2315,6 +2323,8 @@ async function launchDaemon(): Promise<void> {
     mainWindow.webContents.on('did-navigate', () => {
       void finalizeOrphanedLocalCapture('the page reloaded', 'dashboard');
     });
+    // U5: start the loud-notification poll now that the daemon is confirmed up.
+    startDesktopNotificationPoll();
     rebuildTrayMenu();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -2351,6 +2361,107 @@ function postDaemonJson<T>(pathname: string, body: Record<string, unknown>): Pro
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+// ─── U5: desktop as a first-class loud notification destination ──────
+//
+// A ~20s poll asks the daemon for loud, unread notifications newer than a
+// watermark and surfaces each as a native toast. Clicking one reveals the
+// window and marks it read. Always-on by design — there is no per-user opt-out
+// (no notch/notification preference exists to gate on, and being reachable at
+// the OS level is the whole point of U5). The dedupe set is a belt over the
+// read-mark + advancing watermark; pure planning/watermark logic lives in
+// desktop-toast-queue.ts.
+const DESKTOP_NOTIFICATION_POLL_INTERVAL_MS = 20_000;
+/** Cap on the dedupe set so a long-lived session can't grow it unbounded. */
+const DESKTOP_NOTIFICATION_SEEN_CAP = 500;
+let desktopNotificationPollTimer: NodeJS.Timeout | null = null;
+let desktopNotificationPollInFlight = false;
+// Init to app-start time so a restart doesn't replay the backlog.
+let desktopNotificationSince = new Date().toISOString();
+const desktopNotifiedIds = new Set<string>();
+
+function rememberDesktopNotifiedId(id: string): void {
+  desktopNotifiedIds.add(id);
+  if (desktopNotifiedIds.size > DESKTOP_NOTIFICATION_SEEN_CAP) {
+    // Sets preserve insertion order — evict the oldest ids first.
+    const overflow = desktopNotifiedIds.size - DESKTOP_NOTIFICATION_SEEN_CAP;
+    let dropped = 0;
+    for (const seen of desktopNotifiedIds) {
+      desktopNotifiedIds.delete(seen);
+      if (++dropped >= overflow) break;
+    }
+  }
+}
+
+function showDesktopNotificationToast(item: DesktopPendingNotification): void {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({
+    title: item.title || 'Clementine',
+    body: item.body || '',
+    silent: false,
+  });
+  notification.on('click', () => {
+    revealMainWindow();
+    // Fire-and-forget: the click already surfaced the app; a failed read-mark
+    // just means the watermark/dedupe belt suppresses a possible repeat.
+    postDaemonJson(`/api/console/notifications/${encodeURIComponent(item.id)}/read`, {})
+      .catch(() => { /* best-effort */ });
+  });
+  notification.show();
+}
+
+function showDesktopNotificationSummaryToast(count: number): void {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({
+    title: 'Clementine',
+    body: `${count} more update${count === 1 ? '' : 's'} — open Clementine`,
+    silent: false,
+  });
+  notification.on('click', () => { revealMainWindow(); });
+  notification.show();
+}
+
+async function pollDesktopNotifications(): Promise<void> {
+  if (desktopNotificationPollInFlight) return;
+  if (!supervisor?.getPort() || !getWebhookSecret()) return;
+  desktopNotificationPollInFlight = true;
+  try {
+    const payload = await fetchDaemonJson<unknown>(
+      `/api/console/notifications/desktop-pending?since=${encodeURIComponent(desktopNotificationSince)}`,
+    );
+    const { items, now } = parseDesktopPendingResponse(payload);
+    const plan = planDesktopToasts(items, desktopNotifiedIds);
+    for (const item of plan.toasts) showDesktopNotificationToast(item);
+    if (plan.summary) showDesktopNotificationSummaryToast(plan.summary.count);
+    for (const id of plan.seenIds) rememberDesktopNotifiedId(id);
+    // Advance only after a successful poll so a transient failure re-fetches
+    // the same window rather than skipping it.
+    desktopNotificationSince = advanceWatermark(desktopNotificationSince, now);
+  } catch (error) {
+    // Daemon restart / transient network — keep the watermark, retry next tick.
+    console.warn('[desktop-notify] poll failed:', error instanceof Error ? error.message : error);
+  } finally {
+    desktopNotificationPollInFlight = false;
+  }
+}
+
+function startDesktopNotificationPoll(): void {
+  if (desktopNotificationPollTimer) return;
+  desktopNotificationPollTimer = setInterval(() => {
+    void pollDesktopNotifications();
+  }, DESKTOP_NOTIFICATION_POLL_INTERVAL_MS);
+  // Don't hold the event loop open or delay quit on this best-effort timer.
+  desktopNotificationPollTimer.unref?.();
+  // Kick one immediately so a notification that landed while the app was
+  // starting doesn't wait a full interval.
+  void pollDesktopNotifications();
+}
+
+function stopDesktopNotificationPoll(): void {
+  if (!desktopNotificationPollTimer) return;
+  clearInterval(desktopNotificationPollTimer);
+  desktopNotificationPollTimer = null;
 }
 
 interface PendingLocalMeetingCancellation {

@@ -37,7 +37,14 @@ import { dispatchBatchItemTool, READ_ONLY_TOOLS, isMcpNamespacedTool } from '../
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { codexSafeFast } from '../runtime/harness/model-roles.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
-import { recordJudgeMetric, withJudgeHedge, type JudgeMetricOutcome } from '../runtime/harness/judge-family.js';
+import {
+  recordJudgeMetric,
+  withJudgeHedge,
+  judgeChainEnabled,
+  isTransientJudgeError,
+  recordJudgeChainFallover,
+  type JudgeMetricOutcome,
+} from '../runtime/harness/judge-family.js';
 import type { BoundaryJudgeRouting } from '../runtime/harness/debate-model.js';
 import { normalizeComposioBatchItemArgs, validateComposioArgs } from '../tools/composio-batch-validator.js';
 import { getCachedToolSchema } from '../tools/composio-schema-cache.js';
@@ -232,6 +239,13 @@ export interface BatchCertification {
   reason: string;
   concerns: string[];
   judged: boolean;
+  /** J1: set when NO verdict could be obtained (the judge chain was exhausted /
+   *  a single-provider user had no acceptable judge). The consumption site keys
+   *  off THIS — never a raw `allow:false` — to PARK an irreversible send to a
+   *  human approval card / proceed reversible work with an "unverified" label,
+   *  rather than terminal-blocking. A real DENY (judge ran, flagged the payloads)
+   *  leaves this unset, so it still refuses. */
+  judgeUnavailable?: boolean;
 }
 
 /** Typed judge failures so the metric lane can distinguish a hung call from a
@@ -240,14 +254,29 @@ class BatchJudgeTimeoutError extends Error {
   constructor() { super('certification judge timed out'); }
 }
 class BatchJudgeInvalidError extends Error {}
+/** Thrown when every member of the judge chain (J1) has been tried and none
+ *  produced a verdict — carries the LAST underlying failure for metric
+ *  classification + the user-facing reason. */
+class BatchJudgeChainExhaustedError extends Error {
+  constructor(readonly lastError: unknown) { super('certification judge chain exhausted'); }
+}
 
 /** Test seam (same pattern as _setBatchSleepForTests): replaces ONE judge
- *  attempt, so tests exercise retry → fail-closed deterministically without a
+ *  attempt, so tests exercise retry / chain-fallover deterministically without a
  *  live provider — the dev machine's real OAuth logins otherwise make the
- *  "judge unreachable" test silently place a real model call. */
-let certifyJudgeOverride: (() => Promise<BatchCertification>) | null = null;
-export function _setCertifyJudgeForTests(fn: (() => Promise<BatchCertification>) | null): void {
+ *  "judge unreachable" test silently place a real model call. Receives the chain
+ *  member being attempted so a fallover test can behave differently per family. */
+let certifyJudgeOverride: ((member?: BoundaryJudgeRouting) => Promise<BatchCertification>) | null = null;
+export function _setCertifyJudgeForTests(fn: ((member?: BoundaryJudgeRouting) => Promise<BatchCertification>) | null): void {
   certifyJudgeOverride = fn;
+}
+
+/** Test seam: inject the judge CHAIN (J1) so a fallover test can supply a
+ *  ≥2-member chain without live provider logins (which the isolated test HOME
+ *  never has). Null ⇒ the real resolveBoundaryJudgeChain(). */
+let certifyChainOverride: (() => BoundaryJudgeRouting[]) | null = null;
+export function _setCertifyChainForTests(fn: (() => BoundaryJudgeRouting[]) | null): void {
+  certifyChainOverride = fn;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -368,10 +397,10 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
     if (!verdict) throw new BatchJudgeInvalidError(`judge returned no ALLOW/DENY verdict (got: ${raw.slice(0, 120)})`);
     return verdict;
   };
-  const runJudgeAttempt = async (): Promise<BatchCertification> => {
-    if (certifyJudgeOverride) return certifyJudgeOverride();
+  const runJudgeAttempt = async (member?: BoundaryJudgeRouting): Promise<BatchCertification> => {
+    if (certifyJudgeOverride) return certifyJudgeOverride(member);
     const { resolveBoundaryJudgeHedge } = await import('../runtime/harness/debate-model.js');
-    const primary = routing;
+    const primary = member ?? routing;
     const hedgeRouting = primary ? resolveBoundaryJudgeHedge(primary) : null;
     const raced = await withJudgeHedge(
       () => runJudgeOnce(primary),
@@ -386,30 +415,85 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
     if (invalid) throw invalid;
     throw raced.errors[0] instanceof Error ? raced.errors[0] : new Error(String(raced.errors[0]));
   };
+
+  // J1 chain: try each lane in order, falling THROUGH to the next family on a
+  // failure (transient provider shape = the designed trigger; a non-transient
+  // failure also advances since a different family may still verify — the chain
+  // length ≤3 bounds total attempts either way). Exhausting the chain throws
+  // BatchJudgeChainExhaustedError, which the catch turns into the
+  // judge-unavailable PARK/advisory policy (never a terminal block for a send).
+  const runJudgeChain = async (): Promise<BatchCertification> => {
+    const { resolveBoundaryJudgeChain } = await import('../runtime/harness/debate-model.js');
+    const chain = certifyChainOverride ? certifyChainOverride() : resolveBoundaryJudgeChain();
+    if (chain.length === 0) throw new BatchJudgeChainExhaustedError(new Error('no judge lane could be resolved'));
+    let lastErr: unknown;
+    for (let i = 0; i < chain.length; i += 1) {
+      const member = chain[i];
+      routing = member;
+      try {
+        return await runJudgeAttempt(member);
+      } catch (err) {
+        lastErr = err;
+        const next = chain[i + 1];
+        if (!next) break;
+        recordJudgeChainFallover({
+          fromFamily: member.judgeFamily,
+          toFamily: next.judgeFamily,
+          reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+          transient: isTransientJudgeError(err),
+          lane: 'certify',
+        });
+        logger.warn(
+          { from: member.judgeFamily, to: next.judgeFamily, err: err instanceof Error ? err.message : String(err) },
+          'batch certify judge lane failed — falling over to the next family in the chain',
+        );
+      }
+    }
+    throw new BatchJudgeChainExhaustedError(lastErr);
+  };
+
+  const chainOn = judgeChainEnabled();
   try {
-    const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
-    routing = resolveBoundaryJudge();
     let verdict: BatchCertification;
-    try {
-      verdict = await runJudgeAttempt();
-    } catch (firstErr) {
-      // ONE retry before any fail-closed: a schema/transport blip on a single
-      // call must not park an entire approved batch (live 2026-07-07: five
-      // consecutive verdict-shape rejections parked 5 emails).
-      logger.warn({ err: firstErr instanceof Error ? firstErr.message : String(firstErr) }, 'batch certify judge attempt 1 failed — retrying once');
-      verdict = await runJudgeAttempt();
+    if (chainOn) {
+      verdict = await runJudgeChain();
+    } else {
+      // LEGACY single-lane (kill-switch off = pre-J1 behavior): resolve one judge,
+      // ONE retry on a blip, then fail-closed/advisory at the catch.
+      const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
+      routing = resolveBoundaryJudge();
+      try {
+        verdict = await runJudgeAttempt(routing);
+      } catch (firstErr) {
+        // ONE retry before any fail-closed: a schema/transport blip on a single
+        // call must not park an entire approved batch (live 2026-07-07: five
+        // consecutive verdict-shape rejections parked 5 emails).
+        logger.warn({ err: firstErr instanceof Error ? firstErr.message : String(firstErr) }, 'batch certify judge attempt 1 failed — retrying once');
+        verdict = await runJudgeAttempt(routing);
+      }
     }
     record(verdict.allow ? 'passed' : 'blocked');
     return verdict;
   } catch (err) {
-    record(err instanceof BatchJudgeTimeoutError ? 'timeout' : err instanceof BatchJudgeInvalidError ? 'invalid' : 'error');
-    const message = err instanceof Error ? err.message : String(err);
-    // Fail-CLOSED for irreversible plans, advisory for reads (Wave 0 semantics).
+    const underlying = err instanceof BatchJudgeChainExhaustedError ? err.lastError : err;
+    record(underlying instanceof BatchJudgeTimeoutError ? 'timeout' : underlying instanceof BatchJudgeInvalidError ? 'invalid' : 'error');
+    const message = underlying instanceof Error ? underlying.message : String(underlying);
+    // READ is reversible → proceed advisory either way (labeled unverified).
     if (plan.sideEffect === 'read') {
-      logger.warn({ err: message }, 'batch certify judge unavailable — READ plan proceeds advisory');
-      return { allow: true, reason: `judge unavailable (${message}) — read plan proceeds without certification`, concerns: [], judged: false };
+      logger.warn({ err: message }, 'batch certify judge unavailable — READ plan proceeds advisory (unverified)');
+      return chainOn
+        ? { allow: true, reason: `unverified (judge unavailable): ${message} — read plan proceeds without certification`, concerns: [], judged: false, judgeUnavailable: true }
+        : { allow: true, reason: `judge unavailable (${message}) — read plan proceeds without certification`, concerns: [], judged: false };
     }
-    return { allow: false, reason: `certification judge unavailable for a ${plan.sideEffect} plan — refusing (fail-closed): ${message}`, concerns: [], judged: false };
+    if (!chainOn) {
+      // LEGACY fail-CLOSED (kill-switch off): terminal refuse for write/send.
+      return { allow: false, reason: `certification judge unavailable for a ${plan.sideEffect} plan — refusing (fail-closed): ${message}`, concerns: [], judged: false };
+    }
+    // J1: NO terminal block. Signal judgeUnavailable so the run_batch consumption
+    // site parks this ${plan.sideEffect} batch to a human approval card (the human
+    // is the fallback judge) instead of stranding the prepared payloads.
+    logger.warn({ err: message, sideEffect: plan.sideEffect }, 'batch certify judge chain exhausted — parking for human approval (judge unavailable)');
+    return { allow: false, reason: `could not independently verify this ${plan.sideEffect} batch (${message})`, concerns: [], judged: false, judgeUnavailable: true };
   }
 }
 

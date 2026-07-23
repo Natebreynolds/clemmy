@@ -6,6 +6,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { TurnActivity } from '@/components/chat/TurnActivity';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
+import { approveExecutePendingAction } from '@/lib/pendingActions';
 import type { ChatMessage } from '@/lib/useChat';
 
 /** Inline spans within a line: **bold** and `code`; everything else is linkified
@@ -127,6 +128,45 @@ export function ChatBubble({
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
   // without a local latch the buttons stay live forever. Latch on first click.
   const [resolved, setResolved] = useState(false);
+  // Execute-button truth (U3): a pending-action card's Execute fires the exact
+  // stored call server-side and shows the DURABLE outcome — never a client-side
+  // "Submitted" that outruns whether the send actually happened.
+  const [exec, setExec] = useState<{ phase: 'idle' | 'running' | 'executed' | 'failed'; note?: string }>({ phase: 'idle' });
+  // Grant-at-card (C, v2.3.0): opting in stores a NARROW standing send-trust
+  // grant (exactly this card's recipients on this toolkit) so the next
+  // identical send skips the card. trustNote reports the server's truth —
+  // "stored" vs "couldn't scope it" — never an optimistic claim.
+  const [alwaysAllow, setAlwaysAllow] = useState(false);
+  const [trustNote, setTrustNote] = useState<string | null>(null);
+  const pendingActionId = message.approval?.pendingAction?.id;
+  const runExecute = async () => {
+    if (!pendingActionId) return;
+    setResolved(true);
+    setExec({ phase: 'running' });
+    try {
+      const result = await approveExecutePendingAction(pendingActionId, message.approval?.approvalId ?? undefined, alwaysAllow);
+      if (alwaysAllow) {
+        setTrustNote(result.trustGranted
+          ? 'Standing trust saved — identical sends to these recipients won’t ask again. Revoke anytime in Settings.'
+          : 'Couldn’t save standing trust for this one (no verifiable recipients) — it will still ask next time.');
+      }
+      const note = (result.resultSummary || result.record?.resultSummary || '').trim();
+      if (result.status === 'executed') {
+        setExec({ phase: 'executed', note: note ? note.slice(0, 240) : undefined });
+      } else if (result.status === 'failed') {
+        setExec({ phase: 'failed', note: (note || 'The send was refused before it left.').slice(0, 240) });
+      } else {
+        // 'skipped' — the record wasn't in an executable state (still needs
+        // approval, or a run_batch plan). Fall back to the conversational
+        // approve-text path, which drives the normal approval machinery.
+        setExec({ phase: 'idle' });
+        onApprove();
+      }
+    } catch (err) {
+      const msg = err && typeof err === 'object' && 'message' in err ? String((err as { message: unknown }).message) : 'Execution failed.';
+      setExec({ phase: 'failed', note: msg.slice(0, 240) });
+    }
+  };
 
   if (isUser) {
     return (
@@ -230,14 +270,46 @@ export function ChatBubble({
               )}
               {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
               {pendingAction && <PayloadPreview value={pendingAction.payload} />}
+              {pendingAction && !resolved && (
+                <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
+                  <input
+                    type="checkbox"
+                    checked={alwaysAllow}
+                    onChange={(e) => setAlwaysAllow(e.target.checked)}
+                    className="h-3.5 w-3.5 accent-[var(--color-primary,#f97316)]"
+                  />
+                  Always allow sends like this (same recipients — revocable in Settings)
+                </label>
+              )}
               <div className="mt-2.5 flex items-center gap-2">
-                <Button size="sm" disabled={resolved} onClick={() => { setResolved(true); onApprove(); }}>
+                <Button
+                  size="sm"
+                  disabled={resolved || exec.phase === 'running'}
+                  onClick={pendingAction ? runExecute : () => { setResolved(true); onApprove(); }}
+                >
                   {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
                   {pendingAction ? 'Execute queued action' : 'Approve'}
                 </Button>
                 <Button size="sm" variant="secondary" disabled={resolved} onClick={() => { setResolved(true); onReject(); }}><X className="h-4 w-4" aria-hidden /> Not now</Button>
-                {resolved && <span className="text-caption text-muted">Submitted</span>}
+                {/* Truth, not a latch: for a pending-action card the label reflects
+                    the durable executor outcome; the plain approve/plan path keeps
+                    the "Submitted" acknowledgement (its follow-up turn carries the
+                    real result). */}
+                {pendingAction ? (
+                  exec.phase === 'running' ? <span className="text-caption text-muted">Executing…</span>
+                    : exec.phase === 'executed' ? <span className="text-caption font-semibold text-success">Executed ✓</span>
+                      : exec.phase === 'failed' ? <span className="text-caption font-semibold text-danger">Refused / didn’t send</span>
+                        : null
+                ) : (
+                  resolved && <span className="text-caption text-muted">Submitted</span>
+                )}
               </div>
+              {pendingAction && exec.note && (exec.phase === 'executed' || exec.phase === 'failed') && (
+                <p className={cn('mt-1.5 whitespace-pre-wrap text-caption', exec.phase === 'failed' ? 'text-danger' : 'text-muted')}>
+                  {exec.note}
+                </p>
+              )}
+              {trustNote && <p className="mt-1 text-caption text-muted">{trustNote}</p>}
             </div>
           )}
         </div>

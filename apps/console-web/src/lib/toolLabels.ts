@@ -38,6 +38,27 @@ export function salientArgDetail(argsRaw: unknown): string {
   return '';
 }
 
+/** Humanize ONE recorded external write into a plain, short feed line —
+ *  "Sent a message to paul@…", "Created a record", "Saved a file". Keyed off the
+ *  write's shapeKey/slug (SEND / CREATE / UPDATE / …), never a specific tool name,
+ *  so it covers email, chat, SMS, CRM, files. Mirrors the server's
+ *  describeExternalWrite (src/runtime/harness/work-report.ts) so the live feed and
+ *  the report-back message read identically. */
+export function describeExternalWrite(shapeKey: string | undefined, toolName: string, targets: string[]): string {
+  const key = (shapeKey || toolName || 'action').toUpperCase();
+  const to = targets.length
+    ? ` to ${targets.slice(0, 3).join(', ')}${targets.length > 3 ? ` (+${targets.length - 3} more)` : ''}`
+    : '';
+  if (/DRAFT/.test(key) && !/SEND|PUBLISH/.test(key)) return `Created a draft${to}`;
+  if (/SEND|EMAIL|DELIVER|DISPATCH|DM\b|MESSAGE|SMS|TEXT/.test(key)) return `Sent a message${to}`;
+  if (/PUBLISH|POST|TWEET/.test(key)) return `Published a post${to}`;
+  if (/CREATE|ADD|INSERT|UPSERT/.test(key)) return `Created a record${to}`;
+  if (/UPDATE|PATCH|EDIT|MODIFY|SET_/.test(key)) return `Updated a record${to}`;
+  if (/DELETE|REMOVE|ARCHIVE|TRASH/.test(key)) return `Deleted a record${to}`;
+  if (/UPLOAD|SAVE|WRITE/.test(key)) return `Saved a file${to}`;
+  return `Ran ${key.toLowerCase().replace(/_/g, ' ')}${to}`;
+}
+
 /** Human label for a tool call: composio calls read as their inner slug
  *  ("outlook send email"), MCP calls drop the server prefix, underscores drop. */
 export function humanToolLabel(tool: string, argsRaw?: unknown): string {

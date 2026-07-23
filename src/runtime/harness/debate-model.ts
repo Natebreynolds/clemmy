@@ -51,6 +51,7 @@ import {
   codexAvailable,
   debateBrainsAvailable,
   judgeCrossFamilyEnabled,
+  judgeChainEnabled,
   chooseBoundaryJudgeFamily,
   boundaryClaudeJudgeModel,
   boundaryCodexJudgeModel,
@@ -1013,6 +1014,70 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
  * may share the BRAIN's family (a tagged selfJudge verdict beats the advisory
  * downgrade a timeout causes — the verdict is still real, just lower-confidence).
  */
+/**
+ * Resolve the ORDERED judge chain (J1) for a boundary/certifier call: the lanes
+ * to try in order, each falling THROUGH to the next on a transient provider
+ * failure. Bounded to ≤3 members:
+ *   1. the preferred lane (cross-family when a different family is logged in,
+ *      else the same-family fail-open lane) — resolveBoundaryJudge();
+ *   2. the OTHER connected flagship family's cheap boundary judge (a genuinely
+ *      independent second opinion when both Claude + Codex are logged in);
+ *   3. a downshifted same-family lane as the last resort — a tagged self-judge
+ *      verdict still beats NO verdict (which would strand the work).
+ * Deduped by family+model, so a single-provider user collapses to one lane (the
+ * chain then has nothing to fall over to — the caller parks to a human). Never
+ * throws: a provider that can't build a model is simply skipped. Kill-switch off
+ * ⇒ only the preferred lane (pre-J1 single-lane behavior).
+ */
+export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
+  const chain: BoundaryJudgeRouting[] = [];
+  const seen = new Set<string>();
+  const push = (r: BoundaryJudgeRouting | null): void => {
+    if (!r || !r.model) return;
+    const key = `${r.judgeFamily}:${r.modelId}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    chain.push(r);
+  };
+
+  // 1) The preferred lane (cross-family when available; same-family fail-open else).
+  try { push(resolveBoundaryJudge()); } catch { /* no provider could build — skip */ }
+
+  if (!judgeChainEnabled()) return chain; // kill-switch: single lane only
+
+  const haveClaude = claudeAvailable();
+  const haveCodex = codexAvailable();
+  const brainFamily = chain[0]?.brainFamily ?? resolveRoleModel('brain').provider;
+
+  // 2) The other connected flagship family's cheap judge (independent second family).
+  const flagships: Array<{ provider: 'claude' | 'codex'; modelId: string; available: boolean }> = [
+    { provider: 'claude', modelId: boundaryClaudeJudgeModel(), available: haveClaude },
+    { provider: 'codex', modelId: boundaryCodexJudgeModel(), available: haveCodex },
+  ];
+  for (const f of flagships) {
+    if (chain.length >= 3) break;
+    if (!f.available) continue;
+    const model = buildJudgeForRole({ modelId: f.modelId, provider: f.provider, source: 'default' }, haveClaude, haveCodex);
+    if (!model) continue;
+    push({
+      model,
+      modelId: f.modelId,
+      judgeFamily: f.provider,
+      brainFamily,
+      transport: boundaryTransport(f.provider),
+      selfJudge: f.provider === brainFamily,
+    });
+  }
+
+  // 3) Last resort: a downshifted same-family lane (a tagged self-judge beats no
+  //    verdict). Deduped, so this is a no-op when member 1 already covers it.
+  if (chain.length < 3) {
+    try { push(resolveSameFamilyBoundaryJudge(resolveRoleModel('brain'))); } catch { /* skip */ }
+  }
+
+  return chain.slice(0, 3);
+}
+
 export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting): BoundaryJudgeRouting | null {
   if (!judgeCrossFamilyEnabled()) return null;
   const haveClaude = claudeAvailable();

@@ -21,6 +21,8 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type {
@@ -338,9 +340,48 @@ function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
   const workflowName = workflowNameFor(summaryRow);
   const summary = summarizeHarness(summaryRow, runId && workflowName ? workflowName : undefined);
   const turns = reconstructHarnessDetailTurns(row);
+  appendPendingApprovalTurns(row.id, turns);
   summary.turnCount = turns.length;
   summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
   return { session: summary, turns, continueHint: continueHintFor(summary, row.id) };
+}
+
+/**
+ * A2 (v2.3.0): surface STILL-PENDING approval cards in a reopened chat. The
+ * live stream folds `approval_requested` into the actionable card, but the
+ * reconstructed transcript is turn-level, so on reopen the user saw only the
+ * prose "reply approve apr-x" while the card existed nowhere in the chat
+ * (live 2026-07-23). Attach one synthetic assistant turn per approval that is
+ * still pending; resolved/expired approvals render nothing.
+ */
+function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn[]): void {
+  try {
+    const cardEvents = listHarnessEvents(sessionId, { types: ['approval_requested'] });
+    if (cardEvents.length === 0) return;
+    const seen = new Set<string>();
+    for (const ev of cardEvents) {
+      const d = ev.data as Record<string, unknown>;
+      const approvalId = typeof d.approvalId === 'string' ? d.approvalId : '';
+      if (!approvalId || seen.has(approvalId)) continue;
+      seen.add(approvalId);
+      const rowNow = approvalRegistry.get(approvalId);
+      if (!rowNow || rowNow.status !== 'pending') continue;
+      turns.push({
+        role: 'assistant',
+        text: '',
+        createdAt: ev.createdAt,
+        approval: {
+          subject: typeof d.subject === 'string' && d.subject ? d.subject : String(d.tool ?? 'this action'),
+          reason: typeof d.reason === 'string' ? d.reason : undefined,
+          approvalId,
+          // Hydrated fresh from the registry row (card events are slim, ids
+          // only) — also picks up the CURRENT pending-action state rather
+          // than a snapshot from park time.
+          pendingAction: pendingActionApprovalViewFromArgs(rowNow.args ?? null),
+        },
+      });
+    }
+  } catch { /* history remains renderable without the card */ }
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────

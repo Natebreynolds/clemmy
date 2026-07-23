@@ -82,6 +82,7 @@ const {
   isWorkflowStepBrainFalloverEligible,
   _setWorkflowHarnessLoopImplsForTests,
   publishWorkflowRunTerminalForTest,
+  emitParkedApprovalCardToOriginChat,
 } = await import('./workflow-runner.js');
 // The workflow watcher would otherwise place a REAL judge call from any
 // multi-step test run (live OAuth tokens make the judge reachable on dev
@@ -3605,4 +3606,47 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
   const steer = events.find((e) => e.kind === 'step_advisory' && (e.meta as { reason?: string } | undefined)?.reason === 'watcher_steer');
   assert.ok(steer, `expected a watcher_steer advisory, got kinds: ${events.map((e) => e.kind).join(', ')}`);
   assert.match(String((steer!.meta as { steer?: string }).steer ?? ''), /Re-anchor on the goal/);
+});
+
+// A2 (v2.3.0): a workflow park must land the ACTIONABLE approval card in the
+// origin chat — the same `approval_requested` event shape the chat folds into
+// the approve/execute card — not just a prose "reply approve apr-x" turn
+// (live 2026-07-23: user sat in the origin conversation with no card).
+test('A2: parking emits the actionable approval card into the origin chat', () => {
+  const origin = 'desktop-origin-a2';
+  HarnessSession.create({ id: origin, kind: 'chat', channel: 'desktop', title: 'a2 origin', metadata: { source: 'desktop' } });
+  const gateSid = 'workflow-gate:a2-run:post_slack';
+  HarnessSession.create({ id: gateSid, kind: 'workflow', channel: 'workflow', title: 'a2 gate', metadata: { source: 'workflow' } });
+  const row = approvalRegistry.register({
+    sessionId: gateSid,
+    subject: 'Post the update to #clawde-and-order',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'SLACK_SEND_MESSAGE', channel: '#clawde-and-order' },
+    ttlMs: 60_000,
+  });
+  const emitted = emitParkedApprovalCardToOriginChat({
+    originSessionId: origin,
+    approvalId: row.approvalId,
+    workflowName: 'slack-eod',
+    runId: 'run-a2',
+  });
+  assert.equal(emitted, true);
+  const cards = listEvents(origin, { types: ['approval_requested'] });
+  assert.equal(cards.length, 1, 'exactly one card event in the origin chat');
+  const d = cards[0].data as Record<string, unknown>;
+  assert.equal(d.approvalId, row.approvalId);
+  assert.equal(d.subject, 'Post the update to #clawde-and-order');
+  assert.equal(d.tool, 'composio_execute_tool');
+  assert.equal(d.workflowName, 'slack-eod');
+  assert.equal(d.runId, 'run-a2');
+
+  // No registry row (or no approvalId at all) → no card, no throw; the prose
+  // needs_input turn stays the guaranteed baseline.
+  assert.equal(emitParkedApprovalCardToOriginChat({
+    originSessionId: origin, approvalId: 'apr-does-not-exist', workflowName: 'w', runId: 'r',
+  }), false);
+  assert.equal(emitParkedApprovalCardToOriginChat({
+    originSessionId: origin, approvalId: undefined, workflowName: 'w', runId: 'r',
+  }), false);
+  assert.equal(listEvents(origin, { types: ['approval_requested'] }).length, 1, 'failed emits add nothing');
 });

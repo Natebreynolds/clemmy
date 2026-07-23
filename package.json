@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "description": "Local-first AI operator with persistent memory, governed tools, workflows, voice, and meetings",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
