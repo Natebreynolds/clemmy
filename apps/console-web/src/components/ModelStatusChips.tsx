@@ -125,22 +125,34 @@ export function ModelStatusChips() {
       />,
     );
   }
-  if (data.openai?.connected) chips.push(<ConnectedChip key="openai" label="OpenAI" />);
-  const byoProviders = data.byoProviders ?? [];
+  // Every extra API key used to add its own chip until Search/Run/Talk clipped
+  // off the bar. The quota chips carry real signal; plain "connected" providers
+  // collapse into ONE summary chip whose tooltip lists them all.
+  const simple: Array<{ label: string; detail?: string }> = [];
+  if (data.openai?.connected) simple.push({ label: 'OpenAI' });
+  const byoProviders = (data.byoProviders ?? []).filter((p) => p.connected);
   if (byoProviders.length > 0) {
-    for (const provider of byoProviders.filter((p) => p.connected)) {
-      chips.push(
-        <ConnectedChip
-          key={`byo-${provider.id}`}
-          label={provider.label || provider.id}
-          title={`${provider.label || provider.id} connected${provider.modelIds.length ? `\n${provider.modelIds.join('\n')}` : ''}`}
-        />,
-      );
+    for (const provider of byoProviders) {
+      simple.push({
+        label: provider.label || provider.id,
+        detail: provider.modelIds.length ? provider.modelIds.join(', ') : undefined,
+      });
     }
   } else if (data.together?.connected) {
-    chips.push(<ConnectedChip key="together" label="Together" />);
+    simple.push({ label: 'Together' });
+  }
+  if (simple.length === 1) {
+    chips.push(<ConnectedChip key="provider" label={simple[0].label} title={`${simple[0].label} connected${simple[0].detail ? `\n${simple[0].detail}` : ''}`} />);
+  } else if (simple.length > 1) {
+    chips.push(
+      <ConnectedChip
+        key="providers"
+        label={`${simple.length} providers`}
+        title={simple.map((p) => `${p.label} connected${p.detail ? ` · ${p.detail}` : ''}`).join('\n')}
+      />,
+    );
   }
 
   if (chips.length === 0) return null;
-  return <div className="hidden items-center gap-1.5 lg:flex">{chips}</div>;
+  return <div className="hidden min-w-0 shrink items-center gap-1.5 overflow-hidden lg:flex">{chips}</div>;
 }

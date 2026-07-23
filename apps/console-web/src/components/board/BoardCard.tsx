@@ -19,7 +19,32 @@ const dragActions = new Set(['cancel', 'resume', 'promote']);
 function artifactsLine(card: BoardCardT): string {
   const a = card.artifactSummary;
   if (!a) return '';
-  return [...a.counts, ...a.files, ...a.urls].slice(0, 3).join(' · ');
+  // A raw Salesforce URL is 80+ unbroken chars — show the hostname; the full
+  // link lives in the trace drawer. Dedupe: recurring runs repeated the same
+  // count three times ("accounts: 15 · accounts: 15 · accounts: 15").
+  const urlLabel = (u: string) => {
+    try { return new URL(u).hostname.replace(/^www\./, ''); }
+    catch { return u.length > 40 ? `${u.slice(0, 39)}…` : u; }
+  };
+  const parts = [...new Set([
+    ...a.counts,
+    ...a.files.map((f) => f.split('/').pop() || f),
+    ...a.urls.map(urlLabel),
+  ])];
+  return parts.slice(0, 3).join(' · ');
+}
+
+/** The red box adds nothing when its reason just repeats the card's own
+ *  progress hint (both are derived from the same output preview). */
+function failureReasonIsRedundant(card: BoardCardT): boolean {
+  const reason = card.failureSummary?.reason ?? '';
+  const hint = card.progressHint ?? '';
+  if (!reason || !hint) return false;
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+  const a = norm(reason);
+  const b = norm(hint);
+  const probe = Math.min(40, a.length, b.length);
+  return probe > 0 && a.slice(0, probe) === b.slice(0, probe);
 }
 
 function continueIntent(card: BoardCardT): BoardButtonIntent {
@@ -85,16 +110,16 @@ export function BoardCard({
       {card.failureSummary && (
         // line-clamp keeps a verbose failure reason from turning the card into a
         // wall of red — the FULL text lives one click away in the trace drawer.
-        <p className="mt-2 line-clamp-3 rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
+        <p className="mt-2 line-clamp-3 break-words rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
           {card.failureSummary.failedItems > 0
             ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
             : 'Needs review'}
-          {card.failureSummary.reason ? ` · ${card.failureSummary.reason}` : ''}
+          {card.failureSummary.reason && !failureReasonIsRedundant(card) ? ` · ${card.failureSummary.reason}` : ''}
         </p>
       )}
 
       {artifacts && (
-        <p className="mt-2 rounded-sm bg-success-tint px-2 py-1 text-caption text-success">{artifacts}</p>
+        <p className="mt-2 line-clamp-2 break-words rounded-sm bg-success-tint px-2 py-1 text-caption text-success">{artifacts}</p>
       )}
 
       {card.nextSafeAction && (
@@ -125,13 +150,14 @@ export function BoardCard({
         return ref ? <RunQueue slug={ref.slug} runId={ref.runId} /> : null;
       })()}
 
-      <div className="mt-2.5 flex items-center justify-between gap-2">
+      {/* flex-wrap: Approve + Reject + View trace must never clip off the card edge */}
+      <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2">
         <StatusPill tone={tone.tone}>
           {card.column === 'running'
             ? <span className="inline-flex items-center gap-1"><Radio className="h-3 w-3 animate-breathe" />{tone.label}</span>
             : tone.label}
         </StatusPill>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
           {onAction && card.primaryAction === 'approve' && (
             <>
               <Button
