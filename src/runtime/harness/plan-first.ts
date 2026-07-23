@@ -141,6 +141,16 @@ export function detectAmbiguousAction(
 const EXPLICIT_PLAN_FIRST_RE =
   /\b(?:plan\s+first|draft\s+(?:me\s+)?a\s+plan|create\s+(?:me\s+)?a\s+plan|make\s+(?:me\s+)?a\s+plan|show\s+me\s+(?:the\s+)?plan|before\s+you\s+start[, ]+(?:plan|outline)|approve\s+(?:the\s+)?plan)\b/i;
 
+// "Plan" AS A REQUESTED ACTIVITY (live 2026-07-24: "help me plan this out and
+// then we can run it" missed the pattern above, so the entire plan-first flow
+// — the exact experience the user asked for — sat unused while the model
+// improvised). Explicit invocations are a CLOSED vocabulary anchored on the
+// word "plan" used as a verb directed at the work — unlike open conversational
+// prose, this set is small and stable. Artifact-noun usages ("update the
+// project plan in Asana") deliberately do NOT match.
+const PLAN_ACTIVITY_RE =
+  /\b(?:help\s+me|let'?s|can\s+we|we\s+should|i\s+want\s+to|want\s+you\s+to)\s+plan\b|\bplan\s+(?:this|it|that)\s+(?:out|first|together|with\s+me)?\b|\bplan\s+out\b|\bplan\s+(?:this|it|that)\b/i;
+
 export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   if (planFirstDisabled()) return false;
 
@@ -169,6 +179,10 @@ export function shouldUsePlanFirst(input: PlanFirstInput): boolean {
   // user wants. The planner-first preflight was restricting the model;
   // it is now opt-in via an explicit request only.
   if (EXPLICIT_PLAN_FIRST_RE.test(text)) return true;
+  // "Help me plan this out …" — plan requested as an activity. Bounded to
+  // substantive asks (length floor) so "plan it" alone in a short control
+  // reply cannot re-trip the planner mid-conversation.
+  if (PLAN_ACTIVITY_RE.test(text) && text.length >= 80) return true;
 
   return false;
 }

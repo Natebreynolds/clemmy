@@ -139,6 +139,7 @@ import {
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
 import { looksLikeDispatchHandoffReply, steerTurnReplySalvage, textAwaitsUserMaterial, recoverySummaryReplyIsDeliverable } from './turn-decision.js';
+import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
@@ -356,15 +357,29 @@ function finalizeStandardConversation(input: {
   });
   if (parked) return parked;
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  const dataOut: Record<string, unknown> = {
+    ...input.eventData,
+    ...(state ? artifactVerificationProjection(state) : {}),
+  };
+  // PLACEHOLDER EXTINCTION (live 2026-07-24): completions with nothing visible
+  // rendered "(Done.)" / "(Finished without a written reply.)" in a real
+  // conversation. A completion either reports its actual work (turn report) or
+  // says something human — the client must never have to invent scaffolding.
+  const hasVisibleText =
+    (typeof dataOut.reply === 'string' && dataOut.reply.trim().length > 0) ||
+    (typeof dataOut.summary === 'string' && dataOut.summary.trim().length > 0);
+  if (!hasVisibleText) {
+    let floor: string | null = null;
+    try { floor = synthesizeTurnReport(input.sessionId, input.sourceUserSeq); } catch { floor = null; }
+    dataOut.summary = (floor && floor.trim()) || MISSING_REPLY_USER_FALLBACK;
+    dataOut.missingReply = true;
+  }
   safeAppend({
     sessionId: input.sessionId,
     turn: input.turn,
     role: 'system',
     type: 'conversation_completed',
-    data: {
-      ...input.eventData,
-      ...(state ? artifactVerificationProjection(state) : {}),
-    },
+    data: dataOut,
   });
   return input.result;
 }
@@ -2592,6 +2607,45 @@ async function runConversationCore(
         })
       : undefined;
     if (structuredStallInfo) {
+      // STALL JUDGE, structured-path twin (2026-07-24 robust-tool-call audit):
+      // a structured tool-unavailable claim may be TRUE (a specific integration
+      // genuinely unconnected) — honest-gap vs lie is semantic. Same
+      // delivery-only authority and fallbacks as the unparsed site.
+      if (
+        stallRetriesUsed === 0 &&
+        stallIsJudgeAmbiguous(structuredStallInfo, { userInput: String(options.input ?? '') })
+      ) {
+        const structuredReplyText = (decision?.reply ?? decision?.summary ?? '').trim();
+        if (structuredReplyText.length >= 40) {
+          const judgedStructured = await judgeAmbiguousStallReply({
+            userInput: String(options.input ?? ''),
+            replyText: structuredReplyText,
+          });
+          if (judgedStructured === 'deliver') {
+            lastDecision = { summary: structuredReplyText.slice(0, 200), reply: structuredReplyText, done: true, nextAction: 'completed', reason: null };
+            return finalizeStandardConversation({
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              turn: turnResult.turn,
+              eventData: {
+                steps: stepIndex,
+                reason: 'stall_judge_delivered',
+                summary: structuredReplyText.slice(0, 200),
+                reply: structuredReplyText,
+                delivered: true,
+                stallDetail: { signal: structuredStallInfo.signal, ...structuredStallInfo.detail },
+              },
+              result: {
+                sessionId: options.sessionId,
+                status: 'completed',
+                steps: stepIndex,
+                lastDecision,
+                lastTurn,
+              },
+            });
+          }
+        }
+      }
       safeAppend({
         sessionId: options.sessionId,
         turn: turnResult.turn,
@@ -2896,6 +2950,47 @@ async function runConversationCore(
               lastTurn,
             },
           });
+        }
+        // STALL JUDGE (2026-07-24, the verb-regex exit ramp): for the
+        // AMBIGUOUS prose-shape stalls only (announcement/short-generic — the
+        // guesses; detected-bad shapes stay deterministic), ask one
+        // cross-family judge question on FIRST detection: real reply or punt?
+        // "deliver" finalizes with the text; "stall"/judge-failure proceeds
+        // through the unchanged retry → recovery-turn → human-floor chain.
+        if (
+          stallRetriesUsed === 0 &&
+          stallIsJudgeAmbiguous(stallInfo, { userInput: String(options.input ?? '') }) &&
+          typeof turnResult.finalOutput === 'string' &&
+          turnResult.finalOutput.trim().length >= 40
+        ) {
+          const judged = await judgeAmbiguousStallReply({
+            userInput: String(options.input ?? ''),
+            replyText: turnResult.finalOutput.trim(),
+          });
+          if (judged === 'deliver') {
+            const judgeReply = turnResult.finalOutput.trim();
+            lastDecision = { summary: judgeReply.slice(0, 200), reply: judgeReply, done: true, nextAction: 'completed', reason: null };
+            return finalizeStandardConversation({
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              turn: turnResult.turn,
+              eventData: {
+                steps: stepIndex,
+                reason: 'stall_judge_delivered',
+                summary: judgeReply.slice(0, 200),
+                reply: judgeReply,
+                delivered: true,
+                stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
+              },
+              result: {
+                sessionId: options.sessionId,
+                status: 'completed',
+                steps: stepIndex,
+                lastDecision,
+                lastTurn,
+              },
+            });
+          }
         }
         safeAppend({
           sessionId: options.sessionId,

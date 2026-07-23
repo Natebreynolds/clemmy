@@ -422,3 +422,25 @@ test('shouldUsePlanFirst: a control reply never engages even with the flag on', 
     else process.env.CLEMMY_CHAT_CONVERSE = prev;
   }
 });
+
+// Plan-as-activity routing (live 2026-07-24): "help me plan this out and then
+// we can run it" missed EXPLICIT_PLAN_FIRST_RE, so the entire plan-first flow
+// sat unused while the model improvised a dense one-liner + placement question
+// and later jumped into a 120-item foreground fan-out.
+test('plan-activity: the live "help me plan this out" ask routes to plan-first; artifact-noun and control replies do not', async () => {
+  const { shouldUsePlanFirst } = await import('./plan-first.js');
+  const live = 'I would like to run a chatgpt ads scrape for my team. find 15 prospects per rep in salesforce, scrape their websites for a keyword, check chatgpt visibility, and build a google sheet with the SF record, best email, and draft. help me plan this out and then we can run it';
+  assert.equal(shouldUsePlanFirst({ input: live, freshSession: true }), true);
+  assert.equal(shouldUsePlanFirst({
+    input: 'lets plan the Q3 outreach push together: 200 accounts, three touch sequences, and a tracking sheet for each rep',
+    freshSession: true,
+  }), true);
+  // Artifact-noun usage is an ACTION on a plan document, not a planning request.
+  assert.equal(shouldUsePlanFirst({
+    input: 'update the project plan in asana and assign the tasks to sarah for this quarter please, she needs it by friday',
+    freshSession: true,
+  }), false);
+  // Short/control replies can never re-trip the planner mid-conversation.
+  assert.equal(shouldUsePlanFirst({ input: 'plan it', freshSession: false }), false);
+  assert.equal(shouldUsePlanFirst({ input: 'approve', freshSession: false }), false);
+});
