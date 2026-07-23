@@ -5284,3 +5284,84 @@ test('runConversation: when even the recovery turn fails, the floor is HUMAN lan
     if (prev === undefined) delete process.env.HARNESS_STALL_ASK_USER; else process.env.HARNESS_STALL_ASK_USER = prev;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Stall judge (2026-07-24) — the verb-regex exit ramp. For AMBIGUOUS
+// prose-shape stalls only, one cross-family judge question decides reply vs
+// punt on first detection. Authority is one-directional: the judge can only
+// override toward DELIVERY; on "stall"/failure the deterministic machinery
+// (retry → recovery turn → human floor) proceeds unchanged.
+// ---------------------------------------------------------------------------
+
+test('stall judge: "deliver" verdict finalizes the ambiguous reply with no stuck event, no retries', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // A novel phrasing no regex knows — the class the judge exists for.
+  const novelReply = 'Happy to hold here — the moment your announcement copy lands I can weave it into each of the 15 drafts.';
+  let judgeCalls = 0;
+  _setStallJudgeForTests(async () => { judgeCalls += 1; return 'deliver'; });
+  try {
+    // Force the ambiguous stall shape: zero tools + announcement-ish text.
+    const runner = scriptedRunner([{ finalOutput: `I’ll weave it in. ${novelReply}` }]);
+    const result = await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'ill send the copy over soon',
+      makeRunner: makeRunnerStub, runRunner: runner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(judgeCalls, 1, 'judge consulted exactly once');
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.ok(completed.some((e) => (e.data as { reason?: string }).reason === 'stall_judge_delivered'));
+    assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0, 'no stuck event on judge delivery');
+    assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0, 'no retries burned');
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});
+
+test('stall judge: "stall" and "unavailable" verdicts leave the deterministic machinery unchanged', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  for (const verdict of ['stall', 'unavailable'] as const) {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    _setStallJudgeForTests(async () => verdict);
+    try {
+      const runner = scriptedRunner([{ finalOutput: 'I’ll run the Salesforce pull now and report back shortly.' }]);
+      await runConversation({
+        agent: makeAgentStub(), sessionId: sess.id, input: 'pull the prospects',
+        makeRunner: makeRunnerStub, runRunner: runner,
+      });
+      assert.ok(
+        listEventsForConv(sess.id, { types: ['stuck_detected'] }).length >= 1,
+        `verdict=${verdict}: the punt still stalls`,
+      );
+      assert.ok(
+        listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length >= 1,
+        `verdict=${verdict}: retries still fire`,
+      );
+    } finally {
+      _setStallJudgeForTests(null);
+    }
+  }
+});
+
+test('stall judge: detected-bad shapes never consult the judge (deterministic stays deterministic)', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeCalls = 0;
+  _setStallJudgeForTests(async () => { judgeCalls += 1; return 'deliver'; });
+  try {
+    // A fake tool transcript — harness-owned fact, not a prose guess.
+    const fake = '**run_shell_command**\n```\nsf data query --query "SELECT Id FROM Account"\n```';
+    const runner = scriptedRunner([{ finalOutput: fake }]);
+    await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'pull the accounts',
+      makeRunner: makeRunnerStub, runRunner: runner,
+    });
+    assert.equal(judgeCalls, 0, 'a lying transcript is never sent to the judge');
+    assert.ok(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length >= 1);
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});

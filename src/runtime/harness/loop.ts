@@ -139,6 +139,7 @@ import {
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
 import { looksLikeDispatchHandoffReply, steerTurnReplySalvage, textAwaitsUserMaterial, recoverySummaryReplyIsDeliverable } from './turn-decision.js';
+import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
@@ -2896,6 +2897,47 @@ async function runConversationCore(
               lastTurn,
             },
           });
+        }
+        // STALL JUDGE (2026-07-24, the verb-regex exit ramp): for the
+        // AMBIGUOUS prose-shape stalls only (announcement/short-generic — the
+        // guesses; detected-bad shapes stay deterministic), ask one
+        // cross-family judge question on FIRST detection: real reply or punt?
+        // "deliver" finalizes with the text; "stall"/judge-failure proceeds
+        // through the unchanged retry → recovery-turn → human-floor chain.
+        if (
+          stallRetriesUsed === 0 &&
+          stallIsJudgeAmbiguous(stallInfo) &&
+          typeof turnResult.finalOutput === 'string' &&
+          turnResult.finalOutput.trim().length >= 40
+        ) {
+          const judged = await judgeAmbiguousStallReply({
+            userInput: String(options.input ?? ''),
+            replyText: turnResult.finalOutput.trim(),
+          });
+          if (judged === 'deliver') {
+            const judgeReply = turnResult.finalOutput.trim();
+            lastDecision = { summary: judgeReply.slice(0, 200), reply: judgeReply, done: true, nextAction: 'completed', reason: null };
+            return finalizeStandardConversation({
+              sessionId: options.sessionId,
+              sourceUserSeq: activeSourceUserSeq,
+              turn: turnResult.turn,
+              eventData: {
+                steps: stepIndex,
+                reason: 'stall_judge_delivered',
+                summary: judgeReply.slice(0, 200),
+                reply: judgeReply,
+                delivered: true,
+                stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
+              },
+              result: {
+                sessionId: options.sessionId,
+                status: 'completed',
+                steps: stepIndex,
+                lastDecision,
+                lastTurn,
+              },
+            });
+          }
         }
         safeAppend({
           sessionId: options.sessionId,
