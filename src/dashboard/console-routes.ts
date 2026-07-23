@@ -873,6 +873,9 @@ function workflowCertificationSummary(cert: WorkflowCertification) {
     resourceGaps: cert.resourceGaps.slice(0, 5),
     resourceGapCount: cert.resourceGaps.length,
     readinessGapCount: cert.readinessGaps.length,
+    // F3 (live 2026-07-23): the LIST payload shipped only the COUNT, so cards
+    // told the user to "answer readiness questions" they were never shown.
+    readinessGaps: cert.readinessGaps.slice(0, 5),
     blockerCount: cert.blockingReasons.length,
     contractAdvisoryCount: cert.contractAdvisories.length,
     nextActions: cert.nextActions,
@@ -4995,11 +4998,6 @@ export function registerConsoleRoutes(
         res.status(400).json({ error: 'workflow failed validation', errors: prep.errors });
         return;
       }
-      if (prep.status === 'readiness_gaps') {
-        writeWorkflowAndSyncTriggers(entry.name, prep.def);
-        res.status(409).json({ error: 'workflow has unresolved readiness gaps', gaps: workflowReadinessGapPayload(prep.def), repairs: prep.repairs });
-        return;
-      }
       const verification = prepareWorkflowVerification(prep.def, dashboardWorkflowSmokeInputs(body));
       if (verification.needsTest) {
         writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
@@ -5027,7 +5025,14 @@ export function registerConsoleRoutes(
       }
       writeWorkflowAndSyncTriggers(entry.name, prep.def);
       clearWorkflowFailures(entry.name);
-      res.json({ updated: true, enabled: true, repairs: prep.repairs });
+      res.json({
+        updated: true,
+        enabled: true,
+        repairs: prep.repairs,
+        // Advisory (F2): the readiness QUESTIONS ride along with a successful
+        // enable so the UI can invite refinement — never block on them.
+        ...(prep.gaps.length > 0 ? { readinessAdvisories: prep.gaps } : {}),
+      });
       return;
     }
     const cancelledOnDisable = cancelInFlightRunsForWorkflow(entry.data.name, `Workflow "${entry.data.name}" was disabled; its in-flight run was cancelled.`);
@@ -13178,7 +13183,9 @@ export function registerConsoleRoutes(
         // the RAW `input` (not attachment-folded `turnInput`) so dropped-file
         // contents can't trip it; the FULL `turnInput` is what the worker receives.
         // Skips approval-resume, a session paused on approval, and /goal runs.
-        if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input)) {
+        // Space sessions stay foreground unless the background lane is named
+        // explicitly — the user is watching the workspace being edited.
+        if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input, { sessionId })) {
           const task = enqueueDurableChatTask({
             message: turnInput,
             sessionId,

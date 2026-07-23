@@ -24,13 +24,18 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
   hasDurableExecutionIntent,
+  hasForegroundWatchIntent,
+  isSpaceSession,
+  isContinuationDirective,
   stripBackgroundPrefix,
   shouldPromoteToDurable,
   enqueueDurableChatTask,
   renderDurableTaskQueued,
   detectBackgroundItIntent,
   detachRunningTurnToBackground,
+  resolveBackgroundableObjective,
 } = await import('./background-promote.js');
+const { createDirectGoal } = await import('../agents/plan-proposals.js');
 const { getBackgroundTask, listBackgroundTasks } = await import('./background-tasks.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
@@ -123,6 +128,75 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
     shouldPromoteToDurable('Please discuss this transcript. The client described several long-running matters.'),
     false,
   );
+});
+
+test('foreground watch intent vetoes soft durable phrasing but not explicit background directives', () => {
+  // Live 2026-07-23: this exact Workspace-chat message was promoted to a
+  // durable task on the "keep working" trigger despite "here … ill watch".
+  assert.equal(
+    hasDurableExecutionIntent('you can keep working on it here please and ill watch the updates happen as you make them'),
+    false,
+  );
+  assert.equal(hasDurableExecutionIntent('keep working on it here'), false);
+  assert.equal(hasDurableExecutionIntent("keep going and I'll watch the changes as you go"), false);
+  assert.equal(hasDurableExecutionIntent('take your time, I want to see it in real time'), false);
+  // The explicit lane always wins — even next to watch language.
+  assert.equal(hasDurableExecutionIntent("keep working on it in the background and I'll watch for the report"), true);
+  // Soft phrasing WITHOUT watch intent still promotes (unchanged behavior).
+  assert.equal(hasDurableExecutionIntent('keep working until the audit is done'), true);
+  assert.equal(hasForegroundWatchIntent('ill watch the updates happen'), true);
+  assert.equal(hasForegroundWatchIntent('run the enrichment overnight'), false);
+});
+
+test('space sessions promote only on an explicit background directive', () => {
+  assert.equal(isSpaceSession('space-james-english-pipeline'), true);
+  assert.equal(isSpaceSession('sess-abc123'), false);
+  assert.equal(isSpaceSession(undefined), false);
+  const spaceOpts = { sessionId: 'space-james-english-pipeline' };
+  // Soft durable phrasing and pipeline shape stay foreground in a space.
+  assert.equal(shouldPromoteToDurable('keep working until the audit is done', spaceOpts), false);
+  assert.equal(shouldPromoteToDurable("don't stop until it's shipped", spaceOpts), false);
+  assert.equal(
+    shouldPromoteToDurable('Pull all Salesforce leads, enrich them through Apify and Google reviews, then sync the cleaned records into Airtable.', spaceOpts),
+    false,
+  );
+  // The user naming the lane still wins — they own the designation.
+  assert.equal(shouldPromoteToDurable('/background rebuild the coaching tab', spaceOpts), true);
+  assert.equal(shouldPromoteToDurable('run this in the background: refresh all the feeds', spaceOpts), true);
+  // Non-space sessions are unchanged.
+  assert.equal(shouldPromoteToDurable('keep working until the audit is done', { sessionId: 'sess-abc123' }), true);
+});
+
+test('isContinuationDirective spots directives that continue existing work', () => {
+  assert.equal(isContinuationDirective('keep working on it please'), true);
+  assert.equal(isContinuationDirective('carry on with the edits'), true);
+  assert.equal(isContinuationDirective('finish this'), true);
+  assert.equal(isContinuationDirective('build me a rep scorecard dashboard'), false);
+  assert.equal(isContinuationDirective('research SEO options for the firm'), false);
+});
+
+test('continuation promotions title from the active goal, not the raw chat message', () => {
+  const sessionId = 'sess-title-fallback-test';
+  const goal = createDirectGoal({
+    objective: 'Rebuild the pipeline command center with rep scorecards',
+    sessionId,
+  });
+  assert.ok(goal, 'direct goal should activate');
+  const task = enqueueDurableChatTask({
+    message: "keep working on it, don't stop until it's finished",
+    sessionId,
+    channel: 'desktop',
+    source: 'desktop',
+  });
+  assert.match(task.title, /pipeline command center/i);
+  // A message that names its own objective keeps its own title.
+  const named = enqueueDurableChatTask({
+    message: 'run this in the background: audit the coaching notes tab',
+    sessionId,
+    channel: 'desktop',
+    source: 'desktop',
+  });
+  assert.match(named.title, /coaching notes/i);
 });
 
 test('stripBackgroundPrefix removes a leading background command only', () => {
@@ -328,4 +402,37 @@ test('EVERY durable task is goal-bound at creation — including the auto-promot
   assert.ok(goal, 'a task enqueued with NO explicit goal input must still get a bound goal contract');
   const obj = (goal!.approvedPlan ?? goal!.plan).objective ?? '';
   assert.match(obj, /keyword volumes/i, 'default goal objective derives from the message');
+});
+
+// Title/objective truth (live 2026-07-23): a handoff fired by a conversational
+// turn ("you can keep working on it here please…") produced a background task
+// NAMED after that sentence. When no goal and no execute-phase aligned
+// objective exists, the resolver must fall back to the durable work signals —
+// the active FOCUS, then the session title — before ever using the utterance.
+test('handoff objective prefers focus/session-title over a conversational utterance', async () => {
+  const { createFocus } = await import('../memory/focus.js');
+  const { createSession, beginRunAttempt, recordRunAttemptUserInput } = await import('../runtime/harness/eventlog.js');
+  const sess = createSession({ kind: 'chat', channel: 'desktop', title: 'Reconstruct the 15 missing outreach drafts' });
+  const attempt = beginRunAttempt(sess.id, { runId: 'run-title-truth' });
+  recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'you can keep working on it here please and ill watch the updates happen' },
+  });
+  createFocus({
+    resourceRef: 'focus-title-truth',
+    title: '15 missing outreach drafts',
+    summary: 'Reconstructing the July 22 Market Leader emails from verified sources',
+  });
+
+  const resolved = resolveBackgroundableObjective(sess.id, attempt);
+  assert.ok(resolved, 'objective resolves');
+  assert.ok(
+    /outreach drafts|Market Leader/i.test(resolved!.objective),
+    `objective names the WORK, got: ${resolved!.objective}`,
+  );
+  assert.ok(
+    !/keep working on it here/i.test(resolved!.objective),
+    'the conversational utterance never becomes the task name',
+  );
 });

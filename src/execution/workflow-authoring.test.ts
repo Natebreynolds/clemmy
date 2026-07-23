@@ -265,7 +265,11 @@ test('workflowModelPortabilityFromUnknown accepts dashboard and tool aliases', (
   assert.equal(workflowModelPortabilityFromUnknown({}), 'preserve');
 });
 
-test('prepareWorkflowEnableForWrite keeps readiness-gap workflows disabled', () => {
+// F2 (live 2026-07-23): FLIPPED — readiness gaps are QUESTIONS, not enable
+// walls. The old hold force-disabled the workflow at both enable choke points
+// while offering an answer surface that didn't exist (guardrails inform,
+// never override). Enable proceeds; the questions ride along as advisories.
+test('prepareWorkflowEnableForWrite ENABLES a readiness-gap workflow and carries the questions', () => {
   const prepared = prepareWorkflowEnableForWrite({
     name: 'gapful-send-wf',
     description: 'Send outreach.',
@@ -273,12 +277,15 @@ test('prepareWorkflowEnableForWrite keeps readiness-gap workflows disabled', () 
     trigger: { manual: true },
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
   });
-  assert.equal(prepared.status, 'readiness_gaps');
-  assert.equal(prepared.def.enabled, false);
-  assert.ok(prepared.gaps.some((gap) => gap.stepId === 'send'));
+  assert.equal(prepared.status, 'ready');
+  assert.equal(prepared.def.enabled, true);
+  assert.ok(prepared.gaps.some((gap) => gap.stepId === 'send'), 'questions still surface as advisories');
 });
 
-test('prepareWorkflowUpdateForWrite disables enabled updates with unresolved readiness gaps', () => {
+// F2 (live 2026-07-23): FLIPPED — an edit introducing readiness questions
+// keeps the workflow ENABLED and carries the questions as advisories; the
+// runtime approval gates own send protection, not authoring-time disabling.
+test('prepareWorkflowUpdateForWrite keeps enabled updates ENABLED and carries gap advisories', () => {
   const before = {
     name: 'update-gap-wf',
     description: 'Draft a summary.',
@@ -291,8 +298,9 @@ test('prepareWorkflowUpdateForWrite disables enabled updates with unresolved rea
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
   };
   const prepared = prepareWorkflowUpdateForWrite(before, next);
-  assert.equal(prepared.status, 'readiness_gaps');
-  assert.equal(prepared.def.enabled, false);
+  assert.equal(prepared.status, 'ready');
+  assert.equal(prepared.def.enabled, true);
+  assert.ok(prepared.gaps.some((gap) => gap.stepId === 'send'), 'questions still surface as advisories');
 });
 
 test('writeWorkflowAndSyncTriggers updates the event trigger registry immediately', () => {

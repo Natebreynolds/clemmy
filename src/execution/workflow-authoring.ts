@@ -412,21 +412,31 @@ export function prepareWorkflowUpdateForWrite(
   const extra = { ...portability, codifyNotes: compiled.codifyNotes };
   const allowInvalidDisabled = opts.allowInvalidDisabled ?? true;
   if ((!allowInvalidDisabled || prep.def.enabled) && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);
-  if (prep.def.enabled) {
-    const gaps = analyzeWorkflowGaps(prep.def);
-    if (gaps.length > 0) {
-      return preparedFromWrite(prep, 'readiness_gaps', { ...prep.def, enabled: false }, gaps, extra);
-    }
-  }
-  return preparedFromWrite(prep, 'ready', prep.def, [], extra);
+  // F2 (live 2026-07-23): an edit that introduces readiness QUESTIONS no
+  // longer force-disables an ENABLED workflow — the user's stated flow is
+  // "turn it on, test it, make edits", and a silent flip-to-disabled with the
+  // dead readiness hold was the same exitless wall as the enable path. The
+  // questions ride along as advisories; genuinely new sends introduced by an
+  // edit still hit the RUNTIME approval gates (park + card) — the effect
+  // layer is the protection, not authoring-time disabling.
+  const gaps = prep.def.enabled ? analyzeWorkflowGaps(prep.def) : [];
+  return preparedFromWrite(prep, 'ready', prep.def, gaps, extra);
 }
 
 export function prepareWorkflowEnableForWrite(def: WorkflowDefinition): WorkflowPreparedWrite {
   const prep = prepareWorkflowForWrite({ ...def, enabled: true });
   if (!prep.ok) return preparedFromWrite(prep, 'invalid', prep.def);
+  // F2 (live 2026-07-23, guardrails-inform-not-override): readiness gaps are
+  // authoring QUESTIONS, not enable walls. The old 'readiness_gaps' hold
+  // force-disabled the workflow at BOTH enable choke points (console toggle +
+  // chat workflow_set_enabled) while the only offered exit — "answer the
+  // readiness questions" — had no surface, so a clean dry-run workflow was
+  // permanently un-enableable. Enabling now proceeds; the questions ride
+  // along as advisories for the drawer/chat to surface. Validation failures
+  // still refuse ('invalid'), and creation/update flows still ask the
+  // questions conversationally at authoring time.
   const gaps = analyzeWorkflowGaps(prep.def);
-  if (gaps.length > 0) return preparedFromWrite(prep, 'readiness_gaps', { ...prep.def, enabled: false }, gaps);
-  return preparedFromWrite(prep, 'ready', { ...prep.def, enabled: true });
+  return preparedFromWrite(prep, 'ready', { ...prep.def, enabled: true }, gaps);
 }
 
 export function normalizeWorkflowInputs(input: unknown): Record<string, WorkflowInputDef> | undefined {

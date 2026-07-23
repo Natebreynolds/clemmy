@@ -2147,14 +2147,21 @@ test('silent SDK waits emit rate-limited visible heartbeats before the wall-cloc
     prompt: 'wait on a long provider operation',
     sessionId: sid,
     modelId: 'claude-sonnet-4-6',
-    maxWallClockMs: 24,
-    livenessHeartbeatMs: 6,
+    // DETERMINISTIC MARGINS (sweep-flake fix 2026-07-23): the wall-clock
+    // starts BEFORE the SDK setup work, so setup time (variable under load)
+    // eats the window before the tick loop even starts — the original
+    // 24ms/6ms was a coin flip (failed 8/9 solo). 1000ms/100ms leaves ≥800ms
+    // of tick headroom even after slow setup: the ≥2 liveness bound needs
+    // only 200ms of ticking; the ≤11 bound is the rate limit
+    // (wallClock/cadence + 1) — a mis-rate-limited loop would blow past it.
+    maxWallClockMs: 1_000,
+    livenessHeartbeatMs: 100,
   });
   assert.equal(r.limitHit, true);
   const beats = eventlog.listEvents(sid, { types: ['heartbeat'] })
     .filter((event) => event.data.kind === 'progress_check_in');
   assert.ok(beats.length >= 2, 'the user/operator sees progress while iterator.next() is silent');
-  assert.ok(beats.length <= 5, 'ticks stay rate-limited to the configured cadence');
+  assert.ok(beats.length <= 11, 'ticks stay rate-limited to the configured cadence');
   assert.ok(beats.every((event) => event.data.transport === 'claude_agent_sdk'));
   assert.equal(closed, 1);
 });

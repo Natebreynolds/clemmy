@@ -807,7 +807,11 @@ test('workflow_apply_contract_fixes requires explicit stable keys before making 
   assert.equal(readWorkflow('fanout-contract-fix-wf')!.data.steps[1].forEachNewOnly, true);
 });
 
-test('workflow_set_enabled refuses unresolved readiness gaps', async () => {
+// F2 (live 2026-07-23): FLIPPED — readiness gaps no longer refuse an enable
+// (the hold was exitless: no surface existed to answer the questions). The
+// enable proceeds down the normal verify-by-running path and the questions
+// ride along as advisories in the reply.
+test('workflow_set_enabled proceeds past readiness gaps and surfaces the questions as advisory', async () => {
   writeWorkflow('gapful-enable-wf', {
     name: 'gapful-enable-wf',
     description: 'Send outreach.',
@@ -818,12 +822,18 @@ test('workflow_set_enabled refuses unresolved readiness gaps', async () => {
 
   const result = await workflowSetEnabled()({ name: 'gapful-enable-wf', enabled: true });
   const text = resultText(result);
-  assert.match(text, /was NOT enabled/);
-  assert.match(text, /readiness gap test/i);
-  assert.equal(readWorkflow('gapful-enable-wf')!.data.enabled, false);
+  assert.doesNotMatch(text, /was NOT enabled.*readiness/is);
+  // The enable path continues into verify-by-running (creation test) or a
+  // direct enable — either is a REAL exit, never the dead readiness hold.
+  assert.match(text, /approved \(enabled\)|creation test|Queued/i);
 });
 
-test('workflow_update saves enabled workflows DISABLED when readiness gaps are introduced', async () => {
+// F2 (live 2026-07-23): FLIPPED — an edit that introduces readiness
+// questions no longer silently disables an ENABLED workflow (the user's flow
+// is enable → test → edit; the flip-to-disabled hit the same exitless
+// readiness hold). Questions surface as advisories; a genuinely new send
+// still parks at the RUNTIME approval gate before anything fires.
+test('workflow_update keeps enabled workflows ENABLED when readiness gaps are introduced', async () => {
   writeWorkflow('gapful-update-wf', {
     name: 'gapful-update-wf',
     description: 'Draft internal notes.',
@@ -837,9 +847,8 @@ test('workflow_update saves enabled workflows DISABLED when readiness gaps are i
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
   });
   const text = resultText(result);
-  assert.match(text, /stayed DISABLED/);
-  assert.match(text, /readiness gap test/i);
-  assert.equal(readWorkflow('gapful-update-wf')!.data.enabled, false);
+  assert.doesNotMatch(text, /stayed DISABLED/);
+  assert.equal(readWorkflow('gapful-update-wf')!.data.enabled, true, 'the edit never silently disables');
 });
 
 test('workflow lifecycle routes create/update/enable/run through shared workflow paths', async () => {

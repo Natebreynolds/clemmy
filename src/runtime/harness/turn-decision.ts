@@ -967,6 +967,44 @@ export function looksLikeDispatchHandoffReply(text: string): boolean {
   return DISPATCH_HANDOFF_SIGNAL_PATTERN.test(trimmed);
 }
 
+/**
+ * STEER-TURN salvage (live 2026-07-23, a user babysitting a background run):
+ * two chat shapes where a zero-tool prose reply IS the complete answer, yet
+ * the stall machinery demanded tool action, retried twice, and escalated to
+ * "I've been unable to make progress — retry, switch approach, or stop?":
+ *
+ *   1. ACK/INSTRUCTION turns — "Okay well done, from now on always take this
+ *      path ok?" → the right reply is an acknowledgment, zero tools.
+ *   2. CONTINUATION NUDGES while background work this chat dispatched is in
+ *      flight — "Well done, keep pushing through" → the right reply is a
+ *      status line; the work is running elsewhere.
+ *
+ * Both anchors are about the USER'S turn shape (never a refusal — this path
+ * only ever DELIVERS the model's own prose instead of a meta-failure ask).
+ * Detected-bad replies (tool-unavailable self-report, hallucinated tool
+ * transcript, contentless acks) never salvage.
+ */
+const ACK_STEER_OPENING_RE =
+  /^(?:ok(?:ay)?|well done|great|nice|perfect|thanks|thank you|love (?:it|this)|awesome|good (?:job|work|stuff)|got it|sounds good|beautiful|amazing)\b/i;
+const CONTINUATION_STEER_RE =
+  /\b(?:keep (?:going|working|pushing|moving|at it|it going|it up|on)|carry on|push through|keep pushing through|don'?t stop|continue|stay on it|finish (?:it|this|that) up?)\b/i;
+
+export function steerTurnReplySalvage(input: {
+  userInput: string;
+  finalOutput: unknown;
+  hasActiveBackgroundWork: boolean;
+}): string | null {
+  const text = typeof input.finalOutput === 'string' ? input.finalOutput.trim() : '';
+  if (text.length < 40) return null; // contentless acks stay with the stall machinery
+  if (looksLikeToolUnavailableSelfReport(text)) return null;
+  if (looksLikeHallucinatedToolTranscript(text)) return null;
+  const user = (input.userInput ?? '').trim();
+  if (!user || user.length > 200) return null; // long messages carry real work asks
+  const ackSteer = ACK_STEER_OPENING_RE.test(user);
+  const continuationSteer = CONTINUATION_STEER_RE.test(user) && input.hasActiveBackgroundWork;
+  return ackSteer || continuationSteer ? text : null;
+}
+
 export function classifyTurnText(
   text: string,
   evidence: { toolCalls: number; priorSubstantiveWork?: boolean; contractTurn?: boolean },

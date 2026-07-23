@@ -30,9 +30,11 @@ import {
   getActiveRunAttempt,
   getLatestEventSeq,
   getRunAttemptSourceUserEvent,
+  getSession as getHarnessSession,
   requestKill,
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
+import { getActiveObjective } from '../memory/focus.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
 import { HarnessSession } from '../runtime/harness/session.js';
@@ -62,8 +64,29 @@ export function hasDurableExecutionIntent(message: string): boolean {
   if (startsAsForegroundDiscussion(leadingDirective)) {
     return hasDirectDurableDirective(leadingDirective);
   }
+  // "Keep working on it HERE and I'll WATCH the updates" is a request to stay
+  // in the current surface, not to background — the soft continuation phrases
+  // ("keep working", "take your time") must not outrank it. An explicit
+  // background directive still wins. Live 2026-07-23: a Workspace chat turn
+  // saying exactly that was promoted to a durable task.
+  if (hasForegroundWatchIntent(intentText)) return hasExplicitBackgroundDirective(intentText);
   if (hasDirectDurableDirective(intentText)) return true;
   return hasAutomaticDataPipelineShape(lower);
+}
+
+/**
+ * Explicit "stay here, I'll watch" intent — the user wants to SEE the work
+ * happen live on the surface they're already on. Vetoes the soft continuation
+ * triggers in `hasSoftDurableDirective`; never vetoes an explicit background
+ * directive.
+ */
+export function hasForegroundWatchIntent(message: string): boolean {
+  const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (/\b(?:work(?:ing)?|do(?:ing)?|continue|fix(?:ing)?|edit(?:ing)?|updat(?:e|ing)|build(?:ing)?)\b[^.?!]{0,40}\b(?:right\s+)?here\b/.test(lower)) return true;
+  if (/\b(?:i(?:'|’)?ll|i will|let me|i(?:'|’)?m going to|and i(?:'|’)?ll|ill)\s+(?:just\s+)?watch\b/.test(lower)) return true;
+  if (/\bwatch\s+(?:the|your|you|it|them|each)\b[^.?!]{0,40}\b(?:update|edit|change|progress|work|happen)/.test(lower)) return true;
+  if (/\b(?:as you (?:make|go|work)|in real ?time|live updates?|stay (?:here|in this (?:chat|session|space|workspace|window)))\b/.test(lower)) return true;
+  return false;
 }
 
 function startsAsForegroundDiscussion(text: string): boolean {
@@ -71,11 +94,23 @@ function startsAsForegroundDiscussion(text: string): boolean {
 }
 
 function hasDirectDurableDirective(text: string): boolean {
+  return hasExplicitBackgroundDirective(text) || hasSoftDurableDirective(text);
+}
+
+/** The user literally named the background lane. Never vetoed by watch intent. */
+function hasExplicitBackgroundDirective(text: string): boolean {
   if (/^\/?(background|bg)\b/.test(text)) return true;
   if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(text)) return true;
   if (/\b(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background\b/.test(text)) return true;
   if (/\b(?:do|finish)\s+(?:this|it|that|the request|the task)\s+in\s+the\s+background\b/.test(text)) return true;
-  if (/\b(?:in the background|overnight|as a job|keep working|don't stop|do not stop|longer running|take your time)\b/.test(text)) return true;
+  if (/\b(?:in the background|overnight|as a job)\b/.test(text)) return true;
+  return false;
+}
+
+/** Durable-shaped phrasing that does NOT name the background lane — overridable
+ *  by an explicit "I'll watch it here" (see hasForegroundWatchIntent). */
+function hasSoftDurableDirective(text: string): boolean {
+  if (/\b(?:keep working|don't stop|do not stop|longer running|take your time)\b/.test(text)) return true;
   // "long-running" is descriptive in ordinary source material. Treat it as
   // routing intent only when it modifies the task/work itself.
   if (/\b(?:this|that|it|task|job|request|work|process|run)\b.{0,30}\blong[- ]running\b/.test(text)
@@ -168,13 +203,32 @@ export function stripBackgroundPrefix(message: string): string {
 }
 
 /**
+ * Workspace (space) chat sessions — `spaceSessionId` in console-web mints them
+ * as `space-<slug>` — are interactive by nature: the user is looking AT the
+ * live surface being edited, so watching the work IS the product there.
+ */
+export function isSpaceSession(sessionId: string | undefined): boolean {
+  return typeof sessionId === 'string' && sessionId.startsWith('space-');
+}
+
+/**
  * The promotion gate the interactive surfaces should call. Promote only when
  * there is durable intent AND a non-empty instruction once the command prefix is
  * stripped — so a bare "/background" (no actual task) does NOT queue a
  * content-free worker; it falls through to a normal turn instead.
+ *
+ * In a space session (opts.sessionId), soft durable phrasing and pipeline shape
+ * never promote — edits stay foreground where the user watches them land. Only
+ * an explicit background directive ("/background", "run this in the background")
+ * still promotes: the user owns the designation.
  */
-export function shouldPromoteToDurable(message: string): boolean {
-  return hasDurableExecutionIntent(message) && stripBackgroundPrefix(message).trim().length > 0;
+export function shouldPromoteToDurable(message: string, opts?: { sessionId?: string }): boolean {
+  if (stripBackgroundPrefix(message).trim().length === 0) return false;
+  if (isSpaceSession(opts?.sessionId)) {
+    const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
+    return hasExplicitBackgroundDirective(stripNegatedDurableIntent(lower));
+  }
+  return hasDurableExecutionIntent(message);
 }
 
 export interface EnqueueDurableChatTaskInput {
@@ -221,14 +275,34 @@ export interface EnqueueDurableChatTaskInput {
  * — the daemon's processBackgroundTasks loop picks it up on its next tick, and
  * it appears on the Tasks board immediately.
  */
+/** A directive that continues existing work rather than naming a new task. */
+export function isContinuationDirective(message: string): boolean {
+  const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
+  return /\b(?:keep working|keep going|keep at it|keep it going|carry on|continue)\b/.test(lower)
+    || /\bfinish\s+(?:it|this|that)\b/.test(lower);
+}
+
 export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): BackgroundTaskRecord {
   // A composed prompt (the agreed plan from dispatch_background_task) is used
   // verbatim; otherwise strip a keyword prefix from the raw user message.
   const prompt = input.composedPrompt?.trim()
     || stripBackgroundPrefix(input.message)
     || input.message;
+  // A continuation directive ("keep working on it") names no objective of its
+  // own — the goal the session is already pursuing is the real subject, and a
+  // raw-message title reads as chat scaffolding on the Tasks board (live
+  // 2026-07-23: a task titled "You can keep working on it here please and ill
+  // watch the…"). Prefer the active goal's objective for the title then.
+  let title = deriveTitle(input.message) || deriveTitle(prompt);
+  if (isContinuationDirective(input.message)) {
+    try {
+      const goal = getActiveGoalForSession(input.sessionId);
+      const goalObjective = goal ? ((goal.approvedPlan ?? goal.plan).objective ?? '').trim() : '';
+      if (goalObjective) title = deriveTitle(goalObjective) || title;
+    } catch { /* raw-message title stands */ }
+  }
   const task = createBackgroundTask({
-    title: deriveTitle(input.message) || deriveTitle(prompt),
+    title,
     prompt,
     originSessionId: input.sessionId,
     foregroundHandoff: input.foregroundHandoff,
@@ -282,7 +356,7 @@ export function detectBackgroundItIntent(message: string): boolean {
  * reusable session's "latest" text is not ownership: under a stale click it
  * may already belong to a newer turn. Confirmation turns are expanded through
  * their persisted preflight decision so "go ahead" retains the agreed ask. */
-function resolveBackgroundableObjective(
+export function resolveBackgroundableObjective(
   sessionId: string,
   attempt: Pick<RunAttemptRef, 'sessionId' | 'attemptId'>,
 ): { objective: string; sourceUserSeq: number } | null {
@@ -294,15 +368,36 @@ function resolveBackgroundableObjective(
   const fallback = displayText || recordedText;
   if (!fallback) return null;
 
-  let objective = effectiveTurnObjective(sessionId, fallback, source.seq).trim();
-  // A live goal is the contract this exact attempt is executing against and is
-  // richer than a continuation/approval control. Preserve the prior behavior,
-  // but never fall back to unrelated ambient chat text.
+  const aligned = effectiveTurnObjective(sessionId, fallback, source.seq).trim();
+  // Title/objective truth (live 2026-07-23): a handoff triggered by a
+  // CONVERSATIONAL turn ("you can keep working on it here please…") has no
+  // execute-phase aligned objective, so effectiveTurnObjective returns the
+  // raw utterance — and the background task got NAMED after the user's last
+  // sentence instead of what the work IS. Precedence, all effect-anchored:
+  //   1. the session's live GOAL contract (what this attempt executes against)
+  //   2. the exact-turn ALIGNED objective (a real execute-phase decision)
+  //   3. the active FOCUS (the durable "what am I working on" record)
+  //   4. the session TITLE (already objective-derived)
+  //   5. the utterance (last resort — today's fallback)
+  let objective = aligned !== fallback ? aligned : '';
   try {
     const goal = getActiveGoalForSession(sessionId);
     const goalObj = goal ? (goal.approvedPlan ?? goal.plan).objective?.trim() : '';
     if (goalObj) objective = goalObj;
-  } catch { /* exact turn objective remains authoritative */ }
+  } catch { /* the aligned turn objective remains authoritative */ }
+  if (!objective) {
+    try {
+      objective = getActiveObjective()?.trim() ?? '';
+    } catch { /* focus store is optional context */ }
+  }
+  if (!objective) {
+    try {
+      const title = getHarnessSession(sessionId)?.title?.trim() ?? '';
+      // A derived session title is objective-ish; a bare id or "New chat" is not.
+      if (title && !/^(new chat|untitled)/i.test(title) && !/^sess-/.test(title)) objective = title;
+    } catch { /* session title is optional context */ }
+  }
+  if (!objective) objective = fallback;
   return objective ? { objective, sourceUserSeq: source.seq } : null;
 }
 

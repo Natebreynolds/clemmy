@@ -1576,14 +1576,6 @@ export function registerOrchestrationTools(server: McpServer): void {
             `Workflow "${name}" was NOT enabled — fix these first:\n- ${prep.errors.join('\n- ')}`,
           );
         }
-        if (prep.status === 'readiness_gaps') {
-          writeWorkflowAndSyncTriggers(entry.name, prep.def);
-          return textResult(
-            `Workflow "${name}" was NOT enabled. ${renderReadinessHold(name)}`
-              + `${renderWorkflowGapQuestions(prep.gaps)}`
-              + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
-          );
-        }
         // Verify-by-running (2026-06-11): enabling means "set to run" — when
         // the workflow has testable read steps, run the creation test now and
         // let the PASS enable it, instead of trusting the config. Same strict
@@ -1607,8 +1599,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         // Re-enabling is a deliberate fresh start — clear any chronic-failure
         // streak so auto-heal/escalation resets (#6).
         clearWorkflowFailures(entry.name);
+        const gapTail = prep.gaps.length > 0
+          ? `\n\nWorth tightening when you have a minute (advisory, not blocking):${renderWorkflowGapQuestions(prep.gaps)}`
+          : '';
         return textResult(
-          `Workflow "${name}" is now approved (enabled).`
+          `Workflow "${name}" is now approved (enabled).${gapTail}`
             + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
         );
       }

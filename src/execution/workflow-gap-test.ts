@@ -1,5 +1,5 @@
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
-import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
+import { classifyStepSideEffect, stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 
 /**
@@ -145,8 +145,15 @@ export function analyzeWorkflowGaps(def: WorkflowDefinition): WorkflowGap[] {
   }
 
   // 2: irreversible sends — who is the audience, and is it a hard-coded list?
+  // F1 (live 2026-07-23): classify through the CANONICAL side-effect
+  // classifier, which honors an author-declared `side_effect: read` and the
+  // structured-call slug — never the raw prose regex alone. The prose
+  // heuristic is negation-blind ("this report is NEVER emailed, posted, or
+  // published" reads as a send), and it flagged a declared-read report step
+  // whose own dry-run counted zero sends — then the resulting needs_info
+  // state had no exit and the user couldn't enable OR answer anything.
   for (const step of steps) {
-    if (!stepLooksLikeIrreversibleSend(step.prompt ?? '')) continue;
+    if (classifyStepSideEffect(step) !== 'send') continue;
     gaps.push({
       severity: 'clarify',
       stepId: step.id,

@@ -92,15 +92,22 @@ export function certifyWorkflow(
   const hasGaps = readinessGaps.length > 0;
   const enabled = def.enabled !== false;
   const needsCreationTest = verification.needsTest;
-  const canQueueCreationTest = !hardBlocked && !hasResourceGaps && !hasGaps && needsCreationTest && verification.missing.length === 0;
-  const canEnableDirectly = !enabled && !hardBlocked && !hasResourceGaps && !hasGaps && !needsCreationTest;
-  const canRun = enabled && !hardBlocked && !hasResourceGaps && !hasGaps && missingRunInputs.length === 0;
+  // F2 (live 2026-07-23, guardrails-inform-not-override): readiness gaps are
+  // QUESTIONS, not walls. They used to gate all three capability bits, which
+  // produced an exitless needs_info state — the card refused BOTH the toggle
+  // and the creation test while offering "answer readiness questions" with no
+  // surface to answer them on. Gaps now ride the advisory rail (rendered
+  // loudly in the drawer + asked conversationally at authoring); hard blocks
+  // remain what they should be: real blockers, unbound resources, missing
+  // inputs.
+  const canQueueCreationTest = !hardBlocked && !hasResourceGaps && needsCreationTest && verification.missing.length === 0;
+  const canEnableDirectly = !enabled && !hardBlocked && !hasResourceGaps && !needsCreationTest;
+  const canRun = enabled && !hardBlocked && !hasResourceGaps && missingRunInputs.length === 0;
 
   const state = certificationState({
     enabled,
     hardBlocked,
     hasResourceGaps,
-    hasGaps,
     needsCreationTest,
     missingTestInputs: verification.missing,
     missingRunInputs,
@@ -108,6 +115,7 @@ export function certifyWorkflow(
   const nextActions = certificationActions({
     state,
     hasContractAdvisories: contractAdvisories.length > 0,
+    hasReadinessGaps: hasGaps,
   });
 
   return {
@@ -138,14 +146,12 @@ function certificationState(input: {
   enabled: boolean;
   hardBlocked: boolean;
   hasResourceGaps: boolean;
-  hasGaps: boolean;
   needsCreationTest: boolean;
   missingTestInputs: string[];
   missingRunInputs: string[];
 }): WorkflowCertificationState {
   if (input.hardBlocked) return 'blocked';
   if (input.hasResourceGaps) return 'needs_resource_binding';
-  if (input.hasGaps) return 'needs_info';
   if (!input.enabled && input.needsCreationTest && input.missingTestInputs.length > 0) return 'needs_creation_inputs';
   if (!input.enabled && input.needsCreationTest) return 'needs_creation_test';
   if (!input.enabled) return 'ready_to_enable';
@@ -156,6 +162,7 @@ function certificationState(input: {
 function certificationActions(input: {
   state: WorkflowCertificationState;
   hasContractAdvisories: boolean;
+  hasReadinessGaps?: boolean;
 }): WorkflowCertificationAction[] {
   const actions: WorkflowCertificationAction[] = [];
   switch (input.state) {
@@ -185,6 +192,9 @@ function certificationActions(input: {
       break;
   }
   if (input.hasContractAdvisories) actions.push('review_contract_advisories');
+  // Readiness questions ride ALONGSIDE the state's primary action (advisory,
+  // never the only exit): the user can enable/test AND is invited to answer.
+  if (input.hasReadinessGaps) actions.push('answer_readiness_questions');
   return actions;
 }
 
