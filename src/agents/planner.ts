@@ -117,6 +117,9 @@ export const PlanSchema = z.object({
   needsUserInput: z.array(z.string()).max(5).describe(
     'Questions the orchestrator should ask the user before executing. Empty if the plan is fully specified.',
   ),
+  voiceMessage: z.string().nullable().optional().describe(
+    'YOUR OWN WORDS to the user for this conversational beat — the exact message they will read, written as yourself. RUBRIC (what must be true, not how to say it): if needsUserInput is non-empty, ask ALL of those questions naturally and honestly (never call two questions "one detail"), and briefly say where you will start once answered; if the plan is complete, a short warm lead-in to the plan you are presenting. Never template-speak, never mention harnesses, planners, or internal machinery. Use null only if you truly have nothing to say beyond the structured plan.',
+  ),
   appliedInstructions: z.array(z.string()).max(8).describe(
     'Standing instructions / durable preferences from memory that THIS plan is consciously following, each as a short line (quote the instruction, add a "(source: …)" hint when known). Populate by recalling memory scoped to the objective BEFORE planning. Empty array only if a genuine memory check surfaced nothing relevant — never skip the check for mutating or batch work.',
   ),
@@ -274,6 +277,9 @@ export function sanitizePlanOutput(value: unknown): Plan | null {
     needsUserInput: stringArray(obj.needsUserInput ?? obj.needs_user_input ?? obj.questions, 5),
     appliedInstructions: stringArray(obj.appliedInstructions ?? obj.applied_instructions, 8),
     externalSends: sanitizeExternalSends(obj.externalSends ?? obj.external_sends),
+    voiceMessage: typeof (obj.voiceMessage ?? obj.voice_message) === 'string'
+      ? String(obj.voiceMessage ?? obj.voice_message).trim() || null
+      : null,
   };
   const checked = PlanSchema.safeParse(candidate);
   return checked.success ? checked.data : null;
