@@ -10011,7 +10011,32 @@ export function registerConsoleRoutes(
       }
 
       // 4) Executions — long-running, controller-driven work.
+      // One pipeline = one card. A tracked execution can BE a background task's
+      // pipeline rather than a separate item, and there is no execution-id link
+      // on the task — only the shared session ties them:
+      //   • created inside the task's worker session (exec.sessionId ===
+      //     task.runSessionId), always the task's own work; or
+      //   • the origin chat's execution a still-live task was handed off from
+      //     (exec.sessionId === task.originSessionId).
+      // Either way the Task card (section 1) already represents it — collapse
+      // the duplicate Tracked card. Origin-session collapse is gated on BOTH
+      // sides being live so a later, unrelated execution in a reused chat is
+      // never hidden (live 2026-07-24: a running bg Task + its origin chat's
+      // active execution rendered as two Running cards for one job).
+      const bgTaskTerminal = (s: string): boolean =>
+        s === 'done' || s === 'failed' || s === 'aborted' || s === 'interrupted';
+      const liveBgOriginSessions = new Set(
+        backgroundTasks
+          .filter((task) => !task.archived && !bgTaskTerminal(task.status) && task.originSessionId)
+          .map((task) => task.originSessionId as string),
+      );
       for (const exec of new ExecutionStore().list(80)) {
+        // Executions run inside a background worker share its runSessionId — the
+        // Task card owns them at any status (a done worker-exec would otherwise
+        // duplicate the Task in Done too).
+        if (backgroundHarnessSessionIds.has(exec.sessionId)) continue;
+        const execLive = exec.status === 'active' || exec.status === 'paused' || exec.status === 'blocked';
+        if (execLive && exec.sessionId && liveBgOriginSessions.has(exec.sessionId)) continue;
         const column: BoardColumnId =
           exec.status === 'active' ? 'running'
             : exec.status === 'paused' || exec.status === 'blocked' ? 'needs_you'
