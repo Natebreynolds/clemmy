@@ -146,9 +146,15 @@ export function renderWorkflowRoutingAdvisories(advisories: WorkflowRoutingAdvis
  */
 export function resolveStepDisplayModel(
   step: Pick<WorkflowStepInput, 'model' | 'intent' | 'prompt' | 'deterministic' | 'call'>,
+  workflow?: { models?: { brain?: string } },
 ): string | null {
   if (step.deterministic || step.call || !step.prompt?.trim()) return null;
   if (step.model) return step.model;
+  // Workflow-level brain pin (2026-07-24): display must tell the same truth
+  // the runner acts on — a pinned workflow showed "Sonnet" in the pin picker
+  // while the step chips still claimed the global worker default.
+  const pinned = workflow?.models?.brain?.trim();
+  if (pinned) return pinned;
   if (step.intent) return resolveRoleModel('worker', step.intent).modelId;
   return resolveRoleModel('worker').modelId;
 }
