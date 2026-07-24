@@ -243,6 +243,26 @@ async function fetchComposioCliStatus(options: ComposioCliEnvOptions = {}): Prom
   };
 }
 
+/** LIVE CLI auth-death probe (2026-07-24 Slack-send 401 incident): a CLI
+ * mutation failed 401-shaped in AUTO, but auth text alone must never prove
+ * no-dispatch (it leaks into post-dispatch errors). This probe makes it
+ * STRUCTURAL: run an independent, harmless READ through the same CLI session
+ * — if that read ALSO fails 401/unauthorized, the CLI lane's auth is dead,
+ * meaning the original request was rejected at authentication and nothing
+ * dispatched. Cheap, bounded, and only invoked on a 401-shaped failure. */
+export async function composioCliAuthDead(options: ComposioCliEnvOptions = {}): Promise<boolean> {
+  try {
+    const result = await runComposioCli(
+      ['execute', 'COMPOSIO_LIST_TOOLKITS', '-d', '{}'],
+      { ...options, timeoutMs: STATUS_TIMEOUT_MS },
+    );
+    if (result.ok) return false;
+    return /\b401\b|unauthorized/i.test(compactOutput(result.stdout, result.stderr));
+  } catch (err) {
+    return /\b401\b|unauthorized/i.test(String(err));
+  }
+}
+
 export async function executeComposioCliTool(
   toolSlug: string,
   args: Record<string, unknown>,

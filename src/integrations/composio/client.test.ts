@@ -359,3 +359,22 @@ test('dashboard connection state never presents a suppressed ACTIVE account as h
   assert.equal(healthy.usable, true);
   assert.equal(healthy.needsReconnect, false);
 });
+
+// Live 2026-07-24 (Slack team update blocked on a dead CLI session while the
+// SDK connection was ACTIVE): a 401-shaped CLI mutation failure alone stays
+// dispatch-uncertain, but an independent live READ probe failing 401 proves
+// the lane auth-dead — the mutation was rejected at authentication, so the
+// SDK retry is safe. Pin the proof rules stay text-blind otherwise.
+test('composioAutoFallbackAllowed still refuses bare auth text for mutations', async () => {
+  const { composioAutoFallbackAllowed } = await import('./client.js');
+  assert.equal(
+    composioAutoFallbackAllowed('SLACK_SEND_MESSAGE', new Error('HTTP 401 Unauthorized')),
+    false,
+    'bare 401 text never proves no-dispatch by itself — the live probe is the only path to fallback',
+  );
+  assert.equal(
+    composioAutoFallbackAllowed('SLACK_SEND_MESSAGE', new Error('[provider-dispatch:not-started:cli-auth] no CLI login')),
+    true,
+    'the structural not-started marker still proves it',
+  );
+});
