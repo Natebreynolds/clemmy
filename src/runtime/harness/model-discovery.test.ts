@@ -35,10 +35,15 @@ test('filterOpenAiChatModelIds newest-generation tracking is dynamic (a newer ge
   assert.deepEqual(kept, ['gpt-5.2-codex', 'gpt-6'].sort());
 });
 
-test('canonicalPickerId strips date stamps and rejects unpersistable ids', () => {
+test('canonicalPickerId strips date stamps + [1m]-style context annotations to the persistable base alias', () => {
   assert.equal(canonicalPickerId('claude-haiku-4-5-20251001'), 'claude-haiku-4-5');
   assert.equal(canonicalPickerId('claude-fable-5'), 'claude-fable-5');
-  assert.equal(canonicalPickerId('claude-opus-4-8[1m]'), null, 'bracketed variant cannot be saved — never offer it');
+  // The Agent SDK reports the 1M-context flagship as e.g. claude-opus-5[1m]; strip
+  // the annotation to the wire alias Clementine actually dispatches + persists.
+  assert.equal(canonicalPickerId('claude-opus-5[1m]'), 'claude-opus-5');
+  assert.equal(canonicalPickerId('claude-opus-4-8[1m]'), 'claude-opus-4-8');
+  // Still reject genuinely unpersistable junk (mid-string brackets aren't a suffix annotation).
+  assert.equal(canonicalPickerId('claude-[weird]-model'), null);
 });
 
 test('labelForModelId prettifies ids; API display_name wins', () => {

@@ -61,11 +61,17 @@ export function filterOpenAiChatModelIds(ids: string[]): string[] {
   return candidates.filter((id) => isCodex(id) || generation(id) >= newest).sort();
 }
 
-/** Ids must survive the settings-save validator (normalizeModelId's charset) —
- *  offering an unpersistable id (e.g. a bracketed context-variant) would make the
- *  picker silently revert on save. Date stamps strip to the base alias. Pure. */
+/** Ids must survive the settings-save validator (normalizeModelId's charset) and
+ *  dispatch through the clean wire alias Clementine already uses (its presets are
+ *  `claude-opus-4-8`, never the bracketed form). The Agent SDK reports the
+ *  1M-context flagship as `claude-opus-5[1m]` — STRIP that `[…]` context
+ *  annotation to the persistable base alias (`claude-opus-5`) rather than dropping
+ *  the id, so a newly launched flagship actually reaches the picker. Date stamps
+ *  strip to the base alias too. Pure. */
 export function canonicalPickerId(id: string): string | null {
-  const base = id.trim().replace(/-(20\d{6})$/, '');
+  const base = id.trim()
+    .replace(/\[[^\]]*\]$/, '')  // Agent-SDK context annotation, e.g. "[1m]" — unpersistable + not a wire alias
+    .replace(/-(20\d{6})$/, '');
   return /^[A-Za-z0-9._:-]+$/.test(base) ? base : null;
 }
 
@@ -116,7 +122,11 @@ async function discoverAnthropicViaSdk(): Promise<DiscoveredModel[]> {
       if (!raw.startsWith('claude')) continue; // aliases resolve to claude-* wire ids
       const id = canonicalPickerId(raw);
       if (!id) continue; // e.g. bracketed context variants — unpersistable in settings
-      if (!out.some((x) => x.id === id)) out.push({ id, label: labelForModelId(id, m.displayName) });
+      // The SDK labels the flagship with picker CHROME ("Default (recommended)")
+      // rather than a model name; ignore those so the id-derived name wins
+      // ("Claude Opus 5"), and dedup collapses the [1m]/plain pair to one entry.
+      const displayName = m.displayName && !/\b(default|recommended)\b/i.test(m.displayName) ? m.displayName : undefined;
+      if (!out.some((x) => x.id === id)) out.push({ id, label: labelForModelId(id, displayName) });
     }
     return out;
   } finally {
