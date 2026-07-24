@@ -195,6 +195,8 @@ export interface WorkflowDetail {
   description?: string;
   enabled?: boolean;
   trigger?: { schedule?: string; timezone?: string; manual?: boolean };
+  /** Workflow-level model pins: brain runs the steps, worker runs fan-outs. */
+  models?: { brain?: string; worker?: string } | null;
   steps?: WorkflowStep[];
   resources?: Record<string, WorkflowResourceBinding>;
   resourceBinding?: WorkflowResourceBindingReport;
@@ -204,7 +206,7 @@ export interface WorkflowDetail {
 
 export const getWorkflow = (name: string) =>
   apiGet<WorkflowDetail>(`/api/console/workflows/${encodeURIComponent(name)}`);
-export const patchWorkflow = (name: string, body: { description?: string; enabled?: boolean; triggerSchedule?: string; clearTriggerSchedule?: boolean; timezone?: string }) =>
+export const patchWorkflow = (name: string, body: { description?: string; enabled?: boolean; triggerSchedule?: string; clearTriggerSchedule?: boolean; timezone?: string; models?: { brain?: string; worker?: string } }) =>
   api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteWorkflow = (name: string) =>
   api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' });

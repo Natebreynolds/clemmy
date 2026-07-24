@@ -4482,6 +4482,7 @@ export function registerConsoleRoutes(
         project: entry.data.project ?? null,
         enabled: entry.data.enabled,
         trigger: entry.data.trigger,
+        models: entry.data.models ?? null,
         steps: entry.data.steps,
         resources: entry.data.resources ?? {},
         resourceBinding,
@@ -4621,6 +4622,15 @@ export function registerConsoleRoutes(
     }
     if (Array.isArray(body.steps)) next.steps = normalizeWorkflowSteps(mergeWorkflowStepsForPatch(entry.data.steps, body.steps));
     if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
+    // Workflow-level model pins (owner ask, 2026-07-24): brain/worker set from
+    // the workflow drawer. Empty strings clear a pin; both empty clears the block.
+    if (body.models !== undefined) {
+      const raw = (body.models ?? {}) as { brain?: unknown; worker?: unknown };
+      const brain = typeof raw.brain === 'string' && raw.brain.trim() ? raw.brain.trim() : undefined;
+      const worker = typeof raw.worker === 'string' && raw.worker.trim() ? raw.worker.trim() : undefined;
+      if (brain || worker) next.models = { ...(brain ? { brain } : {}), ...(worker ? { worker } : {}) };
+      else delete next.models;
+    }
     if (body.synthesisPrompt !== undefined) {
       next.synthesis = typeof body.synthesisPrompt === 'string' && body.synthesisPrompt.trim()
         ? { prompt: body.synthesisPrompt.trim() } : undefined;

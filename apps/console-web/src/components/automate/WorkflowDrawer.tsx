@@ -8,6 +8,8 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { ScheduleEditor } from './ScheduleEditor';
 import { detectedTimezone } from '@/lib/cron';
+import { getSettings, type ModelRolesSnapshot } from '@/lib/settings';
+import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { certPrimaryAction, certificationActionLabel, certificationTone, workflowCertificationCounts, workflowPrimaryAction } from '@/lib/workflowCertification';
 import { getWorkflow, patchWorkflow, deleteWorkflow, runWorkflow, setWorkflowEnabled, type WorkflowCertification, type WorkflowDetail, type WorkflowResourceBinding, type WorkflowResourceBindingReport, type WorkflowResourceProposalStatus } from '@/lib/automate';
@@ -365,6 +367,10 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
   const [saved, setSaved] = useState(false);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState('');
+  // Workflow-level model pins (owner ask, 2026-07-24): '' = follow global routing.
+  const [pinBrain, setPinBrain] = useState('');
+  const [pinWorker, setPinWorker] = useState('');
+  const settings = usePoll(['settings'], getSettings, 0);
 
   useEffect(() => {
     let alive = true;
@@ -372,6 +378,7 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
     getWorkflow(name).then((d) => {
       if (!alive) return;
       setWf(d); setDesc(d.description ?? ''); setEnabled(!!d.enabled); setCron(d.trigger?.schedule ?? '');
+      setPinBrain(d.models?.brain ?? ''); setPinWorker(d.models?.worker ?? '');
       // Seed the tz so a scheduled time means the owner's time. Default to the
       // host zone when one isn't stored yet, so the picker shows a real value.
       setTz(d.trigger?.timezone || (d.trigger?.schedule ? detectedTimezone() : ''));
@@ -387,6 +394,7 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
       await patchWorkflow(name, {
         description: desc,
         enabled,
+        models: { brain: pinBrain.trim(), worker: pinWorker.trim() },
         ...(cron.trim() ? { triggerSchedule: cron.trim(), ...(tz ? { timezone: tz } : {}) } : { clearTriggerSchedule: true }),
       });
       setSaved(true); invalidate();
@@ -449,6 +457,48 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
               <label className="mb-1.5 mt-4 block text-label text-fg">When it runs</label>
               <ScheduleEditor value={cron} onChange={(c) => { setCron(c); setSaved(false); }}
                 timezone={tz} onTimezoneChange={(z) => { setTz(z); setSaved(false); }} />
+
+              <label className="mb-1.5 mt-4 block text-label text-fg">Models for this workflow</label>
+              <div className="rounded-md border border-border bg-subtle px-3.5 py-3">
+                <p className="mb-2 text-small text-muted">
+                  Pin which models run this workflow — e.g. a cheap brain + cheap workers keeps scheduled runs off your
+                  Codex plan. Blank follows your global Models &amp; routing. The judge always follows the global judge setting.
+                </p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-1 block text-small text-muted" htmlFor="wf-pin-brain">Steps (brain)</label>
+                    <select
+                      id="wf-pin-brain"
+                      className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-body text-fg"
+                      value={pinBrain}
+                      onChange={(e) => { setPinBrain(e.target.value); setSaved(false); }}
+                    >
+                      <option value="">Default (global routing)</option>
+                      {((settings.data?.modelRoles?.available ?? []) as NonNullable<ModelRolesSnapshot['available']>).map((g) => (
+                        <optgroup key={`${g.provider}:${g.label}`} label={g.label}>
+                          {g.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                        </optgroup>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-small text-muted" htmlFor="wf-pin-worker">Workers (fan-outs)</label>
+                    <select
+                      id="wf-pin-worker"
+                      className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-body text-fg"
+                      value={pinWorker}
+                      onChange={(e) => { setPinWorker(e.target.value); setSaved(false); }}
+                    >
+                      <option value="">Default (global routing)</option>
+                      {((settings.data?.modelRoles?.roleOptions?.worker ?? settings.data?.modelRoles?.available ?? []) as NonNullable<ModelRolesSnapshot['available']>).map((g) => (
+                        <optgroup key={`${g.provider}:${g.label}`} label={g.label}>
+                          {g.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                        </optgroup>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
 
               <WorkflowHowItWorks wf={wf} />
 
