@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider, sanitizeClaudeInput, aisdkAcceptsReasoning, withClaudeInputSanitizer, getClaudeModel, resetClaudeModelCache } from './claude-model.js';
+import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider, sanitizeClaudeInput, aisdkAcceptsReasoning, withClaudeInputSanitizer, getClaudeModel, resetClaudeModelCache, ClaudeTransportRoutingModel } from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 
 const ID = "You are Claude Code, Anthropic's official CLI for Claude.".replace('Claude', 'Claude'); // exact identity
@@ -108,11 +108,13 @@ test('getClaudeModel: headless transport falls back to the raw_messages adapter 
   const prevTransport = process.env.CLEMMY_CLAUDE_TRANSPORT;
   process.env.CLEMMY_CLAUDE_TRANSPORT = 'headless';
   try {
-    // CLI present → headless transport (claude -p print mode).
+    // CLI present → the per-request TRANSPORT ROUTER (2026-07-24): text-only
+    // requests ride headless; tool-bearing requests ride the raw Messages
+    // adapter — the claude harness lane is always tool-capable now.
     setClaudeHeadlessCliAvailableForTest(true);
     resetClaudeModelCache();
-    const headless = getClaudeModel('claude-opus-4-8');
-    assert.ok(headless instanceof ClaudeHeadlessModel, 'CLI present → headless transport');
+    const routed = getClaudeModel('claude-opus-4-8');
+    assert.ok(routed instanceof ClaudeTransportRoutingModel, 'CLI present → per-request transport router');
 
     // CLI missing → must NOT commit to headless (every turn would spawn ENOENT
     // with no auto-recovery); fall back to the raw Messages adapter, which uses
@@ -168,3 +170,17 @@ test('transcript caching: a SMALL transcript is NOT breakpointed (below cacheMin
 });
 
 void ID;
+
+// The router's contract, unit-level: tools → raw adapter; text-only → headless.
+test('ClaudeTransportRoutingModel picks the transport per request', async () => {
+  const calls: string[] = [];
+  const stub = (name: string) => ({
+    async getResponse() { calls.push(`${name}:get`); return { output: [], usage: {} }; },
+    async *getStreamedResponse() { calls.push(`${name}:stream`); yield { type: 'response_started' }; },
+  });
+  const router = new ClaudeTransportRoutingModel(stub('headless') as never, stub('raw') as never);
+  await router.getResponse({ input: 'hi', tools: [], handoffs: [] } as never);
+  await router.getResponse({ input: 'hi', tools: [{ name: 'run_shell_command' }], handoffs: [] } as never);
+  for await (const _ of router.getStreamedResponse({ input: 'hi', tools: [], handoffs: [{}] } as never)) break;
+  assert.deepEqual(calls, ['headless:get', 'raw:get', 'raw:stream']);
+});

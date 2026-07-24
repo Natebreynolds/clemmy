@@ -186,9 +186,30 @@ export class RouterModelProvider implements ModelProvider {
       getModel: () => primary.model,
       ...(primary.provider === 'claude' ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
     }];
-    // all_in is a provider-isolation promise, not merely a primary preference.
-    // Even an explicitly enabled fallover must not spend subscription seats.
-    if (getModelRoutingMode() === 'all_in') return chain;
+    // all_in keeps BYO primary — but a CONVERSATION must complete (owner
+    // question, 2026-07-24: kimi rate-limited and the turn died with "go
+    // change your settings" instead of falling back). Connected subscription
+    // brains join as LAST-RESORT rescue targets for the ORCHESTRATOR surface
+    // only: worker fan-outs stay isolated (guardrailScopeId set), so a 429
+    // storm across 100 workers can never silently drain a subscription — a
+    // single user-facing turn rescuing onto Codex/Claude is exactly what the
+    // user wants instead of an error card. No connected subscription → the
+    // original isolation holds by construction.
+    if (getModelRoutingMode() === 'all_in') {
+      const workerScope = Boolean(harnessRunContextStorage.getStore()?.guardrailScopeId);
+      if (workerScope) return chain;
+      if (primary.provider !== 'codex' && codexModelsAvailable()) {
+        chain.push({ label: 'codex:rescue', getModel: () => this.codex.getModel(MODELS.primary) });
+      }
+      if (primary.provider !== 'claude' && claudeModelsAvailable()) {
+        chain.push({
+          label: 'claude:rescue',
+          getModel: () => this.claude.getModel(getClaudeBrainModel()),
+          supportsRequest: claudeHarnessSupportsRequest,
+        });
+      }
+      return chain;
+    }
     // Codex (OpenAI) — generally the steadiest fallback.
     if (primary.provider !== 'codex' && codexModelsAvailable()) {
       chain.push({ label: 'codex', getModel: () => this.codex.getModel(MODELS.primary) });

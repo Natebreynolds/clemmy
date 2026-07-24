@@ -574,13 +574,39 @@ export function withClaudeInputSanitizer(inner: Model): Model {
   return new ClaudeInputSanitizingModel(inner);
 }
 
+/** Per-request transport router (owner question, 2026-07-24: "why can't
+ *  Claude run tools when it's its own lane?"). Headless (Claude Code print
+ *  mode) is deliberately text-only; the raw Messages adapter serves the SAME
+ *  subscription token AND executes tools. Route each request to the transport
+ *  that can actually run it: tools/handoffs → raw adapter; pure text →
+ *  headless. This retires the text-only crash class at the source instead of
+ *  each caller degrading around it (space runner, fallover, fusion drafts —
+ *  three live incidents in one day). */
+export class ClaudeTransportRoutingModel implements Model {
+  constructor(private readonly headless: Model, private readonly raw: Model) {}
+  private pick(request: ModelRequest): Model {
+    const r = request as { tools?: unknown[]; handoffs?: unknown[] };
+    const needsTools = (Array.isArray(r.tools) && r.tools.length > 0)
+      || (Array.isArray(r.handoffs) && r.handoffs.length > 0);
+    return needsTools ? this.raw : this.headless;
+  }
+  getResponse(request: ModelRequest): ReturnType<Model['getResponse']> {
+    return this.pick(request).getResponse(request);
+  }
+  getStreamedResponse(request: ModelRequest): ReturnType<Model['getStreamedResponse']> {
+    return this.pick(request).getStreamedResponse(request);
+  }
+}
+
 const modelCache = new Map<string, Model>();
 export function getClaudeModel(modelId: string): Model {
   const cached = modelCache.get(modelId);
   if (cached) return cached;
   if (claudeSubscriptionTransport() === 'headless') {
     if (claudeHeadlessCliAvailable()) {
-      const model = getClaudeHeadlessModel(modelId);
+      const headless = getClaudeHeadlessModel(modelId);
+      const raw = buildRawClaudeModel(modelId);
+      const model = new ClaudeTransportRoutingModel(headless, raw);
       modelCache.set(modelId, model);
       return model;
     }
@@ -592,6 +618,14 @@ export function getClaudeModel(modelId: string): Model {
   }
   // Sanitize cross-model input FIRST (innermost), so a Codex-shaped reasoning
   // item can't crash the aisdk adapter — on the primary call OR any retry.
+  const model = buildRawClaudeModel(modelId);
+  modelCache.set(modelId, model);
+  return model;
+}
+
+/** The tool-capable raw Messages adapter (subscription token), with the
+ *  standard resilience/parity wrapping. */
+function buildRawClaudeModel(modelId: string): Model {
   let model: Model = withClaudeInputSanitizer(aisdk(getProvider()(modelId)));
   // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
   // translation (effort -> output_config.effort). Wrap BEFORE caching so the
@@ -603,7 +637,6 @@ export function getClaudeModel(modelId: string): Model {
       refreshAuth: refreshClaudeAuth,
     });
   }
-  modelCache.set(modelId, model);
   return model;
 }
 
@@ -611,7 +644,11 @@ export function getClaudeModel(modelId: string): Model {
  * native Clementine tools. Claude Code print mode is deliberately text-only;
  * the raw Messages adapter remains tool-capable. */
 export function claudeHarnessModelSupportsTools(): boolean {
-  return claudeSubscriptionTransport() !== 'headless' || !claudeHeadlessCliAvailable();
+  // Per-request transport routing (2026-07-24): tool-bearing requests go to
+  // the raw Messages adapter even under the headless transport, so the
+  // harness claude lane is ALWAYS tool-capable now. Kept as a function for
+  // its call sites; the capability guards it fed become belts.
+  return true;
 }
 
 function isClaudeModelId(id: string | undefined): boolean {
