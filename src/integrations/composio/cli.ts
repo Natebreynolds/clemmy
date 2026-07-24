@@ -199,7 +199,28 @@ export function invalidateComposioCliStatusCache(): void {
   cliStatusCache = null;
 }
 
+/** Auth-dead bench (2026-07-24): once a live probe PROVES the CLI session is
+ *  rejecting calls at auth, AUTO stops routing through it entirely — the SDK
+ *  (where the user's connections actually live) becomes the lane until the
+ *  bench expires or a real re-login is detected. Prevents every subsequent
+ *  mutation from re-failing into the dead lane first. */
+let cliAuthBenchedUntil = 0;
+const CLI_AUTH_BENCH_MS = 15 * 60_000;
+export function benchComposioCliAuth(): void {
+  cliAuthBenchedUntil = Date.now() + CLI_AUTH_BENCH_MS;
+  cliStatusCache = null; // the cached "authenticated" claim is proven false
+}
+export function _resetComposioCliBenchForTests(): void { cliAuthBenchedUntil = 0; }
+
 export async function getComposioCliStatus(options: ComposioCliEnvOptions = {}): Promise<ComposioCliStatus> {
+  if (Date.now() < cliAuthBenchedUntil) {
+    return {
+      installed: true,
+      authenticated: false,
+      authStatus: 'error',
+      authMessage: 'Composio CLI session was proven auth-dead by a live probe — using the SDK backend until it recovers (run composio login to restore the CLI lane).',
+    } as ComposioCliStatus;
+  }
   const key = JSON.stringify([options.apiKey ?? '', options.userId ?? '']);
   const now = Date.now();
   if (cliStatusCache && cliStatusCache.key === key && now - cliStatusCache.at <= CLI_STATUS_TTL_MS) {

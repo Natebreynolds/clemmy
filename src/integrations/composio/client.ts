@@ -9,6 +9,7 @@ import { getSecretStore } from '../../runtime/secrets/index.js';
 import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import { cachedIdentityEmail, cachedConnectionOwner, recordConnectionOwner } from './identity-cache.js';
 import {
+  benchComposioCliAuth,
   composioCliAuthDead,
   executeComposioCliTool,
   getComposioCliStatus,
@@ -1674,7 +1675,8 @@ export async function executeComposioTool(
           if (!(authShaped && await composioCliAuthDead(cliOptions))) {
             throw new ComposioDispatchUncertainError(toolSlug, error);
           }
-          console.warn(`[composio] CLI lane proven auth-dead by live probe — ${toolSlug} was rejected at auth; retrying via SDK backend`);
+          console.warn(`[composio] CLI lane proven auth-dead by live probe — ${toolSlug} was rejected at auth; retrying via SDK backend and benching the CLI lane`);
+          try { benchComposioCliAuth(); } catch { /* bench is best-effort */ }
         }
       }
     } else if (backend === 'cli') {

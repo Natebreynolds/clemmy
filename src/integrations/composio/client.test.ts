@@ -378,3 +378,15 @@ test('composioAutoFallbackAllowed still refuses bare auth text for mutations', a
     'the structural not-started marker still proves it',
   );
 });
+
+test('a benched CLI lane reports unauthenticated so AUTO routes SDK-first until recovery', async () => {
+  const { benchComposioCliAuth, _resetComposioCliBenchForTests, getComposioCliStatus } = await import('./cli.js');
+  try {
+    benchComposioCliAuth();
+    const status = await getComposioCliStatus();
+    assert.equal(status.authenticated, false, 'benched lane never claims authenticated');
+    assert.match(status.authMessage ?? '', /proven auth-dead/, 'the bench explains itself');
+  } finally {
+    _resetComposioCliBenchForTests();
+  }
+});
