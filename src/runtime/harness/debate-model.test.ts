@@ -929,3 +929,34 @@ test('verifyJudgeAvailable reflects the GLM-brain + Codex-judge pairing', async 
     assert.equal(verifyJudgeAvailable(), false);
   });
 });
+
+
+// Transport-capability degrade (live 2026-07-24, the "judge text failed"
+// Discord incident): high-stakes fusion drafted a TOOL-BEARING turn on a
+// text-only claude transport and the run died twice. A tool-bearing debate
+// turn degrades to the VERIFY shape (executor drafts, tools:[] checker
+// refines); tool-less turns still full-debate.
+test('debate degrades to verify for tool-bearing turns when claude drafts may be text-only', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let draftACalls = 0;
+    let judgeSystem = '';
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('EXECUTOR-DRAFT with plenty of substantive user-facing content here') }),
+      draftA: model({ getResponse: async () => { draftACalls += 1; return msg('CLAUDE-DRAFT'); } }),
+      judge: model({ getResponse: async (r: any) => { judgeSystem = r.systemInstructions; return msg('REFINED FINAL with plenty of substantive user-facing content here'); } }),
+    });
+    (b as DebateBrains).claudeDraftMayBeTextOnly = true;
+    const res = await dm(b).getResponse(req({ tools: [{ name: 'run_shell_command' }] }));
+    assert.equal(draftACalls, 0, 'the text-only claude draft is never dispatched with tools');
+    assert.match(judgeSystem, /VERIFY|DRAFT/i, 'the checker ran the verify shape');
+    assert.match((res.output[0] as any).content, /REFINED FINAL|EXECUTOR-DRAFT/);
+
+    // Tool-less turn: full debate still engages the claude draft.
+    const b2 = brains({
+      draftA: model({ getResponse: async () => { draftACalls += 1; return msg('CLAUDE-DRAFT'); } }),
+    });
+    (b2 as DebateBrains).claudeDraftMayBeTextOnly = true;
+    await dm(b2).getResponse(req());
+    assert.equal(draftACalls, 1, 'tool-less turns still full-debate');
+  });
+});

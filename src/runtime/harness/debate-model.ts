@@ -37,7 +37,7 @@
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateCheckerModel, getByoBackendConfig, judgeChoice, MODELS } from '../../config.js';
-import { ClaudeModelProvider } from './claude-model.js';
+import { ClaudeModelProvider, claudeHarnessModelSupportsTools } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel, resolveEffectiveProviderForModel } from './byo-providers.js';
@@ -138,6 +138,12 @@ export type FusionStrategy = 'debate' | 'verify';
  *    brain) drafts once, then the CHECKER (the judge brain) verifies/refines into the
  *    final answer (2 calls). Cheaper, and the research-optimal verify-over-redraft
  *    pattern. Pair with active-brain=Codex + judge=Claude for the recommended play. */
+function requestNeedsNativeTools(request: ModelRequest): boolean {
+  const r = request as { tools?: unknown[]; handoffs?: unknown[] };
+  return (Array.isArray(r.tools) && r.tools.length > 0)
+    || (Array.isArray(r.handoffs) && r.handoffs.length > 0);
+}
+
 export function fusionStrategy(): FusionStrategy {
   return (getRuntimeEnv('CLEMMY_FUSION_STRATEGY', 'debate') || 'debate').trim().toLowerCase() === 'verify'
     ? 'verify'
@@ -354,6 +360,12 @@ export interface DebateBrains {
   draftB: Model;
   /** Reconciles the two drafts into the final answer. */
   judge: Model;
+  /** True when the DEBATE-strategy drafts include a Claude model whose harness
+   *  transport may be text-only (headless). The wrapper degrades tool-bearing
+   *  turns to the VERIFY shape (checker is tools:[]) instead of letting a
+   *  draft crash on the transport (live 2026-07-24: kimi brain + high-stakes
+   *  fusion drafted Claude WITH tools on headless — run died twice). */
+  claudeDraftMayBeTextOnly?: boolean;
 }
 
 export interface DebateOptions {
@@ -426,7 +438,10 @@ export class DebateModel implements Model {
     // verify budget was spent on consolidation while the answer ran single-brain).
     if (!this.opts.fuseNonStreamed) return this.brains.passthrough.getResponse(request);
     if (!shouldDebate(request)) return this.brains.passthrough.getResponse(request);
-    if (fusionStrategy() === 'verify') return this.verifyResponse(request);
+    if (
+      fusionStrategy() === 'verify'
+      || (this.brains.claudeDraftMayBeTextOnly === true && requestNeedsNativeTools(request))
+    ) return this.verifyResponse(request);
     if (!this.spendFusionSlot()) return this.brains.passthrough.getResponse(request);
     const { a, b } = await this.draftBoth(request);
     if (!a || !b) {
@@ -474,7 +489,14 @@ export class DebateModel implements Model {
       return;
     }
 
-    if (fusionStrategy() === 'verify') {
+    if (
+      fusionStrategy() === 'verify'
+      // Transport-capability degrade (live 2026-07-24): a tool-bearing turn
+      // must never draft on a text-only Claude transport — run the VERIFY
+      // shape instead (executor drafts, tool-less checker refines). Same
+      // second opinion, zero crash surface.
+      || (this.brains.claudeDraftMayBeTextOnly === true && requestNeedsNativeTools(request))
+    ) {
       // verify claims its slot AFTER drafting (only for a user-facing answer).
       yield* this.verifyStreamed(request);
       return;
@@ -1144,6 +1166,7 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   // PROVIDER so it carries the overload fallback chain Opus -> Sonnet -> Codex.
   if (!haveClaude || !haveCodex) return null;
   const claude: Model = new ClaudeModelProvider().getModel();
+  const claudeDraftMayBeTextOnly = !claudeHarnessModelSupportsTools();
   const codex: Model = new CodexModelProvider().getModel();
   // The judge comes from the role→model registry (a UI/chat binding wins; else the
   // provider-derived default), dispatched by its provider so the role snapshot and
@@ -1157,6 +1180,7 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
     draftA: claude,
     draftB: codex,
     judge,
+    claudeDraftMayBeTextOnly,
   };
 }
 
