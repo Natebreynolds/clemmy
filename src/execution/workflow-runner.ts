@@ -148,6 +148,7 @@ import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
+import { setSessionWorkerModelOverride, clearSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { approvedSendSlugsForSessions } from '../runtime/harness/approval-registry.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
@@ -1860,9 +1861,14 @@ function claudeIsActiveWorkflowBrain(): boolean {
   }
 }
 
-function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRoute {
+function resolveWorkflowStepModel(step: WorkflowStepInput, workflow?: WorkflowDefinition): WorkflowStepModelRoute {
   const explicit = step.model || undefined;
   if (explicit) return { model: explicit };
+  // Workflow-level brain pin (owner ask, 2026-07-24): an authored
+  // `models: { brain }` is the default model for every step without its own
+  // `model:` — pin once at authoring, every scheduled run stays cheap.
+  const workflowBrain = workflow?.models?.brain?.trim();
+  if (workflowBrain) return { model: workflowBrain };
   if (workerIntentRoutingEnabled() && step.intent) {
     const routed = resolveRoleModel('worker', step.intent);
     return {
@@ -2220,6 +2226,15 @@ async function runStepViaHarness(
       realSessionId,
       stepAttempt,
     );
+    // Definition lookup for the workflow-level model pins (owner ask,
+    // 2026-07-24). Best-effort: unreadable definition reverts to defaults.
+    const workflowDefForPin = ((): WorkflowDefinition | undefined => {
+      try { return readWorkflow(workflowName)?.data; } catch { return undefined; }
+    })();
+    const workflowWorkerPin = workflowDefForPin?.models?.worker?.trim();
+    if (workflowWorkerPin) {
+      setSessionWorkerModelOverride(realSessionId, workflowWorkerPin);
+    }
     // Standing-consent send graduation (owner feedback, 2026-07-24: "once a
     // workflow is authorized and on it needs to run unless turned off"). For
     // an UNATTENDED SCHEDULED run of an enabled workflow, a send slug a human
@@ -2329,7 +2344,7 @@ async function runStepViaHarness(
     // user bound for it (worker role), e.g. Claude Opus — while untagged steps
     // stay on the brain. An explicit step.model still wins. The registered
     // RouterModelProvider dispatches the resolved id to its provider.
-    const modelRoute = resolveWorkflowStepModel(step);
+    const modelRoute = resolveWorkflowStepModel(step, workflowDefForPin);
     const stepModel = modelRoute.model;
     const appendWorkerRoute = (data: Record<string, unknown>) => {
       try {
@@ -2700,6 +2715,7 @@ async function runStepViaHarness(
     // for the rest of the workflow run.
     clearWorkflowRunPausedForApproval(workflowRunId);
     closePlanScope(realSessionId, 'workflow-step-finished');
+    clearSessionWorkerModelOverride(realSessionId);
   }
 }
 
@@ -3231,7 +3247,7 @@ async function executeStepVerifiedInner(
     return runStepVerifiedAttempt(step, ctx);
   }
   const currentProvider = resolveEffectiveProviderForModel(
-    resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
+    resolveWorkflowStepModel(step, ctx.workflow).model ?? defaultForRole('brain'),
   ) as BrainProviderClass;
   const nextBrains = falloverBrainModelIds(currentProvider);
   if (nextBrains.length === 0) return runStepVerifiedAttempt(step, ctx);
@@ -4059,7 +4075,7 @@ export async function executeStep(
                   // getWorkerModel()) keeps this legacy lane identical to the harness
                   // lane so a single brain setting governs all runs. {} (untagged) →
                   // the codex-safe brain default.
-                  model: resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
+                  model: resolveWorkflowStepModel(step, ctx.workflow).model ?? defaultForRole('brain'),
                   maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
                 }, (r) => ctx.assistant.respond(r));
                 output = response.text;
