@@ -10,15 +10,29 @@ import assert from 'node:assert/strict';
 import { filterOpenAiChatModelIds, canonicalPickerId, labelForModelId, _setDiscoveredModelsForTest } from './model-discovery.js';
 import { resolveProvider } from './model-wire-registry.js';
 
-test('filterOpenAiChatModelIds keeps codex-wire families (gpt-5+/o/codex), drops legacy + modality + date-stamps', () => {
+test('filterOpenAiChatModelIds keeps the codex family + newest-generation flagships only', () => {
   const kept = filterOpenAiChatModelIds([
-    'gpt-5.4', 'gpt-5.5', 'gpt-6', 'gpt-12', 'o3', 'o5-mini', 'codex-large',
-    'gpt-4.1', 'gpt-4o', 'gpt-3.5-turbo', // pre-Codex-backend families → excluded
-    'gpt-5.4-2026-01-15', 'gpt-5.4-20260115', // date-stamped snapshots → excluded
-    'text-embedding-3-small', 'gpt-5-audio-preview', 'whisper-1', 'tts-1',
-    'dall-e-3', 'gpt-image-1', 'omni-moderation-latest',
+    // real-world shape (from live /v1/models):
+    'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5.4', 'gpt-5.5', // older-gen flagships → dropped (superseded)
+    'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra',       // NEWEST gen flagships → kept
+    'gpt-5-codex', 'gpt-5.1-codex', 'gpt-5.1-codex-max', 'gpt-5.2-codex', 'gpt-5.3-codex', // codex family → kept
+    'gpt-5.1-codex-mini',                                 // codex but -mini → dropped (small variant)
+    'gpt-5.6-nano', 'gpt-5.4-pro', 'gpt-5-chat-latest',   // variant noise → dropped
+    'o3', 'o4-mini', 'o1-pro',                            // o-series → dropped
+    'gpt-4o', 'gpt-3.5-turbo',                            // pre-Codex families → dropped
+    'gpt-5.4-2026-01-15', 'gpt-5.4-20260115',             // date stamps → dropped
+    'text-embedding-3-small', 'whisper-1', 'dall-e-3',    // modalities → dropped
   ]);
-  assert.deepEqual(kept.sort(), ['codex-large', 'gpt-12', 'gpt-5.4', 'gpt-5.5', 'gpt-6', 'o3', 'o5-mini'].sort());
+  assert.deepEqual(kept, [
+    'gpt-5-codex', 'gpt-5.1-codex', 'gpt-5.1-codex-max', 'gpt-5.2-codex', 'gpt-5.3-codex',
+    'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra',
+  ].sort());
+});
+
+test('filterOpenAiChatModelIds newest-generation tracking is dynamic (a newer gen supersedes the prior one)', () => {
+  // When gpt-6 ships, the 5.x flagships drop off automatically; the codex family stays.
+  const kept = filterOpenAiChatModelIds(['gpt-5.6-sol', 'gpt-6', 'gpt-6-pro', 'gpt-5.2-codex']);
+  assert.deepEqual(kept, ['gpt-5.2-codex', 'gpt-6'].sort());
 });
 
 test('canonicalPickerId strips date stamps and rejects unpersistable ids', () => {

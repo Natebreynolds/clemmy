@@ -31,15 +31,34 @@ let cache: { anthropic: DiscoveredModel[]; openai: DiscoveredModel[]; fetchedAt:
 };
 let refreshInFlight: Promise<void> | null = null;
 
-/** OpenAI /v1/models returns EVERYTHING (embeddings, audio, images, gpt-3.5…).
- *  Keep families the codex_responses wire actually runs — gpt-5+ / o-series /
- *  codex-* (gpt-3/4-era models predate the Codex backend and would 400 there) —
- *  and drop date-stamped snapshots (near-duplicate picker noise). Pure. */
+/** OpenAI /v1/models returns EVERYTHING (131 ids in the wild: embeddings, audio,
+ *  images, o-series, every gpt-5.x point-release + mini/nano/pro variants…). The
+ *  Codex picker should stay TIGHT and CURRENT — what the Codex agent backend
+ *  actually runs — so we keep only:
+ *    • the codex-branded family (any version: `*-codex`, `*-codex-max`), and
+ *    • the NEWEST generation's flagship chat models (e.g. the gpt-5.6 line),
+ *  and drop older generations, the small/variant noise (mini/nano/pro/
+ *  chat-latest), the o-series, other modalities, and date-stamped snapshots.
+ *  Fully dynamic by design: a new `*-codex` or a newer gpt generation (5.7, 6.x)
+ *  auto-appears on the next refresh and prior generations fall off on their own —
+ *  no Clementine release, no hand-maintained list. Any dropped id is still
+ *  runnable by typing its exact id in Settings → Models. Pure. (owner ask,
+ *  2026-07-24: "only the codex models, but keep the newest flagships like 5.6".) */
 export function filterOpenAiChatModelIds(ids: string[]): string[] {
-  const include = /^(gpt-(?:[5-9]|[1-9][0-9])|o[0-9]|codex)/i;
-  const exclude = /(embed|audio|realtime|whisper|tts|dall-e|image|moderation|transcribe|search|-instruct)/i;
+  const family = /^(gpt-(?:[5-9]|[1-9][0-9])|codex)/i; // gpt-5+ / codex — NOT o-series or gpt-3/4-era
+  const noise = /(embed|audio|realtime|whisper|tts|dall-e|image|moderation|transcribe|search|-instruct|-mini|-nano|-pro|-chat-latest)/i;
   const dateStamp = /-(20\d{2}-\d{2}-\d{2}|20\d{6})$/;
-  return ids.filter((id) => include.test(id) && !exclude.test(id) && !dateStamp.test(id));
+  const candidates = ids.filter((id) => family.test(id) && !noise.test(id) && !dateStamp.test(id));
+
+  const isCodex = (id: string) => /codex/i.test(id);
+  // Numeric generation for a gpt-N.M id (gpt-5.6-sol → 5.06 so 5.6 > 5.5; gpt-6 → 6).
+  // Non-gpt (unreachable here) → 0. Codex ids bypass this via isCodex.
+  const generation = (id: string): number => {
+    const m = id.match(/^gpt-(\d+)(?:\.(\d+))?/i);
+    return m ? Number(m[1]) + (m[2] ? Number(m[2]) / 100 : 0) : 0;
+  };
+  const newest = candidates.reduce((max, id) => Math.max(max, generation(id)), 0);
+  return candidates.filter((id) => isCodex(id) || generation(id) >= newest).sort();
 }
 
 /** Ids must survive the settings-save validator (normalizeModelId's charset) —
