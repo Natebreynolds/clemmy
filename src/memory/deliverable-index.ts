@@ -167,3 +167,25 @@ export function deliverableKindForShape(shapeKey: string | undefined): string {
   if (/SHEET|DOC|SLIDE|AIRTABLE|NOTION|RECORD|ROW|PAGE|UPLOAD/.test(key)) return 'external_doc';
   return 'external_write';
 }
+
+
+/** Deterministic "known artifacts" block for planning surfaces (live
+ *  2026-07-24: the planner asked "where is the banked research stored?" while
+ *  this ledger held the research files, the target sheet URL, and the
+ *  template — every question it asked). Bounded, best-effort, no model call.
+ *  The consuming prompt's rubric forbids asking the user for anything
+ *  answered here. */
+export function deliverableContextBlock(objective: string): string {
+  try {
+    const hits = searchDeliverables(objective).slice(0, 5);
+    if (hits.length === 0) return '';
+    const lines = hits.map((h) => `- ${renderDeliverableHit(h)}`.slice(0, 260));
+    return [
+      'KNOWN ARTIFACTS (from the deliverable ledger — work already produced and where it lives).',
+      'Check here FIRST: never ask the user where prior work, research, sheets, or templates are if this list answers it. Reference these directly in the plan.',
+      ...lines,
+    ].join('\n');
+  } catch {
+    return '';
+  }
+}

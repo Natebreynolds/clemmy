@@ -8,6 +8,7 @@ import { runPostTurnHooks } from './post-turn.js';
 import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
+import { deliverableContextBlock } from '../../memory/deliverable-index.js';
 
 export interface PlanFirstInput {
   input: string;
@@ -423,6 +424,15 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
   } catch {
     // Recall must never block planning — fall through to no memoryContext.
   }
+  // KNOWN ARTIFACTS from the deliverable ledger (live 2026-07-24: the planner
+  // asked "where is the banked research stored?" while its own ledger held the
+  // research files, the target sheet URL, AND the outreach template — every
+  // question it asked). Deterministic local read, no model call; the rubric in
+  // the prompt forbids asking the user for anything answered here.
+  try {
+    const ledgerBlock = deliverableContextBlock(input.input);
+    if (ledgerBlock) memoryContext = [memoryContext, ledgerBlock].filter(Boolean).join('\n\n');
+  } catch { /* the ledger must never block planning */ }
   try {
     appendEvent({
       sessionId: input.sessionId,

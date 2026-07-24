@@ -1712,7 +1712,7 @@ test('dispatch_background_task is terminal in the SDK lane', async () => {
   assert.equal(interrupted, true);
   assert.equal(r.limitHit, false);
   assert.deepEqual(r.toolUses, ['mcp__clementine-local__dispatch_background_task']);
-  assert.match(r.text, /started "Count markdown files" as a background task \(bg-test\)/);
+  assert.match(r.text, /Started "Count markdown files" in the background \(bg-test\)/);
   assert.doesNotMatch(r.text, /wrong foreground answer/);
 });
 
@@ -2389,4 +2389,50 @@ test('SDK child env gets a real MCP startup window (local server cold boot > def
   ], {}); }) as any);
   await runClaudeAgentSdk({ prompt: 'hi', sessionId: 'mcp-timeout-check' });
   assert.equal(capture.call.options.env.MCP_TIMEOUT, '120000');
+});
+
+
+// Voice-first handoff (owner feedback, 2026-07-24): the model's own
+// handoff_note IS the dispatch reply; the generated line is only the floor.
+test('dispatch_background_task terminal reply prefers the model-authored handoff_note', async () => {
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const q = stubsFor((async function* () {
+      yield initOnlyMessage();
+      yield {
+        type: 'assistant',
+        session_id: 's', uuid: 'a2', parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_use', id: 'toolu_bg2',
+            name: 'mcp__clementine-local__dispatch_background_task',
+            input: {
+              objective: 'Count markdown files',
+              handoff_note: 'Kicking that off now — I\u2019ll count the markdown files in the background and drop the tally here the moment it lands.',
+            },
+          }],
+        },
+      } as any;
+      yield {
+        type: 'user',
+        session_id: 's', uuid: 'u2', parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result', tool_use_id: 'toolu_bg2',
+            content: 'Dispatched "Count markdown files" to the background (task bg-test-2) with a goal contract.',
+          }],
+        },
+      } as any;
+      yield successResultMessage('wrong foreground answer');
+    })());
+    return Object.assign(q, { interrupt: async () => { /* terminal interrupt */ } });
+  }) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'please background this',
+    sessionId: 'sdk-dispatch-voice',
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['dispatch_background_task'],
+  });
+  assert.match(r.text, /Kicking that off now/);
+  assert.doesNotMatch(r.text, /it reports back here when it finishes/, 'floor text is not used when the model spoke');
 });
