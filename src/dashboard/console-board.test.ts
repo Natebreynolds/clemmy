@@ -2775,3 +2775,51 @@ test('GET /api/console/board shows ONE card for a live workflow run — the run 
     await h.close();
   }
 });
+
+test('GET /api/console/board collapses a tracked execution that belongs to a background task pipeline (one pipeline = one card)', async () => {
+  const { ExecutionStore } = await import('../execution/store.js');
+  const store = new ExecutionStore();
+  const mkExec = (sessionId: string, title: string) => store.create({
+    sessionId, title, objective: title, reason: 'r', startedFromMessage: 'm',
+    confidence: 1, reasons: [],
+  });
+
+  // A) Origin-chat handoff: a live background task carries the chat as its
+  //    originSessionId, and that chat still has an ACTIVE execution — the same
+  //    pipeline. The Task card wins; the Tracked card collapses.
+  const chat = 'sess-desktop-collapse-origin';
+  const originExec = mkExec(chat, 'Finish ChatGPT ads outreach workbook');
+  const bg = createBackgroundTask({ title: 'Finish and verify the workbook', prompt: 'p', originSessionId: chat });
+  markBackgroundTaskRunning(bg.id);
+  const runSession = getBackgroundTask(bg.id)!.runSessionId;
+  assert.ok(runSession, 'running background task has a runSessionId');
+
+  // B) Worker-internal: an execution created inside the task's worker session
+  //    collapses at ANY status (a done worker-exec must not duplicate the Task
+  //    into Done either).
+  const workerExec = mkExec(runSession!, 'Team ChatGPT visibility workbook');
+  store.update(workerExec.id, { status: 'completed' });
+
+  // C) Standalone: a live execution in a chat with NO live background task must
+  //    still surface as its own Tracked card.
+  const standalone = mkExec('sess-desktop-standalone-exec', 'Independent tracked goal');
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: BoardCard[] };
+    const has = (id: string) => body.cards.some((c) => c.id === id);
+
+    assert.equal(has(bg.id), true, 'the background Task card represents the pipeline');
+    assert.equal(has(originExec.id), false, 'the origin chat execution collapses into the Task card');
+    assert.equal(has(workerExec.id), false, 'the worker-internal execution collapses into the Task card');
+    assert.equal(has(standalone.id), true, 'a standalone execution keeps its own Tracked card');
+    assert.equal(
+      body.cards.find((c) => c.id === standalone.id)?.sourceKind, 'execution',
+      'standalone card is a Tracked/execution card',
+    );
+  } finally {
+    await h.close();
+  }
+});

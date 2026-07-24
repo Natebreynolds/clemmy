@@ -11,6 +11,9 @@ import {
   pickToolkitConnection,
   selectToolkitConnection,
   dispatchUserIdFor,
+  resolveToolkitConnectionId,
+  clearConnectedToolkitsCache,
+  loneToolkitConnection,
   composioAutoFallbackAllowed,
   composioCliErrorProvesNoDispatch,
   toComposioDashboardConnection,
@@ -163,6 +166,27 @@ test('cache invalidation rejects a late old-account refresh and preserves the ne
   }
 });
 
+test('loneToolkitConnection: pins the single connection for a toolkit (never bare-dispatch when one exists), but never guesses among ambiguous', () => {
+  const conns: ConnectedToolkit[] = [
+    { slug: 'apify', connectionId: 'ca_apify', status: 'ACTIVE', ownerUserId: 'pg-test' },
+    { slug: 'firecrawl', connectionId: 'ca_fc', status: 'EXPIRED', ownerUserId: 'pg-test' },
+    { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE', accountEmail: 'a@x.com' },
+    { slug: 'outlook', connectionId: 'ca_b', status: 'ACTIVE', accountEmail: 'b@x.com' },
+  ];
+  // Single connection → pin it, regardless of status (a stale pin yields a precise
+  // reconnect error; a bare dispatch yields an opaque AuthSchemeNotFound).
+  assert.equal(loneToolkitConnection('APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', conns), 'ca_apify');
+  assert.equal(loneToolkitConnection('FIRECRAWL_SEARCH', conns), 'ca_fc');
+  // Two distinct connections for the toolkit → do NOT guess (must ASK).
+  assert.equal(loneToolkitConnection('OUTLOOK_SEND_EMAIL', conns), undefined);
+  // No connection for the toolkit → undefined (falls through to a legible bare fail).
+  assert.equal(loneToolkitConnection('GMAIL_LIST_EMAILS', conns), undefined);
+  // A bare toolkit prefix must not cross-match (google !== googledrive).
+  assert.equal(loneToolkitConnection('GOOGLEDRIVE_DOWNLOAD_FILE', [
+    { slug: 'google', connectionId: 'ca_g', status: 'ACTIVE' },
+  ]), undefined);
+});
+
 test('dispatchUserIdFor: a pinned connection dispatches under the entity that OWNS it, never the env fallback', () => {
   const conns: ConnectedToolkit[] = [
     { slug: 'outlook', connectionId: 'ca_dash', status: 'ACTIVE', ownerUserId: 'pg-test-dashboard-entity' },
@@ -186,6 +210,38 @@ test('refreshConnectedToolkits maps the raw-v3 user_id to ownerUserId', async ()
   const conns = await listConnectedToolkits();
   assert.equal(conns.find((c) => c.connectionId === 'ca_owned')?.ownerUserId, 'pg-test-owner');
   __test__.setConnectedAccountsLoader(null);
+});
+
+test('ROOT CAUSE: a transient refresh failure serves last-good (never empties a healthy lane → no false AuthSchemeNotFound under fan-out load)', async () => {
+  const prev = process.env.COMPOSIO_USER_ID;
+  process.env.COMPOSIO_USER_ID = 'user-main'; // dispatch entity owns NOTHING (the prod shape)
+  let mode: 'ok' | 'throw' = 'ok';
+  __test__.setConnectedAccountsLoader(async () => {
+    if (mode === 'throw') throw new Error('429 Too Many Requests — snapshot throttled under a wide fan-out');
+    // Apify connection is live but owned by a DIFFERENT entity (pg-test), exactly as in prod.
+    return [account('ca_apify', 'apify', 'pg-test-owner')];
+  });
+  try {
+    // 1) Warm the last-good snapshot.
+    assert.deepEqual(
+      (await listConnectedToolkits({ requireFresh: true })).map((c) => c.connectionId),
+      ['ca_apify'],
+    );
+    // 2) Fan-out reality: the self-heal invalidates the cache, then the refetch throttles.
+    clearConnectedToolkitsCache();
+    mode = 'throw';
+    const underLoad = await listConnectedToolkits({ requireFresh: true });
+    assert.deepEqual(underLoad.map((c) => c.connectionId), ['ca_apify'],
+      'serves last-good instead of [] on a throttled refresh');
+    // 3) The payoff: resolution still finds the connection → dispatch stays owner-paired,
+    //    NOT a bare dispatch under user-main that would false-fail AuthSchemeNotFound.
+    const resolved = await resolveToolkitConnectionId('APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS');
+    assert.equal(resolved, 'ca_apify', 'resolution survives the transient failure');
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
+    if (prev === undefined) delete process.env.COMPOSIO_USER_ID;
+    else process.env.COMPOSIO_USER_ID = prev;
+  }
 });
 
 test('selectToolkitConnection: 3 re-auths of ONE mailbox collapse → freshest ACTIVE (the reported bug)', () => {

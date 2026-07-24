@@ -69,3 +69,20 @@ test('connection mismatch classifier recognizes current Composio errors without 
   }), true);
   assert.equal(isComposioReconnectRequiredError(new Error('400 missing required field title')), false);
 });
+
+test('resolution-miss auth-config errors classify as reconnect-class (defer → bare-entity dispatch)', () => {
+  // A toolkit the resolver deferred past dispatches on the bare entity, which has
+  // no auth config → Composio answers with one of these. They must self-heal /
+  // surface reconnect, not be treated as an ordinary retryable error.
+  assert.equal(isComposioReconnectRequiredError(
+    new Error('Auth_Config_AuthSchemeNotFound: no auth config for toolkit on this entity'),
+  ), true);
+  assert.equal(isComposioReconnectRequiredError({
+    cause: { error: { message: 'AuthSchemeNotFound' } },
+  }), true);
+  assert.equal(isComposioReconnectRequiredError(
+    new Error('Tool execution failed: unsupported OAuth2 authentication'),
+  ), true);
+  // Guard against over-matching: a normal auth-scheme *field* echo is not a miss.
+  assert.equal(isComposioReconnectRequiredError(new Error('authScheme: OAUTH2 configured ok')), false);
+});
