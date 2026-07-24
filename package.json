@@ -110,7 +110,7 @@
     "@openai/agents-extensions": "^0.12.0",
     "@openai/agents-openai": "^0.12.0",
     "@openai/agents-realtime": "^0.12.0",
-    "@slack/bolt": "^4.7.3",
+    "@slack/bolt": "^5.0.0",
     "3d-force-graph": "^1.80.0",
     "ai": "^6.0.199",
     "better-sqlite3": "^12.11.1",
