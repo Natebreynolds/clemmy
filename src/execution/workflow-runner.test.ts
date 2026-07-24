@@ -3666,3 +3666,25 @@ test('park relay: discord/slack origins suppress the proactive prose, desktop ke
   // Unknown session → default to relaying (never silence the prose blindly).
   assert.equal(originChannelRendersOwnApprovalCard('sess-does-not-exist'), false);
 });
+
+
+// Workflow-level model pins (owner ask, 2026-07-24): pin brain + worker at
+// authoring to cut tokens on every scheduled run. Precedence: step.model >
+// models.brain > intent routing > role defaults.
+test('resolveWorkflowStepModel honors the workflow-level brain pin under step.model', () => {
+  const resolve = workflowRunnerInternalsForTest.resolveWorkflowStepModel;
+  const wf = { models: { brain: 'kimi-k3' } } as never;
+  assert.equal(resolve({ id: 's1', mode: 'llm' } as never, wf).model, 'kimi-k3', 'workflow brain pin is the step default');
+  assert.equal(resolve({ id: 's1', mode: 'llm', model: 'glm-5.2' } as never, wf).model, 'glm-5.2', 'an explicit step.model still wins');
+});
+
+test('workflow worker pin: session override registers, wins at dispatch, and clears', async () => {
+  const { setSessionWorkerModelOverride, getSessionWorkerModelOverride, clearSessionWorkerModelOverride, _resetSessionRoleOverridesForTests } =
+    await import('../runtime/harness/session-role-overrides.js');
+  _resetSessionRoleOverridesForTests();
+  setSessionWorkerModelOverride('workflow:run-1:step-a', 'zai-org/GLM-5.2');
+  assert.equal(getSessionWorkerModelOverride('workflow:run-1:step-a'), 'zai-org/GLM-5.2');
+  assert.equal(getSessionWorkerModelOverride('some-other-session'), undefined, 'override is session-scoped');
+  clearSessionWorkerModelOverride('workflow:run-1:step-a');
+  assert.equal(getSessionWorkerModelOverride('workflow:run-1:step-a'), undefined, 'cleared at step end');
+});

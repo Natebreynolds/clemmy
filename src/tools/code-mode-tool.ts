@@ -20,6 +20,7 @@ import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRun
 import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/eventlog.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
@@ -384,7 +385,7 @@ async function dispatchCodeModeWorker(args: unknown, sessionId: string, counter?
     return { ok: false, error: `run_worker: invalid spec — ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}` };
   }
   try {
-    const modelId = resolveRoleModel('worker').modelId;
+    const modelId = getSessionWorkerModelOverride(sessionId) ?? resolveRoleModel('worker').modelId;
     const { text, model } = await runCodeModeWorker(parsed.data, modelId, sessionId);
     return { ok: true, text, model };
   } catch (err) {

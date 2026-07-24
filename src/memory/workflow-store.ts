@@ -426,6 +426,12 @@ export interface WorkflowDefinition {
   allowSends?: boolean;
   /** Run-level pinned goal — external validation + bounded re-pursuit. */
   goal?: WorkflowGoal;
+  /** Workflow-level model pins (owner ask, 2026-07-24: cut tokens at
+   *  authoring). `brain` = default model for every step without its own
+   *  `model:`; `worker` = model for run_worker fan-outs inside this
+   *  workflow's steps. Judge stays the global judge setting. Precedence:
+   *  step.model > models.brain > intent routing > role defaults. */
+  models?: { brain?: string; worker?: string };
   /** Who this workflow is for. 'dev' = created by smoke/creation tests —
    *  hidden from every user-facing surface. Absent = 'user'. */
   origin?: 'user' | 'dev';
@@ -780,6 +786,13 @@ if (step.optional === true || (step as Record<string, unknown>).optional === 'tr
       // allowSends round-trip: only `false` is meaningful (strict send gating);
       // the default-true case stays unwritten so legacy files are byte-identical.
       ...(data.allow_sends === false || data.allowSends === false ? { allowSends: false } : {}),
+      ...((): Partial<WorkflowDefinition> => {
+        const raw = (data.models ?? data.model_pins) as { brain?: unknown; worker?: unknown } | undefined;
+        if (!raw || typeof raw !== 'object') return {};
+        const brain = typeof raw.brain === 'string' && raw.brain.trim() ? raw.brain.trim() : undefined;
+        const worker = typeof raw.worker === 'string' && raw.worker.trim() ? raw.worker.trim() : undefined;
+        return brain || worker ? { models: { ...(brain ? { brain } : {}), ...(worker ? { worker } : {}) } } : {};
+      })(),
       ...(goal ? { goal } : {}),
       ...(data.origin === 'dev' ? { origin: 'dev' as const } : {}),
     };
@@ -943,6 +956,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (def.synthesis?.prompt) frontmatter.synthesis = def.synthesis;
   // Only the strict (non-default) setting is persisted — see the parse side.
   if (def.allowSends === false) frontmatter.allow_sends = false;
+  if (def.models && (def.models.brain || def.models.worker)) frontmatter.models = { ...def.models };
   // Only 'dev' is persisted — absent means 'user', keeping legacy files byte-identical.
   if (def.origin === 'dev') frontmatter.origin = 'dev';
   if (def.goal?.objective) {

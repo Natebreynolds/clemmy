@@ -21,7 +21,6 @@ import {
   type ModelRoutingMode,
 } from '../../config.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
-import { claudeAvailable } from './judge-family.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-providers' });
@@ -177,17 +176,6 @@ export function resolveEffectiveProviderForModel(
   assertUnambiguousModelRouting(id, mode);
   const owners = configuredByoProvidersForModel(id);
   if (mode === 'all_in') {
-    // Hybrid stacks (owner ask, 2026-07-24): a claude-shaped id that NO BYO
-    // provider owns, with a CONNECTED Claude login, resolves to its real
-    // family even in all-in — an explicit "cheap brain, frontier judge"
-    // binding must validate and dispatch on the Claude lane. gpt-shaped ids
-    // keep the BYO collapse (the 2026-07-22 undeclared-worker-default guard);
-    // never-connected families fall through to the collapse as before.
-    if (owners.length === 0 && resolveProvider(id) === 'claude') {
-      try {
-        if (claudeAvailable()) return 'claude';
-      } catch { /* availability probe is best-effort; fall through to collapse */ }
-    }
     const defaultByo = getByoBackendConfig();
     if (defaultByo.configured || owners.length === 1) return 'byo';
   }

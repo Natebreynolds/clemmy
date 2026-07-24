@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { runBoundedPool } from '../execution/bounded-pool.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
@@ -309,7 +310,7 @@ export function registerWorkerTools(server: McpServer): void {
       }
 
       const route = resolveSdkBrainWorker(input.intent || undefined);
-      let workerModel = route.modelId;
+      let workerModel = getSessionWorkerModelOverride(getToolOutputContext()?.sessionId) ?? route.modelId;
       const transport = route.claudeLane ? 'claude_agent_sdk' : 'cross_provider';
       // Visible warning when a configured non-Claude worker model is IGNORED
       // (CLEMMY_SDK_BRAIN_CROSS_WORKER=off) — replaces today's silent fallback so

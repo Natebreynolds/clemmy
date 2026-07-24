@@ -208,7 +208,25 @@ export function roleModelCapability(role: ModelRole, modelId: string): RoleModel
   if (!clean) return { ok: false, reason: 'modelId is required.' };
   let provider: ModelProviderClass;
   try {
-    provider = resolveEffectiveProviderForModel(clean);
+    // Hybrid stacks (owner ask, 2026-07-24): in all-in, a claude-shaped id
+    // with a CONNECTED Claude login validates as 'claude' — VALIDATION ONLY.
+    // The wire classifier keeps the full all-in collapse so tool-bearing
+    // dispatch paths (workers, space runners) never route onto the text-only
+    // headless transport; the judge (tools: []) and the agent runner's native
+    // claude mapping dispatch the bound model correctly.
+    let shape: ModelProviderClass | null = null;
+    try { shape = resolveProvider(clean); } catch { shape = null; }
+    if (
+      shape === 'claude'
+      && getModelRoutingMode() === 'all_in'
+      && getByoBackendConfig().configured
+      && configuredByoProvidersForModel(clean).length === 0
+      && debateBrainsAvailable().claude
+    ) {
+      provider = 'claude';
+    } else {
+      provider = resolveEffectiveProviderForModel(clean);
+    }
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }

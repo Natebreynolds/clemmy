@@ -20,6 +20,7 @@ const {
   falloverBrainModelIds,
   roleModelCapability,
 } = await import('./model-role-options.js');
+const { resolveEffectiveProviderForModel } = await import('./byo-providers.js');
 
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
   const prev: Record<string, string | undefined> = {};
@@ -366,4 +367,28 @@ test('all_in honors an explicit judge binding to a CONNECTED OAuth family; disco
     if (!claudeJudge.ok) assert.match(claudeJudge.reason, /needs a connected Claude login/);
   });
   writeAuthFiles(); // restore for any later tests
+});
+
+// Live 2.7.0 regression (space-runner crash): the wire classifier must keep
+// the FULL all-in collapse — a claude id validating for the judge role must
+// NOT re-expose claude to tool-bearing dispatch paths (the claude headless
+// transport is text-only). Validation says 'claude'; the wire says 'byo'.
+test('all_in: claude judge binding validates as claude while the wire classifier still collapses to byo', () => {
+  writeAuthFiles();
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.moonshot.test/v1',
+    BYO_MODEL_ID: 'kimi-k3',
+    BYO_MODEL_API_KEY: 'key',
+    MODEL_ROUTING_MODE: 'all_in',
+    AUTH_MODE: 'api_key',
+  }, () => {
+    const validation = roleModelCapability('judge', 'claude-opus-4-8');
+    assert.equal(validation.ok, true);
+    if (validation.ok) assert.equal(validation.provider, 'claude');
+    assert.equal(
+      resolveEffectiveProviderForModel('claude-opus-4-8'),
+      'byo',
+      'tool-bearing dispatch classification keeps the all-in collapse',
+    );
+  });
 });

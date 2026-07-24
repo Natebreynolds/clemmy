@@ -3,6 +3,7 @@ import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
 import { getRuntimeEnv, MODELS } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import type { RuntimeContextValue } from '../types.js';
 import { buildPlannerTool } from './planner.js';
 // Phase 3 (v0.5.16): single-agent mode — Clem completes the user's
@@ -1153,7 +1154,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
-      let workerModel = route.model ?? resolveRoleModel('worker').modelId;
+      // Workflow-level worker pin (owner ask, 2026-07-24): a step session
+      // registered by the workflow runner overrides the global worker role.
+      let workerModel = getSessionWorkerModelOverride(sessionId)
+        ?? route.model
+        ?? resolveRoleModel('worker').modelId;
       let workerProvider = resolveEffectiveProviderForModel(workerModel);
       // A byo-routed id no BYO provider serves would 400 on dispatch — repair to
       // the backend's real primary id (no-op for owned ids / non-byo providers).
