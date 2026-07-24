@@ -752,6 +752,9 @@ export interface HarnessRunContext {
   /** Per-turn budget for recall_tool_result calls. Optional — when
    *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
   recallBudget?: RecallBudget;
+  /** Warn-advisory dedupe: (action:rule:tool) tuples already logged as
+   *  guardrail_tripped events this run context (2026-07-24 feed-spam fix). */
+  guardrailAdvisoryLogged?: Set<string>;
   /** Cap each tool's wall-clock execution to this. Overrides
    *  timeoutForTool(name) when set; otherwise the default per-name
    *  policy applies. */
@@ -1460,22 +1463,32 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       if (decision.action !== 'allow') {
-        try {
-          appendEvent({
-            sessionId: ctx.sessionId,
-            turn: 0,
-            role: 'system',
-            type: 'guardrail_tripped',
-            data: {
-              kind: 'tool_call_guardrail',
-              action: decision.action,
-              rule: decision.rule,
-              toolName: decision.toolName,
-              count: decision.count,
-              reason: decision.reason,
-            },
-          });
-        } catch { /* telemetry write must never block */ }
+        // Advisory dedupe (live 2026-07-24): a code-mode rebuild emitted 15
+        // identical "run_shell_command called 2×" WARN rows into the visible
+        // feed. A warn logs once per (rule, tool) per run context; blocks and
+        // escalations always log. The guardrail DECISION itself is unchanged.
+        const advisoryKey = `${decision.action}:${decision.rule}:${decision.toolName}`;
+        const advisoryLogged = (ctx.guardrailAdvisoryLogged ??= new Set<string>());
+        const shouldLogAdvisory = decision.action !== 'warn' || !advisoryLogged.has(advisoryKey);
+        if (shouldLogAdvisory) {
+          advisoryLogged.add(advisoryKey);
+          try {
+            appendEvent({
+              sessionId: ctx.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'guardrail_tripped',
+              data: {
+                kind: 'tool_call_guardrail',
+                action: decision.action,
+                rule: decision.rule,
+                toolName: decision.toolName,
+                count: decision.count,
+                reason: decision.reason,
+              },
+            });
+          } catch { /* telemetry write must never block */ }
+        }
       }
       // Terminal: an unrecoverable identical-args mutating loop. Thrown
       // before the block check so it wins at high counts. NOT a soft error —

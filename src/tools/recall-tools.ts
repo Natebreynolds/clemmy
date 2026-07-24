@@ -99,7 +99,9 @@ export function registerRecallTools(server: McpServer): void {
       // Budget check — only when a HarnessRunContext provided one.
       if (ctx.recallBudget) {
         const err = ctx.recallBudget.consume(sliceBytes);
-        if (err) return textResult(err);
+        // Unmistakably an ERROR, never data (live 2026-07-24: a program
+        // JSON.parsed the bare budget message and called good data malformed).
+        if (err) return textResult(`ERROR: ${err}`);
       }
 
       const end = start + slice.length;

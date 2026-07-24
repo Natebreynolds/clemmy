@@ -100,6 +100,16 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
   }
 
   const tokens = actionTokens(upper);
+  // EPHEMERAL COMPUTE (live 2026-07-24): "CREATE" + a compute noun creates no
+  // durable external state — OPENAI_CREATE_CHAT_COMPLETION produces a model
+  // RESPONSE, not a record. Treating it as a write dragged the execution-wrap
+  // ceremony onto every inference batch through the Composio OpenAI lane.
+  // Principled noun rule (like STATE_NOUN_READ_TOKENS), not a tool list.
+  const COMPUTE_NOUNS = new Set(['COMPLETION', 'COMPLETIONS', 'EMBEDDING', 'EMBEDDINGS', 'MODERATION', 'MODERATIONS', 'TRANSCRIPTION', 'TRANSCRIPTIONS', 'TRANSLATION', 'TRANSLATIONS']);
+  const lastToken = tokens[tokens.length - 1] ?? '';
+  if (COMPUTE_NOUNS.has(lastToken) && tokens.some((token) => token === 'CREATE' || token === 'GENERATE' || token === 'RUN')) {
+    return 'read';
+  }
   // An unambiguous write verb anywhere is a mutation, full stop.
   if (tokens.some((token) => WRITE_ACTIONS.has(token) && !AMBIGUOUS_OBJECT_TOKENS.has(token))) {
     return 'write';

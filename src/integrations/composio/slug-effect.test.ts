@@ -96,3 +96,18 @@ test('trailing pure read VERBS still classify read (search/fetch/get suffixes)',
     assert.equal(classifyComposioSlugEffect(slug), 'read', slug);
   }
 });
+
+// Ephemeral-compute rule (live 2026-07-24): OPENAI_CREATE_CHAT_COMPLETION was
+// classified a mutating external write ("CREATE" prefix), dragging the
+// execution-wrap ceremony onto every inference batch through the Composio
+// OpenAI lane. Creating a completion/embedding creates no durable state.
+test('CREATE + compute noun is a read; durable creations stay writes', async () => {
+  const { composioSlugEffectEvidence } = await import('./slug-effect.js');
+  assert.equal(composioSlugEffectEvidence('OPENAI_CREATE_CHAT_COMPLETION'), 'read');
+  assert.equal(composioSlugEffectEvidence('OPENAI_CREATE_EMBEDDING'), 'read');
+  assert.equal(composioSlugEffectEvidence('OPENAI_CREATE_MODERATION'), 'read');
+  // Durable creations are still writes, full stop.
+  assert.equal(composioSlugEffectEvidence('GMAIL_CREATE_DRAFT'), 'write');
+  assert.equal(composioSlugEffectEvidence('GOOGLESHEETS_CREATE_GOOGLE_SHEET1'), 'write');
+  assert.equal(composioSlugEffectEvidence('OUTLOOK_CREATE_EVENT'), 'write');
+});
