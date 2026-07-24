@@ -274,7 +274,7 @@ export function renderPlanReply(plan: Plan, proposalId: string): string {
   ].filter(Boolean).join('\n');
 }
 
-/** Voice-first (Nathan, 2026-07-24: "we have been trying to map WAY too much
+/** Voice-first (owner feedback, 2026-07-24: "we have been trying to map WAY too much
  *  when it's really just a rubric within the harness"): the planner writes its
  *  OWN message for the asking beat — the schema's voiceMessage rubric names
  *  what must be true (all questions asked, honest count, first step named),

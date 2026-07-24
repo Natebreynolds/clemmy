@@ -441,7 +441,7 @@ export function intentForDrop(card: BoardCard, target: BoardColumnId): 'cancel' 
   if (target === 'done' && card.actions.includes('cancel')) return 'cancel';
   if (target === 'running' && card.actions.includes('promote')) return 'promote';
   if (target === 'running' && card.actions.includes('resume')) return 'resume';
-  // Drag Needs You → Running IS the approval gesture (Nathan, 2026-07-23:
+  // Drag Needs You → Running IS the approval gesture (owner feedback, 2026-07-23:
   // "park those in task as queued and I can simply drag them over"). Same
   // server endpoint + gating as the card's Approve button — a drag can never
   // reach anything the button couldn't.

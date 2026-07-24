@@ -149,7 +149,7 @@ test('the trace drawer offers Stop only for a canonical run with a safe projecte
 });
 
 // D (v2.3.0): dragging a waiting card into Running IS the approval gesture
-// (Nathan, 2026-07-23: "park those in task as queued and I can simply drag
+// (owner feedback, 2026-07-23: "park those in task as queued and I can simply drag
 // them over"). The drag maps to the same server-gated approve action as the
 // card button — and a card WITHOUT an approvable action still snaps back with
 // a reason instead of silently approving anything.

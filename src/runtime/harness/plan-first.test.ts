@@ -470,7 +470,7 @@ test('needs-input reply: no verb stitching, honest question count', async () => 
   assert.match(renderPlanNeedsInputReply(onePlan), /one detail/);
 });
 
-// Voice-first doctrine (Nathan 2026-07-24): the planner's OWN words carry the
+// Voice-first doctrine (owner feedback 2026-07-24): the planner's OWN words carry the
 // asking beat; the template is only the silent floor. The rubric lives in the
 // schema, the voice lives in the model.
 test('askingPlanMessage: planner voice wins; template only floors an omitted voice', async () => {
