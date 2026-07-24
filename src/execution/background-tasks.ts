@@ -1870,20 +1870,23 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
       // external action, but the refuters couldn't verify it. Telling the user
       // "I did NOT ship … re-run" here invites a manual DOUBLE-SEND (review
       // the check-first regression review). Say check-first instead.
+      // Neutral system surface (owner feedback, 2026-07-24): notifications
+      // state facts; Clem's VOICE on this outcome is the model-authored
+      // report-back turn (enqueueBackgroundTaskOutcomeTurn below).
       body: blockerType === 'unverified_completion'
         ? [
-          `The run reports this as done and it DID perform an irreversible external action — but I could not independently verify the completion.`,
+          `The run reports this as done and it DID perform an irreversible external action — but the completion could not be independently verified.`,
           ``,
           `Unverified because: ${clean(reason, 600)}`,
           ``,
           `CHECK the actual outcome (sent messages / created records) BEFORE re-running — re-running may duplicate an irreversible send.`,
         ].join('\n')
         : [
-          `I couldn't finish this — I'm blocked, so I did NOT ship a partial/empty result.`,
+          `Stopped at a blocker — no partial or empty result was shipped.`,
           ``,
           `Blocker (${blockerType}): ${clean(reason, 600)}`,
           ``,
-          `Re-run once that's resolved and I'll continue.`,
+          `Re-run once that's resolved and the task continues.`,
         ].join('\n'),
       createdAt: nowIso(),
       read: false,

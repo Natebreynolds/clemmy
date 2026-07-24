@@ -12795,7 +12795,10 @@ export function registerConsoleRoutes(
       const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
       if (parkedTask?.pendingQuestionId) {
         queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, input);
-        const ackText = `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`;
+        // Neutral routing ack (owner feedback, 2026-07-24): no fabricated
+        // first-person voice on harness-only beats — the RESUMING model owns
+        // the next real words in this chat.
+        const ackText = `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`;
         try {
           appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: input } });
           appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'assistant', type: 'conversation_completed', data: { reply: ackText, summary: ackText } });
@@ -12807,7 +12810,7 @@ export function registerConsoleRoutes(
         const continueTask = findSoleAwaitingContinueTaskForOrigin(requestedSessionId);
         if (continueTask) {
           queueBackgroundTaskContinue(continueTask.id);
-          const ackText = `Continuing background task "${continueTask.title}". It will report back here when it's done.`;
+          const ackText = `"${continueTask.title}" is continuing — the result lands here.`;
           try {
             appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: input } });
             appendHarnessEvent({ sessionId: requestedSessionId, turn: 0, role: 'assistant', type: 'conversation_completed', data: { reply: ackText, summary: ackText } });
@@ -13723,7 +13726,7 @@ export function registerConsoleRoutes(
       queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
       res.json({
         sessionId,
-        text: `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
+        text: `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`,
       });
       return;
     }

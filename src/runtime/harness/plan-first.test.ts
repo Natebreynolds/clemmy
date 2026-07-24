@@ -444,3 +444,46 @@ test('plan-activity: the live "help me plan this out" ask routes to plan-first; 
   assert.equal(shouldUsePlanFirst({ input: 'plan it', freshSession: false }), false);
   assert.equal(shouldUsePlanFirst({ input: 'approve', freshSession: false }), false);
 });
+
+// Needs-input renderer (live 2026-07-24, first plan-first run on v2.6.1):
+// "I'll use confirm the exact target sheet/tab ... as.. once that's clear."
+// — sentence-shaped step actions must be QUOTED, never verb-stitched, and
+// the question count must be honest.
+test('needs-input reply: no verb stitching, honest question count', async () => {
+  const { renderPlanNeedsInputReply } = await import('./plan-first.js');
+  const plan = {
+    objective: 'Finish the outreach sheet',
+    steps: [{ n: 1, action: 'Confirm the exact target sheet/tab and identify the rows that represent the new firms.', rationale: 'r' }],
+    successCriteria: ['sheet complete'],
+    risks: [],
+    needsUserInput: [
+      "Which sheet/tab is the 'new sheet' to complete?",
+      'Where is the banked keyword-research output stored?',
+    ],
+  } as never;
+  const reply = renderPlanNeedsInputReply(plan);
+  assert.match(reply, /a couple of details/, 'two questions are never called "one detail"');
+  assert.ok(!/I.ll use [a-z]/.test(reply), 'no lowercased verb-stitching');
+  assert.match(reply, /first step: Confirm the exact target/, 'the step is quoted after a colon');
+
+  const onePlan = { ...(plan as object), needsUserInput: ['Which sheet?'] } as never;
+  assert.match(renderPlanNeedsInputReply(onePlan), /one detail/);
+});
+
+// Voice-first doctrine (owner feedback 2026-07-24): the planner's OWN words carry the
+// asking beat; the template is only the silent floor. The rubric lives in the
+// schema, the voice lives in the model.
+test('askingPlanMessage: planner voice wins; template only floors an omitted voice', async () => {
+  const { askingPlanMessage } = await import('./plan-first.js');
+  const base = {
+    objective: 'Finish the outreach sheet',
+    steps: [{ n: 1, action: 'Confirm the target sheet.', rationale: 'r', verification: null }],
+    successCriteria: ['done'], stages: null, risks: [], estimatedComplexity: 'moderate',
+    recommendsTrackedExecution: false, appliedInstructions: [], externalSends: null,
+    needsUserInput: ['Which sheet?', 'Where is the data?'],
+  };
+  const voiced = { ...base, voiceMessage: 'Happy to finish this — two quick things: which sheet should I fill, and where did we bank the research? I’ll start on the Salesforce rows the moment you answer.' } as never;
+  assert.match(askingPlanMessage(voiced), /two quick things/, 'the model’s own words carry the beat');
+  const unvoiced = { ...base, voiceMessage: null } as never;
+  assert.match(askingPlanMessage(unvoiced), /a couple of details/, 'template floors an omitted voice');
+});

@@ -8,6 +8,7 @@ import { runPostTurnHooks } from './post-turn.js';
 import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent } from './eventlog.js';
+import { deliverableContextBlock } from '../../memory/deliverable-index.js';
 
 export interface PlanFirstInput {
   input: string;
@@ -274,19 +275,31 @@ export function renderPlanReply(plan: Plan, proposalId: string): string {
   ].filter(Boolean).join('\n');
 }
 
+/** Voice-first (owner feedback, 2026-07-24: "we have been trying to map WAY too much
+ *  when it's really just a rubric within the harness"): the planner writes its
+ *  OWN message for the asking beat — the schema's voiceMessage rubric names
+ *  what must be true (all questions asked, honest count, first step named),
+ *  the model owns the words. The template below is only the silent floor when
+ *  the model omits it. */
+export function askingPlanMessage(plan: Plan): string {
+  const voice = plan.voiceMessage?.trim();
+  return voice && voice.length >= 20 ? voice : renderPlanNeedsInputReply(plan);
+}
+
 export function renderPlanNeedsInputReply(plan: Plan): string {
-  const questions = plan.needsUserInput
-    .slice(0, 2)
-    .map((q) => `- ${compact(q, 180)}`)
-    .join('\n');
-  const firstAction = plan.steps[0]?.action
-    ? compact(plan.steps[0].action, 140).replace(/\.$/, '')
-    : '';
+  const shown = plan.needsUserInput.slice(0, 2);
+  const questions = shown.map((q) => `- ${compact(q, 180)}`).join('\n');
+  // Live 2026-07-24: the old template stitched "I'll use <step action>" from a
+  // sentence-shaped action ("Confirm the exact target sheet…") producing
+  // garbled prose ("I'll use confirm the exact… as.. once that's clear"), and
+  // said "one detail" above two bullets. Quote the step after a colon — safe
+  // for any verb form — and count the questions honestly.
+  const firstAction = plan.steps[0]?.action ? compact(plan.steps[0].action, 140) : '';
   const context = firstAction
-    ? `I’ll use ${firstAction.charAt(0).toLowerCase()}${firstAction.slice(1)} once that’s clear.`
+    ? `Once that’s settled I’ll get moving — first step: ${firstAction}`
     : '';
   return [
-    `I can help with that. Before I start, I need one detail:`,
+    `I can help with that. Before I start, I need ${shown.length === 1 ? 'one detail' : 'a couple of details'}:`,
     questions,
     context,
   ].filter(Boolean).join('\n');
@@ -411,6 +424,15 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
   } catch {
     // Recall must never block planning — fall through to no memoryContext.
   }
+  // KNOWN ARTIFACTS from the deliverable ledger (live 2026-07-24: the planner
+  // asked "where is the banked research stored?" while its own ledger held the
+  // research files, the target sheet URL, AND the outreach template — every
+  // question it asked). Deterministic local read, no model call; the rubric in
+  // the prompt forbids asking the user for anything answered here.
+  try {
+    const ledgerBlock = deliverableContextBlock(input.input);
+    if (ledgerBlock) memoryContext = [memoryContext, ledgerBlock].filter(Boolean).join('\n\n');
+  } catch { /* the ledger must never block planning */ }
   try {
     appendEvent({
       sessionId: input.sessionId,
@@ -536,7 +558,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         type: 'awaiting_user_input',
         data: {
           reason: 'plan_first_needs_input',
-          question: renderPlanNeedsInputReply(plan),
+          question: askingPlanMessage(plan),
           needsUserInput: plan.needsUserInput,
           ...(askingProposalId ? { planProposalId: askingProposalId } : {}),
         },
@@ -579,7 +601,9 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       data: {
         reason: 'plan_first',
         summary: `Plan ready for approval: ${plan.objective}`,
-        reply: renderPlanReply(plan, proposal.id),
+        reply: plan.voiceMessage?.trim()
+          ? `${plan.voiceMessage.trim()}\n\n${renderPlanReply(plan, proposal.id)}`
+          : renderPlanReply(plan, proposal.id),
         planProposalId: proposal.id,
       },
     });

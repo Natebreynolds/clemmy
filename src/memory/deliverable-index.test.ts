@@ -16,7 +16,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { recordDeliverable, searchDeliverables, renderDeliverableHit, deliverableKindForShape } = await import('./deliverable-index.js');
+const { recordDeliverable, searchDeliverables, renderDeliverableHit, deliverableKindForShape, deliverableContextBlock } = await import('./deliverable-index.js');
 
 after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -87,4 +87,27 @@ test('capture seam: an external_write event tees into the index for every lane',
   assert.ok(hit, 'external write captured into durable memory');
   assert.equal(hit!.kind, 'external_doc');
   assert.match(hit!.why, /weekly digest/);
+});
+
+// Known-artifacts block for planning surfaces (live 2026-07-24): the planner
+// asked "where is the banked research stored?" while this ledger held the
+// research files, the target sheet, and the template — every question it
+// asked. The block supplies the facts; its rubric forbids re-asking them.
+test('deliverableContextBlock: relevant ledger rows with the never-ask rubric; empty on no hits', () => {
+  recordDeliverable({
+    kind: 'external_doc',
+    target: 'https://docs.google.com/spreadsheets/d/test-outreach-sheet',
+    why: 'ChatGPT-ads outreach sheet for the new firms — SF contact, keyword, mention status, draft',
+  });
+  recordDeliverable({
+    kind: 'file',
+    target: path.join(TMP_HOME, 'outreach-recovery-research-batch-1.json'),
+    why: 'banked keyword research for the new-firms outreach run',
+  });
+  const block = deliverableContextBlock('finish my ChatGPT-Ads outreach sheet for the new firms using the banked keyword research');
+  assert.match(block, /KNOWN ARTIFACTS/);
+  assert.match(block, /never ask the user where prior work/i);
+  assert.match(block, /test-outreach-sheet|research-batch-1/, 'ledger rows are in the block');
+
+  assert.equal(deliverableContextBlock('completely unrelated quantum basket weaving'), '', 'no hits, no block');
 });

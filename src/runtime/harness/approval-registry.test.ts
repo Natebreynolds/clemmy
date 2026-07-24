@@ -261,3 +261,28 @@ test('claimApprovedUnconsumedForSession: rejected rows stay terminal and unclaim
   reg.resolve(row.approvalId, 'rejected', 'unit-test-human');
   assert.equal(reg.claimApprovedUnconsumedForSession(session.id, { tools: ['composio_execute_tool'] }), null);
 });
+
+// Standing-consent graduation source (owner feedback, 2026-07-24): only
+// HUMAN-approved sends graduate; rejections are one-shot and never poison
+// future runs (live: the Slack team update died on a cleanup rejection).
+test('approvedSendSlugsForSessions returns approved slugs only — rejections never graduate', () => {
+  const sessA = createSession({ kind: 'workflow', title: 'wf::post_slack run 1' }).id;
+  const sessB = createSession({ kind: 'workflow', title: 'wf::post_slack run 2' }).id;
+
+  const ok = reg.register({
+    sessionId: sessA, subject: 'Send Slack message', tool: 'composio_execute_tool',
+    args: { tool_slug: 'SLACK_SEND_MESSAGE', arguments: '{"channel":"C1"}' },
+  });
+  reg.resolve(ok.approvalId, 'approved', 'discord-user');
+
+  const no = reg.register({
+    sessionId: sessB, subject: 'Send Slack message', tool: 'composio_execute_tool',
+    args: { tool_slug: 'SLACK_SEND_MESSAGE', arguments: '{"channel":"C1"}' },
+  });
+  reg.resolve(no.approvalId, 'rejected', 'desktop-command-center');
+
+  const slugs = reg.approvedSendSlugsForSessions([sessA, sessB]);
+  assert.deepEqual(slugs, ['SLACK_SEND_MESSAGE'], 'approved run graduates');
+  assert.deepEqual(reg.approvedSendSlugsForSessions([sessB]), [], 'a rejection alone graduates nothing');
+  assert.deepEqual(reg.approvedSendSlugsForSessions([]), []);
+});

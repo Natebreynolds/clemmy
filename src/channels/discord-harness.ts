@@ -1600,7 +1600,7 @@ async function maybeRouteParkedBackgroundReply(input: {
     queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, answer);
     await sendParkedBackgroundAck(
       input.transport,
-      `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
+      `Answer sent to "${parkedTask.title}" — resuming now; the result lands here.`,
       { sessionId: parkedTask.originSessionId ?? input.sessionId ?? input.channelLabel ?? 'unknown', taskId: parkedTask.id },
     );
     return true;

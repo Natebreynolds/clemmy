@@ -1,6 +1,6 @@
 /**
  * Stall judge — ONE cross-family judge question replacing the verb-regex
- * rabbit hole (Nathan, 2026-07-24: "all these one off verbs trying to match
+ * rabbit hole (owner feedback, 2026-07-24: "all these one off verbs trying to match
  * in the code" — every live incident added a pattern, then a suppressor,
  * then a suppressor on the suppressor).
  *

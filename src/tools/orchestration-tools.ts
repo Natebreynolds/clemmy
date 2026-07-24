@@ -1334,7 +1334,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!workflow.data.enabled) return textResult(`Workflow "${canonicalName}" is disabled.`);
 
       // The old name-literal "unrequested workflow" guard was DELETED here
-      // (2026-07-23, Nathan): it refused a user-confirmed run because the slug
+      // (live 2026-07-23): it refused a user-confirmed run because the slug
       // only appeared in the assistant's own question, and it manufactured a
       // robotic name-confirmation beat before every chat-triggered run. The
       // protection it aimed at (a silently-invoked workflow heading toward an

@@ -1129,11 +1129,16 @@ function isTerminalAfterTool(rawName: string | null | undefined): boolean {
 function renderTerminalToolReply(rawName: string, input: unknown, output: string): string {
   const bare = bareMcpToolName(rawName);
   if (bare === 'dispatch_background_task') {
+    // Voice-first (owner feedback, 2026-07-24): the model authors its own
+    // handoff confirmation in the dispatch call (handoff_note rubric) — the
+    // generated line below is only the floor when it omitted one.
+    const note = (input as { handoff_note?: unknown } | null | undefined)?.handoff_note;
+    if (typeof note === 'string' && note.trim().length >= 12) return note.trim();
     const match = output.match(/Dispatched "([^"]+)" to the background \(task ([^)]+)\)/i);
     const inputObjective = (input as { objective?: unknown } | null | undefined)?.objective;
     const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
     const taskId = match?.[2];
-    return `On it - I started "${title}" as a background task${taskId ? ` (${taskId})` : ''}. It will keep running in the daemon and report back here when it finishes or gets stuck.`;
+    return `Started "${title}" in the background${taskId ? ` (${taskId})` : ''} — it reports back here when it finishes or gets stuck.`;
   }
   if (bare === 'ask_user_question') {
     // Surface the QUESTION inline (from the tool input) so the turn ends on a clean

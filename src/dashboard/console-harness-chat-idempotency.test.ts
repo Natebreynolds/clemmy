@@ -617,7 +617,7 @@ test('conversation reply while ONE background task is parked routes as its answe
     assert.equal(res.status, 200);
     const body = await res.json() as { status: string; routedToBackgroundTask?: string; reply?: string };
     assert.equal(body.routedToBackgroundTask, task.id, 'the reply routed to the parked task, not the model');
-    assert.match(body.reply ?? '', /passed that to your background task/i);
+    assert.match(body.reply ?? '', /Answer sent to .+ resuming now/i);
     assert.equal(brainCalls, 0, 'no orchestrator turn ran (the improvise-then-duplicate path is closed)');
 
     const resumed = getBackgroundTask(task.id);

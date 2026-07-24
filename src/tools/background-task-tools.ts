@@ -136,16 +136,18 @@ export function registerBackgroundTaskTools(server: McpServer): void {
     ].join('\n'),
     {
       objective: z.string().min(4).describe('One line: what this run must achieve.'),
+      handoff_note: z.string().nullable().describe('YOUR OWN WORDS to the user confirming the handoff — the exact message they will read as your reply. Rubric: confirm it is running in the background, that you will report back here, and anything worth noting in your own voice. Null falls back to a plain generated line — always prefer writing this yourself.'),
       plan: z.string().min(1).describe('The agreed steps/approach to execute (markdown bullets are fine). This was settled with the user — the worker follows it, it does not re-derive a different approach.'),
       success_criteria: z.array(z.string()).nullable().describe('Concrete done-checks; the run is complete only when all hold.'),
       context_refs: z.array(z.string()).nullable().describe('File paths, resource ids, or tool-call ids the worker should load first before producing artifacts.'),
       max_minutes: z.number().int().min(1).max(240).nullable().describe('Soft wall-clock budget; defaults to the policy long-task minutes.'),
     },
-    async ({ objective, plan, success_criteria, context_refs, max_minutes }) => {
+    async ({ objective, handoff_note, plan, success_criteria, context_refs, max_minutes }) => {
       const sessionId = getToolOutputContext()?.sessionId;
       if (!sessionId) {
         return textResult('I can only dispatch a background task from a live chat session (no session context here) — run the task directly instead.');
       }
+      void handoff_note; // consumed by the terminal reply renderer via output marker below
       const composedPrompt = [
         `Objective: ${objective}`,
         '',
