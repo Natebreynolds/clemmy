@@ -9945,9 +9945,15 @@ export function registerConsoleRoutes(
           latestRunIdByTitle.set(run.title, run.id); // legacyRuns is newest-first
         }
       }
+      // One pipeline = one card (live 2026-07-24: a running workflow showed a
+      // "Workflow" card AND its run-record "Run" card). Live workflow runs are
+      // represented by the pending-workflow card (section 5); the run record
+      // takes over only at terminal (-> Done), per that section's contract.
+      const pendingWorkflowRunIds = new Set(listPendingRuns().map((p) => p.runId));
       for (const run of legacyRuns) {
         if (run.archived) continue;
         if (run.id.startsWith('run-bg-')) continue; // background task's own run record
+        if (run.source === 'workflow' && pendingWorkflowRunIds.has(run.id)) continue;
         if (canonicalHarnessSessionIds.has(run.sessionId)) continue;
         const needsAttention = run.needsAttention === true;
         if (run.pendingApprovalId) coveredApprovalIds.add(run.pendingApprovalId);
