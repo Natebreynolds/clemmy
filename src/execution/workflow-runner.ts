@@ -78,6 +78,7 @@ import {
   readWorkflowEvents,
   type WorkflowEvent,
   type AttemptRecord,
+  listWorkflowRunIds,
 } from './workflow-events.js';
 import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
@@ -147,6 +148,7 @@ import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
+import { approvedSendSlugsForSessions } from '../runtime/harness/approval-registry.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
@@ -2218,16 +2220,56 @@ async function runStepViaHarness(
       realSessionId,
       stepAttempt,
     );
+    // Standing-consent send graduation (owner feedback, 2026-07-24: "once a
+    // workflow is authorized and on it needs to run unless turned off"). For
+    // an UNATTENDED SCHEDULED run of an enabled workflow, a send slug a human
+    // approved for THIS step in any prior run is standing consent — enumerate
+    // it into the step scope so the run does not park on an approval no one
+    // is present to answer (live: the Slack team update sat 3h on a fresh
+    // approval and died on a cleanup rejection). A rejection is one-shot —
+    // it never graduates and never blocks future runs. First-time sends (no
+    // prior human approval) still gate.
+    const graduatedSends = (() => {
+      try {
+        if (!isUnattendedScheduledRun(workflowRunId) || stepSideEffectClass(step) !== 'send') return [];
+        const priorSessions = listWorkflowRunIds(workflowName, 50)
+          .filter((runId) => runId !== workflowRunId)
+          .map((runId) => `workflow:${runId}:${step.id}`);
+        return approvedSendSlugsForSessions(priorSessions).filter((slug) => isIrreversibleSendSlug(slug));
+      } catch {
+        return [];
+      }
+    })();
     openPlanScope({
       sessionId: realSessionId,
       planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
       approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
       ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
       allowedTools,
-      allowedSends: step.requiresApproval
-        ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
-        : [],
+      allowedSends: [...new Set([
+        ...(step.requiresApproval
+          ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
+          : []),
+        ...graduatedSends,
+      ])],
     });
+    if (graduatedSends.length > 0) {
+      try {
+        addNotification({
+          id: `send-graduated-${workflowRunId}-${step.id}`,
+          kind: 'workflow',
+          title: `Send auto-approved by standing consent: ${workflowName} · ${step.id}`,
+          body: [
+            `Scheduled run ${workflowRunId} will send via ${graduatedSends.join(', ')} without pausing — a person approved this step's send in a prior run, and the workflow is enabled + scheduled.`,
+            'Disable the workflow (or remove its schedule) to stop these sends.',
+          ].join('\n'),
+          createdAt: new Date().toISOString(),
+          read: false,
+          silent: true,
+          metadata: { workflow: workflowName, runId: workflowRunId, stepId: step.id, graduatedSends },
+        });
+      } catch { /* audit notification is best-effort */ }
+    }
 
     // Self-heal move 2: arm submission-time contract validation for this step
     // session (workflow_step_result refuses a wrong-shape result with the exact

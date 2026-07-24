@@ -377,8 +377,8 @@ async function routeWorkflowPendingInputs(
     if (input.sendNote) {
       await input.sendNote(
         cls.kind === 'abandon'
-          ? `🍊 Okay, I've dropped the "${workflowName}" run.`
-          : `🍊 I've set the "${workflowName}" run aside. On your new request:`,
+          ? `🍊 Dropped the "${workflowName}" run.`
+          : `🍊 The "${workflowName}" run is set aside — reply "resume" to pick it back up. On your new request:`,
       );
     }
     return { handled: false, kind: cls.kind, proposalId: openWf.id, reason: cls.reason };
@@ -391,7 +391,7 @@ async function routeWorkflowPendingInputs(
 
   if (result.status === 'queued' || result.status === 'duplicate') {
     supersedePlanProposal(openWf.id);
-    if (input.sendNote) await input.sendNote(`🍊 Got it — ${result.message}`);
+    if (input.sendNote) await input.sendNote(`🍊 ${result.message}`);
     return { handled: true, kind: 'answers', proposalId: openWf.id, reason: cls.reason };
   }
 
@@ -400,7 +400,7 @@ async function routeWorkflowPendingInputs(
     const stillNeed = result.missing ?? [];
     if (input.sendNote) {
       await input.sendNote(
-        `🍊 Thanks. I still need ${stillNeed.join(', ')} to run "${workflowName}". Reply with ${stillNeed.length === 1 ? 'it' : 'them'}.`,
+        `🍊 Still needed to run "${workflowName}": ${stillNeed.join(', ')}. Reply with ${stillNeed.length === 1 ? 'it' : 'them'} and it runs.`,
       );
     }
     return { handled: true, kind: 'answers', proposalId: openWf.id, reason: cls.reason };
@@ -475,14 +475,14 @@ export async function routeOpenQuestionPlan(
   if (classification.kind === 'abandon') {
     supersedePlanProposal(openPlan.id);
     if (input.sendNote) {
-      await input.sendNote("🍊 Okay, I've set that plan aside. Handling your message now.");
+      await input.sendNote("🍊 That plan is set aside. On your message now.");
     }
     return { handled: false, kind: classification.kind, reason: classification.reason };
   }
 
   if (input.sendNote) {
     await input.sendNote(
-      `🍊 Those don't look like answers to the saved plan ("${openPlan.plan.objective}"). I've kept it on hold — reply "resume" anytime to pick it back up. Meanwhile, on your new request:`,
+      `🍊 The saved plan ("${openPlan.plan.objective}") stays on hold — reply "resume" anytime to pick it back up. Meanwhile, on your new request:`,
     );
   }
   return { handled: false, kind: classification.kind, reason: classification.reason };

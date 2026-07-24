@@ -595,3 +595,35 @@ export function expireStaleApprovals(now: Date = new Date()): PendingApprovalRow
   }
   return expired;
 }
+
+
+/** Send slugs a HUMAN previously approved in the given sessions (any run).
+ *  Standing-consent graduation for scheduled workflows (owner feedback,
+ *  2026-07-24): a saved + enabled + scheduled workflow whose declared send a
+ *  person approved once keeps running unattended with that same slug
+ *  auto-approved in scope; a rejection stays one-shot — never a standing
+ *  block. Best-effort: an unreadable registry returns []. */
+export function approvedSendSlugsForSessions(sessionIds: string[]): string[] {
+  if (sessionIds.length === 0) return [];
+  try {
+    const db = openEventLog();
+    const placeholders = sessionIds.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT args_json FROM pending_approvals
+       WHERE session_id IN (${placeholders})
+         AND resolution = 'approved'
+    `).all(...sessionIds) as Array<{ args_json: string | null }>;
+    const slugs = new Set<string>();
+    for (const row of rows) {
+      try {
+        const args = JSON.parse(row.args_json ?? '{}') as { tool_slug?: unknown; args?: { tool_slug?: unknown } };
+        const slug = typeof args.tool_slug === 'string' ? args.tool_slug
+          : typeof args.args?.tool_slug === 'string' ? args.args.tool_slug : '';
+        if (slug.trim()) slugs.add(slug.trim().toUpperCase());
+      } catch { /* one unreadable row never poisons the rest */ }
+    }
+    return [...slugs];
+  } catch {
+    return [];
+  }
+}

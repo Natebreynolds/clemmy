@@ -72,7 +72,7 @@ test('Discord/Slack parked background question captures the next freeform reply'
   const stored = getBackgroundTask(task.id);
   assert.equal(stored?.status, 'pending');
   assert.equal(stored?.inputResolution?.answer, 'healthcare only');
-  assert.match(tx.sent[0], /passed that to your background task "Segment prospects"/);
+  assert.match(tx.sent[0], /Answer sent to "Segment prospects"/);
 });
 
 test('Discord/Slack continue resumes one parked background continuation', async () => {
@@ -124,7 +124,7 @@ test('stale Discord channel mapping still captures one parked background questio
   const stored = getBackgroundTask(task.id);
   assert.equal(stored?.status, 'pending');
   assert.equal(stored?.inputResolution?.answer, 'Birmingham');
-  assert.match(tx.sent[0], /passed that to your background task "Stale channel question"/);
+  assert.match(tx.sent[0], /Answer sent to "Stale channel question"/);
 });
 
 test('stale Slack channel mapping still resumes one parked background continuation', async () => {
@@ -181,7 +181,7 @@ test('stale channel fallback uses origin session metadata for tasks without stor
   const stored = getBackgroundTask(task.id);
   assert.equal(stored?.status, 'pending');
   assert.equal(stored?.inputResolution?.answer, 'Austin');
-  assert.match(tx.sent[0], /passed that to your background task "Metadata fallback question"/);
+  assert.match(tx.sent[0], /Answer sent to "Metadata fallback question"/);
 });
 
 test('stale channel fallback does not cross-match discordChannelId across surfaces', async () => {
