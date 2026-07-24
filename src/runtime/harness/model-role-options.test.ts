@@ -216,7 +216,7 @@ test('all_in is provider-isolated and gpt-shaped BYO ids remain BYO in role/UI r
     assert.equal(effectiveBrainValue(), 'api_key:gpt-4o');
     const codex = roleModelCapability('worker', 'gpt-5.6');
     assert.equal(codex.ok, false);
-    if (!codex.ok) assert.match(codex.reason, /not offered by any connected provider/);
+    if (!codex.ok) assert.match(codex.reason, /Codex-family ids stay on the BYO backend in all-in/);
   });
 });
 
@@ -333,4 +333,37 @@ test('falloverBrainModelIds — a repurposed OPENAI_MODEL_PRIMARY (BYO id) canno
     const codex = chain.find((c) => c.provider === 'codex');
     assert.notEqual(codex?.modelId, 'glm-5.2', 'the codex entry must not carry a BYO id');
   });
+});
+
+// Hybrid stacks (owner ask, 2026-07-24: "kimi with cheap workers but a really
+// good judge"): all-in collapses DEFAULTS to the BYO backend, but an EXPLICIT
+// binding to a CONNECTED OAuth family is honored — restoring never-self-grade.
+// Disconnected families stay refused.
+test('all_in honors an explicit judge binding to a CONNECTED OAuth family; disconnected stays refused', () => {
+  writeAuthFiles(); // codex + claude subscription tokens present
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.moonshot.test/v1',
+    BYO_MODEL_ID: 'kimi-k3',
+    BYO_MODEL_API_KEY: 'key',
+    MODEL_ROUTING_MODE: 'all_in',
+    AUTH_MODE: 'api_key',
+  }, () => {
+    const claudeJudge = roleModelCapability('judge', 'claude-opus-4-8');
+    assert.equal(claudeJudge.ok, true, 'connected Claude login can judge a BYO brain');
+    if (claudeJudge.ok) assert.equal(claudeJudge.provider, 'claude');
+  });
+
+  blockClaudeKeychainFallback(); // demote to a non-subscription token → disconnected
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.moonshot.test/v1',
+    BYO_MODEL_ID: 'kimi-k3',
+    BYO_MODEL_API_KEY: 'key',
+    MODEL_ROUTING_MODE: 'all_in',
+    AUTH_MODE: 'api_key',
+  }, () => {
+    const claudeJudge = roleModelCapability('judge', 'claude-opus-4-8');
+    assert.equal(claudeJudge.ok, false, 'a disconnected family is still refused');
+    if (!claudeJudge.ok) assert.match(claudeJudge.reason, /needs a connected Claude login/);
+  });
+  writeAuthFiles(); // restore for any later tests
 });

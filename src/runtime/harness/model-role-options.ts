@@ -1,3 +1,4 @@
+import { debateBrainsAvailable } from './judge-family.js';
 import {
   CLAUDE_MODEL_PRESETS,
   DEFAULT_CODEX_MODEL,
@@ -213,10 +214,21 @@ export function roleModelCapability(role: ModelRole, modelId: string): RoleModel
   }
 
   if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured && provider !== 'byo') {
-    return {
-      ok: false,
-      reason: `All-in mode is isolated to the BYO provider; ${clean} cannot be bound to ${role} until all-in is disabled.`,
-    };
+    // Hybrid stacks (owner ask, 2026-07-24: cheap BYO brain + frontier judge —
+    // "kimi with cheap workers but a really good judge"): all-in collapses
+    // DEFAULTS to the BYO backend, but an EXPLICIT binding to a CONNECTED
+    // OAuth family is honored — the judge/worker runners resolve their own
+    // provider per model, independent of the brain. This also restores the
+    // never-self-grade property all-in was silently breaking (BYO judging
+    // BYO). Only genuinely disconnected families are refused.
+    const oauth = debateBrainsAvailable();
+    const connected = provider === 'claude' ? oauth.claude : provider === 'codex' ? oauth.codex : false;
+    if (!connected) {
+      return {
+        ok: false,
+        reason: `${clean} needs a connected ${provider === 'claude' ? 'Claude' : 'Codex'} login — sign in under Models & routing, or pick a BYO model.`,
+      };
+    }
   }
 
   if (provider === 'byo') {
@@ -226,6 +238,23 @@ export function roleModelCapability(role: ModelRole, modelId: string): RoleModel
     const allowed = connectedByoModelIds();
     if (allowed.size === 0) return { ok: false, reason: 'No BYO backend is configured.' };
     if (!allowed.has(clean)) {
+      // A claude/codex-shaped id landing in the BYO branch means the all-in
+      // collapse claimed it because that family's login is NOT connected —
+      // say so, instead of sending the user to a BYO model list.
+      let family: ModelProviderClass | null = null;
+      try { family = resolveProvider(clean); } catch { family = null; }
+      if (family === 'claude') {
+        return {
+          ok: false,
+          reason: `${clean} needs a connected Claude login — sign in under Models & routing, or pick a BYO model.`,
+        };
+      }
+      if (family === 'codex') {
+        return {
+          ok: false,
+          reason: `${clean} is unavailable while all-in mode is on — Codex-family ids stay on the BYO backend in all-in. Use a Claude model for this role, or turn all-in off.`,
+        };
+      }
       return {
         ok: false,
         reason: `BYO model ${clean} is not offered by any connected provider. Add it to a provider's model list in Settings → Models.`,
