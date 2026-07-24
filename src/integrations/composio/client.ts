@@ -32,8 +32,22 @@ const CONNECTION_SUPPRESSION_SOURCE_FILES = [
 const SECRET_VAULT_FILE = path.join(CACHE_DIR, 'secrets-vault.json');
 const DEFAULT_USER_ID = 'default';
 const DERIVED_USER_ID_PREFIX = 'clementine-';
+// A connection whose identity/entity no longer lines up (reconnect-class), OR a
+// dispatch that reached Composio with NO usable connection resolved for the
+// toolkit. The latter surfaces as an auth-config/scheme lookup miss
+// (`Auth_Config_AuthSchemeNotFound`, a bare `AuthSchemeNotFound`, or an
+// "unsupported OAuth2 authentication" rejection): the resolver deferred past the
+// connection and dispatched on the bare entity, which has no auth config for the
+// toolkit. Treating these as reconnect-class makes the execute path self-heal
+// (invalidate snapshot → re-resolve FRESH → retry once) and, if still
+// unresolved, surface a "reconnect <app>, do not retry" signal instead of
+// returning an opaque ERROR the model retries turn after turn until its budget
+// is spent. Safe to retry: an auth-config miss is a PRE-execution failure, so no
+// mutation was committed (live 2026-07-24: an isolated-worker research fan-out
+// ground its whole token budget on repeated AuthSchemeNotFound instead of
+// stopping to say the lane needed reconnecting).
 const RECONNECT_REQUIRED_RE =
-  /ConnectedAccountEntityIdMismatch|connected account[^\n]{0,100}(?:user|entity)[ _-]?id[^\n]{0,80}(?:does not match|mismatch)|user[ _-]?id[^\n]{0,80}does not match[^\n]{0,80}provided user[ _-]?id|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b/i;
+  /ConnectedAccountEntityIdMismatch|connected account[^\n]{0,100}(?:user|entity)[ _-]?id[^\n]{0,80}(?:does not match|mismatch)|user[ _-]?id[^\n]{0,80}does not match[^\n]{0,80}provided user[ _-]?id|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b|Auth[_ ]?Config[_ ]?AuthSchemeNotFound|\bAuthSchemeNotFound\b|unsupported OAuth2/i;
 const CONNECTIONS_TTL_MS = 60_000;
 const CATALOG_TTL_MS = 60 * 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
@@ -270,6 +284,21 @@ let localEnvCache: { at: number; env: Record<string, string> } | null = null;
 let connectionsCache: { at: number; data: ConnectedToolkit[] } | null = null;
 let connectionsGeneration = 0;
 let connectionsInflight: { generation: number; promise: Promise<ConnectedToolkit[]> } | null = null;
+// Durable last-successful snapshot. Survives invalidateConnectedAccountSnapshot()
+// (the routine cache-bust the self-heal fires) so a transient refresh failure — an
+// API throttle under a wide worker fan-out, or the generation-changed race — can
+// serve the last-known-good connections instead of an EMPTY list. An empty snapshot
+// makes resolution defer → a bare dispatch under an entity that may own no
+// connection for the toolkit → a permanent-looking Auth_Config_AuthSchemeNotFound
+// for a lane that is actually fine (live 2026-07-24: a 60-worker research fan-out
+// throttled the snapshot fetch and every worker hard-failed auth). Cleared only on a
+// real client reset (API-key change), where the prior account's connections no longer apply.
+let lastGoodConnections: ConnectedToolkit[] | null = null;
+// A refresh superseded by a newer generation (concurrent invalidation) throws
+// this specific message so a stale in-flight result is never served. It is NOT a
+// transient fetch failure — the caller should get the newer refresh, so this
+// error propagates (retry contract) rather than degrading to last-good.
+const SNAPSHOT_SUPERSEDED_MESSAGE = 'Composio account state changed during refresh; retry the operation.';
 let connectedAccountsLoaderForTest: (() => Promise<Array<Record<string, unknown>>>) | null = null;
 let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
 
@@ -743,6 +772,7 @@ export function resetComposioClient(): void {
   singleton = null;
   localEnvCache = null;
   invalidateConnectedAccountSnapshot();
+  lastGoodConnections = null; // API key changed → the prior account's connections no longer apply
   catalogCache = null;
   toolkitToolsCache.clear();
   invalidateComposioCliStatusCache();
@@ -960,12 +990,13 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           return learned ? { ...connection, accountEmail: learned } : connection;
         });
       if (generation !== connectionsGeneration) {
-        throw new Error('Composio account state changed during refresh; retry the operation.');
+        throw new Error(SNAPSHOT_SUPERSEDED_MESSAGE);
       }
       connectionsCache = {
         at: Date.now(),
         data,
       };
+      lastGoodConnections = data;
       return data;
   })().finally(() => {
     if (connectionsInflight?.promise === promise) connectionsInflight = null;
@@ -983,15 +1014,29 @@ export async function listConnectedToolkits(
   if (connectionsCache && now - connectionsCache.at < CONNECTIONS_TTL_MS) return connectionsCache.data;
   // Execution routing must use a fresh account snapshot. Dashboard/status reads
   // may use SWR because they cannot produce a side effect.
-  if (options.requireFresh) return refreshConnectedToolkits();
+  if (options.requireFresh) {
+    // Execution routing wants a fresh snapshot, but a transient refresh failure
+    // must not degrade to EMPTY (→ resolution defers → bare dispatch under a
+    // non-owning entity → false AuthSchemeNotFound). Serve last-good instead —
+    // except a genuine supersession, which must propagate its retry contract.
+    try { return await refreshConnectedToolkits(); }
+    catch (err) {
+      if (err instanceof Error && err.message === SNAPSHOT_SUPERSEDED_MESSAGE) throw err;
+      return lastGoodConnections ?? [];
+    }
+  }
   if (connectionsCache) {
     void refreshConnectedToolkits().catch(() => { /* stale stays served; next call retries */ });
     return connectionsCache.data;
   }
   try {
     return await refreshConnectedToolkits();
-  } catch {
-    return [];
+  } catch (err) {
+    // A transient failure (a throttle under a wide fan-out) must NOT erase a
+    // healthy lane. Serve last-good; empty only when we never successfully
+    // fetched. A supersession propagates (the caller retries onto the newer gen).
+    if (err instanceof Error && err.message === SNAPSHOT_SUPERSEDED_MESSAGE) throw err;
+    return lastGoodConnections ?? [];
   }
 }
 
@@ -1705,7 +1750,7 @@ export async function executeComposioTool(
   // opaque user_id default. Served SWR-instant from the cached snapshot (E1);
   // the self-heal below backstops a just-changed connection.
   let selfHealedConnection = false;
-  const resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug, preferredIdentity));
+  let resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug, preferredIdentity));
   // OWNER-PAIR dispatch: Composio validates that userId and connectedAccountId
   // MATCH — a pinned connection dispatched under a different entity 400s with
   // ConnectedAccountEntityIdMismatch. So the dispatch userId is the entity that
@@ -1713,41 +1758,59 @@ export async function executeComposioTool(
   // configured/derived entity only when no specific connection is pinned.
   let snapshotConns: ConnectedToolkit[] = [];
   try { snapshotConns = await listUsableConnectedToolkits(); } catch { snapshotConns = []; }
+  // NEVER DISPATCH BARE WHEN A CONNECTION EXISTS. The SDK sends the dispatch as
+  // `{ connected_account_id, user_id }`; with NO connected_account_id the backend
+  // resolves auth by user_id alone, which returns Auth_Config_AuthSchemeNotFound
+  // whenever the dispatch entity owns no connection for the toolkit (the live
+  // 2026-07-24 shape: COMPOSIO_USER_ID owns zero connections; every real
+  // connection is under other entities). So if identity resolution DEFERRED but
+  // the snapshot holds exactly ONE connection for this toolkit, pin it — the
+  // dispatchUserIdFor pairing below routes it under its true owner. Genuinely
+  // ambiguous (2+ distinct) or truly-absent toolkits still fall through to a bare
+  // dispatch and fail legibly. Kill-switch: CLEMMY_COMPOSIO_LONE_CONN_DISPATCH=off.
+  if (!resolvedConnection && (process.env.CLEMMY_COMPOSIO_LONE_CONN_DISPATCH ?? 'on').toLowerCase() !== 'off') {
+    resolvedConnection = loneToolkitConnection(toolSlug, snapshotConns) ?? resolvedConnection;
+  }
   const body: Record<string, unknown> = {
     userId: dispatchUserIdFor(resolvedConnection, snapshotConns, userId),
     arguments: args,
     dangerouslySkipVersionCheck: true,
   };
   if (resolvedConnection) body.connectedAccountId = resolvedConnection;
+
+  // Self-heal (E2): we picked this connection from a possibly-stale SWR snapshot,
+  // or resolution DEFERRED (no connection) and we dispatched on the bare entity.
+  // Either way a reconnect-class failure — thrown OR returned as a
+  // `successful:false` result (e.g. Auth_Config_AuthSchemeNotFound on a freshly
+  // spawned worker whose snapshot was cold) — means the live connection wasn't
+  // used. Bust the cache, re-resolve FRESH once, and retry only if we land on a
+  // DIFFERENT connection. Never fires for a caller-pinned account (the user's
+  // explicit choice); at most one extra round-trip; safe because an auth-config
+  // miss is PRE-execution so nothing was committed (live 2026-07-24: a worker
+  // research fan-out ground its whole budget on returned AuthSchemeNotFound).
+  const reResolveFreshRetry = async (): Promise<{ retried: true; result: unknown } | { retried: false }> => {
+    if (!(connSwrEnabled() && pinnedAccountId === undefined && !selfHealedConnection)) return { retried: false };
+    selfHealedConnection = true;
+    invalidateConnectedAccountSnapshot();
+    const fresh = await resolveToolkitConnectionId(toolSlug, preferredIdentity);
+    if (!fresh || fresh === resolvedConnection) return { retried: false };
+    let freshConns: ConnectedToolkit[] = [];
+    try { freshConns = await listUsableConnectedToolkits(); } catch { freshConns = []; }
+    const result = await (composio as any).tools.execute(toolSlug, {
+      ...body,
+      userId: dispatchUserIdFor(fresh, freshConns, userId),
+      connectedAccountId: fresh,
+    });
+    return { retried: true, result };
+  };
+
+  let result: unknown;
   try {
-    return await (composio as any).tools.execute(toolSlug, body);
+    result = await (composio as any).tools.execute(toolSlug, body);
   } catch (err) {
-    // Self-heal (E2): we picked this connection from a possibly-stale SWR
-    // snapshot. If the dispatch failed because the account isn't connected
-    // (rotated/just-disconnected), bust the cache, re-resolve FRESH once, and
-    // retry only if we land on a DIFFERENT connection. Never fires for a
-    // caller-pinned account (that's the user's explicit choice), and at most one
-    // extra round-trip. Strictly more correct than pre-emptive requireFresh.
-    if (
-      connSwrEnabled()
-      && pinnedAccountId === undefined
-      && !selfHealedConnection
-      && isComposioReconnectRequiredError(err)
-    ) {
-      selfHealedConnection = true;
-      invalidateConnectedAccountSnapshot();
-      const fresh = await resolveToolkitConnectionId(toolSlug, preferredIdentity);
-      if (fresh && fresh !== resolvedConnection) {
-        let freshConns: ConnectedToolkit[] = [];
-        try { freshConns = await listUsableConnectedToolkits(); } catch { freshConns = []; }
-        return await (composio as any).tools.execute(toolSlug, {
-          ...body,
-          userId: dispatchUserIdFor(fresh, freshConns, userId),
-          connectedAccountId: fresh,
-        });
-      }
-    }
     if (isComposioReconnectRequiredError(err)) {
+      const healed = await reResolveFreshRetry();
+      if (healed.retried) return healed.result;
       throw new ComposioReconnectRequiredError(toolSlug, err);
     }
     // v0.5.65 — discover/execute version split. The SDK resolves a slug under
@@ -1764,6 +1827,17 @@ export async function executeComposioTool(
     }
     throw err;
   }
+  // Returned reconnect-class shape (`successful:false` with an auth-config/scheme
+  // miss): the SDK didn't throw, so the thrown-path self-heal never ran. Apply
+  // the same fresh re-resolve + single retry here so a cold-snapshot worker
+  // recovers to success instead of returning an unusable result the model then
+  // grinds on. A genuinely unresolvable toolkit falls through and the returned
+  // reconnect error surfaces its "reconnect <app>" guidance downstream.
+  if (isComposioReconnectRequiredError(result)) {
+    const healed = await reResolveFreshRetry();
+    if (healed.retried) return healed.result;
+  }
+  return result;
 }
 
 /**
@@ -1787,6 +1861,27 @@ function normEmail(value: unknown): string {
 function toolMatchesConnection(toolSlugLower: string, connSlugLower: string): boolean {
   if (!connSlugLower) return false;
   return toolSlugLower === connSlugLower || toolSlugLower.startsWith(`${connSlugLower}_`);
+}
+
+/**
+ * The single unambiguous connection for a toolkit in the given snapshot, else
+ * undefined. Used at dispatch to AVOID a bare (connectionId-less) call when a
+ * connection exists: the Composio SDK resolves a bare dispatch by user_id alone,
+ * which 500s with Auth_Config_AuthSchemeNotFound whenever the dispatch entity
+ * owns no connection for the toolkit. Returns an id ONLY when exactly one
+ * distinct connection matches — never guesses among genuinely ambiguous mailboxes
+ * (those must ASK). Status-agnostic on purpose: pinning a stale-but-listed
+ * connection yields a precise "reconnect" error, strictly better than a bare
+ * dispatch's opaque auth-config miss. Pure + exported for test.
+ */
+export function loneToolkitConnection(toolSlug: string, snapshotConns: ConnectedToolkit[]): string | undefined {
+  const toolLower = toolSlug.toLowerCase();
+  const distinct = [...new Set(
+    snapshotConns
+      .filter((c) => c.connectionId && toolMatchesConnection(toolLower, (c.slug ?? '').toLowerCase()))
+      .map((c) => c.connectionId),
+  )];
+  return distinct.length === 1 ? distinct[0] : undefined;
 }
 
 export interface DistinctIdentity {

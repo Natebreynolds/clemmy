@@ -473,6 +473,83 @@ test('current Composio entity-mismatch and no-active-connection errors go straig
   assert.doesNotMatch(noActive, /Retry this EXACT call ONCE/);
 });
 
+test('resolution-miss auth-config errors route to reconnect guidance (not a grindable retry) — both result and thrown shapes', () => {
+  // The failure that ground a whole fan-out budget: the resolver deferred past a
+  // toolkit connection, dispatched on the bare entity, and Composio answered
+  // Auth_Config_AuthSchemeNotFound. Post-fix this is reconnect-class, so BOTH the
+  // returned-result and thrown paths steer the model to reconnect + STOP instead
+  // of returning an opaque error it retries turn after turn (any brain).
+  resetEventLog();
+  const resultShape = formatComposioExecuteOutput({
+    successful: false,
+    error: 'Auth_Config_AuthSchemeNotFound: no auth config for this toolkit on the entity',
+  }, { toolSlug: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS' });
+  assert.match(resultShape, /Open Connect and reconnect APIFY/i);
+  assert.match(resultShape, /Do NOT retry/);
+  assert.doesNotMatch(resultShape, /Retry this EXACT call ONCE/);
+
+  const thrownShape = composioThrownErrorOutput(
+    new Error('Tool execution failed: unsupported OAuth2 authentication'),
+    { toolSlug: 'FIRECRAWL_SEARCH' },
+  );
+  assert.match(thrownShape, /Open Connect and reconnect FIRECRAWL/i);
+  assert.match(thrownShape, /Do NOT retry/);
+});
+
+// ─── Grind guard: ONE reconnect-class failure bounds EVERY later call to that
+//     toolkit in the session — the invariant that protects any long-running task
+//     / multi-agent fan-out (all of which funnel through this gateway, on every
+//     brain) from burning a token budget re-dispatching a lane that won't auth.
+const AUTH_MISS_RESULT = { successful: false, error: 'Auth_Config_AuthSchemeNotFound: no auth config for this toolkit on the entity' };
+
+test('grind guard (returned shape): first auth-config miss trips the breaker → the gateway short-circuits later calls with NO dispatch', async () => {
+  const { runComposioExecuteForTestInSession, resolveComposioDispatch, __gatewayTest__ } = await import('./composio-tools.js');
+  const sid = 'sess-grind-returned';
+  const slug = 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS';
+  __gatewayTest__.clearReconnectBreaker(sid, slug);
+
+  let dispatches = 0;
+  const authMissExec = (async () => { dispatches += 1; return AUTH_MISS_RESULT; }) as never;
+  const out = await runComposioExecuteForTestInSession(slug, { q: 'firm-a' }, authMissExec, sid);
+  assert.match(out, /reconnect APIFY/i, 'the miss returns reconnect guidance, not a grindable error');
+  assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, slug), true, 'one failure trips the session/toolkit breaker');
+
+  // The NEXT call is short-circuited at the gateway — it never reaches dispatch.
+  const blocked = await resolveComposioDispatch(slug, { q: 'firm-b' }, undefined, { sessionId: sid });
+  assert.equal(blocked.ok, false, 'gateway blocks the follow-up call');
+  assert.equal(blocked.ok === false && blocked.reason, 'not-connected');
+  assert.equal(dispatches, 1, 'exactly one provider dispatch happened — the budget-burning retry loop is bounded');
+});
+
+test('grind guard (thrown shape): a thrown auth error trips the same breaker', async () => {
+  const { runComposioExecuteForTestInSession, resolveComposioDispatch, __gatewayTest__ } = await import('./composio-tools.js');
+  const sid = 'sess-grind-thrown';
+  const slug = 'FIRECRAWL_SEARCH';
+  __gatewayTest__.clearReconnectBreaker(sid, slug);
+
+  const authThrowExec = (async () => { throw new Error('unsupported OAuth2 authentication'); }) as never;
+  const out = await runComposioExecuteForTestInSession(slug, { query: 'firm-a' }, authThrowExec, sid);
+  assert.match(out, /reconnect FIRECRAWL/i);
+  assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, slug), true);
+
+  const blocked = await resolveComposioDispatch(slug, { query: 'firm-b' }, undefined, { sessionId: sid });
+  assert.equal(blocked.ok === false && blocked.reason, 'not-connected');
+});
+
+test('grind guard isolation: the breaker is scoped to session+toolkit — it never blocks a different toolkit or a different session (healthy lanes stay open)', async () => {
+  const { resolveComposioDispatch, __gatewayTest__ } = await import('./composio-tools.js');
+  const sid = 'sess-iso';
+  __gatewayTest__.recordReconnectBreaker(sid, 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS');
+
+  // Different toolkit, same session → NOT tripped.
+  assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, 'FIRECRAWL_SEARCH'), false);
+  // Same toolkit, different session → NOT tripped.
+  assert.equal(__gatewayTest__.reconnectBreakerTripped('sess-other', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS'), false);
+  // The gateway does not short-circuit the healthy toolkit for this session.
+  const healthy = await resolveComposioDispatch('FIRECRAWL_SEARCH', { query: 'x' }, undefined, { sessionId: sid });
+  assert.notEqual(healthy.ok === false && healthy.reason, 'not-connected');
+});
+
 test('formatComposioExecuteOutput: a genuine record-not-found STILL gets the id-discovery corrective (characterization)', () => {
   resetEventLog();
   const notFound = { successful: false, error: 'Record not found' };
