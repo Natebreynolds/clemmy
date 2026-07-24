@@ -21,6 +21,7 @@ import {
   type ModelRoutingMode,
 } from '../../config.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
+import { claudeAvailable } from './judge-family.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-providers' });
@@ -176,6 +177,20 @@ export function resolveEffectiveProviderForModel(
   assertUnambiguousModelRouting(id, mode);
   const owners = configuredByoProvidersForModel(id);
   if (mode === 'all_in') {
+    // Explicit claude ids dispatch on the claude lane (2026-07-24, second
+    // pass): the all-in collapse silently rewrote a workflow's Sonnet pin to
+    // the BYO primary at the wire (requested claude-sonnet-5 → resolved
+    // glm-5.2) — an honest system may refuse, but never silently substitute.
+    // Safe NOW because the per-request transport router (v2.7.3) makes the
+    // claude harness lane tool-capable; the text-only crash class that
+    // justified the collapse is retired. gpt-shaped ids keep the collapse
+    // (the 2026-07-22 undeclared-worker-default guard); a disconnected
+    // Claude falls through to the collapse as before.
+    if (owners.length === 0 && resolveProvider(id) === 'claude') {
+      try {
+        if (claudeAvailable()) return 'claude';
+      } catch { /* availability probe is best-effort */ }
+    }
     const defaultByo = getByoBackendConfig();
     if (defaultByo.configured || owners.length === 1) return 'byo';
   }
