@@ -61,3 +61,23 @@ test('multi-word category matches only when all words are present', () => {
   assert.deepEqual(kinds([step({ id: 's', prompt: 'design the product hero' })], rule), ['missed_routing_opportunity:s']);
   assert.deepEqual(kinds([step({ id: 's', prompt: 'design the hero' })], rule), [], 'missing "product" → no match');
 });
+
+// Display truth (live 2026-07-24): a workflow pinned to Sonnet showed the pin
+// in the picker while the step chips still claimed the global worker default.
+// The display resolver mirrors the runner: step.model > workflow brain pin >
+// intent > default.
+test('resolveStepDisplayModel honors the workflow-level brain pin', async () => {
+  const { resolveStepDisplayModel } = await import('./workflow-routing-check.js');
+  const step = { prompt: 'summarize the day', deterministic: false } as never;
+  assert.equal(
+    resolveStepDisplayModel(step, { models: { brain: 'claude-sonnet-5' } }),
+    'claude-sonnet-5',
+    'the pin is the displayed truth',
+  );
+  const explicit = { prompt: 'p', model: 'kimi-k3' } as never;
+  assert.equal(
+    resolveStepDisplayModel(explicit, { models: { brain: 'claude-sonnet-5' } }),
+    'kimi-k3',
+    'an explicit step.model still wins over the pin',
+  );
+});

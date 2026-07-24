@@ -369,10 +369,11 @@ test('all_in honors an explicit judge binding to a CONNECTED OAuth family; disco
   writeAuthFiles(); // restore for any later tests
 });
 
-// Live 2.7.0 regression (space-runner crash): the wire classifier must keep
-// the FULL all-in collapse — a claude id validating for the judge role must
-// NOT re-expose claude to tool-bearing dispatch paths (the claude headless
-// transport is text-only). Validation says 'claude'; the wire says 'byo'.
+// 2026-07-24, two-pass history: the wire collapse first CRASHED tool paths
+// (2.7.0 space runner) and, once scoped away, silently REWROTE a workflow's
+// Sonnet pin to GLM at dispatch. With the per-request transport router
+// (v2.7.3) making the claude lane tool-capable, an explicit claude id now
+// resolves 'claude' at the wire too — validation and dispatch tell ONE truth.
 test('all_in: claude judge binding validates as claude while the wire classifier still collapses to byo', () => {
   writeAuthFiles();
   withEnv({
@@ -387,8 +388,8 @@ test('all_in: claude judge binding validates as claude while the wire classifier
     if (validation.ok) assert.equal(validation.provider, 'claude');
     assert.equal(
       resolveEffectiveProviderForModel('claude-opus-4-8'),
-      'byo',
-      'tool-bearing dispatch classification keeps the all-in collapse',
+      'claude',
+      'explicit claude ids dispatch on the claude lane — never a silent substitute',
     );
   });
 });

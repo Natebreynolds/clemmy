@@ -9,6 +9,8 @@ import { getSecretStore } from '../../runtime/secrets/index.js';
 import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import { cachedIdentityEmail, cachedConnectionOwner, recordConnectionOwner } from './identity-cache.js';
 import {
+  benchComposioCliAuth,
+  composioCliAuthDead,
   executeComposioCliTool,
   getComposioCliStatus,
   invalidateComposioCliStatusCache,
@@ -1663,7 +1665,18 @@ export async function executeComposioTool(
         // timeout/5xx/generic exit may have committed remotely; replaying it
         // through the SDK would duplicate the write under one logical call.
         if (!composioAutoFallbackAllowed(toolSlug, error)) {
-          throw new ComposioDispatchUncertainError(toolSlug, error);
+          // 401-shaped mutation failure (live 2026-07-24: the Slack team
+          // update blocked for hours on a dead CLI session while the SDK
+          // connection was ACTIVE): auth text alone never proves no-dispatch,
+          // but an independent live READ probe failing 401 through the same
+          // session does — the lane is auth-dead, the mutation was rejected
+          // at authentication, and the SDK retry is safe.
+          const authShaped = /\b401\b|unauthorized/i.test(errorText(error));
+          if (!(authShaped && await composioCliAuthDead(cliOptions))) {
+            throw new ComposioDispatchUncertainError(toolSlug, error);
+          }
+          console.warn(`[composio] CLI lane proven auth-dead by live probe — ${toolSlug} was rejected at auth; retrying via SDK backend and benching the CLI lane`);
+          try { benchComposioCliAuth(); } catch { /* bench is best-effort */ }
         }
       }
     } else if (backend === 'cli') {

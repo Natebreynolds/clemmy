@@ -170,7 +170,7 @@ export function simulateWorkflowDryRun(
       fanout: fan ? { source: fan.source, newOnly: fan.newOnly } : null,
       // The model this step ACTUALLY runs on (pinned, intent-routed, or the
       // worker default) — not just an explicit pin. Null for non-LLM steps.
-      model: resolveStepDisplayModel(step),
+      model: resolveStepDisplayModel(step, def),
     };
   });
 

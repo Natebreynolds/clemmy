@@ -199,7 +199,28 @@ export function invalidateComposioCliStatusCache(): void {
   cliStatusCache = null;
 }
 
+/** Auth-dead bench (2026-07-24): once a live probe PROVES the CLI session is
+ *  rejecting calls at auth, AUTO stops routing through it entirely — the SDK
+ *  (where the user's connections actually live) becomes the lane until the
+ *  bench expires or a real re-login is detected. Prevents every subsequent
+ *  mutation from re-failing into the dead lane first. */
+let cliAuthBenchedUntil = 0;
+const CLI_AUTH_BENCH_MS = 15 * 60_000;
+export function benchComposioCliAuth(): void {
+  cliAuthBenchedUntil = Date.now() + CLI_AUTH_BENCH_MS;
+  cliStatusCache = null; // the cached "authenticated" claim is proven false
+}
+export function _resetComposioCliBenchForTests(): void { cliAuthBenchedUntil = 0; }
+
 export async function getComposioCliStatus(options: ComposioCliEnvOptions = {}): Promise<ComposioCliStatus> {
+  if (Date.now() < cliAuthBenchedUntil) {
+    return {
+      installed: true,
+      authenticated: false,
+      authStatus: 'error',
+      authMessage: 'Composio CLI session was proven auth-dead by a live probe — using the SDK backend until it recovers (run composio login to restore the CLI lane).',
+    } as ComposioCliStatus;
+  }
   const key = JSON.stringify([options.apiKey ?? '', options.userId ?? '']);
   const now = Date.now();
   if (cliStatusCache && cliStatusCache.key === key && now - cliStatusCache.at <= CLI_STATUS_TTL_MS) {
@@ -241,6 +262,26 @@ async function fetchComposioCliStatus(options: ComposioCliEnvOptions = {}): Prom
     authStatus: authenticated ? 'ok' : (whoami.ok ? 'unknown' : 'error'),
     authMessage: authenticated ? authText : authText || 'Run composio login to enable CLI execution, or keep AUTO/SDK fallback.',
   };
+}
+
+/** LIVE CLI auth-death probe (2026-07-24 Slack-send 401 incident): a CLI
+ * mutation failed 401-shaped in AUTO, but auth text alone must never prove
+ * no-dispatch (it leaks into post-dispatch errors). This probe makes it
+ * STRUCTURAL: run an independent, harmless READ through the same CLI session
+ * — if that read ALSO fails 401/unauthorized, the CLI lane's auth is dead,
+ * meaning the original request was rejected at authentication and nothing
+ * dispatched. Cheap, bounded, and only invoked on a 401-shaped failure. */
+export async function composioCliAuthDead(options: ComposioCliEnvOptions = {}): Promise<boolean> {
+  try {
+    const result = await runComposioCli(
+      ['execute', 'COMPOSIO_LIST_TOOLKITS', '-d', '{}'],
+      { ...options, timeoutMs: STATUS_TIMEOUT_MS },
+    );
+    if (result.ok) return false;
+    return /\b401\b|unauthorized/i.test(compactOutput(result.stdout, result.stderr));
+  } catch (err) {
+    return /\b401\b|unauthorized/i.test(String(err));
+  }
 }
 
 export async function executeComposioCliTool(

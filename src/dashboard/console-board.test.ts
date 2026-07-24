@@ -2728,3 +2728,50 @@ test('U1: a finished origin-chat attempt collapses into its background task card
     await close();
   }
 });
+
+// One pipeline = one card (live 2026-07-24): a RUNNING workflow surfaced BOTH
+// its pending-workflow card ("Running step …") and its run-record card ("Run
+// received."). While the run is live, the pending-workflow card is the ONE
+// card; the run record takes over only at terminal (→ Done).
+test('GET /api/console/board shows ONE card for a live workflow run — the run record defers to the pending-workflow card', async () => {
+  const workflowSlug = 'board-dedup-live-wf';
+  const runId = 'sched-dedup-0001';
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug,
+    description: 'dedup test workflow',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'pull', prompt: 'Pull the data.' }, { id: 'post', prompt: 'Post it.', dependsOn: ['pull'] }],
+  } as never);
+  startRun({
+    id: runId,
+    sessionId: `workflow-run:${runId}`,
+    channel: 'daemon',
+    source: 'workflow',
+    title: `Workflow: ${workflowSlug}`,
+    message: 'Run received.',
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowSlug,
+    status: 'running',
+    createdAt: new Date().toISOString(),
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'pull' });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: Array<{ id: string; sourceKind: string; title: string; column: string }> };
+    const matching = body.cards.filter((c) =>
+      c.id === runId || c.id === `wf:${workflowSlug}:${runId}` || c.title.includes(workflowSlug));
+    assert.equal(matching.length, 1, `exactly one card for the live run, got: ${JSON.stringify(matching.map((c) => ({ id: c.id, kind: c.sourceKind })))}`);
+    assert.equal(matching[0].sourceKind, 'workflow', 'the pending-workflow card is the one card');
+    assert.equal(matching[0].column, 'running');
+  } finally {
+    await h.close();
+  }
+});
