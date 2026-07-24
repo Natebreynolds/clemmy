@@ -546,3 +546,38 @@ test('grant-at-card: no verifiable recipient → no grant (fail-closed)', () => 
   assert.equal(grantSendTrustFromApprovedAction('composio_execute_tool', { tool_slug: 'GMAIL_SEND_EMAIL', body: 'hello' }), null);
   assert.equal(grantSendTrustFromApprovedAction('some_tool', undefined), null);
 });
+
+// Authored-send consent (owner rule, 2026-07-24: "workflows never need
+// approval unless it's a human-in-the-loop step that's authored"). The flag
+// is set only by the workflow runner for authored sideEffect:'send' steps;
+// without it, the 2026-07-09 wildcard send lock stands untouched.
+test('allowAnySend: an authored send step scope auto-approves sends; the wildcard lock holds everywhere else', () => {
+  const sendArgs = { tool_slug: 'SLACK_SEND_MESSAGE', arguments: '{"channel":"C1","markdown_text":"update"}' };
+
+  openPlanScope({
+    sessionId: 'wf-authored-send',
+    planProposalId: 'workflow:test:send-step',
+    approvedPlanObjective: 'Approved workflow step post_slack',
+    ttlMs: 60_000,
+    allowedTools: ['*'],
+    allowAnySend: true,
+  });
+  assert.equal(
+    isAutoApprovedByScope('wf-authored-send', 'composio_execute_tool', sendArgs, 'send'),
+    true,
+    'authored send step sends without parking',
+  );
+
+  openPlanScope({
+    sessionId: 'wf-plain-wildcard',
+    planProposalId: 'workflow:test:other-step',
+    approvedPlanObjective: 'Approved workflow step misc',
+    ttlMs: 60_000,
+    allowedTools: ['*'],
+  });
+  assert.equal(
+    isAutoApprovedByScope('wf-plain-wildcard', 'composio_execute_tool', sendArgs, 'send'),
+    false,
+    'without the authored flag, a wildcard scope still never auto-approves a send',
+  );
+});

@@ -2240,12 +2240,19 @@ async function runStepViaHarness(
         return [];
       }
     })();
+    // Owner rule (2026-07-24): the ONLY human-in-the-loop gates in a workflow
+    // are steps AUTHORED `requiresApproval`. A step the author declared
+    // `sideEffect: 'send'` (without requiresApproval) sends without parking —
+    // saving + launching/enabling the workflow is the consent, first run
+    // included. Graduated slugs remain as the audit trail/belt.
+    const authoredSendConsent = !step.requiresApproval && stepSideEffectClass(step) === 'send';
     openPlanScope({
       sessionId: realSessionId,
       planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
       approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
       ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
       allowedTools,
+      allowAnySend: authoredSendConsent,
       allowedSends: [...new Set([
         ...(step.requiresApproval
           ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
@@ -2253,15 +2260,17 @@ async function runStepViaHarness(
         ...graduatedSends,
       ])],
     });
-    if (graduatedSends.length > 0) {
+    if (authoredSendConsent || graduatedSends.length > 0) {
       try {
         addNotification({
           id: `send-graduated-${workflowRunId}-${step.id}`,
           kind: 'workflow',
-          title: `Send auto-approved by standing consent: ${workflowName} · ${step.id}`,
+          title: `Send runs without approval: ${workflowName} · ${step.id}`,
           body: [
-            `Scheduled run ${workflowRunId} will send via ${graduatedSends.join(', ')} without pausing — a person approved this step's send in a prior run, and the workflow is enabled + scheduled.`,
-            'Disable the workflow (or remove its schedule) to stop these sends.',
+            authoredSendConsent
+              ? `Run ${workflowRunId}: this step is authored as a send (sideEffect: send) without a human-in-the-loop gate, so it sends without pausing — saving and running/enabling the workflow is the consent.`
+              : `Run ${workflowRunId} sends via ${graduatedSends.join(', ')} without pausing — a person approved this step's send in a prior run, and the workflow is enabled + scheduled.`,
+            'Author the step with `requiresApproval` to always wait for a human; disable the workflow to stop it entirely.',
           ].join('\n'),
           createdAt: new Date().toISOString(),
           read: false,
