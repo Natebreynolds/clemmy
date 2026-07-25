@@ -136,6 +136,11 @@ export const backgroundSteerInFlight: ScenarioDef = {
         detail: `stale ${manifest?.staleCheckpoints ?? 0}; ${JSON.stringify(events)}`,
       },
       {
+        name: 'one baseline batch plus one revalidation batch — no receipt-reuse loop',
+        pass: (metrics?.toolCalls['run_worker'] ?? 0) === 2,
+        detail: `run_worker calls: ${metrics?.toolCalls['run_worker'] ?? 'unavailable'}`,
+      },
+      {
         name: 'exactly one terminal outcome returned to origin',
         pass: terminalOutcomes.length === 1 && terminalOutcomes[0]?.data.status === 'done',
         detail: JSON.stringify(outcomes.map((event) => event.data.status)),

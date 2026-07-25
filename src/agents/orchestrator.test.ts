@@ -589,7 +589,10 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
         toolCall: { name: 'run_worker', callId: 'call_worker_design_after_restart', arguments: resumedInput },
       },
     );
-    assert.equal(resumed, 'worker finished on routed model', 'the original persisted work-product is reused');
+    assert.match(String(resumed), /Durable receipt: this item was already complete/);
+    assert.match(String(resumed), /No worker ran and no action was repeated/);
+    assert.match(String(resumed), /worker finished on routed model/, 'the original persisted work-product is reused');
+    assert.match(String(resumed), /Do not call run_worker again for this phase; synthesize the user-facing result now/);
     assert.equal(
       requestedModels.filter((model) => model === 'minimax-01').length,
       1,
@@ -603,6 +606,68 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       summarizeWorkManifest(session.id, 'design-variations')?.items[0]?.phases.design.attempts,
       2,
       'reuse does not manufacture another running/succeeded checkpoint pair',
+    );
+
+    // The long-horizon failure mode was batch-shaped: after a completed
+    // manifest was requested again, the tool returned a generic "Batch
+    // complete" banner, so the brain could not tell receipt reuse from fresh
+    // execution and sometimes asked for the same batch repeatedly. Keep the
+    // persisted outputs, but make terminal graph state explicit.
+    const batchPacket = {
+      ...packet,
+      item: null,
+      items: ['landing page variation a', 'landing page variation b'],
+      workManifest: {
+        id: 'design-batch',
+        contractVersion: '1',
+        phase: 'design',
+        mode: 'declare',
+        phases: [{ id: 'design' }],
+      },
+    };
+    const batchInput = JSON.stringify(batchPacket);
+    const firstBatch = await runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      batchInput,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_worker_design_batch', arguments: batchInput },
+      },
+    );
+    assert.match(String(firstBatch), /Batch complete: 2\/2 items succeeded/);
+    const requestsAfterFirstBatch = requestedModels.length;
+
+    const resumedBatchPacket = {
+      ...batchPacket,
+      instructions: 'Recover completed variations and synthesize without repeating work.',
+      workManifest: {
+        ...batchPacket.workManifest,
+        mode: 'reconcile',
+      },
+    };
+    const resumedBatchInput = JSON.stringify(resumedBatchPacket);
+    const resumedBatch = await runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      resumedBatchInput,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_worker_design_batch_after_restart', arguments: resumedBatchInput },
+      },
+    );
+    assert.match(String(resumedBatch), /Durable receipt: all 2\/2 requested items were already complete/);
+    assert.match(String(resumedBatch), /No worker ran and no action was repeated/);
+    assert.match(String(resumedBatch), /complete "design" phase is already proven/);
+    assert.match(String(resumedBatch), /Do not call run_worker again for this phase; synthesize the user-facing result now/);
+    assert.equal(
+      requestedModels.length,
+      requestsAfterFirstBatch,
+      'a fully completed manifest batch returns receipts without spawning another model',
+    );
+    assert.equal(
+      listEvents(session.id, { types: ['worker_started'] })
+        .filter((event) => String((event.data as { item?: string }).item).startsWith('landing page variation')).length,
+      2,
+      'only the original two batch workers ran',
     );
   } finally {
     for (const [key, value] of Object.entries(prev)) {

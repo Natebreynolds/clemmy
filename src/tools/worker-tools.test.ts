@@ -260,14 +260,44 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
           workManifest: { ...initial.workManifest, mode: 'reconcile' },
         };
         const second = await withToolOutputContext({ sessionId }, () => handler(resumed));
-        assert.equal(second.content[0].text, 'Account A research result');
+        assert.match(second.content[0].text, /Durable receipt: this item was already complete/);
+        assert.match(second.content[0].text, /No worker ran and no action was repeated/);
+        assert.match(second.content[0].text, /Account A research result/);
+        assert.match(second.content[0].text, /Do not call run_worker again for this phase; synthesize the user-facing result now/);
+
+        const batch = {
+          ...packet('unused batch placeholder'),
+          item: null,
+          items: ['Account B — account-b.example', 'Account C — account-c.example'],
+          workManifest: {
+            id: 'account-research-batch',
+            contractVersion: '1',
+            phase: 'research',
+            mode: 'declare',
+            phases: [{ id: 'research' }],
+          },
+        };
+        const firstBatch = await withToolOutputContext({ sessionId }, () => handler(batch));
+        assert.match(firstBatch.content[0].text, /Batch complete: 2\/2 items succeeded/);
+        const dispatchesAfterFirstBatch = dispatches;
+
+        const resumedBatch = await withToolOutputContext({ sessionId }, () => handler({
+          ...batch,
+          instructions: 'Recover the completed batch and synthesize; do not repeat it.',
+          workManifest: { ...batch.workManifest, mode: 'reconcile' },
+        }));
+        assert.match(resumedBatch.content[0].text, /Durable receipt: all 2\/2 requested items were already complete/);
+        assert.match(resumedBatch.content[0].text, /No worker ran and no action was repeated/);
+        assert.match(resumedBatch.content[0].text, /complete "research" phase is already proven/);
+        assert.match(resumedBatch.content[0].text, /Do not call run_worker again for this phase; synthesize the user-facing result now/);
+        assert.equal(dispatches, dispatchesAfterFirstBatch, 'the completed SDK-brain batch did not spawn again');
       },
     );
 
-    assert.equal(dispatches, 1, 'the resumed packet must not execute the logical item twice');
-    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 1);
+    assert.equal(dispatches, 3, 'one single item and two batch items executed exactly once each');
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 3);
     const results = listEvents(sessionId, { types: ['worker_result'] });
-    assert.equal(results.length, 2, 'the no-op reuse remains observable');
+    assert.equal(results.length, 6, 'single + batch no-op reuse remain observable');
     assert.match(String((results[1].data as { reason?: string }).reason), /durable manifest success/i);
     assert.equal(
       summarizeWorkManifest(sessionId, 'account-research')?.items[0]?.phases.research.attempts,

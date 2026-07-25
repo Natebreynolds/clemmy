@@ -56,6 +56,7 @@ import {
   checkpointPreparedWorker,
   completedPreparedWorker,
   prepareWorkerManifest,
+  summarizePreparedWorkerReuse,
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
@@ -1053,6 +1054,24 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (!prepared.ok) return `ERROR: workers were NOT started — ${prepared.error}`;
         manifestBinding = prepared.binding;
       }
+      // A durable completion is materially different from a fresh worker run.
+      // Preserve that truth at the tool boundary so the brain does not mistake
+      // receipt reuse for another execution and keep asking for the same batch.
+      // We still return the persisted work-products below: after a daemon
+      // restart they may be the only synthesis material in the brain's context.
+      const durableReusedItems = new Set<string>();
+      let durablePhaseComplete = false;
+      if (workerResumeIdempotencyEnabled() && manifestSessionId && manifestBinding) {
+        const reuse = summarizePreparedWorkerReuse(manifestSessionId, manifestBinding, callItems);
+        for (const item of reuse.completedItems) durableReusedItems.add(item);
+        durablePhaseComplete = reuse.phaseComplete;
+      }
+      const allRequestedItemsReused = durableReusedItems.size === callItems.length;
+      const durableReuseGuidance = allRequestedItemsReused && manifestBinding
+        ? durablePhaseComplete
+          ? `Manifest guidance: the complete "${manifestBinding.phase}" phase is already proven for ${manifestBinding.manifestId} contract ${manifestBinding.contractVersion}. Do not call run_worker again for this phase; synthesize the user-facing result now from the returned work-products and durable evidence.`
+          : `Manifest guidance: this requested slice is already proven for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. Do not repeat these items; continue only with canonical items that remain incomplete.`
+        : null;
       const { items: _batch, ...packetBase } = call;
       if (callItems.length > 1) {
         // Deterministic batch (2026-07-21): the harness owns the parallelism so
@@ -1119,18 +1138,33 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           } catch { /* best-effort */ }
         }
         const header = failedItems.length === 0
-          ? `Batch complete: ${rendered.length}/${rendered.length} items succeeded.`
+          ? allRequestedItemsReused && manifestBinding
+            ? `Durable receipt: all ${rendered.length}/${rendered.length} requested items were already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`
+            : durableReusedItems.size > 0
+              ? `Batch complete: ${rendered.length}/${rendered.length} items succeeded (${durableReusedItems.size} reused from durable evidence; ${rendered.length - durableReusedItems.size} newly executed).`
+              : `Batch complete: ${rendered.length}/${rendered.length} items succeeded.`
           : uniform
             ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
             : `Batch finished with FAILURES: ${rendered.length - failedItems.length}/${rendered.length} succeeded; FAILED items: ${failedItems.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
-        return [...(heavyAdvisory ? [heavyAdvisory] : []), header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n');
+        return [
+          ...(heavyAdvisory ? [heavyAdvisory] : []),
+          header,
+          ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`),
+          ...(durableReuseGuidance ? [durableReuseGuidance] : []),
+        ].join('\n\n');
       }
-      return runOneOrchestratorWorker(
+      const singleResult = await runOneOrchestratorWorker(
         { ...packetBase, item: callItems[0] } as WorkerToolInput,
         runContext,
         details,
         manifestBinding,
       );
+      if (!allRequestedItemsReused || !manifestBinding) return singleResult;
+      return [
+        `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
+        singleResult,
+        durableReuseGuidance,
+      ].filter(Boolean).join('\n\n');
     },
   }) as Tool<RuntimeContextValue>;
 

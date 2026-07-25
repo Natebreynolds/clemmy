@@ -16,6 +16,7 @@ const {
   prepareWorkerManifest,
   resolveWorkItemId,
   reviseWorkContract,
+  summarizePreparedWorkerReuse,
   summarizeWorkManifest,
 } = await import('./work-manifest.js');
 
@@ -352,6 +353,10 @@ test('prepared worker completion survives a changed call packet but not a contra
   const completion = completedPreparedWorker(sid, prepared.binding, 'row-2');
   assert.equal(completion?.itemId, 'account-a');
   assert.deepEqual(completion?.packetKeys, ['packet-before-restart']);
+  assert.deepEqual(
+    summarizePreparedWorkerReuse(sid, prepared.binding, ['row-2']),
+    { completedItems: ['row-2'], phaseComplete: true },
+  );
 
   reviseWorkContract({
     sessionId: sid,
@@ -372,5 +377,11 @@ test('prepared worker completion survives a changed call packet but not a contra
     },
   });
   assert.equal(revised.ok, true);
-  if (revised.ok) assert.equal(completedPreparedWorker(sid, revised.binding, 'row-2'), null);
+  if (revised.ok) {
+    assert.equal(completedPreparedWorker(sid, revised.binding, 'row-2'), null);
+    assert.deepEqual(
+      summarizePreparedWorkerReuse(sid, revised.binding, ['row-2']),
+      { completedItems: [], phaseComplete: false },
+    );
+  }
 });

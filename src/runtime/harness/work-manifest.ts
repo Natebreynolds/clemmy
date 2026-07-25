@@ -102,6 +102,11 @@ export interface PreparedWorkerCompletion {
   packetKeys: string[];
 }
 
+export interface PreparedWorkerReuseSummary {
+  completedItems: string[];
+  phaseComplete: boolean;
+}
+
 export type PrepareWorkerManifestResult =
   | { ok: true; binding: PreparedWorkerManifest }
   | { ok: false; error: string };
@@ -942,5 +947,51 @@ export function completedPreparedWorker(
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Inspect a prepared batch once before dispatch.
+ *
+ * This is the O(manifest + requested-items) batch twin of
+ * completedPreparedWorker(), whose packet-key recovery is intentionally
+ * item-specific. Both run_worker transports use it to distinguish fresh work
+ * from durable receipt reuse without rebuilding the whole event graph N times.
+ */
+export function summarizePreparedWorkerReuse(
+  sessionId: string,
+  binding: PreparedWorkerManifest,
+  items: readonly string[],
+): PreparedWorkerReuseSummary {
+  try {
+    const manifest = summarizeWorkManifest(sessionId, binding.manifestId);
+    if (!manifest || manifest.contractVersion !== binding.contractVersion) {
+      return { completedItems: [], phaseComplete: false };
+    }
+    const itemById = new Map(manifest.items.map((entry) => [entry.id, entry]));
+    const completedItems = items.filter((item) => {
+      const itemId = binding.itemIds.get(item);
+      if (!itemId) return false;
+      const state = itemById.get(itemId)?.phases[binding.phase];
+      return Boolean(
+        state
+        && state.status === 'succeeded'
+        && state.contractVersion === binding.contractVersion
+        && state.evidence.length > 0
+      );
+    });
+    const phase = manifest.phases.find((entry) => entry.id === binding.phase);
+    const phaseComplete = Boolean(
+      phase
+      && phase.total > 0
+      && phase.succeeded === phase.total
+      && phase.failed === 0
+      && phase.running === 0
+      && phase.needsValidation === 0
+      && phase.invalidated === 0
+    );
+    return { completedItems, phaseComplete };
+  } catch {
+    return { completedItems: [], phaseComplete: false };
   }
 }

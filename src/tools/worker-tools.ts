@@ -25,6 +25,7 @@ import {
   checkpointPreparedWorker,
   completedPreparedWorker,
   prepareWorkerManifest,
+  summarizePreparedWorkerReuse,
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
@@ -178,6 +179,22 @@ export function registerWorkerTools(server: McpServer): void {
         if (!prepared.ok) return textResult(`ERROR: workers were NOT started — ${prepared.error}`);
         manifestBinding = prepared.binding;
       }
+      // Keep the SDK-brain lane truthful and behaviorally identical to the
+      // orchestrator lane: receipt reuse is not a fresh execution. The prior
+      // work-products still flow back below so a restarted brain can synthesize.
+      const durableReusedItems = new Set<string>();
+      let durablePhaseComplete = false;
+      if (workerResumeIdempotencyEnabled() && manifestSessionId && manifestBinding) {
+        const reuse = summarizePreparedWorkerReuse(manifestSessionId, manifestBinding, callItems);
+        for (const item of reuse.completedItems) durableReusedItems.add(item);
+        durablePhaseComplete = reuse.phaseComplete;
+      }
+      const allRequestedItemsReused = durableReusedItems.size === callItems.length;
+      const durableReuseGuidance = allRequestedItemsReused && manifestBinding
+        ? durablePhaseComplete
+          ? `Manifest guidance: the complete "${manifestBinding.phase}" phase is already proven for ${manifestBinding.manifestId} contract ${manifestBinding.contractVersion}. Do not call run_worker again for this phase; synthesize the user-facing result now from the returned work-products and durable evidence.`
+          : `Manifest guidance: this requested slice is already proven for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. Do not repeat these items; continue only with canonical items that remain incomplete.`
+        : null;
       const { items: _batch, ...packetBase } = call;
       if (callItems.length > 1) {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
@@ -245,13 +262,32 @@ export function registerWorkerTools(server: McpServer): void {
           } catch { /* coverage boundary is best-effort */ }
         }
         const header = failed.length === 0
-          ? `Batch complete: ${rendered.length}/${rendered.length} items succeeded.`
+          ? allRequestedItemsReused && manifestBinding
+            ? `Durable receipt: all ${rendered.length}/${rendered.length} requested items were already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`
+            : durableReusedItems.size > 0
+              ? `Batch complete: ${rendered.length}/${rendered.length} items succeeded (${durableReusedItems.size} reused from durable evidence; ${rendered.length - durableReusedItems.size} newly executed).`
+              : `Batch complete: ${rendered.length}/${rendered.length} items succeeded.`
           : uniform
             ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
             : `Batch finished with FAILURES: ${rendered.length - failed.length}/${rendered.length} succeeded; FAILED items: ${failed.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
-        return textResult([...(heavyAdvisory ? [heavyAdvisory] : []), header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n'));
+        return textResult([
+          ...(heavyAdvisory ? [heavyAdvisory] : []),
+          header,
+          ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`),
+          ...(durableReuseGuidance ? [durableReuseGuidance] : []),
+        ].join('\n\n'));
       }
-      return runOneWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput, manifestBinding);
+      const singleResult = await runOneWorker(
+        { ...packetBase, item: callItems[0] } as WorkerToolInput,
+        manifestBinding,
+      );
+      if (!allRequestedItemsReused || !manifestBinding) return singleResult;
+      const singleText = String(singleResult.content?.[0]?.text ?? '');
+      return textResult([
+        `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
+        singleText,
+        durableReuseGuidance,
+      ].filter(Boolean).join('\n\n'));
     },
   );
 
