@@ -64,6 +64,34 @@ test('renderOutcomeText: assembles summary + truncated detail + guidance', () =>
   assert.match(text, /\(.+\)\s*$/, 'ends with the guidance parenthetical');
 });
 
+test('renderOutcomeText: incomplete work leads generic prose with execution evidence and one resume action', () => {
+  const generic = "This background task wasn't completed. Do not retry it.";
+  const text = renderOutcomeText(
+    {
+      status: 'needs_input',
+      detail: generic,
+      evidence: {
+        work: [{ label: 'Research firms', completed: 119, total: 120, evidenceCount: 119 }],
+        artifacts: [{ kind: 'local file', ref: '/workspace/railway-app/package.json', verified: true }],
+        committedExternalActions: 1,
+        lastToolFailure: { tool: 'run_shell_command', summary: 'Unauthorized. Run railway login.' },
+      },
+      blocker: 'Railway CLI authentication is missing.',
+      nextAction: 'Run `railway login`, then reply `continue`.',
+      resumable: true,
+    },
+    ctx(),
+  );
+
+  assert.ok(text.indexOf('Execution evidence:') < text.indexOf(generic), 'facts lead weak incomplete prose');
+  assert.match(text, /Research firms: 119\/120 complete · 119 evidence references/);
+  assert.match(text, /Saved local file: \/workspace\/railway-app\/package\.json \(read back\)/);
+  assert.match(text, /1 committed external action receipt/);
+  assert.match(text, /Last concrete tool failure \(run_shell_command\): Unauthorized\. Run railway login\./);
+  assert.match(text, /Remaining dependency:\nRailway CLI authentication is missing\./);
+  assert.match(text, /Resume action:\nRun `railway login`, then reply `continue`\./);
+});
+
 test('renderOutcomeText: per-lane head-word override (workflow soft-block → needs attention)', () => {
   const text = renderOutcomeText(
     { status: 'blocked', detail: 'a step flagged a gap' },
@@ -81,6 +109,17 @@ test('proactive needs-input directive preserves completed progress instead of co
   assert.match(directive, /exact remaining dependency/i);
   assert.match(directive, /do not replay/i);
   assert.doesNotMatch(directive, /one short message/i);
+});
+
+test('proactive failed directive never erases partial success or replays committed work', () => {
+  const directive = renderProactiveOutcomeDirective(
+    { status: 'failed' },
+    { sourceLabel: 'background task', sourceId: 'bg-partial' },
+  );
+  assert.match(directive, /without erasing partial success/i);
+  assert.match(directive, /completed work, saved artifacts, or committed actions/i);
+  assert.match(directive, /never imply that proven work disappeared/i);
+  assert.match(directive, /do not re-run/i);
 });
 
 test('outcomePrefix matches the idempotency/UI-detect prefix exactly', () => {

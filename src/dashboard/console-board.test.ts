@@ -152,7 +152,7 @@ test('GET /api/console/board normalizes every background-task status into the ri
     expect(pending.id, 'queued', ['promote', 'cancel']);
     expect(running.id, 'running', ['cancel']);
     expect(awaiting.id, 'needs_you', ['approve', 'reject', 'cancel']);
-    expect(blocked.id, 'needs_you', ['cancel']);
+    expect(blocked.id, 'needs_you', ['resume', 'cancel']);
     expect(awaitingContinue.id, 'needs_you', ['resume', 'cancel']);
     expect(awaitingInput.id, 'needs_you', ['cancel']);
     // Terminal tasks now also offer `archive` (declutter the Done column).
@@ -160,6 +160,7 @@ test('GET /api/console/board normalizes every background-task status into the ri
     expect(interrupted.id, 'done', ['resume', 'archive']);
     assert.equal(byId.get(awaiting.id)?.primaryAction, 'approve');
     assert.equal(byId.get(awaiting.id)?.approvalId, 'appr-1');
+    assert.equal(byId.get(blocked.id)?.primaryAction, 'continue');
     assert.equal(byId.get(awaitingContinue.id)?.primaryAction, 'continue');
     assert.equal(byId.get(awaitingInput.id)?.primaryAction, 'none');
     assert.match(byId.get(awaitingInput.id)?.nextSafeAction ?? '', /originating chat/i);
@@ -525,6 +526,28 @@ test('board action route: resume re-queues an awaiting_continue background task'
   }
 });
 
+test('board action route: resume re-queues a blocked task on its saved run', async () => {
+  const task = createBackgroundTask({ title: 'blocked but durable', prompt: 'finish the saved work' });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskBlocked(task.id, 'Authenticate Railway before deployment.', 'The local app is complete.');
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/background/${task.id}/resume`, { method: 'POST' });
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      ok: boolean;
+      task?: { id: string; runSessionId: string; status: string; outcomeSnapshot?: unknown };
+    };
+    assert.equal(body.ok, true);
+    assert.equal(body.task?.id, task.id);
+    assert.equal(body.task?.runSessionId, task.runSessionId);
+    assert.equal(body.task?.status, 'pending');
+    assert.equal(body.task?.outcomeSnapshot, undefined, 'stale blocker snapshot is cleared when execution resumes');
+  } finally {
+    await h.close();
+  }
+});
+
 test('background task cockpit routes save report-back target and repost result', async () => {
   const task = createBackgroundTask({ title: 'share report', prompt: 'p' });
   markBackgroundTaskRunning(task.id);
@@ -588,7 +611,15 @@ test('background task cockpit exposes logical progress and course-corrects a par
     assert.equal(detailRes.status, 200);
     const detailText = await detailRes.text();
     const detailBody = JSON.parse(detailText) as {
-      task: { id: string; contractVersion?: number };
+      task: {
+        id: string;
+        contractVersion?: number;
+        outcomeSnapshot?: {
+          blocker?: string;
+          nextAction?: string;
+          evidence?: { work?: Array<{ completed: number; total: number }> };
+        };
+      };
       detail: Record<string, unknown>;
       workManifests?: Array<{ manifestId: string; total: number; phases: Array<{ id: string }> }>;
     };
@@ -600,6 +631,18 @@ test('background task cockpit exposes logical progress and course-corrects a par
     assert.equal(detailBody.workManifests?.[0]?.manifestId, 'accounts');
     assert.equal(detailBody.workManifests?.[0]?.total, 2);
     assert.deepEqual(detailBody.workManifests?.[0]?.phases.map((phase) => phase.id), ['research', 'merge']);
+    assert.match(detailBody.task.outcomeSnapshot?.blocker ?? '', /original source is unavailable/i);
+    assert.match(detailBody.task.outcomeSnapshot?.nextAction ?? '', /Do not recreate proven work/i);
+    assert.equal(detailBody.task.outcomeSnapshot?.evidence?.work?.[0]?.completed, 0);
+    assert.equal(detailBody.task.outcomeSnapshot?.evidence?.work?.[0]?.total, 2);
+
+    const boardRes = await fetch(`${h.url}/api/console/board`);
+    const boardBody = await boardRes.json() as {
+      cards: Array<{ id: string; progressHint: string; raw?: { outcomeSnapshot?: unknown } }>;
+    };
+    const card = boardBody.cards.find((candidate) => candidate.id === task.id);
+    assert.match(card?.progressHint ?? '', /Do not recreate proven work/i);
+    assert.ok(card?.raw?.outcomeSnapshot, 'board card carries the durable evidence-first snapshot');
 
     const reviseRes = await fetch(`${h.url}/api/console/background-tasks/${task.id}/contract-revisions`, {
       method: 'POST',

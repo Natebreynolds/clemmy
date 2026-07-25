@@ -29,10 +29,39 @@ import pino from 'pino';
 const logger = pino({ name: 'clementine-next.outcome' });
 
 // Kept lean to what lanes actually produce today (done/blocked/failed) plus
-// needs_input — the north-star "ask for clarity" status, the one forward-looking
-// member, intentionally retained. Grow the contract (artifacts, nextStep, …)
-// when a real lane produces them, not before.
+// needs_input — the north-star "ask for clarity" status. The evidence fields
+// below are deliberately execution facts, not another model verdict: manifests,
+// saved artifact references, committed-write receipts, and the latest concrete
+// tool failure. They let the model explain a partial/blocked run without the
+// harness replacing useful work with a generic status sentence.
 export type OutcomeStatus = 'done' | 'blocked' | 'failed' | 'needs_input';
+
+export interface OutcomeWorkEvidence {
+  label: string;
+  completed: number;
+  total: number;
+  evidenceCount?: number;
+}
+
+export interface OutcomeArtifactEvidence {
+  kind: string;
+  ref: string;
+  /** A provider readback or equivalent binding check verified this reference. */
+  verified?: boolean;
+}
+
+export interface OutcomeToolFailureEvidence {
+  tool?: string;
+  summary: string;
+}
+
+/** Bounded, deterministic execution evidence shared by every async lane. */
+export interface OutcomeEvidence {
+  work?: OutcomeWorkEvidence[];
+  artifacts?: OutcomeArtifactEvidence[];
+  committedExternalActions?: number;
+  lastToolFailure?: OutcomeToolFailureEvidence;
+}
 
 /** The single shape every lane produces to report back. */
 export interface Outcome {
@@ -41,6 +70,14 @@ export interface Outcome {
   summary?: string;
   /** The full result body / preview. Truncated on render. */
   detail?: string;
+  /** Runtime-owned facts that survive weak or generic model prose. */
+  evidence?: OutcomeEvidence;
+  /** The one remaining dependency, separate from completed work. */
+  blocker?: string;
+  /** Concrete action that unblocks/resumes this exact saved run. */
+  nextAction?: string;
+  /** True when the same durable run can continue after `nextAction`. */
+  resumable?: boolean;
 }
 
 export interface DeliverContext {
@@ -120,12 +157,46 @@ function guidanceFor(status: OutcomeStatus, statusHint?: string): string {
     case 'done':
       return `This ran in the background and just finished — continue from here.${statusHint ? ` Full result via ${statusHint}.` : ''}`;
     case 'failed':
-      return `This FAILED — it did NOT complete. Decide whether to retry with an adjusted approach or tell the user; do not assume it succeeded.${ref}`;
+      return `This run stopped and did NOT complete the full objective. Preserve and report any execution evidence above; do not describe proven work as lost, and do not replay side effects.${ref}`;
     case 'blocked':
-      return `This is BLOCKED — it could not finish without a prerequisite. Surface the blocker to the user or resolve it, then re-run.${ref}`;
+      return `This needs attention. Preserve and report the completed work above, name only the remaining dependency, and resume this saved work after it is resolved instead of starting over.${ref}`;
     case 'needs_input':
-      return `This NEEDS YOUR INPUT to continue — ask the user the question above, then resume; do not guess.${ref}`;
+      return `This needs user input to continue. Preserve and report the completed work above, ask for the exact remaining action, then resume this saved work; do not guess or restart.${ref}`;
   }
+}
+
+function boundedText(value: string | undefined, max: number): string {
+  return (value ?? '').trim().slice(0, max);
+}
+
+function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined): string {
+  if (!evidence) return '';
+  const lines: string[] = [];
+  for (const work of (evidence.work ?? []).slice(0, 4)) {
+    const label = boundedText(work.label, 160) || 'Logical work';
+    const completed = Math.max(0, Math.trunc(work.completed));
+    const total = Math.max(0, Math.trunc(work.total));
+    const refs = typeof work.evidenceCount === 'number'
+      ? ` · ${Math.max(0, Math.trunc(work.evidenceCount))} evidence reference${Math.trunc(work.evidenceCount) === 1 ? '' : 's'}`
+      : '';
+    lines.push(`- ${label}: ${completed}/${total} complete${refs}`);
+  }
+  for (const artifact of (evidence.artifacts ?? []).slice(0, 8)) {
+    const ref = boundedText(artifact.ref, 500);
+    if (!ref) continue;
+    const kind = boundedText(artifact.kind, 80) || 'artifact';
+    lines.push(`- Saved ${kind}: ${ref}${artifact.verified ? ' (read back)' : ''}`);
+  }
+  if (typeof evidence.committedExternalActions === 'number' && evidence.committedExternalActions > 0) {
+    const count = Math.max(0, Math.trunc(evidence.committedExternalActions));
+    lines.push(`- ${count} committed external action receipt${count === 1 ? '' : 's'}`);
+  }
+  const failureSummary = boundedText(evidence.lastToolFailure?.summary, 700);
+  if (failureSummary) {
+    const tool = boundedText(evidence.lastToolFailure?.tool, 120);
+    lines.push(`- Last concrete tool failure${tool ? ` (${tool})` : ''}: ${failureSummary}`);
+  }
+  return lines.length > 0 ? `Execution evidence:\n${lines.join('\n')}` : '';
 }
 
 /** Render the canonical report-back text. The head + prefix are stable (UI and
@@ -137,9 +208,22 @@ export function renderOutcomeText(outcome: Outcome, ctx: DeliverContext): string
 
   const parts: string[] = [];
   if (outcome.summary && outcome.summary.trim()) parts.push(outcome.summary.trim());
+  const evidence = renderOutcomeEvidence(outcome.evidence);
+  // On incomplete work, runtime-owned facts lead the free-form report. That
+  // way a weak "task did not complete" sentence can never hide 119/120 saved
+  // items or an already-written artifact. Successful runs keep Clementine's
+  // own report first and use the evidence block as support.
+  if (outcome.status !== 'done' && evidence) parts.push(evidence);
   if (outcome.detail && outcome.detail.trim() && outcome.detail.trim() !== outcome.summary?.trim()) {
     const d = outcome.detail.trim();
     parts.push(d.length > cap ? `${d.slice(0, cap)}\n…[truncated]` : d);
+  }
+  if (outcome.status === 'done' && evidence) parts.push(evidence);
+  const blocker = boundedText(outcome.blocker, 1000);
+  if (blocker) parts.push(`Remaining dependency:\n${blocker}`);
+  const nextAction = boundedText(outcome.nextAction, 700);
+  if (nextAction) {
+    parts.push(`${outcome.resumable ? 'Resume action' : 'Next safe action'}:\n${nextAction}`);
   }
   parts.push(`(${guidanceFor(outcome.status, ctx.statusHint)})`);
 
@@ -225,7 +309,8 @@ export function renderProactiveOutcomeDirective(
         + goalTail;
     case 'failed':
       return `A ${ctx.sourceLabel} you started from this conversation FAILED (see the latest ${ref} FAILED note in context). `
-        + 'Relay the failure to the user NOW in one short message: lead with the failure and the key reason. Do not re-run anything in this turn.'
+        + 'Relay it NOW without erasing partial success: first state any completed work, saved artifacts, or committed actions from the note; then name what stopped and the next safe action. '
+        + 'Do not re-run anything in this turn and never imply that proven work disappeared.'
         + goalTail;
     case 'blocked':
       // 'blocked' is a LANE, not one shape: a run that couldn't produce its
@@ -238,6 +323,7 @@ export function renderProactiveOutcomeDirective(
         + 'Relay the note\'s substance NOW in one concise but COMPLETE message, matching what it actually says and preserving completed progress: '
         + 'if it delivered a result with a quality warning, lead with the result and what to review; '
         + 'if a prerequisite was missing, lead with what is missing and what decision or action is needed. '
+        + 'Always include saved artifacts or completed item counts from the execution-evidence block. '
         + 'Never call the work failed or blocked if the note says it completed. Do not replay prior work or side effects in this turn.'
         + goalTail;
     case 'done':
@@ -538,6 +624,10 @@ export function deliverOutcomeWithAcknowledgement(
           sourceId: ctx.sourceId,
           status: outcome.status,
           deliveryPhase: 'passive',
+          ...(outcome.evidence ? { evidence: outcome.evidence } : {}),
+          ...(outcome.blocker ? { blocker: outcome.blocker } : {}),
+          ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}),
+          ...(outcome.resumable !== undefined ? { resumable: outcome.resumable } : {}),
         },
       });
       try {

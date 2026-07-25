@@ -25,8 +25,13 @@ import {
   SLACK_ENABLED,
 } from '../config.js';
 import { addNotification, markNotificationsReadByQuestionId } from '../runtime/notifications.js';
-import { deliverOutcome } from '../runtime/outcome.js';
+import {
+  deliverOutcome,
+  type Outcome,
+  type OutcomeEvidence,
+} from '../runtime/outcome.js';
 import { humanizeReportBody } from '../runtime/report-voice.js';
+import { redactSensitiveText } from '../runtime/security.js';
 import { getGoalPinForDelegation, getActiveGoalForSession } from '../agents/plan-proposals.js';
 import { deliverableProbesEnabled, extractDeliverables, probeSessionDeliverables } from './deliverable-probe.js';
 import { ExecutionStore } from './store.js';
@@ -118,6 +123,15 @@ export type BackgroundTaskStatus =
   | 'aborted'
   | 'interrupted';
 
+export interface BackgroundTaskOutcomeSnapshot {
+  version: 1;
+  capturedAt: string;
+  evidence?: OutcomeEvidence;
+  blocker?: string;
+  nextAction?: string;
+  resumable?: boolean;
+}
+
 export interface BackgroundTaskRecord {
   id: string;
   title: string;
@@ -175,6 +189,10 @@ export interface BackgroundTaskRecord {
   result?: string;
   resultPath?: string;
   error?: string;
+  /** Evidence-first report-back captured at the latest settle/park boundary.
+   * This is runtime-owned execution truth, not a second model verdict. It
+   * survives replay, daemon restart, and weak final prose. */
+  outcomeSnapshot?: BackgroundTaskOutcomeSnapshot;
   pendingApprovalId?: string;
   /** One-shot guard: set when the settle auto-queued a continuation because a
    *  completion lacked deliverable evidence (2026-07-23). A second artifact-less
@@ -1599,6 +1617,7 @@ function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' |
     pendingQuestion: undefined,
     inputResolution: undefined,
     continueResolution: undefined,
+    outcomeSnapshot: undefined,
   };
 }
 
@@ -1619,6 +1638,7 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     status: 'running',
     startedAt: nowIso(),
     error: undefined,
+    outcomeSnapshot: undefined,
     pendingApprovalId: undefined,
     // Clear the parked-question MARKER but preserve inputResolution — the drain
     // reads inputResolution to resume with the answer (mirrors how
@@ -1691,8 +1711,22 @@ function enqueueBackgroundTaskOutcomeTurn(
   // Unified report-back (Move 4): one mechanism for every lane. Preserves the
   // `[background task <id> …]` prefix (idempotency + UI detect); the body is the
   // shared Outcome card. See src/runtime/outcome.ts.
+  const snapshot = task.outcomeSnapshot
+    ?? buildBackgroundTaskOutcomeSnapshot(task, outcome, {
+      blocker: task.error,
+      nextAction: outcome === 'needs_input' ? task.pendingQuestion : undefined,
+      resumable: outcome === 'needs_input',
+    });
+  const payload: Outcome = {
+    status: outcome,
+    detail,
+    evidence: snapshot.evidence,
+    blocker: snapshot.blocker,
+    nextAction: snapshot.nextAction,
+    resumable: snapshot.resumable,
+  };
   return deliverOutcome(
-    { status: outcome, detail },
+    payload,
     {
       originSessionId: task.originSessionId,
       sourceLabel: 'background task',
@@ -1876,6 +1910,7 @@ export function markBackgroundTaskDone(
       result: resultPath ? `${result.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : result,
       resultPath,
       error: undefined,
+      outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'done'),
     };
   });
   if (updated) {
@@ -1976,7 +2011,7 @@ export function markBackgroundTaskAwaitingInput(
   if (!prepareWorkerSettlementForCas(id)) return null;
   const reportDetail = progressPreservingPauseDetail(question, opts);
   const notificationBody = progressPreservingPauseDetail(question, opts, 2000);
-  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
+  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, (task) => ({
     ...clearParkedBackgroundState(),
     status: 'awaiting_input',
     completedAt: undefined,
@@ -1984,7 +2019,13 @@ export function markBackgroundTaskAwaitingInput(
     pendingQuestionId: questionId,
     pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
     result: (opts.resultText ?? question).slice(0, RESULT_TRUNCATE_CHARS),
-  });
+    outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'needs_input', {
+      blocker: opts.blockerReason,
+      blockerType: opts.blockerType,
+      nextAction: question,
+      resumable: true,
+    }),
+  }));
   if (updated) {
     addNotification({
       id: `${Date.now()}-background-${updated.id}-needs-input`,
@@ -2018,12 +2059,17 @@ export function markBackgroundTaskAwaitingInput(
 
 export function markBackgroundTaskAwaitingApproval(id: string, approvalId: string, resultText: string): BackgroundTaskRecord | null {
   if (!prepareWorkerSettlementForCas(id)) return null;
-  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
+  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, (task) => ({
     ...clearParkedBackgroundState(),
     status: 'awaiting_approval',
     pendingApprovalId: approvalId,
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
-  });
+    outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'needs_input', {
+      blocker: `Approval ${approvalId} is required before the remaining action can run.`,
+      nextAction: 'Review the queued approval. If you approve it, this same task resumes automatically.',
+      resumable: true,
+    }),
+  }));
   if (updated) {
     addNotification({
       id: `${Date.now()}-background-${updated.id}-approval`,
@@ -2061,13 +2107,19 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
 export function markBackgroundTaskAwaitingContinue(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
   if (!prepareWorkerSettlementForCas(id)) return null;
   const reasonText = clean(reason || 'The task reached its internal run budget before finishing.', 1000);
-  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
+  const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, (task) => ({
     ...clearParkedBackgroundState(),
     status: 'awaiting_continue',
     completedAt: undefined,
     error: reasonText,
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
-  });
+    outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'needs_input', {
+      blocker: reasonText,
+      blockerType: 'budget',
+      nextAction: 'Reply `continue` or resume this task from the Tasks board. Clementine will continue from the saved run.',
+      resumable: true,
+    }),
+  }));
   if (updated) {
     addNotification({
       id: `${Date.now()}-background-${updated.id}-awaiting-continue`,
@@ -2101,21 +2153,26 @@ export function markBackgroundTaskAwaitingContinue(id: string, reason: string, r
  * without X" — never silently a 'done'. The notification is `approval`
  * kind so it surfaces with attention; the body carries the concrete
  * blocker + what the user can do. The task is NOT auto-resumed (resume
- * would just re-block); the user re-runs once the blocker is cleared.
+ * would just re-block); the user explicitly resumes the same saved task once
+ * the blocker is cleared.
  */
 export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string, knownBlockerType?: BlockerType): BackgroundTaskRecord | null {
   if (!prepareWorkerSettlementForCas(id)) return null;
-  const updated = updateBackgroundTaskWhere(id, workerBlockedMayProceed, {
+  const blockerType = knownBlockerType ?? classifyBlocker(reason);
+  const updated = updateBackgroundTaskWhere(id, workerBlockedMayProceed, (task) => ({
     ...clearParkedBackgroundState(),
     status: 'blocked',
     completedAt: nowIso(),
     error: clean(reason, 1000),
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
-  });
+    outcomeSnapshot: buildBackgroundTaskOutcomeSnapshot(task, 'blocked', {
+      blocker: reason,
+      blockerType,
+    }),
+  }));
   if (updated) {
     // Tag the blocker by KIND (deterministic, zero-token) so the dashboard /
     // proactive brief / future routing can act on the class, not just the prose.
-    const blockerType = knownBlockerType ?? classifyBlocker(reason);
     const reportDetail = progressPreservingPauseDetail(
       'Resolve the remaining blocker before starting another run.',
       { resultText, blockerReason: reason, blockerType },
@@ -2189,12 +2246,15 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
   const updated = updateBackgroundTaskWhere(
     id,
     (task) => workerFailureMayProceed(task, status),
-    {
+    (task) => ({
       ...clearParkedBackgroundState(),
       status,
       completedAt: nowIso(),
       error: clean(error, 1000),
-    },
+      outcomeSnapshot: status === 'failed'
+        ? buildBackgroundTaskOutcomeSnapshot(task, 'failed', { blocker: error })
+        : undefined,
+    }),
   );
   if (updated) emitBackgroundTaskFailedTransition(updated, error, status);
   return updated;
@@ -2422,6 +2482,181 @@ export function backgroundCompletionEvidence(
     }
   } catch { /* unreadable evidence stays absent */ }
   return { artifactBindings, extractedDeliverables, externalWriteReceipts, ambiguousExternalWrites };
+}
+
+function latestConcreteToolFailure(
+  sessionId: string,
+): NonNullable<OutcomeEvidence['lastToolFailure']> | undefined {
+  try {
+    const events = listHarnessEventsForRefute(sessionId, {
+      types: ['tool_returned'],
+      desc: true,
+      limit: 120,
+    });
+    for (const event of events) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      const raw = [data.error, data.result, data.preview, data.output]
+        .find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? '';
+      if (!raw) continue;
+      const structured = detectStructuredToolFailure(raw);
+      const failed = data.ok === false
+        || data.isError === true
+        || (typeof data.error === 'string' && data.error.trim().length > 0)
+        || structured.failed
+        || /\bexit_code\s*:\s*[1-9]\d*\b/i.test(raw);
+      if (!failed) continue;
+      const summary = clean(redactSensitiveText(structured.summary || raw), 700);
+      if (!summary) continue;
+      const tool = typeof data.tool === 'string' ? clean(data.tool, 120) : undefined;
+      return { ...(tool ? { tool } : {}), summary };
+    }
+  } catch {
+    // Outcome evidence is a report-back enhancement, never a settlement gate.
+  }
+  return undefined;
+}
+
+function backgroundOutcomeEvidence(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+  includeToolFailure = true,
+): OutcomeEvidence | undefined {
+  const work = summarizeWorkManifests(task.runSessionId)
+    .slice(-4)
+    .map((manifest) => ({
+      label: manifest.objective || manifest.manifestId,
+      completed: manifest.completed,
+      total: manifest.total,
+      evidenceCount: manifest.evidenceCount,
+    }));
+
+  const artifacts: NonNullable<OutcomeEvidence['artifacts']> = [];
+  const seenArtifacts = new Set<string>();
+  const addArtifact = (kind: string, ref: string | null | undefined, verified?: boolean): void => {
+    const safeRef = redactSensitiveText(ref ?? '').trim().slice(0, 500);
+    if (!safeRef) return;
+    const key = `${kind}:${safeRef}`;
+    if (seenArtifacts.has(key) || artifacts.length >= 8) return;
+    seenArtifacts.add(key);
+    artifacts.push({
+      kind: clean(kind || 'artifact', 80),
+      ref: safeRef,
+      ...(verified ? { verified: true } : {}),
+    });
+  };
+  try {
+    for (const artifact of listRunArtifacts(task.runSessionId)) {
+      if (artifact.status !== 'bound') continue;
+      addArtifact(
+        artifact.kind,
+        artifact.uri || artifact.resourceId,
+        Boolean(artifact.bindingVerifiedAt),
+      );
+    }
+  } catch { /* best-effort evidence projection */ }
+  try {
+    for (const deliverable of extractDeliverables(task.runSessionId)) {
+      addArtifact(deliverable.kind, deliverable.ref);
+    }
+  } catch { /* best-effort evidence projection */ }
+
+  const completion = backgroundCompletionEvidence(task);
+  // A recovered error remains useful trace history, but it is not a remaining
+  // dependency once the run honestly settles done.
+  const lastToolFailure = includeToolFailure
+    ? latestConcreteToolFailure(task.runSessionId)
+    : undefined;
+  const evidence: OutcomeEvidence = {
+    ...(work.length > 0 ? { work } : {}),
+    ...(artifacts.length > 0 ? { artifacts } : {}),
+    ...(completion.externalWriteReceipts > 0
+      ? { committedExternalActions: completion.externalWriteReceipts }
+      : {}),
+    ...(lastToolFailure ? { lastToolFailure } : {}),
+  };
+  return evidence.work
+    || evidence.artifacts
+    || evidence.committedExternalActions
+    || evidence.lastToolFailure
+    ? evidence
+    : undefined;
+}
+
+function defaultBackgroundNextAction(
+  outcome: BackgroundTaskOutcome,
+  blockerType: BlockerType | undefined,
+): { nextAction?: string; resumable?: boolean } {
+  if (outcome === 'done') return {};
+  if (blockerType === 'permission') {
+    return {
+      nextAction: 'Authenticate or reconnect the service named in the concrete tool failure above, then reply `continue`. Clementine will resume this same saved task.',
+      resumable: true,
+    };
+  }
+  if (blockerType === 'needs_user_input') {
+    return {
+      nextAction: 'Provide the missing input, then reply `continue`. Clementine will resume this same saved task.',
+      resumable: true,
+    };
+  }
+  if (blockerType === 'needs_approval') {
+    return {
+      nextAction: 'Review the pending approval. If approved, resume this same saved task.',
+      resumable: true,
+    };
+  }
+  if (blockerType === 'budget') {
+    return {
+      nextAction: 'Reply `continue` or resume from the Tasks board to continue this same saved run.',
+      resumable: true,
+    };
+  }
+  if (blockerType === 'rate_limited' || blockerType === 'external_down') {
+    return {
+      nextAction: 'Wait for the provider to recover, then resume this same saved task. Do not repeat already committed actions.',
+      resumable: true,
+    };
+  }
+  if (outcome === 'needs_input') {
+    return {
+      nextAction: 'Answer the question above so Clementine can resume this same saved task.',
+      resumable: true,
+    };
+  }
+  return outcome === 'blocked' || outcome === 'failed'
+    ? {
+      nextAction: 'Inspect the saved evidence, resolve the remaining issue, then resume this same saved task. Do not recreate proven work or repeat committed actions.',
+      resumable: true,
+    }
+    : {};
+}
+
+function buildBackgroundTaskOutcomeSnapshot(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+  outcome: BackgroundTaskOutcome,
+  input: {
+    blocker?: string;
+    blockerType?: BlockerType;
+    nextAction?: string;
+    resumable?: boolean;
+  } = {},
+): BackgroundTaskOutcomeSnapshot {
+  const blocker = input.blocker ? clean(redactSensitiveText(input.blocker), 1000) : undefined;
+  const blockerType = input.blockerType ?? (blocker ? classifyBlocker(blocker) : undefined);
+  const fallback = defaultBackgroundNextAction(outcome, blockerType);
+  const nextAction = clean(
+    redactSensitiveText(input.nextAction ?? fallback.nextAction ?? ''),
+    700,
+  ) || undefined;
+  return {
+    version: 1,
+    capturedAt: nowIso(),
+    evidence: backgroundOutcomeEvidence(task, outcome !== 'done'),
+    ...(blocker ? { blocker } : {}),
+    ...(nextAction ? { nextAction } : {}),
+    ...((input.resumable ?? fallback.resumable) !== undefined
+      ? { resumable: input.resumable ?? fallback.resumable }
+      : {}),
+  };
 }
 
 function hasDurableDeliverableEvidence(evidence: BackgroundCompletionEvidence): boolean {
@@ -2981,13 +3216,14 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   // original task itself keeps the historical API behavior (Resume on a task
   // that is already live is a no-op).
   if (followed && LIVE_TASK_STATUSES.includes(task.status)) return task;
-  if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') return null;
+  if (task.status !== 'interrupted' && task.status !== 'failed'
+    && task.status !== 'aborted' && task.status !== 'blocked') return null;
 
-  // Every terminal retry stays on the SAME task and run session. Failed/aborted
-  // turns can contain the same committed or ambiguous mutations as a restart;
-  // cloning them would hide that evidence from the next executor. Manual Resume
-  // is the explicit verification boundary, and the continuation prompt directs
-  // the worker to inspect the retained receipt history before another mutation.
+  // Every terminal retry stays on the SAME task and run session. Failed,
+  // aborted, and blocked turns can contain committed or ambiguous mutations;
+  // cloning them would hide that evidence from the next executor. Manual
+  // Resume is the explicit verification boundary, and the continuation prompt
+  // directs the worker to inspect retained receipts before another mutation.
   return reattachBackgroundTaskInPlace(task.id, {
     mode: task.status === 'interrupted' ? 'manual_restart' : 'manual_retry',
     assessment: assessBackgroundTaskRestartSafety(task),
@@ -3069,9 +3305,10 @@ export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): n
  * Reattach a task to its own resuming run instead of cloning it: flip the SAME
  * record back to `pending` (so the drain re-drives its existing
  * `background:<id>` session), clear the interrupt error, and carry a continuation
- * marker. Used for every restart interruption and every explicit failed/aborted
- * retry. The resumeCount bump keeps crash caps meaningful. No new task record,
- * exactly one executor, and the receipt ledger remains attached.
+ * marker. Used for every restart interruption and every explicit
+ * failed/aborted/blocked retry. The resumeCount bump keeps crash caps
+ * meaningful. No new task record, exactly one executor, and the receipt ledger
+ * remains attached.
  */
 function reattachBackgroundTaskInPlace(
   id: string,
@@ -3089,7 +3326,7 @@ function reattachBackgroundTaskInPlace(
   // reattach must survive — never be clobbered back to `pending` (finding C). We
   // both bail on a non-interrupted read here AND pin the CAS below to
   // 'interrupted', closing the abort-before-read and abort-before-write windows.
-  // Manual retries legitimately resume failed/aborted tasks, so they keep
+  // Manual retries legitimately resume failed/aborted/blocked tasks, so they keep
   // anchoring the CAS to the status this reattach observed.
   if (mode === 'automatic_restart' && task.status !== 'interrupted') return null;
   const requiredStatus = mode === 'automatic_restart' ? 'interrupted' : task.status;
@@ -3107,7 +3344,7 @@ function reattachBackgroundTaskInPlace(
     ? 'Resumed in place after a daemon restart (durable history proved no external writes).'
     : mode === 'manual_restart'
       ? 'Explicitly resumed in place after a daemon restart; verify prior external outcomes before any retry.'
-      : 'Explicitly retried in place after a failed or aborted run; verify prior external outcomes before any retry.';
+      : 'Explicitly retried in place after a failed, aborted, or blocked run; verify prior external outcomes before any retry.';
   const updated = updateBackgroundTaskWhere(id, (latest) => (
     latest.status === requiredStatus
     && latest.resumedIntoTaskId === task.resumedIntoTaskId
@@ -3117,6 +3354,7 @@ function reattachBackgroundTaskInPlace(
     error: undefined,
     startedAt: undefined,
     completedAt: undefined,
+    outcomeSnapshot: undefined,
     resumeCount: (latest.resumeCount ?? 0) + 1,
     restartRecovery,
     continueResolution: {

@@ -127,7 +127,8 @@ export function assembleBoardSummary(sources: BoardSummarySources, now: number =
     const column: BoardSummaryColumn =
       task.status === 'pending' ? 'queued'
         : task.status === 'running' || task.status === 'cancelling' ? 'running'
-          : task.status === 'awaiting_approval' || task.status === 'awaiting_continue' || task.status === 'blocked' ? 'needs_you'
+          : task.status === 'awaiting_approval' || task.status === 'awaiting_input'
+            || task.status === 'awaiting_continue' || task.status === 'blocked' ? 'needs_you'
             : 'done';
     place({
       sourceKind: 'background',

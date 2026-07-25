@@ -78,6 +78,7 @@ export interface BoardCard {
     approvalKind?: string;
     workflowSlug?: string;
     needsAttention?: boolean;
+    outcomeSnapshot?: TaskOutcomeSnapshot;
   };
 }
 
@@ -158,6 +159,32 @@ export interface WorkManifestProgress {
   updatedAt?: string;
 }
 
+export interface TaskOutcomeSnapshot {
+  version: 1;
+  capturedAt: string;
+  evidence?: {
+    work?: Array<{
+      label: string;
+      completed: number;
+      total: number;
+      evidenceCount?: number;
+    }>;
+    artifacts?: Array<{
+      kind: string;
+      ref: string;
+      verified?: boolean;
+    }>;
+    committedExternalActions?: number;
+    lastToolFailure?: {
+      tool?: string;
+      summary: string;
+    };
+  };
+  blocker?: string;
+  nextAction?: string;
+  resumable?: boolean;
+}
+
 export interface BackgroundTaskDetail {
   task: {
     id: string;
@@ -182,6 +209,7 @@ export interface BackgroundTaskDetail {
     result?: string;
     resultFull?: string;
     error?: string;
+    outcomeSnapshot?: TaskOutcomeSnapshot;
     requestedModel?: string;
     effectiveModel?: string;
     modelProvider?: string;

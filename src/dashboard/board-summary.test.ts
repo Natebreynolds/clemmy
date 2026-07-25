@@ -56,6 +56,7 @@ test('assembleBoardSummary maps statuses to the same columns as the board', () =
       bgTask({ title: 'Pending task', status: 'pending', updatedAt: ago(5 * MIN) }),
       bgTask({ title: 'Running task', status: 'running', updatedAt: ago(12 * MIN) }),
       bgTask({ title: 'Blocked task', status: 'blocked', updatedAt: ago(2 * MIN) }),
+      bgTask({ title: 'Question task', status: 'awaiting_input', updatedAt: ago(90_000) }),
       bgTask({ title: 'Done task', status: 'done', updatedAt: ago(30 * MIN) }),
       bgTask({ title: 'Archived task', status: 'done', archived: true, updatedAt: ago(1 * MIN) }),
     ],
@@ -83,7 +84,7 @@ test('assembleBoardSummary maps statuses to the same columns as the board', () =
   assert.deepEqual(summary.running.map((i) => i.title).sort(),
     ['Active goal', 'Live run', 'Running task', 'Weekly Report'].sort());
   assert.deepEqual(summary.needsYou.map((i) => i.title).sort(),
-    ['Blocked task', 'Paused goal', 'Send the email'].sort());
+    ['Blocked task', 'Paused goal', 'Question task', 'Send the email'].sort());
   assert.deepEqual(summary.queued.map((i) => i.title).sort(),
     ['Pending task', 'nightly'].sort());
   assert.deepEqual(summary.doneToday.map((i) => i.title), ['Done task']);

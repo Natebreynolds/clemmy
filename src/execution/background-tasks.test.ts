@@ -2236,6 +2236,134 @@ test('Railway auth blocker preserves completed work, pauses resumably, and conti
   assert.equal(calls, 2, 'one initial turn plus one checkpointed continuation');
 });
 
+test('evidence-first Railway report survives a generic model ending', () => {
+  const origin = createSession({ kind: 'chat', title: 'Railway generic-ending origin' });
+  const artifactPath = path.join(TMP_HOME, 'workspace', 'railway-app', 'package.json');
+  mkdirSync(path.dirname(artifactPath), { recursive: true });
+  writeFileSync(artifactPath, '{"scripts":{"build":"vite build"}}');
+  const task = createBackgroundTask({
+    title: 'Build and deploy the Railway app',
+    prompt: 'Build the app locally, verify it, and deploy it with the Railway CLI.',
+    originSessionId: origin.id,
+  });
+  markBackgroundTaskRunning(task.id);
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'write_file',
+      callId: 'railway-local-artifact',
+      ok: true,
+      preview: `Wrote ${artifactPath} (35 bytes)`,
+    },
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'run_shell_command',
+      callId: 'railway-auth-check',
+      ok: false,
+      preview: 'exit_code: 1\n\nstderr:\nUnauthorized. Run `railway login` before deploying.',
+    },
+  });
+
+  const generic = "This background task wasn't completed. Do not retry it.";
+  const parked = markBackgroundTaskAwaitingInput(
+    task.id,
+    'q-railway-evidence-first',
+    'Run `railway login`, then reply `continue` so I can resume this same task.',
+    {
+      resultText: generic,
+      blockerReason: 'Railway CLI authentication is missing. Run `railway login`.',
+      blockerType: 'permission',
+    },
+  );
+
+  assert.equal(parked?.status, 'awaiting_input');
+  assert.ok(parked?.outcomeSnapshot, 'the structured settle snapshot is durable on the task');
+  assert.equal(parked?.outcomeSnapshot?.version, 1);
+  assert.ok(
+    parked?.outcomeSnapshot?.evidence?.artifacts?.some((artifact) => artifact.ref === artifactPath),
+    'the local work product survives independently of model prose',
+  );
+  assert.match(parked?.outcomeSnapshot?.evidence?.lastToolFailure?.summary ?? '', /railway login/i);
+  assert.match(parked?.outcomeSnapshot?.blocker ?? '', /Railway CLI authentication is missing/i);
+  assert.match(parked?.outcomeSnapshot?.nextAction ?? '', /railway login/i);
+  assert.equal(parked?.outcomeSnapshot?.resumable, true);
+
+  const reportBack = listEvents(origin.id, { types: ['user_input_received'] })
+    .map((event) => String(event.data?.text ?? ''))
+    .find((text) => text.includes(task.id));
+  assert.ok(reportBack);
+  assert.ok(
+    reportBack!.indexOf('Execution evidence:') < reportBack!.indexOf(generic),
+    'runtime evidence leads the generic model ending',
+  );
+  assert.match(reportBack!, new RegExp(artifactPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(reportBack!, /Last concrete tool failure.*railway login/i);
+  assert.match(reportBack!, /Remaining dependency.*Railway CLI authentication is missing/is);
+  assert.match(reportBack!, /Resume action.*railway login/is);
+});
+
+test('evidence-first long-horizon report preserves 119 of 120 completed items behind one blocker', () => {
+  const origin = createSession({ kind: 'chat', title: 'Long horizon partial origin' });
+  const task = createBackgroundTask({
+    title: 'Research 120 firms',
+    prompt: 'Research 120 firms and produce a comparison.',
+    originSessionId: origin.id,
+  });
+  markBackgroundTaskRunning(task.id);
+  const items = Array.from({ length: 120 }, (_, index) => ({ id: `firm-${index + 1}` }));
+  declareWorkManifest({
+    sessionId: task.runSessionId,
+    manifestId: 'firm-research',
+    contractVersion: 1,
+    objective: 'Research 120 firms',
+    phases: [{ id: 'research', label: 'Research firms' }],
+    items,
+  });
+  for (let index = 0; index < 119; index += 1) {
+    checkpointWorkItem({
+      sessionId: task.runSessionId,
+      manifestId: 'firm-research',
+      contractVersion: 1,
+      phase: 'research',
+      itemId: `firm-${index + 1}`,
+      status: 'succeeded',
+      evidence: [{ kind: 'source', ref: `source:firm-${index + 1}` }],
+    });
+  }
+
+  const generic = 'The background task did not complete. Do not retry until the missing input is provided.';
+  const blocked = markBackgroundTaskBlocked(
+    task.id,
+    'Firm 120 has no accessible source record. Provide its canonical URL.',
+    generic,
+    'missing_data',
+  );
+  assert.equal(blocked?.status, 'blocked');
+  assert.deepEqual(blocked?.outcomeSnapshot?.evidence?.work, [{
+    label: 'Research 120 firms',
+    completed: 119,
+    total: 120,
+    evidenceCount: 119,
+  }]);
+
+  const reportBack = listEvents(origin.id, { types: ['user_input_received'] })
+    .map((event) => String(event.data?.text ?? ''))
+    .find((text) => text.includes(task.id));
+  assert.ok(reportBack);
+  assert.ok(reportBack!.indexOf('119/120 complete') < reportBack!.indexOf(generic));
+  assert.match(reportBack!, /119 evidence references/);
+  assert.match(reportBack!, /Firm 120 has no accessible source record/);
+  assert.match(reportBack!, /Do not recreate proven work/i);
+});
+
 test('awaiting-input notifications preserve origin metadata and route Slack report-backs to requester DM', () => {
   const discordTask = createBackgroundTask({
     title: 'Discord follow-up',
@@ -2350,6 +2478,33 @@ test('resumeBackgroundTask re-queues awaiting_continue without spawning a child 
   assert.equal(resumed?.id, task.id);
   assert.equal(resumed?.status, 'pending');
   assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, undefined);
+});
+
+test('resumeBackgroundTask reattaches a blocked task to its saved run and clears the stale outcome', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const task = createBackgroundTask({
+    title: 'Deploy the finished Railway app',
+    prompt: 'Deploy the local app after authentication.',
+    originSessionId: 'console:blocked-resume',
+  });
+  markBackgroundTaskRunning(task.id);
+  const blocked = markBackgroundTaskBlocked(
+    task.id,
+    'Railway CLI authentication is missing.',
+    'The application files are complete and saved locally.',
+    'permission',
+  );
+  assert.equal(blocked?.status, 'blocked');
+  assert.ok(blocked?.outcomeSnapshot);
+
+  const resumed = resumeBackgroundTask(task.id);
+  assert.equal(resumed?.id, task.id);
+  assert.equal(resumed?.runSessionId, task.runSessionId);
+  assert.equal(resumed?.status, 'pending');
+  assert.equal(resumed?.resumeCount, 1);
+  assert.equal(resumed?.outcomeSnapshot, undefined);
+  assert.match(resumed?.continueResolution?.reason ?? '', /blocked run/i);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1);
 });
 
 // ─── dispatch tool: agreed plan flows into the worker prompt verbatim ───

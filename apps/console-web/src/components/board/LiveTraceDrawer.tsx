@@ -553,6 +553,14 @@ export function LiveTraceDrawer({
 
   const tone = cardTone(card);
   const taskResult = taskDetail?.task.resultFull ?? taskDetail?.task.result ?? '';
+  const outcomeSnapshot = taskDetail?.task.outcomeSnapshot ?? card.raw.outcomeSnapshot;
+  const outcomeEvidence = outcomeSnapshot?.evidence;
+  const hasOutcomeEvidence = Boolean(
+    outcomeEvidence?.work?.length
+    || outcomeEvidence?.artifacts?.length
+    || outcomeEvidence?.committedExternalActions
+    || outcomeEvidence?.lastToolFailure,
+  );
   const canStopCanonicalRun = Boolean(onAction && canStopCanonicalRunFromDrawer(card));
 
   return (
@@ -728,6 +736,82 @@ export function LiveTraceDrawer({
                       <div>
                         <div className="text-caption font-semibold text-faint">Latest activity</div>
                         <div className="text-small text-fg">{taskDetail.detail.latestActivitySummary}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {(hasOutcomeEvidence || outcomeSnapshot?.blocker || outcomeSnapshot?.nextAction) && (
+                  <div className="space-y-3 rounded-md border border-border px-3 py-3">
+                    <div>
+                      <div className="flex items-center gap-1.5 text-small font-semibold text-fg">
+                        <CheckCircle2 className="h-4 w-4 text-success" aria-hidden />
+                        Execution evidence
+                      </div>
+                      <div className="mt-0.5 text-caption text-faint">
+                        Durable facts from the work graph, artifact ledger, and tool receipts—not a completion guess.
+                      </div>
+                    </div>
+
+                    {(outcomeEvidence?.work?.length ?? 0) > 0 && (
+                      <div className="space-y-1.5">
+                        {outcomeEvidence!.work!.map((work, index) => (
+                          <div key={`${work.label}-${index}`} className="flex items-start justify-between gap-3 rounded-sm bg-subtle px-2.5 py-2 text-small">
+                            <span className="min-w-0 text-fg">{work.label}</span>
+                            <span className="shrink-0 font-semibold text-muted">
+                              {work.completed}/{work.total}
+                              {work.evidenceCount !== undefined ? ` · ${work.evidenceCount} refs` : ''}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {(outcomeEvidence?.artifacts?.length ?? 0) > 0 && (
+                      <div>
+                        <div className="text-caption font-semibold text-faint">Saved artifacts</div>
+                        <div className="mt-1 space-y-1">
+                          {outcomeEvidence!.artifacts!.map((artifact, index) => (
+                            <div key={`${artifact.kind}-${artifact.ref}-${index}`} className="break-all text-small text-fg">
+                              <span className="font-semibold">{artifact.kind}</span>: {artifact.ref}
+                              {artifact.verified ? <span className="text-success"> · read back</span> : null}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {outcomeEvidence?.committedExternalActions ? (
+                      <div className="text-small text-fg">
+                        <span className="font-semibold">{outcomeEvidence.committedExternalActions}</span>{' '}
+                        committed external action receipt{outcomeEvidence.committedExternalActions === 1 ? '' : 's'}
+                      </div>
+                    ) : null}
+
+                    {outcomeEvidence?.lastToolFailure && (
+                      <div className="rounded-sm border border-warning/30 bg-warning-tint px-2.5 py-2">
+                        <div className="text-caption font-semibold text-warning">
+                          Last concrete tool failure{outcomeEvidence.lastToolFailure.tool ? ` · ${outcomeEvidence.lastToolFailure.tool}` : ''}
+                        </div>
+                        <div className="mt-0.5 text-small text-fg">{outcomeEvidence.lastToolFailure.summary}</div>
+                      </div>
+                    )}
+
+                    {outcomeSnapshot?.blocker && (
+                      <div>
+                        <div className="flex items-center gap-1 text-caption font-semibold text-warning">
+                          <AlertCircle className="h-3.5 w-3.5" aria-hidden />
+                          Remaining dependency
+                        </div>
+                        <div className="mt-0.5 text-small text-fg">{outcomeSnapshot.blocker}</div>
+                      </div>
+                    )}
+                    {outcomeSnapshot?.nextAction && (
+                      <div>
+                        <div className="text-caption font-semibold text-primary">
+                          {outcomeSnapshot.resumable ? 'Resume action' : 'Next safe action'}
+                        </div>
+                        <div className="mt-0.5 text-small text-fg">{outcomeSnapshot.nextAction}</div>
                       </div>
                     )}
                   </div>

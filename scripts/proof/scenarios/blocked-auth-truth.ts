@@ -86,6 +86,17 @@ export const blockedAuthTruth: ScenarioDef = {
         detail: factualText.slice(0, 600),
       },
       {
+        name: 'evidence-first snapshot survives independently of model prose',
+        pass: task.outcomeSnapshot?.version === 1
+          && Boolean(task.outcomeSnapshot.evidence?.artifacts?.some((entry: { ref?: string }) => entry.ref === artifactPath))
+          && /railway login/i.test(task.outcomeSnapshot.nextAction ?? ''),
+        detail: JSON.stringify({
+          artifacts: task.outcomeSnapshot?.evidence?.artifacts,
+          nextAction: task.outcomeSnapshot?.nextAction,
+          resumable: task.outcomeSnapshot?.resumable,
+        }).slice(0, 800),
+      },
+      {
         name: 'no generic harness-only non-answer',
         pass: !genericOnly,
         detail: genericOnly ? factualText.slice(0, 400) : undefined,

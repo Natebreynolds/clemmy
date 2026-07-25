@@ -1561,7 +1561,9 @@ function boardActionForStatus(sourceKind: BoardCard['sourceKind'], status: strin
     };
   }
   if (status === 'awaiting_continue' || status === 'paused'
-    || (sourceKind === 'background' && (status === 'interrupted' || status === 'failed' || status === 'aborted'))) {
+    || (sourceKind === 'background' && (
+      status === 'interrupted' || status === 'failed' || status === 'aborted' || status === 'blocked'
+    ))) {
     return {
       primaryAction: 'continue',
       continueMode: sourceKind === 'background' ? 'background' : 'workflow_resume',
@@ -9859,9 +9861,9 @@ export function registerConsoleRoutes(
           actions.push('restore');
         } else {
           if (task.status === 'pending') actions.push('promote', 'cancel');
-          else if (task.status === 'awaiting_continue') actions.push('resume', 'cancel');
+          else if (task.status === 'awaiting_continue' || task.status === 'blocked') actions.push('resume', 'cancel');
           else if (task.status === 'running' || task.status === 'cancelling'
-            || task.status === 'awaiting_input' || task.status === 'blocked') actions.push('cancel');
+            || task.status === 'awaiting_input') actions.push('cancel');
           else if (task.status === 'awaiting_approval') actions.push('approve', 'reject', 'cancel');
           else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
             if (!task.resumedIntoTaskId) actions.push('resume');
@@ -9886,6 +9888,9 @@ export function registerConsoleRoutes(
           progressHint: (task.status === 'awaiting_input' && task.pendingQuestion
             ? `Waiting on you: ${task.pendingQuestion.slice(0, 240)}`
             : '')
+            || (task.status === 'blocked'
+              ? (task.outcomeSnapshot?.nextAction || task.outcomeSnapshot?.blocker || '')
+              : '')
             || (terminal
               ? (task.error || (task.status === 'done' ? 'Completed.' : ''))
               : logicalProgressHint || task.lastCheckInMessage)
@@ -9906,6 +9911,7 @@ export function registerConsoleRoutes(
             pendingQuestion: task.pendingQuestion,
             pendingQuestionId: task.pendingQuestionId,
             error: task.error,
+            outcomeSnapshot: task.outcomeSnapshot,
             resultPreview: task.result?.slice(0, 600),
             source: task.source,
             originSessionId: task.originSessionId,
@@ -10288,7 +10294,8 @@ export function registerConsoleRoutes(
         return;
       }
       if (action === 'resume') {
-        if (task.status !== 'awaiting_continue' && task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
+        if (task.status !== 'awaiting_continue' && task.status !== 'interrupted'
+          && task.status !== 'failed' && task.status !== 'aborted' && task.status !== 'blocked') {
           res.status(409).json({ ok: false, reason: `Cannot resume a ${task.status} task.` });
           return;
         }
