@@ -1,10 +1,15 @@
 /**
- * Live end-to-end smoke for the FUSION debate layer (Seam A).
+ * Legacy end-to-end diagnostic for the three-call FUSION debate strategy.
  *
- * Forces CLEMMY_DEBATE_MODE=all so EVERY turn is debated: Claude + Codex draft
- * the same turn in parallel, a judge reconciles, and the reconciled answer
- * streams back. Drives the real @openai/agents Runner exactly like loop.ts and
- * prints every stream event with elapsed ms, so we can SEE:
+ * This is intentionally NOT the release gate for Settings' "Second opinion"
+ * option. That option uses the bounded verify strategy and is certified with:
+ *
+ *   npm run proof:fusion:codex
+ *
+ * This diagnostic explicitly forces the older debate strategy: Claude + Codex
+ * draft the same turn in parallel, a judge reconciles, and the reconciled
+ * answer streams back. Drives the real @openai/agents Runner exactly like
+ * loop.ts and prints every stream event with elapsed ms, so we can SEE:
  *   - exactly one response_started (ours; the judge's is dropped),
  *   - keep-alive frames reaching the run-loop drain DURING the silent drafting
  *     window (proves the stall-watchdog is actually fed),
@@ -19,6 +24,7 @@
  * Run: npx tsx scripts/debate-smoke.ts
  */
 process.env.CLEMMY_DEBATE_MODE = process.env.CLEMMY_DEBATE_MODE || 'all';
+process.env.CLEMMY_FUSION_STRATEGY = 'debate';
 process.env.CLEMMY_DEBATE_HEARTBEAT_MS = process.env.CLEMMY_DEBATE_HEARTBEAT_MS || '1500';
 
 import { Agent, run } from '@openai/agents';

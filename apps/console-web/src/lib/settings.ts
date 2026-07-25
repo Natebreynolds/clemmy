@@ -271,11 +271,23 @@ export interface JudgeMetricsSnapshot {
   updatedAt?: string;
 }
 
-// Fusion (multi-model) — optional Second opinion: the brain drafts once, then
-// the automatic judge/checker verifies/refines when enabled. A live toggle:
+// Fusion (multi-model) — optional Second opinion: the brain authors once, then
+// a distinct checker returns a bounded accept/correct verdict. A live toggle:
 // mode/strategy apply on the next message, no restart.
 export type FusionMode = 'off' | 'high' | 'all';
 export type FusionStrategy = 'debate' | 'verify';
+export interface FusionHealth {
+  contract: 'bounded-verifier-v2';
+  attempts: number;
+  accepted: number;
+  corrected: number;
+  safeFallbacks: number;
+  timedOut: number;
+  failed: number;
+  legacyRewrites: number;
+  lastOutcome?: string;
+  lastAt?: string;
+}
 export interface FusionSettings {
   mode: FusionMode;
   judge: 'claude' | 'codex';
@@ -283,6 +295,7 @@ export interface FusionSettings {
   strategy: FusionStrategy;
   brainsAvailable: { claude: boolean; codex: boolean };
   active: boolean;
+  health?: FusionHealth;
 }
 export const patchFusion = (p: { mode: FusionMode; judge?: 'claude' | 'codex'; strategy?: FusionStrategy }) =>
   patch<{ fusion: FusionSettings }>('/api/console/settings/fusion', p);

@@ -16,7 +16,7 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { planBrain, provisionDaemon } from './provision.js';
-import { exactBrainRouteChecks, exactWorkflowStepRouteChecks, fusionDisabledChecks, openHarnessDb, summarizeAllSessions } from './score.js';
+import { exactBrainRouteChecks, exactWorkflowStepRouteChecks, fusionBoundedChecks, fusionDisabledChecks, openHarnessDb, summarizeAllSessions } from './score.js';
 import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
@@ -33,9 +33,10 @@ import { longHorizonManifest } from './scenarios/long-horizon-manifest.js';
 import { backgroundSteerInFlight } from './scenarios/background-steer-in-flight.js';
 import { restartResume } from './scenarios/restart-resume.js';
 import { blockedAuthTruth } from './scenarios/blocked-auth-truth.js';
-import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
+import { fusionBoundedVerifier } from './scenarios/fusion-bounded-verifier.js';
+import type { BrainKind, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [
+const DEFAULT_SCENARIOS: ScenarioDef[] = [
   fanoutMultiItem,
   continuityRecall,
   completeSetRecall,
@@ -53,24 +54,39 @@ const ALL_SCENARIOS: ScenarioDef[] = [
   restartResume,
   blockedAuthTruth,
 ];
+const SCENARIO_CATALOG: ScenarioDef[] = [...DEFAULT_SCENARIOS, fusionBoundedVerifier];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
-function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {
+function parseArgs(argv: string[]): {
+  brains: BrainKind[];
+  scenarios: ScenarioDef[];
+  scoreOnly?: string;
+  keep: boolean;
+  fusionMode: FusionProofMode;
+} {
   const brains: BrainKind[] = [];
   const scenarioNames: string[] = [];
   let scoreOnly: string | undefined;
   let keep = false;
+  let fusionMode: FusionProofMode = 'off';
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--brain') brains.push(...(argv[++i] ?? '').split(',').filter((b): b is BrainKind => ALL_BRAINS.includes(b as BrainKind)));
     else if (a === '--scenario') scenarioNames.push(...(argv[++i] ?? '').split(','));
     else if (a === '--score-only') scoreOnly = argv[++i];
     else if (a === '--keep') keep = true;
+    else if (a === '--fusion') {
+      const raw = (argv[++i] ?? '').trim().toLowerCase();
+      if (raw !== 'high' && raw !== 'all') throw new Error('--fusion requires high or all');
+      fusionMode = raw;
+    }
   }
   const scenarios = scenarioNames.length
-    ? ALL_SCENARIOS.filter((s) => scenarioNames.includes(s.name))
-    : ALL_SCENARIOS;
-  return { brains: brains.length ? brains : [...ALL_BRAINS], scenarios, scoreOnly, keep };
+    ? SCENARIO_CATALOG.filter((s) => scenarioNames.includes(s.name))
+    : DEFAULT_SCENARIOS;
+  const missing = scenarioNames.filter((name) => !scenarios.some((scenario) => scenario.name === name));
+  if (missing.length > 0) throw new Error(`Unknown proof scenario(s): ${missing.join(', ')}`);
+  return { brains: brains.length ? brains : [...ALL_BRAINS], scenarios, scoreOnly, keep, fusionMode };
 }
 
 /** Distinct model-family tags ('claude' | 'codex' | 'byo') that actually served
@@ -142,7 +158,7 @@ function printScoreboard(outcomes: ScenarioOutcome[]): void {
 }
 
 async function main(): Promise<void> {
-  const { brains, scenarios, scoreOnly, keep } = parseArgs(process.argv.slice(2));
+  const { brains, scenarios, scoreOnly, keep, fusionMode } = parseArgs(process.argv.slice(2));
 
   if (scoreOnly) {
     const db = openHarnessDb(scoreOnly);
@@ -187,7 +203,7 @@ async function main(): Promise<void> {
     console.log(`\n→ provisioning daemon for brain=${brainKind} …`);
     let daemon;
     try {
-      daemon = await provisionDaemon(plan, { keepHome: keep });
+      daemon = await provisionDaemon(plan, { keepHome: keep, fusionMode });
     } catch (err) {
       for (const s of scenarios) {
         outcomes.push({ scenario: s.name, brain: brainKind, status: 'FAIL', checks: [], latency: [], error: `provision: ${err instanceof Error ? err.message : String(err)}` });
@@ -209,7 +225,13 @@ async function main(): Promise<void> {
           if (result.sessionId) checks.push(...exactWorkflowStepRouteChecks(daemon.home, result.sessionId, brainKind));
           else checks.push({ name: 'exact workflow route has a step session id', pass: false, detail: 'scenario returned no sessionId' });
         }
-        if (result.sessionId) checks.push(...fusionDisabledChecks(daemon.home, result.sessionId));
+        if (result.sessionId) {
+          checks.push(...(
+            fusionMode === 'off'
+              ? fusionDisabledChecks(daemon.home, result.sessionId)
+              : fusionBoundedChecks(daemon.home, result.sessionId, brainKind)
+          ));
+        }
         const failed = checks.some((c) => !c.pass);
         anyFailed ||= failed;
         outcomes.push({ ...result, checks, scenario: scenario.name, brain: brainKind, status: failed ? 'FAIL' : 'PASS' });
@@ -253,7 +275,7 @@ async function main(): Promise<void> {
     finishedAt: new Date().toISOString(),
     gitHead,
     sourceClean,
-    fusionMode: 'off',
+    fusionMode,
     outcomes,
     failures,
   };

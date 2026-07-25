@@ -156,6 +156,12 @@ Current migration status:
   checkpoints, typed evidence, and versioned contract corrections. Background
   completion and the cockpit read logical state directly; they do not invoke a
   fan-out judge or count worker attempt labels as new work.
+- Optional cross-model Fusion is an advisory verifier node, never completion
+  authority or a second executor. Clementine authors once; a distinct model sees
+  a bounded request/evidence packet and may only accept the draft or return one
+  evidence-backed correction. The runtime buffers and validates that verdict,
+  preserves durable URLs/ids/coverage receipts, rejects runaway rewrites, and
+  keeps Clementine's draft on timeout, invalid output, or checker failure.
 - Remaining model-authority surfaces are explicit follow-up work: fan-out item
   demotion/inline-recovery for legacy non-manifest runs, foreground loop
   completion, gateway/cron delivery, and pre-write boundary judges.

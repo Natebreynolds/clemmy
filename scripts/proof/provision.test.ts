@@ -52,7 +52,7 @@ test('glm proof plan copies BYO_PROVIDERS and per-provider key slots', () => {
   assert.equal(plan.env.BYO_PROVIDER_DEEPSEEK_API_KEY, 'deepseek-secret');
 });
 
-test('live proof pins Fusion, fallover, and the optional approach beat off', () => {
+test('live proof defaults Fusion off and only enables it through an explicit canary mode', () => {
   assert.deepEqual(proofRuntimeOverrides(), {
     CLEMMY_BRAIN_FALLOVER: 'off',
     CLEMMY_AUTH_FALLOVER: 'off',
@@ -64,6 +64,8 @@ test('live proof pins Fusion, fallover, and the optional approach beat off', () 
     CLEMMY_JUDGE_CROSS_FAMILY: 'off',
     CLEMMY_LONGTASK_APPROACH_BEAT: 'off',
   });
+  assert.equal(proofRuntimeOverrides('all').CLEMMY_DEBATE_MODE, 'all');
+  assert.equal(proofRuntimeOverrides('all').CLEMMY_FUSION_STRATEGY, 'verify');
 });
 
 test('live proof gives spawned CLIs only the disposable home and dotfiles', () => {

@@ -1,38 +1,27 @@
 /**
- * debate-model — the first slice of the Codex+Claude FUSION layer.
+ * debate-model — Clementine's optional cross-model FUSION layer.
  *
- * Two flagship brains (Claude Opus + Codex gpt-5.x) draft the SAME turn
- * independently; a judge brain then reconciles both drafts into one final
- * answer that is streamed back to the user. Goal: higher accuracy on the turns
- * that matter, by making the answer the product of two models in tandem rather
- * than one.
+ * The Settings-facing `verify` strategy keeps the routed brain as the sole
+ * author, then asks a distinct model for one bounded accept/correct verdict over
+ * compact evidence. The verifier has no tools, cannot own task completion, and
+ * cannot stream unvalidated prose. The legacy `debate` strategy remains an
+ * explicit diagnostic: two flagship brains draft independently and a judge
+ * reconciles them.
  *
- * This is "Seam A — debate the ANSWER": a transparent `Model` wrapper slotted at
- * provider-registration time (codex-client.ts), so the rest of the harness loop
- * never knows it's special. (Seam B — two brains sanity-check an irreversible
- * SEND/PUBLISH at the write boundary — is the natural fast-follow and reuses the
- * existing gate signal in confirm-first-gate.ts.)
+ * This is a transparent `Model` wrapper at provider-registration time
+ * (codex-client.ts), so the durable graph, write boundaries, and harness loop
+ * remain the authority. `CLEMMY_DEBATE_MODE` controls when the optional layer
+ * runs and defaults OFF.
  *
- * Cost control: a debate is 2 drafts + 1 judge ≈ 2–3× tokens, so it must NOT
- * fire on every turn. `shouldDebate(request)` gates it; `CLEMMY_DEBATE_MODE`
- * selects the policy and DEFAULTS TO OFF (this is a measurement scaffold, not a
- * permanent flag — once an accuracy lift is shown it flips to high-stakes-only,
- * then the flag retires).
- *
- *   CLEMMY_DEBATE_MODE = off   (default)  never debate — pure passthrough
- *                      = high             debate only "high-stakes" turns (heuristic)
- *                      = all              debate every turn (for live end-to-end proving)
+ *   CLEMMY_DEBATE_MODE = off   (default)  pure passthrough
+ *                      = high             consequential eligible answers only
+ *                      = all              every eligible final answer
  *
  * Reliability:
- *  - Each draft brain is already individually resilient (retry/backoff/empty/401
- *    via resilient-model; Codex has its own transparent SSE retry), so a draft
- *    rejection here is POST-retry exhaustion. We fail OPEN: drop the failed brain
- *    and answer from the survivor; only if BOTH fail do we surface (passthrough).
- *  - Streaming safety: the silent drafting window is bridged with benign `model`
- *    keep-alive frames (the same shape codex-model emits) so the loop's
- *    pre-content stall watchdog sees activity. NO `output_text_delta` (the only
- *    "committed content" frame) is emitted until the judge streams — so nothing
- *    the user sees can ever be contradicted or duplicated by the reconciliation.
+ *  - Verify failures/timeouts preserve the author's original response.
+ *  - Legacy debate failures preserve the strongest surviving draft.
+ *  - Silent model windows emit non-committing keep-alives. No checker output is
+ *    exposed until its complete verdict has passed local validation.
  */
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
@@ -71,7 +60,7 @@ const logger = pino({ name: 'clementine.debate-model' });
 
 export type DebateMode = 'off' | 'high' | 'all';
 
-/** Read CLEMMY_DEBATE_MODE. Default OFF — fusion debate is opt-in until measured. */
+/** Read CLEMMY_DEBATE_MODE. Default OFF — Fusion is explicitly opt-in. */
 export function debateMode(): DebateMode {
   const raw = (getRuntimeEnv('CLEMMY_DEBATE_MODE', 'off') || 'off').trim().toLowerCase();
   if (raw === 'all' || raw === 'on' || raw === 'always') return 'all';
@@ -104,13 +93,13 @@ function draftGraceMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
 }
 
-/** Deadline (ms) for the verify CHECKER's first event. The executor's draft is
+/** Deadline (ms) for the verify CHECKER's complete verdict. The executor's draft is
  *  already in hand (the safety net), so a hung/slow checker — Anthropic at
  *  capacity HANGS rather than returning a clean 529 — must not block the turn
  *  waiting out the retry budget. Past this, ship the executor draft. */
 function checkerDeadlineMs(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_CHECKER_DEADLINE_MS', '25000') ?? '25000', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 25000;
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_CHECKER_DEADLINE_MS', '12000') ?? '12000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 12000;
 }
 
 /** Max debated iterations per user MESSAGE. The AUTHORITY is the per-turn WeakMap
@@ -127,17 +116,18 @@ function checkerDeadlineMs(): number {
  *  irreversible writes are still verified by the grounding/goal-fidelity gates.
  *  0 = unlimited (legacy behavior). */
 function maxDebatesPerTurn(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_MAX_PER_TURN', '2') ?? '2', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_DEBATE_MAX_PER_TURN', '1') ?? '1', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1;
 }
 
 export type FusionStrategy = 'debate' | 'verify';
 /** How a fused turn spends its two brains:
  *  - 'debate' (default): both flagships draft independently, a judge reconciles (3 calls).
  *  - 'verify' ("Codex drives, Claude checks"): the EXECUTOR (the passthrough/active
- *    brain) drafts once, then the CHECKER (the judge brain) verifies/refines into the
- *    final answer (2 calls). Cheaper, and the research-optimal verify-over-redraft
- *    pattern. Pair with active-brain=Codex + judge=Claude for the recommended play. */
+ *    brain) authors once, then the CHECKER returns a bounded accept/correct verdict
+ *    over a compact evidence packet (2 calls). The checker never runs tools, owns
+ *    completion, or streams unvalidated prose. Pair active-brain=Codex + a
+ *    different-family judge for the recommended cross-model check. */
 function requestNeedsNativeTools(request: ModelRequest): boolean {
   const r = request as { tools?: unknown[]; handoffs?: unknown[] };
   return (Array.isArray(r.tools) && r.tools.length > 0)
@@ -245,9 +235,10 @@ function renderActiveGoalObjective(request: ModelRequest): string {
 /** High-stakes heuristic for mode=high — "minimal Claude, only the consequential
  *  turns." Reads ROLES, not bytes: the v1 proxy over-fired because it measured the
  *  injected system context packet (which alone exceeds 800 chars), not the
- *  request. Fires when the user's latest message names a consequential action, is
- *  genuinely long/complex, or — on a mid-execution continuation — the active
- *  goal's Objective involves an irreversible action. NOTE: the raw send TOOL-CALL
+ *  request. Fires when the user's latest message names a consequential action or
+ *  domain, explicitly requests a cross-check, or — on a mid-execution
+ *  continuation — the active goal's Objective involves an irreversible action.
+ *  NOTE: the raw send TOOL-CALL
  *  turn (no assistant text) is NOT checked here — verify gates on a user-facing
  *  answer (hasUserFacingAnswer), and that write boundary is owned by the grounding
  *  / goal-fidelity gates. Fusion checks the planning/approval ANSWER turn. */
@@ -257,9 +248,13 @@ function isHighStakes(request: ModelRequest): boolean {
   const isContinuation = CONTINUATION_PREFIX_RE.test(userText.trim());
   if (!isContinuation) {
     if (classifyTurnIntent(userText) === 'action') return true;
-    if (userText.length >= 800) return true;
-    const tools = (request as { tools?: unknown[] }).tools;
-    if (Array.isArray(tools) && tools.length > 0 && userText.length >= 200) return true;
+    // Length is not risk. The old "800 chars = high stakes" proxy made a long
+    // research brief pay for Fusion even when the durable graph and workers
+    // already owned its correctness. Keep auto-mode for consequential domains
+    // and for an explicit request to cross-check; `mode=all` remains available
+    // when the operator deliberately wants every eligible final answer checked.
+    if (/\b(?:double[- ]check|cross[- ]check|cross[- ]model|second opinion|verify this answer)\b/i.test(userText)) return true;
+    if (/\b(?:medical|diagnosis|legal advice|tax advice|investment advice|security incident|privacy incident)\b/i.test(userText)) return true;
   }
   // continuation OR no user-text hit → judge by the pending goal's Objective.
   return classifyTurnIntent(renderActiveGoalObjective(request)) === 'action';
@@ -272,10 +267,21 @@ export function shouldDebate(request: ModelRequest): boolean {
   // rejects the turn as "Invalid output type". Keep these on the provider's
   // native structured-output path; fuse only user-facing prose/tool turns.
   if (isStructuredOutputRequest(request)) return false;
+  // These are projections of a durable graph edge, not fresh authoring turns.
+  // A second model must never turn a precise task outcome/continuation into a
+  // new generic status story. The executor relays the authoritative note.
+  if (isHarnessManagedRelay(request)) return false;
   const mode = debateMode();
   if (mode === 'off') return false;
   if (mode === 'all') return true;
   return isHighStakes(request);
+}
+
+function isHarnessManagedRelay(request: ModelRequest): boolean {
+  const text = renderLatestUserText(request).trim();
+  if (CONTINUATION_PREFIX_RE.test(text)) return true;
+  return /^A (?:background task|scheduled workflow|workflow|task|run) you started from this conversation\b/i.test(text)
+    || /^\[background task [^\]]+ (?:DONE|BLOCKED|FAILED|NEEDS INPUT)\]/i.test(text);
 }
 
 function isStructuredOutputRequest(request: ModelRequest): boolean {
@@ -372,7 +378,7 @@ export interface DebateOptions {
   heartbeatMs?: number;
   /** Grace window (ms) for the second draft after the first lands. */
   draftGraceMs?: number;
-  /** Deadline (ms) for the verify checker's first event before shipping the draft. */
+  /** Deadline (ms) for the verify checker's complete verdict before shipping the draft. */
   checkerDeadlineMs?: number;
   /** Max debated iterations per message (0 = unlimited). */
   maxPerTurn?: number;
@@ -660,38 +666,17 @@ export class DebateModel implements Model {
   // --- 'verify' strategy: executor (passthrough) drafts, checker (judge) verifies ---
 
   private async verifyResponse(request: ModelRequest): Promise<ModelResponse> {
-    const draft = await this.brains.passthrough.getResponse(request).catch(() => null);
-    if (!draft) {
-      // Executor failed → the checker answers the original request directly.
-      logger.warn('fusion verify: executor draft failed — checker answers directly');
-      recordDebateTrace({ path: 'verify', outcome: 'executor-failed' });
-      return this.brains.judge.getResponse(request);
-    }
+    // The routed brain is the author. Its own resilient chain already owns
+    // provider failover, so Fusion never promotes the checker into an executor
+    // after that chain is exhausted.
+    const draft = await this.brains.passthrough.getResponse(request);
     // Only spend a checker call on a real USER-FACING answer (not a tool-routing
     // step like focus_get), and only while under the per-message cap — so the
     // fusion budget lands on the answer, never on plumbing iterations.
     if (!hasUserFacingAnswer(draft.output) || !this.spendFusionSlot()) {
       return draft;
     }
-    const checkerReq = linkedAbortRequest(buildVerifyRequest(request, draft));
-    try {
-      const final = await raceDeadline(this.brains.judge.getResponse(checkerReq.request), this.checkerDeadline);
-      if (final === DEADLINE) {
-        checkerReq.abort();
-        logger.warn({ deadlineMs: this.checkerDeadline }, 'fusion verify: checker exceeded deadline — shipping the executor draft');
-        recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-timeout-ship-draft' });
-        return draft;
-      }
-      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeTraceLabel(), executor: capText(summarizeOutput(draft.output)), final: capText(extractAssistantText(final.output)) });
-      return final;
-    } catch (err) {
-      // Checker failed → ship the executor's draft rather than lose the turn.
-      logger.warn({ err: errText(err) }, 'fusion verify: checker failed — shipping the executor draft');
-      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
-      return draft;
-    } finally {
-      checkerReq.cleanup();
-    }
+    return (await this.verifyDraft(request, draft)).response;
   }
 
   private async *verifyStreamed(request: ModelRequest): AsyncIterable<StreamEvent> {
@@ -700,16 +685,9 @@ export class DebateModel implements Model {
 
     // Executor (the active/passthrough brain — Codex in the recommended setup)
     // drafts, buffered; the silent window is bridged with keep-alives.
-    const draftP = this.brains.passthrough.getResponse(request).then((r) => r, () => null);
+    const draftP = this.brains.passthrough.getResponse(request);
     yield* heartbeatsUntil(draftP, this.hb, this.sleep);
     const draft = await draftP;
-
-    if (!draft) {
-      logger.warn('fusion verify: executor draft failed — checker streams the answer directly');
-      recordDebateTrace({ path: 'verify', outcome: 'executor-failed' });
-      yield* forwardWithDoneBackstop(this.brains.judge.getStreamedResponse(request));
-      return;
-    }
 
     // Only spend a checker call on a real USER-FACING answer + under the cap —
     // otherwise ship the executor's draft as-is, so the fusion budget is never
@@ -719,97 +697,80 @@ export class DebateModel implements Model {
       return;
     }
 
-    const da = summarizeOutput(draft.output);
-    let finalText = '';
-    let checkerOutput: unknown;
-    let checkerYieldedContent = false;
-    let sawDone = false;
+    // Buffer the verifier's typed verdict before committing a single byte to the
+    // user. This is the critical trust boundary: an unbounded checker rewrite can
+    // never start streaming and then become impossible to reject.
+    const checkedP = this.verifyDraft(request, draft);
+    yield* heartbeatsUntil(checkedP, this.hb, this.sleep);
+    const checked = await checkedP;
+    yield* streamResponseAsEvents(checked.response);
+  }
+
+  private async verifyDraft(request: ModelRequest, draft: ModelResponse): Promise<VerifyPassResult> {
+    const startedAt = Date.now();
+    const executorText = userFacingDraftText(draft.output);
+    const judge = judgeTraceLabel();
     const checkerReq = linkedAbortRequest(buildVerifyRequest(request, draft));
-    const it = this.brains.judge.getStreamedResponse(checkerReq.request)[Symbol.asyncIterator]();
     try {
-      // DEADLINE on the checker's FIRST event: the executor's Codex draft is
-      // already the answer, so a hung/slow checker (Anthropic at capacity HANGS
-      // rather than 529s — the run-killer) must not block the turn waiting out the
-      // retry budget. If the checker doesn't deliver within the deadline, ship the
-      // draft. (Falling the checker over to Codex would be pointless here — the
-      // executor IS Codex; shipping the draft we already have is the right move.)
-      const deadline = this.checkerDeadline;
-      while (true) {
-        const next = checkerYieldedContent || sawDone
-          ? await it.next()
-          : await raceDeadline(it.next(), deadline);
-        if (next === DEADLINE) {
-          // Nothing committed and the checker hung past the deadline: abort it
-          // and ship the draft. A pre-first-event throw is handled below.
-          checkerReq.abort();
-          void it.return?.().catch(() => {});
-          logger.warn({ deadlineMs: deadline }, 'fusion verify: checker exceeded deadline before committed content — shipping the executor draft');
-          recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-timeout-ship-draft' });
-          yield* streamResponseAsEvents(draft);
-          return;
-        }
-        if (next.done) break;
-        const res = next;
-        const ev = res.value;
-        const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
-        if (e.type !== 'response_started') {
-          if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; checkerYieldedContent = true; }
-          if (e.type === 'response_done') {
-            const outEv = normalizeResponseDoneEvent(ev, 'debate-checker');
-            const doneOutput = (outEv as { response?: { output?: unknown } }).response?.output;
-            // An empty completion with NOTHING streamed → don't ship an empty
-            // turn; ship the executor (Codex) draft instead. We must intercept
-            // BEFORE yielding the empty done (yielding it then the draft would
-            // emit two terminal events). The resilient layer normally throws on
-            // an empty completion before we get here; this is the in-loop
-            // backstop for when it doesn't (e.g. CLEMMY_MODEL_PARITY=off).
-            if (!checkerYieldedContent && !extractAssistantText(doneOutput)) {
-              void it.return?.().catch(() => {});
-              logger.warn({ checkerModel: resolveRoleModel('judge').modelId }, 'fusion verify: checker returned an EMPTY response_done — shipping the executor draft');
-              recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-empty-ship-draft' });
-              yield* streamResponseAsEvents(draft);
-              return;
-            }
-            sawDone = true;
-            checkerOutput = doneOutput;
-            yield outEv;
-          } else {
-            yield ev;
-          }
-        }
+      const checker = await raceDeadline(this.brains.judge.getResponse(checkerReq.request), this.checkerDeadline);
+      if (checker === DEADLINE) {
+        checkerReq.abort();
+        const durationMs = Date.now() - startedAt;
+        logger.warn({ deadlineMs: this.checkerDeadline, judge }, 'fusion verify: checker exceeded deadline — shipping the executor draft');
+        recordDebateTrace({
+          path: 'verify',
+          n: this.debatesThisTurn,
+          outcome: 'checker-timeout-ship-draft',
+          judge,
+          durationMs,
+          executorLen: executorText.length,
+          finalLen: executorText.length,
+        });
+        return { response: draft, outcome: 'checker-timeout-ship-draft', issues: [], durationMs };
       }
+
+      const result = evaluateVerifyResponse(draft, checker);
+      const durationMs = Date.now() - startedAt;
+      const finalText = userFacingDraftText(result.response.output);
+      logger.info({
+        path: 'verify',
+        n: this.debatesThisTurn,
+        outcome: result.outcome,
+        executorLen: executorText.length,
+        finalLen: finalText.length,
+        issues: result.issues.length,
+        durationMs,
+        judge,
+      }, 'fusion bounded verification completed');
+      recordDebateTrace({
+        path: 'verify',
+        n: this.debatesThisTurn,
+        outcome: result.outcome,
+        judge,
+        durationMs,
+        issues: result.issues.map((issue) => capText(issue)),
+        executorLen: executorText.length,
+        finalLen: finalText.length,
+        executor: capText(executorText),
+        final: capText(finalText),
+      });
+      return { ...result, durationMs };
     } catch (err) {
-      // Recover (ship the executor draft) ONLY if nothing committed — no text AND
-      // no terminal response_done — else we'd emit a duplicate response_done.
-      if (checkerYieldedContent || sawDone) throw err;
-      logger.warn({ err: errText(err) }, 'fusion verify: checker failed pre-content — shipping the executor draft');
-      recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
-      yield* streamResponseAsEvents(draft);
-      return;
+      const durationMs = Date.now() - startedAt;
+      logger.warn({ err: errText(err), judge }, 'fusion verify: checker failed — shipping the executor draft');
+      recordDebateTrace({
+        path: 'verify',
+        n: this.debatesThisTurn,
+        outcome: 'checker-failed-ship-draft',
+        judge,
+        durationMs,
+        executorLen: executorText.length,
+        finalLen: executorText.length,
+      });
+      return { response: draft, outcome: 'checker-failed-ship-draft', issues: [], durationMs };
     } finally {
       checkerReq.cleanup();
     }
-    // Backstop a checker that streamed text but no terminal done.
-    if (!sawDone) yield* synthesizeTerminalDone(checkerOutput, finalText);
-    const finalForTrace = finalText || extractAssistantText(checkerOutput);
-    // Observability: distinguish a real refinement from an empty checker so a
-    // 0-length trace can't be misread as a failure. 'checker-refined' = the
-    // checker produced usable content; 'checker-empty' = it returned without
-    // throwing but with nothing usable (an overloaded/empty completion).
-    const outcome = finalForTrace ? 'checker-refined' : 'checker-empty';
-    // Observability: which model actually checked (the registry-resolved judge —
-    // Sonnet by default, or whatever a UI/chat binding set), and on an empty
-    // return, the shape the checker emitted so a regression is diagnosable.
-    const checkerModelId = resolveRoleModel('judge').modelId;
-    if (!finalForTrace) {
-      logger.warn({
-        checkerModel: checkerModelId,
-        outputItemTypes: Array.isArray(checkerOutput) ? (checkerOutput as Array<{ type?: string }>).map((o) => o?.type) : typeof checkerOutput,
-      }, 'fusion verify: checker returned EMPTY — shipping the executor draft');
-    }
-    const judge = judgeTraceLabel();
-    logger.info({ path: 'verify', n: this.debatesThisTurn, outcome, executorLen: da.length, finalLen: finalForTrace.length, judge, checkerModel: checkerModelId }, 'fusion verify reconciled');
-    recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome, judge, executor: capText(da), final: capText(finalForTrace) });
   }
 }
 
@@ -823,7 +784,7 @@ export class DebateModelProvider implements ModelProvider {
   getModel(modelName?: string): Model | Promise<Model> {
     const brains = resolveDebateBrains(this.passthrough, modelName);
     logDebateAvailabilityTransition(brains !== null);
-    // No two distinct flagships available → behave exactly like the normal provider.
+    // No usable Fusion topology → behave exactly like the normal provider.
     if (!brains) return this.passthrough.getModel(modelName);
     return new DebateModel(brains, this.opts);
   }
@@ -857,27 +818,40 @@ export function verifyJudgeAvailable(): boolean {
   return byo.configured;
 }
 
-let lastDebateActive: boolean | null = null;
-/** Log ONCE when debate flips active<->inactive. A flagship login lapsing (e.g.
- *  Claude's OAuth token expiring) makes debate fall back to single-brain — which
- *  was previously SILENT (no trace, no log), so it looked like debate "stopped
- *  working" for no reason. Now the transition is always announced. */
+let lastFusionAvailability: string | null = null;
+/** Log ONCE when Fusion flips active<->inactive. A checker/flagship login lapse
+ * falls back to single-brain and is announced instead of silently disappearing. */
 function logDebateAvailabilityTransition(active: boolean): void {
-  if (active === lastDebateActive) return;
-  lastDebateActive = active;
+  const strategy = fusionStrategy();
+  const state = `${strategy}:${active ? 'active' : 'inactive'}`;
+  if (state === lastFusionAvailability) return;
+  lastFusionAvailability = state;
   if (active) {
-    logger.info('fusion debate ACTIVE — both flagships available, debating turns');
+    if (strategy === 'verify') {
+      logger.info({ strategy }, 'fusion verification ACTIVE — a distinct checker is available');
+    } else {
+      logger.info({ strategy }, 'fusion debate ACTIVE — both flagship drafters are available');
+    }
   } else {
     const { claude, codex } = debateBrainsAvailable();
-    logger.warn({ claude, codex }, 'fusion debate INACTIVE — a flagship login is missing; running SINGLE-BRAIN passthrough until it returns');
+    if (strategy === 'verify') {
+      logger.warn(
+        { strategy, claude, codex },
+        'fusion verification INACTIVE — no distinct available checker; running SINGLE-BRAIN passthrough until one returns',
+      );
+    } else {
+      logger.warn(
+        { strategy, claude, codex },
+        'fusion debate INACTIVE — a flagship drafter login is missing; running SINGLE-BRAIN passthrough until it returns',
+      );
+    }
   }
 }
 
 /**
- * Assemble the two distinct flagship brains + a judge, or null if we can't field
- * two different flagships (then debate is impossible and the caller passes
- * through). The "passthrough" brain is the harness's normal default for the
- * active auth mode — non-debate turns run on it, byte-identical to today.
+ * Assemble the active author plus a distinct verifier, or the two legacy debate
+ * drafters plus their judge. Returns null when the selected topology is not
+ * available, leaving the normal provider byte-identical.
  */
 /**
  * Build the judge Model for the resolved 'judge' role, or null when that
@@ -1275,38 +1249,288 @@ export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: Mo
 }
 
 const VERIFY_PREAMBLE = [
-  'A first model (the EXECUTOR) produced the DRAFT below in response to the user',
-  'request above. You are the CHECKER: verify the draft against the request and the',
-  'context — correct any factual or logical errors, fill gaps, and tighten it — then',
-  'produce the single best FINAL response. If the draft is already correct, confirm',
-  'and refine it. Speak directly to the user as one voice; do NOT mention the draft,',
-  'the executor, or this verification. PRESERVE any local-state or side-effecting',
-  'tool call the draft proposed (focus_* / memory_remember / execution_*) unless you',
-  'have a concrete reason to drop it.',
+  'You are a narrow cross-model VERIFIER, not the agent and not a second author.',
+  'Clementine (the executor) owns the response. Check only the supplied user request,',
+  'available runtime evidence, and draft. Return EXACTLY one JSON object in one of',
+  'these forms: {"verdict":"accept","issues":[]} or',
+  '{"verdict":"correct","issues":["specific evidence-backed problem"],"corrected":"full corrected user-facing reply"}.',
+  'Choose "correct" only for a concrete factual/logical contradiction or an explicit',
+  'user requirement the draft omitted and that the supplied evidence lets you fix.',
+  'Style, tone, phrasing, extra detail, or a merely different approach are NEVER',
+  'reasons to correct. Durable runtime evidence outranks model prose. Preserve all',
+  'completed progress, receipts, artifacts, links, exact identifiers, and the precise',
+  'remaining dependency. Missing evidence is not evidence that no work happened.',
+  'Never invent task state, rerun work, call tools, add a generic status banner,',
+  'mention verification, or return prose outside the JSON object.',
 ].join(' ');
 
-/** Build the checker's request for the 'verify' strategy: the original request
- *  UNCHANGED (tools/outputType/input preserved — same invariant as the judge), with
- *  the executor's single draft appended to the system instructions to verify+refine. */
+const VERIFY_CONTEXT_CHARS = 12_000;
+const VERIFY_ITEM_CHARS = 2_400;
+
+function verifyMaxTokens(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_FUSION_CHECKER_MAX_TOKENS', '1800') ?? '1800', 10);
+  return Number.isFinite(raw) && raw >= 256 ? Math.min(raw, 8_000) : 1_800;
+}
+
+function clipMiddle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.6);
+  const tail = Math.max(0, maxChars - head - 40);
+  return `${text.slice(0, head)}\n…[bounded verifier context]…\n${text.slice(-tail)}`;
+}
+
+function renderVerifyEvidenceItem(item: unknown): string {
+  const it = item as {
+    type?: unknown;
+    role?: unknown;
+    name?: unknown;
+    output?: unknown;
+    result?: unknown;
+    content?: unknown;
+  };
+  const type = typeof it.type === 'string' ? it.type : '';
+  const role = typeof it.role === 'string' ? it.role : '';
+  if (type === 'function_call_result' || type === 'tool_result' || role === 'tool') {
+    const name = typeof it.name === 'string' && it.name ? ` ${it.name}` : '';
+    const value = it.output ?? it.result ?? it.content;
+    return `TOOL RESULT${name}:\n${clipMiddle(stableStringify(value), VERIFY_ITEM_CHARS)}`;
+  }
+  if (role === 'system') {
+    const text = extractItemText(item).trim();
+    if (!text) return '';
+    return `RUNTIME CONTEXT:\n${clipMiddle(text, VERIFY_ITEM_CHARS)}`;
+  }
+  return '';
+}
+
+/** Build a bounded evidence packet for the verifier node. The previous
+ * implementation copied the whole harness prompt and conversation into a second
+ * author, which both choked the model and invited it to reinterpret graph state.
+ * This packet keeps only the latest ask plus recent system/tool evidence. */
+function compactVerifyEvidence(request: ModelRequest): string {
+  const input = (request as { input?: unknown }).input;
+  if (!Array.isArray(input)) return '(No separate runtime evidence was surfaced.)';
+  const selected: string[] = [];
+  let toolResults = 0;
+  let systemContexts = 0;
+  for (let i = input.length - 1; i >= 0; i -= 1) {
+    const item = input[i] as { type?: unknown; role?: unknown };
+    const type = typeof item?.type === 'string' ? item.type : '';
+    const role = typeof item?.role === 'string' ? item.role : '';
+    const isTool = type === 'function_call_result' || type === 'tool_result' || role === 'tool';
+    const isSystem = role === 'system';
+    if (isTool && toolResults >= 6) continue;
+    if (isSystem && systemContexts >= 4) continue;
+    if (!isTool && !isSystem) continue;
+    const rendered = renderVerifyEvidenceItem(input[i]);
+    if (!rendered) continue;
+    selected.push(rendered);
+    if (isTool) toolResults += 1;
+    if (isSystem) systemContexts += 1;
+  }
+  if (selected.length === 0) return '(No separate runtime evidence was surfaced.)';
+  return clipMiddle(selected.reverse().join('\n\n'), VERIFY_CONTEXT_CHARS);
+}
+
+/** Build the isolated verifier-node request. It intentionally does NOT inherit
+ * the executor's full system prompt, tool graph, conversation, output schema, or
+ * tool choice. The checker sees a compact evidence packet and emits a typed
+ * verdict that Clementine can reject before any checker text reaches the user. */
 export function buildVerifyRequest(request: ModelRequest, draft: ModelResponse): ModelRequest {
-  const base = ((request as { systemInstructions?: string }).systemInstructions ?? '').toString();
-  const block = [
-    base,
+  const requestSettings = {
+    ...(((request as { modelSettings?: Record<string, unknown> }).modelSettings ?? {}) as Record<string, unknown>),
+  };
+  delete requestSettings.toolChoice;
+  delete requestSettings.parallelToolCalls;
+  const configuredMax = verifyMaxTokens();
+  const inheritedMax = typeof requestSettings.maxTokens === 'number' ? requestSettings.maxTokens : configuredMax;
+  requestSettings.maxTokens = Math.min(inheritedMax, configuredMax);
+
+  const input = [
+    'USER REQUEST:',
+    clipMiddle(renderLatestUserText(request).trim() || '(No plain-text user request was surfaced.)', 4_000),
     '',
-    '=== EXECUTOR DRAFT — VERIFY & REFINE ===',
-    VERIFY_PREAMBLE,
+    'AVAILABLE RUNTIME EVIDENCE:',
+    compactVerifyEvidence(request),
     '',
-    '--- DRAFT ---',
-    summarizeOutput(draft.output) || '(empty)',
-    '=== END DRAFT ===',
+    'CLEMENTINE DRAFT:',
+    clipMiddle(userFacingDraftText(draft.output) || '(empty)', VERIFY_CONTEXT_CHARS),
+    '',
+    'Return only the JSON verdict object.',
   ].join('\n');
-  // Strip tools/handoffs: the checker is REFINING an already-user-facing text
-  // answer (verify only runs when hasUserFacingAnswer is true), so it must emit
-  // the refined reply, not wander into a tool call. Leaving the executor's full
-  // toolset on the request let the checker (esp. Sonnet) answer with a
-  // function_call instead of text → no assistant text → 'checker-empty' (ship
-  // the unchecked draft). A verify checker never needs tools.
-  return withThinkingDisabled({ ...request, systemInstructions: block, tools: [], handoffs: [] } as ModelRequest);
+  return withThinkingDisabled({
+    ...request,
+    input,
+    systemInstructions: VERIFY_PREAMBLE,
+    modelSettings: requestSettings,
+    outputType: 'text',
+    tools: [],
+    handoffs: [],
+  } as ModelRequest);
+}
+
+type VerifyOutcome =
+  | 'checker-accepted-draft'
+  | 'checker-corrected-draft'
+  | 'checker-empty-ship-draft'
+  | 'checker-invalid-ship-draft'
+  | 'checker-correction-rejected-ship-draft'
+  | 'checker-timeout-ship-draft'
+  | 'checker-failed-ship-draft';
+
+interface VerifyPassResult {
+  response: ModelResponse;
+  outcome: VerifyOutcome;
+  issues: string[];
+  durationMs: number;
+}
+
+interface ParsedVerifyVerdict {
+  verdict: 'accept' | 'correct';
+  issues: string[];
+  corrected?: string;
+}
+
+function parseVerifyVerdict(text: string): ParsedVerifyVerdict | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  const start = unfenced.indexOf('{');
+  const end = unfenced.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(unfenced.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!isRecord(value) || (value.verdict !== 'accept' && value.verdict !== 'correct')) return null;
+  const issues = Array.isArray(value.issues)
+    ? value.issues
+      .filter((issue): issue is string => typeof issue === 'string' && issue.trim().length > 0)
+      .slice(0, 5)
+      .map((issue) => issue.trim().slice(0, 500))
+    : [];
+  if (value.verdict === 'accept') return { verdict: 'accept', issues };
+  if (issues.length === 0 || typeof value.corrected !== 'string' || !value.corrected.trim()) return null;
+  return { verdict: 'correct', issues, corrected: value.corrected.trim() };
+}
+
+function correctionCharLimit(draftChars: number): number {
+  // A small answer may need enough room for one missing fact; a substantial
+  // answer may grow by at most 50%. Never let the verifier recreate the observed
+  // 513 → 29,169 character runaway. For already-large answers, no expansion.
+  if (draftChars >= 24_000) return draftChars;
+  return Math.min(24_000, Math.max(draftChars + 800, Math.ceil(draftChars * 1.5)));
+}
+
+function durableDraftAnchors(text: string): string[] {
+  const anchors = new Set<string>();
+  for (const pattern of [
+    /https?:\/\/[^\s<>"'`)\]]+/gi,
+    /(?:\/Users\/|\/tmp\/)[^\s<>"'`]+/g,
+    /\b(?:bg|run|attempt|sess|call|task)-[A-Za-z0-9._:-]+\b/gi,
+    /\bT-\d+\b/g,
+    /\b\d+\/\d+\b/g,
+    /\b\d+(?:\.\d+)?%\b/g,
+  ]) {
+    for (const match of text.matchAll(pattern)) {
+      const anchor = match[0].replace(/[.,;:!?]+$/, '');
+      if (anchor) anchors.add(anchor);
+    }
+  }
+  return [...anchors];
+}
+
+function correctionIsSafe(draftText: string, corrected: string): boolean {
+  if (!corrected.trim() || corrected.length > correctionCharLimit(draftText.length)) return false;
+  if (/\b(?:as (?:the )?checker|executor draft|cross-model verification)\b/i.test(corrected)) return false;
+  if (/^\s*(?:CONTINUE|ASK):/i.test(corrected)) return false;
+  // Durable identifiers, receipts, URLs, paths, and exact coverage figures are
+  // graph evidence. A prose checker may add context around them but may not
+  // silently delete them from Clementine's answer.
+  if (durableDraftAnchors(draftText).some((anchor) => !corrected.includes(anchor))) return false;
+  return true;
+}
+
+function replaceMessageContent(content: unknown, replacement: string): unknown {
+  if (!Array.isArray(content)) return replacement;
+  let inserted = false;
+  const next: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    const textPart = typeof part.text === 'string'
+      && (part.type === 'output_text' || part.type === 'text' || part.type === undefined);
+    if (textPart) {
+      if (!inserted) {
+        next.push({ ...part, type: part.type ?? 'output_text', text: replacement });
+        inserted = true;
+      }
+      continue;
+    }
+    next.push(part);
+  }
+  if (!inserted) next.unshift({ type: 'output_text', text: replacement });
+  return next;
+}
+
+function replaceDraftReply(draft: ModelResponse, correctedReply: string): ModelResponse {
+  const raw = extractAssistantText(draft.output);
+  let replacement = correctedReply;
+  try {
+    const envelope = JSON.parse(raw);
+    if (isRecord(envelope) && typeof envelope.reply === 'string') {
+      replacement = JSON.stringify({ ...envelope, reply: correctedReply });
+    }
+  } catch {
+    /* plain-text contract */
+  }
+
+  const output = Array.isArray(draft.output) ? draft.output : [];
+  let replaced = false;
+  const nextOutput: unknown[] = [];
+  for (const item of output) {
+    const it = item as { type?: unknown; content?: unknown };
+    if (it?.type === 'message') {
+      if (replaced) continue;
+      nextOutput.push({ ...it, content: replaceMessageContent(it.content, replacement) });
+      replaced = true;
+    } else {
+      nextOutput.push(item);
+    }
+  }
+  return replaced ? ({ ...draft, output: nextOutput } as ModelResponse) : draft;
+}
+
+function evaluateVerifyResponse(draft: ModelResponse, checker: ModelResponse): Omit<VerifyPassResult, 'durationMs'> {
+  const checkerText = extractAssistantText(checker.output);
+  if (!checkerText.trim()) {
+    return { response: draft, outcome: 'checker-empty-ship-draft', issues: [] };
+  }
+  const verdict = parseVerifyVerdict(checkerText);
+  if (!verdict) {
+    return { response: draft, outcome: 'checker-invalid-ship-draft', issues: [] };
+  }
+  if (verdict.verdict === 'accept') {
+    return { response: draft, outcome: 'checker-accepted-draft', issues: verdict.issues };
+  }
+
+  const draftText = userFacingDraftText(draft.output);
+  const corrected = verdict.corrected ?? '';
+  if (!correctionIsSafe(draftText, corrected)) {
+    return { response: draft, outcome: 'checker-correction-rejected-ship-draft', issues: verdict.issues };
+  }
+  if (corrected.trim() === draftText.trim()) {
+    return { response: draft, outcome: 'checker-accepted-draft', issues: verdict.issues };
+  }
+  return {
+    response: replaceDraftReply(draft, corrected),
+    outcome: 'checker-corrected-draft',
+    issues: verdict.issues,
+  };
 }
 
 /** Render a draft's output items into compact text for the judge to weigh. */
@@ -1333,18 +1557,41 @@ export function summarizeOutput(output: unknown): string {
  *  budget lands only on a turn the user actually reads. Plain-prose answers
  *  (non-JSON) are always user-facing. */
 function hasUserFacingAnswer(output: unknown): boolean {
+  if (Array.isArray(output) && output.some((item) => (item as { type?: unknown })?.type === 'function_call')) {
+    // A message may accompany a tool call. Returning a checker-authored message
+    // would silently delete the executable edge, so tool-bearing responses are
+    // always forwarded byte-for-byte and checked at their deterministic boundary.
+    return false;
+  }
   const text = extractAssistantText(output).trim();
   if (!text) return false;
+  // ASK/CONTINUE are graph-control edges, not terminal answers. Preserve the
+  // one verification slot for the final user-facing result.
+  if (/^(?:ASK|CONTINUE):/i.test(text)) return false;
   try {
     const obj = JSON.parse(text);
     if (obj && typeof obj === 'object' && !Array.isArray(obj) && 'reply' in obj) {
-      const r = (obj as { reply?: unknown }).reply;
-      return typeof r === 'string' && r.trim().length > 0;
+      const decision = obj as { reply?: unknown; done?: unknown; nextAction?: unknown };
+      if (decision.done === false) return false;
+      if (typeof decision.nextAction === 'string' && decision.nextAction !== 'completed') return false;
+      return typeof decision.reply === 'string' && decision.reply.trim().length > 0;
     }
   } catch {
     /* not JSON → plain-prose answer; treat as user-facing */
   }
   return true;
+}
+
+function userFacingDraftText(output: unknown): string {
+  const raw = extractAssistantText(output).trim();
+  if (!raw) return '';
+  try {
+    const obj = JSON.parse(raw);
+    if (isRecord(obj) && typeof obj.reply === 'string' && obj.reply.trim()) return obj.reply.trim();
+  } catch {
+    /* plain-text contract */
+  }
+  return raw;
 }
 
 /** Assistant text only (for replaying a single surviving draft to the user). */
@@ -1617,8 +1864,7 @@ export function* synthesizeTerminalDone(output: unknown, text: string): Generato
 
 /** Forward a stream, dropping its response_started (we emit our own single one)
  *  and GUARANTEEING a terminal response_done — synthesizes a conformant one if
- *  the upstream ends without it. For the direct-forward paths (no draft to
- *  recover): both-drafts-failed passthrough, and verify executor-failed. */
+ *  the upstream ends without it. Used by debate's both-drafts-failed fallback. */
 async function* forwardWithDoneBackstop(stream: AsyncIterable<StreamEvent>): AsyncGenerator<StreamEvent> {
   let sawDone = false;
   let finalText = '';
@@ -1672,6 +1918,7 @@ const TRACE_MAX_BYTES = 2_000_000;
 const TRACE_KEEP_LINES = 400;
 function recordDebateTrace(rec: Record<string, unknown>): void {
   if (process.env.NODE_ENV === 'test') return;
+  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
   // Mirror the fusion judge/checker outcome into the operational store so the
   // dashboard sees the otherwise-invisible reconciliation turn (a judge_verdict
   // for every debate/verify pass). Best-effort — never affects the turn.
@@ -1679,7 +1926,7 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
     recordOperationalEvent({
       source: 'safety',
       type: 'judge_verdict',
-      sessionId: harnessRunContextStorage.getStore()?.sessionId,
+      sessionId,
       actor: 'fusion',
       payload: {
         judge: rec.path === 'verify' ? 'verify_checker' : 'debate',
@@ -1700,7 +1947,7 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
     const judgeModel = typeof rec.judge === 'string' && rec.judge ? rec.judge : resolveRoleModel('judge').modelId;
     const outcome = typeof rec.outcome === 'string' ? rec.outcome : 'reconciled';
     const decisionId = recordModelRouteDecision({
-      sessionId: harnessRunContextStorage.getStore()?.sessionId,
+      sessionId,
       role: 'judge',
       resolvedModel: judgeModel,
       provider: resolveEffectiveProviderForModel(judgeModel),
@@ -1717,7 +1964,7 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
   try {
     const p = debateTracePath();
     mkdirSync(path.dirname(p), { recursive: true });
-    appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`);
+    appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), ...(sessionId ? { sessionId } : {}), ...rec })}\n`);
     // Bound the file: when it crosses the cap, keep the last N rows. Stops
     // unbounded growth and keeps readRecentDebateTraces' whole-file read cheap.
     try {
@@ -1749,6 +1996,45 @@ export function readRecentDebateTraces(limit = 40): Array<Record<string, unknown
   } catch {
     return [];
   }
+}
+
+export interface FusionHealthSnapshot {
+  contract: 'bounded-verifier-v2';
+  attempts: number;
+  accepted: number;
+  corrected: number;
+  safeFallbacks: number;
+  timedOut: number;
+  failed: number;
+  legacyRewrites: number;
+  lastOutcome?: string;
+  lastAt?: string;
+}
+
+/** Compact operator-facing health derived from the bounded trace file. Old
+ * checker-refined rows stay visible as legacy rewrites so a post-upgrade UI
+ * never mislabels them as evidence that the new contract accepted/corrected. */
+export function getFusionHealthSnapshot(limit = 100): FusionHealthSnapshot {
+  const rows = readRecentDebateTraces(limit)
+    .filter((row) => row.path === 'verify' && typeof row.outcome === 'string');
+  const outcomes = rows.map((row) => String(row.outcome));
+  const count = (predicate: (outcome: string) => boolean): number => outcomes.filter(predicate).length;
+  return {
+    contract: 'bounded-verifier-v2',
+    attempts: rows.length,
+    accepted: count((outcome) => outcome === 'checker-accepted-draft'),
+    corrected: count((outcome) => outcome === 'checker-corrected-draft'),
+    safeFallbacks: count((outcome) =>
+      /ship-draft$/.test(outcome)
+      || outcome === 'checker-empty'
+      || outcome === 'checker-invalid'
+      || outcome === 'checker-correction-rejected'),
+    timedOut: count((outcome) => /timeout/.test(outcome)),
+    failed: count((outcome) => /failed/.test(outcome)),
+    legacyRewrites: count((outcome) => outcome === 'checker-refined'),
+    ...(typeof rows[0]?.outcome === 'string' ? { lastOutcome: String(rows[0].outcome) } : {}),
+    ...(typeof rows[0]?.ts === 'string' ? { lastAt: rows[0].ts } : {}),
+  };
 }
 
 function errText(err: unknown): string {

@@ -96,13 +96,17 @@ dirty source tree), build it, and run the Fusion-off long-horizon gate:
 npm run proof:critical:codex
 npm run proof:endurance:codex
 npm run proof:critical
+npm run proof:fusion:codex
 ```
 
 `proof:critical:codex` is the first canary. The endurance leg raises the
 manifest to 120 items. `proof:critical` then runs every configured brain and
 records SKIP, rather than a false failure, for a brain whose local sign-in is
-absent. A green proof is release evidence for that commit; it does not create a
-tag.
+absent. The Fusion canary is separate and opt-in: Codex remains the author while
+a distinct connected model must return the bounded accept/correct contract; the
+gate rejects checker timeouts, legacy full rewrites, same-family self-checks,
+protocol leakage, and output beyond the correction ceiling. A green proof is
+release evidence for that commit; it does not create a tag.
 
 ## Live and manual testing
 

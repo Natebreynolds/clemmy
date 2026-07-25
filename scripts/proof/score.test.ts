@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import Database from 'better-sqlite3';
@@ -14,6 +14,7 @@ import Database from 'better-sqlite3';
 import {
   exactBrainRouteChecks,
   exactWorkflowStepRouteChecks,
+  fusionBoundedChecks,
   fusionDisabledChecks,
   narrationCheck,
   openHarnessDb,
@@ -105,7 +106,11 @@ function addOperationalFallover(home: string, sessionId: string): void {
   db.close();
 }
 
-function addOperationalFusion(home: string, sessionId: string): void {
+function addOperationalFusion(
+  home: string,
+  sessionId: string,
+  payload: Record<string, unknown> = {},
+): void {
   const db = new Database(path.join(home, 'state', 'operational-telemetry.db'));
   db.exec(`
     CREATE TABLE IF NOT EXISTS operational_events (
@@ -117,7 +122,7 @@ function addOperationalFusion(home: string, sessionId: string): void {
   `);
   db.prepare(
     `INSERT INTO operational_events (event_id, ts, source, type, severity, session_id, actor, payload_json) VALUES (?,?,?,?,?,?,?,?)`,
-  ).run(`fusion-${sessionId}`, new Date().toISOString(), 'safety', 'judge_verdict', 'info', sessionId, 'fusion', '{}');
+  ).run(`fusion-${sessionId}`, new Date().toISOString(), 'safety', 'judge_verdict', 'info', sessionId, 'fusion', JSON.stringify(payload));
   db.close();
 }
 
@@ -191,6 +196,34 @@ test('Fusion-off scorer fails closed without telemetry and rejects any isolated-
     assert.equal(fusionDisabledChecks(home, 'sess-1')[0]?.pass, false, 'missing evidence fails closed');
     addOperationalFusion(home, 'other-session');
     assert.equal(fusionDisabledChecks(home, 'sess-1')[0]?.pass, false, 'any fusion in the isolated proof home fails');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bounded Fusion scorer requires a new-contract verdict, distinct family, and bounded final', () => {
+  const home = buildFixtureHome();
+  try {
+    addOperationalFusion(home, 'sess-1', {
+      outcome: 'checker-accepted-draft',
+      judgeModel: 'claude:claude-sonnet-4-6',
+    });
+    appendFileSync(
+      path.join(home, 'state', 'debate-traces.jsonl'),
+      `${JSON.stringify({
+        sessionId: 'sess-1',
+        path: 'verify',
+        outcome: 'checker-accepted-draft',
+        executorLen: 400,
+        finalLen: 400,
+      })}\n`,
+    );
+    assert.equal(fusionBoundedChecks(home, 'sess-1', 'codex').every((check) => check.pass), true);
+    assert.equal(
+      fusionBoundedChecks(home, 'sess-1', 'claude')[1]?.pass,
+      false,
+      'same-family checker cannot prove a second opinion',
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

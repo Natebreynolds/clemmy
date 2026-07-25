@@ -47,6 +47,14 @@ function req(extra: Record<string, unknown> = {}): ModelRequest {
 function msg(text: string): ModelResponse {
   return { output: [{ type: 'message', content: text }], usage: {} } as unknown as ModelResponse;
 }
+function extractTextForTest(response: ModelResponse): string {
+  const item = response.output.find((candidate) => (candidate as { type?: unknown }).type === 'message') as { content?: unknown } | undefined;
+  if (typeof item?.content === 'string') return item.content;
+  if (!Array.isArray(item?.content)) return '';
+  return item.content
+    .map((part) => (typeof (part as { text?: unknown }).text === 'string' ? String((part as { text?: unknown }).text) : ''))
+    .join('');
+}
 function model(impl: Partial<Model>): Model {
   return {
     getResponse: impl.getResponse ?? (async () => msg('ok')),
@@ -178,16 +186,36 @@ test('shouldDebate: off never, all always; high (v2) reads the USER message + go
     // A terse user send-ask fires on the keyword (the FATAL case: the user item
     // is NOT last — system packet is appended after it — so a tail-walk would miss it).
     assert.equal(shouldDebate(userTurn('send the proposal to the client')), true, 'user keyword (user item is mid-array)');
-    // A genuinely long USER message fires on length (now user-only, not the packet).
-    assert.equal(shouldDebate(userTurn('x'.repeat(850))), true, 'long user message');
-    // A continuation fires ONLY when the active goal Objective involves an
-    // irreversible action — and the ledger's past-tense "sent" must NOT trigger it.
-    assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Send the 8 priority-account outreach emails'))), true, 'continuation + send goal');
+    // Length is complexity, not risk. Long research belongs to the durable graph,
+    // not an automatic second author.
+    assert.equal(shouldDebate(userTurn('x'.repeat(850))), false, 'long user message alone does not fire');
+    assert.equal(shouldDebate(userTurn('double-check this answer against the sources')), true, 'explicit verification request fires');
+    // Harness continuations and proactive outcome relays project durable graph
+    // state and must never be re-authored by Fusion — even for an action goal.
+    assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Send the 8 priority-account outreach emails'))), false, 'continuation bypasses Fusion');
     assert.equal(shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Research and summarize the market'))), false, 'continuation + non-send goal (ledger "sent" excluded)');
+    assert.equal(
+      shouldDebate(userTurn('A background task you started from this conversation NEEDS ATTENTION (see the latest note).')),
+      false,
+      'durable outcome relay bypasses Fusion',
+    );
   });
   // Kill-switch reverts to the legacy proxy, which over-fires on packet length.
   withEnv({ CLEMMY_DEBATE_MODE: 'high', CLEMMY_DEBATE_STAKES_V2: 'off' }, () => {
     assert.equal(shouldDebate(userTurn('what did we do yesterday?')), true, 'legacy: packet length over-fires (reverted)');
+  });
+});
+
+test('shouldDebate: even mode=all cannot re-author durable outcome relays or continuation edges', () => {
+  withEnv({ CLEMMY_DEBATE_MODE: 'all' }, () => {
+    assert.equal(
+      shouldDebate(userTurn('A background task you started from this conversation just finished (see the latest note).')),
+      false,
+    );
+    assert.equal(
+      shouldDebate(userTurn('Continue with the next step of your plan.', goalItem('Deploy the production app'))),
+      false,
+    );
   });
 });
 
@@ -449,17 +477,30 @@ test('buildVerifyRequest / buildJudgeRequest DISABLE extended thinking (effort=n
   }
 });
 
-test('buildVerifyRequest: STRIPS tools/handoffs so the checker emits a text reply, not a tool call', () => {
-  // The checker refines an already-user-facing answer; leaving the executor's
-  // toolset on the request let Sonnet answer with a function_call instead of text
-  // → no assistant text → 'checker-empty' (ship the unchecked draft). A verify
-  // checker never needs tools. (Contrast buildJudgeRequest, which PRESERVES them.)
-  const r = req({ tools: [{ name: 't' }], handoffs: [{ name: 'h' }], modelSettings: { temperature: 0.3 } });
+test('buildVerifyRequest: isolates a bounded evidence packet and strips the executor graph', () => {
+  const r = req({
+    input: [
+      { role: 'user', content: 'Deploy the app.' },
+      { type: 'function_call_result', name: 'railway', output: { ok: true, url: 'https://example.test' } },
+      { role: 'system', content: `[ACTIVE GOAL]\n${'x'.repeat(30_000)}` },
+    ],
+    systemInstructions: `FULL EXECUTOR HARNESS ${'y'.repeat(20_000)}`,
+    tools: [{ name: 't' }],
+    handoffs: [{ name: 'h' }],
+    modelSettings: { temperature: 0.3, toolChoice: 'required', maxTokens: 9_000 },
+  });
   const vr = buildVerifyRequest(r, msg('DRAFT')) as any;
   assert.deepEqual(vr.tools, [], 'tools stripped');
   assert.deepEqual(vr.handoffs, [], 'handoffs stripped');
+  assert.equal(vr.outputType, 'text', 'verdict is a plain JSON text contract');
   assert.equal(vr.modelSettings.temperature, 0.3, 'other modelSettings preserved');
-  assert.match(vr.systemInstructions, /DRAFT/, 'the draft is included for verification');
+  assert.equal(vr.modelSettings.toolChoice, undefined, 'executor tool choice stripped');
+  assert.ok(vr.modelSettings.maxTokens <= 1_800, 'checker output is capped');
+  assert.doesNotMatch(vr.systemInstructions, /FULL EXECUTOR HARNESS/, 'full harness prompt is not inherited');
+  assert.match(vr.systemInstructions, /narrow cross-model VERIFIER/, 'checker gets only its narrow contract');
+  assert.match(vr.input, /DRAFT/, 'the draft is included in the verifier packet');
+  assert.match(vr.input, /https:\/\/example\.test/, 'recent tool evidence is included');
+  assert.ok(vr.input.length < 20_000, 'huge runtime context is bounded');
 });
 
 test('getDebateCheckerModel: defaults to Sonnet (fast, low-contention checker); env overrides', () => {
@@ -615,59 +656,53 @@ test('debate: judge streams text but NO terminal response_done → one is synthe
   });
 });
 
-test('verify: checker commits response_done (structured) then throws → NO duplicate response_done', async () => {
+test('verify: malformed checker verdict is buffered and Clementine draft ships exactly once', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({
       passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
-      judge: model({ getStreamedResponse: async function* () {
-        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'FINAL' }] } } as any;
-        throw new Error('trailing error after committing the answer');
-      } }),
+      judge: model({ getResponse: async () => msg('I would rewrite this completely.') }),
     });
-    const got: any[] = [];
-    await assert.rejects(async () => { for await (const e of dm(b, { heartbeatMs: 0 }).getStreamedResponse(req())) got.push(e); });
-    assert.equal(got.filter((e) => e.type === 'response_done').length, 1, 'only the committed response_done — no draft-replay duplicate');
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
+    assert.equal(evs.filter((e) => e.type === 'response_done').length, 1);
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'DRAFT-PROSE'));
+    assert.doesNotMatch(JSON.stringify(evs), /rewrite this completely/);
   });
 });
 
-test('verify: forwarded checker response_done is normalized before the SDK parses it', async () => {
+test('verify: a valid bounded correction is applied to the draft and replayed as one conformant response', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({
-      passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
-      judge: model({ getStreamedResponse: async function* () {
-        yield {
-          type: 'response_done',
-          response: {
-            output: [
-              { type: 'message', role: 'user', status: 'completed', content: [{ type: 'output_text', text: 'FINAL' }] },
-              { type: 'reasoning', content: [{ type: 'output_text', text: 'THINK' }] },
-            ],
-            usage: {},
-          },
-        } as any;
-      } }),
+      passthrough: model({ getResponse: async () => ({
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'The deploy is at example.test.' }] }],
+        responseId: 'draft-id',
+        usage: {},
+      } as any) }),
+      judge: model({ getResponse: async () => msg(JSON.stringify({
+        verdict: 'correct',
+        issues: ['The supplied tool receipt contains the HTTPS URL.'],
+        corrected: 'The deploy is live at https://example.test.',
+      })) }),
     });
     const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     const done: any = evs.find((e) => e.type === 'response_done');
     assertSdkDone(done);
+    assert.equal(done.response.id, 'draft-id', 'the executor response identity is preserved');
     assert.equal(done.response.output[0].role, 'assistant');
-    assert.equal(done.response.output[0].content[0].type, 'output_text');
-    assert.equal(done.response.output[1].content[0].type, 'input_text');
+    assert.equal(done.response.output[0].content[0].text, 'The deploy is live at https://example.test.');
+    assert.equal(evs.filter((e) => e.type === 'response_done').length, 1);
   });
 });
 
-test('verify: a HUNG checker (Anthropic capacity hang) ships the executor draft past the deadline — no failure, no hang', async () => {
+test('verify: a HUNG checker ships the executor draft past the deadline — no failure, no hang', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     let aborted = false;
     const b = brains({
       passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
-      // The checker starts the stream but never produces committed content —
-      // exactly the subtle "response_started then transport hang" shape.
-      judge: model({ getStreamedResponse: async function* (r: any) {
+      judge: model({ getResponse: async (r: any) => {
         const sig = r.signal as AbortSignal | undefined;
         sig?.addEventListener('abort', () => { aborted = true; }, { once: true });
-        yield { type: 'response_started' } as any;
-        await new Promise<void>((resolve) => sig?.addEventListener('abort', () => resolve(), { once: true }));
+        return new Promise<ModelResponse>(() => {});
       } }),
     });
     const evs = await collect(dm(b, { heartbeatMs: 0, checkerDeadlineMs: 10 }).getStreamedResponse(req()));
@@ -694,19 +729,129 @@ test('getStreamedResponse: judge failure AFTER content rethrows (cannot duplicat
 
 // --- 'verify' strategy: Codex drives (executor=passthrough), Claude checks (judge) ---
 
-test('verify strategy: executor drafts, checker verifies → returns the checker final', async () => {
+test('verify strategy: executor authors once, checker returns a typed correction', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     let executorCalls = 0;
     let checkerSawDraft = '';
     const b = brains({
       passthrough: model({ getResponse: async () => { executorCalls += 1; return msg('CODEX-DRAFT'); } }),
-      judge: model({ getResponse: async (r: any) => { checkerSawDraft = r.systemInstructions; return msg('CLAUDE-REFINED'); } }),
+      judge: model({ getResponse: async (r: any) => {
+        checkerSawDraft = r.input;
+        return msg(JSON.stringify({
+          verdict: 'correct',
+          issues: ['A concrete evidence-backed correction is required.'],
+          corrected: 'CLAUDE-CORRECTION',
+        }));
+      } }),
     });
     const res = await dm(b).getResponse(req());
-    assert.equal((res.output[0] as any).content, 'CLAUDE-REFINED');
+    assert.equal((res.output[0] as any).content, 'CLAUDE-CORRECTION');
     assert.equal(executorCalls, 1, 'executor drafted exactly once (2 calls total, not 3)');
     assert.match(checkerSawDraft, /CODEX-DRAFT/, 'checker received the executor draft');
-    assert.match(checkerSawDraft, /VERIFY & REFINE/);
+    assert.match(checkerSawDraft, /Return only the JSON verdict object/);
+  });
+});
+
+test('verify strategy: accept verdict preserves Clementine response byte-for-byte', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const draft = {
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Exact Clementine answer.' }] }],
+      responseId: 'exact-draft',
+      usage: { inputTokens: 3, outputTokens: 4 },
+    } as unknown as ModelResponse;
+    const b = brains({
+      passthrough: model({ getResponse: async () => draft }),
+      judge: model({ getResponse: async () => msg('{"verdict":"accept","issues":[]}') }),
+    });
+    const res = await dm(b).getResponse(req());
+    assert.equal(res, draft, 'accept returns the original response object with no rewrite');
+    assert.equal(extractTextForTest(res), 'Exact Clementine answer.');
+  });
+});
+
+test('verify strategy: runaway correction is rejected before any checker text reaches the user', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const runaway = 'x'.repeat(29_169);
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('Short factual draft.') }),
+      judge: model({ getResponse: async () => msg(JSON.stringify({
+        verdict: 'correct',
+        issues: ['Claims a correction is needed.'],
+        corrected: runaway,
+      })) }),
+    });
+    const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'Short factual draft.'));
+    assert.ok(!evs.some((e) => e.type === 'output_text_delta' && e.delta === runaway));
+  });
+});
+
+test('verify strategy: a correction cannot erase durable URLs, ids, or coverage receipts', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    const exact = 'Built 8/8 items locally for bg-proof-123. Artifact: https://example.test/report.';
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg(exact) }),
+      judge: model({ getResponse: async () => msg(JSON.stringify({
+        verdict: 'correct',
+        issues: ['Replace the concrete report with a generic status.'],
+        corrected: 'The background task was not completed. Try again later.',
+      })) }),
+    });
+    const res = await dm(b).getResponse(req());
+    assert.equal(extractTextForTest(res), exact);
+  });
+});
+
+test('verify strategy: a response containing a tool call bypasses the checker and preserves the executable edge', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let checkerCalls = 0;
+    const draft = {
+      output: [
+        { type: 'message', content: 'I am applying the verified change now.' },
+        { type: 'function_call', name: 'run_shell_command', arguments: '{"cmd":"true"}' },
+      ],
+      usage: {},
+    } as unknown as ModelResponse;
+    const b = brains({
+      passthrough: model({ getResponse: async () => draft }),
+      judge: model({ getResponse: async () => { checkerCalls += 1; return msg('{"verdict":"accept","issues":[]}'); } }),
+    });
+    const res = await dm(b).getResponse(req());
+    assert.equal(res, draft);
+    assert.equal(checkerCalls, 0);
+    assert.equal((res.output[1] as any).type, 'function_call');
+  });
+});
+
+test('verify strategy: ASK/CONTINUE graph edges do not consume the one final-answer verification slot', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let executorCalls = 0;
+    let checkerCalls = 0;
+    const b = brains({
+      passthrough: model({ getResponse: async () => (
+        executorCalls++ === 0 ? msg('ASK: Which Railway project should I use?') : msg('Final answer.')
+      ) }),
+      judge: model({ getResponse: async () => {
+        checkerCalls += 1;
+        return msg('{"verdict":"accept","issues":[]}');
+      } }),
+    });
+    const m = dm(b, { maxPerTurn: 1 });
+    assert.equal(extractTextForTest(await m.getResponse(req())), 'ASK: Which Railway project should I use?');
+    assert.equal(extractTextForTest(await m.getResponse(req())), 'Final answer.');
+    assert.equal(checkerCalls, 1, 'only the terminal final answer was checked');
+  });
+});
+
+test('verify strategy: exhausted executor failure is not retried by promoting the checker into the hero role', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let checkerCalls = 0;
+    const b = brains({
+      passthrough: model({ getResponse: async () => { throw new Error('executor chain exhausted'); } }),
+      judge: model({ getResponse: async () => { checkerCalls += 1; return msg('generic checker answer'); } }),
+    });
+    await assert.rejects(() => dm(b).getResponse(req()), /executor chain exhausted/);
+    assert.equal(checkerCalls, 0);
   });
 });
 
@@ -729,15 +874,15 @@ test('verify strategy: non-streamed hung checker hits deadline, aborts, and ship
   });
 });
 
-test('verify strategy (streamed): executor draft → checker streams refined; one response_started', async () => {
+test('verify strategy (streamed): checker verdict is buffered before one corrected response streams', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({
       passthrough: model({ getResponse: async () => msg('CODEX-DRAFT') }),
-      judge: model({ getStreamedResponse: async function* () {
-        yield { type: 'response_started' } as any;
-        yield { type: 'output_text_delta', delta: 'REFINED' } as any;
-        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'REFINED' }] } } as any;
-      } }),
+      judge: model({ getResponse: async () => msg(JSON.stringify({
+        verdict: 'correct',
+        issues: ['Corrected a specific fact.'],
+        corrected: 'REFINED',
+      })) }),
     });
     const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.equal(evs.filter((e) => e.type === 'response_started').length, 1);
@@ -755,7 +900,14 @@ test('verify strategy: tool-routing drafts ship as-is (no slot spent); the answe
     ];
     const b = brains({
       passthrough: model({ getResponse: async () => drafts[executorCall++] }),
-      judge: model({ getResponse: async () => { checkerCalls += 1; return msg('CHECKED'); } }),
+      judge: model({ getResponse: async () => {
+        checkerCalls += 1;
+        return msg(JSON.stringify({
+          verdict: 'correct',
+          issues: ['Concrete correction.'],
+          corrected: 'CHECKED',
+        }));
+      } }),
     });
     const m = dm(b, { maxPerTurn: 1 }); // cap of ONE
     const r1 = await m.getResponse(req()); // tool-routing → ship as-is, no checker, no slot
@@ -774,22 +926,32 @@ test('verify strategy: a structured draft with empty reply (workflow step) ships
     let call = 0;
     const b = brains({
       passthrough: model({ getResponse: async () => (call++ === 0 ? stepDraft : answerDraft) }),
-      judge: model({ getResponse: async () => { checkerCalls += 1; return msg('CHECKED'); } }),
+      judge: model({ getResponse: async () => {
+        checkerCalls += 1;
+        return msg(JSON.stringify({
+          verdict: 'correct',
+          issues: ['Concrete correction.'],
+          corrected: 'CHECKED',
+        }));
+      } }),
     });
     const m = dm(b, { maxPerTurn: 1 });
     const r1 = await m.getResponse(req()); // empty reply → ship as-is, no checker, no slot
     const r2 = await m.getResponse(req()); // real reply → checked (slot preserved)
     assert.equal(JSON.parse((r1.output[0] as any).content).reply, '', 'empty-reply step shipped as-is');
-    assert.equal((r2.output[0] as any).content, 'CHECKED', 'the turn with a real reply got checked');
+    const correctedEnvelope = JSON.parse((r2.output[0] as any).content);
+    assert.equal(correctedEnvelope.reply, 'CHECKED', 'only the user-facing reply was corrected');
+    assert.equal(correctedEnvelope.summary, 's', 'internal decision fields were preserved');
+    assert.equal(correctedEnvelope.done, true, 'completion state was preserved');
     assert.equal(checkerCalls, 1, 'checker ran only on the turn with a non-empty reply');
   });
 });
 
-test('verify strategy: checker failure pre-content ships the executor draft (conformant, no crash)', async () => {
+test('verify strategy: checker failure ships the executor draft (conformant, no crash)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({
       passthrough: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'CODEX-SOLO' }], responseId: 'r9', usage: { inputTokens: 1, outputTokens: 1 } } as any) }),
-      judge: model({ getStreamedResponse: async function* () { throw new Error('checker down'); } }),
+      judge: model({ getResponse: async () => { throw new Error('checker down'); } }),
     });
     const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'CODEX-SOLO'), 'shipped the executor draft');
@@ -802,13 +964,7 @@ test('verify strategy: an EMPTY checker response_done ships the executor draft, 
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
     const b = brains({
       passthrough: model({ getResponse: async () => ({ output: [{ type: 'message', content: 'CODEX-SOLO' }], responseId: 'r11', usage: { inputTokens: 1, outputTokens: 1 } } as any) }),
-      // Checker opens the stream then returns an EMPTY completion with nothing
-      // streamed (overloaded/empty). Without the backstop this would ship an
-      // empty response_done; with it, the executor draft is shipped instead.
-      judge: model({ getStreamedResponse: async function* () {
-        yield { type: 'response_started' } as any;
-        yield { type: 'response_done', response: { output: [] } } as any;
-      } }),
+      judge: model({ getResponse: async () => ({ output: [], usage: {} } as any) }),
     });
     const evs = await collect(dm(b, { heartbeatMs: 0 }).getStreamedResponse(req()));
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'CODEX-SOLO'), 'shipped the executor draft on an empty checker done');

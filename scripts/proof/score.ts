@@ -8,7 +8,7 @@
  * narration check IMPORTS the runtime's own single-source shape detector so
  * the proof gate always tracks the live guard, never a parallel regex.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 
@@ -393,6 +393,77 @@ export function fusionDisabledChecks(home: string, sessionId: string): Check[] {
       detail: error instanceof Error ? error.message : String(error),
     }];
   }
+}
+
+/** Dedicated Fusion canary: prove that one distinct model family returned the
+ * new bounded verdict contract for this exact session, and that the committed
+ * response respected the deterministic expansion ceiling. */
+export function fusionBoundedChecks(home: string, sessionId: string, brain: BrainKind): Check[] {
+  const operationalPath = path.join(home, 'state', 'operational-telemetry.db');
+  if (!existsSync(operationalPath)) {
+    return [{ name: 'bounded Fusion evidence is readable', pass: false, detail: 'operational telemetry database is missing' }];
+  }
+  let rows: Array<{ payload_json?: string }> = [];
+  try {
+    const db = new Database(operationalPath, { readonly: true, fileMustExist: true });
+    rows = db.prepare(
+      "SELECT payload_json FROM operational_events WHERE actor = 'fusion' AND session_id = ? ORDER BY ts ASC",
+    ).all(sessionId) as Array<{ payload_json?: string }>;
+    db.close();
+  } catch (error) {
+    return [{ name: 'bounded Fusion evidence is readable', pass: false, detail: error instanceof Error ? error.message : String(error) }];
+  }
+
+  const payloads = rows.map((row) => {
+    try { return JSON.parse(row.payload_json ?? '{}') as { outcome?: string; judgeModel?: string }; } catch { return {}; }
+  });
+  const outcomes = payloads.map((payload) => payload.outcome ?? '(missing)');
+  const boundedOutcomes = new Set(['checker-accepted-draft', 'checker-corrected-draft']);
+  const brainFamily = brain === 'glm' ? 'byo' : brain;
+  const judgeFamilies = payloads
+    .map((payload) => payload.judgeModel?.split(':', 1)[0])
+    .filter((family): family is string => Boolean(family));
+
+  let traceDetail = 'session trace missing';
+  let boundedLength = false;
+  try {
+    const tracePath = path.join(home, 'state', 'debate-traces.jsonl');
+    const traces = readFileSync(tracePath, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try { return JSON.parse(line) as { sessionId?: string; outcome?: string; executorLen?: number; finalLen?: number }; } catch { return {}; }
+      })
+      .filter((trace) => trace.sessionId === sessionId && typeof trace.outcome === 'string');
+    const trace = traces.at(-1);
+    if (trace && typeof trace.executorLen === 'number' && typeof trace.finalLen === 'number') {
+      const limit = trace.executorLen >= 24_000
+        ? trace.executorLen
+        : Math.min(24_000, Math.max(trace.executorLen + 800, Math.ceil(trace.executorLen * 1.5)));
+      boundedLength = trace.finalLen <= limit;
+      traceDetail = `executor ${trace.executorLen} chars → final ${trace.finalLen} chars (limit ${limit}); ${trace.outcome}`;
+    }
+  } catch {
+    /* missing/partial trace fails the length check below */
+  }
+
+  return [
+    {
+      name: 'exactly one bounded Fusion verdict ran',
+      pass: rows.length === 1 && outcomes.every((outcome) => boundedOutcomes.has(outcome)),
+      detail: `${rows.length} event(s): ${outcomes.join(', ')}`,
+    },
+    {
+      name: 'Fusion checker used a distinct model family',
+      pass: judgeFamilies.length === 1 && judgeFamilies[0] !== brainFamily,
+      detail: `brain ${brainFamily}; checker [${judgeFamilies.join(', ') || 'missing'}]`,
+    },
+    {
+      name: 'Fusion final stayed inside the deterministic correction bound',
+      pass: boundedLength,
+      detail: traceDetail,
+    },
+  ];
 }
 
 // ─── Cross-cutting checks ───────────────────────────────────────────────────

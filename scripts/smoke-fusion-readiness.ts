@@ -13,8 +13,8 @@
  *   --live also runs the Claude subscription transport, Claude Agent SDK local
  *   MCP + memory-read + brain-route + brain workflow-authoring + worker-skill
  *   + workflow-step smokes, Codex-brain→Claude-design workflow smoke, chat
- *   worker routing, BYO backend smoke, and debate live smokes using the user's
- *   real Clementine home/auth. Live mode spends model calls.
+ *   worker routing, BYO backend smoke, and the isolated bounded Fusion proof
+ *   using the user's real model grants. Live mode spends model calls.
  *
  * Run:
  *   npm run smoke:fusion-readiness
@@ -301,7 +301,7 @@ async function main(): Promise<void> {
       ['tsx', 'scripts/smoke-chat-worker-routing-live.ts'],
       { ...liveEnv, CLEMMY_LIVE_WORKER_MODEL: liveEnv.CLEMMY_LIVE_WORKER_MODEL || 'claude-sonnet-4-6' },
     );
-    runCommand('live fusion debate smoke', 'npx', ['tsx', 'scripts/debate-smoke.ts'], liveEnv);
+    runCommand('live bounded Fusion verifier proof', 'npm', ['run', 'proof:fusion:codex'], liveEnv);
     if (process.env.CLEMMY_READINESS_LEGACY_CLAUDE_TOOLTURN === '1') {
       runCommand('legacy live Claude OpenAI-SDK tool-turn diagnostic', 'npx', ['tsx', 'scripts/diag-claude-toolturn.ts'], liveEnv);
     }

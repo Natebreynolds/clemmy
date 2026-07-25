@@ -141,6 +141,9 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const judgeMetrics = settings.data?.judgeMetrics;
   const secondOpinionOn = Boolean(fusion && fusion.mode !== 'off');
   const fusionWhen: 'high' | 'all' = fusion?.mode === 'all' ? 'all' : 'high';
+  const boundedFusionAttempts = (fusion?.health?.accepted ?? 0)
+    + (fusion?.health?.corrected ?? 0)
+    + (fusion?.health?.safeFallbacks ?? 0);
   const onSecondOpinion = (on: boolean) =>
     run('fusion', () => patchFusion({ mode: on ? fusionWhen : 'off', strategy: 'verify' }));
   const onFusionWhen = (when: 'high' | 'all') =>
@@ -242,25 +245,30 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
         <div className="rounded-lg border border-border bg-canvas p-3">
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-2 text-label text-fg">
-              <Switch checked={secondOpinionOn} disabled={busy === 'fusion'} onChange={onSecondOpinion} label="Second opinion" />
-              <span>Second opinion</span>
+              <Switch checked={secondOpinionOn} disabled={busy === 'fusion'} onChange={onSecondOpinion} label="Cross-model verification" />
+              <span>Second opinion · cross-model verification</span>
             </div>
             {secondOpinionOn && (
               <Select className="h-8 w-auto" disabled={busy === 'fusion'} value={fusionWhen}
                 onChange={(e) => onFusionWhen(e.target.value as 'high' | 'all')}>
-                <option value="high">High-stakes turns</option>
-                <option value="all">Every turn (extra call)</option>
+                <option value="high">Consequential final answers</option>
+                <option value="all">Every eligible final answer</option>
               </Select>
             )}
           </div>
           <p className="mt-1.5 text-caption text-muted">
             {secondOpinionOn
-              ? 'The brain drafts once, then the judge above verifies and refines the answer before delivery.'
+              ? 'The brain stays the author. A different model checks a compact evidence packet, accepts the draft unchanged by default, and may return one bounded factual correction. It cannot run tools or decide task completion.'
               : 'The brain answers directly. Write-boundary and completion judges still run when the harness needs them.'}
             {' '}{fusion?.active
               ? <span className="text-success">Active now.</span>
               : (secondOpinionOn && <span className="text-warning">Configured but inactive — the judge is not available yet.</span>)}
           </p>
+          {boundedFusionAttempts > 0 && (
+            <p className="mt-1 text-caption text-muted">
+              Recent bounded checks: {fusion?.health?.accepted ?? 0} accepted unchanged · {fusion?.health?.corrected ?? 0} corrected · {fusion?.health?.safeFallbacks ?? 0} safely kept Clementine&apos;s draft.
+            </p>
+          )}
           {secondOpinionOn && judgeSameAsBrain && (
             <p className="mt-1 flex items-center gap-1.5 text-caption text-warning">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />

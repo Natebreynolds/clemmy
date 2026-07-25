@@ -10,6 +10,7 @@
  */
 
 export type BrainKind = 'claude' | 'codex' | 'glm';
+export type FusionProofMode = 'off' | 'high' | 'all';
 
 export interface BrainPlan {
   kind: BrainKind;
@@ -90,7 +91,7 @@ export interface ProofReport {
   finishedAt: string;
   gitHead: string;
   sourceClean: boolean;
-  fusionMode: 'off';
+  fusionMode: FusionProofMode;
   outcomes: ScenarioOutcome[];
   failures: number;
 }

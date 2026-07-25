@@ -354,7 +354,7 @@ import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
 import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
-import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
+import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot } from '../runtime/harness/debate-model.js';
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction, extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import {
@@ -6891,6 +6891,7 @@ export function registerConsoleRoutes(
         strategy: fusionStrategy(),
         brainsAvailable: fusionBrains,
         active: debateMode() !== 'off' && ((fusionBrains.claude && fusionBrains.codex) || verifyJudgeAvailable()),
+        health: getFusionHealthSnapshot(),
       };
       res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(), judgeMetrics: getJudgeMetricsSnapshot(), developerMode: isDevModeEnabled() });
     } catch (err) {
@@ -12688,6 +12689,7 @@ export function registerConsoleRoutes(
           strategy: fusionStrategy(),
           brainsAvailable: brains,
           active: mode !== 'off' && ((brains.claude && brains.codex) || verifyJudgeAvailable()),
+          health: getFusionHealthSnapshot(),
         },
       });
     } catch (err) {
@@ -12713,6 +12715,7 @@ export function registerConsoleRoutes(
           strategy: fusionStrategy(),
           brainsAvailable: brains,
           active: debateMode() !== 'off' && ((brains.claude && brains.codex) || verifyJudgeAvailable()),
+          health: getFusionHealthSnapshot(),
         },
         traces: readRecentDebateTraces(limit),
       });

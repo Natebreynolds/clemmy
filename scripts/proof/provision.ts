@@ -23,7 +23,7 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 
-import type { BrainKind, BrainPlan, DaemonHandle, TurnResult } from './types.js';
+import type { BrainKind, BrainPlan, DaemonHandle, FusionProofMode, TurnResult } from './types.js';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
 const DAEMON_ENTRY = path.join(REPO_ROOT, 'dist', 'index.js');
@@ -132,12 +132,14 @@ export interface ProvisionOptions {
   /** Keep the temp home on stop (forensics). Failed scenarios set this. */
   keepHome?: boolean;
   bootTimeoutMs?: number;
+  /** Default off. Dedicated live Fusion canaries opt into the mode under test. */
+  fusionMode?: FusionProofMode;
 }
 
 /** Runtime policy pins that make every live proof leg comparable. Exported so
  * the self-test can catch an accidental re-enable before any model quota is
  * spent. */
-export function proofRuntimeOverrides(): Record<string, string> {
+export function proofRuntimeOverrides(fusionMode: FusionProofMode = 'off'): Record<string, string> {
   return {
     // A provider proof must fail on its selected brain, never look green
     // because a recovery lane silently served the turn.
@@ -146,8 +148,9 @@ export function proofRuntimeOverrides(): Record<string, string> {
     CLEMMY_CLAUDE_OVERLOAD_FALLBACK: 'off',
     CLEMMY_LEGACY_RESPOND_FALLBACK: 'off',
     CLEMMY_ROUTE_POLICY: 'off',
-    // Freeze every model-judge/fusion branch. Deterministic safety gates remain.
-    CLEMMY_DEBATE_MODE: 'off',
+    // The release matrix defaults Fusion off. A dedicated cross-model canary
+    // may opt in explicitly while unrelated judge/fallover seams stay frozen.
+    CLEMMY_DEBATE_MODE: fusionMode,
     CLEMMY_FUSION_STRATEGY: 'verify',
     CLEMMY_JUDGE_CROSS_FAMILY: 'off',
     // Proof scenarios need the durable task to start on the explicit
@@ -232,7 +235,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     DISCORD_ENABLED: 'false',
     SLACK_ENABLED: 'false',
     ...plan.env,
-    ...proofRuntimeOverrides(),
+    ...proofRuntimeOverrides(opts.fusionMode),
   };
 
   let proc: ChildProcess;
