@@ -1252,8 +1252,9 @@ const VERIFY_PREAMBLE = [
   'You are a narrow cross-model VERIFIER, not the agent and not a second author.',
   'Clementine (the executor) owns the response. Check only the supplied user request,',
   'available runtime evidence, and draft. Return EXACTLY one JSON object in one of',
-  'these forms: {"verdict":"accept","issues":[]} or',
+  'these forms: {"verdict":"accept","issues":[],"corrected":null} or',
   '{"verdict":"correct","issues":["specific evidence-backed problem"],"corrected":"full corrected user-facing reply"}.',
+  'All three keys are required. For "accept", corrected must be null.',
   'Choose "correct" only for a concrete factual/logical contradiction or an explicit',
   'user requirement the draft omitted and that the supplied evidence lets you fix.',
   'Style, tone, phrasing, extra detail, or a merely different approach are NEVER',
@@ -1263,6 +1264,36 @@ const VERIFY_PREAMBLE = [
   'Never invent task state, rerun work, call tools, add a generic status banner,',
   'mention verification, or return prose outside the JSON object.',
 ].join(' ');
+
+/** A real SDK output contract, not merely a JSON request embedded in prose.
+ * Claude headless uses it to add a second JSON-only instruction, while raw
+ * provider transports can enforce the same schema on the wire. The local
+ * parser remains the final authority, so an invalid checker response still
+ * fails open to Clementine's original draft without another model call. */
+const VERIFY_OUTPUT_TYPE: Exclude<ModelRequest['outputType'], 'text'> = {
+  type: 'json_schema',
+  name: 'fusion_verdict',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      verdict: { type: 'string', enum: ['accept', 'correct'] },
+      issues: {
+        type: 'array',
+        items: { type: 'string', maxLength: 500 },
+        maxItems: 5,
+      },
+      corrected: {
+        anyOf: [
+          { type: 'string' },
+          { type: 'null' },
+        ],
+      },
+    },
+    required: ['verdict', 'issues', 'corrected'],
+    additionalProperties: false,
+  },
+};
 
 const VERIFY_CONTEXT_CHARS = 12_000;
 const VERIFY_ITEM_CHARS = 2_400;
@@ -1363,7 +1394,7 @@ export function buildVerifyRequest(request: ModelRequest, draft: ModelResponse):
     input,
     systemInstructions: VERIFY_PREAMBLE,
     modelSettings: requestSettings,
-    outputType: 'text',
+    outputType: VERIFY_OUTPUT_TYPE,
     tools: [],
     handoffs: [],
   } as ModelRequest);

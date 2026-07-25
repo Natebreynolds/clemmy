@@ -492,7 +492,11 @@ test('buildVerifyRequest: isolates a bounded evidence packet and strips the exec
   const vr = buildVerifyRequest(r, msg('DRAFT')) as any;
   assert.deepEqual(vr.tools, [], 'tools stripped');
   assert.deepEqual(vr.handoffs, [], 'handoffs stripped');
-  assert.equal(vr.outputType, 'text', 'verdict is a plain JSON text contract');
+  assert.equal(vr.outputType.type, 'json_schema', 'verdict has a provider-visible JSON contract');
+  assert.equal(vr.outputType.name, 'fusion_verdict');
+  assert.equal(vr.outputType.strict, true);
+  assert.deepEqual(vr.outputType.schema.required, ['verdict', 'issues', 'corrected']);
+  assert.equal(vr.outputType.schema.additionalProperties, false);
   assert.equal(vr.modelSettings.temperature, 0.3, 'other modelSettings preserved');
   assert.equal(vr.modelSettings.toolChoice, undefined, 'executor tool choice stripped');
   assert.ok(vr.modelSettings.maxTokens <= 1_800, 'checker output is capped');

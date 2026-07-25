@@ -190,11 +190,15 @@ export function renderClaudeHeadlessPrompt(request: ModelRequest): string {
   }
 
   if (request.outputType && request.outputType !== 'text') {
+    const outputType = request.outputType as { type?: unknown; schema?: unknown };
+    const contract = outputType.type === 'json_schema' && outputType.schema
+      ? outputType.schema
+      : request.outputType;
     sections.push([
       'Output contract:',
       'Return only valid JSON for this schema or contract.',
       'Do not wrap the JSON in markdown fences. Do not include prose before or after the JSON.',
-      safeJson(request.outputType),
+      safeJson(contract),
     ].join('\n'));
   }
 

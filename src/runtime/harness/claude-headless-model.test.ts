@@ -121,7 +121,17 @@ test('renderClaudeHeadlessPrompt preserves system/input and marks text-specialis
     input: [{ role: 'user', content: [{ type: 'input_text', text: 'Draft a layout critique.' }] }],
     modelSettings: {},
     tools: [{ type: 'function', name: 'read_file', description: 'Read', parameters: {}, strict: false }],
-    outputType: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'] },
+    outputType: {
+      type: 'json_schema',
+      name: 'reply_contract',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: { reply: { type: 'string' } },
+        required: ['reply'],
+        additionalProperties: false,
+      },
+    },
     handoffs: [],
     tracing: false,
   } as any);
@@ -129,6 +139,8 @@ test('renderClaudeHeadlessPrompt preserves system/input and marks text-specialis
   assert.match(prompt, /text specialist/);
   assert.match(prompt, /Return only valid JSON/);
   assert.match(prompt, /Do not wrap the JSON in markdown fences/);
+  assert.match(prompt, /"reply"/, 'the inner JSON schema is rendered');
+  assert.doesNotMatch(prompt, /reply_contract/, 'transport metadata is not mistaken for the requested output');
   assert.match(prompt, /user:\nDraft a layout critique\./);
 });
 
