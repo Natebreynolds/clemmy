@@ -24,6 +24,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 import type { BrainKind, BrainPlan, DaemonHandle, FusionProofMode, TurnResult } from './types.js';
+import { seedIsolatedClaudeAccess } from '../lib/isolated-claude-auth.js';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
 const DAEMON_ENTRY = path.join(REPO_ROOT, 'dist', 'index.js');
@@ -212,9 +213,20 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   // physically unable to reach external services. Databases, memory and every
   // other state file start EMPTY: that's the isolation contract.
   mkdirSync(path.join(home, 'state'), { recursive: true });
-  for (const authFile of ['auth.json', 'claude-auth.json']) {
-    const src = path.join(REAL_CLEM_HOME, 'state', authFile);
-    if (existsSync(src)) copyFileSync(src, path.join(home, 'state', authFile));
+  const codexAuth = path.join(REAL_CLEM_HOME, 'state', 'auth.json');
+  if (existsSync(codexAuth)) copyFileSync(codexAuth, path.join(home, 'state', 'auth.json'));
+  // Never copy a rotating Claude refresh token into a disposable home. A
+  // refresh there would invalidate the real grant and strand the replacement
+  // token in a directory we delete. Seed a currently-valid access token only.
+  const claudeSeed = seedIsolatedClaudeAccess({
+    targetHome: home,
+    sourceClementineHome: REAL_CLEM_HOME,
+    userHome: REAL_HOME,
+  });
+  if ((plan.kind === 'claude' || opts.fusionMode !== undefined && opts.fusionMode !== 'off') && !claudeSeed) {
+    sanitizeProofHomeForForensics(home);
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+    throw new Error('no currently-valid Claude subscription access token is available for the isolated proof');
   }
   const proofBin = createProofRailwayShim(home);
 

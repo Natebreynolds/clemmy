@@ -8,6 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { seedIsolatedClaudeAccess } from './lib/isolated-claude-auth.js';
 
 const expected = 'CODEX_BRAIN_CLAUDE_DESIGN_WORKFLOW_OK';
 const workerModel = process.env.CLEMMY_LIVE_WORKER_MODEL || 'claude-sonnet-4-6';
@@ -16,13 +17,8 @@ const skillName = 'taste-smoke';
 
 const realHome = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next');
 const realCodexAuth = path.join(realHome, 'state', 'auth.json');
-const realClaudeAuth = path.join(realHome, 'state', 'claude-auth.json');
 if (!existsSync(realCodexAuth)) {
   console.error(`Codex auth not found at ${realCodexAuth}`);
-  process.exit(1);
-}
-if (!existsSync(realClaudeAuth)) {
-  console.error(`Claude auth not found at ${realClaudeAuth}`);
   process.exit(1);
 }
 
@@ -30,7 +26,15 @@ const tmpHome = path.join(os.tmpdir(), `clemmy-codex-brain-claude-design-${Date.
 mkdirSync(path.join(tmpHome, 'state'), { recursive: true });
 mkdirSync(path.join(tmpHome, 'skills', skillName), { recursive: true });
 writeFileSync(path.join(tmpHome, 'state', 'auth.json'), readFileSync(realCodexAuth, 'utf-8'), 'utf-8');
-writeFileSync(path.join(tmpHome, 'state', 'claude-auth.json'), readFileSync(realClaudeAuth, 'utf-8'), 'utf-8');
+if (!seedIsolatedClaudeAccess({
+  targetHome: tmpHome,
+  sourceClementineHome: realHome,
+  userHome: os.homedir(),
+})) {
+  rmSync(tmpHome, { recursive: true, force: true });
+  console.error('No currently-valid Claude subscription access token is available for this isolated smoke.');
+  process.exit(1);
+}
 writeFileSync(
   path.join(tmpHome, 'skills', skillName, 'SKILL.md'),
   [

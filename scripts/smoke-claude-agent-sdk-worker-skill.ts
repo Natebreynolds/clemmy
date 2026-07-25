@@ -4,22 +4,25 @@
  * a Claude worker binding. The worker must run through Claude Agent SDK, call
  * Clementine's local skill_read MCP tool, and return the skill-mandated output.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { seedIsolatedClaudeAccess } from './lib/isolated-claude-auth.js';
 
 const expected = 'CLAUDE_AGENT_SDK_WORKER_SKILL_OK';
 const realHome = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next');
-const realClaudeAuth = path.join(realHome, 'state', 'claude-auth.json');
-if (!existsSync(realClaudeAuth)) {
-  console.error(`Claude auth not found at ${realClaudeAuth}`);
-  process.exit(1);
-}
-
 const tmpHome = path.join(os.tmpdir(), `clemmy-claude-sdk-worker-${Date.now()}`);
 mkdirSync(path.join(tmpHome, 'state'), { recursive: true });
 mkdirSync(path.join(tmpHome, 'skills', 'claude-worker-smoke'), { recursive: true });
-writeFileSync(path.join(tmpHome, 'state', 'claude-auth.json'), readFileSync(realClaudeAuth, 'utf-8'), 'utf-8');
+if (!seedIsolatedClaudeAccess({
+  targetHome: tmpHome,
+  sourceClementineHome: realHome,
+  userHome: os.homedir(),
+})) {
+  rmSync(tmpHome, { recursive: true, force: true });
+  console.error('No currently-valid Claude subscription access token is available for this isolated smoke.');
+  process.exit(1);
+}
 writeFileSync(
   path.join(tmpHome, 'state', 'auth.json'),
   JSON.stringify({ codexOauth: { accessToken: 'codex-smoke-access', refreshToken: 'codex-smoke-refresh' } }),

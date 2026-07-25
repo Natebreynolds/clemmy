@@ -108,6 +108,11 @@ gate rejects checker timeouts, legacy full rewrites, same-family self-checks,
 protocol leakage, and output beyond the correction ceiling. A green proof is
 release evidence for that commit; it does not create a tag.
 
+Live proof/smoke homes receive a currently valid Claude subscription access
+token only. They never copy a Claude refresh token: Anthropic rotates refresh
+tokens, so refreshing a disposable copy would invalidate the production grant
+and strand its replacement in the temporary home.
+
 ## Live and manual testing
 
 Do not point an automated or destructive test at a real

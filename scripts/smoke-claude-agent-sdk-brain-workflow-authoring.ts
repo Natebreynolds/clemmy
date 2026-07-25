@@ -4,9 +4,10 @@
  * it author a local Clementine workflow with a Claude-routed design/report step
  * and an installed skill reference. Runs in an isolated CLEMENTINE_HOME.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { seedIsolatedClaudeAccess } from './lib/isolated-claude-auth.js';
 
 const expected = 'CLAUDE_AGENT_SDK_BRAIN_WORKFLOW_AUTHORING_OK';
 const modelId = process.env.CLEMMY_LIVE_WORKER_MODEL || 'claude-sonnet-4-6';
@@ -14,16 +15,18 @@ const workflowName = `Claude Brain Design Report Smoke ${Date.now()}`;
 const skillName = 'taste-smoke';
 
 const realHome = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine-next');
-const realClaudeAuth = path.join(realHome, 'state', 'claude-auth.json');
-if (!existsSync(realClaudeAuth)) {
-  console.error(`Claude auth not found at ${realClaudeAuth}`);
-  process.exit(1);
-}
-
 const tmpHome = path.join(os.tmpdir(), `clemmy-claude-sdk-brain-author-${Date.now()}`);
 mkdirSync(path.join(tmpHome, 'state'), { recursive: true });
 mkdirSync(path.join(tmpHome, 'skills', skillName), { recursive: true });
-writeFileSync(path.join(tmpHome, 'state', 'claude-auth.json'), readFileSync(realClaudeAuth, 'utf-8'), 'utf-8');
+if (!seedIsolatedClaudeAccess({
+  targetHome: tmpHome,
+  sourceClementineHome: realHome,
+  userHome: os.homedir(),
+})) {
+  rmSync(tmpHome, { recursive: true, force: true });
+  console.error('No currently-valid Claude subscription access token is available for this isolated smoke.');
+  process.exit(1);
+}
 writeFileSync(
   path.join(tmpHome, 'skills', skillName, 'SKILL.md'),
   [
