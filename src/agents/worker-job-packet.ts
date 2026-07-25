@@ -1,6 +1,51 @@
 import { z } from 'zod';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 
+export const WorkerManifestDescriptorSchema = z.object({
+  id: z
+    .string()
+    .min(1)
+    .describe('Stable id for this logical work set across waves, retries, phases, and background continuations.'),
+  contractVersion: z
+    .string()
+    .min(1)
+    .describe('Version of the user-approved work contract. Change it only through an explicit contract revision.'),
+  phase: z
+    .string()
+    .min(1)
+    .describe('Current phase id, such as research, validate, merge, publish, or readback.'),
+  mode: z
+    .enum(['declare', 'reconcile', 'extend'])
+    .nullable()
+    .optional()
+    .describe('First wave declares; later waves reconcile. Use extend only when the logical scope genuinely grows.'),
+  phases: z
+    .array(z.object({
+      id: z.string().min(1),
+      label: z.string().min(1).nullable().optional(),
+      dependsOn: z.array(z.string().min(1)).nullable().optional(),
+    }))
+    .max(32)
+    .nullable()
+    .optional()
+    .describe('Ordered phase graph. Supply on the declaration wave; later waves can omit it.'),
+  aliases: z
+    .array(z.object({
+      alias: z
+        .string()
+        .min(1)
+        .describe('Current worker item label, such as a spreadsheet row or renamed record.'),
+      itemId: z
+        .string()
+        .min(1)
+        .describe('Canonical manifest item id that this label resolves to.'),
+    }))
+    .max(256)
+    .nullable()
+    .optional()
+    .describe('Alias-to-canonical-id pairs for changed labels (for example spreadsheet row -> CRM account id). Use null when labels already match canonical ids.'),
+});
+
 export const WorkerToolInputSchema = z.object({
   objective: z
     .string()
@@ -31,6 +76,10 @@ export const WorkerToolInputSchema = z.object({
     .min(1)
     .nullable()
     .describe('Model-routing intent/category for this item, using the user\'s own word such as "design", "writing", or "research". Pass null for ordinary workers.'),
+  workManifest: WorkerManifestDescriptorSchema
+    .nullable()
+    .optional()
+    .describe('For durable multi-wave work, bind workers to canonical logical items and a phase graph. This prevents retries or changed labels from inflating progress.'),
 });
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
@@ -41,7 +90,8 @@ export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
  * "call this tool N times in parallel" is a prompt-level contract some brains
  * never honor — they serialize the calls and a 5-item fan-out takes 5× wall
  * time (live 2026-07-21). With `items`, the harness runs the pool itself:
- * wall time ≈ the slowest item, regardless of which brain is driving.
+ * wall time follows the slowest concurrency waves, regardless of which brain
+ * is driving.
  */
 export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
   item: z
@@ -52,10 +102,10 @@ export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
     .describe('The single item to process: id, name, domain, row, record, URL, or other concrete identifier. Omit when passing `items`.'),
   items: z
     .array(z.string().min(1))
-    .max(64)
+    .max(256)
     .nullable()
     .optional()
-    .describe('PREFERRED for 2+ independent same-shape items: the full list of item identifiers. The harness runs them as one bounded parallel pool (wall time ≈ slowest item) with a per-item honest ledger — no need to call run_worker once per item.'),
+    .describe('PREFERRED for 2+ independent same-shape items: the full list of up to 256 item identifiers. The harness runs them as one concurrency-bounded pool (wall time follows the slowest pool waves) with a per-item honest ledger — no need to call run_worker once per item.'),
 });
 
 export type WorkerToolCall = z.infer<typeof WorkerToolCallSchema>;
@@ -159,6 +209,7 @@ export function workerPacketKey(input: WorkerToolInput): string {
     input.instructions,
     input.expectedOutput,
     input.intent ?? '',
+    input.workManifest ? JSON.stringify(input.workManifest) : '',
   ];
   let serialized = '';
   for (const f of fields) serialized += `${f.length} ${f} `;

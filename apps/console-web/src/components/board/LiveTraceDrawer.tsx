@@ -32,6 +32,7 @@ import {
   listReportBackChannels,
   repostBackgroundTaskResult,
   repostBackgroundTaskResultByChannel,
+  reviseBackgroundTaskContract,
   setBackgroundTaskReportBackChannel,
   setBackgroundTaskReportBackTarget,
   sourceLabel,
@@ -66,6 +67,9 @@ const LIFECYCLE: Record<string, { label: string; tone: NonNullable<ActivityItem[
   brain_fallover: { label: 'Switched brain', tone: 'warning' },
   sdk_compact_boundary: { label: 'Compacted context', tone: 'muted' },
   sdk_auto_continue: { label: 'Auto-continued', tone: 'muted' },
+  work_manifest_declared: { label: 'Work map declared', tone: 'muted' },
+  work_contract_revised: { label: 'Work contract revised', tone: 'warning' },
+  background_contract_revised: { label: 'Course corrected', tone: 'warning' },
   run_failed: { label: 'Failed', tone: 'danger' },
   conversation_completed: { label: 'Completed', tone: 'success' },
 };
@@ -288,6 +292,10 @@ export function LiveTraceDrawer({
   const [targetKey, setTargetKey] = useState('');
   const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [channelKey, setChannelKey] = useState('');
+  const [revisionDraft, setRevisionDraft] = useState('');
+  const [revisionPolicy, setRevisionPolicy] = useState<'preserve' | 'revalidate' | 'invalidate'>('revalidate');
+  const [revisionState, setRevisionState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [revisionNotice, setRevisionNotice] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // A finished run loses its `sourceKind === 'workflow'` tag but still carries a
@@ -301,6 +309,9 @@ export function LiveTraceDrawer({
 
   useEffect(() => {
     setCurrent(card.progressHint || '');
+    setRevisionDraft('');
+    setRevisionState('idle');
+    setRevisionNotice('');
   }, [card.id, card.progressHint]);
 
   const backgroundDetail = usePoll(
@@ -434,6 +445,28 @@ export function LiveTraceDrawer({
       void backgroundDetail.refetch();
     } catch (err) {
       setTargetNotice({ tone: 'danger', text: err instanceof Error ? err.message : 'Could not repost result.' });
+    }
+  };
+
+  const reviseContract = async () => {
+    const instruction = revisionDraft.trim();
+    if (!instruction || revisionState === 'sending') return;
+    setRevisionState('sending');
+    setRevisionNotice('');
+    try {
+      const response = await reviseBackgroundTaskContract(card.id, instruction, revisionPolicy);
+      if (!response.ok) {
+        setRevisionState('error');
+        setRevisionNotice(response.reason ?? 'Could not update the task contract.');
+        return;
+      }
+      setRevisionState('sent');
+      setRevisionNotice(`Contract v${response.task?.contractVersion ?? 'next'} queued. Completed work will be reconciled, not blindly replayed.`);
+      setRevisionDraft('');
+      void backgroundDetail.refetch();
+    } catch (err) {
+      setRevisionState('error');
+      setRevisionNotice(err instanceof Error ? err.message : 'Could not update the task contract.');
     }
   };
 
@@ -696,6 +729,106 @@ export function LiveTraceDrawer({
                         <div className="text-caption font-semibold text-faint">Latest activity</div>
                         <div className="text-small text-fg">{taskDetail.detail.latestActivitySummary}</div>
                       </div>
+                    )}
+                  </div>
+                )}
+
+                {(taskDetail.workManifests?.length ?? 0) > 0 && (
+                  <div className="space-y-3 rounded-md border border-border px-3 py-3">
+                    <div>
+                      <div className="text-small font-semibold text-fg">Logical work map</div>
+                      <div className="text-caption text-faint">Canonical items and durable phase checkpoints — retries do not increase the total.</div>
+                    </div>
+                    {taskDetail.workManifests!.map((manifest) => (
+                      <div key={manifest.manifestId} className="space-y-2 rounded-md bg-subtle px-3 py-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="truncate text-small font-semibold text-fg">{manifest.objective || manifest.manifestId}</div>
+                            <div className="text-caption text-faint">
+                              Contract {manifest.contractVersion} · {manifest.completed}/{manifest.total} items finished every phase
+                            </div>
+                          </div>
+                          <StatusPill tone={manifest.remaining === 0 ? 'success' : 'neutral'}>
+                            {manifest.remaining === 0 ? 'complete' : `${manifest.remaining} left`}
+                          </StatusPill>
+                        </div>
+                        <div className="space-y-2">
+                          {manifest.phases.map((phase) => {
+                            const percent = phase.total > 0 ? Math.round((phase.succeeded / phase.total) * 100) : 0;
+                            const active = manifest.currentPhase === phase.id;
+                            return (
+                              <div key={phase.id}>
+                                <div className="mb-1 flex items-center justify-between gap-2 text-caption">
+                                  <span className={cn('font-semibold', active ? 'text-primary' : 'text-muted')}>{phase.label}</span>
+                                  <span className="text-faint">
+                                    {phase.succeeded}/{phase.total}
+                                    {phase.running ? ` · ${phase.running} running` : ''}
+                                    {phase.failed ? ` · ${phase.failed} failed` : ''}
+                                    {phase.needsValidation ? ` · ${phase.needsValidation} recheck` : ''}
+                                    {phase.invalidated ? ` · ${phase.invalidated} invalid` : ''}
+                                  </span>
+                                </div>
+                                <div className="h-1.5 overflow-hidden rounded-full bg-border">
+                                  <div
+                                    className={cn('h-full rounded-full', phase.failed || phase.invalidated ? 'bg-warning' : 'bg-primary')}
+                                    style={{ width: `${percent}%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className="text-caption text-faint">
+                          {manifest.evidenceCount} evidence refs · {manifest.artifactCount} artifact/readback refs
+                          {manifest.untrackedCheckpoints ? ` · ${manifest.untrackedCheckpoints} untracked attempts excluded` : ''}
+                          {manifest.staleCheckpoints ? ` · ${manifest.staleCheckpoints} stale-contract results preserved` : ''}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {['pending', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_continue', 'blocked'].includes(taskDetail.task.status) && (
+                  <div className="rounded-md border border-border px-3 py-3">
+                    <div className="text-small font-semibold text-fg">Update the course</div>
+                    <p className="mt-1 text-caption text-muted">
+                      Add a correction to contract v{taskDetail.task.contractVersion ?? 1}. Clementine will reconcile it at the next model boundary on this same task and session.
+                    </p>
+                    <textarea
+                      value={revisionDraft}
+                      onChange={(event) => {
+                        setRevisionDraft(event.target.value);
+                        if (revisionState !== 'idle') {
+                          setRevisionState('idle');
+                          setRevisionNotice('');
+                        }
+                      }}
+                      rows={3}
+                      placeholder="Example: Use the connected ChatGPT research runs, not public website research."
+                      className="mt-2 w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg placeholder:text-faint focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                    <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_auto]">
+                      <Select
+                        value={revisionPolicy}
+                        onChange={(event) => setRevisionPolicy(event.target.value as typeof revisionPolicy)}
+                        aria-label="Prior evidence handling"
+                      >
+                        <option value="revalidate">Recheck completed evidence</option>
+                        <option value="preserve">Keep compatible evidence</option>
+                        <option value="invalidate">Invalidate prior evidence</option>
+                      </Select>
+                      <Button
+                        size="sm"
+                        onClick={() => void reviseContract()}
+                        disabled={!revisionDraft.trim() || revisionState === 'sending'}
+                      >
+                        {revisionState === 'sending' ? 'Updating…' : 'Update course'}
+                      </Button>
+                    </div>
+                    {revisionNotice && (
+                      <p className={cn('mt-2 text-caption', revisionState === 'error' ? 'text-danger' : 'text-success')}>
+                        {revisionNotice}
+                      </p>
                     )}
                   </div>
                 )}

@@ -2712,11 +2712,25 @@ function freshRunsFor(wf: string, origId: string): Array<Record<string, unknown>
     .filter((r) => r.workflow === wf);
 }
 
-test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run carrying attempt+1', async () => {
+function removeFreshRunsFor(wf: string, origId: string): void {
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR)) {
+    if (!file.endsWith('.json') || file === `${origId}.json`) continue;
+    const fullPath = path.join(WORKFLOW_RUNS_DIR, file);
+    try {
+      const run = JSON.parse(readFileSync(fullPath, 'utf-8')) as { workflow?: unknown };
+      if (run.workflow === wf) rmSync(fullPath, { force: true });
+    } catch {
+      // A malformed fixture is not ours to remove.
+    }
+  }
+}
+
+test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run carrying attempt+1', async (t) => {
   // T3.2: the cross-family veto judge would attempt a live model call here —
   // disable it (kill-switch) so the heal proceeds on the fail-open path.
   process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
   const wf = 'heal-below-cap';
+  t.after(() => removeFreshRunsFor(wf, `${wf}-run`));
   writeHealWorkflow(wf, [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }]);
   const origId = `${wf}-run`;
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
@@ -2744,9 +2758,10 @@ test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run
   delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
 });
 
-test('self-heal RSH-1: an edit_contract fix auto-applies (loosens the contract) + re-queues', async () => {
+test('self-heal RSH-1: an edit_contract fix auto-applies (loosens the contract) + re-queues', async (t) => {
   process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
   const wf = 'heal-contract';
+  t.after(() => removeFreshRunsFor(wf, `${wf}-run`));
   writeHealWorkflow(wf, [{ id: 'gather', prompt: 'Gather leads and return them.' }]);
   // give the step a too-strict contract, then heal it
   const entry = (await import('../memory/workflow-store.js'));
@@ -2779,9 +2794,10 @@ test('self-heal RSH-1: an edit_contract fix auto-applies (loosens the contract) 
   delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
 });
 
-test('self-heal RSH-3: an edit_input fix auto-applies (rebinds the input) + re-queues', async () => {
+test('self-heal RSH-3: an edit_input fix auto-applies (rebinds the input) + re-queues', async (t) => {
   process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
   const wf = 'heal-input';
+  t.after(() => removeFreshRunsFor(wf, `${wf}-run`));
   writeHealWorkflow(wf, [{ id: 'fetch', prompt: 'Fetch {{input.url}} and return it.' }]);
   const entry = (await import('../memory/workflow-store.js'));
   const cur = entry.readWorkflow(wf)!.data;

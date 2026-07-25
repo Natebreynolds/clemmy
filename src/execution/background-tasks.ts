@@ -28,7 +28,7 @@ import { addNotification, markNotificationsReadByQuestionId } from '../runtime/n
 import { deliverOutcome } from '../runtime/outcome.js';
 import { humanizeReportBody } from '../runtime/report-voice.js';
 import { getGoalPinForDelegation, getActiveGoalForSession } from '../agents/plan-proposals.js';
-import { deliverableProbesEnabled, probeSessionDeliverables } from './deliverable-probe.js';
+import { deliverableProbesEnabled, extractDeliverables, probeSessionDeliverables } from './deliverable-probe.js';
 import { ExecutionStore } from './store.js';
 import type { AssistantResponse, RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -39,12 +39,12 @@ import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { listRunArtifacts } from '../runtime/harness/artifact-ledger.js';
 import { resetFanoutWindow, sweepFanoutReduce } from '../runtime/harness/fanout-reduce.js';
-import { classifyBlocker, matchesBlockedText, verifyDelivered, type BlockerType } from '../runtime/harness/verify-delivered.js';
+import { classifyBlocker, matchesBlockedText, type BlockerType } from '../runtime/harness/verify-delivered.js';
 import { verifyFanoutItems, fanoutItemVerifyEnabled, verifyInlineRecovery } from '../runtime/harness/fanout-item-verify.js';
-import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
-import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
+import { isPromiseShapedReply, judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
@@ -57,6 +57,13 @@ import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { capacityAdvice } from '../runtime/harness/capacity-advisor.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { recordRunStrategy } from '../memory/run-strategy-store.js';
+import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
+import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
+import {
+  reviseWorkContract,
+  summarizeWorkManifests,
+  type WorkManifestSummary,
+} from '../runtime/harness/work-manifest.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -75,9 +82,9 @@ function finishRun(
   return persistFinishRun(runId, input);
 }
 
-let backgroundDeliveryJudgeForTests: ObjectiveJudgeFn | null = null;
-export function _setBackgroundDeliveryJudgeForTests(fn: ObjectiveJudgeFn | null): void {
-  backgroundDeliveryJudgeForTests = fn;
+let backgroundCompletionVerificationPauseForTests: (() => Promise<void>) | null = null;
+export function _setBackgroundCompletionVerificationPauseForTests(fn: (() => Promise<void>) | null): void {
+  backgroundCompletionVerificationPauseForTests = fn;
 }
 
 export type BackgroundTaskStatus =
@@ -130,6 +137,12 @@ export interface BackgroundTaskRecord {
     throughSeq: number;
   };
   runSessionId: string;
+  /** User-visible, monotonic task contract. The original prompt is v1; later
+   * revisions are appended instead of rewriting history. A run that finishes
+   * against an older version is superseded and re-queued on the same session. */
+  contractVersion?: number;
+  contractRevisions?: BackgroundTaskContractRevision[];
+  pendingContractRevision?: BackgroundTaskContractRevision;
   userId?: string;
   channel?: string;
   reportBackTarget?: BackgroundReportBackTarget;
@@ -215,6 +228,14 @@ export interface BackgroundTaskRecord {
    *  task. Set by archiveBackgroundTask, cleared by restoreBackgroundTask. */
   archived?: boolean;
   archivedAt?: string;
+}
+
+export interface BackgroundTaskContractRevision {
+  version: number;
+  instruction: string;
+  evidencePolicy: 'preserve' | 'revalidate' | 'invalidate';
+  queuedAt: string;
+  appliedAt?: string;
 }
 
 export interface CreateBackgroundTaskInput {
@@ -1016,13 +1037,21 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     'If you are blocked by missing credentials, missing approvals, or ambiguity that could cause damage, stop and explain the blocker.',
     policy.allowComputerActions ? '' : 'Policy: do not modify local files, run shell commands, or operate the computer unless the user explicitly re-enables computer actions.',
     policy.allowComposioActions ? '' : 'Policy: do not use connected-app or Composio actions unless the user explicitly re-enables connected-app actions.',
-    'Keep a concise task ledger in your reasoning and finish with these sections:',
-    '## Completed',
-    '## Evidence / Verification',
-    '## Remaining Risks',
-    '## Next Step',
+    // FLOOR, not FORM. Prescribing `## Completed` first forced a run that MISSED its
+    // objective to open with wins and bury the blocker — live 2026-07-24, the Railway
+    // run led with four completed items and put "authenticate with `railway login`" in
+    // section three of four. A fixed shape also cannot fit both outcomes, which is why
+    // a downstream module (runtime/report-voice.ts) exists purely to strip these headings
+    // back off for humans. Name the facts the report must carry; let the model pick the
+    // shape that fits the outcome it actually got.
+    'Keep a concise task ledger in your reasoning.',
+    'Finish with a short report the user can act on. However you lay it out, it must answer: '
+      + 'whether you met the objective — say so plainly if you did not; the concrete evidence for what you claim; '
+      + 'anything still blocked, with exactly what you need from the user to clear it; and what happens next. '
+      + 'Lead with whatever matters most for THIS outcome — if you were blocked, that is the blocker, not the parts that went well.',
     '',
     `Task ID: ${task.id}`,
+    renderTaskContractBlock(task),
     task.originSessionId ? `Origin session: ${task.originSessionId}` : '',
     `Soft max runtime: ${task.maxMinutes} minutes`,
     '',
@@ -1035,6 +1064,21 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     'Original request:',
     task.prompt,
   ].filter(Boolean).join('\n');
+}
+
+function renderTaskContractBlock(task: BackgroundTaskRecord): string {
+  const contractVersion = task.contractVersion ?? 1;
+  const revisions = (task.contractRevisions ?? []).slice(-8);
+  return [
+    '## Durable Task Contract',
+    `Active contract version: ${contractVersion}.`,
+    revisions.length === 0
+      ? 'Version 1 is the original request below.'
+      : 'The revisions below are authoritative and cumulative. Reconcile durable work against them before retrying; do not discard compatible completed evidence.',
+    ...revisions.map((revision) => (
+      `- v${revision.version} (${revision.evidencePolicy} prior evidence): ${revision.instruction}`
+    )),
+  ].join('\n');
 }
 
 // Wave 4 Stage 1 (finding H): the background/goal lane self-resumes unattended
@@ -1059,6 +1103,7 @@ function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: st
     'The previous worker turn ended before the objective was safely complete, or this task was explicitly queued for continuation.',
     'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
     RESUME_NO_RESEND_DIRECTIVE,
+    renderTaskContractBlock(task),
     restartVerification,
     renderOriginLineageBlock(task),
     previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
@@ -1071,6 +1116,12 @@ function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: st
 function buildWorkerInputResumePrompt(task: BackgroundTaskRecord, answer: string): string {
   return [
     `The user answered your question: "${answer}". Continue the task with this answer.`,
+    'Resume THIS SAME task from its saved progress. Do not restart completed work merely because the dependency pause opened a new model turn.',
+    RESUME_NO_RESEND_DIRECTIVE,
+    renderTaskContractBlock(task),
+    task.result?.trim()
+      ? `Saved progress report from before the pause:\n${task.result.slice(0, RESULT_TRUNCATE_CHARS)}`
+      : '',
     'Use the prior run session state, but preserve the origin session facts below if the continuation is picked up by a different model/backend.',
     renderOriginLineageBlock(task),
     '',
@@ -1165,6 +1216,8 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     originSessionId: input.originSessionId,
     foregroundHandoff: input.foregroundHandoff,
     runSessionId: `background:${id}`,
+    contractVersion: 1,
+    contractRevisions: [],
     userId: input.userId,
     channel: input.channel,
     reportBackTarget: normalizeReportBackTarget(input.reportBackTarget)
@@ -1409,6 +1462,135 @@ export function updateBackgroundTask(id: string, patch: BackgroundTaskPatch): Ba
   return updateBackgroundTaskWhere(id, () => true, patch);
 }
 
+/**
+ * Append a user course-correction without rewriting the original task or
+ * discarding progress. Running work is allowed to reach its current response
+ * boundary, then the stale-contract response is preserved as partial evidence
+ * and the same task/session is re-queued on the new version.
+ */
+export function reviseBackgroundTaskContract(
+  id: string,
+  input: {
+    instruction: string;
+    evidencePolicy?: BackgroundTaskContractRevision['evidencePolicy'];
+  },
+): BackgroundTaskRecord | null {
+  const instruction = clean(input.instruction ?? '', RESULT_TRUNCATE_CHARS);
+  if (!instruction) return null;
+  const evidencePolicy = input.evidencePolicy ?? 'revalidate';
+  const queuedAt = nowIso();
+  let supersededApprovalId: string | undefined;
+  const updated = updateBackgroundTaskWhere(
+    id,
+    (task) => !task.archived
+      && !['done', 'failed', 'aborted', 'interrupted', 'cancelling'].includes(task.status),
+    (task) => {
+      const nextVersion = (task.contractVersion ?? 1) + 1;
+      const revision: BackgroundTaskContractRevision = {
+        version: nextVersion,
+        instruction,
+        evidencePolicy,
+        queuedAt,
+      };
+      const requeueParked = ['blocked', 'awaiting_approval', 'awaiting_input', 'awaiting_continue']
+        .includes(task.status);
+      if (task.status === 'awaiting_approval') supersededApprovalId = task.pendingApprovalId;
+      return {
+        ...(requeueParked
+          ? {
+              ...clearParkedBackgroundState(),
+              status: 'pending' as const,
+              error: undefined,
+              completedAt: undefined,
+              continueResolution: {
+                queuedAt,
+                reason: `Resume under corrected contract v${nextVersion}; reconcile saved progress before new execution.`,
+                auto: false,
+              },
+            }
+          : {}),
+        contractVersion: nextVersion,
+        contractRevisions: [...(task.contractRevisions ?? []), revision].slice(-50),
+        pendingContractRevision: revision,
+        lastCheckInAt: queuedAt,
+        lastCheckInMessage: `Course correction queued as contract v${nextVersion}; current work will reconcile at the next model boundary.`,
+      };
+    },
+  );
+  if (!updated) return null;
+  if (supersededApprovalId) {
+    try {
+      approvalRegistry.resolve(
+        supersededApprovalId,
+        'cancelled_by_user',
+        'background-contract-revision',
+      );
+    } catch { /* task revision remains canonical if approval cleanup fails */ }
+  }
+
+  // Pre-register a pending task's trace so the revision is visible immediately.
+  try {
+    if (!getHarnessSessionRow(updated.runSessionId)) {
+      createHarnessSession({
+        id: updated.runSessionId,
+        kind: 'execution',
+        title: updated.title,
+      });
+    }
+    appendEvent({
+      sessionId: updated.runSessionId,
+      turn: 0,
+      role: 'user',
+      type: 'background_contract_revised',
+      data: {
+        taskId: updated.id,
+        contractVersion: updated.contractVersion ?? 1,
+        instruction,
+        evidencePolicy,
+        queuedAt,
+      },
+    });
+  } catch { /* task record remains canonical */ }
+
+  // Apply the compatibility decision to every declared logical manifest now.
+  // Any old-version worker result that lands after this point is kept as stale
+  // evidence and cannot silently clear the revised contract.
+  for (const manifest of summarizeWorkManifests(updated.runSessionId)) {
+    try {
+      reviseWorkContract({
+        sessionId: updated.runSessionId,
+        manifestId: manifest.manifestId,
+        fromVersion: manifest.contractVersion,
+        toVersion: String(updated.contractVersion ?? 1),
+        instruction,
+        evidencePolicy,
+      });
+    } catch { /* one malformed manifest cannot hide the task revision */ }
+  }
+  if (updated.status === 'pending') requestBackgroundDrain(1);
+  return updated;
+}
+
+function markPendingContractRevisionApplied(task: BackgroundTaskRecord): BackgroundTaskRecord {
+  const pending = task.pendingContractRevision;
+  if (!pending) return task;
+  return updateBackgroundTaskWhere(
+    task.id,
+    (latest) => latest.status === 'running'
+      && latest.pendingContractRevision?.version === pending.version,
+    (latest) => ({
+      pendingContractRevision: undefined,
+      contractRevisions: (latest.contractRevisions ?? []).map((revision) => (
+        revision.version <= pending.version && !revision.appliedAt
+          ? { ...revision, appliedAt: nowIso() }
+          : revision
+      )),
+      lastCheckInAt: nowIso(),
+      lastCheckInMessage: `Contract v${pending.version} applied; reconciling saved work before new execution.`,
+    }),
+  ) ?? task;
+}
+
 function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>> {
   return {
     pendingApprovalId: undefined,
@@ -1538,7 +1720,14 @@ function backgroundTaskOutcomeForStatus(status: BackgroundTaskStatus): Backgroun
 
 function storedBackgroundTaskReportText(task: BackgroundTaskRecord): string {
   const stored = storedResultTextForIntegrityCheck(task).trim();
-  if (stored) return stored;
+  if (stored) {
+    return task.status === 'blocked'
+      ? progressPreservingPauseDetail(
+        'Resolve the remaining blocker before starting another run.',
+        { resultText: stored, blockerReason: task.error },
+      )
+      : stored;
+  }
   if (task.error?.trim()) return task.error.trim();
   if (task.result?.trim()) return task.result.trim();
   return `Task ${task.id} finished with status ${task.status}, but no result text was saved.`;
@@ -1730,33 +1919,99 @@ export function markBackgroundTaskDone(
  * deliverOutcome(needs_input) — so the user sees the question where they're
  * talking, and can just answer there (the answer is routed back to resume).
  */
-export function markBackgroundTaskAwaitingInput(id: string, questionId: string, question: string): BackgroundTaskRecord | null {
+interface BackgroundInputPauseOptions {
+  /** The worker's complete model-authored report. A dependency question must
+   * never replace the useful work that led up to it. */
+  resultText?: string;
+  /** Structured harness fact appended after the report, not substituted for it. */
+  blockerReason?: string;
+  blockerType?: BlockerType;
+}
+
+function progressPreservingPauseDetail(
+  question: string,
+  opts: BackgroundInputPauseOptions = {},
+  maxChars = RESULT_TRUNCATE_CHARS,
+): string {
+  const report = (opts.resultText ?? '').trim();
+  const blocker = (opts.blockerReason ?? '').trim();
+  const ask = question.trim();
+  const suffixes: string[] = [];
+  if (ask && !report.includes(ask)) suffixes.push(`To resume: ${ask}`);
+
+  const fitReport = (): string => {
+    if (!report) return '';
+    const suffixLength = suffixes.length > 0 ? suffixes.join('\n\n').length + 2 : 0;
+    return truncateResultBody(report, Math.max(160, maxChars - suffixLength));
+  };
+
+  let shownReport = fitReport();
+  // A long report can contain the blocker only after the display cap. Test the
+  // actual visible excerpt, not the unbounded source, so the dependency can
+  // never be truncated away by the progress that preceded it.
+  if (blocker && !shownReport.includes(blocker)) {
+    suffixes.unshift(`Remaining dependency: ${clean(blocker, Math.max(120, Math.floor(maxChars / 2)))}`);
+    shownReport = fitReport();
+  }
+  return [shownReport, ...suffixes].filter(Boolean).join('\n\n').slice(0, maxChars);
+}
+
+function isResumableUserDependency(blockerType?: BlockerType): boolean {
+  return blockerType === 'permission' || blockerType === 'needs_user_input';
+}
+
+function dependencyResumeQuestion(blockerType: BlockerType): string {
+  if (blockerType === 'permission') {
+    return 'Authenticate or reconnect the required service described above, then reply `continue`. I’ll resume this same task from its saved progress.';
+  }
+  return 'Reply with the missing input described above. I’ll resume this same task from its saved progress.';
+}
+
+export function markBackgroundTaskAwaitingInput(
+  id: string,
+  questionId: string,
+  question: string,
+  opts: BackgroundInputPauseOptions = {},
+): BackgroundTaskRecord | null {
   if (!prepareWorkerSettlementForCas(id)) return null;
+  const reportDetail = progressPreservingPauseDetail(question, opts);
+  const notificationBody = progressPreservingPauseDetail(question, opts, 2000);
   const updated = updateBackgroundTaskWhere(id, workerParkMayProceed, {
     ...clearParkedBackgroundState(),
     status: 'awaiting_input',
+    completedAt: undefined,
+    error: opts.blockerReason ? clean(opts.blockerReason, 1000) : undefined,
     pendingQuestionId: questionId,
     pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
-    result: question.slice(0, RESULT_TRUNCATE_CHARS),
+    result: (opts.resultText ?? question).slice(0, RESULT_TRUNCATE_CHARS),
   });
   if (updated) {
     addNotification({
       id: `${Date.now()}-background-${updated.id}-needs-input`,
       kind: 'approval',
       title: `Background task needs your input: ${updated.title}`,
-      body: question.slice(0, 2000),
+      body: notificationBody,
       createdAt: nowIso(),
       read: false,
       metadata: {
-        ...taskNotificationMetadata(updated, { status: 'awaiting_input' }),
+        ...taskNotificationMetadata(updated, {
+          status: 'awaiting_input',
+          blockerType: opts.blockerType,
+          resumable: true,
+        }),
         questionId,
         needsInput: true,
       },
     });
     // Surface the question into the origin chat too, so the user can answer in
     // the conversation (the answer is routed back via queueBackgroundTaskInputResolution).
-    enqueueBackgroundTaskOutcomeTurn(updated, 'needs_input', question);
-    emitBackgroundTaskOperational('background_task_parked', updated, { reason: 'awaiting_input' }, 'warn');
+    enqueueBackgroundTaskOutcomeTurn(updated, 'needs_input', reportDetail);
+    emitBackgroundTaskOperational(
+      'background_task_parked',
+      updated,
+      { reason: 'awaiting_input', blockerType: opts.blockerType },
+      'warn',
+    );
   }
   return updated;
 }
@@ -1861,6 +2116,15 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
     // Tag the blocker by KIND (deterministic, zero-token) so the dashboard /
     // proactive brief / future routing can act on the class, not just the prose.
     const blockerType = knownBlockerType ?? classifyBlocker(reason);
+    const reportDetail = progressPreservingPauseDetail(
+      'Resolve the remaining blocker before starting another run.',
+      { resultText, blockerReason: reason, blockerType },
+    );
+    const notificationBody = progressPreservingPauseDetail(
+      'Resolve the remaining blocker before starting another run.',
+      { resultText, blockerReason: reason, blockerType },
+      2000,
+    );
     addNotification({
       id: `${Date.now()}-background-${updated.id}-blocked`,
       kind: 'approval',
@@ -1882,11 +2146,7 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
           `CHECK the actual outcome (sent messages / created records) BEFORE re-running — re-running may duplicate an irreversible send.`,
         ].join('\n')
         : [
-          `Stopped at a blocker — no partial or empty result was shipped.`,
-          ``,
-          `Blocker (${blockerType}): ${clean(reason, 600)}`,
-          ``,
-          `Re-run once that's resolved and the task continues.`,
+          notificationBody,
         ].join('\n'),
       createdAt: nowIso(),
       read: false,
@@ -1894,7 +2154,7 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
     });
     // Report-back without fail: a BLOCKED task must reach Clementine's context,
     // not just a notification — so she can surface the blocker or resolve it.
-    enqueueBackgroundTaskOutcomeTurn(updated, 'blocked', reason);
+    enqueueBackgroundTaskOutcomeTurn(updated, 'blocked', reportDetail);
     emitBackgroundTaskOperational('background_task_parked', updated, { reason: 'blocked' }, 'warn');
   }
   return updated;
@@ -1966,7 +2226,7 @@ export function classifyBackgroundTaskOutcome(
   finalText: string,
   stoppedReason?: RunStoppedReason,
   opts: { ignoreFanoutCoverage?: boolean; ignoreSelfReportedBlockedText?: boolean } = {},
-): { outcome: 'done' | 'blocked'; reason?: string } {
+): { outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType } {
   // 1) Structured signal: did the worker explicitly mark an execution
   //    blocked in its own session? This is the strongest signal — it's
   //    the agent telling us, in code, that it could not proceed.
@@ -1975,7 +2235,8 @@ export function classifyBackgroundTaskOutcome(
       .list(40)
       .find((e) => e.sessionId === task.runSessionId && e.status === 'blocked');
     if (blockedExecution) {
-      return { outcome: 'blocked', reason: blockedExecution.blocker || 'Execution marked blocked by the agent.' };
+      const reason = blockedExecution.blocker || 'Execution marked blocked by the agent.';
+      return { outcome: 'blocked', reason, blockerType: classifyBlocker(reason) };
     }
   } catch {
     // store read is best-effort; fall through to text heuristics
@@ -1985,7 +2246,11 @@ export function classifyBackgroundTaskOutcome(
   //    didn't catch it (defense-in-depth; the explicit pendingApprovalId
   //    branch normally handles this first).
   if (stoppedReason === 'pending-approval') {
-    return { outcome: 'blocked', reason: 'Stopped awaiting an approval that was not surfaced.' };
+    return {
+      outcome: 'blocked',
+      reason: 'Stopped awaiting an approval that was not surfaced.',
+      blockerType: 'needs_approval',
+    };
   }
 
   // 2.5) P0-C — the runtime threw mid-turn and `respond()` converted it to a
@@ -1998,6 +2263,7 @@ export function classifyBackgroundTaskOutcome(
     return {
       outcome: 'blocked',
       reason: (text || 'The run hit a runtime error before finishing.').slice(0, 400),
+      blockerType: classifyBlocker(text, 'error'),
     };
   }
   if (stoppedReason === 'max-turns-with-grace') {
@@ -2005,6 +2271,7 @@ export function classifyBackgroundTaskOutcome(
     return {
       outcome: 'blocked',
       reason: (text || 'The run hit its turn budget before finishing; continue is required.').slice(0, 400),
+      blockerType: 'budget',
     };
   }
 
@@ -2016,6 +2283,7 @@ export function classifyBackgroundTaskOutcome(
       return {
         outcome: 'blocked',
         reason: `The worker wrote a fake tool call transcript instead of calling the tool: ${text.slice(0, 320)}`,
+        blockerType: 'unknown',
       };
     }
     // The self-reported-blocked TEXT heuristic is negation-aware but still
@@ -2029,7 +2297,11 @@ export function classifyBackgroundTaskOutcome(
     // result, a blocked execution row, a fabricated transcript, or a fan-out
     // coverage failure), never on the narrative alone. (Finding A false-positive.)
     if (!opts.ignoreSelfReportedBlockedText && matchesBlockedText(text)) {
-      return { outcome: 'blocked', reason: text.slice(0, 400) };
+      return {
+        outcome: 'blocked',
+        reason: text.slice(0, 400),
+        blockerType: classifyBlocker(text),
+      };
     }
   }
 
@@ -2078,18 +2350,99 @@ const ARTIFACT_INTENT_RE =
 const EXTERNAL_DRAFT_INTENT_RE =
   /\b(?:draft|create|prepare|write|make)\b[^.\n]{0,60}\b(?:emails?|messages?|repl(?:y|ies)|follow[- ]?ups?)\b[^.\n]{0,80}\b(?:in|into)\s+(?:outlook|gmail|my\s+drafts|the\s+drafts?\s+folder|drafts?\s+folder|salesforce|hubspot)/i;
 
+/** A safety constraint such as "do not write files" is evidence AGAINST an
+ * artifact promise, not a promise whose absence should block completion. Check
+ * the clause immediately before the matched action; "do not stop until you
+ * write the report" remains positive because `until` reverses that reading. */
+function promptCommitsTo(
+  prompt: string,
+  intentPattern: RegExp,
+): boolean {
+  for (const clause of prompt.split(/[\n;]|(?<=[.!?])\s+/)) {
+    const match = intentPattern.exec(clause);
+    if (!match) continue;
+    const prefix = clause.slice(Math.max(0, match.index - 80), match.index);
+    const directlyNegated = /\b(?:do\s+not|don't|never)\b(?:(?!\b(?:until|before)\b)[\s\S]){0,70}$/i.test(prefix);
+    if (!directlyNegated) return true;
+  }
+  return false;
+}
+
+export interface BackgroundCompletionEvidence {
+  artifactBindings: number;
+  extractedDeliverables: number;
+  externalWriteReceipts: number;
+  ambiguousExternalWrites: number;
+}
+
+/**
+ * Reduce only facts the runtime already owns. This is the background lane's
+ * completion authority: model prose explains the work, while durable bindings,
+ * successful deliverable-return rows, and uncompensated external-write receipts
+ * prove that promised effects exist. No model call and no semantic verdict.
+ */
+export function backgroundCompletionEvidence(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+): BackgroundCompletionEvidence {
+  let artifactBindings = 0;
+  let extractedDeliverables = 0;
+  let externalWriteReceipts = 0;
+  let ambiguousExternalWrites = 0;
+  try { artifactBindings = listRunArtifacts(task.runSessionId).length; } catch { /* unreadable evidence stays absent */ }
+  try { extractedDeliverables = extractDeliverables(task.runSessionId).length; } catch { /* unreadable evidence stays absent */ }
+  try {
+    const writes = assessBackgroundTaskRestartSafety(task);
+    externalWriteReceipts = writes.externalWriteCount;
+    ambiguousExternalWrites = writes.ambiguousWriteCount;
+    // Restart safety deliberately treats a lone external-write return as
+    // "write touched" even when its result failed, because replay must fail
+    // closed. Completion authority is stricter: only a successful return can
+    // stand in for a missing canonical external_write receipt.
+    const writeEvents = listHarnessEventsForRefute(task.runSessionId, {
+      types: ['external_write', 'tool_returned'],
+    });
+    if (!writeEvents.some((event) => event.type === 'external_write')) {
+      const successfulReturnKeys = new Set<string>();
+      for (const event of writeEvents) {
+        if (event.type !== 'tool_returned') continue;
+        const data = (event.data ?? {}) as Record<string, unknown>;
+        if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
+        const resultText = [data.result, data.preview, data.output, data.error]
+          .filter((value): value is string => typeof value === 'string')
+          .join('\n');
+        const failed = data.ok === false
+          || data.isError === true
+          || (typeof data.error === 'string' && data.error.trim().length > 0)
+          || detectStructuredToolFailure(resultText).failed;
+        if (failed) continue;
+        const callId = typeof data.callId === 'string' ? data.callId : '';
+        successfulReturnKeys.add(callId ? `call:${callId}` : `event:${event.seq}`);
+      }
+      externalWriteReceipts = successfulReturnKeys.size;
+    }
+  } catch { /* unreadable evidence stays absent */ }
+  return { artifactBindings, extractedDeliverables, externalWriteReceipts, ambiguousExternalWrites };
+}
+
+function hasDurableDeliverableEvidence(evidence: BackgroundCompletionEvidence): boolean {
+  return evidence.artifactBindings > 0
+    || evidence.extractedDeliverables > 0
+    || evidence.externalWriteReceipts > 0;
+}
+
+function taskRequiresExternalSendReceipt(
+  task: Pick<BackgroundTaskRecord, 'prompt' | 'title'>,
+): boolean {
+  return stepLooksLikeIrreversibleSend(`${task.title}\n${task.prompt}`);
+}
+
 export function completionLacksDeliverableEvidence(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt'>,
 ): boolean {
   try {
     const prompt = task.prompt ?? '';
-    if (!ARTIFACT_INTENT_RE.test(prompt) && !EXTERNAL_DRAFT_INTENT_RE.test(prompt)) return false;
-    if (listRunArtifacts(task.runSessionId).length > 0) return false;
-    const writes = listHarnessEventsForRefute(task.runSessionId, { types: ['external_write'], limit: 1 });
-    if (writes.length > 0) return false;
-    const calls = listHarnessEventsForRefute(task.runSessionId, { types: ['tool_called'], desc: true, limit: 200 });
-    if (calls.some((e) => (e.data as { tool?: unknown }).tool === 'write_file')) return false;
-    return true;
+    if (!promptCommitsTo(prompt, ARTIFACT_INTENT_RE) && !promptCommitsTo(prompt, EXTERNAL_DRAFT_INTENT_RE)) return false;
+    return !hasDurableDeliverableEvidence(backgroundCompletionEvidence(task));
   } catch {
     return false; // evidence read failure must never block an honest done
   }
@@ -2102,6 +2455,23 @@ async function verifyBackgroundTaskDelivery(
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType }> {
   const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
+  if (backgroundCompletionVerificationPauseForTests) await backgroundCompletionVerificationPauseForTests();
+
+  const completionEvidence = backgroundCompletionEvidence(task);
+  if (completionEvidence.ambiguousExternalWrites > 0) {
+    return {
+      outcome: 'blocked',
+      reason: 'An external mutation started but has no durable success or proven-failure receipt. Check the external system before continuing; replay may duplicate the action.',
+      blockerType: 'unknown',
+    };
+  }
+  if (taskRequiresExternalSendReceipt(task) && completionEvidence.externalWriteReceipts === 0) {
+    return {
+      outcome: 'blocked',
+      reason: 'The task required an external send or publish, but the run has no committed external-write receipt.',
+      blockerType: 'unknown',
+    };
+  }
   if (completionLacksDeliverableEvidence(task)) {
     return {
       outcome: 'blocked',
@@ -2125,7 +2495,8 @@ async function verifyBackgroundTaskDelivery(
   // ok:false so the coverage read below counts it failed (honest "M of N"). Reduce-
   // time + fail-open — never touches the hot fan-out return path. Kill-switch
   // CLEMMY_FANOUT_ITEM_VERIFY. Runs BEFORE the coverage read so its verdicts land.
-  if (fanoutItemVerifyEnabled()) {
+  const workManifests = summarizeWorkManifests(task.runSessionId);
+  if (workManifests.length === 0 && fanoutItemVerifyEnabled()) {
     try {
       const verifyObjective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
       if (verifyObjective.trim()) await verifyFanoutItems(task.runSessionId, verifyObjective);
@@ -2138,11 +2509,13 @@ async function verifyBackgroundTaskDelivery(
   // Inline-recovery promotion (v2.2.1): the brain may have closed failed items
   // INLINE after their workers died — the ledger cannot see that (live
   // 2026-07-22: a complete 3-firm deliverable stamped blocked on its 2
-  // pre-recovery worker failures). Judge each failed item against the final
-  // deliverable; ALL confirmed → durable ok:true promotions flip coverage and
-  // the run proceeds to the probes/judge below (belt and braces — promotion
-  // alone never grants done). Fail-closed: any doubt and the block stands.
-  if (coverageBlock) {
+  // pre-recovery worker failures). The legacy fan-out verifier checks each
+  // failed item against the final deliverable; ALL confirmed → durable ok:true
+  // promotions flip coverage and the run proceeds to deterministic deliverable
+  // readback below. Promotion alone never grants done. This remaining fan-out
+  // judge is intentionally separate from terminal completion authority and is
+  // the next migration slice.
+  if (coverageBlock && workManifests.length === 0) {
     try {
       const cov = summarizeFanoutCoverage(task.runSessionId);
       const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId)) || task.prompt || task.title;
@@ -2154,12 +2527,12 @@ async function verifyBackgroundTaskDelivery(
   // Fan-out coverage is AUTHORITATIVE: if any worker failed (a raw ERROR: from
   // Stage 1, or a Stage-2-confirmed hollow output just recorded above), the run is
   // a partial and MUST NOT report a hollow "done" — per the run_worker contract
-  // ("never report a batch complete if any worker returned ERROR"). Previously
-  // coverageBlock was only ever used as a fallback REASON on the probe/verify-fail
-  // paths, so a confident aggregate that passed verifyDelivered discarded it and
-  // the honest "M of N" never surfaced (Stage-2 adversarial review #1 — the feature
-  // was inert on exactly its target path). Gate here, before the probe/judge, so
-  // their model calls are also skipped when coverage already says blocked.
+  // ("never report a batch complete if any worker returned ERROR"). Before this
+  // gate, coverageBlock was only a fallback reason on later
+  // verification-failure paths, so a confident aggregate could discard it and
+  // the honest "M of N" never surfaced (Stage-2 adversarial review #1 — the
+  // feature was inert on exactly its target path). Gate here before artifact
+  // readback.
   if (coverageBlock) return coverageBlock;
 
   // DELIVERABLE PROBE — deterministic readback of the artifacts THIS run produced
@@ -2167,10 +2540,9 @@ async function verifyBackgroundTaskDelivery(
   // background runs (the trust-critical lane: a bound goal contract exists). The fix
   // for the 2026-07-08 "shipped 5 BLANK Google Sheets as done" — the judge only saw
   // the model's claims. A CONFIRMED probe failure blocks completion with the SPECIFIC
-  // gap; passing/unprobeable findings are folded into the delivery judge's evidence
-  // so even the judge lane can't pass a hollow deliverable. Best-effort per class
-  // (an unprobeable artifact passes through). Kill: CLEMMY_DELIVERABLE_PROBES=off.
-  let probeEvidence = '';
+  // gap. Best-effort per class (an unprobeable artifact preserves the durable
+  // creation evidence but cannot manufacture a failure). Kill:
+  // CLEMMY_DELIVERABLE_PROBES=off.
   if (deliverableProbesEnabled()) {
     try {
       // Objective for the deterministic artifact readback. A GOAL-bound run uses
@@ -2178,36 +2550,30 @@ async function verifyBackgroundTaskDelivery(
       // falls back to its own prompt/title. 2026-07-13 Wave 1: the probe caught
       // the "shipped 5 BLANK sheets as done" class only for goal-bound runs —
       // extend it to EVERY background task so a hollow deliverable is caught by
-      // deterministic readback, not just the (now cross-family) judge.
+      // deterministic readback, not a semantic model verdict.
       const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
       if (objective.trim()) {
         const probe = await probeSessionDeliverables(task.runSessionId, objective);
         if (probe.failures.length > 0) {
           return { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
         }
-        probeEvidence = probe.evidenceText;
       }
     } catch {
-      // A probe error must NEVER block a run — pass through to the judge as before.
+      // A probe error must NEVER manufacture a failure. The durable creation
+      // evidence above still governs whether a promised deliverable exists.
     }
   }
 
-  try {
-    const evidence = probeEvidence ? `${finalText}\n\n${probeEvidence}` : finalText;
-    // Move 3: a run that recorded an IRREVERSIBLE external write gets the
-    // adversarial refuters before its "done" is banked (unattended lane).
-    let refuteHighStakes = false;
-    try { refuteHighStakes = listHarnessEventsForRefute(task.runSessionId, { types: ['external_write'] }).length > 0; } catch { /* fail-open: no refuters */ }
-    const verdict = await verifyDelivered(task.prompt || task.title, evidence, {
-      highStakes: refuteHighStakes,
-      stoppedReason,
-      ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
-    });
-    if (!verdict.delivered) {
-      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.', blockerType: verdict.blockerType };
-    }
-  } catch {
-    return { outcome: 'done' };
+  // Promise-only output is protocol hygiene, not a semantic judgment. When no
+  // durable effect exists, "I'll do it next" is deterministically not a result.
+  // When a receipt/artifact DOES exist, facts win: do not let awkward tense
+  // erase already-committed work or invite a duplicate retry.
+  if (isPromiseShapedReply(finalText) && !hasDurableDeliverableEvidence(completionEvidence)) {
+    return {
+      outcome: 'blocked',
+      reason: 'The worker only promised future work and the run contains no durable completion evidence.',
+      blockerType: 'unknown',
+    };
   }
 
   return { outcome: 'done' };
@@ -2222,6 +2588,17 @@ async function verifyBackgroundTaskDelivery(
 function fanoutCoverageBlock(runSessionId: string): { outcome: 'blocked'; reason: string } | null {
   if (!fanoutLedgerEnabled()) return null;
   try {
+    // The durable logical manifest supersedes attempt-label accounting. Once a
+    // run declares canonical items/phases, completion is measured against that
+    // fixed universe — never against however many worker labels happened to be
+    // emitted. This is what prevents "120 accounts" from becoming "240 items"
+    // when a later wave names the same accounts by spreadsheet row.
+    const manifests = summarizeWorkManifests(runSessionId);
+    if (manifests.length > 0) {
+      const incomplete = manifests.find((manifest) => manifest.remaining > 0);
+      if (incomplete) return workManifestCoverageBlock(incomplete);
+      return null;
+    }
     // Wave 4 Stage 1: read coverage from the DURABLE worker_result log (restart-
     // surviving, deduped by packetKey) rather than the per-process in-memory
     // ledger, so a resumed swarm reports honest "M of N" without a rehydrate that
@@ -2239,6 +2616,27 @@ function fanoutCoverageBlock(runSessionId: string): { outcome: 'blocked'; reason
     // best-effort
   }
   return null;
+}
+
+function workManifestCoverageBlock(
+  manifest: WorkManifestSummary,
+): { outcome: 'blocked'; reason: string } {
+  const current = manifest.phases.find((phase) => phase.id === manifest.currentPhase)
+    ?? manifest.phases.find((phase) => phase.succeeded < phase.total);
+  const phaseProgress = current
+    ? `${current.label}: ${current.succeeded}/${current.total} complete`
+      + (current.running ? `, ${current.running} running` : '')
+      + (current.failed ? `, ${current.failed} failed` : '')
+      + (current.needsValidation ? `, ${current.needsValidation} need validation` : '')
+      + (current.invalidated ? `, ${current.invalidated} invalidated` : '')
+    : `${manifest.completed}/${manifest.total} items complete`;
+  const anomaly = manifest.untrackedCheckpoints > 0
+    ? ` ${manifest.untrackedCheckpoints} untracked attempt${manifest.untrackedCheckpoints === 1 ? '' : 's'} were excluded from logical totals.`
+    : '';
+  return {
+    outcome: 'blocked',
+    reason: `Logical work is incomplete under contract ${manifest.contractVersion}: ${phaseProgress}; ${manifest.completed}/${manifest.total} items completed every phase.${anomaly}`,
+  };
 }
 
 export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'): BackgroundTaskRecord | null {
@@ -3104,6 +3502,33 @@ async function finishWorkerRun(
     return;
   }
   if (outcome.outcome === 'blocked') {
+    if (isResumableUserDependency(outcome.blockerType)) {
+      const blockerType = outcome.blockerType!;
+      const questionId = `bgdep-${task.id}-${Date.now().toString(36)}`;
+      const reason = outcome.reason ?? 'The task needs user input before it can continue.';
+      const parked = markBackgroundTaskAwaitingInput(
+        task.id,
+        questionId,
+        dependencyResumeQuestion(blockerType),
+        {
+          resultText: response.text,
+          blockerReason: reason,
+          blockerType,
+        },
+      );
+      if (!acceptWorkerTransition(parked, 'awaiting_input')) return;
+      finishRun(run.id, {
+        status: 'awaiting_approval',
+        message: `Background task ${task.id} paused on a resumable ${blockerType} dependency.`,
+        outputPreview: response.text,
+      });
+      clearLedger(task.runSessionId);
+      logger.info(
+        { taskId: task.id, questionId, blockerType, reason },
+        'Background task preserved progress and paused on a resumable dependency',
+      );
+      return;
+    }
     const blocked = markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text, outcome.blockerType);
     if (!acceptWorkerTransition(blocked, 'blocked')) return;
     finishRun(run.id, {
@@ -3352,7 +3777,16 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 
         if (result.awaitingInputQuestion) {
           const questionId = `bgq-${task.id}-${Date.now().toString(36)}`;
-          const parkedOnInput = markBackgroundTaskAwaitingInput(task.id, questionId, result.awaitingInputQuestion);
+          const parkedOnInput = markBackgroundTaskAwaitingInput(
+            task.id,
+            questionId,
+            result.awaitingInputQuestion,
+            {
+              resultText: result.text,
+              blockerReason: result.awaitingInputQuestion,
+              blockerType: 'needs_user_input',
+            },
+          );
           if (!acceptApprovalTransition(parkedOnInput, 'awaiting_input', result.text)) continue;
           finishRun(run.id, {
             status: 'awaiting_approval', // run-record paused state (the task status is 'awaiting_input')
@@ -3408,6 +3842,33 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         }
         const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {
+          if (isResumableUserDependency(postApprovalOutcome.blockerType)) {
+            const blockerType = postApprovalOutcome.blockerType!;
+            const questionId = `bgdep-${task.id}-${Date.now().toString(36)}`;
+            const reason = postApprovalOutcome.reason ?? 'The task needs user input before it can continue.';
+            const parkedOnDependency = markBackgroundTaskAwaitingInput(
+              task.id,
+              questionId,
+              dependencyResumeQuestion(blockerType),
+              {
+                resultText: result.text,
+                blockerReason: reason,
+                blockerType,
+              },
+            );
+            if (!acceptApprovalTransition(parkedOnDependency, 'awaiting_input', result.text)) continue;
+            finishRun(run.id, {
+              status: 'awaiting_approval',
+              message: `Background task ${task.id} paused on a resumable ${blockerType} dependency after approval ${resolution.approvalId}.`,
+              outputPreview: result.text,
+            });
+            clearLedger(task.runSessionId);
+            logger.info(
+              { taskId: task.id, approvalId: resolution.approvalId, questionId, blockerType, reason },
+              'Background task preserved progress and paused on a resumable dependency after approval',
+            );
+            continue;
+          }
           const blocked = markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text, postApprovalOutcome.blockerType);
           if (!acceptApprovalTransition(blocked, 'blocked', result.text)) continue;
           finishRun(run.id, {
@@ -3445,6 +3906,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // full history, so it re-enters cleanly. Consume the resolution once.
 	      const resume = task.inputResolution;
 	      const continuation = task.continueResolution;
+	      const acceptedContractVersion = task.contractVersion ?? 1;
 	      let workerMessage = resume
 	        ? buildWorkerInputResumePrompt(task, resume.answer)
 	        : continuation
@@ -3456,6 +3918,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          continueResolution: continuation ? undefined : task.continueResolution,
 	        }) ?? task;
 	      }
+	      // The prompt above now contains the queued revision. Mark it applied
+	      // only after that exact text has been built; a newer revision racing
+	      // this transition remains pending for the next boundary.
+	      task = markPendingContractRevisionApplied(task);
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
 	      // Stage 4 — aggregate run token budget: one durable window per drain
 	      // iteration. The baseline is captured HERE (not per auto-continue), so
@@ -3471,6 +3937,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      let autoContinueAttempts = 0;
 	      let toolCountAtLastCap = 0; // Wave 3: tool activity at each budget cycle
 	      let response: AssistantResponse;
+	      let contractSuperseded = false;
 	      while (true) {
 	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
 	        // gated harness loop; legacy fallback only pre-run. The shouldCancel
@@ -3541,6 +4008,11 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          },
 	        }, (req) => assistant.respond(req));
 	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
+	        const latestContractTask = getBackgroundTask(task.id);
+	        if ((latestContractTask?.contractVersion ?? 1) > acceptedContractVersion) {
+	          contractSuperseded = true;
+	          break;
+	        }
 
 	        if (response.stoppedReason !== 'max-turns-with-grace') break;
 	        // Stage 4 — a turn-budget stop whose token WINDOW is also exhausted
@@ -3602,6 +4074,40 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        workerMessage = buildWorkerContinuePrompt(task, response.text);
 	      }
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+	      if (contractSuperseded) {
+	        const latest = getBackgroundTask(task.id);
+	        const nextVersion = latest?.contractVersion ?? acceptedContractVersion + 1;
+	        const requeued = updateBackgroundTaskWhere(
+	          task.id,
+	          (candidate) => candidate.status === 'running'
+	            && (candidate.contractVersion ?? 1) > acceptedContractVersion,
+	          {
+	            status: 'pending',
+	            result: (response.text ?? '').slice(0, RESULT_TRUNCATE_CHARS),
+	            continueResolution: {
+	              queuedAt: nowIso(),
+	              reason: `The prior response targeted contract v${acceptedContractVersion}; continue under v${nextVersion} after reconciling durable progress.`,
+	              auto: true,
+	            },
+	            lastCheckInAt: nowIso(),
+	            lastCheckInMessage: `Contract changed from v${acceptedContractVersion} to v${nextVersion}; stale-contract completion was preserved and the task was re-queued.`,
+	          },
+	        );
+	        if (requeued) {
+	          finishRun(run.id, {
+	            status: 'cancelled',
+	            message: `Background task run superseded by contract v${nextVersion}; re-queued on the same durable session.`,
+	            outputPreview: response.text,
+	          });
+	          clearLedger(task.runSessionId);
+	          logger.info(
+	            { taskId: task.id, fromVersion: acceptedContractVersion, toVersion: nextVersion },
+	            'Background task re-queued after an in-flight contract revision',
+	          );
+	          continue;
+	        }
+	      }
 
 	      // Classify + record the result: pending-approval / awaiting-input (the
 	      // judge-gated check-in) / partial-coverage / blocked / done — all in the

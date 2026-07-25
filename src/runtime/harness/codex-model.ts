@@ -58,6 +58,7 @@ import { estimateInputTokens } from './token-estimator.js';
 import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { recordCodexRateLimit } from './rate-limit-store.js';
 import { recordModelUsage } from '../usage-log.js';
+import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-model' });
@@ -730,6 +731,7 @@ export class CodexResponsesModel implements Model {
    * able from every other).
    */
   protected async *streamCodex(request: ModelRequest, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
+    assertLiveModelTransportAllowed('Codex Responses API');
     // Request body is token-independent — build it once and reuse across a
     // possible refresh-and-retry below.
     const body = buildCodexRequestBody(this.modelId, request);

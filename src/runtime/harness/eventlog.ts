@@ -228,6 +228,17 @@ export const EVENT_TYPES = [
   // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker
   // spend restart-surviving and queryable for a 30-60min 100-subagent run.
   'worker_result',
+  // Durable long-horizon work graph. A manifest declares the canonical item
+  // universe and ordered phases once; checkpoints update one canonical
+  // item/phase with evidence; contract revisions decide whether completed
+  // evidence remains valid. These are control-plane facts, not model verdicts.
+  'work_manifest_declared',
+  'work_item_checkpoint',
+  'work_contract_revised',
+  // A user changed the objective/constraints of a durable background task while
+  // it was queued or running. The task record owns the revision history; this
+  // event makes the course correction visible in the same live trace.
+  'background_contract_revised',
   // Wave 4 Stage 2: a run/continue boundary for a background task's stable
   // runSessionId, so fan-out coverage (summarizeFanoutCoverage) counts only THIS
   // run's worker_results and a prior run's failures don't leak into a later

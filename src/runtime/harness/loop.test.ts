@@ -1770,7 +1770,7 @@ test('standard lane completes green when the provider create is BOUND', async ()
   resetEventLog();
   artifactLedger._resetArtifactLedgerForTests();
   const sess = HarnessSession.create({ kind: 'chat' });
-  const sheetUri = 'https://docs.google.com/spreadsheets/d/16NwxaMKd3pqT3K0/edit';
+  const sheetUri = 'https://docs.google.com/spreadsheets/d/fixture_sheet_00000001/edit';
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
     const source = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!;
     const rootScopeId = artifactLedger.resolveArtifactRunScopeId(sess.id, `${sess.id}::turn:1`, source.seq);
@@ -2299,6 +2299,47 @@ test('runConversation: a tool-driven ask with an unparsed prose tail stops witho
   assert.equal(runs, 1, 'the durable ask is terminal; no parse-recovery model turn');
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 1);
   assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+});
+
+test('runConversation: a completed-tagged ask_user_question tool result parks before validation or another turn', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  let judgeInvoked = false;
+  const question = 'Railway authentication is missing. Run railway login, then reply continue so I can resume this same task.';
+  const runRunner: RunRunnerFn = async () => {
+    runs += 1;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: { question },
+    });
+    return {
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: `Question posted: ${question}. Awaiting user reply.`,
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'prepare the Railway app, then deploy it',
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeInvoked = true;
+      return { done: false, reason: 'deployment is waiting on authentication' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(runs, 1, 'the terminal tool ask does not trigger another model turn');
+  assert.equal(judgeInvoked, false, 'completion validation never sees a task that is durably waiting on the user');
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 1);
 });
 
 test('objective judge: gates premature completion and continues (action intent)', async () => {

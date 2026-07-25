@@ -44,6 +44,7 @@ const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-
 const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
+const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
 
 async function renderAgentInstructions(agent: { instructions?: unknown }): Promise<string> {
   const instr = agent.instructions;
@@ -345,7 +346,7 @@ test('JIT classification guard: every rubric-named built-in is consciously CORE 
     'workflow_create', 'workflow_run', 'workflow_run_status', 'workflow_update', 'workflow_schedule',
     'memory_pin', 'memory_restore', 'memory_list_facts',
     'task_add', 'task_update', 'task_list',
-    'background_tasks_recent', 'background_task_status', 'dispatch_background_task',
+    'background_tasks_recent', 'background_task_status', 'background_task_revise', 'dispatch_background_task',
     // hold/resume are intent-evident ("hold it for later" / "pick up X") and held
     // tasks are named in the persistent context, so semantic retrieval surfaces them.
     'hold_task_for_later', 'resume_held_task',
@@ -394,12 +395,28 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'instructions',
     'expectedOutput',
     'intent',
+    'workManifest',
     'items',
   ]);
   assert.equal(runWorker.parameters?.additionalProperties, false);
   assert.ok(runWorker.parameters?.properties?.resolvedTools);
   assert.ok(runWorker.parameters?.properties?.intent);
   assert.ok(runWorker.parameters?.properties?.items);
+  const manifestSchema = runWorker.parameters?.properties?.workManifest as {
+    anyOf?: Array<{
+      properties?: Record<string, {
+        anyOf?: Array<{
+          items?: {
+            additionalProperties?: boolean;
+            required?: string[];
+          };
+        }>;
+      }>;
+    }>;
+  } | undefined;
+  const aliasItems = manifestSchema?.anyOf?.[0]?.properties?.aliases?.anyOf?.[0]?.items;
+  assert.equal(aliasItems?.additionalProperties, false);
+  assert.deepEqual(aliasItems?.required, ['alias', 'itemId']);
   assert.equal(Object.hasOwn(runWorker.parameters?.properties ?? {}, 'input'), false);
 });
 
@@ -518,6 +535,13 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       instructions: 'Return one compact design direction.',
       expectedOutput: 'One sentence or ERROR: <reason>.',
       intent: 'design',
+      workManifest: {
+        id: 'design-variations',
+        contractVersion: '1',
+        phase: 'design',
+        mode: 'declare',
+        phases: [{ id: 'design' }],
+      },
     };
     const input = JSON.stringify(packet);
     const result = await runWorker.invoke(
@@ -541,6 +565,45 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
     assert.equal((results[0].data as { ok?: boolean }).ok, true);
     assert.equal((results[0].data as { model?: string }).model, 'minimax-01');
     assert.equal((results[0].data as { toolCallId?: string }).toolCallId, 'call_worker_design');
+    const manifest = summarizeWorkManifest(session.id, 'design-variations');
+    assert.equal(manifest?.total, 1);
+    assert.equal(manifest?.phases[0]?.succeeded, 1);
+    assert.equal(manifest?.evidenceCount, 1);
+
+    // A restarted brain can legitimately rebuild the packet differently. The
+    // durable logical item — not this call's packet hash — owns idempotency.
+    const resumedPacket = {
+      ...packet,
+      instructions: 'After restart, return the same compact design direction without repeating completed work.',
+      workManifest: {
+        ...packet.workManifest,
+        mode: 'reconcile',
+      },
+    };
+    const resumedInput = JSON.stringify(resumedPacket);
+    const resumed = await runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      resumedInput,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_worker_design_after_restart', arguments: resumedInput },
+      },
+    );
+    assert.equal(resumed, 'worker finished on routed model', 'the original persisted work-product is reused');
+    assert.equal(
+      requestedModels.filter((model) => model === 'minimax-01').length,
+      1,
+      'a changed packet must not dispatch the completed logical item again',
+    );
+    assert.equal(listEvents(session.id, { types: ['worker_started'] }).length, 1);
+    const resumedResults = listEvents(session.id, { types: ['worker_result'] });
+    assert.equal(resumedResults.length, 2, 'reuse remains visible without becoming another execution');
+    assert.match(String((resumedResults[1].data as { reason?: string }).reason), /durable manifest success/i);
+    assert.equal(
+      summarizeWorkManifest(session.id, 'design-variations')?.items[0]?.phases.design.attempts,
+      2,
+      'reuse does not manufacture another running/succeeded checkpoint pair',
+    );
   } finally {
     for (const [key, value] of Object.entries(prev)) {
       if (value === undefined) delete process.env[key];
@@ -656,6 +719,11 @@ test('run_worker emits worker_result ok=false when an already-capped item is ref
   assert.equal((results[0].data as { ok?: boolean }).ok, false);
   assert.equal((results[0].data as { toolCallId?: string }).toolCallId, 'call_worker_capped');
   assert.match(String((results[0].data as { reason?: string }).reason), /already exhausted/i);
+  assert.equal(
+    listEvents(session.id, { types: ['worker_started'] }).length,
+    0,
+    'a pre-run refusal is never rendered as a real worker execution',
+  );
 });
 
 test('Orchestrator has NO handoffs in Phase 3 (single-agent architecture)', async () => {

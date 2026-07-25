@@ -30,6 +30,7 @@ import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
+import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-model' });
@@ -403,6 +404,7 @@ export async function logClaudeResponseUsage(stream: ReadableStream<Uint8Array>)
  *  (parity-on) a bounded undici dispatcher so a stalled edge can't hang a turn. */
 export function makeClaudeFetch(): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    assertLiveModelTransportAllowed('Claude Messages API');
     const token = await freshClaudeToken();
     const { headers, body } = applyClaudeEnvelope(init, token);
     const dispatcher = modelParityEnabled() ? getClaudeDispatcher() : undefined;

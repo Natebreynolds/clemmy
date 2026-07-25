@@ -346,7 +346,12 @@ test('withTimeout onTimeout: never fires on the pause-defer re-arm path', async 
 });
 
 test('withTimeout onTimeout: fires once (not per re-arm) after unpause', async () => {
-  const work = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 500));
+  // Never-settling work keeps event-loop load from deciding this race. A
+  // fixed "slow" timer was registered before withTimeout's timer, so a loaded
+  // full-suite worker could wake both late, settle the work first, and falsely
+  // report "Missing expected rejection."
+  let releaseWork!: (value: string) => void;
+  const work = new Promise<string>((resolve) => { releaseWork = resolve; });
   let paused = true;
   let calls = 0;
   const flip = setTimeout(() => { paused = false; }, 30);
@@ -362,6 +367,7 @@ test('withTimeout onTimeout: fires once (not per re-arm) after unpause', async (
   } finally {
     clearTimeout(flip);
   }
+  releaseWork('late'); // drain — nothing observes this settle
   await work;
   assert.equal(calls, 1, 'onTimeout fired exactly once, only on the real rejection after unpause');
 });

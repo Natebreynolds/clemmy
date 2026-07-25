@@ -220,6 +220,11 @@ export class ClaudeAuthError extends Error {
 }
 
 function readRawCredentialJsonFromSystem(): string | null {
+  // The repository suite owns a disposable filesystem home, but the macOS
+  // Keychain is global to the logged-in user. Never let an isolated test probe
+  // the developer's real Claude Code credential; tests inject rawCredentialReader
+  // when they need to exercise this fallback.
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return null;
   // macOS: Keychain. -w prints the secret; may surface a one-time Allow prompt.
   if (process.platform === 'darwin') {
     try {

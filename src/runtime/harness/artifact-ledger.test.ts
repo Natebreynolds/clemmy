@@ -921,7 +921,7 @@ test('bound-but-unverified claims are deliverable — only pending/uncertain par
 
   // The provider responded: bound with a URI (read-back verification NOT run).
   ledger.bindArtifactSlot(sid, intent.slotKey, {
-    uri: 'https://docs.google.com/spreadsheets/d/16NwxaMKd3pqT3K0/edit',
+      uri: 'https://docs.google.com/spreadsheets/d/fixture_sheet_00000001/edit',
   }, 'call-sheet-1');
   assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 0, 'bound = deliverable, never parks');
   assert.equal(ledger.listUnverifiedRunArtifacts(sid).length, 1, 'verification advisory still reports it');

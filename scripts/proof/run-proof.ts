@@ -11,12 +11,12 @@
  * a brain × scenario scoreboard with latency. Exit code = number of FAILs
  * (SKIPs don't count) — usable as a pre-release gate next to test:smoke.
  */
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { planBrain, provisionDaemon } from './provision.js';
-import { exactBrainRouteChecks, exactWorkflowStepRouteChecks, openHarnessDb, summarizeAllSessions } from './score.js';
+import { exactBrainRouteChecks, exactWorkflowStepRouteChecks, fusionDisabledChecks, openHarnessDb, summarizeAllSessions } from './score.js';
 import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
@@ -29,9 +29,30 @@ import { workspaceBuild } from './scenarios/workspace-build.js';
 import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
 import { pendingActionGate } from './scenarios/pending-action-gate.js';
 import { completeSetRecall } from './scenarios/complete-set-recall.js';
+import { longHorizonManifest } from './scenarios/long-horizon-manifest.js';
+import { backgroundSteerInFlight } from './scenarios/background-steer-in-flight.js';
+import { restartResume } from './scenarios/restart-resume.js';
+import { blockedAuthTruth } from './scenarios/blocked-auth-truth.js';
 import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, completeSetRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, clarifyThenExecute, workspaceBuild, teamAgentHandoff, pendingActionGate];
+const ALL_SCENARIOS: ScenarioDef[] = [
+  fanoutMultiItem,
+  continuityRecall,
+  completeSetRecall,
+  longToolSelfCorrect,
+  approvalParkResume,
+  cronReportBack,
+  gatedMutation,
+  converseFirst,
+  clarifyThenExecute,
+  workspaceBuild,
+  teamAgentHandoff,
+  pendingActionGate,
+  longHorizonManifest,
+  backgroundSteerInFlight,
+  restartResume,
+  blockedAuthTruth,
+];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
 function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {
@@ -133,7 +154,25 @@ async function main(): Promise<void> {
 
   const startedAt = new Date().toISOString();
   let gitHead = 'unknown';
-  try { gitHead = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim(); } catch { /* fine */ }
+  let sourceClean = false;
+  try {
+    gitHead = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    const dirty = execFileSync(
+      'git',
+      ['status', '--porcelain', '--untracked-files=all', '--', 'src', 'apps', 'scripts', 'docs', 'package.json', 'package-lock.json'],
+      { encoding: 'utf-8' },
+    ).trim();
+    sourceClean = dirty.length === 0;
+    if (!sourceClean) {
+      throw new Error(
+        `Live proof requires one reproducible candidate commit. Commit the intended source first (no tag required).\n${dirty.slice(0, 4_000)}`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof Error && /reproducible candidate commit/.test(error.message)) throw error;
+    // Not a Git checkout is still scoreable, but it is not release evidence.
+    throw new Error(`Could not fingerprint proof source: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   const outcomes: ScenarioOutcome[] = [];
   for (const brainKind of brains) {
@@ -170,6 +209,7 @@ async function main(): Promise<void> {
           if (result.sessionId) checks.push(...exactWorkflowStepRouteChecks(daemon.home, result.sessionId, brainKind));
           else checks.push({ name: 'exact workflow route has a step session id', pass: false, detail: 'scenario returned no sessionId' });
         }
+        if (result.sessionId) checks.push(...fusionDisabledChecks(daemon.home, result.sessionId));
         const failed = checks.some((c) => !c.pass);
         anyFailed ||= failed;
         outcomes.push({ ...result, checks, scenario: scenario.name, brain: brainKind, status: failed ? 'FAIL' : 'PASS' });
@@ -208,7 +248,15 @@ async function main(): Promise<void> {
   }
 
   const failures = outcomes.filter((o) => o.status === 'FAIL').length;
-  const report: ProofReport = { startedAt, finishedAt: new Date().toISOString(), gitHead, outcomes, failures };
+  const report: ProofReport = {
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    gitHead,
+    sourceClean,
+    fusionMode: 'off',
+    outcomes,
+    failures,
+  };
   const reportPath = path.resolve('proof-report.json');
   writeFileSync(reportPath, JSON.stringify(report, null, 2));
   printScoreboard(outcomes);

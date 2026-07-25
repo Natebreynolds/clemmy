@@ -361,6 +361,40 @@ export function exactWorkflowStepRouteChecks(
   ];
 }
 
+/** A release proof runs with Second Opinion/Fusion explicitly disabled. Check
+ * the session-scoped operational ledger as well as the environment pin: a
+ * fusion reconciliation that somehow bypasses the setting must make the leg
+ * fail instead of hiding behind a green task result. */
+export function fusionDisabledChecks(home: string, sessionId: string): Check[] {
+  const operationalPath = path.join(home, 'state', 'operational-telemetry.db');
+  if (!existsSync(operationalPath)) {
+    return [{
+      name: 'Fusion-off evidence is readable',
+      pass: false,
+      detail: 'operational telemetry database is missing',
+    }];
+  }
+  try {
+    const db = new Database(operationalPath, { readonly: true, fileMustExist: true });
+    const row = db.prepare(
+      "SELECT COUNT(*) AS count FROM operational_events WHERE actor = 'fusion'",
+    ).get() as { count?: number } | undefined;
+    db.close();
+    const count = Number(row?.count ?? 0);
+    return [{
+      name: 'Fusion stayed off',
+      pass: count === 0,
+      detail: `${count} fusion reconciliation event(s) in isolated proof home (scoring session ${sessionId})`,
+    }];
+  } catch (error) {
+    return [{
+      name: 'Fusion-off evidence is readable',
+      pass: false,
+      detail: error instanceof Error ? error.message : String(error),
+    }];
+  }
+}
+
 // ─── Cross-cutting checks ───────────────────────────────────────────────────
 
 export function narrationCheck(replyText: string): Check {

@@ -276,6 +276,7 @@ import {
   queueBackgroundTaskApprovalResolution,
   queueBackgroundTaskContinue,
   queueBackgroundTaskInputResolution,
+  reviseBackgroundTaskContract,
   restoreBackgroundTask,
   resumeBackgroundTask,
   setBackgroundTaskReportBackTarget,
@@ -286,6 +287,7 @@ import {
   truncateResultBody,
   deriveTaskTitle,
 } from '../execution/background-tasks.js';
+import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground, longTaskApproachGate } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
@@ -9615,9 +9617,74 @@ export function registerConsoleRoutes(
         explicit: Boolean(task.reportBackTarget),
         channels: listReportBackChannelOptions(task),
       };
-      res.json({ task: { ...task, resultFull }, detail, vitals, reportBack });
+      // Compact projection: the drawer polls every 4s, so do not ship every
+      // item's evidence graph on every tick. The canonical reducer remains
+      // queryable server-side; UI needs phase totals + anomaly counts.
+      const workManifests = (detail?.workManifests ?? summarizeWorkManifests(task.runSessionId)).map((manifest) => ({
+        manifestId: manifest.manifestId,
+        objective: manifest.objective,
+        contractVersion: manifest.contractVersion,
+        phases: manifest.phases,
+        total: manifest.total,
+        completed: manifest.completed,
+        remaining: manifest.remaining,
+        currentPhase: manifest.currentPhase,
+        evidenceCount: manifest.evidenceCount,
+        artifactCount: manifest.artifactCount,
+        staleCheckpoints: manifest.staleCheckpoints,
+        untrackedCheckpoints: manifest.untrackedCheckpoints,
+        anomalies: manifest.anomalies,
+        updatedAt: manifest.updatedAt,
+      }));
+      // The canonical status object includes the task, 40 raw harness events,
+      // and full item/evidence graphs. Sending that whole object duplicated the
+      // top-level task and made a 12-item cockpit poll exceed 50 KB. The drawer
+      // consumes only this bounded human-facing projection; deep audit history
+      // remains available through the trace APIs.
+      const cockpitDetail = {
+        latestActivityAt: detail?.latestActivityAt,
+        latestActivitySummary: detail?.latestActivitySummary,
+        pendingApprovals: detail?.pendingApprovals ?? [],
+        toolEvents: detail?.toolEvents ?? [],
+        toolCallCount: detail?.toolCallCount ?? 0,
+        notifications: detail?.notifications ?? [],
+      };
+      res.json({ task: { ...task, resultFull }, detail: cockpitDetail, vitals, reportBack, workManifests });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/background-tasks/:id/contract-revisions', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const instruction = typeof req.body?.instruction === 'string' ? req.body.instruction.trim() : '';
+      const rawPolicy = typeof req.body?.evidencePolicy === 'string' ? req.body.evidencePolicy : 'revalidate';
+      const evidencePolicy = ['preserve', 'revalidate', 'invalidate'].includes(rawPolicy)
+        ? rawPolicy as 'preserve' | 'revalidate' | 'invalidate'
+        : null;
+      if (!instruction) {
+        res.status(400).json({ ok: false, reason: 'A course-correction instruction is required.' });
+        return;
+      }
+      if (!evidencePolicy) {
+        res.status(400).json({ ok: false, reason: 'evidencePolicy must be preserve, revalidate, or invalidate.' });
+        return;
+      }
+      const task = reviseBackgroundTaskContract(req.params.id, { instruction, evidencePolicy });
+      if (!task) {
+        const existing = getBackgroundTask(req.params.id);
+        res.status(existing ? 409 : 404).json({
+          ok: false,
+          reason: existing
+            ? `A ${existing.status} task cannot accept a contract revision.`
+            : 'background task not found',
+        });
+        return;
+      }
+      res.json({ ok: true, task });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -9770,6 +9837,13 @@ export function registerConsoleRoutes(
       const backgroundTasks = listBackgroundTasks({ includeArchived });
       const backgroundHarnessSessionIds = new Set(backgroundTasks.map((task) => task.runSessionId));
       for (const task of backgroundTasks) {
+        const logicalManifest = summarizeWorkManifests(task.runSessionId).at(-1);
+        const logicalPhase = logicalManifest?.phases.find((phase) => phase.id === logicalManifest.currentPhase);
+        const logicalProgressHint = logicalManifest && logicalPhase
+          ? `${logicalPhase.label}: ${logicalPhase.succeeded}/${logicalPhase.total} · ${logicalManifest.completed}/${logicalManifest.total} through every phase`
+          : logicalManifest && logicalManifest.remaining === 0
+            ? `Logical work complete: ${logicalManifest.completed}/${logicalManifest.total} items through every phase.`
+            : '';
         const terminal = task.status === 'done' || task.status === 'failed'
           || task.status === 'aborted' || task.status === 'interrupted';
         const sKind = task.archived ? null : staleTaskKind(task, now);
@@ -9813,7 +9887,7 @@ export function registerConsoleRoutes(
             : '')
             || (terminal
               ? (task.error || (task.status === 'done' ? 'Completed.' : ''))
-              : task.lastCheckInMessage)
+              : logicalProgressHint || task.lastCheckInMessage)
             || '',
           sessionId: task.runSessionId,
           ageMs: ageMs(task.updatedAt),
@@ -13456,6 +13530,40 @@ export function registerConsoleRoutes(
     });
   });
 
+  const recordHomeBackgroundHandoff = (
+    sessionId: string,
+    message: string,
+    reply: string,
+    taskId: string,
+  ): void => {
+    try {
+      if (!getHarnessSession(sessionId)) {
+        createHarnessSession({
+          id: sessionId,
+          kind: 'chat',
+          title: message.length > 80 ? `${message.slice(0, 77)}...` : message,
+          metadata: { source: 'desktop' },
+        });
+      }
+      appendHarnessEvent({
+        sessionId,
+        turn: 0,
+        role: 'user',
+        type: 'user_input_received',
+        data: { text: message },
+      });
+      appendHarnessEvent({
+        sessionId,
+        turn: 0,
+        role: 'assistant',
+        type: 'conversation_completed',
+        data: { reason: 'queued_background', summary: reply, reply, steps: 0, queuedTaskId: taskId },
+      });
+    } catch {
+      // The task is already durable; transcript projection is best-effort.
+    }
+  };
+
   app.post('/api/console/home/chat/stream', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body ?? {};
@@ -13487,10 +13595,34 @@ export function registerConsoleRoutes(
     };
 
     try {
-
       writeEvent({ type: 'status', text: 'Clementine run started.' });
-      const streamReq: AssistantRequest = {
+      // Explicit `/background …` is a user command, not a suggestion for the
+      // model to narrate. Route it through the same durable choke point as the
+      // harness chat API so Home cannot acknowledge a background plan without
+      // actually creating a visible, restart-safe task.
+      const backgroundGate = longTaskApproachGate(
+        sessionId,
         message,
+        () => shouldPromoteToDurable(message, { sessionId }),
+      );
+      if (backgroundGate.action === 'dispatch') {
+        const task = enqueueDurableChatTask({
+          message: backgroundGate.message,
+          sessionId,
+          channel: 'desktop',
+          source: 'desktop',
+        });
+        const text = renderDurableTaskQueued(task);
+        recordHomeBackgroundHandoff(sessionId, message, text, task.id);
+        writeEvent({ type: 'done', sessionId, text, pendingApprovalId: null, stoppedReason: 'success', turnsUsed: 0, route: null });
+        res.end();
+        return;
+      }
+      const effectiveMessage = backgroundGate.action === 'beat'
+        ? `${message}${backgroundGate.steer}`
+        : message;
+      const streamReq: AssistantRequest = {
+        message: effectiveMessage,
         sessionId,
         channel: 'cli',
         userId: 'console',
@@ -13800,13 +13932,36 @@ export function registerConsoleRoutes(
       }
     }
     try {
+      // Keep the non-streaming/CLI-compatible Home endpoint behavior identical
+      // to the React stream: an explicit durable command must create the task
+      // before any model has a chance to stop at plan narration.
+      const backgroundGate = longTaskApproachGate(
+        sessionId,
+        message,
+        () => shouldPromoteToDurable(message, { sessionId }),
+      );
+      if (backgroundGate.action === 'dispatch') {
+        const task = enqueueDurableChatTask({
+          message: backgroundGate.message,
+          sessionId,
+          channel: 'desktop',
+          source: 'desktop',
+        });
+        const text = renderDurableTaskQueued(task);
+        recordHomeBackgroundHandoff(sessionId, message, text, task.id);
+        res.json({ sessionId, text });
+        return;
+      }
+      const effectiveMessage = backgroundGate.action === 'beat'
+        ? `${message}${backgroundGate.steer}`
+        : message;
       // FORK collapse (staged): interactive console home chat through the gated
       // harness loop (judgeCompletion ON for desktop/Discord parity). Default-OFF
       // `home` staging surface → byte-identical to legacy until
       // CLEMMY_HARNESS_HOME=on, then live-verified + baked in.
       const response = await respondPreferHarness(
         'home',
-        { message, sessionId, channel: 'cli', userId: 'console' },
+        { message: effectiveMessage, sessionId, channel: 'cli', userId: 'console' },
         (req) => assistant.respond(req),
       );
       res.json({ sessionId, text: response.text, pendingApprovalId: response.pendingApprovalId });

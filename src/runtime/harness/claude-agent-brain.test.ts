@@ -1677,6 +1677,52 @@ test('looksLikeStreamingNarration suppresses live streaming the moment tool-call
   assert.equal(looksLikeStreamingNarration(''), false);
 });
 
+test('mixed turn with a printed later tool call pauses honestly instead of laundering prose into success', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
+  const live = [
+    "I'll close out the execution record with the full evidence, then relay the result.",
+    '',
+    '<invoke name="execution_complete">',
+    '<parameter name="id">f49025b3-17ec-4ea7-9841</parameter>',
+    '<parameter name="summary">Creation test PASSED and the workflow is now ENABLED.</parameter>',
+    '</invoke>',
+    '[tool result call_placeholder]',
+    '',
+    'I acknowledge the completion attempt.',
+  ].join('\n');
+  const chunks: string[] = [];
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    await options.onDelta?.(live);
+    return {
+      text: live,
+      sessionId: 'sdk-session',
+      toolUses: ['mcp__clementine-local__workflow_create'],
+      successfulToolUses: ['workflow_create'],
+    };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Create, validate, and enable the workflow.',
+    sessionId: 'brain-mixed-protocol',
+    onChunk: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(calls, 1, 'never replay a mixed turn that may have committed writes');
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  assert.match(res.text, /cannot claim the task is finished/i);
+  assert.match(res.text, /continue from the recorded state/i);
+  assert.doesNotMatch(res.text, /Creation test PASSED|workflow is now ENABLED|invoke|call_placeholder/i);
+  assert.doesNotMatch(chunks.join(''), /invoke|parameter|call_placeholder/i, 'protocol never reaches the live stream');
+  const terminal = listEvents('brain-mixed-protocol', { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.reason, 'awaiting_user_input');
+  assert.equal(terminal?.data.awaitingUser, true);
+});
+
 test('renderClaudeAgentBrainSystemAppend injects the workspace primer for a "space-" session', async () => {
   const { spaceStore } = await import('../../spaces/store.js');
   spaceStore.save({ id: 'deal-risk', title: 'Deal Risk', actions: [], dataSources: [] });

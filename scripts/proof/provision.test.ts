@@ -37,7 +37,7 @@ writeFileSync(path.join(tmpHome, '.env'), [
   '',
 ].join('\n'));
 
-const { planBrain } = await import('./provision.js');
+const { planBrain, proofProcessIsolationEnv, proofRuntimeOverrides } = await import('./provision.js');
 
 test.after(() => {
   rmSync(tmpHome, { recursive: true, force: true });
@@ -50,4 +50,25 @@ test('glm proof plan copies BYO_PROVIDERS and per-provider key slots', () => {
   assert.equal(plan.env.BYO_MODEL_API_KEY, 'zai-secret');
   assert.equal(plan.env.BYO_PROVIDERS, registry);
   assert.equal(plan.env.BYO_PROVIDER_DEEPSEEK_API_KEY, 'deepseek-secret');
+});
+
+test('live proof pins Fusion, fallover, and the optional approach beat off', () => {
+  assert.deepEqual(proofRuntimeOverrides(), {
+    CLEMMY_BRAIN_FALLOVER: 'off',
+    CLEMMY_AUTH_FALLOVER: 'off',
+    CLEMMY_CLAUDE_OVERLOAD_FALLBACK: 'off',
+    CLEMMY_LEGACY_RESPOND_FALLBACK: 'off',
+    CLEMMY_ROUTE_POLICY: 'off',
+    CLEMMY_DEBATE_MODE: 'off',
+    CLEMMY_FUSION_STRATEGY: 'verify',
+    CLEMMY_JUDGE_CROSS_FAMILY: 'off',
+    CLEMMY_LONGTASK_APPROACH_BEAT: 'off',
+  });
+});
+
+test('live proof gives spawned CLIs only the disposable home and dotfiles', () => {
+  assert.deepEqual(proofProcessIsolationEnv('/tmp/proof-home'), {
+    HOME: '/tmp/proof-home',
+    ZDOTDIR: '/tmp/proof-home',
+  });
 });

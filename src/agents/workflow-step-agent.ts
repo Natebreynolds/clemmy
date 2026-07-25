@@ -72,6 +72,9 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   'update_agent',
   'delete_agent',
   'delegate_task',
+  // Background-task lifecycle belongs to the origin conversation. A child
+  // workflow step must not revise the contract of a sibling/parent run.
+  'background_task_revise',
   // tool authoring
   'create_tool',
   // unbounded fan-out

@@ -44,6 +44,7 @@ const {
   finishRunAttempt,
   recordRunAttemptUserInput,
 } = await import('../runtime/harness/eventlog.js');
+const { declareWorkManifest } = await import('../runtime/harness/work-manifest.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { saveUserMcpServers } = await import('../runtime/mcp-config.js');
 
@@ -561,6 +562,60 @@ test('background task cockpit routes save report-back target and repost result',
     assert.equal(notification?.metadata?.reportBackTargetType, 'discord_channel');
     assert.equal(notification?.metadata?.reportBackTargetId, 'D456');
     assert.equal(notification?.metadata?.discordChannelId, 'D456');
+  } finally {
+    await h.close();
+  }
+});
+
+test('background task cockpit exposes logical progress and course-corrects a parked task in place', async () => {
+  const task = createBackgroundTask({
+    title: 'Research account set',
+    prompt: 'Research the account set and merge the results.',
+  });
+  markBackgroundTaskRunning(task.id);
+  declareWorkManifest({
+    sessionId: task.runSessionId,
+    manifestId: 'accounts',
+    contractVersion: 1,
+    phases: [{ id: 'research' }, { id: 'merge', dependsOn: ['research'] }],
+    items: [{ id: 'account-a', aliases: ['row-2'] }, { id: 'account-b', aliases: ['row-3'] }],
+  });
+  markBackgroundTaskBlocked(task.id, 'The original source is unavailable.', 'Saved partial research.');
+
+  const h = await boot();
+  try {
+    const detailRes = await fetch(`${h.url}/api/console/background-tasks/${task.id}`);
+    assert.equal(detailRes.status, 200);
+    const detailText = await detailRes.text();
+    const detailBody = JSON.parse(detailText) as {
+      task: { id: string; contractVersion?: number };
+      detail: Record<string, unknown>;
+      workManifests?: Array<{ manifestId: string; total: number; phases: Array<{ id: string }> }>;
+    };
+    assert.ok(Buffer.byteLength(detailText, 'utf8') < 50_000);
+    assert.equal(Object.hasOwn(detailBody.detail, 'harnessEvents'), false);
+    assert.equal(Object.hasOwn(detailBody.detail, 'workManifests'), false);
+    assert.equal(Object.hasOwn(detailBody.detail, 'task'), false);
+    assert.equal(detailBody.task.contractVersion, 1);
+    assert.equal(detailBody.workManifests?.[0]?.manifestId, 'accounts');
+    assert.equal(detailBody.workManifests?.[0]?.total, 2);
+    assert.deepEqual(detailBody.workManifests?.[0]?.phases.map((phase) => phase.id), ['research', 'merge']);
+
+    const reviseRes = await fetch(`${h.url}/api/console/background-tasks/${task.id}/contract-revisions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        instruction: 'Use the corrected connected source and revalidate prior account research.',
+        evidencePolicy: 'revalidate',
+      }),
+    });
+    assert.equal(reviseRes.status, 200);
+    const reviseBody = await reviseRes.json() as { ok: boolean; task?: { id: string; status: string; contractVersion: number } };
+    assert.equal(reviseBody.ok, true);
+    assert.equal(reviseBody.task?.id, task.id);
+    assert.equal(reviseBody.task?.status, 'pending');
+    assert.equal(reviseBody.task?.contractVersion, 2);
+    assert.equal(getBackgroundTask(task.id)?.runSessionId, task.runSessionId);
   } finally {
     await h.close();
   }

@@ -32,7 +32,8 @@ const {
   resumeBackgroundTask,
   processBackgroundTasks,
   classifyBackgroundTaskOutcome,
-  _setBackgroundDeliveryJudgeForTests,
+  _setBackgroundCompletionVerificationPauseForTests,
+  backgroundCompletionEvidence,
   markBackgroundTaskAwaitingInput,
   markBackgroundTaskAwaitingContinue,
   queueBackgroundTaskInputResolution,
@@ -62,6 +63,7 @@ const {
   _setBackgroundTaskReattachCasHookForTests,
   markBackgroundTaskAwaitingApproval,
   queueBackgroundTaskApprovalResolution,
+  reviseBackgroundTaskContract,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -72,7 +74,13 @@ const { listNotifications, getNotificationDestinationsForRecord } = await import
 const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
 const { listRuns } = await import('../runtime/run-events.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { runBackgroundTaskWatchdog } = await import('./background-task-watchdog.js');
+const {
+  checkpointWorkItem,
+  declareWorkManifest,
+  summarizeWorkManifest,
+} = await import('../runtime/harness/work-manifest.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -109,6 +117,165 @@ test('probeObjectiveForTask: goal-bound uses plan objective+criteria; ad-hoc (no
   assert.equal(probeObjectiveForTask(task, { approvedPlan: { objective: '  ' } }), 'Scrape the 8 firm sites and build the sheet');
   // No prompt → title
   assert.equal(probeObjectiveForTask({ prompt: '', title: 'Firm scrape' }, null), 'Firm scrape');
+});
+
+test('a running task accepts a versioned course correction and revalidates durable logical evidence', () => {
+  const task = createBackgroundTask({
+    title: 'Research accounts',
+    prompt: 'Research the accounts from public sources.',
+    source: 'desktop',
+  });
+  markBackgroundTaskRunning(task.id);
+  declareWorkManifest({
+    sessionId: task.runSessionId,
+    manifestId: 'accounts',
+    contractVersion: 1,
+    phases: [{ id: 'research' }, { id: 'merge', dependsOn: ['research'] }],
+    items: [{ id: 'account-a', aliases: ['row-2'] }],
+  });
+  checkpointWorkItem({
+    sessionId: task.runSessionId,
+    manifestId: 'accounts',
+    contractVersion: 1,
+    phase: 'research',
+    itemId: 'account-a',
+    status: 'succeeded',
+    evidence: [{ kind: 'source', ref: 'https://example.test/account-a' }],
+  });
+
+  const revised = reviseBackgroundTaskContract(task.id, {
+    instruction: 'Use the connected ChatGPT research runs instead of public website research.',
+    evidencePolicy: 'revalidate',
+  });
+  assert.equal(revised?.id, task.id);
+  assert.equal(revised?.runSessionId, task.runSessionId);
+  assert.equal(revised?.status, 'running');
+  assert.equal(revised?.contractVersion, 2);
+  assert.equal(revised?.pendingContractRevision?.version, 2);
+  assert.match(revised?.lastCheckInMessage ?? '', /next model boundary/i);
+  assert.ok(listEvents(task.runSessionId).some((event) => event.type === 'background_contract_revised'));
+
+  const manifest = summarizeWorkManifest(task.runSessionId, 'accounts');
+  assert.equal(manifest?.contractVersion, '2');
+  assert.equal(manifest?.phases[0]?.needsValidation, 1);
+  assert.equal(manifest?.evidenceCount, 1, 'old evidence stays visible while awaiting revalidation');
+
+  markBackgroundTaskDone(task.id, 'finished');
+  assert.equal(
+    reviseBackgroundTaskContract(task.id, { instruction: 'Too late to alter a terminal task.' }),
+    null,
+  );
+});
+
+test('a course correction re-queues parked work in place but never revives cancellation', () => {
+  const blocked = createBackgroundTask({
+    title: 'Research the approved source',
+    prompt: 'Research the approved source and summarize the findings.',
+  });
+  markBackgroundTaskRunning(blocked.id);
+  markBackgroundTaskBlocked(blocked.id, 'The original source is unavailable.', 'Saved partial research.');
+
+  const revised = reviseBackgroundTaskContract(blocked.id, {
+    instruction: 'Use the corrected source connection and preserve compatible research.',
+    evidencePolicy: 'preserve',
+  });
+  assert.equal(revised?.status, 'pending');
+  assert.equal(revised?.id, blocked.id);
+  assert.equal(revised?.runSessionId, blocked.runSessionId);
+  assert.equal(revised?.completedAt, undefined);
+  assert.equal(revised?.contractVersion, 2);
+  assert.match(revised?.continueResolution?.reason ?? '', /corrected contract v2/i);
+
+  const approvalTask = createBackgroundTask({
+    title: 'Prepare an external update',
+    prompt: 'Prepare the update and pause before sending.',
+  });
+  markBackgroundTaskRunning(approvalTask.id);
+  const approval = approvalRegistry.register({
+    sessionId: approvalTask.runSessionId,
+    subject: 'Send the prepared external update.',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL' },
+  });
+  markBackgroundTaskAwaitingApproval(approvalTask.id, approval.approvalId, 'The update is ready to send.');
+  const approvalRevision = reviseBackgroundTaskContract(approvalTask.id, {
+    instruction: 'Do not send the old update; revise it for the new audience.',
+    evidencePolicy: 'invalidate',
+  });
+  assert.equal(approvalRevision?.status, 'pending');
+  assert.equal(approvalRevision?.pendingApprovalId, undefined);
+  assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'cancelled_by_user');
+
+  const cancelling = createBackgroundTask({
+    title: 'Stop this task',
+    prompt: 'Keep researching until stopped.',
+  });
+  markBackgroundTaskRunning(cancelling.id);
+  cancelBackgroundTask(cancelling.id, 'The user stopped this task.');
+  assert.equal(
+    reviseBackgroundTaskContract(cancelling.id, {
+      instruction: 'Try a different source.',
+      evidencePolicy: 'revalidate',
+    }),
+    null,
+    'a correction cannot race a user cancellation back to pending',
+  );
+  markBackgroundTaskFailed(cancelling.id, 'test cleanup', 'aborted');
+  markBackgroundTaskFailed(blocked.id, 'test cleanup', 'aborted');
+  markBackgroundTaskFailed(approvalTask.id, 'test cleanup', 'aborted');
+});
+
+test('terminal coverage uses the 120-item logical manifest, not 240 worker-attempt labels', () => {
+  const task = createBackgroundTask({
+    title: 'Long-horizon outreach',
+    prompt: 'Research 120 accounts, merge every result, then read the workbook back.',
+  });
+  markBackgroundTaskRunning(task.id);
+  const items = Array.from({ length: 120 }, (_, index) => ({
+    id: `account-${index + 1}`,
+    aliases: [`row-${index + 2}`],
+  }));
+  declareWorkManifest({
+    sessionId: task.runSessionId,
+    manifestId: 'outreach',
+    contractVersion: 1,
+    phases: [
+      { id: 'research', label: 'Research' },
+      { id: 'merge', label: 'Merge', dependsOn: ['research'] },
+      { id: 'readback', label: 'Read back', dependsOn: ['merge'] },
+    ],
+    items,
+  });
+  for (let index = 0; index < 120; index += 1) {
+    checkpointWorkItem({
+      sessionId: task.runSessionId,
+      manifestId: 'outreach',
+      contractVersion: 1,
+      phase: 'research',
+      itemId: `row-${index + 2}`,
+      status: 'succeeded',
+      evidence: [{ kind: 'source', ref: `source:${index + 1}` }],
+    });
+    appendEvent({
+      sessionId: task.runSessionId,
+      turn: 0,
+      role: 'system',
+      type: 'worker_result',
+      data: { item: `account-${index + 1}`, ok: true, packetKey: `account-${index + 1}` },
+    });
+    appendEvent({
+      sessionId: task.runSessionId,
+      turn: 0,
+      role: 'system',
+      type: 'worker_result',
+      data: { item: `row-${index + 2}`, ok: false, packetKey: `row-${index + 2}`, reason: 'redundant retry' },
+    });
+  }
+  const outcome = classifyBackgroundTaskOutcome(task, 'Completed the requested work.');
+  assert.equal(outcome.outcome, 'blocked');
+  assert.match(outcome.reason ?? '', /Merge: 0\/120 complete/i);
+  assert.doesNotMatch(outcome.reason ?? '', /\b240\b/);
+  markBackgroundTaskFailed(task.id, 'test cleanup', 'aborted');
 });
 
 test('enqueueDurableChatTask kicks the drain immediately (fires without waiting for the 15s tick)', () => {
@@ -984,6 +1151,73 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   assert.equal(updated?.modelTransport, 'legacy_assistant');
 });
 
+test('an in-flight contract correction preserves partial work and re-queues the same task/session at the model boundary', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Analyze the account shortlist',
+    prompt: 'Analyze the approved account shortlist and summarize the strongest patterns.',
+  });
+  const messages: string[] = [];
+  let calls = 0;
+
+  const assistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { message: string; sessionId: string }) {
+      messages.push(request.message);
+      calls += 1;
+      if (calls === 1) {
+        const revised = reviseBackgroundTaskContract(task.id, {
+          instruction: 'Use the corrected source policy and revalidate any prior account evidence.',
+          evidencePolicy: 'revalidate',
+        });
+        assert.equal(revised?.status, 'running', 'the correction versions the active task without interrupting its current provider call');
+        assert.equal(revised?.contractVersion, 2);
+        return {
+          text: 'Partial work from contract v1: grouped the shortlist and recorded the initial account patterns.',
+          sessionId: request.sessionId,
+          stoppedReason: 'success' as const,
+        };
+      }
+      return {
+        text: 'Done — revalidated the shortlist under the corrected source policy and summarized the supported account patterns.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 1);
+  const superseded = getBackgroundTask(task.id);
+  assert.equal(superseded?.status, 'pending');
+  assert.equal(superseded?.contractVersion, 2);
+  assert.equal(superseded?.runSessionId, task.runSessionId);
+  assert.match(superseded?.result ?? '', /Partial work from contract v1/);
+  assert.equal(superseded?.pendingContractRevision?.version, 2);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).filter((candidate) => candidate.id === task.id).length, 1);
+
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 1);
+  const completed = getBackgroundTask(task.id);
+  assert.equal(completed?.status, 'done');
+  assert.equal(completed?.runSessionId, task.runSessionId);
+  assert.equal(completed?.pendingContractRevision, undefined);
+  assert.ok(completed?.contractRevisions?.find((revision) => revision.version === 2)?.appliedAt);
+  assert.equal(messages.length, 2);
+  assert.match(messages[0], /Active contract version: 1/);
+  assert.match(messages[1], /Active contract version: 2/);
+  assert.match(messages[1], /corrected source policy/);
+  assert.match(messages[1], /Partial work from contract v1/);
+
+  const runs = listRuns(80).filter((run) => run.sessionId === task.runSessionId);
+  assert.ok(runs.some((run) => /superseded by contract v2/i.test(
+    run.events.map((event) => event.message).join('\n'),
+  )));
+  assert.ok(runs.some((run) => run.status === 'completed'
+    && run.events.some((event) => event.type === 'cancelled')
+    && run.events.some((event) => event.type === 'completed')));
+});
+
 test('processBackgroundTasks carries origin lineage into automatic continuation prompts', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });
@@ -1119,17 +1353,16 @@ test('processBackgroundTasks settles a cancelled response as cancelled/aborted, 
   assert.equal(tracked?.events.some((event) => event.type === 'failed'), false);
 });
 
-test('a cancellation arriving during delivery verification wins over a blocked verdict', async () => {
+test('a cancellation arriving during asynchronous evidence verification wins over a blocked verdict', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Cancel while verifying', prompt: 'prepare the requested report' });
-  let enterJudge!: () => void;
-  let releaseJudge!: () => void;
-  const judgeEntered = new Promise<void>((resolve) => { enterJudge = resolve; });
-  const judgeReleased = new Promise<void>((resolve) => { releaseJudge = resolve; });
-  _setBackgroundDeliveryJudgeForTests(async () => {
-    enterJudge();
-    await judgeReleased;
-    return { done: false, reason: 'no verified report yet' };
+  let enterVerification!: () => void;
+  let releaseVerification!: () => void;
+  const verificationEntered = new Promise<void>((resolve) => { enterVerification = resolve; });
+  const verificationReleased = new Promise<void>((resolve) => { releaseVerification = resolve; });
+  _setBackgroundCompletionVerificationPauseForTests(async () => {
+    enterVerification();
+    await verificationReleased;
   });
 
   try {
@@ -1144,9 +1377,9 @@ test('a cancellation arriving during delivery verification wins over a blocked v
       },
     } as any, 1);
 
-    await judgeEntered;
+    await verificationEntered;
     assert.equal(cancelBackgroundTask(task.id, 'Stopped during verification.')?.status, 'cancelling');
-    releaseJudge();
+    releaseVerification();
     assert.equal(await processing, 1);
 
     assert.equal(getBackgroundTask(task.id)?.status, 'aborted');
@@ -1155,8 +1388,8 @@ test('a cancellation arriving during delivery verification wins over a blocked v
     assert.equal(tracked?.events.filter((event) => event.type === 'cancelled').length, 1);
     assert.equal(tracked?.events.some((event) => event.type === 'failed'), false);
   } finally {
-    releaseJudge?.();
-    _setBackgroundDeliveryJudgeForTests(null);
+    releaseVerification?.();
+    _setBackgroundCompletionVerificationPauseForTests(null);
   }
 });
 
@@ -1254,7 +1487,7 @@ test('an approved continuation with no cancellation dispatches the mutation exac
   // through exactly once (no spurious fail-closed).
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const approvalId = 'approval-clean-dispatch';
-  const task = createBackgroundTask({ title: 'Send the approved follow-up', prompt: 'Send the approved follow-up.' });
+  const task = createBackgroundTask({ title: 'Send the approved follow-up email', prompt: 'Send the approved follow-up email.' });
   assert.equal(
     markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Ready to send after approval.')?.status,
     'awaiting_approval',
@@ -1269,8 +1502,6 @@ test('an approved continuation with no cancellation dispatches the mutation exac
     // No cancellation — the task is genuinely still running at the boundary.
     assert.equal(getBackgroundTask(task.id)?.status, 'running', 'processor won pending->running');
   });
-  _setBackgroundDeliveryJudgeForTests(async () => ({ done: true }));
-
   try {
     const processed = await processBackgroundTasks({
       getRuntime() {
@@ -1279,6 +1510,17 @@ test('an approved continuation with no cancellation dispatches the mutation exac
             dispatchCalls += 1;
             assert.equal(id, approvalId);
             assert.equal(approved, true);
+            appendEvent({
+              sessionId: task.runSessionId,
+              turn: 1,
+              role: 'system',
+              type: 'external_write',
+              data: {
+                callId: 'approved-send-1',
+                shapeKey: 'OUTLOOK_SEND_EMAIL',
+                targets: ['casey@example.com'],
+              },
+            });
             return { text: 'Sent the approved follow-up to casey@example.com (message m-1).' };
           },
         };
@@ -1296,7 +1538,6 @@ test('an approved continuation with no cancellation dispatches the mutation exac
     assert.equal(tracked?.status, 'completed');
   } finally {
     _setBackgroundTaskApprovalDispatchCheckHookForTests(null);
-    _setBackgroundDeliveryJudgeForTests(null);
   }
 });
 
@@ -1347,12 +1588,7 @@ test('processBackgroundTasks lets a verified final deliverable override partial 
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Write comparison doc', prompt: 'Research 10 tools and save comparison.md' });
   clearLedger(task.runSessionId);
-  let judgeCalls = 0;
-
-  _setBackgroundDeliveryJudgeForTests(async () => {
-    judgeCalls += 1;
-    return { done: true, reason: 'comparison.md exists and covers all requested tools' };
-  });
+  const comparisonPath = path.join(TMP_HOME, 'comparison.md');
 
   try {
     const stubAssistant = {
@@ -1367,11 +1603,17 @@ test('processBackgroundTasks lets a verified final deliverable override partial 
           ok: false,
           reason: 'ERROR: worker failed after parent recovered the data',
         });
-        // Deliverable-evidence bar (2026-07-23): the claim is backed by an
-        // actual write in the run session, so the override rule still applies.
+        // Deliverable-evidence bar: the file exists and the successful return
+        // row binds it to this run. A tool_called intent alone is not proof.
+        writeFileSync(comparisonPath, '# Comparison\n\nAll 10 tools covered.\n', 'utf8');
         appendEvent({
-          sessionId: task.runSessionId, turn: 1, role: 'assistant', type: 'tool_called',
-          data: { tool: 'write_file', args: { path: 'comparison.md' } },
+          sessionId: task.runSessionId, turn: 1, role: 'tool', type: 'tool_returned',
+          data: {
+            tool: 'write_file',
+            callId: 'write-comparison',
+            ok: true,
+            preview: `Wrote ${comparisonPath} (37 chars).`,
+          },
         });
         return {
           text: 'Done. Deliverable: comparison.md. Verified all 10 tools and all required sections.',
@@ -1384,13 +1626,10 @@ test('processBackgroundTasks lets a verified final deliverable override partial 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const processed = await processBackgroundTasks(stubAssistant as any, 1);
     assert.equal(processed, 1);
-    assert.equal(judgeCalls, 0, 'concrete artifact text is accepted by the cheap verifier without a judge call');
     const updated = getBackgroundTask(task.id);
     assert.equal(updated?.status, 'done');
     assert.match(updated?.result ?? '', /Verified all 10 tools/);
-  } finally {
-    _setBackgroundDeliveryJudgeForTests(null);
-  }
+  } finally { /* file lives under the per-suite disposable home */ }
 });
 
 test('processBackgroundTasks parks turn-budget exhaustion before terminal fanout coverage', async () => {
@@ -1732,102 +1971,189 @@ test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done
   assert.equal(doneNoReason.outcome, 'done', 'clean text with no stoppedReason stays done');
 });
 
-test('processBackgroundTasks blocks promise-shaped completion when the delivery judge rejects it', async () => {
+test('processBackgroundTasks blocks promise-shaped completion from durable evidence, without a delivery judge', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Prepare contacts', prompt: 'Pull the contacts and write the sheet' });
-  let judgeCalls = 0;
 
-  _setBackgroundDeliveryJudgeForTests(async (objective, response) => {
-    judgeCalls += 1;
-    assert.match(objective, /Pull the contacts/);
-    assert.match(response, /send them next/);
-    return { done: false, reason: 'no verifiable sheet or contact rows' };
-  });
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { sessionId: string }) {
+      return {
+        text: "I'll pull those contacts and send them next.",
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
 
-  try {
-    const stubAssistant = {
-      getRuntime() {
-        return {} as never;
-      },
-      async respond(request: { sessionId: string }) {
-        return {
-          text: "I'll pull those contacts and send them next.",
-          sessionId: request.sessionId,
-          stoppedReason: 'success' as const,
-        };
-      },
-    };
+  // Pass 1 (2026-07-23 contract): an artifact-committed prompt whose first
+  // completion has zero deliverable evidence earns ONE objective-re-anchored
+  // continuation instead of a terminal block.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.equal(getBackgroundTask(task.id)?.status, 'pending', 'first artifact-less completion re-anchors, not blocks');
 
-    // Pass 1 (2026-07-23 contract): an artifact-committed prompt whose first
-    // completion has zero deliverable evidence earns ONE objective-re-anchored
-    // continuation instead of a terminal block.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const processed = await processBackgroundTasks(stubAssistant as any, 1);
-    assert.equal(processed, 1);
-    assert.equal(getBackgroundTask(task.id)?.status, 'pending', 'first artifact-less completion re-anchors, not blocks');
-
-    // Pass 2: the continuation still produces only a promise with ZERO
-    // deliverable evidence — the deterministic tripwire blocks it before the
-    // judge is even consulted (deterministic-over-LLM). Promise text is NEVER
-    // trusted as done; the judge lane still governs evidence-backed claims
-    // (see the post-approval judge test below).
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const processed2 = await processBackgroundTasks(stubAssistant as any, 1);
-    assert.equal(processed2, 1);
-    assert.equal(judgeCalls, 0, 'zero-evidence completion blocks deterministically, no judge spend');
-    const updated = getBackgroundTask(task.id);
-    assert.equal(updated?.status, 'blocked');
-    assert.match(updated?.error ?? '', /promised an external deliverable/);
-  } finally {
-    _setBackgroundDeliveryJudgeForTests(null);
-  }
+  // Pass 2: the continuation still produces only a promise with ZERO
+  // deliverable evidence — the deterministic tripwire blocks it with no model
+  // opinion in the state transition.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed2 = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed2, 1);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'blocked');
+  assert.match(updated?.error ?? '', /promised an external deliverable/);
 });
 
-test('processBackgroundTasks blocks promise-shaped post-approval completion when the delivery judge rejects it', async () => {
+test('processBackgroundTasks requires a committed send receipt after approval, without a delivery judge', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Finish approved send', prompt: 'Send the approved follow-up email' });
   updateBackgroundTask(task.id, {
     approvalResolution: { approvalId: 'approval-bg-1', approved: true, queuedAt: new Date().toISOString() },
   });
-  let judgeCalls = 0;
 
-  _setBackgroundDeliveryJudgeForTests(async () => {
-    judgeCalls += 1;
-    return { done: false, reason: 'approval resumed but no send receipt is present' };
-  });
+  const stubAssistant = {
+    getRuntime() {
+      return {
+        async resolveApproval(approvalId: string, approved: boolean) {
+          return {
+            approvalId,
+            status: approved ? 'approved' as const : 'rejected' as const,
+            text: "I'll send the approved follow-up next.",
+            sessionId: task.runSessionId,
+          };
+        },
+      };
+    },
+    async respond() {
+      throw new Error('respond should not be called on approval resume');
+    },
+  };
 
-  try {
-    const stubAssistant = {
-      getRuntime() {
-        return {
-          async resolveApproval(approvalId: string, approved: boolean) {
-            return {
-              approvalId,
-              status: approved ? 'approved' as const : 'rejected' as const,
-              text: "I'll send the approved follow-up next.",
-              sessionId: task.runSessionId,
-            };
-          },
-        };
-      },
-      async respond() {
-        throw new Error('respond should not be called on approval resume');
-      },
-    };
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const processed = await processBackgroundTasks(stubAssistant as any, 1);
-    assert.equal(processed, 1);
-    assert.equal(judgeCalls, 1, 'post-approval promise-shaped completion must be judged');
-    const updated = getBackgroundTask(task.id);
-    assert.equal(updated?.status, 'blocked');
-    assert.match(updated?.error ?? '', /no send receipt/);
-  } finally {
-    _setBackgroundDeliveryJudgeForTests(null);
-  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'blocked');
+  assert.match(updated?.error ?? '', /no committed external-write receipt/);
 });
 
-// ─── needs_input check-in round-trip (the judge-gated pause/resume) ───
+test('background completion evidence reduces committed, compensated, and ambiguous writes without a model verdict', () => {
+  const committed = createSession({ kind: 'execution', title: 'evidence-committed' });
+  appendEvent({
+    sessionId: committed.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-committed', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] },
+  });
+  assert.deepEqual(backgroundCompletionEvidence({ runSessionId: committed.id }), {
+    artifactBindings: 0,
+    extractedDeliverables: 0,
+    externalWriteReceipts: 1,
+    ambiguousExternalWrites: 0,
+  });
+
+  const compensated = createSession({ kind: 'execution', title: 'evidence-compensated' });
+  appendEvent({
+    sessionId: compensated.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-failed', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] },
+  });
+  appendEvent({
+    sessionId: compensated.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { callId: 'send-failed', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] },
+  });
+  assert.equal(backgroundCompletionEvidence({ runSessionId: compensated.id }).externalWriteReceipts, 0);
+
+  const ambiguous = createSession({ kind: 'execution', title: 'evidence-ambiguous' });
+  appendEvent({
+    sessionId: ambiguous.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'send-unknown', effect: 'external_write', accounting: 'top_level' },
+  });
+  const ambiguousEvidence = backgroundCompletionEvidence({ runSessionId: ambiguous.id });
+  assert.equal(ambiguousEvidence.externalWriteReceipts, 0);
+  assert.equal(ambiguousEvidence.ambiguousExternalWrites, 1);
+
+  const failedReturn = createSession({ kind: 'execution', title: 'evidence-failed-return' });
+  appendEvent({
+    sessionId: failedReturn.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'composio_execute_tool',
+      callId: 'send-returned-failed',
+      effect: 'external_write',
+      accounting: 'top_level',
+      ok: false,
+      error: 'provider rejected the send',
+    },
+  });
+  assert.equal(
+    backgroundCompletionEvidence({ runSessionId: failedReturn.id }).externalWriteReceipts,
+    0,
+    'a failed return is write-touch evidence for replay safety, not a committed completion receipt',
+  );
+});
+
+test('an ambiguous external send blocks once and never auto-replays the mutation', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Send the client update email',
+    prompt: 'Send the client update email to casey@example.com.',
+  });
+  let calls = 0;
+  const assistant = {
+    getRuntime() { return {} as never; },
+    async respond(request: { sessionId: string }) {
+      calls += 1;
+      appendEvent({
+        sessionId: task.runSessionId,
+        turn: 1,
+        role: 'assistant',
+        type: 'tool_called',
+        data: {
+          tool: 'composio_execute_tool',
+          callId: 'send-ambiguous-once',
+          effect: 'external_write',
+          accounting: 'top_level',
+        },
+      });
+      return {
+        text: 'The provider response was lost after dispatching the client email.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 1);
+  const blocked = getBackgroundTask(task.id);
+  assert.equal(blocked?.status, 'blocked');
+  assert.match(blocked?.error ?? '', /check the external system/i);
+  assert.match(blocked?.error ?? '', /replay may duplicate/i);
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 0, 'terminal ambiguity is not silently re-queued');
+  assert.equal(calls, 1);
+  assert.equal(
+    listEvents(task.runSessionId, { types: ['tool_called'] })
+      .filter((event) => event.data?.callId === 'send-ambiguous-once').length,
+    1,
+    'the external dispatch appears exactly once',
+  );
+});
+
+// ─── needs_input check-in round-trip ───
 
 test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
   const task = createBackgroundTask({ title: 'Draft the emails', prompt: 'draft', originSessionId: 'console:home' });
@@ -1835,6 +2161,79 @@ test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
   assert.equal(parked?.status, 'awaiting_input');
   assert.equal(parked?.pendingQuestionId, 'q-1');
   assert.match(parked?.pendingQuestion ?? '', /priority-accounts/);
+});
+
+test('Railway auth blocker preserves completed work, pauses resumably, and continues the same task', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const origin = createSession({ kind: 'chat', title: 'Railway build origin' });
+  const task = createBackgroundTask({
+    title: 'Build and deploy the Railway app',
+    prompt: 'Build the Railway app in the workspace, verify it locally, and deploy it.',
+    originSessionId: origin.id,
+  });
+  const originalRunSessionId = task.runSessionId;
+  const progressReport = [
+    'The Railway app is built in the workspace and the local production build passes.',
+    'Deployment is the only remaining step.',
+    'I need your credentials because Railway CLI authentication is required. Run `railway login`, then continue.',
+  ].join('\n');
+  let calls = 0;
+  let resumeMessage = '';
+  const assistant = {
+    getRuntime() { return {} as never; },
+    async respond(request: { message: string; sessionId: string }) {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          text: progressReport,
+          sessionId: request.sessionId,
+          stoppedReason: 'success' as const,
+        };
+      }
+      resumeMessage = request.message;
+      return {
+        text: 'Deployment completed from the saved project: https://railway.example/app-123',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 1);
+  const parked = getBackgroundTask(task.id);
+  assert.equal(parked?.status, 'awaiting_input', 'authentication is a resumable dependency, not a terminal block');
+  assert.equal(parked?.completedAt, undefined);
+  assert.equal(parked?.runSessionId, originalRunSessionId);
+  assert.match(parked?.result ?? '', /app is built/i, 'the model-authored progress report remains canonical');
+  assert.match(parked?.pendingQuestion ?? '', /reply `continue`/i);
+  assert.ok(parked?.pendingQuestionId);
+
+  const reportBack = listEvents(origin.id)
+    .filter((event) => event.type === 'user_input_received')
+    .map((event) => String(event.data?.text ?? ''))
+    .find((text) => text.includes(task.id) && /NEEDS INPUT/i.test(text));
+  assert.ok(reportBack, 'the dependency pause reached the origin conversation');
+  assert.match(reportBack!, /app is built/i, 'report-back preserves completed work');
+  assert.match(reportBack!, /railway login/i, 'report-back preserves the exact dependency');
+  assert.match(reportBack!, /resume this same task/i, 'report-back exposes the continuation path');
+
+  const queued = queueBackgroundTaskInputResolution(
+    parked!.pendingQuestionId!,
+    'I ran railway login successfully; continue.',
+  );
+  assert.equal(queued?.status, 'pending');
+  assert.equal(queued?.id, task.id);
+  assert.equal(queued?.runSessionId, originalRunSessionId);
+
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 1);
+  const completed = getBackgroundTask(task.id);
+  assert.equal(completed?.status, 'done');
+  assert.equal(completed?.id, task.id);
+  assert.equal(completed?.runSessionId, originalRunSessionId);
+  assert.match(resumeMessage, /app is built/i, 'resume prompt carries the prior completed progress');
+  assert.match(resumeMessage, /DO NOT REPEAT COMPLETED SIDE EFFECTS/i);
+  assert.match(resumeMessage, /railway login successfully/i);
+  assert.equal(calls, 2, 'one initial turn plus one checkpointed continuation');
 });
 
 test('awaiting-input notifications preserve origin metadata and route Slack report-backs to requester DM', () => {
@@ -2261,6 +2660,22 @@ test('tripwire: artifact-committed prompt with zero evidence trips; any evidence
 
   // Non-artifact prompts never trip regardless of evidence.
   assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: 'summarize my unread email' }), false);
+  assert.equal(
+    completionLacksDeliverableEvidence({
+      runSessionId: bare.id,
+      prompt: 'This is read-only and hermetic: do not write files, browse, or make external writes. Return the analysis in the report-back.',
+    }),
+    false,
+    'a negative safety constraint is not misread as a promised file',
+  );
+  assert.equal(
+    completionLacksDeliverableEvidence({
+      runSessionId: bare.id,
+      prompt: 'Do not stop until you write the final report.md.',
+    }),
+    true,
+    'a do-not-stop-until commitment remains a real artifact promise',
+  );
 
   // An external_write clears it.
   const written = createSession({ kind: 'execution', title: 'tripwire-write' });
@@ -2270,13 +2685,27 @@ test('tripwire: artifact-committed prompt with zero evidence trips; any evidence
   });
   assert.equal(completionLacksDeliverableEvidence({ runSessionId: written.id, prompt: artifactPrompt }), false);
 
-  // A local write_file call clears it too (the deliverable may be a file).
+  // A successful local write_file return clears it too. Merely intending to
+  // call write_file is not completion evidence.
   const filed = createSession({ kind: 'execution', title: 'tripwire-file' });
+  const filedPath = path.join(TMP_HOME, 'report.md');
+  writeFileSync(filedPath, '# Report\n', 'utf8');
   appendEvent({
-    sessionId: filed.id, turn: 1, role: 'assistant', type: 'tool_called',
-    data: { tool: 'write_file', args: { path: 'report.md' } },
+    sessionId: filed.id, turn: 1, role: 'tool', type: 'tool_returned',
+    data: { tool: 'write_file', callId: 'write-report', ok: true, preview: `Wrote ${filedPath} (9 chars).` },
   });
   assert.equal(completionLacksDeliverableEvidence({ runSessionId: filed.id, prompt: artifactPrompt }), false);
+
+  const intendedOnly = createSession({ kind: 'execution', title: 'tripwire-file-intent-only' });
+  appendEvent({
+    sessionId: intendedOnly.id, turn: 1, role: 'assistant', type: 'tool_called',
+    data: { tool: 'write_file', callId: 'write-never-returned', args: { path: 'missing.md' } },
+  });
+  assert.equal(
+    completionLacksDeliverableEvidence({ runSessionId: intendedOnly.id, prompt: artifactPrompt }),
+    true,
+    'a call intent without a successful return cannot prove the deliverable exists',
+  );
 });
 
 test('objective re-anchor: first artifact-less completion auto-continues ONCE with the note in front; repeat blocks honestly', async () => {
@@ -2285,7 +2714,6 @@ test('objective re-anchor: first artifact-less completion auto-continues ONCE wi
     title: 'Build the outreach sheet',
     prompt: 'in the background: create a google sheet with the 120-account outreach list, one row per account',
   });
-  _setBackgroundDeliveryJudgeForTests(async () => ({ done: true }));
   const phantom = '## Completed\n- Loaded the account roster\n- Confirmed Salesforce and Sheets access';
 
   try {
@@ -2338,9 +2766,7 @@ test('objective re-anchor: first artifact-less completion auto-continues ONCE wi
     } as any, 1);
     assert.equal(processed3, 1);
     assert.equal(getBackgroundTask(good.id)?.status, 'done', 'evidence-backed completion still lands done in one pass');
-  } finally {
-    _setBackgroundDeliveryJudgeForTests(null);
-  }
+  } finally { /* task records live under the disposable suite home */ }
 });
 
 test('tripwire widening: destination-cued draft promises are gated; bare text-draft asks are not', async () => {

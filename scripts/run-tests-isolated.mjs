@@ -21,14 +21,42 @@ const args = forwarded.length > 0
   ? ['--test', ...forwarded]
   : ['--test', 'src/**/*.test.ts', 'apps/**/*.test.ts'];
 
+const testEnv = { ...process.env };
+for (const key of [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'BROWSER_USE_API_KEY',
+  'BYO_MODEL_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CONFIG_DIR',
+  'CODEX_API_KEY',
+  'CODEX_AUTH_SOURCE_FILE',
+  'CODEX_HOME',
+  'COMPOSIO_API_KEY',
+  'DISCORD_BOT_TOKEN',
+  'OPENAI_API_KEY',
+  'RECALL_API_KEY',
+  'SLACK_APP_TOKEN',
+  'SLACK_BOT_TOKEN',
+  'WEBHOOK_SECRET',
+]) {
+  delete testEnv[key];
+}
+
 let exitCode = 1;
 try {
   const result = spawnSync(tsxBin, args, {
     cwd: repoRoot,
     env: {
-      ...process.env,
+      ...testEnv,
+      // Isolate every conventional home lookup too. CLEMENTINE_HOME protects
+      // Clementine state; HOME/USERPROFILE protect ~/.codex, ~/.claude, and
+      // third-party CLIs that do not know about CLEMENTINE_HOME.
+      HOME: testHome,
+      USERPROFILE: testHome,
       CLEMENTINE_HOME: testHome,
       CLEMMY_TEST_ISOLATED_HOME: '1',
+      CLEMMY_TEST_DISABLE_LIVE_MODELS: '1',
     },
     stdio: 'inherit',
   });

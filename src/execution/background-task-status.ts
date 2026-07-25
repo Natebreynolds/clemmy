@@ -6,6 +6,7 @@ import { listEvents, type EventRow } from '../runtime/harness/eventlog.js';
 import { projectCanonicalTopLevelToolEvents } from '../runtime/harness/tool-effect.js';
 import { listPending, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 import { listNotifications, type NotificationRecord } from '../runtime/notifications.js';
+import { summarizeWorkManifests, type WorkManifestSummary } from '../runtime/harness/work-manifest.js';
 import {
   getBackgroundTask,
   listBackgroundTasks,
@@ -41,6 +42,7 @@ export interface BackgroundTaskStatusDetails {
    *  independent of the (housekeeping-filtered) toolEvents feed above. */
   toolCallCount: number;
   notifications: NotificationRecord[];
+  workManifests: WorkManifestSummary[];
   latestActivityAt?: string;
   latestActivitySummary?: string;
 }
@@ -298,6 +300,7 @@ export function getBackgroundTaskStatus(input?: string): BackgroundTaskStatusDet
       'tool_called',
     ).length,
     notifications: notificationsForTask(task),
+    workManifests: summarizeWorkManifests(task.runSessionId),
   };
   return {
     ...detailsBase,
@@ -358,12 +361,25 @@ export function renderBackgroundTaskStatus(details: BackgroundTaskStatusDetails)
     task.startedAt ? `Started: ${task.startedAt}` : '',
     task.completedAt ? `Completed: ${task.completedAt}` : '',
     task.error ? `Error: ${task.error}` : '',
+    `Contract: v${task.contractVersion ?? 1}${task.pendingContractRevision ? ` (v${task.pendingContractRevision.version} queued for the next model boundary)` : ''}`,
     details.latestActivityAt ? `Latest activity: ${details.latestActivityAt} — ${details.latestActivitySummary ?? ''}` : '',
     task.lastCheckInMessage ? `Latest check-in: ${task.lastCheckInMessage}` : '',
   ].filter(Boolean);
 
   if (details.pendingApprovals.length > 0) {
     lines.push('', 'Pending approvals:', ...details.pendingApprovals.map(renderApproval));
+  }
+
+  if (details.workManifests.length > 0) {
+    lines.push('', 'Logical work progress:');
+    for (const manifest of details.workManifests) {
+      lines.push(`- ${manifest.manifestId} contract ${manifest.contractVersion}: ${manifest.completed}/${manifest.total} items completed every phase; ${manifest.remaining} remaining; ${manifest.evidenceCount} evidence refs.`);
+      for (const phase of manifest.phases) {
+        lines.push(`  - ${phase.label}: ${phase.succeeded}/${phase.total} complete${phase.running ? `, ${phase.running} running` : ''}${phase.failed ? `, ${phase.failed} failed` : ''}${phase.needsValidation ? `, ${phase.needsValidation} need validation` : ''}${phase.invalidated ? `, ${phase.invalidated} invalidated` : ''}`);
+      }
+      if (manifest.untrackedCheckpoints) lines.push(`  - ${manifest.untrackedCheckpoints} untracked attempts excluded from logical totals.`);
+      if (manifest.staleCheckpoints) lines.push(`  - ${manifest.staleCheckpoints} stale-contract checkpoints preserved but not counted.`);
+    }
   }
 
   const recentTools = details.toolEvents.slice(-12);

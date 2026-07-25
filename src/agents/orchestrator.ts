@@ -53,6 +53,13 @@ import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import {
+  checkpointPreparedWorker,
+  completedPreparedWorker,
+  prepareWorkerManifest,
+  type PreparedWorkerManifest,
+  type WorkerManifestDescriptor,
+} from '../runtime/harness/work-manifest.js';
+import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
@@ -990,11 +997,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     return Number.isFinite(n) && n >= 2 ? n : 8;
   })();
   const runWorkerToolDescription = [
-      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` in ONE call — the harness runs them as a bounded parallel pool (wall time ≈ slowest item) with an honest per-item ledger (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
+      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` in ONE call — the harness runs them as a concurrency-bounded pool with an honest per-item ledger (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
       'Each worker gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
       'Input: one packet (objective, resolvedTools, context, instructions, expectedOutput) that applies to every item, plus `items` (the full list) or `item` (a single identifier). You must include exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the items should use a user-configured worker category such as design, writing, research, code, or analysis.',
       'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
       'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
+      'For durable multi-wave or multi-phase work, include workManifest. Declare the canonical item universe and phase graph on the first wave; reconcile later labels (for example sheet rows) back to those ids with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
       'Before fanning out N mutating workers: call `request_approval` ONCE with the batch summary ("Create 50 Salesforce tasks for these leads — review the list?") instead of letting each worker pause individually. Sticky approval then covers the fan-out.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
@@ -1033,6 +1041,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (knownDeadSig) {
         return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
       }
+      const manifestSessionId = extractSessionId(runContext) ?? '';
+      let manifestBinding: PreparedWorkerManifest | undefined;
+      if (call.workManifest && manifestSessionId) {
+        const prepared = prepareWorkerManifest({
+          sessionId: manifestSessionId,
+          items: callItems,
+          descriptor: call.workManifest as WorkerManifestDescriptor,
+          objective: call.objective,
+        });
+        if (!prepared.ok) return `ERROR: workers were NOT started — ${prepared.error}`;
+        manifestBinding = prepared.binding;
+      }
       const { items: _batch, ...packetBase } = call;
       if (callItems.length > 1) {
         // Deterministic batch (2026-07-21): the harness owns the parallelism so
@@ -1049,7 +1069,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               : details;
             try {
               outs[index] = String(await runOneOrchestratorWorker(
-                { ...packetBase, item } as WorkerToolInput, runContext, perDetails,
+                { ...packetBase, item } as WorkerToolInput, runContext, perDetails, manifestBinding,
               ) ?? '');
             } catch (err) {
               outs[index] = `ERROR: worker for "${item}" failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
@@ -1105,7 +1125,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             : `Batch finished with FAILURES: ${rendered.length - failedItems.length}/${rendered.length} succeeded; FAILED items: ${failedItems.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
         return [...(heavyAdvisory ? [heavyAdvisory] : []), header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n');
       }
-      return runOneOrchestratorWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput, runContext, details);
+      return runOneOrchestratorWorker(
+        { ...packetBase, item: callItems[0] } as WorkerToolInput,
+        runContext,
+        details,
+        manifestBinding,
+      );
     },
   }) as Tool<RuntimeContextValue>;
 
@@ -1146,6 +1171,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // threaded through unchanged for the single-item path and per-item for a batch.
     runContext: any,
     details: any,
+    manifestBinding?: PreparedWorkerManifest,
   ) => {
     {
       const input = params as WorkerToolInput;
@@ -1154,6 +1180,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
+      const turn = extractTurn(runContext);
+      const toolCallId = details?.toolCall?.callId ?? null;
       // Workflow-level worker pin (owner ask, 2026-07-24): a step session
       // registered by the workflow runner overrides the global worker role.
       let workerModel = getSessionWorkerModelOverride(sessionId)
@@ -1195,26 +1223,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         } catch { /* telemetry is best-effort */ }
       }, { modelId: workerModel, provider: workerProvider });
       try {
-      try {
-        recordOperationalEvent({
-          source: 'harness',
-          type: 'worker_spawned',
-          sessionId: sessionId ?? undefined,
-          actor: 'run_worker',
-          payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'orchestrator' },
-        });
-      } catch { /* telemetry is best-effort */ }
-      // Live-visibility: announce the agent STARTING so the chat activity strip
-      // renders a running specialist immediately (parity with worker-tools.ts's SDK
-      // lane — this @openai/agents lane emitted worker_spawned telemetry but never
-      // the worker_started event the NowStrip/Slack/Discord read). Fail-open.
-      if (sessionId) {
-        try {
-          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
-        } catch { /* telemetry is best-effort */ }
-      }
-      const turn = extractTurn(runContext);
-      const toolCallId = details?.toolCall?.callId ?? null;
       const appendWorkerRoute = (data: Record<string, unknown>) => {
         if (!sessionId) return;
         try {
@@ -1236,12 +1244,39 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // + spend for a long 100-subagent run (the in-memory fanout ledger is lost
       // on a daemon restart). Best-effort; never blocks fan-out.
       const workerRouteStartedAt = Date.now();
-      const appendWorkerResult = (data: { item: string; ok: boolean; model?: string | null; toolUses?: string[]; tokens?: number; reason?: string; preRun?: boolean }): void => {
+      const appendWorkerResult = (data: {
+        item: string;
+        ok: boolean;
+        model?: string | null;
+        toolUses?: string[];
+        tokens?: number;
+        reason?: string;
+        preRun?: boolean;
+        checkpointManifest?: boolean;
+      }): void => {
         if (!sessionId) return;
-        const { preRun, ...eventData } = data;
+        const { preRun, checkpointManifest = true, ...eventData } = data;
+        let resultEvent: ReturnType<typeof appendEvent> | undefined;
         try {
-          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId } });
+          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId } });
         } catch { /* durable trace is best-effort */ }
+        if (manifestBinding && checkpointManifest) {
+          try {
+            checkpointPreparedWorker(
+              sessionId,
+              manifestBinding,
+              input.item,
+              data.ok ? 'succeeded' : 'failed',
+              {
+                attemptId: toolCallId ?? packetKey,
+                ...(data.ok && resultEvent
+                  ? { evidence: [{ kind: 'worker_result', ref: `event:${resultEvent.seq}` }] }
+                  : {}),
+                ...(data.reason ? { reason: data.reason } : {}),
+              },
+            );
+          } catch { /* manifest visibility is best-effort */ }
+        }
         // Route-outcome capture (adaptive routing evidence): score WORKER models,
         // not just the brain. Skipped for pre-run refusals (respawn guard) — those
         // are not the model's outcome. Fail-open.
@@ -1346,6 +1381,40 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
         } catch { /* visibility trace is best-effort */ }
       };
+      // Manifest identity survives a changed model packet and a daemon restart.
+      // If this exact logical item already has evidence-backed success on the
+      // active contract, reuse its persisted output and never dispatch it again.
+      // A missing auxiliary payload is not permission to repeat an external
+      // action: return the durable evidence receipt truthfully instead.
+      if (workerResumeIdempotencyEnabled() && sessionId && manifestBinding) {
+        const completed = completedPreparedWorker(sessionId, manifestBinding, input.item);
+        if (completed) {
+          const ctx = getToolOutputContext();
+          const parentRunId = ctx?.workflowRunId || sessionId;
+          let prior: string | null = null;
+          for (const completedPacketKey of completed.packetKeys) {
+            prior = findCompletedSubagentOutput(parentRunId, input.item, completedPacketKey);
+            if (prior?.trim()) break;
+          }
+          const reused = prior?.trim()
+            ? prior
+            : [
+                `Durable manifest success reused for "${input.item}" (${manifestBinding.manifestId}/${manifestBinding.phase}, contract ${manifestBinding.contractVersion}).`,
+                'The original worker payload is unavailable after restart; the completed action was NOT executed again.',
+                `Preserved evidence: ${completed.state.evidence.map((entry) => `${entry.kind}:${entry.ref}`).join(', ')}.`,
+              ].join(' ');
+          appendWorkerResult({
+            item: input.item,
+            ok: true,
+            model: workerModel,
+            toolUses: [],
+            reason: 'resume: reused durable manifest success',
+            preRun: true,
+            checkpointManifest: false,
+          });
+          return await reduceReturn(reused);
+        }
+      }
       // Wave 4 Stage 1 — durable-resume idempotency, checked BEFORE the fuzzy
       // cap-guard so an exact-packet ok match (the stronger signal) wins: a worker
       // that genuinely COMPLETED must not be refused-as-failed on resume because a
@@ -1362,7 +1431,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (prior && prior.trim()) {
           // preRun:true → durable worker_result is written but no phantom
           // route-outcome metric is recorded (this worker did not actually run).
-          appendWorkerResult({ item: input.item, ok: true, model: workerModel, toolUses: [], reason: 'resume: reused prior completed result', preRun: true });
+          appendWorkerResult({
+            item: input.item,
+            ok: true,
+            model: workerModel,
+            toolUses: [],
+            reason: 'resume: reused prior completed result',
+            preRun: true,
+            checkpointManifest: false,
+          });
           return await reduceReturn(prior);
         }
         // No recoverable output → do NOT claim success; re-execute below.
@@ -1403,6 +1480,30 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
       }
+      // Announce a real spawn only after every pre-run reuse/refusal gate. A
+      // restart replay that reuses a persisted result must not look like the
+      // worker ran twice in the UI or proof ledger.
+      try {
+        recordOperationalEvent({
+          source: 'harness',
+          type: 'worker_spawned',
+          sessionId: sessionId ?? undefined,
+          actor: 'run_worker',
+          payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'orchestrator' },
+        });
+      } catch { /* telemetry is best-effort */ }
+      if (sessionId) {
+        try {
+          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
+        } catch { /* telemetry is best-effort */ }
+        if (manifestBinding) {
+          try {
+            checkpointPreparedWorker(sessionId, manifestBinding, input.item, 'running', {
+              attemptId: toolCallId ?? packetKey,
+            });
+          } catch { /* manifest visibility is best-effort */ }
+        }
+      }
       if (claudeAgentSdkWorkerEnabled(workerModel)) {
         // Pass the PARENT chat session so the Claude SDK worker's gates +
         // plan-scope + execution lane aggregate across the fan-out (one batch
@@ -1431,6 +1532,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // in-memory honest-partial ledger reads), so the durable coverage map
           // must agree or it would over-report success after a restart.
           const workerOk = !workerResultIndicatesFailure(sdkResult.text);
+          recordWorkerSubagent(sdkResult.text ?? '', sdkResult.model ?? workerModel);
           appendWorkerResult({
             item: input.item,
             ok: workerOk,
@@ -1439,7 +1541,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             toolUses: sdkResult.toolUses,
             tokens: workerResultTokens(sdkResult.usage),
           });
-          recordWorkerSubagent(sdkResult.text ?? '', sdkResult.model ?? workerModel);
           return await reduceReturn(sdkResult.text ?? '');
         } catch (err) {
           // Claude SDK worker overloaded OR its auth expired BEFORE committing
@@ -1466,8 +1567,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           if (!runContext) throw new Error('run_worker requires an SDK run context');
           try {
             const output = await invokeWorkerWithOwnBudget(worker.clone({ model: next.modelId }).asTool(fbOptions), runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
-            appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
+            appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
             return await reduceReturn(output);
           } catch (fallbackErr) {
             appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr) });
@@ -1492,8 +1593,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       try {
         const output = await invokeWorkerWithOwnBudget(nestedWorkerTool, runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
-        appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), route.model ?? workerModel);
+        appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
         return await reduceReturn(output);
       } catch (err) {
         appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });

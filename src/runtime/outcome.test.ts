@@ -23,6 +23,7 @@ const {
   deliverOutcome,
   deliverOutcomeWithAcknowledgement,
   outcomePrefix,
+  renderProactiveOutcomeDirective,
 } = await import('./outcome.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
@@ -69,6 +70,17 @@ test('renderOutcomeText: per-lane head-word override (workflow soft-block → ne
     ctx({ sourceLabel: 'workflow run', sourceId: 'wf-9', title: 'My WF', headWord: { blocked: 'needs attention' } }),
   );
   assert.ok(text.startsWith('[workflow run wf-9 needs attention] My WF'), 'uses the override word, keeps the prefix');
+});
+
+test('proactive needs-input directive preserves completed progress instead of collapsing to a blocker', () => {
+  const directive = renderProactiveOutcomeDirective(
+    { status: 'needs_input' },
+    { sourceLabel: 'background task', sourceId: 'bg-railway' },
+  );
+  assert.match(directive, /completed progress/i);
+  assert.match(directive, /exact remaining dependency/i);
+  assert.match(directive, /do not replay/i);
+  assert.doesNotMatch(directive, /one short message/i);
 });
 
 test('outcomePrefix matches the idempotency/UI-detect prefix exactly', () => {
@@ -141,6 +153,7 @@ test('deliverOutcome: harness origins receive report-back in eventlog, not a des
   assert.equal(reports.length, 1);
   assert.match(String(reports[0].data.text), /completed]/);
   assert.equal(reports[0].data.synthetic, true, 'the report-back is flagged synthetic (machine input)');
+  assert.equal(reports[0].data.deliveryPhase, 'passive', 'the user-deliverable outcome is distinct from its internal proactive directive');
 
   // The report-back reaches the MODEL via the eventlog (asserted above), but is
   // HIDDEN from the USER-facing transcript — a synthetic turn is not a user bubble.

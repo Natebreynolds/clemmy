@@ -10,6 +10,7 @@ import { augmentPath } from '../spawn-env.js';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { recordModelUsage } from '../usage-log.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-headless-model' });
@@ -465,6 +466,9 @@ function collectStderr(child: ChildProcessWithoutNullStreams): () => string {
 }
 
 async function* runClaudeHeadless(request: ModelRequest, modelId: string): AsyncGenerator<{ kind: 'delta'; delta: string } | { kind: 'done'; response: ModelResponse }> {
+  // Fake spawn seams remain usable in transport unit tests. Only the real CLI
+  // edge is forbidden by the isolated-suite boundary.
+  if (spawnImpl === spawn) assertLiveModelTransportAllowed('Claude Code headless CLI');
   const command = resolveClaudeCliPath() ?? 'claude';
   const support = await probeSupportedHeadlessFlags(command);
   // Start from the probed set (or every optional flag when the probe failed).

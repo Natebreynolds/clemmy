@@ -96,6 +96,9 @@
     "proof:claude": "tsx scripts/proof/run-proof.ts --brain claude",
     "proof:codex": "tsx scripts/proof/run-proof.ts --brain codex",
     "proof:glm": "tsx scripts/proof/run-proof.ts --brain glm",
+    "proof:critical": "tsx scripts/proof/run-proof.ts --scenario long-horizon-manifest,background-steer-in-flight,restart-resume,blocked-auth-truth",
+    "proof:critical:codex": "tsx scripts/proof/run-proof.ts --brain codex --scenario long-horizon-manifest,background-steer-in-flight,restart-resume,blocked-auth-truth",
+    "proof:endurance:codex": "CLEMMY_PROOF_LONG_HORIZON_ITEMS=120 tsx scripts/proof/run-proof.ts --brain codex --scenario long-horizon-manifest",
     "proof:selftest": "tsx --test 'scripts/proof/*.test.ts'",
     "journeys": "tsx --test src/journeys/*.test.ts"
   },

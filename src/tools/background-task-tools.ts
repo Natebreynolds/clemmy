@@ -6,7 +6,10 @@ import {
   renderBackgroundTaskStatus,
 } from '../execution/background-task-status.js';
 import { enqueueDurableChatTask } from '../execution/background-promote.js';
-import type { BackgroundTaskRecord } from '../execution/background-tasks.js';
+import {
+  reviseBackgroundTaskContract,
+  type BackgroundTaskRecord,
+} from '../execution/background-tasks.js';
 import { getActiveGoalForSession, holdTaskForLater, listHeldTasks, getHeldTask } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
@@ -75,6 +78,7 @@ const statusSchema = z.enum([
   'awaiting_input',
   'awaiting_continue',
   'done',
+  'blocked',
   'failed',
   'aborted',
   'interrupted',
@@ -122,6 +126,37 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         return textResult(id ? `No background task found for ${id}.` : 'No background tasks recorded yet.');
       }
       return textResult(renderBackgroundTaskStatus(details), { maxChars: 12_000 });
+    },
+  );
+
+  server.tool(
+    'background_task_revise',
+    [
+      'Course-correct an active durable background task without creating a replacement task or losing its receipts.',
+      'Use when the user changes the source, scope, constraint, success criteria, or approach of work that is already queued/running/parked.',
+      'The revision is versioned and applied at the next model boundary on the SAME task/session. Choose how prior evidence should be treated: preserve when compatible, revalidate when it may no longer satisfy the contract, invalidate only when it must not count.',
+    ].join(' '),
+    {
+      id: z.string().min(1).describe('Background task id from background_tasks_recent/background_task_status.'),
+      instruction: z.string().min(4).describe('The user\'s exact course correction in concrete, executable terms.'),
+      evidence_policy: z.enum(['preserve', 'revalidate', 'invalidate'])
+        .nullable()
+        .optional()
+        .describe('How already-completed evidence should be treated. Omit to revalidate by default.'),
+    },
+    async ({ id, instruction, evidence_policy }) => {
+      const evidencePolicy = evidence_policy ?? 'revalidate';
+      const task = reviseBackgroundTaskContract(id, {
+        instruction,
+        evidencePolicy,
+      });
+      if (!task) {
+        return textResult(`Task ${id} was not found or is already terminal, so its contract was not changed.`);
+      }
+      return textResult(
+        `Updated ${task.id} to contract v${task.contractVersion ?? 1}. `
+        + `The same durable task will reconcile saved work at its next model boundary; prior evidence policy: ${evidencePolicy}.`,
+      );
     },
   );
 

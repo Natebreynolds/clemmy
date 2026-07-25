@@ -2,14 +2,21 @@
  * Proof-harness provisioning: boot one real daemon per brain against an
  * ISOLATED CLEMENTINE_HOME.
  *
- * Isolation contract (BINDING): the spawned daemon's BASE_DIR is a mkdtemp —
- * memory.db / harness.db / state all live there and are asserted empty at
- * boot. HOME stays the real one so brain credentials keep working (Claude
- * Code OAuth in ~/.claude + Keychain, Codex OAuth in ~/.codex); those are
- * read-only from the daemon's perspective. No Composio/API keys are seeded,
- * so scenarios physically cannot reach external services.
+ * Isolation contract (BINDING): the spawned daemon's BASE_DIR and HOME are the
+ * same mkdtemp — memory.db / harness.db / state and every CLI config lookup live
+ * there. Clementine's own model grants are copied into its isolated state
+ * vault; no real-home CLI config (Railway, Composio, etc.) is visible.
  */
-import { mkdtempSync, mkdirSync, copyFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { randomBytes } from 'node:crypto';
@@ -127,6 +134,64 @@ export interface ProvisionOptions {
   bootTimeoutMs?: number;
 }
 
+/** Runtime policy pins that make every live proof leg comparable. Exported so
+ * the self-test can catch an accidental re-enable before any model quota is
+ * spent. */
+export function proofRuntimeOverrides(): Record<string, string> {
+  return {
+    // A provider proof must fail on its selected brain, never look green
+    // because a recovery lane silently served the turn.
+    CLEMMY_BRAIN_FALLOVER: 'off',
+    CLEMMY_AUTH_FALLOVER: 'off',
+    CLEMMY_CLAUDE_OVERLOAD_FALLBACK: 'off',
+    CLEMMY_LEGACY_RESPOND_FALLBACK: 'off',
+    CLEMMY_ROUTE_POLICY: 'off',
+    // Freeze every model-judge/fusion branch. Deterministic safety gates remain.
+    CLEMMY_DEBATE_MODE: 'off',
+    CLEMMY_FUSION_STRATEGY: 'verify',
+    CLEMMY_JUDGE_CROSS_FAMILY: 'off',
+    // Proof scenarios need the durable task to start on the explicit
+    // `/background` request. The optional conversational approach beat is a
+    // product UX choice, not part of background execution correctness.
+    CLEMMY_LONGTASK_APPROACH_BEAT: 'off',
+  };
+}
+
+/** Process-level isolation shared by the daemon and every shell it spawns.
+ * ZDOTDIR prevents a login shell from sourcing the real user's dotfiles and
+ * replacing the proof PATH or re-exposing authenticated CLI configuration. */
+export function proofProcessIsolationEnv(home: string): Record<string, string> {
+  return {
+    HOME: home,
+    ZDOTDIR: home,
+  };
+}
+
+function createProofRailwayShim(home: string): string {
+  const bin = path.join(home, 'proof-bin');
+  mkdirSync(bin, { recursive: true });
+  const shim = path.join(bin, process.platform === 'win32' ? 'railway.cmd' : 'railway');
+  const body = process.platform === 'win32'
+    ? '@echo off\r\necho Unauthorized. Run railway login to authenticate. 1>&2\r\nexit /b 1\r\n'
+    : '#!/bin/sh\nprintf "%s\\n" "Unauthorized. Run railway login to authenticate." >&2\nexit 1\n';
+  writeFileSync(shim, body, { encoding: 'utf-8', mode: 0o700 });
+  try { chmodSync(shim, 0o700); } catch { /* best-effort on Windows */ }
+  return bin;
+}
+
+/** Keep event/task state for a failed proof without retaining copied model
+ * credentials or a generated webhook bearer. */
+function sanitizeProofHomeForForensics(home: string): void {
+  for (const relative of [
+    path.join('state', 'auth.json'),
+    path.join('state', 'claude-auth.json'),
+    path.join('state', 'secrets-vault.json'),
+    '.env',
+  ]) {
+    try { rmSync(path.join(home, relative), { force: true }); } catch { /* best effort */ }
+  }
+}
+
 export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = {}): Promise<DaemonHandle> {
   if (!existsSync(DAEMON_ENTRY)) {
     throw new Error(`dist/index.js missing — run \`npm run build\` first (${DAEMON_ENTRY})`);
@@ -148,54 +213,75 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     const src = path.join(REAL_CLEM_HOME, 'state', authFile);
     if (existsSync(src)) copyFileSync(src, path.join(home, 'state', authFile));
   }
+  const proofBin = createProofRailwayShim(home);
 
   const logChunks: string[] = [];
-  const proc: ChildProcess = spawn(process.execPath, [DAEMON_ENTRY, 'service'], {
-    cwd: home,
-    env: {
-      PATH: process.env.PATH,
-      LANG: process.env.LANG ?? 'en_US.UTF-8',
-      TERM: process.env.TERM ?? 'xterm-256color',
-      HOME: REAL_HOME,
-      CLEMENTINE_HOME: home,
-      WEBHOOK_PORT: String(port),
-      WEBHOOK_SECRET: secret,
-      WEBHOOK_ENABLED: 'true',
-      NODE_ENV: 'test',
-      DISCORD_ENABLED: 'false',
-      SLACK_ENABLED: 'false',
-      ...plan.env,
-      // A provider proof must fail on its selected brain, never look green
-      // because a recovery lane silently served the turn.
-      CLEMMY_BRAIN_FALLOVER: 'off',
-      CLEMMY_AUTH_FALLOVER: 'off',
-      CLEMMY_CLAUDE_OVERLOAD_FALLBACK: 'off',
-      CLEMMY_LEGACY_RESPOND_FALLBACK: 'off',
-      CLEMMY_ROUTE_POLICY: 'off',
-      CLEMMY_JUDGE_CROSS_FAMILY: 'off',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  proc.stdout?.on('data', (b) => logChunks.push(String(b)));
-  proc.stderr?.on('data', (b) => logChunks.push(String(b)));
+  const daemonEnv: NodeJS.ProcessEnv = {
+    PATH: `${proofBin}${path.delimiter}${process.env.PATH ?? ''}`,
+    LANG: process.env.LANG ?? 'en_US.UTF-8',
+    TERM: process.env.TERM ?? 'xterm-256color',
+    ...proofProcessIsolationEnv(home),
+    CLEMENTINE_HOME: home,
+    WEBHOOK_PORT: String(port),
+    WEBHOOK_SECRET: secret,
+    WEBHOOK_ENABLED: 'true',
+    // Exercise production runtime branches. Isolation comes from the disposable
+    // CLEMENTINE_HOME and missing connected-app secrets, not from test-only
+    // behavior that can hide telemetry or swap persistence implementations.
+    NODE_ENV: 'production',
+    DISCORD_ENABLED: 'false',
+    SLACK_ENABLED: 'false',
+    ...plan.env,
+    ...proofRuntimeOverrides(),
+  };
 
-  const deadline = Date.now() + (opts.bootTimeoutMs ?? 90_000);
-  let ready = false;
-  while (Date.now() < deadline) {
-    if (proc.exitCode !== null) {
-      throw new Error(`daemon exited during boot (code ${proc.exitCode})\n${logChunks.join('').slice(-2000)}`);
+  let proc: ChildProcess;
+  const spawnDaemon = (): ChildProcess => {
+    logChunks.push(`\n[proof] spawning daemon at ${new Date().toISOString()}\n`);
+    const child = spawn(process.execPath, [DAEMON_ENTRY, 'service'], {
+      cwd: home,
+      env: daemonEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout?.on('data', (b) => logChunks.push(String(b)));
+    child.stderr?.on('data', (b) => logChunks.push(String(b)));
+    return child;
+  };
+  const terminateDaemon = async (): Promise<void> => {
+    if (!proc || proc.exitCode !== null) return;
+    const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+    try { proc.kill('SIGTERM'); } catch { /* already dead */ }
+    await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 1_500))]);
+    if (proc.exitCode === null) {
+      try { proc.kill('SIGKILL'); } catch { /* already dead */ }
+      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 750))]);
     }
-    if (await tcpProbe(port)) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(10_000) });
-        if (res.ok) { ready = true; break; }
-      } catch { /* still warming */ }
+  };
+  const waitForReady = async (): Promise<void> => {
+    const deadline = Date.now() + (opts.bootTimeoutMs ?? 90_000);
+    while (Date.now() < deadline) {
+      if (proc.exitCode !== null) {
+        throw new Error(`daemon exited during boot (code ${proc.exitCode})\n${logChunks.join('').slice(-2000)}`);
+      }
+      if (await tcpProbe(port)) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(10_000) });
+          if (res.ok) return;
+        } catch { /* still warming */ }
+      }
+      await new Promise((r) => setTimeout(r, 300));
     }
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  if (!ready) {
-    try { proc.kill('SIGKILL'); } catch { /* already dead */ }
     throw new Error(`daemon not ready within boot timeout\n${logChunks.join('').slice(-2000)}`);
+  };
+
+  proc = spawnDaemon();
+  try {
+    await waitForReady();
+  } catch (error) {
+    await terminateDaemon();
+    sanitizeProofHomeForForensics(home);
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
+    throw error;
   }
 
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -248,11 +334,18 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     return { status: res.status, json: await res.json().catch(() => ({})) };
   };
 
+  const restart = async (): Promise<void> => {
+    await terminateDaemon();
+    proc = spawnDaemon();
+    await waitForReady();
+  };
+
   const stop = async (stopOpts?: { keepHome?: boolean }): Promise<void> => {
-    try { proc.kill('SIGTERM'); } catch { /* already dead */ }
-    await new Promise((r) => setTimeout(r, 1500));
-    try { proc.kill('SIGKILL'); } catch { /* already dead */ }
-    if (!opts.keepHome && !stopOpts?.keepHome) {
+    await terminateDaemon();
+    const keepHome = Boolean(opts.keepHome || stopOpts?.keepHome);
+    if (keepHome) {
+      sanitizeProofHomeForForensics(home);
+    } else {
       try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   };
@@ -263,5 +356,5 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   let logMark = 0;
   const log = (): string => logChunks.join('').slice(logMark);
   const markLog = (): void => { logMark = logChunks.join('').length; };
-  return { home, port, secret, baseUrl, chat, approve, request, log, markLog, stop };
+  return { home, port, secret, baseUrl, chat, approve, request, log, markLog, restart, stop };
 }

@@ -220,7 +220,8 @@ export function renderProactiveOutcomeDirective(
   switch (outcome.status) {
     case 'needs_input':
       return `A ${ctx.sourceLabel} you started from this conversation needs your input (see the latest ${ref} NEEDS INPUT note in context). `
-        + 'Ask the user for the needed input NOW in one short message. Do not guess, do not retry, do not run tools, and do not describe the work as finished.'
+        + 'Ask the user for the required input or action NOW in one concise but COMPLETE update: preserve any completed progress and key evidence in the note, then name the exact remaining dependency. '
+        + 'Do not guess, do not replay prior work or side effects, and do not describe the whole objective as finished. The saved task will resume from its checkpoint after the user responds.'
         + goalTail;
     case 'failed':
       return `A ${ctx.sourceLabel} you started from this conversation FAILED (see the latest ${ref} FAILED note in context). `
@@ -234,10 +235,10 @@ export function renderProactiveOutcomeDirective(
       // with a judge advisory was relayed as BLOCKED-missing-prerequisite,
       // contradicting the "✓ completed — please review" note one line up).
       return `A ${ctx.sourceLabel} you started from this conversation NEEDS ATTENTION (see the latest ${ref} note in context). `
-        + 'Relay the note\'s substance NOW in one short message, matching what it actually says: '
+        + 'Relay the note\'s substance NOW in one concise but COMPLETE message, matching what it actually says and preserving completed progress: '
         + 'if it delivered a result with a quality warning, lead with the result and what to review; '
         + 'if a prerequisite was missing, lead with what is missing and what decision or action is needed. '
-        + 'Never call the work failed or blocked if the note says it completed. Do not re-run anything in this turn.'
+        + 'Never call the work failed or blocked if the note says it completed. Do not replay prior work or side effects in this turn.'
         + goalTail;
     case 'done':
       return `A ${ctx.sourceLabel} you started from this conversation just finished (see the latest ${ref} note in context). `
@@ -368,6 +369,7 @@ async function fireProactiveReportTurn(sessionId: string, outcome: Outcome, ctx:
       sourceLabel: ctx.sourceLabel,
       sourceId: ctx.sourceId,
       status: outcome.status,
+      deliveryPhase: 'directive',
     },
   });
   await runConversation({
@@ -535,6 +537,7 @@ export function deliverOutcomeWithAcknowledgement(
           sourceLabel: ctx.sourceLabel,
           sourceId: ctx.sourceId,
           status: outcome.status,
+          deliveryPhase: 'passive',
         },
       });
       try {

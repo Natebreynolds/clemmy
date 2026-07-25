@@ -135,6 +135,7 @@ import {
   objectiveMayRequireMultipleResults,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
+import { summarizeWorkManifests } from './work-manifest.js';
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
@@ -1394,6 +1395,69 @@ function yoloAutoResolvedAskThisTurn(sessionId: string, turn: number): boolean {
   }
 }
 
+/** A real ask_user_question event is authoritative at the turn boundary.
+ * Some provider lanes return the tool's terminal text ("Question posted…
+ * Awaiting user reply.") as an otherwise-completed finalOutput. If we parse
+ * that text first, it can look like a completed decision and enter validation
+ * or another model turn even though the task is already waiting on the human.
+ * YOLO auto-resolved asks intentionally emit autonomy_note instead, so the
+ * presence of this event is the conservative halt signal. */
+function awaitingUserQuestionThisTurn(sessionId: string, turn: number): string | null {
+  try {
+    const event = listEvents(sessionId, { types: ['awaiting_user_input'] })
+      .filter((candidate) => candidate.turn === turn)
+      .at(-1);
+    if (!event) return null;
+    const question = String(
+      (event.data as { question?: unknown } | undefined)?.question
+        ?? 'Awaiting your input.',
+    ).trim();
+    return question || 'Awaiting your input.';
+  } catch {
+    return null;
+  }
+}
+
+/** Give the goal contract the harness's durable coverage ledger instead of
+ * forcing the model to re-quote every worker result in its final prose. This is
+ * evidence, not an automatic pass: criteria outside the manifest (a publish,
+ * external write, artifact, etc.) still have to validate normally. */
+function renderWorkManifestEvidenceForGoal(sessionId: string): string {
+  try {
+    const manifests = summarizeWorkManifests(sessionId);
+    if (manifests.length === 0) return '';
+    const lines = [
+      '[DURABLE WORK MANIFEST EVIDENCE — append-only harness ledger; authoritative for item/phase coverage only]',
+    ];
+    for (const manifest of manifests.slice(0, 4)) {
+      lines.push(
+        `Manifest ${manifest.manifestId} contract ${manifest.contractVersion}: ${manifest.completed}/${manifest.total} canonical items complete; ${manifest.remaining} remaining; ${manifest.evidenceCount} evidence refs; ${manifest.anomalies.length} anomalies; ${manifest.untrackedCheckpoints} untracked checkpoints.`,
+      );
+      if (manifest.objective) lines.push(`Manifest objective: ${manifest.objective.slice(0, 500)}`);
+      for (const phase of manifest.phases) {
+        lines.push(
+          `Phase ${phase.id}: ${phase.succeeded}/${phase.total} succeeded; ${phase.failed} failed; ${phase.pending} pending; ${phase.running} running; ${phase.needsValidation} need validation; ${phase.invalidated} invalidated.`,
+        );
+      }
+      lines.push(`Canonical items: ${manifest.items.map((item) => `${item.id.slice(0, 160)}=${item.complete ? 'complete' : 'open'}`).join(', ')}`);
+      for (const item of manifest.items.slice(0, 64)) {
+        const evidence = Object.entries(item.phases)
+          .flatMap(([phaseId, state]) => state.evidence.map((ref) => (
+            `${phaseId}:${ref.kind}:${(ref.summary?.trim() || ref.ref).slice(0, 240)}`
+          )))
+          .slice(0, 8);
+        if (evidence.length > 0) lines.push(`${item.id.slice(0, 160)} evidence: ${evidence.join(' | ')}`);
+      }
+      if (manifest.items.length > 64) {
+        lines.push(`Item evidence detail bounded at 64/${manifest.items.length}; the canonical coverage line above is complete.`);
+      }
+    }
+    return lines.join('\n').slice(0, 30_000);
+  } catch {
+    return '';
+  }
+}
+
 /** An approval card is OPEN for this session (THE-GRANT question-immunity:
  *  the completion judge never fires while the human's decision is pending).
  *  Fail-open to false — a registry read error must not suppress the judge. */
@@ -2460,20 +2524,39 @@ async function runConversationCore(
       }
     }
 
+    // ask_user_question is a terminal tool contract even when a provider
+    // reports the SDK turn itself as "completed". Honor the durable pause
+    // before parsing prose, running completion validation, or starting a
+    // recovery turn.
+    const completedTurnQuestion = turnResult.status === 'completed'
+      ? awaitingUserQuestionThisTurn(options.sessionId, turnResult.turn)
+      : null;
+    if (completedTurnQuestion) {
+      appendStandardArtifactPauseTerminal({
+        sessionId: options.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        summary: completedTurnQuestion,
+        reply: completedTurnQuestion,
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'awaiting_user_input',
+        steps: stepIndex,
+        lastDecision,
+        lastTurn,
+      };
+    }
+
     // Any non-completed status propagates immediately. The conversation
     // can't continue if the SDK paused for approval, the kill switch
     // tripped, the brackets blew, or an error fired.
     if (turnResult.status !== 'completed') {
       const status: RunConversationStatus = turnResult.status;
       if (status === 'awaiting_user_input') {
-        const latestQuestion = (() => {
-          try {
-            const event = listEvents(options.sessionId, { types: ['awaiting_user_input'] })
-              .filter((candidate) => candidate.turn === turnResult.turn)
-              .at(-1);
-            return String((event?.data as { question?: unknown } | undefined)?.question ?? 'Awaiting your input.');
-          } catch { return 'Awaiting your input.'; }
-        })();
+        const latestQuestion = awaitingUserQuestionThisTurn(options.sessionId, turnResult.turn)
+          ?? 'Awaiting your input.';
         appendStandardArtifactPauseTerminal({
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
@@ -3369,6 +3452,10 @@ async function runConversationCore(
       if (activeGoal && goalGate) {
         const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
         const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
+        const manifestEvidence = renderWorkManifestEvidenceForGoal(options.sessionId);
+        const validationEvidenceText = manifestEvidence
+          ? `${evidenceText}\n\n${manifestEvidence}`
+          : evidenceText;
         // Staged goals validate ONE milestone at a time against that stage's
         // criteria; unstaged goals validate the full criteria exactly as
         // before. The current stage is the first pending one (null ⇒ unstaged
@@ -3385,7 +3472,7 @@ async function runConversationCore(
         const validation = await goalValidator({
           objective: goalPlan.objective,
           successCriteria: validateCriteria,
-          evidenceText,
+          evidenceText: validationEvidenceText,
         });
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         recordVerdictEvent(options.sessionId, turnResult.turn, {
@@ -3417,6 +3504,7 @@ async function runConversationCore(
             attempt,
             maxAttempts,
             judgeFailedOpen: validation.judgeFailedOpen ?? false,
+            manifestEvidenceAttached: Boolean(manifestEvidence),
             failures: failures.slice(0, 4).map((f) => ({ criterion: f.criterion.slice(0, 200), detail: f.detail?.slice(0, 200) })),
           },
         });
@@ -6038,6 +6126,27 @@ async function runConversationFromResumeCore(opts: {
     resolveArtifactRunScopeId(opts.sessionId, opts.sessionId, activeSourceUserSeq);
   }
 
+  const firstCompletedQuestion = firstResult.status === 'completed'
+    ? awaitingUserQuestionThisTurn(opts.sessionId, firstResult.turn)
+    : null;
+  if (firstCompletedQuestion) {
+    appendStandardArtifactPauseTerminal({
+      sessionId: opts.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
+      turn: firstResult.turn,
+      steps: 1,
+      summary: firstCompletedQuestion,
+      reply: firstCompletedQuestion,
+    });
+    return {
+      sessionId: opts.sessionId,
+      status: 'awaiting_user_input',
+      steps: 1,
+      lastDecision,
+      lastTurn,
+    };
+  }
+
   if (firstResult.status !== 'completed') {
     return {
       sessionId: opts.sessionId,
@@ -6454,6 +6563,26 @@ async function runConversationFromResumeCore(opts: {
       emitInfraAutoRecoverEvent(opts.sessionId, turnResult.turn, turnResult.infraAutoRetry.kind, countInfraAutoRecover(opts.sessionId) + 1);
       resumeContinuationInput = turnResult.infraAutoRetry.directive;
       continue;
+    }
+    const completedTurnQuestion = turnResult.status === 'completed'
+      ? awaitingUserQuestionThisTurn(opts.sessionId, turnResult.turn)
+      : null;
+    if (completedTurnQuestion) {
+      appendStandardArtifactPauseTerminal({
+        sessionId: opts.sessionId,
+        sourceUserSeq: activeSourceUserSeq,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        summary: completedTurnQuestion,
+        reply: completedTurnQuestion,
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'awaiting_user_input',
+        steps: stepIndex,
+        lastDecision,
+        lastTurn,
+      };
     }
     if (turnResult.status !== 'completed') {
       return {

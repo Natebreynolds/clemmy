@@ -128,6 +128,36 @@ export interface BackgroundToolEvent {
   errorMessage?: string;
 }
 
+export interface WorkManifestPhaseProgress {
+  id: string;
+  label: string;
+  dependsOn: string[];
+  total: number;
+  pending: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  needsValidation: number;
+  invalidated: number;
+}
+
+export interface WorkManifestProgress {
+  manifestId: string;
+  objective?: string;
+  contractVersion: string;
+  phases: WorkManifestPhaseProgress[];
+  total: number;
+  completed: number;
+  remaining: number;
+  currentPhase?: string;
+  evidenceCount: number;
+  artifactCount: number;
+  staleCheckpoints: number;
+  untrackedCheckpoints: number;
+  anomalies: string[];
+  updatedAt?: string;
+}
+
 export interface BackgroundTaskDetail {
   task: {
     id: string;
@@ -155,6 +185,21 @@ export interface BackgroundTaskDetail {
     requestedModel?: string;
     effectiveModel?: string;
     modelProvider?: string;
+    contractVersion?: number;
+    contractRevisions?: Array<{
+      version: number;
+      instruction: string;
+      evidencePolicy: 'preserve' | 'revalidate' | 'invalidate';
+      queuedAt: string;
+      appliedAt?: string;
+    }>;
+    pendingContractRevision?: {
+      version: number;
+      instruction: string;
+      evidencePolicy: 'preserve' | 'revalidate' | 'invalidate';
+      queuedAt: string;
+      appliedAt?: string;
+    };
   };
   detail: {
     latestActivityAt?: string;
@@ -178,6 +223,7 @@ export interface BackgroundTaskDetail {
     /** Whether the task is still running (drives the live-ticking timer). */
     running: boolean;
   };
+  workManifests?: WorkManifestProgress[];
 }
 
 export const COLUMNS: { id: BoardColumnId; label: string }[] = [
@@ -336,6 +382,15 @@ export function canStopCanonicalRunFromDrawer(card: BoardCard): boolean {
 
 export const getBackgroundTaskDetail = (id: string) =>
   apiGet<BackgroundTaskDetail>(`/api/console/background-tasks/${encodeURIComponent(id)}`);
+
+export const reviseBackgroundTaskContract = (
+  id: string,
+  instruction: string,
+  evidencePolicy: 'preserve' | 'revalidate' | 'invalidate',
+) => apiPost<{ ok: boolean; task?: BackgroundTaskDetail['task']; reason?: string }>(
+  `/api/console/background-tasks/${encodeURIComponent(id)}/contract-revisions`,
+  { instruction, evidencePolicy },
+);
 
 export const setBackgroundTaskReportBackTarget = (id: string, target: BackgroundReportBackTarget) =>
   apiPost<{ ok: boolean; task?: BackgroundTaskDetail['task']; reason?: string }>(

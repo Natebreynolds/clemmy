@@ -27,6 +27,7 @@ import type { Runner } from '@openai/agents';
 const { resetEventLog, listEvents } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { runConversation } = await import('./loop.js');
+const { declareWorkManifest, checkpointWorkItem } = await import('./work-manifest.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const {
   createDirectGoal, getPlanProposal, getActiveGoalForSession,
@@ -139,6 +140,57 @@ test('goal validation: fail → evidence continuation → pass → goal satisfie
   assert.equal(validations.length, 2);
   assert.equal(validations[0].data.pass, false);
   assert.equal(validations[1].data.pass, true);
+});
+
+test('goal validation receives durable manifest coverage instead of requiring the model to re-quote worker results', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', title: 'manifest evidence' });
+  const goal = createDirectGoal({ objective: 'process the exact account universe', sessionId: sess.id })!;
+  declareWorkManifest({
+    sessionId: sess.id,
+    manifestId: 'accounts',
+    contractVersion: '2',
+    objective: 'Process every declared account.',
+    phases: [{ id: 'research', label: 'Research accounts' }],
+    items: [{ id: 'account-01' }, { id: 'account-02' }],
+  });
+  for (const itemId of ['account-01', 'account-02']) {
+    checkpointWorkItem({
+      sessionId: sess.id,
+      manifestId: 'accounts',
+      contractVersion: '2',
+      phase: 'research',
+      itemId,
+      status: 'succeeded',
+      evidence: [{
+        kind: 'worker_result',
+        ref: `worker:${itemId}`,
+        summary: `${itemId} | REVALIDATED | complete`,
+      }],
+    });
+  }
+
+  let validatorEvidence = '';
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'process the accounts',
+    makeRunner: makeRunnerStub,
+    runRunner: doneRunner('All accounts are complete.'),
+    goalValidator: async (input) => {
+      validatorEvidence = input.evidenceText;
+      return PASS_RESULT;
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(getPlanProposal(goal.id)!.status, 'satisfied');
+  assert.match(validatorEvidence, /Manifest accounts contract 2: 2\/2 canonical items complete/);
+  assert.match(validatorEvidence, /Phase research: 2\/2 succeeded/);
+  assert.match(validatorEvidence, /account-01=complete, account-02=complete/);
+  assert.match(validatorEvidence, /account-02 \| REVALIDATED \| complete/);
+  const validation = listEvents(sess.id, { types: ['goal_validation'] }).at(-1)!;
+  assert.equal(validation.data.manifestEvidenceAttached, true);
 });
 
 test('staged goal: validates one stage at a time, advances, then satisfies on the final pass', async () => {

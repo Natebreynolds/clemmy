@@ -13,7 +13,7 @@
  * data rows"), which feeds the existing not-done/blocked machinery.
  *
  * Best-effort PER CLASS: an artifact type we cannot probe (or a probe that errors)
- * passes through to the existing judge path — we NEVER block on a probe we can't run.
+ * preserves its durable creation evidence — we NEVER block on a probe we cannot run.
  * Everything is injectable so tests are deterministic with no fs/network dependence.
  */
 import { existsSync, statSync } from 'node:fs';
@@ -45,8 +45,8 @@ export interface DeliverableProbeResult {
   failures: Array<{ ref: string; gap: string }>;
   /** One-line block reason naming the specific gaps (empty when nothing failed). */
   summary: string;
-  /** Hard-evidence lines to fold into the completion judge's evidence, so even the
-   *  judge lane can't pass a probe-failed run. Empty when nothing was probed. */
+  /** Hard-evidence lines for diagnostics and any caller that needs a compact
+   * deterministic readback summary. Empty when nothing was probed. */
   evidenceText: string;
 }
 
@@ -171,7 +171,7 @@ export function countSheetRows(result: unknown): number {
 
 /** Default sheet reader: a composio GOOGLESHEETS_BATCH_GET readback through the
  *  gated dispatch path. Best-effort — any error/unknown shape returns -1 so the
- *  sheet is SKIPPED (passed through to the judge), never falsely failed. Lazily
+ *  sheet is SKIPPED rather than falsely failed. Lazily
  *  imported to keep composio/harness off this module's static graph. */
 async function defaultSheetRowCount(spreadsheetId: string, sessionId: string): Promise<number> {
   try {

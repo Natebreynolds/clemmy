@@ -42,6 +42,9 @@ export interface DaemonHandle {
   /** Advance the log window — the runner calls this between scenarios so one
    *  early provider-back-pressure burst can't fail every later storm check. */
   markLog(): void;
+  /** Restart the real daemon against the SAME isolated home, port, and auth
+   *  sandbox. Used to prove durable recovery instead of simulating it in-process. */
+  restart(): Promise<void>;
   /** keepHome=true preserves the temp home for forensics (failed runs). */
   stop(opts?: { keepHome?: boolean }): Promise<void>;
 }
@@ -86,6 +89,8 @@ export interface ProofReport {
   startedAt: string;
   finishedAt: string;
   gitHead: string;
+  sourceClean: boolean;
+  fusionMode: 'off';
   outcomes: ScenarioOutcome[];
   failures: number;
 }

@@ -41,9 +41,12 @@ npm test -- apps/desktop/src/notch-preferences.test.ts
 ```
 
 The wrapper in `scripts/run-tests-isolated.mjs` creates and removes a temporary
-home automatically. Tests that need narrower fixtures should still create their
-own temporary directories and set `CLEMENTINE_HOME` before importing modules
-that read configuration at module load.
+home automatically. It also strips inherited credential variables, blocks real
+model transports, and prevents macOS Keychain fallback, so a unit test cannot
+silently spend quota or pass because of a developer login. Transport tests must
+use their injected fake seams. Tests that need narrower fixtures should still
+create their own temporary directories and set `CLEMENTINE_HOME` before
+importing modules that read configuration at module load.
 
 ## Application checks
 
@@ -85,6 +88,21 @@ customer record, message, or meeting transcript.
 Use `npm run eval:memory` when memory retrieval, migration, consolidation, or
 evidence reconciliation changes. The proof harness is available through
 `npm run proof:selftest` and the provider-specific `proof:*` scripts.
+
+Before tagging, commit the exact candidate source (the live proof refuses a
+dirty source tree), build it, and run the Fusion-off long-horizon gate:
+
+```bash
+npm run proof:critical:codex
+npm run proof:endurance:codex
+npm run proof:critical
+```
+
+`proof:critical:codex` is the first canary. The endurance leg raises the
+manifest to 120 items. `proof:critical` then runs every configured brain and
+records SKIP, rather than a false failure, for a brain whose local sign-in is
+absent. A green proof is release evidence for that commit; it does not create a
+tag.
 
 ## Live and manual testing
 

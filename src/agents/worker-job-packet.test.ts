@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkerJobPrompt, WorkerToolInputSchema, workerPacketKey } from './worker-job-packet.js';
+import { buildWorkerJobPrompt, WorkerToolCallSchema, WorkerToolInputSchema, workerPacketKey } from './worker-job-packet.js';
 
 const validPacket = {
   objective: 'Research one firm and return an SEO summary for the parent batch.',
@@ -22,6 +22,29 @@ const validPacket = {
 test('WorkerToolInputSchema requires a parent-planned packet, not a legacy raw prompt', () => {
   assert.equal(WorkerToolInputSchema.safeParse({ input: 'research this firm' }).success, false);
   assert.equal(WorkerToolInputSchema.safeParse(validPacket).success, true);
+});
+
+test('WorkerToolCallSchema accepts a 120-item long-horizon batch while execution remains concurrency-bounded', () => {
+  const items = Array.from({ length: 120 }, (_, index) => `account-${index + 1}`);
+  const parsed = WorkerToolCallSchema.safeParse({
+    ...validPacket,
+    item: null,
+    items,
+    workManifest: {
+      id: 'accounts',
+      contractVersion: '1',
+      phase: 'research',
+      mode: 'declare',
+      phases: [
+        { id: 'research', label: 'Research', dependsOn: null },
+        { id: 'merge', label: 'Merge', dependsOn: ['research'] },
+      ],
+      aliases: [
+        { alias: 'account-row-1', itemId: 'account-1' },
+      ],
+    },
+  });
+  assert.equal(parsed.success, true);
 });
 
 test('buildWorkerJobPrompt renders resolved tools as authoritative and blocks rediscovery', () => {

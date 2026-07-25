@@ -497,6 +497,35 @@ test('MCP transport mirrors cannot manufacture a repeated-tool loop signal', () 
   assert.equal(repeated?.detail.repeatCount, 3);
 });
 
+test('bare <invoke> block with no <function_calls> wrapper is a fake tool transcript (live 2026-07-24)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', title: 'bare invoke block' });
+  // The live shape: a real lead-in sentence, THEN a bare invoke block and a
+  // fabricated tool result. The wrapper-only pattern missed it entirely, so the
+  // raw block shipped to the user instead of routing to the stall nudge.
+  const bare = [
+    "I'll close out the execution record with the full evidence, then relay the result.",
+    '',
+    '<invoke name="execution_complete">',
+    '<parameter name="id">f49025b3-17ec-4ea7-9841</parameter>',
+    '</invoke>',
+    '[tool result call_placeholder]',
+  ].join('\n');
+  const stall = evaluateProgress({ finalOutput: bare, toolCalls: 0, sessionId: sess.id });
+  assert.equal(stall?.signal, 'A_zero_tools');
+  assert.equal(stall?.detail.fakeToolTranscript, true);
+  assert.equal(stall?.detail.toolName, 'execution_complete');
+
+  // …but prose that merely MENTIONS the syntax, with no complete block, must not trip
+  // it — the closing tag is what separates a printed call from talking about one.
+  const mention = evaluateProgress({
+    finalOutput: 'The harness rejects any reply carrying an <invoke name="x"> opener, so I checked the logs rather than guessing at the cause.',
+    toolCalls: 0,
+    sessionId: sess.id,
+  });
+  assert.notEqual(mention?.detail?.fakeToolTranscript, true);
+});
+
 test('legacy and native top-level rows still drive repeated-tool detection', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat', title: 'native accounting' });

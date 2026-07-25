@@ -108,6 +108,7 @@ const { runClaudeAgentSdkWorker, setClaudeAgentSdkWorkerRunForTest } = await imp
 const { registerWorkerTools } = await import('./worker-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
 
 // The EXACT ok-gate the run_worker handler applies to a worker's result text
 // (worker-tools.ts): an `ERROR:`-prefixed envelope is a FAILED item.
@@ -223,4 +224,58 @@ test('handler no-session branch: without a live session context the item is a vi
   assert.match(text, /^ERROR:/);
   assert.ok(text.trim().length > 0);
   assert.equal(handlerOkGate(text), false);
+});
+
+test('SDK-brain handler reuses a completed logical manifest item when the resumed packet changes', async () => {
+  const sessionId = 'sess-handler-manifest-resume';
+  const item = 'Account A — account-a.example';
+  const priorAuthMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  createSession({ id: sessionId, kind: 'chat' });
+  const handler = captureRunWorker();
+  const initial = {
+    ...packet(item),
+    workManifest: {
+      id: 'account-research',
+      contractVersion: '1',
+      phase: 'research',
+      mode: 'declare',
+      phases: [{ id: 'research' }],
+    },
+  };
+  let dispatches = 0;
+  try {
+    await withInnerSdk(
+      async () => {
+        dispatches += 1;
+        return { text: 'Account A research result', toolUses: [] };
+      },
+      async () => {
+        const first = await withToolOutputContext({ sessionId }, () => handler(initial));
+        assert.equal(first.content[0].text, 'Account A research result');
+
+        const resumed = {
+          ...initial,
+          instructions: 'A restart occurred. Reconcile prior durable progress before doing any work.',
+          workManifest: { ...initial.workManifest, mode: 'reconcile' },
+        };
+        const second = await withToolOutputContext({ sessionId }, () => handler(resumed));
+        assert.equal(second.content[0].text, 'Account A research result');
+      },
+    );
+
+    assert.equal(dispatches, 1, 'the resumed packet must not execute the logical item twice');
+    assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 1);
+    const results = listEvents(sessionId, { types: ['worker_result'] });
+    assert.equal(results.length, 2, 'the no-op reuse remains observable');
+    assert.match(String((results[1].data as { reason?: string }).reason), /durable manifest success/i);
+    assert.equal(
+      summarizeWorkManifest(sessionId, 'account-research')?.items[0]?.phases.research.attempts,
+      2,
+      'reuse leaves the original running/succeeded checkpoint history intact',
+    );
+  } finally {
+    if (priorAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = priorAuthMode;
+  }
 });

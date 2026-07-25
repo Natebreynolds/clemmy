@@ -14,6 +14,7 @@ import Database from 'better-sqlite3';
 import {
   exactBrainRouteChecks,
   exactWorkflowStepRouteChecks,
+  fusionDisabledChecks,
   narrationCheck,
   openHarnessDb,
   sessionMetrics,
@@ -91,7 +92,7 @@ function addWorkflowRouteMarker(
 function addOperationalFallover(home: string, sessionId: string): void {
   const db = new Database(path.join(home, 'state', 'operational-telemetry.db'));
   db.exec(`
-    CREATE TABLE operational_events (
+    CREATE TABLE IF NOT EXISTS operational_events (
       event_id TEXT PRIMARY KEY, ts TEXT, source TEXT, type TEXT, severity TEXT,
       workspace_id TEXT, workflow_run_id TEXT, workflow_node_run_id TEXT,
       session_id TEXT, model_call_id TEXT, tool_call_id TEXT, actor TEXT,
@@ -101,6 +102,22 @@ function addOperationalFallover(home: string, sessionId: string): void {
   db.prepare(
     `INSERT INTO operational_events (event_id, ts, source, type, severity, session_id, payload_json) VALUES (?,?,?,?,?,?,?)`,
   ).run('fallover-1', new Date().toISOString(), 'model', 'model_fallover', 'warn', sessionId, '{}');
+  db.close();
+}
+
+function addOperationalFusion(home: string, sessionId: string): void {
+  const db = new Database(path.join(home, 'state', 'operational-telemetry.db'));
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS operational_events (
+      event_id TEXT PRIMARY KEY, ts TEXT, source TEXT, type TEXT, severity TEXT,
+      workspace_id TEXT, workflow_run_id TEXT, workflow_node_run_id TEXT,
+      session_id TEXT, model_call_id TEXT, tool_call_id TEXT, actor TEXT,
+      payload_json TEXT
+    );
+  `);
+  db.prepare(
+    `INSERT INTO operational_events (event_id, ts, source, type, severity, session_id, actor, payload_json) VALUES (?,?,?,?,?,?,?,?)`,
+  ).run(`fusion-${sessionId}`, new Date().toISOString(), 'safety', 'judge_verdict', 'info', sessionId, 'fusion', '{}');
   db.close();
 }
 
@@ -166,6 +183,17 @@ test('stormCheck trips on repeated provider-error markers', () => {
   assert.equal(stormCheck('all quiet').pass, true);
   const noisy = Array.from({ length: 5 }, (_, i) => `request failed with 529 overloaded (attempt ${i})`).join('\n');
   assert.equal(stormCheck(noisy).pass, false);
+});
+
+test('Fusion-off scorer fails closed without telemetry and rejects any isolated-home reconciliation', () => {
+  const home = buildFixtureHome();
+  try {
+    assert.equal(fusionDisabledChecks(home, 'sess-1')[0]?.pass, false, 'missing evidence fails closed');
+    addOperationalFusion(home, 'other-session');
+    assert.equal(fusionDisabledChecks(home, 'sess-1')[0]?.pass, false, 'any fusion in the isolated proof home fails');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('exact route evidence is session-scoped, not satisfied by an unrelated provider marker', () => {

@@ -21,6 +21,13 @@ import { maybeFanoutAlignmentBounce, maybeBounceMassExecution, maybeHeavyPerItem
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import {
+  checkpointPreparedWorker,
+  completedPreparedWorker,
+  prepareWorkerManifest,
+  type PreparedWorkerManifest,
+  type WorkerManifestDescriptor,
+} from '../runtime/harness/work-manifest.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -131,11 +138,12 @@ export function registerWorkerTools(server: McpServer): void {
   server.tool(
     'run_worker',
     [
-      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` — the harness runs them as one bounded parallel pool (wall time ≈ slowest item) with an honest per-item ledger. A single item may use `item` instead.',
+      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` — the harness runs them as one concurrency-bounded pool with an honest per-item ledger. A single item may use `item` instead.',
       'Each worker runs in its own isolated context — keeps YOUR context from ballooning over many items, and runs the work concurrently instead of one-at-a-time (which blows your turn budget).',
       'The packet (objective, resolvedTools, context, instructions, expectedOutput) applies to every item. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
       'When to use: 3+ independent items of the same kind. Aggregate the tight results the workers return.',
       'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
+      'For durable multi-wave or multi-phase work, include workManifest. Declare canonical item ids and the phase graph once, then map changed labels back with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never report a batch complete if any worker returned ERROR; report exactly which items succeeded and which failed.',
     ].join(' '),
     WorkerToolCallSchema.shape,
@@ -158,6 +166,18 @@ export function registerWorkerTools(server: McpServer): void {
         callItems.length,
         JSON.stringify(call),
       );
+      const manifestSessionId = getToolOutputContext()?.sessionId ?? '';
+      let manifestBinding: PreparedWorkerManifest | undefined;
+      if (call.workManifest && manifestSessionId) {
+        const prepared = prepareWorkerManifest({
+          sessionId: manifestSessionId,
+          items: callItems,
+          descriptor: call.workManifest as WorkerManifestDescriptor,
+          objective: call.objective,
+        });
+        if (!prepared.ok) return textResult(`ERROR: workers were NOT started — ${prepared.error}`);
+        manifestBinding = prepared.binding;
+      }
       const { items: _batch, ...packetBase } = call;
       if (callItems.length > 1) {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
@@ -169,7 +189,7 @@ export function registerWorkerTools(server: McpServer): void {
           Math.min(callItems.length, 16),
           async ({ input: perItem, index }) => {
             try {
-              const out = await runOneWorker(perItem);
+              const out = await runOneWorker(perItem, manifestBinding);
               outs[index] = String((out as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '');
             } catch (err) {
               outs[index] = `ERROR: worker for "${perItem.item}" failed: ${firstLine(err)}`;
@@ -231,11 +251,11 @@ export function registerWorkerTools(server: McpServer): void {
             : `Batch finished with FAILURES: ${rendered.length - failed.length}/${rendered.length} succeeded; FAILED items: ${failed.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
         return textResult([...(heavyAdvisory ? [heavyAdvisory] : []), header, ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`)].join('\n\n'));
       }
-      return runOneWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput);
+      return runOneWorker({ ...packetBase, item: callItems[0] } as WorkerToolInput, manifestBinding);
     },
   );
 
-  const runOneWorker = async (params: WorkerToolInput) => {
+  const runOneWorker = async (params: WorkerToolInput, manifestBinding?: PreparedWorkerManifest) => {
     {
       const input = params as WorkerToolInput;
       const sessionId = getToolOutputContext()?.sessionId;
@@ -250,11 +270,70 @@ export function registerWorkerTools(server: McpServer): void {
       // Wave 4 Stage 1: packet key identifies this exact job so a resumed run can
       // detect a worker that already completed and skip re-executing it.
       const packetKey = workerPacketKey(input);
-      const recordResult = (ok: boolean, reason?: string, model?: string): void => {
+      const recordResult = (
+        ok: boolean,
+        reason?: string,
+        model?: string,
+        checkpointManifest = true,
+      ): void => {
+        let resultEvent: ReturnType<typeof appendEvent> | undefined;
         try {
-          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
+          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
         } catch { /* durable trace is best-effort */ }
+        if (manifestBinding && checkpointManifest) {
+          try {
+            checkpointPreparedWorker(
+              sessionId,
+              manifestBinding,
+              input.item,
+              ok ? 'succeeded' : 'failed',
+              {
+                attemptId: packetKey,
+                ...(ok && resultEvent
+                  ? { evidence: [{ kind: 'worker_result', ref: `event:${resultEvent.seq}` }] }
+                  : {}),
+                ...(reason ? { reason } : {}),
+              },
+            );
+          } catch { /* manifest visibility is best-effort */ }
+        }
       };
+
+      // A packet identifies one model call; the prepared manifest identifies the
+      // logical work across calls and restarts. A resumed brain is free to phrase
+      // a new packet, but it is never free to repeat an evidence-backed success
+      // on the active contract. Recover the original work-product via the packet
+      // keys attached to its evidence. If the auxiliary output store is missing,
+      // preserve the durable success and return a truthful receipt — repeating a
+      // possibly external action would be the unsafe choice.
+      try {
+        const completed = workerResumeIdempotencyEnabled() && manifestBinding
+          ? completedPreparedWorker(sessionId, manifestBinding, input.item)
+          : null;
+        if (completed) {
+          const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
+          let prior: string | null = null;
+          for (const completedPacketKey of completed.packetKeys) {
+            prior = findCompletedSubagentOutput(parentRunId, input.item, completedPacketKey);
+            if (prior?.trim()) break;
+          }
+          const reused = prior?.trim()
+            ? prior
+            : [
+                `Durable manifest success reused for "${input.item}" (${manifestBinding!.manifestId}/${manifestBinding!.phase}, contract ${manifestBinding!.contractVersion}).`,
+                `The original worker payload is unavailable after restart; the completed action was NOT executed again.`,
+                `Preserved evidence: ${completed.state.evidence.map((entry) => `${entry.kind}:${entry.ref}`).join(', ')}.`,
+              ].join(' ');
+          recordResult(true, 'resume: reused durable manifest success', undefined, false);
+          return textResult(await buildWorkerReturn({
+            sessionId,
+            parentRunId,
+            item: input.item,
+            text: reused,
+            callId: `call_w_manifest_resume_${packetKey.slice(0, 16)}`,
+          }));
+        }
+      } catch { /* fail-open to the older packet-key guard */ }
 
       // Wave 4 Stage 1 — durable-resume idempotency (checked BEFORE the fuzzy
       // cap-guard: an exact-packet ok match is a STRONGER signal than the
@@ -410,6 +489,13 @@ export function registerWorkerTools(server: McpServer): void {
       try {
         appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
       } catch { /* telemetry is best-effort */ }
+      if (manifestBinding) {
+        try {
+          checkpointPreparedWorker(sessionId, manifestBinding, input.item, 'running', {
+            attemptId: packetKey,
+          });
+        } catch { /* manifest visibility is best-effort */ }
+      }
       try {
         // Claude worker role → Claude Agent SDK lane; non-Claude → the SAME
         // cross-provider @openai/agents Worker the orchestrator lane fans out
@@ -433,7 +519,6 @@ export function registerWorkerTools(server: McpServer): void {
             appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_capped', data: { item: input.item } });
           } catch { /* telemetry is best-effort */ }
         }
-        recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
         recordModelRouteOutcome({
           decisionId: routeDecisionId,
           status: ok ? 'success' : 'failed',
@@ -468,6 +553,10 @@ export function registerWorkerTools(server: McpServer): void {
             finishedAt: new Date().toISOString(),
           });
         } catch { /* visibility trace is best-effort */ }
+        // Persist the work-product before the manifest success checkpoint. This
+        // ordering closes the restart window where the ledger said "succeeded"
+        // but the payload needed for safe reuse had not reached disk yet.
+        recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
         // Stage 3 reduce tier: past ~8 results the return compresses to a
         // parked digest + shard summaries; small fan-outs are byte-identical.
         return textResult(await buildWorkerReturn({

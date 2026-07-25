@@ -214,6 +214,10 @@ const ALWAYS_READ = new Set<string>([
   'agent_run_get',
   'background_tasks_recent',
   'background_task_status',
+  // Versioning an already-consented durable task is Clementine-local control
+  // state. It must not introduce an approval pause between the user's explicit
+  // correction and the next safe model boundary.
+  'background_task_revise',
   // dispatch_background_task is a WRITE (it queues autonomous work), but the
   // user just AGREED to it in conversation — the conversation IS the consent, so
   // it must not re-prompt for approval (same rationale as execution_create /

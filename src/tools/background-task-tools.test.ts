@@ -15,8 +15,9 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-bg-tools-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { backgroundRouteForOriginSession } = await import('./background-task-tools.js');
+const { backgroundRouteForOriginSession, registerBackgroundTaskTools } = await import('./background-task-tools.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
+const { createBackgroundTask, getBackgroundTask } = await import('../execution/background-tasks.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -79,4 +80,34 @@ test('backgroundRouteForOriginSession falls back to desktop for unknown or missi
     channel: 'electron',
     userId: undefined,
   });
+});
+
+test('background_task_revise versions the same durable task through the model-facing tool', async () => {
+  type ToolHandler = (input: Record<string, unknown>) => Promise<{ content?: Array<{ text?: string }> }>;
+  const handlers = new Map<string, ToolHandler>();
+  const server = {
+    tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
+      handlers.set(name, handler);
+    },
+  };
+  registerBackgroundTaskTools(server as never);
+  const revise = handlers.get('background_task_revise');
+  assert.ok(revise);
+
+  const task = createBackgroundTask({
+    title: 'Research the shortlist',
+    prompt: 'Research the approved shortlist.',
+  });
+  const output = await revise!({
+    id: task.id,
+    instruction: 'Use the corrected source list and revalidate prior research.',
+    evidence_policy: 'revalidate',
+  });
+
+  assert.match(output.content?.[0]?.text ?? '', /contract v2/i);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.id, task.id);
+  assert.equal(updated?.runSessionId, task.runSessionId);
+  assert.equal(updated?.contractVersion, 2);
+  assert.equal(updated?.contractRevisions?.[0]?.instruction, 'Use the corrected source list and revalidate prior research.');
 });

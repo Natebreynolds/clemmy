@@ -68,11 +68,15 @@ const GOLDEN = {
   // 2026-07-22 (late): offer_background ceremony STRIPPED (subtraction) — the
   // structured offer tool is gone; the rubric teaches the same choice as ONE
   // plain prose sentence routed to dispatch_background_task / hold_task_for_later.
-  instructions: { len: 35596, sha16: '18777b53a8bf4fab' },
-  native: { len: 34699, sha16: 'b2312271cefe4da8' },
-  claudeBrain: { len: 5614, sha16: '9ffb25ab1369e5b2' },
+  // 2026-07-25: compact course-correction + durable fan-out cues route revised
+  // contracts and long-horizon work through code-backed manifests. The old
+  // "N>50 => author a workflow" escalation was removed; workflows are for
+  // genuinely reusable/scheduled procedures.
+  instructions: { len: 35965, sha16: '31bddec850985a64' },
+  native: { len: 35068, sha16: 'a6bdeb052357b13f' },
+  claudeBrain: { len: 5931, sha16: 'dff8c4c8baf44075' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8920, sha16: 'bbe1323683bfc95e' },
+  lean: { len: 9412, sha16: '98eab823bc51f6a0' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

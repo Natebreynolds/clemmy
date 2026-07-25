@@ -340,8 +340,14 @@ function looksLikeZeroWorkStallText(trimmed: string): boolean {
 // replies use those.
 const HALLUCINATED_TOOL_TRANSCRIPT_PATTERN =
   /(?:^|\n)\s*(?:(?:\*\*|`)(?:tool call:\s*)?[a-z][a-z0-9_]*(?:\*\*|`)|tool call:\s*[a-z][a-z0-9_]*|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)\s*\n[\s\S]{0,120}?```/i;
+// A COMPLETE printed tool-call block. The `<function_calls>` wrapper is OPTIONAL:
+// live 2026-07-24 the model emitted a bare `<invoke name="execution_complete">…</invoke>`
+// after a lead-in sentence, which the wrapper-only form missed entirely, so the block
+// shipped to the user instead of routing to the stall nudge. A closing tag is
+// REQUIRED so prose that merely mentions the syntax cannot trip it — only a
+// whole block does.
 const HALLUCINATED_XML_TOOL_CALL_PATTERN =
-  /<function_calls>[\s\S]{0,600}?<invoke\s+name=["']([a-z][a-z0-9_]*)["'][\s\S]{0,1400}?<\/function_calls>/i;
+  /<(?:antml:)?invoke\s+name=["']([a-z][a-z0-9_]*)["'][\s\S]{0,1400}?<\/(?:antml:)?(?:invoke|function_calls)>/i;
 const HALLUCINATED_TOOL_LABEL_PATTERN =
   /(?:^|\n)\s*(?:\*\*)?\s*(?:tool|tool call)\s*:\s*([a-z][a-z0-9_-]*)\s*(?:\*\*)?/i;
 const HALLUCINATED_BRACKET_TOOL_LABEL_PATTERN =
@@ -350,8 +356,11 @@ const HALLUCINATED_TOOL_NO_PARAMS_PATTERN =
   /\b(?:no\s+`?[a-z][a-z0-9_-]*`?\s+provided|assistant's tool call|harness will supply required params|tool call.+missing required)/i;
 
 function hallucinatedToolTranscriptName(trimmed: string): string | null {
+  // No proximity constraint for the XML shape: unlike a bare heading, a COMPLETE
+  // invoke block is unambiguous wherever it lands, and the live failures put it
+  // AFTER a lead-in sentence. The 2,000-char cap in the caller still bounds this.
   const xml = HALLUCINATED_XML_TOOL_CALL_PATTERN.exec(trimmed);
-  if (xml && xml.index <= 200) return xml[1] ?? null;
+  if (xml) return xml[1] ?? null;
   const label = HALLUCINATED_TOOL_LABEL_PATTERN.exec(trimmed);
   if (label && label.index <= 200 && HALLUCINATED_TOOL_NO_PARAMS_PATTERN.test(trimmed)) return label[1] ?? null;
   const bracket = HALLUCINATED_BRACKET_TOOL_LABEL_PATTERN.exec(trimmed);

@@ -29,6 +29,7 @@ import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
+import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import {
@@ -1887,6 +1888,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       if (effectiveShouldCancel && await effectiveShouldCancel()) {
         throw new AgentRuntimeCancelledError('Run cancelled by caller.');
       }
+      // Tests inject queryImpl for SDK behavior coverage. A forgotten seam must
+      // fail locally before the real Claude subprocess can inherit Keychain auth.
+      if (queryImpl === claudeQuery) assertLiveModelTransportAllowed('Claude Agent SDK');
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
       while (true) {

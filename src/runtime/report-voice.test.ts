@@ -73,3 +73,25 @@ test('does not match an inline (non-heading) mention of the section words', () =
   const inline = 'We added an Evidence / Verification column to the sheet.';
   assert.equal(humanizeReportBody(inline), inline);
 });
+
+test('INERT on the facts-floor report shape — nothing to strip once the headings are gone', () => {
+  // The worker prompt no longer prescribes `## Completed` / `## Evidence / Verification`
+  // / `## Remaining Risks` / `## Next Step` (background-tasks.ts buildWorkerPrompt); it
+  // names the facts and lets the model choose the shape. This module then has nothing to
+  // remove — AUDIT_SECTION_RE only matches those headings. Pinning that here so the
+  // "delete it after soak" follow-up is a MEASURED call, not an assumed one: if this ever
+  // starts failing, the prescription has crept back in somewhere.
+  //
+  // Shaped like a real BLOCKED report — blocker first, which the old fixed order could
+  // not express (it forced `## Completed` and its wins to the top).
+  const blockedReport = [
+    'Could not finish: the Railway deploy needs an interactive login I cannot do from here.',
+    '',
+    'Run `railway login`, then I can deploy, mount the /data volume, and verify the live URL.',
+    '',
+    'What did land: the dashboard builds and runs locally with all 8 reps, goals survived a',
+    'process restart, and the ingest endpoint checks its secret with a timing-safe compare.',
+    'Verification notes are in VERIFICATION.md alongside the project.',
+  ].join('\n');
+  assert.equal(humanizeReportBody(blockedReport), blockedReport);
+});
