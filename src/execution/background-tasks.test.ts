@@ -2081,6 +2081,52 @@ test('processBackgroundTasks blocks promise-shaped completion from durable evide
   assert.match(updated?.error ?? '', /promised an external deliverable/);
 });
 
+test('processBackgroundTasks accepts a completed manifest despite a future conditional in the report', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Revalidate fictional records',
+    prompt: 'Revalidate the two fictional records and return the analysis in this report. Do not make external writes.',
+  });
+
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { sessionId: string }) {
+      declareWorkManifest({
+        sessionId: request.sessionId,
+        manifestId: 'record-revalidation',
+        contractVersion: 2,
+        phases: [{ id: 'research' }],
+        items: [{ id: 'record-a' }, { id: 'record-b' }],
+      });
+      for (const itemId of ['record-a', 'record-b']) {
+        checkpointWorkItem({
+          sessionId: request.sessionId,
+          manifestId: 'record-revalidation',
+          contractVersion: 2,
+          phase: 'research',
+          itemId,
+          status: 'succeeded',
+          evidence: [{ kind: 'worker_result', ref: `event:${itemId}` }],
+        });
+      }
+      return {
+        text: 'All 2 records succeeded under contract v2 with 2/2 durable evidence. If contract v3 arrives, I’ll re-run the same universe.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'done');
+  assert.equal(updated?.error, undefined);
+});
+
 test('processBackgroundTasks requires a committed send receipt after approval, without a delivery judge', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Finish approved send', prompt: 'Send the approved follow-up email' });
@@ -2886,6 +2932,27 @@ test('tripwire: artifact-committed prompt with zero evidence trips; any evidence
 
   const bare = createSession({ kind: 'execution', title: 'tripwire-bare' });
   assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: artifactPrompt }), true);
+  declareWorkManifest({
+    sessionId: bare.id,
+    manifestId: 'sheet-rows',
+    contractVersion: 1,
+    phases: [{ id: 'research' }],
+    items: [{ id: 'account-a' }],
+  });
+  checkpointWorkItem({
+    sessionId: bare.id,
+    manifestId: 'sheet-rows',
+    contractVersion: 1,
+    phase: 'research',
+    itemId: 'account-a',
+    status: 'succeeded',
+    evidence: [{ kind: 'worker_result', ref: 'event:account-a' }],
+  });
+  assert.equal(
+    completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: artifactPrompt }),
+    true,
+    'completed worker evidence cannot substitute for the promised Google Sheet receipt',
+  );
 
   // Non-artifact prompts never trip regardless of evidence.
   assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: 'summarize my unread email' }), false);

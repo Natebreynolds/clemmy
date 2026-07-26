@@ -2702,6 +2702,30 @@ function hasDurableDeliverableEvidence(evidence: BackgroundCompletionEvidence): 
     || evidence.externalWriteReceipts > 0;
 }
 
+function workManifestHasDurableCompletionEvidence(manifest: WorkManifestSummary): boolean {
+  if (
+    manifest.total < 1
+    || manifest.completed !== manifest.total
+    || manifest.remaining !== 0
+    || manifest.untrackedCheckpoints !== 0
+    || manifest.anomalies.length > 0
+    || manifest.phases.length === 0
+    || manifest.items.length !== manifest.total
+  ) {
+    return false;
+  }
+  const phaseIds = manifest.phases.map((phase) => phase.id);
+  return manifest.items.every((item) => (
+    item.complete
+    && phaseIds.every((phaseId) => {
+      const state = item.phases[phaseId];
+      return state?.status === 'succeeded'
+        && state.contractVersion === manifest.contractVersion
+        && state.evidence.length > 0;
+    })
+  ));
+}
+
 function taskRequiresExternalSendReceipt(
   task: Pick<BackgroundTaskRecord, 'prompt' | 'title'>,
 ): boolean {
@@ -2840,7 +2864,16 @@ async function verifyBackgroundTaskDelivery(
   // durable effect exists, "I'll do it next" is deterministically not a result.
   // When a receipt/artifact DOES exist, facts win: do not let awkward tense
   // erase already-committed work or invite a duplicate retry.
-  if (isPromiseShapedReply(finalText) && !hasDurableDeliverableEvidence(completionEvidence)) {
+  // A fully completed logical manifest is also durable completion evidence for
+  // hermetic/research fan-out. This gate runs after the stricter external-send
+  // and promised-artifact receipt checks above, so worker receipts can never
+  // substitute for a missing sheet, file, publish, or external mutation.
+  const manifestCompletionEvidence = workManifests.some(workManifestHasDurableCompletionEvidence);
+  if (
+    isPromiseShapedReply(finalText)
+    && !hasDurableDeliverableEvidence(completionEvidence)
+    && !manifestCompletionEvidence
+  ) {
     return {
       outcome: 'blocked',
       reason: 'The worker only promised future work and the run contains no durable completion evidence.',

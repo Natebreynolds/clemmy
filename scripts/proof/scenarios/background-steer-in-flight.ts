@@ -89,11 +89,14 @@ export const backgroundSteerInFlight: ScenarioDef = {
     const result = task.resultFull ?? task.result ?? '';
     const runWorkerReturns = sessionEvents(daemon, task.runSessionId, ['tool_returned'])
       .filter((event) => event.data.tool === 'run_worker');
+    const workerReturnText = (event: (typeof runWorkerReturns)[number]): string => String(
+      event.data.result ?? event.data.preview ?? event.data.output ?? '',
+    );
     const successfulWorkerBatches = runWorkerReturns.filter((event) => (
-      /^Batch complete:/i.test(String(event.data.result ?? ''))
+      event.data.ok !== false && /^Batch complete:/i.test(workerReturnText(event))
     )).length;
     const rejectedBeforeDispatch = runWorkerReturns.filter((event) => (
-      /workers were NOT started/i.test(String(event.data.result ?? ''))
+      /workers were NOT started/i.test(workerReturnText(event))
     )).length;
 
     let metrics = null;

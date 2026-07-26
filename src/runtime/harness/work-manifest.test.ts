@@ -323,6 +323,55 @@ test('run_worker preparation refuses accidental expansion and binds changed labe
   assert.equal(summarizeWorkManifest(sid, 'accounts')?.total, 2);
 });
 
+test('run_worker reconcile treats the declared phase graph as authoritative', () => {
+  const sid = session('manifest-reconcile-canonical-graph');
+  const declared = prepareWorkerManifest({
+    sessionId: sid,
+    items: ['record-001', 'record-002'],
+    objective: 'Analyze then validate the records.',
+    descriptor: {
+      id: 'records',
+      contractVersion: '1',
+      phase: 'analyze',
+      mode: 'declare',
+      phases: [
+        { id: 'analyze', label: 'Analyze records' },
+        { id: 'validate', label: 'Validate records', dependsOn: ['analyze'] },
+      ],
+    },
+  });
+  assert.equal(declared.ok, true);
+
+  const reconciled = prepareWorkerManifest({
+    sessionId: sid,
+    items: ['record-001', 'record-002'],
+    descriptor: {
+      id: 'records',
+      contractVersion: '1',
+      phase: 'validate',
+      mode: 'reconcile',
+      // Reproduces a live BYO provider filling an optional graph field with a
+      // malformed copy on wave two. Reconcile must ignore it, not dirty the
+      // durable contract that was already declared.
+      phases: [
+        { id: 'analyze', label: 'Analyze records', dependsOn: ['analyze'] },
+        { id: 'validate', label: 'Validate records', dependsOn: ['analyze'] },
+      ],
+    },
+  });
+  assert.equal(reconciled.ok, true);
+
+  const summary = summarizeWorkManifest(sid, 'records');
+  assert.deepEqual(
+    summary?.phases.map((phase) => ({ id: phase.id, dependsOn: phase.dependsOn })),
+    [
+      { id: 'analyze', dependsOn: [] },
+      { id: 'validate', dependsOn: ['analyze'] },
+    ],
+  );
+  assert.deepEqual(summary?.anomalies, []);
+});
+
 test('prepared worker completion survives a changed call packet but not a contract revalidation', () => {
   const sid = session('manifest-worker-completion');
   const prepared = prepareWorkerManifest({

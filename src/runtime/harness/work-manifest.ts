@@ -839,17 +839,23 @@ export function prepareWorkerManifest(input: {
       };
     }
 
-    // An idempotent declaration adds only explicitly mapped aliases and any
-    // explicit extension. Reducer ownership checks prevent alias collisions.
-    const phasesToDeclare = input.descriptor.phases?.length
-      ? input.descriptor.phases
-      : missingPhase
-        ? [{ id: phase }]
-        : existing.phases.map((entry) => ({
-          id: entry.id,
-          label: entry.label,
-          dependsOn: entry.dependsOn,
-        }));
+    // Reconciliation is read-only for graph shape. Some providers populate the
+    // optional `phases` field again on a later wave—and may produce a lossy or
+    // malformed copy. Once declared, the durable graph is authoritative; only
+    // an explicit `extend` may submit phase additions. This keeps model-specific
+    // schema filling from manufacturing ledger anomalies after valid work.
+    const canonicalPhases = existing.phases.map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+      dependsOn: entry.dependsOn,
+    }));
+    const phasesToDeclare = requestedMode === 'extend'
+      ? input.descriptor.phases?.length
+        ? input.descriptor.phases
+        : missingPhase
+          ? [{ id: phase }]
+          : canonicalPhases
+      : canonicalPhases;
     declareWorkManifest({
       sessionId: input.sessionId,
       manifestId,
