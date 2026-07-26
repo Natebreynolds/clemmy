@@ -100,6 +100,7 @@ export const capabilityReconnectResume: ScenarioDef = {
   summary: 'workflow parks before disconnected write → reconnect → same run resumes once',
   routeExpectation: 'exact-workflow-step',
   async run(daemon: DaemonHandle) {
+    const startedAt = Date.now();
     const checks: Check[] = [];
     const create = await daemon.request('POST', '/api/console/workflows', {
       name: WORKFLOW_NAME,
@@ -235,7 +236,7 @@ export const capabilityReconnectResume: ScenarioDef = {
 
     return {
       checks,
-      latency: [{ wallMs: metrics?.latency[0]?.wallMs ?? 0, ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null }],
+      latency: [{ wallMs: Date.now() - startedAt, ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null }],
       sessionId: stepSessionId,
       metrics: metrics ? { turns: metrics.turns, toolCallTotal: metrics.toolCallTotal } : undefined,
     };

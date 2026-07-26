@@ -338,6 +338,56 @@ test('terminal publication persists user-objective truth separately from lifecyc
   assert.equal(partial.terminalOutcome, 'partial');
 });
 
+test('terminal publication cannot regress consumed capability resume authority', () => {
+  const runId = `capability-consumed-terminal-${Date.now()}`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const block = {
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    toolkit: 'googlesheets',
+    reason: 'not-connected' as const,
+    message: 'Reconnect Google Sheets.',
+    blockedAt: '2026-07-26T12:00:00.000Z',
+    retryAt: '2026-07-26T12:01:00.000Z',
+    retryCount: 1,
+    provenNoDispatch: true as const,
+    state: 'consumed' as const,
+    resumedAt: '2026-07-26T12:00:10.000Z',
+    resumeAuthorityConsumedAt: '2026-07-26T12:00:11.000Z',
+  };
+  writeFileSync(file, JSON.stringify({
+    id: runId,
+    workflow: 'Capability Terminal Workflow',
+    status: 'running',
+    capabilityBlock: block,
+  }), 'utf-8');
+
+  const terminal = publishWorkflowRunTerminalForTest(
+    file,
+    {
+      id: runId,
+      workflow: 'Capability Terminal Workflow',
+      status: 'completed',
+      finishedAt: '2026-07-26T12:00:20.000Z',
+      capabilityBlock: {
+        ...block,
+        state: 'retrying',
+        resumeAuthorityConsumedAt: undefined,
+      },
+    },
+    {
+      workflowName: 'Capability Terminal Workflow',
+      outcome: 'done',
+      detail: 'The resumed write completed exactly once.',
+    },
+  );
+
+  assert.equal(terminal.capabilityBlock?.state, 'consumed');
+  assert.equal(terminal.capabilityBlock?.resumeAuthorityConsumedAt, block.resumeAuthorityConsumedAt);
+  rmSync(file, { force: true });
+});
+
 test('workflow attempt metrics count one native MCP action, not its transport mirror', () => {
   resetEventLog();
   const runId = `metric-accounting-${Date.now()}`;

@@ -798,6 +798,26 @@ function writeRunRecord(
       ...businessRecord
     } = record;
     let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
+    // Capability retry authority is a monotonic per-retry checkpoint. A
+    // terminal projection is commonly assembled from the run snapshot that
+    // entered this drain pass; after the authority has been consumed, that
+    // snapshot still says `retrying`. Never let such a stale same-generation
+    // projection regress the durable checkpoint and make a completed mutation
+    // look eligible for another resume.
+    if (current?.capabilityBlock && nextRecord.capabilityBlock) {
+      const stateRank = { blocked: 0, retrying: 1, consumed: 2 } as const;
+      const currentGeneration = current.capabilityBlock.retryCount;
+      const requestedGeneration = nextRecord.capabilityBlock.retryCount;
+      if (
+        currentGeneration > requestedGeneration
+        || (
+          currentGeneration === requestedGeneration
+          && stateRank[current.capabilityBlock.state] >= stateRank[nextRecord.capabilityBlock.state]
+        )
+      ) {
+        nextRecord.capabilityBlock = current.capabilityBlock;
+      }
+    }
     // Admission evidence is first-transition immutable. A resumed/parked run
     // preserves even malformed or missing legacy evidence verbatim; it must
     // never gain authority from today's workflow definition. Only the process
