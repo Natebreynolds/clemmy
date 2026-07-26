@@ -14,7 +14,11 @@ import { randomUUID } from 'node:crypto';
 
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-smoke-'));
 process.env.CLEMENTINE_HOME = path.join(TMP_HOME, '.clementine-next');
-process.env.WORKFLOW_USE_HARNESS = 'off'; // belt-and-suspenders; steps also set useHarness:false
+// Workflow execution has two harness seams. Keep both out of this deterministic
+// engine smoke so the local assistant stub is the only model boundary exercised.
+process.env.WORKFLOW_USE_HARNESS = 'off'; // steps also set useHarness:false
+process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 fs.mkdirSync(process.env.CLEMENTINE_HOME, { recursive: true });
 
 const { writeWorkflow } = await import('../src/memory/workflow-store.js');

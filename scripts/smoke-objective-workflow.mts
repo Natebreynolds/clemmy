@@ -9,7 +9,7 @@
  *   3. the run parks at the human review gate for external action;
  *   4. approving the gate resumes from the checkpoint;
  *   5. one failed external-action item marks the run needs-attention;
- *   6. retrying failed items reprocesses only the failed item.
+ *   6. an unreceipted external-action failure cannot be retried blindly.
  *
  * Run: npx tsx scripts/smoke-objective-workflow.mts
  */
@@ -19,7 +19,13 @@ import path from 'node:path';
 
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clemmy-objective-workflow-smoke-'));
 process.env.CLEMENTINE_HOME = path.join(TMP_HOME, '.clementine-next');
+// Workflow execution has two harness seams: the primary step runner and the
+// shared surface bridge used by its fallback lane. This smoke intentionally
+// exercises neither—it proves the durable workflow engine with a deterministic
+// assistant stub—so disable both and opt into the explicit legacy callback.
 process.env.WORKFLOW_USE_HARNESS = 'off';
+process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 process.env.WORKFLOW_APPROVAL_PARKING = 'on';
 // This smoke validates orchestration deterministically. The unit test asserts
 // the workflow declares a pinned goal; live goal judging belongs in a separate
@@ -32,7 +38,7 @@ const {
   OBJECTIVE_EXECUTION_WORKFLOW_NAME,
   OBJECTIVE_EXECUTION_WORKFLOW_SLUG,
 } = await import('../src/runtime/builtin-workflows.js');
-const { readWorkflow } = await import('../src/memory/workflow-store.js');
+const { readWorkflow, writeWorkflow } = await import('../src/memory/workflow-store.js');
 const {
   processWorkflowRuns,
   reapResolvedParkedRuns,
@@ -225,6 +231,22 @@ try {
   check('external action step is gated send', workflow?.data.steps.some((s) =>
     s.id === 'execute_approved_external_action' && s.requiresApproval === true && s.sideEffect === 'send' && s.forEach === 'prepare_approval_packet',
   ) === true);
+  // The production step is intentionally generic: its real harness pauses on
+  // the concrete provider action once the model has resolved an exact payload.
+  // This no-model smoke has no provider tool call, so pin one representative
+  // irreversible slug in the isolated fixture to exercise the runner-owned
+  // declarative gate without weakening the shipped workflow definition.
+  if (workflow) {
+    writeWorkflow(OBJECTIVE_EXECUTION_WORKFLOW_SLUG, {
+      ...workflow.data,
+      steps: workflow.data.steps.map((step) => step.id === 'execute_approved_external_action'
+        ? {
+            ...step,
+            allowedTools: [...new Set([...(step.allowedTools ?? []), 'GMAIL_SEND_EMAIL'])],
+          }
+        : step),
+    });
+  }
 
   const queued = queueWorkflowRun(OBJECTIVE_EXECUTION_WORKFLOW_NAME, {
     objective: 'Increase qualified inbound inquiries by 15% over the next four weeks.',
@@ -260,24 +282,14 @@ try {
   check('only approval-001 is finally failed', failedItems.length === 1 && failedItems[0].itemKey === 'approval-001', JSON.stringify(failedItems));
 
   const retry = requeueWorkflowFailedItemsFromRun(runId, { stepId: 'execute_approved_external_action' });
-  check('failed-item retry queued', retry.status === 'queued', retry.id ?? retry.message);
-
-  await processWorkflowRuns(stub);
-  const retryParked = readRun(retry.id!);
-  check('retry run parked at approval gate', retryParked.status === 'parked', String(retryParked.status));
-  const retryApproval = approvalRegistry.listPending({ status: 'pending' })
-    .find((row) => row.sessionId === `workflow-gate:${retry.id}:execute_approved_external_action`);
-  check('retry approval row created', Boolean(retryApproval), retryApproval?.approvalId ?? '');
-  if (retryApproval) approvalRegistry.resolve(retryApproval.approvalId, 'approved', 'objective-workflow-smoke-retry');
-  reapResolvedParkedRuns();
-  const retryResumed = readRun(retry.id!);
-  check('approved retry run re-admitted', retryResumed.status === 'running', String(retryResumed.status));
-
-  await processWorkflowRuns(stub);
-  const retryRun = readRun(retry.id!);
-  check('retry run completed cleanly', retryRun.status === 'completed', String(retryRun.status));
-  check('retry has no final failed items', listFinalFailedItems(OBJECTIVE_EXECUTION_WORKFLOW_SLUG, retry.id!).length === 0);
-  check('external action was attempted exactly twice', (actionAttempts.get('approval-001') ?? 0) === 2, JSON.stringify(Object.fromEntries(actionAttempts)));
+  check(
+    'unreceipted external-action retry is refused',
+    retry.status === 'ambiguous'
+      && !retry.id
+      && /receipt|prove.*commit|no retry/i.test(retry.message),
+    retry.message,
+  );
+  check('external action was attempted exactly once', (actionAttempts.get('approval-001') ?? 0) === 1, JSON.stringify(Object.fromEntries(actionAttempts)));
 } finally {
   fs.rmSync(TMP_HOME, { recursive: true, force: true });
 }
