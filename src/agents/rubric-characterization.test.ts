@@ -74,11 +74,13 @@ const GOLDEN = {
   // genuinely reusable/scheduled procedures.
   // 2026-07-25 (live smoke): one-shot fetch/write/deploy/verification work no
   // longer pins a durable focus merely because the request names a URL.
-  instructions: { len: 35951, sha16: 'e4116743aebdd7f4' },
-  native: { len: 35054, sha16: '3a2a4009644554c7' },
-  claudeBrain: { len: 5931, sha16: 'dff8c4c8baf44075' },
+  // 2026-07-26 full-catalog soak: manifests track per-item worker phases only;
+  // parent ranking/merge/final synthesis no longer creates phantom N-of-N work.
+  instructions: { len: 35991, sha16: '03141c9d5f6d1b7e' },
+  native: { len: 35094, sha16: '13eb73142c7c26d4' },
+  claudeBrain: { len: 5999, sha16: '7c910221822833aa' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 9412, sha16: '98eab823bc51f6a0' },
+  lean: { len: 9548, sha16: '282e18dc3dec61fd' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

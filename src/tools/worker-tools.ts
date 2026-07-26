@@ -144,7 +144,7 @@ export function registerWorkerTools(server: McpServer): void {
       'The packet (objective, resolvedTools, context, instructions, expectedOutput) applies to every item. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
       'When to use: 3+ independent items of the same kind. Aggregate the tight results the workers return.',
       'On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with tool_output_query(call_id) only where an exact figure is needed.',
-      'For durable multi-wave or multi-phase work, include workManifest. Declare canonical item ids and the phase graph once, then map changed labels back with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
+      'For durable multi-wave or multi-phase work, include workManifest. Its phases are per-item worker stages; exclude parent-only ranking, merge, final synthesis, and reporting. Declare canonical item ids and the graph once, then map changed labels back with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never report a batch complete if any worker returned ERROR; report exactly which items succeeded and which failed.',
     ].join(' '),
     WorkerToolCallSchema.shape,

@@ -7,6 +7,7 @@
  */
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck, tokenCeilingCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import { dispatchBackground, waitForTerminal } from './background-proof-helpers.js';
 
 const FIRMS = [
   'Auric & Vale Law',
@@ -24,15 +25,25 @@ This is same-shape work per firm — parallelize it rather than grinding through
 export const fanoutMultiItem: ScenarioDef = {
   name: 'fanout-multi-item',
   summary: '5 same-shape items → all complete, fan-out elected, no park',
+  routeExpectation: 'exact-brain',
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-fanout-${Date.now().toString(36)}`;
-    const turn = await daemon.chat(PROMPT, sessionId, 900_000);
+    const startedAt = Date.now();
+    const dispatched = await dispatchBackground(daemon, sessionId, PROMPT);
+    const settled = await waitForTerminal(daemon, dispatched.taskId, 20 * 60_000);
+    const task = settled.detail.task;
+    const result = task.resultFull ?? task.result ?? '';
 
     const checks: Check[] = [];
-    checks.push({ name: 'HTTP 200', pass: turn.httpStatus === 200, detail: `status ${turn.httpStatus}` });
-    checks.push(reportBackCheck(turn.text));
+    checks.push({ name: 'HTTP 200', pass: dispatched.turn.httpStatus === 200, detail: `status ${dispatched.turn.httpStatus}` });
+    checks.push({
+      name: 'durable fan-out task completed',
+      pass: task.status === 'done',
+      detail: `${task.status}: ${task.error ?? result.slice(0, 220)}`,
+    });
+    checks.push(reportBackCheck(result));
 
-    const missing = FIRMS.filter((f) => !turn.text.toLowerCase().includes(f.toLowerCase()));
+    const missing = FIRMS.filter((f) => !result.toLowerCase().includes(f.toLowerCase()));
     checks.push({
       name: 'all 5 firms covered',
       pass: missing.length === 0,
@@ -40,24 +51,25 @@ export const fanoutMultiItem: ScenarioDef = {
     });
     checks.push({
       name: 'no park / continue ask',
-      pass: !/say continue|awaiting.continue|reached (the )?turn|maximum number of turns/i.test(turn.text),
+      pass: !/say continue|awaiting.continue|reached (the )?turn|maximum number of turns/i.test(result),
     });
-    checks.push(narrationCheck(turn.text));
+    checks.push(narrationCheck(result));
     checks.push(stormCheck(daemon.log()));
 
     let metrics = null;
     try {
       const db = openHarnessDb(daemon.home);
-      metrics = sessionMetrics(db, turn.sessionId);
+      metrics = sessionMetrics(db, task.runSessionId);
       db.close();
     } catch { /* scored checks below handle null */ }
 
-    // The SDK brain lane logs each worker as a worker_result event; the Codex
-    // lane logs run_worker tool_called events. Either is proof of fan-out.
-    const workerCalls = Math.max(metrics?.toolCalls['run_worker'] ?? 0, metrics?.workerResults ?? 0);
+    // One batched run_worker call is the intended API. Actual worker_result
+    // events prove that all five isolated workers ran; counting top-level calls
+    // would mistake correct batching for no fan-out.
+    const workerCalls = metrics?.workerResults ?? 0;
     checks.push({
-      name: 'fan-out elected (workers ≥ 2)',
-      pass: workerCalls >= 2,
+      name: 'fan-out elected (5 isolated workers)',
+      pass: workerCalls === FIRMS.length,
       detail: `workers × ${workerCalls}${metrics?.workerFailures ? ` (${metrics.workerFailures} failed)` : ''}`,
     });
     checks.push({
@@ -69,8 +81,8 @@ export const fanoutMultiItem: ScenarioDef = {
 
     return {
       checks,
-      latency: [{ wallMs: turn.wallMs, ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null }],
-      sessionId: turn.sessionId,
+      latency: [{ wallMs: Date.now() - startedAt, ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null }],
+      sessionId: task.runSessionId,
       metrics: metrics ? { turns: metrics.turns, toolCallTotal: metrics.toolCallTotal, toolCalls: metrics.toolCalls, tokensUsed: metrics.tokensUsed, autoContinues: metrics.autoContinues } : undefined,
     };
   },

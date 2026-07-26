@@ -12,6 +12,7 @@ import {
   manifestEventCounts,
   manifestFor,
   proofSessionId,
+  sessionEvents,
   waitForBackground,
   waitForOutcomeEvents,
   waitForTerminal,
@@ -86,6 +87,14 @@ export const backgroundSteerInFlight: ScenarioDef = {
       card.sourceKind === 'background' && card.raw?.originSessionId === dispatched.turn.sessionId
     ));
     const result = task.resultFull ?? task.result ?? '';
+    const runWorkerReturns = sessionEvents(daemon, task.runSessionId, ['tool_returned'])
+      .filter((event) => event.data.tool === 'run_worker');
+    const successfulWorkerBatches = runWorkerReturns.filter((event) => (
+      /^Batch complete:/i.test(String(event.data.result ?? ''))
+    )).length;
+    const rejectedBeforeDispatch = runWorkerReturns.filter((event) => (
+      /workers were NOT started/i.test(String(event.data.result ?? ''))
+    )).length;
 
     let metrics = null;
     try {
@@ -136,9 +145,10 @@ export const backgroundSteerInFlight: ScenarioDef = {
         detail: `stale ${manifest?.staleCheckpoints ?? 0}; ${JSON.stringify(events)}`,
       },
       {
-        name: 'one baseline batch plus one revalidation batch — no receipt-reuse loop',
-        pass: (metrics?.toolCalls['run_worker'] ?? 0) === 2,
-        detail: `run_worker calls: ${metrics?.toolCalls['run_worker'] ?? 'unavailable'}`,
+        name: 'one baseline batch plus one revalidation batch — no extra worker dispatch',
+        pass: successfulWorkerBatches === 2
+          && (metrics?.workerResults ?? 0) === ITEMS.length * 2,
+        detail: `successful batches ${successfulWorkerBatches}; worker results ${metrics?.workerResults ?? 'unavailable'}; pre-dispatch refusals ${rejectedBeforeDispatch}; total run_worker calls ${metrics?.toolCalls['run_worker'] ?? 'unavailable'}`,
       },
       {
         name: 'exactly one terminal outcome returned to origin',

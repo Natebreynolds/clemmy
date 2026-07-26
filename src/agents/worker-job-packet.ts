@@ -28,7 +28,10 @@ export const WorkerManifestDescriptorSchema = z.object({
     .max(32)
     .nullable()
     .optional()
-    .describe('Ordered phase graph. Supply on the declaration wave; later waves can omit it.'),
+    .describe(
+      'Ordered per-item graph: every phase must run for every canonical item through run_worker. '
+      + 'Exclude parent-only ranking, merge, final synthesis, and reporting. Supply on the declaration wave; later waves can omit it.',
+    ),
   aliases: z
     .array(z.object({
       alias: z
@@ -79,7 +82,10 @@ export const WorkerToolInputSchema = z.object({
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()
-    .describe('For durable multi-wave work, bind workers to canonical logical items and a phase graph. This prevents retries or changed labels from inflating progress.'),
+    .describe(
+      'Bind durable work to canonical items and per-item worker phases; exclude parent-only synthesis. '
+      + 'This prevents retries or changed labels from inflating progress.',
+    ),
 });
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
