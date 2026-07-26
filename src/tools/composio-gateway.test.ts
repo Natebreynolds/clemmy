@@ -30,7 +30,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { __test__ } = await import('../integrations/composio/client.js');
-const { resolveComposioDispatch, dispatchComposioTool, __gatewayTest__ } = await import('./composio-tools.js');
+const {
+  resolveComposioDispatch,
+  dispatchComposioTool,
+  composioDispatchLaneAvailable,
+  __gatewayTest__,
+} = await import('./composio-tools.js');
 const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
 const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { rememberAccountAlias, resolveAccountAlias } = await import('../memory/account-alias-store.js');
@@ -151,6 +156,27 @@ test('breaker is NARROW: fires only when the snapshot confirms zero usable conne
   const alive = await resolveComposioDispatch('NOTION_SEARCH_PAGES', {}, undefined, { sessionId: sid });
   assert.equal(alive.ok, true, 'a visible reconnect disarms the breaker without waiting for TTL');
   __gatewayTest__.clearReconnectBreaker(sid, 'NOTION_SEARCH_PAGES');
+});
+
+test('a managed toolkit with zero usable connections blocks before its first dispatch', async () => {
+  setAccounts([]);
+  const out = await resolveComposioDispatch('GOOGLESHEETS_BATCH_UPDATE', {}, undefined, {});
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.equal(out.reason, 'not-connected');
+    assert.match(out.message, /No provider dispatch was started/);
+  }
+});
+
+test('dispatch-lane availability distinguishes SDK, CLI, and AUTO auth without guessing', () => {
+  const deadCli = { installed: true, authenticated: false, authStatus: 'error' as const };
+  const liveCli = { installed: true, authenticated: true, authStatus: 'ok' as const };
+  assert.equal(composioDispatchLaneAvailable({ executionBackend: 'sdk', apiKeyPresent: false, cli: liveCli }), false);
+  assert.equal(composioDispatchLaneAvailable({ executionBackend: 'sdk', apiKeyPresent: true, cli: deadCli }), true);
+  assert.equal(composioDispatchLaneAvailable({ executionBackend: 'cli', apiKeyPresent: true, cli: deadCli }), false);
+  assert.equal(composioDispatchLaneAvailable({ executionBackend: 'cli', apiKeyPresent: false, cli: liveCli }), true);
+  assert.equal(composioDispatchLaneAvailable({ executionBackend: 'auto', apiKeyPresent: false, cli: deadCli }), false);
+  assert.equal(composioDispatchLaneAvailable({ executionBackend: 'auto', apiKeyPresent: true, cli: deadCli }), true);
 });
 
 test('named accounts: "remember this as acme" binds pin→name; alias alone then resolves with no ask', async () => {

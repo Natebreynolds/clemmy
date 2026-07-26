@@ -99,8 +99,9 @@ npm run proof:critical
 npm run proof:fusion:codex
 ```
 
-`proof:critical:codex` is the first canary. The endurance leg raises the
-manifest to 120 items. `proof:critical` then runs every configured brain and
+`proof:critical:codex` is the first canary, including disconnect → park →
+reconnect → same-run resume for a proof-local capability. The endurance leg
+raises the manifest to 120 items. `proof:critical` then runs every configured brain and
 records SKIP, rather than a false failure, for a brain whose local sign-in is
 absent. The Fusion canary is separate and opt-in: Codex remains the author while
 a distinct connected model must return the bounded accept/correct contract; the

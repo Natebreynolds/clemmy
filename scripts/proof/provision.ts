@@ -183,6 +183,58 @@ function createProofRailwayShim(home: string): string {
   return bin;
 }
 
+/** A local-only Composio lane for capability recovery proofs. It begins
+ * unauthenticated. Creating $HOME/proof-composio-connected makes `whoami` and
+ * `execute` succeed; every execute appends only its slug to a proof-local log. */
+function createProofComposioShim(home: string): void {
+  const bin = path.join(home, 'proof-bin');
+  mkdirSync(bin, { recursive: true });
+  const shim = path.join(bin, process.platform === 'win32' ? 'composio.cmd' : 'composio');
+  const body = process.platform === 'win32'
+    ? [
+        '@echo off',
+        'if "%1"=="--version" (echo composio-proof 1.0& exit /b 0)',
+        'if "%1"=="whoami" (',
+        '  if exist "%HOME%\\proof-composio-connected" (echo proof-user& exit /b 0)',
+        '  echo Not authenticated. 1>&2',
+        '  exit /b 1',
+        ')',
+        'if "%1"=="execute" (',
+        '  if not exist "%HOME%\\proof-composio-connected" (echo 401 Unauthorized. 1>&2& exit /b 1)',
+        '  echo %2>>"%HOME%\\proof-composio-dispatches.log"',
+        '  echo {"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}',
+        '  exit /b 0',
+        ')',
+        'echo unsupported proof composio command 1>&2',
+        'exit /b 1',
+        '',
+      ].join('\r\n')
+    : [
+        '#!/bin/sh',
+        'state="${HOME}/proof-composio-connected"',
+        'dispatch_log="${HOME}/proof-composio-dispatches.log"',
+        'case "$1" in',
+        '  --version) printf "%s\\n" "composio-proof 1.0"; exit 0 ;;',
+        '  whoami)',
+        '    if [ -f "$state" ]; then printf "%s\\n" "proof-user"; exit 0; fi',
+        '    printf "%s\\n" "Not authenticated." >&2',
+        '    exit 1',
+        '    ;;',
+        '  execute)',
+        '    if [ ! -f "$state" ]; then printf "%s\\n" "401 Unauthorized." >&2; exit 1; fi',
+        '    printf "%s\\n" "$2" >> "$dispatch_log"',
+        '    printf "%s\\n" \'{"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}\'',
+        '    exit 0',
+        '    ;;',
+        'esac',
+        'printf "%s\\n" "unsupported proof composio command" >&2',
+        'exit 1',
+        '',
+      ].join('\n');
+  writeFileSync(shim, body, { encoding: 'utf-8', mode: 0o700 });
+  try { chmodSync(shim, 0o700); } catch { /* best-effort on Windows */ }
+}
+
 /** Keep event/task state for a failed proof without retaining copied model
  * credentials or a generated webhook bearer. */
 function sanitizeProofHomeForForensics(home: string): void {
@@ -229,6 +281,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     throw new Error('no currently-valid Claude subscription access token is available for the isolated proof');
   }
   const proofBin = createProofRailwayShim(home);
+  createProofComposioShim(home);
 
   const logChunks: string[] = [];
   const daemonEnv: NodeJS.ProcessEnv = {

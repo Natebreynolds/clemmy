@@ -33,6 +33,7 @@ import { longHorizonManifest } from './scenarios/long-horizon-manifest.js';
 import { backgroundSteerInFlight } from './scenarios/background-steer-in-flight.js';
 import { restartResume } from './scenarios/restart-resume.js';
 import { blockedAuthTruth } from './scenarios/blocked-auth-truth.js';
+import { capabilityReconnectResume } from './scenarios/capability-reconnect-resume.js';
 import { fusionBoundedVerifier } from './scenarios/fusion-bounded-verifier.js';
 import type { BrainKind, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
@@ -53,6 +54,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
   backgroundSteerInFlight,
   restartResume,
   blockedAuthTruth,
+  capabilityReconnectResume,
 ];
 const SCENARIO_CATALOG: ScenarioDef[] = [...DEFAULT_SCENARIOS, fusionBoundedVerifier];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];

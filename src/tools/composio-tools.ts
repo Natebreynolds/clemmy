@@ -9,8 +9,11 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
   composioCliErrorProvesNoDispatch,
+  CURATED_TOOLKITS,
   getComposioCredentialStatus,
+  getComposioExecutionBackend,
   getComposioRuntimeStatus,
+  listCachedToolkits,
   listComposioToolkitTools,
   listUsableConnectedToolkits,
   listSuppressedConnectedToolkits,
@@ -1203,6 +1206,36 @@ export interface ComposioGatewayResolved {
 
 export type ComposioGatewayResolution = ComposioGatewayResolved | ComposioGatewayBlocked;
 
+interface ComposioDispatchLaneStatus {
+  executionBackend: 'auto' | 'sdk' | 'cli';
+  apiKeyPresent: boolean;
+  cli: {
+    installed: boolean;
+    authenticated: boolean;
+    authStatus: 'ok' | 'missing' | 'error' | 'unknown';
+  };
+}
+
+/** Pure availability decision used by the gateway before the first provider
+ * boundary. `unknown` CLI auth stays fail-open because a custom CLI build may
+ * execute successfully even when `whoami` returns no identity text. */
+export function composioDispatchLaneAvailable(status: ComposioDispatchLaneStatus): boolean {
+  if (status.executionBackend === 'sdk') return status.apiKeyPresent;
+  const cliMayRun = status.cli.installed
+    && (status.cli.authenticated || status.cli.authStatus === 'unknown');
+  if (status.executionBackend === 'cli') return cliMayRun;
+  return status.apiKeyPresent || cliMayRun;
+}
+
+function toolkitRequiresConnectedAccount(toolkit: string): boolean {
+  const normalized = toolkit.trim().toLowerCase();
+  const known = [
+    ...CURATED_TOOLKITS,
+    ...listCachedToolkits(),
+  ].find((entry) => entry.slug.trim().toLowerCase() === normalized);
+  return Boolean(known && known.authMode !== 'none');
+}
+
 function emitComposioGatewayBlock(
   sessionId: string | undefined,
   toolSlug: string,
@@ -1316,6 +1349,32 @@ export async function resolveComposioDispatch(
     return s && (t === s || t.startsWith(`${s}_`));
   });
   const usable = toolkitConns.filter((c) => /active|enabled|initiat/i.test(c.status ?? ''));
+
+  // FIRST-CALL connection gate. A managed/BYO toolkit with no usable account is
+  // provably unable to dispatch; do not make one doomed provider call merely to
+  // arm the session-local reconnect breaker. This is what lets an exact workflow
+  // write park safely on its first attempt instead of becoming a terminal error.
+  if (!pinned && usable.length === 0 && toolkitRequiresConnectedAccount(toolkit)) {
+    const message = `⚠️ ${toolkit} is not connected: no usable ${toolkit} account is available. Reconnect ${toolkit} in Connect, then resume this same task. No provider dispatch was started.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'not-connected');
+    return { ok: false, reason: 'not-connected', message, toolkit };
+  }
+
+  // Unknown/no-auth toolkits can still run through an authenticated CLI or SDK
+  // without a connected-account row. When neither execution lane is usable,
+  // that absence is also structurally pre-dispatch and recoverable immediately.
+  if (!pinned && usable.length === 0) {
+    const runtime = await getComposioRuntimeStatus();
+    if (!composioDispatchLaneAvailable({
+      executionBackend: getComposioExecutionBackend(),
+      apiKeyPresent: runtime.apiKeyPresent,
+      cli: runtime.cli,
+    })) {
+      const message = `⚠️ ${toolkit} cannot run because neither the Composio SDK nor CLI is authenticated. Connect Composio, then resume this same task. No provider dispatch was started.`;
+      emitComposioGatewayBlock(sid, toolSlug, 'not-connected');
+      return { ok: false, reason: 'not-connected', message, toolkit };
+    }
+  }
 
   // Breaker — SHARPLY NARROWED: only when this session already saw a
   // reconnect-required failure for the toolkit AND the current snapshot
