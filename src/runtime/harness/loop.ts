@@ -85,6 +85,11 @@ import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import {
+  evaluateLearningCandidate,
+  recordLearningDecision,
+  type LearningReceipt,
+} from '../../memory/learning-receipt.js';
 import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
 import { isUserFacingSession } from '../../execution/scope.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
@@ -3618,10 +3623,52 @@ async function runConversationCore(
         } else if (validation.pass) {
           satisfyGoal(activeGoal.id, 'external validation passed');
           goalSatisfiedThisTurn = true;
+          const learningManifests = summarizeWorkManifests(options.sessionId);
+          const learningArtifactState = standardArtifactTerminalState(
+            options.sessionId,
+            activeSourceUserSeq,
+          );
+          const learningInput = {
+            target: 'skill' as const,
+            authority: 'goal_validation' as const,
+            sessionId: options.sessionId,
+            sourceId: activeGoal.id,
+            terminalSuccess: true,
+            independentValidation: validation.judgeFailedOpen !== true,
+            failedOpen: validation.judgeFailedOpen === true,
+            artifactVerificationPending: learningArtifactState?.pending.length ?? 0,
+            ambiguousExternalWrites: currentExternalWriteStatus === 'ambiguous' ? 1 : 0,
+            manifestRemaining: learningManifests.reduce((sum, manifest) => sum + manifest.remaining, 0),
+            manifestAnomalies: learningManifests.reduce((sum, manifest) => sum + manifest.anomalies.length, 0),
+            manifestUntrackedCheckpoints: learningManifests.reduce(
+              (sum, manifest) => sum + manifest.untrackedCheckpoints,
+              0,
+            ),
+            externalWriteRequired: freshExternalWriteRequired,
+            externalWriteReceipts: currentExternalWriteStatus === 'confirmed'
+              || acceptedExecutionEvidenceThisRequest
+              ? 1
+              : 0,
+          };
+          const learningDecision = evaluateLearningCandidate(learningInput);
+          recordLearningDecision(learningInput, learningDecision, {
+            goalId: activeGoal.id,
+            criteriaMet: validation.criteriaMet,
+            criteriaTotal: validation.criteriaTotal,
+          });
           // Capability compounding (C2): a satisfied goal that did real
-          // discovery distills into a reusable draft skill. Fire-and-forget —
-          // it gates on novelty internally and never blocks completion.
-          void maybeDistillSkill(options.sessionId, goalPlan.objective, evidenceText, activeGoal.id);
+          // discovery distills into a reusable draft skill only after the same
+          // durable evidence boundary that satisfied the goal issues a receipt.
+          // Fire-and-forget: learning never blocks completion.
+          if (learningDecision.receipt) {
+            void maybeDistillSkill(
+              options.sessionId,
+              goalPlan.objective,
+              evidenceText,
+              activeGoal.id,
+              learningDecision.receipt,
+            );
+          }
         } else if (!validation.judgeFailedOpen && attempt < maxAttempts) {
           nextInput = [
             `You marked this done, but external validation of the session's pinned goal found unmet criteria (attempt ${attempt}/${maxAttempts}):`,
@@ -3821,17 +3868,11 @@ async function runConversationCore(
           const judgeReason = skillGap
             ? `the "${skillGap.skill}" skill was loaded but NONE of its prescribed scripts ran (${skillGap.prescribed.join(', ')}) — the deliverable was hand-rolled instead of built by the skill's own pipeline`
             : verdict.reason;
-          // Self-improvement (C4): a judged not-done where a DRAFT skill was
-          // loaded counts against that draft (pitfall + failureCount; quarantine
-          // at the threshold). Approved skills are never demoted. Best-effort.
-          if (loadedSkills.length > 0) {
-            void (async () => {
-              try {
-                const { reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
-                await reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', judgeReason, options.sessionId);
-              } catch { /* best-effort */ }
-            })();
-          }
+          // This is a corrective continuation, not a terminal skill failure.
+          // Counting each "not done yet" bounce against a draft could quarantine
+          // a sound procedure after two loop iterations even when the run later
+          // succeeded. Keep the trajectory in the trace; procedural trust only
+          // changes at an accepted terminal evidence boundary.
           objectiveJudgeContinuations += 1;
           safeAppend({
             sessionId: options.sessionId,
@@ -4723,7 +4764,13 @@ function safeActiveGoal(sessionId: string): PlanProposal | null {
 /** Fire-and-forget skill distillation on a satisfied goal. Dynamic import keeps
  *  the distiller (and its model client) off the hot completion path; all gating
  *  + error handling lives inside distillSkillFromSession. */
-function maybeDistillSkill(sessionId: string, objective: string, evidence: string, goalId: string): void {
+function maybeDistillSkill(
+  sessionId: string,
+  objective: string,
+  evidence: string,
+  goalId: string,
+  learningReceipt: LearningReceipt,
+): void {
   void (async () => {
     try {
       const { distillSkillFromSession, reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
@@ -4731,12 +4778,21 @@ function maybeDistillSkill(sessionId: string, objective: string, evidence: strin
       // session leaned on (promotes a proven draft toward approved).
       try {
         const usedDrafts = gatherSessionSkills(sessionId).map((s) => s.name);
-        if (usedDrafts.length > 0) await reinforceDraftSkills(usedDrafts, 'success');
+        if (usedDrafts.length > 0) {
+          await reinforceDraftSkills(
+            usedDrafts,
+            'success',
+            undefined,
+            sessionId,
+            learningReceipt,
+          );
+        }
       } catch { /* reinforcement is best-effort */ }
       await distillSkillFromSession(sessionId, {
         objective,
         evidence,
         origin: { kind: 'chat', sourceId: goalId },
+        learningReceipt,
       });
     } catch { /* distillation never affects the run */ }
   })();

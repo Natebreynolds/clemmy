@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import matter from 'gray-matter';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-workflow-patterns-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -15,6 +16,18 @@ const {
   isPatternHealthy,
   renderWorkflowPatternHint,
 } = await import('./workflow-pattern-store.js');
+const { evaluateLearningCandidate } = await import('./learning-receipt.js');
+
+function receipt(runId: string) {
+  return evaluateLearningCandidate({
+    target: 'workflow_pattern',
+    authority: 'workflow_terminal',
+    sessionId: `workflow:${runId}:step`,
+    sourceId: runId,
+    terminalSuccess: true,
+    controllerValidation: true,
+  }).receipt!;
+}
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -39,6 +52,7 @@ test('records and recalls clean workflow patterns', () => {
     workflowSlug: 'weekly-seo-audit',
     runId: 'run-1',
     finalOutput: 'Saved report to /tmp/report.md with 8 opportunities.',
+    learningReceipt: receipt('run-1'),
   });
   assert.ok(first);
   assert.equal(first!.successCount, 1);
@@ -51,6 +65,7 @@ test('records and recalls clean workflow patterns', () => {
     workflowSlug: 'weekly-seo-audit',
     runId: 'run-2',
     finalOutput: 'Saved refreshed report to /tmp/report-2.md.',
+    learningReceipt: receipt('run-2'),
   });
   assert.equal(second!.successCount, 2);
 
@@ -74,6 +89,44 @@ test('misses unrelated workflow intents conservatively', () => {
   assert.equal(matches.length, 0);
 });
 
+test('legacy patterns stay auditable but cannot steer until one verified run rehabilitates them', () => {
+  const legacyWorkflow = {
+    name: 'Orchid Inventory',
+    description: 'Compile an exotic orchid greenhouse inventory',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'inventory', prompt: 'compile inventory', sideEffect: 'read' }],
+  };
+  const initial = recordSuccessfulWorkflowPattern({
+    workflow: legacyWorkflow as never,
+    workflowSlug: 'orchid-inventory',
+    runId: 'orchid-old',
+    finalOutput: 'inventory created',
+    learningReceipt: receipt('orchid-old'),
+  })!;
+  const parsed = matter(readFileSync(initial.filePath, 'utf-8'));
+  delete parsed.data.learningReceipt;
+  parsed.data.successCount = 7;
+  writeFileSync(initial.filePath, matter.stringify(parsed.content, parsed.data), 'utf-8');
+
+  assert.equal(
+    recallWorkflowPatterns('compile exotic orchid greenhouse inventory', 2).length,
+    0,
+    'pre-receipt workflow success cannot steer authoring',
+  );
+
+  const rehabilitated = recordSuccessfulWorkflowPattern({
+    workflow: legacyWorkflow as never,
+    workflowSlug: 'orchid-inventory',
+    runId: 'orchid-verified',
+    finalOutput: 'verified inventory created',
+    learningReceipt: receipt('orchid-verified'),
+  })!;
+  assert.equal(rehabilitated.successCount, 1);
+  assert.equal(rehabilitated.legacySuccessCount, 7);
+  assert.equal(recallWorkflowPatterns('compile exotic orchid greenhouse inventory', 2).length, 1);
+});
+
 // ─── pattern quality / decay (learning) ──────────────────────────────────────
 
 test('isPatternHealthy: net-positive with latest outcome clean → healthy; degraded → not', () => {
@@ -94,7 +147,13 @@ test('a degraded pattern drops out of recall until it succeeds again', () => {
     name: 'Nightly Lead Sync', description: 'Sync new leads from the CRM into the tracker',
     enabled: true, trigger: { manual: true }, steps: [{ id: 'sync', prompt: 'sync leads', sideEffect: 'write' }],
   };
-  recordSuccessfulWorkflowPattern({ workflow: wf as never, workflowSlug: 'nightly-lead-sync', runId: 'r1', finalOutput: 'synced 12 leads' });
+  recordSuccessfulWorkflowPattern({
+    workflow: wf as never,
+    workflowSlug: 'nightly-lead-sync',
+    runId: 'r1',
+    finalOutput: 'synced 12 leads',
+    learningReceipt: receipt('r1'),
+  });
   // recallable while healthy
   assert.ok(recallWorkflowPatterns('sync new leads from the crm into the tracker', 3).some((m) => m.record.workflowName === 'Nightly Lead Sync'));
 
@@ -103,7 +162,13 @@ test('a degraded pattern drops out of recall until it succeeds again', () => {
   assert.equal(recallWorkflowPatterns('sync new leads from the crm into the tracker', 3).some((m) => m.record.workflowName === 'Nightly Lead Sync'), false);
 
   // a fresh clean run recovers it (latest outcome clean again)
-  recordSuccessfulWorkflowPattern({ workflow: wf as never, workflowSlug: 'nightly-lead-sync', runId: 'r2', finalOutput: 'synced 9 leads' });
+  recordSuccessfulWorkflowPattern({
+    workflow: wf as never,
+    workflowSlug: 'nightly-lead-sync',
+    runId: 'r2',
+    finalOutput: 'synced 9 leads',
+    learningReceipt: receipt('r2'),
+  });
   assert.ok(recallWorkflowPatterns('sync new leads from the crm into the tracker', 3).some((m) => m.record.workflowName === 'Nightly Lead Sync'));
 });
 

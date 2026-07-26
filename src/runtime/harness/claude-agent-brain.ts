@@ -10,6 +10,10 @@ import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
+import {
+  evaluateLearningCandidate,
+  recordLearningDecision,
+} from '../../memory/learning-receipt.js';
 import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
 import { isUserFacingSession } from '../../execution/scope.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
@@ -94,9 +98,12 @@ import {
 } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
 import {
+  listRunArtifacts,
   listUnverifiedRunArtifacts,
   type RunArtifact,
 } from './artifact-ledger.js';
+import { summarizeWorkManifests } from './work-manifest.js';
+import { recordVerdictEvent } from '../../execution/verdict.js';
 import {
   createToolEconomyState,
   interactiveToolEconomyEnabled,
@@ -1721,6 +1728,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // (same-family, the model graded its own homework) — record that so the
   // completion is tagged "not independently verified", never a silent green check.
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
+  let completionIndependentlyVerified = false;
   let artifactVerificationPending: RunArtifact[] = [];
   let logicalRunScopeId: string | undefined;
   let result: ClaudeAgentSdkRunResult;
@@ -1837,6 +1845,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
               freshnessStatus as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
             );
           }
+          recordVerdictEvent(sessionId, 0, {
+            door: 'completion',
+            pass: done,
+            reason,
+            failedOpen: verdict.failedOpen,
+            selfJudge: verdict.selfJudge,
+            detail: { lane: 'claude_sdk', freshnessStatus },
+          });
           // A selfJudge NOT-DONE (same family as the brain) gets ONE bounce,
           // never two — the second disagreement is accepted with the advisory
           // tag (parity with loop.ts; ask-first batch regression).
@@ -1848,8 +1864,18 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
             completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
           }
+          if (done && !verdict.failedOpen && !verdict.selfJudge) {
+            completionIndependentlyVerified = true;
+          }
         } catch {
           completionVerification = { failedOpen: true };
+          recordVerdictEvent(sessionId, 0, {
+            door: 'completion',
+            pass: true,
+            reason: 'completion judge unavailable; lane failed open',
+            failedOpen: true,
+            detail: { lane: 'claude_sdk' },
+          });
           break;
         }
         if (done) break;
@@ -2282,24 +2308,72 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     replyText: text,
     toolArgTexts: result.toolUses,
   });
-  // Autonomous learning parity (2026-07-21): the orchestrator lane distills a
-  // reusable skill on goal satisfaction (loop.ts) and workflows distill on
-  // completion — but the DEFAULT Claude SDK brain lane did NOT, so Clementine
-  // learned on Codex/BYO + workflows but not on her own default brain (an
-  // "ever-learning across all models" asymmetry). Fire the SAME distiller on a
-  // successful multi-tool chat turn here. Draft-only + novelty/dedup gated
-  // INSIDE the distiller (the model call only runs for a genuinely novel
-  // multi-system success; trivial/repeat turns short-circuit cheaply), and
-  // fully detached so it never touches the delivery path. NOT reinforcement —
-  // that stays keyed to validated goal success on the orchestrator lane.
+  // Autonomous learning parity: every brain reaches the same evidence-first
+  // boundary. A clean independent judge, accepted execution controller, or
+  // verified artifact read-back can issue a receipt; failed-open/self-judged,
+  // paused, ambiguous, and incomplete runs remain useful traces but cannot
+  // silently become procedural memory.
   if (stoppedReason === 'success' && result.toolUses.length >= 2 && getSession(sessionId)?.kind === 'chat') {
+    const controllerVerified = claudeRequestHasAcceptedExecutionCompletion(
+      sessionId,
+      userInputEvent.seq,
+    );
+    const runArtifacts = logicalRunScopeId ? listRunArtifacts(sessionId, logicalRunScopeId) : [];
+    const artifactReadbackVerified = runArtifacts.length > 0 && artifactVerificationPending.length === 0;
+    const learningAuthority = completionIndependentlyVerified
+      ? 'independent_completion_judge' as const
+      : 'execution_controller' as const;
+    const learningManifests = summarizeWorkManifests(sessionId);
+    const learningExternalWriteStatus = freshExternalWriteRequired
+      ? claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq)
+      : 'confirmed';
+    const learningSourceId = attempt.runId ?? attempt.attemptId;
+    const learningInput = {
+      target: 'skill' as const,
+      authority: learningAuthority,
+      sessionId,
+      sourceId: learningSourceId,
+      terminalSuccess: true,
+      independentValidation: completionIndependentlyVerified,
+      controllerValidation: controllerVerified || artifactReadbackVerified,
+      failedOpen: completionVerification?.failedOpen === true,
+      selfJudge: completionVerification?.selfJudge === true,
+      artifactVerificationPending: artifactVerificationPending.length,
+      ambiguousExternalWrites: learningExternalWriteStatus === 'ambiguous' ? 1 : 0,
+      manifestRemaining: learningManifests.reduce((sum, manifest) => sum + manifest.remaining, 0),
+      manifestAnomalies: learningManifests.reduce((sum, manifest) => sum + manifest.anomalies.length, 0),
+      manifestUntrackedCheckpoints: learningManifests.reduce(
+        (sum, manifest) => sum + manifest.untrackedCheckpoints,
+        0,
+      ),
+      externalWriteRequired: freshExternalWriteRequired,
+      externalWriteReceipts: learningExternalWriteStatus === 'confirmed' || controllerVerified ? 1 : 0,
+    };
+    const learningDecision = evaluateLearningCandidate(learningInput);
+    recordLearningDecision(learningInput, learningDecision, {
+      lane: 'claude_sdk',
+      toolUses: result.toolUses.length,
+      artifactCount: runArtifacts.length,
+    });
     void (async () => {
       try {
-        const { distillSkillFromSession } = await import('../../memory/skill-distiller.js');
+        if (!learningDecision.receipt) return;
+        const { distillSkillFromSession, reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
+        const usedDrafts = gatherSessionSkills(sessionId).map((skill) => skill.name);
+        if (usedDrafts.length > 0) {
+          await reinforceDraftSkills(
+            usedDrafts,
+            'success',
+            undefined,
+            sessionId,
+            learningDecision.receipt,
+          );
+        }
         await distillSkillFromSession(sessionId, {
           objective: turnObjective,
           evidence: text.slice(0, 4000),
-          origin: { kind: 'chat', sourceId: sessionId },
+          origin: { kind: 'chat', sourceId: learningSourceId },
+          learningReceipt: learningDecision.receipt,
         });
       } catch { /* self-evolving is best-effort — never affects the turn */ }
     })();

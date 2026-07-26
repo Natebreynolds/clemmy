@@ -244,6 +244,12 @@ export interface SkillRow {
   bodyPreview?: string;
   tier?: 'draft' | 'approved';
   disabled?: boolean;
+  quarantined?: boolean;
+  useCount?: number;
+  failureCount?: number;
+  learningEvidenceStatus?: 'installed' | 'approved' | 'verified' | 'legacy_unverified';
+  learningAuthority?: string | null;
+  learningVerifiedAt?: string | null;
   supersededBy?: string | null;
   supersededAt?: string | null;
   hasScripts?: boolean;
@@ -259,6 +265,12 @@ export interface SkillDetail {
   body: string;
   tier?: 'draft' | 'approved';
   disabled?: boolean;
+  quarantined?: boolean;
+  useCount?: number;
+  failureCount?: number;
+  learningEvidenceStatus?: 'installed' | 'approved' | 'verified' | 'legacy_unverified';
+  learningAuthority?: string | null;
+  learningVerifiedAt?: string | null;
   supersededBy?: string | null;
   supersededAt?: string | null;
   source?: { repo?: string; updateAvailable?: boolean } | null;

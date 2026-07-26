@@ -62,6 +62,10 @@ import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { capacityAdvice } from '../runtime/harness/capacity-advisor.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { recordRunStrategy } from '../memory/run-strategy-store.js';
+import {
+  evaluateLearningCandidate,
+  recordLearningDecision,
+} from '../memory/learning-receipt.js';
 import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import {
@@ -1905,6 +1909,7 @@ function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
     'SELECT tool, COUNT(*) AS n FROM tool_outputs WHERE session_id = ? GROUP BY tool ORDER BY n DESC LIMIT 24',
   ).all(updated.runSessionId) as Array<{ tool: string | null; n: number }>;
   const toolsUsed = toolRows.map((r) => r.tool ?? '').filter((t) => t && !STRATEGY_META_TOOLS.has(t));
+  if (toolsUsed.length === 0) return;
   const workerCount = (db.prepare(
     "SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND type = 'worker_result'",
   ).get(updated.runSessionId) as { n: number } | undefined)?.n ?? 0;
@@ -1925,7 +1930,78 @@ function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
       if (targets.length > 0) deliverable = targets.slice(0, 2).join(', ');
     }
   } catch { /* deliverable capture is best-effort */ }
-  recordRunStrategy({ objective: updated.title || updated.prompt, toolsUsed, workerCount, durationMs, deliverable });
+
+  // A task record briefly said `done` during the old 120-account run even
+  // though its latest durable terminal event was awaiting input with an
+  // unverified Google Sheet binding. Read that terminal truth before allowing
+  // the run's shape to steer a future objective.
+  let awaitingUser = false;
+  let needsAttention = false;
+  let artifactVerificationPending = 0;
+  try {
+    const terminal = db.prepare(
+      "SELECT data_json FROM events WHERE session_id = ? AND type = 'conversation_completed' ORDER BY seq DESC LIMIT 1",
+    ).get(updated.runSessionId) as { data_json?: string } | undefined;
+    if (terminal?.data_json) {
+      const data = JSON.parse(terminal.data_json) as {
+        reason?: unknown;
+        awaitingUser?: unknown;
+        blockedReason?: unknown;
+        artifactVerification?: { status?: unknown; pending?: unknown; count?: unknown };
+      };
+      const reason = typeof data.reason === 'string' ? data.reason : '';
+      awaitingUser = data.awaitingUser === true || /awaiting_(?:user_)?input/i.test(reason);
+      needsAttention = Boolean(
+        typeof data.blockedReason === 'string' && data.blockedReason.trim(),
+      );
+      if (data.artifactVerification?.status === 'pending') {
+        const pending = Number(
+          data.artifactVerification.pending ?? data.artifactVerification.count ?? 1,
+        );
+        artifactVerificationPending = Number.isFinite(pending) ? Math.max(1, pending) : 1;
+      }
+    }
+  } catch {
+    needsAttention = true; // unreadable terminal truth cannot authorize learning
+  }
+
+  const completion = backgroundCompletionEvidence(updated);
+  const manifests = summarizeWorkManifests(updated.runSessionId);
+  const learningInput = {
+    target: 'strategy' as const,
+    authority: 'background_delivery_verifier' as const,
+    sessionId: updated.runSessionId,
+    sourceId: updated.id,
+    terminalSuccess: updated.status === 'done' && Boolean(updated.result?.trim()),
+    controllerValidation: updated.status === 'done',
+    awaitingUser,
+    needsAttention,
+    artifactVerificationPending,
+    ambiguousExternalWrites: completion.ambiguousExternalWrites,
+    manifestRemaining: manifests.reduce((sum, manifest) => sum + manifest.remaining, 0),
+    manifestAnomalies: manifests.reduce((sum, manifest) => sum + manifest.anomalies.length, 0),
+    manifestUntrackedCheckpoints: manifests.reduce(
+      (sum, manifest) => sum + manifest.untrackedCheckpoints,
+      0,
+    ),
+    externalWriteRequired: taskRequiresExternalSendReceipt(updated),
+    externalWriteReceipts: completion.externalWriteReceipts,
+  };
+  const learningDecision = evaluateLearningCandidate(learningInput);
+  recordLearningDecision(learningInput, learningDecision, {
+    taskId: updated.id,
+    workerCount,
+    toolCount: toolsUsed.length,
+  });
+  if (!learningDecision.receipt) return;
+  recordRunStrategy({
+    objective: updated.title || updated.prompt,
+    toolsUsed,
+    workerCount,
+    durationMs,
+    deliverable,
+    learningReceipt: learningDecision.receipt,
+  });
 }
 
 export function markBackgroundTaskDone(

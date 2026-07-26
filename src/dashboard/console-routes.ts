@@ -194,7 +194,15 @@ import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { getSavedClis, addSavedCli, removeSavedCli } from '../runtime/saved-clis.js';
-import { SKILLS_DIR, listActiveSkills, listSkills, loadSkill, uninstallSkill } from '../memory/skill-store.js';
+import {
+  SKILLS_DIR,
+  latestSkillLearningReceipt,
+  listActiveSkills,
+  listSkills,
+  loadSkill,
+  skillLearningEvidenceStatus,
+  uninstallSkill,
+} from '../memory/skill-store.js';
 import { checkAllSkillUpdates, getSkillInstallJob, startSkillInstall, startSkillUpdate } from '../runtime/skill-installer.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import { getAuthStatus, loginWithNativeOAuth, beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
@@ -6288,20 +6296,29 @@ export function registerConsoleRoutes(
       res.json({
         skillsDir: SKILLS_DIR,
         count: skills.length,
-        skills: skills.map((s) => ({
-          name: s.name,
-          description: s.frontmatter.description,
-          displayName: s.frontmatter.name,
-          bodyPreview: s.bodyPreview,
-          hasScripts: s.hasScripts,
-          hasReferences: s.hasReferences,
-          hasSrc: s.hasSrc,
-          tier: s.frontmatter.tier ?? 'approved',
-          disabled: Boolean(s.frontmatter.disabled),
-          supersededBy: s.frontmatter.supersededBy ?? null,
-          supersededAt: s.frontmatter.supersededAt ?? null,
-          source: s.source ?? null,
-        })),
+        skills: skills.map((s) => {
+          const learningReceipt = latestSkillLearningReceipt(s);
+          return {
+            name: s.name,
+            description: s.frontmatter.description,
+            displayName: s.frontmatter.name,
+            bodyPreview: s.bodyPreview,
+            hasScripts: s.hasScripts,
+            hasReferences: s.hasReferences,
+            hasSrc: s.hasSrc,
+            tier: s.frontmatter.tier ?? 'approved',
+            disabled: Boolean(s.frontmatter.disabled),
+            quarantined: Boolean(s.frontmatter.quarantined),
+            useCount: s.frontmatter.useCount ?? 0,
+            failureCount: s.frontmatter.failureCount ?? 0,
+            learningEvidenceStatus: skillLearningEvidenceStatus(s),
+            learningAuthority: learningReceipt?.authority ?? null,
+            learningVerifiedAt: learningReceipt?.verifiedAt ?? null,
+            supersededBy: s.frontmatter.supersededBy ?? null,
+            supersededAt: s.frontmatter.supersededAt ?? null,
+            source: s.source ?? null,
+          };
+        }),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -6336,6 +6353,7 @@ export function registerConsoleRoutes(
     // through loadSkill's canonical redirect.
     const skill = loadSkill(req.params.name, { raw: true });
     if (!skill) { res.status(404).json({ error: 'skill not found' }); return; }
+    const learningReceipt = latestSkillLearningReceipt(skill);
     res.json({
       name: skill.name,
       displayName: skill.frontmatter.name,
@@ -6343,6 +6361,12 @@ export function registerConsoleRoutes(
       body: skill.body,
       tier: skill.frontmatter.tier ?? 'approved',
       disabled: Boolean(skill.frontmatter.disabled),
+      quarantined: Boolean(skill.frontmatter.quarantined),
+      useCount: skill.frontmatter.useCount ?? 0,
+      failureCount: skill.frontmatter.failureCount ?? 0,
+      learningEvidenceStatus: skillLearningEvidenceStatus(skill),
+      learningAuthority: learningReceipt?.authority ?? null,
+      learningVerifiedAt: learningReceipt?.verifiedAt ?? null,
       supersededBy: skill.frontmatter.supersededBy ?? null,
       supersededAt: skill.frontmatter.supersededAt ?? null,
       source: skill.source ?? null,

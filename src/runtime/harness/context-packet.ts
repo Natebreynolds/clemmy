@@ -2,7 +2,10 @@ import { existsSync, statfsSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, getOpenAiApiKey } from '../../config.js';
 import { getFocusSnapshot } from '../../memory/focus.js';
-import { listActiveSkills } from '../../memory/skill-store.js';
+import {
+  listActiveSkills,
+  skillEligibleForAutomaticRecall,
+} from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
@@ -460,6 +463,11 @@ function rankSkills(
   if (queryTokens.length === 0) return [];
   try {
     return listActiveSkills()
+      .filter((skill) => (
+        opts.includeSemanticallyMatchedDrafts
+        || skillEligibleForAutomaticRecall(skill)
+        || explicitlyNamesCandidate(input, skill.name)
+      ))
       .map((skill) => {
         const description = skill.frontmatter.description || skill.bodyPreview || '';
         const { score, matched } = candidateScore(queryTokens, [

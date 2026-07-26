@@ -6,7 +6,7 @@ import { peerCommsEnabled } from '../agents/agent-comms.js';
 import { listSessions, listEvents, type EventRow } from '../runtime/harness/eventlog.js';
 import { readWorkflowEvents, type WorkflowEvent } from '../execution/workflow-events.js';
 import { listWorkflows } from '../memory/workflow-store.js';
-import { listWorkflowPatterns } from '../memory/workflow-pattern-store.js';
+import { listRecallableWorkflowPatterns } from '../memory/workflow-pattern-store.js';
 import {
   AGENT_INBOX_DIR,
   AGENT_STATE_DIR,
@@ -1192,7 +1192,7 @@ function collectWorkflowLearning(input: {
   cleanRuns: number;
   terminalRuns: number;
 }): WorkflowLearningSnapshot {
-  const patterns = listWorkflowPatterns();
+  const patterns = listRecallableWorkflowPatterns();
   const events = readRecentWorkflowPatternEvents(7);
   const remembers = events.filter((event) => workflowPatternAction(event) === 'remember').length;
   const recallHits = events.filter((event) => workflowPatternAction(event) === 'recall_hit').length;

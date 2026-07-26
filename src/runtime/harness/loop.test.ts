@@ -68,7 +68,14 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@openai/agents';
 
-const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
+const {
+  resetEventLog,
+  requestKill,
+  listEvents,
+  createSession,
+  appendEvent,
+  writeToolOutput,
+} = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
@@ -2364,6 +2371,59 @@ test('objective judge: gates premature completion and continues (action intent)'
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 2, 'judge forced a second step before completing');
   assert.equal(judgeCalls.length, 2);
+});
+
+test('objective judge continuation does not quarantine a draft that later succeeds', async () => {
+  const { loadSkill, writeDistilledSkill } = await import('../../memory/skill-store.js');
+  const skillName = 'loop-continuation-draft';
+  writeDistilledSkill({
+    name: skillName,
+    description: 'Build a research report from captured evidence.',
+    body: 'Build the report and verify the final artifact.',
+    origin: { kind: 'chat', sourceId: 'older-run' },
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'tool_called',
+    data: {
+      tool: 'skill_read',
+      callId: 'skill-loop-continuation',
+      arguments: JSON.stringify({ name: skillName }),
+    },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'skill-loop-continuation',
+    tool: 'skill_read',
+    output: `Loaded ${skillName}\n---\nBuild the report and verify the final artifact.`,
+  });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'first pass', reply: 'The draft is not saved yet.', done: true, nextAction: 'completed', reason: null } },
+    { finalOutput: { summary: 'finished', reply: 'Done — report saved to /tmp/final-report.md', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  let judgeCalls = 0;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build me a research report',
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return judgeCalls === 1
+        ? { done: false, reason: 'the report artifact is not saved yet' }
+        : { done: true, reason: 'the report exists' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(result.status, 'completed');
+  assert.equal(loadSkill(skillName)!.frontmatter.failureCount, 0);
+  assert.equal(loadSkill(skillName)!.frontmatter.quarantined ?? false, false);
 });
 
 test('objective judge: a successful read cannot certify a claimed build', async () => {

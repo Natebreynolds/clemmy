@@ -19,13 +19,25 @@ import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
-  writeDistilledSkill, loadSkill, listSkills, renderSkillsIndex,
-  updateSkillFrontmatter, appendSkillPitfall, SKILLS_DIR,
+  writeDistilledSkill, loadSkill, listSkills, renderSkillsIndex, findRelevantSkills,
+  updateSkillFrontmatter, appendSkillPitfall, skillLearningEvidenceStatus, SKILLS_DIR,
 } = await import('./skill-store.js');
 const { assessNovelty, reinforceDraftSkills, _testOnly_sanitizeDistilledSkillOutput } = await import('./skill-distiller.js');
+const { evaluateLearningCandidate } = await import('./learning-receipt.js');
 const { searchFactsByText } = await import('./facts.js');
 const { getFactEvidence } = await import('./temporal-memory.js');
 import type { TraceToolCall } from '../execution/trace-to-workflow.js';
+
+function successReceipt(sourceId: string) {
+  return evaluateLearningCandidate({
+    target: 'skill',
+    authority: 'independent_completion_judge',
+    sessionId: `session:${sourceId}`,
+    sourceId,
+    terminalSuccess: true,
+    independentValidation: true,
+  }).receipt!;
+}
 
 beforeEach(() => {
   rmSync(SKILLS_DIR, { recursive: true, force: true });
@@ -45,6 +57,28 @@ test('writeDistilledSkill writes a draft with provenance + counters', () => {
   assert.ok(skill.frontmatter.origin?.distilledAt);
   assert.equal(skill.frontmatter.useCount, 0);
   assert.match(skill.body, /Pull metrics/);
+  assert.equal(skillLearningEvidenceStatus(skill), 'legacy_unverified');
+});
+
+test('receipt-backed distilled skill is visibly verified', () => {
+  const learningReceipt = evaluateLearningCandidate({
+    target: 'skill',
+    authority: 'goal_validation',
+    sessionId: 'session-verified',
+    sourceId: 'goal-verified',
+    terminalSuccess: true,
+    independentValidation: true,
+  }).receipt!;
+  writeDistilledSkill({
+    name: 'verified-seo-brief',
+    description: 'Audit a site and write a verified SEO brief.',
+    body: '1. Pull metrics\n2. Verify the brief',
+    origin: { kind: 'chat', sourceId: 'goal-verified' },
+    learningReceipt,
+  });
+  const skill = loadSkill('verified-seo-brief')!;
+  assert.equal(skillLearningEvidenceStatus(skill), 'verified');
+  assert.equal(skill.frontmatter.learningReceipts?.[0]?.sourceId, 'goal-verified');
 });
 
 test('writeDistilledSkill rejects an unsafe name', () => {
@@ -52,16 +86,62 @@ test('writeDistilledSkill rejects an unsafe name', () => {
 });
 
 test('renderSkillsIndex separates draft block and hides quarantined drafts', () => {
-  writeDistilledSkill({ name: 'good-draft', description: 'a usable draft', body: 'do it', origin: { kind: 'chat' } });
-  writeDistilledSkill({ name: 'bad-draft', description: 'a quarantined draft', body: 'do it', origin: { kind: 'chat' } });
+  const verifiedReceipt = evaluateLearningCandidate({
+    target: 'skill',
+    authority: 'goal_validation',
+    sessionId: 'verified-index-session',
+    sourceId: 'verified-index-goal',
+    terminalSuccess: true,
+    independentValidation: true,
+  }).receipt!;
+  writeDistilledSkill({
+    name: 'good-draft',
+    description: 'a usable draft',
+    body: 'do it',
+    origin: { kind: 'chat' },
+    learningReceipt: verifiedReceipt,
+  });
+  writeDistilledSkill({
+    name: 'bad-draft',
+    description: 'a quarantined draft',
+    body: 'do it',
+    origin: { kind: 'chat' },
+    learningReceipt: verifiedReceipt,
+  });
+  writeDistilledSkill({
+    name: 'legacy-draft',
+    description: 'an unverified old draft',
+    body: 'do it',
+    origin: { kind: 'chat' },
+  });
   updateSkillFrontmatter('bad-draft', { quarantined: true });
 
   const index = renderSkillsIndex();
   assert.match(index, /Draft skills/, 'draft section present');
   assert.match(index, /good-draft/);
   assert.doesNotMatch(index, /bad-draft/, 'quarantined draft omitted from the index');
+  assert.doesNotMatch(index, /legacy-draft/, 'pre-receipt draft omitted from automatic recall');
   // But it is still on disk for the dashboard.
   assert.ok(loadSkill('bad-draft'));
+  assert.ok(loadSkill('legacy-draft'));
+});
+
+test('legacy draft stays out of ambient relevance but remains explicitly addressable', () => {
+  writeDistilledSkill({
+    name: 'legacy-orchid-inventory',
+    description: 'Compile an exotic orchid greenhouse inventory.',
+    body: 'old procedure',
+    origin: { kind: 'chat' },
+  });
+
+  assert.equal(
+    findRelevantSkills('Please compile an exotic orchid greenhouse inventory.').length,
+    0,
+  );
+  assert.equal(
+    findRelevantSkills('Use legacy-orchid-inventory for this task.')[0]?.skill.name,
+    'legacy-orchid-inventory',
+  );
 });
 
 test('updateSkillFrontmatter promotes a draft to approved; appendSkillPitfall reuses the section', () => {
@@ -158,11 +238,26 @@ test('distilled skill sanitizer accepts fenced schema-drifted JSON', () => {
 
 test('reinforce success promotes a draft to approved after 2 validated successes', async () => {
   writeDistilledSkill({ name: 'rein-ok', description: 'd', body: 'steps', origin: { kind: 'chat' } });
-  await reinforceDraftSkills(['rein-ok'], 'success');
+  await reinforceDraftSkills(['rein-ok'], 'success', undefined, undefined, successReceipt('rein-ok-1'));
   assert.equal(loadSkill('rein-ok')!.frontmatter.tier, 'draft', 'one success not enough');
   assert.equal(loadSkill('rein-ok')!.frontmatter.useCount, 1);
-  await reinforceDraftSkills(['rein-ok'], 'success');
+  await reinforceDraftSkills(['rein-ok'], 'success', undefined, undefined, successReceipt('rein-ok-2'));
   assert.equal(loadSkill('rein-ok')!.frontmatter.tier, 'approved', 'promoted at 2');
+  assert.equal(loadSkill('rein-ok')!.frontmatter.learningReceipts?.length, 2);
+});
+
+test('unreceipted success cannot inflate or promote a legacy draft', async () => {
+  writeDistilledSkill({
+    name: 'rein-unverified',
+    description: 'd',
+    body: 'steps',
+    origin: { kind: 'chat' },
+  });
+  await reinforceDraftSkills(['rein-unverified'], 'success');
+  const skill = loadSkill('rein-unverified')!;
+  assert.equal(skill.frontmatter.useCount, 0);
+  assert.equal(skill.frontmatter.tier, 'draft');
+  assert.equal(skillLearningEvidenceStatus(skill), 'legacy_unverified');
 });
 
 test('reinforce failure quarantines a draft after 2 failures and appends pitfalls', async () => {

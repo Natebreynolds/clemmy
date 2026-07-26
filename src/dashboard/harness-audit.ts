@@ -4,8 +4,17 @@ import { collectDiagnostics } from './diagnostics.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { listActiveScopes, listStandingGrants, listSendTrustGrants } from '../agents/plan-scope.js';
 import { loadTeamAgents } from '../tools/shared.js';
-import { listWorkflowPatterns } from '../memory/workflow-pattern-store.js';
+import {
+  getWorkflowPatternLearningStats,
+  listWorkflowPatterns,
+} from '../memory/workflow-pattern-store.js';
+import {
+  listActiveSkills,
+  skillLearningEvidenceStatus,
+} from '../memory/skill-store.js';
+import { getRunStrategyLearningStats } from '../memory/run-strategy-store.js';
 import { listRuns } from '../runtime/run-events.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { statSync } from 'node:fs';
 
@@ -317,6 +326,28 @@ function buildAgentChecks(): HarnessAuditCheck[] {
 
 function buildLearningChecks(): HarnessAuditCheck[] {
   const patterns = listWorkflowPatterns();
+  const patternEvidence = getWorkflowPatternLearningStats();
+  const skills = listActiveSkills();
+  const skillEvidence = skills.map((skill) => skillLearningEvidenceStatus(skill));
+  const verifiedDrafts = skillEvidence.filter((status) => status === 'verified').length;
+  const legacyDrafts = skillEvidence.filter((status) => status === 'legacy_unverified').length;
+  const strategyEvidence = getRunStrategyLearningStats();
+  let recentAccepted = 0;
+  let recentRejected = 0;
+  try {
+    const rows = openEventLog().prepare(
+      `SELECT
+         SUM(CASE WHEN json_extract(data_json, '$.eligible') = 1 THEN 1 ELSE 0 END) AS accepted,
+         SUM(CASE WHEN json_extract(data_json, '$.eligible') = 0 THEN 1 ELSE 0 END) AS rejected
+       FROM events
+       WHERE type = 'learning_candidate_evaluated'
+         AND created_at >= datetime('now', '-7 days')`,
+    ).get() as { accepted?: number | null; rejected?: number | null } | undefined;
+    recentAccepted = rows?.accepted ?? 0;
+    recentRejected = rows?.rejected ?? 0;
+  } catch {
+    // A missing/old event DB means no recent receipt telemetry yet.
+  }
   const latestWorkflowRuns = new Map<string, ReturnType<typeof listRuns>[number]>();
   for (const run of listRuns(80).filter((item) => item.source === 'workflow')) {
     const key = run.title?.replace(/^Workflow:\s*/, '') || run.id;
@@ -328,28 +359,61 @@ function buildLearningChecks(): HarnessAuditCheck[] {
   const currentCleanWorkflowCount = Array.from(latestWorkflowRuns.values())
     .filter((run) => run.status === 'completed' && !run.needsAttention)
     .length;
-  const patternCoverageWarn = patterns.length === 0
+  const patternCoverageWarn = patternEvidence.verified === 0
     ? currentCleanWorkflowCount > 0
-    : currentCleanWorkflowCount > patterns.length;
+    : currentCleanWorkflowCount > patternEvidence.verified;
   return [
     check(
       'workflow-patterns',
       'Workflow pattern memory',
-      patterns.length === 0 && currentCleanWorkflowCount > 0 ? 'warn' : 'pass',
-      patterns.length === 0
+      patternEvidence.legacyExcluded > 0 || (patterns.length === 0 && currentCleanWorkflowCount > 0)
+        ? 'warn'
+        : 'pass',
+      patternEvidence.legacyExcluded > 0
+        ? `${patternEvidence.verified} workflow pattern(s) are receipt-backed; ${patternEvidence.legacyExcluded} legacy pattern(s) are preserved for audit but excluded from procedural recall until a clean run rehabilitates them.`
+        : patterns.length === 0
         ? currentCleanWorkflowCount > 0
           ? 'Current clean workflow streams exist, but no workflow patterns have been recorded yet.'
           : 'No workflow pattern memory yet; it will fill after clean workflow runs.'
-        : `${patterns.length} learned workflow pattern(s) available for procedural recall.`,
+        : `${patternEvidence.verified} evidence-backed workflow pattern(s) available for procedural recall.`,
       'medium',
     ),
     check(
       'pattern-coverage',
       'Pattern coverage',
       patternCoverageWarn ? 'warn' : 'pass',
-      patterns.length > 0
-        ? `${patterns.length} pattern(s) cover ${currentCleanWorkflowCount} current clean workflow stream(s).`
+      patternEvidence.verified > 0
+        ? `${patternEvidence.verified} evidence-backed pattern(s) cover ${currentCleanWorkflowCount} current clean workflow stream(s).`
         : 'Pattern coverage starts after the first current clean workflow completion.',
+      'low',
+    ),
+    check(
+      'skill-learning-evidence',
+      'Skill learning evidence',
+      legacyDrafts > 0 ? 'warn' : 'pass',
+      legacyDrafts > 0
+        ? `${verifiedDrafts} self-distilled draft(s) are receipt-backed; ${legacyDrafts} legacy draft(s) predate learning receipts and are excluded from automatic recall until a clean run rehabilitates them.`
+        : verifiedDrafts > 0
+          ? `${verifiedDrafts} self-distilled draft(s) carry clean execution receipts.`
+          : 'No unverified self-distilled drafts are active.',
+      'medium',
+    ),
+    check(
+      'strategy-learning-evidence',
+      'Run-strategy learning evidence',
+      strategyEvidence.legacyExcluded > 0 ? 'warn' : 'pass',
+      strategyEvidence.legacyExcluded > 0
+        ? `${strategyEvidence.verified} strategy record(s) are receipt-backed; ${strategyEvidence.legacyExcluded} legacy record(s) are preserved for audit but excluded from prompt recall.`
+        : `${strategyEvidence.verified} strategy record(s) are receipt-backed and eligible for recall.`,
+      'high',
+    ),
+    check(
+      'recent-learning-decisions',
+      'Recent learning decisions',
+      'pass',
+      recentAccepted + recentRejected > 0
+        ? `${recentAccepted} candidate(s) accepted and ${recentRejected} unsafe/incomplete candidate(s) withheld in the last 7 days.`
+        : 'No automatic learning candidates have reached the new receipt boundary in the last 7 days yet.',
       'low',
     ),
   ];

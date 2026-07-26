@@ -90,6 +90,11 @@ export const EVENT_TYPES = [
   // captureInteractionSignals. Lets the trace show "Clementine learned
   // X from this turn" so memory growth is observable.
   'memory_signals_captured',
+  // Evidence-first procedural learning boundary. Every automatic candidate
+  // records whether it was eligible, which runtime authority verified it, and
+  // why a paused/degraded/ambiguous run was refused. The event never drives the
+  // run; it makes "why did Clem learn (or not learn) this?" auditable.
+  'learning_candidate_evaluated',
   // Cross-session prefix: when a new Discord (or other channel) session
   // opens within the continuity window of a prior same-channel session,
   // the harness prepends ONE event of this type carrying the prior

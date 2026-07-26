@@ -69,7 +69,14 @@ const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
-const { createSession, appendEvent, getSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const {
+  createSession,
+  appendEvent,
+  getSession,
+  listEvents,
+  writeToolOutput,
+} = await import('../runtime/harness/eventlog.js');
+const { renderRunStrategiesForContext } = await import('../memory/run-strategy-store.js');
 const { listNotifications, getNotificationDestinationsForRecord } = await import('../runtime/notifications.js');
 const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
@@ -3084,4 +3091,45 @@ test('tripwire widening: destination-cued draft promises are gated; bare text-dr
     runSessionId: bare.id,
     prompt: 'draft me some emails for the top accounts',
   }), false);
+});
+
+test('awaiting-input terminal truth cannot be learned as a successful background strategy', () => {
+  const task = createBackgroundTask({
+    title: 'Compile an exotic orchid greenhouse inventory',
+    prompt: 'Compile the exotic orchid greenhouse inventory and save it.',
+    source: 'desktop',
+  });
+  markBackgroundTaskRunning(task.id);
+  writeToolOutput({
+    sessionId: task.runSessionId,
+    callId: 'orchid-write',
+    tool: 'write_file',
+    output: 'provider create outcome unresolved',
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reason: 'awaiting_user_input',
+      awaitingUser: true,
+      blockedReason: 'artifact_binding_verification_pending',
+      artifactVerification: { status: 'pending', count: 1 },
+    },
+  });
+
+  markBackgroundTaskDone(task.id, 'The provider create is unresolved; tell me whether to retry.');
+
+  assert.equal(
+    renderRunStrategiesForContext('compile the exotic orchid greenhouse inventory'),
+    '',
+    'a transient done marker cannot poison future strategy recall',
+  );
+  const learning = listEvents(task.runSessionId, {
+    types: ['learning_candidate_evaluated'],
+  }).at(-1);
+  assert.ok(learning);
+  assert.equal(learning!.data.eligible, false);
+  assert.match(JSON.stringify(learning!.data.reasons), /awaiting user input|artifact binding/);
 });

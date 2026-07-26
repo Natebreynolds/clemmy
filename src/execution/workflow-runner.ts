@@ -29,6 +29,10 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import {
+  evaluateLearningCandidate,
+  recordLearningDecision,
+} from '../memory/learning-receipt.js';
+import {
   renderedComposioResultLooksFailed,
   type ComposioGatewayBlockReason,
 } from '../tools/composio-tools.js';
@@ -85,6 +89,7 @@ import {
 } from './workflow-events.js';
 import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import {
   runConversation,
   runConversationFromResume,
@@ -7970,24 +7975,59 @@ async function processOneRunFile(
           if ((run.selfHealAttempt ?? 0) > 0) {
             try { confirmPendingFix(run.id, new Date().toISOString()); } catch { /* best-effort */ }
           }
+          const stepSessionIds = (workflow.data.steps ?? []).map((s) => `workflow:${run.id}:${s.id}`);
+          const learningManifests = stepSessionIds.flatMap((sessionId) => {
+            try { return summarizeWorkManifests(sessionId); } catch { return []; }
+          });
+          const learningSignals = {
+            authority: 'workflow_terminal' as const,
+            sessionId: stepSessionIds[0] ?? `workflow:${run.id}`,
+            sourceId: run.id,
+            terminalSuccess: true,
+            controllerValidation: true,
+            failedOpen: goalVerdict?.judgeFailedOpen === true,
+            needsAttention,
+            manifestRemaining: learningManifests.reduce((sum, manifest) => sum + manifest.remaining, 0),
+            manifestAnomalies: learningManifests.reduce((sum, manifest) => sum + manifest.anomalies.length, 0),
+            manifestUntrackedCheckpoints: learningManifests.reduce(
+              (sum, manifest) => sum + manifest.untrackedCheckpoints,
+              0,
+            ),
+          };
+          const skillLearningInput = { target: 'skill' as const, ...learningSignals };
+          const skillLearningDecision = evaluateLearningCandidate(skillLearningInput);
+          recordLearningDecision(skillLearningInput, skillLearningDecision, {
+            workflow: workflow.name,
+            runId: run.id,
+            goalOutcome: goalDecision?.action ?? null,
+          });
+          const patternLearningInput = { target: 'workflow_pattern' as const, ...learningSignals };
+          const patternLearningDecision = evaluateLearningCandidate(patternLearningInput);
+          recordLearningDecision(patternLearningInput, patternLearningDecision, {
+            workflow: workflow.name,
+            runId: run.id,
+            goalOutcome: goalDecision?.action ?? null,
+          });
           void (async () => {
             try {
+              if (!skillLearningDecision.receipt) return;
               const { distillSkillFromSessions } = await import('../memory/skill-distiller.js');
-              const stepSessionIds = (workflow.data.steps ?? []).map((s) => `workflow:${run.id}:${s.id}`);
               await distillSkillFromSessions(stepSessionIds, {
                 objective: workflow.data.description || workflow.data.name,
                 evidence: typeof finalOutput === 'string' ? finalOutput : undefined,
                 sourceId: run.id,
+                learningReceipt: skillLearningDecision.receipt,
               });
             } catch { /* distillation never affects the run */ }
           })();
-          if (!run.targetStepId) {
+          if (!run.targetStepId && patternLearningDecision.receipt) {
             try {
               recordSuccessfulWorkflowPattern({
                 workflow: workflow.data,
                 workflowSlug: workflow.name,
                 runId: run.id,
                 finalOutput,
+                learningReceipt: patternLearningDecision.receipt,
               });
             } catch { /* pattern learning never affects the run */ }
             try {

@@ -1,9 +1,26 @@
 import { readdirSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { listActiveSkills, loadSkill, type Skill } from '../memory/skill-store.js';
+import {
+  latestSkillLearningReceipt,
+  listActiveSkills,
+  loadSkill,
+  skillLearningEvidenceStatus,
+  type Skill,
+} from '../memory/skill-store.js';
 import { checkSkillPreconditions } from '../runtime/capability-preconditions.js';
 import { textResult } from './shared.js';
+
+/** Runtime check for the model-facing manual distillation authority. A tool
+ * choice alone is not proof that the user asked Clementine to remember a
+ * procedure; the latest real user turn must carry that intent. */
+export function userRequestedSkillDistillation(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return /\b(?:remember|save|distill|capture|learn)\b[^.!?\n]{0,120}\b(?:this|that|how|procedure|process|workflow|skill|playbook|approach)\b/i.test(normalized)
+    || /\b(?:turn|make)\b[^.!?\n]{0,80}\b(?:this|that|it)\b[^.!?\n]{0,80}\b(?:reusable|skill|playbook|procedure|workflow)\b/i.test(normalized)
+    || /\b(?:skill|playbook|procedure|workflow)\b[^.!?\n]{0,100}\b(?:remember|save|distill|capture)\b/i.test(normalized);
+}
 
 /**
  * List up to 20 top-level entries in the skill directory. Helps the
@@ -63,7 +80,7 @@ export function registerSkillTools(server: McpServer): void {
     'skill_list',
     [
       'List installed SKILL.md skills (Anthropic Skills format) with name + one-line description.',
-      'Skills are reusable prompt modules — personas, design systems, domain knowledge, style guides — that the user installed from GitHub.',
+      'Skills are reusable procedures or prompt modules — installed by the user or learned from prior work. Evidence labels distinguish trusted automatic recall from legacy drafts.',
       'Call this at the start of a task when you need specialized knowledge (design taste, copywriting voice, domain rules, etc.). If a listed skill looks relevant, follow up with `skill_read(name)` to load the full instructions.',
     ].join('\n'),
     {},
@@ -72,7 +89,15 @@ export function registerSkillTools(server: McpServer): void {
       if (skills.length === 0) {
         return textResult('No skills installed. The user can install skills from GitHub via the Skills panel in the dashboard.');
       }
-      const lines = skills.map((s) => `- ${s.name}: ${s.frontmatter.description || '(no description)'}`);
+      const lines = skills.map((s) => {
+        const evidence = skillLearningEvidenceStatus(s);
+        const label = evidence === 'legacy_unverified'
+          ? ' [legacy draft — not eligible for automatic recall]'
+          : evidence === 'verified'
+            ? ' [evidence-backed draft]'
+            : '';
+        return `- ${s.name}${label}: ${s.frontmatter.description || '(no description)'}`;
+      });
       return textResult(`${skills.length} installed skill${skills.length === 1 ? '' : 's'}:\n${lines.join('\n')}\n\nUse skill_read("<name>") to load the full instructions.`);
     },
   );
@@ -108,14 +133,28 @@ export function registerSkillTools(server: McpServer): void {
       // A self-distilled DRAFT carries a trust banner: its proven tool slugs +
       // arg shapes are reliable (they ran successfully once), but the procedure
       // prose is unreviewed — so use it, but verify outputs.
-      const draftBanner = skill.frontmatter.tier === 'draft'
+      const learningEvidence = skillLearningEvidenceStatus(skill);
+      const learningReceipt = latestSkillLearningReceipt(skill);
+      const draftBanner = learningEvidence === 'legacy_unverified'
         ? [
-            '🧪 DRAFT SKILL — self-distilled from a prior successful run'
-              + (skill.frontmatter.origin?.distilledAt ? ` on ${String(skill.frontmatter.origin.distilledAt).slice(0, 10)}` : '')
-              + '. The tool slugs and argument shapes below were PROVEN in that run; the procedure text is UNREVIEWED. Follow it, but verify the outputs.',
+            '⚠️ UNVERIFIED LEGACY DRAFT — this procedure predates execution learning receipts, so its claimed success cannot be proven.',
+            'Do not treat its tool slugs, arguments, or completion claims as established. Use it only when the user explicitly selected it or for inspection, and independently verify every result.',
             '',
           ].join('\n')
-        : '';
+        : learningReceipt?.authority === 'manual_user_request'
+          ? [
+              '📝 USER-REQUESTED DRAFT — the user explicitly asked Clementine to preserve this procedure, but that request is not independent execution proof.',
+              'Treat the sequence and prose as unreviewed and verify every output.',
+              '',
+            ].join('\n')
+          : skill.frontmatter.tier === 'draft'
+            ? [
+                '🧪 DRAFT SKILL — self-distilled from a prior successful run'
+                  + (skill.frontmatter.origin?.distilledAt ? ` on ${String(skill.frontmatter.origin.distilledAt).slice(0, 10)}` : '')
+                  + '. The tool slugs and argument shapes below were PROVEN in that run; the procedure text is UNREVIEWED. Follow it, but verify the outputs.',
+                '',
+              ].join('\n')
+            : '';
 
       const head = [
         notReadyBanner,
@@ -174,7 +213,8 @@ export function registerSkillTools(server: McpServer): void {
     'skill_distill',
     [
       'Distill the work you just did in THIS conversation into a reusable DRAFT skill, so the capability compounds and you do not have to re-figure it out next time.',
-      'Use when the user says "remember how to do this", "save this as a skill/playbook", or after you worked out a non-obvious multi-step procedure worth keeping.',
+      'Use only when the user explicitly says "remember how to do this", "save this as a skill/playbook", or otherwise directly asks you to preserve the procedure.',
+      'Do not call this autonomously after ordinary work; verified automatic learning is handled by the runtime.',
       'Captures the proven tool sequence + argument shapes; writes a draft skill the user can approve from the Skills panel.',
     ].join('\n'),
     {
@@ -186,10 +226,35 @@ export function registerSkillTools(server: McpServer): void {
       if (!sessionId) {
         return textResult('I can only distill a skill from inside an active conversation with a recorded tool trace.');
       }
+      const { listEvents } = await import('../runtime/harness/eventlog.js');
+      const latestUserText = listEvents(sessionId, {
+        types: ['user_input_received'],
+        desc: true,
+        limit: 20,
+      }).find((event) => event.role === 'user' && typeof event.data.text === 'string')
+        ?.data.text as string | undefined;
+      if (!latestUserText || !userRequestedSkillDistillation(latestUserText)) {
+        return textResult(
+          'I did not distill a skill because the latest user message did not explicitly ask me to preserve this procedure. Verified automatic learning is handled by the runtime after a clean execution.',
+        );
+      }
+      const { evaluateLearningCandidate } = await import('../memory/learning-receipt.js');
+      const learningReceipt = evaluateLearningCandidate({
+        target: 'skill',
+        authority: 'manual_user_request',
+        sessionId,
+        sourceId: sessionId,
+        terminalSuccess: true,
+        explicitUserRequest: true,
+      }).receipt;
+      if (!learningReceipt) {
+        return textResult('I could not establish explicit user authority to distill this procedure.');
+      }
       const { distillSkillFromSession } = await import('../memory/skill-distiller.js');
       const result = await distillSkillFromSession(sessionId, {
         objective,
         origin: { kind: 'manual', sourceId: sessionId },
+        learningReceipt,
         force: true,
       });
       switch (result.status) {

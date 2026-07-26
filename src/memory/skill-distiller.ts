@@ -27,8 +27,13 @@ import {
   SKILLS_DIR, ensureSkillsDir, loadSkill, writeDistilledSkill, isSafeSkillName,
   updateSkillFrontmatter, appendSkillPitfall, findDistilledSkillByCapabilityTask,
   claimSkillCapabilityFingerprint, capabilityTaskFingerprint, recordSkillCapabilityOrigin,
+  recordSkillLearningReceipt,
   type SkillOrigin,
 } from './skill-store.js';
+import {
+  isValidLearningReceipt,
+  type LearningReceipt,
+} from './learning-receipt.js';
 import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
 import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
@@ -567,9 +572,34 @@ function availableDistilledSkillName(preferred: string, fingerprint: string): st
 }
 
 export interface DistillResult {
-  status: 'written' | 'skipped_not_novel' | 'skipped_duplicate' | 'skipped_disabled' | 'failed';
+  status: 'written' | 'skipped_not_novel' | 'skipped_unverified' | 'skipped_duplicate' | 'skipped_disabled' | 'failed';
   name?: string;
   detail?: string;
+}
+
+interface SkillDistillContext {
+  objective: string;
+  evidence?: string;
+  origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string };
+  learningReceipt?: LearningReceipt;
+  force?: boolean;
+}
+
+/** Every caller supplies a receipt issued by its execution boundary. The
+ * model-facing manual tool may skip novelty with `force`, but the tool itself
+ * must first prove that the latest real user message requested distillation. */
+function resolveLearningReceipt(
+  sessionId: string,
+  context: SkillDistillContext,
+): LearningReceipt | null {
+  if (context.learningReceipt && isValidLearningReceipt(context.learningReceipt, {
+    target: 'skill',
+    sessionId,
+    ...(context.origin.sourceId ? { sourceId: context.origin.sourceId } : {}),
+  })) {
+    return context.learningReceipt;
+  }
+  return null;
 }
 
 /** Shared front door for manual distillation, satisfied chat goals, and
@@ -578,6 +608,7 @@ export interface DistillResult {
 function reuseExistingCapability(
   objective: string,
   origin?: Omit<SkillOrigin, 'distilledAt'>,
+  learningReceipt?: LearningReceipt,
 ): DistillResult | null {
   if (!objective.trim()) return null;
   const match = findDistilledSkillByCapabilityTask(objective);
@@ -588,6 +619,7 @@ function reuseExistingCapability(
   // Preserve the new run/session as lineage evidence instead; counters remain
   // owned by reinforceDraftSkills at the validated execution boundary.
   if (origin) recordSkillCapabilityOrigin(match.skill.name, origin);
+  if (learningReceipt) recordSkillLearningReceipt(match.skill.name, learningReceipt);
   return {
     status: 'skipped_duplicate',
     name: match.skill.name,
@@ -598,9 +630,13 @@ function reuseExistingCapability(
 async function reuseExistingCapabilityLocked(
   objective: string,
   origin?: Omit<SkillOrigin, 'distilledAt'>,
+  learningReceipt?: LearningReceipt,
 ): Promise<DistillResult | null> {
   ensureSkillsDir();
-  return withFileLock(CAPABILITY_CLAIM_LOCK_FILE, () => reuseExistingCapability(objective, origin));
+  return withFileLock(
+    CAPABILITY_CLAIM_LOCK_FILE,
+    () => reuseExistingCapability(objective, origin, learningReceipt),
+  );
 }
 
 interface DistilledCapabilityClaim {
@@ -610,6 +646,7 @@ interface DistilledCapabilityClaim {
   objective: string;
   origin: Omit<SkillOrigin, 'distilledAt'>;
   applicability: { toolFamilies: string[]; entitySlots: string[] };
+  learningReceipt: LearningReceipt;
 }
 
 /**
@@ -621,7 +658,7 @@ interface DistilledCapabilityClaim {
 async function claimDistilledCapability(input: DistilledCapabilityClaim): Promise<DistillResult> {
   ensureSkillsDir();
   return withFileLock(CAPABILITY_CLAIM_LOCK_FILE, () => {
-    const duplicate = reuseExistingCapability(input.objective, input.origin);
+    const duplicate = reuseExistingCapability(input.objective, input.origin, input.learningReceipt);
     if (duplicate) return duplicate;
 
     const fingerprint = capabilityTaskFingerprint(input.objective);
@@ -633,6 +670,7 @@ async function claimDistilledCapability(input: DistilledCapabilityClaim): Promis
       origin: input.origin,
       capabilityTask: input.objective,
       applicability: input.applicability,
+      learningReceipt: input.learningReceipt,
     });
     return name
       ? { status: 'written', name }
@@ -649,8 +687,9 @@ export async function _testOnly_claimDistilledCapability(
 export async function _testOnly_reuseExistingCapability(
   objective: string,
   origin?: Omit<SkillOrigin, 'distilledAt'>,
+  learningReceipt?: LearningReceipt,
 ): Promise<DistillResult | null> {
-  return reuseExistingCapabilityLocked(objective, origin);
+  return reuseExistingCapabilityLocked(objective, origin, learningReceipt);
 }
 
 /**
@@ -660,11 +699,23 @@ export async function _testOnly_reuseExistingCapability(
  */
 export async function distillSkillFromSession(
   sessionId: string,
-  context: { objective: string; evidence?: string; origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string }; force?: boolean },
+  context: SkillDistillContext,
 ): Promise<DistillResult> {
   if (!distillerEnabled()) return { status: 'skipped_disabled' };
   try {
-    const existing = await reuseExistingCapabilityLocked(context.objective, context.origin);
+    const learningReceipt = resolveLearningReceipt(sessionId, context);
+    if (!learningReceipt) {
+      return {
+        status: 'skipped_unverified',
+        detail: 'automatic distillation requires a clean execution learning receipt',
+      };
+    }
+    const verifiedContext = { ...context, learningReceipt };
+    const existing = await reuseExistingCapabilityLocked(
+      context.objective,
+      context.origin,
+      learningReceipt,
+    );
     if (existing) return existing;
     const calls = readSessionTrace(sessionId);
     const returnsByCallId = readSessionToolReturns(sessionId);
@@ -673,7 +724,7 @@ export async function distillSkillFromSession(
       if (!novelty.novel) return { status: 'skipped_not_novel', detail: novelty.reason };
     }
     if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
-    return distillFromCalls(calls, context, returnsByCallId);
+    return distillFromCalls(calls, verifiedContext, returnsByCallId);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err, sessionId }, 'skill distillation failed');
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
@@ -684,7 +735,7 @@ export async function distillSkillFromSession(
  *  Assumes the caller already passed the novelty gate (or force). */
 async function distillFromCalls(
   calls: TraceToolCall[],
-  context: { objective: string; evidence?: string; origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string } },
+  context: SkillDistillContext & { learningReceipt: LearningReceipt },
   returnsByCallId: Map<string, string> = new Map(),
 ): Promise<DistillResult> {
   try {
@@ -723,6 +774,7 @@ async function distillFromCalls(
       objective: context.objective,
       origin: context.origin,
       applicability,
+      learningReceipt: context.learningReceipt,
     });
     if (claim.status !== 'written' || !claim.name) return claim;
     const name = claim.name;
@@ -754,13 +806,23 @@ async function distillFromCalls(
  */
 export async function distillSkillFromSessions(
   sessionIds: string[],
-  context: { objective: string; evidence?: string; sourceId?: string },
+  context: { objective: string; evidence?: string; sourceId?: string; learningReceipt?: LearningReceipt },
 ): Promise<DistillResult> {
   if (!distillerEnabled()) return { status: 'skipped_disabled' };
   try {
+    const learningReceipt = context.learningReceipt;
+    if (!learningReceipt || !isValidLearningReceipt(learningReceipt, {
+      target: 'skill',
+      ...(context.sourceId ? { sourceId: context.sourceId } : {}),
+    })) {
+      return {
+        status: 'skipped_unverified',
+        detail: 'automatic workflow distillation requires a clean execution learning receipt',
+      };
+    }
     const existing = await reuseExistingCapabilityLocked(context.objective, {
       kind: 'workflow', sourceId: context.sourceId,
-    });
+    }, learningReceipt);
     if (existing) return existing;
     const calls = sessionIds.flatMap((id) => {
       try { return readSessionTrace(id); } catch { return []; }
@@ -779,6 +841,7 @@ export async function distillSkillFromSessions(
       objective: context.objective,
       evidence: context.evidence ?? '',
       origin: { kind: 'workflow', sourceId: context.sourceId },
+      learningReceipt,
     }, returnsByCallId);
   } catch (err) {
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
@@ -789,7 +852,8 @@ export async function distillSkillFromSessions(
  * Self-improvement (C4): reinforce the DRAFT skills that were loaded in a
  * session, based on whether that session ultimately succeeded. A draft only —
  * approved skills are never auto-demoted (the user blessed them).
- *  - success: useCount++, and promote to `approved` at 2 validated successes.
+ *  - success: with a valid learning receipt, useCount++, attach the receipt,
+ *    and promote to `approved` at 2 validated successes.
  *  - failure: failureCount++ + a dated pitfall line, and quarantine at 2.
  * Best-effort; only touches drafts, so a session with no loaded drafts is a
  * cheap no-op.
@@ -799,8 +863,16 @@ export async function reinforceDraftSkills(
   outcome: 'success' | 'failure',
   reason?: string,
   sessionId?: string,
+  learningReceipt?: LearningReceipt,
 ): Promise<void> {
   if (!distillerEnabled()) return;
+  const verifiedSuccessReceipt = isValidLearningReceipt(learningReceipt, {
+    target: 'skill',
+    ...(sessionId ? { sessionId } : {}),
+  })
+    ? learningReceipt
+    : null;
+  if (outcome === 'success' && !verifiedSuccessReceipt) return;
   // On failure, prefer a STRUCTURED recovery tip mined from the session's
   // failed-then-corrected trajectory (error signature → corrective retry) over
   // the flat judge reason. Computed ONCE per call, shared across the drafts.
@@ -816,6 +888,8 @@ export async function reinforceDraftSkills(
       if (!skill || skill.frontmatter.tier !== 'draft' || skill.frontmatter.quarantined) continue;
       const canonicalName = skill.name;
       if (outcome === 'success') {
+        if (!verifiedSuccessReceipt) continue;
+        recordSkillLearningReceipt(canonicalName, verifiedSuccessReceipt);
         const useCount = (skill.frontmatter.useCount ?? 0) + 1;
         updateSkillFrontmatter(canonicalName, useCount >= 2 ? { useCount, tier: 'approved' } : { useCount });
       } else {

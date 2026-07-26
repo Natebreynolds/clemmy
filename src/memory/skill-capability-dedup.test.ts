@@ -34,6 +34,24 @@ const {
   distillSkillFromSessions,
   reinforceDraftSkills,
 } = await import('./skill-distiller.js');
+const { evaluateLearningCandidate } = await import('./learning-receipt.js');
+
+function receipt(
+  sessionId: string,
+  sourceId: string,
+  authority: 'workflow_terminal' | 'independent_completion_judge' = 'workflow_terminal',
+) {
+  return evaluateLearningCandidate({
+    target: 'skill',
+    authority,
+    sessionId,
+    sourceId,
+    terminalSuccess: true,
+    ...(authority === 'workflow_terminal'
+      ? { controllerValidation: true }
+      : { independentValidation: true }),
+  }).receipt!;
+}
 
 beforeEach(() => {
   rmSync(SKILLS_DIR, { recursive: true, force: true });
@@ -93,7 +111,11 @@ test('legacy distilled skill is matched, backfilled, and records repeat lineage 
   assert.equal(match?.skill.name, 'legacy-seo-brief');
   assert.equal(match?.legacy, true);
 
-  const result = await _testOnly_reuseExistingCapability(objective, { kind: 'workflow', sourceId: 'repeat-run' });
+  const result = await _testOnly_reuseExistingCapability(
+    objective,
+    { kind: 'workflow', sourceId: 'repeat-run' },
+    receipt('workflow:repeat-run:step', 'repeat-run'),
+  );
   assert.equal(result?.status, 'skipped_duplicate');
   assert.equal(result?.name, 'legacy-seo-brief');
   const reused = loadSkill('legacy-seo-brief')!;
@@ -117,6 +139,11 @@ test('manual/session and automatic/workflow distillation share the pre-LLM dedup
   const manual = await distillSkillFromSession('missing-session-is-never-read', {
     objective: 'Deploy a landing page using Netlify.',
     origin: { kind: 'manual', sourceId: 'manual-session' },
+    learningReceipt: receipt(
+      'missing-session-is-never-read',
+      'manual-session',
+      'independent_completion_judge',
+    ),
     force: true,
   });
   assert.equal(manual.status, 'skipped_duplicate');
@@ -125,6 +152,7 @@ test('manual/session and automatic/workflow distillation share the pre-LLM dedup
   const workflow = await distillSkillFromSessions([], {
     objective: 'Release a landing page on Netlify.',
     sourceId: 'workflow-run',
+    learningReceipt: receipt('workflow:workflow-run:step', 'workflow-run'),
   });
   assert.equal(workflow.status, 'skipped_duplicate');
   assert.equal(workflow.name, 'publish-netlify-site');
@@ -137,6 +165,28 @@ test('manual/session and automatic/workflow distillation share the pre-LLM dedup
   assert.equal(listSkills().length, 1);
 });
 
+test('automatic distillation cannot mutate lineage without a verified learning receipt', async () => {
+  const objective = 'Publish a landing page to Netlify.';
+  writeDistilledSkill({
+    name: 'receipt-gated-netlify',
+    description: 'Deploy a landing page.',
+    body: 'Deploy it.',
+    origin: { kind: 'chat', sourceId: 'verified-original' },
+    capabilityTask: objective,
+  });
+
+  const rejected = await distillSkillFromSessions([], {
+    objective: 'Release a landing page on Netlify.',
+    sourceId: 'unverified-run',
+  });
+  assert.equal(rejected.status, 'skipped_unverified');
+  assert.deepEqual(
+    loadSkill('receipt-gated-netlify')!.frontmatter.capabilityOrigins?.map((origin) => origin.sourceId),
+    ['verified-original'],
+    'an unverified run cannot even inflate capability lineage',
+  );
+});
+
 test('concurrent post-LLM claims atomically create one active capability', async () => {
   const objective = 'Publish a landing page to Netlify.';
   const results = await Promise.all([
@@ -147,6 +197,7 @@ test('concurrent post-LLM claims atomically create one active capability', async
       objective,
       origin: { kind: 'chat', sourceId: 'concurrent-a' },
       applicability: { toolFamilies: ['netlify'], entitySlots: [] },
+      learningReceipt: receipt('session-a', 'concurrent-a', 'independent_completion_judge'),
     }),
     _testOnly_claimDistilledCapability({
       preferredName: 'publish-netlify-site-b',
@@ -155,6 +206,7 @@ test('concurrent post-LLM claims atomically create one active capability', async
       objective: 'Deploy a landing page using Netlify.',
       origin: { kind: 'workflow', sourceId: 'concurrent-b' },
       applicability: { toolFamilies: ['netlify'], entitySlots: [] },
+      learningReceipt: receipt('workflow:concurrent-b:step', 'concurrent-b'),
     }),
   ]);
 
@@ -220,7 +272,13 @@ test('known duplicate drafts reconcile without deletion and retain every origin 
   assert.equal(listSkills().length, 3, 'management/audit keeps the complete catalog');
   assert.deepEqual(listActiveSkills().map((skill) => skill.name), ['daily-standup-email-brief', 'user-approved-standup']);
 
-  await reinforceDraftSkills(['email-daily-standup-from-calendar-and-tasks'], 'success');
+  await reinforceDraftSkills(
+    ['email-daily-standup-from-calendar-and-tasks'],
+    'success',
+    undefined,
+    undefined,
+    receipt('standup-reinforce-session', 'standup-reinforce', 'independent_completion_judge'),
+  );
   assert.equal(loadSkill('daily-standup-email-brief')!.frontmatter.useCount, 1, 'stale alias reinforces canonical');
   assert.equal(loadSkill('email-daily-standup-from-calendar-and-tasks', { raw: true })!.frontmatter.useCount, 0);
 });

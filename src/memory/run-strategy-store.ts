@@ -1,6 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import {
+  isValidLearningReceipt,
+  type LearningReceipt,
+} from './learning-receipt.js';
 
 /**
  * Run-strategy memory (DREAM learning loop v1): after a background run
@@ -30,6 +34,10 @@ export interface RunStrategyRecord {
   createdAt: string;
   uses: number;
   lastUsedAt?: string;
+  /** Runtime-owned proof that at least one clean execution authorized recall. */
+  learningReceipt?: LearningReceipt;
+  /** Pre-receipt observations retained for audit, never counted as proof. */
+  legacyUses?: number;
 }
 
 interface StrategyFile {
@@ -90,12 +98,14 @@ export interface RecordRunStrategyInput {
   workerCount: number;
   durationMs: number;
   deliverable?: string;
+  learningReceipt: LearningReceipt;
 }
 
 /** Record a successful run's shape. Near-duplicate objectives (≥0.8 keyword
  *  overlap) UPDATE the existing record — evidence accumulates, the store does
  *  not fill with restatements of the same job. */
 export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRecord | null {
+  if (!isValidLearningReceipt(input.learningReceipt, { target: 'strategy' })) return null;
   const objective = (input.objective ?? '').trim().slice(0, MAX_OBJECTIVE_CHARS);
   const toolsUsed = [...new Set(input.toolsUsed.map((t) => t.trim()).filter(Boolean))].slice(0, 8);
   if (!objective || toolsUsed.length === 0) return null; // a run that used no real tools teaches nothing
@@ -105,12 +115,15 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   const now = new Date().toISOString();
   const existing = file.strategies.find((s) => overlapScore(keywords, s.keywords) >= 0.8);
   if (existing) {
+    const wasVerified = isValidLearningReceipt(existing.learningReceipt, { target: 'strategy' });
     existing.toolsUsed = toolsUsed;
     existing.workerCount = input.workerCount;
     existing.durationMs = input.durationMs;
     if (input.deliverable?.trim()) existing.deliverable = input.deliverable.trim().slice(0, 240);
-    existing.uses += 1;
+    if (!wasVerified && existing.uses > 0) existing.legacyUses = existing.uses;
+    existing.uses = wasVerified ? existing.uses + 1 : 1;
     existing.lastUsedAt = now;
+    existing.learningReceipt = input.learningReceipt;
     writeStore(file);
     return existing;
   }
@@ -124,6 +137,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     ...(input.deliverable?.trim() ? { deliverable: input.deliverable.trim().slice(0, 240) } : {}),
     createdAt: now,
     uses: 1,
+    learningReceipt: input.learningReceipt,
   };
   file.strategies.push(record);
   if (file.strategies.length > MAX_RECORDS) {
@@ -149,10 +163,31 @@ export function renderRunStrategiesForContext(objective: string | undefined, lim
   if (keywords.length === 0) return '';
   const file = readStore();
   const scored = file.strategies
+    .filter((s) => isValidLearningReceipt(s.learningReceipt, { target: 'strategy' }))
     .map((s) => ({ s, score: overlapScore(keywords, s.keywords) }))
     .filter((x) => x.score >= 0.34)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
   if (scored.length === 0) return '';
   return scored.map((x) => renderOne(x.s)).join('\n');
+}
+
+export interface RunStrategyLearningStats {
+  total: number;
+  verified: number;
+  legacyExcluded: number;
+}
+
+/** Audit projection: legacy records remain on disk but cannot steer a run until
+ * one clean, receipt-backed execution rehabilitates them. */
+export function getRunStrategyLearningStats(): RunStrategyLearningStats {
+  const strategies = readStore().strategies;
+  const verified = strategies.filter((strategy) => (
+    isValidLearningReceipt(strategy.learningReceipt, { target: 'strategy' })
+  )).length;
+  return {
+    total: strategies.length,
+    verified,
+    legacyExcluded: strategies.length - verified,
+  };
 }

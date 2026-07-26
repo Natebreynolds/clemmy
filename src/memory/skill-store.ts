@@ -3,6 +3,10 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import {
+  isValidLearningReceipt,
+  type LearningReceipt,
+} from './learning-receipt.js';
 
 /**
  * SKILL.md skill store.
@@ -70,6 +74,10 @@ export interface SkillFrontmatter {
   /** Every chat goal / workflow run / manual session observed for this same
    * capability. This is lineage evidence, not a validated-use counter. */
   capabilityOrigins?: SkillOrigin[];
+  /** Runtime-owned proof that an automatic distillation source reached a clean,
+   * verified execution boundary. Legacy drafts may not have one yet; a later
+   * verified reuse can rehabilitate them without deleting their lineage. */
+  learningReceipts?: LearningReceipt[];
   /** Non-destructive duplicate reconciliation. Superseded aliases remain on
    * disk, but are omitted from active skill discovery. */
   supersededBy?: string;
@@ -431,8 +439,12 @@ export function capSkillLines(lines: string[], max: number, kind: string): strin
 export function renderSkillsIndex(): string {
   const skills = listActiveSkills();
   if (skills.length === 0) return '';
-  // Quarantined drafts vanish from the index (kept on disk for the dashboard).
-  const visible = skills.filter((s) => !s.frontmatter.quarantined);
+  // Quarantined and pre-receipt drafts stay on disk/in the dashboard but cannot
+  // ambiently steer a run. An explicit skill name or a clean matching run can
+  // still inspect/rehabilitate a legacy draft.
+  const visible = skills.filter((s) => (
+    !s.frontmatter.quarantined && skillEligibleForAutomaticRecall(s)
+  ));
   const approved = visible.filter((s) => (s.frontmatter.tier ?? 'approved') !== 'draft');
   const drafts = visible.filter((s) => s.frontmatter.tier === 'draft');
   const line = (s: Skill) => formatSkillLine(
@@ -559,7 +571,9 @@ export function findRelevantSkills(query: string, options?: RelevantSkillOptions
     ].filter((value): value is string => typeof value === 'string').join(' ');
     const applicabilityTerms = new Set(skillSearchTokens(applicabilityText));
     const normalizedName = skillSearchTokens(skill.name).join(' ');
-    const exactNameMatch = Boolean(normalizedName && q.includes(normalizedName));
+    const exactNameMatch = q.includes(skill.name.toLowerCase())
+      || Boolean(normalizedName && q.includes(normalizedName));
+    if (!skillEligibleForAutomaticRecall(skill) && !exactNameMatch) continue;
     const skillTerms = new Set([...nameTerms, ...descriptionTerms, ...applicabilityTerms]);
     const skillArtifactTerms = [...skillTerms].filter((term) => SKILL_ARTIFACT_TERMS.has(term));
     // An explicit artifact request must not surface a procedure for a different
@@ -871,6 +885,9 @@ export interface DistilledSkillInput {
    *  procedure touches + which entity-class slots it is parameterized over. The
    *  retrieval filter surfaces a procedure only when these match the live task. */
   applicability?: { toolFamilies: string[]; entitySlots: string[] };
+  /** Evidence-first procedural-learning receipt issued by the execution
+   * boundary that authorized this draft. */
+  learningReceipt?: LearningReceipt;
 }
 
 /**
@@ -893,6 +910,9 @@ export function writeDistilledSkill(input: DistilledSkillInput): string | null {
     origin,
     capabilityFingerprint: capabilityTaskFingerprint(input.capabilityTask ?? input.description),
     capabilityOrigins: [origin],
+    ...(input.learningReceipt && isValidLearningReceipt(input.learningReceipt, { target: 'skill' })
+      ? { learningReceipts: [input.learningReceipt] }
+      : {}),
     useCount: 0,
     failureCount: 0,
     ...(input.applicability ? { applicability: input.applicability } : {}),
@@ -909,7 +929,7 @@ export function updateSkillFrontmatter(
   name: string,
   patch: Partial<Pick<SkillFrontmatter,
     | 'tier' | 'useCount' | 'failureCount' | 'quarantined'
-    | 'capabilityFingerprint' | 'capabilityOrigins'
+    | 'capabilityFingerprint' | 'capabilityOrigins' | 'learningReceipts'
     | 'supersededBy' | 'supersededAt' | 'disabled' | 'lineage'>>,
 ): Skill | null {
   const skill = loadSkill(name, { raw: true });
@@ -936,6 +956,59 @@ export function recordSkillCapabilityOrigin(
   return updateSkillFrontmatter(skill.name, {
     capabilityOrigins: [...known, { ...origin, distilledAt: new Date().toISOString() }],
   });
+}
+
+/** Attach a verified learning receipt to an existing self-distilled
+ * capability. This is how a clean new run rehabilitates a legacy draft without
+ * rewriting or deleting its original procedure. */
+export function recordSkillLearningReceipt(
+  name: string,
+  receipt: LearningReceipt,
+): Skill | null {
+  if (!isValidLearningReceipt(receipt, { target: 'skill' })) return null;
+  const skill = loadSkill(name);
+  if (!skill || (!skill.frontmatter.origin && skill.frontmatter.tier !== 'draft')) return null;
+  const known = (skill.frontmatter.learningReceipts ?? [])
+    .filter((entry): entry is LearningReceipt => isValidLearningReceipt(entry, { target: 'skill' }));
+  const duplicate = known.some((entry) => (
+    entry.authority === receipt.authority
+    && entry.sessionId === receipt.sessionId
+    && entry.sourceId === receipt.sourceId
+  ));
+  if (duplicate) return skill;
+  return updateSkillFrontmatter(skill.name, {
+    learningReceipts: [...known, receipt],
+  });
+}
+
+export type SkillLearningEvidenceStatus =
+  | 'installed'
+  | 'approved'
+  | 'verified'
+  | 'legacy_unverified';
+
+/** User-facing provenance label for the Skills panel and audits. */
+export function skillLearningEvidenceStatus(skill: Skill): SkillLearningEvidenceStatus {
+  if (!skill.frontmatter.origin) return 'installed';
+  if (skill.frontmatter.tier === 'approved') return 'approved';
+  return (skill.frontmatter.learningReceipts ?? []).some((receipt) => (
+    isValidLearningReceipt(receipt, { target: 'skill' })
+  ))
+    ? 'verified'
+    : 'legacy_unverified';
+}
+
+export function latestSkillLearningReceipt(skill: Skill): LearningReceipt | null {
+  return (skill.frontmatter.learningReceipts ?? [])
+    .filter((receipt): receipt is LearningReceipt => isValidLearningReceipt(receipt, { target: 'skill' }))
+    .sort((left, right) => right.verifiedAt.localeCompare(left.verifiedAt))[0] ?? null;
+}
+
+/** Automatic prompt/context recall is stricter than management or explicit
+ * `skill_read`: a pre-receipt self-distilled draft cannot ambiently steer work.
+ * Installed skills, approved skills, and receipt-backed drafts remain eligible. */
+export function skillEligibleForAutomaticRecall(skill: Skill): boolean {
+  return skillLearningEvidenceStatus(skill) !== 'legacy_unverified';
 }
 
 export interface ReconcileDistilledSkillsResult {

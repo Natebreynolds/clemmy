@@ -4,6 +4,10 @@ import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { slugifyIntent } from './tool-choice-store.js';
+import {
+  isValidLearningReceipt,
+  type LearningReceipt,
+} from './learning-receipt.js';
 import type { WorkflowAllowedTool, WorkflowDefinition, WorkflowStepInput } from './workflow-store.js';
 
 const PATTERN_ROOT = path.join(BASE_DIR, 'memory', 'workflow-patterns');
@@ -37,6 +41,13 @@ export interface WorkflowPatternRecord {
    *  handed out as a confident hint. */
   failureCount?: number;
   lastFailureAt?: string;
+  /** Runtime-owned proof that a clean terminal workflow boundary authorized
+   * this pattern for future procedural recall. */
+  learningReceipt?: LearningReceipt;
+  /** Pre-receipt counters remain inspectable but never count as verified
+   * procedural evidence. */
+  legacySuccessCount?: number;
+  legacyFailureCount?: number;
   body: string;
   filePath: string;
 }
@@ -147,6 +158,15 @@ function parsePattern(filePath: string): WorkflowPatternRecord | null {
       evidence: typeof fm.evidence === 'string' ? fm.evidence : undefined,
       failureCount: typeof fm.failureCount === 'number' && Number.isFinite(fm.failureCount) ? fm.failureCount : undefined,
       lastFailureAt: typeof fm.lastFailureAt === 'string' ? fm.lastFailureAt : undefined,
+      learningReceipt: isValidLearningReceipt(fm.learningReceipt, { target: 'workflow_pattern' })
+        ? fm.learningReceipt
+        : undefined,
+      legacySuccessCount: typeof fm.legacySuccessCount === 'number' && Number.isFinite(fm.legacySuccessCount)
+        ? fm.legacySuccessCount
+        : undefined,
+      legacyFailureCount: typeof fm.legacyFailureCount === 'number' && Number.isFinite(fm.legacyFailureCount)
+        ? fm.legacyFailureCount
+        : undefined,
       body: parsed.content ?? '',
       filePath,
     };
@@ -169,6 +189,9 @@ function writePattern(record: WorkflowPatternRecord): WorkflowPatternRecord {
     ...(record.evidence ? { evidence: record.evidence } : {}),
     ...(record.failureCount ? { failureCount: record.failureCount } : {}),
     ...(record.lastFailureAt ? { lastFailureAt: record.lastFailureAt } : {}),
+    ...(record.learningReceipt ? { learningReceipt: record.learningReceipt } : {}),
+    ...(record.legacySuccessCount ? { legacySuccessCount: record.legacySuccessCount } : {}),
+    ...(record.legacyFailureCount ? { legacyFailureCount: record.legacyFailureCount } : {}),
   };
   writeFileSync(record.filePath, matter.stringify(record.body, frontmatter), 'utf-8');
   return record;
@@ -190,18 +213,24 @@ export function recordSuccessfulWorkflowPattern(input: {
   workflowSlug: string;
   runId: string;
   finalOutput: string;
+  learningReceipt: LearningReceipt;
 }): WorkflowPatternRecord | null {
+  if (!isValidLearningReceipt(input.learningReceipt, {
+    target: 'workflow_pattern',
+    sourceId: input.runId,
+  })) return null;
   const objective = compactText(input.workflow.description || input.workflow.name, 160);
   if (!objective) return null;
   const filePath = patternPathFor(objective);
   const existing = parsePattern(filePath);
+  const existingVerified = isValidLearningReceipt(existing?.learningReceipt, { target: 'workflow_pattern' });
   const now = new Date().toISOString();
   const evidence = compactText(input.finalOutput, 800);
   const record: WorkflowPatternRecord = {
     objective,
     workflowName: input.workflow.name,
     workflowSlug: input.workflowSlug,
-    successCount: (existing?.successCount ?? 0) + 1,
+    successCount: existingVerified ? (existing?.successCount ?? 0) + 1 : 1,
     lastRunId: input.runId,
     lastSuccessAt: now,
     tools: extractWorkflowTools(input.workflow),
@@ -209,8 +238,19 @@ export function recordSuccessfulWorkflowPattern(input: {
     evidence,
     // preserve the quality signal across updates (a clean run does NOT erase the
     // failure history — health is net over the pattern's whole life).
-    failureCount: existing?.failureCount,
-    lastFailureAt: existing?.lastFailureAt,
+    failureCount: existingVerified ? existing?.failureCount : undefined,
+    lastFailureAt: existingVerified ? existing?.lastFailureAt : undefined,
+    learningReceipt: input.learningReceipt,
+    legacySuccessCount: existingVerified
+      ? existing?.legacySuccessCount
+      : existing
+        ? (existing.legacySuccessCount ?? 0) + existing.successCount
+        : undefined,
+    legacyFailureCount: existingVerified
+      ? existing?.legacyFailureCount
+      : existing
+        ? (existing.legacyFailureCount ?? 0) + (existing.failureCount ?? 0)
+        : undefined,
     body: [
       `# Workflow pattern - ${input.workflow.name}`,
       '',
@@ -271,9 +311,35 @@ export function listWorkflowPatterns(): WorkflowPatternRecord[] {
     .sort((left, right) => right.lastSuccessAt.localeCompare(left.lastSuccessAt));
 }
 
+/** Only receipt-backed patterns may steer workflow authoring. Legacy files stay
+ * in the management/audit view and rehabilitate on their next clean run. */
+export function listRecallableWorkflowPatterns(): WorkflowPatternRecord[] {
+  return listWorkflowPatterns().filter((record) => (
+    isValidLearningReceipt(record.learningReceipt, { target: 'workflow_pattern' })
+  ));
+}
+
+export interface WorkflowPatternLearningStats {
+  total: number;
+  verified: number;
+  legacyExcluded: number;
+}
+
+export function getWorkflowPatternLearningStats(): WorkflowPatternLearningStats {
+  const patterns = listWorkflowPatterns();
+  const verified = patterns.filter((record) => (
+    isValidLearningReceipt(record.learningReceipt, { target: 'workflow_pattern' })
+  )).length;
+  return {
+    total: patterns.length,
+    verified,
+    legacyExcluded: patterns.length - verified,
+  };
+}
+
 export function recallWorkflowPatterns(query: string, limit = 3): WorkflowPatternMatch[] {
   const queryTokens = tokens(query);
-  const matches = listWorkflowPatterns()
+  const matches = listRecallableWorkflowPatterns()
     .filter(isPatternHealthy) // quality gate: never recall a since-degraded pattern
     .map((record) => ({
       record,

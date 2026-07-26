@@ -12,6 +12,7 @@ const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { recallWorkflowPatterns, recordSuccessfulWorkflowPattern } = await import('../memory/workflow-pattern-store.js');
+const { evaluateLearningCandidate } = await import('../memory/learning-receipt.js');
 const { collectAgentSystemMetrics } = await import('./agent-system-metrics.js');
 
 test.after(() => {
@@ -100,6 +101,14 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
     workflowSlug: 'metric-wf',
     runId: 'run-clean',
     finalOutput: 'Saved SEO report with 8 opportunities.',
+    learningReceipt: evaluateLearningCandidate({
+      target: 'workflow_pattern',
+      authority: 'workflow_terminal',
+      sessionId: 'workflow:run-clean:step',
+      sourceId: 'run-clean',
+      terminalSuccess: true,
+      controllerValidation: true,
+    }).receipt!,
   });
   assert.equal(recallWorkflowPatterns('law firm SEO audit report', 2).length, 1);
   assert.equal(recallWorkflowPatterns('book dinner reservation', 2).length, 0);

@@ -1386,6 +1386,70 @@ test('full mode: completion judge receives prior user context and SDK tool evide
   assert.match(toolSummary, /composio_execute_tool x2/);
 });
 
+test('default Claude brain withholds procedural learning from a failed-open completion', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: "I'll finish the researched comparison next.",
+    sessionId: 'sdk',
+    model: 'claude-opus-4-8',
+    toolUses: [
+      'mcp__clementine-local__composio_search_tools',
+      'mcp__clementine-local__composio_execute_tool',
+    ],
+  }));
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({
+    done: true,
+    reason: 'judge transport failed open',
+    failedOpen: true,
+  }));
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Research and compare these providers.',
+    sessionId: 'brain-learning-failed-open',
+  });
+
+  const learning = listEvents('brain-learning-failed-open', {
+    types: ['learning_candidate_evaluated'],
+  }).at(-1);
+  assert.ok(learning);
+  assert.equal(learning!.data.eligible, false);
+  assert.match(JSON.stringify(learning!.data.reasons), /failed open/);
+});
+
+test('default Claude brain issues a learning receipt after clean independent verification', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: "I'll finish the researched comparison next.",
+    sessionId: 'sdk',
+    model: 'claude-opus-4-8',
+    toolUses: [
+      'mcp__clementine-local__composio_search_tools',
+      'mcp__clementine-local__composio_execute_tool',
+    ],
+  }));
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({
+    done: true,
+    reason: 'the comparison is supported by captured sources',
+  }));
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Research and compare these providers.',
+    sessionId: 'brain-learning-verified',
+  });
+
+  const learning = listEvents('brain-learning-verified', {
+    types: ['learning_candidate_evaluated'],
+  }).at(-1);
+  assert.ok(learning);
+  assert.equal(learning!.data.eligible, true);
+  assert.equal(
+    (learning!.data.receipt as { authority?: string } | undefined)?.authority,
+    'independent_completion_judge',
+  );
+});
+
 test('streaming judge continuation appends the corrected final answer when it was not streamed', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

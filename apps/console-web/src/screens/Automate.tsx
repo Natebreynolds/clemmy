@@ -560,12 +560,58 @@ function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => voi
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-h3 text-fg">{skill.displayName || skill.name}</h3>
             {skill.supersededBy && <StatusPill tone="neutral">Retired → {skill.supersededBy}</StatusPill>}
+            {!skill.supersededBy && skill.quarantined && <StatusPill tone="danger">Quarantined</StatusPill>}
+            {!skill.supersededBy
+              && !skill.quarantined
+              && skill.learningEvidenceStatus === 'verified'
+              && skill.learningAuthority === 'manual_user_request' && (
+              <StatusPill
+                tone="neutral"
+                title="The user explicitly asked Clementine to preserve this procedure."
+              >
+                User-requested
+              </StatusPill>
+            )}
+            {!skill.supersededBy
+              && !skill.quarantined
+              && skill.learningEvidenceStatus === 'verified'
+              && skill.learningAuthority !== 'manual_user_request' && (
+              <StatusPill
+                tone="success"
+                title={skill.learningAuthority
+                  ? `Verified by ${skill.learningAuthority.replaceAll('_', ' ')}`
+                  : 'Verified execution evidence'}
+              >
+                Evidence-backed
+              </StatusPill>
+            )}
+            {!skill.supersededBy && !skill.quarantined && skill.learningEvidenceStatus === 'legacy_unverified' && (
+              <StatusPill
+                tone="warning"
+                title="Created before learning receipts were introduced. It is excluded from automatic recall until a clean run rehabilitates it."
+              >
+                Legacy draft · verify
+              </StatusPill>
+            )}
+            {!skill.supersededBy && !skill.quarantined && skill.learningEvidenceStatus === 'approved' && (
+              <StatusPill tone="success">Approved</StatusPill>
+            )}
+            {!skill.supersededBy && !skill.quarantined && skill.learningEvidenceStatus === 'installed' && (
+              <StatusPill tone="neutral">Installed</StatusPill>
+            )}
             {skill.source?.updateAvailable && <StatusPill tone="warning">Update available</StatusPill>}
             {skill.hasScripts && badge('scripts')}
             {skill.hasReferences && badge('references')}
             {skill.hasSrc && badge('src')}
           </div>
           <p className={cn('mt-1 text-body text-muted', !open && 'line-clamp-2')}>{skill.description || 'No description.'}</p>
+          {skill.tier === 'draft' && (
+            <p className="mt-1 text-caption text-muted">
+              {skill.useCount ?? 0} verified reuse{(skill.useCount ?? 0) === 1 ? '' : 's'}
+              {' · '}
+              {skill.failureCount ?? 0} observed failure{(skill.failureCount ?? 0) === 1 ? '' : 's'}
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {skill.source?.updateAvailable && (
@@ -595,6 +641,14 @@ function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => voi
                   <a href={detail.data.source.repo} target="_blank" rel="noopener noreferrer" className="mb-2 inline-flex items-center gap-1 text-caption text-primary hover:underline">
                     <ExternalLink className="h-3.5 w-3.5" aria-hidden /> {detail.data.source.repo}
                   </a>
+                )}
+                {detail.data?.learningVerifiedAt && (
+                  <p className="mb-2 text-caption text-muted">
+                    Learning evidence verified {new Date(detail.data.learningVerifiedAt).toLocaleString()}
+                    {detail.data.learningAuthority
+                      ? ` · ${detail.data.learningAuthority.replaceAll('_', ' ')}`
+                      : ''}
+                  </p>
                 )}
                 <pre className="max-h-[28rem] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-subtle p-3 font-mono text-caption text-fg">{detail.data?.body || '(empty)'}</pre>
               </>
