@@ -17,7 +17,7 @@ import { cn } from '@/lib/cn';
 import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
   checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
-  listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
+  listWorkflows, resumeWorkflowCapability, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
   type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
 } from '@/lib/automate';
@@ -323,6 +323,8 @@ function RunWorkspaceDrawer({
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
+  const [resumingCapability, setResumingCapability] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const [showAllCriteria, setShowAllCriteria] = useState(false);
   const runsQ = useQuery({
     queryKey: ['wf-runs', workflow],
@@ -360,6 +362,21 @@ function RunWorkspaceDrawer({
       setCheckError(reason || 'unknown error');
     } finally {
       setChecking(false);
+    }
+  };
+
+  const resumeCapability = async () => {
+    if (!selectedRunId) return;
+    setResumingCapability(true);
+    setResumeError(null);
+    try {
+      await resumeWorkflowCapability(workflow, selectedRunId);
+      await runsQ.refetch();
+      void qc.invalidateQueries({ queryKey: ['runs'] });
+    } catch (e) {
+      setResumeError((e instanceof Error ? e.message : String(e)).slice(0, 180));
+    } finally {
+      setResumingCapability(false);
     }
   };
 
@@ -419,14 +436,41 @@ function RunWorkspaceDrawer({
                       {selectedRun?.error && <p className="text-small text-danger">{selectedRun.error}</p>}
                     </div>
                     <div className="flex flex-col items-end gap-1">
+                      {selectedRun?.status === 'blocked_capability' && (
+                        <Button size="sm" onClick={resumeCapability} disabled={resumingCapability}>
+                          <RefreshCw className={cn('h-4 w-4', resumingCapability && 'animate-spin')} aria-hidden />
+                          {resumingCapability ? 'Retrying…' : 'Retry now'}
+                        </Button>
+                      )}
                       <Button size="sm" variant="secondary" onClick={runChecker} disabled={checking || !workspace}>
                         {checking ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <CheckCircle2 className="h-4 w-4" aria-hidden />} Check goal
                       </Button>
                       {checkError && (
                         <span className="max-w-xs text-right text-caption text-danger">Check failed — {checkError}. Try again.</span>
                       )}
+                      {resumeError && (
+                        <span className="max-w-xs text-right text-caption text-danger">Retry failed — {resumeError}</span>
+                      )}
                     </div>
                   </div>
+
+                  {selectedRun?.status === 'blocked_capability' && selectedRun.capabilityBlock && (
+                    <section className="rounded-md border border-warning/30 bg-warning-tint px-4 py-3">
+                      <div className="mb-1 flex items-center gap-1.5 text-label text-warning">
+                        <AlertTriangle className="h-4 w-4" aria-hidden /> Waiting for a connection
+                      </div>
+                      <p className="text-body text-fg">
+                        {selectedRun.capabilityBlock.message
+                          || `${selectedRun.capabilityBlock.toolkit || selectedRun.capabilityBlock.tool || 'This tool'} must be connected before the run can continue.`}
+                      </p>
+                      <p className="mt-1 text-caption text-muted">
+                        Completed work is preserved. Reconnect the account, then retry this same run
+                        {selectedRun.capabilityBlock.retryAt
+                          ? `, or Clem will check again around ${new Date(selectedRun.capabilityBlock.retryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                          : ''}.
+                      </p>
+                    </section>
+                  )}
 
                   {workspace?.goal && (
                     <section className="rounded-md border border-border bg-surface px-4 py-3">

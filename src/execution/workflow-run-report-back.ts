@@ -11,6 +11,11 @@ import {
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
+import {
+  isWorkflowTerminalOutcome,
+  workflowTerminalOutcomeMatchesReport,
+  type WorkflowTerminalOutcome,
+} from './workflow-terminal-outcome.js';
 
 export type WorkflowRunReportBackOutcome = 'done' | 'blocked' | 'failed';
 
@@ -41,6 +46,7 @@ export interface WorkflowRunReportBackRecord {
   originSessionIds?: string[];
   status?: string;
   finishedAt?: string;
+  terminalOutcome?: WorkflowTerminalOutcome;
   notifiedAt?: string;
   /** Aggregate origin-chat acknowledgement. Kept separate from notifiedAt,
    * which proves the dashboard/global notification was persisted. */
@@ -170,9 +176,12 @@ function sameReportBack(
 }
 
 function outcomeMatchesCanonicalStatus(
-  run: Pick<WorkflowRunReportBackRecord, 'status' | 'finishedAt'>,
+  run: Pick<WorkflowRunReportBackRecord, 'status' | 'finishedAt' | 'terminalOutcome'>,
   outcome: WorkflowRunReportBackOutcome,
 ): boolean {
+  if (isWorkflowTerminalOutcome(run.terminalOutcome)) {
+    return workflowTerminalOutcomeMatchesReport(run.terminalOutcome, outcome);
+  }
   switch (run.status) {
     case 'cancelled':
       return outcome === 'failed';

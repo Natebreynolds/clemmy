@@ -859,10 +859,18 @@ test('GET /api/console/workflows exposes needs-attention last-run status', async
   try {
     const res = await fetch(`${h.url}/api/console/workflows`);
     assert.equal(res.status, 200);
-    const body = await res.json() as { workflows: Array<{ name: string; lastRunStatus?: string | null; lastRunNeedsAttention?: boolean }> };
+    const body = await res.json() as {
+      workflows: Array<{
+        name: string;
+        lastRunStatus?: string | null;
+        lastRunOutcome?: string | null;
+        lastRunNeedsAttention?: boolean;
+      }>;
+    };
     const row = body.workflows.find((item) => item.name === workflowName);
     assert.ok(row, 'workflow row is present');
     assert.equal(row!.lastRunStatus, 'needs_attention');
+    assert.equal(row!.lastRunOutcome, 'blocked');
     assert.equal(row!.lastRunNeedsAttention, true);
   } finally {
     await h.close();

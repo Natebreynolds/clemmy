@@ -53,7 +53,7 @@ export function registerPendingActionTools(server: McpServer): void {
       'Queue a fully prepared action payload before an irreversible external write/send/deploy or other approval-bound execution.',
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
       'Then ask once at the write boundary, usually with request_approval({pendingActionId:<id>, ...}).',
-      'After approval, execute the exact queued payload with the named tool, then call pending_action_record_result.',
+      'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
     ].join(' '),
     {
       title: z.string().min(3).max(160),
@@ -166,6 +166,7 @@ export function registerPendingActionTools(server: McpServer): void {
     [
       'Fire the exact stored tool call of an APPROVED single-call pending action (e.g. a card minted because a fidelity judge could not verify a send).',
       'The server executes the byte-identical queued payload through the gated write boundary — you cannot alter it. Use this after the user approves such a card; do NOT re-issue the underlying send yourself.',
+      'This call returns the authoritative provider result AND records the outcome. After it succeeds, report that result directly; do NOT call pending_action_get or pending_action_record_result.',
       'run_batch plans are executed via run_batch action=execute instead.',
     ].join(' '),
     {

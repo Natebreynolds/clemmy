@@ -53,6 +53,10 @@ export function armFirstContactBeat(opts: {
   sessionKind: string | undefined;
   itemCount: number;
   userMessageCount: number;
+  /** The typed turn-control decision already answers whether another
+   *  conversational beat is needed. An execute-phase request is aligned by
+   *  definition, so the fan-out gate must not ask the same question again. */
+  preflightPhase?: 'read' | 'align' | 'execute';
 }): void {
   try {
     if (!fanoutAlignmentBeatEnabled()) return;
@@ -60,6 +64,7 @@ export function armFirstContactBeat(opts: {
     if (!sessionId || bouncedSessions.has(sessionId) || armedSessions.has(sessionId)) return;
     if (opts.sessionKind && opts.sessionKind !== 'chat') return;
     if (sessionId.startsWith('background:') || sessionId.startsWith('workflow:')) return;
+    if (opts.preflightPhase && opts.preflightPhase !== 'align') return;
     if (!classifyFanoutAlignmentBounce({ itemCount: opts.itemCount, userMessageCount: opts.userMessageCount })) return;
     armedSessions.set(sessionId, opts.itemCount);
   } catch { /* fail-open */ }
@@ -67,13 +72,28 @@ export function armFirstContactBeat(opts: {
 
 /** Consulted at MASS-EXECUTION tool boundaries (run_worker, code-mode batch):
  *  when the session is armed, bounce ONCE with the plan-beat steer. */
-export function maybeBounceMassExecution(sessionId: string | undefined): { bounce: boolean; steer?: string } {
+export function maybeBounceMassExecution(
+  sessionId: string | undefined,
+  attempt?: {
+    /** Actual items about to execute through this tool boundary. */
+    itemCount: number;
+    /** Read batches are evidence gathering, never a consequential launch. */
+    sideEffect?: 'read' | 'write' | 'send';
+  },
+): { bounce: boolean; steer?: string } {
   try {
     if (!fanoutAlignmentBeatEnabled()) return { bounce: false };
     const id = (sessionId ?? '').trim();
     if (!id) return { bounce: false };
-    const itemCount = armedSessions.get(id);
-    if (itemCount === undefined) return { bounce: false };
+    const armedItemCount = armedSessions.get(id);
+    if (armedItemCount === undefined) return { bounce: false };
+    // An armed consequential objective often begins with a tiny read/discovery
+    // batch. That is not the mass execution the conversational beat protects.
+    // Do not consume the arm; the later real mass write/worker call still gets
+    // its one beat.
+    if (attempt?.sideEffect === 'read') return { bounce: false };
+    if (attempt && attempt.itemCount < itemThreshold()) return { bounce: false };
+    const itemCount = attempt?.itemCount ?? armedItemCount;
     armedSessions.delete(id);
     bouncedSessions.add(id);
     return { bounce: true, steer: fanoutAlignmentSteer(itemCount) };
@@ -116,7 +136,20 @@ export function maybeFanoutAlignmentBounce(opts: {
     if (sessionId.startsWith('background:') || sessionId.startsWith('workflow:')) return { bounce: false };
     let userMessageCount = 0;
     try {
-      userMessageCount = listEvents(sessionId, { types: ['user_input_received'] })
+      const events = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
+      // Legacy callers still consult this run_worker-boundary gate directly.
+      // Honor the same typed preflight decision as the armed path so a precise,
+      // already-authorized request never gets a redundant "do it now?" bounce.
+      const latestPreflight = events
+        .filter((e) => e.type === 'turn_preflight_decision')
+        .sort((a, b) => b.seq - a.seq)
+        .at(0);
+      const preflightPhase = (latestPreflight?.data as { phase?: unknown } | undefined)?.phase;
+      if (preflightPhase === 'read' || preflightPhase === 'execute') {
+        return { bounce: false };
+      }
+      userMessageCount = events
+        .filter((e) => e.type === 'user_input_received')
         .filter((e) => !(e.data as { synthetic?: boolean } | undefined)?.synthetic).length;
     } catch {
       return { bounce: false };

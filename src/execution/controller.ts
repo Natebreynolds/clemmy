@@ -29,6 +29,7 @@ import { validateGoal, type GoalValidationResult } from './goal-validate.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
+import { recentExecutionToolEvidence } from './completion-evidence.js';
 
 const logger = pino({ name: 'clementine-next.execution-controller' });
 
@@ -137,6 +138,7 @@ function executionCompletionEvidence(execution: ExecutionRecord, summary: string
     .slice(-10)
     .map((item) => `- ${item.type}: ${item.message}`)
     .join('\n') || 'none';
+  const toolEvidence = recentExecutionToolEvidence(execution);
 
   return [
     `Controller completion summary: ${summary}`,
@@ -146,6 +148,7 @@ function executionCompletionEvidence(execution: ExecutionRecord, summary: string
     `Workflow bindings:\n${workflowBindings}`,
     `Delegation bindings:\n${delegationBindings}`,
     `Recent execution activity:\n${recentActivity}`,
+    toolEvidence ? `Verified tool receipts from this execution:\n${toolEvidence}` : '',
   ].filter(Boolean).join('\n');
 }
 

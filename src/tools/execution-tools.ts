@@ -5,6 +5,7 @@ import { validateGoal, type GoalValidationResult } from '../execution/goal-valid
 import { textResult } from './shared.js';
 import type { ExecutionRecord } from '../types.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
+import { recentExecutionToolEvidence } from '../execution/completion-evidence.js';
 
 /**
  * Pure focus-matcher: given a `query` (an execution id OR a
@@ -91,10 +92,12 @@ function executionToolCompletionEvidence(execution: ExecutionRecord, summary: st
     .slice(-10)
     .map((item) => `- ${item.type}: ${item.message}`)
     .join('\n') || 'none';
+  const toolEvidence = recentExecutionToolEvidence(execution);
   return [
     `Tool completion summary: ${summary}`,
     execution.lastAssistantSummary ? `Previous summary: ${execution.lastAssistantSummary}` : '',
     `Recent execution activity:\n${recentActivity}`,
+    toolEvidence ? `Verified tool receipts from this execution:\n${toolEvidence}` : '',
   ].filter(Boolean).join('\n');
 }
 

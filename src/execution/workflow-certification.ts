@@ -10,6 +10,10 @@ import {
 } from './workflow-dry-run-simulation.js';
 import { classifyWorkflowExecutionMode, type WorkflowExecutionMode, type WorkflowCodifyCandidate } from './workflow-execution-mode.js';
 import { resourceHasSurface, resourceHasSelector } from './workflow-resource-binding.js';
+import {
+  certifyWorkflowCode,
+  type WorkflowCodeCertification,
+} from './workflow-code-certification.js';
 
 export type WorkflowCertificationState =
   | 'blocked'
@@ -61,6 +65,10 @@ export interface WorkflowCertification {
   readinessGaps: WorkflowGap[];
   blockingReasons: string[];
   contractAdvisories: string[];
+  /** Static proof for authored deterministic helpers: syntax result + exact
+   * source digest. Invalid/missing code is a hard blocker; an unsupported
+   * parser is an advisory that requires a creation test. */
+  code: WorkflowCodeCertification;
   nextActions: WorkflowCertificationAction[];
   dryRun: WorkflowDryRunSimulation;
 }
@@ -77,16 +85,17 @@ export function certifyWorkflow(
     planOptions: options.planOptions,
   });
   const execution = classifyWorkflowExecutionMode(def);
+  const code = certifyWorkflowCode(def, options.workflowSlug ?? def.name);
   const readinessGaps = analyzeWorkflowGaps(def);
   // Model-routing advisories (silent no-op tag / missed routing) ride the
   // contract-advisory channel so the Automate UI surfaces them alongside other
   // advisories. Advisory only — they never flip canRun/canEnable.
   const routingAdvisories = renderWorkflowRoutingAdvisories(analyzeWorkflowRouting(def));
-  const contractAdvisories = [...dryRun.contractAdvisories, ...routingAdvisories];
+  const contractAdvisories = [...dryRun.contractAdvisories, ...routingAdvisories, ...code.advisories];
   const verification = prepareWorkflowVerification(def, testInputs);
   const missingRunInputs = missingWorkflowRunInputs(def, runInputs);
   const resourceGaps = workflowResourceBindingGaps(def);
-  const blockingReasons = dryRun.blockingReasons;
+  const blockingReasons = [...dryRun.blockingReasons, ...code.blockingReasons];
   const hardBlocked = blockingReasons.length > 0;
   const hasResourceGaps = resourceGaps.length > 0;
   const hasGaps = readinessGaps.length > 0;
@@ -137,6 +146,7 @@ export function certifyWorkflow(
     readinessGaps,
     blockingReasons,
     contractAdvisories,
+    code,
     nextActions,
     dryRun,
   };
@@ -340,6 +350,14 @@ export function renderWorkflowCertification(cert: WorkflowCertification): string
   }
   if (cert.contractAdvisories.length > 0) {
     lines.push('', 'Contract advisories:', ...cert.contractAdvisories.slice(0, 6).map((advisory) => `- ${advisory}`));
+  }
+  if (cert.code.artifactCount > 0) {
+    lines.push(
+      '',
+      `Code proof: ${cert.code.readyCount}/${cert.code.artifactCount} syntax-certified${cert.code.bundleHash ? ` · bundle ${cert.code.bundleHash.slice(0, 12)}` : ''}`,
+      ...cert.code.artifacts.map((artifact) =>
+        `- [${artifact.status.toUpperCase()}] ${artifact.runner} (${artifact.stepIds.join(', ')})${artifact.sha256 ? ` sha256:${artifact.sha256.slice(0, 12)}` : ''}${artifact.diagnostic ? ` — ${artifact.diagnostic}` : ''}`),
+    );
   }
   return lines.join('\n');
 }

@@ -43,6 +43,10 @@ import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/mod
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
+import {
+  focusSummaryIsHistoricalForRequest,
+  renderHistoricalFocusPointer,
+} from '../runtime/harness/focus-projection.js';
 
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
@@ -127,17 +131,22 @@ export function renderCurrentTimeForInstructions(): string {
  * Returns the inner content (wrap with section('Current Focus', …)); '' on no
  * focus or error.
  */
-export function renderFocusForInstructions(): string {
+export function renderFocusForInstructions(opts?: {
+  sessionId?: string;
+  input?: string;
+}): string {
   let focus = '';
   try {
     const snap = getFocusSnapshot();
     if (snap.active && !snap.needsConfirm) {
-      focus = [
-        `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
-        `Summary: ${snap.active.summary}`,
-        `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-        `Last touched: ${snap.active.last_touched_at}`,
-      ].join('\n');
+      focus = focusSummaryIsHistoricalForRequest(snap.active, opts?.input, opts?.sessionId)
+        ? renderHistoricalFocusPointer(snap.active)
+        : [
+            `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
+            `Summary: ${snap.active.summary}`,
+            `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
+            `Last touched: ${snap.active.last_touched_at}`,
+          ].join('\n');
       if (snap.parked.length > 0) {
         focus += `\n\nParked (resumable via focus_activate):\n`
           + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');
@@ -291,6 +300,10 @@ const VOLATILE_CONTEXT_TITLES = new Set<string>([
 export function renderHarnessMemoryContext(opts?: {
   sessionId?: string;
   query?: string;
+  /** Current accepted user input used only to decide whether a cross-session
+   * focus summary is historical. Unlike `query`, this does not enable recall or
+   * skill ranking. */
+  focusInput?: string;
   partition?: 'all' | 'stable' | 'volatile';
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
@@ -363,7 +376,10 @@ export function renderHarnessMemoryContext(opts?: {
 
   // Current Focus block — rendered once for this turn, so it is the current
   // state and does not need an immediate focus_get round-trip.
-  const focus = renderFocusForInstructions();
+  const focus = renderFocusForInstructions({
+    sessionId: opts?.sessionId,
+    input: opts?.focusInput ?? opts?.query,
+  });
 
   // Query-driven recall (parity with the main harness loop's buildTurnMemoryPrimer):
   // surface the consolidated facts MOST RELEVANT to the user's CURRENT message. A
@@ -452,12 +468,14 @@ export function renderHarnessMemoryContext(opts?: {
  */
 export function harnessInstructions(roleInstructions: string, opts?: {
   sessionId?: string;
+  focusInput?: string;
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
 }): () => string {
   return () => {
     const ctx = renderHarnessMemoryContext({
       sessionId: opts?.sessionId,
+      focusInput: opts?.focusInput,
       includeRememberedToolChoices: opts?.includeRememberedToolChoices,
       includeSessionActions: opts?.includeSessionActions,
     });

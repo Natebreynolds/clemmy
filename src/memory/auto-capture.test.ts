@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { extractAutoMemoryCandidates, extractProfilePatchFromMessage } from './auto-capture.js';
+import {
+  assessAutoMemoryAdmission,
+  extractAutoMemoryCandidates,
+  extractProfilePatchFromMessage,
+} from './auto-capture.js';
 
 test('extractAutoMemoryCandidates captures Clementine product requirements', () => {
   const candidates = extractAutoMemoryCandidates(
@@ -179,6 +183,39 @@ test('one-off task safety clauses are not promoted into standing prohibitions', 
   );
 });
 
+test('Memory Admission v2 keeps live one-off pollution examples ephemeral', () => {
+  for (const message of [
+    'Create a new disposable Google Sheet named CLEM_VALIDATION_SMOKE_20260725_B with columns company and email. Hard requirement: do not create or write anything until you have validated all rows.',
+    'Hey can you find those emails we crafted yesterday but never actually put in my drafts so I can send them?',
+    'The site files are built at ~/Projects/high-desert-coffee-site but the Netlify deploy never actually ran — execute the deploy now and reply with the live URL.',
+    'Do not send, draft, or write anything anywhere — just answer in chat. Pull my real Salesforce data and tell me which opportunity to re-engage.',
+    'Mock up a one-page website for an AI agent loop product, then build it locally. Do not deploy yet.',
+    'Use the sf CLI instead of Composio for this Salesforce lookup.',
+  ]) {
+    assert.deepEqual(
+      extractAutoMemoryCandidates(message),
+      [],
+      `one-turn task must remain ephemeral: ${message.slice(0, 70)}`,
+    );
+    assert.equal(assessAutoMemoryAdmission(message).scope, 'ephemeral');
+  }
+});
+
+test('Memory Admission v2 distinguishes durable facts and standing policies', () => {
+  assert.equal(
+    assessAutoMemoryAdmission('My CFO is Jordan Example and they approve all spend over 5k.').scope,
+    'durable',
+  );
+  assert.equal(
+    assessAutoMemoryAdmission('Never email the production distribution list.').scope,
+    'standing_policy',
+  );
+  assert.equal(
+    assessAutoMemoryAdmission('I want Clementine to remain proactive and persist long-horizon work across restarts.').scope,
+    'durable',
+  );
+});
+
 test('an explicit no-memory-write boundary suppresses auto-capture for the whole turn', () => {
   assert.deepEqual(
     extractAutoMemoryCandidates('Using only Clementine local memory, list exactly the 8 people on the Northstar live-proof team. Return JSON with a single key names containing an array of names only, no emails. Do not write or change memory. Do not call any external connector.'),
@@ -245,6 +282,10 @@ test('one-off connected-app lookups are not promoted into durable connected-app 
     extractAutoMemoryCandidates('Do I have Outlook connected right now? Tell me only the usable Outlook connection count, not stale IDs.'),
     [],
   );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('I want you to pull Salesforce records for Acme and summarize them.'),
+    [],
+  );
 });
 
 test('durable connected-app setup/access statements are still captured', () => {
@@ -253,6 +294,17 @@ test('durable connected-app setup/access statements are still captured', () => {
 
   const access = extractAutoMemoryCandidates('The agent needs Outlook access for calendar workflows.');
   assert.ok(access.some((candidate) => candidate.kind === 'reference' && /^Connected-app context:/.test(candidate.content)));
+});
+
+test('explicit current-task scope and historical misses remain ephemeral', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('For this task, always use Salesforce and write to this sheet.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('We never actually send email to the production list.'),
+    [],
+  );
 });
 
 test('"don\'t need to ask first" is not treated as a durable no-send rule', () => {

@@ -155,6 +155,42 @@ test('tool_output_query queries JSON embedded in a run_shell_command wrapper (sf
   assert.ok(text.includes('seller0@scorpion.co'), 'embedded records are queryable');
 });
 
+test('tool_output_query recovers complete records from a clipped shell JSON-array prefix', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const wrapped = [
+    'exit_code: 0',
+    '',
+    'stdout:',
+    '[',
+    '{"id":"site-1","default_domain":"first.netlify.app"},',
+    '{"id":"site-target","default_domain":"target.netlify.app"},',
+    '{"id":"partial"',
+  ].join('\n');
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_netlify_clipped',
+    tool: 'run_shell_command',
+    output: wrapped,
+  });
+
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({
+      call_id: 'call_netlify_clipped',
+      filter_field: 'default_domain',
+      filter_equals: 'target.netlify.app',
+      fields: ['id', 'default_domain'],
+    }),
+  );
+  const text = res.content[0].text;
+  assert.doesNotMatch(text, /is not JSON — use recall_tool_result/);
+  assert.match(text, /complete record\(s\) recovered from a clipped JSON-array prefix/);
+  assert.match(text, /full total unknown/);
+  assert.match(text, /site-target/);
+});
+
 test('tool_output_query still bounces genuinely non-JSON output to recall_tool_result', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

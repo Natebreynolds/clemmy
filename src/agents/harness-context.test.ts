@@ -182,6 +182,41 @@ test('stale focus is not rendered as active persistent context', () => {
   }
 });
 
+test('a fresh cross-session action gets the focus pointer but not historical receipts', () => {
+  resetMemoryDb();
+  createFocus({
+    resourceRef: 'https://docs.google.com/spreadsheets/d/sheet-focus-fixture/edit',
+    title: 'Disposable validation sheet',
+    summary: 'Prior execution exec-old completed with receipt old-write-123 and readback old-read-456.',
+    resourceKind: 'sheet',
+    relatedSessionId: 'sess-prior-run',
+  });
+
+  const fresh = renderHarnessMemoryContext({
+    sessionId: 'sess-new-run',
+    focusInput: 'Perform a fresh Google Sheets write to the same range and read it back.',
+    partition: 'volatile',
+  });
+  assert.match(fresh, /RELATED HISTORICAL focus/);
+  assert.match(fresh, /sheet-focus-fixture/);
+  assert.match(fresh, /context only, never completion evidence/i);
+  assert.doesNotMatch(fresh, /exec-old|old-write-123|old-read-456/);
+
+  const review = renderHarnessMemoryContext({
+    sessionId: 'sess-new-run',
+    focusInput: 'Review the status of the previous sheet run.',
+    partition: 'volatile',
+  });
+  assert.match(review, /exec-old/);
+
+  const sameSession = renderHarnessMemoryContext({
+    sessionId: 'sess-prior-run',
+    focusInput: 'Perform another step in this session.',
+    partition: 'volatile',
+  });
+  assert.match(sameSession, /old-write-123/);
+});
+
 test('partition: default ("all") is byte-identical to no partition (regression guard for the cache split)', () => {
   resetMemoryDb();
   rememberFact({ kind: 'project', content: 'Priority_Account__c marks priority account accounts.' });

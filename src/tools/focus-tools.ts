@@ -57,7 +57,7 @@ export function registerFocusTools(server: McpServer): void {
 
   server.tool(
     'focus_set',
-    'Pin a NEW current focus. Auto-parks any previously active focus. Use when the user starts substantive work on something the model should track across messages — a specific document, spreadsheet, project, ticket, or conversation thread. The resource_ref should be the most specific identifier available (URL, doc id, session id, etc.).',
+    'Pin a NEW current focus. Auto-parks any previously active focus. Use only when the user starts substantive, plausibly multi-turn work the model should track across messages — a specific document, spreadsheet, project, ticket, or conversation thread. Do not pin one-shot fetches, writes, deployments, smoke tests, or verifications merely because they name a URL. The resource_ref should be the most specific identifier available (URL, doc id, session id, etc.).',
     {
       resource_ref: z.string().min(1).max(500).describe('Most specific identifier: URL, doc id, session id, or a freeform "the X project" if no canonical id exists.'),
       title: z.string().min(1).max(120).describe('Short human-readable name shown in the dashboard + Discord status.'),

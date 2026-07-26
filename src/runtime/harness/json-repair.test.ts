@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractJsonCandidate, repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
+import {
+  extractCompleteJsonObjects,
+  extractJsonCandidate,
+  repairToParseableJson,
+  isParseableJson,
+  conformsToJsonSchemaShape,
+} from './json-repair.js';
 
 test('repair: ```json fenced object is unwrapped and parses', () => {
   const { text, repaired } = repairToParseableJson('```json\n{"done": true}\n```');
@@ -86,6 +92,26 @@ test('extractJsonCandidate: returns null when nothing recoverable', () => {
 test('isParseableJson basic', () => {
   assert.equal(isParseableJson('{"a":1}'), true);
   assert.equal(isParseableJson('{a:1}'), false);
+});
+
+test('extractCompleteJsonObjects recovers a clipped array prefix and drops its unfinished tail', () => {
+  const raw = [
+    '[',
+    '{"id":"site-1","label":"brace } inside a string"},',
+    '{"id":"site-2","nested":{"ok":true}},',
+    '{"id":"unfinished"',
+  ].join('');
+  assert.deepEqual(extractCompleteJsonObjects(raw), [
+    { id: 'site-1', label: 'brace } inside a string' },
+    { id: 'site-2', nested: { ok: true } },
+  ]);
+});
+
+test('extractCompleteJsonObjects ignores balanced prose braces that are not JSON', () => {
+  assert.deepEqual(
+    extractCompleteJsonObjects('log {not json} then {"id":"real"} trailing'),
+    [{ id: 'real' }],
+  );
 });
 
 // --- conformsToJsonSchemaShape (W2: brain-agnostic decision-shape guard) ----

@@ -50,6 +50,21 @@ test('a runnable workflow surfaces last-run trouble as a clickable run pill', ()
   const attention = workflowCardStatus({ certification: cert({}), lastRunStatus: 'needs_attention' });
   assert.equal(attention?.label, 'Needs attention');
 
+  const blocked = workflowCardStatus({
+    certification: cert({}),
+    lastRunStatus: 'completed',
+    lastRunOutcome: 'blocked',
+  });
+  assert.equal(blocked?.label, 'Last run blocked');
+  assert.equal(blocked?.tone, 'warning');
+
+  const partial = workflowCardStatus({
+    certification: cert({}),
+    lastRunStatus: 'completed_with_errors',
+    lastRunOutcome: 'partial',
+  });
+  assert.equal(partial?.label, 'Last run partial');
+
   const failedItems = workflowCardStatus({ certification: cert({}), lastRunStatus: 'completed', lastRunFailedItemCount: 3 });
   assert.equal(failedItems?.label, '3 failed items');
   assert.equal(failedItems?.tone, 'warning');
@@ -57,6 +72,11 @@ test('a runnable workflow surfaces last-run trouble as a clickable run pill', ()
   const running = workflowCardStatus({ certification: cert({}), lastRunStatus: 'running' });
   assert.equal(running?.label, 'Running now');
   assert.equal(running?.tone, 'live');
+
+  const capability = workflowCardStatus({ certification: cert({}), lastRunStatus: 'blocked_capability' });
+  assert.equal(capability?.label, 'Waiting for connection');
+  assert.equal(capability?.tone, 'warning');
+  assert.match(capability?.detail ?? '', /preserved/);
 });
 
 test('a healthy, certified workflow with a clean last run shows NO pill', () => {

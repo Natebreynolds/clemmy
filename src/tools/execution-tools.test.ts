@@ -30,6 +30,11 @@ const {
   _setExecutionToolCompletionJudgeForTests,
 } = await import('./execution-tools.js');
 const { ExecutionStore } = await import('../execution/store.js');
+const {
+  appendEvent,
+  createSession,
+  writeToolOutput,
+} = await import('../runtime/harness/eventlog.js');
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
 test.after(() => {
@@ -209,4 +214,90 @@ test('execution_complete closes only after completion validation passes', async 
   const updated = new ExecutionStore().get(execution.id);
   assert.equal(updated?.status, 'completed');
   assert.match(updated?.lastAssistantSummary ?? '', /msg_123/);
+});
+
+test('execution_complete gives the judge exact durable readback receipts without making the summary repeat every cell', async () => {
+  const sessionId = `sess-exec-receipts-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'receipt-backed completion' });
+  const execution = createTrackedExecution({
+    sessionId,
+    title: 'Create and verify a disposable sheet',
+    objective: 'Write the supplied company and email rows, then verify the exact range',
+    successCriteria: 'Read-back of Sheet1!A1:B4 matches all 8 expected cells',
+    nextStep: 'Write and verify Sheet1!A1:B4',
+  });
+  const callId = `sheet-read-${Math.random().toString(36).slice(2, 10)}`;
+  const argumentsJson = JSON.stringify({
+    tool_slug: 'GOOGLESHEETS_BATCH_GET',
+    arguments: { spreadsheet_id: 'sheet-test', ranges: ['Sheet1!A1:B4'] },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'agent',
+    type: 'tool_called',
+    data: {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId,
+      accounting: 'top_level',
+      effect: 'read',
+      arguments: argumentsJson,
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'composio_execute_tool',
+      toolSlug: 'GOOGLESHEETS_BATCH_GET',
+      callId,
+      accounting: 'top_level',
+      effect: 'read',
+      ok: true,
+    },
+  });
+  writeToolOutput({
+    sessionId,
+    callId,
+    tool: 'composio_execute_tool',
+    output: JSON.stringify({
+      successful: true,
+      data: {
+        valueRanges: [{
+          range: 'Sheet1!A1:B4',
+          values: [
+            ['company', 'email'],
+            ['Acme', 'acme@example.com'],
+            ['Beacon', 'beacon@example.com'],
+            ['Cedar', 'cedar@example.com'],
+          ],
+        }],
+      },
+    }),
+  });
+
+  let judgeCalls = 0;
+  _setExecutionToolCompletionJudgeForTests(async (_objective, evidence) => {
+    judgeCalls += 1;
+    assert.match(evidence, /Verified tool receipts from this execution/);
+    assert.match(evidence, /GOOGLESHEETS_BATCH_GET/);
+    assert.match(evidence, /Sheet1!A1:B4/);
+    assert.match(evidence, /Beacon/);
+    assert.match(evidence, /beacon@example\.com/);
+    return { done: true, reason: 'the durable readback contains all expected cells' };
+  });
+
+  const handler = registeredToolHandlers().get('execution_complete');
+  assert.ok(handler, 'execution_complete should be registered');
+  const result = await handler({
+    id: execution.id,
+    summary: 'The exact write was completed and its requested range was read back successfully.',
+  });
+
+  assert.equal(judgeCalls, 1);
+  assert.match(result.content[0].text, /completed/);
+  assert.equal(new ExecutionStore().get(execution.id)?.status, 'completed');
 });

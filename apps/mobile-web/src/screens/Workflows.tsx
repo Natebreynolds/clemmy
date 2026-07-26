@@ -47,8 +47,8 @@ export function Workflows() {
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">
             <span class="workflow-row-name">{wf.name}</span>
-            <span class={`workflow-row-status status-${(wf.lastRunStatus ?? 'unknown').toLowerCase()}`}>
-              {wf.enabled ? (wf.lastRunStatus ?? 'idle') : 'disabled'}
+            <span class={`workflow-row-status status-${(wf.lastRunOutcome ?? wf.lastRunStatus ?? 'unknown').toLowerCase()}`}>
+              {wf.enabled ? (wf.lastRunOutcome ?? wf.lastRunStatus ?? 'idle') : 'disabled'}
             </span>
           </div>
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
@@ -150,7 +150,9 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
         {runs.map((run) => (
           <button key={run.id} class="run-card" onClick={() => setSelectedRun(run)}>
             <div class="title">{run.id}</div>
-            <div class={`status ${run.status}`}>{run.status}</div>
+            <div class={`status ${run.terminalOutcome ?? run.status}`}>
+              {run.terminalOutcome ?? run.status}
+            </div>
           </button>
         ))}
       </div>

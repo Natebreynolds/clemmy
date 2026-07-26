@@ -128,6 +128,47 @@ test('Composio gateways classify the inner operation rather than the wrapper', (
   }).effect, 'external_write', 'a real mutation token still wins over the call-read shape');
 });
 
+test('call_tool accounting follows the inner tool and never labels a failed guessed read as a local write', () => {
+  assert.equal(classifyRuntimeToolEffect('call_tool', {
+    name: 'read_file',
+    args_json: JSON.stringify({ path: '/tmp/report.txt' }),
+  }).effect, 'read');
+  assert.equal(classifyRuntimeToolEffect('call_tool', {
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: '{}' }),
+  }).effect, 'external_write');
+  assert.equal(classifyRuntimeToolEffect('call_tool', {
+    name: 'http_fetch',
+    args_json: JSON.stringify({ url: 'https://example.com/posts/1' }),
+  }).effect, 'compute');
+  assert.equal(classifyRuntimeToolEffect('call_tool', {
+    name: 'made_up_reader',
+    args_json: '{}',
+  }).effect, 'unknown');
+  assert.equal(runtimeToolAccountingMetadata(
+    'call_tool',
+    JSON.stringify({
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' }),
+    }),
+  ).effect, 'read');
+});
+
+test('run_batch read proposals account as reads while mutating proposals remain local writes', () => {
+  assert.equal(classifyRuntimeToolEffect('run_batch', {
+    action: 'propose',
+    plan: { sideEffect: 'read', tool: 'http_fetch', items: [] },
+  }).effect, 'read');
+  assert.equal(classifyRuntimeToolEffect('run_batch', {
+    action: 'status',
+    batch_id: 'batch-1',
+  }).effect, 'read');
+  assert.equal(classifyRuntimeToolEffect('run_batch', {
+    action: 'propose',
+    plan: { sideEffect: 'send', tool: 'composio_execute_tool', items: [] },
+  }).effect, 'local_write');
+});
+
 test('shell effects are behavioral: compute stays safe, sends/deploys are external writes', () => {
   for (const command of [
     'rg TODO src',

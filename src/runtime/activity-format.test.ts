@@ -191,6 +191,21 @@ test('completed runs flagged needsAttention render as attention, not done', () =
   assert.equal(runPreview(run), 'Delivered the report, but the target was not confirmed.');
 });
 
+test('canonical workflow outcome overrides optimistic lifecycle completion', () => {
+  assert.equal(userFacingRunState({
+    status: 'completed',
+    terminalOutcome: 'blocked',
+  }), 'needs_attention');
+  assert.equal(userFacingRunState({
+    status: 'completed_with_errors',
+    terminalOutcome: 'partial',
+  }), 'needs_attention');
+  assert.equal(userFacingRunState({
+    status: 'completed',
+    terminalOutcome: 'succeeded',
+  }), 'completed');
+});
+
 test('liveLine + timeline are order-agnostic (harness events arrive newest-first)', () => {
   // Descending (newest-first), as harness sessions are fetched.
   const desc: ActivityRunLike = {

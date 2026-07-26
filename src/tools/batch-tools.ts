@@ -46,11 +46,12 @@ export function registerBatchTools(server: McpServer): void {
       'action=propose: submit the full plan. READ plans certify + execute immediately. WRITE/SEND plans queue as ONE pending action for approval — after it is approved, call action=execute with the pending_action_id.',
       'Writes/sends execute serially with per-call runtime gates intact; the loop halts after consecutive failures instead of replaying a systemic error. The ledger lists every failed item — report failures to the user honestly.',
       'HARD LIMITS (visible by design): max 500 items per plan (split larger jobs into consecutive plans); read concurrency max 8. Provider rate-limits auto-back-off (batch pauses, no items lost); re-running a partial batch is idempotent-safe — already-succeeded items are skipped, never re-executed.',
+      'Plain public GET batches may use the bounded aliases http_fetch, web_fetch, web_fetch_simple, or fetch_url with item args {"url":"https://..."}; the harness resolves them to its real allowed curl path.',
     ].join(' '),
     {
       action: z.enum(['propose', 'execute', 'status']),
       plan: z.object({
-        tool: z.string().describe('composio_execute_tool, an MCP <server>__<tool>, or a local read tool.'),
+        tool: z.string().describe('composio_execute_tool, an MCP <server>__<tool>, a local read tool, or bounded GET alias http_fetch/web_fetch/web_fetch_simple/fetch_url.'),
         composioSlug: z.string().nullable().optional().describe('Required when tool=composio_execute_tool: ONE slug for every item.'),
         sideEffect: z.enum(['read', 'write', 'send']),
         objective: z.string().min(8).max(400).describe('What this batch accomplishes — judged against the payloads.'),
@@ -70,7 +71,10 @@ export function registerBatchTools(server: McpServer): void {
           // First-contact plan beat (armed at the policy classifier): the
           // code-mode batch door gets the same one conversational beat as
           // run_worker (2026-07-22: an inline batch bypassed the fan-out gate).
-          const alignmentBounce = maybeBounceMassExecution(sessionId);
+          const alignmentBounce = maybeBounceMassExecution(sessionId, {
+            itemCount: rawPlan.items.length,
+            sideEffect: rawPlan.sideEffect,
+          });
           if (alignmentBounce.bounce && alignmentBounce.steer) return textResult(alignmentBounce.steer);
           // Parse each item's JSON-string args into an object up front, with a
           // precise per-item error so a malformed item is fixable, not a loop.

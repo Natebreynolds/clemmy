@@ -231,3 +231,39 @@ test('a parked step that resumes and completes ends done, not awaiting_approval'
   assert.equal(detail.steps[0].status, 'done');
   assert.equal(detail.steps[0].output, 'posted');
 });
+
+test('capability parking renders as waiting for connection and returns to running on resume', () => {
+  const blocked = buildWorkflowRunDetail([
+    { t: '2026-07-04T00:00:00.000Z', kind: 'run_started' },
+    { t: '2026-07-04T00:00:01.000Z', kind: 'step_started', stepId: 'publish' },
+    {
+      t: '2026-07-04T00:00:02.000Z',
+      kind: 'step_failed',
+      stepId: 'publish',
+      error: 'Reconnect Google Sheets.',
+      meta: { reason: 'parked_on_capability', toolkit: 'googlesheets', provenNoDispatch: true },
+    },
+    {
+      t: '2026-07-04T00:00:03.000Z',
+      kind: 'run_paused',
+      meta: { reason: 'capability_blocked', toolkit: 'googlesheets' },
+    },
+  ]);
+  assert.equal(blocked.runStatus, 'blocked');
+  assert.equal(blocked.steps[0].status, 'awaiting_capability');
+  assert.match(blocked.steps[0].error, /Reconnect Google Sheets/);
+
+  const resumed = buildWorkflowRunDetail([
+    ...([
+      { t: '2026-07-04T00:00:00.000Z', kind: 'run_started' },
+      { t: '2026-07-04T00:00:01.000Z', kind: 'step_started', stepId: 'publish' },
+      { t: '2026-07-04T00:00:02.000Z', kind: 'step_failed', stepId: 'publish', error: 'Reconnect.', meta: { reason: 'parked_on_capability' } },
+      { t: '2026-07-04T00:00:03.000Z', kind: 'run_paused', meta: { reason: 'capability_blocked' } },
+    ] as Ev[]),
+    { t: '2026-07-04T00:01:00.000Z', kind: 'run_resumed' },
+    { t: '2026-07-04T00:01:01.000Z', kind: 'step_started', stepId: 'publish' },
+  ]);
+  assert.equal(resumed.runStatus, 'running');
+  assert.equal(resumed.steps[0].status, 'running');
+  assert.equal(resumed.steps[0].error, '');
+});

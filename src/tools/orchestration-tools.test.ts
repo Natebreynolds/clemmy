@@ -1242,15 +1242,17 @@ test('renderWorkflowRunsOverview lists in-flight + needs-attention runs, and rec
   writeRunRecord({ id: 'r-run', workflow: 'sf-to-airtable', status: 'running', createdAt: new Date().toISOString() });
   writeRunRecord({ id: 'r-queued', workflow: 'daily-brief', status: 'queued', createdAt: new Date().toISOString() });
   writeRunRecord({ id: 'r-attn', workflow: 'enrich', status: 'completed', needsAttention: true, createdAt: new Date().toISOString() });
+  writeRunRecord({ id: 'r-report-block', workflow: 'publish-site', status: 'completed', needsAttention: false, reportBack: { outcome: 'blocked' }, createdAt: new Date().toISOString() });
   writeRunRecord({ id: 'r-done', workflow: 'old-flow', status: 'completed', createdAt: new Date(Date.now() - 3_600_000).toISOString() });
 
   const out = renderWorkflowRunsOverview();
-  assert.match(out, /3 active runs/);
+  assert.match(out, /4 active runs/);
   assert.match(out, /sf-to-airtable · running · run r-run/);
   assert.match(out, /daily-brief · queued/);
-  assert.match(out, /enrich · completed · NEEDS ATTENTION/);
+  assert.match(out, /enrich · outcome Blocked · NEEDS ATTENTION/);
+  assert.match(out, /publish-site · outcome Blocked · NEEDS ATTENTION/);
   assert.match(out, /Recently finished:/);
-  assert.match(out, /old-flow · completed · run r-done/);
+  assert.match(out, /old-flow · outcome Succeeded · run r-done/);
 });
 
 test('renderWorkflowRunsOverview: nothing active → says so (still lists recent)', () => {

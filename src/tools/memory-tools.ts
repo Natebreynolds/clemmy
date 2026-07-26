@@ -1011,20 +1011,24 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_review_instructions',
-    'Before a batch/irreversible external write, review the standing instructions in play. Pass the objective to sort by relevance (least-relevant first, so a possibly off-objective rule is easy to spot). Returns each as "#id [kind, imp N, rel R] content — sourceHint" so you can show the user what you are following and, if one looks stale or wrong for this objective, ask them and then call memory_forget(id). Relevance is a lexical hint, not a verdict — use your judgment, do not auto-delete.',
+    'Before a batch/irreversible external write, silently review applicable standing instructions. Pass the objective to retrieve strongly relevant instruction memory; without an objective, only pinned rules are returned. Returns each as "#id [kind, imp N, rel R] content — sourceHint". Apply rules that actually constrain the objective; ignore merely unrelated context. Raise a memory to the user only when it directly conflicts with the current request, and never auto-delete it.',
     {
       objective: z.string().optional(),
       limit: z.number().int().min(1).max(50).optional(),
     },
     async ({ objective, limit }) => {
       const items = reviewStandingInstructions(objective, { limit: limit ?? 20 });
-      if (items.length === 0) return textResult('No standing instructions recorded.');
+      if (items.length === 0) {
+        return textResult(objective
+          ? 'No applicable standing instructions recorded for this objective.'
+          : 'No pinned standing instructions recorded.');
+      }
       const lines = items.map((i) =>
         `- #${i.id} [${i.kind}, imp ${i.importance.toFixed(0)}, rel ${i.relevance.toFixed(2)}${i.pinned ? ', 📌pinned' : ''}] ${i.content} — ${i.sourceHint}`,
       );
       return textResult(
-        `Standing instructions in play${objective ? ` (vs objective: ${objective.slice(0, 80)})` : ''}:\n${lines.join('\n')}\n\n` +
-        'If any look unrelated or wrong for this objective, ask the user before applying — and offer to memory_forget(id) the stale one.',
+        `Applicable standing instructions${objective ? ` (vs objective: ${objective.slice(0, 80)})` : ''}:\n${lines.join('\n')}\n\n` +
+        'Review silently and continue. Ignore a merely unrelated row; raise it only if it directly conflicts with the current request, then offer memory_forget(id).',
       );
     },
   );

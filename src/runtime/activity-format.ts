@@ -14,6 +14,10 @@
  *
  * Run: npx tsx --test src/runtime/activity-format.test.ts
  */
+import {
+  isWorkflowTerminalOutcome,
+  type WorkflowTerminalOutcome,
+} from '../execution/workflow-terminal-outcome.js';
 
 /** A run/event shape permissive enough to accept legacy run-store records,
  *  harness-session-derived activity runs, and workflow-run records. */
@@ -39,6 +43,7 @@ export interface ActivityRunLike {
   error?: string;
   queuedTaskId?: string;
   needsAttention?: boolean;
+  terminalOutcome?: WorkflowTerminalOutcome;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string;
@@ -377,6 +382,12 @@ export function userFacingRunState(run: ActivityRunLike, nowMs = Date.now()): Us
   const latest = latestMilestone(run);
   const latestType = latest?.type ?? '';
 
+  if (isWorkflowTerminalOutcome(run.terminalOutcome)) {
+    if (run.terminalOutcome === 'failed') return 'failed';
+    if (run.terminalOutcome === 'cancelled') return 'cancelled';
+    if (run.terminalOutcome === 'partial' || run.terminalOutcome === 'blocked') return 'needs_attention';
+    if (run.terminalOutcome === 'succeeded') return 'completed';
+  }
   if (status === 'failed' || latestType === 'run_failed' || latestType === 'failed' || run.error) return 'failed';
   if (status === 'cancelled' || latestType === 'cancelled') return 'cancelled';
   if (run.needsAttention === true) return 'needs_attention';

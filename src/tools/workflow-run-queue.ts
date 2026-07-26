@@ -31,6 +31,10 @@ import {
   workflowCallMutationSlotHasLedger,
 } from '../execution/workflow-call-receipts.js';
 import { withWorkflowRunRecordLock } from '../execution/workflow-run-record.js';
+import {
+  createWorkflowRunDefinitionSnapshot,
+  type WorkflowRunDefinitionSnapshot,
+} from '../execution/workflow-run-definition.js';
 
 /** Run-record capability marker: this execution was admitted by a runner that
  * enforces fsynced exact-call receipts for every structured mutation. */
@@ -912,6 +916,22 @@ function workflowRunReadinessSnapshot(
   };
 }
 
+function admittedWorkflowDefinition(
+  name: string,
+  admittedAt: string,
+): {
+  workflowEntry: ReturnType<typeof listWorkflows>[number] | undefined;
+  snapshot: WorkflowRunDefinitionSnapshot | undefined;
+} {
+  const workflowEntry = listWorkflows().find((entry) => entry.data.name === name || entry.name === name);
+  return {
+    workflowEntry,
+    snapshot: workflowEntry
+      ? createWorkflowRunDefinitionSnapshot(workflowEntry.name, workflowEntry.data, admittedAt)
+      : undefined,
+  };
+}
+
 export function queueWorkflowRun(
   name: string,
   normalizedInputs: Record<string, string>,
@@ -985,7 +1005,9 @@ function queueWorkflowRunUnlocked(
       message: `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
     };
   }
-  const workflowEntry = listWorkflows().find((entry) => entry.data.name === name || entry.name === name);
+  const createdAt = new Date().toISOString();
+  const { workflowEntry, snapshot: workflowDefinitionSnapshot } =
+    admittedWorkflowDefinition(name, createdAt);
   const readinessTargetStepId = opts?.targetStepId ?? opts?.retryFailedItems?.stepId;
   let readiness: WorkflowRunReadinessCheck | undefined;
   if (workflowEntry) {
@@ -1000,7 +1022,6 @@ function queueWorkflowRunUnlocked(
       };
     }
   }
-  const createdAt = new Date().toISOString();
   const origin = origins[0];
   const source = normalizedOptionalString(opts?.source);
   const targetStepId = normalizedOptionalString(opts?.targetStepId);
@@ -1055,6 +1076,7 @@ function queueWorkflowRunUnlocked(
     inputs: normalizedInputs,
     status: 'queued',
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+    ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
     createdAt,
     ...(source ? { source } : {}),
     ...(triggerReceiptId ? { triggerReceiptId } : {}),
@@ -1132,6 +1154,8 @@ export function queueWorkflowDryRun(
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
+  const createdAt = new Date().toISOString();
+  const { snapshot: workflowDefinitionSnapshot } = admittedWorkflowDefinition(name, createdAt);
   const source = normalizedOptionalString(opts?.source);
   const targetStepId = normalizedOptionalString(opts?.targetStepId);
   const { id } = installFreshRandomRunRecord(opts?.idPrefix, (runId) => ({
@@ -1140,7 +1164,8 @@ export function queueWorkflowDryRun(
     inputs: normalizedInputs,
     status: 'dry_run',
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
-    createdAt: new Date().toISOString(),
+    ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
+    createdAt,
     ...(source ? { source } : {}),
     ...(targetStepId ? { targetStepId } : {}),
   }));
@@ -1166,6 +1191,8 @@ export function queueWorkflowCreationTest(
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
+  const createdAt = new Date().toISOString();
+  const { snapshot: workflowDefinitionSnapshot } = admittedWorkflowDefinition(name, createdAt);
   const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
   const origin = origins[0];
   const source = normalizedOptionalString(opts?.source);
@@ -1175,7 +1202,8 @@ export function queueWorkflowCreationTest(
     inputs: normalizedInputs,
     status: 'creation_test',
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
-    createdAt: new Date().toISOString(),
+    ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
+    createdAt,
     ...(source ? { source } : {}),
     ...(origin ? { originSessionId: origin } : {}),
     ...(origins.length > 1 ? { originSessionIds: origins } : {}),

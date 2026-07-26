@@ -46,6 +46,7 @@ import {
   syncWorkflowTriggerRegistry,
   workflowWebhookResponseDisposition,
 } from '../execution/workflow-trigger-engine.js';
+import { deriveWorkflowTerminalOutcome } from '../execution/workflow-terminal-outcome.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
@@ -832,6 +833,15 @@ function workflowRunRecordAsActivityRun(
   const wfStatus = (rec.status as string | undefined) ?? options.statusFallback ?? 'queued';
   const workflowName = typeof rec.workflow === 'string' && rec.workflow.trim() ? rec.workflow.trim() : '';
   const outputLimit = options.outputLimit ?? 1200;
+  const terminalOutcome = deriveWorkflowTerminalOutcome({
+    status: rec.status,
+    finishedAt: rec.finishedAt,
+    needsAttention: rec.needsAttention,
+    terminalOutcome: rec.terminalOutcome,
+    reportBack: rec.reportBack && typeof rec.reportBack === 'object' && !Array.isArray(rec.reportBack)
+      ? { outcome: (rec.reportBack as Record<string, unknown>).outcome }
+      : undefined,
+  });
   return {
     id,
     sessionId: options.detail ? id : `workflow:${id}`,
@@ -851,6 +861,7 @@ function workflowRunRecordAsActivityRun(
     outputPreview: typeof rec.output === 'string' ? rec.output.slice(0, outputLimit) : '',
     error: typeof rec.error === 'string' ? rec.error : undefined,
     needsAttention: rec.needsAttention === true,
+    terminalOutcome,
     events: [],
   };
 }

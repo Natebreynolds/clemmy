@@ -3,7 +3,7 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -162,6 +162,33 @@ test('authoritative readiness blockers stop certification before lifecycle actio
   assert.equal(cert.canRun, false);
   assert.ok(cert.blockingReasons.some((reason) => reason.includes('missing-skill')));
   assert.ok(cert.nextActions.includes('fix_blockers'));
+});
+
+test('deterministic code must parse, and certification exposes its exact bundle revision', () => {
+  const scriptsDir = path.join(WORKFLOWS_DIR, 'cert-wf', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(path.join(scriptsDir, 'transform.mjs'), 'console.log(JSON.stringify({ ok: true }));\n', 'utf-8');
+  const valid = certifyWorkflow(def({
+    enabled: true,
+    steps: [{ id: 'transform', prompt: 'Transform.', deterministic: { runner: 'transform.mjs' } }],
+  }), { workflowSlug: 'cert-wf' });
+
+  assert.equal(valid.code.ok, true);
+  assert.equal(valid.code.readyCount, 1);
+  assert.match(valid.code.bundleHash ?? '', /^[a-f0-9]{64}$/);
+  assert.equal(valid.canRun, true);
+
+  writeFileSync(path.join(scriptsDir, 'transform.mjs'), 'const = ;\n', 'utf-8');
+  const invalid = certifyWorkflow(def({
+    enabled: true,
+    steps: [{ id: 'transform', prompt: 'Transform.', deterministic: { runner: 'transform.mjs' } }],
+  }), { workflowSlug: 'cert-wf' });
+
+  assert.equal(invalid.code.ok, false);
+  assert.equal(invalid.state, 'blocked');
+  assert.equal(invalid.canRun, false);
+  assert.ok(invalid.blockingReasons.some((reason) => reason.includes('transform.mjs')));
+  assert.match(renderWorkflowCertification(invalid), /Code proof:/);
 });
 
 test('renderWorkflowCertification shows the one-door next action and evidence', () => {

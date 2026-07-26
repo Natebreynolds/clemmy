@@ -516,6 +516,17 @@ function effectiveCommand(tokens: string[], idx: number): { binary: string | und
   return { binary, idx };
 }
 
+/** A CLI help/version invocation inspects command metadata; it cannot publish.
+ * Check only explicit, unquoted argv tokens so `--help` inside a commit message
+ * or payload does not suppress classification of a real mutation. */
+function isReadOnlyCliIntrospection(tokens: string[], commandIdx: number): boolean {
+  const args = tokens.slice(commandIdx + 1).map((token) => token.toLowerCase());
+  return args.includes('--help')
+    || args.includes('--version')
+    || args[0] === 'help'
+    || args[0] === 'version';
+}
+
 /**
  * Classify a raw shell command for the destination gate. Pure — no I/O.
  *
@@ -554,6 +565,7 @@ function classifyOneShellCommand(command: string): ShellWriteShape {
     const effective = effectiveCommand(tokens, idx);
     const segBinary = effective.binary;
     const subcommandIdx = effective.idx;
+    if (isReadOnlyCliIntrospection(tokens, subcommandIdx)) continue;
     // PROD flag anywhere in this segment is a publish signal.
     const prodFlag = tokens.find((t) => PROD_FLAGS.has(t.toLowerCase()));
     // Leading sub-command run: non-flag tokens immediately after the binary.
@@ -664,8 +676,14 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
   switch (binary) {
     case 'curl':
     case 'xh':
-      return /\s(-x|--request|--method[ =])\s*(post|put|patch|delete)\b/i.test(rest)
-        || /\s(-d|--data|--data-raw|--data-binary|--data-urlencode|--json|-f|--form|-t|--upload-file)\b/i.test(rest);
+      // curl short flags are CASE-SENSITIVE: `-d` sends data, while `-D`
+      // merely dumps response headers; `-F` uploads a form, while `-f` is
+      // read-only fail-on-HTTP-error. Keeping them under `/i` mislabeled a
+      // cache-busted GET verification as an irreversible external write.
+      return /\s-X\s*(post|put|patch|delete)\b/i.test(rest)
+        || /\s(?:--request|--method[ =])\s*(post|put|patch|delete)\b/i.test(rest)
+        || /\s(?:-d|-F|-T)(?:$|[^-])/.test(rest)
+        || /\s--(?:data|data-raw|data-binary|data-urlencode|json|form|upload-file)(?:\s|=|$)/i.test(rest);
     case 'wget':
       return /\s(--post-data|--post-file|--body-data|--body-file|--method[ =](post|put|patch|delete))\b/i.test(rest);
     case 'http': // httpie
@@ -738,6 +756,7 @@ function classifyOneShellNetworkMutation(command: string): ShellNetworkMutation 
     const effective = effectiveCommand(tokens, i);
     const binary = effective.binary;
     if (!binary) continue;
+    if (isReadOnlyCliIntrospection(tokens, effective.idx)) continue;
     const rest = ` ${tokens.slice(effective.idx + 1).join(' ')} `;
     if (binaryIsNetworkMutation(binary, rest)) {
       return { isNetworkMutation: true, shapeKey: `shell:${binary}` };

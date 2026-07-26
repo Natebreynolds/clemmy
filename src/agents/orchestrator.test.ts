@@ -260,7 +260,7 @@ test('Orchestrator is now the single agent — carries the union of all action t
     'team_list', 'team_request', 'create_agent', 'update_agent', 'delegate_task', 'check_delegation',
     // Pending-action queue — prepare exact approval-bound payloads before asking
     // once and executing after approval.
-    'pending_action_queue', 'pending_action_list', 'pending_action_get', 'pending_action_record_result',
+    'pending_action_queue', 'pending_action_list', 'pending_action_get', 'pending_action_execute', 'pending_action_record_result',
     // Tasks + goals + executions
     'task_list', 'task_add', 'task_update',
     'goal_upsert', 'goal_list',

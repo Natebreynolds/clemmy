@@ -30,6 +30,25 @@ const CONTROL_ONLY_TOOLS = new Set([
 const MUTATING_OBJECTIVE_RE =
   /\b(?:add|build|call|change|configure|create|delete|deploy|draft|edit|email|execute|generate|install|make|post|publish|remove|run|save|schedule|send|set up|update|write)\b/i;
 
+const NEGATED_ACTION_CLAUSE_RE =
+  /\b(?:do\s+not|don't|dont|never|without)\b[^.!?\n;]*/gi;
+const NEGATED_NO_ACTION_CLAUSE_RE =
+  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^.!?\n;]*/gi;
+const INHERENT_EXTERNAL_WRITE_RE =
+  /\b(?:deploy|invite|publish|send|submit|upload)\b/i;
+const CONTEXTUAL_EXTERNAL_WRITE_VERB_RE =
+  /\b(?:host|post|schedule|reschedule)\s+(?:a|an|the|this|that|it|them|to|on|for)\b/i;
+const LOCAL_SCHEDULE_TARGET_RE =
+  /\b(?:workflow|automation|cron|scheduled job)\b/i;
+const EXTERNAL_DESTINATION_RE =
+  /\b(?:airtable|box|calendar|figma|gmail|google\s+(?:docs?|drive|sheets?)|googledocs?|googledrive|googlesheets?|github|heroku|hubspot|netlify|notion|outlook|railway|salesforce|sharepoint|slack|stripe|supabase|teams|vercel|external\s+(?:app|service|system)|connected\s+(?:app|service|system)|sheet\s+(?:cell|cells|range|row|rows|tab)|spreadsheet)\b/i;
+const EXTERNAL_WRITE_ACTION_RE =
+  /\b(?:add|append|change|create|delete|draft|edit|insert|make|modify|remove|rename|replace|set|update|write)\b/i;
+const EXPLICIT_EXTERNAL_WRITE_RE =
+  /\bexternal[-\s]+write\b/i;
+const URL_TARGETED_WRITE_RE =
+  /\b(?:add|append|create|delete|deploy|edit|modify|post|publish|remove|send|submit|update|upload|write)\b[^.!?\n]{0,100}\b(?:https?:\/\/|api\s+endpoint)\b/i;
+
 const READ_ONLY_TOOL_RE =
   /(?:^|_)(?:check|fetch|find|get|history|info|inspect|list|lookup|probe|query|read|recall|search|status)(?:_|$)/i;
 
@@ -72,6 +91,67 @@ export function completionEvidenceToolName(rawName: string, input?: unknown): st
 
 export function objectiveRequiresMutatingEvidence(objectiveText: string): boolean {
   return MUTATING_OBJECTIVE_RE.test(objectiveText);
+}
+
+function positiveObjectiveActionText(objectiveText: string): string {
+  return objectiveText
+    .replace(NEGATED_ACTION_CLAUSE_RE, ' ')
+    .replace(NEGATED_NO_ACTION_CLAUSE_RE, ' ');
+}
+
+/**
+ * Conservative request classifier for effects that must land in an external
+ * system. It deliberately ignores negated clauses and requires either an
+ * inherently external verb (send/deploy/publish/…) or a write verb paired with
+ * a concrete external destination. A local file build therefore does not gain
+ * an external-receipt requirement.
+ */
+export function objectiveRequiresFreshExternalWrite(objectiveText: string): boolean {
+  const positive = positiveObjectiveActionText(objectiveText);
+  if (!positive.trim()) return false;
+  if (EXPLICIT_EXTERNAL_WRITE_RE.test(positive) || URL_TARGETED_WRITE_RE.test(positive)) return true;
+  if (INHERENT_EXTERNAL_WRITE_RE.test(positive)) return true;
+  if (
+    CONTEXTUAL_EXTERNAL_WRITE_VERB_RE.test(positive)
+    && !(
+      /\b(?:schedule|reschedule)\b/i.test(positive)
+      && LOCAL_SCHEDULE_TARGET_RE.test(positive)
+      && !EXTERNAL_DESTINATION_RE.test(positive)
+    )
+  ) return true;
+  return EXTERNAL_WRITE_ACTION_RE.test(positive) && EXTERNAL_DESTINATION_RE.test(positive);
+}
+
+export type FreshExternalWriteEvidenceStatus =
+  | 'confirmed'
+  | 'missing'
+  | 'failed'
+  | 'ambiguous';
+
+interface SequencedEvidenceEvent {
+  seq: number;
+  type: string;
+}
+
+/**
+ * Resolve external-write evidence strictly after the accepted user row. The
+ * write gate records `external_write` before dispatch; demonstrable failures
+ * and ambiguous timeouts compensate that provisional row. Historical rows at
+ * or before `sourceUserSeq` can never certify this request.
+ */
+export function freshExternalWriteEvidenceStatus(
+  events: readonly SequencedEvidenceEvent[],
+  sourceUserSeq: number | undefined,
+): FreshExternalWriteEvidenceStatus {
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return 'missing';
+  const current = events.filter((event) => event.seq > (sourceUserSeq as number));
+  const writes = current.filter((event) => event.type === 'external_write').length;
+  if (writes === 0) return 'missing';
+  const failed = current.filter((event) => event.type === 'external_write_failed').length;
+  const ambiguous = current.filter((event) => event.type === 'external_write_orphaned').length;
+  if (writes - failed - ambiguous > 0) return 'confirmed';
+  if (ambiguous > 0) return 'ambiguous';
+  return failed > 0 ? 'failed' : 'missing';
 }
 
 export function isReadOnlyCompletionEvidence(rawName: string): boolean {
@@ -158,6 +238,19 @@ export function toolOutputLooksSuccessful(output: unknown, explicitOk?: unknown)
     }
   }
   return true;
+}
+
+/**
+ * The execution controller emits this exact success prefix only after its
+ * pinned success criteria validate and the durable execution is closed.
+ * Rejections begin with "Completion not accepted" and therefore never match.
+ * This gives the chat loop a deterministic way to avoid sending an already
+ * accepted execution through a second, weaker transcript-only judge.
+ */
+export function isAcceptedExecutionCompletionOutput(output: unknown): boolean {
+  if (typeof output !== 'string') return false;
+  const firstLine = output.trim().split(/\r?\n/, 1)[0] ?? '';
+  return /^Execution\s+\S+\s+completed\.(?:\s|$)/i.test(firstLine);
 }
 
 export function hasMeaningfulSuccessfulToolNames(

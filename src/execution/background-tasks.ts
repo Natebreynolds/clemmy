@@ -1589,12 +1589,13 @@ export function reviseBackgroundTaskContract(
   return updated;
 }
 
-function markPendingContractRevisionApplied(task: BackgroundTaskRecord): BackgroundTaskRecord {
+function tryMarkPendingContractRevisionApplied(task: BackgroundTaskRecord): BackgroundTaskRecord | null {
   const pending = task.pendingContractRevision;
   if (!pending) return task;
   return updateBackgroundTaskWhere(
     task.id,
     (latest) => latest.status === 'running'
+      && (latest.contractVersion ?? 1) === pending.version
       && latest.pendingContractRevision?.version === pending.version,
     (latest) => ({
       pendingContractRevision: undefined,
@@ -1606,7 +1607,43 @@ function markPendingContractRevisionApplied(task: BackgroundTaskRecord): Backgro
       lastCheckInAt: nowIso(),
       lastCheckInMessage: `Contract v${pending.version} applied; reconciling saved work before new execution.`,
     }),
-  ) ?? task;
+  );
+}
+
+function markPendingContractRevisionApplied(task: BackgroundTaskRecord): BackgroundTaskRecord {
+  return tryMarkPendingContractRevisionApplied(task) ?? task;
+}
+
+/**
+ * A course correction can arrive while one harness call is still progressing
+ * through its own bounded continuation turns. If that same call emits complete
+ * checkpoints for the new contract, scheduling another background turn only
+ * re-reads receipts (and often calls run_worker just to be told nothing ran).
+ *
+ * Preserve-policy revisions are intentionally excluded: an old complete
+ * manifest can remain complete without proving the model saw the new wording.
+ * Revalidate/invalidate revisions make prior checkpoints incomplete first, so
+ * an exact-version complete manifest is deterministic evidence that the new
+ * contract was actually processed.
+ */
+function pendingContractRevisionSatisfiedByDurableManifest(
+  task: BackgroundTaskRecord,
+): boolean {
+  const pending = task.pendingContractRevision;
+  if (!pending || pending.evidencePolicy === 'preserve') return false;
+  if ((task.contractVersion ?? 1) !== pending.version) return false;
+  try {
+    const manifests = summarizeWorkManifests(task.runSessionId);
+    const expectedVersion = String(pending.version);
+    return manifests.length > 0
+      && manifests.every((manifest) => (
+        manifest.contractVersion === expectedVersion
+        && manifest.total > 0
+        && manifest.remaining === 0
+      ));
+  } catch {
+    return false;
+  }
 }
 
 function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>> {
@@ -4316,34 +4353,61 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      if (contractSuperseded) {
 	        const latest = getBackgroundTask(task.id);
 	        const nextVersion = latest?.contractVersion ?? acceptedContractVersion + 1;
-	        const requeued = updateBackgroundTaskWhere(
-	          task.id,
-	          (candidate) => candidate.status === 'running'
-	            && (candidate.contractVersion ?? 1) > acceptedContractVersion,
-	          {
-	            status: 'pending',
-	            result: (response.text ?? '').slice(0, RESULT_TRUNCATE_CHARS),
-	            continueResolution: {
-	              queuedAt: nowIso(),
-	              reason: `The prior response targeted contract v${acceptedContractVersion}; continue under v${nextVersion} after reconciling durable progress.`,
-	              auto: true,
+	        let latestContractSatisfied = false;
+	        if (latest && pendingContractRevisionSatisfiedByDurableManifest(latest)) {
+	          // The same harness call crossed the contract boundary and produced
+	          // complete exact-version checkpoints. Claim that pending revision
+	          // atomically; if a newer revision raced us, the claim fails and the
+	          // ordinary requeue path below remains authoritative.
+	          const applied = tryMarkPendingContractRevisionApplied(latest);
+	          if (applied) {
+	            task = applied;
+	            latestContractSatisfied = true;
+	            addRunEvent(run.id, {
+	              type: 'status',
+	              message: `Contract v${nextVersion} was satisfied inside the in-flight harness call; reusing its durable manifest without another continuation.`,
+	              data: {
+	                fromVersion: acceptedContractVersion,
+	                toVersion: nextVersion,
+	                disposition: 'completed_in_flight',
+	              },
+	            });
+	            logger.info(
+	              { taskId: task.id, fromVersion: acceptedContractVersion, toVersion: nextVersion },
+	              'In-flight contract revision completed before the harness call returned',
+	            );
+	          }
+	        }
+	        if (!latestContractSatisfied) {
+	          const requeued = updateBackgroundTaskWhere(
+	            task.id,
+	            (candidate) => candidate.status === 'running'
+	              && (candidate.contractVersion ?? 1) > acceptedContractVersion,
+	            {
+	              status: 'pending',
+	              result: (response.text ?? '').slice(0, RESULT_TRUNCATE_CHARS),
+	              continueResolution: {
+	                queuedAt: nowIso(),
+	                reason: `The prior response targeted contract v${acceptedContractVersion}; continue under v${nextVersion} after reconciling durable progress.`,
+	                auto: true,
+	              },
+	              lastCheckInAt: nowIso(),
+	              lastCheckInMessage: `Contract changed from v${acceptedContractVersion} to v${nextVersion}; stale-contract completion was preserved and the task was re-queued.`,
 	            },
-	            lastCheckInAt: nowIso(),
-	            lastCheckInMessage: `Contract changed from v${acceptedContractVersion} to v${nextVersion}; stale-contract completion was preserved and the task was re-queued.`,
-	          },
-	        );
-	        if (requeued) {
-	          finishRun(run.id, {
-	            status: 'cancelled',
-	            message: `Background task run superseded by contract v${nextVersion}; re-queued on the same durable session.`,
-	            outputPreview: response.text,
-	          });
-	          clearLedger(task.runSessionId);
-	          logger.info(
-	            { taskId: task.id, fromVersion: acceptedContractVersion, toVersion: nextVersion },
-	            'Background task re-queued after an in-flight contract revision',
 	          );
-	          continue;
+	          if (requeued) {
+	            finishRun(run.id, {
+	              status: 'cancelled',
+	              message: `Background task run superseded by contract v${nextVersion}; re-queued on the same durable session.`,
+	              outputPreview: response.text,
+	            });
+	            clearLedger(task.runSessionId);
+	            logger.info(
+	              { taskId: task.id, fromVersion: acceptedContractVersion, toVersion: nextVersion },
+	              'Background task re-queued after an in-flight contract revision',
+	            );
+	            continue;
+	          }
 	        }
 	      }
 

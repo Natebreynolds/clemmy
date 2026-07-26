@@ -634,18 +634,23 @@ export async function dispatchBatchItemTool(
   sessionId: string,
   counter: ToolCallsCounter,
   certifiedBatch?: { batchId: string; payloadHash: string },
+  telemetry?: { accounting?: 'transport_mirror'; canonicalCallId?: string },
 ): Promise<unknown> {
   const callId = `batch-${randomUUID()}`;
-  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
+  const telemetryData = {
+    ...(telemetry?.accounting ? { accounting: telemetry.accounting } : {}),
+    ...(telemetry?.canonicalCallId ? { canonicalCallId: telemetry.canonicalCallId } : {}),
+  };
+  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, ...telemetryData, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
       ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch, true)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch, true);
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }
   } catch (err) {
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, batchMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, batchMode: true, ...telemetryData, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
     throw err;
   }
 }

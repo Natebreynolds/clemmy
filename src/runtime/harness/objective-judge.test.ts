@@ -71,6 +71,27 @@ test('gate: one successful mutation does not certify a multi-result objective', 
   }), true);
 });
 
+test('gate: an accepted execution ledger certifies a tool-backed multi-result objective', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    actionIntent: true,
+    meaningfulToolEvidence: true,
+    multiResultObjective: true,
+    acceptedExecutionEvidence: true,
+  }), false);
+});
+
+test('gate: accepted execution does not hide an obviously promise-shaped final reply', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    actionIntent: true,
+    meaningfulToolEvidence: true,
+    multiResultObjective: true,
+    acceptedExecutionEvidence: true,
+    promiseShaped: true,
+  }), true);
+});
+
 test('gate: does NOT fire for a trivial non-action lookup', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false }), false);
 });

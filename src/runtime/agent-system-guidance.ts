@@ -40,13 +40,35 @@ function severityRank(severity: AgentSystemRecommendation['severity']): number {
   }
 }
 
+/** Negative constraints name the exact action they forbid. They must not make
+ * unrelated global workflow-health advice look relevant to an ordinary task
+ * ("do not retry an ambiguous write" previously injected repair-loop policy). */
+function positiveCoordinationSignalText(input: string): string {
+  return input
+    .replace(/\b(?:do\s+not|don'?t|dont|never|without)\b[^.!?\n;]*/gi, ' ')
+    .replace(/\bno\s+(?:retry|rerun|replan|workflow|automation|loop|fan[- ]?out|delegation)\b[^.!?\n;]*/gi, ' ');
+}
+
 function recommendationRelevantToInput(rec: AgentSystemRecommendation, input: string): boolean {
-  const text = input.toLowerCase();
+  const text = positiveCoordinationSignalText(input).toLowerCase();
   if (rec.kind === 'swarm') {
     return /\b(agent|agents|swarm|delegate|delegation|review|debate|parallel|worker|fan[- ]?out|specialist)\b/.test(text)
       || /\b(?:agent\s+team|team\s+(?:agent|agents|of\s+agents))\b/.test(text);
   }
-  return /\b(workflow|automation|automate|retry|replan|rerun|loop|schedule|foreach|for each|failed items?|run)\b/.test(text);
+  return /\b(workflow|automation|automate|retry|replan|rerun|loop|schedule|foreach|for each|failed items?)\b/.test(text);
+}
+
+/** Repair/learning modes summarize failures in existing workflow loops. They
+ * must not become a global kill switch for an unrelated new chat fan-out just
+ * because the user happened to say "run now". */
+function coordinationPolicyRelevantToInput(
+  policy: CoordinationPolicySnapshot | null,
+  input: string,
+): boolean {
+  if (!policy) return false;
+  if (policy.mode !== 'repair-loop' && policy.mode !== 'learning-loop') return true;
+  return /\b(?:workflow|automation|automate|retry|replan|rerun|loop|schedule|foreach|for each|failed items?|resume (?:the|this) (?:run|task|job|workflow))\b/i
+    .test(positiveCoordinationSignalText(input));
 }
 
 function renderMetricsSummary(metrics: AgentSystemMetrics): string {
@@ -99,7 +121,8 @@ export function renderAgentSystemGuidance(input: string, sessionKind?: string): 
     return { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' };
   }
 
-  const { recommendations: all, policy, summary } = loadGuidanceSnapshot();
+  const { recommendations: all, policy: globalPolicy, summary } = loadGuidanceSnapshot();
+  const policy = coordinationPolicyRelevantToInput(globalPolicy, input) ? globalPolicy : null;
   const relevant = all.filter((rec) => recommendationRelevantToInput(rec, input));
   // Keep the coordination policy available to the deterministic fan-out
   // governor, but do not inject generic swarm/workflow advice into an unrelated

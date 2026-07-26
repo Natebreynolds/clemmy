@@ -31,6 +31,7 @@ import { queuePendingAction, findOpenPendingActionByPayload } from './pending-ac
 import {
   isGroundingGateEnabled,
   extractDuplicateIdentityKeys,
+  extractExternalWriteIdentityKeys,
   evaluateGrounding,
   detectDuplicateTarget,
   duplicateResendConsented,
@@ -73,6 +74,7 @@ import {
 } from './destination-gate.js';
 import { establishedTargetsFor, recordPublishedDestination } from './published-destinations.js';
 import { creditMatchingRecall, isTransientFailure } from '../../memory/procedural-recall-link.js';
+import { extractCompleteJsonObjects } from './json-repair.js';
 import {
   asyncJobTimeoutCorrective,
   writeJobTimeoutCorrective,
@@ -333,6 +335,10 @@ export function withTimeout<T>(
   const pauseRecheckMs = options?.pauseRecheckMs ?? 30_000;
   return new Promise<T>((resolve, reject) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (delayMs: number): void => {
+      timer = setTimeout(fireOrDefer, delayMs);
+    };
     const fireOrDefer = (): void => {
       if (settled) return;
       // Approval pause check — if the registry shows a pending
@@ -344,7 +350,10 @@ export function withTimeout<T>(
       let paused = false;
       try { paused = options?.isPaused?.() ?? false; } catch { paused = false; }
       if (paused) {
-        setTimeout(fireOrDefer, pauseRecheckMs).unref?.();
+        // Keep the recheck referenced while the returned promise is pending.
+        // An unreferenced recheck lets a CLI process exit between approval
+        // ticks even though withTimeout has neither resolved nor rejected.
+        arm(pauseRecheckMs);
         return;
       }
       // onTimeout fires ONLY on the actual rejection — never on the pause-defer
@@ -352,17 +361,22 @@ export function withTimeout<T>(
       // already settled (the `settled` guard). S3 uses it to abort the live
       // request; the late AbortError that abort produces is consumed by the
       // `work.then` rejection handler below, so it can't escape as unhandled.
+      settled = true;
       try { options?.onTimeout?.(); } catch { /* abort hook is best-effort */ }
       reject(new ToolTimeout(toolName, ms));
     };
-    setTimeout(fireOrDefer, ms).unref?.();
+    arm(ms);
     work.then(
       (value) => {
+        if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);
         resolve(value);
       },
       (err: unknown) => {
+        if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);
         reject(err);
       },
     );
@@ -539,7 +553,7 @@ function recordExternalWriteOrphan(
       data: {
         tool: toolName,
         slug: shape.shapeKey ?? null,
-        targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
+        targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
         argsDigest: shortArgsDigest(parsedInput),
         timeoutMs,
         aborted: true,
@@ -1001,6 +1015,122 @@ function publishCreateSucceeded(resultText: string): boolean {
     || /\.netlify\.app\b/i.test(resultText);
 }
 
+const DESTINATION_DISCOVERY_COMMAND_RE =
+  /\b(?:netlify|vercel|firebase|wrangler|fly|heroku)\b[\s\S]{0,120}\b(?:status|sites?:list|projects?:list|apps?:list|list(?:sites|projects|apps))\b/i;
+const DESTINATION_ALIAS_KEYS = new Set([
+  'domain',
+  'host',
+  'hostname',
+  'name',
+  'project_name',
+  'site_name',
+  'site_url',
+  'ssl_url',
+  'url',
+]);
+const DESTINATION_ID_KEYS = new Set(['app_id', 'id', 'project_id', 'site_id']);
+
+function shellCommandFromEventData(data: Record<string, unknown> | undefined): string {
+  if (!data) return '';
+  for (const value of [data.arguments, data.args, data.rawArgs]) {
+    if (value && typeof value === 'object' && typeof (value as { command?: unknown }).command === 'string') {
+      return (value as { command: string }).command;
+    }
+    if (typeof value !== 'string') continue;
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && typeof parsed === 'object' && typeof (parsed as { command?: unknown }).command === 'string') {
+        return (parsed as { command: string }).command;
+      }
+    } catch { /* not a JSON-wrapped shell call */ }
+  }
+  return '';
+}
+
+function isReadOnlyDestinationDiscovery(command: string): boolean {
+  if (!DESTINATION_DISCOVERY_COMMAND_RE.test(command)) return false;
+  // A compound "create || list" is still a mutation-shaped call and must never
+  // launder every listed destination into provenance.
+  return !classifyShellNetworkMutation(command).isNetworkMutation
+    && !classifyShellCommand(command).isPublish;
+}
+
+function parseJsonFromShellResult(resultText: string): unknown {
+  const stdout = /\bstdout:\s*([\s\S]*)$/i.exec(resultText)?.[1] ?? resultText;
+  const arrayStart = stdout.indexOf('[');
+  const objectStart = stdout.indexOf('{');
+  const starts = [arrayStart, objectStart].filter((index) => index >= 0);
+  if (starts.length === 0) return null;
+  const start = Math.min(...starts);
+  const opener = stdout[start];
+  const end = stdout.lastIndexOf(opener === '[' ? ']' : '}');
+  if (end <= start) return null;
+  try {
+    return JSON.parse(stdout.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function destinationObjects(value: unknown, out: Array<Record<string, unknown>>, depth = 0): void {
+  if (depth > 5 || out.length >= 200 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) destinationObjects(item, out, depth + 1);
+    return;
+  }
+  if (typeof value !== 'object') return;
+  const object = value as Record<string, unknown>;
+  out.push(object);
+  for (const nested of Object.values(object)) {
+    if (nested && typeof nested === 'object') destinationObjects(nested, out, depth + 1);
+  }
+}
+
+function completeDestinationObjectsFromShellResult(resultText: string): Array<Record<string, unknown>> {
+  const clean = stripAnsi(resultText);
+  const parsed = parseJsonFromShellResult(clean);
+  const objects: Array<Record<string, unknown>> = [];
+  if (parsed) {
+    destinationObjects(parsed, objects);
+    return objects;
+  }
+
+  // Large provider listings can hit the shell capture ceiling mid-array. Parse
+  // only balanced, individually complete objects from that prefix; a partial
+  // object never participates.
+  const stdout = /\bstdout:\s*([\s\S]*)$/i.exec(clean)?.[1] ?? clean;
+  return extractCompleteJsonObjects(stdout, 200);
+}
+
+/**
+ * Resolve a provider's canonical resource ID from a fresh read-only listing,
+ * but only when exactly one returned object carries a full host the user
+ * explicitly named. This keeps URL → UUID handoffs usable without reviving the
+ * clobber bug: unrelated rows in the same listing confer no provenance, and a
+ * create/list fallback is rejected before parsing.
+ */
+function resolvedUserNamedDestinationIds(resultText: string, userBlob: string): string[] {
+  if (!userBlob) return [];
+  const objects = completeDestinationObjectsFromShellResult(resultText);
+  const matched = objects.filter((object) => Object.entries(object).some(([rawKey, value]) => {
+    const key = rawKey.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    if (!DESTINATION_ALIAS_KEYS.has(key) || typeof value !== 'string') return false;
+    return destinationIdentityForms(value).some((form) =>
+      form.includes('.') && form.length >= 6 && userBlob.includes(form));
+  }));
+  if (matched.length !== 1) return [];
+  const identities = new Set<string>();
+  for (const [rawKey, value] of Object.entries(matched[0])) {
+    if (typeof value !== 'string') continue;
+    const key = rawKey.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    if (DESTINATION_ID_KEYS.has(key)) identities.add(value.toLowerCase());
+    if (DESTINATION_ALIAS_KEYS.has(key)) {
+      for (const form of destinationIdentityForms(value)) identities.add(form);
+    }
+  }
+  return [...identities];
+}
+
 /**
  * Wrap a tool so its execute fires the three reliability checks at the
  * entry edge. Gated by HARNESS_TOOL_BRACKETS (default ON; =off kill-switch).
@@ -1027,6 +1157,7 @@ function publishCreateSucceeded(resultText: string): boolean {
  */
 export function buildPublishProvenance(sessionId: string, projectKey?: string): (target: string) => boolean {
   const created = new Set<string>();
+  const resolved = new Set<string>();
   let userBlob = '';
   // Part 2 (2026-06-21): destinations THIS project has successfully published to
   // before — durable, cross-session, project-keyed. A target the project has
@@ -1036,6 +1167,8 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
   try {
     const events = listEvents(sessionId, { types: ['user_input_received', 'tool_called', 'tool_returned'] });
     const createCallNames = new Map<string, string[]>();
+    const discoveryCallIds = new Set<string>();
+    const discoveryResults: string[] = [];
     const userParts: string[] = [];
     for (const e of events) {
       const d = e.data as Record<string, unknown> | undefined;
@@ -1043,6 +1176,9 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
         userParts.push(String(d?.text ?? '').toLowerCase());
       } else if (e.type === 'tool_called') {
         const args = joinedEventText(d?.arguments, d?.args, d?.rawArgs);
+        const command = shellCommandFromEventData(d);
+        const callId = String(d?.callId ?? '');
+        if (callId && command && isReadOnlyDestinationDiscovery(command)) discoveryCallIds.add(callId);
         // Recognize ANY site-creation path, not just one command:
         // `netlify sites:create`, the API `netlify api createSite`,
         // `create-site`. (2026-06-15 Fernwood false-positive: she self-recovered
@@ -1050,7 +1186,6 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
         // freshly-created site because it only matched `sites:create`.) Name is
         // captured from `--name X` OR a `--data '{"name":"X"}'` JSON body.
         if (/sites?:create|projects?:create|create-?sites?\b/i.test(args)) {
-          const callId = String(d?.callId ?? '');
           const names: string[] = [];
           const nm = args.match(/--name(?:=|\s+)["']?([\w.-]+)/i) ?? args.match(/"name"\s*:\s*"([\w.-]+)"/i);
           if (nm) names.push(nm[1].toLowerCase());
@@ -1058,6 +1193,15 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
         }
       } else if (e.type === 'tool_returned') {
         const callId = String(d?.callId ?? '');
+        if (callId && discoveryCallIds.has(callId)) {
+          // Production event rows clip large provider listings (~8KB), while
+          // the lossless tool-output side store keeps the complete JSON. Prefer
+          // that source so a user-named site near the clipped edge can still
+          // resolve to its canonical id; unit fixtures without a side-store row
+          // keep using the event payload.
+          const full = getToolOutput(sessionId, callId)?.output;
+          discoveryResults.push(stripAnsi(full || joinedEventText(d?.result, d?.preview, d?.output)));
+        }
         const names = createCallNames.get(callId);
         if (names) {
           const res = stripAnsi(joinedEventText(d?.result, d?.preview, d?.output));
@@ -1089,6 +1233,9 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
       }
     }
     userBlob = userParts.join(' \n ');
+    for (const result of discoveryResults) {
+      for (const identity of resolvedUserNamedDestinationIds(result, userBlob)) resolved.add(identity);
+    }
   } catch { /* fail-open: empty provenance = stricter gate, never a crash */ }
   return (target: string) => {
     // Identity-aware (Defect A): a site created as `foo` IS `foo.netlify.app` —
@@ -1096,7 +1243,7 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
     // membership against the created/established provenance.
     const forms = destinationIdentityForms(target);
     if (forms.length === 0) return false;
-    if (forms.some((f) => created.has(f) || established.has(f))) return true;
+    if (forms.some((f) => created.has(f) || resolved.has(f) || established.has(f))) return true;
     // The user explicitly named this site in a message this session. Match the
     // FULL host/target form only (forms[0]) — NOT the bare DNS label: a label
     // like "blog"/"docs"/"shop" is too common to confer provenance on a
@@ -1142,7 +1289,7 @@ function compensateFailedExternalWrite(
         data: {
           shapeKey: shape.shapeKey,
           toolName,
-          targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
+          targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
         },
       });
       return;
@@ -1173,7 +1320,10 @@ function compensateFailedExternalWrite(
           data: {
             shapeKey: mutation.shapeKey,
             toolName,
-            targets: extractDuplicateIdentityKeys(command).slice(0, 8),
+            targets: Array.from(new Set([
+              ...extractDuplicateIdentityKeys(command),
+              ...extractExplicitPublishTargets(command),
+            ])).slice(0, 8),
           },
         });
       }
@@ -1561,7 +1711,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     try {
       const shape = classifyExternalWrite(tool.name, parsedInput);
       if (shape.mutating) {
-        const targets = extractDuplicateIdentityKeys(parsedInput);
+        const targets = extractExternalWriteIdentityKeys(parsedInput);
         const match = findOrphanedWriteMatch(ctx.sessionId, shape.shapeKey, targets);
         if (match) {
           const warnKey = `${ctx.sessionId}::${shape.shapeKey}::${match.target}`;
@@ -2053,6 +2203,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
               }
             }
           }
+          // The duplicate gate intentionally stays recipient-focused, but the
+          // durable ledger must still name a publish resource such as --site or
+          // --project. Otherwise a successful deploy is audited as targets=[].
+          const ledgerTargets = Array.from(new Set([
+            ...dupTargets,
+            ...extractExplicitPublishTargets(command),
+          ]));
           const verdict = await evaluateGrounding(ctx.sessionId, tool.name, command);
           if (verdict.action === 'block') {
             try {
@@ -2070,7 +2227,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           try {
             appendEvent({
               sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'external_write',
-              data: { shapeKey: mutation.shapeKey, toolName: tool.name, irreversible: true, shell: true, targets: dupTargets.slice(0, 8) },
+              data: { shapeKey: mutation.shapeKey, toolName: tool.name, irreversible: true, shell: true, targets: ledgerTargets.slice(0, 8) },
             });
           } catch { /* telemetry must never block */ }
         }
@@ -2293,7 +2450,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   // Target identity (recipient email/domain/ids) — read by
                   // the duplicate-target gate so a later same-shape write
                   // to the same target gets a conscious-confirmation bump.
-                  targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
+                  targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
                 },
               });
             } catch { /* telemetry write must never block */ }
@@ -2321,6 +2478,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (
       !ctx.backgroundOfferNudged
       && !ctx.suppressBackgroundOffer
+      && !ctx.codeMode
+      && !ctx.batchItem
       && backgroundOfferNudgeEnabled()
       && !ctx.guardrailScopeId
       && ctx.counter.calls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS

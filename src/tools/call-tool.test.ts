@@ -213,6 +213,77 @@ test('a first-class built-in accidentally wrapped in call_tool dispatches instea
   }
 });
 
+test('a common http_fetch guess repairs to the allowed bounded GET path without double-counting the inner mirror', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  let dispatched: Record<string, unknown> | null = null;
+  _setCodeModeToolsForTests(
+    new Map([['run_shell_command', {
+      name: 'run_shell_command',
+      invoke: async (_ctx: unknown, input: string) => {
+        dispatched = JSON.parse(input) as Record<string, unknown>;
+        return '{"id":1}';
+      },
+    }]]),
+  );
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(),
+      firstClassNames: new Set(['run_shell_command']),
+    }) as unknown as ToolLike;
+    const out = await callTool.invoke!(
+      { context: { sessionId: sess.id } },
+      JSON.stringify({
+        name: 'http_fetch',
+        args_json: JSON.stringify({ url: 'https://example.com/posts/1' }),
+      }),
+      { toolCall: { callId: 'outer-http-fetch' } },
+    );
+    assert.deepEqual(JSON.parse(String(out)), { id: 1 });
+    assert.ok(dispatched);
+    const command = String(dispatched!.command ?? '');
+    assert.match(command, /^curl /);
+    assert.match(command, /--max-filesize 1048576/);
+    assert.match(command, /--write-out/);
+    assert.match(command, /CLEMENTINE_HTTP_META_V1/);
+    assert.ok(
+      command.includes('marker=b"\\n__CLEMENTINE_HTTP_META_V1__"'),
+      'the parser must split on the real newline emitted by curl, not a literal backslash-n',
+    );
+    assert.match(command, /sha256/);
+    assert.match(command, /http_code/);
+    assert.match(command, /https:\/\/example\.com\/posts\/1/);
+
+    const inner = listEvents(sess.id, { types: ['tool_called'] })
+      .find((event) => (event.data as { tool?: string }).tool === 'run_shell_command');
+    assert.ok(inner, 'the repaired real tool remains visible in raw telemetry');
+    assert.equal(inner!.data.accounting, 'transport_mirror');
+    assert.equal(inner!.data.canonicalCallId, 'outer-http-fetch');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
+test('the HTTP alias refuses mutation-shaped or credential-bearing inputs before dispatch', async () => {
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(),
+    firstClassNames: new Set(['run_shell_command']),
+  }) as unknown as ToolLike;
+  for (const args of [
+    { url: 'https://example.com/items', method: 'POST' },
+    { url: 'https://user:secret@example.com/items' },
+    { url: 'file:///etc/passwd' },
+    { url: 'https://example.com/items', headers: { authorization: 'secret' } },
+  ]) {
+    const out = await callTool.invoke!(
+      { context: { sessionId: 'sess-http-alias-refusal' } },
+      JSON.stringify({ name: 'http_fetch', args_json: JSON.stringify(args) }),
+      { toolCall: { callId: `http-refusal-${Math.random()}` } },
+    );
+    assert.equal(JSON.parse(String(out)).error, 'arg_validation');
+  }
+});
+
 test('production run context attributes the inner dispatch without a tool-output ALS shim', async () => {
   _resetHotSetForTest();
   resetEventLog();

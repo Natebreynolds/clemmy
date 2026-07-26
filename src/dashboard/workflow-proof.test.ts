@@ -33,6 +33,7 @@ function run(partial: Partial<WorkflowProofRun> & { workflow: string }): Workflo
     error: partial.error ?? null,
     targetStepId: partial.targetStepId ?? null,
     needsAttention: partial.needsAttention ?? false,
+    terminalOutcome: partial.terminalOutcome,
     workflow: partial.workflow,
   };
 }
@@ -153,6 +154,36 @@ test('evidence.latestSuccessfulRun ignores completed runs that still need attent
   );
   assert.equal(proof.evidence.latestRun?.id, 'recent');
   assert.equal(proof.evidence.latestSuccessfulRun?.id, 'older');
+});
+
+test('evidence.latestSuccessfulRun honors canonical outcome over completed lifecycle', () => {
+  const proof = buildWorkflowProof(
+    {
+      name: 'canonical-evidence-wf',
+      description: 'Draft a short internal note.',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{ id: 'note', prompt: 'Draft a short internal note.' }],
+    },
+    [
+      run({
+        workflow: 'canonical-evidence-wf',
+        id: 'blocked',
+        status: 'completed',
+        terminalOutcome: 'blocked',
+        finishedAt: '2026-07-03T00:00:00.000Z',
+      }),
+      run({
+        workflow: 'canonical-evidence-wf',
+        id: 'succeeded',
+        status: 'completed',
+        terminalOutcome: 'succeeded',
+        finishedAt: '2026-07-01T00:00:00.000Z',
+      }),
+    ],
+  );
+  assert.equal(proof.evidence.latestRun?.id, 'blocked');
+  assert.equal(proof.evidence.latestSuccessfulRun?.id, 'succeeded');
 });
 
 test('aggregates tools, skills, and required input keys across steps', () => {

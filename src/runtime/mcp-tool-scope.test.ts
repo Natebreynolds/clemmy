@@ -106,6 +106,105 @@ test('resolveMcpToolScope: explicit local-memory diagnostics cannot be misread a
   assert.match(scope.reason, /local-only\/no-external-tools/i);
 });
 
+test('resolveMcpToolScope: an email column in a Sheet is structured data, not Outlook intent', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'Create a Google Sheet with columns company and email. Beacon has email missing; validate every row before writing.',
+  });
+  assert.ok(scope.allowedServerSlugs?.includes('googlesheets'));
+  assert.ok(!(scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.equal(scope.reason, 'google-sheets intent');
+
+  const mixed = resolveMcpToolScope({
+    userInput: 'Create a Google Sheet with columns company and email, then email the completed sheet to Bob.',
+  });
+  assert.ok(mixed.allowedServerSlugs?.includes('googlesheets'));
+  assert.ok((mixed.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+});
+
+test('resolveMcpToolScope: a compact Sheet matrix containing email data does not preload Outlook', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'Read Google Sheets range A1:B4 and compare these cells exactly: company,email; Acme,acme@example.com; Beacon,beacon@example.com.',
+  });
+  assert.ok(scope.allowedServerSlugs?.includes('googlesheets'));
+  assert.ok(!(scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.equal(scope.reason, 'google-sheets intent');
+
+  const mixed = resolveMcpToolScope({
+    userInput: 'Read Google Sheets range A1:B4 with headers company,email; then email the verified result to Bob.',
+  });
+  assert.ok(mixed.allowedServerSlugs?.includes('googlesheets'));
+  assert.ok((mixed.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+});
+
+test('resolveMcpToolScope: a negated Outlook boundary plus email-shaped Sheet data does not widen connector scope', () => {
+  const scope = resolveMcpToolScope({
+    userInput: [
+      'Write this matrix to an existing disposable Google Sheet.',
+      'Do not send email or use Outlook; the email-shaped strings below are inert cell data.',
+      'company,email; Acme,alpha@example.invalid',
+    ].join(' '),
+  });
+  assert.ok(scope.allowedServerSlugs?.includes('googlesheets'));
+  assert.ok(!(scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.equal(scope.reason, 'google-sheets intent');
+
+  const mixed = resolveMcpToolScope({
+    userInput: 'Do not send the result yet; draft an Outlook email to Bob with the verified Google Sheet link.',
+  });
+  assert.ok(mixed.allowedServerSlugs?.includes('googlesheets'));
+  assert.ok((mixed.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+});
+
+test('resolveMcpToolScope: a JSON-quoted email header in a precision Sheet replay remains cell data', () => {
+  const scope = resolveMcpToolScope({
+    userInput: [
+      'External-write smoke test against the existing disposable Google Sheet.',
+      'Target: https://docs.google.com/spreadsheets/d/fixture/edit. Modify only Sheet1!E1:G5.',
+      'Write exactly this matrix:',
+      '[["company","email","qualified"],["Clem Smoke Alpha","alpha@example.invalid","TRUE"],["Clem Smoke Beta","beta@example.invalid","FALSE"]]',
+      'Perform exactly one Google Sheets value write and one read-back.',
+      'Do not send email or use Outlook. Do not retry an ambiguous or failed write.',
+      'Report PASS only if every read-back cell is exact; otherwise report FAIL or BLOCKED.',
+    ].join('\n'),
+  });
+  assert.deepEqual(scope.allowedServerSlugs, ['googlesheets', 'google_sheets', 'google']);
+  assert.equal(scope.reason, 'google-sheets intent');
+  assert.equal(scope.maxTools, 8);
+});
+
+test('resolveMcpToolScope: a local Netlify deploy does not preload Salesforce or GitHub from generic nouns', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'Deploy the validated site to Netlify, report the account slug and commit SHA, then verify the production URL.',
+  });
+  assert.deepEqual(scope.allowedServerSlugs, []);
+  assert.equal(scope.maxTools, 0);
+  assert.match(scope.reason, /local deploy CLI intent/i);
+
+  const mixed = resolveMcpToolScope({
+    userInput: 'Deploy the validated site to Netlify, then email the production URL to Bob.',
+  });
+  assert.ok((mixed.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.ok(!(mixed.allowedServerSlugs ?? []).includes('salesforce'));
+  assert.ok(!(mixed.allowedServerSlugs ?? []).includes('github'));
+});
+
+test('resolveMcpToolScope: Salesforce requires its name or real CRM context, not a generic account noun', () => {
+  const named = resolveMcpToolScope({
+    userInput: 'Query the active accounts in Salesforce.',
+  });
+  assert.ok(named.allowedServerSlugs?.includes('salesforce'));
+
+  const crm = resolveMcpToolScope({
+    userInput: 'Query the active accounts in our CRM sales pipeline.',
+  });
+  assert.ok(crm.allowedServerSlugs?.includes('salesforce'));
+
+  const generic = resolveMcpToolScope({
+    userInput: 'Show the current Netlify account and its site settings.',
+  });
+  assert.ok(!(generic.allowedServerSlugs ?? []).includes('salesforce'));
+});
+
 test('resolveMcpToolScope: an explicit external exception remains reachable', () => {
   const scope = resolveMcpToolScope({
     userInput: 'Do not call any external connector except Salesforce; query the active contacts there.',
@@ -166,13 +265,35 @@ test('resolveMcpToolScopeWithRecall: a proven MCP server promotes a fail-open tu
   assert.match(scope.reason, /recall/);
 });
 
-test('resolveMcpToolScopeWithRecall: a learned MCP server WIDENS an existing keyword scope', () => {
+test('resolveMcpToolScopeWithRecall: unrelated learned MCP does not widen an existing precise scope', () => {
   const scope = resolveMcpToolScopeWithRecall({
     userInput: 'do an seo audit on https://example.com',
     learnedMatches: [mcpMatch('airtable__create_record')],
   });
   assert.ok((scope.allowedServerSlugs ?? []).includes('dataforseo'), 'keeps the keyword scope');
-  assert.ok((scope.allowedServerSlugs ?? []).includes('airtable'), 'adds the learned server');
+  assert.ok(!(scope.allowedServerSlugs ?? []).includes('airtable'), 'does not add an unrequested learned server');
+});
+
+test('resolveMcpToolScopeWithRecall: explicitly named learned MCP widens a precise multi-system request', () => {
+  const scope = resolveMcpToolScopeWithRecall({
+    userInput: 'do an seo audit on https://example.com; save the findings to Airtable',
+    learnedMatches: [mcpMatch('airtable__create_record')],
+  });
+  assert.ok((scope.allowedServerSlugs ?? []).includes('dataforseo'), 'keeps the keyword scope');
+  assert.ok((scope.allowedServerSlugs ?? []).includes('airtable'), 'adds the explicitly requested proven server');
+});
+
+test('resolveMcpToolScopeWithRecall: structured payload and prohibited tool names cannot widen a Sheet scope', () => {
+  const scope = resolveMcpToolScopeWithRecall({
+    userInput: [
+      'Write this matrix to an existing Google Sheet:',
+      '[["company","status"],["Clem Smoke Beta","ready"]]',
+      'Perform one read-back. Do not call execution_get or any old receipt tool.',
+    ].join('\n'),
+    learnedMatches: [mcpMatch('beta__get_thing')],
+  });
+  assert.deepEqual(scope.allowedServerSlugs, ['googlesheets', 'google_sheets', 'google']);
+  assert.equal(scope.reason, 'google-sheets intent');
 });
 
 test('resolveMcpToolScopeWithRecall: no learned matches → base scope unchanged', () => {

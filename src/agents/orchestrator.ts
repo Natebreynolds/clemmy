@@ -1788,7 +1788,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
-  const baseInstructions = harnessInstructions(rubricChoice.instructions, { sessionId: options.sessionId ?? undefined });
+  const baseInstructions = harnessInstructions(rubricChoice.instructions, {
+    sessionId: options.sessionId ?? undefined,
+    focusInput: options.userInput ?? undefined,
+  });
 
   // Schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 1), behind
   // CLEMMY_CODEX_TOOL_SEARCH (default ON since v1.3.0; =off restores the full

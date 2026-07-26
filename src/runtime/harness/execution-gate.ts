@@ -31,7 +31,10 @@
  * Tested as pure logic in execution-gate.test.ts (no SDK, no DB).
  */
 
-import { isReadOnlyCallAction } from '../../integrations/composio/slug-effect.js';
+import {
+  composioSlugIsReadOnly,
+  isReadOnlyCallAction,
+} from '../../integrations/composio/slug-effect.js';
 
 /**
  * Verbs in a Composio tool_slug that indicate external state mutation.
@@ -202,6 +205,12 @@ export function isMutatingExternalWrite(
     for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
       if (pattern.test(slug)) return false;
     }
+    // Use the provider boundary's canonical action classifier before the
+    // conservative mutation-token scan. Compound read actions such as
+    // GOOGLESHEETS_BATCH_GET contain the noun BATCH but are still reads; the
+    // old scan mislabeled their verification readback as another external
+    // write, polluting scope, approval, and completion evidence.
+    if (composioSlugIsReadOnly(slug)) return false;
     // CALL is also a communication object. GONG_GET_CALL_TRANSCRIPT and
     // VAPI_RETRIEVE_CALL are reads; another mutation verb still wins.
     if (isReadOnlyCallAction(slug)) return false;

@@ -133,6 +133,7 @@ export function statusTone(status?: string): { tone: Tone; label: string } {
   if (['completed', 'complete', 'done', 'delivered', 'sent', 'ok'].includes(s)) return { tone: 'success', label: 'Done' };
   if (['failed', 'error', 'not_delivered'].includes(s)) return { tone: 'danger', label: 'Failed' };
   if (['running', 'active', 'received', 'in_progress'].includes(s)) return { tone: 'live', label: 'Working' };
+  if (s === 'blocked_capability') return { tone: 'warning', label: 'Connection needed' };
   if (['awaiting_approval', 'needs_attention', 'paused', 'queued', 'pending'].includes(s)) {
     return { tone: 'warning', label: s === 'needs_attention' ? 'Needs attention' : 'Waiting' };
   }

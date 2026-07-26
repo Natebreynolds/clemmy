@@ -84,7 +84,14 @@ import {
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
 import { resolveEffectiveToolNames, type ToolNamePolicyResult } from './tool-policy.js';
-import { hasMeaningfulSuccessfulToolNames, objectiveMayRequireMultipleResults } from './tool-evidence.js';
+import {
+  freshExternalWriteEvidenceStatus,
+  hasMeaningfulSuccessfulToolNames,
+  isAcceptedExecutionCompletionOutput,
+  objectiveMayRequireMultipleResults,
+  objectiveRequiresFreshExternalWrite,
+  type FreshExternalWriteEvidenceStatus,
+} from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
 import {
   listUnverifiedRunArtifacts,
@@ -519,7 +526,7 @@ function modeCanAuthorOrExecute(mode: ClaudeAgentBrainMode): boolean {
 const ACTION_REQUEST_RE =
   /\b(?:create|build|make|set up|schedule|save|write|draft|send|email|update|post|publish|deploy|run|execute|install|configure|generate|add|change|edit|refresh|pull)\b/i;
 const COMPLETION_CLAIM_RE =
-  /\b(?:done|completed|finished|created|built|made|set up|scheduled|saved|wrote|written|drafted|sent|emailed|posted|updated|published|deployed|ran|executed|installed|configured|generated|added|changed|edited|refreshed|pulled)\b/i;
+  /\b(?:pass|verified|done|completed|finished|created|built|made|set up|scheduled|saved|wrote|written|drafted|sent|emailed|posted|updated|published|deployed|ran|executed|installed|configured|generated|added|changed|edited|refreshed|pulled)\b/i;
 
 function looksLikeActionCompletionClaim(requestText: string, replyText: string): boolean {
   return ACTION_REQUEST_RE.test(requestText || '') && COMPLETION_CLAIM_RE.test(replyText || '');
@@ -539,6 +546,51 @@ export function shouldJudgeClaudeCompletion(
     || ((!hasMeaningfulSuccessfulToolNames(successfulToolUses, requestText)
       || objectiveMayRequireMultipleResults(requestText))
       && looksLikeActionCompletionClaim(requestText, replyText));
+}
+
+function claudeRequestFreshExternalWriteStatus(
+  sessionId: string,
+  sourceUserSeq: number,
+): FreshExternalWriteEvidenceStatus {
+  try {
+    return freshExternalWriteEvidenceStatus(
+      listEvents(sessionId, {
+        types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+      }),
+      sourceUserSeq,
+    );
+  } catch {
+    return 'missing';
+  }
+}
+
+function claudeRequestHasAcceptedExecutionCompletion(
+  sessionId: string,
+  sourceUserSeq: number,
+): boolean {
+  try {
+    return listEvents(sessionId, { types: ['tool_returned'] }).some((event) => {
+      if (event.seq <= sourceUserSeq || event.data.tool !== 'execution_complete') return false;
+      return isAcceptedExecutionCompletionOutput(event.data.result ?? event.data.output);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function claudeFreshWriteVerified(sessionId: string, sourceUserSeq: number): boolean {
+  return claudeRequestFreshExternalWriteStatus(sessionId, sourceUserSeq) === 'confirmed'
+    || claudeRequestHasAcceptedExecutionCompletion(sessionId, sourceUserSeq);
+}
+
+function claudeFreshWriteGapReason(status: Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>): string {
+  if (status === 'ambiguous') {
+    return 'the current request has an ambiguous external-write outcome; reconcile the exact target read-only and do not repeat the write';
+  }
+  if (status === 'failed') {
+    return 'the current request has only a failed compensated write and no successful current-request receipt';
+  }
+  return 'no external-write receipt exists after the current user request; historical focus summaries and prior execution receipts are not evidence';
 }
 
 function mergeClaudeRunEvidence(
@@ -870,6 +922,7 @@ async function buildClaudeAgentBrainTurnContext(
   const volatile = splitContext
     ? renderCanonicalMemoryContext({
         sessionId: request.sessionId,
+        focusInput: request.message,
         partition: 'volatile',
         includeSessionActions: false,
       })
@@ -985,10 +1038,9 @@ async function buildClaudeAgentBrainTurnContext(
   // step cap and parked at ~item #15. Now a detected multi-item turn gets the loud
   // "do NOT serialize — run_worker in parallel waves" directive so she actually swarms.
   let fanoutDirective = '';
-  // Confirm beat (parity with the context packet's confirm-first line — this
-  // lane doesn't consume the packet): a FRESH chat session opening with an
-  // execution-shaped request gets one conversational confirm/capability/
-  // background beat before the work starts. The 2026-07-16 incident lane.
+  // Confirm beat (parity with the context packet's legacy opt-in line — this
+  // lane doesn't consume the packet). Default-off: clear requests execute now;
+  // action-specific approval and destination gates remain authoritative.
   let confirmBeat = '';
   const sourceBoundTurn = Number.isSafeInteger(opts?.sourceUserSeq)
     && Number(opts?.sourceUserSeq) > 0;
@@ -1453,6 +1505,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const attemptTrackerScopeId = `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
   const turnObjective = effectiveTurnObjective(sessionId, request.message, userInputEvent.seq);
+  const freshExternalWriteRequired = objectiveRequiresFreshExternalWrite(turnObjective);
   const toolEconomyState = (() => {
     if (surface === 'background' || surface === 'cron' || !interactiveToolEconomyEnabled()) return undefined;
     let multiItem = false;
@@ -1738,7 +1791,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       modeCanAuthorOrExecute(mode) &&
       !resultIsAwaitingInput() &&
       !result.limitHit &&
-      shouldJudgeClaudeCompletion(turnObjective, result.text, result.successfulToolUses ?? result.toolUses)
+      (
+        shouldJudgeClaudeCompletion(turnObjective, result.text, result.successfulToolUses ?? result.toolUses)
+        || (
+          freshExternalWriteRequired
+          && !claudeFreshWriteVerified(sessionId, userInputEvent.seq)
+          && looksLikeActionCompletionClaim(turnObjective, result.text)
+        )
+      )
     ) {
       const objective = composeJudgedObjective(
         turnObjective,
@@ -1748,6 +1808,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       for (let i = 0; i < maxCont; i += 1) {
         let done = true;
         let reason = '';
+        let freshnessGap = false;
+        let freshnessStatus: FreshExternalWriteEvidenceStatus = 'confirmed';
         try {
           const skillContext: SkillExecutionContext = {
             skills: [],
@@ -1762,10 +1824,23 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             result = { ...result, stoppedReason: 'awaiting-input' };
             break;
           }
+          freshnessStatus = freshExternalWriteRequired
+            ? claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq)
+            : 'confirmed';
+          freshnessGap = done
+            && freshExternalWriteRequired
+            && freshnessStatus !== 'confirmed'
+            && !claudeRequestHasAcceptedExecutionCompletion(sessionId, userInputEvent.seq);
+          if (freshnessGap) {
+            done = false;
+            reason = claudeFreshWriteGapReason(
+              freshnessStatus as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
+            );
+          }
           // A selfJudge NOT-DONE (same family as the brain) gets ONE bounce,
           // never two — the second disagreement is accepted with the advisory
           // tag (parity with loop.ts; ask-first batch regression).
-          if (!done && verdict.selfJudge && i >= 1) {
+          if (!done && verdict.selfJudge && !freshnessGap && i >= 1) {
             completionVerification = { selfJudge: true };
             break;
           }
@@ -1782,10 +1857,18 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         // draws from the shared turn budget — so narration+reasoning+judge can't
         // stack into 4-5 full re-runs (Phase 1.3).
         if (continuationsUsed >= continuationBudget) break;
+        const freshnessDirective = freshnessGap
+          ? freshnessStatus === 'ambiguous'
+            ? 'Do NOT repeat the external write. Reconcile the exact target with a read-only lookup/read-back; if it cannot be reconciled, report that precise ambiguity and stop.'
+            : freshnessStatus === 'failed'
+              ? 'The current write failed. Inspect that current-request failure and repair it only when safe and permitted; honor any instruction not to retry. Never substitute an older receipt.'
+              : `No write receipt exists after source user event ${userInputEvent.seq}. Perform the requested external action now, then verify it with a current-request read-back. Never use a historical execution as proof.`
+          : '';
         const contResult = await runContinuation({
           prompt:
             `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
             `Original request: "${turnObjective}". ` +
+            `${freshnessDirective ? `${freshnessDirective} ` : ''}` +
             `IMPORTANT: if finishing requires the USER'S decision or authorization — sending, posting, or deleting something external, or scope left open — do NOT proceed on your own; end your reply with the concrete question for the user. That is a correct, complete answer. ` +
             `Otherwise continue now and FINISH it — produce the concrete artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
           ...cleanContinuationRunOptions(),
@@ -1963,6 +2046,46 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           stoppedReason: 'awaiting-input',
         };
       }
+    }
+    // Final deterministic floor after the bounded judge continuations. A
+    // stale PASS must not become a green terminal merely because the retry
+    // budget ran out. Honest blockers/questions are left untouched.
+    if (
+      completionJudgeForSurface
+      && freshExternalWriteRequired
+      && !result.limitHit
+      && !resultIsAwaitingInput()
+      && looksLikeActionCompletionClaim(turnObjective, result.text)
+      && !claudeFreshWriteVerified(sessionId, userInputEvent.seq)
+    ) {
+      const status = claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq);
+      const reason = claudeFreshWriteGapReason(
+        status as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
+      );
+      result = {
+        ...result,
+        text: status === 'ambiguous'
+          ? 'I cannot honestly confirm this external write: its current-request outcome is ambiguous. I did not repeat it or use an older receipt as proof; the exact target needs a read-only reconciliation.'
+          : status === 'failed'
+            ? 'The external write attempted for this request was recorded as failed, so I cannot call it complete or substitute an older receipt.'
+            : 'I cannot honestly confirm a new external write for this request: no write receipt exists after your current request, and I did not treat an older focus or execution receipt as proof.',
+        stoppedReason: 'awaiting-input',
+      };
+      try {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'request_bound_external_write_missing',
+            status,
+            sourceUserSeq: userInputEvent.seq,
+            reason,
+            lane: 'claude_sdk',
+          },
+        });
+      } catch { /* terminal honesty telemetry is best-effort */ }
     }
     // Snapshot unresolved artifact state for every terminal disposition. A
     // provider-backed resource can be created before the model asks a material

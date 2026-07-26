@@ -81,6 +81,10 @@ import { listActiveFacts } from '../memory/facts.js';
 type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { readWorkflowEvents } from '../execution/workflow-events.js';
+import {
+  deriveWorkflowTerminalOutcome,
+  type WorkflowTerminalOutcome,
+} from '../execution/workflow-terminal-outcome.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
@@ -288,6 +292,7 @@ interface MobileWorkflowRunSummary {
   id: string;
   workflow: string;
   status: string;
+  terminalOutcome?: WorkflowTerminalOutcome;
   createdAt: string | null;
   startedAt: string | null;
   finishedAt: string | null;
@@ -329,6 +334,15 @@ function readMobileWorkflowRuns(): Map<string, MobileWorkflowRunSummary[]> {
         id,
         workflow,
         status: typeof raw.status === 'string' ? raw.status : 'unknown',
+        terminalOutcome: deriveWorkflowTerminalOutcome({
+          status: raw.status,
+          finishedAt: raw.finishedAt,
+          needsAttention: raw.needsAttention,
+          terminalOutcome: raw.terminalOutcome,
+          reportBack: raw.reportBack && typeof raw.reportBack === 'object' && !Array.isArray(raw.reportBack)
+            ? { outcome: (raw.reportBack as Record<string, unknown>).outcome }
+            : undefined,
+        }),
         createdAt: stringOrNull(raw.createdAt),
         startedAt: stringOrNull(raw.startedAt),
         finishedAt: stringOrNull(raw.finishedAt) ?? stringOrNull(raw.completedAt),
@@ -1611,6 +1625,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           requiresInput: Object.keys(entry.data.inputs ?? {}).length > 0,
           lastRunId: last?.id ?? null,
           lastRunStatus: last?.status ?? null,
+          lastRunOutcome: last?.terminalOutcome ?? null,
           lastRunAt: last?.createdAt ?? last?.startedAt ?? null,
         };
       });

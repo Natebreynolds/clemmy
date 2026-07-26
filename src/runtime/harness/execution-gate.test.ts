@@ -117,13 +117,10 @@ test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_UPDATE is a write (BATCH verb)
   );
 });
 
-test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_GET is a read (BATCH+GET — BATCH triggers, but GET doesn\'t exempt)', () => {
-  // Honest behavior: BATCH alone triggers. This is the false-positive
-  // we accept to keep the rule simple — a BATCH_GET is read but still
-  // gated. The audit overhead is small; the safety is real.
+test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_GET is a read (canonical GET action wins over BATCH noun)', () => {
   assert.equal(
     isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_GET' }),
-    true,
+    false,
   );
 });
 

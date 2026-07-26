@@ -4,10 +4,13 @@ import {
   completionEvidenceToolName,
   hasMeaningfulSuccessfulToolNames,
   isControlOnlyTool,
+  isAcceptedExecutionCompletionOutput,
   isReadOnlyCompletionEvidence,
   isToolSurfaceProbeTool,
   objectiveMayRequireMultipleResults,
+  objectiveRequiresFreshExternalWrite,
   objectiveRequiresMutatingEvidence,
+  freshExternalWriteEvidenceStatus,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
 
@@ -72,6 +75,18 @@ test('failed tool outputs are never successful evidence', () => {
   assert.equal(toolOutputLooksSuccessful('saved proof/report.md', false), false);
 });
 
+test('accepted execution completion is distinguished from a rejected completion attempt', () => {
+  assert.equal(
+    isAcceptedExecutionCompletionOutput('Execution exec-123 completed. Verified 41 rows and zero mismatches.'),
+    true,
+  );
+  assert.equal(
+    isAcceptedExecutionCompletionOutput('Completion not accepted: unmet: verify the public artifact.\nExecution exec-123 remains active.'),
+    false,
+  );
+  assert.equal(isAcceptedExecutionCompletionOutput({ status: 'completed' }), false);
+});
+
 test('multi-result objectives retain completeness verification after one successful mutation', () => {
   for (const objective of [
     'send the emails',
@@ -85,4 +100,59 @@ test('multi-result objectives retain completeness verification after one success
   for (const objective of ['send the email', 'create a report', 'update this file']) {
     assert.equal(objectiveMayRequireMultipleResults(objective), false, objective);
   }
+});
+
+test('fresh external-write requirement is destination-aware and ignores prohibitions/data fields', () => {
+  for (const objective of [
+    'Perform one Google Sheets value write, then read it back.',
+    'Update the Airtable record.',
+    'Deploy the validated site to Netlify.',
+    'Send the email.',
+    'Create a page in Notion.',
+  ]) {
+    assert.equal(objectiveRequiresFreshExternalWrite(objective), true, objective);
+  }
+  for (const objective of [
+    'Build and save a local markdown report.',
+    'Create and schedule a daily digest workflow.',
+    'Read the Google Sheet and summarize it.',
+    'The matrix contains an "email" field. Do not send email or use Outlook.',
+    'Do not deploy or publish anything; inspect the Netlify status only.',
+  ]) {
+    assert.equal(objectiveRequiresFreshExternalWrite(objective), false, objective);
+  }
+});
+
+test('fresh external-write evidence is bound to the current user sequence and nets failures/orphans', () => {
+  const oldWrite = { seq: 4, type: 'external_write' };
+  assert.equal(freshExternalWriteEvidenceStatus([oldWrite], 5), 'missing');
+  assert.equal(
+    freshExternalWriteEvidenceStatus([oldWrite, { seq: 6, type: 'external_write' }], 5),
+    'confirmed',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      oldWrite,
+      { seq: 6, type: 'external_write' },
+      { seq: 7, type: 'external_write_failed' },
+    ], 5),
+    'failed',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      oldWrite,
+      { seq: 6, type: 'external_write' },
+      { seq: 7, type: 'external_write_orphaned' },
+    ], 5),
+    'ambiguous',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      oldWrite,
+      { seq: 6, type: 'external_write' },
+      { seq: 7, type: 'external_write_failed' },
+      { seq: 8, type: 'external_write' },
+    ], 5),
+    'confirmed',
+  );
 });

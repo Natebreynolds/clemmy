@@ -132,17 +132,32 @@ export function extractTargetKeys(rawArgs: unknown): string[] {
  * person2@site.example both carry target "site.example" → batch self-blocks). The
  * broader extractTargetKeys (domains, names) is for SOURCE RETRIEVAL only.
  */
+const RECIPIENT_EMAIL_KEY_RE = /(^|_)(to|to_email|recipient|recipients|email|emails|cc|bcc)$/i;
 const DUP_ID_KEY_RE = /(^|_)(contact_id|record_id|lead_id|account_id|to_number|phone)$/i;
+const PROVIDER_CONNECTION_KEY_RE = /(^|_)(connected_account_id|connection_id|connector_id|user_id)$/i;
 export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
   const keys = new Set<string>();
-  const visit = (value: unknown, keyHint?: string): void => {
+  const visit = (value: unknown, keyHint?: string, rootString = false): void => {
     if (value === null || value === undefined) return;
     if (typeof value === 'string') {
       if ((value.startsWith('{') || value.startsWith('[')) && value.length < 50_000) {
         try { visit(JSON.parse(value)); return; } catch { /* plain string */ }
       }
-      for (const m of value.match(EMAIL_RE) ?? []) keys.add(m.toLowerCase());
-      if (keyHint && DUP_ID_KEY_RE.test(keyHint) && value.length >= 3 && value.length <= 80) keys.add(value.toLowerCase());
+      // A root string is usually a shell command, where field context is not
+      // available. Structured calls mine addresses only from recipient fields;
+      // an email in a body, Sheet cell, or other payload is data—not a target.
+      if (rootString || (keyHint && RECIPIENT_EMAIL_KEY_RE.test(keyHint))) {
+        for (const m of value.match(EMAIL_RE) ?? []) keys.add(m.toLowerCase());
+      }
+      if (
+        keyHint
+        && DUP_ID_KEY_RE.test(keyHint)
+        && !PROVIDER_CONNECTION_KEY_RE.test(keyHint)
+        && value.length >= 3
+        && value.length <= 80
+      ) {
+        keys.add(value.toLowerCase());
+      }
       return;
     }
     if (Array.isArray(value)) { for (const v of value) visit(v, keyHint); return; }
@@ -150,8 +165,102 @@ export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) visit(v, k);
     }
   };
-  visit(rawArgs);
+  visit(rawArgs, undefined, typeof rawArgs === 'string');
   keys.delete('me');
+  return [...keys];
+}
+
+const EXTERNAL_WRITE_RESOURCE_KEYS = new Set([
+  'account_id',
+  'base_id',
+  'channel_id',
+  'collection_id',
+  'contact_id',
+  'database_id',
+  'deployment_id',
+  'destination',
+  'document_id',
+  'file_id',
+  'folder_id',
+  'lead_id',
+  'page_id',
+  'project_id',
+  'range',
+  'recipient',
+  'recipients',
+  'record_id',
+  'repository',
+  'repository_id',
+  'sheet_id',
+  'site_id',
+  'site_url',
+  'spreadsheet_id',
+  'table_id',
+  'target',
+  'target_id',
+  'to',
+  'to_email',
+  'to_number',
+  'url',
+  'worksheet_id',
+]);
+const EXTERNAL_WRITE_PAYLOAD_KEYS = new Set([
+  'body',
+  'content',
+  'fields',
+  'html',
+  'message',
+  'row',
+  'rows',
+  'row_data',
+  'subject',
+  'text',
+  'value',
+  'values',
+]);
+
+function normalizedArgKey(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[-\s]+/g, '_').toLowerCase();
+}
+
+/**
+ * Human/audit identity for the durable external-write ledger. Unlike duplicate
+ * recipient extraction, reversible writes need their resource destination
+ * (for example spreadsheet_id + range) recorded. Payload content, provider
+ * connection IDs, and values nested in cells/bodies are deliberately excluded.
+ */
+export function extractExternalWriteIdentityKeys(rawArgs: unknown): string[] {
+  const keys = new Set<string>(extractDuplicateIdentityKeys(rawArgs));
+  const addExplicitValue = (value: unknown): void => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed.length > 0 && trimmed.length <= 2048 && trimmed.toLowerCase() !== 'me') keys.add(trimmed);
+      return;
+    }
+    if (typeof value === 'number' || typeof value === 'bigint') keys.add(String(value));
+    if (Array.isArray(value)) for (const item of value) addExplicitValue(item);
+  };
+  const visit = (value: unknown): void => {
+    if (value === null || value === undefined) return;
+    if (typeof value === 'string') {
+      if ((value.startsWith('{') || value.startsWith('[')) && value.length < 50_000) {
+        try { visit(JSON.parse(value)); } catch { /* opaque string payload */ }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    for (const [rawKey, nested] of Object.entries(value as Record<string, unknown>)) {
+      const key = normalizedArgKey(rawKey);
+      if (PROVIDER_CONNECTION_KEY_RE.test(key) || EXTERNAL_WRITE_PAYLOAD_KEYS.has(key)) continue;
+      if (EXTERNAL_WRITE_RESOURCE_KEYS.has(key)) addExplicitValue(nested);
+      else visit(nested);
+    }
+  };
+  visit(rawArgs);
   return [...keys];
 }
 

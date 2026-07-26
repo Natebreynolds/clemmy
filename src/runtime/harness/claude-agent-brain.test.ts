@@ -79,6 +79,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_UNIFIED_RECALL;
   delete process.env.CLEMMY_UNIFIED_TURN_PRIMER;
   delete process.env.CLEMMY_CONFIRM_BEAT;
+  delete process.env.CLEMMY_BG_OFFER_NUDGE;
   delete process.env.CLEMMY_INTERACTIVE_TOOL_ECONOMY;
   process.env.AUTH_MODE = 'api_key';
 });
@@ -564,6 +565,7 @@ test('CONVERGE guard: after the user answers a clarifying question, the turn con
 });
 
 test('spine confirm beat: each new consequential intent aligns; an old completion is never permanent consent', async () => {
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
   const sid = createSession({ kind: 'chat' }).id;
   const msg = 'send outreach emails to the 20 firms on my prospect list';
   const fresh = await renderClaudeAgentBrainTurnContext({ message: msg, sessionId: sid });
@@ -913,6 +915,7 @@ test('ordinary manual continue rotates attempt scopes without minting artifact l
 });
 
 test('a go-ahead turn preserves the confirmed multi-document objective for SDK scope and artifact identity', async () => {
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_TOOL_JIT = 'off';
   const sid = 'brain-confirmed-objective';
@@ -1049,6 +1052,21 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     prompts.push(options.prompt);
     trackerScopes.push(options.trackerScopeId ?? '');
+    if (prompts.length === 2) {
+      for (const target of ['one@example.com', 'two@example.com', 'three@example.com']) {
+        appendEvent({
+          sessionId: 'brain-judge',
+          turn: 0,
+          role: 'tool',
+          type: 'external_write',
+          data: {
+            shapeKey: 'OUTLOOK_SEND_EMAIL',
+            toolName: 'composio_execute_tool',
+            targets: [target],
+          },
+        });
+      }
+    }
     return {
       text: prompts.length === 1 ? "I'll send the emails next." : 'Sent all 3 emails — here are the message links.',
       sessionId: 'sdk', model: 'claude-opus-4-8',
@@ -1069,6 +1087,90 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   assert.match(prompts[1], /continue now and FINISH it/i);
   assert.match(prompts[1], /do NOT proceed on your own/i, 'continuation permits asking before external actions');
   assert.match(res.text, /Sent all 3 emails/);
+});
+
+test('full mode: a stale execution lookup cannot certify a newly requested external write', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-request-bound-write';
+  createSession({ id: sessionId, kind: 'chat', title: 'request-bound write' });
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['Sheet1!E1:G5'], receipt: 'old-write-123' },
+  });
+  const prompts: string[] = [];
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runs += 1;
+    prompts.push(options.prompt);
+    if (runs === 1) {
+      return {
+        text: 'PASS — prior execution exec-old has write receipt old-write-123 and readback old-read-456.',
+        sessionId: 'sdk',
+        model: 'claude-opus-4-8',
+        toolUses: ['mcp__clementine-local__execution_get'],
+        successfulToolUses: ['execution_get'],
+      };
+    }
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write',
+      data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['Sheet1!E1:G5'], receipt: 'fresh-write-789' },
+    });
+    return {
+      text: 'PASS — the fresh write and exact readback match.',
+      sessionId: 'sdk',
+      model: 'claude-opus-4-8',
+      toolUses: [
+        'mcp__clementine-local__composio_execute_tool',
+        'mcp__clementine-local__composio_execute_tool',
+      ],
+      successfulToolUses: ['GOOGLESHEETS_VALUES_UPDATE', 'GOOGLESHEETS_BATCH_GET'],
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'receipts appear valid' }));
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Perform exactly one fresh Google Sheets value write to Sheet1!E1:G5 and read it back.',
+    sessionId,
+  });
+
+  assert.equal(res.stoppedReason, 'success');
+  assert.equal(runs, 2, 'the stale PASS is continued instead of delivered');
+  assert.match(prompts[1] ?? '', /No write receipt exists after source user event/i);
+  assert.match(res.text, /fresh write/);
+  assert.equal(listEvents(sessionId, { types: ['external_write'] }).length, 2);
+});
+
+test('full mode: exhausted completion retries never false-green a stale external-write PASS', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS = '0';
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'PASS — prior execution exec-old proves the new Google Sheet write.',
+    sessionId: 'sdk',
+    model: 'claude-opus-4-8',
+    toolUses: ['mcp__clementine-local__execution_get'],
+    successfulToolUses: ['execution_get'],
+  }));
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Perform a fresh Google Sheets write now.',
+    sessionId: 'brain-request-bound-write-exhausted',
+  });
+
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  assert.match(res.text, /no write receipt exists after your current request/i);
+  assert.doesNotMatch(res.text, /^PASS\b/);
+  assert.ok(
+    listEvents('brain-request-bound-write-exhausted', { types: ['guardrail_tripped'] })
+      .some((event) => event.data.kind === 'request_bound_external_write_missing'),
+  );
 });
 
 test('artifact completion performs one exact-ID read-back before reporting success', async () => {
@@ -1300,6 +1402,19 @@ test('streaming judge continuation appends the corrected final answer when it wa
         toolUses: ['mcp__clementine-local__composio_execute_tool'],
       };
     }
+    for (const target of ['one@example.com', 'two@example.com', 'three@example.com']) {
+      appendEvent({
+        sessionId: 'brain-stream-judge',
+        turn: 0,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          toolName: 'composio_execute_tool',
+          targets: [target],
+        },
+      });
+    }
     return {
       text: 'Sent all 3 emails — here are the message links.',
       sessionId: 'sdk', model: 'claude-opus-4-8',
@@ -1340,6 +1455,19 @@ test('streaming judge continuation suppresses retry deltas after stale streamed 
         sessionId: 'sdk', model: 'claude-opus-4-8',
         toolUses: ['mcp__clementine-local__composio_execute_tool'],
       };
+    }
+    for (const target of ['one@example.com', 'two@example.com', 'three@example.com']) {
+      appendEvent({
+        sessionId: 'brain-stream-judge-suppress-retry',
+        turn: 0,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          toolName: 'composio_execute_tool',
+          targets: [target],
+        },
+      });
     }
     await options.onDelta?.('STREAMED RETRY SHOULD NOT RENDER');
     return {
@@ -2294,6 +2422,7 @@ test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds 
 test('spine: the FIRST auto-continue of a long chat run carries the background offer, one-shot', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
   let calls = 0;
   const prompts: string[] = [];
   const manyTools = Array.from({ length: 8 }, () => 'mcp__clementine-local__composio_execute_tool');

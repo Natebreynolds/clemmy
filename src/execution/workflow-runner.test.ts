@@ -83,6 +83,13 @@ const {
   _setWorkflowHarnessLoopImplsForTests,
   publishWorkflowRunTerminalForTest,
   emitParkedApprovalCardToOriginChat,
+  resolveWorkflowDefinitionForRun,
+  WorkflowWatcherMailbox,
+  WorkflowCapabilityBlockedError,
+  workflowCapabilityBlockIsRecoverable,
+  workflowCapabilityRetryDelayMs,
+  reapCapabilityBlockedRuns,
+  resumeCapabilityBlockedWorkflowRun,
 } = await import('./workflow-runner.js');
 // The workflow watcher would otherwise place a REAL judge call from any
 // multi-step test run (live OAuth tokens make the judge reachable on dev
@@ -124,6 +131,84 @@ const approvalRegistry = await import('../runtime/harness/approval-registry.js')
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { readWorkflowRunRecord } = await import('./workflow-run-record.js');
+const { createWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
+
+test('run definition resolution pins admitted steps across later workflow edits and fails closed on corruption', () => {
+  const admitted = {
+    name: 'Pinned workflow',
+    description: 'Pinned definition test.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'work', prompt: 'Original admitted instruction.', sideEffect: 'read' as const }],
+  };
+  const snapshot = createWorkflowRunDefinitionSnapshot(
+    'pinned-workflow',
+    admitted,
+    '2026-07-26T12:00:00.000Z',
+  );
+  const current = {
+    name: 'pinned-workflow',
+    data: {
+      ...admitted,
+      steps: [{ id: 'work', prompt: 'Edited after queueing.', sideEffect: 'read' as const }],
+    },
+  };
+
+  const pinned = resolveWorkflowDefinitionForRun(
+    { workflow: admitted.name, workflowDefinitionSnapshot: snapshot },
+    [current] as never,
+  );
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.definitionSource, 'snapshot');
+  assert.equal(pinned.workflow?.data.steps[0].prompt, 'Original admitted instruction.');
+  assert.equal(pinned.currentWorkflow?.data.steps[0].prompt, 'Edited after queueing.');
+
+  const legacy = resolveWorkflowDefinitionForRun(
+    { workflow: admitted.name },
+    [current] as never,
+  );
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.definitionSource, 'legacy_current');
+  assert.equal(legacy.workflow?.data.steps[0].prompt, 'Edited after queueing.');
+
+  const corrupt = structuredClone(snapshot);
+  corrupt.definition.steps[0].prompt = 'Tampered.';
+  const rejected = resolveWorkflowDefinitionForRun(
+    { workflow: admitted.name, workflowDefinitionSnapshot: corrupt },
+    [current] as never,
+  );
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error ?? '', /snapshot is invalid|content does not match/i);
+});
+
+test('run definition resolution fails closed when authored code changes after admission', () => {
+  const slug = `pinned-code-${Date.now()}`;
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  const runner = path.join(scriptsDir, 'transform.mjs');
+  writeFileSync(runner, 'process.stdout.write(JSON.stringify({ revision: 1 }));\n', 'utf-8');
+  const admitted = {
+    name: 'Pinned code workflow',
+    description: 'Pin exact authored code.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'transform',
+      prompt: 'Transform deterministically.',
+      sideEffect: 'read' as const,
+      deterministic: { runner: 'transform.mjs' },
+    }],
+  };
+  const snapshot = createWorkflowRunDefinitionSnapshot(slug, admitted, '2026-07-26T12:00:00.000Z');
+  writeFileSync(runner, 'process.stdout.write(JSON.stringify({ revision: 2 }));\n', 'utf-8');
+
+  const rejected = resolveWorkflowDefinitionForRun(
+    { workflow: admitted.name, workflowDefinitionSnapshot: snapshot },
+    [{ name: slug, data: admitted }] as never,
+  );
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error ?? '', /code changed after this run was admitted/i);
+});
 
 test('SIGKILL after terminal publication cannot leave status without its exact report envelope', async () => {
   const runId = `terminal-envelope-crash-${Date.now()}`;
@@ -180,6 +265,7 @@ test('SIGKILL after terminal publication cannot leave status without its exact r
     assert.equal(signal, 'SIGKILL');
     const raw = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
     assert.equal(raw.status, 'completed');
+    assert.equal(raw.terminalOutcome, 'succeeded');
     assert.equal(raw.output, 'exact durable result');
     assert.deepEqual(raw.reportBack, {
       version: 1,
@@ -198,6 +284,58 @@ test('SIGKILL after terminal publication cannot leave status without its exact r
     rmSync(ready, { force: true });
     rmSync(release, { force: true });
   }
+});
+
+test('terminal publication persists user-objective truth separately from lifecycle completion', () => {
+  const blockedId = `terminal-outcome-blocked-${Date.now()}`;
+  const blockedFile = path.join(WORKFLOW_RUNS_DIR, `${blockedId}.json`);
+  writeFileSync(blockedFile, JSON.stringify({
+    id: blockedId,
+    workflow: 'Truthful Outcome Workflow',
+    status: 'running',
+  }), 'utf-8');
+  const blocked = publishWorkflowRunTerminalForTest(
+    blockedFile,
+    {
+      id: blockedId,
+      workflow: 'Truthful Outcome Workflow',
+      status: 'completed',
+      finishedAt: new Date().toISOString(),
+      needsAttention: true,
+      blockedSteps: [{ stepId: 'publish', reason: 'authentication required' }],
+    },
+    {
+      workflowName: 'Truthful Outcome Workflow',
+      outcome: 'blocked',
+      detail: 'Publishing is blocked until authentication is restored.',
+    },
+  );
+  assert.equal(blocked.status, 'completed', 'lifecycle compatibility remains intact');
+  assert.equal(blocked.terminalOutcome, 'blocked', 'user-objective truth cannot read as success');
+
+  const partialId = `terminal-outcome-partial-${Date.now()}`;
+  const partialFile = path.join(WORKFLOW_RUNS_DIR, `${partialId}.json`);
+  writeFileSync(partialFile, JSON.stringify({
+    id: partialId,
+    workflow: 'Truthful Fanout Workflow',
+    status: 'running',
+  }), 'utf-8');
+  const partial = publishWorkflowRunTerminalForTest(
+    partialFile,
+    {
+      id: partialId,
+      workflow: 'Truthful Fanout Workflow',
+      status: 'completed_with_errors',
+      finishedAt: new Date().toISOString(),
+      needsAttention: true,
+    },
+    {
+      workflowName: 'Truthful Fanout Workflow',
+      outcome: 'blocked',
+      detail: 'Two fan-out items failed; verified items were preserved.',
+    },
+  );
+  assert.equal(partial.terminalOutcome, 'partial');
 });
 
 test('workflow attempt metrics count one native MCP action, not its transport mirror', () => {
@@ -247,6 +385,29 @@ function writeParkedRun(runId: string, approvalIds: string[]): string {
 const statusOf = (filePath: string): string | undefined =>
   JSON.parse(readFileSync(filePath, 'utf-8')).status;
 
+function writeCapabilityBlockedRun(runId: string, retryAt: string): string {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(filePath, JSON.stringify({
+    id: runId,
+    workflow: 'Capability Resume WF',
+    status: 'blocked_capability',
+    capabilityBlock: {
+      stepId: 'publish',
+      tool: 'GOOGLESHEETS_BATCH_UPDATE',
+      toolkit: 'googlesheets',
+      reason: 'not-connected',
+      message: 'Reconnect Google Sheets.',
+      blockedAt: new Date(Date.parse(retryAt) - 60_000).toISOString(),
+      retryAt,
+      retryCount: 1,
+      provenNoDispatch: true,
+      state: 'blocked',
+    },
+  }, null, 2), 'utf-8');
+  return filePath;
+}
+
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
   const prev: Record<string, string | undefined> = {};
   for (const key of Object.keys(over)) {
@@ -268,6 +429,60 @@ function restoreEnv(key: string, value: string | undefined): void {
   if (value === undefined) delete process.env[key];
   else process.env[key] = value;
 }
+
+test('capability blocks are typed control flow only for externally recoverable gateway reasons', () => {
+  assert.equal(workflowCapabilityBlockIsRecoverable('not-connected'), true);
+  assert.equal(workflowCapabilityBlockIsRecoverable('identity-absent'), true);
+  assert.equal(workflowCapabilityBlockIsRecoverable('ambiguous-account'), true);
+  assert.equal(workflowCapabilityBlockIsRecoverable('suppressed'), true);
+  assert.equal(workflowCapabilityBlockIsRecoverable('constraint'), false);
+  assert.equal(workflowCapabilityBlockIsRecoverable('invalid-args'), false);
+
+  const block = new WorkflowCapabilityBlockedError({
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    toolkit: 'googlesheets',
+    reason: 'not-connected',
+    message: 'Reconnect Google Sheets.',
+  });
+  assert.equal(block.provenNoDispatch, true);
+  assert.equal(block.stepId, 'publish');
+  assert.match(block.message, /Reconnect Google Sheets/);
+});
+
+test('capability retry re-admits the same run only when due, and manual resume bypasses the timer', () => {
+  const now = Date.now();
+  const automatic = writeCapabilityBlockedRun('capability-auto-resume', new Date(now + 30_000).toISOString());
+  assert.equal(reapCapabilityBlockedRuns(now), 0);
+  assert.equal(statusOf(automatic), 'blocked_capability');
+
+  assert.equal(reapCapabilityBlockedRuns(now + 30_000), 1);
+  const resumed = JSON.parse(readFileSync(automatic, 'utf-8')) as {
+    status: string;
+    capabilityBlock: { state: string; resumedAt?: string; provenNoDispatch: boolean };
+  };
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.capabilityBlock.state, 'retrying');
+  assert.equal(resumed.capabilityBlock.provenNoDispatch, true);
+  assert.ok(resumed.capabilityBlock.resumedAt);
+
+  const manual = writeCapabilityBlockedRun('capability-manual-resume', new Date(now + 60 * 60_000).toISOString());
+  assert.equal(resumeCapabilityBlockedWorkflowRun('capability-manual-resume'), true);
+  assert.equal(statusOf(manual), 'running');
+  assert.equal(resumeCapabilityBlockedWorkflowRun('../unsafe'), false);
+
+  withEnv({
+    CLEMENTINE_WORKFLOW_CAPABILITY_RETRY_BASE_MS: '1000',
+    CLEMENTINE_WORKFLOW_CAPABILITY_RETRY_MAX_MS: '4000',
+  }, () => {
+    assert.equal(workflowCapabilityRetryDelayMs(1), 1000);
+    assert.equal(workflowCapabilityRetryDelayMs(2), 2000);
+    assert.equal(workflowCapabilityRetryDelayMs(99), 4000);
+  });
+
+  rmSync(automatic, { force: true });
+  rmSync(manual, { force: true });
+});
 
 test('reapResolvedParkedRuns keeps a run parked while its approval is pending, re-admits once resolved', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
@@ -3501,6 +3716,32 @@ test('decideBatchSettlement: failures with no park → fail; all fulfilled → c
   assert.equal(clean.parkedSteps.length, 0);
 });
 
+test('decideBatchSettlement: a proven capability block preserves completed siblings and outranks failure', () => {
+  const stepA = { id: 'a', prompt: 'read stuff' };
+  const stepB = { id: 'b', prompt: 'write sheet', sideEffect: 'write' as const };
+  const stepC = { id: 'c', prompt: 'also read' };
+  const capability = new WorkflowCapabilityBlockedError({
+    stepId: 'b',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    toolkit: 'googlesheets',
+    reason: 'not-connected',
+    message: 'Reconnect Google Sheets.',
+  });
+  const decision = decideBatchSettlement(
+    [stepA, stepB, stepC],
+    [
+      { status: 'fulfilled', value: { step: stepA, output: { rows: 4 } } },
+      { status: 'rejected', reason: capability },
+      { status: 'rejected', reason: new Error('unrelated read failure') },
+    ],
+  );
+
+  assert.equal(decision.action, 'capability');
+  assert.equal(decision.capabilityBlocks[0], capability);
+  assert.deepEqual(decision.completions, [{ stepId: 'a', output: { rows: 4 } }]);
+  assert.deepEqual(decision.failures, [{ stepId: 'c', message: 'unrelated read failure' }]);
+});
+
 test('tightenWorkflowContractsFromCleanRun applies to current workflow without clobbering newer edits', async () => {
   const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
   const slug = 'clean-tighten-current';
@@ -3571,6 +3812,29 @@ test('renderWatcherWorkflowDigest: completed outputs clipped, remaining steps na
   assert.match(digest.summary, /Steps still to run \(NOT drift[^)]*\): send/);
   assert.ok(digest.summary.length < 1200, 'outputs are clipped');
   assert.match(digest.latest, /completed step "enrich"/);
+});
+
+test('WorkflowWatcherMailbox never waits for the judge and exposes a late verdict at a later boundary', async () => {
+  let resolveJudge!: (verdict: { onTrack: boolean; miss: string; steer: string }) => void;
+  const deferred = new Promise<{ onTrack: boolean; miss: string; steer: string }>((resolve) => {
+    resolveJudge = resolve;
+  });
+  const mailbox = new WorkflowWatcherMailbox();
+
+  assert.equal(mailbox.start(2, () => deferred), true);
+  assert.equal(mailbox.inFlight, true);
+  assert.equal(mailbox.take(), undefined, 'execution can continue immediately while the judge is unresolved');
+  assert.equal(mailbox.start(3, () => deferred), false, 'never stacks verifier calls');
+
+  resolveJudge({ onTrack: false, miss: 'criterion missing', steer: 'Address it before finishing.' });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(mailbox.take(), {
+    afterSteps: 2,
+    verdict: { onTrack: false, miss: 'criterion missing', steer: 'Address it before finishing.' },
+  });
+  mailbox.close();
 });
 
 test('workflow watcher: drift at a step boundary records a steer advisory with the right cadence and digest', async () => {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { X, Play, Trash2, Check, Loader2, Activity, AlertTriangle, Database, FileText, Gauge, GitBranch, KeyRound, Layers2, Radio, Send, ShieldCheck, Wrench, type LucideIcon } from 'lucide-react';
+import { X, Play, Trash2, Check, Loader2, Activity, AlertTriangle, Code2, Database, FileText, Fingerprint, Gauge, GitBranch, KeyRound, Layers2, Radio, Send, ShieldCheck, Wrench, type LucideIcon } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Field';
 import { Switch } from '@/components/ui/Switch';
@@ -78,6 +78,14 @@ function WorkflowEnginePanel({
   const blockers = certification.blockingReasons ?? [];
   const gaps = certification.readinessGaps ?? [];
   const advisories = certification.contractAdvisories ?? [];
+  const code = certification.code;
+  const codeTone: Tone = !code || code.artifactCount === 0
+    ? 'neutral'
+    : code.ok && code.issueCount === 0
+      ? 'success'
+      : code.ok
+        ? 'warning'
+        : 'danger';
   const effectTone: Tone = counts.sends > 0 ? 'warning' : counts.writes > 0 ? 'info' : 'success';
   const resourceTone: Tone = resourceGaps.length > 0 ? 'info' : resourceEntries.length > 0 ? 'success' : 'neutral';
   const phases: Array<{ label: string; value: string; tone: Tone; Icon: LucideIcon }> = [
@@ -101,6 +109,12 @@ function WorkflowEnginePanel({
 
         <div className="grid gap-2 sm:grid-cols-3">
           <EngineMetric icon={Layers2} label="Steps" value={`${stepCount}`} tone="neutral" />
+          <EngineMetric
+            icon={Code2}
+            label="Code proof"
+            value={!code || code.artifactCount === 0 ? 'model only' : `${code.readyCount}/${code.artifactCount} certified`}
+            tone={codeTone}
+          />
           <EngineMetric icon={Database} label="Resources" value={resourceEntries.length > 0 ? `${resourceEntries.length} bound` : 'none'} tone={resourceTone} />
           <EngineMetric icon={GitBranch} label="Waves" value={`${counts.parallelWaves}/${counts.waves} parallel`} tone={counts.waves > 1 ? 'info' : 'neutral'} />
           <EngineMetric icon={Wrench} label="Tools" value={tools.length > 0 ? tools.slice(0, 2).join(', ') : 'none'} tone={counts.blockers > 0 ? 'danger' : tools.length > 0 ? 'success' : 'neutral'} />
@@ -204,6 +218,42 @@ function WorkflowEnginePanel({
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {(code?.artifactCount ?? 0) > 0 && (
+          <div className="mt-3">
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-label text-fg">Authored code</div>
+              {code?.bundleHash && (
+                <span className="flex items-center gap-1 rounded-sm bg-subtle px-2 py-0.5 font-mono text-caption text-faint" title={code.bundleHash}>
+                  <Fingerprint className="h-3 w-3" aria-hidden />
+                  {code.bundleHash.slice(0, 12)}
+                </span>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              {code?.artifacts.map((artifact) => {
+                const tone: Tone = artifact.status === 'ready'
+                  ? 'success'
+                  : artifact.status === 'unverified'
+                    ? 'warning'
+                    : 'danger';
+                return (
+                  <div key={artifact.runner} className="grid gap-1 rounded-md border border-border bg-surface px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+                    <div className="min-w-0">
+                      <div className="truncate font-mono text-small font-semibold text-fg">{artifact.runner}</div>
+                      <div className="truncate text-caption text-faint">
+                        {artifact.language} · {artifact.stepIds.join(', ')}
+                        {artifact.sha256 ? ` · ${artifact.sha256.slice(0, 12)}` : ''}
+                      </div>
+                      {artifact.diagnostic && <p className="mt-1 text-caption text-muted">{artifact.diagnostic}</p>}
+                    </div>
+                    <StatusPill tone={tone}>{artifact.status}</StatusPill>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

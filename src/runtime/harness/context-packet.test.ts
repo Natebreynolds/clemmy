@@ -24,6 +24,36 @@ writeFileSync(
   'utf-8',
 );
 
+mkdirSync(path.join(TMP_HOME, 'skills', 'email-report-helper'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'skills', 'email-report-helper', 'SKILL.md'),
+  [
+    '---',
+    'name: email-report-helper',
+    'description: Build polished email reports for campaign review.',
+    'tier: approved',
+    '---',
+    '',
+    'Draft email report artifacts.',
+  ].join('\n'),
+  'utf-8',
+);
+
+mkdirSync(path.join(TMP_HOME, 'skills', 'lunar-audit'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'skills', 'lunar-audit', 'SKILL.md'),
+  [
+    '---',
+    'name: lunar-audit',
+    'description: Generate a branded Digital Footprint audit for a prospect URL and deploy the HTML report to Netlify.',
+    'tier: approved',
+    '---',
+    '',
+    'Turn one prospect URL into an SEO audit, deploy it to Netlify, and provide a screenshot.',
+  ].join('\n'),
+  'utf-8',
+);
+
 mkdirSync(path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'seo-proposal', 'scripts'), { recursive: true });
 writeFileSync(
   path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'seo-proposal', 'SKILL.md'),
@@ -78,6 +108,14 @@ test('context packet ranks relevant skills and workflows for the current request
   // (the resolver confirms), while still not auto-running unrequested workflows.
   assert.match(packet.text, /call workflow_run with their exact phrasing/);
   assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
+});
+
+test('an already-prepared Netlify deploy does not summon an artifact-generation skill', () => {
+  const packet = buildAgentContextPacket(
+    'Deploy the already-prepared local directory /Users/test/project/artifacts/site to production on https://fixture.netlify.app. Return the deploy URL after verification.',
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+  );
+  assert.deepEqual(packet.skills, [], 'paths, URLs, and generic deploy words are payload—not skill intent');
 });
 
 // ─── detectMultiItemIntentFromConversation — count carried from prior turns ──
@@ -195,6 +233,8 @@ test('detectMultiItemIntent does NOT fire on the no-fire cases', () => {
     ['Give me 3 options for the headline.', 'conversational ideation'],
     ['Pull the 200 rows from the leads table.', 'paginated one-table job'],
     ['Summarize the last 30 days of activity.', 'time span, not items'],
+    ['Verify the fetched index SHA-256 equals abc123, then report pass or the exact mismatch.', 'checksum algorithm, not 256 items'],
+    ['Verify all 18 checks passed and report the evidence.', 'checks belong to one validation task'],
     ['Research this firm and its competitors.', 'no explicit count'],
     ['Using only Clementine local memory, list exactly the 8 people on the Northstar live-proof team. Return names only, no emails. Do not write or change memory.', 'aggregate recall plus negated write boundary'],
   ];
@@ -214,6 +254,45 @@ test('local-memory recall stays simple and receives no unrelated agent-system gu
   assert.equal(packet.agentSystem.injected, false);
   assert.equal(packet.agentSystem.recommendationCount, 0);
   assert.doesNotMatch(packet.text, /AGENT SYSTEM GUIDANCE|Fan-out directive/);
+});
+
+test('a negated retry constraint does not inject global repair-loop guidance or unrelated draft skills/workflows', () => {
+  const packet = buildAgentContextPacket(
+    [
+      'External-write smoke test. Modify only Sheet1!E1:G5 in this existing disposable Google Sheet.',
+      'The email-shaped strings are inert cell data. Do not send email or use Outlook.',
+      'Perform one write and one read-back. Do not retry an ambiguous or failed write.',
+    ].join(' '),
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'precision-sheet-write' },
+  );
+  assert.equal(packet.agentSystem.injected, false);
+  assert.equal(packet.skills.length, 0);
+  assert.equal(packet.workflows.length, 0);
+  assert.doesNotMatch(packet.text, /AGENT SYSTEM GUIDANCE/);
+});
+
+test('a full JSON-matrix Sheet replay scopes only Sheets and injects no email/report procedure', () => {
+  const packet = buildAgentContextPacket(
+    [
+      'External-write smoke test against the existing disposable Google Sheet.',
+      'Target: https://docs.google.com/spreadsheets/d/fixture/edit. Modify only Sheet1!E1:G5.',
+      'Write exactly this matrix:',
+      '[["company","email","qualified"],["Clem Smoke Alpha","alpha@example.invalid","TRUE"],["Clem Smoke Beta","beta@example.invalid","FALSE"]]',
+      'The email-shaped strings are inert cell data.',
+      'Perform exactly one Google Sheets value write and one read-back.',
+      'Do not send email or use Outlook. Do not retry an ambiguous or failed write.',
+      'Report PASS only if every read-back cell is exact; otherwise report FAIL or BLOCKED.',
+    ].join('\n'),
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'precision-sheet-json-matrix' },
+  );
+  assert.deepEqual(packet.toolScope.allowedServerSlugs, ['googlesheets', 'google_sheets', 'google']);
+  assert.equal(packet.skills.length, 0);
+  assert.equal(packet.workflows.length, 0);
+  assert.equal(packet.agentSystem.injected, false);
+  assert.doesNotMatch(packet.text, /email-report-helper/);
+  assert.doesNotMatch(packet.text, /outlook\/email intent/i);
 });
 
 test('detectMultiItemIntent is total — never throws, handles junk input', () => {
@@ -334,7 +413,7 @@ test('packet makes small-N fan-out imperative when the user explicitly asks for 
   assert.ok(!/save it as a forEach workflow/.test(packet.text), 'explicit small-N fan-out does not imply workflow offer');
 });
 
-test('packet blocks fan-out directive when coordination policy is in repair mode', () => {
+test('repair-loop policy is scoped to repair work and cannot globally block unrelated fan-out', () => {
   mkdirSync(path.join(TMP_HOME, 'workflows', 'runs'), { recursive: true });
   writeFileSync(path.join(TMP_HOME, 'workflows', 'runs', 'repair-loop-run.json'), JSON.stringify({
     id: 'repair-loop-run',
@@ -357,16 +436,35 @@ test('packet blocks fan-out directive when coordination policy is in repair mode
     { sessionKind: 'chat', sessionId: 'sess-chat-policy-block' },
   );
 
-  assert.equal(packet.agentSystem.policy?.mode, 'repair-loop');
-  assert.equal(packet.agentSystem.policy?.fanoutPosture, 'block');
+  assert.equal(packet.agentSystem.policy, null, 'unrelated new work does not inherit a global workflow repair block');
   assert.equal(packet.multiItem.detected, true);
-  assert.equal(packet.multiItem.offered, false);
-  assert.equal(packet.multiItem.blockedByPolicy, true);
-  assert.equal(packet.multiItem.fanoutPosture, 'block');
-  assert.equal(packet.multiItem.recommendedWorkerWaveSize, 0);
-  assert.match(packet.text, /Fan-out constrained by coordination policy/);
-  assert.match(packet.text, /wave size 0/);
-  assert.doesNotMatch(packet.text, /Fan-out directive: this turn names 10 independent same-shape/);
+  assert.equal(packet.multiItem.offered, true);
+  assert.equal(packet.multiItem.blockedByPolicy, false);
+  assert.match(packet.text, /Fan-out directive: this turn names 10 independent same-shape/);
+  assert.doesNotMatch(packet.text, /Fan-out constrained by coordination policy/);
+
+  const negatedRetryPacket = buildAgentContextPacket(
+    'Write one exact Google Sheets range and read it back. Do not retry an ambiguous or failed write.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-policy-negated-retry' },
+  );
+  assert.equal(
+    negatedRetryPacket.agentSystem.policy,
+    null,
+    'a prohibition against retries is not a request to resume the broken workflow loop',
+  );
+  assert.equal(negatedRetryPacket.agentSystem.injected, false);
+  assert.doesNotMatch(negatedRetryPacket.text, /AGENT SYSTEM GUIDANCE/);
+
+  const repairPacket = buildAgentContextPacket(
+    'Retry the failed workflow loop: research these 10 prospects after repairing its verifier.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-policy-repair' },
+  );
+  assert.equal(repairPacket.agentSystem.policy?.mode, 'repair-loop');
+  assert.equal(repairPacket.agentSystem.policy?.fanoutPosture, 'block');
+  assert.equal(repairPacket.multiItem.blockedByPolicy, true);
+  assert.match(repairPacket.text, /Fan-out constrained by coordination policy/);
 });
 
 test('packet keeps the static line (no directive) for NON-chat sessions even when multi-item', () => {

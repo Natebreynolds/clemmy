@@ -103,6 +103,40 @@ test('runBatchPlan: read batch executes every item, ledger honest, zero model in
   assert.ok(persisted && persisted.succeeded === 3, 'ledger persisted to disk');
 });
 
+test('runBatchPlan: bounded http_fetch aliases validate and execute through the real parallel GET path', async () => {
+  calls.length = 0;
+  const plan = {
+    tool: 'http_fetch',
+    sideEffect: 'read' as const,
+    objective: 'fetch three public JSON fixtures',
+    items: [1, 2, 3].map((n) => ({
+      id: String(n),
+      args: { url: `https://example.com/posts/${n}` },
+    })),
+    concurrency: 3,
+  };
+  assert.deepEqual(validateBatchPlan(plan), []);
+  assert.ok(validateBatchPlan({
+    ...plan,
+    items: [{ id: 'post', args: { url: 'https://example.com/posts', method: 'POST' } }],
+  }).some((error) => /GET only/.test(error)), 'mutation-shaped alias input is refused during validation');
+
+  _setCodeModeToolsForTests(new Map([
+    ['run_shell_command', fakeTool('run_shell_command', (input) => {
+      assert.match(String(input.command), /^curl /);
+      assert.match(String(input.command), /CLEMENTINE_HTTP_META_V1/);
+      assert.match(String(input.command), /sha256/);
+      return 'exit_code: 0\n\nstdout:\n{"ok":true}';
+    })],
+  ]) as never);
+  const ledger = await runBatchPlan(plan, 'sess-http-alias-batch');
+  assert.equal(ledger.succeeded, 3);
+  assert.equal(ledger.failed, 0);
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => call.name === 'run_shell_command'));
+  assert.ok(calls.every((call) => /--max-filesize 1048576/.test(String((call.input as Record<string, unknown>).command))));
+});
+
 test('runBatchPlan: transient failures retry once; hard failures do not; consecutive failures halt', async () => {
   calls.length = 0;
   let flaky = 0;

@@ -20,6 +20,8 @@ import assert from 'node:assert/strict';
 const { resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
 const {
   extractTargetKeys,
+  extractDuplicateIdentityKeys,
+  extractExternalWriteIdentityKeys,
   rankSources,
   detectDuplicateTarget,
   buildGroundingPrompt,
@@ -63,6 +65,42 @@ test('extractTargetKeys: reserved example domains remain legitimate organization
 
 test('extractTargetKeys: no identity → empty (gate stays out of the way)', () => {
   assert.deepEqual(extractTargetKeys({ tool_slug: 'X_SEND_THING', arguments: '{"text":"hello"}' }), []);
+});
+
+test('extractDuplicateIdentityKeys: recipient fields exclude email-shaped message data', () => {
+  const keys = extractDuplicateIdentityKeys({
+    to_email: 'recipient@oakridge-law.example',
+    body: 'Reference-only address: source@example.invalid',
+  });
+  assert.deepEqual(keys, ['recipient@oakridge-law.example']);
+});
+
+test('extractDuplicateIdentityKeys: Sheet cell values and provider connection are not recipients', () => {
+  const keys = extractDuplicateIdentityKeys({
+    tool_slug: 'GOOGLESHEETS_VALUES_UPDATE',
+    connected_account_id: 'ca_fixture',
+    arguments: JSON.stringify({
+      spreadsheet_id: 'sheet-fixture',
+      range: 'Sheet1!E1:G5',
+      values: [['company', 'email'], ['Alpha', 'alpha@example.invalid']],
+    }),
+  });
+  assert.deepEqual(keys, []);
+});
+
+test('extractExternalWriteIdentityKeys: Sheet ledger records destination, never cell payload or connection id', () => {
+  const keys = extractExternalWriteIdentityKeys({
+    tool_slug: 'GOOGLESHEETS_VALUES_UPDATE',
+    connected_account_id: 'ca_fixture',
+    arguments: JSON.stringify({
+      spreadsheet_id: 'SheetFocusFixture',
+      range: 'Sheet1!E1:G5',
+      values: [['company', 'email'], ['Alpha', 'alpha@example.invalid']],
+    }),
+  });
+  assert.deepEqual(keys, ['SheetFocusFixture', 'Sheet1!E1:G5']);
+  assert.ok(!keys.includes('alpha@example.invalid'));
+  assert.ok(!keys.includes('ca_fixture'));
 });
 
 // ─── rankSources ──────────────────────────────────────────────────

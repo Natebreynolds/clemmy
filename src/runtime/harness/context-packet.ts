@@ -12,6 +12,10 @@ import { listHarnessCapabilityHealth } from './capability-health.js';
 import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-system-guidance.js';
 import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
+import {
+  focusSummaryIsHistoricalForRequest,
+  renderHistoricalFocusPointer,
+} from './focus-projection.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import {
   classifyTurnPreflight,
@@ -100,6 +104,20 @@ const STOPWORDS = new Set([
   'please', 'that', 'the', 'then', 'this', 'to', 'use', 'using', 'we', 'with', 'you',
   // Turn-shaping / output-format words are not skill or workflow intent.
   'clementine', 'exactly', 'json', 'key', 'local', 'not', 'only', 'return', 'single',
+  // Transport/test scaffolding is not procedural intent. These tokens caused
+  // disposable smoke prompts and URLs to outrank the user's actual task.
+  'com', 'data', 'http', 'https', 'www', 'external', 'smoke', 'test', 'tests',
+  'url', 'user', 'users',
+  // Generic execution scaffolding describes almost every procedure and should
+  // never be enough to select one ("first perform one read-back" matched image,
+  // SEO-report, and redesign skills on a Google Sheets write).
+  'after', 'back', 'before', 'complete', 'completed', 'create', 'created',
+  'all', 'blocked', 'cell', 'cells', 'clem', 'deploy', 'deployed', 'deployment',
+  'disposable', 'edit', 'existing',
+  'fail', 'first', 'inert', 'last', 'matrix', 'modify', 'one', 'pass', 'perform',
+  'performed', 'range', 'read', 'row', 'rows', 'sheet1',
+  'update', 'updated', 'validate', 'validated', 'value', 'values', 'verification',
+  'verify', 'verified', 'write', 'writes', 'writing', 'wrote',
 ]);
 
 const DOMAIN_PATTERNS: RegExp[] = [
@@ -160,6 +178,10 @@ const NON_ITEM_NOUNS = new Set([
   'words', 'characters', 'chars', 'bytes', 'pages', 'dollars', 'cents', 'miles', 'points', 'percent',
   'options', 'ideas', 'examples', 'reasons', 'tips', 'ways', 'jokes', 'suggestions', 'names',
   'questions', 'thoughts', 'steps', 'versions', 'things', 'ones', 'others',
+  // Validation/result cardinality belongs to one parent task, not N workers.
+  // These also block checksum prose such as "SHA-256 equals …" from treating
+  // the verb "equals" as a plural item noun.
+  'checks', 'assertions', 'criteria', 'requirements', 'statuses', 'hashes', 'codes', 'equals', 'matches',
 ]);
 const COUNT_CONNECTOR_WORDS = new Set(['a', 'an', 'and', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'with']);
 
@@ -169,6 +191,29 @@ function positiveActionSignalText(text: string): string {
   return text
     .replace(/\b(?:do\s+not|don'?t|never|without)\b[^.!?\n]*/gi, ' ')
     .replace(/\bno\s+(?:emails?|external\s+(?:connector|connectors|tool|tools|mcp|service|services)|writes?|changes?)\b/gi, ' ');
+}
+
+function rankingSignalText(text: string): string {
+  return positiveActionSignalText(text)
+    // A URL or absolute filesystem path is task payload/provenance. Tokenizing
+    // its host/path components ("users", "netlify", project names) made broad
+    // artifact-generation skills appear relevant to an already-prepared deploy.
+    .replace(/\bhttps?:\/\/[^\s<>"']+/gi, ' ')
+    .replace(/(^|[\s("'`])\/(?:[^/\s"'`]+\/)*[^/\s"'`]+/g, '$1 ')
+    // Literal matrix values are payload, not procedural intent. A quoted
+    // "email" header or a cell containing "report" must not summon an Outlook
+    // or report-building skill.
+    .replace(/\[\s*\[[\s\S]{0,12000}?\]\s*\]/g, ' structured_matrix ')
+    // Precision replays often state explicitly that email-looking values are
+    // inert payload. That safety boundary is not positive email intent and
+    // must not summon a mail/data procedure.
+    .replace(
+      /\b(?:the\s+)?e-?mail[-\s](?:shaped|like)\s+(?:strings?|values?|fields?|data|payload)\s+(?:(?:are|is)\s+)?(?:inert|cell\s+data|payload\s+data)(?:\s+(?:cell|payload)\s+data)?\b/gi,
+      ' structured_payload ',
+    )
+    // PASS/FAIL/BLOCKED is a smoke-result contract, not a request for a
+    // reporting procedure.
+    .replace(/\b(?:report|return|respond\s+with)\s+(?:only\s+)?(?:pass|fail|blocked)\b[^.!?\n]*/gi, ' result_status ');
 }
 
 const NO_MULTI_ITEM: MultiItemIntent = Object.freeze({
@@ -214,6 +259,12 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
         const n = Number.parseInt(m[1], 10);
         const noun = m[2].toLowerCase();
         if (!Number.isFinite(n) || n < 3 || n > 500 || NON_ITEM_NOUNS.has(noun)) continue;
+        // A count must be a standalone cardinality. Hyphen/slash/dot/hash
+        // prefixes mean a checksum, range, version, date, or identifier:
+        // `SHA-256`, `2-3 sentences`, `HTTP/2`, `issue #12`. The live Netlify
+        // verification prompt otherwise became a fictitious 256-worker batch.
+        const priorChar = m.index > 0 ? text[m.index - 1] : '';
+        if (/[-./:#]/.test(priorChar)) continue;
         // "8 people on James" used to bind the proper name "James" as the
         // plural noun. A connector between the count and candidate noun proves
         // the noun is not actually governed by that count.
@@ -351,7 +402,12 @@ function clip(text: string, max: number): string {
 
 function tokens(text: string): string[] {
   // Canonical tokenizer with this matcher's general-English stopword policy.
-  return tokenize(positiveActionSignalText(text), { minLen: 3, stopwords: STOPWORDS });
+  // Repeated words must not multiply a candidate's score: one URL-heavy prompt
+  // used "Google Sheet" several times and inflated broad draft skills above
+  // the exact requested operation.
+  return Array.from(new Set(
+    tokenize(rankingSignalText(text), { minLen: 3, stopwords: STOPWORDS }),
+  ));
 }
 
 function explicitlyNamesCandidate(input: string, name: string): boolean {
@@ -381,17 +437,25 @@ function candidateScore(queryTokens: string[], fields: Array<{ text: string; wei
   let score = 0;
   for (const token of queryTokens) {
     for (const field of fields) {
-      const haystack = field.text.toLowerCase();
-      if (!haystack.includes(token)) continue;
+      const words = new Set(field.text.toLowerCase().match(/[a-z0-9]+/g) ?? []);
+      const singular = token.length > 4 && token.endsWith('s') ? token.slice(0, -1) : token;
+      const plural = token.length > 3 && !token.endsWith('s') ? `${token}s` : token;
+      if (!words.has(token) && !words.has(singular) && !words.has(plural)) continue;
       matched.add(token);
       score += field.weight;
-      if (haystack.split(/[^a-z0-9]+/).includes(token)) score += field.weight;
+      // Exact lexical matches carry the second weight beat; singular/plural
+      // normalization keeps "sheet"/"sheets" useful without substring noise
+      // such as "read" matching "ready".
+      if (words.has(token)) score += field.weight;
     }
   }
   return { score, matched: Array.from(matched).slice(0, 5) };
 }
 
-function rankSkills(input: string): RankedContextCandidate[] {
+function rankSkills(
+  input: string,
+  opts: { includeSemanticallyMatchedDrafts?: boolean } = {},
+): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
   try {
@@ -406,18 +470,24 @@ function rankSkills(input: string): RankedContextCandidate[] {
         ]);
         return {
           name: skill.name,
-          description: clip(description || '(no description)', 180),
+          description: `${skill.frontmatter.tier === 'draft' ? '[draft] ' : ''}${clip(description || '(no description)', 180)}`,
           score,
           reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
           matchCount: matched.length,
+          draft: skill.frontmatter.tier === 'draft',
+          explicitlyNamed: explicitlyNamesCandidate(input, skill.name),
         };
       })
       .filter((candidate) => candidate.score >= 8 && (
         candidate.matchCount >= 2 || explicitlyNamesCandidate(input, candidate.name)
+      ) && (
+        opts.includeSemanticallyMatchedDrafts
+        || !candidate.draft
+        || candidate.explicitlyNamed
       ))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
       .slice(0, MAX_CANDIDATES)
-      .map(({ matchCount: _matchCount, ...candidate }) => candidate);
+      .map(({ matchCount: _matchCount, draft: _draft, explicitlyNamed: _explicitlyNamed, ...candidate }) => candidate);
   } catch {
     return [];
   }
@@ -428,7 +498,14 @@ function rankSkills(input: string): RankedContextCandidate[] {
  *  lane, which does not consume the context packet (lane-parity export). */
 export function knownPitfallLineForInput(input: string): string | null {
   try {
-    return pitfallsForSkills(rankSkills(input).map((s) => s.name));
+    // A self-distilled skill starts as a draft, so keep its full procedure out
+    // of ambient context until explicitly requested—but do not suppress a
+    // strongly matched failure lesson. Remembering what went wrong is lower
+    // authority than executing an unproven procedure and is the core value of
+    // this pre-flight seam.
+    return pitfallsForSkills(
+      rankSkills(input, { includeSemanticallyMatchedDrafts: true }).map((s) => s.name),
+    );
   } catch {
     return null;
   }
@@ -437,6 +514,13 @@ export function knownPitfallLineForInput(input: string): string | null {
 function rankWorkflows(input: string): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
+  // Existing workflows are relevant only when the user is talking about a
+  // reusable/recurring process or clearly asks to run one. Ad-hoc work is the
+  // default; injecting similarly named smoke workflows into every one-off
+  // request adds noise without granting capability.
+  const workflowIntent =
+    /\b(?:workflow|automation|automate|recurring|scheduled|schedule|daily|weekly|monthly|routine|for\s+each)\b/i.test(input)
+    || /\b(?:run|start|launch|execute|kick\s+off)\b[^.!?\n]{0,80}\b(?:flow|routine|automation|workflow)\b/i.test(input);
   try {
     return listWorkflows()
       .map((entry) => {
@@ -460,7 +544,7 @@ function rankWorkflows(input: string): RankedContextCandidate[] {
       })
       .filter((candidate) => candidate.score >= 8 && (
         candidate.matchCount >= 2 || explicitlyNamesCandidate(input, candidate.name)
-      ))
+      ) && (workflowIntent || explicitlyNamesCandidate(input, candidate.name)))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
       .slice(0, MAX_CANDIDATES)
       .map(({ matchCount: _matchCount, ...candidate }) => candidate);
@@ -511,10 +595,15 @@ function mcpHealth(): AgentContextPacket['mcp'] {
   }
 }
 
-function focusLine(): string | null {
+function focusLine(input?: string, sessionId?: string): string | null {
   try {
     const focus = getFocusSnapshot();
-    if (focus.active && !focus.needsConfirm) return `Active focus: ${focus.active.title} — ${clip(focus.active.summary, 180)}`;
+    if (focus.active && !focus.needsConfirm) {
+      if (focusSummaryIsHistoricalForRequest(focus.active, input, sessionId)) {
+        return renderHistoricalFocusPointer(focus.active).replace(/\n/g, ' ');
+      }
+      return `Active focus: ${focus.active.title} — ${clip(focus.active.summary, 180)}`;
+    }
     if (focus.active && focus.needsConfirm) return `Stale focus exists: ${focus.active.title}. Confirm before relying on it.`;
     if (focus.parked.length > 0) return `Parked resumable threads: ${focus.parked.slice(0, 3).map((p) => p.title).join('; ')}`;
   } catch {
@@ -622,7 +711,7 @@ export function buildAgentContextPacket(
           ...mcp.map((server) => `MCP ${server.slug} is ${server.state}${server.lastError ? `: ${server.lastError}` : ''}`),
         ]),
   ];
-  const focus = focusLine();
+  const focus = focusLine(input, opts?.sessionId);
   const memoryLine = memory.enabled
     ? `Memory preflight: ${memory.hitCount} hit${memory.hitCount === 1 ? '' : 's'} via ${memory.source ?? 'local search'}${memory.injected ? ' and injected below' : ''}${memory.skippedReason ? ` (${memory.skippedReason})` : ''}.`
     : 'Memory preflight: disabled.';
@@ -651,10 +740,11 @@ export function buildAgentContextPacket(
       ? fanoutPolicyLine(multiItem, agentSystem)
       : STATIC_PARALLELISM_LINE;
 
-  // TURN-CONTROL SPINE confirm beat (policy 2026-07-16): a FRESH chat session
-  // opening with an execution-shaped request gets one conversational
-  // confirm-the-plan / surface-missing-tools / offer-background beat before
-  // the work starts. Continuations, questions, and non-chat kinds are null.
+  // TURN-CONTROL SPINE confirm beat (legacy opt-in): operators can experiment
+  // with a conversational confirm/surface-tools/background beat. Normal
+  // operation starts a clear request immediately and leaves authorization to
+  // the real action boundary. Continuations, questions, and non-chat kinds are
+  // null even when the experiment is enabled.
   // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
   // continuation/retry inputs (turn-control review) — the beat must only
   // ever evaluate a REAL user message, never a substituted one mid-run.

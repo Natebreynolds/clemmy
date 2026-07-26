@@ -49,6 +49,7 @@ import type { BoundaryJudgeRouting } from '../runtime/harness/debate-model.js';
 import { normalizeComposioBatchItemArgs, validateComposioArgs } from '../tools/composio-batch-validator.js';
 import { getCachedToolSchema } from '../tools/composio-schema-cache.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { isCallToolAliasName, resolveCallToolAlias } from '../tools/call-tool-alias.js';
 
 const logger = pino({ name: 'clementine-next.batch-runner' });
 
@@ -202,6 +203,13 @@ export function validateBatchPlan(plan: BatchPlan): string[] {
   if (tool === 'composio_execute_tool') {
     if (typeof plan.composioSlug !== 'string' || !plan.composioSlug.trim()) {
       errors.push('composio batches must pin ONE composioSlug for every item');
+    }
+  } else if (isCallToolAliasName(tool) && plan.sideEffect === 'read') {
+    for (const [index, item] of (plan.items ?? []).entries()) {
+      const alias = resolveCallToolAlias(tool, item?.args);
+      if (!alias?.ok) {
+        errors.push(`items[${index}] ("${item?.id ?? ''}") has invalid ${tool} args: ${alias?.detail ?? 'alias did not resolve'}`);
+      }
     }
   } else if (!isMcpNamespacedTool(tool) && !READ_ONLY_TOOLS.has(tool)) {
     errors.push(`tool "${tool}" is not batchable — allowed: composio_execute_tool, MCP <server>__<tool>, or a local read tool`);
@@ -646,15 +654,33 @@ export async function runBatchPlan(
     // must be present (null allowed, absent NOT). Omitting connected_account_id
     // failed ALL items of the 2026-07-08 sheet batch in milliseconds with
     // InvalidToolInputError — before any network call.
-    const args = plan.tool === 'composio_execute_tool'
+    let dispatchTool = plan.tool;
+    let args: unknown = plan.tool === 'composio_execute_tool'
       ? { tool_slug: plan.composioSlug, arguments: JSON.stringify(item.args), connected_account_id: item.connectedAccountId ?? null }
       : item.args;
+    const alias = resolveCallToolAlias(plan.tool, item.args);
+    if (alias) {
+      if (!alias.ok) {
+        return {
+          outcome: {
+            id: item.id,
+            ok: false,
+            attempts: 0,
+            ms: Date.now() - t0,
+            error: alias.detail,
+            idempotencyKey: key,
+          },
+        };
+      }
+      dispatchTool = alias.targetName;
+      args = alias.targetArgs;
+    }
     let attempts = 0;
     let lastError = '';
     while (attempts < 2) {
       attempts += 1;
       try {
-        const out = await dispatchBatchItemTool(plan.tool, args, sessionId, counter, certifiedBatch);
+        const out = await dispatchBatchItemTool(dispatchTool, args, sessionId, counter, certifiedBatch);
         const text = previewOf(out);
         // A "polite failure" comes back as a NORMAL result whose text is an
         // error banner — composio's ⚠️ banners AND the @openai/agents SDK's

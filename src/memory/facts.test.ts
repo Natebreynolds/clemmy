@@ -228,9 +228,10 @@ test('leak repro: an off-objective high-importance fact is demoted out of the sl
 
 // ---- Move 4: review standing instructions for in-loop pruning ----
 
-test('reviewStandingInstructions: returns ids + provenance, least-relevant first', () => {
-  const home = rememberFact({ kind: 'project', content: 'Home services: emphasize plumbing and HVAC.', importance: 9 });
-  const legal = rememberFact({ kind: 'project', content: 'Legal practice: contract litigation focus.', importance: 5 });
+test('reviewStandingInstructions: returns strongly applicable instruction memory and filters unrelated rows', () => {
+  const home = rememberFact({ kind: 'feedback', content: 'Home services: emphasize plumbing and HVAC.', importance: 9 });
+  const legal = rememberFact({ kind: 'feedback', content: 'Legal contract emails require a named client and authorization.', importance: 5 });
+  const unrelatedPinned = rememberFact({ kind: 'constraint', content: 'Use the calendar integration for event scheduling.', importance: 10 });
 
   const review = reviewStandingInstructions('Draft legal contract emails for the client');
   // Every item carries an id and a source hint the user can act on.
@@ -240,19 +241,17 @@ test('reviewStandingInstructions: returns ids + provenance, least-relevant first
     assert.ok(item.sourceHint.length > 0);
   }
   const ids = review.map((r) => r.id);
-  assert.ok(ids.includes(home.id) && ids.includes(legal.id), 'both standing instructions are listed');
-  // Least-relevant first: the off-objective home-services rule sorts
-  // ahead of the on-objective legal one, so a stale rule is easy to spot.
-  assert.ok(
-    ids.indexOf(home.id) < ids.indexOf(legal.id),
-    `off-objective instruction should sort first: ${ids.join(',')}`,
-  );
+  assert.ok(ids.includes(legal.id), 'strongly on-objective instruction memory is listed');
+  assert.ok(!ids.includes(home.id), 'unrelated memory is not injected');
+  assert.ok(!ids.includes(unrelatedPinned.id), 'unrelated pinned policy is already handled by the normal policy path, not duplicated here');
 });
 
-test('reviewStandingInstructions: no objective → relevance 0, still lists with sources', () => {
-  rememberFact({ kind: 'feedback', content: 'Always confirm before sending external emails.' });
+test('reviewStandingInstructions: no objective returns pinned rules only', () => {
+  const unpinned = rememberFact({ kind: 'feedback', content: 'Prefer concise summaries.' });
+  const pinned = rememberFact({ kind: 'constraint', content: 'Never send external emails without authorization.' });
   const review = reviewStandingInstructions(undefined);
-  assert.ok(review.length >= 1);
+  assert.ok(review.some((r) => r.id === pinned.id));
+  assert.ok(!review.some((r) => r.id === unpinned.id));
   assert.ok(review.every((r) => r.relevance === 0));
 });
 

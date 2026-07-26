@@ -131,8 +131,12 @@ import {
 } from './turn-decision.js';
 import {
   completionEvidenceToolName,
+  freshExternalWriteEvidenceStatus,
   hasMeaningfulSuccessfulToolNames,
+  isAcceptedExecutionCompletionOutput,
   objectiveMayRequireMultipleResults,
+  objectiveRequiresFreshExternalWrite,
+  type FreshExternalWriteEvidenceStatus,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
 import { summarizeWorkManifests } from './work-manifest.js';
@@ -451,6 +455,54 @@ function turnHasMeaningfulSuccessfulToolEvidence(
   } catch {
     return false;
   }
+}
+
+/** True only when the durable execution controller accepted completion after
+ * the exact user-input row that owns this logical request. A prior turn's
+ * completed execution cannot suppress verification for a new objective. */
+function requestHasAcceptedExecutionCompletion(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+): boolean {
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return false;
+  try {
+    return listEvents(sessionId, { types: ['tool_returned'] }).some((event) => {
+      if (event.seq <= (sourceUserSeq as number)) return false;
+      if ((event.data as { tool?: unknown } | undefined)?.tool !== 'execution_complete') return false;
+      const data = event.data as { result?: unknown; output?: unknown };
+      return isAcceptedExecutionCompletionOutput(data.result ?? data.output);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function requestFreshExternalWriteStatus(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+): FreshExternalWriteEvidenceStatus {
+  try {
+    return freshExternalWriteEvidenceStatus(
+      listEvents(sessionId, {
+        types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+      }),
+      sourceUserSeq,
+    );
+  } catch {
+    // External writes must never become a silent green when their durable
+    // request-bound ledger is unavailable.
+    return 'missing';
+  }
+}
+
+function freshExternalWriteGapReason(status: Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>): string {
+  if (status === 'ambiguous') {
+    return 'this request has an ambiguous external-write outcome, so it must be reconciled read-only and must not be repeated or claimed complete';
+  }
+  if (status === 'failed') {
+    return 'this request has only a compensated failed external-write attempt and no successful current-request write receipt';
+  }
+  return 'there is no external-write receipt after the user event that owns this request; historical execution summaries and receipts do not count';
 }
 
 /** An explicit user-memory candidate is persisted to the crash-safe intake
@@ -3449,7 +3501,22 @@ async function runConversationCore(
       const activeGoal = safeActiveGoal(options.sessionId);
       const goalGate = Boolean(activeGoal)
         && (totalToolCalls >= 1 || isPromiseShapedReply(decision.reply || decision.summary));
-      if (activeGoal && goalGate) {
+      const acceptedExecutionEvidenceThisRequest = requestHasAcceptedExecutionCompletion(
+        options.sessionId,
+        activeSourceUserSeq,
+      );
+      // This floor belongs to the opted-in interactive completion contract.
+      // Non-judged workflow/reporting lanes preserve their existing terminal
+      // semantics; their execution controllers own request-bound validation.
+      const freshExternalWriteRequired = objectiveJudgeOptIn
+        && objectiveRequiresFreshExternalWrite(objective);
+      const currentExternalWriteStatus = freshExternalWriteRequired
+        ? requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq)
+        : 'confirmed';
+      const freshExternalWriteVerified = !freshExternalWriteRequired
+        || currentExternalWriteStatus === 'confirmed'
+        || acceptedExecutionEvidenceThisRequest;
+      if (activeGoal && goalGate && freshExternalWriteVerified) {
         const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
         const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
         const manifestEvidence = renderWorkManifestEvidenceForGoal(options.sessionId);
@@ -3577,9 +3644,13 @@ async function runConversationCore(
       // Bounded + fail-open (judge defaults to done) so it can never wedge.
         shouldRunObjectiveJudge({
           optIn: objectiveJudgeOptIn,
-          actionIntent: objectiveJudgeActionIntent,
-          meaningfulToolEvidence,
+          actionIntent: objectiveJudgeActionIntent || freshExternalWriteRequired,
+          // A local mutation or bookkeeping tool cannot certify a requested
+          // external write. Force the judge path until this exact request owns
+          // a durable external receipt (or an accepted execution completion).
+          meaningfulToolEvidence: meaningfulToolEvidence && freshExternalWriteVerified,
           multiResultObjective: objectiveMayRequireMultipleResults(objective),
+          acceptedExecutionEvidence: acceptedExecutionEvidenceThisRequest,
           continuationsUsed: objectiveJudgeContinuations,
           maxContinuations: MAX_OBJECTIVE_JUDGE_CONTINUATIONS,
           nextAction: decision.nextAction,
@@ -3629,7 +3700,24 @@ async function runConversationCore(
           if (priorInputs.length > 0 && priorInputs[priorInputs.length - 1] === objective) priorInputs.pop();
           judgedObjective = composeJudgedObjective(objective, priorInputs);
         } catch { /* fail-open: judge the raw input */ }
-        const verdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
+        const rawVerdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
+        const freshnessGap = rawVerdict.done
+          && !rawVerdict.awaitingUser
+          && !freshExternalWriteVerified;
+        // Deterministic request-bound floor: a language-model judge cannot
+        // promote historical receipts into evidence for a newly accepted
+        // external action. Override its PASS before recording the verdict.
+        const verdict: ObjectiveJudgeVerdict = freshnessGap
+          ? {
+              ...rawVerdict,
+              done: false,
+              reason: freshExternalWriteGapReason(
+                currentExternalWriteStatus as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
+              ),
+              failedOpen: false,
+              selfJudge: false,
+            }
+          : rawVerdict;
         objectiveJudgeVerdictThisTurn = verdict;
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         recordVerdictEvent(options.sessionId, turnResult.turn, {
@@ -3763,6 +3851,21 @@ async function runConversationCore(
                 'Do NOT hand-roll the deliverable. Run the skill\'s actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill\'s template exactly, then re-verify and finish.',
                 'Only set nextAction=completed once the skill\'s own scripts have produced and validated the artifact.',
               ].join(' ')
+            : freshnessGap
+              ? currentExternalWriteStatus === 'ambiguous'
+                ? [
+                    'The current request has an ambiguous external-write outcome. Do NOT repeat the write.',
+                    'Use only a read-only exact-target lookup/read-back to reconcile whether it landed. If it cannot be reconciled, stop and report that precise ambiguity; never cite a prior session as proof.',
+                  ].join(' ')
+                : currentExternalWriteStatus === 'failed'
+                  ? [
+                      'The current request has no successful external-write receipt; its attempted write was explicitly recorded as failed.',
+                      'Inspect the current-request failure and either repair it safely or report the exact blocker. Honor any user instruction not to retry. Never reuse historical receipts to claim success.',
+                    ].join(' ')
+                  : [
+                      `This accepted request asks for a NEW external write, but no external-write receipt exists after source user event ${activeSourceUserSeq ?? 'unknown'}.`,
+                      'Historical focus summaries, execution ids, and prior receipts are context only. Perform the requested action now, then verify it with a current-request read-back and cite only the new receipts.',
+                    ].join(' ')
             : [
             `You marked this objective complete, but an independent verification check found it is NOT finished: ${judgeReason}.`,
             'IMPORTANT: if finishing requires the USER\'S decision or authorization — sending, posting, or deleting something external, choosing between options, or scope the user left open — do NOT proceed on your own. Set nextAction=awaiting_user_input with the concrete question. Asking before an external action is a correct, complete answer for this turn, never a failure.',
@@ -3841,7 +3944,40 @@ async function runConversationCore(
       // user must SEE that, never a silent clean-looking completion. The
       // output-grounding advisory (an unverifiable figure) rides the same rail.
       const completionNotes = [goalUnmetNote, outputGroundingNote].filter((n) => n && n.trim());
-      const userVisibleSummary = completionNotes.length ? `${baseSummary}\n\n${completionNotes.join('\n\n')}` : baseSummary;
+      let userVisibleSummary = completionNotes.length ? `${baseSummary}\n\n${completionNotes.join('\n\n')}` : baseSummary;
+      const terminalExternalWriteRequired = objectiveJudgeOptIn
+        && objectiveRequiresFreshExternalWrite(objective);
+      const terminalExternalWriteStatus = terminalExternalWriteRequired
+        ? requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq)
+        : 'confirmed';
+      const terminalFreshWriteGap = isCompletedAction
+        && terminalExternalWriteRequired
+        && terminalExternalWriteStatus !== 'confirmed'
+        && !requestHasAcceptedExecutionCompletion(options.sessionId, activeSourceUserSeq);
+      const terminalFreshWriteReason = terminalFreshWriteGap
+        ? freshExternalWriteGapReason(
+            terminalExternalWriteStatus as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
+          )
+        : '';
+      if (terminalFreshWriteGap) {
+        userVisibleSummary = terminalExternalWriteStatus === 'ambiguous'
+          ? 'I cannot honestly confirm this external write: the current request has an ambiguous outcome. I did not repeat it, and I did not treat an older receipt as proof. The exact target needs a read-only reconciliation before this can be called complete.'
+          : terminalExternalWriteStatus === 'failed'
+            ? 'The external write attempted for this request was recorded as failed, so I cannot call the task complete or substitute an older receipt. The current failure needs to be resolved before any success claim.'
+            : 'I cannot honestly confirm a new external write for this request: no write receipt exists after your current request. I did not treat an older focus summary or execution receipt as proof.';
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'request_bound_external_write_missing',
+            status: terminalExternalWriteStatus,
+            sourceUserSeq: activeSourceUserSeq ?? null,
+            reason: terminalFreshWriteReason,
+          },
+        });
+      }
 
       // Honest-completion backstop (Done? node). The objective judge above
       // handles opted-in ACTION objectives with bounded continuations. This
@@ -3854,8 +3990,15 @@ async function runConversationCore(
       // override a contract-verified completion into awaiting_user_input.
       const cachedObjectiveVerdict = objectiveJudgeVerdictThisTurn;
       const deliveryGateRan = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn);
-      const delivery: DeliveryVerdict = deliveryGateRan
-        ? await verifyDelivered(objective, userVisibleSummary, {
+      const delivery: DeliveryVerdict = terminalFreshWriteGap
+        ? {
+            delivered: false,
+            status: 'blocked',
+            reason: terminalFreshWriteReason,
+            blockerType: 'unverified_completion',
+          }
+        : deliveryGateRan
+          ? await verifyDelivered(objective, userVisibleSummary, {
             // Reuse the objective judge's verdict when it ran this iteration —
             // its audit covered this same reply with MORE context, so a second
             // identical model call adds latency, not information. The
@@ -3863,7 +4006,7 @@ async function runConversationCore(
             // verifyDelivered still run first either way.
             judgeFn: cachedObjectiveVerdict ? async () => cachedObjectiveVerdict : objectiveJudge,
           })
-        : { delivered: true as const, status: 'completed' as const };
+          : { delivered: true as const, status: 'completed' as const };
       // Verdict door (T3-B4) — recorded only when the gate actually evaluated
       // (a skipped gate is not a verdict).
       if (deliveryGateRan) {
@@ -3888,7 +4031,7 @@ async function runConversationCore(
             steps: stepIndex,
             summary: userVisibleSummary,
             internalSummary: decision.summary,
-            reply: decision.reply ?? null,
+            reply: terminalFreshWriteGap ? userVisibleSummary : decision.reply ?? null,
             missingReply: isCompletedAction && !hasReply ? true : undefined,
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
@@ -4478,8 +4621,6 @@ function goalContractEnabled(): boolean {
  *  multi-step action task without offering/dispatching. Default off: background
  *  movement is a user/model choice, not a runtime-injected second gate. */
 function backgroundOfferNudgeEnabled(): boolean {
-  // 2026-07-16 policy: ALWAYS offer background on long execution — graduated
-  // to default ON via the shared turn-control spine (single authority).
   return backgroundOfferEnabled();
 }
 
@@ -5237,6 +5378,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         sessionKind: session.sessionRow.kind,
         itemCount: contextPacket.multiItem.itemCount ?? 0,
         userMessageCount,
+        preflightPhase: contextPacket.preflightPhase,
       });
     } catch { /* fail-open */ }
     const policy = contextPacket.agentSystem.policy;

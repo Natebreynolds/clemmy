@@ -141,7 +141,7 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   for (const n of ro) assert.ok(auth.has(n), `authoring must be a superset of read-only (missing ${n})`);
-  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'set_model_role']) {
+  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role']) {
     assert.ok(auth.has(n), `authoring must include ${n}`);
   }
 });

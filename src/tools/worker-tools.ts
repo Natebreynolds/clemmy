@@ -157,7 +157,10 @@ export function registerWorkerTools(server: McpServer): void {
       }
       // First-contact mass fan-out earns ONE alignment beat (SDK-lane twin;
       // fail-open, one-shot — see fanout-alignment-gate.ts).
-      const armedBounce = maybeBounceMassExecution(getToolOutputContext()?.sessionId);
+      const armedBounce = maybeBounceMassExecution(
+        getToolOutputContext()?.sessionId,
+        { itemCount: callItems.length },
+      );
       if (armedBounce.bounce && armedBounce.steer) return textResult(armedBounce.steer);
       const alignmentBounce = maybeFanoutAlignmentBounce({ sessionId: getToolOutputContext()?.sessionId, itemCount: callItems.length });
       if (alignmentBounce.bounce && alignmentBounce.steer) return textResult(alignmentBounce.steer);

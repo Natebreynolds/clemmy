@@ -72,8 +72,10 @@ const GOLDEN = {
   // contracts and long-horizon work through code-backed manifests. The old
   // "N>50 => author a workflow" escalation was removed; workflows are for
   // genuinely reusable/scheduled procedures.
-  instructions: { len: 35965, sha16: '31bddec850985a64' },
-  native: { len: 35068, sha16: 'a6bdeb052357b13f' },
+  // 2026-07-25 (live smoke): one-shot fetch/write/deploy/verification work no
+  // longer pins a durable focus merely because the request names a URL.
+  instructions: { len: 35951, sha16: 'e4116743aebdd7f4' },
+  native: { len: 35054, sha16: '3a2a4009644554c7' },
   claudeBrain: { len: 5931, sha16: 'dff8c4c8baf44075' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
   lean: { len: 9412, sha16: '98eab823bc51f6a0' },

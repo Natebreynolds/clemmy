@@ -38,6 +38,7 @@ const {
 } = await import('../execution/workflow-call-receipts.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
+const { resolveWorkflowRunDefinitionSnapshot } = await import('../execution/workflow-run-definition.js');
 
 function writeAuditWorkflow(enabled = true): void {
   writeWorkflow('audit-brief', {
@@ -159,6 +160,30 @@ test('queueWorkflowRun: writes a queued run and dedupes identical inputs', () =>
   assert.match(second.message, /No duplicate was queued/);
   assert.match(second.message, /running in the background/i);
   assert.equal(runFiles().length, 1);
+});
+
+test('every resolvable queue lane pins the exact content-hashed workflow definition', () => {
+  writeAuditWorkflow(false);
+  const queued = [
+    queueWorkflowRun('audit-brief', { url: 'https://production.example' }, { dedupe: false }),
+    queueWorkflowDryRun('audit-brief', { url: 'https://dry.example' }),
+    queueWorkflowCreationTest('audit-brief', { url: 'https://creation.example' }),
+  ];
+  assert.ok(queued.every((result) => result.status === 'queued'));
+
+  const records = runFiles().map((file) =>
+    JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
+      workflowDefinitionSnapshot?: unknown;
+    });
+  assert.equal(records.length, 3);
+  for (const record of records) {
+    const resolved = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+    assert.equal(resolved.status, 'valid');
+    if (resolved.status !== 'valid') continue;
+    assert.equal(resolved.snapshot.workflowSlug, 'audit-brief');
+    assert.equal(resolved.snapshot.definition.enabled, false);
+    assert.equal(resolved.snapshot.definition.steps[0].prompt, 'Normalize the prospect: {{input.url}}.');
+  }
 });
 
 test('queue writers use create-only installs and never replace a colliding canonical run id', () => {

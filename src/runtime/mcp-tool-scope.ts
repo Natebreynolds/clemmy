@@ -69,8 +69,55 @@ const SEO_RE =
   /\b(seo|audit|ranking|rankings|serp|keyword|keywords|backlink|backlinks|domain authority|organic traffic|search visibility|site health|technical audit|crawl|meta title|meta description|schema markup)\b/i;
 const WEB_RE =
   /\b(scrape|crawl|website|web page|webpage|article|news|browser|search the web|look up|research online|recent article)\b/i;
-const SALESFORCE_RE = /\b(salesforce|sf cli|soql|opportunit(?:y|ies)|account(?:s)?|lead(?:s)?|contact(?:s)?)\b/i;
+const SALESFORCE_STRONG_RE = /\b(salesforce|sf cli|soql)\b/i;
+const SALESFORCE_OBJECT_RE = /\b(opportunit(?:y|ies)|account(?:s)?|lead(?:s)?|contact(?:s)?)\b/i;
+const SALESFORCE_CONTEXT_RE = /\b(crm|sales pipeline|salesforce pipeline|deal(?:s)?|prospect(?:s)?)\b/i;
 const OUTLOOK_RE = /\b(outlook|email|emails|draft(?:s)?|inbox|calendar|meeting invite)\b/i;
+const EMAIL_DATA_FIELD_RE =
+  /\b(?:column|columns|field|fields|header|headers|property|properties|key|keys)\b[^.!?\n]{0,80}?\be-?mails?\b|\be-?mail\b\s+(?:column|field|address|value|missing|blank|data)\b/i;
+const EMAIL_DATA_LIST_RE =
+  /([,;|]\s*)e-?mail\b|\be-?mail\b(?=\s*(?:[,;|/]|and\b)\s*(?:company|name|contact|account|domain|phone|title|status|value|field|column|header)\b)/gi;
+const EMAIL_DATA_SHAPE_RE =
+  /\be-?mail[-\s]shaped\s+(?:string|strings|value|values|field|fields|data)\b/gi;
+const QUOTED_EMAIL_FIELD_RE =
+  /(["'])e-?mail\1(?=\s*[,:\]}])/gi;
+const STRUCTURED_TABULAR_CONTEXT_RE =
+  /\b(?:google\s+sheets?|googlesheets?|spreadsheet|worksheet|sheet\s+(?:range|row|rows|tab|cells?)|cell\s+data|matrix|tabular|headers?|columns?|value\s+range)\b/i;
+const NEGATED_OUTLOOK_ACTION_RE =
+  /\b(?:do\s+not|don't|dont|never|without)\s+(?:(?:send|sending|draft|drafting|read|reading|search|searching|check|checking|use|using|open|opening|call|calling|contact|contacting|access|accessing|query|querying|invoke|invoking|create|creating|schedule|scheduling)\s+)?(?:any\s+)?(?:outlook|e-?mail(?:s|ing|ed)?|inbox|calendar|meeting\s+invites?)(?:\s+(?:or|and)\s+(?:(?:send|sending|draft|drafting|read|reading|search|searching|check|checking|use|using|open|opening|call|calling|contact|contacting|access|accessing|query|querying|invoke|invoking|create|creating|schedule|scheduling)\s+)?(?:any\s+)?(?:outlook|e-?mail(?:s|ing|ed)?|inbox|calendar|meeting\s+invites?))?/gi;
+const NO_OUTLOOK_ACTION_RE =
+  /\bno\s+(?:outlook|e-?mail|mail|calendar)\s+(?:action|actions|tool|tools|call|calls|send|sends|draft|drafts|access)\b/gi;
+
+/**
+ * Remove only email-as-data mentions before selecting Outlook tools. This is
+ * intentionally a text projection rather than another broad negative regex:
+ * a mixed request keeps its second operational mention ("columns company and
+ * email, then email Bob"), while compact Sheet matrices such as
+ * "company,email; Acme,acme@example.com" no longer preload an unrelated inbox.
+ */
+function withoutStructuredEmailMentions(input: string): string {
+  const projected = STRUCTURED_TABULAR_CONTEXT_RE.test(input)
+    ? input.replace(QUOTED_EMAIL_FIELD_RE, '"structured_field"')
+    : input;
+  return projected
+    .replace(new RegExp(EMAIL_DATA_FIELD_RE.source, 'gi'), ' structured_field ')
+    .replace(EMAIL_DATA_LIST_RE, '$1structured_field')
+    .replace(EMAIL_DATA_SHAPE_RE, ' structured_data ');
+}
+
+/**
+ * Project away explicit prohibitions before detecting Outlook intent. A
+ * prohibition names a connector precisely so it will *not* be used; treating
+ * that noun as positive intent both wastes schema budget and widens authority.
+ * Mixed requests remain monotonic: only the negated action is removed, so
+ * "do not send yet; draft an Outlook email" still exposes Outlook for the
+ * positive draft clause.
+ */
+function withoutNegatedOutlookMentions(input: string): string {
+  return withoutStructuredEmailMentions(input)
+    .replace(NEGATED_OUTLOOK_ACTION_RE, ' prohibited_outlook_action ')
+    .replace(NO_OUTLOOK_ACTION_RE, ' prohibited_outlook_action ');
+}
 const DATEISH_RE =
   /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week)|next (?:week|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|\d{1,2}\/\d{1,2}|\d{4}-\d{2}-\d{2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
 // A shorthand ask that names a pinned calendar's org label ("check <org>
@@ -86,9 +133,11 @@ function namesPinnedCalendarLabel(input: string, labels: string[] | undefined): 
     return false;
   }
 }
-const GOOGLE_SHEETS_RE = /\b(google sheet|googlesheet|spreadsheet|sheet row|sheet tab|worksheet)\b/i;
+const GOOGLE_SHEETS_RE = /\b(google sheets?|googlesheets?|spreadsheet|sheet row|sheet tab|worksheet)\b/i;
 const GITHUB_RE =
-  /\b(github|pull request|pr\b|repo|repository|branch|commit|gh issue|github issue|issue #\d+)\b/i;
+  /\b(github|pull request|pr\b|gh issue|github issue|issue #\d+)\b/i;
+const LOCAL_DEPLOY_CLI_RE =
+  /\b(netlify|vercel|railway|fly\.io|wrangler|cloudflare pages|firebase|render\.com|heroku)\b/i;
 const LOCAL_CONTEXT_FOLLOWUP_RE =
   /\b(existing context|use the existing context|from context|remember|remembered|we just ran|previous|already found|append|local file update|local markdown|markdown report|the report|the audit we just ran)\b/i;
 const FRESH_EXTERNAL_RE =
@@ -224,8 +273,11 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const hasNegatedFreshExternalIntent = NEGATED_FRESH_EXTERNAL_RE.test(input) || NEGATED_EXTERNAL_WINDOW_RE.test(input);
   const wantsSeo = SEO_RE.test(input) || (URL_RE.test(input) && /\baudit\b/i.test(input));
   const wantsWeb = WEB_RE.test(input);
-  const wantsSalesforce = SALESFORCE_RE.test(input);
-  const wantsOutlook = OUTLOOK_RE.test(input)
+  const wantsSalesforce = SALESFORCE_STRONG_RE.test(input)
+    || (SALESFORCE_OBJECT_RE.test(input) && SALESFORCE_CONTEXT_RE.test(input));
+  const outlookIntentInput = withoutNegatedOutlookMentions(input);
+  const mentionsOutlookFamily = OUTLOOK_RE.test(outlookIntentInput);
+  const wantsOutlook = mentionsOutlookFamily
     || (DATEISH_RE.test(input) && namesPinnedCalendarLabel(input, options.pinnedCalendarLabels));
   const wantsGoogleSheets = GOOGLE_SHEETS_RE.test(input);
   const wantsGithub = GITHUB_RE.test(input);
@@ -313,6 +365,20 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   }
 
   if (scopes.length === 0) {
+    // These providers are driven by Clementine's local CLI + shell surface,
+    // not an external MCP server. A deploy prompt often contains generic words
+    // such as "account", "site", "commit", and "branch"; failing open here
+    // used to preload unrelated Salesforce/GitHub tools before a Netlify call.
+    // Mixed requests have already populated `scopes` above (for example,
+    // "deploy to Netlify, then email Bob"), so their real connector remains.
+    if (LOCAL_DEPLOY_CLI_RE.test(input)) {
+      return {
+        reason: `local deploy CLI intent; no external MCP needed: ${lower.slice(0, 120)}`,
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      };
+    }
     // No keyword family matched. The old behavior returned maxTools:0 — which
     // made ANY connected app outside the 6 hardcoded families (Airtable, Slack,
     // Notion, Stripe, …) silently invisible, so Clem falsely reported "not
@@ -434,6 +500,33 @@ function learnedMcpServerSlugs(matches: StepToolChoiceMatch[]): string[] {
 }
 
 /**
+ * Only positive action text may authorize recall to add a second MCP server to
+ * an already-precise keyword scope. Structured payload can contain arbitrary
+ * provider-like words ("Clem Smoke Beta"), and prohibitions often name tools
+ * specifically so they will not be used. Neither is connector intent.
+ */
+function recallWideningSignalText(input: string): string {
+  return input
+    .replace(/\[\s*\[[\s\S]{0,12000}?\]\s*\]/g, ' structured_payload ')
+    .replace(/\b(?:do\s+not|don'?t|dont|never|without)\b[^.!?;\n]*/gi, ' prohibited_action ')
+    .replace(/\bno\s+(?:calls?|writes?|access|actions?|tools?|connectors?)\b[^.!?;\n]*/gi, ' prohibited_action ');
+}
+
+function explicitlyNamesLearnedServer(input: string, serverSlug: string): boolean {
+  const phrase = serverSlug
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!phrase) return false;
+  const escaped = phrase
+    .split(' ')
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\\s+');
+  return new RegExp(`\\b${escaped}\\b`, 'i').test(recallWideningSignalText(input));
+}
+
+/**
  * Recall-aware scope: resolve continuity-aware normally, then WIDEN with the
  * user's own proven MCP servers when the current prompt strongly names a
  * remembered tool. This closes the native-MCP compounding loop — a server proven
@@ -480,15 +573,27 @@ export function resolveMcpToolScopeWithRecall(
   if (learned.length === 0) return base;
 
   // Precise recall beats broad fail-open: drop failOpenCandidate and target the
-  // learned servers (merged with any keyword-matched ones).
+  // learned servers. Once keyword routing already produced a precise scope,
+  // recall may add another server only when the positive action text explicitly
+  // names it. A semantic hit caused only by payload or a prohibited tool is not
+  // authority to widen the live connector surface.
   const existing = base.failOpenCandidate ? [] : (base.allowedServerSlugs ?? []);
-  const merged = Array.from(new Set([...existing, ...learned]));
+  const eligibleLearned = base.failOpenCandidate
+    ? learned
+    : learned.filter((slug) => existing.includes(slug) || explicitlyNamesLearnedServer(input, slug));
+  const additions = eligibleLearned.filter((slug) => !existing.includes(slug));
+  if (additions.length === 0) return base;
+  const merged = Array.from(new Set([...existing, ...additions]));
   const baseCap = base.failOpenCandidate ? 0 : (base.maxTools ?? 0);
   return {
     ...base,
     failOpenCandidate: undefined,
     allowedServerSlugs: merged,
-    maxTools: baseCap + learned.length * 8,
-    reason: `${base.reason} + recall: proven server(s) ${learned.join(', ')}`,
+    maxTools: baseCap + additions.length * 8,
+    serverMaxTools: {
+      ...(base.serverMaxTools ?? {}),
+      ...Object.fromEntries(additions.map((slug) => [slug, 8])),
+    },
+    reason: `${base.reason} + recall: explicitly requested proven server(s) ${additions.join(', ')}`,
   };
 }

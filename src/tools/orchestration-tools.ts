@@ -95,6 +95,12 @@ import {
   buildWorkflowResourceBindingReportFromRuntime,
   renderWorkflowResourceBindingReport,
 } from '../execution/workflow-resource-binding.js';
+import {
+  deriveWorkflowTerminalOutcome,
+  workflowTerminalOutcomeLabel,
+  workflowTerminalOutcomeNeedsAttention,
+  type WorkflowTerminalOutcome,
+} from '../execution/workflow-terminal-outcome.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -570,19 +576,37 @@ function formatRunAge(iso?: string): string {
  */
 export function renderWorkflowRunsOverview(limit = 15): string {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return 'No workflow runs yet — nothing is running.';
-  interface RunRow { id: string; workflow: string; status: string; createdAt?: string; needsAttention?: boolean; }
+  interface RunRow {
+    id: string;
+    workflow: string;
+    status: string;
+    createdAt?: string;
+    needsAttention?: boolean;
+    terminalOutcome?: WorkflowTerminalOutcome;
+  }
   const rows: RunRow[] = [];
   for (const file of readdirSync(WORKFLOW_RUNS_DIR)) {
     if (!file.endsWith('.json')) continue;
     try {
       const r = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
       if (typeof r.id !== 'string') continue;
+      const terminalOutcome = deriveWorkflowTerminalOutcome({
+        status: r.status,
+        finishedAt: r.finishedAt,
+        needsAttention: r.needsAttention,
+        terminalOutcome: r.terminalOutcome,
+        reportBack: r.reportBack && typeof r.reportBack === 'object' && !Array.isArray(r.reportBack)
+          ? { outcome: (r.reportBack as Record<string, unknown>).outcome }
+          : undefined,
+      });
       rows.push({
         id: r.id,
         workflow: typeof r.workflow === 'string' ? r.workflow : '(unknown)',
         status: typeof r.status === 'string' ? r.status : 'unknown',
         createdAt: typeof r.createdAt === 'string' ? r.createdAt : undefined,
-        needsAttention: r.needsAttention === true,
+        needsAttention: r.needsAttention === true
+          || workflowTerminalOutcomeNeedsAttention(terminalOutcome),
+        terminalOutcome,
       });
     } catch { /* skip malformed run file */ }
   }
@@ -590,8 +614,12 @@ export function renderWorkflowRunsOverview(limit = 15): string {
   const byCreated = (a: RunRow, b: RunRow) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '');
   const active = rows.filter((r) => ACTIVE_RUN_STATUSES.has(r.status) || r.needsAttention).sort(byCreated);
   const recent = rows.filter((r) => !ACTIVE_RUN_STATUSES.has(r.status) && !r.needsAttention).sort(byCreated).slice(0, 5);
-  const fmt = (r: RunRow) =>
-    `- ${r.workflow} · ${r.status}${r.needsAttention ? ' · NEEDS ATTENTION' : ''} · run ${r.id}${r.createdAt ? ` · ${formatRunAge(r.createdAt)}` : ''}`;
+  const fmt = (r: RunRow) => {
+    const state = r.terminalOutcome
+      ? `outcome ${workflowTerminalOutcomeLabel(r.terminalOutcome)}`
+      : r.status;
+    return `- ${r.workflow} · ${state}${r.needsAttention ? ' · NEEDS ATTENTION' : ''} · run ${r.id}${r.createdAt ? ` · ${formatRunAge(r.createdAt)}` : ''}`;
+  };
   const parts: string[] = [];
   if (active.length > 0) {
     parts.push(`${active.length} active run${active.length === 1 ? '' : 's'} (in-flight / needs attention):`);
@@ -2021,10 +2049,20 @@ export function registerOrchestrationTools(server: McpServer): void {
           const blockedLines = blockedSteps.map((b) => `  - ${String(b.stepId ?? '?')}: ${String(b.reason ?? '(no reason recorded)')}`);
           const failedItemLines = failedItems.map((f) => `  - ${f.stepId} · ${f.itemKey}: ${f.error.slice(0, 240)}`);
           const output = typeof record.output === 'string' ? record.output : '';
+          const terminalOutcome = deriveWorkflowTerminalOutcome({
+            status: record.status,
+            finishedAt: record.finishedAt,
+            needsAttention: record.needsAttention,
+            terminalOutcome: record.terminalOutcome,
+            reportBack: record.reportBack && typeof record.reportBack === 'object' && !Array.isArray(record.reportBack)
+              ? { outcome: (record.reportBack as Record<string, unknown>).outcome }
+              : undefined,
+          });
           const lines = [
             `Run ${run_id}`,
             `Workflow: ${record.workflow ?? '(unknown)'}`,
             `Status: ${record.status ?? '(unknown)'}${record.needsAttention ? ' · NEEDS ATTENTION' : ''}`,
+            terminalOutcome ? `Outcome: ${workflowTerminalOutcomeLabel(terminalOutcome)}` : '',
             record.createdAt ? `Created: ${record.createdAt}` : '',
             record.finishedAt ? `Finished: ${record.finishedAt}` : '',
             record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',

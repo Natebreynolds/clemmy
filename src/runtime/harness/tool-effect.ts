@@ -2,6 +2,7 @@ import { TOOL_REGISTRY, type ToolSideEffect } from '../../tools/tool-registry.js
 import { classifyComposioSlugEffect, isReadOnlyCallAction } from '../../integrations/composio/slug-effect.js';
 import { classifyShellCommand, classifyShellNetworkMutation, expandLiteralShellCommands } from './destination-gate.js';
 import { isMutatingExternalWrite } from './execution-gate.js';
+import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
 
 /**
  * Runtime effect classification used by the guardrail and SDK call ceiling.
@@ -307,6 +308,39 @@ function classifyRegistered(toolName: string): RuntimeToolEffectDecision | null 
 export function classifyRuntimeToolEffect(toolName: string, args: unknown): RuntimeToolEffectDecision {
   const normalized = normalizedToolName(toolName);
   const tail = localToolTail(normalized);
+
+  if (tail === 'call_tool') {
+    const outer = decodedToolArgs(args);
+    if (!outer || typeof outer !== 'object' || Array.isArray(outer)) {
+      return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+    }
+    const input = outer as Record<string, unknown>;
+    const target = typeof input.name === 'string' ? input.name.trim() : '';
+    if (!target || target === 'call_tool') {
+      return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+    }
+    const innerArgs = decodedToolArgs(input.args_json ?? {});
+    const alias = resolveCallToolAlias(target, innerArgs);
+    if (alias?.ok) return classifyRuntimeToolEffect(alias.targetName, alias.targetArgs);
+    if (alias && !alias.ok) {
+      return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+    }
+    return classifyRuntimeToolEffect(target, innerArgs);
+  }
+
+  if (tail === 'run_batch') {
+    const input = decodedToolArgs(args);
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+      const batch = input as Record<string, unknown>;
+      const action = typeof batch.action === 'string' ? batch.action.trim().toLowerCase() : '';
+      const plan = batch.plan && typeof batch.plan === 'object' && !Array.isArray(batch.plan)
+        ? batch.plan as Record<string, unknown>
+        : null;
+      if (action === 'status' || (action === 'propose' && plan?.sideEffect === 'read')) {
+        return readDecision('registry');
+      }
+    }
+  }
 
   if (tail === 'run_shell_command') {
     const command = shellCommand(args);

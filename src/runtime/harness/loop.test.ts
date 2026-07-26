@@ -2402,6 +2402,13 @@ test('objective judge: a successful concrete send slug is completion evidence', 
     const tool = { name: 'composio_execute_tool' };
     const details = { toolCall: { callId: 'send-1', arguments: '{"tool_slug":"GMAIL_SEND_EMAIL"}' } };
     ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['fixture@example.invalid'] },
+    });
     ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'sent', details);
     const decision = { summary: 'sent', reply: 'Sent the email.', done: true, nextAction: 'completed', reason: null };
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
@@ -2429,6 +2436,13 @@ test('objective judge: one successful send does not certify a plural objective',
     const tool = { name: 'composio_execute_tool' };
     const details = { toolCall: { callId: 'send-1', arguments: '{"tool_slug":"GMAIL_SEND_EMAIL"}' } };
     ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['fixture@example.invalid'] },
+    });
     ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'sent', details);
     const decision = { summary: 'sent', reply: 'Sent the emails.', done: true, nextAction: 'completed', reason: null };
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
@@ -2448,6 +2462,145 @@ test('objective judge: one successful send does not certify a plural objective',
   });
   assert.equal(result.status, 'completed');
   assert.equal(judgeInvoked, true);
+});
+
+test('request-bound write evidence: stale execution receipts cannot certify a fresh external write', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['Sheet1!E1:G5'], receipt: 'old-write-123' },
+  });
+  let runs = 0;
+  const modelInputs: string[] = [];
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    runs += 1;
+    const last = items.at(-1) as { content?: unknown } | undefined;
+    modelInputs.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? ''));
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    if (runs === 1) {
+      const tool = { name: 'execution_get' };
+      const details = { toolCall: { callId: 'stale-exec-get', arguments: '{"id":"exec-old"}' } };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+      ee.emit(
+        'agent_tool_end',
+        runContext,
+        { name: 'Orchestrator' },
+        tool,
+        'Execution exec-old completed with receipt old-write-123 and readback old-read-456.',
+        details,
+      );
+      const decision = {
+        summary: 'PASS using prior receipts',
+        reply: 'PASS — write old-write-123 and readback old-read-456 prove the range is correct.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      };
+      ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+      return { history: items, lastResponseId: undefined, finalOutput: decision };
+    }
+
+    const writeTool = { name: 'composio_execute_tool' };
+    const writeDetails = {
+      toolCall: {
+        callId: 'fresh-sheet-write',
+        arguments: '{"tool_slug":"GOOGLESHEETS_VALUES_UPDATE","arguments":{"range":"Sheet1!E1:G5"}}',
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, writeTool, writeDetails);
+    appendEvent({
+      sessionId: sess.id,
+      turn: 2,
+      role: 'system',
+      type: 'external_write',
+      data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['Sheet1!E1:G5'], receipt: 'fresh-write-789' },
+    });
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, writeTool, 'fresh write receipt fresh-write-789', writeDetails);
+    const readDetails = {
+      toolCall: {
+        callId: 'fresh-sheet-read',
+        arguments: '{"tool_slug":"GOOGLESHEETS_BATCH_GET","arguments":{"ranges":["Sheet1!E1:G5"]}}',
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, writeTool, readDetails);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, writeTool, 'fresh readback receipt fresh-read-987 exact match', readDetails);
+    const decision = {
+      summary: 'fresh write verified',
+      reply: 'PASS — fresh write receipt fresh-write-789 and readback fresh-read-987 match exactly.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Perform exactly one fresh Google Sheets value write to Sheet1!E1:G5 and read it back.',
+    judgeCompletion: true,
+    judgeFn: async () => ({ done: true, reason: 'the cited receipts look valid' }),
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(runs, 2, 'the stale PASS must be bounced exactly once');
+  assert.match(modelInputs[1] ?? '', /no external-write receipt exists after source user event/i);
+  const requestWrites = listEventsForConv(sess.id, { types: ['external_write'] });
+  assert.equal(requestWrites.length, 2, 'one historical fixture + exactly one fresh write');
+  const completionVerdicts = listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+    .filter((event) => event.data.door === 'completion');
+  assert.equal(completionVerdicts[0]?.data.pass, false, 'the language-model PASS is deterministically overridden');
+  assert.match(String(completionVerdicts[0]?.data.reason ?? ''), /historical execution summaries/i);
+  const deliveryVerdicts = listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+    .filter((event) => event.data.door === 'delivery');
+  assert.equal(deliveryVerdicts.at(-1)?.data.pass, true);
+});
+
+test('request-bound write evidence: exhausted verification never false-greens a stale PASS', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runner = scriptedRunner([
+      {
+        finalOutput: {
+          summary: 'PASS using an old execution',
+          reply: 'PASS — prior receipt old-write-123 proves the new Sheet write completed.',
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      },
+    ]);
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Perform one fresh Google Sheets write now.',
+      judgeCompletion: true,
+      judgeFn: async () => ({ done: true, reason: 'accepted stale claim' }),
+      makeRunner: makeRunnerStub,
+      runRunner: runner,
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.delivered, false);
+    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+    assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
+    const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
+    assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
+  }
 });
 
 test('objective judge: fail-open accepted completions are tagged in conversation_completed', async () => {

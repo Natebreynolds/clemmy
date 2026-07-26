@@ -1642,6 +1642,49 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   }
 });
 
+test('shell publish ledger records the explicit destination instead of targets=[]', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  const prevDestination = process.env.CLEMMY_DESTINATION_GATE;
+  const prevGoal = process.env.CLEMMY_GOAL_FIDELITY_GATE;
+  const prevOutput = process.env.CLEMMY_OUTPUT_GROUNDING_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(20);
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async () => 'deployed',
+    });
+    assert.equal(
+      await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({
+        command: 'netlify deploy --prod --dir /x/site --site site_fixture_ledger --json',
+      })),
+      'deployed',
+    );
+    const ledger = listEvents(sess.id, { types: ['external_write'] });
+    assert.equal(ledger.length, 1);
+    assert.deepEqual((ledger[0].data as { targets?: string[] }).targets, ['site_fixture_ledger']);
+  } finally {
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    if (prevConfirm === undefined) delete process.env.CLEMMY_CONFIRM_FIRST; else process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    if (prevExecGate === undefined) delete process.env.CLEMMY_EXECUTION_GATE; else process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+    if (prevDestination === undefined) delete process.env.CLEMMY_DESTINATION_GATE; else process.env.CLEMMY_DESTINATION_GATE = prevDestination;
+    if (prevGoal === undefined) delete process.env.CLEMMY_GOAL_FIDELITY_GATE; else process.env.CLEMMY_GOAL_FIDELITY_GATE = prevGoal;
+    if (prevOutput === undefined) delete process.env.CLEMMY_OUTPUT_GROUNDING_GATE; else process.env.CLEMMY_OUTPUT_GROUNDING_GATE = prevOutput;
+  }
+});
+
 test('shell-send grounding: a curl POST with a contradicting payload soft-blocks; the corrected payload passes (audit #2)', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
@@ -1908,11 +1951,11 @@ test('Inc A2: no offer nudge below the floor, with the kill-switch off, or in a 
     return (await withHarnessRunContext({ sessionId, counter }, async () => wrapped.execute!({}))) as string;
   };
   try {
-    // 2026-07-16 policy graduation: default is now ON — past the floor the
-    // nudge fires with no flag set.
+    // Normal operation never injects an ask-and-stop gate merely because the
+    // model used six tools.
     delete process.env.CLEMMY_BG_OFFER_NUDGE;
     const chatDefault = createSession({ kind: 'chat' });
-    assert.match(await run(chatDefault.id, 5), /\[background offer\]/, 'default ON → nudge past the floor');
+    assert.doesNotMatch(await run(chatDefault.id, 5), /\[background offer\]/, 'default OFF → let the task finish');
     // below the floor (2 calls) → no nudge
     process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
     const chatA = createSession({ kind: 'chat' });
@@ -1947,6 +1990,31 @@ test('Inc A2: clarification-resolution state suppresses the background offer rai
       async () => wrapped.execute!({}),
     );
     assert.doesNotMatch(String(result), /\[background offer\]/);
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevB;
+    if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE;
+    else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
+  }
+});
+
+test('Inc A2: code-mode and batch-item carriers never receive conversational background offers', async () => {
+  const prevB = process.env.HARNESS_TOOL_BRACKETS;
+  const prevN = process.env.CLEMMY_BG_OFFER_NUDGE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
+  try {
+    const run = async (extra: { codeMode?: boolean; batchItem?: boolean }): Promise<string> => {
+      const sess = createSession({ kind: 'chat' });
+      const counter = new ToolCallsCounter(50);
+      for (let i = 0; i < 5; i++) counter.increment();
+      const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'tool-output' });
+      return String(await withHarnessRunContext(
+        { sessionId: sess.id, counter, ...extra },
+        async () => wrapped.execute!({}),
+      ));
+    };
+    assert.doesNotMatch(await run({ codeMode: true }), /\[background offer\]/);
+    assert.doesNotMatch(await run({ batchItem: true }), /\[background offer\]/);
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevB;
     if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE;

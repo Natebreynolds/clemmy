@@ -43,6 +43,63 @@ test('session gate: one bounce, steer teaches the beat, retry goes through', () 
   assert.equal(retry.bounce, false, 'the retry always proceeds');
 });
 
+test('execute-phase preflight is already aligned and never gets a redundant fan-out bounce', async () => {
+  resetEventLog();
+  createSession({ id: 'sess-align-execute', kind: 'chat' });
+  appendEvent({ sessionId: 'sess-align-execute', turn: 0, role: 'user', type: 'user_input_received', data: { text: 'fetch todos 1 through 40 now' } });
+  appendEvent({
+    sessionId: 'sess-align-execute',
+    turn: 0,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: { phase: 'execute', consequential: false, reason: 'ordinary_execution' },
+  });
+
+  assert.equal(
+    maybeFanoutAlignmentBounce({ sessionId: 'sess-align-execute', itemCount: 40 }).bounce,
+    false,
+    'the legacy run_worker boundary honors typed execute authority',
+  );
+
+  const { armFirstContactBeat, maybeBounceMassExecution } = await import('./fanout-alignment-gate.js');
+  armFirstContactBeat({
+    sessionId: 'sess-align-execute',
+    sessionKind: 'chat',
+    itemCount: 40,
+    userMessageCount: 1,
+    preflightPhase: 'execute',
+  });
+  assert.equal(
+    maybeBounceMassExecution('sess-align-execute').bounce,
+    false,
+    'the policy-classifier path does not arm an execute-phase request',
+  );
+});
+
+test('read-phase fan-out starts immediately without a conversational pause', async () => {
+  resetEventLog();
+  createSession({ id: 'sess-align-read', kind: 'chat' });
+  appendEvent({ sessionId: 'sess-align-read', turn: 0, role: 'user', type: 'user_input_received', data: { text: 'research these 40 public records' } });
+  appendEvent({
+    sessionId: 'sess-align-read',
+    turn: 0,
+    role: 'system',
+    type: 'turn_preflight_decision',
+    data: { phase: 'read', consequential: false, reason: 'read_only' },
+  });
+  assert.equal(maybeFanoutAlignmentBounce({ sessionId: 'sess-align-read', itemCount: 40 }).bounce, false);
+
+  const { armFirstContactBeat, maybeBounceMassExecution } = await import('./fanout-alignment-gate.js');
+  armFirstContactBeat({
+    sessionId: 'sess-align-read',
+    sessionKind: 'chat',
+    itemCount: 40,
+    userMessageCount: 1,
+    preflightPhase: 'read',
+  });
+  assert.equal(maybeBounceMassExecution('sess-align-read').bounce, false);
+});
+
 test('an already-conversing session never bounces; synthetic events do not count as conversation', () => {
   resetEventLog();
   createSession({ id: 'sess-align-2', kind: 'chat' });
@@ -74,18 +131,33 @@ test('armed flow: policy classifier arms, ANY execution door bounces once, resea
   const { armFirstContactBeat, maybeBounceMassExecution } = await import('./fanout-alignment-gate.js');
   clearFanoutAlignmentBouncesForTest();
   // Arm: first-contact chat with mass work (the 2026-07-22 acceptance shape).
-  armFirstContactBeat({ sessionId: 'sess-armed-1', sessionKind: 'chat', itemCount: 30, userMessageCount: 1 });
-  const first = maybeBounceMassExecution('sess-armed-1');
+  armFirstContactBeat({ sessionId: 'sess-armed-1', sessionKind: 'chat', itemCount: 30, userMessageCount: 1, preflightPhase: 'align' });
+  const first = maybeBounceMassExecution('sess-armed-1', { itemCount: 30, sideEffect: 'write' });
   assert.equal(first.bounce, true, 'the first mass-execution call bounces (whichever door)');
   assert.match(first.steer ?? '', /PAUSE before fan-out/);
-  assert.equal(maybeBounceMassExecution('sess-armed-1').bounce, false, 'one-shot: the retry proceeds');
+  assert.equal(
+    maybeBounceMassExecution('sess-armed-1', { itemCount: 30, sideEffect: 'write' }).bounce,
+    false,
+    'one-shot: the retry proceeds',
+  );
+  // A tiny/read batch is evidence gathering, not the mass launch. It neither
+  // bounces nor consumes the arm; the later real write still gets the beat.
+  armFirstContactBeat({ sessionId: 'sess-armed-read-first', sessionKind: 'chat', itemCount: 30, userMessageCount: 1, preflightPhase: 'align' });
+  assert.equal(
+    maybeBounceMassExecution('sess-armed-read-first', { itemCount: 2, sideEffect: 'read' }).bounce,
+    false,
+  );
+  assert.equal(
+    maybeBounceMassExecution('sess-armed-read-first', { itemCount: 30, sideEffect: 'write' }).bounce,
+    true,
+  );
   // Never armed → never bounced (read-only research and ordinary sessions).
   assert.equal(maybeBounceMassExecution('sess-armed-2').bounce, false);
   // Conversing session never arms.
-  armFirstContactBeat({ sessionId: 'sess-armed-3', sessionKind: 'chat', itemCount: 30, userMessageCount: 3 });
+  armFirstContactBeat({ sessionId: 'sess-armed-3', sessionKind: 'chat', itemCount: 30, userMessageCount: 3, preflightPhase: 'align' });
   assert.equal(maybeBounceMassExecution('sess-armed-3').bounce, false);
   // Non-chat kinds never arm.
-  armFirstContactBeat({ sessionId: 'sess-armed-4', sessionKind: 'workflow', itemCount: 30, userMessageCount: 1 });
+  armFirstContactBeat({ sessionId: 'sess-armed-4', sessionKind: 'workflow', itemCount: 30, userMessageCount: 1, preflightPhase: 'align' });
   assert.equal(maybeBounceMassExecution('sess-armed-4').bounce, false);
 });
 

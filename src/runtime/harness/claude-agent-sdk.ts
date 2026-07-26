@@ -40,7 +40,7 @@ import {
 import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
-import { extractDuplicateIdentityKeys } from './grounding-gate.js';
+import { extractExternalWriteIdentityKeys } from './grounding-gate.js';
 import {
   evaluateToolEconomy,
   type ToolEconomyState,
@@ -789,7 +789,7 @@ function nativeExternalWriteAttempt(toolName: string, input: unknown, callId: st
     callId,
     toolName,
     shapeKey: shape.shapeKey ?? toolName.replace(/^mcp__/, ''),
-    targets: extractDuplicateIdentityKeys(input).slice(0, 8),
+    targets: extractExternalWriteIdentityKeys(input).slice(0, 8),
   };
 }
 

@@ -143,6 +143,11 @@ export function extractNumericClaims(text: string): NumericClaim[] {
     const after = text.slice(start + whole.trimStart().length, start + whole.trimStart().length + 16);
 
     // ── noise filters ───────────────────────────────────────────
+    // Regex backtracking must not turn an alphanumeric identifier fragment
+    // into a numeric claim (`...-420e-...` previously became the figure `42`).
+    // Real prose figures have a token boundary; IDs, hashes, and compact codes
+    // do not.
+    if (/[A-Za-z0-9_]$/.test(before) || /^[A-Za-z0-9_]/.test(after)) continue;
     // URL / path-embedded number.
     if (/[/=?&#]\s*$/.test(before) || /https?:\/\/\S*$/.test(before)) continue;
     // Version string (v1.2, 0.5.20, or "version 3").

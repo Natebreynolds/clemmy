@@ -60,7 +60,11 @@ export interface AutoCaptureResult {
 
 const PROJECT_TERMS = /\b(clementine|clemmy|agent|assistant|dashboard|discord|composio|memory|workflow|autonom(?:y|ous)|setup|install|mcp|oauth|keychain|electron|tooling|project)\b/i;
 const PROJECT_REQUIREMENT_CUES = /\b(should|needs?|must|has to|have to|main goal|north star|goal|i want|i need|we need|make sure|be able to|easy to|full autonomous|proactive|persistent|long-running|long lasting)\b/i;
-const FEEDBACK_CUES = /\b(i (?:do not|don'?t) like|i hate|i would rather|i prefer|instead of|from now on|please (?:always|never|don'?t|do not)|\balways\b|\bnever\b|\btoo noisy\b|\bnot helpful\b)\b/i;
+// Bare "always" / "never" are intentionally NOT preference signals. They are
+// common in task history ("the deploy never actually ran") and were the main
+// source of one-turn requests becoming permanent, pinned instructions.
+const FEEDBACK_CUES = /\b(i (?:do not|don'?t) like|i hate|i would rather|i prefer|instead of|from now on|please (?:always|never|don'?t|do not)|too noisy|not helpful)\b/i;
+const EXPLICIT_PREFERENCE_CUES = /\b(?:i (?:do not|don'?t) like|i hate|i would rather|i prefer|too noisy|not helpful)\b/i;
 const CONNECTED_APP_TERMS = /\b(composio|outlook|gmail|google calendar|calendar|slack|notion|github|linear|asana|salesforce|hubspot|drive|docs|sheets)\b/i;
 const CONNECTED_APP_CUES = /\b(i|we|the agent|users?)\s+(?:use|uses|have|has|need|needs|want|wants|connect|connects|access|auth|authenticate|oauth)\b/i;
 
@@ -77,8 +81,16 @@ const PROHIBITION_ACTION_RE = /\b(?:send|sends|email|emails|e-?mail|cc|bcc|share
 const PROHIBITION_ONE_OFF_RE = /\b(?:this once|just this|right now|today only|for now|this time|that one|never\s*mind)\b/i;
 const NEGATED_ACTION_RE = /\b(?:do not|don'?t|do n'?t)\s+(?:(?:ever|also|just|please|blindly|accidentally|automatically|anything|any|the|a|an|it|this|that|or|and|,|-|\/)\s*){0,8}(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|create|edit|save|write|mark|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
 const HARD_PROHIBITION_RE = /\b(?:never|under no circumstances)\b(?:(?![.!?]).){0,120}\b(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|create|edit|save|write|mark|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
-const ONE_OFF_TASK_SAFETY_RE = /\b(?:read[- ]only|smoke(?:\s+test)?|live\s+smoke|stress\s+test|draft\s+only|just\s+draft|after the tool returns)\b/i;
-const ONE_OFF_TASK_START_RE = /^\s*(?:hey\s+)?(?:can you|please|check|pull|draft|write|create|build|run|call|use|using|find|list|research|mock up|take|read|author)\b/i;
+const HISTORICAL_NEVER_RE = /\bnever\s+(?:actually|previously|yet|did|does|was|were|has|have|had|ran|happened|got|failed|finished|completed|executed|deployed|sent|wrote|created)\b/i;
+const PERSISTENT_SCOPE_RE = /\b(?:always|from now on|from here on(?: out)?|going forward|by default|as a rule|each time|every time|whenever|in the future|for future|next time|under no circumstances)\b/i;
+const ONE_OFF_TASK_SAFETY_RE = /(?:\b(?:read[- ]only|live\s+smoke|stress\s+test|draft\s+only|just\s+draft|after the tool returns|disposable|diagnostic|validation)\b|(?:^|[_\W])smoke(?:[_\W]|$))/i;
+const ONE_OFF_TASK_START_RE = /^\s*(?:hey\s+)?(?:can you|could you|please|i (?:want|need) you to|we need you to|check|pull|draft|write|create|build|run|execute|deploy|send|email|post|update|fix|call|use|using|find|list|research|mock up|take|read|author)\b/i;
+const TASK_REQUEST_RE = /(?:^|[.!?;]\s+|—\s+)(?:hey\s+)?(?:can you|could you|please|i (?:want|need) you to|we need you to|check|pull|draft|write|create|build|run|execute|deploy|send|email|post|update|fix|call|use|using|find|list|research|mock up|take|read|author)\b/i;
+const CURRENT_TURN_SCOPE_RE = /\b(?:today|tomorrow|yesterday|right now|currently|this (?:request|run|turn|task|time)|for now|this once|that one|just answer|answer in chat|reply with|do not deploy yet|don'?t send yet|until (?:you|the|it)|disposable)\b/i;
+const EXPLICIT_EPHEMERAL_SCOPE_RE = /\b(?:for|in|during)\s+this\s+(?:task|request|run|turn)\b/i;
+const STANDALONE_PROHIBITION_START_RE = /^\s*(?:please\s+)?(?:never|under no circumstances|do not|don'?t|do n'?t)\b/i;
+const STANDALONE_PROHIBITION_OBJECT_RE = /\b(?:this|that|it|these|those)\b|\b(?:yet|today|tonight|tomorrow|right now|for now|this time|this once)\b/i;
+const CLEMENTINE_VISION_RE = /\b(?:i want|i need|we need)\s+(?:clementine|clemmy|the agent|my (?:agent|assistant))\s+to\b|\b(?:north star|main goal)\b/i;
 const ONE_OFF_VALIDATION_RE = /\b(?:live\s+validation(?:\s+only)?|validation\s+only|live\s+read[- ]only\s+validation|read[- ]only\s+live\s+validation|read[- ]only\s+validation\s+after|live\s+validation\s+after|live\s+(?:local\s+)?safety\s+validation|(?:this\s+is\s+(?:a\s+)?)?(?:live|read[- ]only|local|safety)\s+diagnostic(?:\s+(?:only|probe|run|test))?|diagnostic\s+(?:only|probe|run|test))\b/i;
 const MEMORY_CAPTURE_OPTOUT_RE = /\b(?:do\s+not|don'?t|do n'?t)\s+(?:(?:save|store|remember|capture|persist)\s+(?:this|it|that|the request|this request)?\s*(?:as|to|in)?\s*(?:a\s+)?(?:memory|durable memory|long[- ]term memory)?|(?:write(?:\s+to)?|change|modify|update)\s+(?:my\s+|the\s+|any\s+)?(?:memory|durable memory|long[- ]term memory))\b/i;
 const MUST_CALL_TOOL_RE = /\byou\s+must\s+call\s+\w+/i;
@@ -88,13 +100,31 @@ const ONE_OFF_CONNECTED_APP_LOOKUP_START_RE = /^\s*(?:hey\s+)?(?:can you|could y
 const ONE_OFF_CONNECTED_APP_LOOKUP_CONTEXT_RE = /\b(?:today|tomorrow|tmrw|tmr|yesterday|right now|currently|this (?:morning|afternoon|week|month)|next (?:day|week)|calendar|inbox|e-?mail|messages?|meetings?|events?|unread|connected|connection|connections|accounts?|usable|stale|available)\b/i;
 
 function hasDirectSafetyProhibition(text: string): boolean {
-  return HARD_PROHIBITION_RE.test(text) || NEGATED_ACTION_RE.test(text);
+  const directNegation = NEGATED_ACTION_RE.test(text);
+  const hardStanding = HARD_PROHIBITION_RE.test(text) && !HISTORICAL_NEVER_RE.test(text);
+  return hardStanding || directNegation;
+}
+
+function looksLikeOneOffTaskRequest(text: string): boolean {
+  return ONE_OFF_TASK_START_RE.test(text) || TASK_REQUEST_RE.test(text);
+}
+
+function isStandaloneSafetyProhibition(text: string): boolean {
+  if (text.length > 180 || !STANDALONE_PROHIBITION_START_RE.test(text)) return false;
+  if (STANDALONE_PROHIBITION_OBJECT_RE.test(text)) return false;
+  if (CURRENT_TURN_SCOPE_RE.test(text) || ONE_OFF_TASK_SAFETY_RE.test(text)) return false;
+  // A second imperative after the prohibition means this is a task with a
+  // local safety clause ("Do not send. Pull the records and answer here.").
+  const afterFirstSentence = text.replace(/^[^.!?]*[.!?]\s*/, '');
+  if (afterFirstSentence !== text && TASK_REQUEST_RE.test(afterFirstSentence)) return false;
+  return true;
 }
 
 function isOneOffTaskSafetyInstruction(text: string): boolean {
   if (!hasDirectSafetyProhibition(text)) return false;
   if (ONE_OFF_TASK_SAFETY_RE.test(text)) return true;
-  return ONE_OFF_TASK_START_RE.test(text) && /\b(?:today|tomorrow|this request|this run|this turn|just|only)\b/i.test(text);
+  if (CURRENT_TURN_SCOPE_RE.test(text)) return true;
+  return looksLikeOneOffTaskRequest(text) && /\b(?:today|tomorrow|this request|this run|this turn|this task|just|only|yet|until)\b/i.test(text);
 }
 
 function isOneOffValidationOrToolProbe(text: string): boolean {
@@ -114,18 +144,16 @@ function isSafetyProhibition(text: string): boolean {
     && PROHIBITION_ACTION_RE.test(text)
     && hasDirectSafetyProhibition(text)
     && !PROHIBITION_ONE_OFF_RE.test(text)
-    && !isOneOffTaskSafetyInstruction(text);
+    && !isOneOffTaskSafetyInstruction(text)
+    && (PERSISTENT_SCOPE_RE.test(text) || isStandaloneSafetyProhibition(text));
 }
 
 // Standing-rule capture — a durable "going forward / every Monday / by default"
 // instruction that should PERSIST ACROSS SESSIONS (routed to the facts vault),
 // as opposed to a one-off action (handled by the session-scoped Active Task pin
-// in working-memory.ts). "always" / "never" / "from now on" are DELIBERATELY
-// OMITTED: they already match FEEDBACK_CUES above and are captured today, so the
-// length-gated branch below would never run for them. This marker set fills only
-// the gap those cues miss. A marker alone is not enough — an imperative verb AND
+// in working-memory.ts). A marker alone is not enough — an imperative verb AND
 // a concrete target are also required (see hasConcreteStandingTarget).
-const STANDING_MARKER_RE = /\b(?:from here on(?: out)?|going forward|by default|as a rule|every (?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each (?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|whenever)\b/i;
+const STANDING_MARKER_RE = /\b(?:always|never|from now on|from here on(?: out)?|going forward|by default|as a rule|next time|in the future|for future|every (?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each (?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|whenever)\b/i;
 // The imperative verbs isDurableDeclarative explicitly rejects — exactly why a
 // standing imperative is uncaptured today.
 const STANDING_VERB_RE = /\b(?:send|e-?mail|message|dm|post|publish|reply|forward|cc|bcc|route|use)\b/i;
@@ -233,9 +261,15 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // One-off validation/probe prompts often contain durable-looking words such as
   // "instead of" or "must", but they describe this smoke turn, not user memory.
   if (isOneOffValidationOrToolProbe(text)) return [];
+  // An explicit current-task scope belongs in working memory, even when the
+  // sentence also contains durable-looking markers such as "always".
+  if (EXPLICIT_EPHEMERAL_SCOPE_RE.test(text)) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);
+  const taskRequest = looksLikeOneOffTaskRequest(text);
+  const persistentScope = PERSISTENT_SCOPE_RE.test(text);
+  const explicitPreference = EXPLICIT_PREFERENCE_CUES.test(text);
 
   // Enforceable sender/account routing rule → kind:'constraint' so the dispatch
   // gate (constraint-guard via listConstraints) actually ENFORCES it, closing the
@@ -252,7 +286,11 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   }
   const capturedConstraint = candidates.some((c) => c.kind === 'constraint');
 
-  if (FEEDBACK_CUES.test(text) && !capturedConstraint) {
+  if (
+    FEEDBACK_CUES.test(text)
+    && !capturedConstraint
+    && (!taskRequest || persistentScope || explicitPreference)
+  ) {
     const kind: ConsolidatedFactKind = PROJECT_TERMS.test(text) ? 'feedback' : 'user';
     addCandidate(candidates, {
       kind,
@@ -264,7 +302,12 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
-  if (PROJECT_TERMS.test(text) && PROJECT_REQUIREMENT_CUES.test(text) && !isOneOffValidationOrToolProbe(text)) {
+  if (
+    PROJECT_TERMS.test(text)
+    && PROJECT_REQUIREMENT_CUES.test(text)
+    && !isOneOffValidationOrToolProbe(text)
+    && (!taskRequest || CLEMENTINE_VISION_RE.test(text))
+  ) {
     addCandidate(candidates, {
       kind: 'project',
       content: `Clementine requirement: ${text}`,
@@ -272,7 +315,12 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
-  if (CONNECTED_APP_TERMS.test(text) && CONNECTED_APP_CUES.test(text) && !isOneOffConnectedAppLookup(text)) {
+  if (
+    CONNECTED_APP_TERMS.test(text)
+    && CONNECTED_APP_CUES.test(text)
+    && !isOneOffConnectedAppLookup(text)
+    && (!taskRequest || persistentScope)
+  ) {
     addCandidate(candidates, {
       kind: 'reference',
       content: `Connected-app context: ${text}`,
@@ -317,7 +365,13 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // This is ADDITIVE — it only fires when the cued paths found nothing,
   // so it never reduces what's captured today. Questions and commands
   // are excluded so we don't store "what's my balance?" as a fact.
-  if (candidates.length === 0 && !isOneOffConnectedAppLookup(text) && isDurableDeclarative(text)) {
+  if (
+    candidates.length === 0
+    && !taskRequest
+    && !isOneOffConnectedAppLookup(text)
+    && !HISTORICAL_NEVER_RE.test(text)
+    && isDurableDeclarative(text)
+  ) {
     addCandidate(candidates, {
       kind: 'user',
       content: text,
@@ -338,6 +392,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     && STANDING_MARKER_RE.test(text)
     && STANDING_VERB_RE.test(text)
     && hasConcreteStandingTarget(text)
+    && !HISTORICAL_NEVER_RE.test(text)
   ) {
     addCandidate(candidates, {
       kind: 'feedback',
@@ -351,6 +406,30 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   }
 
   return candidates.slice(0, maxCandidates);
+}
+
+export type AutoMemoryAdmissionScope = 'ephemeral' | 'durable' | 'standing_policy';
+
+export interface AutoMemoryAdmissionDecision {
+  scope: AutoMemoryAdmissionScope;
+  reasons: string[];
+}
+
+/**
+ * Read-only explanation of the deterministic admission decision. This is the
+ * observability seam for evals/UI: callers can inspect whether a turn stayed
+ * ephemeral without writing a candidate or invoking a model.
+ */
+export function assessAutoMemoryAdmission(message: string): AutoMemoryAdmissionDecision {
+  const candidates = extractAutoMemoryCandidates(message);
+  if (candidates.length === 0) {
+    return { scope: 'ephemeral', reasons: ['no durable-memory admission rule matched'] };
+  }
+  const standing = candidates.some((candidate) => candidate.pin || candidate.kind === 'constraint');
+  return {
+    scope: standing ? 'standing_policy' : 'durable',
+    reasons: [...new Set(candidates.map((candidate) => candidate.reason))],
+  };
 }
 
 /**

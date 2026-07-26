@@ -32,11 +32,13 @@ import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
+import { resolveCallToolAlias } from './call-tool-alias.js';
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
   'Use this to reach a catalog-only tool without a round-trip: e.g. call_tool("workflow_schedule", "{\\"workflow_id\\":\\"...\\"}").',
   'APPROVAL: call_tool never prompts on its own — the target tool\'s own classification decides. A read runs immediately; a write/send/irreversible target gates for approval exactly as if you had called it directly.',
+  'RESILIENT HTTP GET: common guessed names http_fetch, web_fetch, web_fetch_simple, and fetch_url are bounded read-only aliases for the real run_shell_command curl path when that tool is allowed on the active turn.',
   'If the arguments do not match the tool\'s schema, call_tool returns the schema and an error and makes NO change — fix the args and call again. If you are unsure of the exact name or args, call tool_search first.',
 ].join(' ');
 
@@ -102,6 +104,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     execute: async (
       { name, args_json }: { name: string; args_json: string },
       runContext: unknown,
+      details: { toolCall?: { callId?: string; id?: string } } | undefined,
     ): Promise<string> => {
       // Exactly-once budget contract: the harness wrapper exempts call_tool
       // from the per-turn counter (the INNER tool's wrapper charges it on the
@@ -117,17 +120,42 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         }
         return JSON.stringify(payload);
       };
-      const target = (name ?? '').trim();
-      if (!target) return refuse({ error: 'bad_request', detail: 'name is required' });
+      const requestedTarget = (name ?? '').trim();
+      if (!requestedTarget) return refuse({ error: 'bad_request', detail: 'name is required' });
 
-      if (deniedNames.has(target)) {
+      // 1. Parse args_json before alias repair. Parsing has no side effect, and
+      // a recognized alias needs its structured arguments to resolve to the
+      // real tool without wasting a failed model round-trip.
+      let args: unknown = {};
+      const raw = (args_json ?? '').trim();
+      if (raw) {
+        try {
+          args = JSON.parse(raw);
+        } catch {
+          return refuse({ error: 'arg_validation', detail: 'args_json is not valid JSON' });
+        }
+      }
+
+      let target = requestedTarget;
+      let resolvedArgs = args;
+      const alreadyReachable = reachableBuiltinNames.has(target) || firstClassNames.has(target);
+      if (!alreadyReachable && !isMcpNamespacedTool(target)) {
+        const alias = resolveCallToolAlias(target, args);
+        if (alias) {
+          if (!alias.ok) return refuse({ error: 'arg_validation', detail: alias.detail });
+          target = alias.targetName;
+          resolvedArgs = alias.targetArgs;
+        }
+      }
+
+      if (deniedNames.has(requestedTarget) || deniedNames.has(target)) {
         return refuse({
           error: 'not_reachable',
-          detail: `"${target}" is excluded from this turn's effective tool policy.`,
+          detail: `"${requestedTarget}" is excluded from this turn's effective tool policy.`,
         });
       }
 
-      // 1. Authority — never escalate past the curated orchestrator surface.
+      // 2. Authority — never escalate past the curated orchestrator surface.
       // External MCP names (<server>__<tool>) are admitted here and enforced
       // DOWNSTREAM: dispatchBatchItemTool resolves them against the session's
       // connected MCP scope (unknown/unconnected servers error honestly) and
@@ -139,28 +167,17 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         if (!reachableBuiltinNames.has(target) && !firstClassNames.has(target)) {
           return refuse({
             error: 'not_reachable',
-            detail: `"${target}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.`,
+            detail: `"${requestedTarget}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.`,
           });
-        }
-      }
-
-      // 2. Parse args_json.
-      let args: unknown = {};
-      const raw = (args_json ?? '').trim();
-      if (raw) {
-        try {
-          args = JSON.parse(raw);
-        } catch {
-          return refuse({ error: 'arg_validation', detail: 'args_json is not valid JSON' });
         }
       }
 
       // 3. Zod-validate BEFORE dispatch — zero side effects on failure.
       const local = await localSchemas();
       const schema = local.schemas.get(target);
-      let dispatchArgs = args;
+      let dispatchArgs = resolvedArgs;
       if (schema) {
-        const parsed = schema.safeParse(args);
+        const parsed = schema.safeParse(resolvedArgs);
         if (!parsed.success) {
           return refuse({
             error: 'arg_validation',
@@ -196,7 +213,15 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // invocation; the fallback only serves direct/unit invocations without a
       // harness run context.
       const counter = harnessRunContextStorage.getStore()?.counter ?? new ToolCallsCounter(1000);
-      const out = await dispatchBatchItemTool(target, dispatchArgs, sessionId, counter);
+      const outerCallId = details?.toolCall?.callId ?? details?.toolCall?.id;
+      const out = await dispatchBatchItemTool(
+        target,
+        dispatchArgs,
+        sessionId,
+        counter,
+        undefined,
+        { accounting: 'transport_mirror', canonicalCallId: outerCallId },
+      );
 
       // 5. Promote the reached tool into the session hot-set.
       recordToolHit(sessionId, target);

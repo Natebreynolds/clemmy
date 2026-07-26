@@ -1218,6 +1218,80 @@ test('an in-flight contract correction preserves partial work and re-queues the 
     && run.events.some((event) => event.type === 'completed')));
 });
 
+test('an in-flight harness call that completes the revised manifest settles without a redundant continuation', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Revalidate the account shortlist',
+    prompt: 'Process account-a and account-b, including any in-flight contract correction.',
+  });
+  let calls = 0;
+
+  const assistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { sessionId: string }) {
+      calls += 1;
+      declareWorkManifest({
+        sessionId: request.sessionId,
+        manifestId: 'in-flight-revision',
+        contractVersion: 1,
+        phases: [{ id: 'research' }],
+        items: [{ id: 'account-a' }, { id: 'account-b' }],
+      });
+      for (const itemId of ['account-a', 'account-b']) {
+        checkpointWorkItem({
+          sessionId: request.sessionId,
+          manifestId: 'in-flight-revision',
+          contractVersion: 1,
+          phase: 'research',
+          itemId,
+          status: 'succeeded',
+          evidence: [{ kind: 'worker_result', ref: `v1:${itemId}` }],
+        });
+      }
+      const revised = reviseBackgroundTaskContract(task.id, {
+        instruction: 'Replace the baseline result and revalidate both accounts.',
+        evidencePolicy: 'revalidate',
+      });
+      assert.equal(revised?.contractVersion, 2);
+      for (const itemId of ['account-a', 'account-b']) {
+        checkpointWorkItem({
+          sessionId: request.sessionId,
+          manifestId: 'in-flight-revision',
+          contractVersion: 2,
+          phase: 'research',
+          itemId,
+          status: 'succeeded',
+          evidence: [{ kind: 'worker_result', ref: `v2:${itemId}` }],
+        });
+      }
+      return {
+        text: 'Done — contract v2 revalidated account-a and account-b with exact durable evidence.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  assert.equal(await processBackgroundTasks(assistant as any, 1), 1);
+  const completed = getBackgroundTask(task.id);
+  assert.equal(calls, 1, 'a complete revised manifest must not schedule a receipt-only continuation');
+  assert.equal(completed?.status, 'done');
+  assert.equal(completed?.contractVersion, 2);
+  assert.equal(completed?.pendingContractRevision, undefined);
+  assert.ok(completed?.contractRevisions?.find((revision) => revision.version === 2)?.appliedAt);
+  assert.equal(summarizeWorkManifest(task.runSessionId, 'in-flight-revision')?.remaining, 0);
+  const runs = listRuns(40).filter((run) => run.sessionId === task.runSessionId);
+  assert.ok(runs.some((run) => run.events.some((event) => (
+    event.type === 'status'
+    && /satisfied inside the in-flight harness call/i.test(event.message)
+  ))));
+  assert.equal(runs.some((run) => /superseded by contract v2/i.test(
+    run.events.map((event) => event.message).join('\n'),
+  )), false);
+});
+
 test('processBackgroundTasks carries origin lineage into automatic continuation prompts', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });

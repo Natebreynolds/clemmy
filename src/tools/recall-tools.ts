@@ -4,6 +4,7 @@ import { getToolOutput, TOOL_OUTPUT_MAX_BYTES } from '../runtime/harness/eventlo
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './code-mode-tool.js';
+import { extractCompleteJsonObjects } from '../runtime/harness/json-repair.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -157,6 +158,7 @@ export function registerRecallTools(server: McpServer): void {
         return textResult(`No tool output found for call_id "${callId}" in this session.`);
       }
       let parsed: unknown;
+      let recoveredClippedArrayPrefix = false;
       try { parsed = JSON.parse(row.output); } catch {
         // Very common footgun: the parked output is a run_shell_command wrapper
         // (`exit_code:/stdout:/stderr:`) around a `--json` payload (sf, gh, aws…),
@@ -168,6 +170,13 @@ export function registerRecallTools(server: McpServer): void {
         const shell = parseShellToolOutput(row.output);
         if (shell?.stdout_json !== undefined) {
           parsed = shell.stdout_json;
+        } else if (shell?.stdout.trimStart().startsWith('[')) {
+          const completeObjects = extractCompleteJsonObjects(shell.stdout, 200);
+          if (completeObjects.length === 0) {
+            return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
+          }
+          parsed = completeObjects;
+          recoveredClippedArrayPrefix = true;
         } else {
           return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
         }
@@ -198,7 +207,9 @@ export function registerRecallTools(server: McpServer): void {
         const offset = Number.isFinite(input.offset as number) ? Math.max(0, Math.trunc(input.offset as number)) : 0;
         const limit = Number.isFinite(input.limit as number) ? Math.min(200, Math.max(1, Math.trunc(input.limit as number))) : 50;
         const page = rows.slice(offset, offset + limit).map(project);
-        const header = `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total)`;
+        const header = recoveredClippedArrayPrefix
+          ? `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
+          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total)`;
         // Hand the model the EXACT, copy-paste reference for these values, so a
         // downstream send binds them by reference instead of retyping (which is
         // how a value gets invented or dropped). Root array + single projected

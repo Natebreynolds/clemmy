@@ -110,6 +110,7 @@ export function workflowCardStatus(w: {
   health?: { status: string; issues: Array<{ stepId: string }> };
   certification?: WorkflowCertification | null;
   lastRunStatus?: string | null;
+  lastRunOutcome?: string | null;
   lastRunNeedsAttention?: boolean;
   lastRunFailedItemCount?: number;
 }): WorkflowCardStatus | null {
@@ -125,9 +126,28 @@ export function workflowCardStatus(w: {
   if (cert && !cert.canRun) {
     return { tone: certificationTone(cert.state), label: cert.label, detail: cert.summary };
   }
+  const outcome = (w.lastRunOutcome ?? '').toLowerCase();
+  if (outcome === 'failed') return { tone: 'danger', label: 'Last run failed', aboutLastRun: true };
+  if (outcome === 'blocked') return { tone: 'warning', label: 'Last run blocked', aboutLastRun: true };
+  if (outcome === 'partial') return { tone: 'warning', label: 'Last run partial', aboutLastRun: true };
+  if (outcome === 'cancelled') return { tone: 'neutral', label: 'Last run cancelled', aboutLastRun: true };
   const s = (w.lastRunStatus ?? '').toLowerCase();
-  if (s === 'failed' || s === 'error') return { tone: 'danger', label: 'Last run failed', aboutLastRun: true };
-  if (s === 'needs_attention' || w.lastRunNeedsAttention) return { tone: 'warning', label: 'Needs attention', aboutLastRun: true };
+  // Once canonical outcome exists it is authoritative; status is only the
+  // backwards-compatible lifecycle fallback for legacy records.
+  if (!outcome && (s === 'failed' || s === 'error')) {
+    return { tone: 'danger', label: 'Last run failed', aboutLastRun: true };
+  }
+  if (!outcome && (s === 'needs_attention' || w.lastRunNeedsAttention)) {
+    return { tone: 'warning', label: 'Needs attention', aboutLastRun: true };
+  }
+  if (s === 'blocked_capability') {
+    return {
+      tone: 'warning',
+      label: 'Waiting for connection',
+      detail: 'Completed work is preserved. This run resumes after its required account or capability is reconnected.',
+      aboutLastRun: true,
+    };
+  }
   if ((w.lastRunFailedItemCount ?? 0) > 0) {
     const n = w.lastRunFailedItemCount ?? 0;
     return { tone: 'warning', label: `${n} failed item${n === 1 ? '' : 's'}`, aboutLastRun: true };

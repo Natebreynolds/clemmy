@@ -28,7 +28,10 @@ import {
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
 import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
-import { renderedComposioResultLooksFailed } from '../tools/composio-tools.js';
+import {
+  renderedComposioResultLooksFailed,
+  type ComposioGatewayBlockReason,
+} from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
@@ -154,7 +157,15 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
-import { runWatcherJudge, watcherJudgeEnabled, watcherWorkflowIntervalSteps, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn } from '../runtime/harness/watcher-judge.js';
+import {
+  runWatcherJudge,
+  watcherJudgeEnabled,
+  watcherWorkflowIntervalSteps,
+  MAX_WATCHER_INJECTIONS,
+  MAX_WATCHER_CHECKS,
+  type WatcherJudgeFn,
+  type WatcherVerdict,
+} from '../runtime/harness/watcher-judge.js';
 import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
@@ -173,6 +184,16 @@ import {
   type WorkflowRunReportBackRetryState,
 } from './workflow-run-report-back.js';
 import {
+  deriveWorkflowTerminalOutcome,
+  type WorkflowTerminalOutcome,
+} from './workflow-terminal-outcome.js';
+import {
+  resolveWorkflowRunDefinitionSnapshot,
+  workflowCodeRevisionMatchesSnapshot,
+  workflowDefinitionMatchesSnapshotIgnoringEnabled,
+  type WorkflowRunDefinitionSnapshot,
+} from './workflow-run-definition.js';
+import {
   readWorkflowRunRecord,
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
@@ -190,6 +211,7 @@ import {
   recordFailedWorkflowPattern,
   renderWorkflowPatternHint,
 } from '../memory/workflow-pattern-store.js';
+import { workflowCodeRevisionFingerprint } from './workflow-code-certification.js';
 import { compileWorkflowStepsToGraph } from './workflow-graph.js';
 import { persistWorkflowGraphSnapshot } from './workflow-graph-store.js';
 import {
@@ -507,6 +529,12 @@ export interface QueuedRunRecord {
    * mark it as needing attention and link the proposed fix (if diagnosed).
    */
   needsAttention?: boolean;
+  /**
+   * Canonical user-objective outcome. `status` remains the runner lifecycle
+   * state for compatibility; this field prevents a mechanically-finished
+   * `completed` run from masquerading as successful when required work blocked.
+   */
+  terminalOutcome?: WorkflowTerminalOutcome;
   blockedSteps?: Array<{ stepId: string; reason: string }>;
   proposedFixId?: string | null;
   /**
@@ -540,6 +568,10 @@ export interface QueuedRunRecord {
    * by structured exact-call receipts. Crash recovery must never infer this
    * authority from a later workflow definition. */
   mutationContractSnapshot?: unknown;
+  /** Exact workflow definition admitted when this run was queued. A present
+   * snapshot is content-hashed and immutable; legacy runs omit it and retain
+   * the pre-v2 behavior of resolving the current workflow definition. */
+  workflowDefinitionSnapshot?: unknown;
   /**
    * Failed-item retry lineage. A retry run inherits completed upstream step
    * outputs and completed forEach items from the source run, then leaves only
@@ -559,6 +591,13 @@ export interface QueuedRunRecord {
    * driven by events.jsonl / computeResumeState).
    */
   parked?: ParkedRunState;
+  /**
+   * Recoverable, proven-pre-dispatch capability interruption (for example an
+   * expired/missing Composio connection). Unlike `parked`, this waits on
+   * external capability state rather than a human approval row. Completed
+   * steps remain in events.jsonl and the same run is retried with backoff.
+   */
+  capabilityBlock?: WorkflowCapabilityBlockState;
   /**
    * Report-back backstop (north star: REPORTS BACK WITHOUT FAIL). Set
    * once the terminal (completed/error) user notification has been
@@ -734,6 +773,7 @@ function writeRunRecord(
             cancelledAt: receipt.requestedAt,
             finishedAt: receipt.requestedAt,
             error: receipt.reason,
+            terminalOutcome: 'cancelled' as const,
           };
           writeWorkflowRunRecordDurablyUnlocked(filePath, canonical);
           return { record: canonical, publishedTerminal: false };
@@ -753,6 +793,8 @@ function writeRunRecord(
       reportBackAcknowledgedAt: _staleReportBackAcknowledgedAt,
       notifiedAt: _staleNotifiedAt,
       mutationContractSnapshot: _staleMutationContractSnapshot,
+      workflowDefinitionSnapshot: _staleWorkflowDefinitionSnapshot,
+      terminalOutcome: _staleTerminalOutcome,
       ...businessRecord
     } = record;
     let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
@@ -766,6 +808,13 @@ function writeRunRecord(
       nextRecord.mutationContractSnapshot = current.mutationContractSnapshot;
     } else {
       delete nextRecord.mutationContractSnapshot;
+    }
+    // The queue's content-hashed definition is immutable for the lifetime of
+    // the run. Later runner snapshots may be stale and can never replace it.
+    if (current && Object.prototype.hasOwnProperty.call(current, 'workflowDefinitionSnapshot')) {
+      nextRecord.workflowDefinitionSnapshot = current.workflowDefinitionSnapshot;
+    } else {
+      delete nextRecord.workflowDefinitionSnapshot;
     }
     if (current?.reportBack !== undefined) nextRecord.reportBack = current.reportBack;
     else delete nextRecord.reportBack;
@@ -814,6 +863,24 @@ function writeRunRecord(
         delete nextRecord.reportBackAcknowledgedAt;
         delete nextRecord.reportBackRetry;
       }
+    }
+    // The record may be a legacy non-terminal snapshot carrying stale outcome
+    // data. Terminal publication derives a new value from this write's status
+    // and immutable report envelope; it never trusts inherited projection.
+    delete nextRecord.terminalOutcome;
+    if (isTerminalRunRecord(nextRecord)) {
+      const terminalOutcome = deriveWorkflowTerminalOutcome(
+        nextRecord,
+        terminalReport?.outcome,
+      );
+      if (!terminalOutcome) {
+        throw new Error(`Could not derive canonical terminal outcome for workflow run status ${nextRecord.status ?? 'unknown'}.`);
+      }
+      nextRecord.terminalOutcome = terminalOutcome;
+    } else {
+      // A queued/running/parked record can never inherit terminal truth from a
+      // stale caller snapshot or requeue lineage.
+      delete nextRecord.terminalOutcome;
     }
     writeWorkflowRunRecordDurablyUnlocked(filePath, nextRecord);
     if (terminalReport && isTerminalRunRecord(nextRecord)) waitAfterTerminalPublishForTest();
@@ -903,6 +970,59 @@ export class ParkRunSignal extends Error {
     this.name = 'ParkRunSignal';
     this.parkedSteps = parkedSteps;
   }
+}
+
+const RECOVERABLE_CAPABILITY_BLOCK_REASONS: ReadonlySet<ComposioGatewayBlockReason> = new Set([
+  'not-connected',
+  'identity-absent',
+  'ambiguous-account',
+  'suppressed',
+]);
+
+/** A typed, proven-pre-dispatch capability interruption. This is control flow,
+ * not a failed task: processOneRunFile checkpoints it and releases the worker
+ * slot, then the capability reaper retries the SAME run from its durable step
+ * history after the user reconnects or disambiguates the account. */
+export class WorkflowCapabilityBlockedError extends Error {
+  readonly stepId: string;
+  readonly tool: string;
+  readonly toolkit: string;
+  readonly reason: ComposioGatewayBlockReason;
+  readonly provenNoDispatch = true;
+
+  constructor(input: {
+    stepId: string;
+    tool: string;
+    toolkit: string;
+    reason: ComposioGatewayBlockReason;
+    message: string;
+  }) {
+    super(input.message);
+    this.name = 'WorkflowCapabilityBlockedError';
+    this.stepId = input.stepId;
+    this.tool = input.tool;
+    this.toolkit = input.toolkit;
+    this.reason = input.reason;
+  }
+}
+
+export function workflowCapabilityBlockIsRecoverable(reason: ComposioGatewayBlockReason): boolean {
+  return RECOVERABLE_CAPABILITY_BLOCK_REASONS.has(reason);
+}
+
+export interface WorkflowCapabilityBlockState {
+  stepId: string;
+  tool: string;
+  toolkit: string;
+  reason: ComposioGatewayBlockReason;
+  message: string;
+  blockedAt: string;
+  retryAt: string;
+  retryCount: number;
+  provenNoDispatch: true;
+  state: 'blocked' | 'retrying' | 'consumed';
+  resumedAt?: string;
+  resumeAuthorityConsumedAt?: string;
 }
 
 
@@ -1355,6 +1475,17 @@ async function executeWorkflowCallNode(
   if (!outcome.ok) {
     // Typed gateway block → fail the step VISIBLY with the deterministic
     // corrective (which account / reconnect / fix args) instead of dispatching.
+    // Connection/identity routing blocks are also PROVEN pre-dispatch, so keep
+    // the run alive and resumable instead of throwing away completed work.
+    if (workflowCapabilityBlockIsRecoverable(outcome.reason)) {
+      throw new WorkflowCapabilityBlockedError({
+        stepId: step.id,
+        tool: call.tool,
+        toolkit: outcome.toolkit,
+        reason: outcome.reason,
+        message: outcome.message,
+      });
+    }
     throw new Error(`composio dispatch blocked (${outcome.reason}): ${outcome.message}`);
   }
   return outcome.result;
@@ -1575,10 +1706,10 @@ async function runWithConcurrency<T, R>(
           results[idx] = { ok: true, value };
         } catch (err) {
           results[idx] = { ok: false, error: err instanceof Error ? err.message : String(err), reason: err };
-          // A human-approval park is a control signal, not an item failure to
-          // fan past. Stop assigning new work; completed siblings are already
-          // durable in events.jsonl and resume will skip them.
-          if (err instanceof ParkRunSignal) halted = true;
+          // A park is a control signal, not an item failure to fan past. Stop
+          // assigning new work; completed siblings are already durable in
+          // events.jsonl and resume will skip them.
+          if (err instanceof ParkRunSignal || err instanceof WorkflowCapabilityBlockedError) halted = true;
         }
       }
     })());
@@ -1637,6 +1768,23 @@ interface StepExecutionContext {
   // a small authoritative lineage block so a different model/backend can preserve
   // the user's decisions and avoid repeating prior external writes.
   originSessionId?: string;
+  /** Exact deterministic-code bundle admitted with this run. Older queued
+   * records omit it and retain their legacy behavior. */
+  admittedCodeRevision?: string;
+}
+
+function assertAdmittedWorkflowCodeRevision(ctx: Pick<
+  StepExecutionContext,
+  'workflow' | 'workflowSlug' | 'admittedCodeRevision'
+>): void {
+  if (!ctx.admittedCodeRevision) return;
+  const actual = workflowCodeRevisionFingerprint(ctx.workflow, ctx.workflowSlug);
+  if (actual === ctx.admittedCodeRevision) return;
+  throw new Error(
+    `Authored workflow code changed after this run was admitted ` +
+    `(expected ${ctx.admittedCodeRevision.slice(0, 12)}, found ${actual.slice(0, 12)}). ` +
+    'No changed script was executed. Start a fresh run to admit and execute the new revision.',
+  );
 }
 
 function applyWorkflowPatternHint(ctx: Pick<StepExecutionContext, 'learnedPatternHint'>, prompt: string): string {
@@ -2691,7 +2839,7 @@ async function runStepViaHarness(
     stepAttemptStatus = 'completed';
     return { output: guardPhantom(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } catch (err) {
-    if (err instanceof ParkRunSignal) {
+    if (err instanceof ParkRunSignal || err instanceof WorkflowCapabilityBlockedError) {
       stepAttemptStatus = 'interrupted';
     } else if (
       err instanceof WorkflowRunCancelledError
@@ -3187,7 +3335,12 @@ async function executeStepVerified(
   } catch (err) {
     // Control-flow signals always propagate — a park/cancel/approval-rejection
     // is a decision, not a soft failure an optional step may gap past.
-    if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError || err instanceof WorkflowStepNotApprovedError) throw err;
+    if (
+      err instanceof ParkRunSignal
+      || err instanceof WorkflowCapabilityBlockedError
+      || err instanceof WorkflowRunCancelledError
+      || err instanceof WorkflowStepNotApprovedError
+    ) throw err;
     if (step.optional !== true) throw err;
     // Only READ-class enrichment may gap (fold-1 review): a send/write step —
     // or any step whose session may already have recorded an external write —
@@ -3275,7 +3428,11 @@ async function executeStepVerifiedInner(
     try {
       return await runStepVerifiedAttempt(attemptStep, ctx);
     } catch (err) {
-      if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
+      if (
+        err instanceof ParkRunSignal
+        || err instanceof WorkflowCapabilityBlockedError
+        || err instanceof WorkflowRunCancelledError
+      ) throw err;
       // A real deterministic error (bad input, contract, 4xx) repeats identically
       // on any model — fail fast, don't burn the whole chain.
       if (!isWorkflowStepBrainFalloverEligible(err)) throw err;
@@ -3350,9 +3507,10 @@ async function runStepVerifiedAttempt(
   const runAttempt = !stepHasLoopProbe(step)
     ? runOnce
     : async (attemptStep: WorkflowStepInput): Promise<unknown> => {
-        const output = await runOnce(attemptStep);
-        const probe = step.loopUntil!.probe!;
-        const probeOutput = await runDeterministicWorkflowStep(probe.runner, {
+      const output = await runOnce(attemptStep);
+      const probe = step.loopUntil!.probe!;
+      assertAdmittedWorkflowCodeRevision(ctx);
+      const probeOutput = await runDeterministicWorkflowStep(probe.runner, {
           workflow: ctx.workflow.name,
           workflowSlug: ctx.workflowSlug,
           runId: ctx.runId,
@@ -3807,6 +3965,7 @@ export async function executeStep(
   //    receives structured JSON on stdin and emits stdout that is
   //    parsed as JSON when possible.
   if (step.deterministic?.runner) {
+    assertAdmittedWorkflowCodeRevision(ctx);
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',
       stepId: step.id,
@@ -4146,6 +4305,9 @@ export async function executeStep(
           ? result.reason.parkedSteps
           : []);
       if (parkedSteps.length > 0) throw new ParkRunSignal(parkedSteps);
+      const capabilityBlock = settled.find((result) =>
+        result && !result.ok && result.reason instanceof WorkflowCapabilityBlockedError);
+      if (capabilityBlock && !capabilityBlock.ok) throw capabilityBlock.reason;
       return settled.map((r, localIndex) => {
         if (r.ok) return r;
         const item = windowItems[localIndex];
@@ -4267,7 +4429,19 @@ export async function executeStep(
         kind: 'step_failed',
         stepId: step.id,
         error: err instanceof Error ? err.message : String(err),
-        ...(err instanceof ParkRunSignal ? { meta: { reason: 'parked_on_approval' } } : {}),
+        ...(err instanceof ParkRunSignal
+          ? { meta: { reason: 'parked_on_approval' } }
+          : err instanceof WorkflowCapabilityBlockedError
+            ? {
+              meta: {
+                reason: 'parked_on_capability',
+                capabilityReason: err.reason,
+                toolkit: err.toolkit,
+                tool: err.tool,
+                provenNoDispatch: err.provenNoDispatch,
+              },
+            }
+            : {}),
       });
       throw err;
     }
@@ -4345,6 +4519,65 @@ export async function executeStep(
 let workflowWatcherOverride: WatcherJudgeFn | null = null;
 export function _setWorkflowWatcherForTests(fn: WatcherJudgeFn | null): void {
   workflowWatcherOverride = fn;
+}
+
+interface WorkflowWatcherResult {
+  verdict: WatcherVerdict | null;
+  afterSteps: number;
+}
+
+/**
+ * One-slot result mailbox for the workflow trajectory watcher.
+ *
+ * Starting a check is deliberately synchronous and never awaits the judge.
+ * The workflow keeps executing while the promise settles; `take()` exposes a
+ * completed verdict at a later step boundary. A slow or broken judge therefore
+ * cannot add latency to the execution graph, and the one-slot/in-flight guard
+ * prevents overlapping verifier calls.
+ */
+export class WorkflowWatcherMailbox {
+  private pending = false;
+  private resolved: WorkflowWatcherResult | undefined;
+  private closed = false;
+
+  get inFlight(): boolean {
+    return this.pending;
+  }
+
+  start(afterSteps: number, work: () => Promise<WatcherVerdict | null>): boolean {
+    if (this.closed || this.pending || this.resolved) return false;
+    this.pending = true;
+    let promise: Promise<WatcherVerdict | null>;
+    try {
+      promise = work();
+    } catch {
+      this.pending = false;
+      return false;
+    }
+    void promise
+      .then((verdict) => {
+        if (!this.closed) this.resolved = { verdict, afterSteps };
+      })
+      .catch(() => {
+        // Detection-only and fail-open: a watcher failure never reaches the
+        // workflow execution lane.
+      })
+      .finally(() => {
+        this.pending = false;
+      });
+    return true;
+  }
+
+  take(): WorkflowWatcherResult | undefined {
+    const result = this.resolved;
+    this.resolved = undefined;
+    return result;
+  }
+
+  close(): void {
+    this.closed = true;
+    this.resolved = undefined;
+  }
 }
 
 /** Compact trajectory digest for the workflow watcher: completed step outputs
@@ -4494,10 +4727,12 @@ export function planWorkflowExecutionBatches(
 export interface BatchSettlement {
   completions: Array<{ stepId: string; output: unknown }>;
   parkedSteps: ParkedStepRef[];
+  capabilityBlocks: WorkflowCapabilityBlockedError[];
   failures: Array<{ stepId: string; message: string }>;
-  /** continue = all fulfilled; park = at least one sibling parked (park WINS
-   *  over a sibling failure — see below); fail = failures and no park. */
-  action: 'continue' | 'park' | 'fail';
+  /** continue = all fulfilled; park = at least one sibling waiting on approval;
+   * capability = a proven-pre-dispatch capability interruption; fail = ordinary
+   * failures only. Approval park outranks capability, which outranks failure. */
+  action: 'continue' | 'park' | 'capability' | 'fail';
 }
 
 /** T1.3: merge a parallel batch's settled results into one decision. The rule
@@ -4514,12 +4749,15 @@ export function decideBatchSettlement(
 ): BatchSettlement {
   const completions: BatchSettlement['completions'] = [];
   const parkedSteps: ParkedStepRef[] = [];
+  const capabilityBlocks: WorkflowCapabilityBlockedError[] = [];
   const failures: BatchSettlement['failures'] = [];
   settled.forEach((result, i) => {
     if (result.status === 'fulfilled') {
       completions.push({ stepId: result.value.step.id, output: result.value.output });
     } else if (result.reason instanceof ParkRunSignal) {
       parkedSteps.push(...result.reason.parkedSteps);
+    } else if (result.reason instanceof WorkflowCapabilityBlockedError) {
+      capabilityBlocks.push(result.reason);
     } else {
       failures.push({
         stepId: batch[i]?.id ?? 'unknown',
@@ -4527,8 +4765,14 @@ export function decideBatchSettlement(
       });
     }
   });
-  const action = parkedSteps.length > 0 ? 'park' : failures.length > 0 ? 'fail' : 'continue';
-  return { completions, parkedSteps, failures, action };
+  const action = parkedSteps.length > 0
+    ? 'park'
+    : capabilityBlocks.length > 0
+      ? 'capability'
+      : failures.length > 0
+        ? 'fail'
+        : 'continue';
+  return { completions, parkedSteps, capabilityBlocks, failures, action };
 }
 
 function stringifyForPrompt(value: unknown): string {
@@ -5266,6 +5510,8 @@ async function executeWorkflow(
   crashResume = false,
   mutationReceiptProtocolVersion?: number,
   mutationContractSnapshot?: unknown,
+  capabilityResume?: WorkflowCapabilityBlockState,
+  admittedCodeRevision?: string,
 ): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>; qualityAdvisories: WorkflowQualityAdvisory[] }> {
   const resume = computeResumeState(workflowSlug, runId);
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
@@ -5286,6 +5532,7 @@ async function executeWorkflow(
   let watcherInjections = 0;
   let watcherChecks = 0;
   let watcherSteer: string | undefined;
+  const watcherMailbox = new WorkflowWatcherMailbox();
 
   // Anchor the shared run workspace on this run's goal — the objective + learned
   // success criteria every step/agent references, and the file the checker agent
@@ -5360,22 +5607,31 @@ async function executeWorkflow(
       }
     }
   }
-  const resumeHalt = shouldHaltResumeForSideEffect(
-    workflow,
-    resume,
-    targetStepId,
-    {
-      resumedRun: crashResume,
-      durableMutationProtocolStepIds,
-      ...(inFlightStep
-        ? {
-            claimedExternalWrite,
-            harnessEnabled: workflowHarnessEnabled(inFlightStep),
-            mutationReceiptProtected,
-          }
-        : {}),
-    },
+  const capabilityResumeProvesNoDispatch = Boolean(
+    crashResume
+    && capabilityResume?.state === 'retrying'
+    && capabilityResume.provenNoDispatch === true
+    && inFlightStep
+    && capabilityResume.stepId === inFlightStep.id,
   );
+  const resumeHalt = capabilityResumeProvesNoDispatch
+    ? null
+    : shouldHaltResumeForSideEffect(
+      workflow,
+      resume,
+      targetStepId,
+      {
+        resumedRun: crashResume,
+        durableMutationProtocolStepIds,
+        ...(inFlightStep
+          ? {
+              claimedExternalWrite,
+              harnessEnabled: workflowHarnessEnabled(inFlightStep),
+              mutationReceiptProtected,
+            }
+          : {}),
+      },
+    );
   if (resumeHalt) {
     throw new Error(
       `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +
@@ -5430,7 +5686,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId,
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -5468,6 +5724,32 @@ async function executeWorkflow(
       } catch { /* the advisory must never fail a run */ }
     };
     while (completedStepIds.size < steps.length) {
+      // Give already-resolved watcher promises one microtask turn to publish
+      // into the mailbox. This never waits for judge I/O: a slow check simply
+      // remains in flight while the next graph batch starts.
+      await Promise.resolve();
+      const watcherResult = watcherMailbox.take();
+      if (
+        watcherResult?.verdict
+        && !watcherResult.verdict.onTrack
+        && watcherInjections < MAX_WATCHER_INJECTIONS
+      ) {
+        watcherInjections += 1;
+        watcherSteer = `${watcherResult.verdict.miss}. ${watcherResult.verdict.steer}`;
+        appendWorkflowEvent(workflowSlug, runId, {
+          kind: 'step_advisory',
+          stepId: '(watcher)',
+          meta: {
+            reason: 'watcher_steer',
+            miss: watcherResult.verdict.miss,
+            steer: watcherResult.verdict.steer,
+            injection: watcherInjections,
+            afterSteps: watcherResult.afterSteps,
+            nonBlocking: true,
+          },
+        });
+      }
+
       executionRound += 1;
       maybeWarnRunBudget();
       const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
@@ -5485,7 +5767,7 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId,
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision,
           ...(watcherSteer ? { watcherSteer } : {}),
         });
         return { step, output };
@@ -5514,49 +5796,53 @@ async function executeWorkflow(
         }
         throw new ParkRunSignal(decision.parkedSteps);
       }
+      if (decision.action === 'capability') {
+        for (const failure of decision.failures) {
+          appendWorkflowEvent(workflowSlug, runId, {
+            kind: 'step_advisory',
+            stepId: failure.stepId,
+            error: failure.message,
+            meta: { reason: 'batch_sibling_failed_while_capability_blocked' },
+          });
+        }
+        throw decision.capabilityBlocks[0];
+      }
       if (decision.action === 'fail') {
         const messages = decision.failures.map((e) => e.message);
         throw new Error(messages.length === 1 ? messages[0] : `Workflow batch failed: ${messages.join('; ')}`);
       }
       completedStepIds = new Set(Object.keys(stepOutputs));
 
-      // WATCHER (workflow mount): at a step boundary with steps still ahead,
-      // one trajectory check judges the run so far against the workflow's goal
-      // (watcher-judge.ts — the same core as the chat mount). BLOCKING here on
-      // purpose, unlike chat: steps run for minutes, so a ~10s check between
-      // steps is negligible while letting the steer land on the VERY NEXT
-      // step's prompt instead of one step late. Fail-open + silent when
-      // on-track/unsure; ≤ MAX_WATCHER_INJECTIONS steers per run.
+      // WATCHER (workflow mount): launch a trajectory check at a step boundary
+      // but never await it. A verdict is consumed at the next available graph
+      // boundary; if the judge is slow, execution keeps breathing and the
+      // steer lands on a later batch (or is discarded when no work remains).
+      // Fail-open + silent when on-track/unsure; bounded checks and steers.
       if (
         watcherEnabled
         && completedStepIds.size < steps.length
+        && !watcherMailbox.inFlight
         && watcherInjections < MAX_WATCHER_INJECTIONS
         && watcherChecks < MAX_WATCHER_CHECKS
         && completedStepIds.size - watcherLastCheckedAtSteps >= WATCHER_STEP_INTERVAL
       ) {
         watcherChecks += 1;
         watcherLastCheckedAtSteps = completedStepIds.size;
-        try {
-          const digest = renderWatcherWorkflowDigest(steps, stepOutputs);
-          const verdict = await workflowWatcherFn({
+        const digest = renderWatcherWorkflowDigest(steps, stepOutputs);
+        watcherMailbox.start(completedStepIds.size, () =>
+          workflowWatcherFn({
             objective: watcherObjective,
             ...(watcherCriteria ? { successCriteria: watcherCriteria } : {}),
             toolCallSummary: digest.summary,
             latestAssistantNote: digest.latest,
             toolCallCount: completedStepIds.size,
-          });
-          if (verdict && !verdict.onTrack) {
-            watcherInjections += 1;
-            watcherSteer = `${verdict.miss}. ${verdict.steer}`;
-            appendWorkflowEvent(workflowSlug, runId, {
-              kind: 'step_advisory',
-              stepId: '(watcher)',
-              meta: { reason: 'watcher_steer', miss: verdict.miss, steer: verdict.steer, injection: watcherInjections, afterSteps: completedStepIds.size },
-            });
-          }
-        } catch { /* the watcher is silent on any failure */ }
+          }),
+        );
       }
     }
+    // Never join an advisory verifier at run completion. Late results are
+    // intentionally discarded: terminal proof owns the final outcome.
+    watcherMailbox.close();
     // Stage 4 — final-batch coverage: a ceiling crossed during the LAST round
     // would exit the while before the next round-start check (review F6).
     maybeWarnRunBudget();
@@ -5741,6 +6027,119 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
   }
 }
 
+/** Exponential capability retry cadence: persistent but quiet. A reconnect made
+ * after the first pause is normally picked up within one minute; a long-lived
+ * missing connection eventually settles at one safe pre-dispatch probe every
+ * fifteen minutes instead of hammering the provider or choking the run lane. */
+export function workflowCapabilityRetryDelayMs(retryCount: number): number {
+  const baseRaw = Number.parseInt(
+    getRuntimeEnv('CLEMENTINE_WORKFLOW_CAPABILITY_RETRY_BASE_MS', '60000') ?? '60000',
+    10,
+  );
+  const maxRaw = Number.parseInt(
+    getRuntimeEnv('CLEMENTINE_WORKFLOW_CAPABILITY_RETRY_MAX_MS', '900000') ?? '900000',
+    10,
+  );
+  const base = Number.isFinite(baseRaw) && baseRaw >= 1_000 ? baseRaw : 60_000;
+  const max = Number.isFinite(maxRaw) && maxRaw >= base ? maxRaw : Math.max(base, 900_000);
+  const exponent = Math.max(0, Math.min(20, Math.trunc(retryCount) - 1));
+  return Math.min(max, base * (2 ** exponent));
+}
+
+function readmitCapabilityBlockedRun(
+  filePath: string,
+  run: QueuedRunRecord,
+  resumedAt: string,
+  source: 'automatic-retry' | 'manual-resume',
+): boolean {
+  if (run.status !== 'blocked_capability' || !run.capabilityBlock) return false;
+  const resumedRecord = writeRunRecord(filePath, {
+    ...run,
+    status: 'running',
+    capabilityBlock: {
+      ...run.capabilityBlock,
+      state: 'retrying',
+      resumedAt,
+    },
+  }).record;
+  if (isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
+  try {
+    appendWorkflowEvent(run.workflow, run.id, {
+      kind: 'run_resumed',
+      meta: {
+        reason: 'capability_retry',
+        source,
+        stepId: run.capabilityBlock.stepId,
+        tool: run.capabilityBlock.tool,
+        toolkit: run.capabilityBlock.toolkit,
+        retryCount: run.capabilityBlock.retryCount,
+        provenNoDispatch: true,
+      },
+    });
+  } catch { /* the run record is authoritative */ }
+  try {
+    addRunEvent(run.id, {
+      type: 'run_resumed',
+      status: 'running',
+      message: `Capability retry ${run.capabilityBlock.retryCount}: resuming ${run.capabilityBlock.stepId}.`,
+      data: {
+        workflow: run.workflow,
+        stepId: run.capabilityBlock.stepId,
+        toolkit: run.capabilityBlock.toolkit,
+        source,
+      },
+    });
+  } catch { /* Activity is best-effort */ }
+  logger.info(
+    {
+      workflow: run.workflow,
+      runId: run.id,
+      stepId: run.capabilityBlock.stepId,
+      toolkit: run.capabilityBlock.toolkit,
+      retryCount: run.capabilityBlock.retryCount,
+      source,
+    },
+    'Capability-blocked workflow re-admitted with proven-no-dispatch resume authority',
+  );
+  return true;
+}
+
+/** Timer/boot scan for recoverable capability interruptions. This only
+ * re-admits blocks created by a typed gateway that proved dispatch never
+ * started, so retrying a write/send step cannot duplicate an external action. */
+export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return 0;
+  let resumed = 0;
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
+    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
+    const run = readRunRecord(filePath);
+    if (
+      !run
+      || run.status !== 'blocked_capability'
+      || !run.capabilityBlock
+      || run.capabilityBlock.state !== 'blocked'
+      || run.capabilityBlock.provenNoDispatch !== true
+    ) continue;
+    const retryAtMs = Date.parse(run.capabilityBlock.retryAt);
+    if (!Number.isFinite(retryAtMs) || retryAtMs > nowMs) continue;
+    if (readmitCapabilityBlockedRun(filePath, run, new Date(nowMs).toISOString(), 'automatic-retry')) {
+      resumed += 1;
+    }
+  }
+  return resumed;
+}
+
+/** Operator/UI affordance: retry a capability-blocked run immediately after
+ * reconnecting, without minting a fresh run or replaying completed steps. */
+export function resumeCapabilityBlockedWorkflowRun(runId: string): boolean {
+  if (!/^[A-Za-z0-9_.:-]+$/.test(runId)) return false;
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const run = readRunRecord(filePath);
+  return run
+    ? readmitCapabilityBlockedRun(filePath, run, new Date().toISOString(), 'manual-resume')
+    : false;
+}
+
 /**
  * P0 event-driven approval parking — the resolution scan. Runs on the
  * workflow-run lane tick (and on boot). For each run checkpointed as
@@ -5753,6 +6152,9 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
  * run is ever written as 'parked', so this scan finds nothing.
  */
 export function reapResolvedParkedRuns(): void {
+  // Capability parks are independent of the human-approval parking
+  // kill-switch and share this daemon tick only as a scheduling convenience.
+  reapCapabilityBlockedRuns();
   if (!parkingEnabled()) return;
   if (!existsSync(WORKFLOW_RUNS_DIR)) return;
   let approvalsById: Map<string, approvalRegistry.PendingApprovalRow>;
@@ -6631,6 +7033,80 @@ export async function runCreationTest(
   return { pass, steps: results };
 }
 
+type WorkflowCatalogEntry = ReturnType<typeof listWorkflows>[number];
+
+interface WorkflowDefinitionForRunResolution {
+  ok: boolean;
+  workflow?: WorkflowCatalogEntry;
+  currentWorkflow?: WorkflowCatalogEntry;
+  definitionSource: 'snapshot' | 'legacy_current';
+  snapshot?: WorkflowRunDefinitionSnapshot;
+  error?: string;
+}
+
+/**
+ * Resolve the executable definition without mixing a current SKILL.md with an
+ * older run's checkpoints. A present corrupt snapshot fails closed. Legacy
+ * records deliberately retain the old current-definition behavior so upgrades
+ * do not strand runs queued before this protocol shipped.
+ */
+export function resolveWorkflowDefinitionForRun(
+  run: Pick<QueuedRunRecord, 'workflow' | 'workflowDefinitionSnapshot'>,
+  workflows: WorkflowCatalogEntry[],
+): WorkflowDefinitionForRunResolution {
+  const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+  if (admitted.status === 'invalid') {
+    return {
+      ok: false,
+      definitionSource: 'snapshot',
+      error: `Workflow run definition snapshot is invalid: ${admitted.reason}.`,
+    };
+  }
+  const snapshot = admitted.status === 'valid' ? admitted.snapshot : undefined;
+  const currentWorkflow = workflows.find((entry) =>
+    entry.data.name === run.workflow
+    || entry.name === run.workflow
+    || (snapshot ? entry.name === snapshot.workflowSlug : false));
+  if (!currentWorkflow) {
+    return {
+      ok: false,
+      definitionSource: snapshot ? 'snapshot' : 'legacy_current',
+      ...(snapshot ? { snapshot } : {}),
+      error: `Workflow not found: "${run.workflow}". It may have been renamed or deleted.`,
+    };
+  }
+  if (!snapshot) {
+    return {
+      ok: true,
+      workflow: currentWorkflow,
+      currentWorkflow,
+      definitionSource: 'legacy_current',
+    };
+  }
+  if (!workflowCodeRevisionMatchesSnapshot(snapshot)) {
+    return {
+      ok: false,
+      currentWorkflow,
+      definitionSource: 'snapshot',
+      snapshot,
+      error:
+        'Authored workflow code changed after this run was admitted. ' +
+        'No workflow step was executed; start a fresh run to admit the new code revision.',
+    };
+  }
+  return {
+    ok: true,
+    workflow: {
+      ...currentWorkflow,
+      name: snapshot.workflowSlug,
+      data: snapshot.definition,
+    },
+    currentWorkflow,
+    definitionSource: 'snapshot',
+    snapshot,
+  };
+}
+
 async function processOneRunFile(
   file: string,
   filePath: string,
@@ -6652,9 +7128,11 @@ async function processOneRunFile(
       if (cancelledRecord && !cancelledRecord.notifiedAt) notifyCancelledRunOnce(filePath, cancelledRecord);
       return;
     }
-    const workflow = workflows.find((entry) => entry.data.name === run.workflow);
-    if (!workflow) {
-      const message = `Workflow not found: "${run.workflow}". It may have been renamed or deleted.`;
+    const definitionResolution = resolveWorkflowDefinitionForRun(run, workflows);
+    const workflow = definitionResolution.workflow;
+    const currentWorkflow = definitionResolution.currentWorkflow;
+    if (!definitionResolution.ok || !workflow || !currentWorkflow) {
+      const message = definitionResolution.error ?? `Workflow not found: "${run.workflow}".`;
       const report = { workflowName: run.workflow, outcome: 'failed' as const, detail: message };
       const terminalRecord = writeRunRecord(filePath, {
         ...run,
@@ -6669,8 +7147,8 @@ async function processOneRunFile(
       addNotification({
         id: `workflow-${run.id}-not-found`,
         kind: 'workflow',
-        title: `Workflow failed before start: ${run.workflow}`,
-        body: `${message} Check the workflow name in Console → Workflows, then re-run.`,
+        title: `Workflow definition blocked: ${run.workflow}`,
+        body: `${message} The run was stopped before executing any workflow step; review the workflow, then start a fresh run.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { workflow: run.workflow, runId: run.id },
@@ -6761,16 +7239,34 @@ async function processOneRunFile(
       } catch (err) {
         result = { pass: false, steps: [{ stepId: '(run)', status: 'error', detail: err instanceof Error ? err.message : String(err) }] };
       }
+      let activationCompatible = true;
+      let activationBlockedReason = '';
+      if (result.pass && definitionResolution.snapshot) {
+        const latest = readWorkflow(definitionResolution.snapshot.workflowSlug);
+        if (!latest) {
+          activationCompatible = false;
+          activationBlockedReason = 'the workflow was deleted while its creation test was running';
+        } else if (!workflowDefinitionMatchesSnapshotIgnoringEnabled(definitionResolution.snapshot, latest.data)) {
+          activationCompatible = false;
+          activationBlockedReason = 'the workflow definition changed while its creation test was running';
+        } else if (!workflowCodeRevisionMatchesSnapshot(definitionResolution.snapshot, latest.data)) {
+          activationCompatible = false;
+          activationBlockedReason = 'the workflow code changed while its creation test was running';
+        }
+      }
+      const creationReady = result.pass && activationCompatible;
       const lines = result.steps.map((s) => {
         const icon = s.status === 'ok' ? '✅' : s.status === 'previewed' ? '⏭️ previewed (mutating — not run)' : '⚠️';
         return `- ${s.stepId}: ${s.status === 'ok' ? '✅ returned data' : s.status === 'previewed' ? '⏭️ previewed (mutating step — not run)' : `${icon} ${s.status}${s.detail ? ` — ${s.detail}` : ''}`}`;
       });
-      const body = result.pass
+      const body = creationReady
         ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
+        : result.pass
+          ? `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
         : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nFix the flagged step(s) with workflow_update (e.g. bind the right tool), then re-test. To run it as-is anyway: workflow_set_enabled.`;
       const report = {
         workflowName: workflow.data.name,
-        outcome: result.pass ? 'done' as const : 'blocked' as const,
+        outcome: creationReady ? 'done' as const : 'blocked' as const,
         detail: body,
       };
       const terminalRecord = writeRunRecord(
@@ -6783,29 +7279,49 @@ async function processOneRunFile(
       // Only the process that published this creation-test terminal may enable
       // the draft or clear its failure history. A cancellation/other terminal
       // winner leaves workflow state untouched.
-      if (result.pass) {
-        try { writeWorkflowAndSyncTriggers(workflow.name, { ...workflow.data, enabled: true }); } catch { /* best-effort */ }
+      if (creationReady) {
+        try {
+          const latest = readWorkflow(workflow.name);
+          if (
+            !definitionResolution.snapshot
+            || (
+              latest
+              && workflowDefinitionMatchesSnapshotIgnoringEnabled(definitionResolution.snapshot, latest.data)
+              && workflowCodeRevisionMatchesSnapshot(definitionResolution.snapshot, latest.data)
+            )
+          ) {
+            writeWorkflowAndSyncTriggers(workflow.name, { ...(latest?.data ?? workflow.data), enabled: true });
+          }
+        } catch { /* best-effort */ }
         try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
       }
       addNotification({
         id: `workflow-${run.id}-creationtest`,
         kind: 'workflow',
-        title: result.pass ? `Workflow ready: ${workflow.data.name}` : `Workflow needs a fix: ${workflow.data.name}`,
+        title: creationReady ? `Workflow ready: ${workflow.data.name}` : `Workflow needs review: ${workflow.data.name}`,
         body,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: workflow.data.name, runId: run.id, creationTest: true, pass: result.pass },
+        metadata: {
+          workflow: workflow.data.name,
+          runId: run.id,
+          creationTest: true,
+          pass: result.pass,
+          activationCompatible,
+          definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
+          codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
+        },
       });
       markRunNotified(filePath);
       finishWorkflowActivityRun(run.id, {
         status: 'completed',
-        message: result.pass ? 'Workflow creation test passed' : 'Workflow creation test found issues',
+        message: creationReady ? 'Workflow creation test passed' : 'Workflow creation test needs review',
         outputPreview: body,
-        needsAttention: !result.pass,
+        needsAttention: !creationReady,
       });
       recordAndAttemptWorkflowRunReportBack(filePath, {
         workflowName: workflow.data.name,
-        outcome: result.pass ? 'done' : 'blocked',
+        outcome: creationReady ? 'done' : 'blocked',
         detail: body,
       });
       return;
@@ -6813,7 +7329,7 @@ async function processOneRunFile(
     // TRY (single-step) runs bypass the workflow enabled gate — they're
     // explicit dashboard actions on a draft. Full runs still require
     // the workflow to be approved.
-    if (!run.targetStepId && !workflow.data.enabled) {
+    if (!run.targetStepId && !currentWorkflow.data.enabled) {
       const message = `Workflow "${workflow.data.name}" is disabled — approve/enable it before it can run.`;
       const report = { workflowName: workflow.data.name, outcome: 'failed' as const, detail: message };
       const terminalRecord = writeRunRecord(filePath, {
@@ -6857,12 +7373,22 @@ async function processOneRunFile(
           if (!authoritative || isTerminalRunRecord(authoritative)) return;
           repairAuthorized = true;
           workflow.data = prep.def;
-          try { writeWorkflowAndSyncTriggers(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
+          // A snapshotted run may normalize its own admitted definition, but it
+          // must never overwrite a newer workflow edit. Legacy runs keep the
+          // prior best-effort persistence behavior for compatibility.
+          if (definitionResolution.definitionSource === 'legacy_current') {
+            try { writeWorkflowAndSyncTriggers(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
+          }
           try {
             appendWorkflowEvent(workflow.name, run.id, {
               kind: 'step_advisory',
               stepId: '(preflight)',
-              meta: { reason: 'pre_run_auto_repair', repairs: prep.repairs.slice(0, 8) },
+              meta: {
+                reason: 'pre_run_auto_repair',
+                repairs: prep.repairs.slice(0, 8),
+                definitionSource: definitionResolution.definitionSource,
+                persistedToWorkflow: definitionResolution.definitionSource === 'legacy_current',
+              },
             });
           } catch { /* best-effort */ }
         });
@@ -6973,7 +7499,7 @@ async function processOneRunFile(
     }
 
     const isResume = run.status === 'running';
-    const runningRecord = writeRunRecord(filePath, {
+    let runningRecord = writeRunRecord(filePath, {
       ...run,
       status: 'running',
       startedAt: run.startedAt ?? new Date().toISOString(),
@@ -6985,16 +7511,49 @@ async function processOneRunFile(
       }
       return;
     }
+    // Capability resume authority is ONE-SHOT. Consume it durably before a new
+    // step attempt starts, while passing the pre-consumption value only to this
+    // in-process execution. If the process crashes after this write, the next
+    // daemon pass sees `consumed` and falls back to the normal fail-closed
+    // mutation crash guard rather than assuming the newer attempt never sent.
+    const capabilityResumeAuthority = runningRecord.capabilityBlock?.state === 'retrying'
+      ? runningRecord.capabilityBlock
+      : undefined;
+    if (capabilityResumeAuthority) {
+      runningRecord = writeRunRecord(filePath, {
+        ...runningRecord,
+        capabilityBlock: {
+          ...capabilityResumeAuthority,
+          state: 'consumed',
+          resumeAuthorityConsumedAt: new Date().toISOString(),
+        },
+      }).record;
+      if (isTerminalRunRecord(runningRecord)) return;
+    }
     appendWorkflowEvent(workflow.name, run.id, {
       kind: isResume ? 'run_resumed' : 'run_started',
-      meta: { inputs, source: run.source, targetStepId: run.targetStepId ?? null },
+      meta: {
+        inputs,
+        source: run.source,
+        targetStepId: run.targetStepId ?? null,
+        definitionSource: definitionResolution.definitionSource,
+        definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
+        codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
+        definitionAdmittedAt: definitionResolution.snapshot?.admittedAt ?? null,
+      },
     });
     if (!isResume) {
       try {
         const graph = compileWorkflowStepsToGraph(workflow.data.steps, {
           id: `${workflow.name}:${run.id}`,
           name: workflow.data.name,
-          metadata: { workflowSlug: workflow.name, runId: run.id },
+          metadata: {
+            workflowSlug: workflow.name,
+            runId: run.id,
+            definitionSource: definitionResolution.definitionSource,
+            definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
+            codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
+          },
         });
         persistWorkflowGraphSnapshot({
           workflowName: workflow.name,
@@ -7058,6 +7617,8 @@ async function processOneRunFile(
         isResume,
         runningRecord.mutationReceiptProtocolVersion,
         runningRecord.mutationContractSnapshot,
+        capabilityResumeAuthority,
+        definitionResolution.snapshot?.codeRevision,
       );
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
@@ -7716,6 +8277,114 @@ async function processOneRunFile(
       // lane. A routine no-op never wakes the chat.
       logger.info({ workflow: workflow.data.name, runId: run.id, partialFailures: forEachFailures.length, blockedSteps: blockedSteps.length, advisories: qualityAdvisories.length, diagnosed: !!diagnosis }, 'Workflow run completed');
     } catch (error) {
+      // Recoverable capability parking: the shared Composio gateway proved the
+      // requested action never crossed the dispatch boundary. Preserve every
+      // completed step, release the worker slot, tell the user exactly what to
+      // connect/fix, and retry this SAME run with quiet exponential backoff.
+      if (error instanceof WorkflowCapabilityBlockedError) {
+        const blockedAtMs = Date.now();
+        const retryCount = (run.capabilityBlock?.retryCount ?? 0) + 1;
+        const blockedAt = new Date(blockedAtMs).toISOString();
+        const retryAt = new Date(blockedAtMs + workflowCapabilityRetryDelayMs(retryCount)).toISOString();
+        const capabilityBlock: WorkflowCapabilityBlockState = {
+          stepId: error.stepId,
+          tool: error.tool,
+          toolkit: error.toolkit,
+          reason: error.reason,
+          message: error.message,
+          blockedAt,
+          retryAt,
+          retryCount,
+          provenNoDispatch: true,
+          state: 'blocked',
+        };
+        const blockedRecord = writeRunRecord(filePath, {
+          ...run,
+          status: 'blocked_capability',
+          startedAt: run.startedAt ?? blockedAt,
+          capabilityBlock,
+        }).record;
+        if (blockedRecord.status === 'cancelled') {
+          stopAfterCancellationWonWrite(filePath, blockedRecord);
+          return;
+        }
+        if (isTerminalRunRecord(blockedRecord)) return;
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'run_paused',
+          error: error.message,
+          meta: {
+            reason: 'capability_blocked',
+            stepId: error.stepId,
+            tool: error.tool,
+            toolkit: error.toolkit,
+            capabilityReason: error.reason,
+            retryAt,
+            retryCount,
+            provenNoDispatch: true,
+          },
+        });
+        const detail = [
+          `I paused "${workflow.data.name}" at step "${error.stepId}" because ${error.toolkit} is not currently usable.`,
+          error.message,
+          `Everything completed before this step is preserved. No ${error.tool} dispatch occurred, so this same run can safely resume.`,
+          `I will retry automatically after ${retryAt}; reconnect or disambiguate ${error.toolkit} first. You can also resume the run immediately after fixing it.`,
+        ].join('\n\n');
+        try {
+          addNotification({
+            id: `workflow-${run.id}-capability-${error.toolkit.toLowerCase()}`,
+            kind: 'workflow',
+            title: `Workflow paused — connect ${error.toolkit}`,
+            body: detail,
+            createdAt: blockedAt,
+            read: false,
+            metadata: {
+              workflow: workflow.data.name,
+              runId: run.id,
+              status: 'blocked_capability',
+              stepId: error.stepId,
+              tool: error.tool,
+              toolkit: error.toolkit,
+              reason: error.reason,
+              retryAt,
+              retryCount,
+              provenNoDispatch: true,
+            },
+          });
+        } catch { /* durable run state remains visible */ }
+        try {
+          finishRun(run.id, {
+            status: 'awaiting_approval',
+            message: `Waiting for ${error.toolkit} connection at step ${error.stepId}; completed work is preserved.`,
+            outputPreview: detail,
+          });
+        } catch { /* Activity is best-effort */ }
+        for (const originSessionId of workflowRunOriginSessionIds(run)) {
+          deliverOutcome(
+            { status: 'needs_input', detail },
+            {
+              originSessionId,
+              sourceLabel: 'workflow run',
+              sourceId: `${run.id}#capability-${error.toolkit.toLowerCase()}`,
+              title: workflow.data.name,
+              statusHint: `workflow_run_status run_id="${run.id}"`,
+              proactiveTurn: true,
+            },
+          );
+        }
+        logger.info(
+          {
+            workflow: workflow.data.name,
+            runId: run.id,
+            stepId: error.stepId,
+            toolkit: error.toolkit,
+            reason: error.reason,
+            retryAt,
+            retryCount,
+          },
+          'Workflow paused on recoverable capability block — bounded-pool slot released',
+        );
+        return;
+      }
       // P0 parking: the run paused on a human approval. Checkpoint the
       // resume coordinates as status='parked' and RETURN — this is NOT a
       // failure. processOneRunFile returning frees the bounded-pool slot;

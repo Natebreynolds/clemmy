@@ -17,7 +17,7 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-provenance-'));
 process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
-const { resetEventLog, createSession, appendEvent } = await import('./eventlog.js');
+const { resetEventLog, createSession, appendEvent, writeToolOutput } = await import('./eventlog.js');
 const { buildPublishProvenance } = await import('./brackets.js');
 
 function seed(sessionId: string, command: string, result: string): void {
@@ -53,6 +53,93 @@ test('a genuine single-site create result still confers provenance (unchanged pa
   const has = buildPublishProvenance(sess.id);
   assert.equal(has('fresh-site'), true);
   assert.equal(has('bbbb2222'), true);
+});
+
+const TWO_SITE_LISTING = `exit_code: 0
+
+stdout:
+[
+  {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "site_id": "11111111-1111-4111-8111-111111111111",
+    "name": "explicit-smoke-site",
+    "url": "http://explicit-smoke-site.netlify.app"
+  },
+  {
+    "id": "22222222-2222-4222-8222-222222222222",
+    "site_id": "22222222-2222-4222-8222-222222222222",
+    "name": "unrelated-live-site",
+    "url": "http://unrelated-live-site.netlify.app"
+  }
+]`;
+
+function seedReadOnlyListing(sessionId: string, clippedEvent = false): void {
+  const secondObject = TWO_SITE_LISTING.indexOf('  {\n    "id": "22222222');
+  const capturedPrefix = `${TWO_SITE_LISTING.slice(0, secondObject)}  {"id":"partial"\n...[capture stopped after 200000 chars]`;
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: 'run_shell_command',
+      callId: 'list-1',
+      arguments: JSON.stringify({ command: 'netlify sites:list --json' }),
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'run_shell_command',
+      callId: 'list-1',
+      result: clippedEvent
+        ? 'exit_code: 0\n\nstdout:\n[{"id":"partial"\n[clipped: use recall_tool_result("list-1") for full output]'
+        : TWO_SITE_LISTING,
+    },
+  });
+  if (clippedEvent) {
+    writeToolOutput({
+      sessionId,
+      callId: 'list-1',
+      tool: 'run_shell_command',
+      output: capturedPrefix,
+    });
+  }
+}
+
+test('an exact user-named site URL can resolve to its canonical UUID without provenancing neighboring sites', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Deploy this to https://explicit-smoke-site.netlify.app and no other site.' },
+  });
+  seedReadOnlyListing(sess.id, true);
+  const has = buildPublishProvenance(sess.id);
+  assert.equal(has('11111111-1111-4111-8111-111111111111'), true, 'fresh exact URL → matching canonical id');
+  assert.equal(has('22222222-2222-4222-8222-222222222222'), false, 'an unrelated row in the same list stays unprovenanced');
+});
+
+test('a read-only site listing without a user-named host confers no UUID provenance', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Deploy this somewhere suitable.' },
+  });
+  seedReadOnlyListing(sess.id);
+  const has = buildPublishProvenance(sess.id);
+  assert.equal(has('11111111-1111-4111-8111-111111111111'), false);
+  assert.equal(has('22222222-2222-4222-8222-222222222222'), false);
 });
 
 test('run_batch gets the long-executor timeout tier, never the 60s default (2026-07-08 false-kill)', async () => {

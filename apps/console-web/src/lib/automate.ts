@@ -49,6 +49,23 @@ export interface WorkflowCertification {
   readinessGaps?: Array<{ severity?: string; stepId?: string; question: string; why?: string }>;
   blockingReasons?: string[];
   contractAdvisories?: string[];
+  code?: {
+    ok: boolean;
+    artifactCount: number;
+    readyCount: number;
+    issueCount: number;
+    bundleHash: string | null;
+    artifacts: Array<{
+      runner: string;
+      stepIds: string[];
+      uses: Array<'step' | 'loop_probe'>;
+      status: 'ready' | 'missing' | 'invalid' | 'unverified';
+      language: string;
+      sha256?: string;
+      bytes?: number;
+      diagnostic?: string;
+    }>;
+  };
   nextActions: WorkflowCertificationAction[];
   dryRun?: {
     verdict?: 'ready' | 'needs_inputs' | 'blocked';
@@ -174,6 +191,7 @@ export interface WorkflowRow {
   stepCount?: number;
   resourceCount?: number;
   lastRunStatus?: string | null;
+  lastRunOutcome?: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled' | null;
   lastRunNeedsAttention?: boolean;
   lastRunId?: string | null;
   lastRunFailedItemCount?: number;
@@ -268,6 +286,16 @@ export interface WorkflowRunRecord {
   targetStepId?: string | null;
   needsAttention?: boolean;
   error?: string | null;
+  capabilityBlock?: {
+    stepId?: string;
+    tool?: string;
+    toolkit?: string;
+    reason?: string;
+    message?: string;
+    retryAt?: string;
+    retryCount?: number;
+    state?: 'blocked' | 'retrying' | 'consumed';
+  };
 }
 
 export interface RunWorkspaceArtifact {
@@ -316,6 +344,11 @@ export const retryWorkflowFailedItems = (name: string, runId: string, stepId?: s
   apiPost<FailedItemRetryResult>(
     `/api/console/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/retry-failed-items`,
     stepId ? { stepId } : {},
+  );
+export const resumeWorkflowCapability = (name: string, runId: string) =>
+  apiPost<{ ok: boolean; runId: string; status: string; alreadyResumed: boolean }>(
+    `/api/console/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/resume-capability`,
+    {},
   );
 export const setWorkflowEnabled = (name: string, enabled: boolean) =>
   apiPost(`/api/console/workflows/${encodeURIComponent(name)}/set-enabled`, { enabled });

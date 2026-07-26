@@ -32,6 +32,7 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
     'pending_action_queue',
     'pending_action_list',
     'pending_action_get',
+    'pending_action_execute',
     'pending_action_record_result',
     'execution_update_step',
     'execution_complete',

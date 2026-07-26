@@ -34,6 +34,12 @@ test('classifyExternalWrite: a read is not mutating and has no shapeKey', () => 
   assert.equal(s.shapeKey, undefined);
 });
 
+test('classifyExternalWrite: compound BATCH_GET readback is not recorded as a write', () => {
+  const s = classifyExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_GET' });
+  assert.equal(s.mutating, false);
+  assert.equal(s.shapeKey, undefined);
+});
+
 test('classifyExternalWrite: tolerates a JSON-string args payload', () => {
   const s = classifyExternalWrite('composio_execute_tool', JSON.stringify({ tool_slug: 'SALESFORCE_CREATE_RECORD' }));
   assert.equal(s.mutating, true);

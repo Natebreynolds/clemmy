@@ -92,6 +92,13 @@ export interface ObjectiveJudgeGateInput {
   meaningfulToolEvidence: boolean;
   /** A batch/compound objective cannot be certified by one successful tool. */
   multiResultObjective?: boolean;
+  /**
+   * The durable execution controller already accepted its pinned success
+   * criteria for this exact user request. This is stronger than the later
+   * transcript-only judge, which cannot see full tool returns and must not
+   * overrule the execution ledger.
+   */
+  acceptedExecutionEvidence?: boolean;
   /** Independent judge continuations already spent this turn. */
   continuationsUsed: number;
   /** Hard cap on judge continuations. */
@@ -138,7 +145,9 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
     !input.openApprovalCard &&
     input.continuationsUsed < input.maxContinuations &&
     (Boolean(input.promiseShaped)
-      || (input.actionIntent && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective))))
+      || (!input.acceptedExecutionEvidence
+        && input.actionIntent
+        && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective))))
   );
 }
 

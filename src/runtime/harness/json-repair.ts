@@ -98,6 +98,60 @@ export function extractJsonCandidate(raw: string): string | null {
 }
 
 /**
+ * Recover individually complete JSON objects from an incomplete stream or
+ * clipped top-level array. Only balanced objects that independently parse are
+ * returned; an unfinished tail is ignored. The scanner is string/escape aware,
+ * so braces inside JSON strings cannot terminate a record early.
+ *
+ * This is intentionally narrower than JSON repair: it never invents a closing
+ * bracket or claims the recovered prefix is the complete result.
+ */
+export function extractCompleteJsonObjects(
+  raw: string,
+  maxObjects = 200,
+): Array<Record<string, unknown>> {
+  if (typeof raw !== 'string' || !raw) return [];
+  const limit = Math.max(1, Math.min(10_000, Math.trunc(maxObjects) || 200));
+  const objects: Array<Record<string, unknown>> = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < raw.length && objects.length < limit; index += 1) {
+    const char = raw[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (char !== '}' || depth === 0) continue;
+    depth -= 1;
+    if (depth !== 0 || start < 0) continue;
+    try {
+      const value = JSON.parse(raw.slice(start, index + 1)) as unknown;
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        objects.push(value as Record<string, unknown>);
+      }
+    } catch {
+      // A balanced-looking non-JSON block is prose, not a recoverable record.
+    }
+    start = -1;
+  }
+  return objects;
+}
+
+/**
  * Best-effort repair: returns `{ text, repaired }`. When no JSON can be
  * recovered, returns the original text untouched with `repaired: false`
  * (preserving whatever fail-open behavior exists downstream).

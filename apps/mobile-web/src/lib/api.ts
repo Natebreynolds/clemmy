@@ -493,6 +493,7 @@ export interface MobileWorkflow {
   requiresInput: boolean;
   lastRunId: string | null;
   lastRunStatus: string | null;
+  lastRunOutcome: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled' | null;
   lastRunAt: string | null;
 }
 
@@ -504,6 +505,7 @@ export interface WorkflowRunSummary {
   id: string;
   workflow: string;
   status: string;
+  terminalOutcome?: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled';
   createdAt: string | null;
   startedAt: string | null;
   finishedAt: string | null;

@@ -46,7 +46,10 @@ test('extractNumericClaims: pulls currency, percent, count; normalizes K/M scali
 });
 
 test('extractNumericClaims: ignores years, versions, ordinals, bare small ints, code', () => {
-  const claims = extractNumericClaims('In 2026 we shipped v0.5.20 as the 3rd release; step 2 done. `port 8080`. Pick 5.');
+  const claims = extractNumericClaims(
+    'In 2026 we shipped v0.5.20 as the 3rd release; step 2 done. `port 8080`. Pick 5. '
+    + 'Site ID 81b831b3-e109-420e-97e5-822a85e87fed.',
+  );
   assert.equal(claims.length, 0, 'no load-bearing figures — all are noise');
 });
 

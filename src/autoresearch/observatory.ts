@@ -29,6 +29,10 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { VAULT_DIR } from '../memory/vault.js';
 import { openMemoryDb } from '../memory/db.js';
+import {
+  deriveWorkflowTerminalOutcome,
+  type WorkflowTerminalOutcome,
+} from '../execution/workflow-terminal-outcome.js';
 
 const logger = pino({ name: 'clementine-next.autoresearch.observatory' });
 
@@ -52,6 +56,8 @@ interface ToolEvent {
 interface WorkflowRunSummary {
   id: string;
   workflow: string;
+  /** User-objective truth, distinct from the runner lifecycle `status`. */
+  terminalOutcome?: WorkflowTerminalOutcome;
   status: string;
   startedAt?: string;
   finishedAt?: string;
@@ -295,9 +301,20 @@ function loadWorkflowRuns(windowStartMs: number): WorkflowRunSummary[] {
       const steps = (raw.stepOutputs ?? {}) as Record<string, unknown>;
       const stepCount = Object.keys(steps).length;
       const stepErrors = Object.values(steps).filter((v) => typeof v === 'string' && /\berror\b|fail/i.test(v)).length;
+      const reportBack = raw.reportBack && typeof raw.reportBack === 'object' && !Array.isArray(raw.reportBack)
+        ? raw.reportBack as Record<string, unknown>
+        : undefined;
+      const terminalOutcome = deriveWorkflowTerminalOutcome({
+        status: raw.status,
+        finishedAt: raw.finishedAt,
+        needsAttention: raw.needsAttention,
+        terminalOutcome: raw.terminalOutcome,
+        reportBack: reportBack ? { outcome: reportBack.outcome } : undefined,
+      });
       out.push({
         id: String(raw.id ?? entry.replace(/\.json$/, '')),
         workflow: String(raw.workflow ?? '?'),
+        terminalOutcome,
         status: String(raw.status ?? '?'),
         startedAt,
         finishedAt: typeof raw.finishedAt === 'string' ? raw.finishedAt : undefined,
@@ -518,8 +535,12 @@ export function renderReportMarkdown(report: ObservatoryReport): string {
     lines.push('## Workflow runs');
     lines.push('');
     for (const r of report.workflowRuns.slice(0, 10)) {
-      const ok = r.stepErrors === 0 ? '✓' : '⚠';
-      lines.push(`- ${ok} \`${r.workflow}\` · ${r.status} · ${r.stepCount} steps · ${r.stepErrors} step error(s) · started ${r.startedAt ?? '—'}`);
+      const ok = r.terminalOutcome === 'succeeded' && r.stepErrors === 0 ? '✓' : '⚠';
+      const truth = r.terminalOutcome ?? r.status;
+      const lifecycle = r.terminalOutcome && r.status !== r.terminalOutcome
+        ? ` · lifecycle ${r.status}`
+        : '';
+      lines.push(`- ${ok} \`${r.workflow}\` · outcome ${truth}${lifecycle} · ${r.stepCount} steps · ${r.stepErrors} step error(s) · started ${r.startedAt ?? '—'}`);
     }
     lines.push('');
   }

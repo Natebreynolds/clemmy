@@ -1118,19 +1118,17 @@ export interface StandingInstructionReview {
 }
 
 /**
- * Move 4 (in-loop prune): list the active standing instructions /
- * durable preferences, annotated with relevance to the current
- * objective, importance, and provenance — so the confirm-first turn can
- * show the user exactly which stored instructions are in play and let
- * them prune a stale one via `memory_forget`.
+ * Review the instructions actually in play for this objective. With an
+ * objective, only instruction-shaped kinds with strong lexical relevance are
+ * returned. Pinned policy is already injected/enforced by the normal memory
+ * path, so an unrelated pinned row need not be duplicated at this boundary.
+ * Without an objective, pinned rows are the only defensible review set.
  *
- * Deliberately returns ALL of them (least-relevant first) with the
- * relevance SCORE rather than auto-flagging "delete this": lexical
- * zero-overlap is a safe demotion signal (a fact merely loses prompt
- * slots) but a dangerous deletion signal — a genuinely relevant rule can
- * share no tokens with the objective phrasing. The keep/drop judgment
- * stays with the model + user; this just hands them accurate, sourced,
- * id-bearing data to judge from.
+ * The old least-relevant-first scan returned twenty arbitrary project/reference
+ * facts at relevance 0.00 before an unrelated deploy. That made memory a second
+ * approval ceremony and could push genuinely applicable guidance out of the
+ * bounded window. Low overlap is still never a deletion signal; it simply
+ * means a fact is not part of this write-boundary review.
  */
 export function reviewStandingInstructions(
   objective: string | undefined,
@@ -1154,10 +1152,16 @@ export function reviewStandingInstructions(
       sourceHint: sourceHintOf(fact),
       pinned: fact.pinned === true,
     }))
-    // Least-relevant first so a potentially off-objective instruction is
-    // easy to spot at the top; break ties by importance (loudest rules
-    // first).
-    .sort((a, b) => (a.relevance - b.relevance) || (b.importance - a.importance))
+    .filter((item) => obj.length > 0
+      ? (
+        (item.kind === 'constraint' || item.kind === 'feedback' || item.kind === 'user')
+        && item.relevance >= 0.25
+      )
+      : item.pinned)
+    // The most applicable and important guidance comes first.
+    .sort((a, b) =>
+      b.relevance - a.relevance
+      || b.importance - a.importance)
     .slice(0, limit);
 }
 

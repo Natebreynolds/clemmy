@@ -111,6 +111,7 @@ import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadI
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
+import { workflowCodeRevisionFingerprint } from '../execution/workflow-code-certification.js';
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
 import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspaceCheckerReport, writeWorkspaceCheckerReport } from '../execution/workflow-run-workspace.js';
@@ -136,6 +137,10 @@ import type {
 import { buildWorkflowGoalLineage } from './workflow-goal-lineage.js';
 import { buildWorkflowRecoveryLineage } from './workflow-recovery-lineage.js';
 import { buildWorkflowProof, type WorkflowProofRun } from './workflow-proof.js';
+import {
+  deriveWorkflowTerminalOutcome,
+  workflowTerminalOutcomeNeedsAttention,
+} from '../execution/workflow-terminal-outcome.js';
 import { promoteWorkflowFromSession } from '../tools/orchestration-tools.js';
 import { resolveRealtimeVad, buildRealtimeSessionConfig, VOICE_DELIVERY_INSTRUCTIONS } from './realtime-session-config.js';
 import { ExecutionStore } from '../execution/store.js';
@@ -428,6 +433,7 @@ import {
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { cancelWorkflowRunAtBoundary, isTerminalWorkflowRunStatus } from '../execution/workflow-run-cancellation.js';
+import { resumeCapabilityBlockedWorkflowRun } from '../execution/workflow-runner.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -815,7 +821,7 @@ function memoizedWorkflowListDerivations(
   runRecords: WorkflowRunRecordSummary[],
   lastRunId: string | null,
 ): { proof: unknown; certification: ReturnType<typeof workflowCertificationFor> } {
-  const key = `${djb2(JSON.stringify(entry.data))}::${lastRunId ?? 'none'}`;
+  const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}`;
   const hit = workflowListMemo.get(entry.name);
   if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
   const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
@@ -880,6 +886,14 @@ function workflowCertificationSummary(cert: WorkflowCertification) {
     readinessGaps: cert.readinessGaps.slice(0, 5),
     blockerCount: cert.blockingReasons.length,
     contractAdvisoryCount: cert.contractAdvisories.length,
+    code: {
+      ok: cert.code.ok,
+      artifactCount: cert.code.artifactCount,
+      readyCount: cert.code.readyCount,
+      issueCount: cert.code.issueCount,
+      bundleHash: cert.code.bundleHash,
+      artifacts: cert.code.artifacts.slice(0, 8),
+    },
     nextActions: cert.nextActions,
     dryRun: {
       verdict: dryRun.verdict,
@@ -2003,6 +2017,15 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
   const workflow = stringField(raw.workflow);
   if (!id || !workflow) return null;
   const recoveryIntent = normalizeWorkflowRunRecoveryIntent(raw.recoveryIntent);
+  const terminalOutcome = deriveWorkflowTerminalOutcome({
+    status: raw.status,
+    finishedAt: raw.finishedAt,
+    needsAttention: raw.needsAttention,
+    terminalOutcome: raw.terminalOutcome,
+    reportBack: raw.reportBack && typeof raw.reportBack === 'object' && !Array.isArray(raw.reportBack)
+      ? { outcome: (raw.reportBack as Record<string, unknown>).outcome }
+      : undefined,
+  });
   return {
     id,
     workflow,
@@ -2013,7 +2036,9 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
     source: stringField(raw.source),
     error: stringField(raw.error),
     targetStepId: stringField(raw.targetStepId),
-    needsAttention: raw.needsAttention === true,
+    needsAttention: raw.needsAttention === true
+      || workflowTerminalOutcomeNeedsAttention(terminalOutcome),
+    ...(terminalOutcome ? { terminalOutcome } : {}),
     ...(recoveryIntent ? { recoveryIntent } : {}),
   };
 }
@@ -4235,7 +4260,12 @@ export function registerConsoleRoutes(
           allowedTools: entry.data.allowedTools ?? null,
           whenToUse: entry.data.whenToUse ?? null,
           health: checkWorkflowHealth(entry.data),
-          lastRunStatus: lastRun ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status) : null,
+          // Preserve the lifecycle/status compatibility contract for existing
+          // clients. User-objective truth is deliberately a separate field.
+          lastRunStatus: lastRun
+            ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status)
+            : null,
+          lastRunOutcome: lastRun?.terminalOutcome ?? null,
           lastRunNeedsAttention: lastRun?.needsAttention === true || undefined,
           lastRunId: lastRun?.id ?? null,
           lastRunFailedItemCount: lastRunFailedItems.length,
@@ -5424,6 +5454,61 @@ export function registerConsoleRoutes(
         });
       }
       res.json({ ok: true, run: cancellation.run });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/workflows/:name/runs/:runId/resume-capability', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((candidate) => candidate.data.name === target || candidate.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'workflow run not found' });
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const capabilityBlock = raw.capabilityBlock as { state?: unknown } | undefined;
+      if (
+        raw.status === 'running'
+        && capabilityBlock
+        && (capabilityBlock.state === 'retrying' || capabilityBlock.state === 'consumed')
+      ) {
+        res.json({ ok: true, runId, status: raw.status, alreadyResumed: true });
+        return;
+      }
+      if (raw.status !== 'blocked_capability') {
+        res.status(409).json({
+          error: 'workflow run is not waiting on a recoverable capability',
+          status: raw.status ?? null,
+        });
+        return;
+      }
+      if (!resumeCapabilityBlockedWorkflowRun(runId)) {
+        // An automatic retry may win the race after our read. Treat that as the
+        // requested outcome instead of showing a spurious operator error.
+        const latest = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+        const latestBlock = latest.capabilityBlock as { state?: unknown } | undefined;
+        if (
+          latest.status === 'running'
+          && latestBlock
+          && (latestBlock.state === 'retrying' || latestBlock.state === 'consumed')
+        ) {
+          res.json({ ok: true, runId, status: latest.status, alreadyResumed: true });
+          return;
+        }
+        res.status(409).json({ error: 'workflow run could not be resumed', status: latest.status ?? null });
+        return;
+      }
+      res.json({ ok: true, runId, status: 'running', alreadyResumed: false });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

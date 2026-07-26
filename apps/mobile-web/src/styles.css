@@ -357,8 +357,9 @@ input { font: inherit; }
   text-transform: uppercase;
 }
 .status-active { color: var(--accent); border-color: var(--accent); }
-.status-completed { color: var(--accent-2); border-color: var(--accent-2); }
+.status-completed, .status-succeeded { color: var(--accent-2); border-color: var(--accent-2); }
 .status-failed, .status-cancelled { color: var(--accent-fail); border-color: var(--accent-fail); }
+.status-blocked, .status-partial { color: var(--accent-warn); border-color: var(--accent-warn); }
 .status-paused { color: var(--accent-warn); border-color: var(--accent-warn); }
 
 .chat-shell {
@@ -731,10 +732,14 @@ input { font: inherit; }
   border: 1px solid var(--line);
   color: var(--fg-3);
 }
-.workflow-row-status.status-completed { color: var(--accent-2); border-color: var(--accent-2); }
+.workflow-row-status.status-completed,
+.workflow-row-status.status-succeeded { color: var(--accent-2); border-color: var(--accent-2); }
 .workflow-row-status.status-running { color: var(--accent); border-color: var(--accent); }
-.workflow-row-status.status-failed { color: var(--accent-fail); border-color: var(--accent-fail); }
-.workflow-row-status.status-queued { color: var(--accent-warn); border-color: var(--accent-warn); }
+.workflow-row-status.status-failed,
+.workflow-row-status.status-cancelled { color: var(--accent-fail); border-color: var(--accent-fail); }
+.workflow-row-status.status-queued,
+.workflow-row-status.status-blocked,
+.workflow-row-status.status-partial { color: var(--accent-warn); border-color: var(--accent-warn); }
 .workflow-row-desc { font-size: 12px; color: var(--fg-2); }
 .workflow-row-meta {
   display: flex;

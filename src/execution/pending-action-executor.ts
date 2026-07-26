@@ -93,7 +93,17 @@ export async function executeApprovedPendingActionCall(
     }
     const preview = outText.slice(0, 400);
     const updated = recordPendingActionResult(record.id, 'executed', `Executed the approved ${record.toolName} call. ${preview}`.slice(0, 4000));
-    return { ok: true, status: 'executed', resultSummary: `Executed ${record.toolName} for pending action ${record.id}.`, record: updated ?? getPendingAction(id) };
+    return {
+      ok: true,
+      status: 'executed',
+      resultSummary: [
+        `Executed ${record.toolName} for pending action ${record.id}.`,
+        'Authoritative tool result:',
+        preview,
+        'Outcome is already recorded. Do not call pending_action_get or pending_action_record_result.',
+      ].join('\n'),
+      record: updated ?? getPendingAction(id),
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const updated = recordPendingActionResult(record.id, 'failed', `Execution failed: ${msg}`.slice(0, 4000));

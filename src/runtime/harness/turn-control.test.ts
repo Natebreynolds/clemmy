@@ -8,7 +8,7 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-turn-control-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-import { test, afterEach } from 'node:test';
+import { test, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
@@ -42,6 +42,12 @@ function freshSession(kind = 'chat'): string {
   createSession({ id, kind } as never);
   return id;
 }
+
+beforeEach(() => {
+  // Most tests below exercise the legacy alignment mechanism directly. The
+  // production default is asserted separately and remains off.
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+});
 
 afterEach(() => {
   delete process.env.CLEMMY_BG_OFFER_NUDGE;
@@ -209,19 +215,31 @@ test('evaluateTurnBoundary precedence: kill → wall-clock → token budget → 
   assert.equal((steps as { limit?: string }).limit, 'max_steps');
 });
 
-// ── background offer (policy: default ON) ────────────────────────────────────
+// ── background offer (legacy opt-in) ─────────────────────────────────────────
 
-// ── confirm beat (the shovel policy) ─────────────────────────────────────────
+// ── confirm beat (legacy opt-in) ─────────────────────────────────────────────
+
+test('confirm beat is default-off so an explicit action does not require a duplicate go-ahead', () => {
+  delete process.env.CLEMMY_CONFIRM_BEAT;
+  const sessionId = freshSession('chat');
+  const message = 'Deploy this prepared directory to the exact Netlify site I named, then verify it.';
+  assert.equal(confirmBeatDirective({ message, sessionId, sessionKind: 'chat' }), null);
+  assert.equal(classifyTurnPreflight({ message, sessionId, sessionKind: 'chat' }).phase, 'execute');
+  process.env.CLEMMY_CONFIRM_BEAT = 'on';
+  assert.ok(confirmBeatDirective({ message, sessionId, sessionKind: 'chat' }), 'operators can still opt in');
+});
 
 test('confirm beat: fires for a FRESH chat execution-shaped request only', () => {
   const chat = freshSession('chat');
   const msg = 'send outreach emails to the 20 firms on my prospect list';
   assert.ok(confirmBeatDirective({ message: msg, sessionId: chat, sessionKind: 'chat' }), 'fresh + execution-shaped → beat');
-  // multi-item without an external-write verb still counts as execution-shaped
+  // Item count alone is parallelism guidance, not a reason to interrupt a
+  // fully specified read-only task with another confirmation round trip.
   const chat2 = freshSession('chat');
-  assert.ok(
+  assert.equal(
     confirmBeatDirective({ message: 'research these 8 companies and rank their weaknesses in detail', sessionId: chat2, sessionKind: 'chat', isMultiItem: true, itemCount: 8 }),
-    'multi-item shape → beat',
+    null,
+    'read-only multi-item work starts immediately',
   );
   const incident = freshSession('chat');
   assert.ok(
@@ -271,6 +289,49 @@ test('confirm beat: fires for a FRESH chat execution-shaped request only', () =>
     'align',
     'noun-shaped artifact requests receive a typed alignment decision',
   );
+});
+
+test('preflight ignores negated destinations and never invents providers from scope grammar', () => {
+  const sessionId = freshSession('chat');
+  const decision = classifyTurnPreflight({
+    message: 'In exactly one run_worker call, compute 10 squares using no external tools. Do not write files or deploy to Netlify.',
+    sessionId,
+    sessionKind: 'chat',
+    isMultiItem: true,
+    itemCount: 10,
+  });
+  assert.equal(decision.phase, 'execute');
+  assert.equal(decision.consequential, false);
+  assert.equal(decision.destination, undefined);
+  assert.deepEqual(decision.allowedDestinations, undefined);
+});
+
+test('preflight reports a concrete validation blocker before aligning a conditional external write', () => {
+  const sessionId = freshSession('chat');
+  const message = 'Create a disposable Google Sheet with columns company and email using these rows: Acme — acme@example.com; Beacon — email missing; Cedar — cedar@example.com. Do not create or write any spreadsheet unless every row has a non-empty email. If anything is missing, identify the row and stop.';
+  const decision = classifyTurnPreflight({
+    message,
+    sessionId,
+    sessionKind: 'chat',
+    isMultiItem: true,
+    itemCount: 3,
+  });
+  assert.equal(decision.phase, 'read');
+  assert.equal(decision.reason, 'validation_blocked');
+  assert.equal(decision.consequential, false);
+  assert.ok(!decision.allowedActionFamilies?.includes('send'));
+  assert.ok(!decision.allowedDestinations?.includes('provider:these'));
+
+  const complete = classifyTurnPreflight({
+    message: 'Create a disposable Google Sheet with columns company and email using these rows: Acme — acme@example.com; Beacon — beacon@example.com. Do not create or write it unless every row has a non-empty email.',
+    sessionId: freshSession('chat'),
+    sessionKind: 'chat',
+    isMultiItem: true,
+    itemCount: 2,
+  });
+  assert.equal(complete.phase, 'align', 'a defensive validation rule alone is not a concrete blocker');
+  assert.ok(!complete.allowedActionFamilies?.includes('send'), 'an email column is data, not send authority');
+  assert.ok(!complete.allowedDestinations?.includes('provider:these'));
 });
 
 test('confirm beat: old completions never grant permanent alignment; reads and non-chat lanes remain immediate', () => {
@@ -415,11 +476,14 @@ test('a stale alignment cannot be approved after an unrelated intervening input'
   assert.equal(staleYes.confirmedIntentKey, undefined);
 });
 
-test('background offer: default ON; triggers on tool count OR elapsed; one-shot; chat-only', () => {
-  assert.equal(backgroundOfferEnabled(), true, 'graduated to default ON per the 2026-07-16 policy');
+test('background offer: default OFF; opt-in triggers on tool count OR elapsed; one-shot; chat-only', () => {
+  delete process.env.CLEMMY_BG_OFFER_NUDGE;
+  assert.equal(backgroundOfferEnabled(), false);
   const chat = freshSession('chat');
   const base = { sessionId: chat, toolCalls: 0, elapsedMs: 0, alreadyNudged: false };
   assert.equal(shouldOfferBackground(base), false, 'quick turns are never nudged');
+  assert.equal(shouldOfferBackground({ ...base, toolCalls: 20 }), false, 'normal operation never injects an ask-and-stop gate');
+  process.env.CLEMMY_BG_OFFER_NUDGE = 'on';
   assert.equal(shouldOfferBackground({ ...base, toolCalls: 6 }), true, 'tool-count trigger');
   assert.equal(shouldOfferBackground({ ...base, elapsedMs: 91_000 }), true, 'elapsed trigger');
   assert.equal(shouldOfferBackground({ ...base, toolCalls: 6, alreadyNudged: true }), false, 'one-shot');

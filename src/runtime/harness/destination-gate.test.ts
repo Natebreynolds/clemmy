@@ -116,6 +116,15 @@ test('NO false positive: git push (push is not a tracked publish verb)', () => {
 test('NO false positive: a plain read command', () => {
   assert.equal(evaluateShellDestination('ls -la /tmp/site').action, 'allow');
   assert.equal(evaluateShellDestination('netlify status --json').action, 'allow');
+  assert.equal(evaluateShellDestination('netlify deploy --help').action, 'allow');
+  assert.equal(classifyShellNetworkMutation('netlify deploy --help').isNetworkMutation, false);
+  assert.equal(classifyShellNetworkMutation('npm publish --version').isNetworkMutation, false);
+  // Introspection suppresses only its own command segment; a later real write
+  // in the same shell string remains visible.
+  assert.equal(
+    evaluateShellDestination('netlify deploy --help && netlify deploy --prod').action,
+    'flag',
+  );
 });
 
 test('a publish verb only after a FLAG does not count (not a sub-command)', () => {
@@ -185,6 +194,8 @@ test('classifyShellNetworkMutation: NO false positives on reads / benign command
   const benign = [
     'curl https://api.x.com/status',          // GET = read, no method/body
     'curl -s https://example.com',            // plain fetch
+    'curl -sS --fail-with-body -D - https://example.com', // `-D` dumps headers; it is not lowercase data `-d`
+    'curl -f https://example.com',             // `-f` fails on HTTP errors; it is not uppercase form `-F`
     'gh pr list',                             // read
     'gh api /repos/o/r',                      // GET
     'sf data query --query "SELECT Id FROM Account"', // read
@@ -196,6 +207,8 @@ test('classifyShellNetworkMutation: NO false positives on reads / benign command
     'docker build -t local-preview .',         // local compute, not a registry push
     'kubectl get pods',                        // cluster read
     'terraform plan',                          // preview only
+    'netlify deploy --help',                   // CLI schema read, not a deploy
+    'npm publish --version',                   // CLI metadata read
   ];
   for (const cmd of benign) {
     assert.equal(classifyShellNetworkMutation(cmd).isNetworkMutation, false, `should NOT flag: ${cmd}`);

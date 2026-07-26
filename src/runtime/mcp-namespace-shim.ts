@@ -12,6 +12,7 @@ import {
   detectDuplicateTarget,
   duplicateResendConsented,
   extractDuplicateIdentityKeys,
+  extractExternalWriteIdentityKeys,
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
 } from './harness/grounding-gate.js';
@@ -1329,7 +1330,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               irreversible: true,
               mcp: true,
               preDispatch: true,
-              targets: extractDuplicateIdentityKeys(args ?? {}).slice(0, 8),
+              targets: extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8),
             },
           });
           preRecordedSend = true;
@@ -1367,7 +1368,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
                 toolName,
                 irreversible: isIrreversibleSend,
                 mcp: true,
-                targets: extractDuplicateIdentityKeys(args ?? {}).slice(0, 8),
+                targets: extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8),
               },
             });
           } catch { /* telemetry write must never block */ }
@@ -1400,7 +1401,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           const demonstrablyNeverSent = kind === 'permission_denied' || kind === 'not_found'
             || kind === 'rate_limit' || isInvalidMcpCallResultValidationError(err)
             || /econnrefused|enotfound|eai_again|getaddrinfo|dns|connection refused/i.test(errMsg);
-          const targets = extractDuplicateIdentityKeys(args ?? {}).slice(0, 8);
+          const targets = extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8);
           try {
             appendEvent({
               sessionId: integritySessionId,

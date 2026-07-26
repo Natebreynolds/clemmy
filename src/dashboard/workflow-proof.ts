@@ -1,6 +1,7 @@
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 import { analyzeWorkflowGaps } from '../execution/workflow-gap-test.js';
 import { classifyStepSideEffect } from '../execution/workflow-enforce.js';
+import type { WorkflowTerminalOutcome } from '../execution/workflow-terminal-outcome.js';
 
 export type WorkflowLifecycleState = 'draft' | 'needs_info' | 'testing' | 'live';
 
@@ -15,6 +16,7 @@ export interface WorkflowProofRun {
   error: string | null;
   targetStepId: string | null;
   needsAttention: boolean;
+  terminalOutcome?: WorkflowTerminalOutcome;
 }
 
 export interface WorkflowProof {
@@ -85,7 +87,9 @@ export function buildWorkflowProof(def: WorkflowDefinition, runs: WorkflowProofR
   const creationRuns = workflowRuns.filter((run) => run.status === 'creation_test');
   const latestCreationTest = creationRuns[0] ?? null;
   const latestSuccessfulRun = workflowRuns.find((run) =>
-    (run.status === 'completed' || run.status === 'success') && run.needsAttention !== true,
+    run.terminalOutcome
+      ? run.terminalOutcome === 'succeeded'
+      : (run.status === 'completed' || run.status === 'success') && run.needsAttention !== true,
   ) ?? null;
   const readinessGaps = analyzeWorkflowGaps(def).map((gap) => ({
     ...(gap.stepId ? { stepId: gap.stepId } : {}),

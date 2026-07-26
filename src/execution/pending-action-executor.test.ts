@@ -66,6 +66,8 @@ test('approved single-call executes the EXACT stored payload via the dispatcher'
   // The dispatch carries the payloadHash so the write boundary skips the (failed) judge.
   assert.equal((dispatched[0].certifiedBatch as { payloadHash?: string }).payloadHash, record.payloadHash);
   assert.equal(getPendingAction(record.id)?.status, 'executed', 'the card is marked executed');
+  assert.match(res.resultSummary, /Authoritative tool result:\s*OK sent/, 'the caller can verify without a redundant pending_action_get');
+  assert.match(res.resultSummary, /Outcome is already recorded.*Do not call pending_action_get or pending_action_record_result/);
 });
 
 test('a NOT-approved pending action is not executed', async () => {

@@ -187,12 +187,14 @@ export function evaluateTurnBoundary(input: {
   return { kind: 'continue', tokenStatus };
 }
 
-// ── background offer (policy 2026-07-16: always offer on long execution) ────
+// ── background offer (legacy operator opt-in) ────────────────────────────────
 
-/** The nudge graduates to default ON (validated behavior; the incident's run
- *  got no offer partly because this flag sat default-off). */
+/** A mid-run "ask, then STOP" prompt is itself an execution gate: it can
+ * interrupt a task that is one step from completion merely because it used six
+ * tools. Normal operation lets the model finish; operators can opt into the
+ * legacy handoff experiment explicitly. */
 export function backgroundOfferEnabled(): boolean {
-  const v = (getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'on') ?? 'on').trim().toLowerCase();
+  const v = (getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'off') ?? 'off').trim().toLowerCase();
   return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
 }
 
@@ -220,14 +222,15 @@ export function shouldOfferBackground(input: {
     || input.elapsedMs >= BACKGROUND_OFFER_MIN_ELAPSED_MS;
 }
 
-// ── confirm beat (policy 2026-07-16: "shovel before driving over") ──────────
+// ── confirm beat (legacy opt-in) ────────────────────────────────────────────
 // "If I asked a friend to help me dig a hole and they just blindly drove to my
-// house without a shovel it would be a waste of time." A FRESH chat request
-// that is execution-shaped gets ONE conversational beat — confirm the plan,
-// surface missing tools/connections, offer background — before the work
-// starts. Delivered as a directive in the agent context packet (both lanes
-// read it), NOT a formal plan card: the 2026-06-01 converse-until-aligned
-// rollback stands — the model converses, the trigger is deterministic.
+// house without a shovel it would be a waste of time." The original policy made
+// every fresh execution-shaped request wait for a second "go", even when the
+// user had already named the exact action, destination, verification, and retry
+// boundary. That duplicated the real approval/destination gates and turned a
+// command into ceremony. Keep the mechanism as an explicit operator experiment;
+// normal operation starts clear work immediately and asks only when a concrete
+// ambiguity is discovered.
 
 // Confirmation is based on a typed turn decision, not a write-ish word anywhere
 // in the sentence. The structural patterns below are inputs to that decision,
@@ -282,6 +285,7 @@ export interface TurnPreflightDecision {
     | 'continuation_approved'
     | 'already_aligned_session'
     | 'read_only_request'
+    | 'validation_blocked'
     | 'external_action'
     | 'multi_item_action'
     | 'noun_shaped_artifact_request'
@@ -331,6 +335,12 @@ function destinationKeysFromText(text: string): string[] {
 const GENERIC_PROVIDER_STOPWORDS = new Set([
   'a', 'an', 'the', 'my', 'our', 'new', 'existing', 'client', 'customer',
   'project', 'company', 'firm', 'single', 'one', 'another',
+  // Grammar/scope words are not provider names. Without these, phrases such
+  // as "in exactly one run_worker call" and "using no external tools" minted
+  // fake destinations provider:exactly and provider:no, which in turn
+  // upgraded a local read-only task into an external mutation.
+  'all', 'any', 'each', 'every', 'exactly', 'external', 'local', 'no', 'not',
+  'only', 'state', 'that', 'these', 'this', 'those', 'tool', 'tools', 'without',
 ]);
 
 function normalizeProviderAlias(value: string): string {
@@ -343,7 +353,11 @@ function genericProviderAliasesFromObjective(text: string): string[] {
   const aliases: string[] = [];
   const patterns = [
     /\b(?:create|update|edit|delete|remove|add|send|schedule|publish|upload)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9.-]{1,30})\s+(?:record|card|issue|task|ticket|row|page|item|contact|lead|entry|message|event)\b/gi,
-    /\b(?:in|on|via|using|through)\s+([A-Za-z][A-Za-z0-9.-]{1,30})\b/gi,
+    // "in/on <word>" is ordinary English far more often than a provider
+    // reference ("research in detail", "run on Monday"). Keep only explicit
+    // integration prepositions; known providers still resolve through
+    // DESTINATION_RULES regardless of phrasing.
+    /\b(?:via|using|through)\s+([A-Za-z][A-Za-z0-9.-]{1,30})\b/gi,
   ];
   for (const pattern of patterns) {
     for (const match of text.matchAll(pattern)) {
@@ -352,6 +366,39 @@ function genericProviderAliasesFromObjective(text: string): string[] {
     }
   }
   return [...new Set(aliases)];
+}
+
+/** Remove explicitly forbidden action clauses before inferring destination or
+ * mutation authority. Constraints such as "do not deploy to Netlify" and
+ * "using no external tools" describe what must NOT happen; treating their
+ * nouns as positive intent creates exactly the redundant confirmation loops
+ * the typed preflight was meant to prevent. */
+function positivePreflightSignalText(text: string): string {
+  return text
+    .replace(/\b(?:do\s+not|don't|never|without)\b[^.!?;\n]{0,160}/gi, ' ')
+    .replace(/\bno\s+(?:external|remote|provider|network|write|writes|writing|mutation|mutations|tool|tools)\b[^.!?;\n]{0,120}/gi, ' ');
+}
+
+/**
+ * A conditional mutation with a concrete incomplete value is not ready for an
+ * alignment/execute beat yet. The useful next action is to identify the blocker.
+ *
+ * Strip hypothetical "if/unless something is missing" clauses before looking
+ * for a real data marker, so a fully populated batch with a defensive rule does
+ * not get mislabeled as blocked.
+ */
+function hasExplicitValidationBlocker(text: string): boolean {
+  const gatedMutation =
+    /\b(?:do\s+not|don't|never)\b[^.!?\n]{0,180}\b(?:create|write|send|publish|deploy|update|upload|submit)\b[^.!?\n]{0,120}\b(?:unless|until)\b/i.test(text)
+    || /\b(?:validate|verify|check)\b[^.!?\n]{0,120}\bbefore\b[^.!?\n]{0,80}\b(?:create|write|send|publish|deploy|update|upload|submit)\b/i.test(text);
+  if (!gatedMutation) return false;
+  const concreteData = text
+    .replace(/\bif\b[^.!?;\n]{0,220}/gi, ' ')
+    .replace(/\bunless\b[^.!?;\n]{0,220}/gi, ' ');
+  return (
+    /\b(?:email|e-mail|field|value|data|row|record|address|phone|url|id)\b\s*(?::|—|-|=|\bis\b)?\s*\b(?:missing|blank|unknown|null|not\s+provided|tbd)\b/i.test(concreteData)
+    || /\b(?:missing|blank|unknown|null|not\s+provided|tbd)\b\s+(?:email|e-mail|field|value|data|row|record|address|phone|url|id)\b/i.test(concreteData)
+  );
 }
 
 function mutationAuthorityForObjective(
@@ -386,7 +433,7 @@ function actionFamiliesFromText(text: string, objective: boolean): ConfirmedActi
   if (
     /\b(?:send|notify|dispatch|forward|reply|broadcast|dm)\b/i.test(normalized)
     || (objective
-      ? /(?:^|\b(?:you|to|then|and)\s+)(?:please\s+)?(?:email|message)\b/i.test(normalized.trim())
+      ? /(?:^|\b(?:you|to|then|and)\s+)(?:please\s+)?(?:email|message)\s+(?!address|column|field|value|missing|blank|data|using|with|is\b|=|:)(?:the\s+)?[a-z0-9@]/i.test(normalized.trim())
       : /\b(?:email|message)\b/i.test(normalized))
   ) actions.push('send');
   if (
@@ -523,20 +570,35 @@ export function classifyTurnPreflight(input: {
     }
   }
 
-  const requestedAction = REQUESTED_ACTION_PATTERNS.some((pattern) => pattern.test(text));
-  const genericProviders = genericProviderAliasesFromObjective(text);
-  const destination = destinationFromText(text) ?? genericProviders[0]?.replace(/^provider:/, '');
-  const externalAction = requestedAction && (Boolean(destination) || EXTERNAL_ACTION_RE.test(text) || genericProviders.length > 0);
-  const multiItemAction = input.isMultiItem === true && (input.itemCount ?? 0) >= 3;
-  const nounShapedArtifactRequest = Boolean(destination) && NOUN_SHAPED_REQUEST_RE.test(text);
-  const authority = mutationAuthorityForObjective(text, externalAction, nounShapedArtifactRequest);
+  const signalText = positivePreflightSignalText(text);
+  const requestedAction = REQUESTED_ACTION_PATTERNS.some((pattern) => pattern.test(signalText.trim()));
+  const genericProviders = genericProviderAliasesFromObjective(signalText);
+  const destination = destinationFromText(signalText) ?? genericProviders[0]?.replace(/^provider:/, '');
+  const externalAction = requestedAction && (Boolean(destination) || EXTERNAL_ACTION_RE.test(signalText) || genericProviders.length > 0);
+  const nounShapedArtifactRequest = Boolean(destination) && NOUN_SHAPED_REQUEST_RE.test(signalText);
+  const authority = mutationAuthorityForObjective(signalText, externalAction, nounShapedArtifactRequest);
+  // Item count alone is a parallelism hint, not a consequential action. Pure
+  // research/computation should start; only a batch that actually carries
+  // mutation authority earns the extra conversational alignment beat.
+  const multiItemAction = input.isMultiItem === true
+    && (input.itemCount ?? 0) >= 3
+    && (authority.allowedMutationEffects?.length ?? 0) > 0;
 
   // Interrogative/read leads win when the user did not grammatically ask
   // Clementine to perform an action. This keeps “what should I send?” and
   // “can Google Docs create tables?” immediate even though they contain
   // consequential nouns and verbs.
-  if ((READ_ONLY_LEAD_RE.test(text) || (!requestedAction && /\?\s*$/.test(text))) && !requestedAction) {
+  if ((READ_ONLY_LEAD_RE.test(signalText.trim()) || (!requestedAction && /\?\s*$/.test(text))) && !requestedAction) {
     return { phase: 'read', consequential: false, destination, reason: 'read_only_request' };
+  }
+  if (hasExplicitValidationBlocker(text)) {
+    return {
+      phase: 'read',
+      consequential: false,
+      destination,
+      objective: text,
+      reason: 'validation_blocked',
+    };
   }
   if (multiItemAction) {
     return {
@@ -560,8 +622,8 @@ export function classifyTurnPreflight(input: {
 }
 
 export function confirmBeatEnabled(): boolean {
-  const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'on') ?? 'on').trim().toLowerCase();
-  return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
+  const v = (getRuntimeEnv('CLEMMY_CONFIRM_BEAT', 'off') ?? 'off').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
 }
 
 export const CONFIRM_BEAT_TEXT =
