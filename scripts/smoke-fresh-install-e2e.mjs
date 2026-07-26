@@ -18,7 +18,7 @@
 // Exits 0 if the dashboard answers with HTML on /console and a JSON
 // payload on /api/dashboard. Non-zero otherwise.
 
-import { mkdtempSync, existsSync, rmSync, writeFileSync, cpSync, symlinkSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, rmSync, writeFileSync, cpSync, symlinkSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -26,6 +26,7 @@ import { pathToFileURL } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const DESKTOP_DIST = path.join(REPO_ROOT, 'apps', 'desktop', 'dist');
+const CONSOLE_DIST = path.join(REPO_ROOT, 'apps', 'console-web', 'dist');
 const DAEMON_DIST = path.join(REPO_ROOT, 'dist', 'index.js');
 
 if (!existsSync(path.join(DESKTOP_DIST, 'setup-state.js'))) {
@@ -34,6 +35,10 @@ if (!existsSync(path.join(DESKTOP_DIST, 'setup-state.js'))) {
 }
 if (!existsSync(DAEMON_DIST)) {
   console.error('✗ dist/index.js missing. Run: npm run build');
+  process.exit(2);
+}
+if (!existsSync(path.join(CONSOLE_DIST, 'index.html'))) {
+  console.error('✗ apps/console-web/dist not built. Run: npm run build:console-web');
   process.exit(2);
 }
 
@@ -119,12 +124,15 @@ info(`port=${daemonPort}`);
 // Mirror the packaged-app layout: the daemon's PKG_DIR (computed as
 // path.resolve(__dirname, '..') in config.ts) must not have a sibling
 // .env. In dev that resolves to the repo root which DOES have one.
-// We stage dist/ + package.json into the tmpHome and run the daemon
-// from there so PKG_DIR points at a clean directory — same as the
-// packaged-app Resources/daemon/ layout.
+// We stage dist/, the shipped console bundle, and package.json into the
+// tmpHome and run the daemon from there so PKG_DIR points at a clean
+// directory — same as the packaged-app Resources/daemon/ layout.
 const stagedDaemonRoot = path.join(tmpHome, 'daemon-stage');
 const stagedDist = path.join(stagedDaemonRoot, 'dist');
+const stagedConsoleDist = path.join(stagedDaemonRoot, 'apps', 'console-web', 'dist');
 cpSync(path.join(REPO_ROOT, 'dist'), stagedDist, { recursive: true });
+mkdirSync(path.dirname(stagedConsoleDist), { recursive: true });
+cpSync(CONSOLE_DIST, stagedConsoleDist, { recursive: true });
 writeFileSync(path.join(stagedDaemonRoot, 'package.json'), readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8'));
 // Symlink node_modules so the staged daemon can resolve runtime deps.
 symlinkSync(path.join(REPO_ROOT, 'node_modules'), path.join(stagedDaemonRoot, 'node_modules'));
