@@ -2,18 +2,17 @@ import { listEvents } from './eventlog.js';
 import { getRuntimeEnv } from '../../config.js';
 
 /**
- * CONVERGENCE — one clarifying beat, then execute.
+ * CONVERGENCE — carry an answer forward without imposing an execution timer.
  *
- * When Clem's previous turn ended by asking the user a clarifying question and
- * the user just answered it, the harness injects the directive below so the
- * brain plans ONCE and acts, instead of dripping back-to-back questions
- * turn-by-turn (the 2026-07-09 "it kept asking me redundant questions" report).
- * Provider-agnostic: applied by the standard harness lane (Codex, OpenAI, and
- * BYO models) and the Claude SDK brain. The rubric says the same thing, but the
- * transient state makes the prior conversational outcome explicit.
+ * The old steer treated every answer as "you now have enough: EXECUTE". That
+ * stopped redundant clarification, but it also collapsed collaborative
+ * exploration into a one-question command flow. This transient now carries
+ * only the useful invariant: honor the answer and never re-ask the resolved
+ * point. The model still owns whether the conversation is exploring or ready
+ * to execute. Provider-agnostic: applied by the standard and Claude SDK lanes.
  */
 export const CONVERGENCE_STEER =
-  'CONVERGE — your previous turn asked the user a clarifying question. If their new message answers that question, you now have enough: EXECUTE the work this turn. Treat the new answer as authoritative data: preserve its exact identifiers, labels, paths, quantities, and any requested casing; do not normalize or paraphrase a literal value into a synonym. A casing transformation changes letter case only, never spelling, plurality, or word choice. Choose sensible defaults for anything still open and state them in one line; do NOT ask another separate clarifying question, and do NOT stack an "offer to run it in the background" question. Pause again ONLY if a decision is genuinely blocking and unguessable, or — for an irreversible/batch external write — to queue the payload and request approval once. If the user clearly changed topics instead, handle the new request normally.';
+  'CONVERGE — your previous turn asked the user a question. If their new message answers it, treat that answer as authoritative and never re-ask the resolved point. Preserve exact identifiers, labels, paths, quantities, and requested casing; do not normalize a literal value into a synonym. If the user has now committed or the request is execution-ready, act autonomously with sensible non-blocking defaults. If they are still comparing, brainstorming, shaping, or deciding, continue that conversation naturally — an answer is not automatic permission for external writes or durable execution. Ask again only for a genuinely blocking, unguessable fact, bundling any remaining execution-critical choices. Do not stack a background-routing question unless work is now committed and truly long. If the user changed topics, handle the new request normally.';
 
 export function convergenceSteerEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_CONVERGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';

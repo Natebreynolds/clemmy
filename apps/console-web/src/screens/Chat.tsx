@@ -11,6 +11,7 @@ import { DogMark } from '@/components/DogMark';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { StatusPill } from '@/components/ui/StatusPill';
+import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
 
 function timeGreeting(): string {
@@ -170,6 +171,8 @@ export function Chat() {
           </div>
         )}
 
+        <CollaborativeWorkstate snapshot={cc.data?.focus} compact className="mb-5" />
+
         <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
 
         <div className="mt-4 flex flex-wrap justify-center gap-2">
@@ -196,6 +199,7 @@ export function Chat() {
           {(needsYou.length > 0 || workingNow.length > 0) && (
             <AttentionStrip needsYou={needsYou} workingNow={workingNow} onDismiss={dismissCard} />
           )}
+          <CollaborativeWorkstate snapshot={cc.data?.focus} compact />
           {chat.messages.map((m) => (
             <ChatBubble key={m.id} message={m} onApprove={approveLast} onReject={rejectLast} onBackground={chat.background} />
           ))}

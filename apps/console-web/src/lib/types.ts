@@ -1,4 +1,5 @@
 /** Shared API DTOs mirrored from the daemon (kept loose where shapes vary). */
+import type { FocusSnapshot } from './focus';
 
 export interface HarnessEvent {
   seq: number;
@@ -74,7 +75,7 @@ export interface CommandCenter {
   recentCompleted?: CommandCenterItem[];
   memory?: Record<string, unknown>;
   integrations?: Record<string, unknown>;
-  focus?: unknown;
+  focus?: FocusSnapshot | null;
 }
 
 export interface AttachResult {

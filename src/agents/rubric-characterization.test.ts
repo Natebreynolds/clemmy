@@ -76,11 +76,19 @@ const GOLDEN = {
   // longer pins a durable focus merely because the request names a URL.
   // 2026-07-26 full-catalog soak: manifests track per-item worker phases only;
   // parent ranking/merge/final synthesis no longer creates phantom N-of-N work.
-  instructions: { len: 35991, sha16: '03141c9d5f6d1b7e' },
-  native: { len: 35094, sha16: '13eb73142c7c26d4' },
-  claudeBrain: { len: 5999, sha16: '7c910221822833aa' },
+  // 2026-07-26 collaborative readiness: exploration no longer has a one-turn
+  // timer. Execution-ready ambiguity stays bundled, while the shared rule and
+  // shorter background cue reduce every flagship prompt.
+  // 2026-07-26 shared workstate: Focus now covers sustained decision threads
+  // and material sparse patches, replacing the longer resource-only heuristic.
+  // 2026-07-26 cross-brain workstate: the lean Claude lanes receive the same
+  // injected notebook and maintain it only when the conversation materially
+  // changes, while lifecycle reconciliation remains runtime-owned.
+  instructions: { len: 35466, sha16: '30c746cd1f3e4e9d' },
+  native: { len: 34569, sha16: '8041a57d187da1fb' },
+  claudeBrain: { len: 5954, sha16: 'ea2ddcbfe8061631' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 9548, sha16: '282e18dc3dec61fd' },
+  lean: { len: 9503, sha16: '3a0e8b6e19df9acf' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -147,16 +155,20 @@ test('provider parity: focus context is injected, never a mandatory per-turn too
     ['claude', CLAUDE_BRAIN_RUBRIC],
   ] as const) {
     assert.doesNotMatch(rubric, /focus_get`? at the START of every turn|non-negotiable for chat\/Discord/i, lane);
-    assert.match(rubric, /Current Focus(?: block)? is already injected/i, lane);
-    assert.match(rubric, /only when (?:the user )?explicitly/i, lane);
+    assert.match(rubric, /Current Focus(?: block)? is (?:already )?injected/i, lane);
+    assert.match(rubric, /focus_get[^.\n]*(?:only when (?:the user )?explicitly|only for explicit)/i, lane);
   }
 });
 
-test('interaction contract: clarification is at most one beat, never a required closing question', () => {
+test('interaction contract: exploration is model-led while execution-ready ambiguity stays bundled', () => {
   for (const rubric of [ORCHESTRATOR_INSTRUCTIONS, CLAUDE_BRAIN_RUBRIC]) {
-    assert.match(rubric, /at most ONE/i);
-    assert.match(rubric, /precise request means act immediately/i);
-    assert.match(rubric, /\[confirm-first\].*(?:exception|required fresh-turn beat)/is);
+    assert.match(rubric, /exploration is not execution/i);
+    assert.match(rubric, /stay conversational for as many useful turns as needed/i);
+    assert.match(rubric, /Act when the request is precise or the user clearly commits/i);
+    assert.match(rubric, /ask one plain question bundling it/i);
+    assert.match(rubric, /\[confirm-first\].*fresh-turn beat/is);
+    assert.doesNotMatch(rubric, /at most ONE (?:steering|consultative) beat/i);
+    assert.doesNotMatch(rubric, /The moment the user answers, EXECUTE/i);
     assert.doesNotMatch(rubric, /END your reply with ONE concrete offer/i);
   }
 });

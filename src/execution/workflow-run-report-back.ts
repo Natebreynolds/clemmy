@@ -16,6 +16,7 @@ import {
   workflowTerminalOutcomeMatchesReport,
   type WorkflowTerminalOutcome,
 } from './workflow-terminal-outcome.js';
+import { updateLinkedFocusAction } from '../memory/focus.js';
 
 export type WorkflowRunReportBackOutcome = 'done' | 'blocked' | 'failed';
 
@@ -403,8 +404,18 @@ export function recordAndAttemptWorkflowRunReportBack(
   filePath: string,
   input: Omit<WorkflowRunReportBackEnvelope, 'version' | 'acknowledgedOriginSessionIds'>,
 ): boolean {
-  return checkpointWorkflowRunReportBack(filePath, input)
-    && attemptWorkflowRunReportBack(filePath);
+  const checkpointed = checkpointWorkflowRunReportBack(filePath, input);
+  if (!checkpointed) return false;
+  const run = readRunRecordUnlocked(filePath);
+  if (run) {
+    updateLinkedFocusAction(run.id, {
+      status: input.outcome === 'done' ? 'done' : 'blocked',
+      note: input.outcome === 'done'
+        ? 'Completed and reported back.'
+        : input.detail.replace(/\s+/g, ' ').trim().slice(0, 240),
+    });
+  }
+  return attemptWorkflowRunReportBack(filePath);
 }
 
 /** True when delivery failed, its aggregate marker is missing, or a late
@@ -448,6 +459,12 @@ export function deliverWorkflowRunOutcome(
     acknowledgedOriginSessionIds: [],
   };
   const delivered = deliverToOrigins(run, envelope);
+  updateLinkedFocusAction(run.id, {
+    status: outcome === 'done' ? 'done' : 'blocked',
+    note: outcome === 'done'
+      ? 'Completed and reported back.'
+      : detail.replace(/\s+/g, ' ').trim().slice(0, 240),
+  });
   const required = workflowRunReportBackOrigins(run);
   return delivered.complete
     && required.complete

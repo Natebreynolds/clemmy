@@ -141,7 +141,7 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
   const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
   for (const n of ro) assert.ok(auth.has(n), `authoring must be a superset of read-only (missing ${n})`);
-  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role']) {
+  for (const n of ['workflow_create', 'goal_upsert', 'space_save', 'pending_action_queue', 'pending_action_execute', 'set_model_role', 'focus_get', 'focus_set', 'focus_update']) {
     assert.ok(auth.has(n), `authoring must include ${n}`);
   }
 });
@@ -165,7 +165,7 @@ test('SDK worker == read-only ∪ agentic; brain-only fan-out excluded', () => {
     assert.ok(worker.has(n), `worker must include ${n}`);
   }
   // A worker must NEVER get the fan-out/batch/execution primitives (no worker-spawns-worker).
-  for (const n of ['run_worker', 'run_batch', 'execution_create']) {
+  for (const n of ['run_worker', 'run_batch', 'execution_create', 'focus_get', 'focus_set', 'focus_update']) {
     assert.ok(!worker.has(n), `worker must NOT include the brain-only primitive ${n}`);
   }
 });
@@ -183,11 +183,11 @@ test('JIT core surface: mandated members present, JIT-able tools absent', () => 
   // always-loaded CORE must keep the tools whose JIT-pruning caused a live incident,
   // and must NOT swallow the intent-evident JIT-able tools (which retrieval brings back).
   const core = asSet(TOOL_JIT_MANDATED);
-  for (const n of ['focus_get', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
+  for (const n of ['focus_get', 'focus_set', 'focus_update', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
     assert.ok(core.has(n), `JIT core must include mandated ${n}`);
   }
   // These are intent-evident / discoverable — they must stay JIT-able, not core.
-  for (const n of ['workflow_run', 'space_save', 'delegate_task', 'convert_to_markdown', 'add_cron_job']) {
+  for (const n of ['workflow_run', 'space_save', 'delegate_task', 'convert_to_markdown', 'add_cron_job', 'focus_activate', 'focus_clear', 'focus_park', 'focus_touch']) {
     assert.ok(!core.has(n), `JIT core must NOT include the JIT-able tool ${n}`);
   }
 });

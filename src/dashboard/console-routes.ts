@@ -43,7 +43,7 @@ import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js'
 import { countActiveFacts, FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
-import { MEMORY_DB_PATH, openMemoryDb } from '../memory/db.js';
+import { MEMORY_DB_PATH, openMemoryDb, type FocusRow } from '../memory/db.js';
 import { auditMemoryReadiness } from '../memory/readiness.js';
 import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
 import { recallMemory } from '../memory/recall-memory.js';
@@ -54,6 +54,7 @@ import { listMemoryPolicies, readTemporalEvidenceHealth, reconcileTemporalEviden
 import { applyMemoryFix, detectMemoryHealCandidates, dismissMemoryFix } from '../memory/self-heal.js';
 import {
   getFocusSnapshot,
+  getFocusWorkstate,
   activateFocus as activateFocusRow,
   parkFocus as parkFocusRow,
   clearFocus as clearFocusRow,
@@ -2438,6 +2439,25 @@ interface BoardFailureSummary {
   failedItems: number;
   retryable: boolean;
   reason: string;
+}
+
+/**
+ * User-facing projection of Current Focus.
+ *
+ * metadata_json is an internal extension seam and may contain unrelated
+ * provider/runtime bookkeeping. The console gets only the normalized shared
+ * notebook so every surface renders the same bounded, validated shape.
+ */
+type ConsoleFocusView = Omit<FocusRow, 'metadata_json'> & {
+  workstate: ReturnType<typeof getFocusWorkstate>;
+};
+
+function consoleFocusView(row: FocusRow): ConsoleFocusView {
+  const { metadata_json: _metadataJson, ...focus } = row;
+  return {
+    ...focus,
+    workstate: getFocusWorkstate(row),
+  };
 }
 
 /** One normalized card on the Tasks board (see GET /api/console/board). */
@@ -11680,8 +11700,8 @@ export function registerConsoleRoutes(
           try {
             const snap = getFocusSnapshot();
             return {
-              active: snap.active,
-              parked: snap.parked,
+              active: snap.active ? consoleFocusView(snap.active) : null,
+              parked: snap.parked.map((row) => consoleFocusView(row)),
               parkedCount: snap.parked.length,
               needsConfirm: snap.needsConfirm,
             };
@@ -11752,8 +11772,8 @@ export function registerConsoleRoutes(
     try {
       const snap = getFocusSnapshot();
       res.json({
-        active: snap.active,
-        parked: snap.parked,
+        active: snap.active ? consoleFocusView(snap.active) : null,
+        parked: snap.parked.map((row) => consoleFocusView(row)),
         needsConfirm: snap.needsConfirm,
       });
     } catch (err) {

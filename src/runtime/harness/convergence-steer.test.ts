@@ -1,10 +1,9 @@
 /**
  * Run: npx tsx --test src/runtime/harness/convergence-steer.test.ts
  *
- * The lane-agnostic convergence detector: after Clem asks a clarifying question
- * and the user answers, the next turn gets an EXECUTE-now steer — the enforceable
- * backstop to the "it kept asking me redundant questions" regression, on BOTH the
- * Codex/GPT loop lane and the Claude SDK brain lane.
+ * The lane-agnostic convergence detector: after Clem asks a question and the
+ * user answers, the next turn carries the answer forward without re-asking it
+ * or treating every exploratory reply as permission to execute.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import path from 'node:path';
@@ -113,12 +112,14 @@ test('kill-switch CLEMMY_BRAIN_CONVERGE=off disables the steer', () => {
   if (prev !== undefined) process.env.CLEMMY_BRAIN_CONVERGE = prev;
 });
 
-test('the steer text tells the model to execute and not re-ask / not stack a background offer', () => {
-  assert.match(CONVERGENCE_STEER, /EXECUTE the work this turn/);
-  assert.match(CONVERGENCE_STEER, /preserve its exact identifiers, labels, paths, quantities/i);
-  assert.match(CONVERGENCE_STEER, /do not normalize or paraphrase/i);
-  assert.match(CONVERGENCE_STEER, /changes letter case only, never spelling, plurality, or word choice/i);
-  assert.match(CONVERGENCE_STEER, /do NOT ask another separate clarifying question/);
+test('the steer preserves answers without forcing exploratory conversation into execution', () => {
+  assert.match(CONVERGENCE_STEER, /never re-ask the resolved point/i);
+  assert.match(CONVERGENCE_STEER, /Preserve exact identifiers, labels, paths, quantities/i);
+  assert.match(CONVERGENCE_STEER, /do not normalize a literal value/i);
+  assert.match(CONVERGENCE_STEER, /If the user has now committed or the request is execution-ready, act autonomously/i);
+  assert.match(CONVERGENCE_STEER, /still comparing, brainstorming, shaping, or deciding, continue that conversation naturally/i);
+  assert.match(CONVERGENCE_STEER, /not automatic permission for external writes or durable execution/i);
+  assert.doesNotMatch(CONVERGENCE_STEER, /you now have enough|EXECUTE the work this turn/i);
   assert.match(CONVERGENCE_STEER, /background/i);
   assert.match(CONVERGENCE_STEER, /changed topics/i);
 });

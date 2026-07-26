@@ -30,6 +30,12 @@ const {
 } = await import('./workflow-run-report-back.js');
 const { cancelWorkflowRunAtBoundary } = await import('./workflow-run-cancellation.js');
 const { runWorkflowWatchdog } = await import('./workflow-watchdog.js');
+const {
+  createFocus,
+  getActiveFocus,
+  getFocusWorkstate,
+  linkFocusActionForSession,
+} = await import('../memory/focus.js');
 
 test.after(() => {
   _setWorkflowRunReportBackBeforeCheckpointLockForTests();
@@ -112,6 +118,36 @@ test('failed origin write stays unacknowledged and a later retry marks notified 
     new SessionStore().get(origin).turns.filter((turn) => turn.text.startsWith(`[workflow run ${runId} `)).length,
     1,
   );
+});
+
+test('terminal workflow report-back reconciles the linked conversation action', () => {
+  const runId = 'report-linked-workstate';
+  const origin = 'report-linked-origin';
+  createFocus({
+    resourceRef: `session:${origin}`,
+    title: 'Weekly planning',
+    summary: 'Run the agreed calendar update.',
+    resourceKind: 'thread',
+    relatedSessionId: origin,
+  });
+  assert.equal(linkFocusActionForSession(origin, {
+    id: runId,
+    label: 'Calendar update',
+    status: 'running',
+    kind: 'workflow',
+    ref: runId,
+  })?.status, 'updated');
+
+  const file = writeRun(runId, origin);
+  assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+    workflowName: 'Calendar update',
+    outcome: 'done',
+    detail: 'Three dinner blocks were created and verified.',
+  }), true);
+
+  const action = getFocusWorkstate(getActiveFocus())?.actions.find((item) => item.ref === runId);
+  assert.equal(action?.status, 'done');
+  assert.equal(action?.note, 'Completed and reported back.');
 });
 
 test('crash-after-delivery retry treats the existing idempotent turn as an acknowledgement', () => {

@@ -27,6 +27,8 @@ import { cn } from '@/lib/cn';
 import { BoardColumn } from '@/components/board/BoardColumn';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
 import { NowStrip } from '@/components/board/NowStrip';
+import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
+import { listFocusSnapshot } from '@/lib/focus';
 import {
   listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
   findBoardCardForRun, reconcileOpenBoardCard, resolveBoardRunSelection,
@@ -39,6 +41,7 @@ export function BackgroundTasks() {
   const qc = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const board = usePoll(['board'], listBoard, 4000);
+  const focus = usePoll(['focus'], listFocusSnapshot, 4000);
   const cards = useMemo(() => board.data?.cards ?? [], [board.data]);
 
   const [active, setActive] = useState<BoardCard | null>(null);
@@ -200,6 +203,8 @@ export function BackgroundTasks() {
 
       {/* Live "running now" rail — rides the telemetry SSE, independent of the
           board poll, so swarms / tool calls / brain switches show as they happen. */}
+      <CollaborativeWorkstate snapshot={focus.data} className="mb-4" />
+
       <NowStrip cards={cards} onOpen={setOpen} />
 
       {board.isLoading ? (

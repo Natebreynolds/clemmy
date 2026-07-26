@@ -122,7 +122,6 @@ import {
   resolveArtifactRunScopeId,
   type RunArtifact,
 } from './artifact-ledger.js';
-import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
   STRUCTURED_OUTPUT_RECOVERY_FALLBACK,
@@ -520,15 +519,6 @@ function turnHasDurableMemoryCaptureEvidence(sessionId: string, turn: number): b
         && Number((event.data as { queuedCandidateCount?: unknown }).queuedCandidateCount ?? 0) > 0);
   } catch {
     return false;
-  }
-}
-
-function safeMaybeAutoFocus(sessionId: string, summaryHint?: unknown): void {
-  try {
-    maybeAutoFocusSession({ sessionId, summaryHint });
-  } catch (err) {
-    // Focus is a context aid, not a reason to fail the user's turn.
-    console.warn('[harness] auto-focus failed', err instanceof Error ? err.message : err);
   }
 }
 
@@ -5708,7 +5698,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         toolCalls: toolCounter.currentCount,
       },
     });
-    safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
     // Post-turn hooks (correction detection then auto-credit) via the ONE shared
     // spine — identical on every brain lane. New post-turn behavior wires there.
     runPostTurnHooks({
@@ -6146,7 +6135,6 @@ export async function resumePendingApproval(
         toolCalls: toolCounter.currentCount,
       },
     });
-    safeMaybeAutoFocus(options.sessionId, outcome.finalOutput);
     // A resumed turn has no memory primer; credit only tool-recorded recall
     // runs. The resumed state's full history stands in for "this turn's"
     // items — any run credited here was recorded during the resume itself.

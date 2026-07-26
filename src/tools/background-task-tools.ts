@@ -14,6 +14,7 @@ import { getActiveGoalForSession, holdTaskForLater, listHeldTasks, getHeldTask }
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { linkFocusActionForSession, updateLinkedFocusAction } from '../memory/focus.js';
 import { textResult } from './shared.js';
 
 /** Split an agreed plan (markdown bullets / numbered lines) into discrete next
@@ -153,6 +154,10 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       if (!task) {
         return textResult(`Task ${id} was not found or is already terminal, so its contract was not changed.`);
       }
+      updateLinkedFocusAction(task.id, {
+        status: 'running',
+        note: `Course-corrected to contract v${task.contractVersion ?? 1}; reconciling saved work.`,
+      });
       return textResult(
         `Updated ${task.id} to contract v${task.contractVersion ?? 1}. `
         + `The same durable task will reconcile saved work at its next model boundary; prior evidence policy: ${evidencePolicy}.`,
@@ -214,6 +219,14 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         },
       });
       const goal = getActiveGoalForSession(task.runSessionId);
+      linkFocusActionForSession(sessionId, {
+        id: task.id,
+        label: task.title,
+        status: 'running',
+        kind: 'background',
+        ref: task.id,
+        note: goal ? 'Bound to its durable goal contract.' : undefined,
+      });
 
       return textResult(
         `Dispatched "${task.title}" to the background (task ${task.id})`
@@ -285,6 +298,14 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       if (!result) {
         return textResult(`I found the held task "${id}" but could not queue it — try again or re-state the task.`);
       }
+      linkFocusActionForSession(getToolOutputContext()?.sessionId, {
+        id: result.task.id,
+        label: result.task.title,
+        status: 'running',
+        kind: 'background',
+        ref: result.task.id,
+        note: `Resumed from held task ${id}.`,
+      });
       return textResult(
         `Picking "${result.task.title}" back up — it's now running in the background (task ${result.task.id}) bound to its goal, and will report back HERE when done. `
         + `Tell the user it's resumed + running; do NOT do the work yourself this turn.`,

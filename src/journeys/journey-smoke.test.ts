@@ -29,6 +29,7 @@ process.env.AUTH_MODE = 'claude_oauth';
 process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
 process.env.CLEMMY_CONFIRM_BEAT = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
+process.env.CLEMMY_PROACTIVE_REPORT_DEFER = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
   accessToken: 'sk-ant-oat01-journey-token',
@@ -61,8 +62,16 @@ const {
   resetDataQualityForTest,
 } = await import('../tools/composio-tools.js');
 const { listNotifications } = await import('../runtime/notifications.js');
+const { setProactiveReportFireForTest } = await import('../runtime/outcome.js');
 
-after(() => {
+setProactiveReportFireForTest(async () => { /* passive outcome turns are asserted directly */ });
+
+after(async () => {
+  // Outcome delivery schedules its optional proactive relay fire-and-forget.
+  // Keep the no-provider stub installed until those microtasks have crossed
+  // their dynamic-import boundary, then remove the isolated temp home.
+  await new Promise<void>((resolve) => setTimeout(resolve, 400));
+  setProactiveReportFireForTest(null);
   _setBridgeImplsForTests({});
   resetHarnessRuntimeConfig();
   resetEventLog();
@@ -70,6 +79,7 @@ after(() => {
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_CONFIRM_BEAT;
   delete process.env.CLEMMY_DEBATE_MODE;
+  delete process.env.CLEMMY_PROACTIVE_REPORT_DEFER;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 

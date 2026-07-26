@@ -28,7 +28,8 @@
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
-import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
+import { getActiveObjective, getFocusSnapshot, getFocusWorkstate } from '../memory/focus.js';
+import type { FocusRow } from '../memory/db.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderRunStrategiesForContext } from '../memory/run-strategy-store.js';
@@ -51,6 +52,61 @@ import {
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
   return `## ${title}\n${body.trim()}`;
+}
+
+const FOCUS_WORKSTATE_PROMPT_MAX_CHARS = 6_000;
+const FOCUS_WORKSTATE_LINE_MAX_CHARS = 180;
+
+function compactFocusWorkstateLine(value: string): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (compact.length <= FOCUS_WORKSTATE_LINE_MAX_CHARS) return compact;
+  return `${compact.slice(0, FOCUS_WORKSTATE_LINE_MAX_CHARS - 1).trimEnd()}…`;
+}
+
+function renderBoundedLines(label: string, values: string[], limit = 8): string[] {
+  if (values.length === 0) return [];
+  const shown = values.slice(0, limit);
+  const lines = [`${label}:`, ...shown.map((value) => `  - ${compactFocusWorkstateLine(value)}`)];
+  if (values.length > shown.length) {
+    lines.push(`  - … +${values.length - shown.length} more saved; use focus_get only if needed`);
+  }
+  return lines;
+}
+
+/** Compact, provider-neutral rendering of the shared conversational notebook. */
+function renderFocusWorkstateForInstructions(row: FocusRow): string {
+  const state = getFocusWorkstate(row);
+  if (!state) return '';
+  const candidates = [...state.candidates]
+    .sort((a, b) => {
+      const rank = { selected: 0, considering: 1, rejected: 2 } as const;
+      return rank[a.status] - rank[b.status];
+    })
+    .map((item) =>
+      `[${item.status}] ${item.id}: ${item.label}`
+      + (item.note ? ` — ${item.note}` : '')
+      + (item.ref ? ` (${item.ref})` : ''),
+    );
+  const actions = state.actions.map((item) =>
+    `[${item.status}] ${item.id}: ${item.label}`
+    + (item.kind ? ` · ${item.kind}` : '')
+    + (item.ref ? ` · ${item.ref}` : '')
+    + (item.note ? ` — ${item.note}` : ''),
+  );
+  const rendered = [
+    `Shared workstate v${state.version}${state.mode ? ` · ${state.mode}` : ''} (advisory facts, not a required plan):`,
+    ...(state.objective ? [`Objective: ${compactFocusWorkstateLine(state.objective)}`] : []),
+    ...renderBoundedLines('Candidates', candidates),
+    ...renderBoundedLines('Constraints', state.constraints, 5),
+    ...renderBoundedLines('Decisions', state.decisions, 5),
+    ...renderBoundedLines('Open loops', state.openLoops, 5),
+    ...renderBoundedLines('Linked actions', actions),
+  ].join('\n');
+  if (rendered.length <= FOCUS_WORKSTATE_PROMPT_MAX_CHARS) return rendered;
+  const suffix = '\n… shared notebook truncated; use focus_get only if needed';
+  const maxBody = FOCUS_WORKSTATE_PROMPT_MAX_CHARS - suffix.length;
+  const lineBreak = rendered.lastIndexOf('\n', maxBody);
+  return `${rendered.slice(0, lineBreak > 0 ? lineBreak : maxBody).trimEnd()}${suffix}`;
 }
 
 /**
@@ -139,14 +195,18 @@ export function renderFocusForInstructions(opts?: {
   try {
     const snap = getFocusSnapshot();
     if (snap.active && !snap.needsConfirm) {
-      focus = focusSummaryIsHistoricalForRequest(snap.active, opts?.input, opts?.sessionId)
-        ? renderHistoricalFocusPointer(snap.active)
-        : [
-            `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
-            `Summary: ${snap.active.summary}`,
-            `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
-            `Last touched: ${snap.active.last_touched_at}`,
-          ].join('\n');
+      if (focusSummaryIsHistoricalForRequest(snap.active, opts?.input, opts?.sessionId)) {
+        focus = renderHistoricalFocusPointer(snap.active);
+      } else {
+        const workstate = renderFocusWorkstateForInstructions(snap.active);
+        focus = [
+          `ACTIVE focus #${snap.active.id}: ${snap.active.title}`,
+          `Summary: ${snap.active.summary}`,
+          `Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`,
+          `Last touched: ${snap.active.last_touched_at}`,
+          ...(workstate ? [workstate] : []),
+        ].join('\n');
+      }
       if (snap.parked.length > 0) {
         focus += `\n\nParked (resumable via focus_activate):\n`
           + snap.parked.slice(0, 5).map((p) => `  - #${p.id} ${p.title}`).join('\n');

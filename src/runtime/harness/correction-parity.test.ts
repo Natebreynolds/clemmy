@@ -26,11 +26,13 @@ for (const lane of LANES) {
   });
 }
 
-// The seam itself must contain BOTH halves of the credit loop.
-test('the post-turn spine runs correction detection AND auto-credit', () => {
+// The seam itself must contain BOTH halves of the credit loop plus the shared
+// continuity hook. This keeps auto-focus provider-neutral too.
+test('the post-turn spine runs correction detection, auto-credit, AND auto-focus', () => {
   const src = readFileSync(path.join(here, 'post-turn.ts'), 'utf8');
   assert.match(src, /safeDetectCorrection\(/, 'the spine must run correction detection');
   assert.match(src, /autoCreditRecallRuns\(/, 'the spine must run auto-credit');
+  assert.match(src, /maybeAutoFocusSession\(/, 'the spine must run provider-neutral auto-focus');
 });
 
 // No lane may reach past the seam and call a post-turn hook directly. This is
@@ -43,5 +45,6 @@ for (const lane of LANES) {
     const src = readFileSync(path.join(here, lane), 'utf8');
     assert.doesNotMatch(src, /\bautoCreditRecallRuns\s*\(/, `${lane} must not call auto-credit outside the seam`);
     assert.doesNotMatch(src, /\bsafeDetectCorrection\s*\(/, `${lane} must not call correction detection outside the seam`);
+    assert.doesNotMatch(src, /\bmaybeAutoFocusSession\s*\(/, `${lane} must not call auto-focus outside the seam`);
   });
 }

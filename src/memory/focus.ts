@@ -235,6 +235,8 @@ export interface UpdateFocusInput {
   title?: string;
   summary?: string;
   resourceKind?: string;
+  /** Latest chat surface that explicitly continued this focus. */
+  relatedSessionId?: string;
 }
 export function updateFocus(id: number, patch: UpdateFocusInput): FocusRow | null {
   const db = openMemoryDb();
@@ -245,24 +247,405 @@ export function updateFocus(id: number, patch: UpdateFocusInput): FocusRow | nul
   const newTitle = (patch.title ?? '').trim() || existing.title;
   const newSummary = (patch.summary ?? '').trim() || existing.summary;
   const newKind = patch.resourceKind === undefined ? existing.resource_kind : (patch.resourceKind || null);
+  const newRelatedSessionId = patch.relatedSessionId === undefined
+    ? existing.related_session_id
+    : patch.relatedSessionId.trim() || existing.related_session_id;
   const info = db.prepare(`
     UPDATE current_focus
-    SET title=?, summary=?, resource_kind=?,
+    SET title=?, summary=?, resource_kind=?, related_session_id=?,
         last_touched_at=?, confirm_after=?
     WHERE id=?
-  `).run(newTitle, newSummary, newKind, now, confirmAfterFromNow(), id);
+  `).run(newTitle, newSummary, newKind, newRelatedSessionId, now, confirmAfterFromNow(), id);
   if (info.changes > 0) emitChange('set');
   return getFocusById(id);
 }
 
-export function touchFocus(id: number): FocusRow | null {
+/**
+ * Sparse conversational workstate stored inside current_focus.metadata_json.
+ *
+ * This is a shared notebook, not a workflow/state-machine contract: the model
+ * decides how to reason and when to move. The runtime only persists material
+ * decisions so a long conversation, provider switch, or background handoff
+ * does not erase what the user already chose.
+ */
+export type FocusWorkMode = 'explore' | 'decide' | 'execute' | 'monitor';
+export type FocusCandidateStatus = 'considering' | 'selected' | 'rejected';
+export type FocusActionStatus = 'planned' | 'running' | 'blocked' | 'done';
+export type FocusActionKind = 'background' | 'workflow' | 'external' | 'local' | 'other';
+
+export interface FocusWorkstateCandidate {
+  id: string;
+  label: string;
+  status: FocusCandidateStatus;
+  note?: string;
+  ref?: string;
+}
+
+export interface FocusWorkstateAction {
+  id: string;
+  label: string;
+  status: FocusActionStatus;
+  kind?: FocusActionKind;
+  ref?: string;
+  note?: string;
+}
+
+export interface FocusWorkstate {
+  version: number;
+  updatedAt: string;
+  mode?: FocusWorkMode;
+  objective?: string;
+  candidates: FocusWorkstateCandidate[];
+  constraints: string[];
+  decisions: string[];
+  openLoops: string[];
+  actions: FocusWorkstateAction[];
+}
+
+export interface FocusWorkstatePatch {
+  clear?: boolean;
+  mode?: FocusWorkMode | null;
+  objective?: string | null;
+  upsertCandidates?: FocusWorkstateCandidate[];
+  removeCandidateIds?: string[];
+  addConstraints?: string[];
+  removeConstraints?: string[];
+  addDecisions?: string[];
+  removeDecisions?: string[];
+  /** Replacement semantics: pass [] when all open loops are resolved. */
+  openLoops?: string[];
+  upsertActions?: FocusWorkstateAction[];
+  removeActionIds?: string[];
+}
+
+export interface PatchFocusWorkstateResult {
+  status: 'updated' | 'cleared' | 'conflict' | 'not_found';
+  row: FocusRow | null;
+  workstate: FocusWorkstate | null;
+  actualVersion: number;
+}
+
+const WORKSTATE_LIMITS = {
+  candidates: 48,
+  constraints: 24,
+  decisions: 24,
+  openLoops: 24,
+  actions: 32,
+} as const;
+
+function cleanWorkstateText(value: unknown, maxChars: number): string {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+function parseFocusMetadata(row: Pick<FocusRow, 'metadata_json'> | null | undefined): Record<string, unknown> {
+  if (!row?.metadata_json) return {};
+  try {
+    const parsed = JSON.parse(row.metadata_json) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function cleanStringList(value: unknown, maxItems: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of value) {
+    const item = cleanWorkstateText(raw, 300);
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function cleanCandidate(value: unknown): FocusWorkstateCandidate | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<FocusWorkstateCandidate>;
+  const id = cleanWorkstateText(raw.id, 80);
+  const label = cleanWorkstateText(raw.label, 200);
+  if (!id || !label || !['considering', 'selected', 'rejected'].includes(String(raw.status))) return null;
+  const note = cleanWorkstateText(raw.note, 300);
+  const ref = cleanWorkstateText(raw.ref, 300);
+  return {
+    id,
+    label,
+    status: raw.status as FocusCandidateStatus,
+    ...(note ? { note } : {}),
+    ...(ref ? { ref } : {}),
+  };
+}
+
+function cleanAction(value: unknown): FocusWorkstateAction | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<FocusWorkstateAction>;
+  const id = cleanWorkstateText(raw.id, 100);
+  const label = cleanWorkstateText(raw.label, 200);
+  if (!id || !label || !['planned', 'running', 'blocked', 'done'].includes(String(raw.status))) return null;
+  const kind = ['background', 'workflow', 'external', 'local', 'other'].includes(String(raw.kind))
+    ? raw.kind as FocusActionKind
+    : undefined;
+  const ref = cleanWorkstateText(raw.ref, 300);
+  const note = cleanWorkstateText(raw.note, 300);
+  return {
+    id,
+    label,
+    status: raw.status as FocusActionStatus,
+    ...(kind ? { kind } : {}),
+    ...(ref ? { ref } : {}),
+    ...(note ? { note } : {}),
+  };
+}
+
+function normalizeStoredWorkstate(value: unknown): FocusWorkstate | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<FocusWorkstate>;
+  const version = Number.isSafeInteger(raw.version) && Number(raw.version) > 0
+    ? Number(raw.version)
+    : 1;
+  const updatedAt = cleanWorkstateText(raw.updatedAt, 40) || nowIso();
+  const mode = ['explore', 'decide', 'execute', 'monitor'].includes(String(raw.mode))
+    ? raw.mode as FocusWorkMode
+    : undefined;
+  const objective = cleanWorkstateText(raw.objective, 500);
+  const candidates = Array.isArray(raw.candidates)
+    ? raw.candidates.map(cleanCandidate).filter((item): item is FocusWorkstateCandidate => Boolean(item))
+      .slice(0, WORKSTATE_LIMITS.candidates)
+    : [];
+  const actions = Array.isArray(raw.actions)
+    ? raw.actions.map(cleanAction).filter((item): item is FocusWorkstateAction => Boolean(item))
+      .slice(0, WORKSTATE_LIMITS.actions)
+    : [];
+  return {
+    version,
+    updatedAt,
+    ...(mode ? { mode } : {}),
+    ...(objective ? { objective } : {}),
+    candidates,
+    constraints: cleanStringList(raw.constraints, WORKSTATE_LIMITS.constraints),
+    decisions: cleanStringList(raw.decisions, WORKSTATE_LIMITS.decisions),
+    openLoops: cleanStringList(raw.openLoops, WORKSTATE_LIMITS.openLoops),
+    actions,
+  };
+}
+
+export function getFocusWorkstate(row: Pick<FocusRow, 'metadata_json'> | null | undefined): FocusWorkstate | null {
+  return normalizeStoredWorkstate(parseFocusMetadata(row).workstate);
+}
+
+function mergeStringList(
+  current: string[],
+  additions: unknown,
+  removals: unknown,
+  maxItems: number,
+): string[] {
+  const removed = new Set(cleanStringList(removals, maxItems));
+  return cleanStringList(
+    [...current.filter((item) => !removed.has(item)), ...cleanStringList(additions, maxItems)],
+    maxItems,
+  );
+}
+
+function upsertById<T extends { id: string }>(current: T[], incoming: T[], maxItems: number): T[] {
+  const next = [...current];
+  for (const item of incoming) {
+    const at = next.findIndex((existing) => existing.id === item.id);
+    if (at >= 0) next[at] = item;
+    else next.push(item);
+  }
+  return next.slice(0, maxItems);
+}
+
+/**
+ * Atomically patch one focus's shared notebook. expectedVersion is optional for
+ * ordinary single-writer chat turns; background/runtime writers should pass it
+ * when they need optimistic concurrency.
+ */
+export function patchFocusWorkstate(
+  id: number,
+  patch: FocusWorkstatePatch,
+  expectedVersion?: number,
+): PatchFocusWorkstateResult {
+  const db = openMemoryDb();
+  const apply = db.transaction((): PatchFocusWorkstateResult => {
+    const row = db.prepare(`SELECT * FROM current_focus WHERE id=?`).get(id) as FocusRow | undefined;
+    if (!row || (row.status !== 'active' && row.status !== 'paused')) {
+      return { status: 'not_found', row: row ?? null, workstate: null, actualVersion: 0 };
+    }
+    const metadata = parseFocusMetadata(row);
+    const current = normalizeStoredWorkstate(metadata.workstate);
+    const actualVersion = current?.version ?? 0;
+    if (expectedVersion !== undefined && expectedVersion !== actualVersion) {
+      return { status: 'conflict', row, workstate: current, actualVersion };
+    }
+
+    const now = nowIso();
+    if (patch.clear) {
+      delete metadata.workstate;
+      db.prepare(`
+        UPDATE current_focus
+        SET metadata_json=?, last_touched_at=?, confirm_after=?
+        WHERE id=?
+      `).run(JSON.stringify(metadata), now, confirmAfterFromNow(), id);
+      return {
+        status: 'cleared',
+        row: db.prepare(`SELECT * FROM current_focus WHERE id=?`).get(id) as FocusRow,
+        workstate: null,
+        actualVersion: 0,
+      };
+    }
+
+    const base: FocusWorkstate = current ?? {
+      version: 0,
+      updatedAt: now,
+      candidates: [],
+      constraints: [],
+      decisions: [],
+      openLoops: [],
+      actions: [],
+    };
+    const removedCandidateIds = new Set(
+      cleanStringList(patch.removeCandidateIds, WORKSTATE_LIMITS.candidates),
+    );
+    const incomingCandidates = Array.isArray(patch.upsertCandidates)
+      ? patch.upsertCandidates.map(cleanCandidate)
+        .filter((item): item is FocusWorkstateCandidate => Boolean(item))
+      : [];
+    const removedActionIds = new Set(
+      cleanStringList(patch.removeActionIds, WORKSTATE_LIMITS.actions),
+    );
+    const incomingActions = Array.isArray(patch.upsertActions)
+      ? patch.upsertActions.map(cleanAction)
+        .filter((item): item is FocusWorkstateAction => Boolean(item))
+      : [];
+    const mode = patch.mode === null
+      ? undefined
+      : patch.mode ?? base.mode;
+    const objective = patch.objective === null
+      ? undefined
+      : cleanWorkstateText(patch.objective, 500) || base.objective;
+    const next: FocusWorkstate = {
+      version: actualVersion + 1,
+      updatedAt: now,
+      ...(mode ? { mode } : {}),
+      ...(objective ? { objective } : {}),
+      candidates: upsertById(
+        base.candidates.filter((item) => !removedCandidateIds.has(item.id)),
+        incomingCandidates,
+        WORKSTATE_LIMITS.candidates,
+      ),
+      constraints: mergeStringList(
+        base.constraints,
+        patch.addConstraints,
+        patch.removeConstraints,
+        WORKSTATE_LIMITS.constraints,
+      ),
+      decisions: mergeStringList(
+        base.decisions,
+        patch.addDecisions,
+        patch.removeDecisions,
+        WORKSTATE_LIMITS.decisions,
+      ),
+      openLoops: patch.openLoops === undefined
+        ? base.openLoops
+        : cleanStringList(patch.openLoops, WORKSTATE_LIMITS.openLoops),
+      actions: upsertById(
+        base.actions.filter((item) => !removedActionIds.has(item.id)),
+        incomingActions,
+        WORKSTATE_LIMITS.actions,
+      ),
+    };
+    metadata.workstate = next;
+    db.prepare(`
+      UPDATE current_focus
+      SET metadata_json=?, last_touched_at=?, confirm_after=?
+      WHERE id=?
+    `).run(JSON.stringify(metadata), now, confirmAfterFromNow(), id);
+    return {
+      status: 'updated',
+      row: db.prepare(`SELECT * FROM current_focus WHERE id=?`).get(id) as FocusRow,
+      workstate: next,
+      actualVersion: next.version,
+    };
+  });
+  const result = apply();
+  if (result.status === 'updated' || result.status === 'cleared') emitChange('set');
+  return result;
+}
+
+/**
+ * Best-effort runtime link from a chat-dispatched action into the active
+ * conversational notebook. Automatic graph edges require an exact owning
+ * session. A user can continue the same focus on another surface by explicitly
+ * touching/evolving/activating it there, which rebinds that continuity identity.
+ */
+export function linkFocusActionForSession(
+  sessionId: string | undefined,
+  action: FocusWorkstateAction,
+): PatchFocusWorkstateResult | null {
+  if (!sessionId) return null;
+  try {
+    const snap = getFocusSnapshot();
+    if (!snap.active || snap.needsConfirm) return null;
+    const active = snap.active;
+    const resourceSessionId = active.resource_ref.startsWith('session:')
+      ? active.resource_ref.slice('session:'.length)
+      : undefined;
+    const ownerSessionIds = new Set(
+      [active.related_session_id, resourceSessionId].filter((value): value is string => Boolean(value)),
+    );
+    if (ownerSessionIds.size !== 1 || !ownerSessionIds.has(sessionId)) return null;
+    return patchFocusWorkstate(active.id, { upsertActions: [action] });
+  } catch {
+    return null;
+  }
+}
+
+/** Reconcile a terminal/blocked runtime outcome into any non-terminal focus
+ * that already links the exact task/run ref. No model bookkeeping required. */
+export function updateLinkedFocusAction(
+  ref: string,
+  patch: Pick<FocusWorkstateAction, 'status'> & { note?: string },
+): number {
+  const normalizedRef = cleanWorkstateText(ref, 300);
+  if (!normalizedRef) return 0;
+  let updated = 0;
+  try {
+    for (const row of listFocuses({ includeTerminal: false, limit: 50 })) {
+      const workstate = getFocusWorkstate(row);
+      const existing = workstate?.actions.find((action) =>
+        action.ref === normalizedRef || action.id === normalizedRef,
+      );
+      if (!existing) continue;
+      const result = patchFocusWorkstate(row.id, {
+        upsertActions: [{
+          ...existing,
+          status: patch.status,
+          ...(patch.note ? { note: cleanWorkstateText(patch.note, 300) } : {}),
+        }],
+      });
+      if (result.status === 'updated') updated += 1;
+    }
+  } catch {
+    return updated;
+  }
+  return updated;
+}
+
+export function touchFocus(id: number, relatedSessionId?: string): FocusRow | null {
   const db = openMemoryDb();
   const now = nowIso();
   const info = db.prepare(`
     UPDATE current_focus
-    SET last_touched_at=?, confirm_after=?
+    SET related_session_id=COALESCE(?, related_session_id),
+        last_touched_at=?, confirm_after=?
     WHERE id=? AND status='active'
-  `).run(now, confirmAfterFromNow(), id);
+  `).run(relatedSessionId?.trim() || null, now, confirmAfterFromNow(), id);
   if (info.changes > 0) emitChange('touch');
   return getFocusById(id);
 }
@@ -279,10 +662,14 @@ export function parkFocus(id: number, reason?: string): FocusRow | null {
   return getFocusById(id);
 }
 
-export function activateFocus(id: number): FocusRow | null {
+export function activateFocus(id: number, relatedSessionId?: string): FocusRow | null {
   const target = getFocusById(id);
   if (!target) return null;
-  if (target.status === 'active') return target;
+  if (target.status === 'active') {
+    return relatedSessionId?.trim()
+      ? updateFocus(id, { relatedSessionId })
+      : target;
+  }
   if (target.status !== 'paused') return null; // refuse to reactivate completed/abandoned
   parkActiveIfPresent('switched to another paused focus');
   const db = openMemoryDb();
@@ -290,9 +677,10 @@ export function activateFocus(id: number): FocusRow | null {
   const info = db.prepare(`
     UPDATE current_focus
     SET status='active', parked_at=NULL, parked_reason=NULL,
+        related_session_id=COALESCE(?, related_session_id),
         last_touched_at=?, confirm_after=?
     WHERE id=?
-  `).run(now, confirmAfterFromNow(), id);
+  `).run(relatedSessionId?.trim() || null, now, confirmAfterFromNow(), id);
   if (info.changes > 0) emitChange('activate');
   return getFocusById(id);
 }

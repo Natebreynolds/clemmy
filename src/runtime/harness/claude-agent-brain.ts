@@ -719,7 +719,6 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
   if (mode === 'full') {
     return [
       'CAPABILITY — you are the AGENTIC Clementine brain on the user\'s Claude subscription. You CAN execute tools to complete the request: run shell commands (run_shell_command), discover + execute Composio actions (composio_search_tools → composio_execute_tool), write files, and chain multi-step work — exactly like the Codex harness.',
-      '- CONVERSE FIRST on an AMBIGUOUS or big multi-step request: recall what you can, then ask ONE plain clarifying question with `ask_user_question` about the choice that genuinely changes the work (e.g. new topic vs. resume prior work, which source/destination) and WAIT for the answer. Do NOT decide you "know enough" and run the whole task unasked. Once aligned — or when the request is already unambiguous — proceed AUTONOMOUSLY to completion; do not stop again mid-run. (A pure question or a read-only lookup: just do it, no clarifying question.)',
       '- Every tool call runs through Clementine\'s safety gates (grounding, goal-fidelity, execution-wrap, destination, duplicate-write, loop-guard). Irreversible/external actions (sends, batch external writes) PAUSE for the user\'s approval BEFORE they run. Do the work — the gates + approval protect it; you do not need to ask permission in prose first.',
       '- SURFACE NOTE: the intent-matched native vendor MCP servers for THIS turn (e.g. a native dataforseo/firecrawl/supabase MCP) ARE attached on this lane — their tool schemas load on demand via tool search (surfaced by name, fetched when you call them). When a skill or instruction says "use the <X> MCP", use that native server/tool directly. Fall back to composio_search_tools → composio_execute_tool (e.g. a DATAFORSEO_* slug) or run_shell_command (the vendor CLI) only when no native server is attached for the need. Use ONE surface per capability — do not pull the same data from two surfaces in the same run.',
       '- Before a MUTATING external write (a composio send/create, a batch), call execution_create FIRST (title, objective, successCriteria), then proceed — the harness requires an active execution lane for those.',
@@ -736,7 +735,6 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
     '- You may create workflows with steps tagged by intent and usesSkill. For design/report requests, prefer a read-only design/report step with intent:"design" and usesSkill set to the requested skill name.',
     '- Do not call shell, file-write, external Composio execution, external sends, admin, credential, plugin, or deletion tools. Those are intentionally not exposed here.',
     '- Do not claim you ran a workflow, created a workflow, changed model routing, or saved memory unless the corresponding tool result in this run proves it.',
-    '- Keep talking first for ambiguous multi-step or external-write requests. Ask one steering question when the next action would commit the user to a workflow shape or external side effect.',
   ].join('\n');
 }
 
@@ -1092,11 +1090,9 @@ async function buildClaudeAgentBrainTurnContext(
   try { pitfalls = knownPitfallLineForInput(request.message ?? '') ?? ''; } catch { pitfalls = ''; }
   let harnessHealth = '';
   try { harnessHealth = renderHarnessCapabilityHealthForContext({ limit: 3 }); } catch { harnessHealth = ''; }
-  // CONVERGENCE (one beat, then execute): if Clem's PREVIOUS turn asked the user a
-  // clarifying question and they just answered it, bias hard toward EXECUTION this
-  // turn — the enforceable backstop to the "back-to-back questions" friction where
-  // the brain drips a second/third separate question turn-by-turn instead of
-  // planning once and acting (2026-07-09). Kill-switch CLEMMY_BRAIN_CONVERGE=off.
+  // CONVERGENCE: carry the user's answer forward and forbid re-asking the
+  // resolved point, without turning every exploratory reply into permission to
+  // execute. Kill-switch CLEMMY_BRAIN_CONVERGE=off.
   let convergenceSteer = '';
   if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(request.sessionId)) {
     convergenceSteer = CONVERGENCE_STEER;

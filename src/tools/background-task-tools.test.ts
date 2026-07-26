@@ -17,7 +17,9 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { backgroundRouteForOriginSession, registerBackgroundTaskTools } = await import('./background-task-tools.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
-const { createBackgroundTask, getBackgroundTask } = await import('../execution/background-tasks.js');
+const { createBackgroundTask, getBackgroundTask, markBackgroundTaskDone } = await import('../execution/background-tasks.js');
+const { createFocus, getActiveFocus, getFocusWorkstate } = await import('../memory/focus.js');
+const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -110,4 +112,46 @@ test('background_task_revise versions the same durable task through the model-fa
   assert.equal(updated?.runSessionId, task.runSessionId);
   assert.equal(updated?.contractVersion, 2);
   assert.equal(updated?.contractRevisions?.[0]?.instruction, 'Use the corrected source list and revalidate prior research.');
+});
+
+test('dispatch_background_task links and terminally reconciles the shared conversation workstate', async () => {
+  type ToolHandler = (input: Record<string, unknown>) => Promise<{ content?: Array<{ text?: string }> }>;
+  const handlers = new Map<string, ToolHandler>();
+  registerBackgroundTaskTools({
+    tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
+      handlers.set(name, handler);
+    },
+  } as never);
+  const dispatch = handlers.get('dispatch_background_task');
+  assert.ok(dispatch);
+
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'meal planning' });
+  createFocus({
+    resourceRef: `session:${session.id}`,
+    title: 'Meal planning',
+    summary: 'Update the recipe base after choosing this week’s meals.',
+    resourceKind: 'thread',
+    relatedSessionId: session.id,
+  });
+
+  const output = await withToolOutputContext({ sessionId: session.id }, () => dispatch!({
+    objective: 'Add the three selected dinners to the recipe base.',
+    handoff_note: 'I’m updating the recipe base now and will report back here.',
+    plan: '- Add only the selected recipes\n- Verify all three saved records',
+    success_criteria: ['Exactly three verified records exist'],
+    context_refs: [],
+    max_minutes: 15,
+  }));
+  const text = output.content?.[0]?.text ?? '';
+  const taskId = text.match(/task (bg-[a-zA-Z0-9_-]+)/)?.[1];
+  assert.ok(taskId, `dispatch returns a durable task id (got: ${text.slice(0, 240)})`);
+
+  const running = getFocusWorkstate(getActiveFocus())?.actions.find((action) => action.ref === taskId);
+  assert.equal(running?.kind, 'background');
+  assert.equal(running?.status, 'running');
+
+  markBackgroundTaskDone(taskId!, 'Verified three selected recipes in the base.');
+  const completed = getFocusWorkstate(getActiveFocus())?.actions.find((action) => action.ref === taskId);
+  assert.equal(completed?.status, 'done');
+  assert.equal(completed?.note, 'Completed and reported back.');
 });

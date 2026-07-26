@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { resetMemoryDb } = await import('../memory/db.js');
-const { createFocus } = await import('../memory/focus.js');
+const { createFocus, patchFocusWorkstate } = await import('../memory/focus.js');
 const { renderHarnessMemoryContext } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
@@ -180,6 +180,91 @@ test('stale focus is not rendered as active persistent context', () => {
   } finally {
     delete process.env.CLEMMY_FOCUS_CONFIRM_MS;
   }
+});
+
+test('Current Focus injects a compact shared workstate across provider contexts', () => {
+  resetMemoryDb();
+  const focus = createFocus({
+    resourceRef: 'session:meal-plan',
+    title: 'Weeknight meal plan',
+    summary: 'Comparing recipes before updating the user\'s systems.',
+    resourceKind: 'thread',
+    relatedSessionId: 'meal-plan',
+  });
+  patchFocusWorkstate(focus.id, {
+    mode: 'decide',
+    objective: 'Choose three vegetarian dinners and schedule them.',
+    upsertCandidates: [
+      { id: 'tacos', label: 'Black bean tacos', status: 'selected', note: 'Thursday' },
+      { id: 'curry', label: 'Chickpea curry', status: 'considering' },
+      { id: 'lasagna', label: 'Vegetable lasagna', status: 'rejected', note: 'Too slow' },
+    ],
+    addConstraints: ['Under 40 minutes'],
+    addDecisions: ['Black bean tacos are selected for Thursday'],
+    openLoops: ['Pick two more dinners'],
+    upsertActions: [
+      { id: 'airtable', label: 'Update recipe database', status: 'planned', kind: 'external' },
+    ],
+  });
+
+  const context = renderHarnessMemoryContext({
+    sessionId: 'meal-plan',
+    focusInput: 'What about the curry?',
+    partition: 'volatile',
+  });
+  assert.match(context, /Shared workstate v1 · decide \(advisory facts, not a required plan\)/);
+  assert.match(context, /\[selected\] tacos: Black bean tacos — Thursday/);
+  assert.match(context, /\[considering\] curry: Chickpea curry/);
+  assert.match(context, /Constraints:\n  - Under 40 minutes/);
+  assert.match(context, /Decisions:\n  - Black bean tacos are selected for Thursday/);
+  assert.match(context, /Open loops:\n  - Pick two more dinners/);
+  assert.match(context, /\[planned\] airtable: Update recipe database · external/);
+});
+
+test('Current Focus applies one hard prompt budget to an oversized shared workstate', () => {
+  resetMemoryDb();
+  const focus = createFocus({
+    resourceRef: 'session:bounded-workstate',
+    title: 'Bounded planning',
+    summary: 'A deliberately oversized notebook fixture.',
+    resourceKind: 'thread',
+    relatedSessionId: 'bounded-workstate',
+  });
+  const long = (label: string, index: number) => `${label} ${index} ${'x'.repeat(280)}`;
+  patchFocusWorkstate(focus.id, {
+    mode: 'monitor',
+    objective: 'o'.repeat(500),
+    upsertCandidates: Array.from({ length: 48 }, (_, index) => ({
+      id: `candidate-${index}`,
+      label: long('Candidate', index),
+      status: 'considering' as const,
+      note: long('Note', index),
+    })),
+    addConstraints: Array.from({ length: 24 }, (_, index) => long('Constraint', index)),
+    addDecisions: Array.from({ length: 24 }, (_, index) => long('Decision', index)),
+    openLoops: Array.from({ length: 24 }, (_, index) => long('Open loop', index)),
+    upsertActions: Array.from({ length: 32 }, (_, index) => ({
+      id: `action-${index}`,
+      label: long('Action', index),
+      status: 'running' as const,
+      kind: 'background' as const,
+      ref: `bg-${index}`,
+      note: long('Action note', index),
+    })),
+  });
+
+  const context = renderHarnessMemoryContext({
+    sessionId: 'bounded-workstate',
+    focusInput: 'How is it going?',
+    partition: 'volatile',
+  });
+  const start = context.indexOf('Shared workstate');
+  assert.ok(start >= 0);
+  const followingSection = context.indexOf('\n\n## ', start);
+  const rendered = context.slice(start, followingSection >= 0 ? followingSection : undefined);
+  assert.ok(rendered.length <= 6_000, `workstate prompt was ${rendered.length} chars`);
+  assert.match(rendered, /shared notebook truncated; use focus_get only if needed/);
+  assert.doesNotMatch(rendered, /x{180}/, 'individual notebook lines are compact too');
 });
 
 test('a fresh cross-session action gets the focus pointer but not historical receipts', () => {

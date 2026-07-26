@@ -79,6 +79,7 @@ import {
 } from './workflow-resolve.js';
 import { addNotification } from '../runtime/notifications.js';
 import { matchToolChoicesForStep, slugifyIntent, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import { linkFocusActionForSession } from '../memory/focus.js';
 import { analyzeWorkflowIntent, type WorkflowBuilderIntent } from '../execution/workflow-builder-analysis.js';
 import { synthesizeWorkflowDefinition, renderAnalysisForApproval } from '../execution/workflow-builder-synthesis.js';
 import { readDurableBindings, type RoleBinding } from '../runtime/harness/model-roles.js';
@@ -1423,9 +1424,20 @@ export function registerOrchestrationTools(server: McpServer): void {
       // terminal state (in-context report-back, in ADDITION to the global
       // notification). toolCtx is the agent's tool-output context resolved
       // above; absent for non-chat callers → notification-only.
-      return textResult(
-        queueWorkflowRun(canonicalName, normalizedInputs, { originSessionId: toolCtx?.sessionId }).message,
-      );
+      const queued = queueWorkflowRun(canonicalName, normalizedInputs, { originSessionId: toolCtx?.sessionId });
+      if (queued.id && (queued.status === 'queued' || queued.status === 'duplicate')) {
+        linkFocusActionForSession(toolCtx?.sessionId, {
+          id: queued.id,
+          label: canonicalName,
+          status: 'running',
+          kind: 'workflow',
+          ref: queued.id,
+          note: queued.status === 'duplicate'
+            ? 'Rejoined the already-running workflow; no duplicate was queued.'
+            : undefined,
+        });
+      }
+      return textResult(queued.message);
     },
   );
 

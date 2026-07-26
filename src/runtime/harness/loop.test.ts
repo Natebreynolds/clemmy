@@ -1914,7 +1914,7 @@ test('runConversation: stops on first completed decision', async () => {
   assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
 });
 
-test('runConversation: an answer to a genuine prior clarification reaches the standard provider lane with convergence state', async () => {
+test('runConversation: an answer reaches the standard lane with non-coercive convergence state', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   appendEvent({
@@ -1945,7 +1945,9 @@ test('runConversation: an answer to a genuine prior clarification reaches the st
 
   assert.equal(result.status, 'completed');
   assert.match(modelInput, /CONVERGE/);
-  assert.match(modelInput, /EXECUTE the work this turn/);
+  assert.match(modelInput, /never re-ask the resolved point/);
+  assert.match(modelInput, /not automatic permission for external writes or durable execution/);
+  assert.doesNotMatch(modelInput, /EXECUTE the work this turn/);
   const recordedInputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
   assert.equal(recordedInputs.at(-1)?.data.text, 'Use the win-back queue.');
   assert.ok(recordedInputs.every((event) => !String(event.data.text ?? '').includes('CONVERGE')), 'internal convergence text never enters durable user history');

@@ -28,6 +28,11 @@ const {
   activateFocus,
   clearFocus,
   getFocusSnapshot,
+  getFocusWorkstate,
+  patchFocusWorkstate,
+  linkFocusActionForSession,
+  updateLinkedFocusAction,
+  updateFocus,
   checkResourceMatchesFocus,
   extractNamedResource,
 } = await import('./focus.js');
@@ -170,6 +175,144 @@ test('getFocusSnapshot: needsConfirm false when fresh', () => {
   const snap = getFocusSnapshot();
   assert.equal(snap.needsConfirm, false);
   assert.equal(snap.active?.title, 'A');
+});
+
+test('shared workstate patches material conversational state without replacing focus metadata', () => {
+  resetMemoryDb();
+  const focus = createFocus({
+    resourceRef: 'session:meal-planning',
+    title: 'Meal planning',
+    summary: 'Comparing recipes before scheduling the selected meals.',
+    resourceKind: 'thread',
+    metadata: { source: 'test-auto-focus' },
+  });
+  const first = patchFocusWorkstate(focus.id, {
+    mode: 'explore',
+    objective: 'Choose three weeknight dinners.',
+    upsertCandidates: [
+      { id: 'tacos', label: 'Black bean tacos', status: 'considering' },
+      { id: 'curry', label: 'Chickpea curry', status: 'considering', note: 'User prefers mild.' },
+    ],
+    addConstraints: ['Under 40 minutes', 'Vegetarian'],
+    openLoops: ['Which nights should be cook nights?'],
+  });
+  assert.equal(first.status, 'updated');
+  assert.equal(first.actualVersion, 1);
+  assert.equal(first.workstate?.candidates.length, 2);
+  assert.equal(first.workstate?.mode, 'explore');
+  assert.equal(JSON.parse(first.row?.metadata_json ?? '{}').source, 'test-auto-focus');
+
+  const second = patchFocusWorkstate(focus.id, {
+    mode: 'decide',
+    upsertCandidates: [
+      { id: 'tacos', label: 'Black bean tacos', status: 'selected', note: 'Thursday meal.' },
+    ],
+    addDecisions: ['Use black bean tacos on Thursday'],
+    openLoops: [],
+  }, 1);
+  assert.equal(second.status, 'updated');
+  assert.equal(second.actualVersion, 2);
+  assert.equal(second.workstate?.candidates.find((item) => item.id === 'tacos')?.status, 'selected');
+  assert.deepEqual(second.workstate?.openLoops, []);
+  assert.deepEqual(getFocusWorkstate(second.row)?.decisions, ['Use black bean tacos on Thursday']);
+});
+
+test('shared workstate optimistic version refuses stale overwrite and clear preserves other metadata', () => {
+  resetMemoryDb();
+  const focus = createFocus({
+    resourceRef: 'session:planning',
+    title: 'Planning',
+    summary: 'A collaborative planning thread.',
+    metadata: { source: 'harness_auto_focus', keep: true },
+  });
+  const first = patchFocusWorkstate(focus.id, {
+    mode: 'execute',
+    addDecisions: ['Ship the selected three items'],
+  });
+  assert.equal(first.actualVersion, 1);
+
+  const conflict = patchFocusWorkstate(focus.id, {
+    addDecisions: ['Stale writer should not land'],
+  }, 0);
+  assert.equal(conflict.status, 'conflict');
+  assert.equal(conflict.actualVersion, 1);
+  assert.deepEqual(conflict.workstate?.decisions, ['Ship the selected three items']);
+
+  const cleared = patchFocusWorkstate(focus.id, { clear: true }, 1);
+  assert.equal(cleared.status, 'cleared');
+  assert.equal(getFocusWorkstate(cleared.row), null);
+  assert.deepEqual(JSON.parse(cleared.row?.metadata_json ?? '{}'), {
+    source: 'harness_auto_focus',
+    keep: true,
+  });
+});
+
+test('runtime actions link only to their owning thread and reconcile without model bookkeeping', () => {
+  resetMemoryDb();
+  const focus = createFocus({
+    resourceRef: 'session:meal-planning-chat',
+    title: 'Meal planning',
+    summary: 'Schedule the selected meals and update the shared recipe base.',
+    resourceKind: 'thread',
+    relatedSessionId: 'meal-planning-chat',
+  });
+
+  const wrongThread = linkFocusActionForSession('unrelated-chat', {
+    id: 'bg-wrong',
+    label: 'Wrong chat task',
+    status: 'running',
+    kind: 'background',
+    ref: 'bg-wrong',
+  });
+  assert.equal(wrongThread, null);
+  assert.equal(getFocusWorkstate(focus), null, 'a different chat cannot acquire this notebook');
+
+  const linked = linkFocusActionForSession('meal-planning-chat', {
+    id: 'bg-airtable',
+    label: 'Update recipe base',
+    status: 'running',
+    kind: 'background',
+    ref: 'bg-airtable',
+  });
+  assert.equal(linked?.status, 'updated');
+  assert.equal(linked?.workstate?.actions[0]?.status, 'running');
+
+  assert.equal(updateLinkedFocusAction('bg-airtable', {
+    status: 'done',
+    note: 'Verified 3 selected recipes in Airtable.',
+  }), 1);
+  const reconciled = getFocusWorkstate(getActiveFocus());
+  assert.equal(reconciled?.actions[0]?.status, 'done');
+  assert.equal(reconciled?.actions[0]?.note, 'Verified 3 selected recipes in Airtable.');
+});
+
+test('automatic action links require exact session ownership even for concrete resources', () => {
+  resetMemoryDb();
+  const focus = createFocus({
+    resourceRef: 'https://docs.google.com/spreadsheets/d/fixture-owned-sheet',
+    title: 'Owned planning sheet',
+    summary: 'Continue the sheet-backed planning work.',
+    resourceKind: 'sheet',
+    relatedSessionId: 'sheet-origin-chat',
+  });
+
+  assert.equal(linkFocusActionForSession('unrelated-chat', {
+    id: 'bg-unrelated',
+    label: 'Unrelated coding task',
+    status: 'running',
+    kind: 'background',
+    ref: 'bg-unrelated',
+  }), null);
+  assert.equal(getFocusWorkstate(focus), null, 'a global concrete focus cannot absorb an unrelated task');
+
+  updateFocus(focus.id, { relatedSessionId: 'continued-on-desktop' });
+  assert.equal(linkFocusActionForSession('continued-on-desktop', {
+    id: 'bg-related',
+    label: 'Continue the sheet work',
+    status: 'running',
+    kind: 'background',
+    ref: 'bg-related',
+  })?.status, 'updated');
 });
 
 test('checkResourceMatchesFocus ignores stale focus that needs confirmation', () => {

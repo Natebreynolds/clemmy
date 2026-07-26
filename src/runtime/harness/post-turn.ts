@@ -1,6 +1,7 @@
 import { autoCreditRecallRuns } from '../../memory/recall-auto-credit.js';
 import { safeDetectCorrection } from './correction-hook.js';
 import { appendEvent } from './eventlog.js';
+import { maybeAutoFocusSession } from './auto-focus.js';
 
 /**
  * The ONE post-turn hook spine every brain lane calls.
@@ -10,7 +11,7 @@ import { appendEvent } from './eventlog.js';
  * credit (correction detection) then positive credit (auto-credit) — with a
  * byte-identical recall_auto_credit event. Wiring a new behavior meant editing
  * every lane, and one lane silently missed a hook (the "two-lane trap"). Now the
- * pairing lives here: new post-turn behavior is added ONCE and every lane
+ * pairing and continuity hooks live here: new post-turn behavior is added ONCE and every lane
  * inherits it. Both SDK runtimes are preserved untouched — they just call the
  * same seam.
  *
@@ -75,5 +76,19 @@ export function runPostTurnHooks(input: PostTurnHookInput): void {
   } catch (err) {
     // Crediting is bookkeeping; it must never break the turn.
     console.warn('[harness] post-turn auto-credit failed', err instanceof Error ? err.message : err);
+  }
+
+  // Focus is a provider-neutral continuity aid. Keeping this in the shared
+  // spine prevents one brain from auto-pinning a sustained collaboration while
+  // another silently forgets it. maybeAutoFocusSession is conservative
+  // (chat-only, three substantive turns or strong tool/resource evidence) and
+  // never invents a workstate/plan.
+  try {
+    maybeAutoFocusSession({
+      sessionId: input.sessionId,
+      summaryHint: input.replyText,
+    });
+  } catch (err) {
+    console.warn('[harness] post-turn auto-focus failed', err instanceof Error ? err.message : err);
   }
 }

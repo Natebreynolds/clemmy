@@ -1493,6 +1493,7 @@ test('workflow_get notes a deterministic step whose runner file is missing (does
 // path, they fail.
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession: createJourneySession, appendEvent: appendJourneyEvent } = await import('../runtime/harness/eventlog.js');
+const { createFocus, getActiveFocus, getFocusWorkstate } = await import('../memory/focus.js');
 
 function writeSlackUpdatesWorkflow(): void {
   writeWorkflow('team-activity-slack-updates', {
@@ -1529,4 +1530,41 @@ test('journey: a clear paraphrase with a typo queues directly — no name-confir
     workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
   const text = resultText(result);
   assert.match(text, /Queued "team-activity-slack-updates"/, `paraphrased ask must queue, got: ${text.slice(0, 200)}`);
+});
+
+test('workflow_run links one durable action to the shared conversation workstate and rejoins duplicates', async () => {
+  writeSlackUpdatesWorkflow();
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'linked workflow journey' });
+  createFocus({
+    resourceRef: `session:${session.id}`,
+    title: 'Team activity update',
+    summary: 'Shape and run the agreed daily team update.',
+    resourceKind: 'thread',
+    relatedSessionId: session.id,
+  });
+
+  const first = await withToolOutputContext({ sessionId: session.id, callId: 'linked-run-1' }, () =>
+    workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  assert.match(resultText(first), /Queued "team-activity-slack-updates"/);
+  const [runFile] = workflowRunFiles();
+  assert.ok(runFile, 'one durable run was queued');
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFile), 'utf-8')) as { id: string };
+
+  let actions = getFocusWorkstate(getActiveFocus())?.actions ?? [];
+  assert.deepEqual(actions.map((action) => ({
+    ref: action.ref,
+    kind: action.kind,
+    status: action.status,
+  })), [{
+    ref: run.id,
+    kind: 'workflow',
+    status: 'running',
+  }]);
+
+  const duplicate = await withToolOutputContext({ sessionId: session.id, callId: 'linked-run-2' }, () =>
+    workflowRun()({ name: 'team-activity-slack-updates', inputs: '{}' }));
+  assert.match(resultText(duplicate), /No duplicate was queued/);
+  actions = getFocusWorkstate(getActiveFocus())?.actions ?? [];
+  assert.equal(actions.length, 1, 'rejoining a run updates its action rather than cloning it');
+  assert.match(actions[0].note ?? '', /already-running workflow/i);
 });

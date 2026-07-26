@@ -534,7 +534,7 @@ test('stable memory freezing is opt-in and supports explicit invalidation', () =
   invalidateStableMemorySnapshot();
 });
 
-test('CONVERGE guard: after the user answers a clarifying question, the turn context steers toward EXECUTION (one beat, no turn-by-turn re-ask)', async () => {
+test('CONVERGE guard: an answer carries forward without forcing exploratory work into execution', async () => {
   process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
   delete process.env.CLEMMY_BRAIN_CONVERGE;
   const sid = createSession({ kind: 'chat' }).id;
@@ -544,9 +544,10 @@ test('CONVERGE guard: after the user answers a clarifying question, the turn con
   // Clem's PREVIOUS turn ended by asking a clarifying question (awaiting-user completion).
   appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed', data: { awaitingUser: true, summary: 'win-back action or closed-lost diagnosis?' } });
   const after = await renderClaudeAgentBrainTurnContext({ message: 'winback action please', sessionId: sid });
-  assert.match(after, /CONVERGE/, 'answering a clarifying question injects the execute-now steer');
-  assert.match(after, /EXECUTE the work this turn/);
-  assert.match(after, /do NOT ask another separate clarifying question/);
+  assert.match(after, /CONVERGE/, 'answering a question injects the continuity steer');
+  assert.match(after, /never re-ask the resolved point/);
+  assert.match(after, /not automatic permission for external writes or durable execution/);
+  assert.doesNotMatch(after, /EXECUTE the work this turn/);
   // An approval card (approval_requested) is NOT a clarifying question — it must not trip the steer.
   const sid2 = createSession({ kind: 'chat' }).id;
   appendEvent({ sessionId: sid2, turn: 1, role: 'system', type: 'conversation_completed', data: { summary: 'done, sent 3 emails' } });
@@ -580,7 +581,7 @@ test('spine confirm beat: each new consequential intent aligns; an old completio
   assert.equal(continuedDecision?.data.phase, 'align');
 });
 
-test('Claude SDK dispatch receives convergence state on a clarification answer', async () => {
+test('Claude SDK dispatch receives non-coercive convergence state on a clarification answer', async () => {
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_TOOL_JIT = 'off';
   const sid = createSession({ kind: 'chat' }).id;
@@ -604,7 +605,8 @@ test('Claude SDK dispatch receives convergence state on a clarification answer',
 
   assert.equal(response.text, 'Built the win-back queue.');
   assert.match(capturedTurnContext, /CONVERGE/);
-  assert.match(capturedTurnContext, /EXECUTE the work this turn/);
+  assert.match(capturedTurnContext, /never re-ask the resolved point/);
+  assert.doesNotMatch(capturedTurnContext, /EXECUTE the work this turn/);
 });
 
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {
@@ -2170,7 +2172,9 @@ test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-inpu
     'awaiting_user_input_reply',
   );
   assert.match(nextTurnContext, /CONVERGE/);
-  assert.match(nextTurnContext, /EXECUTE the work this turn/);
+  assert.match(nextTurnContext, /never re-ask the resolved point/);
+  assert.match(nextTurnContext, /not automatic permission for external writes or durable execution/);
+  assert.doesNotMatch(nextTurnContext, /EXECUTE the work this turn/);
 });
 
 test('respondViaClaudeAgentSdkBrain persists a material plain-text clarification as awaiting-input', async () => {

@@ -62,6 +62,7 @@ import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { capacityAdvice } from '../runtime/harness/capacity-advisor.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { recordRunStrategy } from '../memory/run-strategy-store.js';
+import { updateLinkedFocusAction } from '../memory/focus.js';
 import {
   evaluateLearningCandidate,
   recordLearningDecision,
@@ -1749,6 +1750,12 @@ function enqueueBackgroundTaskOutcomeTurn(
   outcome: BackgroundTaskOutcome,
   detail: string,
 ): boolean {
+  updateLinkedFocusAction(task.id, {
+    status: outcome === 'done' ? 'done' : 'blocked',
+    note: outcome === 'done'
+      ? 'Completed and reported back.'
+      : detail.replace(/\s+/g, ' ').trim().slice(0, 240),
+  });
   // Unified report-back (Move 4): one mechanism for every lane. Preserves the
   // `[background task <id> …]` prefix (idempotency + UI detect); the body is the
   // shared Outcome card. See src/runtime/outcome.ts.

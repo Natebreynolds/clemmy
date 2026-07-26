@@ -10,8 +10,46 @@ import {
   getFocusSnapshot,
   listFocuses,
   getFocusById,
+  getFocusWorkstate,
+  patchFocusWorkstate,
 } from '../memory/focus.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
+
+const workstateCandidateSchema = z.object({
+  id: z.string().min(1).max(80).describe('Stable short id reused when this candidate changes.'),
+  label: z.string().min(1).max(200),
+  status: z.enum(['considering', 'selected', 'rejected']),
+  note: z.string().max(300).optional(),
+  ref: z.string().max(300).optional(),
+});
+
+const workstateActionSchema = z.object({
+  id: z.string().min(1).max(100).describe('Stable short id, or the durable run/task id when one exists.'),
+  label: z.string().min(1).max(200),
+  status: z.enum(['planned', 'running', 'blocked', 'done']),
+  kind: z.enum(['background', 'workflow', 'external', 'local', 'other']).optional(),
+  ref: z.string().max(300).optional(),
+  note: z.string().max(300).optional(),
+});
+
+const workstatePatchSchema = z.object({
+  expected_version: z.number().int().min(0).optional()
+    .describe('Optional optimistic version from Current Focus; a mismatch refuses the patch instead of overwriting newer state.'),
+  clear: z.boolean().optional().describe('Remove the workstate notebook while preserving the focus and its other metadata.'),
+  mode: z.enum(['explore', 'decide', 'execute', 'monitor']).nullable().optional(),
+  objective: z.string().max(500).nullable().optional(),
+  upsert_candidates: z.array(workstateCandidateSchema).max(48).optional(),
+  remove_candidate_ids: z.array(z.string().min(1).max(80)).max(48).optional(),
+  add_constraints: z.array(z.string().min(1).max(300)).max(24).optional(),
+  remove_constraints: z.array(z.string().min(1).max(300)).max(24).optional(),
+  add_decisions: z.array(z.string().min(1).max(300)).max(24).optional(),
+  remove_decisions: z.array(z.string().min(1).max(300)).max(24).optional(),
+  open_loops: z.array(z.string().min(1).max(300)).max(24).optional()
+    .describe('Replace the current open-loop list; pass [] when every open question is resolved.'),
+  upsert_actions: z.array(workstateActionSchema).max(32).optional(),
+  remove_action_ids: z.array(z.string().min(1).max(100)).max(32).optional(),
+});
 
 /**
  * Current Focus tool surface — the assistant's working-memory attention
@@ -37,6 +75,19 @@ export function registerFocusTools(server: McpServer): void {
         lines.push(`  Summary: ${snap.active.summary}`);
         lines.push(`  Resource: ${snap.active.resource_ref}${snap.active.resource_kind ? ` (${snap.active.resource_kind})` : ''}`);
         lines.push(`  Last touched: ${snap.active.last_touched_at}`);
+        const workstate = getFocusWorkstate(snap.active);
+        if (workstate) {
+          lines.push(`  Workstate: v${workstate.version}${workstate.mode ? ` · ${workstate.mode}` : ''}`);
+          if (workstate.objective) lines.push(`    Objective: ${workstate.objective}`);
+          if (workstate.candidates.length > 0) {
+            lines.push(`    Candidates: ${workstate.candidates.map((item) => `${item.label} [${item.status}]`).join('; ')}`);
+          }
+          if (workstate.decisions.length > 0) lines.push(`    Decisions: ${workstate.decisions.join('; ')}`);
+          if (workstate.openLoops.length > 0) lines.push(`    Open loops: ${workstate.openLoops.join('; ')}`);
+          if (workstate.actions.length > 0) {
+            lines.push(`    Actions: ${workstate.actions.map((item) => `${item.label} [${item.status}]`).join('; ')}`);
+          }
+        }
         if (snap.needsConfirm) {
           lines.push(`  ⚠ NEEDS CONFIRM — idle since ${snap.active.last_touched_at}. Ask: "still on \"${snap.active.title}\" or new topic?" before doing other work.`);
         }
@@ -68,12 +119,15 @@ export function registerFocusTools(server: McpServer): void {
     },
     async ({ resource_ref, title, summary, resource_kind, related_session_id, related_goal_id }) => {
       try {
+        const ambientSessionId = getToolOutputContext()?.sessionId;
         const focus = createFocus({
           resourceRef: resource_ref,
           title,
           summary,
           resourceKind: resource_kind,
-          relatedSessionId: related_session_id,
+          // The runtime context is the trustworthy origin. The explicit field
+          // remains useful for CLI/tests where no ambient chat exists.
+          relatedSessionId: ambientSessionId ?? related_session_id,
           relatedGoalId: related_goal_id,
         });
         return textResult(`Pinned focus #${focus.id}: ${focus.title} (resource ${focus.resource_ref}). Any prior active focus has been parked and can be resumed via focus_activate.`);
@@ -85,17 +139,55 @@ export function registerFocusTools(server: McpServer): void {
 
   server.tool(
     'focus_update',
-    'Evolve an existing focus IN PLACE — same id, same active status, but updated title and/or summary. Use when the plan develops within a single focus (e.g. opening title "Q2 sheet · dropdowns" becomes "Q2 sheet · scoring 10/25 leads via firecrawl" after the user decides on the mechanism). Different from focus_set, which parks the prior and starts a new id. Bumps last_touched_at + extends the confirm window as a side effect.',
+    'Evolve an existing focus IN PLACE. Update title/summary when the thread changes, and optionally patch its sparse shared workstate after a MATERIAL conversational change (candidate, constraint, decision, open loop, or linked action). The workstate is a notebook of user-agreed facts, not a required plan and not per-turn bookkeeping. Different from focus_set, which starts a new id.',
     {
       id: z.number().int().positive(),
       title: z.string().min(1).max(120).optional(),
       summary: z.string().min(3).max(500).optional(),
       resource_kind: z.string().max(40).optional(),
+      workstate_patch: workstatePatchSchema.optional(),
     },
-    async ({ id, title, summary, resource_kind }) => {
-      const row = updateFocus(id, { title, summary, resourceKind: resource_kind });
+    async ({ id, title, summary, resource_kind, workstate_patch }) => {
+      const ambientSessionId = getToolOutputContext()?.sessionId;
+      let workstateResult: ReturnType<typeof patchFocusWorkstate> | undefined;
+      if (workstate_patch) {
+        workstateResult = patchFocusWorkstate(id, {
+          clear: workstate_patch.clear,
+          mode: workstate_patch.mode,
+          objective: workstate_patch.objective,
+          upsertCandidates: workstate_patch.upsert_candidates,
+          removeCandidateIds: workstate_patch.remove_candidate_ids,
+          addConstraints: workstate_patch.add_constraints,
+          removeConstraints: workstate_patch.remove_constraints,
+          addDecisions: workstate_patch.add_decisions,
+          removeDecisions: workstate_patch.remove_decisions,
+          openLoops: workstate_patch.open_loops,
+          upsertActions: workstate_patch.upsert_actions,
+          removeActionIds: workstate_patch.remove_action_ids,
+        }, workstate_patch.expected_version);
+        if (workstateResult.status === 'conflict') {
+          return textResult(
+            `focus_update conflict: focus #${id} workstate is now v${workstateResult.actualVersion}. `
+            + 'Use the injected Current Focus state (or focus_get if it is stale), merge the user\'s change, and retry once.',
+          );
+        }
+        if (workstateResult.status === 'not_found') {
+          return textResult(`focus_update: focus ${id} not found or not in an updatable state.`);
+        }
+      }
+      const row = updateFocus(id, {
+        title,
+        summary,
+        resourceKind: resource_kind,
+        relatedSessionId: ambientSessionId,
+      });
       if (!row) return textResult(`focus_update: focus ${id} not found or not in an updatable state.`);
-      return textResult(`Updated focus #${row.id}: ${row.title}. Summary: ${row.summary}.`);
+      const workstateSuffix = workstateResult?.status === 'cleared'
+        ? ' Shared workstate cleared.'
+        : workstateResult?.workstate
+          ? ` Shared workstate v${workstateResult.workstate.version}${workstateResult.workstate.mode ? ` (${workstateResult.workstate.mode})` : ''}.`
+          : '';
+      return textResult(`Updated focus #${row.id}: ${row.title}. Summary: ${row.summary}.${workstateSuffix}`);
     },
   );
 
@@ -104,7 +196,7 @@ export function registerFocusTools(server: McpServer): void {
     'Bump the last-touched time + reset the idle-confirm window for an active focus. Call when the current turn continues work on the active focus, so the model isn\'t prompted to confirm next time. Usually called implicitly when the model references the focus — explicit touch is for edge cases.',
     { id: z.number().int().positive() },
     async ({ id }) => {
-      const row = touchFocus(id);
+      const row = touchFocus(id, getToolOutputContext()?.sessionId);
       if (!row) return textResult(`focus_touch: no active focus with id ${id}`);
       return textResult(`Touched focus #${row.id} (${row.title}). Confirm window extended to ${row.confirm_after}.`);
     },
@@ -129,7 +221,7 @@ export function registerFocusTools(server: McpServer): void {
     'Resume a previously parked focus. Auto-parks any currently active focus. Use when the user returns to earlier work ("let\'s get back to the proposal").',
     { id: z.number().int().positive() },
     async ({ id }) => {
-      const row = activateFocus(id);
+      const row = activateFocus(id, getToolOutputContext()?.sessionId);
       if (!row) return textResult(`focus_activate: focus ${id} is not parked (or does not exist). Cannot reactivate completed/abandoned focuses.`);
       if (row.status !== 'active') return textResult(`focus_activate: focus ${id} is now ${row.status}, not active.`);
       return textResult(`Resumed focus #${row.id}: ${row.title}.`);
@@ -172,7 +264,7 @@ export function registerFocusTools(server: McpServer): void {
     async ({ id }) => {
       const row = getFocusById(id);
       if (!row) return textResult(`focus_inspect: no focus with id ${id}`);
-      return textResult(JSON.stringify(row, null, 2));
+      return textResult(JSON.stringify({ ...row, workstate: getFocusWorkstate(row) }, null, 2));
     },
   );
 }

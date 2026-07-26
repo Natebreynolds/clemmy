@@ -6,6 +6,7 @@ const MIN_RESOURCE_HITS = 2;
 const MIN_THREAD_TOOL_CALLS = 4;
 const MIN_THREAD_USER_INPUTS = 2;
 const MIN_SINGLE_TURN_THREAD_TOOL_CALLS = 8;
+const MIN_CONVERSATIONAL_TURNS = 3;
 const MAX_EVENT_SCAN = 240;
 
 export interface MaybeAutoFocusOptions {
@@ -97,6 +98,48 @@ function latestUserInput(events: EventRow[]): string {
     if (cleaned && !isInternalBoilerplate(cleaned)) return cleaned;
   }
   return '';
+}
+
+const CASUAL_ONLY_RE =
+  /^(?:hi|hey|hello|thanks|thank you|cool|great|nice|ok|okay|got it|sounds good|perfect|bye)[\s!.?]*$/i;
+const CONTINUATION_LANGUAGE_RE =
+  /(?:\b(?:what|how) about\b|^\s*(?:yes|no|maybe|also|instead|another|actually|that|those|these|it|let'?s|i (?:like|prefer|don'?t))\b)/i;
+const CONVERSATION_STOPWORDS = new Set([
+  'about', 'after', 'again', 'also', 'and', 'are', 'but', 'can', 'could', 'for',
+  'from', 'have', 'help', 'into', 'just', 'like', 'maybe', 'more', 'need', 'not',
+  'please', 'that', 'the', 'them', 'then', 'these', 'they', 'this', 'those',
+  'want', 'what', 'when', 'where', 'which', 'with', 'would', 'you', 'your',
+]);
+
+function conversationTokens(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase().match(/[a-z0-9][a-z0-9_-]{3,}/g)
+      ?.filter((token) => !CONVERSATION_STOPWORDS.has(token))
+      ?? [],
+  );
+}
+
+/**
+ * A real collaborative thread can become focus-worthy before any tool runs.
+ * Require three substantive user turns plus either explicit continuation
+ * language or a repeated topic token, so three unrelated one-off questions in
+ * a long-lived channel do not automatically become one focus.
+ */
+function isSustainedCollaborativeConversation(events: EventRow[]): boolean {
+  const messages = events
+    .filter((event) => event.type === 'user_input_received')
+    .map((event) => cleanLine((event.data as { text?: unknown }).text, 500))
+    .filter((text) => text.length >= 12 && !CASUAL_ONLY_RE.test(text) && !isInternalBoilerplate(text));
+  if (messages.length < MIN_CONVERSATIONAL_TURNS) return false;
+  const recent = messages.slice(-6);
+  if (recent.slice(1).some((text) => CONTINUATION_LANGUAGE_RE.test(text))) return true;
+  const tokenTurns = new Map<string, number>();
+  for (const message of recent) {
+    for (const token of conversationTokens(message)) {
+      tokenTurns.set(token, (tokenTurns.get(token) ?? 0) + 1);
+    }
+  }
+  return [...tokenTurns.values()].some((count) => count >= 2);
 }
 
 function makeTitle(summary: string, fallback: string): string {
@@ -214,7 +257,8 @@ export function maybeAutoFocusSession(options: MaybeAutoFocusOptions): AutoFocus
   const resource = bestResource(events);
   const qualifiesForThreadFocus =
     (toolCalls >= MIN_THREAD_TOOL_CALLS && userInputs >= MIN_THREAD_USER_INPUTS)
-    || toolCalls >= MIN_SINGLE_TURN_THREAD_TOOL_CALLS;
+    || toolCalls >= MIN_SINGLE_TURN_THREAD_TOOL_CALLS
+    || isSustainedCollaborativeConversation(events);
 
   if (!resource && !qualifiesForThreadFocus) return null;
 

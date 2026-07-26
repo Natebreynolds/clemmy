@@ -347,6 +347,11 @@ test('JIT classification guard: every rubric-named built-in is consciously CORE 
     'memory_pin', 'memory_restore', 'memory_list_facts',
     'task_add', 'task_update', 'task_list',
     'background_tasks_recent', 'background_task_status', 'background_task_revise', 'dispatch_background_task',
+    // Focus lifecycle is conditional and phrased explicitly by the user
+    // ("done", "move on", "save this for later", "back to X"). Keep the
+    // common get/set/update notebook surface core; retrieve these rarer state
+    // transitions only when that lifecycle intent is present.
+    'focus_activate', 'focus_clear', 'focus_park', 'focus_touch',
     // hold/resume are intent-evident ("hold it for later" / "pick up X") and held
     // tasks are named in the persistent context, so semantic retrieval surfaces them.
     'hold_task_for_later', 'resume_held_task',

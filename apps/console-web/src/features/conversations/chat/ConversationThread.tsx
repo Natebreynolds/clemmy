@@ -7,7 +7,10 @@ import { ChatBubble } from '@/components/chat/ChatBubble';
 import { useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
+import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
+import { listFocusSnapshot } from '@/lib/focus';
+import { usePoll } from '@/lib/poll';
 import { useSession } from '../hooks/useSession';
 import { useSessionMutations } from '../hooks/useSessionMutations';
 import { sessionKeys } from '../hooks/keys';
@@ -71,6 +74,7 @@ function Header({ session }: { session: Session }) {
 /** Live, continuable conversation — reuses the canonical harness chat loop. */
 function ContinuableThread({ session, history }: { session: Session; history: Turn[] }) {
   const qc = useQueryClient();
+  const focus = usePoll(['focus'], listFocusSnapshot, 4000);
   const chat = useChat({
     initialSessionId: rawId(session.id),
     initialMessages: historyToMessages(history),
@@ -103,6 +107,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       <Header session={session} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl space-y-5 px-6 py-6">
+          <CollaborativeWorkstate snapshot={focus.data} compact />
           {chat.messages.map((m) => (
             <ChatBubble
               key={m.id}

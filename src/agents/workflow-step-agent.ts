@@ -75,6 +75,16 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // Background-task lifecycle belongs to the origin conversation. A child
   // workflow step must not revise the contract of a sibling/parent run.
   'background_task_revise',
+  // Conversational focus/workstate belongs to the main brain. Stateless
+  // workers and workflow steps return evidence; they never steer the user's
+  // active thread or rewrite its shared notebook directly.
+  'focus_get',
+  'focus_set',
+  'focus_update',
+  'focus_touch',
+  'focus_park',
+  'focus_activate',
+  'focus_clear',
   // tool authoring
   'create_tool',
   // unbounded fan-out

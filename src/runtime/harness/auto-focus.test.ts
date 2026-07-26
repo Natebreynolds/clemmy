@@ -188,6 +188,75 @@ test('maybeAutoFocusSession pins a thread focus for substantive multi-turn work 
   assert.match(active?.title ?? '', /AI visibility outreach/);
 });
 
+test('maybeAutoFocusSession pins a sustained collaborative conversation before tools run', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'weeknight meal planning' });
+  for (const [turn, text] of [
+    [1, 'Help me plan dinners for next week.'],
+    [2, 'What about black bean tacos on Thursday?'],
+    [3, 'I like that, and I also want a mild curry.'],
+  ] as const) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text },
+    });
+  }
+
+  const result = maybeAutoFocusSession({
+    sessionId: sess.id,
+    summaryHint: { summary: 'Comparing weeknight recipes before choosing and scheduling them.' },
+  });
+
+  assert.ok(result);
+  assert.equal(getActiveFocus()?.resource_ref, `session:${sess.id}`);
+  assert.equal(getActiveFocus()?.resource_kind, 'thread');
+});
+
+test('maybeAutoFocusSession does not merge three unrelated one-off questions into a focus', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'general chat' });
+  for (const [turn, text] of [
+    [1, 'Explain binary search in plain English.'],
+    [2, 'Show tomorrow weather for Seattle.'],
+    [3, 'Draft a concise apology to my neighbor.'],
+  ] as const) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text },
+    });
+  }
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus(), null);
+});
+
+test('maybeAutoFocusSession does not treat repeated generic "I want" phrasing as continuity', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'unrelated requests' });
+  for (const [turn, text] of [
+    [1, 'I want a plain summary of binary search.'],
+    [2, 'I want tomorrow’s weather for Seattle.'],
+    [3, 'I want a short apology note for my neighbor.'],
+  ] as const) {
+    appendEvent({
+      sessionId: sess.id,
+      turn,
+      role: 'system',
+      type: 'user_input_received',
+      data: { text },
+    });
+  }
+
+  assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
+  assert.equal(getActiveFocus(), null);
+});
+
 test('maybeAutoFocusSession pins a thread focus for one-turn high-tool work', () => {
   resetAll();
   const sess = createSession({ kind: 'chat', title: 'research and draft a proposal' });

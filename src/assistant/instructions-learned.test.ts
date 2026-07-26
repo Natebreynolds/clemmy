@@ -68,7 +68,7 @@ test('tiered ON: Constitution (voice+reasoning+SOUL) stays in instructions; dyna
     const instr = buildAssistantInstructions(ctx, 'dashboard', 'action', 'send an outlook email');
     // Tier-1 always present (personality + reasoning never stripped):
     assert.match(instr, /Core Personality/, 'SOUL stays in the cached instructions');
-    assert.match(instr, /Ask ONE clarifying question/, 'reasoning rules stay in instructions');
+    assert.match(instr, /Treat exploration and execution differently/, 'reasoning rules stay in instructions');
     // Dynamic blocks are NOT in the instructions prefix anymore:
     assert.doesNotMatch(instr, /Remembered Tool Choices/, 'tool-choices left the cached prefix');
     assert.doesNotMatch(instr, /## Working Memory/, 'working-memory left the cached prefix');
