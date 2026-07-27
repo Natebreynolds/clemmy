@@ -139,6 +139,25 @@ test('multi-result objectives retain completeness verification after one success
   for (const objective of ['send the email', 'create a report', 'update this file']) {
     assert.equal(objectiveMayRequireMultipleResults(objective), false, objective);
   }
+  for (const objective of [
+    'return up to three real suggestions',
+    'return at most 10 records',
+    'find no more than 5 matching items',
+    'make one real call and return a maximum of 3 results',
+    'make one real call; do not write files, create tasks, or save memories',
+  ]) {
+    assert.equal(objectiveMayRequireMultipleResults(objective), false, `upper bound is not a quota: ${objective}`);
+  }
+  assert.equal(
+    objectiveMayRequireMultipleResults('return up to three suggestions from each of four sites'),
+    true,
+    'required multiplicity outside the optional result bound remains visible',
+  );
+  assert.equal(
+    objectiveMayRequireMultipleResults('do not create files, but send two emails'),
+    true,
+    'a positive deliverable after a negated clause remains visible',
+  );
 });
 
 test('fresh external-write requirement is destination-aware and ignores prohibitions/data fields', () => {

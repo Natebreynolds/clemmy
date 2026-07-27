@@ -18,6 +18,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-mcp-servers-t
 
 const {
   getOrCreateExternalMcpServers,
+  getOrCreateExternalMcpServerForTool,
   invalidateConfiguredMcpServers,
   mcpServersTestHooks,
   prewarmMcpServers,
@@ -116,6 +117,20 @@ test('multiple tool-pattern scopes for the same server set reuse one scoped base
   assert.deepEqual(state.scopedExternalBaseKeys, ['dataforseo']);
   assert.equal(state.scopedExternalViewKeys.length, 2, 'different caps/patterns remain distinct filtered views');
   assert.equal(state.allExternalBaseCreated, false);
+});
+
+test('exact on-demand tool dispatch reuses only its server-scoped base', () => {
+  const shim = getOrCreateExternalMcpServerForTool(
+    'dataforseo__dataforseo_labs_google_keyword_suggestions',
+  );
+  assert.match(shim.name, /mcp/i);
+  const state = mcpServersTestHooks.cacheState();
+  assert.equal(state.allExternalBaseCreated, false, 'exact dispatch must not cold-start every external server');
+  assert.deepEqual(state.scopedExternalBaseKeys, ['dataforseo']);
+  assert.throws(
+    () => getOrCreateExternalMcpServerForTool('missing__tool'),
+    /No enabled MCP server matches namespace/,
+  );
 });
 
 test('fail-open and allow-all still use the all-external base by design', async () => {

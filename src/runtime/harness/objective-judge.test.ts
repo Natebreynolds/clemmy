@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
+const { boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
 
 test('parseProgressVerdict: on-contract PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
   assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
@@ -151,6 +151,45 @@ test('buildObjectiveJudgePrompt includes the objective and the assistant respons
   const prompt = buildObjectiveJudgePrompt('build a report on X', 'Done — saved to /tmp/report.md');
   assert.match(prompt, /build a report on X/);
   assert.match(prompt, /\/tmp\/report\.md/);
+});
+
+test('judge contract treats upper bounds as ceilings and never authorizes forbidden retries', () => {
+  const prompt = buildObjectiveJudgePrompt(
+    'Make one call and return up to three results. Do not retry.',
+    'The verified call returned zero results.',
+  );
+  assert.match(JUDGE_SYSTEM_PROMPT, /ceiling, not a minimum/i);
+  assert.match(JUDGE_SYSTEM_PROMPT, /verification never grants authority/i);
+  assert.match(prompt, /returned zero results/i);
+});
+
+test('bounded attempt: a meaningful call with an honest empty result is terminal', () => {
+  assert.equal(
+    boundedAttemptResultIsTerminal(
+      'Make one real read-only call and return up to three suggestions. Do not retry.',
+      'The configured endpoint returned zero suggestions for that exact query.',
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    boundedAttemptResultIsTerminal(
+      'Make one real read-only call.',
+      'Done.',
+      true,
+    ),
+    false,
+    'a bare completion claim is not evidence of a bounded result',
+  );
+  assert.equal(
+    boundedAttemptResultIsTerminal(
+      'Make one real read-only call.',
+      'The endpoint returned zero results.',
+      false,
+    ),
+    false,
+    'request-bound meaningful tool evidence is required',
+  );
 });
 
 test('clipForJudge passes a sub-cap body through untouched', () => {

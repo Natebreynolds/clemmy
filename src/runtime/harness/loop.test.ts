@@ -2612,6 +2612,116 @@ test('objective judge: one successful send does not certify a plural objective',
   assert.equal(judgeInvoked, true);
 });
 
+test('objective judge: an upper-bound result count is not a quota after one meaningful lookup', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeInvoked = false;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'call_tool' };
+    const details = {
+      toolCall: {
+        callId: 'bounded-lookup-1',
+        arguments: JSON.stringify({
+          name: 'dataforseo__dataforseo_labs_google_keyword_suggestions',
+          args_json: '{"keyword":"clementine ai assistant","limit":3}',
+        }),
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit(
+      'agent_tool_end',
+      runContext,
+      { name: 'Orchestrator' },
+      tool,
+      '{"status_code":20000,"status_message":"Ok.","items":[]}',
+      details,
+    );
+    const decision = {
+      summary: 'zero verified suggestions',
+      reply: 'The one permitted DataForSEO call completed successfully and returned zero suggestions.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Make one real read-only call and return up to three real suggestions. Do not retry.',
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeInvoked = true;
+      return { done: false, reason: 'try another endpoint' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(judgeInvoked, false, '"up to three" is a ceiling, so one verified lookup is concrete completion evidence');
+});
+
+test('objective judge: a false verdict cannot widen an exhausted one-attempt contract', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  let judgeInvoked = false;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    runs += 1;
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'call_tool' };
+    const details = {
+      toolCall: {
+        callId: 'exact-one-lookup',
+        arguments: JSON.stringify({
+          name: 'dataforseo__dataforseo_labs_google_keyword_suggestions',
+          args_json: '{"keyword":"clementine ai assistant","limit":3}',
+        }),
+      },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit(
+      'agent_tool_end',
+      runContext,
+      { name: 'Orchestrator' },
+      tool,
+      '{"status_code":20000,"status_message":"Ok.","items":[]}',
+      details,
+    );
+    const decision = {
+      summary: 'zero verified suggestions',
+      reply: 'The endpoint returned zero suggestions for the exact query after the one allowed call.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Make exactly one read-only call and return exactly three suggestions. Do not retry.',
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeInvoked = true;
+      return { done: false, reason: 'Try an alternate tool to find three suggestions.' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(runs, 1, 'the verifier cannot authorize a second model/tool turn');
+  assert.equal(judgeInvoked, true, 'the plural exact-count objective is still audited');
+  const completion = listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+    .find((event) => event.data.door === 'completion');
+  assert.equal(completion?.data.pass, true);
+  assert.match(String(completion?.data.reason), /verification cannot authorize another attempt/i);
+});
+
 test('request-bound write evidence: stale execution receipts cannot certify a fresh external write', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

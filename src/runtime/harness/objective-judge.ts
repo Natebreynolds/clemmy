@@ -27,6 +27,8 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
   '- A plan, intention, or "I will work on this next" is NOT complete.',
   '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
+  '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry.',
+  '- Quantity language such as "up to N", "at most N", "no more than N", and "maximum N" is a CEILING, not a minimum. Zero through N verified results satisfies that quantity. Never reinterpret an upper bound as a quota.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
   '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
@@ -171,6 +173,31 @@ export function isPromiseShapedReply(reply?: string | null): boolean {
   // correction/acknowledgement, not a promise to perform this turn's work.
   if (/\b(?:going forward|from now on)\s+i'?ll\b/i.test(text)) return false;
   return PROMISE_PHRASE_RE.test(text) && !ARTIFACT_EVIDENCE_RE.test(text);
+}
+
+const BOUNDED_ATTEMPT_RE =
+  /\b(?:(?:make|run|perform|issue|use|do)\s+)?(?:(?:only|exactly|at\s+most|no\s+more\s+than)\s+)?(?:one|1)\s+(?:(?:real|single|read[- ]only)\s+){0,3}(?:call|request|query|lookup|attempt)\b|\b(?:do\s+not|don't|dont|never)\s+retry\b|\bno\s+retries\b/i;
+const HONEST_NEGATIVE_RESULT_RE =
+  /\b(?:no|zero|0)\s+(?:real\s+)?(?:results?|suggestions?|matches?|records?|items?|rows?|ideas?|options?|data)\b|\b(?:returned|found|produced|yielded|received)\s+(?:no|zero|0|none|nothing)\b|\b(?:none|nothing)\s+(?:(?:was|were)\s+)?(?:returned|found|matched|available|produced)\b|\b(?:could\s+not|couldn't|unable\s+to)\b[^.!?\n]{0,180}\b(?:because|due\s+to|unavailable|denied|failed|error|not\s+found)\b/i;
+
+/**
+ * Deterministic backstop for a verifier that tries to widen the user's
+ * execution contract. A successful meaningful tool call plus an honest
+ * empty/negative report is terminal when the user allowed only one attempt (or
+ * explicitly forbade retries). The language-model judge remains useful for
+ * missing artifacts, but it cannot turn its disagreement into new authority.
+ *
+ * This intentionally does NOT accept a bare "done" or a plan, and the caller
+ * must pass request-bound meaningful evidence. Fresh external writes have a
+ * separate deterministic receipt floor and must not use this read-result rule.
+ */
+export function boundedAttemptResultIsTerminal(
+  objective: string,
+  assistantResponse: string,
+  meaningfulToolEvidence: boolean,
+): boolean {
+  if (!meaningfulToolEvidence) return false;
+  return BOUNDED_ATTEMPT_RE.test(objective) && HONEST_NEGATIVE_RESULT_RE.test(assistantResponse);
 }
 
 /** Harness-injected inputs recorded as user_input_received that are NOT real

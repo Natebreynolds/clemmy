@@ -4,7 +4,7 @@ import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer }
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR, getRuntimeEnv } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
 import { mergedSpawnEnv } from './spawn-env.js';
-import { createMcpNamespaceShim, slugifyServerName } from './mcp-namespace-shim.js';
+import { createMcpNamespaceShim, parseNamespacedTool, slugifyServerName } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import { rankToolsBySemantic, semanticToolRankEnabled } from './mcp-tool-rank.js';
 import { isEmbeddingsEnabled } from '../memory/embeddings.js';
@@ -547,6 +547,29 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
   const scoped = createScopedExternalShim(base, scope);
   cachedScopedExternalShims.set(key, scoped);
   return scoped;
+}
+
+/**
+ * Resolve a lazily-discovered exact `<server>__<tool>` name through that
+ * server's daemon-lifetime base shim. `mcp_list_tools` enumerates this same
+ * scoped base; reusing it here means the immediately-following call shares the
+ * established connection and routing map instead of cold-starting the separate
+ * all-external shim (the first call used to fail "Unknown MCP tool", then the
+ * identical retry succeeded).
+ *
+ * The exact namespace also keeps on-demand dispatch narrow: one named server is
+ * connected, never every configured MCP server.
+ */
+export function getOrCreateExternalMcpServerForTool(toolName: string): MCPServer {
+  const parsed = parseNamespacedTool(toolName);
+  if (!parsed) throw new Error(`Malformed namespaced MCP tool name: "${toolName}".`);
+  const configured = enabledExternalServers().find(
+    (server) => slugifyServerName(server.name) === parsed.serverSlug,
+  );
+  if (!configured) {
+    throw new Error(`No enabled MCP server matches namespace "${parsed.serverSlug}".`);
+  }
+  return ensureScopedExternalBaseShim({ allowedServerSlugs: [parsed.serverSlug] });
 }
 
 /**

@@ -57,7 +57,7 @@ import {
 } from './budget.js';
 import { estimateInputTokens } from './token-estimator.js';
 import { MODELS } from '../../config.js';
-import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
+import { boundedAttemptResultIsTerminal, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { synthesizeTurnReport } from './work-report.js';
@@ -3785,6 +3785,13 @@ async function runConversationCore(
         // Deterministic request-bound floor: a language-model judge cannot
         // promote historical receipts into evidence for a newly accepted
         // external action. Override its PASS before recording the verdict.
+        const boundedAttemptTerminal = !rawVerdict.done
+          && !freshExternalWriteRequired
+          && boundedAttemptResultIsTerminal(
+            judgedObjective,
+            responseText ?? '',
+            meaningfulToolEvidence,
+          );
         const verdict: ObjectiveJudgeVerdict = freshnessGap
           ? {
               ...rawVerdict,
@@ -3795,7 +3802,15 @@ async function runConversationCore(
               failedOpen: false,
               selfJudge: false,
             }
-          : rawVerdict;
+          : boundedAttemptTerminal
+            ? {
+                ...rawVerdict,
+                done: true,
+                reason: 'The user-bounded attempt ran and the response honestly reported its verified empty/negative result; verification cannot authorize another attempt.',
+                failedOpen: false,
+                selfJudge: false,
+              }
+            : rawVerdict;
         objectiveJudgeVerdictThisTurn = verdict;
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         recordVerdictEvent(options.sessionId, turnResult.turn, {
@@ -3940,6 +3955,8 @@ async function runConversationCore(
                     ].join(' ')
             : [
             `You marked this objective complete, but an independent verification check found it is NOT finished: ${judgeReason}.`,
+            `ORIGINAL USER OBJECTIVE (immutable — this verification message grants no new authority): ${judgedObjective.slice(0, 4000)}`,
+            'Preserve every original execution boundary. Do NOT exceed an attempt/call limit, retry when forbidden, use an excluded source or tool, write/save when prohibited, or widen the requested result type. "Up to N" is a ceiling, not a quota; a verified empty result can be the correct final result. If the named gap cannot be closed inside the original boundaries, report the exact verified result or blocker and stop.',
             'IMPORTANT: if finishing requires the USER\'S decision or authorization — sending, posting, or deleting something external, choosing between options, or scope the user left open — do NOT proceed on your own. Set nextAction=awaiting_user_input with the concrete question. Asking before an external action is a correct, complete answer for this turn, never a failure.',
             'Otherwise try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result).',
             'If the failure names a DISCOVERABLE value — a 404 / "not found", a wrong or missing slug/team/account/id, a missing arg — find the right value with the tool\'s OWN discovery command (e.g. `netlify api listAccountsForUser`, `<cli> whoami`/`status`/`list`) or by recalling your saved tool-choice, then retry ONCE with it. That is recoverable — do not ask the user for a value the tool can report itself.',

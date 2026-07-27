@@ -592,8 +592,8 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
  *  demanded (the shim mount is where discrete native-MCP serial reads are
  *  refused as of 2026-07-12). `certifiedBatch` rides along for the batch lane. */
 async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean): Promise<unknown> {
-  const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
-  const shim = getOrCreateExternalMcpServers() as unknown as {
+  const { getOrCreateExternalMcpServerForTool } = await import('../runtime/mcp-servers.js');
+  const shim = getOrCreateExternalMcpServerForTool(method) as unknown as {
     listTools?: () => Promise<unknown>;
     callTool: (name: string, args: Record<string, unknown> | null) => Promise<unknown>;
   } | null;

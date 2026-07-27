@@ -215,16 +215,38 @@ function surfaceProbeDirectlyAnswersObjective(rawName: string, objectiveText: st
 const MULTI_RESULT_NOUN_RE = /\b(?:emails|messages|files|documents|reports|posts|records|contacts|tasks|events|invoices|rows|items)\b/i;
 const MULTI_RESULT_QUANTIFIER_RE = /\b(?:all|both|each|every|multiple|several|many|remaining|these|those|[2-9]|[1-9][0-9]+|two|three|four|five|six|seven|eight|nine|ten)\b/i;
 const ACTION_SEQUENCE_RE = /\b(?:create|build|write|draft|send|email|update|post|publish|deploy|run|execute|install|configure|generate|add|edit)\b[^\n.!?]{0,100}\b(?:and|then)\b[^\n.!?]{0,40}\b(?:create|build|write|draft|send|email|update|post|publish|deploy|run|execute|install|configure|generate|add|edit)\b/i;
+const OPTIONAL_UPPER_BOUND_RESULT_RE =
+  /\b(?:up\s+to|at\s+most|no\s+more\s+than|a\s+maximum\s+of|max(?:imum)?\s+of)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)(?:\s+[\w-]+){0,4}\s+(?:emails|messages|files|documents|reports|posts|records|contacts|tasks|events|invoices|rows|items|results|suggestions|matches|ideas|options)\b/gi;
+const OPTIONAL_UPPER_BOUND_QUANTIFIER_RE =
+  /\b(?:up\s+to|at\s+most|no\s+more\s+than|a\s+maximum\s+of|max(?:imum)?\s+of)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/gi;
+const NEGATED_DELIVERABLE_CLAUSE_RE =
+  /\b(?:do\s+not|don't|dont|never)\b(?:(?!\b(?:but|however|instead|then)\b)[^;.!?\n])*/gi;
 
 /** A single successful mutation cannot prove a batch or compound objective is
- * complete. These objectives retain one bounded completion-judge check. */
+ * complete. These objectives retain one bounded completion-judge check.
+ *
+ * An explicit upper bound is a ceiling, not a quota. "Return up to three
+ * suggestions" may correctly produce zero, one, two, or three results from one
+ * verified lookup; treating "three" as three required deliverables caused the
+ * completion judge to overrule a real empty result and authorize extra vendor
+ * calls the user had explicitly forbidden. Project only the bounded result
+ * phrase away before looking for required plurals/quantifiers; compound actions
+ * and any required quantity elsewhere remain visible. */
 export function objectiveMayRequireMultipleResults(objectiveText: string): boolean {
   const objective = objectiveText.trim();
   if (!objective) return false;
-  return MULTI_RESULT_NOUN_RE.test(objective)
-    || MULTI_RESULT_QUANTIFIER_RE.test(objective)
-    || ACTION_SEQUENCE_RE.test(objective)
-    || /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/.test(objective);
+  const required = objective
+    // Prohibited work is an authority boundary, never a deliverable. Without
+    // this projection, "do not write files or create tasks" looked like a
+    // plural objective and paid for a completion judge after an otherwise
+    // concrete one-call lookup.
+    .replace(NEGATED_DELIVERABLE_CLAUSE_RE, ' prohibited work ')
+    .replace(OPTIONAL_UPPER_BOUND_RESULT_RE, ' optional bounded result ')
+    .replace(OPTIONAL_UPPER_BOUND_QUANTIFIER_RE, ' optional bound ');
+  return MULTI_RESULT_NOUN_RE.test(required)
+    || MULTI_RESULT_QUANTIFIER_RE.test(required)
+    || ACTION_SEQUENCE_RE.test(required)
+    || /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/.test(required);
 }
 
 function recordLooksFailed(record: Record<string, unknown>): boolean {
