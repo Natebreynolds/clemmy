@@ -584,7 +584,11 @@ function diversify(hits: MemoryEvidenceHit[], limit: number): MemoryEvidenceHit[
 
 function resolveAsOf(query: string, explicit?: string, nowMs = Date.now(), timeZone?: string): { iso?: string; ms: number } {
   const raw = explicit?.trim()
-    || query.match(/\b(?:as of|on)\s+(\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]+)?)/i)?.[1]
+    // Keep trailing sentence punctuation outside the timestamp. The previous
+    // `[0-9:.+-Z]+` class accidentally formed a broad `+`→`Z` character range,
+    // so a natural "...00Z?" query captured `?`; Date.parse rejected it and
+    // silently fell back to current-time recall.
+    || query.match(/\b(?:as of|on)\s+(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?)/i)?.[1]
     || query.match(/\b(?:as of|in)\s+(\d{4})\b/i)?.[1];
   if (!raw) {
     const relative = /\b(?:as\s+of|by|before)\s+(?:today|yesterday|this\s+(?:week|month|year)|last\s+(?:week|month|year))\b/i.test(query)
@@ -905,18 +909,66 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
           ...(lexicalClauses.length > 0 ? [`(${lexicalClauses.join(' OR ')})`] : []),
           ...(temporalWindow ? ['1 = 1'] : []),
         ];
+    // Evidence remains in the temporal ledger after memory_forget so the user
+    // can audit or restore it. That audit history must not silently resurrect
+    // the forgotten claim through the episode store, though. Unlinked episodes
+    // (meetings, tool results, imports) remain searchable. A linked episode is
+    // model-recallable only while at least one supporting fact is active, or
+    // while answering an explicit historical/as-of query inside that fact's
+    // recorded validity interval.
+    const linkedEpisodeVisibilitySql = historicalAsOf
+      ? `
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM fact_evidence episode_link
+            WHERE episode_link.episode_id = memory_episodes.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM fact_evidence episode_link
+            JOIN fact_validity_intervals validity
+              ON validity.fact_id = episode_link.fact_id
+            WHERE episode_link.episode_id = memory_episodes.id
+              AND validity.valid_from <= ?
+              AND (validity.valid_to IS NULL OR validity.valid_to > ?)
+          )
+        )`
+      : `
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM fact_evidence episode_link
+            WHERE episode_link.episode_id = memory_episodes.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM fact_evidence episode_link
+            JOIN consolidated_facts linked_fact
+              ON linked_fact.id = episode_link.fact_id
+            WHERE episode_link.episode_id = memory_episodes.id
+              AND linked_fact.active = 1
+          )
+        )`;
     const baseEpisodeSql = `
       SELECT id, kind, subtype, title, source_app, source_uri, occurred_at, evidence_excerpt, status
       FROM memory_episodes
       WHERE evidence_excerpt IS NOT NULL
         AND status IN ('available','partial')
         AND (${candidateClauses.join(' OR ')})
+        ${linkedEpisodeVisibilitySql}
       ORDER BY occurred_at DESC
     `;
     const episodeQueryTokens = temporalMeetingDate ? [] : tokenList;
+    const episodeVisibilityParams = historicalAsOf ? [historicalAsOf, historicalAsOf] : [];
     const rows = candidateClauses.length === 0 ? [] : (temporalWindow
-      ? db.prepare(baseEpisodeSql).all(...episodeQueryTokens.map((token) => `%${token}%`))
-      : db.prepare(`${baseEpisodeSql} LIMIT ?`).all(...episodeQueryTokens.map((token) => `%${token}%`), temporalMeetingDate ? 200 : perStore)) as Array<{
+      ? db.prepare(baseEpisodeSql).all(
+          ...episodeQueryTokens.map((token) => `%${token}%`),
+          ...episodeVisibilityParams,
+        )
+      : db.prepare(`${baseEpisodeSql} LIMIT ?`).all(
+          ...episodeQueryTokens.map((token) => `%${token}%`),
+          ...episodeVisibilityParams,
+          temporalMeetingDate ? 200 : perStore,
+        )) as Array<{
       id: string; kind: string; subtype: string | null; title: string | null; source_app: string | null; source_uri: string | null;
       occurred_at: string; evidence_excerpt: string; status: MemoryEpisodeStatus;
     }>;

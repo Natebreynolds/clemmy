@@ -17,7 +17,7 @@ process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off'; // force lexical, fully offline + d
 // eslint-disable-next-line import/first
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
-const { rememberFact, supersedeFact } = await import('./facts.js');
+const { forgetFact, reactivateFact, rememberFact, supersedeFact } = await import('./facts.js');
 // eslint-disable-next-line import/first
 const { upsertEntity } = await import('./reflection.js');
 // eslint-disable-next-line import/first
@@ -311,6 +311,62 @@ test('a recalled fact expands back to its stored people, resources, and evidence
   assert.ok(episodeHit?.whyRecalled.includes('stored fact-to-evidence relationship'));
   assert.equal(entity?.evidence[0]?.episodeId, episode.id);
   assert.equal(resourceHit?.evidence[0]?.episodeId, episode.id);
+});
+
+test('forgotten facts cannot resurrect through linked episodes, while audit-time recall and restore still work', async () => {
+  const content = "Project Ember Lattice's launch code is AZURE-6381 and its owner is Nolan Reed.";
+  const fact = rememberFact({
+    kind: 'project',
+    content,
+    occurredAt: '2026-07-27T12:00:00.000Z',
+  });
+  const episode = recordMemoryEpisode({
+    kind: 'user_turn',
+    title: 'Explicit durable memory',
+    sourceApp: 'Conversation',
+    occurredAt: '2026-07-27T12:01:00.000Z',
+    content,
+  });
+  linkFactEvidence({ factId: fact.id, episodeId: episode.id, excerpt: content });
+
+  const before = await recallMemory('What is the Ember Lattice launch code?', {
+    stores: ['fact', 'episode'],
+    graphDepth: 1,
+    limit: 10,
+  });
+  assert.ok(before.hits.some((hit) => hit.ref.type === 'fact' && hit.ref.id === String(fact.id)));
+  assert.ok(before.hits.some((hit) => hit.ref.type === 'episode' && hit.ref.id === episode.id));
+
+  assert.equal(forgetFact(fact.id), true);
+  const forgotten = await recallMemory('What is the Ember Lattice launch code?', {
+    stores: ['fact', 'episode'],
+    graphDepth: 1,
+    limit: 10,
+  });
+  assert.ok(!forgotten.hits.some((hit) => hit.ref.id === String(fact.id)));
+  assert.ok(
+    !forgotten.hits.some((hit) => hit.ref.type === 'episode' && hit.ref.id === episode.id),
+    'the retained audit episode must not bypass memory_forget',
+  );
+
+  const historical = await recallMemory('What was the Ember Lattice launch code as of 2026-07-27T13:00:00.000Z?', {
+    stores: ['fact', 'episode'],
+    graphDepth: 1,
+    limit: 10,
+  });
+  assert.ok(
+    historical.hits.some((hit) => hit.ref.type === 'episode' && hit.ref.id === episode.id),
+    'explicit historical recall may use evidence from the then-valid interval',
+  );
+
+  assert.equal(reactivateFact(fact.id), true);
+  const restored = await recallMemory('What is the Ember Lattice launch code?', {
+    stores: ['fact', 'episode'],
+    graphDepth: 1,
+    limit: 10,
+  });
+  assert.ok(restored.hits.some((hit) => hit.ref.type === 'fact' && hit.ref.id === String(fact.id)));
+  assert.ok(restored.hits.some((hit) => hit.ref.type === 'episode' && hit.ref.id === episode.id));
 });
 
 test('a scoped entity/resource recall can use facts as invisible graph bridges', async () => {
