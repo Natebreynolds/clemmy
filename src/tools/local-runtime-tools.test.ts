@@ -62,6 +62,7 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
     'user_profile_read',
     'check_capability',
     'mcp_status',
+    'mcp_list_tools',
     'harness_status',
   ]) {
     assert.equal(names.has(required), true, `expected local runtime tool ${required}`);

@@ -301,6 +301,37 @@ test('a common http_fetch guess repairs to the allowed bounded GET path without 
   }
 });
 
+test('the common mcp_tools guess repairs to the on-demand MCP inventory tool', async () => {
+  let dispatched: Record<string, unknown> | null = null;
+  _setCodeModeToolsForTests(
+    new Map([['mcp_list_tools', {
+      name: 'mcp_list_tools',
+      invoke: async (_ctx: unknown, input: string) => {
+        dispatched = JSON.parse(input) as Record<string, unknown>;
+        return '{"results":[{"name":"dataforseo__keyword_suggestions"}]}';
+      },
+    }]]),
+  );
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['mcp_list_tools']),
+    }) as unknown as ToolLike;
+    const out = await callTool.invoke!(
+      { context: { sessionId: 'sess-mcp-tools-alias' } },
+      JSON.stringify({
+        name: 'mcp_tools',
+        args_json: JSON.stringify({ server_name: 'dataforseo', query: 'keyword suggestions' }),
+      }),
+      { toolCall: { callId: 'mcp-tools-alias' } },
+    );
+    assert.match(String(out), /dataforseo__keyword_suggestions/);
+    assert.equal(dispatched?.server_name, 'dataforseo');
+    assert.equal(dispatched?.query, 'keyword suggestions');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
 test('the HTTP alias refuses mutation-shaped or credential-bearing inputs before dispatch', async () => {
   const callTool = buildCallTool({
     reachableBuiltinNames: new Set(),

@@ -9,6 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateMcpServerConfig, serverEnvStatus } from './mcp-server-tools.js';
+import { rankMcpToolInventory } from './mcp-status-tools.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
 
 test('validateMcpServerConfig: accepts well-formed stdio/http, rejects malformed', () => {
@@ -48,9 +49,33 @@ test('serverEnvStatus: returns key NAMES only — never a value (no secret leak)
   assert.ok(blob.includes('SECRET_KEY'), 'key name is fine');
 });
 
-test('GATING: mcp_add / mcp_configure are admin (always confirm-first); reconnect/status are read', () => {
+test('GATING: mcp_add / mcp_configure are admin; reconnect/status/inventory are read', () => {
   assert.equal(classifyTool('mcp_add'), 'admin');
   assert.equal(classifyTool('mcp_configure'), 'admin');
   assert.equal(classifyTool('mcp_reconnect'), 'read');
   assert.equal(classifyTool('mcp_status'), 'read');
+  assert.equal(classifyTool('mcp_list_tools'), 'read');
+});
+
+test('MCP inventory ranks an exact vendor tool instead of forcing name guesses', () => {
+  const ranked = rankMcpToolInventory([
+    {
+      name: 'dataforseo__dataforseo_labs_google_keyword_ideas',
+      description: 'Relevant ideas in the same product category.',
+      inputSchema: { type: 'object' },
+    },
+    {
+      name: 'dataforseo__dataforseo_labs_google_keyword_suggestions',
+      description: 'Search queries that include the specified seed keyword.',
+      inputSchema: { type: 'object' },
+    },
+    {
+      name: 'dataforseo__backlinks_summary',
+      description: 'Backlink totals.',
+      inputSchema: { type: 'object' },
+    },
+  ], 'Google keyword suggestions', 2);
+
+  assert.equal(ranked[0]?.name, 'dataforseo__dataforseo_labs_google_keyword_suggestions');
+  assert.equal(ranked[1]?.name, 'dataforseo__dataforseo_labs_google_keyword_ideas');
 });

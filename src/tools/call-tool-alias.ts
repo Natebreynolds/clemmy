@@ -14,8 +14,13 @@ const SIMPLE_HTTP_GET_ALIASES = new Set([
   'fetch_url',
 ]);
 
+const SIMPLE_TOOL_ALIASES = new Map([
+  ['mcp_tools', 'mcp_list_tools'],
+]);
+
 export function isCallToolAliasName(rawName: string): boolean {
-  return SIMPLE_HTTP_GET_ALIASES.has(rawName.trim().toLowerCase());
+  const name = rawName.trim().toLowerCase();
+  return SIMPLE_HTTP_GET_ALIASES.has(name) || SIMPLE_TOOL_ALIASES.has(name);
 }
 
 export interface ResolvedCallToolAlias {
@@ -85,6 +90,17 @@ export function resolveCallToolAlias(
   rawName: string,
   args: unknown,
 ): CallToolAliasResolution | null {
+  const simpleTarget = SIMPLE_TOOL_ALIASES.get(rawName.trim().toLowerCase());
+  if (simpleTarget) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return { ok: false, detail: `${rawName} requires a JSON object.` };
+    }
+    return {
+      ok: true,
+      targetName: simpleTarget,
+      targetArgs: args as Record<string, unknown>,
+    };
+  }
   if (!isCallToolAliasName(rawName)) return null;
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     return { ok: false, detail: `${rawName} requires a JSON object with one "url" field.` };
