@@ -35,7 +35,11 @@ export interface SessionMetrics {
   kind: string;
   tokensUsed: number;
   turns: number;
+  /** Per-tool evidence includes transport mirrors so a proof can assert that
+   * call_tool reached the exact deferred inner tool. */
   toolCalls: Record<string, number>;
+  /** Model-issued/canonical calls only. A call_tool wrapper and its
+   * transport_mirror inner event are one physical decision, not two. */
   toolCallTotal: number;
   guardrailsTripped: number;
   externalWrites: number;
@@ -83,6 +87,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
   const latency: TurnLatency[] = [];
   let openTurnStartedAt: number | null = null;
   let openTurnFirstAction: number | null = null;
+  let canonicalToolCallTotal = 0;
 
   for (const ev of events) {
     const ts = Date.parse(ev.created_at);
@@ -97,8 +102,14 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
       case 'tool_called': {
         if (openTurnStartedAt !== null && openTurnFirstAction === null) openTurnFirstAction = ts;
         let name = 'unknown';
-        try { name = String((JSON.parse(ev.data_json) as { tool?: string }).tool ?? 'unknown'); } catch { /* keep unknown */ }
+        let accounting = '';
+        try {
+          const data = JSON.parse(ev.data_json) as { tool?: string; accounting?: string };
+          name = String(data.tool ?? 'unknown');
+          accounting = String(data.accounting ?? '');
+        } catch { /* keep unknown */ }
         toolCalls[name] = (toolCalls[name] ?? 0) + 1;
+        if (accounting !== 'transport_mirror') canonicalToolCallTotal += 1;
         break;
       }
       case 'turn_ended':
@@ -150,7 +161,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     tokensUsed: session.tokens_used,
     turns,
     toolCalls,
-    toolCallTotal: Object.values(toolCalls).reduce((a, b) => a + b, 0),
+    toolCallTotal: canonicalToolCallTotal,
     guardrailsTripped,
     externalWrites,
     autoContinues,

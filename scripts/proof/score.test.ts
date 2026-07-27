@@ -58,6 +58,11 @@ function buildFixtureHome(): string {
   ev('turn_memory_primer', { injectedBytes: 512 }, 100);
   ev('tool_called', { tool: 'run_worker', callId: 'c1' }, 2_000);
   ev('tool_called', { tool: 'run_worker', callId: 'c2' }, 2_500);
+  ev('tool_called', {
+    tool: 'workspace_roots',
+    callId: 'batch-c2',
+    accounting: 'transport_mirror',
+  }, 2_600);
   ev('tool_called', { tool: 'remember_fact', callId: 'c3' }, 9_000);
   ev('worker_result', { item: 'firm-1', ok: true }, 9_500);
   ev('worker_result', { item: 'firm-2', ok: false }, 9_800);
@@ -138,6 +143,7 @@ test('sessionMetrics computes counts, TTFT, and latency from the fixture', () =>
     assert.equal(m.turns, 1);
     assert.equal(m.toolCalls['run_worker'], 2);
     assert.equal(m.toolCalls['remember_fact'], 1);
+    assert.equal(m.toolCalls['workspace_roots'], 1, 'inner-tool evidence remains queryable');
     assert.equal(m.toolCallTotal, 3);
     assert.equal(m.guardrailsTripped, 1);
     assert.equal(m.workerResults, 2);
