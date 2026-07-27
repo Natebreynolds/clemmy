@@ -856,6 +856,34 @@ test('fan-out advisory inside a WORKFLOW step recommends forEach, NOT run_worker
   assert.ok(!/run_worker once per item/.test(advice!), 'must NOT tell a workflow step to use the blocklisted run_worker');
 });
 
+test('code-mode Composio batches keep every successful payload parseable and free of in-band advisories', async () => {
+  const { runComposioExecuteForTestInSession } = await import('./composio-tools.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const sid = 'workflow:run-code-mode:tracker';
+  const execute = (async (_slug: string, args: Record<string, unknown>) => ({
+    successful: true,
+    data: { range: args.range, values: [['ok']] },
+  })) as never;
+
+  await withHarnessRunContext(
+    { sessionId: sid, counter: new ToolCallsCounter(100), codeMode: true },
+    async () => {
+      for (let i = 1; i <= 4; i += 1) {
+        const output = await runComposioExecuteForTestInSession(
+          'GOOGLESHEETS_BATCH_GET',
+          { spreadsheet_id: 'sheet-1', range: `Sheet1!A${i}:D${i}` },
+          execute,
+          sid,
+        );
+        assert.doesNotMatch(output, /FAN-OUT NOW|forEach|run_worker/);
+        const parsed = JSON.parse(output) as { successful?: boolean; data?: { range?: string } };
+        assert.equal(parsed.successful, true);
+        assert.equal(parsed.data?.range, `Sheet1!A${i}:D${i}`);
+      }
+    },
+  );
+});
+
 // ─── FIX 2.5: the mid-run advisory is IMPERATIVE at the data-derived count ───
 
 test('FIX2.5: chat fan-out advisory is IMPERATIVE on the 3rd serial call', async () => {

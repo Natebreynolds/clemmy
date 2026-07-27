@@ -375,7 +375,10 @@ function appendMcpFanoutAdvisory(
   try {
     const active = harnessRunContextStorage.getStore();
     const sessionId = active?.sessionId;
-    if (!sessionId || !Array.isArray(result)) return result;
+    // Code mode is itself the batching primitive. Its callers need the native
+    // MCP content blocks unchanged so they can normalize/parse them; appending
+    // a prose fan-out hint here makes a valid structured result ambiguous.
+    if (!sessionId || active.codeMode === true || !Array.isArray(result)) return result;
     const resultText = result
       .map((block) => {
         const text = (block as { text?: unknown } | null)?.text;

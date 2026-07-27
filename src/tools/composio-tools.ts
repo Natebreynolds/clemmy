@@ -1931,7 +1931,13 @@ async function runComposioExecute(
       }
 
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
-      if (!failure.failed) {
+      //
+      // A code-mode program is already the sanctioned batching lane. Appending
+      // prose to its machine-readable JSON corrupts the return shape (the
+      // program receives a string instead of the provider object) and can turn
+      // a successful batch read into a blocked workflow step. Keep every
+      // advisory out-of-band for that lane by not producing one here at all.
+      if (!failure.failed && harnessRunContextStorage.getStore()?.codeMode !== true) {
         // P1-D — a schema/describe execute is DISCOVERY, not per-item work. Route
         // it to the discovery advisory (which counts repeated describes of one
         // toolkit) and skip the fan-out advisory so the two never double-fire on

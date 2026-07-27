@@ -109,6 +109,23 @@ test('MCP shim leaves results untouched when there is no harness session context
   assert.ok(!/FAN-OUT NOW/.test(last), 'no advisory without a session context (cannot key the bucket)');
 });
 
+test('MCP shim leaves structured results untouched inside a code-mode batch', async () => {
+  const slug = 'dataforseo';
+  const tool = 'serp_organic_live_advanced';
+  const shim = createMcpNamespaceShim({ servers: [makeFakeServer(slug, tool)] });
+  const namespaced = namespaceToolName(slugifyServerName(slug), tool);
+
+  await withHarnessRunContext({ ...ctx('workflow:run-code-mode:seo'), codeMode: true }, async () => {
+    await shim.listTools();
+    for (let i = 1; i <= 6; i += 1) {
+      const result = await shim.callTool(namespaced, { target: `firm-${i}.example` });
+      const serialized = JSON.stringify(result);
+      assert.ok(!/FAN-OUT NOW|forEach|run_worker/.test(serialized), `call ${i}: no prose appended in code mode`);
+      assert.match(serialized, /serp rank 4/, `call ${i}: native result is preserved`);
+    }
+  });
+});
+
 // ─── READ-FANOUT HARD BLOCK at the shim mount (2026-07-12) ──────────────────
 // Native MCP dispatches bypass wrapToolForHarness, so the deterministic block
 // lives HERE too. These integration tests drive the REAL shim -> guardrail
