@@ -56,7 +56,6 @@ import {
 import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-evidence.js';
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
-import { resolveToolSurface } from './tool-surface.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
 import {
   artifactIntentForTool,
@@ -75,6 +74,7 @@ import {
   type ArtifactIntent,
   type ArtifactVerificationIntent,
 } from './artifact-ledger.js';
+import { resolveHotSet } from '../../agents/tool-catalog.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -430,7 +430,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   gatedMutations = false,
   mcpToolAllowlist?: string[],
   attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string; runScopeId?: string; sourceUserSeq?: number },
-  loading?: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean },
+  loading?: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean; deferredTools?: string[] },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
@@ -454,6 +454,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
           gatedMutations,
           allowedTools: allowlist,
           alwaysLoadTools: loading?.alwaysLoadTools,
+          deferredTools: loading?.deferredTools,
           workflowRunId: attribution?.workflowRunId,
           workflowName: attribution?.workflowName,
           stepId: attribution?.stepId,
@@ -472,6 +473,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
     ...((loading?.alwaysLoadTools?.length ?? 0) > 0
       ? { CLEMENTINE_MCP_ALWAYS_LOAD_TOOLS: loading!.alwaysLoadTools!.join(',') }
+      : {}),
+    ...((loading?.deferredTools?.length ?? 0) > 0
+      ? { CLEMENTINE_MCP_DEFERRED_TOOLS: loading!.deferredTools!.join(',') }
       : {}),
     ...(attribution?.workflowRunId?.trim() ? { CLEMENTINE_MCP_WORKFLOW_RUN_ID: attribution.workflowRunId.trim() } : {}),
     ...(attribution?.workflowName?.trim() ? { CLEMENTINE_MCP_WORKFLOW_NAME: attribution.workflowName.trim() } : {}),
@@ -986,13 +990,20 @@ export interface ClaudeAgentSdkRunOptions {
    * canUseTool permits only exact-id read-backs for these resources. */
   artifactVerificationOnly?: Array<Pick<ArtifactVerificationIntent, 'kind' | 'resourceId'>>;
   /**
-   * First-class local MCP tools. In agentic mode with native ToolSearch enabled,
-   * the SDK registers the full permission surface but schema-loads only these
-   * names; every other allowed tool remains deferred and same-turn searchable.
-   * With native ToolSearch disabled (or on a non-agentic lane), this retains its
-   * legacy meaning as the exact advertised allowlist.
+   * First-class local MCP tools. In agentic schema-on-demand mode these are the
+   * hot schemas loaded at turn start; every other name in localMcpToolUniverse
+   * remains same-turn reachable through tool_search → call_tool without being
+   * registered in the provider prompt. With schema-on-demand disabled (or on a
+   * non-agentic lane), this retains its legacy exact-advertised meaning.
    */
   mcpToolAllowlist?: string[];
+  /**
+   * Exact local authority surface for schema-on-demand. The chat brain supplies
+   * its broader advertised universe; workers/workflow steps omit it and default
+   * to allowedLocalMcpTools. This is authority, not exposure: only the bounded
+   * hot set is registered, while the remainder is dispatched through call_tool.
+   */
+  localMcpToolUniverse?: string[];
   /**
    * Concrete tools this run is about to depend on. The SDK init message is the
    * authoritative advertised MCP surface; if any required tool is missing there,
@@ -1722,36 +1733,54 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     }
   }) as CanUseTool;
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
-  // When Claude's native ToolSearch is active, a reduced JIT surface should not
-  // make every other local capability disappear. Register the full agentic MCP
-  // surface, mark the exact former JIT subset first-class, and leave the rest
-  // registered-but-deferred for same-turn acquisition. If JIT did not reduce the
-  // surface (or this is a deny-only worker/read lane), preserve prior behavior.
-  const useLocalDeferredAcquisition = Boolean(
+  // True schema-on-demand for every agentic Claude SDK lane. Native MCP
+  // `alwaysLoad:false` hid definitions from Claude's initial list but Anthropic
+  // still accounted the registered schemas (~85K input tokens on a trivial live
+  // turn). Register only a tiny hot set plus tool_search/call_tool; the omitted
+  // authority surface stays same-turn reachable through the generic dispatcher,
+  // whose INNER call uses the existing schema validation and harness gates.
+  const localUniverse = [...new Set(
+    (options.localMcpToolUniverse?.length ? options.localMcpToolUniverse : allowed)
+      .map((name) => name.trim())
+      .filter(Boolean),
+  )];
+  const useLocalSchemaOnDemand = Boolean(
     agentic
     && claudeToolSearchEnabled()
-    && options.mcpToolAllowlist
-    && options.mcpToolAllowlist.length > 0,
+    && localUniverse.length > 0,
   );
   let localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
-  let localMcpLoading: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean } | undefined;
-  if (useLocalDeferredAcquisition) {
-    const localSurface = resolveToolSurface({
-      surface: 'claude_agent_sdk_local_mcp',
-      lane: 'brain',
-      availableNames: claudeAgentSdkAdvertisableLocalTools(),
-      alwaysLoadedNames: [
-        ...(options.mcpToolAllowlist ?? []),
-        ...(options.requiredLocalMcpTools ?? []),
-      ],
-      deferralEnabled: true,
-      reason: 'Claude native local ToolSearch acquisition',
-    });
-    localMcpToolAllowlist = undefined;
-    localMcpLoading = {
-      alwaysLoadTools: localSurface.firstClass,
-      deferUnlistedTools: true,
-    };
+  let localMcpLoading: {
+    alwaysLoadTools?: string[];
+    deferUnlistedTools?: boolean;
+    deferredTools?: string[];
+  } | undefined;
+  if (useLocalSchemaOnDemand) {
+    const universeSet = new Set(localUniverse);
+    const requestedFirstClass = options.mcpToolAllowlist?.length
+      ? new Set(options.mcpToolAllowlist.filter((name) => universeSet.has(name)))
+      : resolveHotSet(options.sessionId, options.prompt, { allowedNames: universeSet });
+    for (const name of options.requiredLocalMcpTools ?? []) {
+      if (universeSet.has(name)) requestedFirstClass.add(name);
+    }
+    // Some SDK-profile tools are local-runtime-only: call_tool can dispatch
+    // them, but createClementineMcpServer has no direct registration adapter.
+    // Never remove such a tool from the deferred authority set merely because
+    // the prompt named it; otherwise it disappears from both surfaces.
+    const firstClassCapable = new Set(claudeAgentSdkAdvertisableLocalTools());
+    const selected = new Set(
+      [...requestedFirstClass].filter((name) => firstClassCapable.has(name)),
+    );
+    // Acquisition must never acquire itself. These are intentionally outside
+    // the profile/universe because they are transport primitives, not business
+    // capabilities.
+    selected.add('tool_search');
+    selected.add('call_tool');
+    const deferredTools = localUniverse.filter((name) => !selected.has(name));
+    if (deferredTools.length > 0) {
+      localMcpToolAllowlist = [...selected];
+      localMcpLoading = { deferredTools };
+    }
   }
   const runScopeId = trackerScopeId;
   const sdkOptions: ClaudeAgentOptions = {

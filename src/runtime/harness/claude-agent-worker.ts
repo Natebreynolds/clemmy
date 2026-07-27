@@ -51,6 +51,7 @@ export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agen
     ? [
         'Current capability — you CAN execute the gated tools for THIS item:',
         '- run_shell_command, composio discovery + composio_execute_tool, write_file, plus read/recall tools.',
+        '- If a needed local tool schema is not loaded, use `tool_search` and then invoke the selected result with `call_tool(name, args_json)`.',
         '- Every call runs through Clementine\'s safety gates; irreversible/external actions pause for the user\'s approval. The PARENT already opened the execution lane and the batch approval, so just do the item — do not call execution_create or request_approval yourself.',
         '- Do NOT claim a mutation happened unless the tool result proves it. If a tool result begins with `ERROR:`, return `ERROR: <reason>` for this item instead of fabricating completion.',
         '- If the packet names a skill, a style guide, or installed skill rules, call `skill_read` for it before producing the output.',

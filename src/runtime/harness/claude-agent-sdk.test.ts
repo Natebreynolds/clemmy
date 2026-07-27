@@ -716,10 +716,15 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
       true,
       undefined,
       undefined,
-      { alwaysLoadTools: ['memory_recall_all'], deferUnlistedTools: true },
+      {
+        alwaysLoadTools: ['memory_recall_all'],
+        deferUnlistedTools: true,
+        deferredTools: ['workflow_update'],
+      },
     )['clementine-local'] as any;
     assert.equal(deferred.alwaysLoad, false);
     assert.equal(deferred.env.CLEMENTINE_MCP_ALWAYS_LOAD_TOOLS, 'memory_recall_all');
+    assert.equal(deferred.env.CLEMENTINE_MCP_DEFERRED_TOOLS, 'workflow_update');
   } finally {
     if (original === undefined) delete process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
     else process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = original;
@@ -891,7 +896,7 @@ test('replayed assistant frames contribute one returned tool use per provider ca
   assert.equal(result.toolCallLedger?.[0]?.name, 'ping', 'a replay cannot replace canonical call metadata');
 });
 
-test('agentic JIT keeps its selected local tools first-class while registering the rest for same-turn acquisition', async () => {
+test('agentic schema-on-demand registers only the hot kernel while keeping deferred tools callable', async () => {
   const capture: { call?: any } = {};
   setClaudeAgentSdkQueryForTest(((params: any) => {
     capture.call = params;
@@ -919,15 +924,61 @@ test('agentic JIT keeps its selected local tools first-class while registering t
     agentic: true,
     allowedLocalMcpTools: ['memory_recall_all', 'tool_search'],
     mcpToolAllowlist: ['memory_recall_all', 'tool_search'],
+    localMcpToolUniverse: ['memory_recall_all', 'tool_search', 'workflow_update'],
     requiredLocalMcpTools: ['memory_recall_all'],
   });
 
   const local = capture.call.options.mcpServers['clementine-local'] as any;
   const registered = local.instance._registeredTools as Record<string, { _meta?: Record<string, unknown> }>;
-  assert.equal(registered.memory_recall_all?._meta?.['anthropic/alwaysLoad'], true);
-  assert.equal(registered.tool_search?._meta?.['anthropic/alwaysLoad'], true);
-  assert.ok(registered.workflow_update, 'a non-JIT tool stays registered for native acquisition');
-  assert.equal(registered.workflow_update?._meta?.['anthropic/alwaysLoad'], undefined);
+  assert.ok(registered.memory_recall_all);
+  assert.ok(registered.tool_search);
+  assert.ok(registered.call_tool, 'generic same-turn dispatcher is first-class');
+  assert.equal(registered.workflow_update, undefined, 'deferred schemas are not registered or billed');
+});
+
+test('agentic schema-on-demand keeps local-runtime-only tools deferred even when explicitly selected', async () => {
+  const capture: { call?: any } = {};
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    capture.call = params;
+    return queryFromMessages([
+      {
+        type: 'system', subtype: 'init', model: 'claude-sonnet-4-6',
+        session_id: 'sdk-runtime-only', uuid: 'runtime-only-init', apiKeySource: 'none',
+        claude_code_version: '2.1.181', cwd: process.cwd(),
+        tools: ['mcp__clementine-local__tool_search', 'mcp__clementine-local__call_tool'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+      } as any,
+      {
+        type: 'result', subtype: 'success', session_id: 'sdk-runtime-only', uuid: 'runtime-only-result',
+        result: 'ok', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1,
+        stop_reason: 'end_turn', total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [],
+      } as any,
+    ], {});
+  }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Use workspace_roots.',
+    sessionId: 'sdk-runtime-only-clem',
+    agentic: true,
+    allowedLocalMcpTools: ['workspace_roots', 'tool_search'],
+    mcpToolAllowlist: ['workspace_roots', 'tool_search'],
+    localMcpToolUniverse: ['workspace_roots', 'tool_search'],
+    requiredLocalMcpTools: ['tool_search', 'call_tool'],
+  });
+
+  const local = capture.call.options.mcpServers['clementine-local'] as any;
+  const registered = local.instance._registeredTools as Record<string, unknown>;
+  assert.equal(registered.workspace_roots, undefined, 'no nonexistent first-class MCP adapter is promised');
+  assert.ok(registered.tool_search);
+  assert.ok(registered.call_tool);
+  const searched = await (registered.tool_search as any).handler({
+    query: 'list configured workspace root paths',
+    limit: 8,
+  });
+  const body = JSON.parse(searched.content[0].text) as { results: Array<{ name: string }> };
+  assert.ok(body.results.some((result) => result.name === 'workspace_roots'));
 });
 
 test('runClaudeAgentSdk fails before model work when required local MCP tools are absent from SDK init', async () => {

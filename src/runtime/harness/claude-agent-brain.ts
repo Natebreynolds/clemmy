@@ -518,7 +518,12 @@ export function claudeAgentSdkAdvertisedToolUniverse(
 ): string[] {
   const excluded = new Set(excludeNames);
   const names = mode === 'full'
-    ? claudeAgentSdkAdvertisableLocalTools()
+    // The MCP server directly registers most capabilities. Four computer reads
+    // (workspace_roots/list_files/read_file/git_status) are implemented only as
+    // local-runtime tools, but the schema-on-demand call_tool bridge can invoke
+    // them with the same inner harness gates. Keep the permission profile in the
+    // authority union so discovery does not silently erase those capabilities.
+    ? [...claudeAgentSdkAdvertisableLocalTools(), ...fastAllowNames]
     : [...fastAllowNames];
   return [...new Set(names)].filter((name) => !excluded.has(name));
 }
@@ -1448,12 +1453,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     ? request.model
     : resolveRoleModel('brain').modelId;
 
-  // Tool acquisition for the Claude Agent SDK brain. In full/agentic mode,
-  // Claude's native ToolSearch keeps the ENTIRE permission surface registered
-  // and same-turn reachable while only a tiny hot set is schema-loaded. This is
-  // intentionally independent of the older semantic JIT switch: native search
-  // is an acquisition mechanism, not permission pruning. If native ToolSearch
-  // is disabled, fall back to the legacy semantic JIT behavior byte-for-byte.
+  // Tool acquisition for the Claude Agent SDK brain. In full/agentic mode, keep
+  // the ENTIRE permission surface same-turn reachable while registering only a
+  // tiny hot set plus tool_search/call_tool. Unlike native MCP deferral, omitted
+  // definitions never enter provider accounting. This is an acquisition
+  // mechanism, not permission pruning. If disabled, fall back to the legacy
+  // semantic JIT behavior byte-for-byte.
   const fullToolPolicy = toolPolicyForRequest(request, mode);
   const fullAllowed = fullToolPolicy.names;
   const advertisedUniverse = claudeAgentSdkAdvertisedToolUniverse(
@@ -1476,12 +1481,13 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let mcpToolAllowlist: string[] | undefined;
   let jitDropped = 0;
   let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
-  const nativeDeferredAcquisition = mode === 'full' && claudeToolSearchEnabled();
+  const schemaOnDemandAcquisition = mode === 'full' && claudeToolSearchEnabled();
   const jitQuery = [request.message, ...recentPriorBrainInputs(sessionId, request.message)]
     .filter((s) => s.trim().length > 0)
     .join('\n');
-  if (nativeDeferredAcquisition) {
+  if (schemaOnDemandAcquisition) {
     try {
+      const firstClassCapable = new Set(claudeAgentSdkAdvertisableLocalTools());
       const hot = resolveHotSet(sessionId, jitQuery, {
         allowedNames: new Set(advertisedUniverse),
       });
@@ -1492,19 +1498,23 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           if (advertisedUniverse.includes(toolName)) hot.add(toolName);
         }
       }
-      jitAdvertised = advertisedUniverse.filter((name) => hot.has(name));
-      // Permissions remain fullAllowed. mcpToolAllowlist means "always load"
-      // when native ToolSearch is on; the SDK registers all other tools deferred.
+      // A local-runtime-only tool cannot become a first-class MCP schema. Leave
+      // it deferred even when explicitly named; tool_search → call_tool remains
+      // the truthful, gated route.
+      jitAdvertised = advertisedUniverse.filter((name) => hot.has(name) && firstClassCapable.has(name));
+      // Permissions remain fullAllowed. mcpToolAllowlist is the tiny first-class
+      // schema set; the SDK omits every other schema and keeps it reachable via
+      // tool_search → call_tool.
       jitAllowed = fullAllowed;
       mcpToolAllowlist = jitAdvertised;
       jitDropped = advertisedUniverse.length - jitAdvertised.length;
-      jitReason = 'native-tool-search-deferred';
+      jitReason = 'schema-on-demand-dispatch';
     } catch {
       jitAllowed = fullAllowed;
       jitAdvertised = advertisedUniverse;
       mcpToolAllowlist = undefined;
       jitDropped = 0;
-      jitReason = 'native-tool-search-error-fellback';
+      jitReason = 'schema-on-demand-selection-fellback';
     }
   } else if (jitDecision.active && request.message.trim()) {
     try {
@@ -1552,8 +1562,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         sessionId, turn: 0, role: 'system', type: 'tool_jit_scope',
         data: {
           lane: 'claude_sdk',
-          jitActive: nativeDeferredAcquisition || jitDecision.active,
-          acquisition: nativeDeferredAcquisition ? 'native_tool_search' : 'semantic_jit',
+          jitActive: schemaOnDemandAcquisition || jitDecision.active,
+          acquisition: schemaOnDemandAcquisition ? 'tool_search_call_tool' : 'semantic_jit',
           droppedCount: jitDropped,
           exposedCount: jitAdvertised.length,
           fastAllowCount: jitAllowed.length,
@@ -1648,6 +1658,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     turnContext,
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
+    localMcpToolUniverse: schemaOnDemandAcquisition ? advertisedUniverse : undefined,
     agentic: mode === 'full',
     // Mount the read-fanout block on native external MCP: the orchestrator brain
     // is the ONE lane with run_tool_program (the recovery), so serial native-MCP
@@ -1659,7 +1670,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // silently). If the local server didn't attach, these sentinels are absent
     // from the SDK init → typed ClaudeAgentSdkToolSurfaceError → the bridge's
     // cross-brain fallover completes the turn on Codex instead of a blind run.
-    requiredLocalMcpTools: ['memory_recall_all'],
+    requiredLocalMcpTools: schemaOnDemandAcquisition
+      ? ['memory_recall_all', 'tool_search', 'call_tool']
+      : ['memory_recall_all'],
     // Scope the native external MCP servers to THIS turn's intent (the user's message)
     // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
     // the Codex lane, without attaching all of them.

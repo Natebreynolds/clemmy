@@ -87,9 +87,12 @@ const GOLDEN = {
   // 2026-07-26 memory-ingress subtraction: explicit store requests rely on the
   // crash-safe auto-capture seam instead of demanding a duplicate model tool
   // write; ordinary memory calls default to the small kind+content payload.
+  // 2026-07-27 schema-on-demand: Claude's provider-specific rubric teaches its
+  // bounded tool_search → call_tool path without leaking that transport into
+  // the shared Codex/BYO rubric.
   instructions: { len: 35384, sha16: '2f61cf2192bbaac8' },
   native: { len: 34487, sha16: 'bcdd4c3da1aed9d2' },
-  claudeBrain: { len: 6140, sha16: '856a799baedf7d42' },
+  claudeBrain: { len: 6230, sha16: 'f43b0d42f91fb9ef' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
   lean: { len: 9689, sha16: '348ba65d991a9202' },
 } as const;

@@ -220,10 +220,11 @@ test('JIT monotonic floor: the EMITTED allowlist string is byte-identical once c
 });
 
 test('full-mode JIT keeps MCP advertisement separate from the permission fast-allow set', () => {
-  const fastAllow = ['memory_recall', 'tool_search'];
+  const fastAllow = ['memory_recall', 'tool_search', 'workspace_roots'];
   const universe = claudeAgentSdkAdvertisedToolUniverse('full', fastAllow);
   assert.ok(universe.includes('task_hygiene'), 'catalog-only gated tools remain advertisable');
   assert.ok(universe.includes('focus_get'), 'real MCP tools outside the CLI catalog remain advertisable');
+  assert.ok(universe.includes('workspace_roots'), 'local-runtime-only tools remain reachable through call_tool');
   assert.ok(!universe.includes('browser_harness_run'), 'CLI-only names absent from this MCP server are not promised');
 
   const selected = new Set(['memory_recall', 'tool_search', 'task_hygiene']);
@@ -1120,7 +1121,7 @@ test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllo
   assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'));
 });
 
-test('full mode: native ToolSearch loads a bounded hot set without pruning permissions', async () => {
+test('full mode: schema-on-demand loads a bounded hot set without pruning permissions', async () => {
   process.env.CLEMMY_TOOL_JIT = 'off';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.AUTH_MODE = 'claude_oauth';
@@ -1143,9 +1144,18 @@ test('full mode: native ToolSearch loads a bounded hot set without pruning permi
     captured.mcpToolAllowlist.length < captured.allowedLocalMcpTools.length,
     'unneeded schemas are deferred instead of permission-pruned',
   );
+  assert.ok(
+    captured.localMcpToolUniverse.length > captured.mcpToolAllowlist.length,
+    'the deferred authority universe remains available to the generic dispatcher',
+  );
+  assert.deepEqual(
+    captured.requiredLocalMcpTools,
+    ['memory_recall_all', 'tool_search', 'call_tool'],
+    'the acquisition and recovery kernel is required at SDK init',
+  );
   const scope = listEvents('native-tool-search-run', { types: ['tool_jit_scope'] }).at(-1);
-  assert.equal(scope?.data.acquisition, 'native_tool_search');
-  assert.equal(scope?.data.reason, 'native-tool-search-deferred');
+  assert.equal(scope?.data.acquisition, 'tool_search_call_tool');
+  assert.equal(scope?.data.reason, 'schema-on-demand-dispatch');
 });
 
 test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {
@@ -2634,7 +2644,7 @@ test('overflow A2: committed overflow with ZERO external writes falls through to
   assert.match(res.text, /finished after retry/);
 });
 
-test('brain runOptions demand the local-MCP sentinel so tool starvation throws instead of running blind', async () => {
+test('brain runOptions demand the recovery/acquisition kernel so tool starvation throws instead of running blind', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   let seen: string[] | undefined;
@@ -2644,5 +2654,9 @@ test('brain runOptions demand the local-MCP sentinel so tool starvation throws i
   });
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
   await respondViaClaudeAgentSdkBrain('home', { message: 'hi', sessionId: 'sentinel-check' });
-  assert.deepEqual(seen, ['memory_recall_all'], 'unified-memory sentinel demanded on every brain run');
+  assert.deepEqual(
+    seen,
+    ['memory_recall_all', 'tool_search', 'call_tool'],
+    'memory plus schema-on-demand acquisition must exist on every full brain run',
+  );
 });

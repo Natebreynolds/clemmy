@@ -21,14 +21,20 @@ interface Captured {
   handler: Handler;
 }
 
-function captureToolSearch(allowedNames?: ReadonlySet<string>): Captured {
+function captureToolSearch(
+  allowedNames?: ReadonlySet<string>,
+  dispatchViaCallTool = false,
+): Captured {
   let captured: Captured | undefined;
   const fakeServer = {
     tool(name: string, description: string, schema: Record<string, unknown>, handler: Handler): void {
       captured = { name, description, schema, handler };
     },
   };
-  registerToolSearchTool(fakeServer as unknown as McpServer, { allowedNames });
+  registerToolSearchTool(fakeServer as unknown as McpServer, {
+    allowedNames,
+    dispatchViaCallTool,
+  });
   assert.ok(captured, 'tool_search should register');
   return captured!;
 }
@@ -41,6 +47,7 @@ async function runSearch(handler: Handler, query: string, sessionId?: string) {
     query: string;
     results: Array<{ name: string; summary: string }>;
     schemas: Record<string, unknown>;
+    hint: string;
   };
 }
 
@@ -88,4 +95,12 @@ test('a scoped MCP search never promises tools outside the active advertised sur
   assert.ok(out.results.length > 0);
   assert.ok(out.results.every((result) => allowed.has(result.name)));
   assert.ok(out.results.some((result) => result.name === 'task_hygiene'));
+});
+
+test('schema-on-demand search tells Claude to dispatch a deferred result through call_tool', async () => {
+  const allowed = new Set(['workspace_roots', 'tool_search', 'call_tool']);
+  const t = captureToolSearch(allowed, true);
+  const out = await runSearch(t.handler, 'list workspace roots');
+  assert.match(out.hint, /call_tool\(name, args_json\)/);
+  assert.ok(out.results.some((result) => result.name === 'workspace_roots'));
 });

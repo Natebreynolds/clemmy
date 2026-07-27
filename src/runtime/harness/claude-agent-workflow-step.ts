@@ -111,6 +111,7 @@ export function renderClaudeAgentWorkflowStepSystemAppend(args: {
     ? [
         'Current capability boundary (FULL gated lane — Claude is the active brain):',
         '- You may use the exposed Clementine MCP tools for read/recall AND the gated execution tools: run_shell_command, write_file, and composio_search_tools / composio_list_tools / composio_execute_tool, plus local_cli_list / local_cli_probe.',
+        '- If a needed local tool schema is not loaded, use `tool_search` and then invoke the selected result with `call_tool(name, args_json)`.',
         '- Every mutating/external call is routed through the harness gate chain (grounding, goal-fidelity, confirm-first, and async approval) and the workflow\'s pre-authorized tool grants — so do the real work the step asks for; do not fabricate or merely describe it.',
         '- If a required tool is genuinely unavailable or a gate blocks you, return status "blocked" with a concrete reason rather than claiming completion.',
       ]

@@ -9,6 +9,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const { createClementineMcpServer } = await import('./mcp-server.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+const { createSession } = await import('../runtime/harness/eventlog.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -48,6 +49,40 @@ test('MCP always-load metadata is additive and leaves unselected tools deferred'
   assert.equal(registered.memory_recall_all?._meta?.['anthropic/alwaysLoad'], true);
   assert.equal(registered.tool_search?._meta?.['anthropic/alwaysLoad'], true);
   assert.equal(registered.workflow_update?._meta?.['anthropic/alwaysLoad'], undefined);
+});
+
+test('MCP schema-on-demand omits deferred schemas but search → call_tool still dispatches them', async () => {
+  const session = createSession({ kind: 'chat' });
+  const server = createClementineMcpServer({
+    sessionId: session.id,
+    allowedTools: ['memory_recall_all', 'tool_search', 'call_tool'],
+    deferredTools: ['workspace_roots'],
+  });
+  const registered = (server as any)._registeredTools as Record<string, {
+    handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+  }>;
+
+  assert.ok(registered.memory_recall_all);
+  assert.ok(registered.tool_search);
+  assert.ok(registered.call_tool);
+  assert.equal(registered.workspace_roots, undefined, 'deferred schema must not enter the MCP surface');
+
+  const searched = await registered.tool_search.handler({ query: 'list workspace roots', limit: 20 });
+  const searchBody = JSON.parse(searched.content[0].text) as {
+    results: Array<{ name: string }>;
+    schemas: Record<string, unknown>;
+    hint: string;
+  };
+  assert.equal(searchBody.results.some((hit) => hit.name === 'workspace_roots'), true);
+  assert.ok(searchBody.schemas.workspace_roots, 'search returns the exact deferred schema');
+  assert.match(searchBody.hint, /call_tool\(name, args_json\)/);
+
+  const called = await registered.call_tool.handler({
+    name: 'workspace_roots',
+    args_json: '{}',
+  });
+  assert.doesNotMatch(called.content[0].text, /not_reachable|arg_validation|missing_session_context/i);
+  assert.match(called.content[0].text, /clementine-next|clemmy-mcp-surface/i);
 });
 
 test('in-process MCP handlers inherit the exact SDK source turn', async () => {

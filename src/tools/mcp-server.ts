@@ -40,6 +40,7 @@ import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerToolSearchTool } from './tool-search-tool.js';
+import { registerCallToolMcp } from './call-tool.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { codeModeEnabled, codeModeDescription, runCodeModeForSession } from './code-mode-tool.js';
 import { ensureToolDirectories, textResult } from './shared.js';
@@ -66,6 +67,9 @@ export interface ClementineMcpServerOptions {
    * deferral. Every unmarked registered tool remains available for native
    * same-turn ToolSearch acquisition. */
   alwaysLoadTools?: string[];
+  /** Tools deliberately omitted from this server's advertised schema surface
+   * but still reachable this turn through tool_search → call_tool. */
+  deferredTools?: string[];
   /** Set for a workflow-step MCP surface so a fan-out spawned here (run_worker) is
    *  attributed to the workflow RUN in the subagent-runs store, not just the session. */
   workflowRunId?: string;
@@ -149,6 +153,16 @@ function resolvedAlwaysLoadTools(opts: ClementineMcpServerOptions = {}): string[
       : [];
 }
 
+function resolvedDeferredTools(opts: ClementineMcpServerOptions = {}): string[] {
+  const fromOptions = opts.deferredTools?.map((s) => s.trim()).filter(Boolean);
+  const raw = process.env.CLEMENTINE_MCP_DEFERRED_TOOLS?.trim();
+  return fromOptions && fromOptions.length > 0
+    ? fromOptions
+    : raw
+      ? raw.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+}
+
 function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
   const allowlist = resolvedToolAllowlist(opts);
   if (allowlist.length === 0) return;
@@ -197,6 +211,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   ensureToolDirectories();
   const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
   const registeredNames = new Set<string>();
+  const deferredNames = new Set(resolvedDeferredTools(opts));
 
   installAmbientToolContext(server, opts);
   installToolRegistrationObserver(server, (name) => {
@@ -280,14 +295,32 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
     );
   }
 
+  // Genuine schema-on-demand for the Claude SDK lane. Deferred tools are not
+  // registered here (so their schemas cannot be billed in the provider prompt),
+  // but remain callable through the same generic dispatcher and inner-tool gate
+  // chain the Codex lane uses.
+  if (deferredNames.size > 0) {
+    registerCallToolMcp(server, {
+      reachableBuiltinNames: deferredNames,
+      // This Set is intentionally live: ping/tool_search/call_tool register
+      // below and become valid first-class targets without rebuilding it.
+      firstClassNames: registeredNames,
+    });
+  }
+
   server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
 
-  // Register discovery LAST, scoped to what this exact feature-gated server
-  // actually registered. This prevents tool_search from promising registry
-  // entries that are absent from the active MCP server or filtered by JIT.
-  // The Set is intentionally live: registering tool_search adds itself after
-  // the handler captures the set.
-  registerToolSearchTool(server, { allowedNames: registeredNames });
+  // Register discovery LAST. A normal allowlisted server searches only what it
+  // actually registered. A schema-on-demand server additionally searches the
+  // explicitly deferred authority set; every such result is callable through
+  // call_tool in this same turn.
+  const searchableNames = deferredNames.size > 0
+    ? new Set([...registeredNames, ...deferredNames])
+    : registeredNames;
+  registerToolSearchTool(server, {
+    allowedNames: searchableNames,
+    dispatchViaCallTool: deferredNames.size > 0,
+  });
   return server;
 }
 

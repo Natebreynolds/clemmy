@@ -24,6 +24,7 @@
  *    first-class next turn (stops paying the catalog/dispatch indirection).
  */
 import { tool, type Tool } from '@openai/agents';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
@@ -33,6 +34,7 @@ import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js'
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
+import { textResult } from './shared.js';
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
@@ -228,6 +230,46 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       return jsonResult(out);
     },
   });
+}
+
+/**
+ * MCP wrapper for the same schema-on-demand dispatcher used by the Codex lane.
+ *
+ * The Claude Agent SDK must not register every deferred tool merely to keep it
+ * reachable: Anthropic still accounts those schemas in the provider prompt even
+ * when native ToolSearch marks them deferred. This two-field MCP tool keeps the
+ * model-facing surface tiny while dispatching the selected INNER tool through
+ * buildCallTool's existing authority, schema validation, budget, and harness
+ * gates. The surrounding MCP server installs the active session/run context
+ * before this handler executes.
+ */
+export function registerCallToolMcp(
+  server: McpServer,
+  options: BuildCallToolOptions,
+): void {
+  const dispatcher = buildCallTool(options) as unknown as {
+    invoke: (
+      runContext: unknown,
+      input: string,
+      details?: { toolCall?: { callId?: string; id?: string } },
+    ) => Promise<unknown>;
+  };
+  server.tool(
+    'call_tool',
+    DESCRIPTION,
+    {
+      name: z.string().min(1).describe('Exact built-in tool name returned by tool_search.'),
+      args_json: z.string().describe('JSON object string matching that tool\'s returned schema. Use "{}" for no args.'),
+    },
+    async ({ name, args_json }: { name: string; args_json: string }) => {
+      const sessionId = getToolOutputContext()?.sessionId ?? '';
+      const output = await dispatcher.invoke(
+        { context: { sessionId } },
+        JSON.stringify({ name, args_json }),
+      );
+      return textResult(jsonResult(output));
+    },
+  );
 }
 
 /** Test-only: reset the memoized local-schema map. */

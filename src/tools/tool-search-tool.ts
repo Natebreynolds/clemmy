@@ -25,7 +25,7 @@ const TOP_SCHEMAS = 3;
 
 const DESCRIPTION = [
   'Search the full built-in tool catalog by intent and get the tools that match — names + one-line summaries for the top results, plus the complete JSON input schema for the closest few so you can call them right the first time.',
-  'Use this when the tool you need is not already on your surface: describe what you want to do (e.g. "schedule a recurring workflow", "read a clipped tool result", "spawn workers for N items") and call the returned tool by name.',
+  'Use this when the tool you need is not already on your surface: describe what you want to do (e.g. "schedule a recurring workflow", "read a clipped tool result", "spawn workers for N items") and follow the returned invocation hint.',
   'Read-only — searching never changes anything.',
 ].join(' ');
 
@@ -52,7 +52,12 @@ async function toolSchemaMap(): Promise<Map<string, unknown>> {
 
 export function registerToolSearchTool(
   server: McpServer,
-  opts: { allowedNames?: ReadonlySet<string> } = {},
+  opts: {
+    allowedNames?: ReadonlySet<string>;
+    /** Deferred results are intentionally absent from the advertised schema
+     * surface and must be invoked through the generic same-turn dispatcher. */
+    dispatchViaCallTool?: boolean;
+  } = {},
 ): void {
   server.tool(
     'tool_search',
@@ -92,9 +97,11 @@ export function registerToolSearchTool(
           query,
           results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
           schemas,
-          hint: opts.allowedNames
-            ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-            : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
+          hint: opts.dispatchViaCallTool
+            ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above.'
+            : opts.allowedNames
+              ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
+              : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
         },
         null,
         2,
