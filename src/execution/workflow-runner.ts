@@ -78,6 +78,7 @@ import { sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { projectCanonicalTopLevelToolEvents } from '../runtime/harness/tool-effect.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
+import { compactWorkflowGoalEvidence, countNonEmptyLines } from './workflow-goal-evidence.js';
 import {
   appendWorkflowEvent,
   computeResumeState,
@@ -6987,8 +6988,7 @@ function finishWorkflowActivityRun(
 /** Evidence the validator judges: the final deliverable + a truncated
  *  per-step ledger (so a criterion about an intermediate step is checkable). */
 function compactEvidencePreview(value: unknown, maxChars: number): string {
-  const text = stringifyForPrompt(value).replace(/\s+/g, ' ').trim();
-  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}…`;
+  return compactWorkflowGoalEvidence(value, maxChars, stringifyForPrompt);
 }
 
 function formatStepOutputEvidence(
@@ -6996,7 +6996,7 @@ function formatStepOutputEvidence(
   output: unknown,
   opts?: StepContextRenderOptions,
 ): string {
-  const preview = compactEvidencePreview(output, 700);
+  const preview = compactEvidencePreview(output, 1_000);
   const ref = stepOutputArtifactRefForPrompt(stepId, output, opts);
   if (ref && typeof ref === 'object') {
     const rec = ref as { path?: unknown; workspacePath?: unknown; summary?: unknown; bytes?: unknown };
@@ -7018,11 +7018,16 @@ function buildGoalEvidenceText(
   const stepLines = Object.entries(stepOutputs)
     .slice(0, 20)
     .map(([id, out]) => `- ${id}: ${formatStepOutputEvidence(id, out, opts)}`);
+  const nonEmptyFinalLines = countNonEmptyLines(finalOutput || '');
   return [
-    'FINAL OUTPUT:',
+    `FINAL OUTPUT (${nonEmptyFinalLines} non-empty line${nonEmptyFinalLines === 1 ? '' : 's'}):`,
     (finalOutput || '(empty)').slice(0, 6000),
     '',
-    'STEP RESULTS (truncated):',
+    'RUN ENGINE EVIDENCE:',
+    `${stepLines.length} step result${stepLines.length === 1 ? '' : 's'} reached step_completed after blocked/error detection and declared output-contract verification. An unresolved blocked/error result does not reach this goal-validation path as a successful step result.`,
+    'No listed step returned blocked:true, an unresolved error envelope, an empty value forbidden by non_empty/min_items, or an output outside its declared URL/path checks.',
+    '',
+    'STEP RESULTS (bounded structural projections; arrays show count + sample):',
     ...stepLines,
   ].join('\n');
 }

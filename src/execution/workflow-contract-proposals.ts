@@ -63,6 +63,8 @@ const ARTIFACT_WRITE_RE =
   /\b(?:build|create|generate|render|write|save|export|compile|assemble)\b[\s\S]{0,80}\b(?:html|pdf|file|report|brief|audit|document|deck|slides?|page|website|site)\b/i;
 const EXTERNAL_TOOL_RE =
   /^(?:\*|composio|mcp|dataforseo|firecrawl|apify|fetch|web_|browser|run_shell_command|recall_tool_result|tool_output_query)/i;
+const PINNED_COMPOSIO_MUTATION_SLUG_RE =
+  /\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+){0,4}_(?:ADD|APPEND|COPY|CREATE|DELETE|EXECUTE|INSERT|MODIFY|MOVE|PATCH|POST|PUBLISH|REPLACE|SEND|TRIGGER|UPDATE|UPLOAD|UPSERT)(?:_[A-Z0-9]+)*\b/;
 const IDENTITY_CONTRACT_KEYS = new Set([
   'id',
   'name',
@@ -144,6 +146,33 @@ function stepReachesExternalToolSurface(workflow: WorkflowDefinition, step: Work
   return effectiveToolNames(workflow, step).some((tool) => EXTERNAL_TOOL_RE.test(tool));
 }
 
+function isUnattendedWorkflow(workflow: WorkflowDefinition): boolean {
+  return Boolean(
+    workflow.trigger?.schedule
+    || workflow.trigger?.webhookPath
+    || (workflow.trigger?.events?.length ?? 0) > 0,
+  );
+}
+
+/**
+ * A generic Composio executor is intentionally schema-light. That keeps the
+ * normal tool surface lean, but an unattended write must either carry a proven
+ * action binding in its own prompt or retain bounded catalog discovery. Without
+ * either, the model can reach the mutation node knowing *what* to do but with
+ * no executable slug/argument contract — the legacy morning-outreach failure.
+ */
+function unattendedComposioWriteNeedsBinding(
+  workflow: WorkflowDefinition,
+  step: WorkflowStepInput,
+): boolean {
+  if (!isUnattendedWorkflow(workflow)) return false;
+  if (step.sideEffect !== 'write' || step.call || step.deterministic) return false;
+  const tools = new Set(effectiveToolNames(workflow, step).map((tool) => tool.toLowerCase()));
+  if (!tools.has('composio_execute_tool')) return false;
+  if (tools.has('composio_search_tools')) return false;
+  return !PINNED_COMPOSIO_MUTATION_SLUG_RE.test(step.prompt ?? '');
+}
+
 function contractEvidenceKeys(contract: WorkflowStepOutputContract | undefined): Set<string> {
   const keys = new Set<string>();
   for (const key of contract?.required_keys ?? []) keys.add(key);
@@ -216,6 +245,12 @@ export function hardenWeakLiveResearchOutputContract(
 export function workflowAuthoringAdvisories(workflow: WorkflowDefinition): string[] {
   const warnings: string[] = [];
   for (const step of workflow.steps ?? []) {
+    if (unattendedComposioWriteNeedsBinding(workflow, step)) {
+      warnings.push(
+        `Step "${step.id}" is an unattended external write through composio_execute_tool, but its prompt names no concrete mutation slug and the step cannot call composio_search_tools. Pin a proven TOOLKIT_ACTION slug plus its argument shape, or allow bounded discovery, so the run reaches the write with an executable action.`,
+      );
+    }
+
     if (stepHasWeakLiveResearchContract(workflow, step)) {
       const keys = [...contractEvidenceKeys(step.output)].filter(Boolean);
       warnings.push(

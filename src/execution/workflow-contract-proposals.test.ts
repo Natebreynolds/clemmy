@@ -234,6 +234,59 @@ test('does not mistake a write that preserves SEO fields for a live-research ste
   assert.deepEqual(warnings, [], 'write receipt/read-back proof should not be inflated with research-summary keys');
 });
 
+test('advises when an unattended generic Composio write has neither a pinned action nor discovery', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    enabled: true,
+    trigger: { schedule: '0 8 * * *', timezone: 'America/Los_Angeles' },
+    steps: [
+      {
+        id: 'upsert_accounts',
+        prompt: 'Upsert every prepared account into the existing tracker, then read the written rows back.',
+        allowedTools: ['composio_execute_tool', 'run_tool_program'],
+        sideEffect: 'write',
+      },
+    ],
+  }));
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /unattended external write/);
+  assert.match(warnings[0], /Pin a proven TOOLKIT_ACTION slug/);
+});
+
+test('accepts an unattended Composio write with a pinned mutation slug', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    enabled: true,
+    trigger: { schedule: '0 8 * * *', timezone: 'America/Los_Angeles' },
+    steps: [
+      {
+        id: 'upsert_accounts',
+        prompt: 'Call GOOGLESHEETS_UPDATE_VALUES_BATCH with the pinned spreadsheet_id and exact data ranges, then read them back.',
+        allowedTools: ['composio_execute_tool', 'run_tool_program'],
+        sideEffect: 'write',
+      },
+    ],
+  }));
+
+  assert.deepEqual(warnings, []);
+});
+
+test('accepts an unattended generic Composio write that retains bounded discovery', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    enabled: true,
+    trigger: { schedule: '0 8 * * *', timezone: 'America/Los_Angeles' },
+    steps: [
+      {
+        id: 'upsert_accounts',
+        prompt: 'Find the correct Sheets upsert action, execute it once, then read the written rows back.',
+        allowedTools: ['composio_search_tools', 'composio_execute_tool'],
+        sideEffect: 'write',
+      },
+    ],
+  }));
+
+  assert.deepEqual(warnings, []);
+});
+
 test('advises when a verified artifact step is model-written instead of deterministic', () => {
   const warnings = workflowAuthoringAdvisories(wf({
     steps: [

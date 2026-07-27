@@ -102,11 +102,13 @@ test('workflowEditAdvisories: includes unattended reliability drift warnings', (
   const out = workflowEditAdvisories([
     'Step "draft" looks like multi-item work but has no forEach — it will run serially in one context.',
     'Step "pull" looks like it should use your proven cli `sf data query --json`, but its prompt doesn\'t embed it and its tools still include composio — at runtime the step may re-decide and drift onto a stale path.',
+    'Step "upsert" is an unattended external write through composio_execute_tool, but its prompt names no concrete mutation slug and the step cannot call composio_search_tools.',
     'Workflow is currently disabled — scheduled triggers will not fire.',
   ]);
   assert.deepEqual(out, [
     'Step "draft" looks like multi-item work but has no forEach — it will run serially in one context.',
     'Step "pull" looks like it should use your proven cli `sf data query --json`, but its prompt doesn\'t embed it and its tools still include composio — at runtime the step may re-decide and drift onto a stale path.',
+    'Step "upsert" is an unattended external write through composio_execute_tool, but its prompt names no concrete mutation slug and the step cannot call composio_search_tools.',
   ]);
 });
 

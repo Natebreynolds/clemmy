@@ -16,10 +16,13 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { validateGoal, type GoalCriterionVerdict, type GoalValidationResult, type ValidateGoalDeps } from './goal-validate.js';
 import { readRunGoal, readWorkspaceManifest, runWorkspaceDir, type WorkspaceArtifact } from './workflow-run-workspace.js';
+import { readWorkflowEvents } from './workflow-events.js';
+import { compactWorkflowGoalEvidence, countNonEmptyLines } from './workflow-goal-evidence.js';
 
-/** How much of each step's work product the checker reads as evidence — a
- *  bounded sample (progressive disclosure) so the checker itself stays cheap. */
-const EVIDENCE_PER_ARTIFACT = 3000;
+/** How much of each step's structurally-projected work product the checker
+ *  reads as evidence. Wide arrays become count + sample instead of hiding
+ *  trailing proof fields behind a raw prefix clip. */
+const EVIDENCE_PER_ARTIFACT = 1800;
 
 export interface CheckerReport {
   runId: string;
@@ -51,11 +54,34 @@ export function buildWorkspaceEvidence(
   const dir = runWorkspaceDir(workflowName, runId);
   const blocks: string[] = [];
   if (goal) blocks.push(goal.trim());
+  try {
+    const events = readWorkflowEvents(workflowName, runId);
+    const finalStepState = new Map<string, 'completed' | 'failed'>();
+    for (const event of events) {
+      if (!event.stepId || event.stepId === '__synthesis__') continue;
+      if (event.kind === 'step_completed') finalStepState.set(event.stepId, 'completed');
+      if (event.kind === 'step_failed') finalStepState.set(event.stepId, 'failed');
+    }
+    const completedCount = [...finalStepState.values()].filter((state) => state === 'completed').length;
+    const failedCount = [...finalStepState.values()].filter((state) => state === 'failed').length;
+    blocks.push([
+      '### Run engine evidence',
+      `${completedCount} workflow step${completedCount === 1 ? '' : 's'} reached step_completed after blocked/error detection and output-contract verification.`,
+      `Unresolved step_failed events: ${failedCount}.`,
+    ].join('\n'));
+  } catch {
+    // Workspace artifacts remain usable evidence when the event journal is
+    // unavailable; the judge simply lacks the extra engine-status statement.
+  }
   for (const a of artifacts) {
     let sample = '';
     try {
       const raw = readFileSync(path.join(dir, a.path), 'utf-8');
-      sample = raw.length > EVIDENCE_PER_ARTIFACT ? `${raw.slice(0, EVIDENCE_PER_ARTIFACT)}\n…[${raw.length - EVIDENCE_PER_ARTIFACT} more chars]` : raw;
+      let parsed: unknown = raw;
+      try { parsed = JSON.parse(raw) as unknown; } catch { /* retain text */ }
+      sample = typeof parsed === 'string'
+        ? `Non-empty lines: ${countNonEmptyLines(parsed)}\n${parsed.slice(0, EVIDENCE_PER_ARTIFACT)}`
+        : compactWorkflowGoalEvidence(parsed, EVIDENCE_PER_ARTIFACT);
     } catch { sample = a.summary; }
     blocks.push(`### Step "${a.agent}" produced (${a.bytes} bytes): ${a.summary}\n${sample}`);
   }

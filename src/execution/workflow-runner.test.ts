@@ -1465,6 +1465,59 @@ test('final synthesis and goal evidence render large completed outputs as querya
   assert.doesNotMatch(evidence, new RegExp(lastNeedle), 'goal evidence stays bounded and points to the artifact');
 });
 
+test('goal evidence preserves line count and scalar metadata after wide arrays', () => {
+  const evidence = workflowRunnerInternalsForTest.buildGoalEvidenceText(
+    'Pulled 5 candidates.\nPrepared 1 account.\nVerified row 29.\nTracker: https://example.test/sheet',
+    {
+      tracker: {
+        spreadsheetId: 'sheet-1',
+        columns: Array.from({ length: 70 }, (_, index) => `Column ${index + 1}`),
+        gridRowCount: 1009,
+        nextAppendRow: 98,
+        existingRows: [{ rowNumber: 29, accountId: 'acct-1', domain: 'example.test' }],
+        duplicateMatches: [{ stableKey: 'acct-1', canonicalRowNumber: 29, ignoredRowNumbers: [13, 28] }],
+      },
+    },
+  );
+
+  assert.match(evidence, /FINAL OUTPUT \(4 non-empty lines\)/);
+  assert.match(evidence, /"columns": \{ "count": 70/);
+  assert.match(evidence, /"gridRowCount": 1009/);
+  assert.match(evidence, /"nextAppendRow": 98/);
+  assert.match(evidence, /"existingRows": \{ "count": 1/);
+  assert.match(evidence, /"duplicateMatches": \{ "count": 1/);
+  assert.match(evidence, /reached step_completed after blocked\/error detection/);
+});
+
+test('goal evidence keeps trailing proof fields when a nested provider string is long', () => {
+  const evidence = workflowRunnerInternalsForTest.buildGoalEvidenceText('Done.', {
+    tracker: {
+      spreadsheetId: 'sheet-1',
+      existingRows: [{
+        rowNumber: 29,
+        accountId: 'acct-1',
+        seoSource: `provider detail ${'x'.repeat(2_000)}`,
+      }],
+      duplicateMatches: [{ stableKey: 'acct-1', canonicalRowNumber: 29, ignoredRowNumbers: [13, 28] }],
+    },
+  });
+
+  assert.match(evidence, /"spreadsheetId": "sheet-1"/);
+  assert.match(evidence, /"duplicateMatches": \{ "count": 1/);
+});
+
+test('goal evidence prioritizes proof fields after more than thirty top-level fields', () => {
+  const output = Object.fromEntries([
+    ...Array.from({ length: 35 }, (_, index) => [`providerField${index + 1}`, `value-${index + 1}`]),
+    ['verifiedCount', 1],
+    ['protectedFieldsUnchanged', true],
+  ]);
+  const evidence = workflowRunnerInternalsForTest.buildGoalEvidenceText('Done.', { upsert: output });
+
+  assert.match(evidence, /"verifiedCount": 1/);
+  assert.match(evidence, /"protectedFieldsUnchanged": true/);
+});
+
 test('workflow step model route uses the intent-bound worker model and trace metadata', () => {
   withEnv({
     AUTH_MODE: 'codex_oauth',

@@ -11,6 +11,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-run-checker-test-'))
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
+const { appendWorkflowEvent } = await import('./workflow-events.js');
 const { anchorRunGoal, recordStepOutput } = await import('./workflow-run-workspace.js');
 const { buildWorkspaceEvidence, checkRunAgainstGoal, renderCheckerReport, checkerReportFromVerdict } = await import('./workflow-run-checker.js');
 
@@ -37,6 +38,41 @@ test('checker reads the shared workspace (goal + every step work-product) as its
   assert.match(evidenceText, /Email each prospect a tailored note/); // the goal
   assert.match(evidenceText, /Step "pull" produced/);
   assert.match(evidenceText, /Acme LLP/); // the actual draft work product
+});
+
+test('checker evidence preserves trailing proof fields after wide arrays and long provider text', () => {
+  anchorRunGoal('wf', 'r-proof', { objective: 'Verify the tracker write', successCriteria: ['Must preserve duplicate and read-back proof'] });
+  recordStepOutput({
+    workflowName: 'wf',
+    runId: 'r-proof',
+    stepId: 'upsert',
+    output: {
+      columns: Array.from({ length: 70 }, (_, index) => `Column ${index + 1}`),
+      providerDetail: `provider ${'x'.repeat(4_000)}`,
+      duplicateMatches: [{ stableKey: 'acct-1', canonicalRowNumber: 29, ignoredRowNumbers: [13, 28] }],
+      verifiedCount: 1,
+      protectedFieldsUnchanged: true,
+    },
+    nowIso: NOW,
+  });
+
+  const { evidenceText } = buildWorkspaceEvidence('wf', 'r-proof');
+  assert.match(evidenceText, /"columns": \{ "count": 70/);
+  assert.match(evidenceText, /"duplicateMatches": \{ "count": 1/);
+  assert.match(evidenceText, /"verifiedCount": 1/);
+  assert.match(evidenceText, /"protectedFieldsUnchanged": true/);
+});
+
+test('checker engine evidence counts only each step final state after retries', () => {
+  anchorRunGoal('wf', 'r-recovered', { objective: 'Recover and finish', successCriteria: ['Must finish the recovered step'] });
+  recordStepOutput({ workflowName: 'wf', runId: 'r-recovered', stepId: 'recovered', output: { verifiedCount: 1 }, nowIso: NOW });
+  appendWorkflowEvent('wf', 'r-recovered', { kind: 'step_failed', stepId: 'recovered', error: 'transient' });
+  appendWorkflowEvent('wf', 'r-recovered', { kind: 'step_completed', stepId: 'recovered', output: { verifiedCount: 1 } });
+  appendWorkflowEvent('wf', 'r-recovered', { kind: 'step_failed', stepId: 'still_failed', error: 'terminal' });
+
+  const { evidenceText } = buildWorkspaceEvidence('wf', 'r-recovered');
+  assert.match(evidenceText, /1 workflow step reached step_completed/);
+  assert.match(evidenceText, /Unresolved step_failed events: 1/);
 });
 
 test('checker PASSES when the accumulated work satisfies the goal, attributing evidence to steps', async () => {
