@@ -105,6 +105,41 @@ test('infers a summary contract without treating prospect site as a list', () =>
   assert.equal(proposal.proposedStepOutputs[0].output.min_items, undefined);
 });
 
+test('prefers an explicitly declared tracker payload over nearby account/summary nouns', () => {
+  const proposal = proposeWorkflowContractUpgrades(wf({
+    description: 'Maintain a Salesforce account tracker and summarize the run.',
+    steps: [
+      {
+        id: 'find_tracker',
+        prompt: 'Find the account tracker sheet and read all account rows. Return structured JSON via workflow_step_result with the complete tracker information, including: spreadsheetId, sheetName, sheetUrl, columns, and existingRows.',
+      },
+    ],
+  }));
+
+  const output = proposal.proposedStepOutputs[0]?.output;
+  assert.deepEqual(output?.required_keys, ['spreadsheetId', 'sheetName', 'sheetUrl', 'columns', 'existingRows']);
+  assert.deepEqual(output?.verify, { url_present: ['sheetUrl'] });
+  assert.equal(output?.min_items, undefined, 'existingRows is not forced non-empty merely because accounts are discussed');
+  assert.ok(!output?.required_keys?.includes('accounts'));
+  assert.ok(!output?.required_keys?.includes('summary'));
+  assert.ok(!output?.required_keys?.includes('url'));
+});
+
+test('preserves exact object-literal return keys without inventing generic fields', () => {
+  const proposal = proposeWorkflowContractUpgrades(wf({
+    steps: [
+      {
+        id: 'upsert',
+        prompt: 'Upsert every prepared account into the sheet. Return exactly {preparedCount, sheetUrl, upsertedRowNumbers}.',
+      },
+    ],
+  }));
+
+  const output = proposal.proposedStepOutputs[0]?.output;
+  assert.deepEqual(output?.required_keys, ['preparedCount', 'sheetUrl', 'upsertedRowNumbers']);
+  assert.deepEqual(output?.verify, { url_present: ['sheetUrl'] });
+});
+
 test('renders a reviewable non-mutating proposal report', () => {
   const proposal = proposeWorkflowContractUpgrades(wf({
     synthesis: { prompt: 'Return the live audit URL.' },
@@ -156,6 +191,47 @@ test('does not advise when live research already requires evidence keys', () => 
   }));
 
   assert.deepEqual(warnings, []);
+});
+
+test('does not add generic research-summary keys to evidence-bearing account collections', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'enrich_accounts',
+        prompt: 'Enrich the selected accounts with DataForSEO rank and keyword metrics and preserve the source on every account.',
+        allowedTools: ['dataforseo__dataforseo_labs_google_ranked_keywords'],
+        output: {
+          type: 'object',
+          required_keys: ['accounts'],
+          non_empty: ['accounts'],
+          min_items: { accounts: 1 },
+        },
+        sideEffect: 'read',
+      },
+    ],
+  }));
+
+  assert.deepEqual(warnings, [], 'the account records are the evidence payload; top-level sources/key_findings would be redundant');
+});
+
+test('does not mistake a write that preserves SEO fields for a live-research step', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'upsert_accounts',
+        prompt: 'Upsert account and SEO fields, then read back the exact written sheet rows.',
+        allowedTools: ['composio_execute_tool'],
+        output: {
+          type: 'object',
+          required_keys: ['sheetUrl', 'upsertedRowNumbers'],
+          non_empty: ['sheetUrl', 'upsertedRowNumbers'],
+        },
+        sideEffect: 'write',
+      },
+    ],
+  }));
+
+  assert.deepEqual(warnings, [], 'write receipt/read-back proof should not be inflated with research-summary keys');
 });
 
 test('advises when a verified artifact step is model-written instead of deterministic', () => {

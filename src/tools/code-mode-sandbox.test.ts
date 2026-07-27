@@ -193,6 +193,46 @@ test('failure breaker: structured ok:false tool results also abort the program',
   assert.ok((r.partial?.failed ?? 0) >= 10);
 });
 
+test('all-failed return guard: ignored Composio failure cannot become an empty successful result', async () => {
+  const dispatch: CodeModeDispatch = async () => ({
+    ok: false,
+    error: '⚠️ composio_execute_tool FAILED (slug=GOOGLESHEETS_BATCH_GET): Error: Range Sheet1!A1202:BR1401 exceeds grid limits. Max rows: 1009.',
+    error_kind: 'tool_error',
+  });
+  const r = await runCodeModeProgram(
+    `const raw = await clem.composio_execute_tool({ slug: 'GOOGLESHEETS_BATCH_GET' });
+     const rows = raw?.data?.valueRanges || [];
+     return { rows };`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, false, 'an ignored tool failure must not be laundered into rows:[]');
+  assert.match(r.error ?? '', /all 1 tool call failed/i);
+  assert.match(r.error ?? '', /do not interpret missing tool data as an empty result/i);
+  assert.equal(r.partial?.completed, 0);
+  assert.equal(r.partial?.failed, 1);
+});
+
+test('all-failed return guard: a failed optional probe followed by a real success may return normally', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    calls++;
+    return calls === 1
+      ? { ok: false, error: 'optional source unavailable', error_kind: 'tool_error' }
+      : { records: [{ id: 'real-1' }] };
+  };
+  const r = await runCodeModeProgram(
+    `await clem.optional_probe({});
+     const primary = await clem.primary_source({});
+     return { records: primary.records };`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(r.value, { records: [{ id: 'real-1' }] });
+  assert.equal(calls, 2);
+});
+
 test('failure breaker: non-zero structured shell results also abort the program', async () => {
   let calls = 0;
   const dispatch: CodeModeDispatch = async () => {

@@ -87,6 +87,15 @@ const EVIDENCE_CONTRACT_KEYS = new Set([
   'items',
   'rows',
   'records',
+  // Domain collections are evidence-bearing workflow payloads just like
+  // generic rows/records. Requiring an extra top-level sources/key_findings
+  // wrapper around `{ accounts: [...] }` or `{ contacts: [...] }` adds token
+  // weight without improving proof when each item already carries its source
+  // fields and the collection has a non-empty/min-items contract.
+  'accounts',
+  'contacts',
+  'leads',
+  'prospects',
   'metrics',
   'data',
   'ranked_keywords',
@@ -163,6 +172,11 @@ export function stepHasWeakLiveResearchContract(
 ): boolean {
   if (!hasOutputContract(step)) return false;
   if (step.deterministic) return false;
+  // A write/upsert step may mention the research data it is preserving (SEO,
+  // keywords, audit fields) without being a research step itself. Its proof is
+  // the destination receipt/read-back contract, not invented research-summary
+  // keys. Explicit side effects are authoritative here.
+  if (step.sideEffect && step.sideEffect !== 'read') return false;
   if ((step.output?.verify?.path_exists?.length ?? 0) > 0) return false;
   const prompt = step.prompt ?? '';
   if (!LIVE_RESEARCH_RE.test(prompt)) return false;
@@ -289,6 +303,49 @@ function stepLooksContractWorthy(prompt: string): boolean {
     || (LIST_DELIVERABLE_RE.test(prompt) && READ_DATA_RE.test(prompt));
 }
 
+function uniqueKeys(keys: string[]): string[] {
+  return [...new Set(keys.filter((key) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)))];
+}
+
+/**
+ * Prefer the payload shape the workflow author actually named over noun-based
+ * guessing. The old inference saw words such as "accounts", "summary", and
+ * "sheet URL" anywhere in a tracker prompt and invented `{url, summary,
+ * accounts}` even when the prompt explicitly returned
+ * `{spreadsheetId, sheetName, sheetUrl, columns, existingRows}`. That turns a
+ * helpful contract into a model-choking false gate.
+ *
+ * Intentionally conservative: recognize only an object literal immediately
+ * after "return" or a comma-separated "including/exactly these fields" clause.
+ * If neither exists, the legacy coarse proposal remains the fallback.
+ */
+function explicitReturnKeys(prompt: string): string[] {
+  const objectShape = prompt.match(
+    /\breturn(?:\s+only|\s+exactly)?\s+(?:structured\s+JSON\s+)?\{([\s\S]{1,600}?)\}/i,
+  );
+  if (objectShape) {
+    const keys = objectShape[1]
+      .split(',')
+      .map((part) => part.trim().match(/^`?([A-Za-z_][A-Za-z0-9_]*)`?\s*(?::|$)/)?.[1] ?? '');
+    const unique = uniqueKeys(keys);
+    if (unique.length > 0) return unique;
+  }
+
+  const fieldClause = prompt.match(
+    /\breturn[\s\S]{0,300}?\b(?:including|exactly\s+these\s+fields)\s*:\s*([^.\n]{1,600})/i,
+  );
+  if (!fieldClause) return [];
+  const clause = fieldClause[1];
+  const quoted = [...clause.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`/g)].map((match) => match[1]);
+  if (quoted.length > 0) return uniqueKeys(quoted);
+  return uniqueKeys(
+    clause
+      .replace(/\band\b/gi, ',')
+      .split(',')
+      .map((part) => part.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)$/)?.[1] ?? ''),
+  );
+}
+
 function compactContract(contract: WorkflowStepOutputContract): WorkflowStepOutputContract {
   const out: WorkflowStepOutputContract = { ...contract };
   if (out.required_keys && out.required_keys.length === 0) delete out.required_keys;
@@ -316,6 +373,26 @@ function proposeStepOutput(step: WorkflowStepInput): WorkflowContractStepOutputP
   const verify: NonNullable<WorkflowStepOutputContract['verify']> = {};
   const minItems: Record<string, number> = {};
   const nonEmpty = new Set<string>();
+
+  const declaredKeys = explicitReturnKeys(prompt);
+  if (declaredKeys.length > 0) {
+    const urlKeys = declaredKeys.filter((key) => /(?:url|link)$/i.test(key));
+    const pathKeys = declaredKeys.filter((key) => /(?:^|_)(?:path|file_path)$/i.test(key) || /Path$/.test(key));
+    return {
+      stepId: step.id,
+      output: compactContract({
+        type: 'object',
+        required_keys: declaredKeys,
+        verify: {
+          ...(urlKeys.length > 0 ? { url_present: urlKeys } : {}),
+          ...(pathKeys.length > 0 ? { path_exists: pathKeys } : {}),
+        },
+        description: `Prompt-declared output shape for step "${step.id}".`,
+      }),
+      reasons: ['prompt explicitly declares its returned object fields; preserve that shape instead of guessing from nearby nouns'],
+      promptSnippet: snippet(prompt),
+    };
+  }
 
   if (URL_DELIVERABLE_RE.test(prompt)) {
     required.add('url');

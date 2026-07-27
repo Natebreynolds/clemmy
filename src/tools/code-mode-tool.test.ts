@@ -191,6 +191,16 @@ test('normalizeCodeModeToolResult: obvious tool-error banners become structured 
   assert.match(out.error ?? '', /InvalidToolInputError/);
 });
 
+test('normalizeCodeModeToolResult: Composio warning-prefixed FAILED banners become structured failures', () => {
+  const out = normalizeCodeModeToolResult(
+    'composio_execute_tool',
+    '⚠️ composio_execute_tool FAILED (slug=GOOGLESHEETS_BATCH_GET): Error: Range Sheet1!A1202:BR1401 exceeds grid limits. Max rows: 1009, max columns: 70.',
+  ) as { ok?: boolean; error?: string; error_kind?: string };
+  assert.equal(out.ok, false);
+  assert.equal(out.error_kind, 'tool_error');
+  assert.match(out.error ?? '', /exceeds grid limits/);
+});
+
 test('runCodeModeForSession: run_shell_command exposes stdout/stdout_json instead of the text wrapper', async () => {
   const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;

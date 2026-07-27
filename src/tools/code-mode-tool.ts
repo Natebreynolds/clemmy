@@ -216,7 +216,7 @@ function parseToolErrorText(raw: string): { ok: false; error: string; raw: strin
     /^An error occurred while running the tool\b/i.test(text) ||
     /^\s*(?:ERROR|Error|InvalidToolInputError)\b/i.test(text) ||
     /^MCP error\b/i.test(text) ||
-    /^FAILED \(slug=/i.test(text) ||
+    /^(?:⚠️\s*)?(?:composio_execute_tool\s+)?FAILED\b/i.test(text) ||
     /^NOT CONNECTED\b/i.test(text)
   ) {
     return { ok: false, error: text.slice(0, 2000), raw, error_kind: 'tool_error' };

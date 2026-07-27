@@ -490,6 +490,22 @@ export async function runCodeModeProgram(
               try { child.stdin.write(JSON.stringify({ id, error: errMsg }) + '\n'); } catch { /* child gone */ }
             });
         } else if (msg.__cm === 'return') {
+          // A model-authored program can accidentally ignore a soft tool
+          // failure and turn a missing payload into an apparently valid empty
+          // result (for example, `raw?.data?.rows || []`). Do not let an
+          // all-failed program launder that failure into success. Mixed
+          // probe/fallback programs remain valid as soon as at least one real
+          // tool call succeeds.
+          if (rpcFailed > 0 && rpcCompleted === 0) {
+            result = {
+              ok: false,
+              error: `code-mode program returned after all ${rpcFailed} tool ${rpcFailed === 1 ? 'call failed' : 'calls failed'}; do not interpret missing tool data as an empty result — fix the tool arguments and retry.`,
+              rpcCalls,
+              logs,
+              partial: partialOnFailure(),
+            };
+            continue;
+          }
           const json = JSON.stringify(msg.value ?? null);
           let value: unknown;
           if (json.length <= maxReturn) {
