@@ -2292,6 +2292,18 @@ test('buildScopedNativeMcpServers: an EMPTY scope attaches NO external servers (
     assert.deepEqual(buildScopedNativeMcpServers(''), {}, 'empty string ⇒ no external servers');
     assert.deepEqual(buildScopedNativeMcpServers('   '), {}, 'whitespace ⇒ no external servers');
     assert.deepEqual(buildScopedNativeMcpServers(undefined), {}, 'undefined ⇒ no external servers');
+    assert.deepEqual(
+      buildScopedNativeMcpServers(
+        'Use only Clementine local memory. Do not call any external connector. Return names only, no emails.',
+      ),
+      {},
+      'a concrete local-only boundary ⇒ no external servers',
+    );
+    assert.deepEqual(
+      buildScopedNativeMcpServers('write a local markdown file with a project checklist'),
+      {},
+      'an ordinary local-file turn ⇒ no external servers',
+    );
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
     if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;

@@ -583,7 +583,16 @@ export function buildScopedNativeMcpServers(
       ? externalMcpScopeFromResolvedTools(scopeInput, all.map((server) => server.name))
       : resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     if (!scope) return {};
-    if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
+    // A deliberate zero-tool prompt scope is represented by maxTools:0 + an
+    // empty slug list (allowAll is intentionally undefined), while the bounded
+    // unrecognized-intent fallback is the only empty-slug scope allowed to
+    // reach the user's own servers. Resolved worker packets intentionally omit
+    // maxTools, so only an EXPLICIT zero carries denial authority.
+    if (
+      !scope.allowAll
+      && !scope.failOpenCandidate
+      && (scope.maxTools === 0 || (scope.allowedServerSlugs ?? []).length === 0)
+    ) return {};
     const deferExternal = claudeToolSearchEnabled();
     const out: Record<string, McpServerConfig> = {};
     for (const s of all) {

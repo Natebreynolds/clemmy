@@ -97,6 +97,8 @@ import {
   type FreshExternalWriteEvidenceStatus,
 } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
+import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import {
   listRunArtifacts,
   listUnverifiedRunArtifacts,
@@ -1508,6 +1510,34 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
   const attemptTrackerScopeId = `${sessionId}::brain:${attempt.runId ?? attempt.attemptId}`;
   const turnObjective = effectiveTurnObjective(sessionId, request.message, userInputEvent.seq);
+  // Keep the Claude-native external MCP surface observable with the same event
+  // contract as the Codex lane. This is also the auditable proof that an
+  // explicit local-only boundary resolved to zero external authority.
+  const nativeMcpScope: McpToolScope = mode === 'full'
+    ? resolveMcpToolScope({
+        userInput: turnObjective,
+        pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+      })
+    : {
+        reason: `Claude SDK ${mode} mode does not attach native external MCP servers`,
+        allowedServerSlugs: [],
+        maxTools: 0,
+      };
+  try {
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'mcp_tool_scope',
+      data: {
+        reason: nativeMcpScope.reason,
+        allowAll: !!nativeMcpScope.allowAll,
+        allowedServerSlugs: nativeMcpScope.allowedServerSlugs ?? [],
+        maxTools: nativeMcpScope.maxTools ?? null,
+        lane: 'claude_sdk',
+      },
+    });
+  } catch { /* scope telemetry must never block model dispatch */ }
   const freshExternalWriteRequired = objectiveRequiresFreshExternalWrite(turnObjective);
   const toolEconomyState = (() => {
     if (surface === 'background' || surface === 'cron' || !interactiveToolEconomyEnabled()) return undefined;

@@ -351,6 +351,35 @@ test('SDK brain auto-captures explicit remember turns even when the model skips 
   );
 });
 
+test('Claude brain records a zero-authority external MCP scope for explicit local-only turns', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-local-only-mcp-scope';
+  createSession({ id: sessionId, kind: 'chat', title: 'local recall' });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Avery Rowan\nBlair Solis',
+    sessionId: 'sdk',
+    model: 'm',
+    toolUses: [],
+  }));
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Use only Clementine local memory. Do not call any external connector. Return names only, no emails.',
+    sessionId,
+  });
+
+  const scopeEvent = listEvents(sessionId, { types: ['mcp_tool_scope'] }).at(-1);
+  assert.ok(scopeEvent, 'Claude brain emits the shared MCP scope telemetry');
+  const scope = scopeEvent!.data as {
+    lane?: string;
+    maxTools?: number;
+    allowedServerSlugs?: string[];
+  };
+  assert.equal(scope.lane, 'claude_sdk');
+  assert.equal(scope.maxTools, 0);
+  assert.deepEqual(scope.allowedServerSlugs, []);
+});
+
 test('Move 4: a judge-failed-open completion is TAGGED verification.failedOpen (no silent green check)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
