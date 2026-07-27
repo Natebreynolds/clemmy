@@ -3,13 +3,14 @@
  *
  * This spends one real model call through the user's configured Clementine auth.
  * It invokes the built chat `run_worker` tool directly with intent:"design" and
- * verifies the nested Worker is routed to the configured Claude model.
+ * verifies the nested Worker is routed to the configured model/provider.
  *
  * Run:
  *   AUTH_MODE=codex_oauth npx tsx scripts/smoke-chat-worker-routing-live.ts
  *
  * Optional:
- *   CLEMMY_LIVE_WORKER_MODEL=claude-sonnet-4-6
+ *   CLEMMY_LIVE_WORKER_MODEL=gpt-5.6-luna
+ *   CLEMMY_LIVE_WORKER_MODEL=claude-fable-5
  */
 
 const workerModel = (process.env.CLEMMY_LIVE_WORKER_MODEL || 'claude-opus-4-8').trim();
@@ -34,6 +35,8 @@ const { configureHarnessRuntime } = await import('../src/runtime/harness/codex-c
 const { buildOrchestratorAgent } = await import('../src/agents/orchestrator.js');
 const { createSession, listEvents } = await import('../src/runtime/harness/eventlog.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../src/runtime/harness/brackets.js');
+const { resolveProvider } = await import('../src/runtime/harness/model-wire-registry.js');
+const expectedProvider = resolveProvider(workerModel);
 
 function fail(message: string): never {
   console.error(`FAIL ${message}`);
@@ -55,7 +58,7 @@ const session = createSession({
 
 const agent = await buildOrchestratorAgent({
   sessionId: session.id,
-  userInput: 'Live smoke: route a design worker to the configured Claude model.',
+  userInput: 'Live smoke: route a design worker to the configured model.',
   mcpToolScope: {
     reason: 'live smoke: no external MCP tools required',
     allowedServerSlugs: [],
@@ -109,15 +112,17 @@ const route = routed[0].data as Record<string, unknown>;
 console.log(`route=${JSON.stringify(route)}`);
 if (route.seam !== 'chat') fail(`expected seam=chat, got ${String(route.seam)}`);
 if (route.modelId !== workerModel) fail(`expected modelId=${workerModel}, got ${String(route.modelId)}`);
-if (route.provider !== 'claude') fail(`expected provider=claude, got ${String(route.provider)}`);
+if (route.provider !== expectedProvider) {
+  fail(`expected provider=${expectedProvider}, got ${String(route.provider)}`);
+}
 if (route.matchedIntent !== 'design') fail(`expected matchedIntent=design, got ${String(route.matchedIntent)}`);
 
 if (/^\s*ERROR:/i.test(text)) fail(`worker returned an error result: ${text}`);
 if (/out of extra usage/i.test(text)) {
-  fail(`Claude OAuth dispatch succeeded but the subscription rejected the call for usage: ${text}`);
+  fail(`Worker dispatch succeeded but the provider rejected the call for usage: ${text}`);
 }
 if (!/ROUTED_DESIGN_WORKER_OK/i.test(text)) {
   fail(`worker completed but did not return the expected sentinel; result=${JSON.stringify(text)}`);
 }
 
-console.log(`PASS chat run_worker intent routing dispatched to ${workerModel}`);
+console.log(`PASS chat run_worker intent routing dispatched to ${workerModel} via ${expectedProvider}`);
