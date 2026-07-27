@@ -76,6 +76,7 @@ export async function runSetupWizard(): Promise<number> {
     choices: [
       { value: 'api_key', name: `api_key       Use direct OpenAI API billing for the agent runtime` },
       { value: 'codex_oauth', name: `codex_oauth   Use ChatGPT/Codex OAuth for the agent runtime` },
+      { value: 'claude_oauth', name: `claude_oauth  Use a Claude subscription for the agent runtime` },
     ],
   });
 
