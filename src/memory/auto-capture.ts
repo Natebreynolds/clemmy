@@ -205,9 +205,53 @@ function clean(value: string, maxChars = 260): string {
     .slice(0, maxChars);
 }
 
+/**
+ * Keep explicit store requests as the fact itself, not as a second-order
+ * "the user asked Clementine to remember..." wrapper. The full user turn still
+ * lives in the evidence episode, so this only cleans the canonical claim that
+ * is injected on later turns.
+ *
+ * Deliberately do not strip bare "remember to ...": that wording can describe
+ * a reminder/task rather than a declarative fact, and preserving it is safer
+ * than turning it into the awkward/ambiguous "to ...".
+ */
+function explicitRememberContent(text: string): string {
+  const leaders = [
+    /^(?:please\s+)?remember\s+(?:this|that|exactly)\s*:?\s*/i,
+    /^(?:please\s+)?remember\s*:\s*/i,
+    /^(?:please\s+)?note\s+that\s+/i,
+    /^(?:please\s+)?keep\s+in\s+mind(?:\s+that)?\s+/i,
+    /^(?:please\s+)?don'?t\s+forget(?:\s+that)?\s+/i,
+    /^(?:please\s+)?make\s+a\s+note(?:\s+that)?\s*:?\s*/i,
+  ];
+  const leader = leaders.find((candidate) => candidate.test(text));
+  if (!leader) return text;
+
+  const clause = text
+    .replace(leader, '')
+    .replace(
+      /\s+(?:then\s+)?(?:just\s+)?confirm\s+(?:you(?:'ve| have)\s+)?(?:noted|saved|remembered)\s+it(?:\s*[—,:;-]\s*nothing\s+else)?[.!?]*$/i,
+      '',
+    )
+    // A standalone final sentence is framing; "I need to confirm" is not.
+    .replace(/(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i, '');
+  return clause.trim() || text;
+}
+
+function explicitRememberKind(content: string): ConsolidatedFactKind {
+  // A literal project/tooling context should not be mislabeled as a personal
+  // preference merely because the user used the word "remember".
+  return PROJECT_TERMS.test(content) ? 'project' : 'user';
+}
+
 function addCandidate(candidates: AutoMemoryCandidate[], candidate: AutoMemoryCandidate): void {
   const content = clean(candidate.content);
-  if (!content || content.length < 12) return;
+  // Explicit store requests are user-authored memory intent, not a heuristic:
+  // accept the same minimum as memory_remember so short labels/codewords are not
+  // silently lost after removing the old long wrapper. Keep the higher floor for
+  // inferred candidates to avoid filling durable memory with low-signal scraps.
+  const minChars = candidate.reason === 'explicit remember request' ? 3 : 12;
+  if (!content || content.length < minChars) return;
   const key = `${candidate.kind}:${content.toLowerCase()}`;
   if (candidates.some((entry) => `${entry.kind}:${entry.content.toLowerCase()}` === key)) return;
   candidates.push({ ...candidate, content });
@@ -351,9 +395,10 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     && !/^\s*(?:do|did|does|can|could|would|will)\b/i.test(text)
     && /\b(?:remember|note|keep in mind|don'?t forget|make a note)\b/i.test(text)
   ) {
+    const content = explicitRememberContent(text);
     addCandidate(candidates, {
-      kind: 'user',
-      content: `User explicitly asked Clementine to remember: ${text}`,
+      kind: explicitRememberKind(content),
+      content,
       reason: 'explicit remember request',
     });
   }

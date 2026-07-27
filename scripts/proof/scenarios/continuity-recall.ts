@@ -46,6 +46,7 @@ export const continuityRecall: ScenarioDef = {
 
     let metrics = null;
     let decisionParseRetries = -1;
+    let invalidRememberReturns = -1;
     try {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn2.sessionId);
@@ -53,6 +54,12 @@ export const continuityRecall: ScenarioDef = {
         SELECT COUNT(*) AS count FROM events
         WHERE session_id = ? AND type = 'stall_retry_attempted'
           AND json_extract(data_json, '$.signal') = 'D_decision_unparsed'
+      `).get(turn2.sessionId) as { count: number }).count;
+      invalidRememberReturns = (db.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE session_id = ? AND type = 'tool_returned'
+          AND json_extract(data_json, '$.tool') = 'memory_remember'
+          AND lower(COALESCE(json_extract(data_json, '$.result'), '')) LIKE '%invalidtoolinputerror%'
       `).get(turn2.sessionId) as { count: number }).count;
       db.close();
     } catch { /* handled below */ }
@@ -70,6 +77,11 @@ export const continuityRecall: ScenarioDef = {
       name: 'remember mutation runs at most once',
       pass: (metrics?.toolCalls.memory_remember ?? 0) <= 1,
       detail: `memory_remember calls: ${metrics?.toolCalls.memory_remember ?? 'n/a'}`,
+    });
+    checks.push({
+      name: 'no invalid memory tool input',
+      pass: invalidRememberReturns === 0,
+      detail: `invalid memory_remember returns: ${invalidRememberReturns}`,
     });
 
     let activeCodewordFacts = -1;
@@ -99,6 +111,7 @@ export const continuityRecall: ScenarioDef = {
         tokensUsed: metrics.tokensUsed,
         primerInjectedBytes: metrics.primerInjectedBytes,
         memoryRememberCalls: metrics.toolCalls.memory_remember ?? 0,
+        invalidRememberReturns,
         decisionParseRetries,
         activeCodewordFacts,
       } : undefined,

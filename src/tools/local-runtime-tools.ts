@@ -85,6 +85,102 @@ function resultToText(result: unknown): string {
   }
 }
 
+interface JsonStringToken {
+  value: string;
+  end: number;
+}
+
+function skipJsonWhitespace(input: string, start: number): number {
+  let cursor = start;
+  while (cursor < input.length && /\s/.test(input[cursor] ?? '')) cursor += 1;
+  return cursor;
+}
+
+/** Read one fully valid JSON string without requiring the rest of the object to
+ * parse. This lets the boundary retain an already-complete required prefix when
+ * corruption occurs later in optional annotations. */
+function readJsonStringToken(input: string, start: number): JsonStringToken | null {
+  const first = skipJsonWhitespace(input, start);
+  if (input[first] !== '"') return null;
+  let cursor = first + 1;
+  while (cursor < input.length) {
+    const char = input[cursor];
+    if (char === '"') {
+      const raw = input.slice(first, cursor + 1);
+      try {
+        const value = JSON.parse(raw) as unknown;
+        return typeof value === 'string' ? { value, end: cursor + 1 } : null;
+      } catch {
+        return null;
+      }
+    }
+    if (char === '\\') {
+      cursor += 1;
+      if (cursor >= input.length) return null;
+      if (input[cursor] === 'u') {
+        const hex = input.slice(cursor + 1, cursor + 5);
+        if (!/^[0-9a-f]{4}$/i.test(hex)) return null;
+        cursor += 4;
+      }
+    } else if ((char?.charCodeAt(0) ?? 0) < 0x20) {
+      return null;
+    }
+    cursor += 1;
+  }
+  return null;
+}
+
+function consumeJsonPunctuation(input: string, start: number, expected: string): number | null {
+  const cursor = skipJsonWhitespace(input, start);
+  return input[cursor] === expected ? cursor + 1 : null;
+}
+
+/**
+ * Narrow recovery for the only safe case observed in live proof:
+ * memory_remember produced a valid, schema-ordered `kind` + `content` prefix,
+ * then malformed an OPTIONAL graph annotation. Saving that already-grounded
+ * local fact is safer and cheaper than asking the model to repeat the mutation.
+ *
+ * This is intentionally NOT generic JSON repair:
+ *   - requires the exact leading object shape emitted by our schema;
+ *   - accepts only ordinary, idempotent fact kinds (never a hard constraint);
+ *   - requires kind/content to be complete JSON strings and within schema bounds;
+ *   - discards every optional field rather than guessing how to repair it.
+ * Any other corruption follows the SDK's normal visible retry path.
+ */
+export function recoverMemoryRememberRequiredPrefix(error: unknown): Record<string, unknown> | null {
+  if (!error || typeof error !== 'object') return null;
+  const name = (error as { name?: unknown }).name;
+  const toolInvocation = (error as { toolInvocation?: unknown }).toolInvocation;
+  if (name !== 'InvalidToolInputError' || !toolInvocation || typeof toolInvocation !== 'object') return null;
+  const raw = (toolInvocation as { input?: unknown }).input;
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 20_000) return null;
+
+  let cursor = consumeJsonPunctuation(raw, 0, '{');
+  if (cursor === null) return null;
+  const kindKey = readJsonStringToken(raw, cursor);
+  if (!kindKey || kindKey.value !== 'kind') return null;
+  cursor = consumeJsonPunctuation(raw, kindKey.end, ':');
+  if (cursor === null) return null;
+  const kind = readJsonStringToken(raw, cursor);
+  if (!kind) return null;
+  cursor = consumeJsonPunctuation(raw, kind.end, ',');
+  if (cursor === null) return null;
+  const contentKey = readJsonStringToken(raw, cursor);
+  if (!contentKey || contentKey.value !== 'content') return null;
+  cursor = consumeJsonPunctuation(raw, contentKey.end, ':');
+  if (cursor === null) return null;
+  const content = readJsonStringToken(raw, cursor);
+  if (!content) return null;
+  const next = raw[skipJsonWhitespace(raw, content.end)];
+  if (next !== ',' && next !== '}') return null;
+
+  const safeKinds = new Set(['user', 'project', 'feedback', 'reference']);
+  const cleanContent = content.value.trim();
+  if (!safeKinds.has(kind.value) || cleanContent.length < 3 || cleanContent.length > 800) return null;
+  return { kind: kind.value, content: cleanContent };
+}
+
 // v0.5.22 — moved the body of this normalizer to
 // `src/runtime/schema-normalizer.ts` so agent outputType schemas can
 // share the same transformation. The helpers below are thin re-exports
@@ -193,6 +289,27 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
       toolOutputContextFromSdk(localTool.name, runContext, details),
       async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
     ),
+    // A malformed optional graph tail must not force a second memory mutation
+    // attempt when kind/content were already complete. Keep this recovery local
+    // and narrow; every other tool/error retains the SDK's default behavior.
+    errorFunction: localTool.name === 'memory_remember'
+      ? async (runContext, error) => {
+          const recovered = recoverMemoryRememberRequiredPrefix(error);
+          if (!recovered) {
+            return 'memory_remember input was invalid. Retry once with only the required kind and content fields; omit optional graph annotations.';
+          }
+          const details = error && typeof error === 'object'
+            ? (error as { toolInvocation?: { details?: unknown } }).toolInvocation?.details
+            : undefined;
+          return withToolOutputContext(
+            toolOutputContextFromSdk(localTool.name, runContext, details),
+            async () => {
+              const result = resultToText(await localTool.handler(recovered));
+              return `${result}\n[Recovered valid kind/content; malformed optional graph annotations were ignored.]`;
+            },
+          );
+        }
+      : undefined,
   });
 }
 

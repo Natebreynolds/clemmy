@@ -72,6 +72,7 @@ test('extractAutoMemoryCandidates keeps explicit remember for personal facts', (
 
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0]?.kind, 'user');
+  assert.equal(candidates[0]?.content, 'my preferred contract reviewer is Taylor Example.');
 });
 
 test('extractAutoMemoryCandidates keeps explicit "remember exactly" smoke facts', () => {
@@ -79,7 +80,41 @@ test('extractAutoMemoryCandidates keeps explicit "remember exactly" smoke facts'
 
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0]?.kind, 'user');
-  assert.match(candidates[0]?.content, /MEMTOK-123456/);
+  assert.equal(candidates[0]?.content, 'my smoke marker is MEMTOK-123456.');
+});
+
+test('explicit project remember stores one clean canonical claim without confirmation framing', () => {
+  const candidates = extractAutoMemoryCandidates(
+    'Remember this: the codeword for the Falcon project is "tangerine-osprey-42". Just confirm you\'ve noted it — nothing else.',
+  );
+
+  assert.deepEqual(candidates, [{
+    kind: 'project',
+    content: 'the codeword for the Falcon project is "tangerine-osprey-42".',
+    reason: 'explicit remember request',
+  }]);
+});
+
+test('bare "remember to" keeps its task-like wording intact', () => {
+  const candidates = extractAutoMemoryCandidates('Remember to call the vendor on Friday about the renewal.');
+
+  assert.equal(candidates[0]?.content, 'Remember to call the vendor on Friday about the renewal.');
+});
+
+test('explicit remember cleaner does not strip a fact whose substance ends in "confirm"', () => {
+  const candidates = extractAutoMemoryCandidates('Remember that I need to confirm.');
+
+  assert.equal(candidates[0]?.content, 'I need to confirm.');
+});
+
+test('explicit remember honors short user-authored facts down to the memory schema minimum', () => {
+  const candidates = extractAutoMemoryCandidates('Remember this: blue.');
+
+  assert.deepEqual(candidates, [{
+    kind: 'user',
+    content: 'blue.',
+    reason: 'explicit remember request',
+  }]);
 });
 
 test('extractProfilePatchFromMessage captures explicit communication preferences', () => {

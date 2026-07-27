@@ -4,11 +4,15 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, rmSync } from 'node:fs';
+import { RunContext } from '@openai/agents';
 
 const TEST_HOME = '/tmp/clemmy-test-local-tools';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { getLocalRuntimeTools } = await import('./local-runtime-tools.js');
+const {
+  getLocalRuntimeTools,
+  recoverMemoryRememberRequiredPrefix,
+} = await import('./local-runtime-tools.js');
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -50,4 +54,43 @@ test('local runtime tools include autonomy, execution, run tracking, and profile
   ]) {
     assert.equal(names.has(required), true, `expected local runtime tool ${required}`);
   }
+});
+
+test('memory input recovery salvages only a complete safe kind/content prefix', () => {
+  const raw = '{"kind":"project","content":"The Falcon codeword is \\"tangerine-osprey-42\\".",'
+    + '"entities":null,"relationships":[{"validFrom":"2026-07-26\'}]}garbage';
+  const recovered = recoverMemoryRememberRequiredPrefix({
+    name: 'InvalidToolInputError',
+    toolInvocation: { input: raw },
+  });
+  assert.deepEqual(recovered, {
+    kind: 'project',
+    content: 'The Falcon codeword is "tangerine-osprey-42".',
+  });
+
+  assert.equal(recoverMemoryRememberRequiredPrefix({
+    name: 'InvalidToolInputError',
+    toolInvocation: { input: '{"kind":"constraint","content":"Never send mail from prod",' },
+  }), null, 'hard constraints are never recovered from partial input');
+  assert.equal(recoverMemoryRememberRequiredPrefix({
+    name: 'InvalidToolInputError',
+    toolInvocation: { input: '{"kind":"project","content":"unterminated' },
+  }), null, 'an incomplete required field is never guessed');
+});
+
+test('memory_remember executes once from a valid prefix when optional annotations are malformed', async () => {
+  const memoryTool = getLocalRuntimeTools()
+    .find((candidate) => (candidate as { name?: string }).name === 'memory_remember');
+  assert.ok(memoryTool && memoryTool.type === 'function');
+  const marker = `Recovered memory marker ${Date.now()}-falcon.`;
+  const malformed = JSON.stringify({ kind: 'project', content: marker }).slice(0, -1)
+    + ',"entities":null,"relationships":[{"validFrom":"2026-07-26\'}]}garbage';
+
+  const output = await memoryTool.invoke(
+    new RunContext({ sessionId: 'local-runtime-memory-recovery' }),
+    malformed,
+  );
+  assert.match(String(output), /Remembered|Reinforced an existing fact|Already known/);
+  assert.match(String(output), /Recovered valid kind\/content/);
+  assert.doesNotMatch(String(output), /InvalidToolInputError/);
 });

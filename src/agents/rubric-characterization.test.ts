@@ -84,11 +84,14 @@ const GOLDEN = {
   // 2026-07-26 cross-brain workstate: the lean Claude lanes receive the same
   // injected notebook and maintain it only when the conversation materially
   // changes, while lifecycle reconciliation remains runtime-owned.
-  instructions: { len: 35466, sha16: '30c746cd1f3e4e9d' },
-  native: { len: 34569, sha16: '8041a57d187da1fb' },
-  claudeBrain: { len: 5954, sha16: 'ea2ddcbfe8061631' },
+  // 2026-07-26 memory-ingress subtraction: explicit store requests rely on the
+  // crash-safe auto-capture seam instead of demanding a duplicate model tool
+  // write; ordinary memory calls default to the small kind+content payload.
+  instructions: { len: 35384, sha16: '2f61cf2192bbaac8' },
+  native: { len: 34487, sha16: 'bcdd4c3da1aed9d2' },
+  claudeBrain: { len: 6140, sha16: '856a799baedf7d42' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 9503, sha16: '3a0e8b6e19df9acf' },
+  lean: { len: 9689, sha16: '348ba65d991a9202' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -170,6 +173,18 @@ test('interaction contract: exploration is model-led while execution-ready ambig
     assert.doesNotMatch(rubric, /at most ONE (?:steering|consultative) beat/i);
     assert.doesNotMatch(rubric, /The moment the user answers, EXECUTE/i);
     assert.doesNotMatch(rubric, /END your reply with ONE concrete offer/i);
+  }
+});
+
+test('memory contract: explicit stores are captured once and ordinary model writes stay small', () => {
+  for (const [lane, rubric] of [
+    ['standard', ORCHESTRATOR_INSTRUCTIONS],
+    ['claude', CLAUDE_BRAIN_RUBRIC],
+  ] as const) {
+    assert.match(rubric, /explicit (?:store|["“]remember this["”])[^.\n]*auto-captured/i, lane);
+    assert.match(rubric, /without (?:duplicating|a duplicate)/i, lane);
+    assert.match(rubric, /kind \+ content/i, lane);
+    assert.match(rubric, /omit (?:graph annotations|them) for codewords/i, lane);
   }
 });
 
