@@ -1178,33 +1178,45 @@ export function _resetResolverStatsForTest(): void {
 // guarantees a final pass after the last write. The nightly backfill remains the
 // backstop. Kill-switch CLEMMY_EMBED_AT_WRITE=off.
 const EMBED_AT_WRITE_BATCH = 8;
-let embedAtWriteRunning = false;
 let embedAtWriteRerun = false;
+let embedAtWritePromise: Promise<void> | null = null;
 
 function embedAtWriteEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_EMBED_AT_WRITE', 'on') || 'on').toLowerCase() !== 'off';
 }
 
-export async function triggerEmbedAtWrite(): Promise<void> {
-  if (!embedAtWriteEnabled() || !isEmbeddingsEnabled()) return;
-  if (embedAtWriteRunning) { embedAtWriteRerun = true; return; }
-  embedAtWriteRunning = true;
-  try {
-    do {
-      embedAtWriteRerun = false;
-      await embedMissingFacts({ maxChunks: EMBED_AT_WRITE_BATCH, newestFirst: true });
-    } while (embedAtWriteRerun);
-  } catch {
-    // Best-effort: the nightly backfill is the backstop.
-  } finally {
-    embedAtWriteRunning = false;
+export function triggerEmbedAtWrite(): Promise<void> {
+  if (!embedAtWriteEnabled() || !isEmbeddingsEnabled()) return Promise.resolve();
+  if (embedAtWritePromise) {
+    embedAtWriteRerun = true;
+    return embedAtWritePromise;
   }
+  embedAtWritePromise = (async () => {
+    try {
+      do {
+        embedAtWriteRerun = false;
+        await embedMissingFacts({ maxChunks: EMBED_AT_WRITE_BATCH, newestFirst: true });
+      } while (embedAtWriteRerun);
+    } catch {
+      // Best-effort: the nightly backfill is the backstop.
+    } finally {
+      embedAtWritePromise = null;
+    }
+  })();
+  return embedAtWritePromise;
 }
 
 /** Test-only: reset the embed-at-write coalescing guard. */
 export function _resetEmbedAtWriteForTest(): void {
-  embedAtWriteRunning = false;
+  if (embedAtWritePromise) {
+    throw new Error('cannot reset embed-at-write while a pass is active');
+  }
   embedAtWriteRerun = false;
+}
+
+/** Test-only: wait for a fire-and-forget embed pass to fully settle. */
+export async function _drainEmbedAtWriteForTest(): Promise<void> {
+  await embedAtWritePromise;
 }
 
 export async function consolidateFact(

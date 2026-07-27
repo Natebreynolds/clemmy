@@ -18,6 +18,9 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 // Env wins over the (absent) file vault in a fresh test home, so this
 // flips isEmbeddingsEnabled() on.
 process.env.OPENAI_API_KEY = 'sk-test-fact-embeddings';
+// The fake key exists only to select the embedding provider. Keep the Agents
+// SDK trace exporter offline so it cannot mistake the fixture for a live key.
+process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
 // Determinism: cross-family judging is DEFAULT ON (2026-07-13); this suite tests
 // fact-derivation precedence, not judge routing. Pin =off so the dev-machine
 // ~/.claude credential fallback can't resolve a LIVE judge (see loop.test.ts note).
@@ -30,7 +33,13 @@ const { rememberFact, updateFact, findSimilarFacts, findSimilarFactsScored, getF
 // eslint-disable-next-line import/first
 const { embedMissingFacts, loadFactEmbeddings, isEmbeddingsEnabled } = await import('./embeddings.js');
 // eslint-disable-next-line import/first
-const { consolidateActiveFacts, consolidateFact, triggerEmbedAtWrite, _resetEmbedAtWriteForTest } = await import('./reflection.js');
+const {
+  consolidateActiveFacts,
+  consolidateFact,
+  triggerEmbedAtWrite,
+  _drainEmbedAtWriteForTest,
+  _resetEmbedAtWriteForTest,
+} = await import('./reflection.js');
 
 /**
  * Deterministic 4-dim "topic" embedding. Semantically-related text maps
@@ -83,7 +92,8 @@ beforeEach(() => {
   }) as unknown as typeof fetch;
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await _drainEmbedAtWriteForTest();
   globalThis.fetch = realFetch;
 });
 
@@ -373,11 +383,9 @@ test('consolidateFact (novelty fast-path) auto-embeds the new fact via embed-at-
   );
   assert.equal(outcome.written, 1, 'novel candidate ADDed');
 
-  // consolidateFact fires embed-at-write fire-and-forget (which takes the
-  // running guard). Reset the guard, then await a clean pass so the assertion
-  // is deterministic instead of racing the background trigger. embedMissingFacts
-  // is idempotent, so a concurrent background pass is harmless.
-  _resetEmbedAtWriteForTest();
+  // consolidateFact fires embed-at-write in the background. A second trigger
+  // must join that active pass (and coalesce one trailing pass), not return
+  // before the vector is durable or fork a competing DB writer.
   await triggerEmbedAtWrite();
   const newest = listActiveFacts({ kind: 'reference', limit: 100 })
     .sort((a, b) => b.id - a.id)[0];
