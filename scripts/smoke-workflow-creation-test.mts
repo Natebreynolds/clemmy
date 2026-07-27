@@ -104,7 +104,7 @@ const PASS_NAME = 'Smoke Creation Test PASS';
 try {
   const res = resultText(await workflowCreate({
     name: PASS_NAME,
-    description: 'Smoke: read-only Firecrawl scrape, then a previewed send.',
+    description: 'Smoke: read-only catalog lookup, then a previewed reversible write.',
     steps: [
       {
         // Deterministic real read: search the live Composio catalog (a real
@@ -118,11 +118,14 @@ try {
         maxTurns: 6,
       },
       {
-        id: 'send',
-        prompt: 'Send the morning summary email to the owner using the scraped text from the scrape step.',
+        id: 'write_draft',
+        // Use a reversible write here, not an underspecified outbound send.
+        // Readiness questions intentionally hold vague sends before activation;
+        // that is a separate safety behavior, not a creation-test failure.
+        prompt: 'Update the preselected smoke-test draft record with the tool names returned by the scrape step.',
         dependsOn: ['scrape'],
         requiresApproval: true,
-        approvalPreview: 'Send summary email to owner',
+        approvalPreview: 'Preview smoke-test draft update',
         maxTurns: 4,
       },
     ],
