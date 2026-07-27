@@ -30,6 +30,7 @@ import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { fireDueTimers } from '../runtime/timers.js';
+import { syncProspectiveIntentions } from '../runtime/prospective-sync.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
@@ -1757,6 +1758,22 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     setDaemonRuntimePhase('daemon.loop.tick', { tickCount });
     await withDaemonRuntimePhase('daemon.loop.cron_schedules', { tickCount }, () => processCronSchedules(assistant, state));
     await withDaemonRuntimePhase('daemon.loop.cron_triggers', { tickCount }, () => processCronTriggers(assistant));
+    // Prospective memory control plane: rebuild the compact future-intention
+    // index from timers, goals, workflows, monitors, check-ins, and background
+    // report-backs. Boot + ~60s cadence; unchanged definitions are true DB
+    // no-ops. Existing source engines remain execution-authoritative.
+    if (tickCount === 1 || tickCount % 4 === 0) {
+      await withDaemonRuntimePhase('daemon.loop.prospective_sync', { tickCount }, async () => {
+        try {
+          syncProspectiveIntentions();
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'prospective intention sync failed',
+          );
+        }
+      });
+    }
     // set_timer reminders (2026-07-20): fire everything past-due. Durable
     // due-compare (fireAt <= now) → survives restart AND laptop sleep — the
     // tool used to be WRITE-ONLY (no consumer; every reminder silently lost).

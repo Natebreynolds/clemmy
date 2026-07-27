@@ -18,6 +18,12 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import { TIMERS_FILE } from '../tools/shared.js';
 import { addNotification } from './notifications.js';
+import {
+  claimProspectiveIntention,
+  prospectiveIntentionId,
+  recordProspectiveCue,
+  recordProspectiveOutcome,
+} from './prospective-intentions.js';
 
 const logger = pino({ name: 'clementine.timers' });
 
@@ -73,6 +79,12 @@ export function fireDueTimers(now: number = Date.now()): number {
     let fired = 0;
     for (const timer of due) {
       const lateMs = now - timer.fireAt;
+      const intentionId = prospectiveIntentionId('timer', timer.id);
+      const cueKey = `time:${new Date(timer.fireAt).toISOString()}`;
+      try {
+        recordProspectiveCue(intentionId, cueKey, { timerId: timer.id, fireAt: timer.fireAt }, new Date(now));
+        claimProspectiveIntention(intentionId, cueKey, 'timer-daemon', new Date(now));
+      } catch { /* the timer file remains the execution authority */ }
       const lateNote = lateMs > LATE_ANNOTATION_MS
         ? ` (delayed ${Math.round(lateMs / 60_000)} min — the app was closed or your Mac was asleep when it was due)`
         : '';
@@ -87,9 +99,25 @@ export function fireDueTimers(now: number = Date.now()): number {
           metadata: { timerId: timer.id, fireAt: timer.fireAt, lateMs },
         });
         fired += 1;
+        try {
+          recordProspectiveOutcome(
+            intentionId,
+            'completed',
+            { notificationId: `timer-fired-${timer.id}`, fireAt: timer.fireAt, lateMs },
+            new Date(now),
+          );
+        } catch { /* best-effort control-plane receipt */ }
       } catch (err) {
         logger.warn({ err: err instanceof Error ? err.message : String(err), timerId: timer.id }, 'timer fire notification failed — keeping the timer for retry');
         remaining.push(timer); // do NOT drop a reminder whose delivery failed
+        try {
+          recordProspectiveOutcome(
+            intentionId,
+            'blocked',
+            { reason: 'notification_delivery_failed', error: err instanceof Error ? err.message : String(err) },
+            new Date(now),
+          );
+        } catch { /* best-effort control-plane receipt */ }
       }
     }
     writeTimers(remaining);

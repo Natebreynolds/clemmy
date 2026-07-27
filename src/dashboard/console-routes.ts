@@ -260,6 +260,12 @@ import {
   handleGoalContractCommand,
 } from '../agents/goal-commands.js';
 import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
+import {
+  countProspectiveIntentions,
+  listProspectiveIntentions,
+  type ProspectiveSourceKind,
+  type ProspectiveStatus,
+} from '../runtime/prospective-intentions.js';
 import { PlanSchema } from '../agents/planner.js';
 import {
   closePlanScope, listActiveScopes, listAllScopes,
@@ -8578,6 +8584,48 @@ export function registerConsoleRoutes(
   });
 
   // ─── Goals (activated plan-contracts) ───────────────────────────
+
+  app.get('/api/console/prospective-intentions', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const validStatuses = new Set<ProspectiveStatus>([
+      'active', 'due', 'claimed', 'blocked', 'completed', 'cancelled',
+    ]);
+    const validSources = new Set<ProspectiveSourceKind>([
+      'timer', 'goal', 'workflow_schedule', 'workflow_event',
+      'workflow_webhook', 'monitor', 'check_in', 'background',
+    ]);
+    const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'open';
+    const statuses = rawStatus === 'all'
+      ? undefined
+      : rawStatus === 'open'
+        ? ['active', 'due', 'claimed', 'blocked'] as ProspectiveStatus[]
+        : rawStatus.split(',').map((item) => item.trim())
+          .filter((item): item is ProspectiveStatus => validStatuses.has(item as ProspectiveStatus));
+    const rawSource = typeof req.query.source === 'string' ? req.query.source.trim() : '';
+    const sourceKind = validSources.has(rawSource as ProspectiveSourceKind)
+      ? rawSource as ProspectiveSourceKind
+      : undefined;
+    const parsedLimit = Number.parseInt(
+      typeof req.query.limit === 'string' ? req.query.limit : '100',
+      10,
+    );
+    const limit = Math.max(1, Math.min(500, Number.isFinite(parsedLimit) ? parsedLimit : 100));
+    try {
+      const intentions = listProspectiveIntentions({ statuses, sourceKind, limit });
+      const counts = countProspectiveIntentions({ sourceKind });
+      res.json({
+        intentions,
+        counts: {
+          ...counts,
+          open: counts.active + counts.due + counts.claimed + counts.blocked,
+          needsAttention: counts.due + counts.blocked,
+        },
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   app.get('/api/console/goals', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }

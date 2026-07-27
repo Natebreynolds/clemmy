@@ -5433,6 +5433,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       inputPreview: contextPacket.inputPreview,
       complexity: contextPacket.complexity,
       memory: contextPacket.memory,
+      prospective: contextPacket.prospective,
       skills: contextPacket.skills,
       workflows: contextPacket.workflows,
       toolScope: contextPacket.toolScope,

@@ -77,8 +77,14 @@ writeFileSync(
 const { buildAgentContextPacket, detectMultiItemIntent, detectMultiItemIntentFromConversation } = await import('./context-packet.js');
 const { __resetAgentSystemGuidanceCacheForTests } = await import('../agent-system-guidance.js');
 const capabilityHealth = await import('./capability-health.js');
+const {
+  cancelProspectiveIntention,
+  closeProspectiveIntentionsDbForTest,
+  upsertProspectiveIntention,
+} = await import('../prospective-intentions.js');
 
 test.after(() => {
+  closeProspectiveIntentionsDbForTest();
   try {
     rmSync(TMP_HOME, { recursive: true, force: true });
   } catch {
@@ -108,6 +114,48 @@ test('context packet ranks relevant skills and workflows for the current request
   // (the resolver confirms), while still not auto-running unrequested workflows.
   assert.match(packet.text, /call workflow_run with their exact phrasing/);
   assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
+});
+
+test('context packet projects only relevant future commitments and conditionally suggests durable capture', () => {
+  upsertProspectiveIntention({
+    id: 'timer:orchid-launch',
+    sourceKind: 'timer',
+    sourceId: 'orchid-launch',
+    objective: 'Review the Orchid launch dashboard',
+    trigger: { kind: 'time', at: '2026-08-01T16:00:00.000Z' },
+    action: { kind: 'notify', ref: 'orchid-launch' },
+    sessionId: 'chat:orchid',
+    risk: 'read',
+    approvalMode: 'none',
+  });
+  try {
+    const unrelated = buildAgentContextPacket(
+      'What is the capital of France?',
+      { enabled: true, hitCount: 0, injected: false },
+      { sessionKind: 'chat', sessionId: 'chat:other' },
+    );
+    assert.equal(unrelated.prospective.injected, false);
+    assert.doesNotMatch(unrelated.text, /RELEVANT FUTURE INTENTIONS/);
+
+    const relevant = buildAgentContextPacket(
+      'What is next for the Orchid launch?',
+      { enabled: true, hitCount: 0, injected: false },
+      { sessionKind: 'chat', sessionId: 'chat:orchid' },
+    );
+    assert.equal(relevant.prospective.injected, true);
+    assert.equal(relevant.prospective.count, 1);
+    assert.match(relevant.text, /Review the Orchid launch dashboard/);
+
+    const capture = buildAgentContextPacket(
+      'Remind me tomorrow to review the Orchid launch dashboard.',
+      { enabled: true, hitCount: 0, injected: false },
+      { sessionKind: 'chat', sessionId: 'chat:other' },
+    );
+    assert.equal(capture.prospective.captureSuggested, true);
+    assert.match(capture.text, /Do not rely on chat memory or merely promise it/);
+  } finally {
+    cancelProspectiveIntention('timer:orchid-launch', 'test_cleanup');
+  }
 });
 
 test('an already-prepared Netlify deploy does not summon an artifact-generation skill', () => {

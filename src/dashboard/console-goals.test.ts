@@ -16,6 +16,8 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { getPlanProposal } = await import('../agents/plan-proposals.js');
+const { syncProspectiveIntentions } = await import('../runtime/prospective-sync.js');
+const { cancelProspectiveIntention } = await import('../runtime/prospective-intentions.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -109,6 +111,18 @@ test('console goals API creates an activated goal and drives its lifecycle contr
     assert.equal(created.counts.active, 1);
     assert.equal(created.counts.selfDriving, 1);
     assert.ok(getPlanProposal(created.goal.id), 'goal contract is persisted in the plan-proposals store');
+    const futureRes = await fetch(`${h.url}/api/console/prospective-intentions?status=open`);
+    assert.equal(futureRes.status, 200);
+    const future = await futureRes.json() as {
+      intentions: Array<{ id: string; status: string; sourceKind: string; approvalMode: string }>;
+      counts: { open: number };
+    };
+    const goalCommitment = future.intentions.find((item) => item.id === `goal:${created.goal.id}`);
+    assert.ok(goalCommitment, 'self-driving goal is immediately visible as a durable future commitment');
+    assert.equal(goalCommitment.sourceKind, 'goal');
+    assert.equal(goalCommitment.status, 'active');
+    assert.equal(goalCommitment.approvalMode, 'enforce_at_action');
+    assert.ok(future.counts.open >= 1);
 
     const parkedRes = await fetch(`${h.url}/api/console/goals/${created.goal.id}/park`, {
       method: 'POST',
@@ -118,6 +132,15 @@ test('console goals API creates an activated goal and drives its lifecycle contr
     assert.equal(parkedRes.status, 200);
     const parked = await parkedRes.json() as { goal: GoalRow; counts: { active: number; parked: number } };
     assert.equal(parked.goal.parked?.reason, 'blocker');
+    cancelProspectiveIntention(`goal:${created.goal.id}`, 'simulate_rebuild_from_source');
+    syncProspectiveIntentions();
+    const blockedFuture = await (await fetch(
+      `${h.url}/api/console/prospective-intentions?status=blocked`,
+    )).json() as { intentions: Array<{ id: string; status: string }> };
+    assert.equal(
+      blockedFuture.intentions.find((item) => item.id === `goal:${created.goal.id}`)?.status,
+      'blocked',
+    );
     assert.equal(parked.counts.active, 0);
     assert.equal(parked.counts.parked, 1);
 

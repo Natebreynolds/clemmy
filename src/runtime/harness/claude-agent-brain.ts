@@ -113,6 +113,10 @@ import {
   interactiveToolEconomyEnabled,
   interactiveToolEconomyPolicy,
 } from './tool-economy.js';
+import {
+  buildProspectiveIntentionContext,
+  prospectiveCaptureDirective,
+} from '../prospective-intentions.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -1022,8 +1026,22 @@ async function buildClaudeAgentBrainTurnContext(
       memoryPrimer = { ...memoryPrimer, source: 'legacy_fallback_error', skippedReason: 'error' };
     }
   }
+  let prospectiveContext = '';
+  let prospectiveCapture = '';
+  try {
+    prospectiveContext = buildProspectiveIntentionContext({
+      query: request.message ?? '',
+      sessionId: request.sessionId,
+    }).text;
+    prospectiveCapture = prospectiveCaptureDirective(request.message ?? '') ?? '';
+  } catch {
+    // Future-intention projection is advisory context, never turn authority.
+  }
   if (!splitContext) {
-    return { text: recall, memoryPrimer };
+    return {
+      text: [recall, prospectiveContext, prospectiveCapture].filter(Boolean).join('\n\n'),
+      memoryPrimer,
+    };
   }
   // Legacy cross-store breadcrumbs are retained only when the unified primer is
   // explicitly disabled or unavailable. The primary result already contains
@@ -1102,7 +1120,21 @@ async function buildClaudeAgentBrainTurnContext(
     convergenceSteer = CONVERGENCE_STEER;
   }
   return {
-    text: [convergenceSteer, volatile, relevantSkills, continuationContext, harnessHealth, recall, breadcrumbs, sessionActions, fanoutDirective, confirmBeat, pitfalls].filter(Boolean).join('\n\n'),
+    text: [
+      convergenceSteer,
+      volatile,
+      relevantSkills,
+      continuationContext,
+      harnessHealth,
+      recall,
+      breadcrumbs,
+      prospectiveContext,
+      prospectiveCapture,
+      sessionActions,
+      fanoutDirective,
+      confirmBeat,
+      pitfalls,
+    ].filter(Boolean).join('\n\n'),
     memoryPrimer,
   };
 }
@@ -1135,6 +1167,13 @@ function emitClaudeAgentSdkBrainContextTelemetry(
   const answerability = recallText.match(/answerability:\s*(supported|partial|insufficient)/i)?.[1] ?? null;
   const includedCount = primer?.hitCount ?? refs ?? 0;
   const omittedCount = primer?.omittedCount ?? 0;
+  const prospectiveBlock = turnContext.split('\n\n')
+    .find((block) => block.startsWith('[RELEVANT FUTURE INTENTIONS')) ?? '';
+  const prospectiveBytes = Buffer.byteLength(prospectiveBlock, 'utf-8');
+  const prospectiveCount = prospectiveBlock
+    ? prospectiveBlock.split('\n').filter((line) => line.startsWith('- [')).length
+    : 0;
+  const prospectiveCaptureSuggested = turnContext.includes('Prospective-intention signal:');
   try {
     appendEvent({
       sessionId,
@@ -1172,6 +1211,12 @@ function emitClaudeAgentSdkBrainContextTelemetry(
           enabled: true,
           injected,
           source: unified ? 'unified' : injected ? 'legacy_fallback' : null,
+        },
+        prospective: {
+          injected: prospectiveCount > 0,
+          count: prospectiveCount,
+          bytes: prospectiveBytes,
+          captureSuggested: prospectiveCaptureSuggested,
         },
         skills: { detected: false },
         workflows: { detected: false },

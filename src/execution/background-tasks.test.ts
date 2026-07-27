@@ -88,8 +88,15 @@ const {
   declareWorkManifest,
   summarizeWorkManifest,
 } = await import('../runtime/harness/work-manifest.js');
+const {
+  cancelProspectiveIntention,
+  closeProspectiveIntentionsDbForTest,
+  getProspectiveIntention,
+} = await import('../runtime/prospective-intentions.js');
+const { syncProspectiveIntentions } = await import('../runtime/prospective-sync.js');
 
 test.after(() => {
+  closeProspectiveIntentionsDbForTest();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -124,6 +131,40 @@ test('probeObjectiveForTask: goal-bound uses plan objective+criteria; ad-hoc (no
   assert.equal(probeObjectiveForTask(task, { approvedPlan: { objective: '  ' } }), 'Scrape the 8 firm sites and build the sheet');
   // No prompt → title
   assert.equal(probeObjectiveForTask({ prompt: '', title: 'Firm scrape' }, null), 'Firm scrape');
+});
+
+test('authoritative background-task writes close the matching future report-back commitment', () => {
+  const completed = createBackgroundTask({
+    title: 'Prospective lifecycle completion',
+    prompt: 'Finish this test task and report back.',
+  });
+  assert.equal(getProspectiveIntention(`background:${completed.id}`)?.status, 'active');
+  markBackgroundTaskRunning(completed.id);
+  assert.ok(markBackgroundTaskDone(completed.id, 'Completed with evidence.'));
+  const completedIntention = getProspectiveIntention(`background:${completed.id}`);
+  assert.equal(completedIntention?.status, 'completed');
+  assert.deepEqual(completedIntention?.evidence, {
+    resultPath: null,
+    success: true,
+    taskStatus: 'done',
+  });
+
+  const blocked = createBackgroundTask({
+    title: 'Prospective lifecycle blocker',
+    prompt: 'Pause honestly when the dependency is missing.',
+  });
+  markBackgroundTaskRunning(blocked.id);
+  assert.ok(markBackgroundTaskBlocked(blocked.id, 'Missing test credential.', 'Waiting for test credential.'));
+  const blockedIntention = getProspectiveIntention(`background:${blocked.id}`);
+  assert.equal(blockedIntention?.status, 'blocked');
+  assert.equal(blockedIntention?.evidence?.reason, 'Missing test credential.');
+  cancelProspectiveIntention(`background:${blocked.id}`, 'simulate_rebuild_from_source');
+  syncProspectiveIntentions();
+  assert.equal(
+    getProspectiveIntention(`background:${blocked.id}`)?.status,
+    'blocked',
+    'periodic reconciliation restores blocked source truth without relying on the original hook',
+  );
 });
 
 test('a running task accepts a versioned course correction and revalidates durable logical evidence', () => {

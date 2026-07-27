@@ -74,6 +74,13 @@ import {
   summarizeWorkManifests,
   type WorkManifestSummary,
 } from '../runtime/harness/work-manifest.js';
+import { backgroundProspectiveDefinition } from '../runtime/prospective-adapters.js';
+import {
+  cancelProspectiveIntention,
+  prospectiveIntentionId,
+  recordProspectiveOutcome,
+  upsertProspectiveIntention,
+} from '../runtime/prospective-intentions.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -595,12 +602,55 @@ function writeTask(task: BackgroundTaskRecord): void {
       const dirFd = openSync(BACKGROUND_TASK_DIR, 'r');
       try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
     }
+    syncBackgroundProspectiveIntention(task);
   } catch (err) {
     if (fd !== undefined) {
       try { closeSync(fd); } catch { /* best effort */ }
     }
     try { unlinkSync(tmpPath); } catch { /* best effort */ }
     throw err;
+  }
+}
+
+/**
+ * Mirror the authoritative task record into the rebuildable prospective index.
+ * This is deliberately best-effort and runs only AFTER the task file is durable:
+ * an indexing failure can never roll back, invent, or veto task execution.
+ */
+function syncBackgroundProspectiveIntention(task: BackgroundTaskRecord): void {
+  try {
+    const id = prospectiveIntentionId('background', task.id);
+    const definition = backgroundProspectiveDefinition(task);
+    if (definition) {
+      upsertProspectiveIntention(definition);
+      if (task.status === 'blocked') {
+        recordProspectiveOutcome(id, 'blocked', {
+          taskStatus: task.status,
+          reason: task.error ?? 'background_task_blocked',
+          resultPath: task.resultPath ?? null,
+        });
+      }
+      return;
+    }
+    if (task.status === 'done') {
+      recordProspectiveOutcome(id, 'completed', {
+        taskStatus: task.status,
+        success: true,
+        resultPath: task.resultPath ?? null,
+      });
+    } else if (task.status === 'failed') {
+      // The future commitment is to report back. A reported task failure
+      // fulfills that commitment while preserving failure evidence.
+      recordProspectiveOutcome(id, 'completed', {
+        taskStatus: task.status,
+        success: false,
+        error: task.error ?? null,
+      });
+    } else if (task.status === 'aborted') {
+      cancelProspectiveIntention(id, task.error ?? 'background_task_aborted');
+    }
+  } catch {
+    // Materialized control-plane state is never task-persistence authority.
   }
 }
 

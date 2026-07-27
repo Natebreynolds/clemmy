@@ -29,6 +29,8 @@ const {
 } = await import('./workflow-trigger-engine.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { getProspectiveIntention } = await import('../runtime/prospective-intentions.js');
+const { workflowTriggerPayloadHash } = await import('./workflow-trigger-registry.js');
 const ENGINE_MODULE_URL = pathToFileURL(path.join(process.cwd(), 'src/execution/workflow-trigger-engine.ts')).href;
 
 async function waitForFiles(files: string[], timeoutMs = 60_000): Promise<void> {
@@ -130,6 +132,16 @@ test('sync + system_event fire: a subscribed workflow queues a run; same dedupe 
   ]);
   const synced = syncWorkflowTriggerRegistry();
   assert.ok(synced.synced >= 1, 'trigger row synced');
+  const futureCommitment = getProspectiveIntention(
+    'workflow_event:system_event:on-new-lead:crm.lead.created:'
+    + workflowTriggerPayloadHash({
+      type: 'crm.lead.created',
+      filter: {},
+      dedupeKeyTemplate: 'lead-{{payload.id}}',
+    }).slice(0, 16),
+  );
+  assert.equal(futureCommitment?.status, 'active');
+  assert.equal(futureCommitment?.workflowName, 'on-new-lead');
 
   const first = fireWorkflowSystemEvent('crm.lead.created', { id: 'L-1', name: 'Acme' });
   assert.equal(first.length, 1);
@@ -138,6 +150,8 @@ test('sync + system_event fire: a subscribed workflow queues a run; same dedupe 
   assert.deepEqual(triggerEventRows('on-new-lead').map((row) => row.state), ['enqueued']);
   const runs = queuedRuns().filter((r) => r.workflow === 'on-new-lead');
   assert.equal(runs.length, 1);
+  assert.equal(getProspectiveIntention(futureCommitment!.id)?.status, 'active');
+  assert.equal(getProspectiveIntention(futureCommitment!.id)?.evidence?.queueAccepted, true);
   // declared input bound from the payload — code-level, no LLM
   assert.equal(runs[0].inputs?.name, 'Acme');
 

@@ -12,6 +12,8 @@ import {
   textResult,
 } from './shared.js';
 import { readTimers, writeTimers } from '../runtime/timers.js';
+import { timerProspectiveDefinition } from '../runtime/prospective-adapters.js';
+import { upsertProspectiveIntention } from '../runtime/prospective-intentions.js';
 
 // Timer store moved to src/runtime/timers.ts (2026-07-20): set_timer used to be
 // WRITE-ONLY — no consumer ever fired what this tool wrote, so every reminder
@@ -89,13 +91,19 @@ export function registerAdminTools(server: McpServer): void {
       const now = Date.now();
       const fireAt = now + minutes * 60 * 1000;
       const timers = readTimers();
-      timers.push({
+      const timer = {
         id: `timer-${randomBytes(4).toString('hex')}`,
         message,
         fireAt,
         createdAt: now,
-      });
+      };
+      timers.push(timer);
       writeTimers(timers);
+      // Materialize the future commitment immediately. The timer file remains
+      // execution-authoritative; a control-plane indexing failure must never
+      // make the proven reminder path fail.
+      try { upsertProspectiveIntention(timerProspectiveDefinition(timer)); }
+      catch { /* daemon reconciliation repairs the index on its next tick */ }
 
       return textResult(`Timer set for ${minutes} minute${minutes === 1 ? '' : 's'} from now: "${message}" — it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).`);
     },

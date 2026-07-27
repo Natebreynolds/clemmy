@@ -6,6 +6,11 @@ import { listWorkflows } from '../memory/workflow-store.js';
 import { reapRunEventDir } from './workflow-events.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import {
+  prospectiveIntentionId,
+  recordProspectiveCue,
+  recordProspectiveOutcome,
+} from '../runtime/prospective-intentions.js';
 // Static import (2026-07-20): the old lazy `require('../runtime/notifications.js')`
 // was DEAD CODE in this "type":"module" package — require is undefined in ESM,
 // so the backpressure, catch-up, and enqueue-failure notices silently fell into
@@ -248,6 +253,16 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
     }
     const latestKey = matchedKeys[matchedKeys.length - 1];
     const missed = matchedKeys.length - 1; // earlier fires collapsed into one
+    const prospectiveId = prospectiveIntentionId('workflow_schedule', wf.name);
+    const prospectiveCueKey = `cron:${latestKey}`;
+    try {
+      recordProspectiveCue(
+        prospectiveId,
+        prospectiveCueKey,
+        { workflowName: wf.name, schedule, matchedMinute: latestKey, missed },
+        now,
+      );
+    } catch { /* the workflow schedule store remains authoritative */ }
 
     // A parked approval is already the workflow's one visible decision. Do not
     // stack tomorrow's occurrence behind it: parked runs used to be excluded
@@ -265,6 +280,14 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         payload: { workflowName: wf.name, schedule, reason: 'parked_awaiting_approval', parked: activeRuns.parked },
       });
       state.lastRunByMinute[dedupeKey] = latestKey;
+      try {
+        recordProspectiveOutcome(
+          prospectiveId,
+          'blocked',
+          { reason: 'parked_awaiting_approval', parked: activeRuns.parked, cueKey: prospectiveCueKey },
+          now,
+        );
+      } catch { /* best-effort control-plane receipt */ }
       continue;
     }
 
@@ -287,6 +310,14 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       });
       // Mark the latest matched minute "seen" so we don't recheck it.
       state.lastRunByMinute[dedupeKey] = latestKey;
+      try {
+        recordProspectiveOutcome(
+          prospectiveId,
+          'blocked',
+          { reason: 'schedule_backpressure', pending, cueKey: prospectiveCueKey },
+          now,
+        );
+      } catch { /* best-effort control-plane receipt */ }
       continue;
     }
 
@@ -303,6 +334,14 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         actor: 'workflow-scheduler',
         payload: { workflowName: wf.name, schedule, missed, source: 'schedule' },
       });
+      try {
+        recordProspectiveOutcome(
+          prospectiveId,
+          'rearmed',
+          { runId, cueKey: prospectiveCueKey, missed, queueAccepted: true },
+          now,
+        );
+      } catch { /* best-effort control-plane receipt */ }
       logger.info({ workflow: wf.name, schedule, minuteKey: latestKey, missed }, 'Scheduled workflow run enqueued');
       if (missed > 0) {
         emitCatchupNotice(wf.name, missed, latestKey);
@@ -317,6 +356,18 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       // with a log line only — the user's recurring commitment silently
       // stopped happening. Daily-bucketed so a broken workflow nags once/day.
       emitEnqueueFailureNotice(wf.name, err);
+      try {
+        recordProspectiveOutcome(
+          prospectiveId,
+          'blocked',
+          {
+            reason: 'schedule_enqueue_failed',
+            cueKey: prospectiveCueKey,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          now,
+        );
+      } catch { /* best-effort control-plane receipt */ }
     }
   }
 

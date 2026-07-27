@@ -26,6 +26,10 @@ import {
   recordTurnPreflightDecision,
   type TurnPreflightPhase,
 } from './turn-control.js';
+import {
+  buildProspectiveIntentionContext,
+  prospectiveCaptureDirective,
+} from '../prospective-intentions.js';
 
 export interface MemoryPrimerSummary {
   enabled: boolean;
@@ -69,6 +73,14 @@ export interface AgentContextPacket {
    *  capability hints (skills/workflows) are always kept. Advisory only. */
   turnIntent: 'qa' | 'action';
   memory: MemoryPrimerSummary;
+  /** Relevance-gated future commitments. Empty on unrelated turns so durable
+   * proactivity does not become another permanent prompt tax. */
+  prospective: {
+    injected: boolean;
+    count: number;
+    bytes: number;
+    captureSuggested: boolean;
+  };
   skills: RankedContextCandidate[];
   workflows: RankedContextCandidate[];
   toolScope: Pick<McpToolScope, 'reason' | 'allowAll' | 'allowedServerSlugs' | 'maxTools'>;
@@ -723,6 +735,17 @@ export function buildAgentContextPacket(
   const memoryLine = memory.enabled
     ? `Memory preflight: ${memory.hitCount} hit${memory.hitCount === 1 ? '' : 's'} via ${memory.source ?? 'local search'}${memory.injected ? ' and injected below' : ''}${memory.skippedReason ? ` (${memory.skippedReason})` : ''}.`
     : 'Memory preflight: disabled.';
+  let prospective = { text: '', count: 0, ids: [] as string[], bytes: 0 };
+  let prospectiveCapture: string | null = null;
+  try {
+    prospective = buildProspectiveIntentionContext({
+      query: input,
+      sessionId: opts?.sessionId,
+    });
+    prospectiveCapture = prospectiveCaptureDirective(input);
+  } catch {
+    // Future-intention projection is advisory context, never turn authority.
+  }
 
   // Turn-start fan-out directive (P0). Fires only for CHAT sessions: workflow
   // steps can't restructure their own pipeline (forEach is an authoring-time
@@ -795,6 +818,8 @@ export function buildAgentContextPacket(
     `Complexity: ${complexity}.`,
     focus,
     memoryLine,
+    prospective.text,
+    prospectiveCapture,
     `External MCP scope: ${toolScope.allowAll ? 'all external tools allowed' : `${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''}`} (${toolScope.reason}).`,
     providerAccessLine(),
     ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),
@@ -815,6 +840,12 @@ export function buildAgentContextPacket(
     complexity,
     turnIntent,
     memory,
+    prospective: {
+      injected: prospective.count > 0,
+      count: prospective.count,
+      bytes: prospective.bytes,
+      captureSuggested: Boolean(prospectiveCapture),
+    },
     skills,
     workflows,
     toolScope,

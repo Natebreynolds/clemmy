@@ -53,6 +53,11 @@ const capabilityHealth = await import('./capability-health.js');
 const artifactLedger = await import('./artifact-ledger.js');
 const { openMemoryDb } = await import('../../memory/db.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
+const {
+  cancelProspectiveIntention,
+  closeProspectiveIntentionsDbForTest,
+  upsertProspectiveIntention,
+} = await import('../prospective-intentions.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -91,6 +96,7 @@ after(() => {
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
+  closeProspectiveIntentionsDbForTest();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -105,6 +111,42 @@ test('JIT monotonic floor: the per-session advertised tool set only GROWS (cache
   assert.deepEqual([...bumpSessionToolFloor(sid, ['a'])].sort(), ['a', 'b', 'c']);
   // A different session has its own independent floor.
   assert.deepEqual([...bumpSessionToolFloor('other-session', ['x'])].sort(), ['x']);
+});
+
+test('Claude brain receives the same relevance-gated future commitments without a permanent context tax', async () => {
+  upsertProspectiveIntention({
+    id: 'background:orchid-research',
+    sourceKind: 'background',
+    sourceId: 'orchid-research',
+    objective: 'Report back with the Orchid market research',
+    trigger: { kind: 'completion', resourceType: 'background_task', resourceId: 'orchid-research' },
+    action: { kind: 'report_back', ref: 'orchid-research' },
+    sessionId: 'brain:orchid',
+    risk: 'read',
+    approvalMode: 'none',
+  });
+  try {
+    const relevant = await renderClaudeAgentBrainTurnContext({
+      message: 'What is happening with the Orchid research?',
+      sessionId: 'brain:orchid',
+    });
+    assert.match(relevant, /RELEVANT FUTURE INTENTIONS/);
+    assert.match(relevant, /Report back with the Orchid market research/);
+
+    const unrelated = await renderClaudeAgentBrainTurnContext({
+      message: 'What is the capital of France?',
+      sessionId: 'brain:other',
+    });
+    assert.doesNotMatch(unrelated, /RELEVANT FUTURE INTENTIONS/);
+
+    const capture = await renderClaudeAgentBrainTurnContext({
+      message: 'Notify me when the Orchid launch report arrives.',
+      sessionId: 'brain:other',
+    });
+    assert.match(capture, /Prospective-intention signal/);
+  } finally {
+    cancelProspectiveIntention('background:orchid-research', 'test_cleanup');
+  }
 });
 
 test('completion judge targets suspicious text and skips concrete tool-backed results', () => {

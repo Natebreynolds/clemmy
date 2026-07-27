@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import {
-  CheckCircle2, CirclePause, ClipboardCheck, Goal as GoalIcon, Loader2, Pause, Play, RefreshCw,
+  BellRing, CheckCircle2, CirclePause, ClipboardCheck, Goal as GoalIcon, Loader2, Pause, Play, RefreshCw,
   RotateCw, SlidersHorizontal, Sparkles, Timer, Trash2, XCircle,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -18,6 +18,10 @@ import {
   createGoal, createGoalFromDraft, dismissGoalDraft, draftGoal, expireGoal, listGoalDrafts, listGoals, parkGoal, satisfyGoal, setGoalSelfDrive, unparkGoal,
   type GoalDraftRecord, type GoalFilter, type GoalSummary,
 } from '@/lib/goals';
+import {
+  listOpenProspectiveIntentions,
+  type ProspectiveIntentionSummary,
+} from '@/lib/prospective';
 
 const FILTERS: Array<{ id: GoalFilter; label: string }> = [
   { id: 'all', label: 'All' },
@@ -48,6 +52,36 @@ function cadence(ms: number | null): string {
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.round(minutes / 60);
   return `${hours}h`;
+}
+
+function commitmentSourceLabel(source: ProspectiveIntentionSummary['sourceKind']): string {
+  if (source === 'workflow_schedule') return 'Workflow schedule';
+  if (source === 'workflow_event') return 'Workflow event';
+  if (source === 'workflow_webhook') return 'Workflow webhook';
+  if (source === 'check_in') return 'Check-in';
+  if (source === 'background') return 'Background task';
+  return source.charAt(0).toUpperCase() + source.slice(1);
+}
+
+function commitmentTriggerLabel(item: ProspectiveIntentionSummary): string {
+  const trigger = item.trigger;
+  if (trigger.kind === 'time') return `At ${shortDate(trigger.at)}`;
+  if (trigger.kind === 'cron') return `Schedule ${trigger.expression}${trigger.timezone ? ` · ${trigger.timezone}` : ''}`;
+  if (trigger.kind === 'event') return `When ${trigger.eventType} arrives`;
+  if (trigger.kind === 'webhook') return `When /${trigger.path.replace(/^\/+/, '')} receives a webhook`;
+  if (trigger.kind === 'state') return `Watching ${trigger.channel}`;
+  if (trigger.kind === 'completion') return `Waiting for ${trigger.resourceType.replace(/_/g, ' ')}`;
+  return 'Waiting to resume';
+}
+
+function commitmentStatus(item: ProspectiveIntentionSummary): { tone: Tone; label: string } {
+  if (item.status === 'blocked') return { tone: 'warning', label: 'Needs you' };
+  if (item.status === 'due') return { tone: 'live', label: 'Due' };
+  if (item.status === 'claimed') return { tone: 'info', label: 'In progress' };
+  if (item.trigger.kind === 'event' || item.trigger.kind === 'webhook' || item.trigger.kind === 'state') {
+    return { tone: 'neutral', label: 'Watching' };
+  }
+  return { tone: 'neutral', label: 'Scheduled' };
 }
 
 function percent(done: number, total: number): number {
@@ -214,13 +248,16 @@ export function Goals() {
 
   const goalsQ = usePoll(['goals', filter], () => listGoals(filter), 5000);
   const draftsQ = usePoll(['goal-drafts'], () => listGoalDrafts('pending'), 8000);
+  const intentionsQ = usePoll(['prospective-intentions'], () => listOpenProspectiveIntentions(100), 5000);
   const payload = goalsQ.data;
   const goals = useMemo(() => payload?.goals ?? [], [payload]);
   const goalDrafts = useMemo(() => draftsQ.data?.drafts ?? [], [draftsQ.data]);
+  const intentions = useMemo(() => intentionsQ.data?.intentions ?? [], [intentionsQ.data]);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['goals'] });
     void qc.invalidateQueries({ queryKey: ['goal-drafts'] });
+    void qc.invalidateQueries({ queryKey: ['prospective-intentions'] });
   };
 
   const applyDraft = (record: GoalDraftRecord) => {
@@ -359,7 +396,17 @@ export function Goals() {
     <Page
       title="Goals"
       subtitle="Long-running outcomes Clementine can track, resume, and validate."
-      actions={<Button variant="secondary" onClick={() => void goalsQ.refetch()}><RefreshCw className="h-4 w-4" aria-hidden /> Refresh</Button>}
+      actions={(
+        <Button
+          variant="secondary"
+          onClick={() => {
+            void goalsQ.refetch();
+            void intentionsQ.refetch();
+          }}
+        >
+          <RefreshCw className="h-4 w-4" aria-hidden /> Refresh
+        </Button>
+      )}
     >
       <div className="grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Active" value={payload?.counts.active ?? 0} tone="info" />
@@ -367,6 +414,64 @@ export function Goals() {
         <StatCard label="Self-driving" value={payload?.counts.selfDriving ?? 0} tone="live" />
         <StatCard label="Done" value={(payload?.counts.satisfied ?? 0) + (payload?.counts.expired ?? 0)} tone="success" />
       </div>
+
+      <Card className="mt-5 min-w-0 p-4 sm:p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <BellRing className="h-5 w-5 text-primary" aria-hidden />
+              <h3 className="text-title-sm font-semibold text-fg">Future commitments</h3>
+            </div>
+            <p className="mt-1 text-small text-muted">
+              What Clementine has durably remembered to resume, watch, run, or report back.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <StatusPill tone="info">{intentionsQ.data?.counts.open ?? 0} open</StatusPill>
+            {(intentionsQ.data?.counts.needsAttention ?? 0) > 0 && (
+              <StatusPill tone="warning">{intentionsQ.data?.counts.needsAttention} need attention</StatusPill>
+            )}
+          </div>
+        </div>
+        {intentionsQ.isLoading ? (
+          <Skeleton className="mt-4 h-20" />
+        ) : intentionsQ.isError ? (
+          <div className="mt-4 rounded-md border border-warning/30 bg-warning/5 px-3 py-3 text-small text-muted">
+            Future commitments are temporarily unavailable. Goal execution is unaffected.
+          </div>
+        ) : intentions.length === 0 ? (
+          <div className="mt-4 rounded-md border border-border bg-subtle px-3 py-3 text-small text-muted">
+            No open reminders, self-driving goals, workflow triggers, monitors, or background report-backs.
+          </div>
+        ) : (
+          <div className="mt-4 divide-y divide-border rounded-md border border-border">
+            {intentions.slice(0, 8).map((item) => {
+              const status = commitmentStatus(item);
+              return (
+                <div key={item.id} className="flex flex-wrap items-start justify-between gap-3 px-3 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusPill tone={status.tone}>{status.label}</StatusPill>
+                      <span className="text-caption text-faint">{commitmentSourceLabel(item.sourceKind)}</span>
+                      {item.recurring && <span className="text-caption text-faint">Recurring</span>}
+                    </div>
+                    <div className="mt-2 break-words text-small font-semibold text-fg">{item.objective}</div>
+                    <div className="mt-1 break-words text-caption text-muted">{commitmentTriggerLabel(item)}</div>
+                  </div>
+                  {item.approvalMode === 'enforce_at_action' && (
+                    <StatusPill tone="neutral">Approval at action</StatusPill>
+                  )}
+                </div>
+              );
+            })}
+            {intentions.length > 8 && (
+              <div className="px-3 py-2 text-caption text-muted">
+                +{Math.max(intentions.length, intentionsQ.data?.counts.open ?? 0) - 8} more open commitments
+              </div>
+            )}
+          </div>
+        )}
+      </Card>
 
       {goalDrafts.length > 0 && (
         <Card className="mt-5 min-w-0 p-4 sm:p-5">

@@ -4,6 +4,13 @@ import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
+import { goalProspectiveDefinition } from '../runtime/prospective-adapters.js';
+import {
+  cancelProspectiveIntention,
+  prospectiveIntentionId,
+  recordProspectiveOutcome,
+  upsertProspectiveIntention,
+} from '../runtime/prospective-intentions.js';
 import type { Plan } from './planner.js';
 import { openPlanScope, closePlanScope, getPlanScope } from './plan-scope.js';
 
@@ -85,6 +92,15 @@ function closeGoalScopeFor(goal: PlanProposal): void {
 const logger = pino({ name: 'clementine-next.plan-proposals' });
 
 const PROPOSALS_DIR = path.join(BASE_DIR, 'state', 'plan-proposals');
+
+/** The goal file remains authoritative; this materializes its future resume
+ *  edge into the rebuildable prospective-intention control plane. */
+function syncGoalProspectiveIntention(goal: PlanProposal): void {
+  try {
+    const definition = goalProspectiveDefinition(goal);
+    if (definition) upsertProspectiveIntention(definition);
+  } catch { /* daemon reconciliation repairs the index */ }
+}
 
 export type PlanProposalStatus =
   | 'pending' | 'approved' | 'rejected' | 'superseded'
@@ -1258,6 +1274,7 @@ export function enableGoalSelfDrive(id: string, options: EnableSelfDriveOptions 
     parked: undefined,
   };
   writeProposal(updated);
+  syncGoalProspectiveIntention(updated);
   logger.info({ goalId: id, resumeEveryMs, maxResumes: updated.maxResumes }, 'goal self-drive enabled');
   return updated;
 }
@@ -1273,6 +1290,12 @@ export function disableGoalSelfDrive(id: string): PlanProposal | null {
     lastActivityAt: new Date().toISOString(),
   };
   writeProposal(updated);
+  try {
+    cancelProspectiveIntention(
+      prospectiveIntentionId('goal', id),
+      'goal_self_drive_disabled',
+    );
+  } catch { /* best-effort control-plane update */ }
   logger.info({ goalId: id }, 'goal self-drive disabled');
   return updated;
 }
@@ -1298,6 +1321,7 @@ export function recordGoalResumeScheduled(
     lastActivityAt: new Date().toISOString(),
   };
   writeProposal(updated);
+  syncGoalProspectiveIntention(updated);
   return updated;
 }
 
@@ -1315,6 +1339,16 @@ export function parkGoal(
     parked: { at: new Date().toISOString(), reason, note: note?.trim() || undefined },
   };
   writeProposal(updated);
+  // Persist the parked definition first so the daemon's next reconciliation
+  // sees an unchanged generation and cannot accidentally re-activate it.
+  syncGoalProspectiveIntention(updated);
+  try {
+    recordProspectiveOutcome(
+      prospectiveIntentionId('goal', id),
+      'blocked',
+      { reason, note: note?.trim() || undefined },
+    );
+  } catch { /* best-effort control-plane update */ }
   logger.info({ goalId: id, reason }, 'goal parked');
   return updated;
 }
@@ -1333,6 +1367,7 @@ export function unparkGoal(id: string): PlanProposal | null {
     ...(proposal.selfDriving ? { nextResumeAt: new Date(Date.now() + resumeEveryMs).toISOString() } : {}),
   };
   writeProposal(updated);
+  syncGoalProspectiveIntention(updated);
   logger.info({ goalId: id }, 'goal unparked');
   return updated;
 }
@@ -1376,6 +1411,13 @@ export function satisfyGoal(id: string, reason?: string): PlanProposal | null {
     doneReason: reason?.trim() || undefined,
   };
   writeProposal(resolved);
+  try {
+    recordProspectiveOutcome(
+      prospectiveIntentionId('goal', id),
+      'completed',
+      { reason: reason?.trim() || 'goal_satisfied' },
+    );
+  } catch { /* best-effort control-plane update */ }
   closeGoalScopeFor(resolved);
   logger.info({ goalId: id, sessionId: proposal.sessionId }, 'goal contract satisfied');
   return resolved;
@@ -1393,6 +1435,12 @@ export function expireGoal(id: string, reason?: string): PlanProposal | null {
     doneReason: reason?.trim() || undefined,
   };
   writeProposal(resolved);
+  try {
+    cancelProspectiveIntention(
+      prospectiveIntentionId('goal', id),
+      reason?.trim() || 'goal_expired',
+    );
+  } catch { /* best-effort control-plane update */ }
   closeGoalScopeFor(resolved);
   logger.info({ goalId: id, sessionId: proposal.sessionId, reason }, 'goal contract expired');
   return resolved;

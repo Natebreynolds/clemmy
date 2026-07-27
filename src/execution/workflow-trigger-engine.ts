@@ -37,6 +37,14 @@ import {
   type WorkflowTriggerKind,
   type WorkflowTriggerEventState,
 } from './workflow-trigger-registry.js';
+import {
+  prospectiveIntentionId,
+  recordProspectiveCue,
+  recordProspectiveOutcome,
+  reconcileProspectiveIntentions,
+  type ProspectiveSourceKind,
+} from '../runtime/prospective-intentions.js';
+import { workflowProspectiveDefinitions } from '../runtime/prospective-adapters.js';
 
 const logger = pino({ name: 'clementine-next.workflow-trigger-engine' });
 
@@ -134,9 +142,13 @@ function waitAtTriggerTestBoundary(readyEnv: string, releaseEnv: string): void {
 export function syncWorkflowTriggerRegistry(): { synced: number; removed: number } {
   const database = openTriggerDb();
   const now = new Date().toISOString();
-  const buildWanted = (): Map<string, { workflowName: string; kind: WorkflowTriggerKind; webhookPath?: string; eventType?: string; filter: Record<string, unknown>; dedupeKeyTemplate?: string }> => {
+  const buildWanted = (): {
+    wanted: Map<string, { workflowName: string; kind: WorkflowTriggerKind; webhookPath?: string; eventType?: string; filter: Record<string, unknown>; dedupeKeyTemplate?: string }>;
+    workflowSnapshot: ReturnType<typeof listWorkflows>;
+  } => {
+    const workflowSnapshot = listWorkflows();
     const wanted = new Map<string, { workflowName: string; kind: WorkflowTriggerKind; webhookPath?: string; eventType?: string; filter: Record<string, unknown>; dedupeKeyTemplate?: string }>();
-    for (const entry of listWorkflows()) {
+    for (const entry of workflowSnapshot) {
       const def = entry.data;
       if (!def.enabled) continue;
       const trigger = def.trigger ?? {};
@@ -160,7 +172,7 @@ export function syncWorkflowTriggerRegistry(): { synced: number; removed: number
         });
       }
     }
-    return wanted;
+    return { wanted, workflowSnapshot };
   };
 
   const upsert = database.prepare(`
@@ -247,7 +259,7 @@ export function syncWorkflowTriggerRegistry(): { synced: number; removed: number
     // Read the filesystem snapshot only after BEGIN IMMEDIATE owns the registry
     // generation. A waiter can no longer commit a snapshot it built before a
     // newer workflow edit became visible.
-    const wanted = buildWanted();
+    const { wanted, workflowSnapshot } = buildWanted();
     const existing = database.prepare(
       `SELECT id, workflow_name, kind, webhook_path, event_type, filter_json, dedupe_key_template, enabled, generation FROM workflow_triggers WHERE kind IN ('webhook','system_event')`,
     ).all() as TriggerRow[];
@@ -287,14 +299,33 @@ export function syncWorkflowTriggerRegistry(): { synced: number; removed: number
       reconcileDurableQueueAcceptance(row.id);
       cancelPending.run(now, row.id);
     }
-    return { synced, removed };
+    return { synced, removed, workflowSnapshot };
   });
   // One registry generation becomes visible atomically. A filter/dedupe edit
   // changes row identity, so exposing the new row before disabling the old one
   // can otherwise fire the same delivery twice in another process.
-  const { synced, removed } = replaceGeneration.immediate();
+  const { synced, removed, workflowSnapshot } = replaceGeneration.immediate();
   if (synced > 0 || removed > 0) {
     logger.info({ synced, removed }, 'workflow trigger registry synced');
+  }
+  // The same authoritative filesystem snapshot immediately refreshes the
+  // rebuildable future-intention index. A failure here cannot affect trigger
+  // registry truth and the daemon's periodic full reconciliation repairs it.
+  try {
+    const definitions = workflowSnapshot
+      .flatMap((entry) => workflowProspectiveDefinitions(entry.name, entry.data));
+    for (const kind of [
+      'workflow_schedule',
+      'workflow_event',
+      'workflow_webhook',
+    ] as const) {
+      reconcileProspectiveIntentions(
+        kind,
+        definitions.filter((definition) => definition.sourceKind === kind),
+      );
+    }
+  } catch {
+    // Source-specific workflow scheduling/ingestion remains authoritative.
   }
   return { synced, removed };
 }
@@ -305,6 +336,53 @@ export interface WorkflowTriggerFireResult {
   status: 'queued' | 'duplicate_run' | 'readiness_blocked' | 'deduped_event' | 'pending_retry' | 'filtered' | 'error';
   runId?: string;
   message?: string;
+}
+
+function prospectiveSourceKindForTriggerId(triggerId: string): ProspectiveSourceKind {
+  return triggerId.startsWith('webhook:') ? 'workflow_webhook' : 'workflow_event';
+}
+
+/** Mirror durable trigger receipts into the unified future-intention graph.
+ *  This is observability/context state only; workflow_trigger_events remains
+ *  the queue/dedupe authority. */
+function recordProspectiveWorkflowTriggerResults(
+  results: WorkflowTriggerFireResult[],
+  input: { payload?: unknown; cuePrefix?: string; now?: Date } = {},
+): void {
+  const now = input.now ?? new Date();
+  const payloadHash = input.payload === undefined ? null : workflowTriggerPayloadHash(input.payload);
+  for (const result of results) {
+    if (result.status === 'filtered' || result.status === 'deduped_event') continue;
+    const sourceKind = prospectiveSourceKindForTriggerId(result.triggerId);
+    const intentionId = prospectiveIntentionId(sourceKind, result.triggerId);
+    if (payloadHash) {
+      try {
+        recordProspectiveCue(
+          intentionId,
+          `${input.cuePrefix ?? 'trigger'}:${payloadHash}`,
+          input.payload,
+          now,
+        );
+      } catch { /* trigger registry remains authoritative */ }
+    }
+    try {
+      if (result.status === 'queued' || result.status === 'duplicate_run') {
+        recordProspectiveOutcome(
+          intentionId,
+          'rearmed',
+          { status: result.status, runId: result.runId ?? null, queueAccepted: true },
+          now,
+        );
+      } else {
+        recordProspectiveOutcome(
+          intentionId,
+          'blocked',
+          { status: result.status, reason: result.message ?? result.status, runId: result.runId ?? null },
+          now,
+        );
+      }
+    } catch { /* best-effort control-plane receipt */ }
+  }
 }
 
 /** Honest HTTP summary for webhook ingestion. Queue errors return a retryable
@@ -857,6 +935,7 @@ export function recoverPendingWorkflowTriggerEvents(
     };
     results.push(attemptPendingTriggerEvent(database, trigger, event, def, now));
   }
+  recordProspectiveWorkflowTriggerResults(results, { now });
   return results;
 }
 
@@ -868,7 +947,12 @@ export function fireWorkflowSystemEvent(eventType: string, payload: unknown): Wo
   const type = eventType?.trim();
   if (!type) return [];
   try {
-    return fireTriggers('system_event', type, payload);
+    const results = fireTriggers('system_event', type, payload);
+    recordProspectiveWorkflowTriggerResults(results, {
+      payload,
+      cuePrefix: `event:${type}`,
+    });
+    return results;
   } catch (err) {
     const message = `Trigger ingestion failed before a durable receipt could be confirmed: ${err instanceof Error ? err.message : String(err)}`;
     logger.warn({ eventType: type, err: message }, 'fireWorkflowSystemEvent failed');
@@ -887,7 +971,12 @@ export function fireWorkflowWebhook(hookPath: string, payload: unknown): Workflo
   const key = hookPath?.trim();
   if (!key) return [];
   try {
-    return fireTriggers('webhook', key, payload);
+    const results = fireTriggers('webhook', key, payload);
+    recordProspectiveWorkflowTriggerResults(results, {
+      payload,
+      cuePrefix: `webhook:${key}`,
+    });
+    return results;
   } catch (err) {
     const message = `Trigger ingestion failed before a durable receipt could be confirmed: ${err instanceof Error ? err.message : String(err)}`;
     logger.warn({ hookPath: key, err: message }, 'fireWorkflowWebhook failed');
