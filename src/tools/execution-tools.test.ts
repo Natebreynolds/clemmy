@@ -35,6 +35,10 @@ const {
   createSession,
   writeToolOutput,
 } = await import('../runtime/harness/eventlog.js');
+const {
+  ToolCallsCounter,
+  withHarnessRunContext,
+} = await import('../runtime/harness/brackets.js');
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
 test.after(() => {
@@ -170,6 +174,31 @@ test('pickFocusTarget: records with undefined title/objective are skipped, not c
   const result = pickFocusTarget('social', records);
   assert.equal(result.kind, 'match');
   if (result.kind === 'match') assert.equal(result.target.id, 'good');
+});
+
+test('execution_create accepts natural criteria arrays and preserves the full audit trail', async () => {
+  const sessionId = `sess-exec-array-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'criteria-array' });
+  const handler = registeredToolHandlers().get('execution_create');
+  assert.ok(handler, 'execution_create should be registered');
+
+  const result = await withHarnessRunContext(
+    { sessionId, counter: new ToolCallsCounter(10) },
+    () => handler({
+      title: 'Verify a disposable deployment',
+      objective: 'Create one disposable deployment and verify its public response exactly.',
+      successCriteria: [
+        'Exactly one resource is created.',
+        'The public endpoint returns HTTP 200.',
+        'The exact sentinel appears once.',
+      ],
+      nextStep: 'Create the disposable resource once.',
+    }),
+  );
+  assert.match(result.content[0].text, /Created execution/);
+  const created = new ExecutionStore().getActiveForSession(sessionId);
+  assert.match(created?.successCriteria ?? '', /1\. Exactly one resource/);
+  assert.match(created?.successCriteria ?? '', /3\. The exact sentinel/);
 });
 
 test('execution_complete rejects completion when the judge finds no deliverable evidence', async () => {

@@ -93,8 +93,10 @@ const GOLDEN = {
   instructions: { len: 35384, sha16: '2f61cf2192bbaac8' },
   native: { len: 34487, sha16: 'bcdd4c3da1aed9d2' },
   claudeBrain: { len: 6230, sha16: 'f43b0d42f91fb9ef' },
-  // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 9689, sha16: '348ba65d991a9202' },
+  // 2026-07-27 live efficiency proof: execution_create already guards against
+  // a duplicate active lane, so the lean rubric no longer makes the model dump
+  // every user's old executions before opening/reusing the current one.
+  lean: { len: 9771, sha16: 'dfde474429efbdb9' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

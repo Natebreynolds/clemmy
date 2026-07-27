@@ -4,7 +4,7 @@ import { getToolOutput, TOOL_OUTPUT_MAX_BYTES } from '../runtime/harness/eventlo
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './code-mode-tool.js';
-import { extractCompleteJsonObjects } from '../runtime/harness/json-repair.js';
+import { extractCompleteJsonObjects, extractJsonCandidate } from '../runtime/harness/json-repair.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -170,15 +170,24 @@ export function registerRecallTools(server: McpServer): void {
         const shell = parseShellToolOutput(row.output);
         if (shell?.stdout_json !== undefined) {
           parsed = shell.stdout_json;
-        } else if (shell?.stdout.trimStart().startsWith('[')) {
-          const completeObjects = extractCompleteJsonObjects(shell.stdout, 200);
-          if (completeObjects.length === 0) {
+        } else {
+          // A useful CLI invocation may print a help/status preamble and then a
+          // complete JSON value (for example `--help && list --json`). Recover
+          // the balanced value instead of forcing a raw-recall/model-reparse
+          // round trip. The extractor returns only text that JSON.parse accepts.
+          const embedded = shell ? extractJsonCandidate(shell.stdout) : null;
+          if (embedded) {
+            parsed = JSON.parse(embedded) as unknown;
+          } else if (shell?.stdout.includes('[')) {
+            const completeObjects = extractCompleteJsonObjects(shell.stdout, 200);
+            if (completeObjects.length === 0) {
+              return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
+            }
+            parsed = completeObjects;
+            recoveredClippedArrayPrefix = true;
+          } else {
             return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
           }
-          parsed = completeObjects;
-          recoveredClippedArrayPrefix = true;
-        } else {
-          return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
         }
       }
 

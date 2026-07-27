@@ -1,12 +1,12 @@
 /**
  * Tool catalog and schema-on-demand hot-set resolution.
  *
- * The catalog is the compact "name — one-liner" list of EVERY built-in tool,
- * derived 1:1 from TOOL_REGISTRY (the single source of truth). On the Codex
- * schema-on-demand lane it replaces ~18K tokens of always-loaded JSON schemas:
- * the model reads the catalog, then reaches a specific tool THIS turn via
- * tool_search (names + one-liners + full schema for the top hits). First-class
- * schemas are reserved for the HOT SET (resolveHotSet).
+ * Catalogs are derived 1:1 from TOOL_REGISTRY (the single source of truth).
+ * On schema-on-demand lanes, the model gets a complete names-only index and
+ * reaches a specific tool THIS turn via tool_search, which returns ranked
+ * one-liners plus exact schemas. First-class schemas are reserved for the HOT
+ * SET (resolveHotSet). The richer name + description catalog remains available
+ * for diagnostics.
  *
  * The live Codex orchestrator and Claude native-ToolSearch brain both consume
  * this bounded hot set. No import cycle: this module imports only the registry
@@ -76,6 +76,28 @@ export function buildToolCatalog(opts: { allowedNames?: ReadonlySet<string> } = 
   return catalogEntries(opts)
     .map((e) => (e.oneLiner ? `${e.name} — ${e.oneLiner}` : e.name))
     .join('\n');
+}
+
+/**
+ * Complete names-only index for schema-on-demand lanes.
+ *
+ * The full catalog remains useful for human diagnostics, but repeating every
+ * one-liner in every model turn costs more than the schemas we deliberately
+ * deferred. Tool names are intentionally descriptive, and `tool_search`
+ * returns the ranked one-liners plus exact schemas on demand. Grouping names
+ * keeps every capability discoverable while making the always-present index
+ * roughly one quarter of the previous prompt footprint.
+ */
+export function buildCompactToolCatalog(
+  opts: { allowedNames?: ReadonlySet<string>; namesPerLine?: number } = {},
+): string {
+  const names = catalogEntries(opts).map((entry) => entry.name);
+  const width = Math.max(4, Math.min(20, Math.trunc(opts.namesPerLine ?? 10)));
+  const lines: string[] = [];
+  for (let index = 0; index < names.length; index += width) {
+    lines.push(`- ${names.slice(index, index + width).join(', ')}`);
+  }
+  return lines.join('\n');
 }
 
 /**

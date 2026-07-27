@@ -3,7 +3,7 @@ import type { Handoff, Tool } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool } from '../tools/call-tool.js';
-import { buildToolCatalog } from './tool-catalog.js';
+import { buildCompactToolCatalog } from './tool-catalog.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from './workflow-step-agent.js';
@@ -159,7 +159,7 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
     if (deferredNames.size > 0) {
       tools = tools.filter((t) => firstClassNames.has((t as { name?: string }).name ?? ''));
       tools.push(buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames }) as Tool<RuntimeContextValue>);
-      const catalog = buildToolCatalog({ allowedNames: deferredNames });
+      const catalog = buildCompactToolCatalog({ allowedNames: deferredNames });
       workerCatalogBlock = [
         '',
         '## Additional tools (callable via call_tool)',

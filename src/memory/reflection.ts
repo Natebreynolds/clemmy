@@ -544,8 +544,13 @@ const SELF_TOOL_DENY_EXACT = new Set<string>([
   'call_tool', 'tool_search', 'mcp_list_tools', 'mcp_status',
   'composio_search_tools', 'composio_list_tools', 'composio_status',
   'local_cli_list', 'local_cli_probe', 'harness_status',
+  // Approval/execution envelopes contain Clementine's own queued payload,
+  // hashes, status and receipts. The provider result remains lossless inside
+  // the pending-action record; reflecting the envelope learns no user fact and
+  // previously spent a boundary-model call on every queue/execute transition.
+  'request_approval',
 ]);
-const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_'];
+const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_', 'pending_action_', 'approval_'];
 
 export function isSelfReferentialTool(toolName: string | null | undefined): boolean {
   if (!toolName) return false;

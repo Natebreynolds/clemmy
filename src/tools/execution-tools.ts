@@ -128,7 +128,10 @@ export function registerExecutionTools(server: McpServer): void {
     {
       title: z.string().min(3).max(120).describe('Short scannable title (Discord presence + dashboard chip use this).'),
       objective: z.string().min(10).max(800).describe('One-paragraph WHAT — the user-visible goal of this work.'),
-      successCriteria: z.string().min(5).max(800).describe('The rule applied to evaluate completion. For bulk decisions, the criteria that distinguish kept vs dropped / approved vs rejected items. This is the audit trail — future-you should be able to read this and answer "why did Clem make decision X?".'),
+      successCriteria: z.union([
+        z.string().min(5).max(800),
+        z.array(z.string().min(3).max(300)).min(1).max(8),
+      ]).describe('One completion rule string OR 1–8 concrete criteria strings. Arrays are joined into the durable audit trail. For bulk decisions, include what distinguishes kept vs dropped / approved vs rejected items.'),
       nextStep: z.string().min(3).max(400).describe('The immediate first action you will take (a verb + object).'),
       reason: z.string().max(400).optional().describe('Optional one-line reason this execution was opened (defaults to "Audited execution lane opened by Clem to wrap mutating work.").'),
     },
@@ -146,6 +149,9 @@ export function registerExecutionTools(server: McpServer): void {
             `Use execution_update_step to record progress, or execution_complete to close it before opening a new one.`,
         );
       }
+      const durableCriteria = Array.isArray(successCriteria)
+        ? successCriteria.map((criterion, index) => `${index + 1}. ${criterion}`).join(' ')
+        : successCriteria;
       const created = store.create({
         sessionId,
         title,
@@ -155,7 +161,7 @@ export function registerExecutionTools(server: McpServer): void {
         confidence: 1.0,
         reasons: ['Explicit execution_create call'],
         nextStep,
-        successCriteria,
+        successCriteria: durableCriteria,
       });
       return textResult(
         `Created execution ${created.id} for session ${sessionId}.\n` +

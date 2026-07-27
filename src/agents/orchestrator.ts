@@ -32,7 +32,7 @@ import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-b
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSet, buildToolCatalog } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog } from './tool-catalog.js';
 import { deriveOrchestratorDiscoveryNames } from '../tools/tool-registry.js';
 import { buildCallTool } from '../tools/call-tool.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
@@ -832,6 +832,35 @@ export function recentPriorUserInputsForScope(
 }
 
 /**
+ * A second model should plan only when planning is itself part of the user's
+ * conversational need. A precise "go build/do/deploy this" request already has
+ * a capable orchestrator and does not benefit from paying an agent-as-tool
+ * planning loop before work begins.
+ *
+ * Batch/large review stays eligible because the confirm-first gate can require
+ * an inspectable plan. No-input construction keeps the tool for autonomous and
+ * compatibility callers that do not provide turn text.
+ */
+export function shouldExposePlannerTool(
+  userInput: string | null | undefined,
+): boolean {
+  const current = (userInput ?? '').trim();
+  if (!current) return true;
+  // Let the current turn decide whether the user wants planning. Carrying old
+  // "how should we..." language forward made a later "do it" turn pay for a
+  // planner it neither requested nor needed. Conversation-aware batch/fan-out
+  // detection remains separate below and can still expose the planner.
+  const text = current.toLowerCase();
+  if (
+    /\b(?:plan|planning|roadmap|strategy|strategize|brainstorm|compare (?:the )?(?:options|approaches)|talk (?:it )?through|think (?:it )?through|proposal)\b/.test(text)
+    || /\b(?:how|what) (?:should|would|could) (?:we|i|you)\b/.test(text)
+    || /\b(?:do not|don't|dont|without) (?:start|execute|build|change|write|send|deploy)\b/.test(text)
+  ) return true;
+  return /\b(?:batch|bulk|long[- ]horizon|multi[- ]session|dozens?|hundreds?|thousands?)\b/.test(text)
+    || /\b(?:send|write|update|create|post|publish|delete)\b[\s\S]{0,80}\b(?:all|every|\d{2,})\b/.test(text);
+}
+
+/**
  * Recent conversation texts (BOTH roles, newest first) for multi-item/fan-out
  * detection. The item count usually lives in the ASSISTANT's own proposal
  * ("run research on these 18 email-ready firms?"), so user inputs alone miss
@@ -896,8 +925,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   //
   // autonomy-v2.ts still uses sub-agent handoffs for its scheduled
   // cycles; that path is a separate migration.
-  const plannerTool = buildPlannerTool();
-
   // run_worker: stateless leaf for parallel fan-out across N items.
   // The agent calls this MULTIPLE TIMES IN PARALLEL (one per item)
   // when the work is "do the same operation across N independent
@@ -943,6 +970,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.sessionId ? recentConversationTextsForFanout(options.sessionId, options.userInput) : priorUserInputs,
       )
     : undefined;
+  const plannerTool = (
+    shouldExposePlannerTool(options.userInput)
+    || Boolean(multiItem?.isMultiItem)
+  )
+    ? buildPlannerTool()
+    : null;
   const codeModeMandate = codeModeMandateDirective({
     mcpServersInScope: mcpToolScope.allowedServerSlugs?.length ?? 0,
     allowAllMcp: !!mcpToolScope.allowAll,
@@ -1815,11 +1848,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
-  const baseInstructions = harnessInstructions(rubricChoice.instructions, {
-    sessionId: options.sessionId ?? undefined,
-    focusInput: options.userInput ?? undefined,
-  });
-
   // Schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 1), behind
   // CLEMMY_CODEX_TOOL_SEARCH (default ON since v1.3.0; =off restores the full
   // first-class surface byte-identically). When active on an interactive chat lane:
@@ -1879,15 +1907,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       callTool = localMemoryScope
         ? null
         : buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames, deniedNames: excludes });
-      const catalogText = buildToolCatalog({ allowedNames: deferredNames });
-      searchCatalogCount = catalogText ? catalogText.split('\n').length : 0;
+      const catalogText = buildCompactToolCatalog({ allowedNames: deferredNames });
+      searchCatalogCount = deferredNames.size;
       searchCatalogTokens = Math.round(catalogText.length / 4);
       catalogBlock = [
         // Leads with an unambiguous "you HAVE access" — live 2026-07-08 a model
         // read the name-only listing as evidence it had NO tool access and
         // refused the task outright (A_zero_tools stall). The catalog must be
         // impossible to misread as a capability restriction.
-        '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: your first-class tools (loaded above — call them directly), every deferred built-in below, and your connected external MCP/composio tools. NEVER claim you lack tool access. The tools below are not schema-loaded yet (to save context), but every listed name is callable THIS turn: invoke one with `call_tool(name, args_json)` using its exact name and a JSON args string — or `tool_search(query)` first if unsure of the name or arguments. External MCP tools are callable the same way: `call_tool("<server>__<tool>", args_json)`. call_tool never prompts on its own: a read runs immediately, a write/send target gates for approval exactly as a direct call would.',
+        '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: first-class tools above, every deferred built-in name below, and connected external MCP/Composio tools. NEVER claim access is missing. Deferred schemas are intentionally omitted: call `tool_search(query)` for the ranked description + exact schema when unsure, then `call_tool(name, args_json)`. If you already know the exact name and arguments, call it directly through `call_tool`. External MCP names use `<server>__<tool>`. The inner tool—not call_tool—controls approval.',
         catalogText,
       ].join('\n');
     } catch {
@@ -1898,13 +1926,26 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
-  const instructionsTrailer = [codeModeMandate, catalogBlock].filter(Boolean).join('\n\n');
-  const instructions = instructionsTrailer
-    ? () => `${baseInstructions()}\n\n${instructionsTrailer}`
-    : baseInstructions;
+  // Keep stable lane rules + the within-run catalog BEFORE the dynamic memory
+  // tail. The previous `[rubric][fresh memory][catalog]` order broke the prompt
+  // cache immediately before a ~3K-token catalog on every model cycle.
+  const staticInstructions = [
+    rubricChoice.instructions,
+    codeModeMandate,
+    catalogBlock,
+  ].filter(Boolean).join('\n\n');
+  const instructions = harnessInstructions(staticInstructions, {
+    sessionId: options.sessionId ?? undefined,
+    focusInput: options.userInput ?? undefined,
+  });
   const structuralTools = localMemoryScope
     ? [buildAskUserQuestionTool()]
-    : [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool];
+    : [
+        ...(plannerTool ? [plannerTool] : []),
+        buildRequestApprovalTool(),
+        buildAskUserQuestionTool(),
+        runWorkerTool,
+      ];
   const assembledTools = [
     ...structuralTools,
     ...(callTool ? [callTool] : []),

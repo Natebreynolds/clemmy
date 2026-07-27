@@ -12,6 +12,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 const {
   catalogEntries,
   buildToolCatalog,
+  buildCompactToolCatalog,
   allRegistryNames,
   resolveHotSet,
   rankCatalog,
@@ -45,6 +46,14 @@ test('buildToolCatalog renders "name — one-liner" lines and is non-trivial', (
   assert.equal(lines.length, TOOL_REGISTRY.length);
   const runBatch = lines.find((l) => l.startsWith('run_batch —'));
   assert.ok(runBatch && runBatch.length > 'run_batch — '.length, 'run_batch line should carry a summary');
+});
+
+test('compact catalog preserves every name without repeating descriptions', () => {
+  const text = buildCompactToolCatalog();
+  const tokens = new Set(text.split(/[^a-zA-Z0-9_]+/).filter(Boolean));
+  for (const name of allRegistryNames()) assert.ok(tokens.has(name), `${name} missing from compact index`);
+  assert.ok(text.length * 2 < buildToolCatalog().length, 'names-only index should materially reduce prompt bytes');
+  assert.doesNotMatch(text, / — /, 'compact index carries names; tool_search supplies descriptions and schemas');
 });
 
 // ── hot-set resolution ────────────────────────────────────────────────────────

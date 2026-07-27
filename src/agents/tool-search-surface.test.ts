@@ -24,7 +24,7 @@ const {
   externalMcpAttachmentScope,
   localMemoryBuiltinScope,
 } = await import('./orchestrator.js');
-const { createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { appendEvent, createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 // A discovery tool that is NOT in the hot set for a benign query (not in the
 // tiny acquisition/recovery kernel,
@@ -111,9 +111,9 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok(instr.includes('[tool-catalog]'), 'catalog block injected when on');
   assert.ok(instr.includes(CATALOG_ONLY_WHEN_ON), 'the catalog lists the tools it moved off first-class');
   const catalog = instr.split('[tool-catalog]')[1] ?? '';
-  assert.ok(!catalog.includes('\nmemory_recall_all —'), 'a first-class tool is not duplicated in the deferred catalog');
-  assert.ok(catalog.includes('\nmemory_recall —'), 'specialized recall stays reachable through the deferred catalog');
-  assert.ok(!catalog.includes('\ncron_list —'), 'a CLI-only tool is never advertised on the chat catalog');
+  assert.doesNotMatch(catalog, /\bmemory_recall_all\b/, 'a first-class tool is not duplicated in the deferred catalog');
+  assert.match(catalog, /\bmemory_recall\b/, 'specialized recall stays reachable through the deferred catalog');
+  assert.doesNotMatch(catalog, /\bcron_list\b/, 'a CLI-only tool is never advertised on the chat catalog');
 
   // Telemetry records the split.
   const scope = listEvents(onSess.id, { types: ['tool_search_scope'] });
@@ -137,7 +137,38 @@ test('ON: an excluded tool is absent from both first-class and deferred reachabi
   assert.equal(namesOf(agent).has(CATALOG_ONLY_WHEN_ON), false);
   const instr = await renderInstructions(agent);
   const catalog = instr.split('[tool-catalog]')[1] ?? '';
-  assert.ok(!catalog.includes(`\n${CATALOG_ONLY_WHEN_ON} —`));
+  assert.doesNotMatch(catalog, new RegExp(`\\b${CATALOG_ONLY_WHEN_ON}\\b`));
+});
+
+test('execute-now work lets the primary model act without an agent-as-tool planning tax', async () => {
+  const direct = await withFlag('on', () => buildOrchestratorAgent({
+    userInput: 'Create one disposable Netlify site, deploy the supplied sentinel page, and verify the live URL.',
+    allowToolJit: true,
+  }));
+  assert.equal(namesOf(direct).has('draft_plan'), false);
+
+  const collaborative = await withFlag('on', () => buildOrchestratorAgent({
+    userInput: 'Before changing anything, compare the approaches and make a plan for the deployment.',
+    allowToolJit: true,
+  }));
+  assert.equal(namesOf(collaborative).has('draft_plan'), true);
+});
+
+test('old planning language does not tax a later direct execution turn', async () => {
+  const session = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'How should we approach this deployment? Compare the options and make a plan.' },
+  });
+  const agent = await withFlag('on', () => buildOrchestratorAgent({
+    sessionId: session.id,
+    userInput: 'Great, deploy the supplied page now and verify its live URL.',
+    allowToolJit: true,
+  }));
+  assert.equal(namesOf(agent).has('draft_plan'), false);
 });
 
 test('explicit local-memory-only turns load a bounded read surface and honor no-memory-write', async () => {

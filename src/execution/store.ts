@@ -138,7 +138,7 @@ export class ExecutionStore {
       startedFromMessage: clean(input.startedFromMessage, 500),
       planId: input.planId,
       nextStep: input.nextStep ? clean(input.nextStep, 220) : undefined,
-      successCriteria: input.successCriteria ? clean(input.successCriteria, 300) : undefined,
+      successCriteria: input.successCriteria ? clean(input.successCriteria, 800) : undefined,
       lastAssistantSummary: input.lastAssistantSummary ? clean(input.lastAssistantSummary, 400) : undefined,
       nextReviewAt: input.nextReviewAt,
       blocker: input.blocker ? clean(input.blocker, 220) : undefined,

@@ -1233,6 +1233,7 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     'call_tool', 'tool_search', 'mcp_list_tools', 'mcp_status',
     'composio_search_tools', 'composio_list_tools', 'composio_status',
     'local_cli_list', 'local_cli_probe', 'harness_status',
+    'pending_action_queue', 'pending_action_execute', 'request_approval',
     'MEMORY_READ', // case-insensitive
     'FOCUS_GET',   // case-insensitive
   ]) {
