@@ -10,9 +10,21 @@ const TEST_HOME = '/tmp/clemmy-test-local-tools';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const {
+  getLocalToolCatalog,
   getLocalRuntimeTools,
   recoverMemoryRememberRequiredPrefix,
 } = await import('./local-runtime-tools.js');
+
+test('local tool catalog is the exact loaded surface without schemas', () => {
+  const tools = getLocalRuntimeTools();
+  const catalog = getLocalToolCatalog();
+  assert.equal(catalog.length, tools.length);
+  assert.deepEqual(
+    catalog.map((entry) => entry.name),
+    tools.map((entry) => entry.name),
+  );
+  assert.ok(catalog.every((entry) => typeof entry.description === 'string'));
+});
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });

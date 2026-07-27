@@ -564,17 +564,24 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     // Seed registry with a "connecting" snapshot so the dashboard
     // immediately shows what servers exist even before any connect
     // attempt has resolved. Updated by syncHealthRegistry on transitions.
-    HEALTH_REGISTRY.set(slug, {
-      slug,
-      name: server.name,
-      state: 'connecting',
-      toolCount: 0,
-      failureCount: 0,
-    });
+    if (!HEALTH_REGISTRY.has(slug)) {
+      HEALTH_REGISTRY.set(slug, {
+        slug,
+        name: server.name,
+        state: 'connecting',
+        toolCount: 0,
+        failureCount: 0,
+      });
+    }
   }
 
   let cachedTools: MCPTool[] | null = null;
   let cachedToolToServer: Map<string, MCPServer> | null = null;
+  // Successful tool counts must be recorded before markServerConnected()
+  // publishes health. Deriving them from cachedTools was racy: listTools marks
+  // connected while the flattened cache is still null, so a 69-tool live
+  // server stayed displayed as "0 tools" forever.
+  const lastToolCounts = new WeakMap<MCPServer, number>();
 
   // Snapshot used by the dashboard's MCP status pill — last known
   // health of each underlying server, keyed by slug (the stable string
@@ -656,6 +663,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       reconnectBackoffMs: backoff,
     };
     serverHealth.set(server, next);
+    lastToolCounts.set(server, 0);
 
     // Fire ONE user notification per server-down event (rate-limited
     // to 10 min). Without this, a flapping server spams the log; with
@@ -709,11 +717,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     } else {
       state = 'degraded';
     }
-    let toolCount = 0;
-    if (cachedTools) {
-      const prefix = `${slug}${SEPARATOR}`;
-      toolCount = cachedTools.filter((t) => t.name.startsWith(prefix) && !t.name.endsWith(`${SEPARATOR}unavailable`)).length;
-    }
+    const toolCount = lastToolCounts.get(server) ?? 0;
     HEALTH_REGISTRY.set(slug, {
       slug,
       name: server.name,
@@ -855,6 +859,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             mcpListToolsTimeoutMs(),
             `mcp.listTools[${server.name}]`,
           );
+          lastToolCounts.set(server, list.length);
           markServerConnected(server);
           return { server, slug, list, status: 'ok' as const };
         } catch (err) {

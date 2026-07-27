@@ -82,19 +82,19 @@ import { getSlackRuntimeStatus } from './slack.js';
 import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { readEnvFile, writeEnvFile } from '../setup/env-file.js';
 import {
-  authorizeToolkit,
   buildComposioDashboardSnapshot,
   bustComposioDashboardCaches,
-  COMPOSIO_AUTH_CONFIGS_URL,
-  ComposioNeedsAuthConfigError,
   disconnectToolkit,
   getComposioCredentialStatus,
   getComposioRuntimeStatus,
+  isRedirectableToolkitAuthScheme,
+  prepareInAppToolkitConnection,
   resetComposioClient,
   saveComposioCredentials,
+  selectToolkitCredentialValues,
   validateComposioApiKey,
   saveComposioExecutionBackend,
-  setupApiKeyToolkit,
+  setupCredentialToolkit,
   setupOAuthToolkit,
   getToolkitSetupMeta,
 } from '../integrations/composio/client.js';
@@ -1437,19 +1437,10 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   app.post('/api/composio/toolkits/:slug/authorize', requireAuth, async (req, res) => {
     const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
     try {
-      const authorized = await authorizeToolkit(slug);
+      const authorized = await prepareInAppToolkitConnection(slug);
       bustComposioDashboardCaches();
       res.json(authorized);
     } catch (error) {
-      if (error instanceof ComposioNeedsAuthConfigError) {
-        res.status(409).json({
-          error: error.message,
-          needsAuthConfig: true,
-          toolkit: slug,
-          setupUrl: COMPOSIO_AUTH_CONFIGS_URL,
-        });
-        return;
-      }
       res.status(500).json({ error: error instanceof Error ? error.message : String(error), toolkit: slug });
     }
   });
@@ -1522,26 +1513,48 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     }
   });
 
-  // Bypass route for API_KEY-mode toolkits whose Composio hosted popup
-  // throws "Something went wrong" (firecrawl, apify, ...). Front-end
-  // collects the API key in a Clementine-native modal and POSTs here;
-  // we create both the auth_config and the per-user connection via
-  // Composio's REST API directly.
-  app.post('/api/composio/toolkits/:slug/setup-api-key', requireAuth, async (req, res) => {
+  // Clementine-native credential setup for API_KEY / BASIC / BEARER and other
+  // non-redirect schemes. The field allow-list and scheme come from Composio's
+  // live toolkit metadata; the browser cannot inject arbitrary connection
+  // state. Secrets go straight to Composio and are never persisted locally.
+  const setupToolkitCredentials: express.RequestHandler = async (req, res) => {
     const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
-    const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : '';
-    const baseUrl = typeof req.body?.baseUrl === 'string' ? req.body.baseUrl.trim() : '';
-    if (!slug || !apiKey) {
-      res.status(400).json({ error: 'slug + apiKey required' });
+    if (!slug) {
+      res.status(400).json({ error: 'slug required' });
       return;
     }
     try {
-      const result = await setupApiKeyToolkit(slug, apiKey, baseUrl || undefined);
+      const setup = await getToolkitSetupMeta(slug);
+      if (!setup) {
+        res.status(404).json({ error: 'toolkit not found or Composio not configured' });
+        return;
+      }
+      if (isRedirectableToolkitAuthScheme(setup.authScheme)) {
+        res.status(400).json({ error: `${setup.name} uses ${setup.authScheme}; start its authorization flow instead.` });
+        return;
+      }
+      const submitted = req.body?.credentials && typeof req.body.credentials === 'object' && !Array.isArray(req.body.credentials)
+        ? req.body.credentials as Record<string, unknown>
+        : {};
+      // Back-compat for the original API-key-only route/body.
+      if (typeof req.body?.apiKey === 'string') submitted.generic_api_key = req.body.apiKey;
+      if (typeof req.body?.baseUrl === 'string') submitted.base_url = req.body.baseUrl;
+
+      const { credentials, missing } = selectToolkitCredentialValues(setup, submitted);
+      if (missing.length > 0) {
+        res.status(400).json({ error: `Missing required credential field${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}` });
+        return;
+      }
+
+      const result = await setupCredentialToolkit(slug, setup.authScheme, credentials);
+      bustComposioDashboardCaches();
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
     }
-  });
+  };
+  app.post('/api/composio/toolkits/:slug/setup-credentials', requireAuth, setupToolkitCredentials);
+  app.post('/api/composio/toolkits/:slug/setup-api-key', requireAuth, setupToolkitCredentials);
 
   // OAuth2 auto-setup. Creates a `use_composio_managed_auth` config
   // for OAUTH2 toolkits where Composio offers managed credentials
@@ -1867,16 +1880,21 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
       return;
     }
     try {
-      const result = await authorizeToolkit(slug);
+      const result = await prepareInAppToolkitConnection(slug);
+      if (result.kind === 'credentials') {
+        redirectDashboard(res, token, {
+          kind: 'error',
+          text: `${result.setup.name} needs credentials. Open Connect in Clementine to add them securely.`,
+        });
+        return;
+      }
       if (result.redirectUrl) {
         res.redirect(result.redirectUrl);
         return;
       }
       redirectDashboard(res, token, { kind: 'success', text: `Composio connection started for ${slug}.` });
     } catch (error) {
-      const text = error instanceof ComposioNeedsAuthConfigError
-        ? `${error.message} Open ${COMPOSIO_AUTH_CONFIGS_URL}, then try again.`
-        : error instanceof Error ? error.message : String(error);
+      const text = error instanceof Error ? error.message : String(error);
       redirectDashboard(res, token, { kind: 'error', text });
     }
   });

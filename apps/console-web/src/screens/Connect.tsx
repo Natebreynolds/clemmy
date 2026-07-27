@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -19,11 +19,12 @@ import { usePoll } from '@/lib/poll';
 import { CodexReauth } from './settings/CodexLoginForm';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio,
-  setAccountLabel, setComposioApiKey,
+  setAccountLabel, setComposioApiKey, setupComposioCredentials,
   getCredentials, setCredential, setDiscordOwner,
   normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
   connectedToolkits, reconnectConnectionId, searchToolkits, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit, type ComposioConnection,
+  type ComposioAuthorization, type ComposioConnectResult, type ComposioSetupMeta,
 } from '@/lib/connect';
 
 function prettyName(name: string): string {
@@ -80,8 +81,9 @@ export function Connect() {
 
   const [refreshing, setRefreshing] = useState(false);
   const [appNotice, setAppNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+  const [credentialSetup, setCredentialSetup] = useState<{ slug: string; setup: ComposioSetupMeta } | null>(null);
 
-  const openAuthorization = (res: { url?: string; redirectUrl?: string }, prefix = '') => {
+  const openAuthorization = (res: ComposioAuthorization, prefix = '') => {
     const url = res.url || res.redirectUrl;
     if (url) {
       window.open(url, '_blank', 'noopener');
@@ -91,6 +93,15 @@ export function Connect() {
     } else {
       setAppNotice({ tone: 'error', text: 'No authorization URL was returned.' });
     }
+  };
+
+  const handleConnectResult = (slug: string, res: ComposioConnectResult, prefix = '') => {
+    if (res.kind === 'credentials') {
+      setCredentialSetup({ slug, setup: res.setup });
+      if (prefix) setAppNotice({ tone: 'info', text: prefix.trim() });
+      return;
+    }
+    openAuthorization(res, prefix);
   };
 
   const refreshApps = async () => {
@@ -109,7 +120,7 @@ export function Connect() {
     setAppNotice(null);
     try {
       const res = await authorizeComposio(slug);
-      openAuthorization(res, prefix);
+      handleConnectResult(slug, res, prefix);
     } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
   };
 
@@ -123,7 +134,7 @@ export function Connect() {
         : res.staleRemoved
           ? 'Removed the stale connection. '
           : 'The stale record could not be removed; the new connection will replace it for Clementine. ';
-      openAuthorization(res, prefix);
+      handleConnectResult(t.slug, res, prefix);
     } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
   };
 
@@ -247,7 +258,136 @@ export function Connect() {
 
       {/* Projects & folders */}
       <ProjectsPanel />
+
+      {credentialSetup && (
+        <ComposioCredentialsModal
+          key={`${credentialSetup.slug}:${credentialSetup.setup.authScheme}`}
+          slug={credentialSetup.slug}
+          setup={credentialSetup.setup}
+          onClose={() => setCredentialSetup(null)}
+          onSaved={async () => {
+            const name = credentialSetup.setup.name || credentialSetup.slug;
+            setCredentialSetup(null);
+            await refreshApps();
+            setAppNotice({ tone: 'info', text: `${name} connected inside Clementine.` });
+          }}
+        />
+      )}
     </Page>
+  );
+}
+
+function ComposioCredentialsModal({
+  slug,
+  setup,
+  onClose,
+  onSaved,
+}: {
+  slug: string;
+  setup: ComposioSetupMeta;
+  onClose: () => void;
+  onSaved: () => void | Promise<void>;
+}) {
+  const fields = setup.fields.length > 0
+    ? setup.fields
+    : [{ name: 'generic_api_key', label: 'API Key', description: null, default: null, isSecret: true, required: true }];
+  const [values, setValues] = useState<Record<string, string>>(
+    Object.fromEntries(fields.map((field) => [field.name, field.default ?? ''])),
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape' && !busy) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
+  const missingRequired = fields.some((field) => field.required !== false && !(values[field.name] ?? '').trim());
+  const submit = async () => {
+    if (busy || missingRequired) return;
+    setBusy(true);
+    setError('');
+    try {
+      await setupComposioCredentials(slug, values);
+      await onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not connect this app.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[110] flex items-start justify-center bg-black/30 p-4 pt-[10vh] animate-fade-in"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Connect ${setup.name}`}
+      onMouseDown={() => { if (!busy) onClose(); }}
+    >
+      <div
+        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-lg"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start gap-3 border-b border-border px-5 py-4">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10">
+            <KeyRound className="h-4 w-4 text-primary" aria-hidden />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-h3 text-fg">Connect {setup.name}</h2>
+            <p className="mt-0.5 text-small text-muted">
+              Add the credentials here. Clementine sends them directly to Composio and does not save them in her local settings.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} disabled={busy} className="text-faint hover:text-fg disabled:opacity-50" aria-label="Close">
+            <X className="h-4 w-4" aria-hidden />
+          </button>
+        </div>
+
+        <div className="max-h-[62vh] space-y-4 overflow-y-auto p-5">
+          {fields.map((field, index) => (
+            <label key={field.name} className="flex flex-col gap-1.5">
+              <span className="text-small font-medium text-fg">
+                {field.label || field.name}
+                {field.required !== false && <span className="text-danger"> *</span>}
+              </span>
+              <Input
+                type={field.isSecret ? 'password' : 'text'}
+                value={values[field.name] ?? ''}
+                onChange={(event) => setValues((current) => ({ ...current, [field.name]: event.target.value }))}
+                autoFocus={index === 0}
+                autoComplete={field.isSecret ? 'new-password' : 'off'}
+                placeholder={field.default ?? ''}
+                onKeyDown={(event) => { if (event.key === 'Enter') void submit(); }}
+              />
+              {field.description && <span className="text-caption text-faint">{field.description}</span>}
+            </label>
+          ))}
+
+          {(setup.authHintUrl || setup.authGuideUrl || setup.appUrl) && (
+            <a
+              href={setup.authHintUrl || setup.authGuideUrl || setup.appUrl || '#'}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-small text-primary hover:underline"
+            >
+              Where to find these credentials <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+            </a>
+          )}
+
+          {error && <p className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-small text-danger">{error}</p>}
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-border px-5 py-3">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button onClick={() => void submit()} disabled={busy || missingRequired}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plug className="h-4 w-4" aria-hidden />}
+            {busy ? 'Connecting…' : 'Connect'}
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 

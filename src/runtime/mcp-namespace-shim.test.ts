@@ -162,6 +162,11 @@ test('shim: rewrites identical tool names from different servers to unique names
   // Descriptions retain origin info so the model can tell them apart.
   const alphaTool = tools.find((t) => t.name === 'alpha__search')!;
   assert.match(alphaTool.description ?? '', /\[alpha\]/);
+  assert.equal(
+    listMcpServerHealth().find((server) => server.slug === 'alpha')?.toolCount,
+    1,
+    'health publishes the successful per-server list count before the flattened cache is assigned',
+  );
 });
 
 test('shim: collides slugs from differently-spelled-but-same server names get suffixed', async () => {

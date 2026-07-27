@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   COMPOSIO_AUTH_CONFIGS_URL,
+  ComposioNeedsAuthConfigError,
   ComposioDispatchUncertainError,
   __test__,
   filterSuppressedConnectedToolkits,
@@ -16,6 +17,8 @@ import {
   loneToolkitConnection,
   composioAutoFallbackAllowed,
   composioCliErrorProvesNoDispatch,
+  prepareInAppToolkitConnection,
+  selectToolkitCredentialValues,
   toComposioDashboardConnection,
   type ConnectedToolkit,
 } from './client.js';
@@ -83,17 +86,136 @@ test('selectAuthConfigIdForToolkit handles current auth config response shapes',
     { nanoid: 'ac_outlook', toolkit_slug: 'outlook' },
     { authConfigId: 'ac_slack', toolkitSlug: 'slack' },
     { auth_config: { id: 'ac_drive', toolkit_slug: 'googledrive' } },
+    { id: 'ac_dual_oauth', toolkit: { slug: 'dual' }, auth_scheme: 'OAUTH2' },
+    { id: 'ac_dual_key', toolkit: { slug: 'dual' }, auth_scheme: 'API_KEY' },
   ];
 
   assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'outlook'), 'ac_outlook');
   assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'slack'), 'ac_slack');
   assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'googledrive'), 'ac_drive');
+  assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'dual', 'API_KEY'), 'ac_dual_key');
+  assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'dual', 'OAUTH2'), 'ac_dual_oauth');
+  assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'dual', 'BASIC'), null);
   assert.equal(__test__.selectAuthConfigIdForToolkit(items, 'missing'), null);
   assert.equal(__test__.authConfigId({ auth_config: { nanoid: 'ac_nested' } }), 'ac_nested');
+  assert.equal(__test__.authConfigAuthScheme({ authConfig: 'ignored', auth_scheme: 'BASIC' }), 'BASIC');
 });
 
 test('Composio auth-config fallback URL uses the current dashboard path', () => {
   assert.equal(COMPOSIO_AUTH_CONFIGS_URL, 'https://dashboard.composio.dev/~/project/auth-configs');
+});
+
+test('in-app connection returns native credential fields without opening Composio', async () => {
+  let authorizeCalls = 0;
+  const result = await prepareInAppToolkitConnection('firecrawl', {
+    getSetupMeta: async () => ({
+      name: 'Firecrawl',
+      description: null,
+      appUrl: null,
+      authHintUrl: null,
+      authGuideUrl: null,
+      authScheme: 'API_KEY',
+      fields: [
+        { name: 'full', label: 'Base URL', description: null, default: 'https://api.firecrawl.dev/v1', isSecret: false, required: true },
+        { name: 'generic_api_key', label: 'API Key', description: null, default: null, isSecret: true, required: true },
+      ],
+    }),
+    authorize: async () => { authorizeCalls += 1; return { redirectUrl: 'https://should-not-open.test', connectionId: '' }; },
+    setupOAuth: async () => ({ ok: true, authConfigId: 'unused' }),
+  });
+
+  assert.equal(result.kind, 'credentials');
+  assert.equal(result.setup.fields[0].name, 'full');
+  assert.equal(authorizeCalls, 0, 'non-OAuth credentials stay inside Clementine');
+});
+
+test('native credential selection preserves exact live field names, fills defaults, and drops extras', () => {
+  const selected = selectToolkitCredentialValues({
+    name: 'Firecrawl',
+    description: null,
+    appUrl: null,
+    authHintUrl: null,
+    authGuideUrl: null,
+    authScheme: 'API_KEY',
+    fields: [
+      { name: 'full', label: 'Base URL', description: null, default: 'https://api.firecrawl.dev/v1', isSecret: false, required: true },
+      { name: 'generic_api_key', label: 'API Key', description: null, default: null, isSecret: true, required: true },
+    ],
+  }, {
+    generic_api_key: '  fc-secret  ',
+    attacker_supplied: 'must-not-cross',
+  });
+
+  assert.deepEqual(selected, {
+    credentials: {
+      full: 'https://api.firecrawl.dev/v1',
+      generic_api_key: 'fc-secret',
+    },
+    missing: [],
+  });
+});
+
+test('native credential selection reports missing fields by their human labels', () => {
+  const selected = selectToolkitCredentialValues({
+    name: 'DataForSEO',
+    description: null,
+    appUrl: null,
+    authHintUrl: null,
+    authGuideUrl: null,
+    authScheme: 'BASIC',
+    fields: [
+      { name: 'username', label: 'API Login', description: null, default: null, isSecret: false, required: true },
+      { name: 'password', label: 'API Password', description: null, default: null, isSecret: true, required: true },
+    ],
+  }, { username: 'user@example.com' });
+  assert.deepEqual(selected.missing, ['API Password']);
+});
+
+test('in-app OAuth provisions missing managed auth then retries once', async () => {
+  let authorizeCalls = 0;
+  let setupCalls = 0;
+  const result = await prepareInAppToolkitConnection('github', {
+    getSetupMeta: async () => ({
+      name: 'GitHub',
+      description: null,
+      appUrl: null,
+      authHintUrl: null,
+      authGuideUrl: null,
+      authScheme: 'OAUTH2',
+      fields: [],
+    }),
+    authorize: async (slug) => {
+      authorizeCalls += 1;
+      if (authorizeCalls === 1) throw new ComposioNeedsAuthConfigError(slug, 'missing');
+      return { redirectUrl: 'https://connect.example.test/github', connectionId: 'ca_new' };
+    },
+    setupOAuth: async () => { setupCalls += 1; return { ok: true, authConfigId: 'ac_github' }; },
+  });
+
+  assert.equal(result.kind, 'authorization');
+  assert.equal(result.redirectUrl, 'https://connect.example.test/github');
+  assert.equal(authorizeCalls, 2);
+  assert.equal(setupCalls, 1);
+});
+
+test('in-app OAuth with an existing config does not create another', async () => {
+  let setupCalls = 0;
+  const result = await prepareInAppToolkitConnection('notion', {
+    getSetupMeta: async () => ({
+      name: 'Notion',
+      description: null,
+      appUrl: null,
+      authHintUrl: null,
+      authGuideUrl: null,
+      authScheme: 'OAUTH2',
+      fields: [],
+    }),
+    authorize: async () => ({ redirectUrl: 'https://connect.example.test/notion', connectionId: 'ca_notion' }),
+    setupOAuth: async () => { setupCalls += 1; return { ok: true, authConfigId: 'unused' }; },
+  });
+
+  assert.equal(result.kind, 'authorization');
+  assert.equal(setupCalls, 0);
 });
 
 test('getPreferredUserId honors a real explicit COMPOSIO_USER_ID (short-circuits before any network)', async () => {

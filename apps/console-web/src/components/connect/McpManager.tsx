@@ -1,13 +1,22 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Server, Plus, Trash2, Loader2, ChevronDown } from 'lucide-react';
+import { Server, Plus, Trash2, Loader2, ChevronDown, Wrench } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
-import { getMcpServers, addMcpServer, deleteMcpServer, setMcpCredential, type McpServerInput, type McpServer } from '@/lib/connect';
+import {
+  getMcpServers,
+  getMcpServerTools,
+  addMcpServer,
+  deleteMcpServer,
+  setMcpCredential,
+  type McpServerInput,
+  type McpServer,
+  type McpToolSummary,
+} from '@/lib/connect';
 import { cn } from '@/lib/cn';
 
 export function McpManager() {
@@ -47,7 +56,7 @@ export function McpManager() {
         <Server className="h-5 w-5 text-primary" aria-hidden />
         <div className="flex-1">
           <h3 className="text-h3 text-fg">MCP servers</h3>
-          <p className="text-small text-muted">Extra tool surfaces from Model Context Protocol servers</p>
+          <p className="text-small text-muted">Built-in and connected tools. Full inventories load only when you open them.</p>
         </div>
         <Button variant="secondary" size="sm" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
           <Plus className="h-4 w-4" aria-hidden /> Add server
@@ -107,6 +116,11 @@ function McpServerCard({ server, refresh }: { server: McpServer; refresh: () => 
   const [values, setValues] = useState<Record<string, string>>({});
   const [savingKey, setSavingKey] = useState('');
   const [error, setError] = useState('');
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolsLoading, setToolsLoading] = useState(false);
+  const [toolsError, setToolsError] = useState('');
+  const [tools, setTools] = useState<McpToolSummary[] | null>(null);
+  const displayedToolCount = tools?.length ?? server.toolCount;
 
   const saveCred = async (key: string) => {
     const value = (values[key] ?? '').trim();
@@ -120,6 +134,22 @@ function McpServerCard({ server, refresh }: { server: McpServer; refresh: () => 
     finally { setSavingKey(''); }
   };
 
+  const toggleTools = async () => {
+    const nextOpen = !toolsOpen;
+    setToolsOpen(nextOpen);
+    if (!nextOpen || tools !== null || toolsLoading) return;
+    setToolsError('');
+    setToolsLoading(true);
+    try {
+      const result = await getMcpServerTools(label);
+      setTools(result.tools ?? []);
+    } catch (e) {
+      setToolsError((e as Error).message);
+    } finally {
+      setToolsLoading(false);
+    }
+  };
+
   return (
     <Card className="flex flex-col gap-2 p-4">
       <div className="flex items-center gap-3">
@@ -128,11 +158,54 @@ function McpServerCard({ server, refresh }: { server: McpServer; refresh: () => 
           <StatusPill tone={STATE_TONE[server.state] ?? 'neutral'}>{server.state}</StatusPill>
         )}
         <StatusPill tone={server.enabled !== false ? 'success' : 'neutral'}>{server.enabled !== false ? 'Enabled' : 'Disabled'}</StatusPill>
-        <Button variant="ghost" size="icon" aria-label={`Remove ${label}`} title="Remove"
-          onClick={async () => { await deleteMcpServer(label); refresh(); }}>
-          <Trash2 className="h-4 w-4" aria-hidden />
+        {!server.builtin && (
+          <Button variant="ghost" size="icon" aria-label={`Remove ${label}`} title="Remove"
+            onClick={async () => { await deleteMcpServer(label); refresh(); }}>
+            <Trash2 className="h-4 w-4" aria-hidden />
+          </Button>
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-caption text-muted">
+          {typeof displayedToolCount === 'number'
+            ? `${displayedToolCount.toLocaleString()} ${displayedToolCount === 1 ? 'tool' : 'tools'}`
+            : 'Tool count available after connection'}
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={toggleTools}
+          disabled={server.enabled === false}
+          aria-expanded={toolsOpen}
+        >
+          <Wrench className="h-3.5 w-3.5" aria-hidden />
+          {toolsOpen ? 'Hide tools' : 'View tools'}
+          <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', toolsOpen && 'rotate-180')} aria-hidden />
         </Button>
       </div>
+      {toolsOpen && (
+        <div className="rounded-md border border-border bg-subtle/40 p-2.5">
+          {toolsLoading ? (
+            <p className="flex items-center gap-2 text-small text-muted">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> Discovering tools…
+            </p>
+          ) : toolsError ? (
+            <p className="text-small text-danger">{toolsError}</p>
+          ) : tools?.length ? (
+            <ul className="max-h-64 space-y-2 overflow-y-auto pr-1">
+              {tools.map((tool) => (
+                <li key={tool.name}>
+                  <p className="break-all text-small font-medium text-fg">{tool.name}</p>
+                  {tool.description && <p className="line-clamp-2 text-caption text-muted">{tool.description}</p>}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-small text-muted">No tools surfaced. The server may still be connecting.</p>
+          )}
+          <p className="mt-2 text-caption text-muted">Schemas stay unloaded until a task selects a relevant tool.</p>
+        </div>
+      )}
       {unset.length > 0 && (
         <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5">
           <p className="mb-1.5 text-small font-medium text-warning">Needs credentials</p>

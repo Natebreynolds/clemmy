@@ -47,6 +47,7 @@ const {
 const { declareWorkManifest } = await import('../runtime/harness/work-manifest.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { saveUserMcpServers } = await import('../runtime/mcp-config.js');
+const { getLocalToolCatalog } = await import('../tools/local-runtime-tools.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -1737,6 +1738,42 @@ test('POST /api/console/mcp-servers/:name/reconnect clears MCP runtime connectio
     assert.equal(body.server, 'clemflow-mcp');
     assert.match(body.message || '', /will reconnect/);
     assert.ok(Array.isArray(body.servers));
+  } finally {
+    await h.close();
+    saveUserMcpServers({});
+  }
+});
+
+test('GET /api/console/mcp-servers exposes the exact built-in tool inventory on demand without schemas', async () => {
+  saveUserMcpServers({});
+  const h = await boot();
+  try {
+    const listRes = await fetch(`${h.url}/api/console/mcp-servers`);
+    assert.equal(listRes.status, 200);
+    const listBody = await listRes.json() as {
+      servers?: Array<{ name?: string; builtin?: boolean; state?: string; toolCount?: number }>;
+    };
+    const builtin = listBody.servers?.find((server) => server.name === 'clementine-local');
+    assert.equal(builtin?.builtin, true);
+    assert.equal(builtin?.state, 'connected');
+    assert.equal(builtin?.toolCount, getLocalToolCatalog().length);
+
+    const toolsRes = await fetch(`${h.url}/api/console/mcp-servers/clementine-local/tools`);
+    assert.equal(toolsRes.status, 200);
+    const toolsBody = await toolsRes.json() as {
+      server?: string;
+      state?: string;
+      toolCount?: number;
+      tools?: Array<Record<string, unknown>>;
+    };
+    assert.equal(toolsBody.server, 'clementine-local');
+    assert.equal(toolsBody.state, 'connected');
+    assert.equal(toolsBody.toolCount, getLocalToolCatalog().length);
+    assert.equal(toolsBody.tools?.length, getLocalToolCatalog().length);
+    assert.ok(toolsBody.tools?.some((tool) => tool.name === 'memory_search'));
+    assert.ok(toolsBody.tools?.some((tool) => tool.name === 'file_query'));
+    assert.ok(toolsBody.tools?.every((tool) =>
+      Object.keys(tool).every((key) => key === 'name' || key === 'description')));
   } finally {
     await h.close();
     saveUserMcpServers({});

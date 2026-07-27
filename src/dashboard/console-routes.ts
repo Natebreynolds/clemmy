@@ -183,7 +183,11 @@ import {
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { buildDevFlagsSnapshot, setDevFlag, clearDevFlag, setDevMode, isDevModeEnabled } from '../runtime/dev-flags.js';
-import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
+import {
+  getOrCreateExternalMcpServers,
+  invalidateConfiguredMcpServers,
+  prewarmMcpServers,
+} from '../runtime/mcp-servers.js';
 import {
   getWorkflowImportJob,
   listRecentWorkflowImportJobs,
@@ -433,8 +437,13 @@ import {
   LocalMeetingCaptureError,
   type LocalMeetingSettings,
 } from '../integrations/local-meetings/meeting-capture.js';
-import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
+import {
+  listMcpServerHealth,
+  parseNamespacedTool,
+  slugifyServerName,
+} from '../runtime/mcp-namespace-shim.js';
 import { serverEnvStatus } from '../tools/mcp-server-tools.js';
+import { getLocalToolCatalog } from '../tools/local-runtime-tools.js';
 import { collectDiagnostics } from './diagnostics.js';
 import { collectHarnessAudit } from './harness-audit.js';
 import { collectAgentSystemMetrics } from './agent-system-metrics.js';
@@ -9022,14 +9031,101 @@ export function registerConsoleRoutes(
       // are still UNSET (names only, never values) so the dashboard can show a
       // "needs credentials" badge + an entry field. Mirrors the mcp_status tool.
       const health = listMcpServerHealth();
-      const servers = discovered.map((s) => {
+      const externalServers = discovered.map((s) => {
         const h = health.find((x) => x.slug === slugifyServerName(s.name) || x.name === s.name);
         const { declaredEnvKeys, unsetEnvKeys } = serverEnvStatus(s);
-        return { ...s, state: h?.state ?? 'unknown', failureCount: h?.failureCount ?? 0, lastError: h?.lastError, declaredEnvKeys, unsetEnvKeys };
+        return {
+          ...s,
+          state: h?.state ?? 'unknown',
+          toolCount: h?.toolCount,
+          failureCount: h?.failureCount ?? 0,
+          lastError: h?.lastError,
+          declaredEnvKeys,
+          unsetEnvKeys,
+        };
       });
+      const localTools = getLocalToolCatalog();
+      const servers = [
+        {
+          name: 'clementine-local',
+          slug: 'clementine-local',
+          type: 'builtin',
+          description: 'Clementine built-in tools',
+          enabled: true,
+          state: 'connected',
+          toolCount: localTools.length,
+          failureCount: 0,
+          declaredEnvKeys: [],
+          unsetEnvKeys: [],
+          builtin: true,
+        },
+        ...externalServers.filter((server) => slugifyServerName(server.name) !== 'clementine-local'),
+      ];
       res.json({ servers, userOverrides: user });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Lightweight, on-demand tool inventory for the Integrations UI. The normal
+   * server-list poll returns counts only. External MCP schemas are fetched only
+   * when a human expands one server, keeping both the UI poll and every model
+   * turn free of unrelated schemas.
+   */
+  app.get('/api/console/mcp-servers/:name/tools', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const requested = req.params.name;
+    const requestedSlug = slugifyServerName(requested);
+    try {
+      if (requestedSlug === 'clementine-local') {
+        const tools = getLocalToolCatalog()
+          .map((entry) => ({
+            name: entry.name,
+            description: entry.description.slice(0, 400),
+          }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        res.json({ server: 'clementine-local', state: 'connected', tools, toolCount: tools.length });
+        return;
+      }
+
+      const server = discoverMcpServers().find((candidate) =>
+        candidate.name === requested || slugifyServerName(candidate.name) === requestedSlug);
+      if (!server) { res.status(404).json({ error: 'server not found' }); return; }
+      if (server.enabled === false) {
+        res.status(409).json({ error: 'server is disabled; enable it before loading its tools' });
+        return;
+      }
+
+      const serverSlug = slugifyServerName(server.name);
+      await prewarmMcpServers({ attempts: 1, allowedServerSlugs: [serverSlug] });
+      const listed = await getOrCreateExternalMcpServers({
+        reason: 'console on-demand MCP tool inventory',
+        allowedServerSlugs: [serverSlug],
+        maxTools: 1_000,
+      }).listTools();
+      const tools = listed
+        .map((entry) => {
+          const parsed = parseNamespacedTool(entry.name);
+          return {
+            name: parsed?.toolName ?? entry.name,
+            description: (entry.description ?? '')
+              .replace(new RegExp(`^\\[${serverSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]\\s*`), '')
+              .slice(0, 400),
+          };
+        })
+        .filter((entry) => entry.name !== 'unavailable')
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const health = listMcpServerHealth().find((entry) => entry.slug === serverSlug);
+      res.json({
+        server: server.name,
+        state: health?.state ?? (tools.length > 0 ? 'connected' : 'connecting'),
+        tools,
+        toolCount: tools.length,
+        lastError: health?.lastError,
+      });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

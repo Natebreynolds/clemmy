@@ -317,6 +317,20 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
   return captureLocalTools().map(localToolToRuntimeTool);
 }
 
+let cachedLocalToolCatalog: Array<{ name: string; description: string }> | null = null;
+
+/** Lightweight, schema-free inventory for the Console. This is generated from
+ * the exact in-process registration surface, not the broader static taxonomy,
+ * so the UI only claims tools Clementine actually loaded. The local surface is
+ * immutable for a daemon lifetime, so cache it instead of rebuilding every
+ * 15-second dashboard poll. */
+export function getLocalToolCatalog(): Array<{ name: string; description: string }> {
+  if (!cachedLocalToolCatalog) {
+    cachedLocalToolCatalog = captureLocalTools().map(({ name, description }) => ({ name, description }));
+  }
+  return cachedLocalToolCatalog.map((entry) => ({ ...entry }));
+}
+
 /** Build the Codex lane's tool_search against the exact deferred surface for
  * this turn. The static runtime tool remains available for non-schema-on-demand
  * lanes; this scoped instance prevents discovery from promising a tool that the

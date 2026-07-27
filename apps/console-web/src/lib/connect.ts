@@ -37,6 +37,36 @@ export interface ComposioSnapshot {
   featured?: string[];
   catalogError?: string | null;
 }
+export interface ComposioSetupField {
+  name: string;
+  label: string;
+  description?: string | null;
+  default?: string | null;
+  isSecret?: boolean;
+  required?: boolean;
+}
+export interface ComposioSetupMeta {
+  name: string;
+  description?: string | null;
+  appUrl?: string | null;
+  authHintUrl?: string | null;
+  authGuideUrl?: string | null;
+  fields: ComposioSetupField[];
+  authScheme: string;
+}
+export interface ComposioAuthorization {
+  kind?: 'authorization';
+  url?: string;
+  redirectUrl?: string | null;
+  connectionId?: string;
+}
+export interface ComposioCredentialsRequired {
+  kind: 'credentials';
+  setup: ComposioSetupMeta;
+  url?: never;
+  redirectUrl?: never;
+}
+export type ComposioConnectResult = ComposioAuthorization | ComposioCredentialsRequired;
 
 /** One toolkit's connection state, collapsing its connection history. */
 export type ToolkitStatus = 'active' | 'reconnect' | 'expired' | 'none';
@@ -78,13 +108,33 @@ export function searchToolkits(snap: ComposioSnapshot | undefined, q: string, li
 // `required`/`description` metadata lives in the separate `descriptors` map.
 export interface CredentialRow { name?: string; status?: string; hasValue?: boolean; source?: string; [k: string]: unknown }
 export interface CredentialDescriptor { required?: boolean; description?: string; setupHint?: string; label?: string; [k: string]: unknown }
-export interface McpServer { slug?: string; name?: string; status?: string; enabled?: boolean; state?: string; failureCount?: number; lastError?: string; declaredEnvKeys?: string[]; unsetEnvKeys?: string[]; [k: string]: unknown }
+export interface McpServer {
+  slug?: string;
+  name?: string;
+  status?: string;
+  enabled?: boolean;
+  state?: string;
+  toolCount?: number;
+  failureCount?: number;
+  lastError?: string;
+  declaredEnvKeys?: string[];
+  unsetEnvKeys?: string[];
+  builtin?: boolean;
+  type?: string;
+  [k: string]: unknown;
+}
+export interface McpToolSummary { name: string; description?: string }
 export interface CliRow { command?: string; path?: string; isLikelyCli?: boolean; version?: string; helpHead?: string; [k: string]: unknown }
 
 export const getComposioStatus = () => apiGet<ComposioStatus>('/api/composio/status');
 export const getComposioToolkits = () => apiGet<ComposioSnapshot>('/api/composio/toolkits');
 export const authorizeComposio = (slug: string) =>
-  apiPost<{ url?: string; redirectUrl?: string }>(`/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`);
+  apiPost<ComposioConnectResult>(`/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`);
+export const setupComposioCredentials = (slug: string, credentials: Record<string, string>) =>
+  apiPost<{ ok: true; authConfigId: string; connectionId: string }>(
+    `/api/composio/toolkits/${encodeURIComponent(slug)}/setup-credentials`,
+    { credentials },
+  );
 // Reset the daemon's cached Composio client so the next status/toolkits read is fresh.
 export const refreshComposio = () => apiPost<{ ok: boolean }>('/api/composio/refresh');
 // Disconnect a connected app (deletes the connected account). Needs the connection id.
@@ -108,8 +158,7 @@ export const setComposioApiKey = (apiKey: string, userId?: string) =>
     { api_key: apiKey, ...(userId ? { user_id: userId } : {}) },
   );
 
-export interface ComposioAuthorization { url?: string; redirectUrl?: string }
-export interface ComposioReconnectResult extends ComposioAuthorization { staleRemoved: boolean }
+export type ComposioReconnectResult = ComposioConnectResult & { staleRemoved: boolean };
 
 /** Replace a known-bad account before opening the normal authorization flow.
  * Some legacy entity-owned records cannot be deleted; authorization still
@@ -181,6 +230,10 @@ export interface SlackStatus {
 }
 export const getSlackStatus = () => apiGet<SlackStatus>('/api/console/slack/status');
 export const getMcpServers = () => apiGet<{ servers?: McpServer[] }>('/api/console/mcp-servers');
+export const getMcpServerTools = (name: string) =>
+  apiGet<{ server: string; state?: string; tools: McpToolSummary[]; toolCount: number; lastError?: string }>(
+    `/api/console/mcp-servers/${encodeURIComponent(name)}/tools`,
+  );
 
 export interface McpServerInput {
   name: string;
