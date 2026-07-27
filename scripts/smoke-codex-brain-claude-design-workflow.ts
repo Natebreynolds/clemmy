@@ -180,3 +180,9 @@ try {
 } finally {
   rmSync(tmpHome, { recursive: true, force: true });
 }
+
+// The Codex brain transport can retain an SDK child/process handle after the
+// workflow and synchronous temp-home cleanup are complete. This is a CLI smoke,
+// so a successful assertion path must terminate deterministically instead of
+// leaving the parent readiness gate blocked on an unrelated open handle.
+process.exit(0);
