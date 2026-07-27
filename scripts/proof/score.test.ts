@@ -144,6 +144,9 @@ test('sessionMetrics computes counts, TTFT, and latency from the fixture', () =>
     assert.equal(m.toolCalls['run_worker'], 2);
     assert.equal(m.toolCalls['remember_fact'], 1);
     assert.equal(m.toolCalls['workspace_roots'], 1, 'inner-tool evidence remains queryable');
+    assert.equal(m.logicalToolCalls['run_worker'], 2);
+    assert.equal(m.logicalToolCalls['remember_fact'], 1);
+    assert.equal(m.logicalToolCalls['workspace_roots'] ?? 0, 0, 'transport mirrors never inflate logical dispatches');
     assert.equal(m.toolCallTotal, 3);
     assert.equal(m.guardrailsTripped, 1);
     assert.equal(m.workerResults, 2);

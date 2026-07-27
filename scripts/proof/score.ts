@@ -38,6 +38,9 @@ export interface SessionMetrics {
   /** Per-tool evidence includes transport mirrors so a proof can assert that
    * call_tool reached the exact deferred inner tool. */
   toolCalls: Record<string, number>;
+  /** Per-tool model-issued/canonical calls only. Use this for exact-dispatch
+   * assertions; an SDK call plus its local-MCP mirror is one logical action. */
+  logicalToolCalls: Record<string, number>;
   /** Model-issued/canonical calls only. A call_tool wrapper and its
    * transport_mirror inner event are one physical decision, not two. */
   toolCallTotal: number;
@@ -75,6 +78,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     .all(sessionId) as EventRow[];
 
   const toolCalls: Record<string, number> = {};
+  const logicalToolCalls: Record<string, number> = {};
   let guardrailsTripped = 0;
   let externalWrites = 0;
   const sdkFirstBytes: number[] = [];
@@ -109,7 +113,10 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
           accounting = String(data.accounting ?? '');
         } catch { /* keep unknown */ }
         toolCalls[name] = (toolCalls[name] ?? 0) + 1;
-        if (accounting !== 'transport_mirror') canonicalToolCallTotal += 1;
+        if (accounting !== 'transport_mirror') {
+          logicalToolCalls[name] = (logicalToolCalls[name] ?? 0) + 1;
+          canonicalToolCallTotal += 1;
+        }
         break;
       }
       case 'turn_ended':
@@ -161,6 +168,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     tokensUsed: session.tokens_used,
     turns,
     toolCalls,
+    logicalToolCalls,
     toolCallTotal: canonicalToolCallTotal,
     guardrailsTripped,
     externalWrites,

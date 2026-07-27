@@ -123,26 +123,6 @@ function approvalAudit(daemon: DaemonHandle, runId: string): ApprovalAuditRow[] 
   }
 }
 
-function actualToolDispatchCount(daemon: DaemonHandle, sessionId: string, tool: string): number {
-  const db = openHarnessDb(daemon.home);
-  try {
-    const row = db.prepare(
-      `SELECT COUNT(*) AS count
-         FROM events
-        WHERE session_id = ?
-          AND type = 'tool_called'
-          AND json_extract(data_json, '$.tool') = ?
-          AND (
-            json_type(data_json, '$.args') IS NOT NULL
-            OR json_type(data_json, '$.arguments') IS NOT NULL
-          )`,
-    ).get(sessionId, tool) as { count?: number } | undefined;
-    return Number(row?.count ?? 0);
-  } finally {
-    db.close();
-  }
-}
-
 function workflowEvents(daemon: DaemonHandle, runId: string): WorkflowEventRow[] {
   const file = path.join(
     daemon.home,
@@ -251,7 +231,7 @@ export const approvalParkResume: ScenarioDef = {
         try { stepMetrics = sessionMetrics(db, stepSessionId); } finally { db.close(); }
       }
       const rawWriteEvents = stepMetrics?.toolCalls.write_file ?? 0;
-      const writeDispatches = stepSessionId ? actualToolDispatchCount(daemon, stepSessionId, 'write_file') : 0;
+      const writeDispatches = stepMetrics?.logicalToolCalls.write_file ?? 0;
       const completedSteps = events.filter((event) => event.kind === 'step_completed' && event.stepId === STEP_ID);
       const completedRuns = events.filter((event) => event.kind === 'run_completed');
       const serializedRun = JSON.stringify(finalRun ?? {});
