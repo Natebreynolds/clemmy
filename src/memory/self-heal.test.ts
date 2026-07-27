@@ -75,9 +75,9 @@ beforeEach(() => {
   delete process.env.CLEMMY_MEMORY_SELF_HEAL_MAX;
 });
 
-function ageFact(id: number, days: number) {
+function ageFact(id: number, days: number, relativeToIso = new Date().toISOString()) {
   const db = openMemoryDb();
-  const iso = new Date(Date.now() - days * 86_400_000).toISOString();
+  const iso = new Date(Date.parse(relativeToIso) - days * 86_400_000).toISOString();
   db.prepare('UPDATE consolidated_facts SET created_at = ?, updated_at = ?, last_accessed_at = NULL WHERE id = ?').run(iso, iso, id);
 }
 
@@ -219,7 +219,7 @@ test('internal-noise review scans the complete derived pool beyond the former 10
 
 test('lift_recall_gap: boosts importance without changing content', async () => {
   const f = rememberFact({ kind: 'project', content: 'High-value buried fact for a client workspace.', importance: 8 });
-  ageFact(f.id, 30);
+  ageFact(f.id, 30, '2026-07-04T12:00:00.000Z');
   const beforeHash = contentHash(f.id);
 
   const out = await runMemorySelfHeal({ maxApply: 5, nowIso: '2026-07-04T12:00:00.000Z' });
@@ -507,7 +507,7 @@ test('supersede_stale_fact: only lower-trust derived preference is deactivated',
     trustLevel: 0.5,
     derivedFrom: { tool: 'calendar_read', sessionId: 's1' },
   });
-  ageFact(old.id, 40);
+  ageFact(old.id, 40, '2026-07-04T12:00:00.000Z');
   const newer = rememberFact({ kind: 'user', content: 'Alexander now prefers Wednesday calls.', trustLevel: 1 });
 
   const fixes = detectMemoryHealCandidates({ nowIso: '2026-07-04T12:00:00.000Z' });
