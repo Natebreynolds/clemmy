@@ -95,6 +95,22 @@ test('explicit project remember stores one clean canonical claim without confirm
   }]);
 });
 
+test('explicit release-validation remember does not become a truncated project-requirement wrapper', () => {
+  const candidates = extractAutoMemoryCandidates(
+    [
+      "Remember this disposable release-validation fact exactly: Project Saffron Quasar's launch code is VIOLET-7429 and its owner is Mira Vale.",
+      'This is a durable fact that must be available in a new conversation.',
+      'Confirm only after it is saved.',
+    ].join(' '),
+  );
+
+  assert.deepEqual(candidates, [{
+    kind: 'project',
+    content: "Project Saffron Quasar's launch code is VIOLET-7429 and its owner is Mira Vale.",
+    reason: 'explicit remember request',
+  }]);
+});
+
 test('bare "remember to" keeps its task-like wording intact', () => {
   const candidates = extractAutoMemoryCandidates('Remember to call the vendor on Friday about the renewal.');
 

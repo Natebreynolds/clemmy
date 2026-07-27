@@ -217,6 +217,11 @@ function clean(value: string, maxChars = 260): string {
  */
 function explicitRememberContent(text: string): string {
   const leaders = [
+    // Natural variants such as "remember this release-validation fact
+    // exactly: <claim>" are still explicit store requests. Strip the
+    // descriptive command wrapper before the generic "remember this" rule,
+    // otherwise "release-validation fact exactly:" becomes part of memory.
+    /^(?:please\s+)?remember\s+(?:this\s+)?(?:[\w-]+\s+){0,5}?fact(?:\s+exactly)?\s*:\s*/i,
     /^(?:please\s+)?remember\s+(?:this|that|exactly)\s*:?\s*/i,
     /^(?:please\s+)?remember\s*:\s*/i,
     /^(?:please\s+)?note\s+that\s+/i,
@@ -230,12 +235,23 @@ function explicitRememberContent(text: string): string {
   const clause = text
     .replace(leader, '')
     .replace(
-      /\s+(?:then\s+)?(?:just\s+)?confirm\s+(?:you(?:'ve| have)\s+)?(?:noted|saved|remembered)\s+it(?:\s*[—,:;-]\s*nothing\s+else)?[.!?]*$/i,
+      /\s+(?:then\s+)?(?:just\s+)?confirm(?:\s+only)?\s+(?:(?:you(?:'ve| have)\s+)?(?:noted|saved|remembered)\s+it|after\s+it\s+is\s+(?:noted|saved|stored|remembered))(?:\s*[—,:;-]\s*nothing\s+else)?[.!?]*$/i,
+      '',
+    )
+    // Durability/next-conversation wording describes the requested storage
+    // contract, not the claim itself. The source episode keeps the full turn.
+    .replace(
+      /\s+this\s+is\s+(?:a\s+)?durable\s+(?:fact|memory)\s+that\s+(?:must|should|needs?\s+to)\s+be\s+available\s+in\s+(?:a|the)\s+new\s+(?:conversation|session)[.!?]*$/i,
       '',
     )
     // A standalone final sentence is framing; "I need to confirm" is not.
     .replace(/(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i, '');
   return clause.trim() || text;
+}
+
+function isExplicitRememberRequest(text: string): boolean {
+  return !/^\s*(?:do|did|does|can|could|would|will)\b/i.test(text)
+    && /\b(?:remember|note|keep in mind|don'?t forget|make a note)\b/i.test(text);
 }
 
 function explicitRememberKind(content: string): ConsolidatedFactKind {
@@ -314,6 +330,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   const taskRequest = looksLikeOneOffTaskRequest(text);
   const persistentScope = PERSISTENT_SCOPE_RE.test(text);
   const explicitPreference = EXPLICIT_PREFERENCE_CUES.test(text);
+  const explicitRemember = isExplicitRememberRequest(text);
 
   // Enforceable sender/account routing rule → kind:'constraint' so the dispatch
   // gate (constraint-guard via listConstraints) actually ENFORCES it, closing the
@@ -329,6 +346,31 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
   const capturedConstraint = candidates.some((c) => c.kind === 'constraint');
+
+  // An explicit store request is already the user's durable-memory decision.
+  // Canonicalize it before the broader project/feedback heuristics see words
+  // such as "project", "must", or "durable" in the surrounding command. Those
+  // heuristics previously stored a second, truncated "Clementine requirement:
+  // Remember this..." wrapper before memory_remember wrote the clean claim.
+  if (explicitRemember && !capturedConstraint) {
+    const content = explicitRememberContent(text);
+    if (prohibition) {
+      addCandidate(candidates, {
+        kind: 'feedback',
+        content: `Standing prohibition: ${content}`,
+        reason: 'safety-critical prohibition (auto-pinned)',
+        pin: true,
+      });
+    } else {
+      addCandidate(candidates, {
+        kind: explicitRememberKind(content),
+        content,
+        reason: 'explicit remember request',
+      });
+    }
+    return candidates.slice(0, maxCandidates);
+  }
+  if (capturedConstraint && explicitRemember) return candidates.slice(0, maxCandidates);
 
   if (
     FEEDBACK_CUES.test(text)
@@ -390,11 +432,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // vendor", "remember: ship Friday", and "note that …" / "don't forget
   // …". A "do you remember X?" question is NOT a store request, so we
   // exclude leading interrogatives.
-  if (
-    candidates.length === 0
-    && !/^\s*(?:do|did|does|can|could|would|will)\b/i.test(text)
-    && /\b(?:remember|note|keep in mind|don'?t forget|make a note)\b/i.test(text)
-  ) {
+  if (candidates.length === 0 && explicitRemember) {
     const content = explicitRememberContent(text);
     addCandidate(candidates, {
       kind: explicitRememberKind(content),
