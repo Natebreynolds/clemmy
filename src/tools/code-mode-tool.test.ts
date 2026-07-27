@@ -209,6 +209,48 @@ test('normalizeCodeModeToolResult: Composio warning-prefixed FAILED banners beco
   assert.match(out.error ?? '', /exceeds grid limits/);
 });
 
+test('code-mode wrapper never appends harness advisories to structured Composio results', async () => {
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const { _resetAllTrackersForTests } = await import('../runtime/harness/tool-guardrail.js');
+  const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.CLEMMY_CODE_MODE_WRITES = 'on';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  _resetAllTrackersForTests();
+  _setCodeModeToolsForTests(new Map([
+    ['composio_execute_tool', {
+      name: 'composio_execute_tool',
+      invoke: async (_ctx: unknown, raw: unknown) => {
+        const input = JSON.parse(String(raw)) as { arguments?: string };
+        const args = JSON.parse(input.arguments ?? '{}') as { range?: string };
+        return JSON.stringify({ successful: true, data: { range: args.range, values: [['ok']] } });
+      },
+    }],
+  ]) as never);
+  try {
+    const sid = 'workflow:code-mode-wrapper:tracker';
+    const counter = new ToolCallsCounter(100);
+    for (let i = 1; i <= 4; i += 1) {
+      const result = await dispatchCodeModeTool(
+        'composio_execute_tool',
+        {
+          tool_slug: 'GOOGLESHEETS_BATCH_GET',
+          arguments: JSON.stringify({ spreadsheet_id: 'sheet-1', range: `Sheet1!A${i}:D${i}` }),
+        },
+        sid,
+        counter,
+      ) as { successful?: boolean; data?: { range?: string } };
+      assert.equal(result.successful, true, `call ${i}: JSON stayed structured`);
+      assert.equal(result.data?.range, `Sheet1!A${i}:D${i}`);
+    }
+  } finally {
+    _setCodeModeToolsForTests(null);
+    _resetAllTrackersForTests();
+    if (prevWrites === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prevWrites;
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
+});
+
 test('runCodeModeForSession: run_shell_command exposes stdout/stdout_json instead of the text wrapper', async () => {
   const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;

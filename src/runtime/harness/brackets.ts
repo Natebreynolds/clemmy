@@ -1546,10 +1546,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
       // run_worker — inside a worker scope (guardrailScopeId set) the nudge
       // is wrong advice (workers can't spawn workers), so suppress it. Also
-      // suppress for CERTIFIED batch items: run_batch IS the sanctioned
-      // serial primitive — nudging its own approved execution toward
-      // run_worker is contradictory noise (it fired mid-batch in the ask-first regression).
-      if (decision.fanoutNudge && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
+      // suppress for CODE MODE and CERTIFIED batch items: both are sanctioned
+      // aggregation primitives. Appending prose to a code-mode tool's JSON
+      // also corrupts its machine-readable result (successful provider data
+      // becomes a string), so the exemption is a response-shape invariant.
+      if (decision.fanoutNudge && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         fanoutNudge = decision.fanoutNudge;
         try {
           appendEvent({
@@ -1593,7 +1594,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // worker scope they diverge, so suppress. Also suppress when the prior
       // output was error-shaped: a retry after a transient failure must NOT be
       // discouraged. Nudge points at recall_tool_result; never serves a payload.
-      if (decision.cachedCallId && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
+      if (decision.cachedCallId && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         let priorOutput: string | null = null;
         try {
           priorOutput = getToolOutput(ctx.sessionId, decision.cachedCallId)?.output ?? null;
@@ -2525,6 +2526,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
         + 'Return your best result NOW as your final answer. A partial result with honest gaps beats nothing: '
         + 'include everything you gathered, and mark anything missing with an "ERROR: <what is missing>" line.';
     }
+    // Code-mode callers must always receive the native result unchanged.
+    // Keep this final invariant even if a future advisory is added above and
+    // forgets its local codeMode exemption.
+    if (ctx.codeMode) return undefined;
     // All nudges ride the same advisory rail (appended to the tool result by the
     // caller). Combine so a turn that trips several still delivers each.
     const nudges = [fanoutNudge, cacheNudge, bgOfferNudge, workerFinishNudge].filter(Boolean);
