@@ -2079,15 +2079,15 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       return stubsFor((async function* () {
         yield initOnlyMessage();
         // A behaviorally mutating shell command registers an approval and
-        // AWAITS a human. Resolve it ~150ms later (a "slow human").
-        // That 150ms is spent INSIDE canUseTool → pausedMs, so it must NOT count
-        // toward the 40ms wall clock.
+        // AWAITS a human. Resolve it well after the active-work wall clock.
+        // That delay is spent INSIDE canUseTool → pausedMs, so it must NOT count
+        // toward the turn budget.
         const callP = canUse('mcp__clementine-local__run_shell_command', { command: 'git push origin main' }, { signal: new AbortController().signal });
         setTimeout(() => {
           for (const row of approvalRegistry.listPending({ sessionId: sid })) {
             approvalRegistry.resolve(row.approvalId, 'approved', 'test');
           }
-        }, 150);
+        }, 1_200);
         await callP;
         yield successResultMessage('finished after the slow approval');
       })());
@@ -2098,7 +2098,12 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       sessionId: sid,
       modelId: 'claude-sonnet-4-6',
       agentic: true,
-      maxWallClockMs: 40, // far below the ~150ms approval wait
+      // Leave enough headroom for module/event-loop scheduling when this file
+      // runs alongside the other heavy SDK suites. The former 40ms budget could
+      // expire on unrelated CPU contention before approval waiting dominated,
+      // producing a false release-gate failure. The 1.2s wait remains far above
+      // this budget, so a regression that counts paused time still fails.
+      maxWallClockMs: 500,
       // Force the silent-iterator ticker to inspect the wall clock repeatedly
       // while canUseTool is still waiting. The regression used to pass only
       // because the default 60s heartbeat never observed the live wait.
@@ -2106,8 +2111,8 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
       allowedLocalMcpTools: ['read_file', 'memory_search'],
     });
 
-    // WITHOUT the pausedMs exclusion this would limitHit (150ms > 40ms). WITH it,
-    // wall - pausedMs ≈ 0 < 40ms → the turn completes normally after the approval.
+    // WITHOUT the pausedMs exclusion this would limitHit (1.2s > 500ms). WITH it,
+    // wall - pausedMs remains below 500ms and the turn completes after approval.
     assert.notEqual(r.limitHit, true, 'a long approval wait must not trip the wall clock');
     assert.match(r.text, /finished after the slow approval/);
   } finally {
