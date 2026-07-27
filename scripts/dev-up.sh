@@ -27,6 +27,7 @@ DEV_FUSION_MODE="${DEV_FUSION_MODE:-}"
 DEV_FUSION_STRATEGY="${DEV_FUSION_STRATEGY:-}"
 DEV_BRAIN_FALLOVER="${DEV_BRAIN_FALLOVER:-on}"
 DEV_AUTH_FALLOVER="${DEV_AUTH_FALLOVER:-on}"
+DAEMON_LOG="$HOME_DIR/logs/daemon.log"
 
 if [ -n "$DEV_PRIMARY_MODEL" ] && [[ ! "$DEV_PRIMARY_MODEL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
   echo "✗ DEV_PRIMARY_MODEL contains unsupported characters"; exit 2
@@ -82,7 +83,9 @@ DEV_DISCORD="${DEV_DISCORD:-true}"
 PRIMARY_LABEL="${DEV_PRIMARY_MODEL:-profile}"
 FUSION_LABEL="${DEV_FUSION_MODE:-profile}"
 echo "→ starting dev daemon from source (Discord $DEV_DISCORD, model $PRIMARY_LABEL, Fusion $FUSION_LABEL, fallover brain=$DEV_BRAIN_FALLOVER auth=$DEV_AUTH_FALLOVER, proactivity off)"
-(
+LOG_START_LINE=1
+if [ -f "$DAEMON_LOG" ]; then LOG_START_LINE=$(( $(wc -l < "$DAEMON_LOG") + 1 )); fi
+if ! (
   cd "$ROOT" || exit 1
   export CLEMENTINE_HOME="$HOME_DIR"
   export DISCORD_ENABLED="$DEV_DISCORD"
@@ -93,8 +96,17 @@ echo "→ starting dev daemon from source (Discord $DEV_DISCORD, model $PRIMARY_
   if [ -n "$DEV_PRIMARY_MODEL" ]; then export OPENAI_MODEL_PRIMARY="$DEV_PRIMARY_MODEL"; fi
   if [ -n "$DEV_FUSION_MODE" ]; then export CLEMMY_DEBATE_MODE="$DEV_FUSION_MODE"; fi
   if [ -n "$DEV_FUSION_STRATEGY" ]; then export CLEMMY_FUSION_STRATEGY="$DEV_FUSION_STRATEGY"; fi
-  npx tsx src/index.ts daemon --foreground > /tmp/clem-dev-daemon.log 2>&1
-) &
+  # Use the product's detached daemon launcher rather than backgrounding a
+  # foreground process. The latter inherits a non-interactive caller's process
+  # group and can be reaped as soon as a hotpatch command/CI shell exits.
+  npx tsx src/index.ts daemon start
+); then
+  echo "✗ detached source daemon failed to start — see $DAEMON_LOG"
+  exit 1
+fi
+# Keep the familiar dev-tail path while preserving the real daemon log and its
+# rotation/history. Readiness checks below only inspect lines from THIS launch.
+ln -sf "$DAEMON_LOG" /tmp/clem-dev-daemon.log
 for _ in $(seq 1 60); do lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1 && break; sleep 1; done
 if lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
   echo "✓ dev daemon up on $PORT (source: $ROOT, home: $HOME_DIR)"
@@ -109,11 +121,11 @@ if [ "$DEV_DISCORD" = "true" ]; then
   printf '→ waiting for Discord to connect'
   READY=""
   for _ in $(seq 1 30); do
-    if grep -q "Discord bot ready" /tmp/clem-dev-daemon.log 2>/dev/null; then READY=1; break; fi
+    if tail -n +"$LOG_START_LINE" "$DAEMON_LOG" 2>/dev/null | grep -q "Discord bot ready"; then READY=1; break; fi
     printf '.'; sleep 1
   done
   if [ -n "$READY" ]; then
-    TAG="$(grep -m1 "Discord bot ready" /tmp/clem-dev-daemon.log | sed -E 's/.*"user":"([^"]+)".*/\1/')"
+    TAG="$(tail -n +"$LOG_START_LINE" "$DAEMON_LOG" | grep -m1 "Discord bot ready" | sed -E 's/.*"user":"([^"]+)".*/\1/')"
     printf '\r✓ Discord live as %s — DM the bot or @mention it to test           \n' "$TAG"
   else
     printf '\r⚠ Discord did not report ready in 30s — check /tmp/clem-dev-daemon.log (token/intents?)\n'
