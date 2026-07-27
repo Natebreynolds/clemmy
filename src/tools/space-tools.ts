@@ -40,32 +40,36 @@ function expandHome(p: string): string {
   return p;
 }
 
-/** A view_path Clem hands us must live inside the agent-owned BASE_DIR. */
-function readAgentOwnedFile(viewPath: string): { ok: true; content: string; resolved: string } | { ok: false; error: string } {
+/** An authored file Clem hands us must live inside the agent-owned BASE_DIR. */
+function readAgentOwnedFile(
+  filePath: string,
+  field = 'view_path',
+): { ok: true; content: string; resolved: string } | { ok: false; error: string } {
   let resolved: string;
   try {
-    resolved = path.resolve(expandHome(viewPath));
+    resolved = path.resolve(expandHome(filePath));
   } catch {
-    return { ok: false, error: `could not resolve view_path: ${viewPath}` };
+    return { ok: false, error: `could not resolve ${field}: ${filePath}` };
   }
   const base = path.resolve(BASE_DIR);
   const rel = path.relative(base, resolved);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    return { ok: false, error: `view_path must be inside ${base} (where write_file saves). Got: ${resolved}` };
+    return { ok: false, error: `${field} must be inside ${base} (where write_file saves). Got: ${resolved}` };
   }
   if (!existsSync(resolved)) {
-    return { ok: false, error: `view_path does not exist: ${resolved}. Write the HTML with write_file first.` };
+    return { ok: false, error: `${field} does not exist: ${resolved}. Write the file with write_file first.` };
   }
   try {
     return { ok: true, content: readFileSync(resolved, 'utf-8'), resolved };
   } catch (err) {
-    return { ok: false, error: `could not read view_path: ${(err as Error).message}` };
+    return { ok: false, error: `could not read ${field}: ${(err as Error).message}` };
   }
 }
 
 const dataSourceShape = z.object({
   id: z.string().min(1).max(60).describe('Stable id for this data source within the workspace, e.g. "daily_pull".'),
-  runner: z.string().max(120).nullable().describe('Filename of a deterministic script you authored (e.g. "refresh.mjs") that prints JSON to stdout. Runs server-side with NO LLM. Mutually exclusive with composio_slug.'),
+  runner: z.string().max(120).nullable().describe('Installed filename for a deterministic script (e.g. "refresh.mjs") that prints JSON to stdout. Use runner_path to install a newly-authored script in the same space_save call. Mutually exclusive with composio_slug.'),
+  runner_path: z.string().max(1000).nullable().describe(`Optional source path to the runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
   composio_slug: z.string().max(120).nullable().describe('A Composio tool slug to call server-side for data (credentials resolve server-side, never in the view). Mutually exclusive with runner.'),
   composio_args_json: z.string().max(4000).nullable().describe('JSON string of frozen args for composio_slug.'),
   schedule: z.string().max(60).nullable().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
@@ -76,10 +80,43 @@ const actionShape = z.object({
   id: z.string().min(1).max(60).describe('Stable id for this action, e.g. "send_followup".'),
   label: z.string().max(80).nullable().describe('Button label shown in the view, e.g. "Send follow-up".'),
   composio_slug: z.string().max(120).nullable().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner.'),
-  runner: z.string().max(120).nullable().describe('OR a script under data/ that performs the side effect.'),
+  runner: z.string().max(120).nullable().describe('OR the installed filename of a script under data/ that performs the side effect. Use runner_path to install a newly-authored script in this call.'),
+  runner_path: z.string().max(1000).nullable().describe(`Optional source path to the action runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
   args_template_json: z.string().max(4000).nullable().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
   confirm: z.boolean().nullable().describe('Hint that the view should confirm before firing (advisory).'),
 });
+
+interface StagedRunner {
+  owner: string;
+  runner: string;
+  source: string;
+  content: string;
+}
+
+function declaredRunner(
+  rawRunner: string | null | undefined,
+  rawRunnerPath: string | null | undefined,
+  owner: string,
+  errors: string[],
+  staged: StagedRunner[],
+): string | undefined {
+  let runner = rawRunner?.trim() || undefined;
+  const sourcePath = rawRunnerPath?.trim();
+  if (sourcePath) {
+    const read = readAgentOwnedFile(sourcePath, `${owner} runner_path`);
+    if (!read.ok) {
+      errors.push(read.error);
+      return runner;
+    }
+    runner ??= path.basename(read.resolved);
+    staged.push({ owner, runner, source: read.resolved, content: read.content });
+  }
+  if (runner) {
+    const filenameError = runnerFilenameError(runner);
+    if (filenameError) errors.push(`${owner} ${filenameError}.`);
+  }
+  return runner;
+}
 
 function parseJsonObjectField(raw: string | null | undefined, label: string, errors: string[]): Record<string, unknown> | undefined {
   const text = raw?.trim();
@@ -96,20 +133,30 @@ function parseJsonObjectField(raw: string | null | undefined, label: string, err
   return undefined;
 }
 
-function toAction(raw: z.infer<typeof actionShape>, errors: string[] = []): SpaceAction {
+function toAction(
+  raw: z.infer<typeof actionShape>,
+  errors: string[] = [],
+  staged: StagedRunner[] = [],
+): SpaceAction {
   const a: SpaceAction = { id: raw.id.trim() };
   if (raw.label && raw.label.trim()) a.label = raw.label.trim();
   if (raw.composio_slug && raw.composio_slug.trim()) a.composioSlug = raw.composio_slug.trim();
-  if (raw.runner && raw.runner.trim()) a.runner = raw.runner.trim();
+  const runner = declaredRunner(raw.runner, raw.runner_path, `Action "${a.id}"`, errors, staged);
+  if (runner) a.runner = runner;
   const argsTemplate = parseJsonObjectField(raw.args_template_json, `Action "${a.id}" args_template_json`, errors);
   if (argsTemplate) a.argsTemplate = argsTemplate;
   if (raw.confirm) a.confirm = true;
   return a;
 }
 
-function toDataSource(raw: z.infer<typeof dataSourceShape>, errors: string[] = []): SpaceDataSource {
+function toDataSource(
+  raw: z.infer<typeof dataSourceShape>,
+  errors: string[] = [],
+  staged: StagedRunner[] = [],
+): SpaceDataSource {
   const ds: SpaceDataSource = { id: raw.id.trim() };
-  if (raw.runner && raw.runner.trim()) ds.runner = raw.runner.trim();
+  const runner = declaredRunner(raw.runner, raw.runner_path, `Data source "${ds.id}"`, errors, staged);
+  if (runner) ds.runner = runner;
   if (raw.composio_slug && raw.composio_slug.trim()) ds.composioSlug = raw.composio_slug.trim();
   const composioArgs = parseJsonObjectField(raw.composio_args_json, `Data source "${ds.id}" composio_args_json`, errors);
   if (composioArgs) ds.composioArgs = composioArgs;
@@ -236,11 +283,11 @@ export function registerSpaceTools(server: McpServer): void {
     'space_save',
     [
       'Create or update a Workspace — a persistent, interactive HTML surface you build for the user (a live report, a CRM mini-app, a daily planner, a tracker). Idempotent: pass an existing slug to UPDATE it.',
-      `FIRST write the self-contained view with write_file (inline CSS/JS only — external CDNs are blocked by CSP). Save it under ${BASE_DIR}/spaces/<slug>/view/index.html (or any path inside ${BASE_DIR}), then call this with view_path pointing at it.`,
+      `FIRST write the self-contained view with write_file (inline CSS/JS only — external CDNs are blocked by CSP). It may live at ANY path inside ${BASE_DIR}; pass that path as view_path and space_save installs it.`,
       'The view calls same-origin data routes the user opens in the desktop: GET /api/console/spaces/<slug>/data, POST /api/console/spaces/<slug>/notes. It can call any /api endpoint (it inherits the session).',
-      'A helper `clem` is auto-injected into every served view — PREFER it over hand-writing fetch (fewer wrong-slug/wrong-key bugs): `await clem.data()` → the dataset (keyed by sourceId); `await clem.refresh(sourceId?)`; `await clem.compose(instructions, context)` → a grounded draft (e.g. a personalized email from a row); `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
+      'A helper `clem` is auto-injected into every served view. For declared data, USE `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; do not hand-write a relative fetch such as `fetch("./data/...")` (it is not a valid Workspace API URL). Also available: `await clem.refresh(sourceId?)`; `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
-      'Optionally declare data_sources (a deterministic script that prints JSON, or a Composio op) so the workspace can refresh its data server-side without spending tokens.',
+      'Optionally declare data_sources (a deterministic script that prints JSON, or a Composio op) so the workspace can refresh its data server-side without spending tokens. For a new script, write it anywhere inside the Clementine home and pass that file as runner_path in the SAME space_save call; space_save installs it. Do not pre-create or guess the hidden Workspace data/ directory.',
       'RUNNER CONTRACT (when a data source is a script — .mjs/.js/.ts/.py/.sh): it runs SERVER-SIDE with NO LLM and a SCRUBBED env (PATH/HOME/locale only — NO API keys or daemon secrets). It receives a JSON payload on stdin and MUST print the dataset as JSON to stdout and NOTHING else (a stray console.log/print corrupts the parse). Exit non-zero on failure. Use only language built-ins + (node) global fetch — there is NO node_modules, so no npm imports. It MAY shell out to CLIs on PATH (e.g. `sf`, `gh`), which read their own auth from $HOME. For anything that needs a secret/OAuth, declare a Composio op (composio_slug) instead of a runner. The view reads each source at data["<sourceId>"] from GET /api/console/spaces/<slug>/data.',
       'PROACTIVE WAKE (optional): a SCHEDULED runner can ping the user when something crosses a threshold — include `_reengage: { fire: true, message: "<what changed>", key: "<stable-condition-id>" }` in its JSON output. The scheduler fires a re-engage when `fire` is true and dedups by `key` (a persistent condition pings ONCE, not every refresh; it can re-fire after the condition clears). Requires reengage_triggers to include "threshold"; omit `_reengage` (or set fire:false) when nothing is notable.',
       'Changing a data source (or editing its runner file) auto-refreshes on save and reports the row count, so you can confirm the new data before telling the user it is done.',
@@ -281,21 +328,59 @@ export function registerSpaceTools(server: McpServer): void {
       // Authoring-reliability gate (mirror of prepareWorkflowForWrite): auto-repair
       // + validate the declared data sources/actions BEFORE installing the view or
       // persisting. Refuse a Workspace set up to fail; repairs surface as advisories.
+      let authoredView: ReturnType<typeof readAgentOwnedFile> | null = null;
+      if (view_path && view_path.trim()) {
+        authoredView = readAgentOwnedFile(view_path.trim());
+        if (!authoredView.ok) return textResult(`Error: ${authoredView.error}`);
+      }
+
       const parseErrors: string[] = [];
-      const dsList = data_sources ? data_sources.map((src) => toDataSource(src, parseErrors)) : (existing?.dataSources ?? []);
-      const actList = actions ? actions.map((act) => toAction(act, parseErrors)) : (existing?.actions ?? []);
+      const stagedRunners: StagedRunner[] = [];
+      const dsList = data_sources ? data_sources.map((src) => toDataSource(src, parseErrors, stagedRunners)) : (existing?.dataSources ?? []);
+      const actList = actions ? actions.map((act) => toAction(act, parseErrors, stagedRunners)) : (existing?.actions ?? []);
+      const runnerSources = new Map<string, StagedRunner>();
+      for (const staged of stagedRunners) {
+        const prior = runnerSources.get(staged.runner);
+        if (prior && (prior.source !== staged.source || prior.content !== staged.content)) {
+          parseErrors.push(
+            `${staged.owner} and ${prior.owner} both install "data/${staged.runner}" from different source files — use distinct runner filenames.`,
+          );
+        } else {
+          runnerSources.set(staged.runner, staged);
+        }
+      }
       if (parseErrors.length > 0) {
         return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${parseErrors.join('\n- ')}`);
       }
-      const prep = prepareSpaceForWrite({ slug, dataSources: dsList, actions: actList, status: existing?.status });
+      const prep = prepareSpaceForWrite({
+        slug,
+        dataSources: dsList,
+        actions: actList,
+        status: existing?.status,
+        availableRunnerFiles: new Set(runnerSources.keys()),
+      });
       if (!prep.ok) {
         return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
       }
 
+      // Install newly-authored runners only after every source path and manifest
+      // field has validated. The model never needs to discover or pre-create our
+      // private spaces/<slug>/data convention.
+      const usedRunners = new Set(
+        [...prep.dataSources, ...prep.actions]
+          .map((entry) => entry.runner)
+          .filter((runner): runner is string => Boolean(runner)),
+      );
+      for (const [runner, staged] of runnerSources) {
+        if (!usedRunners.has(runner)) continue; // auto-repair may prefer Composio and drop it
+        const target = resolveInSpace(slug, path.join('data', runner));
+        mkdirSync(path.dirname(target), { recursive: true });
+        if (staged.source !== target || !existsSync(target)) writeFileSync(target, staged.content, 'utf-8');
+      }
+
       // Install the view (snapshot the prior canonical first, for revert).
-      if (view_path && view_path.trim()) {
-        const read = readAgentOwnedFile(view_path.trim());
-        if (!read.ok) return textResult(`Error: ${read.error}`);
+      if (authoredView?.ok) {
+        const read = authoredView;
         const canonical = resolveInSpace(slug, existing?.viewEntry ?? 'view/index.html');
         const prior = existsSync(canonical) ? readFileSync(canonical, 'utf-8') : null;
         if (prior !== null && prior !== read.content) {
@@ -386,7 +471,7 @@ export function registerSpaceTools(server: McpServer): void {
       appendNote(slug, {
         text: gaps.length > 0 ? `Gap test flagged ${gaps.length} item${gaps.length === 1 ? '' : 's'} to confirm.` : 'Gap test: clean.',
         kind: 'gap',
-        meta: { gaps: gaps.map((g) => ({ question: g.question, why: g.why })) },
+        meta: { gaps: gaps.map((g) => ({ resolution: g.resolution, question: g.question, why: g.why })) },
       });
       const gapQuestions = renderSpaceGapQuestions(gaps);
       return textResult(

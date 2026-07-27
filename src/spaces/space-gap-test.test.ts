@@ -48,6 +48,18 @@ test('view that never references a declared source → a question (the nesting c
   assert.ok(gaps.some((g) => g.sourceId === 'contacts' && /reads the rows from data\["contacts"\]/.test(g.question)));
 });
 
+test('relative data fetch is a Clementine implementation fix, not a user question', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'open-tasks', runner: 'r.mjs' }] }),
+    '<html><script>fetch("./data/open_tasks").then(render)</script><p>open-tasks</p></html>',
+  );
+  const brokenFetch = gaps.find((g) => /relative fetch/.test(g.question));
+  assert.equal(brokenFetch?.resolution, 'fix');
+  const rendered = renderSpaceGapQuestions(gaps);
+  assert.match(rendered, /fix these implementation issues now/);
+  assert.match(rendered, /do not ask the user to debug/i);
+});
+
 test('send-like action with no recipient in template → a question', () => {
   const gaps = analyzeSpaceGaps(
     rec({
@@ -57,6 +69,7 @@ test('send-like action with no recipient in template → a question', () => {
     GOOD_VIEW,
   );
   assert.ok(gaps.some((g) => g.actionId === 'send_email' && /recipient/i.test(g.question)));
+  assert.equal(gaps.find((g) => g.actionId === 'send_email')?.resolution, 'clarify');
 });
 
 test('send action WITH a recipient key in template → no recipient question', () => {

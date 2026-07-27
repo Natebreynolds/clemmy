@@ -98,6 +98,17 @@ test('ERROR: runner file that is not on disk blocks the save', () => {
   assert.match(prep.errors.join(' '), /doesn.t exist/);
 });
 
+test('a validated runner_path staging set satisfies the pre-install existence gate', () => {
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'staged',
+    dataSources: [{ id: 'pull', runner: 'new.mjs' }],
+    actions: [],
+    availableRunnerFiles: new Set(['new.mjs']),
+  });
+  assert.equal(prep.ok, true);
+  assert.equal(prep.errors.length, 0);
+});
+
 test('ERROR: runner declarations must be filenames under data/, not paths', () => {
   const viewDir = store.resolveInSpace('runner-paths', 'view');
   mkdirSync(viewDir, { recursive: true });

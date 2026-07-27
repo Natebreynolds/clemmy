@@ -16,6 +16,8 @@ import type { SpaceRecord } from './store.js';
 
 export interface SpaceGap {
   severity: 'clarify';
+  /** Mechanical/code gaps are Clementine's job to fix; only clarify gaps need the user. */
+  resolution: 'fix' | 'clarify';
   sourceId?: string;
   actionId?: string;
   question: string;
@@ -96,6 +98,7 @@ export function analyzeSpaceGaps(
   if (syntaxErr) {
     gaps.push({
       severity: 'clarify',
+      resolution: 'fix',
       question: `The view has a JavaScript syntax error (${syntaxErr}) — fix it before relying on the Workspace, or the surface renders blank/half-built.`,
       why: 'A script that does not parse means the page never runs its logic.',
     });
@@ -118,8 +121,22 @@ export function analyzeSpaceGaps(
   if (sources.length > 0 && !consumesDataPlane) {
     gaps.push({
       severity: 'clarify',
+      resolution: 'fix',
       question: `The view declares ${sources.length} data source${sources.length === 1 ? '' : 's'} but its HTML never reads them — no clem.data()/clem.refresh(), no GET …/data, and no embedded dataset. How does the surface get populated?`,
       why: 'The Workspace will render empty on load — the data is fetched, not embedded.',
+    });
+  }
+
+  // 1b: a relative fetch such as fetch("./data/tasks") resolves below the
+  // served /view URL and is NOT a Workspace data API. This exact shape slipped
+  // through the first live workspace proof because "/data" was treated as
+  // sufficient even though the browser would get a 404.
+  if (sources.length > 0 && /\bfetch\s*\(\s*['"`](?:\.{1,2}\/)?data(?:\/|['"`?#])/i.test(html)) {
+    gaps.push({
+      severity: 'clarify',
+      resolution: 'fix',
+      question: 'The view uses a relative fetch("…data/…") URL, which resolves under the served /view path and cannot reach Workspace data. Replace it with `const data = await clem.data()` and read the exact declared source id.',
+      why: 'The HTML can look complete while every browser load gets a 404 and renders no rows.',
     });
   }
 
@@ -130,6 +147,7 @@ export function analyzeSpaceGaps(
     if (html && !html.includes(s.id)) {
       gaps.push({
         severity: 'clarify',
+        resolution: 'fix',
         sourceId: s.id,
         question: `The view never references source "${s.id}" — confirm it reads the rows from data["${s.id}"] (the /refresh route nests each source's output under its id, so the array is at data["${s.id}"].<yourKey>).`,
         why: 'Reading the wrong key renders an empty table even though the data is there — the most common Workspace bug.',
@@ -146,6 +164,7 @@ export function analyzeSpaceGaps(
   if (html && actions.length > 0 && !firesActions) {
     gaps.push({
       severity: 'clarify',
+      resolution: 'fix',
       question: `The view declares ${actions.length} action${actions.length === 1 ? '' : 's'} but never fires one — add a control that calls clem.action('<id>', {…}).`,
       why: 'A declared action with no control is dead weight — the user can never trigger it.',
     });
@@ -154,6 +173,7 @@ export function analyzeSpaceGaps(
       if (!html.includes(a.id)) {
         gaps.push({
           severity: 'clarify',
+          resolution: 'fix',
           actionId: a.id,
           question: `The view fires actions but never references "${a.id}" — confirm a control calls clem.action('${a.id}', {…}).`,
           why: 'A declared action the view never wires can never run.',
@@ -169,6 +189,7 @@ export function analyzeSpaceGaps(
     if (templateHasRecipient(a)) continue;
     gaps.push({
       severity: 'clarify',
+      resolution: 'clarify',
       actionId: a.id,
       question: `Action "${a.id}" sends to the outside world but its argsTemplate has no recipient — does the view supply the recipient (to/to_email) at click time, and is it always the right person?`,
       why: 'A send to nobody — or the wrong person — is the costliest thing to get wrong.',
@@ -179,6 +200,7 @@ export function analyzeSpaceGaps(
   for (const id of zeroRowSourceIds) {
     gaps.push({
       severity: 'clarify',
+      resolution: 'clarify',
       sourceId: id,
       question: `Source "${id}" returned 0 rows when I ran it — is that expected right now, or is the query/filter wrong?`,
       why: 'An empty data source ships a working-looking but useless Workspace.',
@@ -195,13 +217,27 @@ export function analyzeSpaceGaps(
  */
 export function renderSpaceGapQuestions(gaps: SpaceGap[]): string {
   if (gaps.length === 0) return '';
-  const lines = gaps.map((g) => `- ${g.question}\n  (why: ${g.why})`);
-  return [
+  const fixes = gaps.filter((g) => g.resolution === 'fix');
+  const clarifications = gaps.filter((g) => g.resolution === 'clarify');
+  const out = ['', ''];
+  if (fixes.length > 0) {
+    out.push(
+      'Gap test — fix these implementation issues now (do not ask the user to debug your Workspace):',
+      ...fixes.map((g) => `- ${g.question}\n  (why: ${g.why})`),
+    );
+  }
+  if (clarifications.length > 0) {
+    if (fixes.length > 0) out.push('');
+    out.push(
+      "Gap test — get the user's answer on these genuine product/data choices:",
+      ...clarifications.map((g) => `- ${g.question}\n  (why: ${g.why})`),
+    );
+  }
+  out.push(
     '',
-    '',
-    "Gap test — before this Workspace is reliable, get the user's answer on:",
-    ...lines,
-    '',
-    'Ask these now, then refine with space_save (same slug). Do not present it as ready until they\'re resolved.',
-  ].join('\n');
+    fixes.length > 0
+      ? 'Refine the implementation, then call space_save with the same slug. Do not present it as ready while a fix remains.'
+      : 'Ask these now, then refine with space_save (same slug). Do not present it as ready until they\'re resolved.',
+  );
+  return out.join('\n');
 }

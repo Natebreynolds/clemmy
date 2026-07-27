@@ -9,6 +9,8 @@
  */
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 
 const SLUG = 'proof-cockpit';
 
@@ -35,7 +37,11 @@ export const workspaceBuild: ScenarioDef = {
     // The workspace exists and is ACTIVE (a paused save = the pipeline parked it).
     const rec = await daemon.request('GET', `/api/console/spaces/${SLUG}`);
     const space = (rec.json ?? {}) as { id?: string; status?: string; dataSources?: unknown[]; space?: { id?: string; status?: string; dataSources?: unknown[] } };
-    const record = (space.space ?? space) as { id?: string; status?: string; dataSources?: unknown[] };
+    const record = (space.space ?? space) as {
+      id?: string;
+      status?: string;
+      dataSources?: Array<{ id?: string }>;
+    };
     checks.push({ name: 'workspace saved', pass: rec.status === 200 && record.id === SLUG, detail: `GET status ${rec.status}, id ${record.id ?? 'n/a'}` });
     checks.push({ name: 'workspace ACTIVE (creation smoke passed)', pass: record.status === 'active', detail: `status ${record.status ?? 'n/a'}` });
     checks.push({
@@ -49,21 +55,45 @@ export const workspaceBuild: ScenarioDef = {
     const view = await fetch(`${daemon.baseUrl}/console/spaces/${SLUG}/view`, {
       headers: { authorization: `Bearer ${daemon.secret}` },
     });
-    const html = view.ok ? await view.text() : '';
-    checks.push({ name: 'view serves (HTTP 200, non-trivial HTML)', pass: view.ok && html.length > 200, detail: `status ${view.status}, ${html.length} bytes` });
+    const servedHtml = view.ok ? await view.text() : '';
+    let authoredHtml = '';
+    try {
+      authoredHtml = readFileSync(path.join(daemon.home, 'spaces', SLUG, 'view', 'index.html'), 'utf-8');
+    } catch { /* check below reports the miss */ }
     checks.push({
-      name: 'view reads its data (clem.data()/data route referenced)',
-      pass: /clem\.data\b|\/data\b/.test(html),
-      detail: /clem\.data\b|\/data\b/.test(html) ? undefined : 'view never fetches data — static page smell',
+      name: 'view serves (HTTP 200, non-trivial HTML)',
+      pass: view.ok && servedHtml.length > 200 && authoredHtml.length > 200,
+      detail: `status ${view.status}, served ${servedHtml.length} bytes, authored ${authoredHtml.length} bytes`,
+    });
+    checks.push({
+      name: 'authored view uses the canonical clem.data() bridge',
+      pass: /\bclem\s*\.\s*data\s*\(/.test(authoredHtml),
+      detail: /\bclem\s*\.\s*data\s*\(/.test(authoredHtml)
+        ? undefined
+        : 'authored view does not call clem.data() (served bridge injection cannot satisfy this check)',
+    });
+    checks.push({
+      name: 'view has no broken relative data fetch',
+      pass: !/\bfetch\s*\(\s*['"`](?:\.{1,2}\/)?data(?:\/|['"`?#])/i.test(authoredHtml),
+      detail: 'relative fetch("./data/…") resolves below /view and returns 404',
     });
 
-    // The first pull landed (or the turn honestly surfaced a gap question).
+    const sourceIds = (record.dataSources ?? []).map((source) => source.id).filter((id): id is string => Boolean(id));
+    const missingViewIds = sourceIds.filter((id) => !authoredHtml.includes(id));
+    checks.push({
+      name: 'view reads every declared source by its exact id',
+      pass: sourceIds.length > 0 && missingViewIds.length === 0,
+      detail: missingViewIds.length > 0 ? `missing ids: ${missingViewIds.join(', ')}` : `ids: ${sourceIds.join(', ')}`,
+    });
+
+    // The first pull landed under every declared key. Empty arrays are valid for
+    // this scenario; absence of the key is not.
     const dataRes = await daemon.request('GET', `/api/console/spaces/${SLUG}/data`);
     const payload = (dataRes.json ?? {}) as { data?: Record<string, unknown> };
     const keys = Object.keys(payload.data ?? {}).filter((k) => !k.startsWith('_'));
     checks.push({
-      name: 'first data pull persisted (or gap question asked)',
-      pass: keys.length > 0 || /\?/.test(turn.text),
+      name: 'first data pull persisted under every declared source id',
+      pass: dataRes.status === 200 && sourceIds.length > 0 && sourceIds.every((id) => Object.hasOwn(payload.data ?? {}, id)),
       detail: `data keys: [${keys.join(', ')}]`,
     });
 
@@ -73,6 +103,11 @@ export const workspaceBuild: ScenarioDef = {
       metrics = sessionMetrics(db, turn.sessionId);
       db.close();
     } catch { /* optional */ }
+    checks.push({
+      name: 'workspace authoring stays within a bounded tool budget',
+      pass: metrics == null || metrics.toolCallTotal <= 24,
+      detail: metrics ? `${metrics.toolCallTotal} tool calls (limit 24)` : 'metrics unavailable',
+    });
 
     return {
       checks,

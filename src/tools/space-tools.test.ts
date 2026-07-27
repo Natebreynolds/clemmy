@@ -92,6 +92,65 @@ test('space_save records declared data sources + re-engage contract', async () =
   assert.deepEqual(rec?.reengage?.triggers, ['note', 'ask']);
 });
 
+test('space_save installs a newly-authored runner_path in one call', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-one-pass.html');
+  const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-open-tasks.mjs');
+  writeFileSync(
+    draft,
+    '<html><script>async function load(){const data=await clem.data();render(data["open-tasks"])}</script></html>',
+    'utf-8',
+  );
+  writeFileSync(runnerDraft, 'process.stdout.write(JSON.stringify([]))', 'utf-8');
+
+  const out = text(await tools.space_save({
+    slug: 'one-pass',
+    title: 'One Pass',
+    view_path: draft,
+    data_sources: [{
+      id: 'open-tasks',
+      runner: null,
+      runner_path: runnerDraft,
+      composio_slug: null,
+      composio_args_json: null,
+      schedule: null,
+      timezone: null,
+    }],
+  }));
+
+  assert.match(out, /Created workspace "One Pass"/);
+  const rec = store.spaceStore.get('one-pass');
+  assert.equal(rec?.dataSources[0].runner, 'tmp-open-tasks.mjs');
+  assert.equal(
+    readFileSync(store.resolveInSpace('one-pass', 'data/tmp-open-tasks.mjs'), 'utf-8'),
+    'process.stdout.write(JSON.stringify([]))',
+  );
+  assert.ok(existsSync(store.resolveInSpace('one-pass', 'data.json')), 'creation smoke runs the staged runner');
+});
+
+test('space_save rejects conflicting runner sources before installing either', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-conflict.html');
+  const runnerA = path.join(process.env.CLEMENTINE_HOME!, 'conflict-a.mjs');
+  const runnerB = path.join(process.env.CLEMENTINE_HOME!, 'conflict-b.mjs');
+  writeFileSync(draft, '<html><script>clem.data().then(data=>render(data.a,data.b))</script></html>', 'utf-8');
+  writeFileSync(runnerA, 'process.stdout.write("{}")', 'utf-8');
+  writeFileSync(runnerB, 'process.stdout.write("[]")', 'utf-8');
+
+  const out = text(await tools.space_save({
+    slug: 'runner-conflict',
+    title: 'Runner Conflict',
+    view_path: draft,
+    data_sources: [
+      { id: 'a', runner: 'same.mjs', runner_path: runnerA, composio_slug: null, composio_args_json: null, schedule: null, timezone: null },
+      { id: 'b', runner: 'same.mjs', runner_path: runnerB, composio_slug: null, composio_args_json: null, schedule: null, timezone: null },
+    ],
+  }));
+
+  assert.match(out, /was NOT saved/);
+  assert.match(out, /different source files/);
+  assert.equal(store.spaceStore.get('runner-conflict'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('runner-conflict', 'data/same.mjs')), false);
+});
+
 test('space_save rejects invalid Composio JSON templates before installing a workspace', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-bad-json.html');
   writeFileSync(draft, '<html>bad-json</html>', 'utf-8');

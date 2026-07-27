@@ -108,6 +108,7 @@ export function checkSpaceForWrite(
   slug: string,
   dataSources: SpaceDataSource[],
   actions: SpaceAction[],
+  availableRunnerFiles: ReadonlySet<string> = new Set(),
 ): SpaceWriteCheck {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -125,8 +126,8 @@ export function checkSpaceForWrite(
       }
       let target = '';
       try { target = resolveInSpace(slug, path.join('data', s.runner.trim())); } catch { /* invalid path */ }
-      if (!target || !existsSync(target)) {
-        errors.push(`Data source "${s.id}" points at runner "data/${s.runner}" but that file doesn't exist — write it with write_file before saving the Workspace.`);
+      if ((!target || !existsSync(target)) && !availableRunnerFiles.has(s.runner.trim())) {
+        errors.push(`Data source "${s.id}" points at runner "data/${s.runner}" but that file doesn't exist — pass the authored file as runner_path in this space_save call.`);
       }
     }
     if (s.schedule && s.schedule.trim() && !validateCronExpression(s.schedule.trim())) {
@@ -147,8 +148,8 @@ export function checkSpaceForWrite(
       }
       let target = '';
       try { target = resolveInSpace(slug, path.join('data', a.runner.trim())); } catch { /* invalid */ }
-      if (!target || !existsSync(target)) {
-        errors.push(`Action "${a.id}" points at runner "data/${a.runner}" but that file doesn't exist — write it first.`);
+      if ((!target || !existsSync(target)) && !availableRunnerFiles.has(a.runner.trim())) {
+        errors.push(`Action "${a.id}" points at runner "data/${a.runner}" but that file doesn't exist — pass the authored file as runner_path in this space_save call.`);
       }
     }
   }
@@ -172,8 +173,10 @@ export function prepareSpaceForWrite(input: {
   dataSources: SpaceDataSource[];
   actions: SpaceAction[];
   status?: SpaceStatus;
+  /** Runner filenames that space_save already validated and will install atomically. */
+  availableRunnerFiles?: ReadonlySet<string>;
 }): SpaceWritePrep {
   const { dataSources, actions, repairs } = autoRepairSpaceManifest(input.dataSources ?? [], input.actions ?? []);
-  const check = checkSpaceForWrite(input.slug, dataSources, actions);
+  const check = checkSpaceForWrite(input.slug, dataSources, actions, input.availableRunnerFiles);
   return { dataSources, actions, ok: check.ok, errors: check.errors, warnings: check.warnings, repairs };
 }
