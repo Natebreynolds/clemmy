@@ -34,6 +34,14 @@ const NEGATED_ACTION_CLAUSE_RE =
   /\b(?:do\s+not|don't|dont|never|without)\b[^.!?\n;]*/gi;
 const NEGATED_NO_ACTION_CLAUSE_RE =
   /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^.!?\n;]*/gi;
+// Mutation evidence uses a tighter, comma-bounded form. A prohibition such as
+// "do not run shell commands" must not turn a lookup into a mutation, while a
+// positive clause after it ("do not send email, but write the local report")
+// must remain visible to the classifier.
+const NEGATED_MUTATION_SEGMENT_RE =
+  /\b(?:do\s+not|don't|dont|never|without)\b[^,.!?\n;]*/gi;
+const NEGATED_NO_MUTATION_SEGMENT_RE =
+  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^,.!?\n;]*/gi;
 const INHERENT_EXTERNAL_WRITE_RE =
   /\b(?:deploy|invite|publish|send|submit|upload)\b/i;
 const CONTEXTUAL_EXTERNAL_WRITE_VERB_RE =
@@ -90,7 +98,10 @@ export function completionEvidenceToolName(rawName: string, input?: unknown): st
 }
 
 export function objectiveRequiresMutatingEvidence(objectiveText: string): boolean {
-  return MUTATING_OBJECTIVE_RE.test(objectiveText);
+  const positive = objectiveText
+    .replace(NEGATED_MUTATION_SEGMENT_RE, ' ')
+    .replace(NEGATED_NO_MUTATION_SEGMENT_RE, ' ');
+  return MUTATING_OBJECTIVE_RE.test(positive);
 }
 
 function positiveObjectiveActionText(objectiveText: string): string {

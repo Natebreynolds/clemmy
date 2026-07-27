@@ -52,6 +52,22 @@ test('control and read tools cannot certify a mutating objective', () => {
   assert.equal(isReadOnlyCompletionEvidence('read_file'), true);
   assert.equal(isReadOnlyCompletionEvidence('calendar__getEvent'), true);
   assert.equal(objectiveRequiresMutatingEvidence('Build and save the report'), true);
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Do not run shell commands. Report the workspace root paths.'),
+    false,
+  );
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Without changing files, inspect the workspace status.'),
+    false,
+  );
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Do not send email, but write the local report.'),
+    true,
+  );
+  assert.equal(
+    objectiveRequiresMutatingEvidence('Do not run shell commands; write the report.'),
+    true,
+  );
   assert.equal(hasMeaningfulSuccessfulToolNames(['ask_user_question'], 'send the email'), false);
   assert.equal(hasMeaningfulSuccessfulToolNames(['read_file'], 'build the app'), false);
   assert.equal(hasMeaningfulSuccessfulToolNames(['read_file', 'write_file'], 'build the app'), true);
