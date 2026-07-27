@@ -1072,6 +1072,68 @@ export function lexicalRelevance(objective: string, content: string): number {
   return Math.max(precision, coverage);
 }
 
+function tokenJaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const token of a) if (b.has(token)) intersection += 1;
+  return intersection / (a.size + b.size - intersection);
+}
+
+/**
+ * Keep the policy prompt useful when many equal-priority standing rules have
+ * accumulated. Pure recency lets a burst of near-duplicate newer policies
+ * crowd every distinct older rule out of the character budget. This greedy
+ * ordering preserves the existing relevance → importance priorities, then
+ * favors lexical diversity before using recency as the final tie-break.
+ *
+ * It does not enlarge the prompt or discard policies. It only moves a distinct
+ * rule earlier than redundant peers so bounded rendering covers more meaning.
+ */
+function orderPoliciesForPrompt(
+  facts: ConsolidatedFact[],
+  objective?: string,
+): ConsolidatedFact[] {
+  if (facts.length <= 1) return [...facts];
+
+  const remaining = [...facts];
+  const ordered: ConsolidatedFact[] = [];
+  const tokensById = new Map(facts.map((fact) => [fact.id, relevanceTokens(fact.content)]));
+  const maxSimilarityById = new Map(facts.map((fact) => [fact.id, 0]));
+  const relevanceById = new Map(facts.map((fact) => [
+    fact.id,
+    objective ? lexicalRelevance(objective, fact.content) : 0,
+  ]));
+
+  while (remaining.length > 0) {
+    remaining.sort((a, b) => {
+      const relevanceDelta = (relevanceById.get(b.id) ?? 0) - (relevanceById.get(a.id) ?? 0);
+      if (Math.abs(relevanceDelta) > 1e-9) return relevanceDelta;
+      const importanceDelta = (b.importance ?? 5) - (a.importance ?? 5);
+      if (importanceDelta !== 0) return importanceDelta;
+      const similarityDelta = (maxSimilarityById.get(a.id) ?? 0) - (maxSimilarityById.get(b.id) ?? 0);
+      if (Math.abs(similarityDelta) > 1e-9) return similarityDelta;
+      const updatedDelta = Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+      return Number.isFinite(updatedDelta) && updatedDelta !== 0 ? updatedDelta : b.id - a.id;
+    });
+
+    const selected = remaining.shift()!;
+    ordered.push(selected);
+    const selectedTokens = tokensById.get(selected.id) ?? new Set<string>();
+    for (const candidate of remaining) {
+      const similarity = tokenJaccard(
+        selectedTokens,
+        tokensById.get(candidate.id) ?? new Set<string>(),
+      );
+      maxSimilarityById.set(
+        candidate.id,
+        Math.max(maxSimilarityById.get(candidate.id) ?? 0, similarity),
+      );
+    }
+  }
+
+  return ordered;
+}
+
 // Weights for the objective-scoped blend (Move 1 — scoped recall).
 // stanfordRecallScore tops out near 2.0 (recency≤1 + importance≤1).
 // RELEVANCE_WEIGHT is set high enough that a clearly on-objective fact
@@ -1496,11 +1558,10 @@ export function renderFactsForInstructions(
       dispatch_constraint: pinned.filter((f) => f.kind === 'constraint' && dispatchBackedFactIds.has(f.id)),
       prompt_instruction: pinned.filter((f) => f.kind === 'constraint' && !dispatchBackedFactIds.has(f.id)),
       core_profile: pinned.filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) === 'core_profile'),
-      standing_preference: pinned
-        .filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) !== 'core_profile')
-        .sort((a, b) => objective
-          ? lexicalRelevance(objective, b.content) - lexicalRelevance(objective, a.content)
-          : (b.importance ?? 5) - (a.importance ?? 5)),
+      standing_preference: orderPoliciesForPrompt(
+        pinned.filter((f) => f.kind !== 'constraint' && policyTypeByFactId.get(f.id) !== 'core_profile'),
+        objective,
+      ),
     };
     // Allocate only among groups that exist. Reserving 75% of a small budget
     // for empty tiers can hide the one real preference even when it fits.

@@ -295,6 +295,28 @@ test('policy overflow is explicit and never claims omitted preferences were appl
   assert.match(rendered, /more standing preferences? available/);
 });
 
+test('equal-priority duplicate policies cannot crowd a distinct older rule out of the prompt budget', () => {
+  const distinct = rememberFact({
+    kind: 'feedback',
+    content: 'GENUINE RULE: send invoices only from billing@acme-co.example.',
+    importance: 5,
+  });
+  setFactPinned(distinct.id, true);
+  for (let i = 0; i < 19; i += 1) {
+    const duplicate = rememberFact({
+      kind: 'feedback',
+      content: `Synthetic auto-pin ${i}: you marked an objective complete and continued.`,
+      importance: 5,
+    });
+    setFactPinned(duplicate.id, true);
+  }
+
+  const rendered = renderFactsForInstructions(10, 1600);
+  assert.match(rendered, /GENUINE RULE: send invoices only from billing@acme-co\.example/);
+  assert.match(rendered, /Policy manifest: \d+\/20 shown/);
+  assert.ok(rendered.length <= 1700, 'diversity ordering must not solve coverage by inflating the prompt');
+});
+
 test('message-scoped recall surfaces a query-relevant fact that global recall buries (the "MY accounts" fix)', () => {
   // The fact that should govern "pull MY priority-account accounts".
   rememberFact({ kind: 'project', content: 'My priority-account accounts are Salesforce accounts owned by Alexander Chen where Priority_Account__c is true.' });
