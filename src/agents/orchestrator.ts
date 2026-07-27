@@ -175,6 +175,24 @@ export interface BuildOrchestratorAgentOptions {
   allowToolJit?: boolean;
 }
 
+/** Schema-on-demand already exposes mcp_status + mcp_list_tools + call_tool, so
+ * an unknown-intent chat does not need to connect every configured external
+ * server just to keep obscure apps discoverable. Preserve concrete keyword /
+ * recalled scopes for one-hop speed; defer only the broad fail-open candidate
+ * until the model selects a named server. */
+export function externalMcpAttachmentScope(
+  scope: McpToolScope,
+  schemaOnDemandActive: boolean,
+): McpToolScope {
+  if (!schemaOnDemandActive || !scope.failOpenCandidate) return scope;
+  return {
+    reason: `${scope.reason}; external MCP connection deferred to mcp_list_tools/call_tool`,
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  };
+}
+
 // A turn that explicitly selects Clementine memory ("use only local memory",
 // "remember this", or a recent-conversation recall) needs a much narrower
 // built-in capability surface. Keep every read/recovery hatch that can answer
@@ -1982,7 +2000,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // Orchestrator couldn't discover or route MCP-only capabilities —
     // it would mistakenly tell the user "DataForSEO isn't connected"
     // when in fact the MCP server is running with 118 tools loaded.
-    mcpServers: [getOrCreateExternalMcpServers(mcpToolScope)],
+    mcpServers: [
+      getOrCreateExternalMcpServers(externalMcpAttachmentScope(mcpToolScope, searchDecision.active)),
+    ],
     // Phase 2: handoffs intentionally omitted. Sub-agents are tools
     // (run_researcher / run_writer / run_reviewer / run_executor /
     // run_deployer). This puts the Orchestrator in control of every

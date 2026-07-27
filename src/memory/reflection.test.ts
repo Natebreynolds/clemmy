@@ -36,7 +36,9 @@ const {
   scheduleReflection,
   _testOnly_reflectionPending,
   isSelfReferentialTool,
+  isWriteReceiptTool,
   REFLECTION_MIN_CONTENT_CHARS,
+  REFLECTION_MAX_INPUT_CHARS,
   EXTRACTOR_MAX_FACTS,
   getReflectionThreshold,
   runRecursiveReflection,
@@ -473,6 +475,49 @@ test('REFLECTION_MIN_CONTENT_CHARS: gate constant exposed for hooks.ts use', () 
 test('EXTRACTOR_MAX_FACTS: bounds facts-per-return to a small cap (intake throttle)', () => {
   assert.ok(EXTRACTOR_MAX_FACTS >= 1 && EXTRACTOR_MAX_FACTS <= 6, 'a few facts per tool return, not a dump');
   assert.ok(EXTRACTOR_MAX_FACTS < 8, 'tighter than the legacy 8 ceiling so the low-value tail is trimmed');
+});
+
+test('reflection digests oversized results before extraction and preserves a raw-result recovery pointer', async () => {
+  resetMemoryDb();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  delete process.env.CLEMMY_REFLECTION;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  let extractorInput = '';
+  try {
+    _testOnly_setReflectionExtractor(async (prompt) => {
+      extractorInput = prompt;
+      return { facts: [], entities: [], pointers: [] };
+    });
+    const result = await reflectOnToolReturn({
+      sessionId: 'sess-reflection-digest',
+      callId: 'call-large-sheet',
+      tool: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+      output: JSON.stringify({
+        data: {
+          display_url: 'https://docs.google.com/spreadsheets/d/sheet-proof/edit',
+          properties: {
+            title: 'Clementine Release Validation',
+            defaultFormat: Object.fromEntries(
+              Array.from({ length: 500 }, (_, index) => [`format_${index}`, { red: 1, green: 1, blue: 1 }]),
+            ),
+          },
+          spreadsheetId: 'sheet-proof',
+        },
+        successful: true,
+      }),
+    });
+    assert.equal(result.skipped, undefined);
+    assert.ok(
+      extractorInput.length <= REFLECTION_MAX_INPUT_CHARS + 700,
+      `extractor input stays bounded (got ${extractorInput.length})`,
+    );
+    assert.match(extractorInput, /Clementine Release Validation/);
+    assert.match(extractorInput, /recall_tool_result\(\"call-large-sheet\"\)/);
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = prevThreshold;
+  }
 });
 
 test('getReflectionThreshold: default is Stanford/2 (75), env override accepted', () => {
@@ -1185,6 +1230,9 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     'space_get', 'space_get_runner', 'space_get_view', 'attempt_record',
     // Clem's own scratchpad + ephemeral status pollers.
     'focus_get', 'focus_set', 'focus_park', 'browser_harness_status',
+    'call_tool', 'tool_search', 'mcp_list_tools', 'mcp_status',
+    'composio_search_tools', 'composio_list_tools', 'composio_status',
+    'local_cli_list', 'local_cli_probe', 'harness_status',
     'MEMORY_READ', // case-insensitive
     'FOCUS_GET',   // case-insensitive
   ]) {
@@ -1200,6 +1248,70 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     null, undefined, '',
   ]) {
     assert.equal(isSelfReferentialTool(t as string | null | undefined), false, `${t} should be reflectable`);
+  }
+});
+
+test('isWriteReceiptTool: recognizes operation tokens without confusing reads or create pointers', () => {
+  for (const tool of [
+    'GOOGLESHEETS_VALUES_UPDATE',
+    'OUTLOOK_SEND_EMAIL',
+    'salesforce_upsert_record',
+    'mcp__airtable__delete_record',
+    'github__add_issue_comment',
+  ]) {
+    assert.equal(isWriteReceiptTool(tool), true, `${tool} is a mutation receipt`);
+  }
+  for (const tool of [
+    'GOOGLESHEETS_BATCH_GET',
+    'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    'SALESFORCE_GET_UPDATED_RECORDS',
+    'read_file',
+    null,
+  ]) {
+    assert.equal(isWriteReceiptTool(tool), false, `${tool} remains reflectable`);
+  }
+});
+
+test('reflectOnToolReturn: a write receipt skips semantic extraction but keeps create responses reflectable', async () => {
+  resetMemoryDb();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevWrites = process.env.CLEMMY_REFLECT_WRITE_RECEIPTS;
+  delete process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECT_WRITE_RECEIPTS;
+  let extractorCalls = 0;
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return { facts: [], entities: [], pointers: [] };
+    });
+    const receipt = JSON.stringify({
+      successful: true,
+      data: {
+        spreadsheetId: 'sheet-write-receipt',
+        updatedRange: 'Sheet1!A1:C4',
+        updatedCells: 12,
+        values: Array.from({ length: 200 }, (_, index) => [`row-${index}`, 'ok']),
+      },
+    });
+    const skipped = await reflectOnToolReturn({
+      sessionId: 'sess-write-receipt',
+      callId: 'call-update',
+      tool: 'GOOGLESHEETS_VALUES_UPDATE',
+      output: receipt,
+    });
+    assert.equal(skipped.skipped, 'write_receipt');
+    assert.equal(extractorCalls, 0, 'no boundary model is spent on the acknowledgement');
+
+    await reflectOnToolReturn({
+      sessionId: 'sess-write-receipt',
+      callId: 'call-create',
+      tool: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+      output: `${receipt}${' durable create metadata'.repeat(40)}`,
+    });
+    assert.equal(extractorCalls, 1, 'create responses may introduce a durable resource pointer');
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevWrites === undefined) delete process.env.CLEMMY_REFLECT_WRITE_RECEIPTS; else process.env.CLEMMY_REFLECT_WRITE_RECEIPTS = prevWrites;
   }
 });
 

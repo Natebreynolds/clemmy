@@ -138,6 +138,24 @@ function workerItemFromDetails(details: ToolDetails | undefined): string | null 
  * throws; falls back to the wrapper name.
  */
 export function effectiveReflectionTool(toolName: string | null, details: ToolDetails | undefined): string | null {
+  // Schema-on-demand wrapper → the exact inner tool. Without this, a
+  // call_tool(composio_search_tools) return was attributed to "call_tool", so
+  // the reflection filter could not recognize catalog/status noise and spent a
+  // full extractor call learning zero durable facts.
+  if (toolName === 'call_tool') {
+    try {
+      const raw = details?.toolCall?.arguments;
+      if (typeof raw === 'string' && raw.trim()) {
+        const parsed = JSON.parse(raw) as { name?: unknown };
+        if (typeof parsed.name === 'string' && parsed.name.trim()) {
+          return parsed.name.trim();
+        }
+      }
+    } catch {
+      // fall through to the wrapper name
+    }
+    return toolName;
+  }
   // Composio wrapper → its action slug (SALESFORCE_*, GOOGLEDRIVE_*).
   if (toolName === 'composio_execute_tool') {
     try {

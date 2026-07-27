@@ -326,6 +326,32 @@ test('generic execution vocabulary does not recall unrelated future intentions',
   }
 });
 
+test('read-back validation does not recall unrelated due report-back commitments', () => {
+  const id = prospective.prospectiveIntentionId('timer', 'background-seo-reportback');
+  prospective.upsertProspectiveIntention({
+    ...timerDefinition(
+      'background-seo-reportback',
+      '2020-01-01T00:00:00.000Z',
+      'Report back when the background task completes: pull the deep SEO rankings',
+    ),
+    sessionId: 'sess-old-background',
+  });
+  try {
+    const unrelated = prospective.buildProspectiveIntentionContext({
+      query: 'Create a disposable Google Sheet, write the exact matrix, and read back every cell.',
+      sessionId: 'sess-sheet-proof',
+      now: new Date('2026-07-27T12:00:00.000Z'),
+    });
+    assert.equal(
+      unrelated.text,
+      '',
+      '"read back" is validation vocabulary, not a cue for every old "report back" intention',
+    );
+  } finally {
+    prospective.cancelProspectiveIntention(id, 'test_cleanup');
+  }
+});
+
 test('blocked time commitments stay blocked until their source is explicitly resumed', () => {
   const at = '2026-07-27T09:00:00.000Z';
   const intention = prospective.upsertProspectiveIntention(

@@ -35,6 +35,7 @@ import {
   resolveReflectionCandidate,
 } from './reflection-candidates.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
+import { digestToolOutput } from '../runtime/harness/tool-output-digest.js';
 
 export { upsertEntity } from './entity-identity.js';
 
@@ -77,7 +78,11 @@ const logger = pino({ name: 'clementine.memory.reflection' });
 // extractor runs. User-stated facts come through the SEPARATE auto-capture path
 // (not gated by this floor), so high-trust signal is unaffected.
 export const REFLECTION_MIN_CONTENT_CHARS = 800;
-const REFLECTION_MAX_INPUT_CHARS = 8_000;
+// The raw result remains losslessly available through recall_tool_result.
+// Reflection needs a representative, structure-aware slice—not another copy
+// of an 8k schema/default-format blob. A 3k digest is ample for the extractor's
+// capped five facts while cutting the live catalog/write-receipt tax by >50%.
+export const REFLECTION_MAX_INPUT_CHARS = 3_000;
 
 // Max facts the extractor may pull from a SINGLE tool return. Lowered 8 → 5: most
 // high-signal returns yield 1–3 facts; the higher ceiling mostly let verbose
@@ -205,7 +210,7 @@ export interface ReflectionResult {
   entitiesUpserted: number;
   pointersStored: number;
   sumImportance?: number;
-  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance' | 'self_tool';
+  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance' | 'self_tool' | 'write_receipt';
 }
 
 const PROMPT_PREAMBLE = buildExtractorPreamble(false);
@@ -532,6 +537,13 @@ const SELF_TOOL_DENY_EXACT = new Set<string>([
   // durable facts. See [[project_workflow_system_audit_0703]].
   'focus_get', 'focus_set', 'focus_park',
   'browser_harness_status',
+  // Capability discovery/configuration is procedural memory, not semantic
+  // memory. Exact slugs and schemas already flow into the tool-choice/schema
+  // stores; reflecting the same catalogs minted no facts and paid thousands of
+  // tokens per call (live Sheets proof, 2026-07-27).
+  'call_tool', 'tool_search', 'mcp_list_tools', 'mcp_status',
+  'composio_search_tools', 'composio_list_tools', 'composio_status',
+  'local_cli_list', 'local_cli_probe', 'harness_status',
 ]);
 const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_'];
 
@@ -543,12 +555,40 @@ export function isSelfReferentialTool(toolName: string | null | undefined): bool
   return SELF_TOOL_DENY_PREFIXES.some((p) => name.startsWith(p));
 }
 
+// Mutation acknowledgements are operational receipts, not new semantic source
+// material. The exact result is already retained in tool_outputs; the write
+// brackets/ledger preserve external effect truth; and procedural memory learns
+// whether this operation shape worked. Sending the same receipt through a
+// language-model extractor duplicates those systems and routinely learns zero
+// facts (live Sheets proof: VALUES_UPDATE cost a Claude call and returned all
+// empty arrays). CREATE is deliberately absent: a create response may introduce
+// a new durable resource id/name that landscape memory should retain.
+const WRITE_RECEIPT_VERBS = new Set([
+  'add', 'append', 'archive', 'assign', 'cancel', 'copy', 'delete', 'deploy',
+  'insert', 'invite', 'mark', 'move', 'patch', 'post', 'publish', 'put',
+  'remove', 'rename', 'replace', 'restore', 'send', 'set', 'trash', 'update',
+  'upload', 'upsert', 'write',
+]);
+
+export function isWriteReceiptTool(toolName: string | null | undefined): boolean {
+  if (!toolName) return false;
+  const tokens = toolName.trim().toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return tokens.some((token) => WRITE_RECEIPT_VERBS.has(token));
+}
+
 // Filter defaults ON (do NOT reflect on self/introspective tools). The
 // kill-switch CLEMMY_REFLECT_SELF_TOOLS=on restores the old reflect-everything
 // behavior. Read via getRuntimeEnv so a live ~/.clementine-next/.env override
 // applies under launchd too.
 function selfToolReflectionFilterEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_REFLECT_SELF_TOOLS', 'off') || 'off').toLowerCase() !== 'on';
+}
+
+// Kill switch for operators who intentionally want mutation receipts passed
+// through semantic extraction. Default behavior keeps them on the lossless
+// operational/procedural rails without paying a boundary-model call.
+function writeReceiptReflectionFilterEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_REFLECT_WRITE_RECEIPTS', 'off') || 'off').toLowerCase() !== 'on';
 }
 
 // Stanford §4.2: reflection fires when sum(importance) of recent
@@ -1937,6 +1977,9 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     // mints self-referential facts (memory_read→fact recursion).
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'self_tool' });
   }
+  if (writeReceiptReflectionFilterEnabled() && isWriteReceiptTool(input.tool)) {
+    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'write_receipt' });
+  }
   if (!input.output || input.output.length < REFLECTION_MIN_CONTENT_CHARS) {
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'too_short' });
   }
@@ -1945,9 +1988,15 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'already_reflected' });
   }
 
-  // Cap input size to keep the extraction call cheap.
+  // Cap input size with the shared structure-aware digest. Unlike a raw head
+  // slice, this keeps complete records/object shape and points to the lossless
+  // raw result, so token savings do not become memory truncation.
   const serialized = input.output.length > REFLECTION_MAX_INPUT_CHARS
-    ? `${input.output.slice(0, REFLECTION_MAX_INPUT_CHARS)}…[+${input.output.length - REFLECTION_MAX_INPUT_CHARS} chars truncated]`
+    ? digestToolOutput(input.output, {
+        maxChars: REFLECTION_MAX_INPUT_CHARS,
+        toolName: input.tool,
+        callId: input.callId,
+      })
     : input.output;
 
   const extraction = await runExtractor(`Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`);

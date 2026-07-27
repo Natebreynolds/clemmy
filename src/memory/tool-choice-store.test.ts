@@ -792,6 +792,35 @@ test('recallComposioForSearch: excludes a net-negative (broken) remembered path'
   assert.deepEqual(recallComposioForSearch('brokenapp export widgets report'), [], 'a net-negative path is never short-circuited onto');
 });
 
+test('recallComposioForSearch: compound work returns one exact tool per operation and excludes composite pseudo-slugs', () => {
+  const toolkit = 'releaseproofsheets';
+  rememberComposio(`${toolkit} exact matrix cells search`, 'RELEASEPROOFSHEETS_SEARCH_SPREADSHEETS', 80);
+  rememberComposio(`${toolkit} exact matrix cells spreadsheet info`, 'RELEASEPROOFSHEETS_GET_SPREADSHEET_INFO', 70);
+  rememberComposio(`${toolkit} exact matrix cells create`, 'RELEASEPROOFSHEETS_CREATE_SHEET', 8);
+  rememberComposio(`${toolkit} exact matrix cells write values`, 'RELEASEPROOFSHEETS_VALUES_UPDATE', 7);
+  rememberComposio(`${toolkit} exact matrix cells read values`, 'RELEASEPROOFSHEETS_BATCH_GET', 6);
+  rememberComposio(
+    `${toolkit} exact matrix cells combined procedure`,
+    'RELEASEPROOFSHEETS_CREATE_SHEET + RELEASEPROOFSHEETS_VALUES_UPDATE + RELEASEPROOFSHEETS_BATCH_GET',
+    100,
+  );
+
+  const hits = recallComposioForSearch(
+    `Use ${toolkit} to create a new sheet, write the exact matrix cells, and read back every cell value.`,
+    { limit: 3 },
+  );
+  assert.deepEqual(
+    hits.map((hit) => hit.slug),
+    [
+      'RELEASEPROOFSHEETS_CREATE_SHEET',
+      'RELEASEPROOFSHEETS_VALUES_UPDATE',
+      'RELEASEPROOFSHEETS_BATCH_GET',
+    ],
+    'operation diversity beats high-success search/info lookalikes',
+  );
+  assert.equal(hits.some((hit) => hit.slug.includes(' + ')), false);
+});
+
 // ─── Canonical procedural memory ────────────────────────────────────────────
 
 function switchTestMachine(machineId: string): void {

@@ -75,6 +75,8 @@ test('buildClaudeHeadlessArgs uses print-mode stream-json without bare mode', ()
   const args = buildClaudeHeadlessArgs('claude-opus-4-8');
   assert.deepEqual(args.slice(0, 2), ['-p', '--safe-mode']);
   assert.equal(args.includes('--bare'), false);
+  assert.equal(args.includes('--system-prompt'), true);
+  assert.match(args[args.indexOf('--system-prompt') + 1] ?? '', /Clementine.s precise text-only reasoning boundary/);
   assert.equal(args.includes('--output-format'), true);
   assert.equal(args.includes('stream-json'), true);
   assert.equal(args.includes('--model'), true);
@@ -94,6 +96,9 @@ test('buildClaudeHeadlessArgs drops optional flags an installed CLI does not sup
   const withTools = buildClaudeHeadlessArgs('sonnet', (f) => f === '--tools');
   assert.equal(withTools[withTools.indexOf('--tools') + 1], '');
   assert.equal(minimal.includes('--tools'), false);
+  const withSystem = buildClaudeHeadlessArgs('sonnet', (f) => f === '--system-prompt');
+  assert.match(withSystem[withSystem.indexOf('--system-prompt') + 1] ?? '', /authoritative/);
+  assert.equal(minimal.includes('--system-prompt'), false);
 });
 
 test('buildClaudeHeadlessEnv uses OAuth token and strips API-key envs', async () => {

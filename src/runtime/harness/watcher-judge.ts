@@ -25,7 +25,7 @@
  *  - FAIL-OPEN. Any judge error/timeout → no injection, run untouched.
  *
  * Kill-switch: CLEMMY_WATCHER_JUDGE=off. Cadence: CLEMMY_WATCHER_INTERVAL_TOOLS
- * (default 8 tool calls between checks).
+ * (default 12 tool calls between checks).
  */
 import { getRuntimeEnv } from '../../config.js';
 
@@ -36,8 +36,8 @@ export function watcherJudgeEnabled(): boolean {
 /** Tool calls between trajectory checks. Low enough to catch drift before it
  *  compounds, high enough that a focused run sees at most a few checks. */
 export function watcherCheckIntervalTools(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WATCHER_INTERVAL_TOOLS', '8') ?? '8', 10);
-  return Number.isFinite(raw) && raw >= 2 ? raw : 8;
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WATCHER_INTERVAL_TOOLS', '12') ?? '12', 10);
+  return Number.isFinite(raw) && raw >= 2 ? raw : 12;
 }
 
 /** Hard cap on steers per turn — the watcher nudges, it never nags. */

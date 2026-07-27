@@ -164,7 +164,7 @@ const DEFAULT_CONTEXT_MAX_ITEMS = 6;
 const ACTIVE_STATUSES: ReadonlySet<ProspectiveStatus> = new Set(['active', 'due', 'claimed', 'blocked']);
 const TERMINAL_STATUSES: ReadonlySet<ProspectiveStatus> = new Set(['completed', 'cancelled']);
 const CONTEXT_STOPWORDS: ReadonlySet<string> = new Set([
-  'about', 'after', 'again', 'all', 'also', 'and', 'are', 'before', 'but', 'call',
+  'about', 'after', 'again', 'all', 'also', 'and', 'are', 'back', 'before', 'but', 'call',
   'calls', 'can', 'could', 'do', 'each', 'every', 'exactly', 'file', 'files',
   'for', 'from', 'give', 'have', 'into', 'item', 'items', 'later', 'me', 'my',
   'no', 'not', 'of', 'on', 'one', 'only', 'or', 'output', 'outputs', 'please',

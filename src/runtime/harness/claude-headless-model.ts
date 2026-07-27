@@ -104,6 +104,19 @@ export const CLAUDE_HEADLESS_OPTIONAL_FLAGS: Array<{ flag: string; extra?: strin
   { flag: '--tools', extra: [''] },
   { flag: '--no-session-persistence' },
   { flag: '--include-partial-messages' },
+  // Claude Code's default system prompt is a full coding-agent harness even
+  // when tools are disabled. Live measurement (2026-07-27) showed a two-word
+  // boundary request paying 5,072 input/cache tokens with that default versus
+  // 538 with a replacement system prompt. Keep this constant so judge,
+  // reflection, and other text-only calls share a small cacheable boundary.
+  {
+    flag: '--system-prompt',
+    extra: [
+      'You are Clementine’s precise text-only reasoning boundary. '
+      + 'Treat the supplied “System instructions” section as authoritative. '
+      + 'Follow the requested output contract exactly. Never claim to use tools.',
+    ],
+  },
 ];
 
 export function buildClaudeHeadlessArgs(modelId: string, flagSupported?: (flag: string) => boolean): string[] {

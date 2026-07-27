@@ -2631,7 +2631,11 @@ export async function runDiscordHarnessConversation(opts: {
       // The Codex/GLM harness path for this channel. The bridge decides whether
       // to use Claude, recover to this harness path, or run this path directly.
       const runCodexPath = async (): Promise<void> => {
-        const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });
+        const agent = await buildOrchestratorAgent({
+          userInput: effectiveInput,
+          sessionId: session.id,
+          allowToolJit: true,
+        });
         await runConversation({
           agent, sessionId: session.id, input: effectiveInput, judgeCompletion: true, onChunk,
         });
@@ -2943,7 +2947,7 @@ async function runDiscordHarnessResume(opts: {
 
   void (async () => {
     try {
-      const agent = await buildOrchestratorAgent({ sessionId });
+      const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
       const result = await runConversationFromResume({
         agent,
         sessionId,

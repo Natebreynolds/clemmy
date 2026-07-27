@@ -479,8 +479,11 @@ function requestHasAcceptedExecutionCompletion(
     return listEvents(sessionId, { types: ['tool_returned'] }).some((event) => {
       if (event.seq <= (sourceUserSeq as number)) return false;
       if ((event.data as { tool?: unknown } | undefined)?.tool !== 'execution_complete') return false;
-      const data = event.data as { result?: unknown; output?: unknown };
-      return isAcceptedExecutionCompletionOutput(data.result ?? data.output);
+      const data = event.data as { result?: unknown; output?: unknown; preview?: unknown };
+      // Direct tools persist `result`; schema-on-demand call_tool dispatch
+      // persists the exact inner execution as a transport-mirror event whose
+      // accepted text is in `preview`. Both are the same controller verdict.
+      return isAcceptedExecutionCompletionOutput(data.result ?? data.output ?? data.preview);
     });
   } catch {
     return false;

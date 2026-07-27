@@ -19,7 +19,11 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildOrchestratorAgent, localMemoryBuiltinScope } = await import('./orchestrator.js');
+const {
+  buildOrchestratorAgent,
+  externalMcpAttachmentScope,
+  localMemoryBuiltinScope,
+} = await import('./orchestrator.js');
 const { createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 // A discovery tool that is NOT in the hot set for a benign query (not in the
@@ -179,5 +183,37 @@ test('explicit remember and recent-conversation recall use the bounded memory su
     localMemoryBuiltinScope('Can you improve the memory settings screen?'),
     null,
     'ordinary memory-ish product work keeps the general tool surface',
+  );
+});
+
+test('schema-on-demand defers broad MCP fail-open but preserves concrete provider scopes', () => {
+  const broad = {
+    reason: 'unknown app intent',
+    failOpenCandidate: true,
+    toolPatterns: [],
+    maxTools: 12,
+  };
+  assert.deepEqual(externalMcpAttachmentScope(broad, true), {
+    reason: 'unknown app intent; external MCP connection deferred to mcp_list_tools/call_tool',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  });
+  assert.equal(
+    externalMcpAttachmentScope(broad, false),
+    broad,
+    'the schema-on-demand kill switch restores the legacy bounded fail-open attachment',
+  );
+
+  const precise = {
+    reason: 'seo intent',
+    allowedServerSlugs: ['dataforseo'],
+    toolPatterns: ['serp'],
+    maxTools: 8,
+  };
+  assert.equal(
+    externalMcpAttachmentScope(precise, true),
+    precise,
+    'an intent-matched server remains directly attached for one-hop execution',
   );
 });

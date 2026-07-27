@@ -43,6 +43,12 @@ import {
 } from './integrations/local-meetings/whisper-runtime.js';
 
 const logger = pino({ name: 'clementine-next' });
+// A cold source launch loads the full TypeScript graph before foreground code
+// can claim the singleton lease. Live hotpatching measured just over the old
+// 10s ceiling: the launcher reported failure while the healthy child acquired
+// the lease moments later. Packaged starts remain fast; this is only the upper
+// bound, and dead children are still detected immediately in the poll loop.
+const DAEMON_START_HANDSHAKE_TIMEOUT_MS = 30_000;
 
 function printUsage(): void {
   console.log(`
@@ -137,7 +143,7 @@ async function cmdDaemonStart(): Promise<number> {
     const pid = spawnDaemonProcess();
     // Poll the child/lease handshake: module loading on a cold packaged start
     // can legitimately exceed 300 ms, while a dead child must fail promptly.
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + DAEMON_START_HANDSHAKE_TIMEOUT_MS;
     let owner: number | null = null;
     while (Date.now() < deadline) {
       owner = readDaemonPid();
@@ -149,7 +155,10 @@ async function cmdDaemonStart(): Promise<number> {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     if (!owner || !isDaemonRunning()) {
-      console.error(`Daemon process ${pid} did not acquire the singleton lease within 10 seconds. Check ${DAEMON_LOG_FILE}.`);
+      console.error(
+        `Daemon process ${pid} did not acquire the singleton lease within `
+        + `${DAEMON_START_HANDSHAKE_TIMEOUT_MS / 1_000} seconds. Check ${DAEMON_LOG_FILE}.`,
+      );
       return 1;
     }
     console.log(owner === pid ? `Daemon started (PID ${pid}).` : `Daemon is already running (PID ${owner}).`);

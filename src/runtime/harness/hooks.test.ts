@@ -34,6 +34,18 @@ test('effectiveReflectionTool unwraps composio_execute_tool to its action slug',
   assert.equal(effectiveReflectionTool('composio_execute_tool', details as never), 'SALESFORCE_GET_RECORD_BY_ID');
 });
 
+test('effectiveReflectionTool unwraps schema-on-demand call_tool to its exact inner tool', () => {
+  const details = {
+    toolCall: {
+      arguments: JSON.stringify({
+        name: 'composio_search_tools',
+        args_json: '{"query":"Google Sheets values"}',
+      }),
+    },
+  };
+  assert.equal(effectiveReflectionTool('call_tool', details as never), 'composio_search_tools');
+});
+
 test('effectiveReflectionTool passes through non-composio tools unchanged', () => {
   assert.equal(effectiveReflectionTool('read_file', undefined), 'read_file');
   assert.equal(effectiveReflectionTool(null, undefined), null);
@@ -54,6 +66,7 @@ test('effectiveReflectionTool falls back to the wrapper name when the slug is mi
   assert.equal(effectiveReflectionTool('composio_execute_tool', { toolCall: { arguments: 'not json' } } as never), 'composio_execute_tool');
   assert.equal(effectiveReflectionTool('composio_execute_tool', { toolCall: {} } as never), 'composio_execute_tool');
   assert.equal(effectiveReflectionTool('composio_execute_tool', undefined), 'composio_execute_tool');
+  assert.equal(effectiveReflectionTool('call_tool', { toolCall: { arguments: 'not json' } } as never), 'call_tool');
 });
 
 test.after(() => {

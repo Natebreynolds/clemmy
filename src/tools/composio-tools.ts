@@ -2251,7 +2251,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       // CLEMMY_COMPOSIO_SEARCH_RECALL=off restores the always-discover behavior.
       if (!toolkit_slug && (process.env.CLEMMY_COMPOSIO_SEARCH_RECALL ?? 'on').toLowerCase() !== 'off') {
         try {
-          const remembered = recallComposioForSearch(query);
+          const remembered = recallComposioForSearch(query, { limit: limit ?? undefined });
           if (remembered.length > 0) {
             const sid = sessionIdFromRunContext(context);
             const useIdsBySlug: Record<string, string> = {};

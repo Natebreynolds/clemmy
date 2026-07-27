@@ -138,7 +138,7 @@ const STOPWORDS = new Set([
   // relevant ("for each item, call a worker and return its output" previously
   // recalled skills whose only overlap was exactly that scaffolding).
   'call', 'calls', 'each', 'fanout', 'item', 'items', 'its', 'output', 'outputs',
-  'parallel', 'run', 'running', 'task', 'tasks', 'worker', 'workers',
+  'every', 'parallel', 'ready', 'run', 'running', 'task', 'tasks', 'worker', 'workers',
 ]);
 
 const DOMAIN_PATTERNS: RegExp[] = [

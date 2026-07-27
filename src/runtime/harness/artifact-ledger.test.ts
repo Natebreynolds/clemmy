@@ -514,6 +514,89 @@ test('provider verification survives expiry of the raw tool result', () => {
   assert.ok(durable?.bindingVerifiedAt, 'the compact proof lives independently of raw tool-output TTL');
 });
 
+test('Google Sheets create extracts its root id and an exact range read verifies the binding', () => {
+  const sid = session();
+  const runScope = 'run:sheets-readback';
+  const spreadsheetId = 'sheet_exact_123456789';
+  const createArgs = {
+    tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    arguments: JSON.stringify({ title: 'Exact release sheet' }),
+  };
+  const intent = ledger.artifactIntentForTool('composio_execute_tool', createArgs);
+  assert.deepEqual(intent, {
+    kind: 'resource',
+    provider: 'googlesheets',
+    slotKey: 'resource:primary',
+    title: 'Exact release sheet',
+    createShape: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+  });
+  const createOutput = {
+    successful: true,
+    data: {
+      spreadsheetId,
+      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+    },
+  };
+  const resource = ledger.extractArtifactResource(intent!, createOutput);
+  assert.deepEqual(resource, {
+    resourceId: spreadsheetId,
+    uri: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+    title: 'Exact release sheet',
+  });
+  ledger.claimArtifactSlot(sid, intent!, 'create-sheet', runScope);
+  ledger.bindArtifactSlot(sid, intent!.slotKey, resource!, 'create-sheet', runScope);
+
+  const getter = {
+    tool_slug: 'GOOGLESHEETS_BATCH_GET',
+    arguments: JSON.stringify({ spreadsheet_id: spreadsheetId, ranges: ['Sheet1!A1:C4'] }),
+  };
+  assert.deepEqual(
+    ledger.artifactVerificationIntentForTool('composio_execute_tool', getter),
+    {
+      kind: 'resource',
+      provider: 'googlesheets',
+      resourceId: spreadsheetId,
+      verificationShape: 'GOOGLESHEETS_BATCH_GET',
+    },
+  );
+  assert.equal(
+    ledger.artifactVerificationIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_LIST_SPREADSHEETS',
+      arguments: '{}',
+    }),
+    null,
+    'broad catalog reads cannot certify a binding',
+  );
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid,
+    runScope,
+    'composio_execute_tool',
+    getter,
+    { successful: true, data: { spreadsheetId: 'different_sheet', valueRanges: [] } },
+    'wrong-sheet-read',
+  ), null);
+
+  const verified = ledger.verifyArtifactBindingFromToolResult(
+    sid,
+    runScope,
+    'composio_execute_tool',
+    getter,
+    {
+      successful: true,
+      data: {
+        display_url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+        spreadsheetId,
+        valueRanges: [{ range: 'Sheet1!A1:C4', values: [['verified']] }],
+      },
+    },
+    'readback-sheet',
+  );
+  assert.ok(verified?.bindingVerifiedAt);
+  assert.equal(verified?.verificationCallId, 'readback-sheet');
+  assert.equal(verified?.verificationShape, 'GOOGLESHEETS_BATCH_GET');
+  assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
+});
+
 test('explicit artifact keys preserve legitimate multi-document work', () => {
   const sid = session();
   const base = { kind: 'google_doc', provider: 'Google Docs', title: 'Doc', createShape: 'CREATE' } as const;

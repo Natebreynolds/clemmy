@@ -378,6 +378,26 @@ export function artifactVerificationIntentForTool(
     };
   }
 
+  // Google Sheets create is intentionally covered by the generic root-resource
+  // classifier below, but its exact getters still need a provider-shaped
+  // binding proof. A range read names one spreadsheet id and the response
+  // echoes that same id, so it is independent proof that the newly bound root
+  // is readable. Broad list/search operations never enter this branch.
+  if (
+    /^(?:CX_)?GOOGLE_?SHEETS?_(?:BATCH_GET|VALUES_(?:BATCH_)?GET|GET_SPREADSHEET(?:_BY_ID)?|SPREADSHEETS_GET)$/.test(normalized)
+  ) {
+    const resourceId = stringField(args, [
+      'spreadsheet_id', 'spreadsheetId', 'spreadsheetid', 'id',
+    ]);
+    if (!resourceId) return null;
+    return {
+      kind: 'resource',
+      provider: 'googlesheets',
+      resourceId,
+      verificationShape: normalized,
+    };
+  }
+
   if (/^(?:CX_)?NETLIFY_(?:GET_SITE|GETSITE)$/.test(normalized)) {
     const resourceId = stringField(args, ['site_id', 'siteId', 'siteid', 'id']);
     if (!resourceId) return null;
@@ -1177,6 +1197,10 @@ function googleDocumentIdFromUri(uri: string | undefined): string | undefined {
   return uri?.match(/^https:\/\/docs\.google\.com\/document\/d\/([A-Za-z0-9_-]+)(?:\/|$|[?#])/i)?.[1];
 }
 
+function googleSpreadsheetIdFromUri(uri: string | undefined): string | undefined {
+  return uri?.match(/^https:\/\/docs\.google\.com\/spreadsheets\/d\/([A-Za-z0-9_-]+)(?:\/|$|[?#])/i)?.[1];
+}
+
 function jsonRecordFromOutput(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
   if (typeof value !== 'string') return null;
@@ -1220,6 +1244,18 @@ function readbackResource(intent: ArtifactVerificationIntent, output: unknown): 
         : undefined);
     const resourceId = walkForKey(parsed, new Set(['documentid', 'document_id', 'docid', 'doc_id']))
       ?? googleDocumentIdFromUri(uri);
+    return resourceId ? { resourceId, uri } : null;
+  }
+  if (intent.kind === 'resource' && intent.provider === 'googlesheets') {
+    const uri = walkForKey(parsed, new Set([
+      'display_url', 'spreadsheeturl', 'spreadsheet_url', 'url', 'uri',
+    ]))
+      ?? (typeof output === 'string'
+        ? output.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)?.[0]
+        : undefined);
+    const resourceId = walkForKey(parsed, new Set([
+      'spreadsheetid', 'spreadsheet_id',
+    ])) ?? googleSpreadsheetIdFromUri(uri);
     return resourceId ? { resourceId, uri } : null;
   }
   if (!direct) return null;
@@ -1334,8 +1370,13 @@ export function extractArtifactResource(intent: ArtifactIntent, output: unknown)
   // evidence a human would read. Without this branch every generic claim
   // settled 'uncertain' even on SUCCESS, turning the broadened classifier into
   // a park factory instead of a safety net.
-  const resourceId = walkForKey(parsed, new Set(['id', 'resource_id', 'resourceid', 'uid', 'uuid']));
-  const uri = walkForKey(parsed, new Set(['url', 'uri', 'html_url', 'web_url', 'link', 'permalink']))
+  const resourceId = walkForKey(parsed, new Set([
+    'id', 'resource_id', 'resourceid', 'uid', 'uuid', 'spreadsheet_id', 'spreadsheetid',
+  ]));
+  const uri = walkForKey(parsed, new Set([
+    'url', 'uri', 'html_url', 'web_url', 'link', 'permalink',
+    'display_url', 'spreadsheet_url', 'spreadsheeturl',
+  ]))
     ?? (typeof output === 'string' ? output.match(/https?:\/\/[^\s"')\]]+/i)?.[0] : undefined);
   return resourceId || uri ? { resourceId, uri, title: commonTitle ?? intent.title } : null;
 }

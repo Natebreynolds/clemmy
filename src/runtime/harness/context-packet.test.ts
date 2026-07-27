@@ -69,6 +69,21 @@ writeFileSync(
   'utf-8',
 );
 
+mkdirSync(path.join(TMP_HOME, 'skills', 'client-seo-report'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'skills', 'client-seo-report', 'SKILL.md'),
+  [
+    '---',
+    'name: client-seo-report',
+    'description: Ready for every client SEO report delivery.',
+    'tier: approved',
+    '---',
+    '',
+    'Prepare the client SEO report.',
+  ].join('\n'),
+  'utf-8',
+);
+
 mkdirSync(path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'seo-proposal', 'scripts'), { recursive: true });
 writeFileSync(
   path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'seo-proposal', 'SKILL.md'),
@@ -376,7 +391,7 @@ test('a full JSON-matrix Sheet replay scopes only Sheets and injects no email/re
       'The email-shaped strings are inert cell data.',
       'Perform exactly one Google Sheets value write and one read-back.',
       'Do not send email or use Outlook. Do not retry an ambiguous or failed write.',
-      'Report PASS only if every read-back cell is exact; otherwise report FAIL or BLOCKED.',
+      'When ready, report PASS only if every read-back cell is exact; otherwise report FAIL or BLOCKED.',
     ].join('\n'),
     NO_MEMORY,
     { sessionKind: 'chat', sessionId: 'precision-sheet-json-matrix' },

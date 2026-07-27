@@ -10824,7 +10824,7 @@ export function registerConsoleRoutes(
 
         setImmediate(async () => {
           try {
-            const agent = await buildOrchestratorAgent({ sessionId });
+            const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
             await runConversationFromResume({
               agent,
               sessionId,
@@ -11147,7 +11147,7 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgent({ sessionId });
+        const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
         // v0.5.19 Bug A fix — sticky-approval auto-resume.
         // After the initial resume, the resumed turn may itself trigger
         // a fresh approval pause (e.g. a composio_execute_tool inside the
@@ -13750,7 +13750,11 @@ export function registerConsoleRoutes(
           return;
         }
         if (intent && harnessSession) {
-          const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId });
+          const agent = await buildOrchestratorAgent({
+            userInput: effectiveInput,
+            sessionId,
+            allowToolJit: true,
+          });
           await runConversationFromResume({
             agent,
             sessionId,
@@ -13774,7 +13778,11 @@ export function registerConsoleRoutes(
           'home',
           { message: effectiveInput, sessionId, runId: requestRunId, channel: 'desktop', userId: 'desktop', onChunk },
           async (req) => {
-            const agent = await buildOrchestratorAgent({ userInput: req.message, sessionId });
+            const agent = await buildOrchestratorAgent({
+              userInput: req.message,
+              sessionId,
+              allowToolJit: true,
+            });
             const result = await runConversation({
               agent,
               sessionId,

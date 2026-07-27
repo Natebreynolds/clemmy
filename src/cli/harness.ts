@@ -27,6 +27,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { runConversation } from '../runtime/harness/loop.js';
 import { actionBus } from '../runtime/action-bus.js';
+import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 
 interface HarnessRunOptions {
   prompt: string;
@@ -64,7 +65,11 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
 
   let result;
   try {
-    const agent = await buildOrchestratorAgent({ userInput: opts.prompt, sessionId: session.id });
+    const agent = await buildOrchestratorAgent({
+      userInput: opts.prompt,
+      sessionId: session.id,
+      allowToolJit: true,
+    });
     result = await runConversation({
       agent,
       sessionId: session.id,
@@ -74,6 +79,10 @@ async function harnessRun(opts: HarnessRunOptions): Promise<number> {
     });
   } finally {
     unsubscribe();
+    // `harness run` is a one-shot process, unlike the daemon. Close any MCP
+    // stdio children it lazily connected so a completed smoke test exits
+    // cleanly instead of hanging on (for example) a DataForSEO server.
+    await invalidateConfiguredMcpServers();
   }
 
   process.stdout.write(`\nstatus: ${result.status}\n`);

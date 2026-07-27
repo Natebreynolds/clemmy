@@ -2575,6 +2575,52 @@ test('objective judge: a successful concrete send slug is completion evidence', 
   assert.equal(judgeInvoked, false);
 });
 
+test('objective judge: schema-on-demand execution_complete preview is an accepted request-bound certificate', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeCalls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    // call_tool dispatch records the inner execution as a transport-mirror
+    // tool_returned event. Its exact controller result lives in `preview`, not
+    // `result`; this is the shape emitted by a real live Sheets run.
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'system',
+      type: 'tool_returned',
+      data: {
+        tool: 'execution_complete',
+        callId: 'batch-execution-complete',
+        batchMode: true,
+        accounting: 'transport_mirror',
+        preview: 'Execution exec-release-proof completed. Created the requested resource and verified the exact readback.',
+      },
+    });
+    const decision = {
+      summary: 'request completed and verified',
+      reply: 'Completed the requested resource creation, population, and exact readback verification.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    };
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Create the resource, populate all requested records, and read them back exactly.',
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeCalls += 1;
+      return { done: false, reason: 'should not re-judge an accepted execution certificate' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeCalls, 0, 'the execution controller already performed the completion judgment');
+});
+
 test('objective judge: one successful send does not certify a plural objective', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   let judgeInvoked = false;

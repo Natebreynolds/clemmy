@@ -20,9 +20,9 @@ import {
 
 const baseGate = {
   enabled: true,
-  totalToolCalls: 8,
+  totalToolCalls: 12,
   lastCheckedAtToolCalls: 0,
-  checkIntervalTools: 8,
+  checkIntervalTools: 12,
   injectionsUsed: 0,
   maxInjections: MAX_WATCHER_INJECTIONS,
   checksUsed: 0,
@@ -35,7 +35,7 @@ test('gate: fires when the tool-call interval has elapsed on an enabled run', ()
 });
 
 test('gate: silent below the interval, when disabled, mid-flight, or out of injections', () => {
-  assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 7 }), false, 'below interval');
+  assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 11 }), false, 'below interval');
   assert.equal(shouldStartWatcherCheck({ ...baseGate, enabled: false }), false, 'disabled / not opted in');
   assert.equal(shouldStartWatcherCheck({ ...baseGate, checkInFlight: true }), false, 'never stacks checks');
   assert.equal(shouldStartWatcherCheck({ ...baseGate, injectionsUsed: MAX_WATCHER_INJECTIONS }), false, 'nudges, never nags');
@@ -43,8 +43,8 @@ test('gate: silent below the interval, when disabled, mid-flight, or out of inje
 });
 
 test('gate: interval measures from the LAST check, not zero', () => {
-  assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 15, lastCheckedAtToolCalls: 8 }), false);
-  assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 16, lastCheckedAtToolCalls: 8 }), true);
+  assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 23, lastCheckedAtToolCalls: 12 }), false);
+  assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 24, lastCheckedAtToolCalls: 12 }), true);
 });
 
 test('parse: ON-TRACK is silent (no miss, no steer)', () => {
@@ -95,18 +95,18 @@ test('prompt: renders goal, declared criteria, tool evidence, and the latest not
   assert.match(p, /Drafting the remaining three/);
 });
 
-test('knobs: default on, interval defaults to 8 and rejects sub-2 overrides', () => {
+test('knobs: default on, interval defaults to 12 and rejects sub-2 overrides', () => {
   const prevOn = process.env.CLEMMY_WATCHER_JUDGE;
   const prevInt = process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
   try {
     delete process.env.CLEMMY_WATCHER_JUDGE;
     delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
     assert.equal(watcherJudgeEnabled(), true);
-    assert.equal(watcherCheckIntervalTools(), 8);
+    assert.equal(watcherCheckIntervalTools(), 12);
     process.env.CLEMMY_WATCHER_JUDGE = 'off';
     assert.equal(watcherJudgeEnabled(), false);
     process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '1';
-    assert.equal(watcherCheckIntervalTools(), 8, 'sub-2 interval rejected');
+    assert.equal(watcherCheckIntervalTools(), 12, 'sub-2 interval rejected');
     process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '4';
     assert.equal(watcherCheckIntervalTools(), 4);
   } finally {

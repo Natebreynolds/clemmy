@@ -1247,7 +1247,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgent({ sessionId });
+        const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
         const MAX_STICKY_RESUMES = 5;
         let resumeIter = 0;
         while (resumeIter < MAX_STICKY_RESUMES) {

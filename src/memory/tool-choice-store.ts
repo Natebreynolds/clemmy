@@ -1788,6 +1788,56 @@ export interface RememberedComposioMatch {
   procedureId?: string;
 }
 
+type ComposioSearchOperation = 'create' | 'write' | 'read' | 'search' | 'list' | 'delete' | 'send';
+
+function requestedComposioSearchOperations(query: string): ComposioSearchOperation[] {
+  const patterns: Array<[ComposioSearchOperation, RegExp]> = [
+    ['create', /\b(?:create|make|new|provision|duplicate|copy)\b/i],
+    ['write', /\b(?:write|update|append|insert|upsert|populate|modify|set|add)\b/i],
+    ['read', /\b(?:read(?:\s*-\s*|\s+)?back|read|get|fetch|retrieve|inspect|verify|verification|check|download)\b/i],
+    ['search', /\b(?:search|find|look\s*up|lookup)\b/i],
+    ['list', /\b(?:list|enumerate|show)\b/i],
+    ['delete', /\b(?:delete|remove|trash|archive)\b/i],
+    ['send', /\b(?:send|reply|forward|publish|post)\b/i],
+  ];
+  return patterns
+    .map(([operation, pattern]) => ({ operation, index: query.search(pattern) }))
+    .filter((entry) => entry.index >= 0)
+    .sort((a, b) => a.index - b.index)
+    .map((entry) => entry.operation);
+}
+
+function composioSlugOperation(slug: string): ComposioSearchOperation | null {
+  const normalized = slug.toUpperCase();
+  if (/(?:^|_)(?:SEND|REPLY|FORWARD|PUBLISH|POST)(?:_|$)/.test(normalized)) return 'send';
+  if (/(?:^|_)(?:DELETE|REMOVE|TRASH|ARCHIVE)(?:_|$)/.test(normalized)) return 'delete';
+  if (/(?:^|_)(?:SEARCH|FIND|LOOKUP)(?:_|$)/.test(normalized)) return 'search';
+  if (/(?:^|_)(?:LIST|ENUMERATE)(?:_|$)/.test(normalized)) return 'list';
+  if (/(?:^|_)(?:CREATE|MAKE|PROVISION|DUPLICATE|COPY|NEW)(?:_|$)/.test(normalized)) return 'create';
+  if (/(?:^|_)(?:WRITE|UPDATE|APPEND|INSERT|UPSERT|POPULATE|MODIFY|SET|ADD)(?:_|$)/.test(normalized)) return 'write';
+  if (/(?:^|_)(?:READ|GET|FETCH|RETRIEVE|INSPECT|DOWNLOAD)(?:_|$)/.test(normalized)) return 'read';
+  return null;
+}
+
+/** Prefer the exact data operation within a family. For example, a Sheets
+ * "read back these cells" request needs BATCH_GET/VALUES_GET rather than the
+ * superficially valid GET_SPREADSHEET_INFO. */
+function composioOperationSpecificity(slug: string, query: string): number {
+  const operation = composioSlugOperation(slug);
+  const normalized = slug.toUpperCase();
+  const valueShaped = /\b(?:cell|cells|matrix|range|ranges|row|rows|value|values|read(?:\s*-\s*|\s+)?back)\b/i.test(query);
+  if (!valueShaped) return 0;
+  if (operation === 'read') {
+    if (/(?:^|_)(?:BATCH_GET|GET_(?:RANGE|RANGES|VALUE|VALUES)|(?:RANGE|RANGES|VALUE|VALUES)_GET|READ)(?:_|$)/.test(normalized)) return 10;
+    if (/(?:INFO|METADATA|PROPERT|NAME|TITLE)/.test(normalized)) return -10;
+  }
+  if (operation === 'write') {
+    if (/(?:^|_)(?:BATCH_UPDATE|UPDATE_(?:RANGE|RANGES|VALUE|VALUES)|(?:RANGE|RANGES|VALUE|VALUES)_UPDATE|APPEND|WRITE)(?:_|$)/.test(normalized)) return 10;
+    if (/(?:INFO|METADATA|PROPERT|TITLE)/.test(normalized)) return -10;
+  }
+  return 0;
+}
+
 /**
  * The DISCOVERY-TAX killer: given a natural-language composio_search_tools query,
  * return the CONFIDENT remembered Composio slug(s) so the search can short-circuit
@@ -1835,6 +1885,10 @@ export function recallComposioForSearch(
     const c = rec.choice;
     if (!c || c.kind !== 'composio') continue;
     if (placeholderChoiceString(c.identifier)) continue;
+    // A learned procedure must resolve to ONE executable slug. Historical
+    // summaries such as "TOOL_A + TOOL_B + TOOL_C" are useful evidence but can
+    // never be sent to Composio and must not occupy a discovery result.
+    if (!/^[A-Za-z0-9_]+$/.test(c.identifier)) continue;
     // Never short-circuit onto a net-negative (broken) remembered path.
     if (outcomesOn && computeChoiceScore(c) < TOOL_CHOICE_SCORE_FLOOR) continue;
 
@@ -1901,7 +1955,39 @@ export function recallComposioForSearch(
     procedureId: a.procedureIds.size === 1 ? [...a.procedureIds][0] : undefined,
   }));
   results.sort((x, y) => (y.matched.length - x.matched.length) || (y.successCount - x.successCount));
-  return results.slice(0, opts.limit ?? 3);
+
+  // Compound work needs one useful candidate per requested operation, not the
+  // three most-successful variants of one family. This turns "create a sheet,
+  // write cells, read them back" into one memory lookup instead of a second
+  // composio_search_tools call after CREATE or UPDATE crowded out BATCH_GET.
+  const requestedOperations = requestedComposioSearchOperations(query);
+  const selected: RememberedComposioMatch[] = [];
+  const selectedSlugs = new Set<string>();
+  for (const operation of requestedOperations) {
+    const best = results
+      .filter((candidate) => (
+        !selectedSlugs.has(candidate.slug)
+        && composioSlugOperation(candidate.slug) === operation
+      ))
+      .sort((a, b) => (
+        composioOperationSpecificity(b.slug, query) - composioOperationSpecificity(a.slug, query)
+        || b.matched.length - a.matched.length
+        || b.successCount - a.successCount
+      ))[0];
+    if (!best) continue;
+    selected.push(best);
+    selectedSlugs.add(best.slug);
+  }
+  for (const candidate of results) {
+    if (selectedSlugs.has(candidate.slug)) continue;
+    selected.push(candidate);
+    selectedSlugs.add(candidate.slug);
+  }
+  const maxResults = Math.max(
+    1,
+    Math.min(opts.limit ?? Math.max(3, requestedOperations.length), 6),
+  );
+  return selected.slice(0, maxResults);
 }
 
 /**
