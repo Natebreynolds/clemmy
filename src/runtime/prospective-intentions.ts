@@ -164,9 +164,13 @@ const DEFAULT_CONTEXT_MAX_ITEMS = 6;
 const ACTIVE_STATUSES: ReadonlySet<ProspectiveStatus> = new Set(['active', 'due', 'claimed', 'blocked']);
 const TERMINAL_STATUSES: ReadonlySet<ProspectiveStatus> = new Set(['completed', 'cancelled']);
 const CONTEXT_STOPWORDS: ReadonlySet<string> = new Set([
-  'about', 'after', 'again', 'also', 'and', 'are', 'before', 'but', 'can', 'could',
-  'for', 'from', 'have', 'into', 'later', 'me', 'my', 'of', 'on', 'or', 'please',
-  'that', 'the', 'then', 'this', 'to', 'what', 'when', 'with', 'you', 'your',
+  'about', 'after', 'again', 'all', 'also', 'and', 'are', 'before', 'but', 'call',
+  'calls', 'can', 'could', 'do', 'each', 'every', 'exactly', 'file', 'files',
+  'for', 'from', 'give', 'have', 'into', 'item', 'items', 'later', 'me', 'my',
+  'no', 'not', 'of', 'on', 'one', 'only', 'or', 'output', 'outputs', 'please',
+  'real', 'return', 'run', 'running', 'task', 'tasks', 'test', 'tests', 'that',
+  'the', 'then', 'this', 'to', 'tool', 'tools', 'use', 'using', 'what', 'when',
+  'with', 'worker', 'workers', 'write', 'writes', 'you', 'your',
 ]);
 
 let db: Database.Database | null = null;

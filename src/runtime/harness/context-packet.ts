@@ -133,6 +133,12 @@ const STOPWORDS = new Set([
   'performed', 'range', 'read', 'row', 'rows', 'sheet1',
   'update', 'updated', 'validate', 'validated', 'value', 'values', 'verification',
   'verify', 'verified', 'write', 'writes', 'writing', 'wrote',
+  // Coordination vocabulary is ubiquitous across unrelated skills. It can
+  // shape the current turn, but it is not evidence that a stored procedure is
+  // relevant ("for each item, call a worker and return its output" previously
+  // recalled skills whose only overlap was exactly that scaffolding).
+  'call', 'calls', 'each', 'fanout', 'item', 'items', 'its', 'output', 'outputs',
+  'parallel', 'run', 'running', 'task', 'tasks', 'worker', 'workers',
 ]);
 
 const DOMAIN_PATTERNS: RegExp[] = [
@@ -539,7 +545,7 @@ function rankWorkflows(input: string): RankedContextCandidate[] {
   // default; injecting similarly named smoke workflows into every one-off
   // request adds noise without granting capability.
   const workflowIntent =
-    /\b(?:workflow|automation|automate|recurring|scheduled|schedule|daily|weekly|monthly|routine|for\s+each)\b/i.test(input)
+    /\b(?:workflow|automation|automate|recurring|scheduled|schedule|daily|weekly|monthly|routine)\b/i.test(input)
     || /\b(?:run|start|launch|execute|kick\s+off)\b[^.!?\n]{0,80}\b(?:flow|routine|automation|workflow)\b/i.test(input);
   try {
     return listWorkflows()

@@ -55,7 +55,7 @@ function recommendationRelevantToInput(rec: AgentSystemRecommendation, input: st
     return /\b(agent|agents|swarm|delegate|delegation|review|debate|parallel|worker|fan[- ]?out|specialist)\b/.test(text)
       || /\b(?:agent\s+team|team\s+(?:agent|agents|of\s+agents))\b/.test(text);
   }
-  return /\b(workflow|automation|automate|retry|replan|rerun|loop|schedule|foreach|for each|failed items?)\b/.test(text);
+  return /\b(workflow|automation|automate|retry|replan|rerun|loop|schedule|failed items?)\b/.test(text);
 }
 
 /** Repair/learning modes summarize failures in existing workflow loops. They
@@ -67,7 +67,7 @@ function coordinationPolicyRelevantToInput(
 ): boolean {
   if (!policy) return false;
   if (policy.mode !== 'repair-loop' && policy.mode !== 'learning-loop') return true;
-  return /\b(?:workflow|automation|automate|retry|replan|rerun|loop|schedule|foreach|for each|failed items?|resume (?:the|this) (?:run|task|job|workflow))\b/i
+  return /\b(?:workflow|automation|automate|retry|replan|rerun|loop|schedule|failed items?|resume (?:the|this) (?:run|task|job|workflow))\b/i
     .test(positiveCoordinationSignalText(input));
 }
 

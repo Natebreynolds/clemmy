@@ -295,6 +295,37 @@ test('model context is relevance-scoped, session-aware, and bounded', () => {
   assert.match(overview.text, /cue is not permission/i);
 });
 
+test('generic execution vocabulary does not recall unrelated future intentions', () => {
+  const id = prospective.prospectiveIntentionId('timer', 'salesforce-snapshot');
+  prospective.upsertProspectiveIntention({
+    ...timerDefinition(
+      'salesforce-snapshot',
+      '2026-08-03T17:00:00.000Z',
+      'Run the weekly Salesforce snapshot task',
+    ),
+    sessionId: 'sess-salesforce',
+  });
+  try {
+    const unrelated = prospective.buildProspectiveIntentionContext({
+      query: 'Run one task per worker in parallel and return each output.',
+      sessionId: 'sess-other',
+    });
+    assert.equal(
+      unrelated.text,
+      '',
+      'shared harness verbs are not durable-memory relevance',
+    );
+
+    const relevant = prospective.buildProspectiveIntentionContext({
+      query: 'What is next with the Salesforce snapshot?',
+      sessionId: 'sess-other',
+    });
+    assert.match(relevant.text, /weekly Salesforce snapshot task/);
+  } finally {
+    prospective.cancelProspectiveIntention(id, 'test_cleanup');
+  }
+});
+
 test('blocked time commitments stay blocked until their source is explicitly resumed', () => {
   const at = '2026-07-27T09:00:00.000Z';
   const intention = prospective.upsertProspectiveIntention(

@@ -54,6 +54,21 @@ writeFileSync(
   'utf-8',
 );
 
+mkdirSync(path.join(TMP_HOME, 'skills', 'generic-worker-helper'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'skills', 'generic-worker-helper', 'SKILL.md'),
+  [
+    '---',
+    'name: generic-worker-helper',
+    'description: Run each task with a worker call and return its output',
+    'tier: approved',
+    '---',
+    '',
+    'For each item, call a worker and return the output.',
+  ].join('\n'),
+  'utf-8',
+);
+
 mkdirSync(path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'seo-proposal', 'scripts'), { recursive: true });
 writeFileSync(
   path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'seo-proposal', 'SKILL.md'),
@@ -70,6 +85,26 @@ writeFileSync(
     '## step: research',
     '',
     'Research the site and produce proposal inputs.',
+  ].join('\n'),
+  'utf-8',
+);
+
+mkdirSync(path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'generic-item-loop', 'scripts'), { recursive: true });
+writeFileSync(
+  path.join(TMP_HOME, 'vault', '00-System', 'workflows', 'generic-item-loop', 'SKILL.md'),
+  [
+    '---',
+    'name: Generic Item Loop',
+    'description: Run a call for each item and return worker outputs',
+    'enabled: true',
+    'when_to_use: Use for each task that needs a worker call.',
+    'steps:',
+    '  - id: execute',
+    '---',
+    '',
+    '## step: execute',
+    '',
+    'Run each item and return its output.',
   ].join('\n'),
   'utf-8',
 );
@@ -320,6 +355,17 @@ test('a negated retry constraint does not inject global repair-loop guidance or 
   assert.doesNotMatch(packet.text, /AGENT SYSTEM GUIDANCE/);
 });
 
+test('generic fan-out scaffolding does not recall unrelated skills or workflows', () => {
+  const packet = buildAgentContextPacket(
+    'For each of alpha, beta, and gamma, run one worker call in parallel and return only its output.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'generic-fanout-relevance' },
+  );
+  assert.equal(packet.skills.length, 0);
+  assert.equal(packet.workflows.length, 0);
+  assert.doesNotMatch(packet.text, /generic-worker-helper|generic-item-loop/i);
+});
+
 test('a full JSON-matrix Sheet replay scopes only Sheets and injects no email/report procedure', () => {
   const packet = buildAgentContextPacket(
     [
@@ -503,6 +549,22 @@ test('repair-loop policy is scoped to repair work and cannot globally block unre
   );
   assert.equal(negatedRetryPacket.agentSystem.injected, false);
   assert.doesNotMatch(negatedRetryPacket.text, /AGENT SYSTEM GUIDANCE/);
+
+  const genericForEachPacket = buildAgentContextPacket(
+    'For each of alpha, beta, and gamma, run one worker call in parallel and return its output.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-policy-generic-for-each' },
+  );
+  assert.equal(
+    genericForEachPacket.agentSystem.policy,
+    null,
+    'generic per-item execution is not a request to resume a broken workflow loop',
+  );
+  assert.equal(
+    genericForEachPacket.agentSystem.recommendations.every((recommendation) => recommendation.kind === 'swarm'),
+    true,
+    'explicit parallel-worker language may receive swarm guidance, but not unrelated loop guidance',
+  );
 
   const repairPacket = buildAgentContextPacket(
     'Retry the failed workflow loop: research these 10 prospects after repairing its verifier.',
