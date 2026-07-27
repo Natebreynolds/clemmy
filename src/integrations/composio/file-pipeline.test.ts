@@ -30,6 +30,7 @@ test('the client enables the SDK file pipeline: staging download dir + upload al
   // instance (private field access via cast — a config regression here is the
   // whole feature silently dying, worth pinning).
   const config = (client as unknown as { config?: Record<string, unknown> }).config ?? {};
+  assert.equal(config.allowTracking, false, 'the local agent owns observability; SDK telemetry stays off');
   assert.equal(config.dangerouslyAllowAutoUploadDownloadFiles, true, 'file support ON — without it every file tool degrades to raw S3 urls');
   assert.equal(config.fileDownloadDir, composioFilesDir(), 'downloads land in OUR staging dir (BASE_DIR/files)');
   const uploadDirs = config.fileUploadDirs as string[] | undefined;

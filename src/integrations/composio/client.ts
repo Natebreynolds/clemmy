@@ -529,13 +529,18 @@ export function getComposio(): Composio | null {
     try { mkdirSync(filesDir, { recursive: true }); } catch { /* the SDK falls back to ~/.composio/files */ }
     singleton = new Composio({
       apiKey,
+      // Clementine owns provider-call observability locally. The SDK's
+      // independent telemetry adds an unrelated background request, makes
+      // deterministic fetch/abort accounting harder, and is unnecessary for a
+      // user-controlled local agent.
+      allowTracking: false,
       dangerouslyAllowAutoUploadDownloadFiles: true,
       fileDownloadDir: filesDir,
       fileUploadDirs: [filesDir, os.homedir()],
       // sensitiveFileUploadProtection stays default ON.
     });
   } else {
-    singleton = new Composio({ apiKey });
+    singleton = new Composio({ apiKey, allowTracking: false });
   }
   installAbortAwareFetch(singleton);
   return singleton;
