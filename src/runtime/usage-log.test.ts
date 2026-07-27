@@ -8,7 +8,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { rollupUsage, classifyUsageKind, parseWorkflowSource } = await import('./usage-log.js');
+const {
+  rollupUsage,
+  classifyUsageKind,
+  parseWorkflowSource,
+  reconcilePromptComponents,
+} = await import('./usage-log.js');
 
 function ev(over: Partial<import('./usage-log.js').UsageEvent>): import('./usage-log.js').UsageEvent {
   return {
@@ -71,6 +76,19 @@ test('events without cachedInputTokens count as zero cached (no crash)', () => {
   const r = rollupUsage([ev({ cachedInputTokens: undefined })]);
   assert.equal(r.totalCachedInputTokens, 0);
   assert.equal(r.cacheHitRate, 0);
+});
+
+test('reconcilePromptComponents exposes provider/tool overhead without inventing negative shares', () => {
+  assert.deepEqual(
+    reconcilePromptComponents({ instructions: 4_000, history: 2_000, junk: Number.NaN }, 10_000),
+    { instructions: 4_000, history: 2_000, providerAndToolOverhead: 4_000 },
+  );
+  assert.deepEqual(
+    reconcilePromptComponents({ instructions: 12_000 }, 10_000),
+    { instructions: 12_000 },
+    'an over-estimate is preserved and never offset with a negative bucket',
+  );
+  assert.equal(reconcilePromptComponents(undefined, 10_000), undefined);
 });
 
 test('parseWorkflowSource derives runId/stepId/itemKey from a workflow session id', () => {

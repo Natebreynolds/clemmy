@@ -148,12 +148,9 @@ export const CLAUDE_BRAIN_RUBRIC = CLAUDE_BRAIN_RUBRIC_LINES.join('\n\n');
 //     one-line marker now; the old JSON-envelope rationale no longer applies),
 //   - PLUS the proven TAIL (close-the-loop + compacted-context recall) verbatim.
 //
-// NOT wired as the default. It is registered in orchestrator.ts's
-// RUBRIC_INSTRUCTIONS_BY_VARIANT behind the existing CLEMMY_RUBRIC_VARIANT
-// switch (default 'legacy'); the default flips to 'lean' ONLY after a live A/B
-// (scripts measure narration/tool-call reliability + tokens, jit-style) shows
-// reliability ≥ legacy. Byte-identity is snapshot-guarded in
-// rubric-characterization.test.ts so any future edit is a reviewable diff.
+// This is now the default, with CLEMMY_RUBRIC_VARIANT=legacy as the instant
+// rollback. Byte-identity is snapshot-guarded in rubric-characterization.test.ts
+// so any future edit remains a reviewable diff.
 const LEAN_CODEX_ESSENTIAL_LINES = [
   "EXECUTION LANE — before a BATCH of mutating external writes, or a mutating `composio_execute_tool` (slug with UPDATE/CREATE/INSERT/DELETE/SEND/POST/PATCH/WRITE/PUBLISH), open an execution lane: `execution_list` → if none, `execution_create({title, objective, successCriteria, nextStep})` where successCriteria records the RULE you applied (e.g. \"dropped any account with no activity in 30d\"). An `EXECUTION_WRAP_REQUIRED` error is the harness telling you HOW to comply — create the lane and immediately re-issue the exact failed call in the SAME turn; never report it as \"couldn't do the work\". Read-only calls (GETs, *_LIST_*, SEO/web reads) are never gated.",
   "FAN OUT for 3+ independent same-shape units (50 CRM tasks, 30 drafts, 25 URL scrapes) and ESPECIALLY for independent MULTI-STEP per-item work (\"research these 10 prospects\" = per item: pull data → analyze → write the record): resolve the shared tools/slugs/schema/approval-scope ONCE, then call `run_worker` with the FULL `items` list in ONE call — the harness pools them under its concurrency cap; do NOT serialize them in your own context (that balloons tokens and forces the harness to clip your own freshly-fetched data mid-run). Pass each worker a structured packet with the exact slugs/commands; aggregate their tight results yourself. For durable multi-phase or restart-sensitive fan-out, include workManifest with canonical ids, PER-ITEM phases, and aliases; never put parent-only ranking/merge/final synthesis in it. Use a workflow only for a reusable or scheduled procedure. For external writes inside a fan-out: `execution_create` + `pending_action_queue` + one `request_approval` for the batch first.",

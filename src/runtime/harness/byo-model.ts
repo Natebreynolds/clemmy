@@ -508,7 +508,8 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
     const outputTokens = 'completion_tokens' in u ? n(u.completion_tokens) : n(u.output_tokens);
     if (inputTokens === 0 && outputTokens === 0) return;
     const cached = n(details?.cached_tokens) || n(u.cached_tokens);
-    const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? 'unknown';
+    const harnessContext = harnessRunContextStorage.getStore();
+    const sessionId = harnessContext?.sessionId ?? 'unknown';
     recordModelUsage({
       sessionId,
       model: (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : 'byo'),
@@ -516,6 +517,7 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
       cachedInputTokens: cached,
       outputTokens,
       totalTokens: n(u.total_tokens) || inputTokens + outputTokens,
+      promptComponents: harnessContext?.promptComponents,
     });
   } catch { /* never break the call path */ }
 }

@@ -64,7 +64,7 @@ test('returns ranked names + summaries and full schemas for the top hits', async
   assert.ok(first && typeof first === 'object' && ('properties' in first || 'type' in first), 'schema looks like JSON Schema');
 });
 
-test('records the schema-bearing hits to the session hot-set', async () => {
+test('does not promote speculative schema-bearing hits to the session hot-set', async () => {
   _resetHotSetForTest();
   const t = captureToolSearch();
   const sid = 'search-sess-1';
@@ -72,7 +72,7 @@ test('records the schema-bearing hits to the session hot-set', async () => {
   const schemaNames = Object.keys(out.schemas);
   const hot = getHotSet(sid);
   assert.ok(schemaNames.length > 0);
-  for (const n of schemaNames) assert.ok(hot.includes(n), `${n} should be recorded to the LRU`);
+  for (const n of schemaNames) assert.equal(hot.includes(n), false, `${n} was suggested, not dispatched`);
 });
 
 test('no session context still returns results (recording is a no-op)', async () => {

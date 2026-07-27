@@ -805,6 +805,10 @@ export interface HarnessRunContext {
    *  lane that records a run gets credit matching — the code-level replacement
    *  for the never-called memory_mark_used tool. */
   turnRecallRunIds?: string[];
+  /** Assembly-time estimate for the model call currently in flight. Model
+   * adapters attach this to usage events so prompt cost is attributable instead
+   * of appearing as one opaque input-token number. Refreshed before every call. */
+  promptComponents?: Record<string, number>;
 }
 
 /** The tracker scope a call registers under. EXEMPT lanes (code-mode programs,

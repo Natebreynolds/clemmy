@@ -1576,6 +1576,7 @@ export function recordCodexHarnessUsage(
       reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
       totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : inputTokens + outputTokens,
       responseId,
+      promptComponents: harnessRunContextStorage.getStore()?.promptComponents,
     });
   } catch { /* fail-silent */ }
 }

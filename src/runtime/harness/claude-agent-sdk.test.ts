@@ -1277,6 +1277,8 @@ test('runClaudeAgentSdk records usage for the shared usage dashboard and workflo
   assert.equal(events[0].durationMs, 17);
   assert.equal(events[0].providerApiDurationMs, 12);
   assert.equal(events[0].responseId, 'usage-result-1');
+  assert.equal(events[0].promptComponents?.currentMessage, 1);
+  assert.equal(events[0].promptComponents?.providerAndToolOverhead, 19);
 
   const operationalEvents = operationalTelemetry.listOperationalEvents({
     source: 'model',

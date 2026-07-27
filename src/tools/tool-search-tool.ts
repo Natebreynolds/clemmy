@@ -18,9 +18,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
-import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { rankCatalog } from '../agents/tool-catalog.js';
-import { recordToolHit } from '../agents/tool-hotset.js';
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
@@ -109,10 +107,10 @@ export function registerToolSearchTool(
         text = render();
       }
 
-      // Promote the schema-bearing hits into the session hot-set (first-class next turn).
-      const sessionId = getToolOutputContext()?.sessionId;
-      for (const name of shownSchemaNames) recordToolHit(sessionId, name);
-
+      // Do not promote speculative search hits. The selected tool is promoted
+      // after call_tool successfully dispatches it; promoting all three schema
+      // previews made ordinary sessions grow their first-class surface on every
+      // search even when two suggestions were never used.
       return textResult(text);
     },
   );

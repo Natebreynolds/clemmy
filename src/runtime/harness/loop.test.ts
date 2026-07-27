@@ -80,7 +80,7 @@ const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
-const { ToolCallsLimitExceeded } = await import('./brackets.js');
+const { ToolCallsLimitExceeded, harnessRunContextStorage } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
@@ -1019,6 +1019,92 @@ test('runTurn injects a transient memory primer before the first model response'
   assert.match(String(primerEvents[0].data.recallId), /^mr-/);
   assert.equal(typeof primerEvents[0].data.omittedCount, 'number');
   assert.equal(primerEvents[0].data.includedCount, primerEvents[0].data.hitCount);
+});
+
+test('runTurn compacts oversized same-turn tool results only in model-facing input', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let filteredInput: AgentInputItem[] = [];
+  let activeInputJson = '';
+  let observedPromptComponents: Record<string, number> | undefined;
+  const priorEnv = {
+    trigger: process.env.CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS,
+    budget: process.env.CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS,
+    min: process.env.CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS,
+    max: process.env.CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS,
+  };
+  process.env.CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS = '1000';
+  process.env.CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS = '2000';
+  process.env.CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS = '2';
+  process.env.CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS = '4';
+
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const activeInput: AgentInputItem[] = [...items];
+    for (let i = 0; i < 10; i++) {
+      const callId = `same_turn_${i}`;
+      const output = `result ${i} ${'q'.repeat(4000)}`;
+      activeInput.push({
+        type: 'function_call',
+        callId,
+        name: 'research.target',
+        arguments: `{"target":${i}}`,
+        status: 'completed',
+      } as unknown as AgentInputItem);
+      activeInput.push({
+        type: 'function_call_result',
+        callId,
+        output: { type: 'text', text: output },
+        status: 'completed',
+      } as unknown as AgentInputItem);
+      writeToolOutput({ sessionId: sess.id, callId, tool: 'research.target', output });
+    }
+    activeInputJson = JSON.stringify(activeInput);
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    filteredInput = filter!({ modelData: { input: activeInput, instructions: 'base' } }).input;
+    observedPromptComponents = harnessRunContextStorage.getStore()?.promptComponents;
+    assert.equal(JSON.stringify(activeInput), activeInputJson, 'filter must not mutate Runner history');
+    return {
+      history: [
+        ...items,
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'done' }] },
+      ],
+      finalOutput: 'done',
+    };
+  };
+
+  try {
+    await runTurn({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'research these ten targets',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+  } finally {
+    if (priorEnv.trigger === undefined) delete process.env.CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS;
+    else process.env.CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS = priorEnv.trigger;
+    if (priorEnv.budget === undefined) delete process.env.CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS;
+    else process.env.CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS = priorEnv.budget;
+    if (priorEnv.min === undefined) delete process.env.CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS;
+    else process.env.CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS = priorEnv.min;
+    if (priorEnv.max === undefined) delete process.env.CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS;
+    else process.env.CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS = priorEnv.max;
+  }
+
+  const modelJson = JSON.stringify(filteredInput);
+  assert.match(modelJson, /summary of older completed tool activity/);
+  assert.doesNotMatch(modelJson, /"callId":"same_turn_0"/);
+  assert.match(modelJson, /"callId":"same_turn_8"/);
+  assert.match(modelJson, /"callId":"same_turn_9"/);
+  assert.ok((observedPromptComponents?.history ?? 0) > 0);
+  assert.ok((observedPromptComponents?.instructions ?? 0) > 0);
+  assert.ok((observedPromptComponents?.contextPacket ?? 0) > 0);
+  const event = listEvents(sess.id, { types: ['condenser_applied'] })
+    .find((row) => row.data.inFlight === true);
+  assert.ok(event, 'same-turn compaction should be visible in harness telemetry');
+  assert.equal(event.data.retainedToolPairs, 2);
 });
 
 test('turn numbers monotonically increment across runs', async () => {

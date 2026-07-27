@@ -3,6 +3,7 @@ import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
 import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
+import { resolveHotSet } from '../../agents/tool-catalog.js';
 import {
   buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_TOOLS,
 } from '../../spaces/workspace-context.js';
@@ -81,6 +82,7 @@ import {
   type ClaudeAgentSdkToolProfile,
   defaultClaudeAgentSdkAllowedLocalTools,
   claudeAgentSdkAdvertisableLocalTools,
+  claudeToolSearchEnabled,
   runClaudeAgentSdk,
   ClaudeSdkProviderOverloadError,
   ClaudeSdkContextOverflowError,
@@ -1401,13 +1403,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     ? request.model
     : resolveRoleModel('brain').modelId;
 
-  // JIT tool-RAG for the Claude Agent SDK brain (Phase 1, Claude-brain port). The
-  // brain runs the SAME decision as the Codex lane (resolveToolJitDecision — global
-  // flag OR the per-session A/B arm). When active, retrieve only the tools this turn
-  // plausibly needs (CORE + semantic top-K of the profile tools) and advertise ONLY
-  // those on the MCP surface, so the model receives fewer tool schemas. Brain lanes
-  // are interactive (a user is present), so allowLane=true. Off / no-signal / no
-  // embeddings → the full profile (byte-identical). Never throws into the turn.
+  // Tool acquisition for the Claude Agent SDK brain. In full/agentic mode,
+  // Claude's native ToolSearch keeps the ENTIRE permission surface registered
+  // and same-turn reachable while only a tiny hot set is schema-loaded. This is
+  // intentionally independent of the older semantic JIT switch: native search
+  // is an acquisition mechanism, not permission pruning. If native ToolSearch
+  // is disabled, fall back to the legacy semantic JIT behavior byte-for-byte.
   const fullToolPolicy = toolPolicyForRequest(request, mode);
   const fullAllowed = fullToolPolicy.names;
   const advertisedUniverse = claudeAgentSdkAdvertisedToolUniverse(
@@ -1430,14 +1431,41 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let mcpToolAllowlist: string[] | undefined;
   let jitDropped = 0;
   let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
-  if (jitDecision.active && request.message.trim()) {
+  const nativeDeferredAcquisition = mode === 'full' && claudeToolSearchEnabled();
+  const jitQuery = [request.message, ...recentPriorBrainInputs(sessionId, request.message)]
+    .filter((s) => s.trim().length > 0)
+    .join('\n');
+  if (nativeDeferredAcquisition) {
+    try {
+      const hot = resolveHotSet(sessionId, jitQuery, {
+        allowedNames: new Set(advertisedUniverse),
+      });
+      // A dock chat IS editing a Workspace. Keep its structural workspace
+      // controls first-class; every other allowed tool remains native-searchable.
+      if (isSpaceSession) {
+        for (const toolName of WORKSPACE_DOCK_TOOLS) {
+          if (advertisedUniverse.includes(toolName)) hot.add(toolName);
+        }
+      }
+      jitAdvertised = advertisedUniverse.filter((name) => hot.has(name));
+      // Permissions remain fullAllowed. mcpToolAllowlist means "always load"
+      // when native ToolSearch is on; the SDK registers all other tools deferred.
+      jitAllowed = fullAllowed;
+      mcpToolAllowlist = jitAdvertised;
+      jitDropped = advertisedUniverse.length - jitAdvertised.length;
+      jitReason = 'native-tool-search-deferred';
+    } catch {
+      jitAllowed = fullAllowed;
+      jitAdvertised = advertisedUniverse;
+      mcpToolAllowlist = undefined;
+      jitDropped = 0;
+      jitReason = 'native-tool-search-error-fellback';
+    }
+  } else if (jitDecision.active && request.message.trim()) {
     try {
       const descByName = await coreToolDescriptions();
       // Fold recent prior-turn messages into the ranking query so bare follow-ups
       // inherit the conversation's intent (parity with the Codex lane).
-      const jitQuery = [request.message, ...recentPriorBrainInputs(sessionId, request.message)]
-        .filter((s) => s.trim().length > 0)
-        .join('\n');
       const selection = await selectToolsForTurn({
         userInput: jitQuery,
         tools: advertisedUniverse.map((name) => ({ name, description: descByName.get(name) ?? '' })),
@@ -1479,7 +1507,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         sessionId, turn: 0, role: 'system', type: 'tool_jit_scope',
         data: {
           lane: 'claude_sdk',
-          jitActive: jitDecision.active,
+          jitActive: nativeDeferredAcquisition || jitDecision.active,
+          acquisition: nativeDeferredAcquisition ? 'native_tool_search' : 'semantic_jit',
           droppedCount: jitDropped,
           exposedCount: jitAdvertised.length,
           fastAllowCount: jitAllowed.length,

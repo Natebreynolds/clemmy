@@ -22,7 +22,8 @@ import assert from 'node:assert/strict';
 const { buildOrchestratorAgent, localMemoryBuiltinScope } = await import('./orchestrator.js');
 const { createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
-// A discovery tool that is NOT in the hot set for a benign query (not TOOL_JIT_MANDATED,
+// A discovery tool that is NOT in the hot set for a benign query (not in the
+// tiny acquisition/recovery kernel,
 // no recall/LRU) → it must be first-class OFF but catalog-only ON.
 const CATALOG_ONLY_WHEN_ON = 'workflow_import_framework';
 const USER_INPUT = 'hello there, how are you today';
@@ -88,7 +89,8 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
 
   // Hot-set members are real first-class tools when on.
   assert.ok(on.has('tool_search'), 'tool_search (mandated) stays first-class');
-  assert.ok(on.has('memory_recall'), 'a TOOL_JIT_MANDATED tool stays first-class');
+  assert.ok(on.has('memory_recall_all'), 'the memory acquisition primitive stays first-class');
+  assert.equal(on.has('memory_recall'), false, 'specialized recall remains deferred and callable');
 
   // A non-hot discovery tool leaves the schema surface.
   assert.ok(off.has(CATALOG_ONLY_WHEN_ON), `${CATALOG_ONLY_WHEN_ON} is first-class off`);
@@ -105,7 +107,8 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok(instr.includes('[tool-catalog]'), 'catalog block injected when on');
   assert.ok(instr.includes(CATALOG_ONLY_WHEN_ON), 'the catalog lists the tools it moved off first-class');
   const catalog = instr.split('[tool-catalog]')[1] ?? '';
-  assert.ok(!catalog.includes('\nmemory_recall —'), 'a first-class tool is not duplicated in the deferred catalog');
+  assert.ok(!catalog.includes('\nmemory_recall_all —'), 'a first-class tool is not duplicated in the deferred catalog');
+  assert.ok(catalog.includes('\nmemory_recall —'), 'specialized recall stays reachable through the deferred catalog');
   assert.ok(!catalog.includes('\ncron_list —'), 'a CLI-only tool is never advertised on the chat catalog');
 
   // Telemetry records the split.
@@ -116,6 +119,7 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok((data.firstClassCount ?? 0) > 0, 'firstClassCount recorded');
   assert.ok((data.catalogCount ?? 0) > 0, 'catalogCount recorded');
   assert.ok((data.estCatalogTokens ?? 0) > 0, 'estCatalogTokens recorded');
+  assert.ok((data.firstClassCount ?? 999) <= 12, 'benign turns keep a bounded schema-loaded surface');
 });
 
 test('ON: an excluded tool is absent from both first-class and deferred reachability', async () => {

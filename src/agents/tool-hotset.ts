@@ -21,7 +21,10 @@ import pino from 'pino';
 const logger = pino({ name: 'clementine-next.tool-hotset' });
 
 /** Most-recent-first names a session has reached for, capped per session. */
-const PER_SESSION_CAP = 16;
+// Only ACTUALLY-dispatched tools are promoted. Three is enough to remove repeat
+// dispatcher friction without letting a long conversation slowly reconstruct
+// the old 60-schema always-loaded surface.
+const PER_SESSION_CAP = 3;
 /** Cap the number of sessions retained so the state file can't grow unbounded. */
 const MAX_SESSIONS = 200;
 

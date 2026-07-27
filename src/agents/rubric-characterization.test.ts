@@ -125,8 +125,8 @@ test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewabl
 test('lean variant: registered behind the variant switch, materially leaner, keeps load-bearing rules', () => {
   // Wired into the A/B substrate (opt in via CLEMMY_RUBRIC_VARIANT=lean)…
   assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.lean, ORCHESTRATOR_INSTRUCTIONS_LEAN, 'lean must be registered in the variant map');
-  // …default is unchanged (legacy), so there is zero behavior change until an A/B flips it.
-  assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.legacy, renderClemRubric('codex'), 'legacy stays the codex default');
+  // The legacy body stays intact as a one-flag rollback.
+  assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.legacy, renderClemRubric('codex'), 'legacy rollback stays canonical');
   // Genuinely a prune: well under half the legacy size.
   assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.length * 2 < renderClemRubric('codex').length, 'lean must be far smaller than legacy');
   // Load-bearing rules survive the prune (composition invariants):

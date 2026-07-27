@@ -727,8 +727,7 @@ export const RUBRIC_INSTRUCTIONS_BY_VARIANT: Record<string, string> = {
   legacy: ORCHESTRATOR_INSTRUCTIONS,
   // Phase-5 surgical prune (~1/4 the tokens) — composed of proven text (the
   // lean Claude-brain rubric + Codex essentials + the decision contract +
-  // tail). Opt in with CLEMMY_RUBRIC_VARIANT=lean to A/B; default stays legacy
-  // until a live A/B shows reliability ≥ legacy. See clem-rubric.ts.
+  // tail). This is the default; CLEMMY_RUBRIC_VARIANT=legacy is the rollback.
   lean: ORCHESTRATOR_INSTRUCTIONS_LEAN,
 };
 
@@ -750,7 +749,17 @@ export function selectOrchestratorRubric(sessionId?: string | null): {
   // the requested one" — true if resolveRubricVariant fell back OR the resolved
   // variant has no real instructions registered (a future mis-registration).
   if (mapped == null) {
-    return { variant: DEFAULT_RUBRIC_VARIANT, requested: choice.requested, fellBack: true, experiment: choice.experiment, arm: choice.arm, instructions: ORCHESTRATOR_INSTRUCTIONS };
+    const fallbackVariant = RUBRIC_INSTRUCTIONS_BY_VARIANT[DEFAULT_RUBRIC_VARIANT]
+      ? DEFAULT_RUBRIC_VARIANT
+      : 'legacy';
+    return {
+      variant: fallbackVariant,
+      requested: choice.requested,
+      fellBack: true,
+      experiment: choice.experiment,
+      arm: choice.arm,
+      instructions: RUBRIC_INSTRUCTIONS_BY_VARIANT[fallbackVariant] ?? ORCHESTRATOR_INSTRUCTIONS,
+    };
   }
   return { ...choice, instructions: mapped };
 }
@@ -1796,8 +1805,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // Schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 1), behind
   // CLEMMY_CODEX_TOOL_SEARCH (default ON since v1.3.0; =off restores the full
   // first-class surface byte-identically). When active on an interactive chat lane:
-  // first-class tools = structural + the session HOT SET (TOOL_JIT_MANDATED ∪ recall
-  // pins ∪ session LRU); every other discovery tool leaves the schema surface and
+  // first-class tools = structural + the tiny acquisition/recovery kernel + a
+  // bounded set of explicitly named / proven / actually-used tools; every other
+  // discovery tool leaves the schema surface and
   // appears only in the catalog block, reachable THIS turn via call_tool. The catalog
   // is injected via the SAME instructions-trailer mechanism as codeModeMandate (a
   // per-turn re-render), not baked into a separate cacheable prefix.
@@ -1827,7 +1837,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         availableNames,
         excludeNames: excludes,
         promotedNames: hot,
-        deferralEnabled: true,
+        // The explicit local-memory scope intentionally suppresses call_tool,
+        // so every policy-allowed memory tool must stay directly reachable.
+        // General turns have the dispatcher and can safely defer.
+        deferralEnabled: !localMemoryScope,
         reason: 'Codex schema-on-demand surface',
       });
       const firstClassNames = new Set(surface.firstClass);

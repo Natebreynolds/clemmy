@@ -30,11 +30,16 @@ import {
   maxTurnsForRole,
   defaultToolCallsPerTurn,
   withHarnessRunContext,
+  harnessRunContextStorage,
   harnessToolBracketsEnabled,
   startGate,
   type HarnessRunContext,
 } from './brackets.js';
-import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
+import {
+  compactInFlightToolContext,
+  compactSessionIfNeeded,
+  checkpointGoalStage,
+} from './compaction.js';
 import {
   pullRecentTurnsForHarnessHistory,
   renderRecentActionsForHarnessHistory,
@@ -50,6 +55,7 @@ import {
   estimateTokens,
   predictTurnCost,
 } from './budget.js';
+import { estimateInputTokens } from './token-estimator.js';
 import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
@@ -1335,6 +1341,41 @@ export const DEFAULT_MAX_CONVERSATION_WALL_MS = positiveIntEnv(
   'HARNESS_MAX_CONVERSATION_WALL_MS',
   positiveIntEnv('HARNESS_MAX_CONVERSATION_WALL_MINUTES', 120) * 60 * 1000,
 );
+
+function inFlightCompactionEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_INFLIGHT_COMPACTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+function estimateAgentToolPromptComponents(agent: Agent<any, any>): Record<string, number> {
+  let firstClass = 0;
+  let deferredIndex = 0;
+  for (const rawTool of agent.tools ?? []) {
+    const tool = rawTool as unknown as Record<string, unknown>;
+    try {
+      if (tool.deferLoading === true) {
+        deferredIndex += estimateTokens(JSON.stringify({
+          type: tool.type,
+          name: tool.name,
+          description: tool.description,
+        }));
+      } else {
+        firstClass += estimateTokens(JSON.stringify({
+          type: tool.type,
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+          strict: tool.strict,
+        }));
+      }
+    } catch {
+      firstClass += 50;
+    }
+  }
+  return {
+    ...(firstClass > 0 ? { toolSchemas: firstClass } : {}),
+    ...(deferredIndex > 0 ? { deferredToolIndex: deferredIndex } : {}),
+  };
+}
 
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
@@ -5456,12 +5497,80 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // (1) a per-turn memory primer from local FTS/hybrid recall, and
   // (2) retry context for infra-error recovery. Honors
   // CLEMMY_TURN_MEMORY_PRIMER=off and CLEMMY_RETRY_CONTEXT_INJECT=off.
+  let inFlightCompactionReported = false;
+  const toolPromptComponents = estimateAgentToolPromptComponents(options.agent);
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
   }) => {
     let modelData = args.modelData;
+    let promptComponents: Record<string, number> = {};
+    const publishPromptComponents = <T extends { input: AgentInputItem[]; instructions?: string }>(value: T): T => {
+      const harnessContext = harnessRunContextStorage.getStore();
+      if (harnessContext) {
+        harnessContext.promptComponents = Object.keys(promptComponents).length > 0
+          ? { ...promptComponents }
+          : {
+              instructions: estimateTokens(value.instructions),
+              history: estimateInputTokens(value.input),
+              ...toolPromptComponents,
+            };
+      }
+      return value;
+    };
     try {
+      // The Runner may make dozens of model calls inside this ONE turn. Its
+      // persisted history must remain lossless, but later model calls should
+      // not re-send every raw result from the beginning of the turn. Once the
+      // completed-result payload crosses the threshold, replace only the
+      // model-facing old pairs with a recall ledger and retain a recent working
+      // set. Every full output was durably parked by the tool-end hook first.
+      if (inFlightCompactionEnabled()) {
+        const compacted = compactInFlightToolContext(modelData.input, options.sessionId, {
+          resultTriggerTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS', 32_000),
+          retainedResultBudgetTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', 20_000),
+          minRetainPairs: positiveIntEnv('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', 3),
+          maxRetainPairs: positiveIntEnv('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', 8),
+        });
+        if (compacted.applied) {
+          modelData = {
+            input: compacted.nextItems,
+            instructions: modelData.instructions,
+          };
+          if (!inFlightCompactionReported) {
+            inFlightCompactionReported = true;
+            safeAppend({
+              sessionId: options.sessionId,
+              turn,
+              role: 'system',
+              type: 'condenser_applied',
+              data: {
+                inFlight: true,
+                layer1: {
+                  applied: true,
+                  clipped: 0,
+                  collapsedToolPairs: compacted.collapsed,
+                },
+                layer2: { applied: false },
+                layer3: { applied: false },
+                beforeTokens: compacted.beforeTokens,
+                afterTokens: compacted.afterTokens,
+                budgetTokens: compacted.triggerTokens,
+                resultTokensBefore: compacted.resultTokensBefore,
+                retainedToolPairs: compacted.retainedPairs,
+              },
+            });
+          }
+        }
+      }
+
+      promptComponents = {
+        instructions: estimateTokens(modelData.instructions),
+        history: estimateInputTokens(modelData.input),
+        ...toolPromptComponents,
+      };
+
       if (contextPacket.text) {
+        promptComponents.contextPacket = estimateTokens(contextPacket.text);
         modelData = {
           input: [
             ...modelData.input,
@@ -5472,6 +5581,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       }
 
       if (turnMemoryPrimer.text) {
+        promptComponents.memoryPrimer = estimateTokens(turnMemoryPrimer.text);
         modelData = {
           input: [
             ...modelData.input,
@@ -5485,26 +5595,32 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // transient context (like the memory primer — never persisted into
       // session history, re-rendered fresh from the store each turn).
       if (activeGoalForTurn) {
+        const goalContext = renderGoalContextBlock(activeGoalForTurn);
+        promptComponents.goal = estimateTokens(goalContext);
         modelData = {
           input: [
             ...modelData.input,
-            { role: 'system', content: renderGoalContextBlock(activeGoalForTurn) } as AgentInputItem,
+            { role: 'system', content: goalContext } as AgentInputItem,
           ],
           instructions: modelData.instructions,
         };
       }
 
       if ((getRuntimeEnv('CLEMMY_RETRY_CONTEXT_INJECT', 'on') ?? 'on').toLowerCase() === 'off') {
-        return modelData;
+        return publishPromptComponents(modelData);
       }
       const recentAwaiting = listEvents(options.sessionId, { types: ['awaiting_user_input'], limit: 1, desc: true });
       const last = recentAwaiting[recentAwaiting.length - 1];
       const lastData = last?.data as
         | { source?: string; retry_context?: Record<string, unknown> | null; boundaryKind?: string }
         | undefined;
-      if (lastData?.source !== 'infra_error_recovery' || !lastData.retry_context) return modelData;
+      if (lastData?.source !== 'infra_error_recovery' || !lastData.retry_context) {
+        return publishPromptComponents(modelData);
+      }
       const userInputRaw = typeof options.input === 'string' ? options.input.trim() : '';
-      if (!/^(retry|yes|continue|resume|go|try again)$/i.test(userInputRaw)) return modelData;
+      if (!/^(retry|yes|continue|resume|go|try again)$/i.test(userInputRaw)) {
+        return publishPromptComponents(modelData);
+      }
       const ctx = lastData.retry_context as {
         failed_tool?: string;
         failed_args?: string | null;
@@ -5523,12 +5639,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           `If the same call is not the right move (e.g. the args genuinely need to change), call ` +
           `\`ask_user_question\` to clarify — do not silently change resources or scope.`,
       } as AgentInputItem;
-      return {
+      promptComponents.retryContext = estimateInputTokens([retryMsg]);
+      return publishPromptComponents({
         input: [...modelData.input, retryMsg],
         instructions: modelData.instructions,
-      };
+      });
     } catch {
-      return modelData; // best-effort
+      return publishPromptComponents(modelData); // best-effort
     }
   });
 

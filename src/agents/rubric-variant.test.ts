@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT, assignRubricArm } from './rubric-variant.js';
-import { selectOrchestratorRubric, RUBRIC_INSTRUCTIONS_BY_VARIANT, ORCHESTRATOR_INSTRUCTIONS } from './orchestrator.js';
+import {
+  selectOrchestratorRubric,
+  RUBRIC_INSTRUCTIONS_BY_VARIANT,
+  ORCHESTRATOR_INSTRUCTIONS,
+} from './orchestrator.js';
+import { ORCHESTRATOR_INSTRUCTIONS_LEAN } from './clem-rubric.js';
 
 function withVariant(value: string | undefined, fn: () => void): void {
   const prev = process.env.CLEMMY_RUBRIC_VARIANT;
@@ -32,12 +37,13 @@ function withAb(opts: { on: boolean; ratio?: string }, fn: () => void): void {
 const AVAILABLE = ['legacy'] as const;
 const BOTH = ['legacy', 'lean'] as const;
 
-test('resolveRubricVariant: unset → the proven default, no fallback flag', () => {
+test('resolveRubricVariant: unset → the available safe fallback when lean is absent', () => {
   withVariant(undefined, () => {
     const r = resolveRubricVariant(AVAILABLE);
-    assert.equal(r.variant, DEFAULT_RUBRIC_VARIANT);
+    assert.equal(DEFAULT_RUBRIC_VARIANT, 'lean');
+    assert.equal(r.variant, 'legacy');
     assert.equal(r.requested, DEFAULT_RUBRIC_VARIANT);
-    assert.equal(r.fellBack, false);
+    assert.equal(r.fellBack, true);
   });
 });
 
@@ -72,19 +78,19 @@ test('resolveRubricVariant: case-insensitive + trims whitespace', () => {
   });
 });
 
-test('selectOrchestratorRubric: DEFAULT is byte-identical to the legacy rubric (no behavior change)', () => {
+test('selectOrchestratorRubric: DEFAULT is the characterized lean rubric', () => {
   withVariant(undefined, () => {
     const sel = selectOrchestratorRubric();
-    assert.equal(sel.variant, 'legacy');
+    assert.equal(sel.variant, 'lean');
     assert.equal(sel.fellBack, false);
-    assert.equal(sel.instructions, ORCHESTRATOR_INSTRUCTIONS, 'default must select the unchanged 34KB rubric');
+    assert.equal(sel.instructions, ORCHESTRATOR_INSTRUCTIONS_LEAN);
   });
 });
 
-test('selectOrchestratorRubric: an unknown variant still serves the legacy rubric (fail-safe)', () => {
+test('selectOrchestratorRubric: an unknown variant serves the lean default observably', () => {
   withVariant('does-not-exist', () => {
     const sel = selectOrchestratorRubric();
-    assert.equal(sel.instructions, ORCHESTRATOR_INSTRUCTIONS);
+    assert.equal(sel.instructions, ORCHESTRATOR_INSTRUCTIONS_LEAN);
     assert.equal(sel.fellBack, true);
   });
 });

@@ -75,6 +75,8 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE;
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
+  delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
+  delete process.env.CLEMMY_TOOL_JIT;
   delete process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS;
   delete process.env.CLEMMY_UNIFIED_RECALL;
   delete process.env.CLEMMY_UNIFIED_TURN_PRIMER;
@@ -1058,9 +1060,10 @@ test('the shared post-turn seam FIRES on the Claude brain lane (auto-credit runs
 });
 
 test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
-  // Guards the kill-switch path: with CLEMMY_TOOL_JIT=off the brain must not reduce
-  // the tool surface (no mcpToolAllowlist → MCP server advertises every tool).
+  // Guards both kill switches: disabling native ToolSearch and semantic JIT
+  // restores the pre-deferral surface byte-for-byte.
   process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'off';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.AUTH_MODE = 'claude_oauth';
   let captured: any;
@@ -1073,6 +1076,34 @@ test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllo
   // full profile still present (e.g. the agentic execution tools), unfiltered.
   assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'));
   assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'));
+});
+
+test('full mode: native ToolSearch loads a bounded hot set without pruning permissions', async () => {
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.AUTH_MODE = 'claude_oauth';
+  let captured: any;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured = options;
+    return { text: 'ok', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [], usage: { input_tokens: 1, output_tokens: 1 } };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Use run_shell_command to inspect the project.',
+    sessionId: 'native-tool-search-run',
+  });
+
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'), 'the full permission surface remains allowed');
+  assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'));
+  assert.ok(captured.mcpToolAllowlist.includes('memory_recall_all'), 'the recovery kernel stays first-class');
+  assert.ok(captured.mcpToolAllowlist.includes('run_shell_command'), 'an explicitly named tool is promoted');
+  assert.ok(
+    captured.mcpToolAllowlist.length < captured.allowedLocalMcpTools.length,
+    'unneeded schemas are deferred instead of permission-pruned',
+  );
+  const scope = listEvents('native-tool-search-run', { types: ['tool_jit_scope'] }).at(-1);
+  assert.equal(scope?.data.acquisition, 'native_tool_search');
+  assert.equal(scope?.data.reason, 'native-tool-search-deferred');
 });
 
 test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {

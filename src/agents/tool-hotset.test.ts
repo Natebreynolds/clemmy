@@ -18,15 +18,15 @@ test('records most-recent-first and dedupes', () => {
   assert.deepEqual(getHotSet(sid), ['alpha', 'beta']);
 });
 
-test('caps at 16 names per session', () => {
+test('caps at 3 actually-used names per session', () => {
   _resetHotSetForTest();
   const sid = 'lru-b';
   for (let i = 0; i < 25; i++) recordToolHit(sid, `tool_${i}`);
   const hot = getHotSet(sid);
-  assert.equal(hot.length, 16);
-  // most recent (tool_24) at front, oldest kept is tool_9
+  assert.equal(hot.length, 3);
+  // most recent (tool_24) at front, oldest kept is tool_22
   assert.equal(hot[0], 'tool_24');
-  assert.equal(hot[hot.length - 1], 'tool_9');
+  assert.equal(hot[hot.length - 1], 'tool_22');
 });
 
 test('persists across an in-memory cache reset (reads back from disk)', () => {

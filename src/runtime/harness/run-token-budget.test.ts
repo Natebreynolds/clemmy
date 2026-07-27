@@ -30,7 +30,7 @@ const {
   resolveRunTokenCeiling,
   runTokenBudgetEnforcementEnabled,
 } = await import('./run-token-budget.js');
-const { recordModelUsage } = await import('../usage-log.js');
+const { recordModelUsage, readUsageEventsForDate } = await import('../usage-log.js');
 const { recordCodexHarnessUsage } = await import('./codex-model.js');
 const { harnessRunContextStorage, ToolCallsCounter } = await import('./brackets.js');
 
@@ -97,7 +97,11 @@ test('recordModelUsage accrues UNCACHED tokens to the source session', () => {
 
 test('recordCodexHarnessUsage records under the ALS run session (the false-pass fix)', () => {
   const sess = freshSession();
-  harnessRunContextStorage.run({ sessionId: sess, counter: new ToolCallsCounter(100) }, () => {
+  harnessRunContextStorage.run({
+    sessionId: sess,
+    counter: new ToolCallsCounter(100),
+    promptComponents: { instructions: 2_500, toolSchemas: 1_000 },
+  }, () => {
     recordCodexHarnessUsage(
       { input_tokens: 10_000, output_tokens: 2_000, total_tokens: 12_000, input_tokens_details: { cached_tokens: 4_000 } },
       'gpt-5.6-codex',
@@ -105,6 +109,12 @@ test('recordCodexHarnessUsage records under the ALS run session (the false-pass 
     );
   });
   assert.equal(getSessionTokensUsed(sess), 8_000, 'the Codex harness lane now meters (uncached)');
+  const usage = readUsageEventsForDate().find((event) => event.responseId === 'resp-1');
+  assert.deepEqual(usage?.promptComponents, {
+    instructions: 2_500,
+    toolSchemas: 1_000,
+    providerAndToolOverhead: 6_500,
+  });
 });
 
 test('sumSessionTokensUsedByPrefix sums a workflow run and escapes LIKE metacharacters', () => {

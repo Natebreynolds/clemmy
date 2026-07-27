@@ -56,6 +56,7 @@
     "eval:spans": "tsx scripts/eval-spans.ts",
     "eval:promote": "tsx scripts/eval-promote.ts",
     "measure:code-mode": "tsx scripts/measure-code-mode-opportunity.ts",
+    "measure:efficiency": "tsx scripts/measure-efficiency.ts",
     "probe:judge": "tsx scripts/probe-boundary-judge.ts",
     "probe:judge:live": "tsx scripts/probe-judge-live.ts",
     "stress:memory": "tsx scripts/memory-roundtrip-stress.ts",

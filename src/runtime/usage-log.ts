@@ -113,6 +113,27 @@ export function classifyUsageKind(sessionId: string, channel?: string): UsageKin
 }
 
 /**
+ * Sanitize assembly-time estimates and make their gap to provider-reported
+ * input explicit. The remainder includes provider framing and any schemas a
+ * lane cannot inspect (notably native MCP tools on the Claude SDK path).
+ */
+export function reconcilePromptComponents(
+  components: Record<string, number> | undefined,
+  inputTokens: number,
+): Record<string, number> | undefined {
+  if (!components) return undefined;
+  const clean: Record<string, number> = {};
+  for (const [name, raw] of Object.entries(components)) {
+    if (!name || !Number.isFinite(raw) || raw <= 0) continue;
+    clean[name] = Math.round(raw);
+  }
+  const attributed = Object.values(clean).reduce((sum, value) => sum + value, 0);
+  const remainder = Math.max(0, Math.round(inputTokens) - attributed);
+  if (remainder > 0) clean.providerAndToolOverhead = remainder;
+  return clean;
+}
+
+/**
  * Convenience recorder shared by every model lane. Derives `source`/`kind`/`at`
  * from the session so the Codex, Claude, and BYO brains all log usage the SAME
  * way (today only the Codex native runtime logged; the Claude/BYO lanes were
@@ -153,7 +174,7 @@ export function recordModelUsage(args: {
     durationMs: args.durationMs,
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
-    promptComponents: args.promptComponents,
+    promptComponents: reconcilePromptComponents(args.promptComponents, args.inputTokens),
     contextWindowTokens: args.contextWindowTokens,
     windowUtilization: args.windowUtilization,
     firstByteMs: args.firstByteMs,

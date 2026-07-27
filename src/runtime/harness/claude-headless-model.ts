@@ -397,7 +397,8 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
     const inputTokens = n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens);
     const outputTokens = n(u.output_tokens);
     if (inputTokens === 0 && outputTokens === 0) return;
-    const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? state.sessionId ?? 'unknown';
+    const harnessContext = harnessRunContextStorage.getStore();
+    const sessionId = harnessContext?.sessionId ?? state.sessionId ?? 'unknown';
     recordModelUsage({
       sessionId,
       model: state.model || 'claude-headless',
@@ -406,6 +407,7 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
       outputTokens,
       totalTokens: inputTokens + outputTokens,
       responseId: state.requestId || state.responseId,
+      promptComponents: harnessContext?.promptComponents,
     });
   } catch { /* observability must never break the response path */ }
 }

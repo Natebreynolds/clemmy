@@ -29,6 +29,7 @@ const { resetEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPU
 const {
   clipOldToolResults,
   collapseOldCompletedToolPairs,
+  compactInFlightToolContext,
   compactSessionIfNeeded,
   summarizeOlderMessages,
   validateCallIdReferences,
@@ -220,6 +221,44 @@ test('collapseOldCompletedToolPairs — skips old pairs that are not recallable 
   );
   assert.equal(remainingCallIds.has('call_0'), false);
   assert.equal(remainingCallIds.has('call_1'), true, 'unrecallable old pair should stay verbatim');
+});
+
+test('compactInFlightToolContext — bounds same-turn results without mutating durable history', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const items: AgentInputItem[] = [userMessage('research all ten targets')];
+  for (let i = 0; i < 10; i++) {
+    const callId = `flight_${i}`;
+    const output = `target ${i} ${'r'.repeat(4000)}`;
+    items.push(toolCall(callId, 'research.target', `{"target":${i}}`));
+    items.push(toolResult(callId, output));
+    writeToolOutput({ sessionId: sess.id, callId, tool: 'research.target', output });
+  }
+  const originalJson = JSON.stringify(items);
+
+  const result = compactInFlightToolContext(items, sess.id, {
+    resultTriggerTokens: 1_000,
+    retainedResultBudgetTokens: 2_000,
+    minRetainPairs: 2,
+    maxRetainPairs: 4,
+  });
+
+  assert.equal(result.applied, true);
+  assert.equal(result.retainedPairs, 2, 'the minimum recent working set survives even when it exceeds the soft budget');
+  assert.equal(result.collapsed, 8);
+  assert.ok(result.afterTokens < result.beforeTokens);
+  assert.equal(JSON.stringify(items), originalJson, 'model-only compaction must not mutate durable Runner history');
+
+  const filteredJson = JSON.stringify(result.nextItems);
+  assert.match(filteredJson, /summary of older completed tool activity/);
+  const summary = result.nextItems.find((item) =>
+    (item as { role?: unknown }).role === 'system'
+    && typeof (item as { content?: unknown }).content === 'string',
+  ) as { content: string } | undefined;
+  assert.match(summary?.content ?? '', /recall_tool_result\("flight_0"\)/);
+  assert.doesNotMatch(filteredJson, /"callId":"flight_0"/);
+  assert.match(filteredJson, /"callId":"flight_8"/);
+  assert.match(filteredJson, /"callId":"flight_9"/);
 });
 
 test('compactSessionIfNeeded — applies pair collapse during layer 1 preflight', async () => {

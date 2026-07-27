@@ -15,8 +15,13 @@ import { createHash } from 'node:crypto';
 
 export type RubricVariant = string;
 
-/** The proven default — the full 34KB rubric. Never regress off this implicitly. */
-export const DEFAULT_RUBRIC_VARIANT = 'legacy';
+/**
+ * The default is the characterized lean rubric. It composes the already-proven
+ * Claude brain rules, the Codex execution/fan-out essentials, and the same
+ * decision/recall contract at roughly one quarter of the legacy prompt cost.
+ * `CLEMMY_RUBRIC_VARIANT=legacy` remains the instant rollback.
+ */
+export const DEFAULT_RUBRIC_VARIANT = 'lean';
 
 /** The two arms a live A/B compares: the lean rubric vs the proven legacy one. */
 export type RubricArm = 'lean' | 'legacy';
@@ -75,10 +80,19 @@ export function resolveRubricVariant(available: readonly string[], sessionId?: s
   if (avail.has(requested)) {
     return { variant: requested, requested, fellBack: false, experiment: false, arm: null };
   }
+  // A lower-level caller may intentionally expose only one variant (unit tests,
+  // a reduced bundle, or an emergency build). Never return a variant that is
+  // absent from the supplied registry; prefer legacy as the universal fallback,
+  // then the first concrete available key.
+  const fallback = avail.has(DEFAULT_RUBRIC_VARIANT)
+    ? DEFAULT_RUBRIC_VARIANT
+    : avail.has('legacy')
+      ? 'legacy'
+      : available.map((v) => v.trim().toLowerCase()).find(Boolean) ?? DEFAULT_RUBRIC_VARIANT;
   return {
-    variant: DEFAULT_RUBRIC_VARIANT,
+    variant: fallback,
     requested,
-    fellBack: requested !== DEFAULT_RUBRIC_VARIANT,
+    fellBack: requested !== fallback,
     experiment: false,
     arm: null,
   };

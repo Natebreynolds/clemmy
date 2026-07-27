@@ -8,15 +8,14 @@
  * tool_search (names + one-liners + full schema for the top hits). First-class
  * schemas are reserved for the HOT SET (resolveHotSet).
  *
- * Phase 0 is additive + dormant: these helpers ship and the tool_search tool is
- * registered, but nothing here is wired into the live orchestrator surface yet
- * (that is Phase 1, behind CLEMMY_CODEX_TOOL_SEARCH). No import cycle: this module
- * imports only the registry (plain data), tool-jit's exported seed/recall helpers,
- * and the hot-set store — never the orchestrator or the runtime tool registry.
+ * The live Codex orchestrator and Claude native-ToolSearch brain both consume
+ * this bounded hot set. No import cycle: this module imports only the registry
+ * (plain data), tool-jit's recall helpers, and the hot-set store — never the
+ * orchestrator or the runtime tool registry.
  */
 import { getRuntimeEnv } from '../config.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
-import { TOOL_JIT_MANDATED, queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
+import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
 
@@ -25,6 +24,30 @@ export interface CatalogEntry {
   /** First-sentence one-liner from the registry (may be empty for a bare tool). */
   oneLiner: string;
 }
+
+/**
+ * The tiny schema-loaded kernel for lanes that have a same-turn acquisition
+ * path (`tool_search` + `call_tool`, or Claude's native ToolSearch).
+ *
+ * This is deliberately NOT TOOL_JIT_MANDATED. That older set protects lanes
+ * which can only use schemas present at turn start, and has accumulated dozens
+ * of incident-specific tools. Reusing it here kept 60+ schemas in every chat
+ * prompt even though every deferred tool remained callable. These four tools
+ * are the actual acquisition/recovery primitives; structural tools such as
+ * ask_user_question, request_approval, and run_worker are assembled separately
+ * by the orchestrator.
+ */
+export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
+  'memory_recall_all',
+  'recall_tool_result',
+  'tool_output_query',
+  'tool_search',
+]);
+
+/** At most the last few tools ACTUALLY dispatched stay schema-loaded. */
+const MAX_SESSION_PROMOTIONS = 3;
+/** Proven choices help skip discovery, but must not rebuild a giant surface. */
+const MAX_RECALL_PROMOTIONS = 3;
 
 /** Every registry tool name (the reachable built-in universe). */
 export function allRegistryNames(): Set<string> {
@@ -58,10 +81,10 @@ export function buildToolCatalog(opts: { allowedNames?: ReadonlySet<string> } = 
 /**
  * The hot set for this turn: tools that get a FIRST-CLASS schema instead of living
  * behind tool_search. Union of
- *   - TOOL_JIT_MANDATED (the structural CORE seed — always first-class),
+ *   - TOOL_SEARCH_ALWAYS_LOADED (the tiny acquisition/recovery kernel),
  *   - exact tool names present in the user's request,
  *   - tool_choice_recall pins for this input (memory says these worked before), and
- *   - the session LRU (tools this session already reached for),
+ *   - a bounded session LRU (tools this session actually dispatched),
  * intersected with policy-allowed (defaults to the whole registry). Only names that
  * are real registry tools survive, so LRU/recall drift can never inject a ghost tool.
  */
@@ -75,12 +98,16 @@ export function resolveHotSet(
   const keep = (name: string) => universe.has(name) && passesPolicy(name, allowed);
 
   const out = new Set<string>();
-  for (const name of TOOL_JIT_MANDATED) if (keep(name)) out.add(name);
+  for (const name of TOOL_SEARCH_ALWAYS_LOADED) if (keep(name)) out.add(name);
   for (const name of universe) {
     if (keep(name) && queryExplicitlyNamesTool(userInput ?? '', name)) out.add(name);
   }
-  for (const name of recallPinnedBuiltinTools(userInput)) if (keep(name)) out.add(name);
-  for (const name of getHotSet(sessionId)) if (keep(name)) out.add(name);
+  for (const name of recallPinnedBuiltinTools(userInput).slice(0, MAX_RECALL_PROMOTIONS)) {
+    if (keep(name)) out.add(name);
+  }
+  for (const name of getHotSet(sessionId).slice(0, MAX_SESSION_PROMOTIONS)) {
+    if (keep(name)) out.add(name);
+  }
   return out;
 }
 

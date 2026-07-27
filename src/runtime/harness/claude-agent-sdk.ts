@@ -26,6 +26,7 @@ import {
   type ClaudeAgentApprovalBoundary,
 } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
+import { estimateTokens } from './budget.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
@@ -985,11 +986,11 @@ export interface ClaudeAgentSdkRunOptions {
    * canUseTool permits only exact-id read-backs for these resources. */
   artifactVerificationOnly?: Array<Pick<ArtifactVerificationIntent, 'kind' | 'resourceId'>>;
   /**
-   * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
-   * spawned advertising ONLY these tools, so the model receives only their schemas
-   * (fewer input tokens). The brain computes it per turn via selectToolsForTurn;
-   * absent → the server advertises every tool (byte-identical). Should be a SUPERSET
-   * of whatever the model is permitted to call (allowedLocalMcpTools).
+   * First-class local MCP tools. In agentic mode with native ToolSearch enabled,
+   * the SDK registers the full permission surface but schema-loads only these
+   * names; every other allowed tool remains deferred and same-turn searchable.
+   * With native ToolSearch disabled (or on a non-agentic lane), this retains its
+   * legacy meaning as the exact advertised allowlist.
    */
   mcpToolAllowlist?: string[];
   /**
@@ -1306,6 +1307,18 @@ function recordClaudeAgentSdkUsage(
     const responseId = (result as { uuid?: unknown } | null)?.uuid;
     const providerApiDurationMs = (result as { duration_api_ms?: unknown } | null)?.duration_api_ms;
     const contextWindowTokens = contextWindowFromResult(result);
+    const priorTranscript = options.priorTurns && options.priorTurns.length > 0
+      ? renderTranscriptTurns(options.priorTurns)
+      : '';
+    const promptComponents = {
+      instructions: estimateTokens(options.systemAppend),
+      history: estimateTokens(priorTranscript),
+      contextPacket: estimateTokens(options.turnContext),
+      currentMessage: estimateTokens(options.prompt),
+      ...(options.outputSchema
+        ? { outputSchema: estimateTokens(JSON.stringify(options.outputSchema)) }
+        : {}),
+    };
     recordModelUsage({
       sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
       model: init?.model || options.modelId || 'claude-agent-sdk',
@@ -1316,6 +1329,7 @@ function recordClaudeAgentSdkUsage(
       durationMs: numeric((result as { duration_ms?: unknown } | null)?.duration_ms),
       ...(typeof providerApiDurationMs === 'number' && Number.isFinite(providerApiDurationMs) ? { providerApiDurationMs } : {}),
       responseId: typeof responseId === 'string' ? responseId : undefined,
+      promptComponents,
       ...(timing && timing.firstByteMs !== null ? { firstByteMs: timing.firstByteMs } : {}),
       ...(contextWindowTokens
         ? {

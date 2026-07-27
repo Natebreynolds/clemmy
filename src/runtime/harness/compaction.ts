@@ -62,6 +62,10 @@ const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
 const DEFAULT_LAYER1_ITEM_TRIGGER_MIN_FRACTION = 0.5;
 const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
+const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
+const DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS = 20_000;
+const DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS = 3;
+const DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS = 8;
 const COMPACTION_SYSTEM_SUMMARY_PREFIXES = [
   '[summary of older completed tool activity]',
   '[summary of earlier conversation]',
@@ -299,13 +303,13 @@ function collapsedPairLine(pair: CompletedToolPair): string {
   const args = pair.args ? oneLine(pair.args, 180) : '{}';
   const clippedMarker = pair.resultText.match(/\[clipped:[^\]]*recall_tool_result\("[^"]+"\)[^\]]*\]/)?.[0];
   const result = clippedMarker ?? oneLine(pair.resultText, 220);
-  return `- ${pair.name} [${pair.callId}] args: ${args}; result: ${result || '(empty)'} [clipped: ${pair.name} collapsed before this turn - call recall_tool_result("${pair.callId}") for full output]`;
+  return `- ${pair.name} [${pair.callId}] args: ${args}; result: ${result || '(empty)'} [clipped: ${pair.name} collapsed from active context - call recall_tool_result("${pair.callId}") for full output]`;
 }
 
 function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[]): AgentInputItem {
   const lines: string[] = [
     '[summary of older completed tool activity]',
-    `${pairs.length} older completed tool call/result pairs were collapsed before this turn to keep the first model request small. Recent tool calls remain verbatim. Exact older outputs remain available with recall_tool_result("call_id").`,
+    `${pairs.length} older completed tool call/result pairs were collapsed to keep the active model context small. Recent tool calls remain verbatim. Exact older outputs remain available with recall_tool_result("call_id").`,
   ];
 
   let chars = lines.join('\n').length;
@@ -422,6 +426,122 @@ export function collapseOldCompletedToolPairs(
     nextItems,
     collapsed: pairs.length,
     callIds: pairs.map((pair) => pair.callId),
+  };
+}
+
+export interface InFlightToolContextOptions {
+  /** Begin compacting once completed tool-result payloads exceed this estimate. */
+  resultTriggerTokens?: number;
+  /** Keep as many newest result pairs as fit within this estimate. */
+  retainedResultBudgetTokens?: number;
+  /** Always keep at least this many newest completed pairs verbatim. */
+  minRetainPairs?: number;
+  /** Never keep more than this many completed pairs once pressure triggers. */
+  maxRetainPairs?: number;
+}
+
+export interface InFlightToolContextResult {
+  nextItems: AgentInputItem[];
+  applied: boolean;
+  collapsed: number;
+  callIds: string[];
+  retainedPairs: number;
+  resultTokensBefore: number;
+  beforeTokens: number;
+  afterTokens: number;
+  triggerTokens: number;
+}
+
+/**
+ * Model-only compaction for a tool-heavy Runner loop.
+ *
+ * `compactSessionIfNeeded` runs between user turns, but one SDK Runner call can
+ * itself contain dozens of model→tool→model rounds. Without this seam, every
+ * later round resends every earlier raw result from the same turn. Once result
+ * payloads cross a bounded threshold, retain an adaptive recent tail and
+ * replace older, durably parked pairs with a recall ledger.
+ *
+ * This helper is intentionally pure: unlike between-turn Layer 1, it never
+ * mutates or persists `items`. The full transcript remains available to the
+ * Runner and every collapsed result remains losslessly recallable.
+ */
+export function compactInFlightToolContext(
+  items: AgentInputItem[],
+  sessionId?: string,
+  opts: InFlightToolContextOptions = {},
+): InFlightToolContextResult {
+  const triggerTokens = Math.max(1, Math.floor(
+    opts.resultTriggerTokens ?? DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS,
+  ));
+  const retainedBudget = Math.max(1, Math.floor(
+    opts.retainedResultBudgetTokens ?? DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS,
+  ));
+  const minRetain = Math.max(0, Math.floor(
+    opts.minRetainPairs ?? DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS,
+  ));
+  const maxRetain = Math.max(minRetain, Math.floor(
+    opts.maxRetainPairs ?? DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS,
+  ));
+  const beforeTokens = estimateInputTokens(items);
+
+  const callIds = new Set<string>();
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    if (any.type === 'function_call' && typeof any.callId === 'string') {
+      callIds.add(any.callId);
+    }
+  }
+
+  const completedResults: Array<{ callId: string; tokens: number }> = [];
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    const callId = typeof any.callId === 'string' ? any.callId : '';
+    if (any.type !== 'function_call_result' || !callId || !callIds.has(callId)) continue;
+    completedResults.push({ callId, tokens: estimateInputTokens([item]) });
+  }
+  const resultTokensBefore = completedResults.reduce((sum, pair) => sum + pair.tokens, 0);
+  const unchanged = (): InFlightToolContextResult => ({
+    nextItems: items,
+    applied: false,
+    collapsed: 0,
+    callIds: [],
+    retainedPairs: completedResults.length,
+    resultTokensBefore,
+    beforeTokens,
+    afterTokens: beforeTokens,
+    triggerTokens,
+  });
+
+  if (resultTokensBefore <= triggerTokens || completedResults.length <= minRetain) {
+    return unchanged();
+  }
+
+  let retainedPairs = 0;
+  let retainedTokens = 0;
+  for (let i = completedResults.length - 1; i >= 0; i--) {
+    const nextTokens = completedResults[i].tokens;
+    if (retainedPairs < minRetain) {
+      retainedPairs += 1;
+      retainedTokens += nextTokens;
+      continue;
+    }
+    if (retainedPairs >= maxRetain || retainedTokens + nextTokens > retainedBudget) break;
+    retainedPairs += 1;
+    retainedTokens += nextTokens;
+  }
+
+  const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId);
+  if (collapsed.collapsed === 0) return unchanged();
+  return {
+    nextItems: collapsed.nextItems,
+    applied: true,
+    collapsed: collapsed.collapsed,
+    callIds: collapsed.callIds,
+    retainedPairs,
+    resultTokensBefore,
+    beforeTokens,
+    afterTokens: estimateInputTokens(collapsed.nextItems),
+    triggerTokens,
   };
 }
 

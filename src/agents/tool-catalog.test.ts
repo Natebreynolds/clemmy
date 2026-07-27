@@ -18,7 +18,7 @@ const {
 } = await import('./tool-catalog.js');
 const { recordToolHit, getHotSet, _resetHotSetForTest } = await import('./tool-hotset.js');
 const { TOOL_REGISTRY } = await import('../tools/tool-registry.js');
-const { TOOL_JIT_MANDATED } = await import('./tool-jit.js');
+const { TOOL_SEARCH_ALWAYS_LOADED } = await import('./tool-catalog.js');
 
 // ── catalog derives 1:1 from the registry ─────────────────────────────────────
 
@@ -49,15 +49,27 @@ test('buildToolCatalog renders "name — one-liner" lines and is non-trivial', (
 
 // ── hot-set resolution ────────────────────────────────────────────────────────
 
-test('resolveHotSet seeds from TOOL_JIT_MANDATED and includes session LRU', () => {
+test('resolveHotSet seeds from the tiny schema kernel and includes session LRU', () => {
   _resetHotSetForTest();
   const sid = 'sess-hotset-1';
   recordToolHit(sid, 'workflow_schedule'); // a discoverable (non-core) registry tool
   const hot = resolveHotSet(sid, 'schedule a recurring workflow');
 
-  const mandatedInRegistry = [...TOOL_JIT_MANDATED].filter((n) => allRegistryNames().has(n));
-  for (const n of mandatedInRegistry) assert.ok(hot.has(n), `mandated ${n} should be first-class`);
+  const kernelInRegistry = [...TOOL_SEARCH_ALWAYS_LOADED].filter((n) => allRegistryNames().has(n));
+  for (const n of kernelInRegistry) assert.ok(hot.has(n), `schema kernel ${n} should be first-class`);
   assert.ok(hot.has('workflow_schedule'), 'session LRU tool should be promoted');
+});
+
+test('resolveHotSet does not inherit the broad legacy JIT core', () => {
+  const hot = resolveHotSet('sess-lean-kernel', 'hello there');
+  assert.deepEqual(
+    [...hot].sort(),
+    [...TOOL_SEARCH_ALWAYS_LOADED].sort(),
+    'a benign turn should load only the acquisition/recovery kernel',
+  );
+  for (const formerlyBroadCore of ['browser_harness_run', 'composio_execute_tool', 'run_shell_command', 'write_file']) {
+    assert.equal(hot.has(formerlyBroadCore), false, `${formerlyBroadCore} must remain deferred but reachable`);
+  }
 });
 
 test('resolveHotSet drops LRU names that are not real registry tools', () => {
