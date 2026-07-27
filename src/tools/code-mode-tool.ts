@@ -712,6 +712,7 @@ export function codeModeDescription(): string {
     'Run ONE short JavaScript program (the body of an async function — use `return` for the result) against the `clem` API instead of emitting many separate tool calls.',
     'Use this for DATA-HEAVY or MULTI-STEP work — loop/filter/paginate/aggregate over many items and `return` only the distilled result, so the large intermediate tool outputs never enter the conversation.',
     'The API is `clem.<tool>(args)` returning a Promise; built-in tools: ' + surface + '.',
+    'Every `clem.<tool>` promise resolves to that tool\'s normalized payload DIRECTLY — there is no `{ ok, result }` transport wrapper. In particular, `composio_execute_tool` returns `{ successful, data, error? }` at the top level: check `r.successful === true` and read `r.data`, never `r.result.successful` or `r.result.data`.',
     '`run_shell_command` is normalized inside code mode: it returns `{ ok, exit_code, stdout, stderr, raw, stdout_json? }`, not the model-facing `exit_code:\\nstdout:` text wrapper. For JSON-emitting CLIs, use `result.stdout_json ?? JSON.parse(result.stdout)`; never parse the whole tool result.',
     'Obvious upstream tool-error banners return structured `{ ok:false, error, raw }`; branch on `ok === false` instead of trying to parse them as data.',
     'You can ALSO call any connected external MCP tool here by its `<server>__<tool>` name — e.g. `await clem["dataforseo__serp_organic_live_advanced"]({...})` — and they run through the SAME gates as a normal MCP call.',

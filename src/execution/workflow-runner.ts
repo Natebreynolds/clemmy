@@ -4749,6 +4749,64 @@ export function planWorkflowExecutionBatches(
   return batches;
 }
 
+export interface BlockedDependencySkip {
+  stepId: string;
+  output: { blocked: true; reason: string };
+  blockedBy: string[];
+}
+
+/**
+ * A blocked node is a graph outcome, not usable upstream data. Propagate that
+ * outcome through dependent nodes before scheduling another batch so a child
+ * cannot query, write, or send after a prerequisite explicitly said it could
+ * not produce its deliverable. Independent branches remain runnable.
+ *
+ * The closure is computed in one pass-to-fixpoint: a skipped child becomes a
+ * blocked prerequisite for its own descendants. Pure + exported for tests.
+ */
+export function planBlockedDependencySkips(
+  steps: WorkflowStepInput[],
+  stepOutputs: Record<string, unknown>,
+): BlockedDependencySkip[] {
+  const blocked = new Map<string, string>();
+  const rootBlocks = new Map<string, Array<{ stepId: string; reason: string }>>();
+  for (const [stepId, output] of Object.entries(stepOutputs)) {
+    if (!isBlockedStepOutput(output)) continue;
+    const reason = (output as { reason?: unknown }).reason;
+    const normalized = typeof reason === 'string' && reason.trim()
+      ? reason.trim().slice(0, 500)
+      : 'the step reported that it was blocked';
+    blocked.set(stepId, normalized);
+    rootBlocks.set(stepId, [{ stepId, reason: normalized }]);
+  }
+
+  const skips: BlockedDependencySkip[] = [];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const step of steps) {
+      if (step.id in stepOutputs || blocked.has(step.id)) continue;
+      const blockedBy = (step.dependsOn ?? []).filter((dep) => blocked.has(dep));
+      if (blockedBy.length === 0) continue;
+      const roots = Array.from(new Map(
+        blockedBy
+          .flatMap((dep) => rootBlocks.get(dep) ?? [{ stepId: dep, reason: blocked.get(dep) ?? 'blocked' }])
+          .map((root) => [root.stepId, root]),
+      ).values()).slice(0, 4);
+      const detail = roots
+        .map((root) => `"${root.stepId}" (${root.reason})`)
+        .join('; ');
+      const reason = `Skipped because the required upstream path is blocked by ${detail}.`;
+      const output = { blocked: true as const, reason };
+      blocked.set(step.id, reason);
+      rootBlocks.set(step.id, roots);
+      skips.push({ stepId: step.id, output, blockedBy });
+      changed = true;
+    }
+  }
+  return skips;
+}
+
 export interface BatchSettlement {
   completions: Array<{ stepId: string; output: unknown }>;
   parkedSteps: ParkedStepRef[];
@@ -5777,6 +5835,26 @@ async function executeWorkflow(
 
       executionRound += 1;
       maybeWarnRunBudget();
+      // A fulfilled `{blocked:true}` is an honest terminal outcome for that
+      // node, not valid data. Close every dependent branch without executing
+      // more model/tool work; independent branches are left untouched.
+      const dependencySkips = planBlockedDependencySkips(steps, stepOutputs);
+      for (const skipped of dependencySkips) {
+        stepOutputs[skipped.stepId] = skipped.output;
+        completedStepIds.add(skipped.stepId);
+        appendWorkflowEvent(workflowSlug, runId, {
+          kind: 'step_completed',
+          stepId: skipped.stepId,
+          output: skipped.output,
+          meta: {
+            blocked: true,
+            skipped: true,
+            reason: 'blocked_upstream_dependency',
+            blockedBy: skipped.blockedBy,
+          },
+        });
+      }
+      if (completedStepIds.size >= steps.length) break;
       const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
       const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
       const batch = readyBatch.slice(0, concurrencyCap);
@@ -5882,7 +5960,8 @@ async function executeWorkflow(
   // when TRY is running a single step in isolation — the step's own
   // output is the user-facing result.
   let finalOutput: string;
-  if (workflow.synthesis?.prompt && !targetStepId) {
+  const hasBlockedStepOutput = Object.values(stepOutputs).some(isBlockedStepOutput);
+  if (workflow.synthesis?.prompt && !targetStepId && !hasBlockedStepOutput) {
     throwIfWorkflowRunCancelled(runId);
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_started',
@@ -6006,6 +6085,16 @@ async function executeWorkflow(
     throwIfWorkflowRunCancelled(runId);
     finalizeStepOutput(workflowSlug, runId, synthesisStep, finalOutput);
   } else {
+    if (workflow.synthesis?.prompt && !targetStepId && hasBlockedStepOutput) {
+      appendWorkflowEvent(workflowSlug, runId, {
+        kind: 'step_advisory',
+        stepId: '__synthesis__',
+        meta: {
+          reason: 'synthesis_skipped_upstream_block',
+          note: 'Synthesis was skipped because one or more required steps blocked; the deterministic step rollup preserves the actual failure reasons.',
+        },
+      });
+    }
     finalOutput = formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
   }
 

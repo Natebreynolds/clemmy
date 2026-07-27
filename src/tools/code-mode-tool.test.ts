@@ -15,6 +15,7 @@ import {
   isCodeModeToolAllowed,
   isMcpNamespacedTool,
   codeModeMandateDirective,
+  codeModeDescription,
   normalizeCodeModeToolResult,
   parseShellToolOutput,
   runCodeModeForSession,
@@ -170,6 +171,13 @@ test('codeModeMandateDirective: no mandate when code mode itself is off', () => 
 test('buildCodeModeTool exposes run_tool_program with a program parameter', () => {
   const t = buildCodeModeTool() as { name?: string };
   assert.equal(t.name, 'run_tool_program');
+});
+
+test('codeModeDescription names the direct Composio response envelope', () => {
+  const description = codeModeDescription();
+  assert.match(description, /no `\{ ok, result \}` transport wrapper/i);
+  assert.match(description, /r\.successful === true/);
+  assert.match(description, /never `r\.result\.successful`/);
 });
 
 test('parseShellToolOutput: exit_code/stdout/stderr wrapper becomes a structured shell result', () => {

@@ -41,6 +41,7 @@ writeFileSync(
 const {
   applySkillToPrompt,
   planWorkflowExecutionBatches,
+  planBlockedDependencySkips,
   callToolSideEffectClass,
   runDeterministicWorkflowStepForTest,
   workflowRunnerInternalsForTest,
@@ -111,6 +112,26 @@ test('callToolSideEffectClass: telephony + comm-object dispatches are SEND (vali
   assert.equal(callToolSideEffectClass('OUTLOOK_CREATE_DRAFT'), 'write');
   assert.equal(callToolSideEffectClass('VAPI_GET_CALL'), 'read');
   assert.equal(callToolSideEffectClass('TWILIO_LIST_CALLS'), 'read');
+});
+
+test('blocked workflow nodes propagate through dependents without cancelling independent branches', () => {
+  const steps = [
+    { id: 'fetch', prompt: 'fetch' },
+    { id: 'tracker', prompt: 'tracker', dependsOn: ['fetch'] },
+    { id: 'contact', prompt: 'contact', dependsOn: ['fetch', 'tracker'] },
+    { id: 'write', prompt: 'write', dependsOn: ['contact'] },
+    { id: 'independent', prompt: 'independent' },
+  ];
+  const skips = planBlockedDependencySkips(steps, {
+    fetch: { accounts: [{ id: 'a' }] },
+    tracker: { blocked: true, reason: 'Google Sheets auth expired' },
+  });
+
+  assert.deepEqual(skips.map((skip) => skip.stepId), ['contact', 'write']);
+  assert.deepEqual(skips[0].blockedBy, ['tracker']);
+  assert.deepEqual(skips[1].blockedBy, ['contact']);
+  assert.match(skips[0].output.reason, /Google Sheets auth expired/);
+  assert.equal(skips.some((skip) => skip.stepId === 'independent'), false);
 });
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
