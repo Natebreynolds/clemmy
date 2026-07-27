@@ -14,11 +14,34 @@ import {
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
 
-test('probe-only tool calls are not completion evidence', () => {
+test('probe-only tool calls count only when the requested deliverable is that probe result', () => {
   for (const name of ['memory_search', 'composio_search_tools', 'clementine-local__tool_choice_recall']) {
     assert.equal(isToolSurfaceProbeTool(name), true);
   }
   assert.equal(hasMeaningfulSuccessfulToolNames(['memory_search', 'composio_search_tools']), false);
+  assert.equal(
+    hasMeaningfulSuccessfulToolNames(
+      ['workspace_roots'],
+      'Use local tools to report the configured workspace root paths.',
+    ),
+    true,
+  );
+  assert.equal(
+    hasMeaningfulSuccessfulToolNames(['memory_recall'], 'What do you remember about my meal plan?'),
+    true,
+  );
+  assert.equal(
+    hasMeaningfulSuccessfulToolNames(['skill_list'], 'Which skills are installed?'),
+    true,
+  );
+  assert.equal(
+    hasMeaningfulSuccessfulToolNames(['workspace_roots'], 'Inspect the workspace and summarize the project.'),
+    false,
+  );
+  assert.equal(
+    hasMeaningfulSuccessfulToolNames(['workspace_roots'], 'Build the app in the workspace root.'),
+    false,
+  );
   assert.equal(hasMeaningfulSuccessfulToolNames(['memory_search', 'write_file']), true);
 });
 

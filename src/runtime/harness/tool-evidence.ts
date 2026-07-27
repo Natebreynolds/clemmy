@@ -159,6 +159,48 @@ export function isReadOnlyCompletionEvidence(rawName: string): boolean {
   return isToolSurfaceProbeTool(normalized) || READ_ONLY_TOOL_RE.test(normalized);
 }
 
+/**
+ * A surface probe normally proves only that a capability exists, not that the
+ * user's task is complete. The exception is a request whose deliverable is the
+ * probe result itself ("what are the workspace root paths?", "what do you
+ * remember about X?", "list the available skills"). Keep this intentionally
+ * phrase-tight: a workspace-root lookup must not certify a broader request to
+ * inspect the workspace, and a capability check must never certify an action.
+ */
+function surfaceProbeDirectlyAnswersObjective(rawName: string, objectiveText: string): boolean {
+  const objective = objectiveText.trim();
+  if (!objective) return false;
+  switch (normalizedToolName(rawName)) {
+    case 'workspace_roots':
+      return /\bworkspace\b[^.!?\n]{0,60}\b(?:root|roots|path|paths|director(?:y|ies))\b/i.test(objective)
+        || /\b(?:root|roots|path|paths|director(?:y|ies))\b[^.!?\n]{0,60}\bworkspace\b/i.test(objective);
+    case 'workspace_info':
+      return /\bworkspace\b[^.!?\n]{0,40}\b(?:info|information|details?|configuration|configured)\b/i.test(objective)
+        || /\b(?:info|information|details?|configuration|configured)\b[^.!?\n]{0,40}\bworkspace\b/i.test(objective);
+    case 'workspace_list':
+      return /\b(?:list|which|what)\b[^.!?\n]{0,50}\bworkspaces?\b/i.test(objective);
+    case 'session_history':
+      return /\b(?:session|conversation|chat)\b[^.!?\n]{0,40}\bhistory\b/i.test(objective)
+        || /\bhistory\b[^.!?\n]{0,40}\b(?:session|conversation|chat)\b/i.test(objective);
+    case 'memory_recall':
+    case 'memory_search':
+    case 'memory_list_facts':
+      return /\b(?:remember|recall|memory|memories|fact|facts)\b/i.test(objective);
+    case 'skill_list':
+      return /\b(?:available|installed|list|what|which)\b[^.!?\n]{0,40}\bskills?\b/i.test(objective);
+    case 'check_capability':
+    case 'list_capabilities':
+      return /\b(?:capability|capabilities|able to|available tools?|connected (?:apps?|services?|integrations?))\b/i.test(objective);
+    case 'composio_search_tools':
+      return /\bcomposio\b[^.!?\n]{0,60}\b(?:tool|tools|action|actions|integration|integrations)\b/i.test(objective);
+    case 'local_cli_list':
+      return /\b(?:local\s+)?clis?\b/i.test(objective)
+        || /\bcommand[- ]line\b[^.!?\n]{0,30}\b(?:tool|tools|clients?)\b/i.test(objective);
+    default:
+      return false;
+  }
+}
+
 const MULTI_RESULT_NOUN_RE = /\b(?:emails|messages|files|documents|reports|posts|records|contacts|tasks|events|invoices|rows|items)\b/i;
 const MULTI_RESULT_QUANTIFIER_RE = /\b(?:all|both|each|every|multiple|several|many|remaining|these|those|[2-9]|[1-9][0-9]+|two|three|four|five|six|seven|eight|nine|ten)\b/i;
 const ACTION_SEQUENCE_RE = /\b(?:create|build|write|draft|send|email|update|post|publish|deploy|run|execute|install|configure|generate|add|edit)\b[^\n.!?]{0,100}\b(?:and|then)\b[^\n.!?]{0,40}\b(?:create|build|write|draft|send|email|update|post|publish|deploy|run|execute|install|configure|generate|add|edit)\b/i;
@@ -259,7 +301,10 @@ export function hasMeaningfulSuccessfulToolNames(
 ): boolean {
   const mutationRequired = objectiveRequiresMutatingEvidence(objectiveText);
   return toolNames.some((name) => {
-    if (!name || isToolSurfaceProbeTool(name) || isControlOnlyTool(name)) return false;
+    if (!name || isControlOnlyTool(name)) return false;
+    if (isToolSurfaceProbeTool(name)) {
+      return !mutationRequired && surfaceProbeDirectlyAnswersObjective(name, objectiveText);
+    }
     return !mutationRequired || !isReadOnlyCompletionEvidence(name);
   });
 }
