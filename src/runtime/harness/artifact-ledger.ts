@@ -1182,15 +1182,39 @@ function walkForKey(value: unknown, wanted: Set<string>, depth = 0): string | un
 function parseLooseResult(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   try { return JSON.parse(value); } catch { /* provider formatter may be JS-ish */ }
-  const documentId = value.match(/(?:"documentId"|"document_id"|documentId|document_id)\s*:\s*"([A-Za-z0-9_-]{10,})"/i)?.[1];
-  const siteId = value.match(/(?:"site_id"|"siteId"|site_id|siteId)\s*:\s*"([A-Za-z0-9_-]{6,})"/i)?.[1]
-    ?? value.match(/\bProject\s+ID\s*:\s*([A-Za-z0-9_-]{6,})/i)?.[1]
-    ?? value.match(/\bSite\s+ID\s*:\s*([A-Za-z0-9_-]{6,})/i)?.[1];
-  const uri = value.match(/https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+\/edit/i)?.[0]
-    ?? value.match(/\b(?:Website|Site|Live)\s+URL\s*:\s*(https:\/\/[^\s]+)/i)?.[1]
-    ?? value.match(/https:\/\/[A-Za-z0-9.-]+\.netlify\.app\/?/i)?.[0]
-    ?? value.match(/\bAdmin\s+URL\s*:\s*(https:\/\/[^\s]+)/i)?.[1];
+  // Current provider CLIs colorize label/value boundaries even when stdout is
+  // captured non-interactively. Netlify CLI 24, for example, prints
+  // `Project ID: <reset-code><uuid>`. Parse the semantic text, not terminal
+  // decoration, or a successful create is persisted as URL-only and its later
+  // exact-ID readback cannot settle the binding.
+  const text = value.replace(
+    // eslint-disable-next-line no-control-regex
+    /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g,
+    '',
+  );
+  const documentId = text.match(/(?:"documentId"|"document_id"|documentId|document_id)\s*:\s*"([A-Za-z0-9_-]{10,})"/i)?.[1];
+  const siteId = text.match(/(?:"site_id"|"siteId"|site_id|siteId)\s*:\s*"([A-Za-z0-9_-]{6,})"/i)?.[1]
+    ?? text.match(/\bProject\s+ID\s*:\s*([A-Za-z0-9_-]{6,})/i)?.[1]
+    ?? text.match(/\bSite\s+ID\s*:\s*([A-Za-z0-9_-]{6,})/i)?.[1];
+  const uri = text.match(/https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+\/edit/i)?.[0]
+    ?? text.match(/\b(?:Website|Site|Live)\s+URL\s*:\s*(https:\/\/[^\s]+)/i)?.[1]
+    ?? text.match(/https:\/\/[A-Za-z0-9.-]+\.netlify\.app\/?/i)?.[0]
+    ?? text.match(/\bAdmin\s+URL\s*:\s*(https:\/\/[^\s]+)/i)?.[1];
   return { documentId, siteId, uri };
+}
+
+function canonicalArtifactUri(uri: string | null | undefined): string | null {
+  const trimmed = uri?.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = '';
+    parsed.search = '';
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return trimmed.replace(/\/+$/, '');
+  }
 }
 
 function googleDocumentIdFromUri(uri: string | undefined): string | undefined {
@@ -1295,7 +1319,7 @@ export function verifyArtifactBindingFromToolResult(
 
   ensureSchema();
   const db = openEventLog();
-  const row = db.prepare(`
+  let row = db.prepare(`
     SELECT * FROM run_artifacts
      WHERE session_id = ? AND run_scope_id = ? AND kind = ? AND provider = ?
        AND status = 'bound' AND resource_id = ?
@@ -1308,6 +1332,30 @@ export function verifyArtifactBindingFromToolResult(
     intent.provider,
     intent.resourceId,
   ) as ArtifactRow | undefined;
+  // A successful create can legitimately expose only a canonical URL (older
+  // CLI output, provider formatter, or a pre-fix persisted row). An exact-ID
+  // getter is still strong binding proof when BOTH the request and response
+  // agree on the ID and the response URL independently matches exactly one
+  // URL-only row from this run. Promote that row to the returned ID instead of
+  // leaving truthful readback evidence detached forever.
+  if (!row && response.uri) {
+    const expectedUri = canonicalArtifactUri(response.uri);
+    const candidates = db.prepare(`
+      SELECT * FROM run_artifacts
+       WHERE session_id = ? AND run_scope_id = ? AND kind = ? AND provider = ?
+         AND status = 'bound' AND resource_id IS NULL AND uri IS NOT NULL
+       ORDER BY created_at ASC
+    `).all(
+      sessionId,
+      runScopeId,
+      intent.kind,
+      intent.provider,
+    ) as ArtifactRow[];
+    const uriMatches = candidates.filter(
+      (candidate) => canonicalArtifactUri(candidate.uri) === expectedUri,
+    );
+    if (uriMatches.length === 1) row = uriMatches[0];
+  }
   if (!row) return null;
 
   const now = new Date().toISOString();
@@ -1325,13 +1373,18 @@ export function verifyArtifactBindingFromToolResult(
     .slice(0, 16);
   db.prepare(`
     UPDATE run_artifacts
-       SET binding_verified_at = COALESCE(binding_verified_at, ?),
+       SET resource_id = COALESCE(resource_id, ?),
+           uri = COALESCE(uri, ?),
+           binding_verified_at = COALESCE(binding_verified_at, ?),
            verification_call_id = COALESCE(verification_call_id, ?),
            verification_shape = COALESCE(verification_shape, ?),
            verification_fingerprint = COALESCE(verification_fingerprint, ?),
            updated_at = ?
-     WHERE id = ? AND status = 'bound' AND resource_id = ?
+     WHERE id = ? AND status = 'bound'
+       AND (resource_id = ? OR resource_id IS NULL)
   `).run(
+    intent.resourceId,
+    response.uri ?? null,
     now,
     sourceCallId ?? null,
     intent.verificationShape,

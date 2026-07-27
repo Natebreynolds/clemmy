@@ -751,6 +751,72 @@ test('extracts Netlify CLI Project ID and gives a repairable reuse instruction',
   assert.match(ledger.artifactReuseMessage(bound), /do not run sites:create again/i);
 });
 
+test('extracts the current colorized Netlify CLI Project ID', () => {
+  const intent = {
+    kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
+    title: 'colorized-site', createShape: 'NETLIFY_SITE_CREATE',
+  } as const;
+  const resource = ledger.extractArtifactResource(intent, [
+    'exit_code: 0',
+    '',
+    'stdout:',
+    '',
+    'Project Created',
+    '',
+    '\x1B[32mAdmin URL: \x1B[39m https://app.netlify.com/projects/colorized-site',
+    '\x1B[32mURL: \x1B[39m       https://colorized-site.netlify.app',
+    '\x1B[32mProject ID: \x1B[39m00000000-0000-4000-8000-000000000099',
+  ].join('\n'));
+  assert.deepEqual(resource, {
+    resourceId: '00000000-0000-4000-8000-000000000099',
+    uri: 'https://colorized-site.netlify.app',
+    title: 'colorized-site',
+  });
+});
+
+test('exact Netlify getSite readback promotes one matching URL-only binding', () => {
+  const sid = session();
+  const runScope = 'run:netlify-url-only';
+  const siteId = '00000000-0000-4000-8000-000000000098';
+  const intent = {
+    kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
+    title: 'url-only-site', createShape: 'NETLIFY_SITE_CREATE',
+  } as const;
+  ledger.claimArtifactSlot(sid, intent, 'create-url-only', runScope);
+  ledger.bindArtifactSlot(sid, intent.slotKey, {
+    uri: 'https://url-only-site.netlify.app/',
+  }, 'create-url-only', runScope);
+
+  const verified = ledger.verifyArtifactBindingFromToolResult(
+    sid,
+    runScope,
+    'run_shell_command',
+    {
+      command: `netlify api getSite --data '{"site_id":"${siteId}"}' | jq '{id,name,ssl_url}'`,
+    },
+    `exit_code: 0\n\nstdout:\n{"id":"${siteId}","name":"url-only-site","ssl_url":"https://url-only-site.netlify.app"}`,
+    'readback-url-only',
+  );
+  assert.equal(verified?.resourceId, siteId);
+  assert.ok(verified?.bindingVerifiedAt);
+
+  const mismatchScope = 'run:netlify-url-mismatch';
+  ledger.claimArtifactSlot(sid, intent, 'create-url-mismatch', mismatchScope);
+  ledger.bindArtifactSlot(sid, intent.slotKey, {
+    uri: 'https://different-site.netlify.app',
+  }, 'create-url-mismatch', mismatchScope);
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
+    sid,
+    mismatchScope,
+    'run_shell_command',
+    {
+      command: `netlify api getSite --data '{"site_id":"${siteId}"}' | jq '{id,name,ssl_url}'`,
+    },
+    `exit_code: 0\n\nstdout:\n{"id":"${siteId}","name":"url-only-site","ssl_url":"https://url-only-site.netlify.app"}`,
+    'readback-url-mismatch',
+  ), null, 'an exact ID read cannot attach to a different bound URL');
+});
+
 test('synthetic retry replay permits one Google Doc and one asset container despite renamed retries', () => {
   const sid = session();
   const runScope = 'run:multi-artifact-retry';
