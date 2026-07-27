@@ -52,6 +52,7 @@ test.beforeEach(() => {
   resetHarnessRuntimeConfig();
   clearAuth();
   delete process.env.CLEMMY_BRAIN_FALLOVER;
+  delete process.env.CLEMMY_AUTH_FALLOVER;
 });
 
 test.after(() => {
@@ -188,11 +189,17 @@ test('configureHarnessRuntime: all_in + configured BYO wins over a stale claude_
   }
 });
 
-test('configureHarnessRuntime: dead Claude brain FALLS BACK to an available Codex (session-only)', async () => {
-  const prev = { mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE, fallover: process.env.CLEMMY_BRAIN_FALLOVER };
+test('configureHarnessRuntime: the auth-fallover flag sends a dead Claude brain to available Codex (session-only)', async () => {
+  const prev = {
+    mode: process.env.AUTH_MODE,
+    routing: process.env.MODEL_ROUTING_MODE,
+    fallover: process.env.CLEMMY_BRAIN_FALLOVER,
+    authFallover: process.env.CLEMMY_AUTH_FALLOVER,
+  };
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.MODEL_ROUTING_MODE = 'off';
-  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+  process.env.CLEMMY_AUTH_FALLOVER = 'on';
   writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' }); // Claude unusable (api03)
   writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
   try {
@@ -207,6 +214,58 @@ test('configureHarnessRuntime: dead Claude brain FALLS BACK to an available Code
     if (prev.mode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prev.mode;
     if (prev.routing === undefined) delete process.env.MODEL_ROUTING_MODE; else process.env.MODEL_ROUTING_MODE = prev.routing;
     if (prev.fallover === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER; else process.env.CLEMMY_BRAIN_FALLOVER = prev.fallover;
+    if (prev.authFallover === undefined) delete process.env.CLEMMY_AUTH_FALLOVER; else process.env.CLEMMY_AUTH_FALLOVER = prev.authFallover;
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('configureHarnessRuntime: legacy brain-fallover opt-in still enables boot recovery when auth flag is unset', async () => {
+  const prev = {
+    mode: process.env.AUTH_MODE,
+    fallover: process.env.CLEMMY_BRAIN_FALLOVER,
+    authFallover: process.env.CLEMMY_AUTH_FALLOVER,
+  };
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  delete process.env.CLEMMY_AUTH_FALLOVER;
+  writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' });
+  writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(result.fallback?.to, 'codex_oauth');
+  } finally {
+    clearClaudeVault(); clearAuth();
+    if (prev.mode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prev.mode;
+    if (prev.fallover === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER; else process.env.CLEMMY_BRAIN_FALLOVER = prev.fallover;
+    if (prev.authFallover === undefined) delete process.env.CLEMMY_AUTH_FALLOVER; else process.env.CLEMMY_AUTH_FALLOVER = prev.authFallover;
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('configureHarnessRuntime: explicit auth-fallover off overrides the legacy brain-fallover opt-in', async () => {
+  const prev = {
+    mode: process.env.AUTH_MODE,
+    fallover: process.env.CLEMMY_BRAIN_FALLOVER,
+    authFallover: process.env.CLEMMY_AUTH_FALLOVER,
+  };
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  process.env.CLEMMY_AUTH_FALLOVER = 'off';
+  writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' });
+  writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, false);
+    assert.equal(result.fallback, undefined);
+    assert.equal(process.env.AUTH_MODE, 'claude_oauth');
+  } finally {
+    clearClaudeVault(); clearAuth();
+    if (prev.mode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prev.mode;
+    if (prev.fallover === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER; else process.env.CLEMMY_BRAIN_FALLOVER = prev.fallover;
+    if (prev.authFallover === undefined) delete process.env.CLEMMY_AUTH_FALLOVER; else process.env.CLEMMY_AUTH_FALLOVER = prev.authFallover;
     resetHarnessRuntimeConfig();
   }
 });

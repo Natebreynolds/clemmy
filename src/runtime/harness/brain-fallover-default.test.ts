@@ -12,8 +12,9 @@
  * BOOT-time brain SUBSTITUTION (the chosen brain can't auth at startup). It is
  * intentionally OPT-IN / default-'off' (fail-closed at boot + notify, let the user
  * decide — see codex-client.test.ts "fails closed by default even when Codex is
- * connected"). It shares the env var but keeps the opposite default ON PURPOSE, so it
- * is allowlisted here rather than flagged.
+ * connected"). New installs control it with CLEMMY_AUTH_FALLOVER; the old
+ * CLEMMY_BRAIN_FALLOVER default-'off' read remains only as a compatibility fallback,
+ * so it is allowlisted here rather than flagged.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -37,7 +38,7 @@ function walk(dir: string): string[] {
   return out;
 }
 
-// The one intentional default-'off' site: boot-time brain substitution (opt-in).
+// The one intentional default-'off' compatibility read: boot-time brain substitution.
 const BOOT_SUBSTITUTION_OPT_IN = path.join('runtime', 'harness', 'codex-client.ts');
 
 test('every RUNTIME CLEMMY_BRAIN_FALLOVER gate defaults to ON (no lane drifts back to off)', () => {

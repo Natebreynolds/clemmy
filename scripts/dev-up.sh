@@ -11,11 +11,31 @@
 #       * proactivity DISABLED (autonomy/briefs/check-ins won't fire) — original
 #         policy backed up to state/proactivity-policy.json.devbak, restored by dev-down.sh
 #   - the 3 staged FORK surfaces ON so smokes exercise the converted paths
+# Optional reproducible model-routing overrides (process-local; .env is untouched):
+#   DEV_PRIMARY_MODEL=gpt-5.6-sol DEV_FUSION_MODE=all ./scripts/dev-up.sh
+#   DEV_FUSION_MODE=high DEV_FUSION_STRATEGY=verify ./scripts/dev-up.sh
+# Mid-turn and boot-auth fallover are both ON for the dev daemon by default; set
+# DEV_BRAIN_FALLOVER=off and/or DEV_AUTH_FALLOVER=off to isolate a provider.
 # Re-run after every source patch (ESM cache → needs a fresh process to pick up changes).
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="$HOME/.clementine-next"
 PORT="$(grep -E '^WEBHOOK_PORT=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"'"'"' ' )"; PORT="${PORT:-8520}"
+
+DEV_PRIMARY_MODEL="${DEV_PRIMARY_MODEL:-}"
+DEV_FUSION_MODE="${DEV_FUSION_MODE:-}"
+DEV_FUSION_STRATEGY="${DEV_FUSION_STRATEGY:-}"
+DEV_BRAIN_FALLOVER="${DEV_BRAIN_FALLOVER:-on}"
+DEV_AUTH_FALLOVER="${DEV_AUTH_FALLOVER:-on}"
+
+if [ -n "$DEV_PRIMARY_MODEL" ] && [[ ! "$DEV_PRIMARY_MODEL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+  echo "✗ DEV_PRIMARY_MODEL contains unsupported characters"; exit 2
+fi
+case "$DEV_FUSION_MODE" in ""|off|high|all) ;; *) echo "✗ DEV_FUSION_MODE must be off, high, or all"; exit 2 ;; esac
+case "$DEV_FUSION_STRATEGY" in ""|verify|debate) ;; *) echo "✗ DEV_FUSION_STRATEGY must be verify or debate"; exit 2 ;; esac
+case "$DEV_BRAIN_FALLOVER" in on|off) ;; *) echo "✗ DEV_BRAIN_FALLOVER must be on or off"; exit 2 ;; esac
+case "$DEV_AUTH_FALLOVER" in on|off) ;; *) echo "✗ DEV_AUTH_FALLOVER must be on or off"; exit 2 ;; esac
+if [ -n "$DEV_FUSION_MODE" ] && [ -z "$DEV_FUSION_STRATEGY" ]; then DEV_FUSION_STRATEGY=verify; fi
 
 echo "→ quitting installed app + any prior dev daemon"
 osascript -e 'tell application "Clementine" to quit' 2>/dev/null || true
@@ -59,11 +79,22 @@ node -e '
 # Discord ON by default so Alexander can test via the Discord surface; DEV_DISCORD=false
 # suppresses it for pure automated smoke runs.
 DEV_DISCORD="${DEV_DISCORD:-true}"
-echo "→ starting dev daemon from source (Discord $DEV_DISCORD, FORK surfaces on, proactivity off)"
-( cd "$ROOT" && CLEMENTINE_HOME="$HOME_DIR" DISCORD_ENABLED="$DEV_DISCORD" \
-    CLEMMY_HARNESS_DASHBOARD=on CLEMMY_HARNESS_HOME=on CLEMMY_HARNESS_WORKFLOW=on \
-    CLEMMY_CODE_MODE=on CLEMMY_CODE_MODE_WRITES=on \
-    npx tsx src/index.ts daemon --foreground > /tmp/clem-dev-daemon.log 2>&1 ) &
+PRIMARY_LABEL="${DEV_PRIMARY_MODEL:-profile}"
+FUSION_LABEL="${DEV_FUSION_MODE:-profile}"
+echo "→ starting dev daemon from source (Discord $DEV_DISCORD, model $PRIMARY_LABEL, Fusion $FUSION_LABEL, fallover brain=$DEV_BRAIN_FALLOVER auth=$DEV_AUTH_FALLOVER, proactivity off)"
+(
+  cd "$ROOT" || exit 1
+  export CLEMENTINE_HOME="$HOME_DIR"
+  export DISCORD_ENABLED="$DEV_DISCORD"
+  export CLEMMY_HARNESS_DASHBOARD=on CLEMMY_HARNESS_HOME=on CLEMMY_HARNESS_WORKFLOW=on
+  export CLEMMY_CODE_MODE=on CLEMMY_CODE_MODE_WRITES=on
+  export CLEMMY_BRAIN_FALLOVER="$DEV_BRAIN_FALLOVER"
+  export CLEMMY_AUTH_FALLOVER="$DEV_AUTH_FALLOVER"
+  if [ -n "$DEV_PRIMARY_MODEL" ]; then export OPENAI_MODEL_PRIMARY="$DEV_PRIMARY_MODEL"; fi
+  if [ -n "$DEV_FUSION_MODE" ]; then export CLEMMY_DEBATE_MODE="$DEV_FUSION_MODE"; fi
+  if [ -n "$DEV_FUSION_STRATEGY" ]; then export CLEMMY_FUSION_STRATEGY="$DEV_FUSION_STRATEGY"; fi
+  npx tsx src/index.ts daemon --foreground > /tmp/clem-dev-daemon.log 2>&1
+) &
 for _ in $(seq 1 60); do lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1 && break; sleep 1; done
 if lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
   echo "✓ dev daemon up on $PORT (source: $ROOT, home: $HOME_DIR)"

@@ -89,8 +89,16 @@ export function planBrain(kind: BrainKind): BrainPlan {
   if (kind === 'codex') {
     const hasCodex = existsSync(path.join(REAL_HOME, '.codex'));
     const apiKey = realEnvValue('OPENAI_API_KEY');
-    if (hasCodex) return { kind, env: { AUTH_MODE: 'codex_oauth' } };
-    if (apiKey) return { kind, env: { AUTH_MODE: 'api_key', OPENAI_API_KEY: apiKey } };
+    // Mirror the candidate install's exact Codex model slots. Without this, a
+    // user running GPT-5.6 locally could get a green release proof that silently
+    // exercised the code-level GPT-5.4 defaults in the isolated daemon.
+    const modelEnv: Record<string, string> = {};
+    for (const key of ['OPENAI_MODEL_FAST', 'OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER']) {
+      const value = realEnvValue(key);
+      if (value) modelEnv[key] = value;
+    }
+    if (hasCodex) return { kind, env: { AUTH_MODE: 'codex_oauth', ...modelEnv } };
+    if (apiKey) return { kind, env: { AUTH_MODE: 'api_key', OPENAI_API_KEY: apiKey, ...modelEnv } };
     return { kind, env: {}, skipReason: 'no ~/.codex and no OPENAI_API_KEY' };
   }
   // glm — BYO all-in brain. Copy only the BYO/GLM material the real install
