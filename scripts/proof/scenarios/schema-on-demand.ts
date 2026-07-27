@@ -43,10 +43,18 @@ export const schemaOnDemand: ScenarioDef = {
     ];
 
     let metrics = null;
+    let completionVerdicts = -1;
     let failedOpenVerdicts = -1;
     try {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn.sessionId);
+      completionVerdicts = (db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM events
+        WHERE session_id = ?
+          AND type = 'verdict_recorded'
+          AND json_extract(data_json, '$.door') = 'completion'
+      `).get(turn.sessionId) as { count: number }).count;
       failedOpenVerdicts = (db.prepare(`
         SELECT COUNT(*) AS count
         FROM events
@@ -75,6 +83,11 @@ export const schemaOnDemand: ScenarioDef = {
       name: 'no shell fallback',
       pass: (calls.run_shell_command ?? 0) === 0,
       detail: `run_shell_command × ${calls.run_shell_command ?? 0}`,
+    });
+    checks.push({
+      name: 'grounded lookup skipped redundant completion judge',
+      pass: completionVerdicts === 0,
+      detail: `completion-judge verdicts: ${completionVerdicts}`,
     });
     checks.push({
       name: 'completion did not fail open',
