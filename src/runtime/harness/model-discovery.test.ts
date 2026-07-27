@@ -7,7 +7,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { filterOpenAiChatModelIds, canonicalPickerId, labelForModelId, _setDiscoveredModelsForTest } from './model-discovery.js';
+import {
+  filterOpenAiChatModelIds,
+  canonicalPickerId,
+  labelForModelId,
+  modelDiscoveryStatus,
+  warmModelDiscovery,
+  _setDiscoveredModelsForTest,
+  _setModelDiscoverersForTest,
+} from './model-discovery.js';
 import { resolveProvider } from './model-wire-registry.js';
 
 test('filterOpenAiChatModelIds keeps the codex family + newest-generation flagships only', () => {
@@ -33,6 +41,11 @@ test('filterOpenAiChatModelIds newest-generation tracking is dynamic (a newer ge
   // When gpt-6 ships, the 5.x flagships drop off automatically; the codex family stays.
   const kept = filterOpenAiChatModelIds(['gpt-5.6-sol', 'gpt-6', 'gpt-6-pro', 'gpt-5.2-codex']);
   assert.deepEqual(kept, ['gpt-5.2-codex', 'gpt-6'].sort());
+});
+
+test('filterOpenAiChatModelIds compares multi-digit point releases as versions, not decimals', () => {
+  const kept = filterOpenAiChatModelIds(['gpt-5.6-sol', 'gpt-5.10-sol', 'gpt-5.10-terra', 'gpt-5.3-codex']);
+  assert.deepEqual(kept, ['gpt-5.3-codex', 'gpt-5.10-sol', 'gpt-5.10-terra'].sort());
 });
 
 test('canonicalPickerId strips date stamps + [1m]-style context annotations to the persistable base alias', () => {
@@ -87,5 +100,62 @@ test('picker choices include DISCOVERED models after presets, deduped against pr
     assert.equal(codex[0].id, 'gpt-5.4-nano', 'presets stay first / ordering stable');
   } finally {
     _setDiscoveredModelsForTest(null);
+  }
+});
+
+test('boot warmup exposes refreshing state, then independently readies both provider catalogs', async () => {
+  const previousOpenAiKey = process.env.OPENAI_API_KEY;
+  const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  process.env.OPENAI_API_KEY = 'sk-test-model-discovery';
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-test-model-discovery';
+  _setDiscoveredModelsForTest(null);
+  _setModelDiscoverersForTest({
+    openai: async () => [{ id: 'gpt-5.6-luna', label: 'GPT 5.6 Luna' }],
+    anthropic: async () => [{ id: 'claude-fable-5', label: 'Claude Fable 5' }],
+  });
+  try {
+    const warming = warmModelDiscovery(1_000);
+    assert.equal(modelDiscoveryStatus().refreshing, true);
+    const ready = await warming;
+    assert.equal(ready.refreshing, false);
+    assert.deepEqual(ready.providers.openai, {
+      phase: 'ready',
+      modelCount: 1,
+      attemptedAt: ready.providers.openai.attemptedAt,
+      fetchedAt: ready.providers.openai.fetchedAt,
+    });
+    assert.equal(ready.providers.anthropic.phase, 'ready');
+    assert.equal(ready.providers.anthropic.modelCount, 1);
+  } finally {
+    if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+    _setModelDiscoverersForTest(null);
+    _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+  }
+});
+
+test('a degraded refresh retains last-known models instead of erasing the catalog', () => {
+  const previousOpenAiKey = process.env.OPENAI_API_KEY;
+  const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  process.env.OPENAI_API_KEY = 'sk-test-model-discovery';
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-test-model-discovery';
+  _setDiscoveredModelsForTest({
+    openai: [{ id: 'gpt-5.6-luna', label: 'GPT 5.6 Luna' }],
+    anthropic: [{ id: 'claude-fable-5', label: 'Claude Fable 5' }],
+  }, 'degraded');
+  try {
+    const status = modelDiscoveryStatus();
+    assert.equal(status.providers.openai.phase, 'degraded');
+    assert.equal(status.providers.openai.modelCount, 1);
+    assert.equal(status.providers.anthropic.phase, 'degraded');
+    assert.equal(status.providers.anthropic.modelCount, 1);
+  } finally {
+    if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+    _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
   }
 });

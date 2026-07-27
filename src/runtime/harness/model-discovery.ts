@@ -23,11 +23,43 @@ export interface DiscoveredModel { id: string; label: string }
 
 const TTL_MS = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 8_000;
+const FAILURE_RETRY_MS = 60 * 1000;
 
-let cache: { anthropic: DiscoveredModel[]; openai: DiscoveredModel[]; fetchedAt: number } = {
-  anthropic: [],
-  openai: [],
-  fetchedAt: 0,
+export type ModelDiscoveryPhase = 'idle' | 'refreshing' | 'ready' | 'degraded' | 'unavailable';
+export interface ModelDiscoveryProviderStatus {
+  phase: ModelDiscoveryPhase;
+  modelCount: number;
+  attemptedAt: number | null;
+  fetchedAt: number | null;
+  error?: string;
+}
+export interface ModelDiscoveryStatus {
+  refreshing: boolean;
+  providers: {
+    anthropic: ModelDiscoveryProviderStatus;
+    openai: ModelDiscoveryProviderStatus;
+  };
+}
+
+interface ProviderCache extends ModelDiscoveryProviderStatus {
+  models: DiscoveredModel[];
+}
+
+type ProviderName = 'anthropic' | 'openai';
+
+function emptyProviderCache(): ProviderCache {
+  return {
+    models: [],
+    phase: 'idle',
+    modelCount: 0,
+    attemptedAt: null,
+    fetchedAt: null,
+  };
+}
+
+let cache: Record<ProviderName, ProviderCache> = {
+  anthropic: emptyProviderCache(),
+  openai: emptyProviderCache(),
 };
 let refreshInFlight: Promise<void> | null = null;
 
@@ -51,14 +83,20 @@ export function filterOpenAiChatModelIds(ids: string[]): string[] {
   const candidates = ids.filter((id) => family.test(id) && !noise.test(id) && !dateStamp.test(id));
 
   const isCodex = (id: string) => /codex/i.test(id);
-  // Numeric generation for a gpt-N.M id (gpt-5.6-sol → 5.06 so 5.6 > 5.5; gpt-6 → 6).
-  // Non-gpt (unreachable here) → 0. Codex ids bypass this via isCodex.
-  const generation = (id: string): number => {
+  // Compare numeric generation components as a tuple, not a decimal:
+  // 5.10 must sort AFTER 5.6 (Number("5.10") would incorrectly become 5.1).
+  // Codex ids bypass newest-generation filtering via isCodex.
+  const generation = (id: string): readonly [number, number] => {
     const m = id.match(/^gpt-(\d+)(?:\.(\d+))?/i);
-    return m ? Number(m[1]) + (m[2] ? Number(m[2]) / 100 : 0) : 0;
+    return m ? [Number(m[1]), Number(m[2] ?? 0)] : [0, 0];
   };
-  const newest = candidates.reduce((max, id) => Math.max(max, generation(id)), 0);
-  return candidates.filter((id) => isCodex(id) || generation(id) >= newest).sort();
+  const compareGeneration = (a: readonly [number, number], b: readonly [number, number]): number =>
+    a[0] - b[0] || a[1] - b[1];
+  const newest = candidates.reduce<readonly [number, number]>((max, id) => {
+    const current = generation(id);
+    return compareGeneration(current, max) > 0 ? current : max;
+  }, [0, 0]);
+  return candidates.filter((id) => isCodex(id) || compareGeneration(generation(id), newest) === 0).sort();
 }
 
 /** Ids must survive the settings-save validator (normalizeModelId's charset) and
@@ -149,40 +187,176 @@ async function discoverOpenAi(): Promise<DiscoveredModel[]> {
   return filterOpenAiChatModelIds(ids).sort().map((id) => ({ id, label: labelForModelId(id) }));
 }
 
-const FAILURE_RETRY_MS = 60 * 1000;
+function providerHasDiscoveryCredential(provider: ProviderName): boolean {
+  if (provider === 'openai') return Boolean(getOpenAiApiKey().trim());
+  const apiKey = (getRuntimeEnv('ANTHROPIC_API_KEY', '') ?? '').trim();
+  return Boolean(apiKey || getStoredClaudeTokens()?.accessToken);
+}
 
-async function refresh(): Promise<void> {
-  const [anthropic, openai] = await Promise.allSettled([discoverAnthropic(), discoverOpenAi()]);
-  // A refresh that produced NOTHING (both failed, or both came back empty —
-  // the boot-time shape: the daemon's first settings poll fires while network/
-  // keys are still settling) must NOT claim the full TTL: stamping 6h on a
-  // failure locked the picker to presets-only for the whole session (live
-  // 2026-07-09: three freshly-dropped gpt-5.6 models invisible all day).
-  // Back-date the stamp so the next poll retries within a minute; a refresh
-  // with ANY real result keeps the full TTL.
-  const nextAnthropic = anthropic.status === 'fulfilled' ? anthropic.value : cache.anthropic;
-  const nextOpenai = openai.status === 'fulfilled' ? openai.value : cache.openai;
-  const producedAnything = nextAnthropic.length > 0 || nextOpenai.length > 0;
-  cache = {
-    anthropic: nextAnthropic,
-    openai: nextOpenai,
-    fetchedAt: producedAnything ? Date.now() : Date.now() - (TTL_MS - FAILURE_RETRY_MS),
+function providerNeedsRefresh(provider: ProviderName, now = Date.now()): boolean {
+  const current = cache[provider];
+  const haveCredential = providerHasDiscoveryCredential(provider);
+  if (current.phase === 'refreshing') return false;
+  if (current.phase === 'idle') return true;
+  // Login/logout should invalidate an unavailable/ready catalog immediately,
+  // rather than waiting for the retry/TTL window.
+  if (current.phase === 'unavailable' && haveCredential) return true;
+  if (current.phase !== 'unavailable' && !haveCredential) return true;
+  const stamp = current.phase === 'ready' ? current.fetchedAt : current.attemptedAt;
+  const maxAge = current.phase === 'ready' ? TTL_MS : FAILURE_RETRY_MS;
+  return stamp === null || now - stamp > maxAge;
+}
+
+function safeDiscoveryError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.trim().slice(0, 240) || 'Model catalog refresh failed.';
+}
+
+let discoverers: Record<ProviderName, () => Promise<DiscoveredModel[]>> = {
+  anthropic: discoverAnthropic,
+  openai: discoverOpenAi,
+};
+
+async function refreshProvider(provider: ProviderName): Promise<void> {
+  const attemptedAt = Date.now();
+  const current = cache[provider];
+  if (!providerHasDiscoveryCredential(provider)) {
+    cache[provider] = {
+      ...current,
+      phase: 'unavailable',
+      modelCount: current.models.length,
+      attemptedAt,
+      error: undefined,
+    };
+    return;
+  }
+
+  try {
+    const models = await discoverers[provider]();
+    if (models.length === 0) {
+      // Empty provider responses are not proof that a previously available
+      // model disappeared. Retain the last-known catalog and retry soon.
+      cache[provider] = {
+        ...current,
+        phase: 'degraded',
+        modelCount: current.models.length,
+        attemptedAt,
+        error: 'Provider returned no compatible models; retrying.',
+      };
+      return;
+    }
+    cache[provider] = {
+      models,
+      phase: 'ready',
+      modelCount: models.length,
+      attemptedAt,
+      fetchedAt: Date.now(),
+      error: undefined,
+    };
+  } catch (err) {
+    // A network/auth/schema failure must never erase the last-known choices or
+    // demote a saved role binding. Keep cached models and retry within a minute.
+    cache[provider] = {
+      ...current,
+      phase: 'degraded',
+      modelCount: current.models.length,
+      attemptedAt,
+      error: safeDiscoveryError(err),
+    };
+  }
+}
+
+function ensureRefresh(): Promise<void> | null {
+  if (refreshInFlight) return refreshInFlight;
+  const targets = (['anthropic', 'openai'] as const).filter((provider) => providerNeedsRefresh(provider));
+  if (targets.length === 0) return null;
+  for (const provider of targets) {
+    cache[provider] = { ...cache[provider], phase: 'refreshing', error: undefined };
+  }
+  refreshInFlight = Promise.all(targets.map((provider) => refreshProvider(provider)))
+    .then(() => undefined)
+    .catch(() => { /* refreshProvider is fail-open; this is a final backstop */ })
+    .finally(() => { refreshInFlight = null; });
+  return refreshInFlight;
+}
+
+function statusSnapshot(): ModelDiscoveryStatus {
+  const providerStatus = (provider: ProviderName): ModelDiscoveryProviderStatus => {
+    const { phase, modelCount, attemptedAt, fetchedAt, error } = cache[provider];
+    return { phase, modelCount, attemptedAt, fetchedAt, ...(error ? { error } : {}) };
+  };
+  return {
+    refreshing: cache.anthropic.phase === 'refreshing' || cache.openai.phase === 'refreshing',
+    providers: {
+      anthropic: providerStatus('anthropic'),
+      openai: providerStatus('openai'),
+    },
   };
 }
 
 /** Sync cache read; kicks a background refresh when stale. Never throws. */
 export function discoveredModels(): { anthropic: DiscoveredModel[]; openai: DiscoveredModel[] } {
-  if (Date.now() - cache.fetchedAt > TTL_MS && !refreshInFlight) {
-    refreshInFlight = refresh()
-      .catch(() => { /* fail-open: presets remain the floor */ })
-      .finally(() => { refreshInFlight = null; });
+  ensureRefresh();
+  return { anthropic: cache.anthropic.models, openai: cache.openai.models };
+}
+
+/** Observable readiness for Settings/UI and diagnostics. Reading also starts a
+ * stale refresh, so a cold first paint can truthfully render "refreshing". */
+export function modelDiscoveryStatus(): ModelDiscoveryStatus {
+  ensureRefresh();
+  return statusSnapshot();
+}
+
+/** Daemon-boot warmup. Waits only up to the caller's small startup budget; an
+ * unfinished refresh continues in the background and remains visible via status. */
+export async function warmModelDiscovery(timeoutMs = 2_500): Promise<ModelDiscoveryStatus> {
+  const pending = ensureRefresh();
+  if (!pending || timeoutMs <= 0) return statusSnapshot();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      pending,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return { anthropic: cache.anthropic, openai: cache.openai };
+  return statusSnapshot();
 }
 
 /** Test-only. */
-export function _setDiscoveredModelsForTest(next: { anthropic?: DiscoveredModel[]; openai?: DiscoveredModel[] } | null): void {
-  cache = next
-    ? { anthropic: next.anthropic ?? [], openai: next.openai ?? [], fetchedAt: Date.now() }
-    : { anthropic: [], openai: [], fetchedAt: 0 };
+export function _setDiscoveredModelsForTest(
+  next: { anthropic?: DiscoveredModel[]; openai?: DiscoveredModel[] } | null,
+  phase: Exclude<ModelDiscoveryPhase, 'idle' | 'refreshing'> = 'ready',
+): void {
+  refreshInFlight = null;
+  if (!next) {
+    cache = { anthropic: emptyProviderCache(), openai: emptyProviderCache() };
+    return;
+  }
+  const now = Date.now();
+  const seeded = (models: DiscoveredModel[]): ProviderCache => ({
+    models,
+    phase,
+    modelCount: models.length,
+    attemptedAt: now,
+    fetchedAt: phase === 'ready' ? now : null,
+    ...(phase === 'degraded' ? { error: 'Test-seeded degraded catalog.' } : {}),
+  });
+  cache = {
+    anthropic: seeded(next.anthropic ?? []),
+    openai: seeded(next.openai ?? []),
+  };
+}
+
+/** Test-only dependency injection for deterministic warmup/failure coverage. */
+export function _setModelDiscoverersForTest(
+  next: Partial<Record<ProviderName, () => Promise<DiscoveredModel[]>>> | null,
+): void {
+  discoverers = next
+    ? { anthropic: next.anthropic ?? discoverAnthropic, openai: next.openai ?? discoverOpenAi }
+    : { anthropic: discoverAnthropic, openai: discoverOpenAi };
 }

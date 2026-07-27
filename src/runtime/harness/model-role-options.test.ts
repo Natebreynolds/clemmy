@@ -19,8 +19,13 @@ const {
   effectiveBrainValue,
   falloverBrainModelIds,
   roleModelCapability,
+  savedRoleModelIdsForProvider,
 } = await import('./model-role-options.js');
 const { resolveEffectiveProviderForModel } = await import('./byo-providers.js');
+const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
+// Keep this unit file deterministic: provider auth fixtures are fake, so model
+// discovery itself is covered separately with injected discoverers.
+_setDiscoveredModelsForTest({ anthropic: [], openai: [] });
 
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
   const prev: Record<string, string | undefined> = {};
@@ -115,6 +120,44 @@ test('connected model catalog includes authenticated Codex/Claude and configured
     assert.equal(validateRoleModelBinding('judge', 'not-connected').ok, false);
     assert.equal(validateRoleModelBinding('worker', 'not-connected').ok, false);
   });
+});
+
+test('saved dynamic role models remain available while provider discovery is degraded', () => {
+  writeAuthFiles();
+  _setDiscoveredModelsForTest({ anthropic: [], openai: [] }, 'degraded');
+  try {
+    withEnv({
+      CLEMMY_MODEL_ROLES: JSON.stringify([
+        { role: 'worker', modelId: 'gpt-5.6-luna', scope: 'durable', source: 'settings' },
+        { role: 'judge', modelId: 'claude-fable-5', scope: 'durable', source: 'settings' },
+      ]),
+      BYO_MODEL_BASE_URL: '',
+      BYO_MODEL_API_KEY: '',
+      BYO_MODEL_ID: '',
+      BYO_MODEL_JUDGE_ID: '',
+      OPENAI_MODEL_WORKER: '',
+    }, () => {
+      const ids = new Set(connectedModelGroups().flatMap((group) => group.models.map((model) => model.id)));
+      assert.equal(ids.has('gpt-5.6-luna'), true);
+      assert.equal(ids.has('claude-fable-5'), true);
+      assert.deepEqual(validateRoleModelBinding('worker', 'gpt-5.6-luna'), { ok: true, provider: 'codex' });
+      assert.deepEqual(validateRoleModelBinding('judge', 'claude-fable-5'), { ok: true, provider: 'claude' });
+    });
+  } finally {
+    _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+  }
+});
+
+test('saved role-model parsing is provider-scoped and ignores malformed bindings', () => {
+  const raw = JSON.stringify([
+    { role: 'worker', modelId: 'gpt-5.6-luna' },
+    { role: 'judge', modelId: 'claude-fable-5' },
+    { role: 'brain', modelId: 'gpt-5.6-sol' },
+    { role: 'worker', modelId: 'deepseek-chat' },
+    { role: 'worker', modelId: '' },
+  ]);
+  assert.deepEqual(savedRoleModelIdsForProvider(raw, 'codex'), ['gpt-5.6-luna']);
+  assert.deepEqual(savedRoleModelIdsForProvider(raw, 'claude'), ['claude-fable-5']);
 });
 
 test('multi-provider: picker lists every model across all connected BYO providers', () => {

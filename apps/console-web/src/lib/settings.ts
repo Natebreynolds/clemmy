@@ -167,6 +167,25 @@ export interface ModelRolesSnapshot {
   // The selector VALUE for the active brain — matches a brainOptions().value.
   effectiveBrainValue?: string;
   activeBrain: ActiveBrain;
+  discovery?: {
+    refreshing: boolean;
+    providers: {
+      anthropic: {
+        phase: 'idle' | 'refreshing' | 'ready' | 'degraded' | 'unavailable';
+        modelCount: number;
+        attemptedAt: number | null;
+        fetchedAt: number | null;
+        error?: string;
+      };
+      openai: {
+        phase: 'idle' | 'refreshing' | 'ready' | 'degraded' | 'unavailable';
+        modelCount: number;
+        attemptedAt: number | null;
+        fetchedAt: number | null;
+        error?: string;
+      };
+    };
+  };
 }
 // Set (or clear) a worker/judge role model. Brain is a provider login switch
 // (setActiveBrain). Applies on the next message, no restart.

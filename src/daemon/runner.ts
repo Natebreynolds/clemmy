@@ -15,6 +15,7 @@ import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-i
 import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
+import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks } from '../execution/background-tasks.js';
@@ -1186,6 +1187,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // Surface exactly which build is running so a stale packaged bundle
   // can't masquerade as the latest src silently (see build-info.ts).
   logger.info({ build: getBuildInfo() }, `Clementine daemon build: ${describeBuild()}`);
+  const modelDiscovery = await warmModelDiscovery();
+  logger.info(
+    {
+      openai: modelDiscovery.providers.openai.phase,
+      openaiModels: modelDiscovery.providers.openai.modelCount,
+      anthropic: modelDiscovery.providers.anthropic.phase,
+      anthropicModels: modelDiscovery.providers.anthropic.modelCount,
+      refreshing: modelDiscovery.refreshing,
+    },
+    'Model catalog discovery initialized',
+  );
   ensureDir(CRON_PROGRESS_DIR);
   const state = loadState();
   // Surface "we missed N scheduled runs while you were offline" BEFORE

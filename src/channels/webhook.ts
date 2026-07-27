@@ -79,6 +79,7 @@ import { runChannelAcceptance } from '../runtime/channel-acceptance.js';
 import { fetchDiscordInstallInfo } from './discord-install.js';
 import { getDiscordRuntimeStatus } from './discord.js';
 import { getSlackRuntimeStatus } from './slack.js';
+import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { readEnvFile, writeEnvFile } from '../setup/env-file.js';
 import {
   authorizeToolkit,
@@ -2792,6 +2793,11 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
 }
 
 export async function startWebhookServer(assistant: ClementineAssistant): Promise<void> {
+  // Warm provider catalogs before the Settings endpoint becomes reachable.
+  // The wait is bounded; a slow provider continues in the background and the
+  // API reports its honest refreshing/degraded state instead of a false empty
+  // catalog on first paint.
+  await warmModelDiscovery();
   const app = await buildWebhookApp(assistant);
   const listeners = await startIngressListeners(app, {
     host: WEBHOOK_HOST,

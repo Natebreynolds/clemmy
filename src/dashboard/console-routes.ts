@@ -372,6 +372,7 @@ import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding
 import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
+import { modelDiscoveryStatus } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot } from '../runtime/harness/debate-model.js';
@@ -6997,6 +6998,7 @@ export function registerConsoleRoutes(
       effectiveBrain: effectiveBrain(),
       effectiveBrainValue: effectiveBrainValue(),
       activeBrain: getActiveAuthMode(),
+      discovery: modelDiscoveryStatus(),
     };
   };
 

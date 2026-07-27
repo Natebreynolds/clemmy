@@ -9,6 +9,7 @@ import {
   getByoBackendConfig,
   getModelRoutingMode,
   getActiveAuthMode,
+  getRuntimeEnv,
 } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
@@ -20,7 +21,7 @@ import {
   configuredByoProvidersForModel,
   resolveEffectiveProviderForModel,
 } from './byo-providers.js';
-import { discoveredModels } from './model-discovery.js';
+import { discoveredModels, labelForModelId, modelDiscoveryStatus, type ModelDiscoveryPhase } from './model-discovery.js';
 
 export interface AvailableModelGroup {
   provider: ModelProviderClass;
@@ -55,6 +56,53 @@ function pushUnique(models: Array<{ id: string; label: string }>, id: string, la
   models.push({ id: clean, label });
 }
 
+/** Parse only model ids from durable worker/judge bindings. Kept as a leaf-level
+ * parser here (instead of importing model-roles.ts) to avoid the intentional
+ * model-roles ↔ model-role-options validation cycle. */
+export function savedRoleModelIdsForProvider(raw: string, provider: ModelProviderClass): string[] {
+  if (!raw.trim() || (provider !== 'codex' && provider !== 'claude')) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const ids: string[] = [];
+    for (const value of parsed) {
+      if (!value || typeof value !== 'object') continue;
+      const binding = value as { role?: unknown; modelId?: unknown };
+      if (binding.role !== 'worker' && binding.role !== 'judge') continue;
+      if (typeof binding.modelId !== 'string') continue;
+      const id = binding.modelId.trim();
+      if (!id || ids.includes(id)) continue;
+      try {
+        if (resolveProvider(id) === provider) ids.push(id);
+      } catch {
+        // Invalid/custom ids remain excluded; normal validation explains them.
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
+function addSavedRoleModelsWhileCatalogUncertain(
+  models: Array<{ id: string; label: string }>,
+  provider: 'codex' | 'claude',
+  phase: ModelDiscoveryPhase,
+): void {
+  // A completed non-empty provider catalog is authoritative. Before that point,
+  // preserve recognized saved bindings provisionally so a daemon restart cannot
+  // flash "unavailable; using default" merely because discovery is still cold
+  // or a refresh encountered a transient provider failure.
+  if (phase === 'ready') return;
+  const raw = getRuntimeEnv('CLEMMY_MODEL_ROLES', '') ?? '';
+  const suffix = phase === 'refreshing' || phase === 'idle'
+    ? ' (saved; checking availability)'
+    : ' (saved; using last known route)';
+  for (const id of savedRoleModelIdsForProvider(raw, provider)) {
+    pushUnique(models, id, `${labelForModelId(id)}${suffix}`);
+  }
+}
+
 function codexBrainModelChoices(): Array<{ id: string; label: string }> {
   const models = [...MODEL_PRESETS];
   for (const id of [MODELS.fast, MODELS.primary, MODELS.deep, DEFAULT_CODEX_MODEL]) {
@@ -68,6 +116,7 @@ function codexBrainModelChoices(): Array<{ id: string; label: string }> {
   // credentials can see (providers' /v1/models) — a NEW model shows up in the
   // picker without a Clementine release. Presets stay first (curated labels win).
   for (const m of discoveredModels().openai) pushUnique(models, m.id, m.label);
+  addSavedRoleModelsWhileCatalogUncertain(models, 'codex', modelDiscoveryStatus().providers.openai.phase);
   return models;
 }
 
@@ -83,6 +132,7 @@ function claudeBrainModelChoices(): Array<{ id: string; label: string }> {
   // Live discovery (Anthropic /v1/models via API key or the subscription OAuth):
   // a newly dropped Claude model appears here on the next settings poll.
   for (const m of discoveredModels().anthropic) pushUnique(models, m.id, m.label);
+  addSavedRoleModelsWhileCatalogUncertain(models, 'claude', modelDiscoveryStatus().providers.anthropic.phase);
   return models;
 }
 

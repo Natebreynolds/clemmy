@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
@@ -121,6 +121,14 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const [newIntent, setNewIntent] = useState('');
   const [newIntentModel, setNewIntentModel] = useState('');
 
+  useEffect(() => {
+    if (!settings.data?.modelRoles?.discovery?.refreshing) return;
+    const timer = window.setInterval(() => {
+      void qc.invalidateQueries({ queryKey: ['settings'] });
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [qc, settings.data?.modelRoles?.discovery?.refreshing]);
+
   if (settings.isLoading || !mr) {
     const sk = <Skeleton className="h-44 w-full" />;
     return embedded ? sk : <Card className="p-5">{sk}</Card>;
@@ -134,6 +142,16 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const judgeOptions = mr.roleOptions?.judge ?? mr.available;
   const judgeFlat = judgeOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
+  const discovery = mr.discovery;
+  const discoveryProviders = discovery ? Object.values(discovery.providers) : [];
+  const discoveryDegraded = discoveryProviders.some((provider) => provider.phase === 'degraded');
+  const discoveryMessage = discovery?.refreshing
+    ? 'Refreshing OpenAI and Claude model catalogs. Saved routes stay active while this completes.'
+    : discoveryDegraded
+      ? 'A model catalog refresh is degraded. Clementine is using last-known models and saved routes, and will retry automatically.'
+      : discoveryProviders.some((provider) => provider.phase === 'ready')
+        ? `Live catalogs ready · OpenAI ${discovery?.providers.openai.modelCount ?? 0} · Claude ${discovery?.providers.anthropic.modelCount ?? 0}`
+        : 'Dynamic model discovery is waiting for provider catalog credentials; presets and saved routes remain available.';
 
   // ── Second opinion (fusion) — one user-facing judge path. The resolved Judge
   // row says WHO checks; this switch says WHETHER it verifies the brain's draft.
@@ -205,6 +223,14 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
       )}
 
       <div className="space-y-3">
+        {discovery && (
+          <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-caption ${
+            discoveryDegraded ? 'border-warning/40 bg-warning/5 text-warning' : 'border-border bg-canvas text-muted'
+          }`}>
+            <Sparkles className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${discovery.refreshing ? 'animate-pulse text-accent' : ''}`} aria-hidden />
+            <span>{discoveryMessage}</span>
+          </div>
+        )}
         <RoleRow icon={BrainCircuit} label="Brain" hint="Orchestrates every turn — Codex, Claude, or a BYO model (all-in)." resolved={mr.roles.brain}>
           {(id) => (
             <Select id={id} disabled={busy === 'brain'}
