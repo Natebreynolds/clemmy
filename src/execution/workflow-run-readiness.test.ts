@@ -17,7 +17,12 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-workflow-readiness-t
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
-const { partitionWorkflowReadiness, renderWorkflowRunReadinessMessage, renderWorkflowVisualContract } = await import('./workflow-run-readiness.js');
+const {
+  buildWorkflowReadinessInventory,
+  partitionWorkflowReadiness,
+  renderWorkflowRunReadinessMessage,
+  renderWorkflowVisualContract,
+} = await import('./workflow-run-readiness.js');
 type ReadinessItem = Parameters<typeof partitionWorkflowReadiness>[0][number];
 
 test.after(() => {
@@ -73,6 +78,11 @@ test('ready items are neither blockers nor warnings', () => {
   ]);
   assert.equal(blockers.length, 0);
   assert.equal(warnings.length, 0);
+});
+
+test('workflow readiness advertises code mode because workflow steps can execute it', () => {
+  const inventory = buildWorkflowReadinessInventory();
+  assert.ok(inventory.availableTools?.includes('run_tool_program'));
 });
 
 test('targetStepId scopes the partition to that step only', () => {

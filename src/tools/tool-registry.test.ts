@@ -101,7 +101,7 @@ function assertReadMutatorsEqual(
 
 test('catalog surface contains its known-critical members', () => {
   const catalog = asSet(LOCAL_MCP_TOOL_NAMES);
-  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
+  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'run_tool_program', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
     assert.ok(catalog.has(n), `catalog (LOCAL_MCP_TOOL_NAMES) must include ${n}`);
   }
 });
