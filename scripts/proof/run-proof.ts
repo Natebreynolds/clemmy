@@ -194,6 +194,17 @@ async function main(): Promise<void> {
     throw new Error(`Could not fingerprint proof source: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  // The daemon deliberately runs the production dist/ entrypoint. Rebuild it
+  // from the fingerprinted commit before every live matrix so a green proof can
+  // never come from stale generated JS (a source-only Workspace fix was once
+  // "validated" against the previous dist and produced the old tool schema).
+  console.log(`\n→ building candidate ${gitHead.slice(0, 12)} …`);
+  try {
+    execFileSync('npm', ['run', 'build'], { stdio: 'inherit' });
+  } catch (error) {
+    throw new Error(`Candidate build failed before live proof: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   const outcomes: ScenarioOutcome[] = [];
   for (const brainKind of brains) {
     const plan = planBrain(brainKind);
