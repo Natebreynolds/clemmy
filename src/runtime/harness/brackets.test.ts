@@ -376,6 +376,14 @@ test('timeoutForTool: run_shell_command uses the shell budget', () => {
   assert.equal(timeoutForTool('run_shell_command'), DEFAULT_TIMEOUTS_MS.shell);
 });
 
+test('timeoutForTool: call_tool outlives every independently bounded inner tool', () => {
+  assert.equal(timeoutForTool('call_tool'), DEFAULT_TIMEOUTS_MS.dispatcher);
+  assert.ok(
+    timeoutForTool('call_tool') > Math.max(DEFAULT_TIMEOUTS_MS.shell, DEFAULT_TIMEOUTS_MS.mcp),
+    'generic dispatch must not time out before its selected inner tool',
+  );
+});
+
 test('timeoutForTool: MCP-namespaced tools use the MCP budget', () => {
   assert.equal(timeoutForTool('dataforseo__serp_organic_live'), DEFAULT_TIMEOUTS_MS.mcp);
 });

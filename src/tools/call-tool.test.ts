@@ -129,6 +129,17 @@ test('call_tool materializes omitted optional keys before invoking the real stri
   assert.ok(Array.isArray(JSON.parse(out)), 'the real inner memory tool completed with valid JSON');
 });
 
+test('call_tool materializes omitted nullable computer-tool defaults before strict dispatch', async () => {
+  _resetCallToolSchemaCacheForTest();
+  const out = String(await invokeCallTool(
+    'sess-computer-null-defaults',
+    'run_shell_command',
+    JSON.stringify({ command: 'echo CALL_TOOL_NULL_DEFAULTS_OK' }),
+  ));
+  assert.doesNotMatch(out, /InvalidToolInputError|arg_validation/);
+  assert.match(out, /CALL_TOOL_NULL_DEFAULTS_OK/);
+});
+
 test('gate parity: a mutating inner tool routed through call_tool trips the write boundary (keyed on inner name)', async () => {
   const prev = {
     brackets: process.env.HARNESS_TOOL_BRACKETS,

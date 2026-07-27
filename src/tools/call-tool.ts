@@ -49,6 +49,8 @@ const DESCRIPTION = [
  *  cycle with the runtime tool registry. */
 let schemaCache: Map<string, z.ZodTypeAny> | null = null;
 let optionalKeysCache: Map<string, ReadonlySet<string>> | null = null;
+let nullableRequiredKeysPromise: Promise<Map<string, ReadonlySet<string>>> | null = null;
+
 async function localSchemas(): Promise<{ schemas: Map<string, z.ZodTypeAny>; optionalKeys: Map<string, ReadonlySet<string>> }> {
   if (!schemaCache) {
     try {
@@ -61,6 +63,60 @@ async function localSchemas(): Promise<{ schemas: Map<string, z.ZodTypeAny>; opt
     }
   }
   return { schemas: schemaCache, optionalKeys: optionalKeysCache ?? new Map() };
+}
+
+function jsonSchemaAllowsNull(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const schema = value as {
+    type?: unknown;
+    nullable?: unknown;
+    anyOf?: unknown;
+    oneOf?: unknown;
+  };
+  if (schema.nullable === true || schema.type === 'null') return true;
+  if (Array.isArray(schema.type) && schema.type.includes('null')) return true;
+  for (const branch of [schema.anyOf, schema.oneOf]) {
+    if (Array.isArray(branch) && branch.some(jsonSchemaAllowsNull)) return true;
+  }
+  return false;
+}
+
+/**
+ * Strict Responses schemas encode optional/defaultable fields as required +
+ * nullable. The local Zod catalog does not include computer/Composio tools, so
+ * a direct catalog call such as run_shell_command({command}) used to reach the
+ * strict inner parser without cwd/timeout_ms and waste a correction round.
+ *
+ * Derive these null-fill keys from the exact assembled core-tool schemas. This
+ * is transport normalization only: non-null required fields remain untouched
+ * and are still rejected by the inner tool parser.
+ */
+async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>> {
+  if (!nullableRequiredKeysPromise) {
+    nullableRequiredKeysPromise = (async () => {
+      const map = new Map<string, ReadonlySet<string>>();
+      try {
+        const { getCoreTools } = await import('./registry.js');
+        for (const runtimeTool of getCoreTools() as Array<{ name?: string; parameters?: unknown }>) {
+          if (!runtimeTool?.name || !runtimeTool.parameters || typeof runtimeTool.parameters !== 'object') continue;
+          const root = runtimeTool.parameters as {
+            required?: unknown;
+            properties?: unknown;
+          };
+          if (!Array.isArray(root.required) || !root.properties || typeof root.properties !== 'object') continue;
+          const properties = root.properties as Record<string, unknown>;
+          const keys = root.required
+            .filter((key): key is string => typeof key === 'string')
+            .filter((key) => jsonSchemaAllowsNull(properties[key]));
+          if (keys.length > 0) map.set(runtimeTool.name, new Set(keys));
+        }
+      } catch {
+        // Best effort: the strict inner parser remains the final authority.
+      }
+      return map;
+    })();
+  }
+  return nullableRequiredKeysPromise;
 }
 
 function jsonResult(value: unknown): string {
@@ -198,6 +254,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           dispatchArgs = strictArgs;
         }
       }
+      // Core-tool schemas also cover computer/Composio tools that are absent
+      // from getLocalToolSchemas(). Materialize their defaultable strict-null
+      // fields so direct catalog dispatch works without a discovery/retry tax.
+      if (dispatchArgs && typeof dispatchArgs === 'object' && !Array.isArray(dispatchArgs)) {
+        const strictArgs = { ...(dispatchArgs as Record<string, unknown>) };
+        for (const key of (await nullableRequiredKeys()).get(target) ?? []) {
+          if (!(key in strictArgs) || strictArgs[key] === undefined) strictArgs[key] = null;
+        }
+        dispatchArgs = strictArgs;
+      }
 
       // 4. Dispatch through the gated inner path (gates key on the INNER name).
       const sessionId = sessionIdFromRunContext(runContext)
@@ -276,4 +342,5 @@ export function registerCallToolMcp(
 export function _resetCallToolSchemaCacheForTest(): void {
   schemaCache = null;
   optionalKeysCache = null;
+  nullableRequiredKeysPromise = null;
 }

@@ -418,10 +418,16 @@ export const DEFAULT_TIMEOUTS_MS = {
   shell: 600_000,
   externalApi: 300_000,
   mcp: 600_000,
+  // call_tool is a transport wrapper around one independently bounded inner
+  // tool. Its outer deadline must include inner execution plus gate/provider
+  // overhead; otherwise a legitimate 70s shell call is falsely killed at the
+  // generic 60s boundary while the inner process continues to completion.
+  dispatcher: 900_000,
 } as const;
 
 /** Pick a default timeout from the tool name. */
 export function timeoutForTool(toolName: string): number {
+  if (toolName === 'call_tool') return DEFAULT_TIMEOUTS_MS.dispatcher;
   if (toolName === 'run_shell_command') return DEFAULT_TIMEOUTS_MS.shell;
   if (/^(exec|spawn|launch|run_shell|shell_)/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.shell;
