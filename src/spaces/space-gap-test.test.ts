@@ -145,3 +145,13 @@ test('check 1 still fires on a view that demonstrably consumes nothing', () => {
   const gaps = analyzeSpaceGaps(record, '<html><body><h1>pipeline dashboard</h1><script>document.title="x";</script></body></html>', []);
   assert.ok(gaps.some((g) => g.question.includes('never reads them')), 'a truly data-blind view is still flagged');
 });
+
+test('reading an unassigned window seed does not pretend the view is data-connected', () => {
+  const record = { dataSources: [{ id: 'tasks' }], actions: [] } as never;
+  const gaps = analyzeSpaceGaps(
+    record,
+    '<html><script>const data = window.__SPACE_DATA__ || {}; render(data.tasks)</script></html>',
+    [],
+  );
+  assert.ok(gaps.some((g) => g.resolution === 'fix' && g.question.includes('never reads them')));
+});

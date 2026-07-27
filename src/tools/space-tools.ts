@@ -10,7 +10,7 @@
  * surface) and mcp-server.ts (the standalone MCP server) — mirrors
  * registerWorkflowScheduleTools.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -19,7 +19,8 @@ import { BASE_DIR } from '../config.js';
 import { textResult } from './shared.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
-  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, type SpaceDataSource, type SpaceAction,
+  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError,
+  type SpaceDataSource, type SpaceAction, type SpaceRecord,
 } from '../spaces/store.js';
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
@@ -51,13 +52,22 @@ function readAgentOwnedFile(
   } catch {
     return { ok: false, error: `could not resolve ${field}: ${filePath}` };
   }
-  const base = path.resolve(BASE_DIR);
+  if (!existsSync(resolved)) {
+    return { ok: false, error: `${field} does not exist: ${resolved}. Write the file with write_file first.` };
+  }
+  // macOS exposes /var through /private/var. Canonicalize both sides so a file
+  // write reported under one spelling is not falsely rejected under the other;
+  // resolving symlinks also prevents an in-home symlink from escaping BASE_DIR.
+  try {
+    resolved = realpathSync(resolved);
+  } catch {
+    return { ok: false, error: `could not resolve ${field}: ${filePath}` };
+  }
+  let base = path.resolve(BASE_DIR);
+  try { base = realpathSync(base); } catch { /* BASE_DIR may be created shortly after startup */ }
   const rel = path.relative(base, resolved);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     return { ok: false, error: `${field} must be inside ${base} (where write_file saves). Got: ${resolved}` };
-  }
-  if (!existsSync(resolved)) {
-    return { ok: false, error: `${field} does not exist: ${resolved}. Write the file with write_file first.` };
   }
   try {
     return { ok: true, content: readFileSync(resolved, 'utf-8'), resolved };
@@ -68,22 +78,22 @@ function readAgentOwnedFile(
 
 const dataSourceShape = z.object({
   id: z.string().min(1).max(60).describe('Stable id for this data source within the workspace, e.g. "daily_pull".'),
-  runner: z.string().max(120).nullable().describe('Installed filename for a deterministic script (e.g. "refresh.mjs") that prints JSON to stdout. Use runner_path to install a newly-authored script in the same space_save call. Mutually exclusive with composio_slug.'),
-  runner_path: z.string().max(1000).nullable().describe(`Optional source path to the runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
-  composio_slug: z.string().max(120).nullable().describe('A Composio tool slug to call server-side for data (credentials resolve server-side, never in the view). Mutually exclusive with runner.'),
-  composio_args_json: z.string().max(4000).nullable().describe('JSON string of frozen args for composio_slug.'),
-  schedule: z.string().max(60).nullable().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
-  timezone: z.string().max(60).nullable().describe('IANA timezone for the schedule (e.g. "America/Los_Angeles").'),
+  runner: z.string().max(120).nullish().describe('Installed filename for a deterministic script (e.g. "refresh.mjs") that prints JSON to stdout. Use runner_path to install a newly-authored script in the same space_save call. Mutually exclusive with composio_slug.'),
+  runner_path: z.string().max(1000).nullish().describe(`Optional source path to the runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
+  composio_slug: z.string().max(120).nullish().describe('A Composio tool slug to call server-side for data (credentials resolve server-side, never in the view). Mutually exclusive with runner.'),
+  composio_args_json: z.string().max(4000).nullish().describe('JSON string of frozen args for composio_slug.'),
+  schedule: z.string().max(60).nullish().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
+  timezone: z.string().max(60).nullish().describe('IANA timezone for the schedule (e.g. "America/Los_Angeles").'),
 });
 
 const actionShape = z.object({
   id: z.string().min(1).max(60).describe('Stable id for this action, e.g. "send_followup".'),
-  label: z.string().max(80).nullable().describe('Button label shown in the view, e.g. "Send follow-up".'),
-  composio_slug: z.string().max(120).nullable().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner.'),
-  runner: z.string().max(120).nullable().describe('OR the installed filename of a script under data/ that performs the side effect. Use runner_path to install a newly-authored script in this call.'),
-  runner_path: z.string().max(1000).nullable().describe(`Optional source path to the action runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
-  args_template_json: z.string().max(4000).nullable().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
-  confirm: z.boolean().nullable().describe('Hint that the view should confirm before firing (advisory).'),
+  label: z.string().max(80).nullish().describe('Button label shown in the view, e.g. "Send follow-up".'),
+  composio_slug: z.string().max(120).nullish().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner.'),
+  runner: z.string().max(120).nullish().describe('OR the installed filename of a script under data/ that performs the side effect. Use runner_path to install a newly-authored script in this call.'),
+  runner_path: z.string().max(1000).nullish().describe(`Optional source path to the action runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
+  args_template_json: z.string().max(4000).nullish().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
+  confirm: z.boolean().nullish().describe('Hint that the view should confirm before firing (advisory).'),
 });
 
 interface StagedRunner {
@@ -296,12 +306,12 @@ export function registerSpaceTools(server: McpServer): void {
     {
       slug: z.string().min(2).max(63).describe('Workspace id, lowercase kebab-case (e.g. "sf-daily-report"). Reuse to update.'),
       title: z.string().min(1).max(200).describe('Human title shown in the Workspaces gallery.'),
-      view_path: z.string().max(1000).nullable().describe(`Path to the HTML file you wrote with write_file (inside ${BASE_DIR}). Required when first creating; omit to update only metadata.`),
-      data_sources: z.array(dataSourceShape).nullable().describe('Optional declared data sources for server-side (token-free) refresh.'),
-      actions: z.array(actionShape).nullable().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
-      reengage_triggers: z.array(z.enum(['note', 'ask', 'threshold'])).nullable().describe('Which in-workspace events should wake you to reason: "note" (user left a note), "ask" (user asked in the workspace chat), "threshold" (data crossed a limit).'),
-      reengage_guidance: z.string().max(2000).nullable().describe('What you should do when re-engaged (e.g. "draft a follow-up for any deal stalled >14 days").'),
-      origin_session_id: z.string().max(200).nullable().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
+      view_path: z.string().max(1000).nullish().describe(`Path to the HTML file you wrote with write_file (inside ${BASE_DIR}). Required when first creating; omit to update only metadata.`),
+      data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh.'),
+      actions: z.array(actionShape).nullish().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
+      reengage_triggers: z.array(z.enum(['note', 'ask', 'threshold'])).nullish().describe('Which in-workspace events should wake you to reason: "note" (user left a note), "ask" (user asked in the workspace chat), "threshold" (data crossed a limit).'),
+      reengage_guidance: z.string().max(2000).nullish().describe('What you should do when re-engaged (e.g. "draft a follow-up for any deal stalled >14 days").'),
+      origin_session_id: z.string().max(200).nullish().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
     },
     async ({ slug, title, view_path, data_sources, actions, reengage_triggers, reengage_guidance, origin_session_id }) => {
       if (!isValidSpaceSlug(slug)) {
@@ -361,6 +371,38 @@ export function registerSpaceTools(server: McpServer): void {
       });
       if (!prep.ok) {
         return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
+      }
+
+      // Code/runtime gaps are Clementine's responsibility, not questions for
+      // the user. Refuse them BEFORE installing runners, copying the view, or
+      // persisting an ACTIVE manifest. Genuine data/product clarifications
+      // (for example a valid query returning zero rows) still happen after the
+      // creation smoke below.
+      let candidateView = authoredView?.ok ? authoredView.content : '';
+      if (!candidateView && existing) {
+        try { candidateView = readFileSync(resolveInSpace(slug, existing.viewEntry), 'utf-8'); } catch { /* gap test reports it */ }
+      }
+      const now = new Date().toISOString();
+      const prospective: SpaceRecord = existing
+        ? { ...existing, title, dataSources: prep.dataSources, actions: prep.actions }
+        : {
+          id: slug,
+          title,
+          status: 'active',
+          viewEntry: 'view/index.html',
+          dataSources: prep.dataSources,
+          actions: prep.actions,
+          version: 1,
+          revisions: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+      const implementationGaps = analyzeSpaceGaps(prospective, candidateView, [])
+        .filter((gap) => gap.resolution === 'fix');
+      if (implementationGaps.length > 0) {
+        return textResult(
+          `Workspace "${slug}" was NOT saved — its view has implementation gaps.${renderSpaceGapQuestions(implementationGaps)}`,
+        );
       }
 
       // Install newly-authored runners only after every source path and manifest

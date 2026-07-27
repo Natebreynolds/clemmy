@@ -117,7 +117,7 @@ export function analyzeSpaceGaps(
     || /\/refresh\b/.test(html)
     || /\bclem\s*\.\s*(data|refresh)\s*\(/.test(html)
     || /<script[^>]*\btype\s*=\s*["']?application\/json/i.test(html) // inlined dataset
-    || /\bwindow\.__[A-Z_]*DATA/i.test(html); // embedded seed convention
+    || /\bwindow\.__[A-Z_]*DATA\s*=/i.test(html); // actual embedded seed assignment (not merely a read)
   if (sources.length > 0 && !consumesDataPlane) {
     gaps.push({
       severity: 'clarify',

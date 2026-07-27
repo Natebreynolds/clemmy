@@ -76,7 +76,7 @@ test('space_save updates in place + snapshots the prior view (revert path)', asy
 
 test('space_save records declared data sources + re-engage contract', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-planner.html');
-  writeFileSync(draft, '<html>planner</html>', 'utf-8');
+  writeFileSync(draft, '<html><script>clem.data().then(data => render(data.cal))</script></html>', 'utf-8');
   await tools.space_save({
     slug: 'planner',
     title: 'Daily Planner',
@@ -90,6 +90,25 @@ test('space_save records declared data sources + re-engage contract', async () =
   assert.equal(rec?.dataSources[0].composioSlug, 'GOOGLECALENDAR_LIST_EVENTS');
   assert.deepEqual(rec?.dataSources[0].composioArgs, { max: 10 });
   assert.deepEqual(rec?.reengage?.triggers, ['note', 'ask']);
+});
+
+test('space_save refuses a data-backed view that only reads an imaginary window seed', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-imaginary-seed.html');
+  const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-imaginary-seed.mjs');
+  writeFileSync(draft, '<html><script>const data=window.__SPACE_DATA__||{}; render(data.tasks)</script></html>', 'utf-8');
+  writeFileSync(runnerDraft, 'process.stdout.write(JSON.stringify([]))', 'utf-8');
+
+  const out = text(await tools.space_save({
+    slug: 'imaginary-seed',
+    title: 'Imaginary Seed',
+    view_path: draft,
+    data_sources: [{ id: 'tasks', runner_path: runnerDraft }],
+  }));
+
+  assert.match(out, /was NOT saved/);
+  assert.match(out, /fix these implementation issues now/);
+  assert.equal(store.spaceStore.get('imaginary-seed'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('imaginary-seed', 'data/tmp-imaginary-seed.mjs')), false);
 });
 
 test('space_save installs a newly-authored runner_path in one call', async () => {
@@ -211,7 +230,11 @@ test('space_get surfaces hand-written manifest JSON errors and space_save requir
   assert.match(got, /args_template_json must be a JSON object/);
 
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-handwrite-fix.html');
-  writeFileSync(draft, '<html>new</html>', 'utf-8');
+  writeFileSync(
+    draft,
+    '<html><script>clem.data().then(data => render(data.pull)); function act(){return clem.action("act", {})}</script></html>',
+    'utf-8',
+  );
   const viewOnly = text(await tools.space_save({ slug, title: 'Handwritten', view_path: draft }));
   assert.match(viewOnly, /was NOT saved/);
   assert.match(viewOnly, /Pass corrected data_sources and actions/);
