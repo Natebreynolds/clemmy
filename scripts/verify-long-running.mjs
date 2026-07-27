@@ -128,12 +128,15 @@ async function testPreflightBlockReferencesRealTools() {
     { ok: msg.includes('CONTEXT BUDGET NOTICE'), label: 'preserves operator-visible budget notice header' },
     { ok: msg.includes('300,000'), label: 'interpolates predicted tokens with locale formatting' },
   ];
-  // Revert lever still works: with legacy block on, v1 wording returns.
+  // The legacy hard-stop flag was deliberately retired. A stale environment
+  // entry must not resurrect the phantom propose_plan tool or block the model.
   process.env.CLEMMY_PREFLIGHT_LEGACY_BLOCK = 'on';
-  const legacyMsg = loop.buildPreflightBlockMessage({
+  const retiredFlagMsg = loop.buildPreflightBlockMessage({
     predictedTokens: 1, blockFraction: 0.85, effectiveLimit: 1,
   });
-  checks.push({ ok: legacyMsg.includes('propose_plan'), label: 'legacy fallback still emits propose_plan when knob=on' });
+  checks.push({ ok: retiredFlagMsg.includes('create_plan'), label: 'retired legacy flag still references create_plan' });
+  checks.push({ ok: !retiredFlagMsg.includes('propose_plan'), label: 'retired legacy flag cannot resurrect propose_plan' });
+  checks.push({ ok: /guidance, not a stop|keep moving|proceed if the work is worth it/i.test(retiredFlagMsg), label: 'retired legacy flag remains advisory' });
   delete process.env.CLEMMY_PREFLIGHT_LEGACY_BLOCK;
 
   const failed = checks.filter((c) => !c.ok);
@@ -355,7 +358,8 @@ async function testWorkflowPreflightCompacts() {
 //     sub_agent_stalled, which was the v0.5.18 behavior)
 //   - the eventlog contains an `awaiting_user_input` event with
 //     source: 'stall_recovery'
-//   - 2 stall_retry_attempted events fired before the question
+//   - 2 corrective retries, then one model-authored recovery-summary
+//     turn, fired before the minimal user question
 
 async function testStallConvertsToQuestion() {
   const eventlog = await import(pathToFileURL(path.join(DAEMON_DIST, 'runtime/harness/eventlog.js')).href);
@@ -403,14 +407,21 @@ async function testStallConvertsToQuestion() {
   checks.push({ ok: result.status === 'awaiting_user_input', label: `result.status === 'awaiting_user_input' (got '${result.status}')` });
   const events = eventlog.listEvents(sess.id);
   const retryEvents = events.filter((e) => e.type === 'stall_retry_attempted');
-  checks.push({ ok: retryEvents.length === 2, label: `2 stall_retry_attempted events (got ${retryEvents.length})` });
+  const correctiveRetries = retryEvents.filter((e) => typeof e.data?.attempt === 'number');
+  const recoverySummaryRetries = retryEvents.filter((e) => e.data?.attempt === 'recovery_summary');
+  checks.push({ ok: correctiveRetries.length === 2, label: `2 corrective stall retries (got ${correctiveRetries.length})` });
+  checks.push({ ok: recoverySummaryRetries.length === 1, label: `1 recovery-summary turn (got ${recoverySummaryRetries.length})` });
+  checks.push({ ok: retryEvents.length === 3, label: `3 total stall recovery events (got ${retryEvents.length})` });
   const awaitingEvents = events.filter((e) => e.type === 'awaiting_user_input');
   checks.push({ ok: awaitingEvents.length === 1, label: `1 awaiting_user_input event (got ${awaitingEvents.length})` });
   if (awaitingEvents.length > 0) {
     const evt = awaitingEvents[0];
     checks.push({ ok: evt.data?.source === 'stall_recovery', label: `awaiting_user_input.source === 'stall_recovery'` });
     checks.push({ ok: typeof evt.data?.question === 'string' && evt.data.question.length > 0, label: 'awaiting_user_input has a question' });
-    checks.push({ ok: Array.isArray(evt.data?.options) && evt.data.options.length === 3, label: 'awaiting_user_input offers 3 options' });
+    checks.push({
+      ok: JSON.stringify(evt.data?.options) === JSON.stringify(['Continue', 'Start over']),
+      label: 'awaiting_user_input offers the two minimal recovery actions',
+    });
   }
   // No sub_agent_stalled termination should have fired.
   const stalledTerm = events.find((e) => e.type === 'conversation_completed' && e.data?.reason === 'sub_agent_stalled');
@@ -593,7 +604,8 @@ async function testLoopDetectionSurvivesRestart() {
 // Exercises the exported `shouldPostExpiryCheckIn` throttle predicate
 // across the gates that matter: token not expired (skip), state done
 // (skip), no sendFollowup transport (skip), within throttle window
-// (skip), past throttle window (fire), knob=off (skip).
+// (skip), past throttle window (fire), and the retired knob cannot
+// disable visibility on a long-running Discord task.
 
 async function testDiscordTokenExpiryThinkingIndicator() {
   const discord = await import(
@@ -627,9 +639,10 @@ async function testDiscordTokenExpiryThinkingIndicator() {
   checks.push({ ok: discord.shouldPostExpiryCheckIn({ ...baseInput, now: checkInMs - 1000 }) === false, label: 'within throttle window → skip' });
   // At exactly the throttle window → fire.
   checks.push({ ok: discord.shouldPostExpiryCheckIn({ ...baseInput, now: checkInMs }) === true, label: 'exactly at throttle window → fires' });
-  // Revert knob: forces false even when everything else aligns.
+  // This flag graduated to always-on. A stale value in an upgraded install
+  // must not make a long-running Discord task silently disappear.
   process.env.CLEMMY_DISCORD_POST_EXPIRY_CHECKINS = 'off';
-  checks.push({ ok: discord.shouldPostExpiryCheckIn(baseInput) === false, label: 'CLEMMY_DISCORD_POST_EXPIRY_CHECKINS=off → skip' });
+  checks.push({ ok: discord.shouldPostExpiryCheckIn(baseInput) === true, label: 'retired expiry-checkin flag cannot disable visibility' });
   delete process.env.CLEMMY_DISCORD_POST_EXPIRY_CHECKINS;
 
   const failed = checks.filter((c) => !c.ok);
@@ -666,31 +679,31 @@ async function test80ToolCallEndToEnd() {
   const REQUIRED_TURNS = Math.ceil(TOTAL_TOOL_CALLS / TOOL_CALLS_PER_TURN); // 5
 
   let turnCount = 0;
-  // Emit synthetic tool_called events from inside the runRunner so the
-  // eventlog reflects what the model would have done. The real path
-  // emits these via `hooks.onToolEnd`; for the smoke we shortcut by
-  // calling appendEvent directly through the eventlog module.
+  // Emit synthetic SDK tool lifecycle events from inside runRunner so BOTH
+  // the real hook-backed eventlog path and the per-turn counter see them.
+  // Writing tool_called rows directly would create telemetry without work;
+  // the anti-fake-progress guard correctly treats that as a zero-tool stall.
   // The runner must expose `.on/.off` (EventEmitter) because the
   // harness attaches hooks to it — see hooks.js attachEventLogHooks.
   const makeRunnerStub = () => new EventEmitter();
 
-  const runRunner = async (_runner, _agent, items, opts) => {
+  const runRunner = async (runner, _agent, items, opts) => {
     turnCount += 1;
     const callsThisTurn = Math.min(TOOL_CALLS_PER_TURN, TOTAL_TOOL_CALLS - (turnCount - 1) * TOOL_CALLS_PER_TURN);
     const sessionId = opts?.context?.sessionId ?? sess.id;
     const turn = opts?.context?.turn ?? turnCount;
+    const runContext = { context: { sessionId, turn } };
+    const sdkAgent = { name: 'Clem' };
+    const sdkTool = { name: 'verify_smoke_stub' };
     for (let i = 0; i < callsThisTurn; i++) {
-      eventlog.appendEvent({
-        sessionId,
-        turn,
-        role: 'tool',
-        type: 'tool_called',
-        data: {
-          name: 'verify_smoke_stub',
+      const details = {
+        toolCall: {
           callId: `call_smoke_${turnCount}_${i}`,
-          args: { iter: i },
+          arguments: JSON.stringify({ iter: i }),
         },
-      });
+      };
+      runner.emit('agent_tool_start', runContext, sdkAgent, sdkTool, details);
+      runner.emit('agent_tool_end', runContext, sdkAgent, sdkTool, `ok ${i}`, details);
     }
     const isLast = turnCount >= REQUIRED_TURNS;
     // The harness loop auto-continues when nextAction is
@@ -728,16 +741,28 @@ async function test80ToolCallEndToEnd() {
   // model dispatch never fires.
   const agentStub = { model: 'gpt-5.5' };
 
-  const result = await loop.runConversation({
-    agent: agentStub,
-    sessionId: sess.id,
-    input: 'do 80 tool calls and finish',
-    runRunner,
-    makeRunner: makeRunnerStub,
-    // Allow the loop to run to completion across all 5 turns.
-    maxSteps: 10,
-    maxTurns: 50,
-  });
+  // Scripted runners do not execute wrapped tool bodies, so use the loop's
+  // supported event-counter fallback for this integration smoke. Brackets-on
+  // execution is covered independently by brackets.test.ts.
+  const previousBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'off';
+  let result;
+  try {
+    result = await loop.runConversation({
+      agent: agentStub,
+      sessionId: sess.id,
+      input: 'do 80 tool calls and finish',
+      runRunner,
+      makeRunner: makeRunnerStub,
+      // Allow the loop to run to completion across all 5 turns.
+      maxSteps: 10,
+      maxTurns: 50,
+      toolCallsPerTurn: 80,
+    });
+  } finally {
+    if (previousBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previousBrackets;
+  }
 
   const checks = [];
   checks.push({ ok: result.status === 'completed', label: `terminal status is completed (got ${result.status})` });
@@ -1013,11 +1038,11 @@ async function testApprovalPreviewAutoEnrichment() {
 //   (2) Unit:   buildTransportTimeoutError produces a BoundaryError
 //               with kind='codex.transport_timeout', retryable=true,
 //               and a real userMessage.
-//   (3) E2E:    runTurn catches a BoundaryError(kind=transport_timeout)
-//               thrown from runRunner and routes it through F4 to an
-//               `awaiting_user_input` event with source=infra_error_recovery
-//               and boundaryKind='codex.transport_timeout'. Same shape
-//               as Bug C/I — same Retry/Switch/Stop card.
+//   (3) E2E:    runConversation catches a BoundaryError(kind=transport_timeout),
+//               performs one silent attended retry, then routes a persistent
+//               failure to an `awaiting_user_input` event with
+//               source=infra_error_recovery and boundaryKind=
+//               'codex.transport_timeout'. Same Retry/Switch/Stop card.
 //
 // Why this matters: the long-running Salesforce chat hang regression
 // silently sat for 3+ minutes because undici defaults are 5 min and
@@ -1057,13 +1082,13 @@ async function testCodexTransportTimeoutRoutesToF4() {
   checks.push({ ok: typeof headerErr.context.budgetMs === 'number', label: 'context preserves budgetMs' });
   checks.push({ ok: boundaryMod.BoundaryError.isTransient(headerErr), label: 'isTransient classifies as transient' });
 
-  // ─── (3) E2E — runTurn routes the BoundaryError through F4 ──────
+  // ─── (3) E2E — quiet retry, then F4 recovery card ────────────────
   // Same pattern as the existing http_5xx/sse_truncated paths in
   // loop.ts:2281-2289. Seed a tool_called event so retry_context can
   // populate, then have runRunner throw a transport_timeout.
   eventlog.resetEventLog?.();
-  // Default behavior: HARNESS_INFRA_ASK_USER unset = on. Ensure no
-  // stale env from a prior sub-test forces it off.
+  // HARNESS_INFRA_ASK_USER is retired; a stale install value cannot bypass
+  // the recovery path.
   delete process.env.HARNESS_INFRA_ASK_USER;
 
   const sess = sessionMod.HarnessSession.create({ kind: 'chat', title: 'transport timeout smoke' });
@@ -1095,7 +1120,7 @@ async function testCodexTransportTimeoutRoutesToF4() {
     });
   };
 
-  const result = await loop.runTurn({
+  const result = await loop.runConversation({
     agent: { model: 'gpt-5.5' },
     sessionId: sess.id,
     input: 'who owns the Prairie Law account in salesforce',
@@ -1103,8 +1128,10 @@ async function testCodexTransportTimeoutRoutesToF4() {
     makeRunner: makeRunnerStub,
   });
 
-  checks.push({ ok: runRunnerInvoked === 1, label: 'runRunner invoked exactly once' });
-  checks.push({ ok: result?.status === 'awaiting_user_input', label: 'runTurn returns status=awaiting_user_input (not failed)' });
+  checks.push({ ok: runRunnerInvoked === 2, label: 'runRunner invoked twice (one quiet retry)' });
+  checks.push({ ok: result?.status === 'awaiting_user_input', label: 'persistent timeout returns status=awaiting_user_input' });
+  const recoveryEvents = eventlog.listEvents(sess.id, { types: ['infra_auto_recover'] });
+  checks.push({ ok: recoveryEvents.length === 1, label: 'exactly one attended quiet-retry event emitted' });
 
   // Find the awaiting_user_input event the F4 path wrote.
   const events = eventlog.listEvents(sess.id, { types: ['awaiting_user_input'] });
@@ -1119,28 +1146,27 @@ async function testCodexTransportTimeoutRoutesToF4() {
     checks.push({ ok: data.retry_context?.failed_call_id === 'call_sf_test', label: 'retry_context captures call_id' });
   }
 
-  // Verify the env-gate revert still works — HARNESS_INFRA_ASK_USER=off
-  // should bypass F4 entirely and surface as a normal error.
+  // The retired env gate is intentionally inert: upgraded installations that
+  // still contain =off must retain the same bounded retry + recovery card.
   process.env.HARNESS_INFRA_ASK_USER = 'off';
   eventlog.resetEventLog?.();
-  const sess2 = sessionMod.HarnessSession.create({ kind: 'chat', title: 'transport timeout — env off' });
-  let normalErrorPath = false;
-  try {
-    await loop.runTurn({
-      agent: { model: 'gpt-5.5' },
-      sessionId: sess2.id,
-      input: 'q',
-      runRunner: async () => { throw dispatcher.buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', {}); },
-      makeRunner: makeRunnerStub,
-    });
-    // No throw with knob=off but the result should not be awaiting_user_input.
-    const evts2 = eventlog.listEvents(sess2.id, { types: ['awaiting_user_input'] });
-    normalErrorPath = evts2.length === 0;
-  } catch {
-    // A surfaced error (rather than awaiting_user_input) is also valid evidence the gate flipped.
-    normalErrorPath = true;
-  }
-  checks.push({ ok: normalErrorPath, label: 'HARNESS_INFRA_ASK_USER=off bypasses F4 (revert lever works)' });
+  const sess2 = sessionMod.HarnessSession.create({ kind: 'chat', title: 'transport timeout — retired env flag' });
+  let retiredFlagCalls = 0;
+  const retiredFlagResult = await loop.runConversation({
+    agent: { model: 'gpt-5.5' },
+    sessionId: sess2.id,
+    input: 'q',
+    runRunner: async () => {
+      retiredFlagCalls += 1;
+      throw dispatcher.buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', {});
+    },
+    makeRunner: makeRunnerStub,
+  });
+  const retiredFlagAsks = eventlog.listEvents(sess2.id, { types: ['awaiting_user_input'] });
+  checks.push({
+    ok: retiredFlagResult.status === 'awaiting_user_input' && retiredFlagCalls === 2 && retiredFlagAsks.length === 1,
+    label: 'retired HARNESS_INFRA_ASK_USER=off cannot disable bounded recovery',
+  });
   delete process.env.HARNESS_INFRA_ASK_USER;
 
   const failed = checks.filter((c) => !c.ok);
