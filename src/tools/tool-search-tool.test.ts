@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync } from 'node:fs';
+import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-toolsearch-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -47,6 +48,7 @@ async function runSearch(handler: Handler, query: string, sessionId?: string) {
     query: string;
     results: Array<{ name: string; summary: string }>;
     schemas: Record<string, unknown>;
+    guidance?: Record<string, string>;
     hint: string;
   };
 }
@@ -69,6 +71,25 @@ test('returns ranked names + summaries and full schemas for the top hits', async
   // A returned schema is a real JSON Schema object.
   const first = out.schemas[schemaNames[0]] as { type?: string; properties?: unknown };
   assert.ok(first && typeof first === 'object' && ('properties' in first || 'type' in first), 'schema looks like JSON Schema');
+});
+
+test('an explicitly searched large schema survives the output budget instead of forcing an invalid probe call', async () => {
+  const t = captureToolSearch();
+  const raw = await t.handler({
+    query: 'space_save exact input schema create Workspace with title slug HTML view and runner data source code',
+    limit: 3,
+  });
+  const text = raw.content[0].text;
+  const out = JSON.parse(text) as {
+    results: Array<{ name: string }>;
+    schemas: Record<string, unknown>;
+    guidance?: Record<string, string>;
+  };
+  assert.equal(out.results[0]?.name, 'space_save');
+  assert.ok(out.schemas.space_save, 'the requested large schema must remain available');
+  assert.deepEqual(Object.keys(out.schemas), ['space_save'], 'an exact-name query spends tokens on only the selected schema');
+  assert.match(out.guidance?.space_save ?? '', /clem\.data\(\)/, 'exact selection includes its critical usage contract');
+  assert.ok(text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS, 'tool_search stays within its own intact-JSON budget');
 });
 
 test('does not promote speculative schema-bearing hits to the session hot-set', async () => {

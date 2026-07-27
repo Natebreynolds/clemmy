@@ -413,11 +413,28 @@ export function registerSpaceTools(server: McpServer): void {
           .map((entry) => entry.runner)
           .filter((runner): runner is string => Boolean(runner)),
       );
+      const runnerInstallRepairs: string[] = [];
       for (const [runner, staged] of runnerSources) {
         if (!usedRunners.has(runner)) continue; // auto-repair may prefer Composio and drop it
         const target = resolveInSpace(slug, path.join('data', runner));
         mkdirSync(path.dirname(target), { recursive: true });
-        if (staged.source !== target || !existsSync(target)) writeFileSync(target, staged.content, 'utf-8');
+        if (staged.source !== target || !existsSync(target)) {
+          // A repair tool edits the installed runner in place. If a later
+          // metadata save repeats the original runner_path, do not silently
+          // restore that now-stale authoring copy over the newer repair.
+          if (existing && staged.source !== target && existsSync(target)) {
+            const installed = readFileSync(target, 'utf-8');
+            const installedMtime = statSync(target).mtimeMs;
+            const sourceMtime = statSync(staged.source).mtimeMs;
+            if (installed !== staged.content && installedMtime > sourceMtime) {
+              runnerInstallRepairs.push(
+                `Preserved newer edited runner "data/${runner}" instead of reinstalling stale runner_path "${path.basename(staged.source)}".`,
+              );
+              continue;
+            }
+          }
+          writeFileSync(target, staged.content, 'utf-8');
+        }
       }
 
       // Install the view (snapshot the prior canonical first, for revert).
@@ -481,8 +498,8 @@ export function registerSpaceTools(server: McpServer): void {
       const dsNote = record.dataSources.length > 0
         ? ` ${record.dataSources.length} data source${record.dataSources.length === 1 ? '' : 's'} declared.`
         : '';
-      const advisories = (prep.repairs.length > 0 || prep.warnings.length > 0)
-        ? `\n\nHeads up (the workspace was saved):\n- ${[...prep.repairs, ...prep.warnings].join('\n- ')}`
+      const advisories = (prep.repairs.length > 0 || prep.warnings.length > 0 || runnerInstallRepairs.length > 0)
+        ? `\n\nHeads up (the workspace was saved):\n- ${[...prep.repairs, ...prep.warnings, ...runnerInstallRepairs].join('\n- ')}`
         : '';
       let smokeNote = '';
       if (smoke) {

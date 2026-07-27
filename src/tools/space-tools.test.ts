@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -144,6 +144,48 @@ test('space_save installs a newly-authored runner_path in one call', async () =>
     'process.stdout.write(JSON.stringify([]))',
   );
   assert.ok(existsSync(store.resolveInSpace('one-pass', 'data.json')), 'creation smoke runs the staged runner');
+});
+
+test('space_save preserves a newer installed runner repair over a stale runner_path', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-newer-runner-view.html');
+  const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-newer-runner.mjs');
+  const original = 'process.stdout.write(JSON.stringify([]))';
+  const repaired = 'process.stdout.write(JSON.stringify([{title:"kept repair"}]))';
+  writeFileSync(
+    draft,
+    '<html><script>async function load(){const data=await clem.data();render(data.tasks)}</script></html>',
+    'utf-8',
+  );
+  writeFileSync(runnerDraft, original, 'utf-8');
+
+  const args = {
+    slug: 'newer-runner-wins',
+    title: 'Newer Runner Wins',
+    view_path: draft,
+    data_sources: [{
+      id: 'tasks',
+      runner: null,
+      runner_path: runnerDraft,
+      composio_slug: null,
+      composio_args_json: null,
+      schedule: null,
+      timezone: null,
+    }],
+  };
+  assert.match(text(await tools.space_save(args)), /Created workspace/);
+
+  const installed = store.resolveInSpace('newer-runner-wins', 'data/tmp-newer-runner.mjs');
+  writeFileSync(installed, repaired, 'utf-8');
+  const old = new Date('2026-01-01T00:00:01.000Z');
+  const newer = new Date('2026-01-01T00:00:02.000Z');
+  utimesSync(runnerDraft, old, old);
+  utimesSync(installed, newer, newer);
+
+  const out = text(await tools.space_save(args));
+  assert.match(out, /Preserved newer edited runner/);
+  assert.equal(readFileSync(installed, 'utf-8'), repaired);
+  const data = JSON.parse(readFileSync(store.resolveInSpace('newer-runner-wins', 'data.json'), 'utf-8'));
+  assert.equal(data.tasks[0].title, 'kept repair');
 });
 
 test('space_save rejects conflicting runner sources before installing either', async () => {

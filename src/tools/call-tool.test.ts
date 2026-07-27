@@ -99,6 +99,28 @@ test('bad args return the schema with error=arg_validation and NO dispatch', asy
   assert.ok(!getHotSet('sess-argval').includes(target!), 'a validation miss must not dispatch');
 });
 
+test('unknown deferred arguments are rejected instead of silently stripped before dispatch', async () => {
+  _resetHotSetForTest();
+  _resetCallToolSchemaCacheForTest();
+  const out = JSON.parse(String(await invokeCallTool(
+    'sess-stale-workspace-schema',
+    'space_save',
+    JSON.stringify({
+      slug: 'stale-workspace-shape',
+      title: 'Stale Workspace Shape',
+      view_path: '/tmp/never-dispatched.html',
+      description: 'obsolete field',
+      dataSources: [{ id: 'tasks', type: 'runner' }],
+    }),
+  )));
+  assert.equal(out.error, 'arg_validation');
+  assert.match(out.detail, /Unrecognized keys?:.*description.*dataSources|Unrecognized keys?:.*dataSources.*description/i);
+  assert.ok(out.schema && typeof out.schema === 'object');
+  assert.match(out.guidance, /clem\.data\(\)/, 'the correction includes the selected tool contract, not only its arguments');
+  assert.match(out.guidance, /MUST print the dataset as JSON to stdout/, 'runner semantics are available on direct stale-schema calls');
+  assert.ok(!getHotSet('sess-stale-workspace-schema').includes('space_save'), 'unknown fields must prevent dispatch and promotion');
+});
+
 test('invalid JSON in args_json returns arg_validation with no dispatch', async () => {
   const out = JSON.parse(String(await invokeCallTool('sess-json', 'composio_execute_tool', '{not json')));
   assert.equal(out.error, 'arg_validation');
@@ -110,12 +132,16 @@ test('deferred validation accepts omitted optional keys as well as strict-mode n
   const facts = schemas.get('memory_list_facts');
   const working = schemas.get('working_memory');
   const recall = schemas.get('memory_recall_all');
-  assert.ok(facts && working && recall);
+  const getRunner = schemas.get('space_get_runner');
+  const refreshSpace = schemas.get('space_refresh');
+  assert.ok(facts && working && recall && getRunner && refreshSpace);
   assert.equal(facts!.safeParse({ query: 'Northstar live-proof team', limit: 50 }).success, true);
   assert.equal(facts!.safeParse({ kind: null, query: 'Northstar live-proof team', limit: 50, includeInactive: false }).success, true);
   assert.equal(working!.safeParse({ action: 'read' }).success, true);
   assert.equal(working!.safeParse({ action: 'read', content: null }).success, true);
   assert.equal(recall!.safeParse({}).success, false, 'genuinely required keys remain required');
+  assert.equal(getRunner!.safeParse({ slug: 'proof-cockpit', runner_path: 'tasks.mjs' }).success, true);
+  assert.equal(refreshSpace!.safeParse({ slug: 'proof-cockpit' }).success, true);
 });
 
 test('call_tool materializes omitted optional keys before invoking the real strict inner tool', async () => {

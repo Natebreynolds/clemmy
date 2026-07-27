@@ -49,20 +49,35 @@ const DESCRIPTION = [
  *  cycle with the runtime tool registry. */
 let schemaCache: Map<string, z.ZodTypeAny> | null = null;
 let optionalKeysCache: Map<string, ReadonlySet<string>> | null = null;
+let descriptionCache: Map<string, string> | null = null;
 let nullableRequiredKeysPromise: Promise<Map<string, ReadonlySet<string>>> | null = null;
 
-async function localSchemas(): Promise<{ schemas: Map<string, z.ZodTypeAny>; optionalKeys: Map<string, ReadonlySet<string>> }> {
+async function localSchemas(): Promise<{
+  schemas: Map<string, z.ZodTypeAny>;
+  optionalKeys: Map<string, ReadonlySet<string>>;
+  descriptions: Map<string, string>;
+}> {
   if (!schemaCache) {
     try {
-      const { getLocalToolSchemas, getLocalToolOptionalKeys } = await import('./local-runtime-tools.js');
+      const {
+        getLocalToolCatalog,
+        getLocalToolSchemas,
+        getLocalToolOptionalKeys,
+      } = await import('./local-runtime-tools.js');
       schemaCache = getLocalToolSchemas();
       optionalKeysCache = getLocalToolOptionalKeys();
+      descriptionCache = new Map(getLocalToolCatalog().map((entry) => [entry.name, entry.description]));
     } catch {
       schemaCache = new Map();
       optionalKeysCache = new Map();
+      descriptionCache = new Map();
     }
   }
-  return { schemas: schemaCache, optionalKeys: optionalKeysCache ?? new Map() };
+  return {
+    schemas: schemaCache,
+    optionalKeys: optionalKeysCache ?? new Map(),
+    descriptions: descriptionCache ?? new Map(),
+  };
 }
 
 function jsonSchemaAllowsNull(value: unknown): boolean {
@@ -240,6 +255,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           return refuse({
             error: 'arg_validation',
             schema: z.toJSONSchema(schema),
+            guidance: local.descriptions.get(target),
             detail: parsed.error.issues
               .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
               .join('; '),
@@ -342,5 +358,6 @@ export function registerCallToolMcp(
 export function _resetCallToolSchemaCacheForTest(): void {
   schemaCache = null;
   optionalKeysCache = null;
+  descriptionCache = null;
   nullableRequiredKeysPromise = null;
 }

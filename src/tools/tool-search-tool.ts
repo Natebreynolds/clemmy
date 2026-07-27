@@ -29,17 +29,28 @@ const DESCRIPTION = [
   'Read-only — searching never changes anything.',
 ].join(' ');
 
-/** Lazily-built, memoized name → JSON-schema map. Dynamic-imported so this module
- *  (which the runtime tool registry imports) never forms an eval-time import cycle. */
-let schemaMapPromise: Promise<Map<string, unknown>> | null = null;
-async function toolSchemaMap(): Promise<Map<string, unknown>> {
-  if (!schemaMapPromise) {
-    schemaMapPromise = (async () => {
-      const map = new Map<string, unknown>();
+interface ToolSearchMetadata {
+  schema: unknown;
+  description: string;
+}
+
+/** Lazily-built, memoized name → schema/instructions map. Dynamic-imported so
+ * this module (which the runtime tool registry imports) never forms an
+ * eval-time import cycle. */
+let metadataMapPromise: Promise<Map<string, ToolSearchMetadata>> | null = null;
+async function toolMetadataMap(): Promise<Map<string, ToolSearchMetadata>> {
+  if (!metadataMapPromise) {
+    metadataMapPromise = (async () => {
+      const map = new Map<string, ToolSearchMetadata>();
       try {
         const { getCoreTools } = await import('./registry.js');
-        for (const t of getCoreTools() as Array<{ name?: string; parameters?: unknown }>) {
-          if (t?.name && t.parameters) map.set(t.name, t.parameters);
+        for (const t of getCoreTools() as Array<{ name?: string; description?: string; parameters?: unknown }>) {
+          if (t?.name && t.parameters) {
+            map.set(t.name, {
+              schema: t.parameters,
+              description: typeof t.description === 'string' ? t.description : '',
+            });
+          }
         }
       } catch {
         /* schemas are best-effort; names + one-liners still return */
@@ -47,7 +58,7 @@ async function toolSchemaMap(): Promise<Map<string, unknown>> {
       return map;
     })();
   }
-  return schemaMapPromise;
+  return metadataMapPromise;
 }
 
 export function registerToolSearchTool(
@@ -79,38 +90,64 @@ export function registerToolSearchTool(
     async ({ query, limit }: { query: string; limit?: number }) => {
       const ranked = await rankCatalog(query, { allowedNames: opts.allowedNames });
       const topN = ranked.slice(0, Math.min(limit ?? TOP_RESULTS, 20));
-      const schemaMap = await toolSchemaMap();
+      const metadataMap = await toolMetadataMap();
 
-      const schemaNames = topN.slice(0, TOP_SCHEMAS).map((r) => r.name);
+      const normalizedQuery = query.toLowerCase();
+      const exactNamedHit = topN.find((result) => {
+        const escaped = result.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(normalizedQuery);
+      });
+      // When the model supplied an exact tool name, it has already selected
+      // the capability. Return only that schema instead of spending tokens on
+      // two neighboring suggestions. Natural-language discovery still gets up
+      // to three candidates.
+      const schemaNames = exactNamedHit
+        ? [exactNamedHit.name]
+        : topN.slice(0, TOP_SCHEMAS).map((r) => r.name);
       const schemas: Record<string, unknown> = {};
       for (const name of schemaNames) {
-        const schema = schemaMap.get(name);
-        if (schema !== undefined) schemas[name] = schema;
+        const metadata = metadataMap.get(name);
+        if (metadata?.schema !== undefined) schemas[name] = metadata.schema;
+      }
+      // Complex tools carry critical execution contracts beyond their argument
+      // shape (for example Workspace views must call clem.data()). Include the
+      // selected tool's own instructions only when the query named it exactly;
+      // broad discovery remains one-liners + schemas and does not load three
+      // unrelated prompt blocks.
+      const guidance: Record<string, string> = {};
+      if (exactNamedHit) {
+        const description = metadataMap.get(exactNamedHit.name)?.description;
+        if (description) guidance[exactNamedHit.name] = description;
       }
 
       // Bound our OWN payload: the generic tool-result cap would otherwise slice
       // the JSON mid-escape and hand the model (and tests) an unparseable blob.
       // Dropping the largest trailing schema keeps the ranked names intact — a
       // dropped schema is re-acquirable with a tighter query, per the hint.
-      const render = (): string => JSON.stringify(
-        {
-          query,
-          results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
-          schemas,
-          hint: opts.dispatchViaCallTool
-            ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above.'
-            : opts.allowedNames
-              ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-              : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
-        },
-        null,
-        2,
-      );
+      // Keep this machine-consumable JSON compact. Pretty-printing more than
+      // doubled large but legitimate authoring schemas (space_save: ~5.7K →
+      // ~13.6K), which crossed the 12K result ceiling and caused us to drop the
+      // *only* schema the model explicitly searched for. The live consequence
+      // was a second search followed by an intentional invalid `{}` call just
+      // to obtain that schema. Compact JSON preserves the exact schema while
+      // spending fewer prompt tokens and tool round-trips.
+      const render = (): string => JSON.stringify({
+        query,
+        results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
+        schemas,
+        ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
+        hint: opts.dispatchViaCallTool
+          ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above.'
+          : opts.allowedNames
+            ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
+            : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
+      });
       let text = render();
       const shownSchemaNames = [...schemaNames];
       while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
         const dropped = shownSchemaNames.pop()!;
         delete schemas[dropped];
+        delete guidance[dropped];
         text = render();
       }
 
@@ -125,5 +162,5 @@ export function registerToolSearchTool(
 
 /** Test-only: reset the memoized schema map. */
 export function _resetToolSearchSchemaCacheForTest(): void {
-  schemaMapPromise = null;
+  metadataMapPromise = null;
 }

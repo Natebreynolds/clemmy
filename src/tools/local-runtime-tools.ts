@@ -372,25 +372,42 @@ export function getLocalToolSchemas(): Map<string, z.ZodTypeAny> {
       // models naturally omit optional keys. Preserve null compatibility while
       // also accepting omission so call_tool does not waste a round trip merely
       // adding `kind:null` / `includeInactive:false` / `content:""`.
-      deferredShape[key] = (raw as z.ZodTypeAny).safeParse(undefined).success
+      // On the deferred JSON-string transport, omission and explicit null are
+      // equivalent for a field whose schema accepts null. Provider-strict
+      // first-class tools still receive an explicit null below via
+      // getLocalToolOptionalKeys(). Accepting omission here prevents a
+      // schema-correction turn for ordinary calls such as
+      // space_refresh({slug}) / space_get_runner({slug, runner_path}).
+      deferredShape[key] = (
+        (raw as z.ZodTypeAny).safeParse(undefined).success
+        || (raw as z.ZodTypeAny).safeParse(null).success
+      )
         ? normalized.optional()
         : normalized;
     }
-    map.set(localTool.name, z.object(deferredShape));
+    // First-class provider schemas already declare additionalProperties:false.
+    // The deferred dispatcher must preserve that contract too: a plain
+    // z.object silently strips unknown keys. That allowed stale camelCase
+    // arguments such as space_save({dataSources, viewHtml}) to disappear while
+    // the remaining slug/title/view_path dispatched successfully, producing a
+    // static Workspace that Clementine falsely reported as data-connected.
+    map.set(localTool.name, z.strictObject(deferredShape));
   }
   return map;
 }
 
-/** Optional fields in the original MCP-facing shapes. Codex's strict
- * first-class schema represents these as required+nullable, so deferred
- * args_json dispatch must materialize an omitted key as null before invoking
- * that strict inner tool. */
+/** Omissible fields on the deferred transport. Codex's strict first-class
+ * schema represents both optional and nullable fields as required+nullable, so
+ * args_json dispatch materializes an omitted key as null before invoking that
+ * strict inner tool. */
 export function getLocalToolOptionalKeys(): Map<string, ReadonlySet<string>> {
   const map = new Map<string, ReadonlySet<string>>();
   for (const localTool of captureLocalTools()) {
     map.set(localTool.name, new Set(
       Object.entries(localTool.parameters)
-        .filter(([, raw]) => (raw as z.ZodTypeAny).safeParse(undefined).success)
+        .filter(([, raw]) =>
+          (raw as z.ZodTypeAny).safeParse(undefined).success
+          || (raw as z.ZodTypeAny).safeParse(null).success)
         .map(([key]) => key),
     ));
   }
