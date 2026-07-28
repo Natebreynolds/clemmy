@@ -14,7 +14,8 @@ import {
   listApprovals, decideApproval, cancelStaleApprovals,
   listNotifications, markNotificationRead, retryNotification,
   listTrustProposals, decideTrustProposal,
-  relativeTime, notifTone, notifFailed,
+  relativeTime,
+  collapseAttentionRows, notifTone, notifFailed,
   type ApprovalRow, type NotificationRow, type TrustProposalRow,
 } from '@/lib/inbox';
 
@@ -66,7 +67,10 @@ export function Inbox() {
   const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
-  const needsCount = approvalRows.length + attentionRows.length + trustRows.length;
+  // A burst of blocked runs from one workflow is ONE decision, not ten rows —
+  // collapse duplicates to the newest and badge the earlier ones.
+  const collapsedAttention = collapseAttentionRows(attentionRows);
+  const needsCount = approvalRows.length + collapsedAttention.length + trustRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
@@ -206,9 +210,10 @@ export function Inbox() {
                     onApprove={() => onDecideTrust(p.id, 'approve')}
                     onDecline={() => onDecideTrust(p.id, 'decline')} />
                 ))}
-                {attentionRows.map((n) => (
+                {collapsedAttention.map(({ row: n, collapsedCount }) => (
                   <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
-                    title={n.title || n.body || 'Needs attention'} meta={relativeTime(n.createdAt)}
+                    title={n.title || n.body || 'Needs attention'}
+                    meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
                     tone={{ tone: 'warning', label: 'Needs attention' }} />
                 ))}
               </>

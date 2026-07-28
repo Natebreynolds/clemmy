@@ -53,6 +53,42 @@ export interface NotificationRow {
   deliveryError?: string;
 }
 
+/** One visible needs-attention row per underlying subject. A flaky morning
+ *  produced ten "Workflow needs attention: morning-…" rows — one per blocked
+ *  run — burying the two decisions that actually differed. Group by the
+ *  workflow (or exact title), keep the NEWEST row, and surface how many
+ *  earlier duplicates it stands for. */
+export interface CollapsedAttentionRow {
+  row: NotificationRow;
+  /** Older rows this one stands for (0 = unique). */
+  collapsedCount: number;
+  /** Ids of every row in the group (newest first) — dismissing dismisses all. */
+  groupIds: string[];
+}
+
+export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttentionRow[] {
+  const keyFor = (row: NotificationRow): string => {
+    const title = (row.title || row.body || '').trim();
+    const workflow = /workflow needs attention:\s*(.+)$/i.exec(title)?.[1]?.trim();
+    return workflow ? `wf:${workflow.toLowerCase()}` : `title:${title.toLowerCase()}`;
+  };
+  const groups = new Map<string, NotificationRow[]>();
+  for (const row of rows) {
+    const key = keyFor(row);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(row);
+    else groups.set(key, [row]);
+  }
+  const newestFirst = (a: NotificationRow, b: NotificationRow) =>
+    Date.parse(b.createdAt ?? '') - Date.parse(a.createdAt ?? '') || a.id.localeCompare(b.id);
+  return [...groups.values()]
+    .map((bucket) => {
+      const sorted = [...bucket].sort(newestFirst);
+      return { row: sorted[0], collapsedCount: sorted.length - 1, groupIds: sorted.map((r) => r.id) };
+    })
+    .sort((a, b) => newestFirst(a.row, b.row));
+}
+
 export const listApprovals = () =>
   apiGet<{ approvals: ApprovalRow[]; count: number }>('/api/console/approvals/list');
 

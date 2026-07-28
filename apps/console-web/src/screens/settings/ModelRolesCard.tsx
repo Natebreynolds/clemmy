@@ -6,6 +6,8 @@ import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { Switch } from '@/components/ui/Switch';
 import { usePoll } from '@/lib/poll';
+import { getRecentFusionTraces, fusionOutcomeLabel } from '@/lib/fusion';
+import { relativeTime } from '@/lib/inbox';
 import {
   getSettings,
   setActiveBrain,
@@ -295,6 +297,7 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
               Recent bounded checks: {fusion?.health?.accepted ?? 0} accepted unchanged · {fusion?.health?.corrected ?? 0} corrected · {fusion?.health?.safeFallbacks ?? 0} safely kept Clementine&apos;s draft.
             </p>
           )}
+          <LastVerificationLine enabled={secondOpinionOn} />
           {secondOpinionOn && judgeSameAsBrain && (
             <p className="mt-1 flex items-center gap-1.5 text-caption text-warning">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -360,4 +363,21 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
     </>
   );
   return embedded ? body : <Card className="p-5">{body}</Card>;
+}
+
+/** The most recent REAL verification from the durable fusion trace — shown
+ *  only when second-opinion is on and a trace exists, so the UI never claims
+ *  "verified" beyond what actually ran. One lazy fetch; no polling. */
+function LastVerificationLine({ enabled }: { enabled: boolean }) {
+  const traces = usePoll(['fusion-traces'], () => getRecentFusionTraces(1), 0, { enabled });
+  const last = traces.data?.[0];
+  if (!enabled || !last) return null;
+  return (
+    <p className="mt-1 text-caption text-muted">
+      Last verification: the judge {fusionOutcomeLabel(last.outcome)}
+      {last.judge ? ` · ${last.judge.replace(/^[a-z]+:/, '')}` : ''}
+      {last.ts ? ` · ${relativeTime(last.ts)}` : ''}
+      {typeof last.durationMs === 'number' ? ` · ${(last.durationMs / 1000).toFixed(1)}s` : ''}
+    </p>
+  );
 }
