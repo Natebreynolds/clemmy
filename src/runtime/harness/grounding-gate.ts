@@ -133,6 +133,11 @@ export function extractTargetKeys(rawArgs: unknown): string[] {
  * broader extractTargetKeys (domains, names) is for SOURCE RETRIEVAL only.
  */
 const RECIPIENT_EMAIL_KEY_RE = /(^|_)(to|to_email|recipient|recipients|email|emails|cc|bcc)$/i;
+// Sender-context keys that RECIPIENT_EMAIL_KEY_RE would otherwise catch
+// (reply_to ends in "_to", from_email/sender_email end in "_email"). Sender
+// identity is the same for every item in a batch — mining it as a duplicate
+// identity would self-block every multi-send from one mailbox.
+const SENDER_EMAIL_KEY_RE = /(^|_)(from|sender|reply_to|return_path|on_behalf_of)(_email|_emails|_address|_addresses)?$/i;
 const DUP_ID_KEY_RE = /(^|_)(contact_id|record_id|lead_id|account_id|to_number|phone)$/i;
 const PROVIDER_CONNECTION_KEY_RE = /(^|_)(connected_account_id|connection_id|connector_id|user_id)$/i;
 export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
@@ -146,14 +151,18 @@ export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
   const visit = (value: unknown, keyHint?: string, rootString = false, inRecipientField = false): void => {
     if (value === null || value === undefined) return;
     const normalizedHint = keyHint === undefined ? undefined : normalizedArgKey(keyHint);
+    // A sender-context key ends recipient treatment for its entire subtree
+    // (Graph's replyTo is recipient-SHAPED but sender-semantic).
+    const senderContext = normalizedHint !== undefined && SENDER_EMAIL_KEY_RE.test(normalizedHint);
+    const recipientContext = !senderContext && inRecipientField;
     if (typeof value === 'string') {
       if ((value.startsWith('{') || value.startsWith('[')) && value.length < 50_000) {
-        try { visit(JSON.parse(value), undefined, false, inRecipientField); return; } catch { /* plain string */ }
+        try { visit(JSON.parse(value), undefined, false, recipientContext); return; } catch { /* plain string */ }
       }
       // A root string is usually a shell command, where field context is not
       // available. Structured calls mine addresses only from recipient fields;
       // an email in a body, Sheet cell, or other payload is data—not a target.
-      if (rootString || inRecipientField || (normalizedHint && RECIPIENT_EMAIL_KEY_RE.test(normalizedHint))) {
+      if (rootString || recipientContext || (normalizedHint && !senderContext && RECIPIENT_EMAIL_KEY_RE.test(normalizedHint))) {
         for (const m of value.match(EMAIL_RE) ?? []) keys.add(m.toLowerCase());
       }
       if (
@@ -168,7 +177,8 @@ export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
       return;
     }
     const enteringRecipientField =
-      inRecipientField || (normalizedHint !== undefined && RECIPIENT_EMAIL_KEY_RE.test(normalizedHint));
+      recipientContext
+      || (normalizedHint !== undefined && !senderContext && RECIPIENT_EMAIL_KEY_RE.test(normalizedHint));
     if (Array.isArray(value)) { for (const v of value) visit(v, keyHint, false, enteringRecipientField); return; }
     if (typeof value === 'object') {
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) visit(v, k, false, enteringRecipientField);

@@ -94,6 +94,20 @@ test('extractDuplicateIdentityKeys: camelCase recipient keys are recipients (Gra
   assert.ok(!flat.includes('ca_fixture'));
 });
 
+test('extractDuplicateIdentityKeys: sender-context keys (replyTo/fromEmail/senderEmail) are never recipients', () => {
+  // Sender identity is the SAME for every item in a batch — mining it as a
+  // duplicate-identity key would self-block every multi-send from one mailbox.
+  const keys = extractDuplicateIdentityKeys({
+    toRecipients: [{ emailAddress: { address: 'person@oakridge-law.example' } }],
+    replyTo: [{ emailAddress: { address: 'inbox@ourfirm.example' } }],
+    fromEmail: 'sales@ourfirm.example',
+    senderEmail: 'sales@ourfirm.example',
+    from_email: 'sales-two@ourfirm.example',
+    onBehalfOf: 'principal@ourfirm.example',
+  });
+  assert.deepEqual(keys, ['person@oakridge-law.example']);
+});
+
 test('extractDuplicateIdentityKeys: Sheet cell values and provider connection are not recipients', () => {
   const keys = extractDuplicateIdentityKeys({
     tool_slug: 'GOOGLESHEETS_VALUES_UPDATE',
