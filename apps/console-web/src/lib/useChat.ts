@@ -55,6 +55,10 @@ export interface ChatMessage {
   approval?: { subject: string; reason?: string; approvalId?: string | null; pendingAction?: PendingActionApprovalView };
   planProposalId?: string;
   attachmentNames?: string[];
+  /** The durable work item behind a report-back message (background task /
+   *  workflow run), so the thread can attach evidence + a board deep-link
+   *  instead of trusting prose alone. */
+  taskRef?: { id: string; label?: string };
 }
 
 let idSeq = 0;
@@ -483,7 +487,7 @@ export function useChat(options?: UseChatOptions) {
   // only advances, so nothing renders twice. Busy turns pause the poll — the
   // run's own stream owns the conversation then.
   const inboxSeqRef = useRef(0);
-  const inboxSyntheticTurnsRef = useRef(new Set<number>());
+  const inboxSyntheticTurnsRef = useRef(new Map<number, { sourceId?: string; sourceLabel?: string }>());
   useEffect(() => {
     if (busy) return;
     let stopped = false;
@@ -803,23 +807,32 @@ export function useChat(options?: UseChatOptions) {
  *  survives batch splits. Exported for tests. */
 export function inboxAdditionsFromEvents(
   events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }>,
-  syntheticTurns: Set<number>,
+  syntheticTurns: Map<number, { sourceId?: string; sourceLabel?: string }>,
 ): ChatMessage[] {
   for (const ev of events) {
     const d = ev.data ?? {};
     if (ev.type === 'user_input_received' && d.synthetic === true && d.source === 'outcome') {
-      syntheticTurns.add(ev.turn);
+      // The synthetic outcome turn names the durable work item — carry it so
+      // the rendered report can attach evidence + a board deep-link.
+      syntheticTurns.set(ev.turn, {
+        sourceId: typeof d.sourceId === 'string' ? d.sourceId : undefined,
+        sourceLabel: typeof d.sourceLabel === 'string' ? d.sourceLabel : undefined,
+      });
     }
   }
+  const taskRefFor = (turn: number): ChatMessage['taskRef'] => {
+    const src = syntheticTurns.get(turn);
+    return src?.sourceId ? { id: src.sourceId, label: src.sourceLabel } : undefined;
+  };
   const additions: ChatMessage[] = [];
   for (const ev of events) {
     const d = ev.data ?? {};
     if (ev.type === 'conversation_completed' && syntheticTurns.has(ev.turn)) {
       const text = humanHarnessText((d.reply ?? d.summary) as string | undefined, '');
-      if (text) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text, status: 'complete' });
+      if (text) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text, status: 'complete', taskRef: taskRefFor(ev.turn) });
     } else if (ev.type === 'awaiting_user_input' && syntheticTurns.has(ev.turn)) {
       const q = typeof d.question === 'string' ? d.question : '';
-      if (q) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text: q, status: 'awaiting-reply' });
+      if (q) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text: q, status: 'awaiting-reply', taskRef: taskRefFor(ev.turn) });
     } else if (ev.type === 'approval_requested') {
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
       additions.push({

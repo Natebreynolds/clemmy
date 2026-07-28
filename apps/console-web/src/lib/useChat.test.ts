@@ -417,23 +417,26 @@ test('reduceActivity preserves explicit BYO identity for provider-shaped model I
 // fold decides what freshly-polled session events add to the thread. ──
 test('idle inbox: a proactive report-back renders; the user\'s own turns never re-render', async () => {
   const { inboxAdditionsFromEvents } = await import('./useChat');
-  const syntheticTurns = new Set<number>();
+  const syntheticTurns = new Map<number, { sourceId?: string; sourceLabel?: string }>();
   const additions = inboxAdditionsFromEvents([
     // A normal turn the live stream already rendered — must add NOTHING.
     { seq: 10, turn: 3, type: 'user_input_received', data: { text: 'run the update' } },
     { seq: 11, turn: 3, type: 'conversation_completed', data: { reply: 'Queued — will report back.' } },
     // The report-back: synthetic outcome user event + the relayed assistant turn.
-    { seq: 20, turn: 0, type: 'user_input_received', data: { text: '[workflow run wf-1 completed] …', synthetic: true, source: 'outcome' } },
+    { seq: 20, turn: 0, type: 'user_input_received', data: { text: '[workflow run wf-1 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-report-1', sourceLabel: 'background task' } },
     { seq: 21, turn: 0, type: 'conversation_completed', data: { reply: 'Your slack update posted — 1 message to #team. ✅' } },
   ], syntheticTurns);
   assert.equal(additions.length, 1);
   assert.equal(additions[0].status, 'complete');
   assert.match(additions[0].text, /slack update posted/);
+  // The durable work item rides along so the thread can attach evidence +
+  // a board deep-link instead of trusting the prose.
+  assert.deepEqual(additions[0].taskRef, { id: 'bg-report-1', label: 'background task' });
 });
 
 test('idle inbox: approval cards and blocking questions surface; pairing survives batch splits', async () => {
   const { inboxAdditionsFromEvents } = await import('./useChat');
-  const syntheticTurns = new Set<number>();
+  const syntheticTurns = new Map<number, { sourceId?: string; sourceLabel?: string }>();
   // Batch 1 carries only the synthetic user event…
   assert.equal(inboxAdditionsFromEvents([
     { seq: 30, turn: 7, type: 'user_input_received', data: { text: 'x', synthetic: true, source: 'outcome' } },

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type KeyboardEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, Sparkles, X } from 'lucide-react';
@@ -75,12 +75,33 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
           See all {needsYou.length} in Inbox
         </button>
       )}
-      {workingNow.slice(0, 2).map((item, i) => (
-        <div key={`w${i}`} className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3 py-2.5">
-          <StatusPill tone="live">Working now</StatusPill>
-          <span className="min-w-0 flex-1 truncate text-body text-muted">{item.title ?? 'In progress'}</span>
-        </div>
-      ))}
+      {workingNow.slice(0, 2).map((item, i) => {
+        // A live row you can't open is a dead end — deep-link to the board
+        // card when the item names its session, so "what is she doing?"
+        // is always one click away.
+        const target = item.targetSessionId ? `/tasks?select=${encodeURIComponent(item.targetSessionId)}` : null;
+        return (
+          <div
+            key={`w${i}`}
+            {...(target
+              ? {
+                  role: 'button' as const,
+                  tabIndex: 0,
+                  onClick: () => navigate(target),
+                  onKeyDown: (e: KeyboardEvent) => { if (e.key === 'Enter') navigate(target); },
+                }
+              : {})}
+            className={cn(
+              'flex items-center gap-3 rounded-md border border-border bg-subtle px-3 py-2.5',
+              target && 'cursor-pointer transition-colors hover:brightness-[0.99]',
+            )}
+          >
+            <StatusPill tone="live">Working now</StatusPill>
+            <span className="min-w-0 flex-1 truncate text-body text-muted">{item.title ?? 'In progress'}</span>
+            {target && <ArrowRight className="h-4 w-4 shrink-0 text-muted" aria-hidden />}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -201,7 +222,14 @@ export function Chat() {
           )}
           <CollaborativeWorkstate snapshot={cc.data?.focus} compact />
           {chat.messages.map((m) => (
-            <ChatBubble key={m.id} message={m} onApprove={approveLast} onReject={rejectLast} onBackground={chat.background} />
+            <ChatBubble
+              key={m.id}
+              message={m}
+              onApprove={approveLast}
+              onReject={rejectLast}
+              onBackground={chat.background}
+              traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
+            />
           ))}
           <div ref={bottomRef} />
         </div>

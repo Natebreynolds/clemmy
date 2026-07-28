@@ -4,6 +4,7 @@ import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { TurnActivity } from '@/components/chat/TurnActivity';
+import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import { approveExecutePendingAction } from '@/lib/pendingActions';
@@ -311,6 +312,13 @@ export function ChatBubble({
               )}
               {trustNote && <p className="mt-1 text-caption text-muted">{trustNote}</p>}
             </div>
+          )}
+
+          {/* Durable evidence beneath a report-back: the harness's ledger row
+              (status, counts, verified artifacts, receipts, exact next action)
+              so completion never rests on the prose above it. */}
+          {message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply') && (
+            <TaskEvidenceFooter taskRef={message.taskRef} />
           )}
         </div>
 
