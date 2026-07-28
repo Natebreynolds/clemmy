@@ -71,6 +71,7 @@ export const longHorizonManifest: ScenarioDef = {
   name: 'long-horizon-manifest',
   summary: `${ITEM_COUNT} logical items → durable phase graph → exact completion`,
   routeExpectation: 'exact-brain',
+  workerRouteExpectation: true,
   async run(daemon: DaemonHandle) {
     const originSessionId = proofSessionId('long-horizon-origin');
     const dispatched = await dispatchBackground(daemon, originSessionId, prompt());

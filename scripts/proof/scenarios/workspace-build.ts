@@ -103,10 +103,10 @@ export const workspaceBuild: ScenarioDef = {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn.sessionId);
       db.close();
-    } catch { /* optional */ }
+    } catch { /* fail closed below */ }
     checks.push({
       name: 'workspace authoring stays within a bounded tool budget',
-      pass: metrics == null || metrics.toolCallTotal <= 24,
+      pass: metrics != null && metrics.toolCallTotal <= 24,
       detail: metrics ? `${metrics.toolCallTotal} tool calls (limit 24)` : 'metrics unavailable',
     });
 

@@ -11,11 +11,27 @@
 
 export type BrainKind = 'claude' | 'codex' | 'glm';
 export type FusionProofMode = 'off' | 'high' | 'all';
+export type ProofModelProvider = 'claude' | 'codex' | 'byo';
+
+/** Non-secret release expectation derived from the candidate install's model
+ * configuration. Live scoring must prove this exact provider/model pair from
+ * session-scoped telemetry; a provider-family match alone is insufficient. */
+export interface ProofModelExpectation {
+  modelId: string;
+  provider: ProofModelProvider;
+  source: 'role-binding' | 'provider-slot' | 'fusion-fallback';
+}
 
 export interface BrainPlan {
   kind: BrainKind;
   /** Extra env for the spawned daemon (brain selection + auth material). */
   env: Record<string, string>;
+  /** Exact brain model the isolated leg is expected to exercise. */
+  expectedBrain: ProofModelExpectation;
+  /** Exact role-wide/default worker model fan-out is expected to exercise. */
+  expectedWorker: ProofModelExpectation;
+  /** Exact judge/checker the Fusion canary is expected to exercise. */
+  expectedFusionChecker: ProofModelExpectation;
   /** Human-readable reason when the brain cannot run (missing auth ⇒ SKIP, never FAIL). */
   skipReason?: string;
 }
@@ -83,6 +99,8 @@ export interface ScenarioDef {
   summary: string;
   /** Require session-scoped provider identity and zero fallover for this run. */
   routeExpectation?: 'exact-brain' | 'exact-workflow-step';
+  /** This scenario deliberately dispatches the configured worker role. */
+  workerRouteExpectation?: boolean;
   run(daemon: DaemonHandle): Promise<Omit<ScenarioOutcome, 'brain' | 'scenario' | 'status'> & { checks: Check[] }>;
 }
 

@@ -66,8 +66,10 @@ export const converseFirst: ScenarioDef = {
       .reduce((a, [, n]) => a + n, 0);
     checks.push({
       name: 'zero OUTWARD actions before alignment',
-      pass: outwardCalls === 0 && (metrics?.externalWrites ?? 0) === 0,
-      detail: `outward × ${outwardCalls}, external_write × ${metrics?.externalWrites ?? 0}, all tools: ${JSON.stringify(metrics?.toolCalls ?? {})}`,
+      pass: metrics != null && outwardCalls === 0 && metrics.externalWrites === 0,
+      detail: metrics
+        ? `outward × ${outwardCalls}, external_write × ${metrics.externalWrites}, all tools: ${JSON.stringify(metrics.toolCalls)}`
+        : 'session metrics unavailable',
     });
 
     return {

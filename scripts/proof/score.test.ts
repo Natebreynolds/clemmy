@@ -13,6 +13,8 @@ import Database from 'better-sqlite3';
 
 import {
   exactBrainRouteChecks,
+  exactBrainServedChecks,
+  exactWorkerRouteChecks,
   exactWorkflowStepRouteChecks,
   fusionBoundedChecks,
   fusionDisabledChecks,
@@ -22,8 +24,21 @@ import {
   sessionRouteEvidence,
   stormCheck,
   summarizeAllSessions,
+  tokenCeilingCheck,
   workflowStepRouteEvidence,
 } from './score.js';
+import type { ProofModelExpectation } from './types.js';
+
+const CODEX_MODEL: ProofModelExpectation = {
+  modelId: 'gpt-5.4',
+  provider: 'codex',
+  source: 'provider-slot',
+};
+const CLAUDE_MODEL: ProofModelExpectation = {
+  modelId: 'claude-sonnet-4-6',
+  provider: 'claude',
+  source: 'role-binding',
+};
 
 function buildFixtureHome(): string {
   const home = mkdtempSync(path.join(os.tmpdir(), 'proof-score-fixture-'));
@@ -93,6 +108,15 @@ function addWorkflowRouteMarker(
     `INSERT INTO events (id, session_id, turn, role, type, data_json, created_at) VALUES (?,?,?,?,?,?,?)`,
   ).run(`workflow-route-${suffix}`, sessionId, 0, 'system', type, JSON.stringify(data), new Date().toISOString());
   db.close();
+}
+
+function addUsage(home: string, source: string, model: string): void {
+  const dir = path.join(home, 'state', 'token-usage');
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(
+    path.join(dir, '2026-07-01.ndjson'),
+    `${JSON.stringify({ at: new Date().toISOString(), source, model, inputTokens: 1, outputTokens: 1, totalTokens: 2 })}\n`,
+  );
 }
 
 function addOperationalFallover(home: string, sessionId: string): void {
@@ -188,6 +212,10 @@ test('sessionMetrics returns null for an unknown session', () => {
   }
 });
 
+test('token ceiling fails closed when session metrics are unavailable', () => {
+  assert.equal(tokenCeilingCheck(null, 100_000).pass, false);
+});
+
 test('narrationCheck flags tool-call-shaped replies and passes prose', () => {
   assert.equal(narrationCheck('Here is your summary — all five firms are covered.').pass, true);
   assert.equal(narrationCheck('Tool call: composio_execute_tool\n{"tool_slug":"GMAIL_SEND"}').pass, false);
@@ -227,9 +255,10 @@ test('bounded Fusion scorer requires a new-contract verdict, distinct family, an
         finalLen: 400,
       })}\n`,
     );
-    assert.equal(fusionBoundedChecks(home, 'sess-1', 'codex').every((check) => check.pass), true);
+    addUsage(home, 'sess-1', CLAUDE_MODEL.modelId);
+    assert.equal(fusionBoundedChecks(home, 'sess-1', 'codex', CLAUDE_MODEL).every((check) => check.pass), true);
     assert.equal(
-      fusionBoundedChecks(home, 'sess-1', 'claude')[1]?.pass,
+      fusionBoundedChecks(home, 'sess-1', 'claude', CLAUDE_MODEL)[4]?.pass,
       false,
       'same-family checker cannot prove a second opinion',
     );
@@ -244,8 +273,8 @@ test('exact route evidence is session-scoped, not satisfied by an unrelated prov
     addRouteMarker(home, 'other-session', { provider: 'claude', model: 'claude-opus-4-8' }, 'other');
     addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'one');
     addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'two');
-    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'codex', 2).every((check) => check.pass), true);
-    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'claude', 2)[1].pass, false);
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'codex', 2, CODEX_MODEL).every((check) => check.pass), true);
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'claude', 2, CODEX_MODEL)[1].pass, false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -258,7 +287,9 @@ test('explicit BYO provider identity wins over a gpt-shaped model id', () => {
     addRouteMarker(home, 'sess-1', { provider: 'byo', model: 'gpt-4o', transport: 'openai_agents_harness' }, 'byo-two');
     const evidence = sessionRouteEvidence(home, 'sess-1');
     assert.deepEqual([...new Set(evidence.families)], ['byo']);
-    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'glm', 2).every((check) => check.pass), true);
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'glm', 2, {
+      modelId: 'gpt-4o', provider: 'byo', source: 'role-binding',
+    }).every((check) => check.pass), true);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -270,9 +301,9 @@ test('mixed same-session providers and a same-session fallover fail the exact ro
     addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'mixed-one');
     addRouteMarker(home, 'sess-1', { provider: 'claude', model: 'claude-opus-4-8' }, 'mixed-two');
     addOperationalFallover(home, 'sess-1');
-    const checks = exactBrainRouteChecks(home, 'sess-1', 'codex', 2);
+    const checks = exactBrainRouteChecks(home, 'sess-1', 'codex', 2, CODEX_MODEL);
     assert.equal(checks[1].pass, false, 'mixed providers are not an exact Codex route');
-    assert.equal(checks[2].pass, false, 'a recorded fallover fails the route gate');
+    assert.equal(checks[3].pass, false, 'a recorded fallover fails the route gate');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -293,7 +324,7 @@ test('workflow step route accepts the Claude SDK nested route marker and exact t
     const evidence = workflowStepRouteEvidence(home, 'workflow:run-1:write');
     assert.deepEqual([...new Set(evidence.families)], ['claude']);
     assert.deepEqual([...new Set(evidence.transports)], ['claude_agent_sdk_workflow_step']);
-    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-1:write', 'claude').every((check) => check.pass), true);
+    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-1:write', 'claude', CLAUDE_MODEL).every((check) => check.pass), true);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -307,8 +338,11 @@ test('workflow step route preserves BYO identity for a gpt-shaped model on the h
       model: 'gpt-shaped-private-model',
       transport: 'openai_agents_harness',
     }, 'byo');
-    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-2:write', 'glm').every((check) => check.pass), true);
-    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-2:write', 'codex')[1].pass, false);
+    const byoExpected: ProofModelExpectation = {
+      modelId: 'gpt-shaped-private-model', provider: 'byo', source: 'role-binding',
+    };
+    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-2:write', 'glm', byoExpected).every((check) => check.pass), true);
+    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-2:write', 'codex', byoExpected)[1].pass, false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -325,9 +359,47 @@ test('workflow step route fails a wrong transport and same-step fallover', () =>
       },
     }, 'wrong-transport');
     addOperationalFallover(home, 'workflow:run-3:write');
-    const checks = exactWorkflowStepRouteChecks(home, 'workflow:run-3:write', 'claude');
-    assert.equal(checks[2].pass, false, 'wrong workflow transport fails');
-    assert.equal(checks[3].pass, false, 'same-step fallover fails');
+    const checks = exactWorkflowStepRouteChecks(home, 'workflow:run-3:write', 'claude', {
+      modelId: 'claude-sonnet-4-6', provider: 'claude', source: 'provider-slot',
+    });
+    assert.equal(checks[3].pass, false, 'wrong workflow transport fails');
+    assert.equal(checks[4].pass, false, 'same-step fallover fails');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('exact model proof rejects a same-family default and missing configured evidence', () => {
+  const home = buildFixtureHome();
+  try {
+    addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'exact-wrong');
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'codex', 1, {
+      modelId: 'gpt-5.6-sol', provider: 'codex', source: 'provider-slot',
+    })[2]?.pass, false, 'provider family cannot substitute for the configured id');
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'codex', 1, {
+      modelId: '', provider: 'codex', source: 'provider-slot',
+    })[2]?.pass, false, 'missing configured model fails closed');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('worker and whole-leg usage proof are exact and session-scoped', () => {
+  const home = buildFixtureHome();
+  try {
+    addWorkflowRouteMarker(home, 'sess-1', 'worker_model_routed', {
+      provider: 'byo',
+      modelId: 'gpt-shaped-private-worker',
+      transport: 'openai_agents_harness',
+    }, 'worker-exact');
+    addUsage(home, 'other-session', 'gpt-shaped-private-worker');
+    const expected: ProofModelExpectation = {
+      modelId: 'gpt-shaped-private-worker', provider: 'byo', source: 'role-binding',
+    };
+    assert.equal(exactWorkerRouteChecks(home, 'sess-1', expected)[2]?.pass, false, 'unrelated usage cannot satisfy worker proof');
+    addUsage(home, 'sess-1', expected.modelId);
+    assert.equal(exactWorkerRouteChecks(home, 'sess-1', expected).every((check) => check.pass), true);
+    assert.equal(exactBrainServedChecks(home, ['sess-1'], expected).every((check) => check.pass), true);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

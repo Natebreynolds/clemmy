@@ -80,8 +80,8 @@ export const completeSetRecall: ScenarioDef = {
     checks.push({ name: 'explicit local-only turn exposed zero external MCP tools', pass: localOnlyScope });
     checks.push({
       name: 'recall turn made no external writes',
-      pass: (metrics?.externalWrites ?? 0) === 0,
-      detail: `external writes: ${metrics?.externalWrites ?? 'n/a'}`,
+      pass: metrics != null && metrics.externalWrites === 0,
+      detail: `external writes: ${metrics?.externalWrites ?? 'metrics unavailable'}`,
     });
     checks.push({
       name: 'recall converged without a tool-search spiral',

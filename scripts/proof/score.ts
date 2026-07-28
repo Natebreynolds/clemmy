@@ -8,12 +8,17 @@
  * narration check IMPORTS the runtime's own single-source shape detector so
  * the proof gate always tracks the live guard, never a parallel regex.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 
 import { looksLikeToolCallShape } from '../../src/runtime/harness/tool-narration-shapes.js';
-import type { BrainKind, Check, TurnLatency } from './types.js';
+import type {
+  BrainKind,
+  Check,
+  ProofModelExpectation,
+  TurnLatency,
+} from './types.js';
 
 /** Tools whose effect leaves the machine or commits work on the user's behalf —
  *  the converse-first hard line: NONE of these may fire on an ambiguous ask
@@ -195,8 +200,16 @@ interface RouteMarker {
   provider?: unknown;
   model?: unknown;
   modelId?: unknown;
+  effectiveModel?: unknown;
   transport?: unknown;
   modelRoute?: unknown;
+}
+
+function routeModelId(data: RouteMarker): string | null {
+  for (const value of [data.effectiveModel, data.model, data.modelId]) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
 }
 
 function routeFamily(data: RouteMarker): ServedModelFamily | null {
@@ -205,7 +218,7 @@ function routeFamily(data: RouteMarker): ServedModelFamily | null {
   }
   const transport = typeof data.transport === 'string' ? data.transport.toLowerCase() : '';
   if (transport.includes('claude_agent_sdk')) return 'claude';
-  const model = String(data.model ?? data.modelId ?? '').toLowerCase();
+  const model = (routeModelId(data) ?? '').toLowerCase();
   if (!model) return null;
   if (model.includes('claude')) return 'claude';
   if (/^(gpt|o\d)|codex/.test(model)) return 'codex';
@@ -215,8 +228,45 @@ function routeFamily(data: RouteMarker): ServedModelFamily | null {
 export interface SessionRouteEvidence {
   markerCount: number;
   explicitProviderCount: number;
+  explicitModelCount: number;
   families: ServedModelFamily[];
+  modelIds: string[];
   falloverCount: number;
+}
+
+/** Exact model ids from the append-only usage stream, scoped to the scenario
+ * session(s). Warmups and unrelated proof scenarios can never satisfy this
+ * evidence because UsageEvent.source is the harness session id. */
+export function sessionUsageModelIds(home: string, sessionIds: Iterable<string>): string[] {
+  const wanted = new Set([...sessionIds].filter(Boolean));
+  if (wanted.size === 0) return [];
+  const models: string[] = [];
+  const usageDir = path.join(home, 'state', 'token-usage');
+  try {
+    for (const file of readdirSync(usageDir)) {
+      if (!file.endsWith('.ndjson')) continue;
+      const lines = readFileSync(path.join(usageDir, file), 'utf-8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as { source?: unknown; model?: unknown };
+          if (
+            typeof event.source === 'string'
+            && wanted.has(event.source)
+            && typeof event.model === 'string'
+            && event.model.trim()
+          ) {
+            models.push(event.model.trim());
+          }
+        } catch {
+          /* malformed rows are absent evidence */
+        }
+      }
+    }
+  } catch {
+    /* missing usage directory remains empty evidence */
+  }
+  return models;
 }
 
 function sessionFalloverCount(home: string, sessionId: string): number {
@@ -244,7 +294,9 @@ export function sessionRouteEvidence(home: string, sessionId: string): SessionRo
   db.close();
 
   let explicitProviderCount = 0;
+  let explicitModelCount = 0;
   const families: ServedModelFamily[] = [];
+  const modelIds: string[] = [];
   for (const row of rows) {
     try {
       const data = JSON.parse(row.data_json) as RouteMarker;
@@ -253,13 +305,20 @@ export function sessionRouteEvidence(home: string, sessionId: string): SessionRo
       }
       const family = routeFamily(data);
       if (family) families.push(family);
+      const modelId = routeModelId(data);
+      if (modelId) {
+        explicitModelCount += 1;
+        modelIds.push(modelId);
+      }
     } catch { /* malformed telemetry is missing evidence */ }
   }
 
   return {
     markerCount: rows.length,
     explicitProviderCount,
+    explicitModelCount,
     families,
+    modelIds,
     falloverCount: sessionFalloverCount(home, sessionId),
   };
 }
@@ -272,11 +331,13 @@ export function exactBrainRouteChecks(
   sessionId: string,
   brain: BrainKind,
   expectedTurns: number,
+  expectedModel: ProofModelExpectation,
 ): Check[] {
   const expected: ServedModelFamily = brain === 'glm' ? 'byo' : brain;
   const evidence = sessionRouteEvidence(home, sessionId);
   const unique = [...new Set(evidence.families)];
-  const markerDetail = `markers ${evidence.markerCount}, explicit providers ${evidence.explicitProviderCount}, families [${unique.join(', ') || 'none'}]`;
+  const models = [...new Set(evidence.modelIds)];
+  const markerDetail = `markers ${evidence.markerCount}, explicit providers ${evidence.explicitProviderCount}, explicit models ${evidence.explicitModelCount}, families [${unique.join(', ') || 'none'}], models [${models.join(', ') || 'none'}]`;
   return [
     {
       name: `all ${expectedTurns} turns carry explicit provider identity`,
@@ -287,6 +348,15 @@ export function exactBrainRouteChecks(
       name: `session served only by the requested ${expected} brain`,
       pass: unique.length === 1 && unique[0] === expected,
       detail: markerDetail,
+    },
+    {
+      name: `session route used exact configured brain model ${expectedModel.modelId || '(missing)'}`,
+      pass: Boolean(expectedModel.modelId)
+        && evidence.markerCount >= expectedTurns
+        && evidence.explicitModelCount === evidence.markerCount
+        && models.length === 1
+        && models[0] === expectedModel.modelId,
+      detail: `${markerDetail}; expected ${expectedModel.provider}:${expectedModel.modelId || '(missing)'} from ${expectedModel.source}`,
     },
     {
       name: 'no same-session model fallover',
@@ -313,7 +383,9 @@ export function workflowStepRouteEvidence(home: string, sessionId: string): Work
   db.close();
 
   let explicitProviderCount = 0;
+  let explicitModelCount = 0;
   const families: ServedModelFamily[] = [];
+  const modelIds: string[] = [];
   const transports: string[] = [];
   for (const row of rows) {
     try {
@@ -327,6 +399,11 @@ export function workflowStepRouteEvidence(home: string, sessionId: string): Work
       }
       const family = routeFamily(marker);
       if (family) families.push(family);
+      const modelId = routeModelId(marker);
+      if (modelId) {
+        explicitModelCount += 1;
+        modelIds.push(modelId);
+      }
       if (typeof marker.transport === 'string' && marker.transport.trim()) {
         transports.push(marker.transport.trim());
       }
@@ -336,7 +413,9 @@ export function workflowStepRouteEvidence(home: string, sessionId: string): Work
   return {
     markerCount: rows.length,
     explicitProviderCount,
+    explicitModelCount,
     families,
+    modelIds,
     transports,
     falloverCount: sessionFalloverCount(home, sessionId),
   };
@@ -347,6 +426,7 @@ export function exactWorkflowStepRouteChecks(
   home: string,
   sessionId: string,
   brain: BrainKind,
+  expectedModel: ProofModelExpectation,
 ): Check[] {
   const expectedFamily: ServedModelFamily = brain === 'glm' ? 'byo' : brain;
   const expectedTransport = brain === 'claude'
@@ -354,8 +434,9 @@ export function exactWorkflowStepRouteChecks(
     : 'openai_agents_harness';
   const evidence = workflowStepRouteEvidence(home, sessionId);
   const families = [...new Set(evidence.families)];
+  const models = [...new Set(evidence.modelIds)];
   const transports = [...new Set(evidence.transports)];
-  const detail = `markers ${evidence.markerCount}, explicit providers ${evidence.explicitProviderCount}, families [${families.join(', ') || 'none'}], transports [${transports.join(', ') || 'none'}]`;
+  const detail = `markers ${evidence.markerCount}, providers ${evidence.explicitProviderCount}, models [${models.join(', ') || 'none'}], families [${families.join(', ') || 'none'}], transports [${transports.join(', ') || 'none'}]`;
   return [
     {
       name: 'workflow step carries explicit provider identity',
@@ -368,6 +449,14 @@ export function exactWorkflowStepRouteChecks(
       detail,
     },
     {
+      name: `workflow step used exact configured brain model ${expectedModel.modelId || '(missing)'}`,
+      pass: Boolean(expectedModel.modelId)
+        && evidence.explicitModelCount === evidence.markerCount
+        && models.length === 1
+        && models[0] === expectedModel.modelId,
+      detail: `${detail}; expected ${expectedModel.provider}:${expectedModel.modelId || '(missing)'} from ${expectedModel.source}`,
+    },
+    {
       name: `workflow step used ${expectedTransport}`,
       pass: transports.length === 1 && transports[0] === expectedTransport,
       detail,
@@ -376,6 +465,83 @@ export function exactWorkflowStepRouteChecks(
       name: 'no workflow-step model fallover',
       pass: evidence.falloverCount === 0,
       detail: `${evidence.falloverCount} model_fallover event(s)`,
+    },
+  ];
+}
+
+/** Exact worker-role proof for scenarios that deliberately fan out. Provider
+ * metadata remains authoritative, so a gpt-shaped BYO model stays BYO. */
+export function exactWorkerRouteChecks(
+  home: string,
+  sessionId: string,
+  expectedModel: ProofModelExpectation,
+): Check[] {
+  const db = openHarnessDb(home);
+  const rows = db.prepare(
+    "SELECT data_json FROM events WHERE session_id = ? AND type = 'worker_model_routed' ORDER BY seq ASC",
+  ).all(sessionId) as Array<{ data_json: string }>;
+  db.close();
+  const models: string[] = [];
+  const providers: string[] = [];
+  for (const row of rows) {
+    try {
+      const outer = JSON.parse(row.data_json) as RouteMarker;
+      const marker = outer.modelRoute && typeof outer.modelRoute === 'object'
+        ? outer.modelRoute as RouteMarker
+        : outer;
+      const model = routeModelId(marker);
+      if (model) models.push(model);
+      if (marker.provider === 'claude' || marker.provider === 'codex' || marker.provider === 'byo') {
+        providers.push(marker.provider);
+      }
+    } catch { /* malformed marker is missing evidence */ }
+  }
+  const usage = sessionUsageModelIds(home, [sessionId]);
+  const detail = `markers ${rows.length}; providers [${[...new Set(providers)].join(', ') || 'none'}]; models [${[...new Set(models)].join(', ') || 'none'}]; usage [${[...new Set(usage)].join(', ') || 'none'}]`;
+  return [
+    {
+      name: `worker routes used exact configured model ${expectedModel.modelId || '(missing)'}`,
+      pass: Boolean(expectedModel.modelId)
+        && rows.length > 0
+        && models.length === rows.length
+        && models.every((model) => model === expectedModel.modelId),
+      detail,
+    },
+    {
+      name: `worker routes carried explicit ${expectedModel.provider} identity`,
+      pass: rows.length > 0
+        && providers.length === rows.length
+        && providers.every((provider) => provider === expectedModel.provider),
+      detail,
+    },
+    {
+      name: `worker usage proves exact model ${expectedModel.modelId || '(missing)'}`,
+      pass: Boolean(expectedModel.modelId) && usage.includes(expectedModel.modelId),
+      detail,
+    },
+  ];
+}
+
+/** Whole-leg backstop: a pre-dispatch route marker is not enough. At least one
+ * completed call in the scenario sessions must name the exact configured id. */
+export function exactBrainServedChecks(
+  home: string,
+  sessionIds: Iterable<string>,
+  expectedModel: ProofModelExpectation,
+): Check[] {
+  const ids = [...new Set([...sessionIds].filter(Boolean))];
+  const usageModels = sessionUsageModelIds(home, ids);
+  const uniqueUsage = [...new Set(usageModels)];
+  return [
+    {
+      name: 'configured brain expectation is present',
+      pass: Boolean(expectedModel.modelId),
+      detail: `expected ${expectedModel.provider}:${expectedModel.modelId || '(missing)'} from ${expectedModel.source}`,
+    },
+    {
+      name: `session-scoped usage proves model ${expectedModel.modelId || '(missing)'} completed a call`,
+      pass: Boolean(expectedModel.modelId) && usageModels.includes(expectedModel.modelId),
+      detail: `sessions ${ids.length}; usage models [${uniqueUsage.join(', ') || 'none'}]`,
     },
   ];
 }
@@ -414,10 +580,15 @@ export function fusionDisabledChecks(home: string, sessionId: string): Check[] {
   }
 }
 
-/** Dedicated Fusion canary: prove that one distinct model family returned the
- * new bounded verdict contract for this exact session, and that the committed
- * response respected the deterministic expansion ceiling. */
-export function fusionBoundedChecks(home: string, sessionId: string, brain: BrainKind): Check[] {
+/** Dedicated Fusion canary: prove that the exact configured checker—not merely
+ * some distinct family/default—returned the bounded verdict contract for this
+ * session, and that the committed response respected the correction ceiling. */
+export function fusionBoundedChecks(
+  home: string,
+  sessionId: string,
+  brain: BrainKind,
+  expectedChecker: ProofModelExpectation,
+): Check[] {
   const operationalPath = path.join(home, 'state', 'operational-telemetry.db');
   if (!existsSync(operationalPath)) {
     return [{ name: 'bounded Fusion evidence is readable', pass: false, detail: 'operational telemetry database is missing' }];
@@ -439,9 +610,17 @@ export function fusionBoundedChecks(home: string, sessionId: string, brain: Brai
   const outcomes = payloads.map((payload) => payload.outcome ?? '(missing)');
   const boundedOutcomes = new Set(['checker-accepted-draft', 'checker-corrected-draft']);
   const brainFamily = brain === 'glm' ? 'byo' : brain;
+  const judgeModels = payloads
+    .map((payload) => payload.judgeModel)
+    .filter((model): model is string => typeof model === 'string' && model.length > 0);
   const judgeFamilies = payloads
     .map((payload) => payload.judgeModel?.split(':', 1)[0])
     .filter((family): family is string => Boolean(family));
+  const usageModels = sessionUsageModelIds(home, [sessionId]);
+  const uniqueUsageModels = [...new Set(usageModels)];
+  const expectedJudgeLabel = expectedChecker.modelId
+    ? `${expectedChecker.provider}:${expectedChecker.modelId}`
+    : '';
 
   let traceDetail = 'session trace missing';
   let boundedLength = false;
@@ -473,9 +652,28 @@ export function fusionBoundedChecks(home: string, sessionId: string, brain: Brai
       detail: `${rows.length} event(s): ${outcomes.join(', ')}`,
     },
     {
+      name: 'configured Fusion checker expectation is present',
+      pass: Boolean(expectedChecker.modelId),
+      detail: `expected ${expectedJudgeLabel || '(missing)'} from ${expectedChecker.source}`,
+    },
+    {
+      name: `Fusion verdict names exact configured checker ${expectedChecker.modelId || '(missing)'}`,
+      pass: Boolean(expectedJudgeLabel)
+        && judgeModels.length === 1
+        && judgeModels[0] === expectedJudgeLabel,
+      detail: `expected ${expectedJudgeLabel || '(missing)'}; verdict telemetry [${judgeModels.join(', ') || 'missing'}]`,
+    },
+    {
+      name: `Fusion checker usage proves exact model ${expectedChecker.modelId || '(missing)'}`,
+      pass: Boolean(expectedChecker.modelId) && usageModels.includes(expectedChecker.modelId),
+      detail: `session usage models [${uniqueUsageModels.join(', ') || 'none'}]`,
+    },
+    {
       name: 'Fusion checker used a distinct model family',
-      pass: judgeFamilies.length === 1 && judgeFamilies[0] !== brainFamily,
-      detail: `brain ${brainFamily}; checker [${judgeFamilies.join(', ') || 'missing'}]`,
+      pass: judgeFamilies.length === 1
+        && judgeFamilies[0] === expectedChecker.provider
+        && judgeFamilies[0] !== brainFamily,
+      detail: `brain ${brainFamily}; expected checker family ${expectedChecker.provider}; actual [${judgeFamilies.join(', ') || 'missing'}]`,
     },
     {
       name: 'Fusion final stayed inside the deterministic correction bound',
@@ -508,6 +706,16 @@ export function reportBackCheck(replyText: string): Check {
 }
 
 export function tokenCeilingCheck(metrics: SessionMetrics | null, ceiling: number): Check {
-  const used = metrics?.tokensUsed ?? 0;
-  return { name: `tokens ≤ ${ceiling}`, pass: used <= ceiling, detail: `${used} used` };
+  if (!metrics) {
+    return {
+      name: `tokens ≤ ${ceiling}`,
+      pass: false,
+      detail: 'session metrics unavailable; token use cannot be proven',
+    };
+  }
+  return {
+    name: `tokens ≤ ${ceiling}`,
+    pass: metrics.tokensUsed <= ceiling,
+    detail: `${metrics.tokensUsed} used`,
+  };
 }

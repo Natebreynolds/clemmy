@@ -22,6 +22,11 @@ const ENV_KEYS = [
   'BYO_PROVIDERS',
   'BYO_PROVIDERS_JSON',
   'BYO_PROVIDER_DEEPSEEK_API_KEY',
+  'CLAUDE_MODEL',
+  'OPENAI_MODEL_PRIMARY',
+  'CLEMMY_MODEL_ROLES',
+  'CLEMMY_MODEL_ROLES_REGISTRY',
+  'CLEMMY_DEBATE_JUDGE',
 ];
 for (const k of ENV_KEYS) delete process.env[k];
 
@@ -29,11 +34,20 @@ const registry = JSON.stringify([
   { id: 'deepseek', label: 'DeepSeek', baseURL: 'https://api.deepseek.com', modelIds: ['deepseek-chat'] },
 ]);
 writeFileSync(path.join(tmpHome, '.env'), [
+  'CLAUDE_MODEL=claude-sonnet-5',
+  'OPENAI_MODEL_PRIMARY=gpt-5.6-sol',
   'BYO_MODEL_ID=glm-5.2',
   'BYO_MODEL_BASE_URL=https://api.z.ai/api/paas/v4',
   'BYO_MODEL_API_KEY=zai-secret',
   `BYO_PROVIDERS=${registry}`,
   'BYO_PROVIDER_DEEPSEEK_API_KEY=deepseek-secret',
+  `CLEMMY_MODEL_ROLES=${JSON.stringify([
+    { role: 'brain', modelId: 'deepseek-chat', scope: 'durable', source: 'settings' },
+    { role: 'worker', modelId: 'deepseek-chat', scope: 'durable', source: 'settings' },
+    { role: 'judge', modelId: 'deepseek-chat', scope: 'durable', source: 'settings' },
+  ])}`,
+  'CLEMMY_MODEL_ROLES_REGISTRY=on',
+  'CLEMMY_DEBATE_JUDGE=claude',
   '',
 ].join('\n'));
 
@@ -50,6 +64,27 @@ test('glm proof plan copies BYO_PROVIDERS and per-provider key slots', () => {
   assert.equal(plan.env.BYO_MODEL_API_KEY, 'zai-secret');
   assert.equal(plan.env.BYO_PROVIDERS, registry);
   assert.equal(plan.env.BYO_PROVIDER_DEEPSEEK_API_KEY, 'deepseek-secret');
+  assert.equal(plan.expectedBrain.modelId, 'glm-5.2', 'global brain binding cannot override the GLM matrix lane');
+  assert.deepEqual(plan.expectedWorker, {
+    modelId: 'deepseek-chat', provider: 'byo', source: 'role-binding',
+  });
+  assert.deepEqual(plan.expectedFusionChecker, {
+    modelId: 'deepseek-chat', provider: 'byo', source: 'role-binding',
+  });
+  assert.equal(
+    (JSON.parse(plan.env.CLEMMY_MODEL_ROLES) as Array<{ role: string }>).some((binding) => binding.role === 'brain'),
+    false,
+    'the isolated matrix removes only global brain bindings',
+  );
+});
+
+test('codex proof copies non-secret role selection while pinning the exact configured brain slot', () => {
+  const plan = planBrain('codex');
+  assert.equal(plan.env.OPENAI_MODEL_PRIMARY, 'gpt-5.6-sol');
+  assert.equal(plan.expectedBrain.modelId, 'gpt-5.6-sol');
+  assert.equal(plan.expectedBrain.provider, 'codex');
+  assert.equal(plan.expectedWorker.modelId, 'deepseek-chat');
+  assert.equal(plan.expectedFusionChecker.modelId, 'deepseek-chat');
 });
 
 test('live proof defaults Fusion off and only enables it through an explicit canary mode', () => {

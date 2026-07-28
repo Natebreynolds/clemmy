@@ -27,6 +27,7 @@ export const fanoutMultiItem: ScenarioDef = {
   name: 'fanout-multi-item',
   summary: '5 same-shape items → all complete, fan-out elected, no park',
   routeExpectation: 'exact-brain',
+  workerRouteExpectation: true,
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-fanout-${Date.now().toString(36)}`;
     const startedAt = Date.now();

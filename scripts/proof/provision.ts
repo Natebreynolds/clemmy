@@ -23,7 +23,15 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 
-import type { BrainKind, BrainPlan, DaemonHandle, FusionProofMode, TurnResult } from './types.js';
+import type {
+  BrainKind,
+  BrainPlan,
+  DaemonHandle,
+  FusionProofMode,
+  ProofModelExpectation,
+  ProofModelProvider,
+  TurnResult,
+} from './types.js';
 import { seedIsolatedClaudeAccess } from '../lib/isolated-claude-auth.js';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
@@ -68,63 +76,189 @@ function byoProviderIdsFromRegistry(raw: string | undefined): string[] {
   }
 }
 
+/** Copy only non-secret model selection. Provider credentials keep using the
+ * existing per-brain paths below and are never printed or reported. */
+function configuredModelEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of [
+    'CLAUDE_MODEL', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_DEEP',
+    'OPENAI_MODEL_WORKER', 'BYO_MODEL_ID', 'BYO_BRAIN_MODEL_ID', 'BYO_MODEL_JUDGE_ID',
+    'BYO_MODEL_BASE_URL', 'BYO_MODEL_PROVIDER', 'BYO_PROVIDERS', 'BYO_PROVIDERS_JSON',
+    'CLEMMY_MODEL_ROLES_REGISTRY', 'CLEMMY_MODEL_ROLES', 'CLEMMY_DEBATE_JUDGE',
+    'CLEMMY_DEBATE_CHECKER_MODEL', 'CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL',
+  ]) {
+    const value = realEnvValue(key);
+    if (value) env[key] = value;
+  }
+  if (!env.BYO_PROVIDERS && env.BYO_PROVIDERS_JSON) env.BYO_PROVIDERS = env.BYO_PROVIDERS_JSON;
+  return env;
+}
+
+function roleModel(env: Record<string, string>, role: 'worker' | 'judge'): string | undefined {
+  if ((env.CLEMMY_MODEL_ROLES_REGISTRY ?? 'on').toLowerCase() === 'off') return undefined;
+  try {
+    const rows = JSON.parse(env.CLEMMY_MODEL_ROLES ?? '') as Array<{ role?: string; modelId?: string; whenIntent?: string }>;
+    return rows.find((row) => row.role === role && row.modelId?.trim() && !row.whenIntent?.trim())?.modelId?.trim();
+  } catch { return undefined; }
+}
+
+function withoutBrainRoleBindings(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const rows = JSON.parse(raw) as Array<{ role?: string }>;
+    return JSON.stringify(rows.filter((row) => row?.role !== 'brain'));
+  } catch { return raw; }
+}
+
+function providerFor(modelId: string, env: Record<string, string>): ProofModelProvider {
+  const byoIds = [env.BYO_MODEL_ID, env.BYO_BRAIN_MODEL_ID, env.BYO_MODEL_JUDGE_ID];
+  try {
+    const rows = JSON.parse(env.BYO_PROVIDERS ?? '[]') as Array<{ modelIds?: string[] }>;
+    byoIds.push(...rows.flatMap((row) => row.modelIds ?? []));
+  } catch { /* bad registry is missing ownership evidence */ }
+  if (byoIds.includes(modelId)) return 'byo'; // declared ownership beats gpt-shaped ids
+  if (/claude|opus|sonnet|haiku/i.test(modelId)) return 'claude';
+  return /^(?:gpt|o\d)|codex/i.test(modelId) ? 'codex' : 'byo';
+}
+
+function expectation(
+  env: Record<string, string>,
+  modelId: string,
+  source: ProofModelExpectation['source'],
+): ProofModelExpectation {
+  return { modelId, provider: providerFor(modelId, env), source };
+}
+
+function roleExpectations(kind: BrainKind, env: Record<string, string>): {
+  brain: ProofModelExpectation;
+  worker: ProofModelExpectation;
+  judge: ProofModelExpectation;
+} {
+  const brainSlot = kind === 'claude'
+    ? env.CLAUDE_MODEL || ''
+    : kind === 'glm'
+      ? env.BYO_BRAIN_MODEL_ID || env.BYO_MODEL_ID || ''
+      : providerFor(env.OPENAI_MODEL_PRIMARY || '', env) === 'codex'
+        ? env.OPENAI_MODEL_PRIMARY || ''
+        : '';
+  const brain = expectation(env, brainSlot, 'provider-slot');
+  const workerBinding = roleModel(env, 'worker');
+  const worker = expectation(env, workerBinding || brainSlot, workerBinding ? 'role-binding' : 'provider-slot');
+  const judgeBinding = roleModel(env, 'judge');
+  const judgeSlot = kind === 'glm'
+    ? env.BYO_MODEL_JUDGE_ID || env.BYO_MODEL_ID || ''
+    : (env.CLEMMY_DEBATE_JUDGE ?? 'claude').toLowerCase() === 'codex'
+      ? (env.OPENAI_MODEL_PRIMARY || '')
+      : (env.CLEMMY_DEBATE_CHECKER_MODEL || '');
+  let judge = expectation(env, judgeBinding || judgeSlot, judgeBinding ? 'role-binding' : 'provider-slot');
+  if (judge.provider === brain.provider && judge.modelId === brain.modelId) {
+    const choice = (env.CLEMMY_DEBATE_JUDGE ?? 'claude').toLowerCase();
+    if (choice === 'codex' && brain.provider !== 'codex') {
+      judge = expectation(env, env.CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL || '', 'fusion-fallback');
+    } else if (choice !== 'codex' && brain.provider !== 'claude') {
+      judge = expectation(env, env.CLEMMY_DEBATE_CHECKER_MODEL || '', 'fusion-fallback');
+    }
+  }
+  return { brain, worker, judge };
+}
+
 /**
  * Build the per-brain env. Missing auth material ⇒ skipReason (the matrix
  * reports SKIP, never FAIL — absence of a subscription isn't a regression).
  */
 export function planBrain(kind: BrainKind): BrainPlan {
+  const configured = configuredModelEnv();
+  // Each matrix leg pins its requested provider lane while preserving the real
+  // install's exact model slots and durable worker/judge role bindings. A
+  // global brain binding is deliberately removed: it would make every matrix
+  // label exercise the same provider instead of the requested brain.
+  const proofRoles = withoutBrainRoleBindings(configured.CLEMMY_MODEL_ROLES);
+  const selectionEnv = {
+    ...configured,
+    ...(proofRoles ? { CLEMMY_MODEL_ROLES: proofRoles } : {}),
+    MODEL_ROUTING_MODE: kind === 'glm' ? 'all_in' : 'off',
+  };
+  const expected = roleExpectations(kind, selectionEnv);
   if (kind === 'claude') {
     const hasClaude = existsSync(path.join(REAL_HOME, '.claude'));
     return {
       kind,
       env: {
+        ...selectionEnv,
         AUTH_MODE: 'claude_oauth',
-        CLAUDE_MODEL: realEnvValue('CLAUDE_MODEL') ?? '',
         // Fan-out requires the full agentic profile (run_worker is full-mode-only).
         CLEMMY_CLAUDE_AGENT_SDK_BRAIN: 'full',
       },
+      expectedBrain: expected.brain,
+      expectedWorker: expected.worker,
+      expectedFusionChecker: expected.judge,
       skipReason: hasClaude ? undefined : 'no ~/.claude (Claude Code OAuth) on this machine',
     };
   }
   if (kind === 'codex') {
     const hasCodex = existsSync(path.join(REAL_HOME, '.codex'));
     const apiKey = realEnvValue('OPENAI_API_KEY');
-    // Mirror the candidate install's exact Codex model slots. Without this, a
-    // user running GPT-5.6 locally could get a green release proof that silently
-    // exercised the code-level GPT-5.4 defaults in the isolated daemon.
-    const modelEnv: Record<string, string> = {};
-    for (const key of ['OPENAI_MODEL_FAST', 'OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER']) {
-      const value = realEnvValue(key);
-      if (value) modelEnv[key] = value;
+    if (hasCodex) {
+      return {
+        kind,
+        env: { ...selectionEnv, AUTH_MODE: 'codex_oauth' },
+        expectedBrain: expected.brain,
+        expectedWorker: expected.worker,
+        expectedFusionChecker: expected.judge,
+      };
     }
-    if (hasCodex) return { kind, env: { AUTH_MODE: 'codex_oauth', ...modelEnv } };
-    if (apiKey) return { kind, env: { AUTH_MODE: 'api_key', OPENAI_API_KEY: apiKey, ...modelEnv } };
-    return { kind, env: {}, skipReason: 'no ~/.codex and no OPENAI_API_KEY' };
+    if (apiKey) {
+      return {
+        kind,
+        env: { ...selectionEnv, AUTH_MODE: 'api_key', OPENAI_API_KEY: apiKey },
+        expectedBrain: expected.brain,
+        expectedWorker: expected.worker,
+        expectedFusionChecker: expected.judge,
+      };
+    }
+    return {
+      kind,
+      env: selectionEnv,
+      expectedBrain: expected.brain,
+      expectedWorker: expected.worker,
+      expectedFusionChecker: expected.judge,
+      skipReason: 'no ~/.codex and no OPENAI_API_KEY',
+    };
   }
   // glm — BYO all-in brain. Copy only the BYO/GLM material the real install
   // uses. The canonical single-BYO config keys are BYO_MODEL_ID /
   // BYO_MODEL_API_KEY / BYO_MODEL_BASE_URL (what a real install writes);
   // BYO_BRAIN_MODEL_ID is accepted as a legacy alias.
-  const byoModel = realEnvValue('BYO_MODEL_ID') ?? realEnvValue('BYO_BRAIN_MODEL_ID');
-  if (!byoModel) return { kind, env: {}, skipReason: 'no BYO_MODEL_ID (or BYO_BRAIN_MODEL_ID) configured in the real home' };
-  const env: Record<string, string> = { MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_ID: byoModel };
+  const byoModel = selectionEnv.BYO_MODEL_ID ?? selectionEnv.BYO_BRAIN_MODEL_ID;
+  if (!byoModel) {
+    return {
+      kind,
+      env: selectionEnv,
+      expectedBrain: expected.brain,
+      expectedWorker: expected.worker,
+      expectedFusionChecker: expected.judge,
+      skipReason: 'no BYO_MODEL_ID (or BYO_BRAIN_MODEL_ID) configured in the real home',
+    };
+  }
+  const env = { ...selectionEnv, BYO_MODEL_ID: byoModel };
   for (const key of [
-    'BYO_MODEL_API_KEY', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_JUDGE_ID', 'BYO_MODEL_PROVIDER',
-    'ZHIPU_API_KEY', 'GLM_API_KEY', 'OPENROUTER_API_KEY',
+    'BYO_MODEL_API_KEY', 'ZHIPU_API_KEY', 'GLM_API_KEY', 'OPENROUTER_API_KEY',
   ]) {
-    const v = realEnvValue(key);
-    if (v) env[key] = v;
+    const value = realEnvValue(key);
+    if (value) env[key] = value;
   }
-  const registry = realEnvValue('BYO_PROVIDERS') ?? realEnvValue('BYO_PROVIDERS_JSON');
-  if (registry) {
-    env.BYO_PROVIDERS = registry;
-    for (const id of byoProviderIdsFromRegistry(registry)) {
-      const key = byoProviderKeyEnvKey(id);
-      const v = realEnvValue(key);
-      if (v) env[key] = v;
-    }
+  for (const id of byoProviderIdsFromRegistry(env.BYO_PROVIDERS)) {
+    const key = byoProviderKeyEnvKey(id);
+    const value = realEnvValue(key);
+    if (value) env[key] = value;
   }
-  return { kind, env };
+  return {
+    kind,
+    env,
+    expectedBrain: expected.brain,
+    expectedWorker: expected.worker,
+    expectedFusionChecker: expected.judge,
+  };
 }
 
 async function tcpProbe(port: number): Promise<boolean> {
@@ -210,6 +344,7 @@ function createProofComposioShim(home: string): void {
         'if "%1"=="execute" (',
         '  if not exist "%HOME%\\proof-composio-connected" (echo 401 Unauthorized. 1>&2& exit /b 1)',
         '  echo %2>>"%HOME%\\proof-composio-dispatches.log"',
+        '  if "%2"=="PROOF_SOCIAL_CONTENT_PLAN" (echo {"successful":true,"data":[{"sourceMarker":"SOCIAL_SOURCE:PROOF_ONLY","brand":"Juniper Vale Coffee","handle":"@junipervale","campaign":"Rainy Day Roast","offer":"Complimentary oat-milk upgrade on August 14","hashtag":"#RainyDayRoast"}]}& exit /b 0)',
         '  echo {"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}',
         '  exit /b 0',
         ')',
@@ -231,6 +366,10 @@ function createProofComposioShim(home: string): void {
         '  execute)',
         '    if [ ! -f "$state" ]; then printf "%s\\n" "401 Unauthorized." >&2; exit 1; fi',
         '    printf "%s\\n" "$2" >> "$dispatch_log"',
+        '    if [ "$2" = "PROOF_SOCIAL_CONTENT_PLAN" ]; then',
+        '      printf "%s\\n" \'{"successful":true,"data":[{"sourceMarker":"SOCIAL_SOURCE:PROOF_ONLY","brand":"Juniper Vale Coffee","handle":"@junipervale","campaign":"Rainy Day Roast","offer":"Complimentary oat-milk upgrade on August 14","hashtag":"#RainyDayRoast"}]}\'',
+        '      exit 0',
+        '    fi',
         '    printf "%s\\n" \'{"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}\'',
         '    exit 0',
         '    ;;',

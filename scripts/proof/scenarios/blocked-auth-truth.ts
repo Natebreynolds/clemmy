@@ -115,8 +115,10 @@ export const blockedAuthTruth: ScenarioDef = {
       },
       {
         name: 'proof made no external write',
-        pass: (metrics?.externalWrites ?? 0) === 0,
-        detail: `${metrics?.externalWrites ?? 0} external_write event(s); tools=${JSON.stringify(metrics?.toolCalls ?? {})}`,
+        pass: metrics != null && metrics.externalWrites === 0,
+        detail: metrics
+          ? `${metrics.externalWrites} external_write event(s); tools=${JSON.stringify(metrics.toolCalls)}`
+          : 'session metrics unavailable',
       },
       narrationCheck(result),
       stormCheck(daemon.log()),
