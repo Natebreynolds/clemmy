@@ -40,6 +40,28 @@ after(() => { server?.close(); });
 
 const j = async (res: Response) => ({ status: res.status, body: await res.json().catch(() => null) as any });
 
+test('PATCH contract lists on a workspace with no contract is an explicit 400, never a silent no-op', async () => {
+  const c = await j(await fetch(`${base}/api/console/spaces`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'Legacy Board' }),
+  }));
+  assert.equal(c.status, 201);
+  assert.equal(c.body.space.contract, undefined);
+  const slug = c.body.space.id;
+
+  const patched = await j(await fetch(`${base}/api/console/spaces/${slug}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ successCriteria: ['Orphaned criterion'] }),
+  }));
+  assert.equal(patched.status, 400);
+  assert.match(String(patched.body?.error ?? ''), /objective/i);
+
+  const detail = await j(await fetch(`${base}/api/console/spaces/${slug}`));
+  assert.equal(detail.body.space.contract, undefined);
+});
+
 test('POST creates a workspace with a placeholder view; GET list shows it', async () => {
   const c = await j(await fetch(`${base}/api/console/spaces`, {
     method: 'POST',
@@ -86,6 +108,17 @@ test('POST creates a workspace with a placeholder view; GET list shows it', asyn
     successCriteria: ['Every row is sourced', 'The board is ready before standup'],
     invariants: [],
   });
+
+  // A blank objective in a PATCH cannot silently discard the rest of the
+  // contract patch — the objective is preserved and the lists apply.
+  const blankObjective = await j(await fetch(`${base}/api/console/spaces/${slug}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ objective: '', successCriteria: ['Blank-objective lists still apply'] }),
+  }));
+  assert.equal(blankObjective.status, 200);
+  assert.equal(blankObjective.body.space.contract.objective, 'Keep the test pipeline decision-ready.');
+  assert.deepEqual(blankObjective.body.space.contract.successCriteria, ['Blank-objective lists still apply']);
 
   // The placeholder view is served as HTML.
   const view = await fetch(`${base}/console/spaces/${slug}/view`);

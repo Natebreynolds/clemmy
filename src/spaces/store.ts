@@ -266,9 +266,13 @@ export function mergeSpaceContract(
     invariants?: unknown;
   },
 ): SpaceContract | undefined {
-  const objective = patch.objective == null
-    ? current?.objective
+  const requestedObjective = patch.objective == null
+    ? undefined
     : contractText(patch.objective, CONTRACT_OBJECTIVE_MAX_CHARS);
+  // A provided-but-blank objective means "objective unchanged", not "discard
+  // the rest of this patch" — list edits must still apply to an existing
+  // contract. Without any objective a contract still cannot come into being.
+  const objective = requestedObjective || current?.objective;
   if (!objective) return current;
   const successCriteria = patch.successCriteria == null
     ? [...(current?.successCriteria ?? [])]

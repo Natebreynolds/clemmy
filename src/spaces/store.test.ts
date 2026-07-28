@@ -87,6 +87,28 @@ test('mergeSpaceContract is bounded, deduplicated, and supports explicit list cl
   assert.equal(revised?.objective, initial?.objective);
 });
 
+test('mergeSpaceContract: a blank objective edits lists without erasing or silently aborting', () => {
+  const current = {
+    objective: 'Keep the pipeline decision-ready.',
+    successCriteria: ['Old criterion'],
+    invariants: ['Never send automatically'],
+  };
+  // Blank objective on an existing contract means "objective unchanged", not
+  // "discard the rest of my patch".
+  const revised = store.mergeSpaceContract(current, {
+    objective: '   ',
+    successCriteria: ['Every row is sourced', 'Board ready before standup'],
+  });
+  assert.deepEqual(revised, {
+    objective: 'Keep the pipeline decision-ready.',
+    successCriteria: ['Every row is sourced', 'Board ready before standup'],
+    invariants: ['Never send automatically'],
+  });
+  // Without any objective a contract still cannot come into existence.
+  assert.equal(store.mergeSpaceContract(undefined, { objective: '', successCriteria: ['x'] }), undefined);
+  assert.equal(store.mergeSpaceContract(undefined, { successCriteria: ['x'] }), undefined);
+});
+
 test('hand-written manifests accept canonical and snake-case contract fields', () => {
   const slug = 'contract-manifest';
   const dir = store.resolveSpaceDir(slug);

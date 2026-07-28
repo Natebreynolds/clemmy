@@ -550,9 +550,13 @@ export function registerSpaceTools(server: McpServer): void {
         meta: { gaps: gaps.map((g) => ({ resolution: g.resolution, question: g.question, why: g.why })) },
       });
       const gapQuestions = renderSpaceGapQuestions(gaps);
+      const contractListsDropped =
+        !record.contract && ((success_criteria?.length ?? 0) > 0 || (invariants?.length ?? 0) > 0);
       const contractNote = record.contract
         ? ` Operating contract pinned: "${record.contract.objective}".`
-        : ' Operating contract is not pinned yet; preserve the user\'s stated purpose on the next substantive save.';
+        : contractListsDropped
+          ? ' Operating contract NOT saved: success criteria/invariants need an objective — re-save with objective to pin them.'
+          : ' Operating contract is not pinned yet; preserve the user\'s stated purpose on the next substantive save.';
       return textResult(
         `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
         + `${contractNote} The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`,

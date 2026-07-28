@@ -240,7 +240,14 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
         successCriteria: req.body?.successCriteria ?? req.body?.success_criteria,
         invariants: req.body?.invariants,
       });
-      if (contract) patch.contract = contract;
+      if (contract) {
+        patch.contract = contract;
+      } else {
+        // Contract fields were sent but no contract can exist yet — a silent
+        // 200 here would discard the caller's criteria/invariants.
+        res.status(400).json({ error: 'A workspace contract needs an objective before success criteria or invariants can be saved. Send objective (or set it first) and retry.' });
+        return;
+      }
     }
     const updated = spaceStore.update(slug, patch);
     res.json({ space: updated });
