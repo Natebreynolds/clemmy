@@ -75,6 +75,30 @@ test('checker engine evidence counts only each step final state after retries', 
   assert.match(evidenceText, /Unresolved step_failed events: 1/);
 });
 
+test('checker engine evidence separates blocked/skipped step_completed events from verified successes', () => {
+  anchorRunGoal('wf', 'r-blocked', { objective: 'Enrich and upsert rows', successCriteria: ['Must upsert verified rows'] });
+  recordStepOutput({ workflowName: 'wf', runId: 'r-blocked', stepId: 'pull', output: { rows: [{ id: 1 }] }, nowIso: NOW });
+  recordStepOutput({ workflowName: 'wf', runId: 'r-blocked', stepId: 'upsert', output: { blocked: true, reason: 'tracker has zero data rows' }, nowIso: NOW });
+  appendWorkflowEvent('wf', 'r-blocked', { kind: 'step_completed', stepId: 'pull', output: { rows: [{ id: 1 }] } });
+  // An honest block flows through as step_completed with meta.blocked (runner
+  // tags both direct blocks and blocked-upstream dependency skips this way).
+  appendWorkflowEvent('wf', 'r-blocked', {
+    kind: 'step_completed', stepId: 'upsert',
+    output: { blocked: true, reason: 'tracker has zero data rows' },
+    meta: { blocked: true },
+  });
+  appendWorkflowEvent('wf', 'r-blocked', {
+    kind: 'step_completed', stepId: 'notify',
+    output: { blocked: true, reason: 'Skipped because the required upstream path is blocked by "upsert"' },
+    meta: { blocked: true, skipped: true, reason: 'blocked_upstream_dependency', blockedBy: 'upsert' },
+  });
+
+  const { evidenceText } = buildWorkspaceEvidence('wf', 'r-blocked');
+  assert.match(evidenceText, /1 workflow step reached step_completed/);
+  assert.match(evidenceText, /2 steps? finished BLOCKED/i);
+  assert.doesNotMatch(evidenceText, /3 workflow steps reached step_completed/);
+});
+
 test('checker PASSES when the accumulated work satisfies the goal, attributing evidence to steps', async () => {
   seed('wf', 'r2');
   const report = await checkRunAgainstGoal({

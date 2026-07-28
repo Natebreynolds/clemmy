@@ -56,17 +56,27 @@ export function buildWorkspaceEvidence(
   if (goal) blocks.push(goal.trim());
   try {
     const events = readWorkflowEvents(workflowName, runId);
-    const finalStepState = new Map<string, 'completed' | 'failed'>();
+    // An honest block (and a blocked-upstream dependency skip) also flows
+    // through as step_completed — the runner tags those events meta.blocked.
+    // Counting them as verified successes would over-report completion on
+    // exactly the runs that need scrutiny, so they get their own bucket.
+    const finalStepState = new Map<string, 'completed' | 'failed' | 'blocked'>();
     for (const event of events) {
       if (!event.stepId || event.stepId === '__synthesis__') continue;
-      if (event.kind === 'step_completed') finalStepState.set(event.stepId, 'completed');
+      if (event.kind === 'step_completed') {
+        finalStepState.set(event.stepId, event.meta?.blocked === true ? 'blocked' : 'completed');
+      }
       if (event.kind === 'step_failed') finalStepState.set(event.stepId, 'failed');
     }
     const completedCount = [...finalStepState.values()].filter((state) => state === 'completed').length;
     const failedCount = [...finalStepState.values()].filter((state) => state === 'failed').length;
+    const blockedCount = [...finalStepState.values()].filter((state) => state === 'blocked').length;
     blocks.push([
       '### Run engine evidence',
       `${completedCount} workflow step${completedCount === 1 ? '' : 's'} reached step_completed after blocked/error detection and output-contract verification.`,
+      ...(blockedCount > 0
+        ? [`${blockedCount} step${blockedCount === 1 ? '' : 's'} finished BLOCKED or skipped on a blocked upstream dependency — their outputs are not verified successes.`]
+        : []),
       `Unresolved step_failed events: ${failedCount}.`,
     ].join('\n'));
   } catch {
