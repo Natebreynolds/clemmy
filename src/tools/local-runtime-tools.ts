@@ -274,6 +274,65 @@ function captureLocalTools(): CapturedLocalTool[] {
   return captured;
 }
 
+/**
+ * Actionable guidance for an input-validation failure on the local tool
+ * surface. The SDK default ("Invalid JSON input for tool") names nothing the
+ * model can correct — observed live (proof workspace-build, 2026-07-27): three
+ * blind space_save retries with large payloads, then a silently degraded
+ * static deliverable. Name the violated paths and point at the schema so the
+ * next retry is a corrected retry, not a guess.
+ */
+export function describeInvalidToolInput(error: unknown, toolName: string): string | null {
+  if (!error || typeof error !== 'object') return null;
+  if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
+  const original = (error as { originalError?: unknown }).originalError;
+  const rawIssues = original && typeof original === 'object'
+    ? (original as { issues?: unknown }).issues
+    : undefined;
+  const issues = Array.isArray(rawIssues)
+    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, 5).map((issue) => {
+        const path = Array.isArray(issue.path) && issue.path.length > 0 ? issue.path.join('.') : '(root)';
+        return `${path}: ${String(issue.message ?? 'invalid')}`;
+      })
+    : [];
+  const cause = issues.length > 0
+    ? ` — ${issues.join('; ')}`
+    : ' — the input was not parseable JSON (rebuild the arguments as ONE compact JSON object; escape embedded quotes/newlines once, not twice)';
+  return `The arguments for ${toolName} did not match its schema${cause}. `
+    + `Call tool_search with the exact query "${toolName}" to get the full input schema, then retry once with corrected arguments.`;
+}
+
+/** Error handler for every local runtime tool. Non-input errors keep the exact
+ * SDK default text (downstream failure detection keys on that prefix);
+ * input-validation errors append schema guidance, and memory_remember keeps
+ * its narrow required-prefix recovery. */
+export function buildLocalToolErrorFunction(
+  localTool: CapturedLocalTool,
+): (runContext: unknown, error: unknown) => Promise<string> {
+  return async (runContext: unknown, error: unknown): Promise<string> => {
+    if (localTool.name === 'memory_remember') {
+      const recovered = recoverMemoryRememberRequiredPrefix(error);
+      if (!recovered) {
+        return 'memory_remember input was invalid. Retry once with only the required kind and content fields; omit optional graph annotations.';
+      }
+      const details = error && typeof error === 'object'
+        ? (error as { toolInvocation?: { details?: unknown } }).toolInvocation?.details
+        : undefined;
+      return withToolOutputContext(
+        toolOutputContextFromSdk(localTool.name, runContext, details),
+        async () => {
+          const result = resultToText(await localTool.handler(recovered));
+          return `${result}\n[Recovered valid kind/content; malformed optional graph annotations were ignored.]`;
+        },
+      );
+    }
+    const details = error instanceof Error ? error.toString() : String(error);
+    const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
+    const guidance = describeInvalidToolInput(error, localTool.name);
+    return guidance ? `${base}\n${guidance}` : base;
+  };
+}
+
 function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeContextValue> {
   return tool({
     name: localTool.name,
@@ -290,27 +349,10 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
       toolOutputContextFromSdk(localTool.name, runContext, details),
       async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
     ),
-    // A malformed optional graph tail must not force a second memory mutation
-    // attempt when kind/content were already complete. Keep this recovery local
-    // and narrow; every other tool/error retains the SDK's default behavior.
-    errorFunction: localTool.name === 'memory_remember'
-      ? async (runContext, error) => {
-          const recovered = recoverMemoryRememberRequiredPrefix(error);
-          if (!recovered) {
-            return 'memory_remember input was invalid. Retry once with only the required kind and content fields; omit optional graph annotations.';
-          }
-          const details = error && typeof error === 'object'
-            ? (error as { toolInvocation?: { details?: unknown } }).toolInvocation?.details
-            : undefined;
-          return withToolOutputContext(
-            toolOutputContextFromSdk(localTool.name, runContext, details),
-            async () => {
-              const result = resultToText(await localTool.handler(recovered));
-              return `${result}\n[Recovered valid kind/content; malformed optional graph annotations were ignored.]`;
-            },
-          );
-        }
-      : undefined,
+    // Input-validation failures return the violated paths + a tool_search
+    // pointer (see buildLocalToolErrorFunction); execution errors keep the
+    // SDK's default text; memory_remember keeps its required-prefix recovery.
+    errorFunction: buildLocalToolErrorFunction(localTool),
   });
 }
 

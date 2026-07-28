@@ -13,7 +13,54 @@ const {
   getLocalToolCatalog,
   getLocalRuntimeTools,
   recoverMemoryRememberRequiredPrefix,
+  describeInvalidToolInput,
+  buildLocalToolErrorFunction,
 } = await import('./local-runtime-tools.js');
+
+test('invalid tool input returns the violated paths and a tool_search pointer, never a blind retry prompt', async () => {
+  const { z } = await import('zod');
+  const schema = z.strictObject({
+    slug: z.string(),
+    data_sources: z.array(z.object({ id: z.string(), runner_path: z.string() })),
+  });
+  const parsed = schema.safeParse({ slug: 'proof-cockpit', data_sources: [{ id: 1 }], extra_key: true });
+  assert.equal(parsed.success, false);
+  const invalidInput = {
+    name: 'InvalidToolInputError',
+    originalError: parsed.success ? undefined : parsed.error,
+    toolInvocation: { input: '{"slug":"proof-cockpit"' },
+  };
+
+  const guidance = describeInvalidToolInput(invalidInput, 'space_save');
+  assert.ok(guidance);
+  assert.match(guidance!, /space_save/);
+  assert.match(guidance!, /data_sources/);
+  assert.match(guidance!, /tool_search/);
+
+  const errorFunction = buildLocalToolErrorFunction({
+    name: 'space_save',
+    description: 'test',
+    parameters: {},
+    handler: async () => { throw new Error('handler must not run on input errors'); },
+  });
+  const message = await errorFunction(undefined, Object.assign(new Error('Invalid JSON input for tool'), invalidInput));
+  // Keeps the SDK default prefix (failure detection keys on it) AND adds guidance.
+  assert.match(message, /^An error occurred while running the tool/);
+  assert.match(message, /did not match its schema/);
+  assert.match(message, /tool_search/);
+
+  // A plain execution error keeps the exact SDK default shape — no guidance.
+  const executionMessage = await errorFunction(undefined, new Error('disk full'));
+  assert.equal(executionMessage, 'An error occurred while running the tool. Please try again. Error: Error: disk full');
+
+  // Unparseable JSON (no zod issues) gets the single-escaping guidance.
+  const parseGuidance = describeInvalidToolInput(
+    { name: 'InvalidToolInputError', originalError: new SyntaxError('Unexpected token') },
+    'space_save',
+  );
+  assert.ok(parseGuidance);
+  assert.match(parseGuidance!, /not parseable JSON/);
+});
 
 test('local tool catalog is the exact loaded surface without schemas', () => {
   const tools = getLocalRuntimeTools();
