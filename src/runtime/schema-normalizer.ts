@@ -132,3 +132,118 @@ export function normalizeShapeForCodexStrict(shape: z.ZodRawShape): z.ZodRawShap
     ]),
   );
 }
+
+/**
+ * Schema used INSIDE `call_tool(args_json)`.
+ *
+ * The outer provider schema must be Codex-strict, but args_json is ordinary
+ * JSON and omission is the natural representation of an optional field. Keep
+ * the same recursive type normalization while accepting BOTH omission and the
+ * explicit null shown by strict tool_search schemas. This is recursive on
+ * purpose: workflow_create/workflow_update contain arrays of objects with many
+ * optional fields, and relaxing only the root still forced the model to emit
+ * dozens of meaningless nested nulls.
+ */
+export function normalizeZodForDeferredJson(schema: z.ZodTypeAny): z.ZodTypeAny {
+  const def = (schema as unknown as { _def: { type?: string; [key: string]: unknown } })._def;
+
+  switch (def?.type) {
+    case 'optional':
+      return withDescription(
+        schema,
+        normalizeZodForDeferredJson(def.innerType as z.ZodTypeAny).nullish(),
+      );
+    case 'nullable':
+      return withDescription(
+        schema,
+        // On the args_json transport a nullable tool field is the strict-mode
+        // representation of "optional"; accept omission as well as null.
+        normalizeZodForDeferredJson(def.innerType as z.ZodTypeAny).nullish(),
+      );
+    case 'object': {
+      const anySchema = schema as unknown as { shape: z.ZodRawShape | (() => z.ZodRawShape) };
+      const shape = typeof anySchema.shape === 'function' ? anySchema.shape() : anySchema.shape;
+      const normalizedShape = Object.fromEntries(
+        Object.entries(shape as z.ZodRawShape).map(([key, value]) => [
+          key,
+          normalizeZodForDeferredJson(value as z.ZodTypeAny),
+        ]),
+      );
+      return withDescription(schema, z.strictObject(normalizedShape));
+    }
+    case 'array':
+      return withDescription(schema, z.array(normalizeZodForDeferredJson(def.element as z.ZodTypeAny)));
+    case 'record': {
+      const valueType = def.valueType
+        ? normalizeZodForDeferredJson(def.valueType as z.ZodTypeAny)
+        : z.string();
+      return withDescription(schema, z.object({}).catchall(valueType));
+    }
+    case 'any':
+    case 'unknown':
+      return withDescription(schema, z.string());
+    case 'union': {
+      const options = Array.isArray(def.options)
+        ? def.options.map((item) => normalizeZodForDeferredJson(item as z.ZodTypeAny))
+        : [];
+      if (options.length === 0) return withDescription(schema, z.string());
+      if (options.length === 1) return withDescription(schema, options[0]);
+      return withDescription(
+        schema,
+        z.union(options as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]),
+      );
+    }
+    default:
+      return schema;
+  }
+}
+
+export function normalizeShapeForDeferredJson(shape: z.ZodRawShape): z.ZodRawShape {
+  return Object.fromEntries(
+    Object.entries(shape).map(([key, value]) => [
+      key,
+      normalizeZodForDeferredJson(value as z.ZodTypeAny),
+    ]),
+  );
+}
+
+function jsonSchemaAllowsNull(schemaValue: unknown): boolean {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
+  const schema = schemaValue as {
+    type?: unknown;
+    nullable?: unknown;
+    anyOf?: unknown;
+    oneOf?: unknown;
+  };
+  if (schema.nullable === true || schema.type === 'null') return true;
+  if (Array.isArray(schema.type) && schema.type.includes('null')) return true;
+  for (const branch of [schema.anyOf, schema.oneOf]) {
+    if (Array.isArray(branch) && branch.some(jsonSchemaAllowsNull)) return true;
+  }
+  return false;
+}
+
+/**
+ * Present a truthful, compact schema on the deferred args_json transport.
+ * Codex-strict JSON Schema marks optional fields as required+nullable; through
+ * call_tool those fields may be omitted. Remove only nullable keys from every
+ * nested `required` list while preserving all real required fields and types.
+ */
+export function relaxJsonSchemaForDeferred(schemaValue: unknown): unknown {
+  if (Array.isArray(schemaValue)) return schemaValue.map(relaxJsonSchemaForDeferred);
+  if (!schemaValue || typeof schemaValue !== 'object') return schemaValue;
+  const source = schemaValue as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    out[key] = relaxJsonSchemaForDeferred(value);
+  }
+  if (Array.isArray(source.required) && source.properties && typeof source.properties === 'object') {
+    const properties = source.properties as Record<string, unknown>;
+    const required = source.required.filter(
+      (key): key is string => typeof key === 'string' && !jsonSchemaAllowsNull(properties[key]),
+    );
+    if (required.length > 0) out.required = required;
+    else delete out.required;
+  }
+  return out;
+}

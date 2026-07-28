@@ -746,7 +746,7 @@ const STEP_INPUT_CONTRACT_DESC =
   + 'Example: {"target":{"from":"input.domain","type":"string"}}.';
 
 const STEP_OUTPUT_CONTRACT_DESC =
-  'OPTIONAL output contract — what this step PRODUCES. When declared, the engine verifies the step output against it BEFORE recording completion; a violation fails the step loudly (reports back) instead of feeding bad data to the next step. Declare it on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable (e.g. a created sheet/file/URL), so the result is verified, not just claimed. Omit it for free-form/conversational steps.';
+  'OPTIONAL output contract — what this step PRODUCES. When declared, the engine verifies the step output against it BEFORE recording completion; a violation fails the step loudly (reports back) instead of feeding bad data to the next step. Declare it on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable (e.g. a created sheet/file/URL), so the result is verified, not just claimed. For a forEach step, an object/string/number/boolean contract validates EACH item result; an array contract validates the final aggregate array of {itemKey, output} records. Omit it for free-form/conversational steps.';
 
 const WorkflowLoopUntilSchema = z.object({
   maxAttempts: z.number().min(1).max(10).optional(),
@@ -1003,7 +1003,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
-        forEach: z.string().optional(),
+        forEach: z.string().optional().describe('Fan out once per item from an upstream step output. The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
@@ -1029,7 +1029,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
-      resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"lead_sheet":{"kind":"sheet","toolkit":"googlesheets","resourceId":"<spreadsheet id>","name":"Leads"}}. Use for fixed accounts, sheets, folders, campaigns, channels, repos, CLIs, and API endpoints that the workflow should remember between runs; do NOT put these in run inputs.'),
+      resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"lead_sheet":{"kind":"sheet","toolkit":"googlesheets","resourceId":"<spreadsheet id>","name":"Leads"}} or {"content_calendar":{"kind":"workspace","id":"my-workspace-slug"}}. Use for fixed Workspaces, accounts, sheets, folders, campaigns, channels, repos, CLIs, and API endpoints that the workflow should remember between runs; do NOT put these in run inputs.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the authoring smoke test, e.g. {"url":"https://example.com"}. Use when an external read step needs inputs that are not defaulted in `inputs`; otherwise the workflow stays disabled until it can be verified.'),
       synthesis_prompt: z.string().optional(),
       portable_models: z.boolean().optional().describe('Set true when the workflow should run on any available model/provider. This removes exact per-step model pins and keeps intent/default routing instead. Omit/false to preserve intentional model pins.'),
@@ -1655,6 +1655,7 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_update',
     'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
+      + 'IMPORTANT: when `steps` is present it REPLACES THE ENTIRE STEP GRAPH; never send one step as a patch. Read and resend every step for a graph change, or use workflow_edit_step for a targeted prompt edit. '
       + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. '
       + 'For mechanical tool steps, declare `inputs` argument bindings plus `output`, or use `call` directly when the exact tool and args are known.',
     {
@@ -1670,7 +1671,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
-        forEach: z.string().optional(),
+        forEach: z.string().optional().describe('Fan out once per item from an upstream step output. The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
@@ -1689,7 +1690,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class ('read' | 'write' | 'send'). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends."),
         loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
         loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent. Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
-      })).optional(),
+      })).optional().describe('COMPLETE REPLACEMENT graph. If provided, this array replaces ALL existing steps; it is not an upsert/patch. Include every step you intend to keep. For one prompt-only edit, use workflow_edit_step instead.'),
       project: z.string().optional().describe('Set or clear the workflow-level default local workspace/project. Empty string clears it.'),
       clear_project: z.boolean().optional().describe('Pass true to remove the workflow-level default local project.'),
       trigger_schedule: z.string().optional(),
@@ -1700,7 +1701,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('Replace the workflow event subscriptions. Pass [] or clear_trigger_events=true to remove existing event triggers.'),
       clear_trigger_events: z.boolean().optional().describe('Pass true to remove existing internal event trigger subscriptions.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
-      resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"ads_account":{"kind":"account","toolkit":"googleads","account":"123-456-7890"}}. Pass only to replace resource bindings; omit to preserve them.'),
+      resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"ads_account":{"kind":"account","toolkit":"googleads","account":"123-456-7890"}} or {"content_calendar":{"kind":"workspace","id":"my-workspace-slug"}}. Pass only to replace resource bindings; omit to preserve them.'),
       clear_resources: z.boolean().optional().describe('Pass true to remove all workflow resource bindings.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the re-verification smoke test when this update changes an enabled workflow, e.g. {"url":"https://example.com"}.'),
       synthesis_prompt: z.string().optional(),
@@ -1714,6 +1715,31 @@ export function registerOrchestrationTools(server: McpServer): void {
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
     async ({ name, description, steps, project, clear_project, trigger_schedule, trigger_timezone, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
+      // OpenAI strict function schemas materialize omitted nullable optionals as
+      // `null`. workflow_update is a PATCH surface: null must mean "omitted",
+      // never "clear this field" and never `.trim()` on null. Preserve explicit
+      // false / [] / "" values because those carry real patch semantics.
+      description = description ?? undefined;
+      steps = steps ?? undefined;
+      project = project ?? undefined;
+      clear_project = clear_project ?? undefined;
+      trigger_schedule = trigger_schedule ?? undefined;
+      trigger_timezone = trigger_timezone ?? undefined;
+      clear_trigger_schedule = clear_trigger_schedule ?? undefined;
+      trigger_webhook_path = trigger_webhook_path ?? undefined;
+      clear_trigger_webhook_path = clear_trigger_webhook_path ?? undefined;
+      trigger_events = trigger_events ?? undefined;
+      clear_trigger_events = clear_trigger_events ?? undefined;
+      inputs = inputs ?? undefined;
+      resources = resources ?? undefined;
+      clear_resources = clear_resources ?? undefined;
+      test_inputs = test_inputs ?? undefined;
+      synthesis_prompt = synthesis_prompt ?? undefined;
+      portable_models = portable_models ?? undefined;
+      allowSends = allowSends ?? undefined;
+      goal = goal ?? undefined;
+      clear_goal = clear_goal ?? undefined;
+
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);

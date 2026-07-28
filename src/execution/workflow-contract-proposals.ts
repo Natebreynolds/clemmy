@@ -82,7 +82,9 @@ const IDENTITY_CONTRACT_KEYS = new Set([
 ]);
 const EVIDENCE_CONTRACT_KEYS = new Set([
   'sources',
+  'source_urls',
   'source_errors',
+  'evidence',
   'key_findings',
   'findings',
   'results',
@@ -195,6 +197,13 @@ function onlyIdentityKeys(contract: WorkflowStepOutputContract | undefined): boo
   return keys.length > 0 && keys.every((key) => IDENTITY_CONTRACT_KEYS.has(key));
 }
 
+function arrayContractHasRootEvidence(contract: WorkflowStepOutputContract | undefined): boolean {
+  if (contract?.type !== 'array') return false;
+  if ((contract.non_empty ?? []).some((path) => path === '' || path === '.')) return true;
+  return Object.entries(contract.min_items ?? {})
+    .some(([path, minimum]) => (path === '' || path === '.') && minimum >= 1);
+}
+
 export function stepHasWeakLiveResearchContract(
   workflow: WorkflowDefinition,
   step: WorkflowStepInput,
@@ -210,6 +219,11 @@ export function stepHasWeakLiveResearchContract(
   const prompt = step.prompt ?? '';
   if (!LIVE_RESEARCH_RE.test(prompt)) return false;
   if (!stepReachesExternalToolSurface(workflow, step)) return false;
+  // A root array is the evidence payload itself. Object-only keys such as
+  // sources/key_findings cannot be grafted onto it without creating an
+  // impossible contract (`type:array` + `required_keys`). For forEach this is
+  // also the runner's aggregate shape: [{itemKey, output}].
+  if (arrayContractHasRootEvidence(step.output)) return false;
   return onlyIdentityKeys(step.output) || !hasEvidenceKey(step.output);
 }
 
@@ -219,10 +233,30 @@ export function hardenWeakLiveResearchOutputContract(
 ): WorkflowStepOutputContract | null {
   if (!stepHasWeakLiveResearchContract(workflow, step)) return null;
   const current = step.output ?? {};
+  if (current.type === 'array') {
+    const nonEmpty = new Set(current.non_empty ?? []);
+    const minItems = { ...(current.min_items ?? {}) };
+    const rootKey = Object.hasOwn(minItems, '.') ? '.' : '';
+    const minimum = step.forEach ? 1 : (EVIDENCE_DENSE_RE.test(step.prompt ?? '') ? 3 : 1);
+    nonEmpty.add(rootKey);
+    minItems[rootKey] = Math.max(minItems[rootKey] ?? 0, minimum);
+    return compactContract({
+      ...current,
+      // required_keys only applies to an object root. Dropping it repairs
+      // legacy impossible array contracts without guessing an item schema.
+      required_keys: undefined,
+      non_empty: [...nonEmpty],
+      min_items: minItems,
+      description: current.description ?? `Evidence-bearing research result array for step "${step.id}".`,
+    });
+  }
   const required = new Set(current.required_keys ?? []);
   const nonEmpty = new Set(current.non_empty ?? []);
   const minItems = { ...(current.min_items ?? {}) };
-  const minEvidenceItems = EVIDENCE_DENSE_RE.test(step.prompt ?? '') ? 3 : 1;
+  // A fan-out item represents one researched entity. Requiring three sources
+  // and three findings from every item is an invented burden; the aggregate
+  // supplies breadth. Non-fan-out evidence-dense research still gets 3.
+  const minEvidenceItems = step.forEach ? 1 : (EVIDENCE_DENSE_RE.test(step.prompt ?? '') ? 3 : 1);
 
   required.add('sources');
   required.add('key_findings');
@@ -396,6 +430,30 @@ function compactContract(contract: WorkflowStepOutputContract): WorkflowStepOutp
   return out;
 }
 
+const ROOT_ARRAY_OUTPUT_RE =
+  /\b(?:return|emit|output|produce|respond\s+with)\b[\s\S]{0,180}\b(?:only\s+)?(?:a\s+)?(?:json\s+)?array\b|\bconverge\b[\s\S]{0,180}\binto\s+(?:only\s+)?(?:a\s+)?json\s+array\b/i;
+
+const NUMBER_WORDS: Record<string, number> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+};
+
+function explicitRootArrayMinimum(prompt: string): number {
+  const match = prompt.match(/\b(?:exactly|at\s+least)\s+(\d{1,4}|one|two|three|four|five|six|seven|eight|nine|ten)\b/i);
+  if (!match) return 1;
+  const raw = match[1].toLowerCase();
+  const parsed = NUMBER_WORDS[raw] ?? Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
 function proposeStepOutput(step: WorkflowStepInput): WorkflowContractStepOutputProposal | null {
   if (hasOutputContract(step)) return null;
   if (step.forEach) return null;
@@ -408,6 +466,26 @@ function proposeStepOutput(step: WorkflowStepInput): WorkflowContractStepOutputP
   const verify: NonNullable<WorkflowStepOutputContract['verify']> = {};
   const minItems: Record<string, number> = {};
   const nonEmpty = new Set<string>();
+
+  // Preserve an explicitly requested ROOT array. The generic list heuristic
+  // used to rewrite prompts such as "return only a JSON array of three drafts"
+  // into an object contract `{rows:[...]}`. The model then obeyed the invented
+  // harness shape instead of the authored task, and downstream writes received
+  // a different payload than requested.
+  if (ROOT_ARRAY_OUTPUT_RE.test(prompt)) {
+    const minimum = explicitRootArrayMinimum(prompt);
+    return {
+      stepId: step.id,
+      output: {
+        type: 'array',
+        non_empty: [''],
+        min_items: { '': minimum },
+        description: `Prompt-declared root array for step "${step.id}".`,
+      },
+      reasons: [`prompt explicitly requests a root JSON array; require at least ${minimum} item(s) without wrapping it in an invented object key`],
+      promptSnippet: snippet(prompt),
+    };
+  }
 
   const declaredKeys = explicitReturnKeys(prompt);
   if (declaredKeys.length > 0) {

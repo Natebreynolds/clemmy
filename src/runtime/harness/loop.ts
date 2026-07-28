@@ -1409,6 +1409,41 @@ export function dispatchedBackgroundWorkflowRun(sessionId: string, turn: number)
   return false;
 }
 
+/**
+ * A successful workflow_run queue receipt closes the foreground chat turn even
+ * when the model selects the legacy `awaiting_handoff_result` enum. The daemon,
+ * not another foreground model turn, owns the remaining work and will deliver
+ * its terminal report back to the originating chat.
+ *
+ * This is deliberately receipt-backed and turn-local. Text such as "running in
+ * the background" without the workflow_run success output cannot reach this
+ * path, so the narration-deferral guard remains strict for phantom handoffs.
+ */
+function settleQueuedWorkflowDecision(
+  sessionId: string,
+  turn: number,
+  decision: OrchestratorDecisionShape | null,
+): OrchestratorDecisionShape | null {
+  if (
+    !decision
+    || decision.nextAction !== 'awaiting_handoff_result'
+    || !dispatchedBackgroundWorkflowRun(sessionId, turn)
+  ) {
+    return decision;
+  }
+  const reply = decision.reply?.trim()
+    || decision.summary?.trim()
+    || 'The workflow is running in the background. I’ll report back here when it finishes.';
+  return {
+    ...decision,
+    summary: decision.summary?.trim() || reply,
+    reply,
+    done: true,
+    nextAction: 'completed',
+    reason: 'queued_workflow_owns_continuation',
+  };
+}
+
 function composeResumeDeliveryObjective(sessionId: string): string {
   try {
     const inputs = listEvents(sessionId, { types: ['user_input_received'] })
@@ -2720,6 +2755,14 @@ async function runConversationCore(
         reason: 'dispatch_handoff_reply',
       };
     }
+    // Structured twin of the prose salvage above. A real workflow queue receipt
+    // means the foreground turn is finished; `awaiting_handoff_result` now
+    // refers to the daemon's automatic report-back, not another model turn.
+    decision = settleQueuedWorkflowDecision(
+      options.sessionId,
+      turnResult.turn,
+      decision,
+    );
     lastDecision = decision ?? lastDecision;
 
     captureWorkflowStepResultTranscript({
@@ -6482,7 +6525,11 @@ async function runConversationFromResumeCore(opts: {
     };
   }
 
-  let decision = toOrchestratorDecision(firstResult.finalOutput);
+  let decision = settleQueuedWorkflowDecision(
+    opts.sessionId,
+    firstResult.turn,
+    toOrchestratorDecision(firstResult.finalOutput),
+  );
   lastDecision = decision ?? lastDecision;
 
   // If reject was the decision, treat it as "done — we cancelled
@@ -6606,6 +6653,7 @@ async function runConversationFromResumeCore(opts: {
       const deliveryObjective = composeResumeDeliveryObjective(opts.sessionId);
       const objectiveJudge = opts.judgeFn ?? judgeObjectiveComplete;
       const delivery: DeliveryVerdict = verifyDeliveredEnabled()
+        && !dispatchedBackgroundWorkflowRun(opts.sessionId, lastTurn)
         ? await verifyDelivered(deliveryObjective, userVisibleSummary ?? '', { judgeFn: objectiveJudge })
         : { delivered: true as const, status: 'completed' as const };
       if (!delivery.delivered) {
@@ -6918,7 +6966,11 @@ async function runConversationFromResumeCore(opts: {
         error: turnResult.error,
       };
     }
-    decision = toOrchestratorDecision(turnResult.finalOutput);
+    decision = settleQueuedWorkflowDecision(
+      opts.sessionId,
+      turnResult.turn,
+      toOrchestratorDecision(turnResult.finalOutput),
+    );
     lastDecision = decision ?? lastDecision;
 
     captureWorkflowStepResultTranscript({

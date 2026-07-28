@@ -432,6 +432,20 @@ export function artifactIntentForTool(toolName: string, rawArgs: unknown): Artif
   const { shape, args } = innerToolCall(toolName, rawArgs);
   const upper = shape.toUpperCase();
 
+  // Composio's one-call Sheets constructor creates a brand-new spreadsheet
+  // even though its slug says SHEET_FROM_JSON rather than CREATE. Treat it as
+  // the same root artifact as CREATE_GOOGLE_SHEET1 so a lost provider response
+  // cannot cause a duplicate spreadsheet on retry.
+  if (/^(?:CX_)?GOOGLE_?SHEETS?_SHEET_FROM_JSON$/.test(normalizedShape(shape))) {
+    return {
+      kind: 'resource',
+      provider: 'googlesheets',
+      slotKey: explicitSlot(args, 'resource'),
+      title: stringField(args, ['title', 'name']),
+      createShape: upper,
+    };
+  }
+
   if (
     /GOOGLE.*DOC/.test(upper)
     && /CREATE/.test(upper)
@@ -449,9 +463,13 @@ export function artifactIntentForTool(toolName: string, rawArgs: unknown): Artif
 
   if (toolTail(toolName) === 'run_shell_command') {
     const command = stringField(args, ['command']) ?? '';
-    if (/\bnetlify(?:-cli)?\b[^\n]*(?:sites?:create|site:create|sites:create)\b/i.test(command)) {
+    const netlifySiteCreate =
+      /\bnetlify(?:-cli)?\b[^\n]*(?:sites?:create|site:create|sites:create)\b/i.test(command)
+      || /\bnetlify(?:-cli)?\s+api\s+(?:createSite|createSiteInTeam)\b/i.test(command);
+    if (netlifySiteCreate) {
       const name = command.match(/--(?:name|site)\s+(?:["']([^"']+)["']|([^\s]+))/i);
-      let resolvedName = name?.[1] ?? name?.[2];
+      const apiName = command.match(/["']?name["']?\s*:\s*["']([^"']+)["']/i);
+      let resolvedName = name?.[1] ?? name?.[2] ?? apiName?.[1];
       const variable = resolvedName?.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/)?.[1];
       if (variable) {
         const assignment = command.match(new RegExp(`(?:^|[;\\n]\\s*)(?:export\\s+)?${variable}\\s*=\\s*(?:["']([^"']+)["']|([^;\\s]+))`));
@@ -462,7 +480,9 @@ export function artifactIntentForTool(toolName: string, rawArgs: unknown): Artif
         provider: 'Netlify',
         slotKey: explicitSlot(args, 'site'),
         title: resolvedName && !resolvedName.startsWith('$') ? resolvedName : undefined,
-        createShape: 'NETLIFY_SITE_CREATE',
+        createShape: /\bapi\s+(?:createSite|createSiteInTeam)\b/i.test(command)
+          ? 'NETLIFY_API_CREATE_SITE'
+          : 'NETLIFY_SITE_CREATE',
       };
     }
     // GENERIC CLI create (2026-07-22 restructure — effect-anchored, no product
@@ -1447,7 +1467,13 @@ export function artifactReuseMessage(artifact: RunArtifact): string {
         : ' Verify that exact resource, then reuse or update it; do not create another.';
     return `Artifact slot ${artifact.slotKey} is already bound but not yet provider-verified: ${pointer}.${repair}`;
   }
-  return `Artifact slot ${artifact.slotKey} already has a ${artifact.status} create attempt (${artifact.sourceCallId ?? artifact.id}). Verify that attempt before retrying; do not create another resource blindly.`;
+  const attempt = artifact.sourceCallId ? `; provider attempt ${artifact.sourceCallId}` : '';
+  return [
+    `Artifact slot ${artifact.slotKey} already has an unresolved ${artifact.status} create claim (artifactId ${artifact.id}${attempt}).`,
+    'Do not create another resource blindly.',
+    'Verify that attempt before retrying with a read-only provider list/get.',
+    `Then call artifact_claim_resolve with artifactId="${artifact.id}" and resolution="bind" plus the exact resourceId if it exists, or resolution="absent" if the read-back proves it does not; continue only after that resolution succeeds.`,
+  ].join(' ');
 }
 
 /** A provider gateway can prove that execution stopped before the network

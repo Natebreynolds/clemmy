@@ -55,7 +55,12 @@ function recommendationRelevantToInput(rec: AgentSystemRecommendation, input: st
     return /\b(agent|agents|swarm|delegate|delegation|review|debate|parallel|worker|fan[- ]?out|specialist)\b/.test(text)
       || /\b(?:agent\s+team|team\s+(?:agent|agents|of\s+agents))\b/.test(text);
   }
-  return /\b(workflow|automation|automate|retry|replan|rerun|loop|schedule|failed items?)\b/.test(text);
+  // Global loop-health advice is diagnostic context, not an execution
+  // prerequisite. Mentioning or running a workflow must not inherit old,
+  // unrelated failures; inject it only when the user is actually diagnosing,
+  // repairing, retrying, or asking about workflow-system health.
+  return /\b(?:retry|replan|rerun|repair|fix|debug|failed|failure|error|issue|loop|health|effectiveness|observability|optimi[sz]|improv|failed items?)\b/.test(text)
+    && /\b(?:workflow|automation|automate|run|task|job|schedule|loop|system)\b/.test(text);
 }
 
 /** Repair/learning modes summarize failures in existing workflow loops. They
@@ -67,8 +72,11 @@ function coordinationPolicyRelevantToInput(
 ): boolean {
   if (!policy) return false;
   if (policy.mode !== 'repair-loop' && policy.mode !== 'learning-loop') return true;
-  return /\b(?:workflow|automation|automate|retry|replan|rerun|loop|schedule|failed items?|resume (?:the|this) (?:run|task|job|workflow))\b/i
-    .test(positiveCoordinationSignalText(input));
+  const text = positiveCoordinationSignalText(input);
+  if (policy.mode === 'repair-loop') {
+    return /\b(?:retry|replan|rerun|repair|fix|debug|failed|failure|error|broken|failed items?|resume (?:the|this) (?:run|task|job|workflow))\b/i.test(text);
+  }
+  return /\b(?:workflow|automation|automate|learning|memory|pattern|procedure|repeatable|recurring)\b/i.test(text);
 }
 
 function renderMetricsSummary(metrics: AgentSystemMetrics): string {

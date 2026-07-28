@@ -724,10 +724,17 @@ export function buildAgentContextPacket(
   // health-probe telemetry, never anything the turn's work depends on.
   const turnIntent: 'qa' | 'action' = classifyTurnIntent(input);
   const lightenQa = lightQaTurnsEnabled() && turnIntent === 'qa';
-  const skills = rankSkills(input);
-  const workflows = rankWorkflows(input);
+  // A workflow node already has a pinned graph, exact step prompt, allowed-tool
+  // scope, upstream data, and (when authored) its explicit usesSkill body.
+  // Ambient recall of similarly-worded skills/workflows is both redundant and
+  // contaminating: live synthesis nodes were receiving Salesforce/SEO helpers
+  // merely because their prompt contained generic words such as "manager" and
+  // "report". Route only node-owned context here.
+  const constrainedWorkflowNode = opts?.sessionKind === 'workflow';
+  const skills = constrainedWorkflowNode ? [] : rankSkills(input);
+  const workflows = constrainedWorkflowNode ? [] : rankWorkflows(input);
   const toolScope = summarizeToolScope(input);
-  const mcp = lightenQa ? [] : mcpHealth();
+  const mcp = lightenQa || constrainedWorkflowNode ? [] : mcpHealth();
   const healthWarnings = [
     ...harnessCapabilityHealthWarnings(),
     ...(lightenQa
@@ -743,14 +750,16 @@ export function buildAgentContextPacket(
     : 'Memory preflight: disabled.';
   let prospective = { text: '', count: 0, ids: [] as string[], bytes: 0 };
   let prospectiveCapture: string | null = null;
-  try {
-    prospective = buildProspectiveIntentionContext({
-      query: input,
-      sessionId: opts?.sessionId,
-    });
-    prospectiveCapture = prospectiveCaptureDirective(input);
-  } catch {
-    // Future-intention projection is advisory context, never turn authority.
+  if (!constrainedWorkflowNode) {
+    try {
+      prospective = buildProspectiveIntentionContext({
+        query: input,
+        sessionId: opts?.sessionId,
+      });
+      prospectiveCapture = prospectiveCaptureDirective(input);
+    } catch {
+      // Future-intention projection is advisory context, never turn authority.
+    }
   }
 
   // Turn-start fan-out directive (P0). Fires only for CHAT sessions: workflow

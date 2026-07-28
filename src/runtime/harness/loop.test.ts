@@ -5190,6 +5190,73 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   assert.equal(dispatchedBackgroundWorkflowRun(sess2.id, 1), false, 'a refused dispatch still gets judged');
 });
 
+test('runConversation: a receipt-backed structured workflow handoff parks after one turn without polling', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    runs += 1;
+    const runContext = { context: opts.context };
+    const details = {
+      toolCall: {
+        callId: 'call_workflow_dispatch',
+        arguments: '{"name":"social-manager-rc"}',
+      },
+    };
+    (runner as unknown as EventEmitter).emit(
+      'agent_tool_start',
+      runContext,
+      { name: 'Orchestrator' },
+      { name: 'workflow_run' },
+      details,
+    );
+    writeToolOutput({
+      sessionId: sess.id,
+      callId: 'call_workflow_dispatch',
+      tool: 'workflow_run',
+      output:
+        'Queued "social-manager-rc" (run run-123) — it is now running in the BACKGROUND. '
+        + 'Its outcome will be delivered to this chat automatically.',
+    });
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'The social-manager workflow is running in the background.',
+        reply: 'It is running in the background. I’ll report back here when it finishes.',
+        done: false,
+        nextAction: 'awaiting_handoff_result',
+        reason: 'Waiting for the automatic workflow report-back.',
+      },
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run the social-manager workflow',
+    makeRunner: makeRunnerStub,
+    runRunner,
+    judgeFn: async () => {
+      throw new Error('a queued workflow must not invoke the completion judge');
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(runs, 1, 'the foreground model is not called again while the daemon owns the run');
+  assert.equal(result.lastDecision?.done, true);
+  assert.equal(result.lastDecision?.nextAction, 'completed');
+  assert.equal(result.lastDecision?.reason, 'queued_workflow_owns_continuation');
+  assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0);
+  const calls = listEventsForConv(sess.id, { types: ['tool_called'] });
+  assert.deepEqual(
+    calls.map((event) => (event.data as { tool?: string }).tool),
+    ['workflow_run'],
+    'no workflow_run_status poll is generated',
+  );
+});
+
 test('speed: a hanging embeddings provider cannot gate model dispatch (fire-and-forget recall vector)', async () => {
   // Live incident 2026-07-03: the OpenAI embeddings endpoint degraded (6s fetch
   // timeouts + retries) and, because the turn awaited Promise.all(primer,

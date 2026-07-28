@@ -590,6 +590,15 @@ test('repair-loop policy is scoped to repair work and cannot globally block unre
   assert.equal(repairPacket.agentSystem.policy?.fanoutPosture, 'block');
   assert.equal(repairPacket.multiItem.blockedByPolicy, true);
   assert.match(repairPacket.text, /Fan-out constrained by coordination policy/);
+
+  const ordinaryRunPacket = buildAgentContextPacket(
+    'Run the existing workflow named social-manager now and rely on its automatic report-back.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-ordinary-workflow-run' },
+  );
+  assert.equal(ordinaryRunPacket.agentSystem.policy, null, 'ordinary workflow execution never inherits unrelated repair policy');
+  assert.equal(ordinaryRunPacket.agentSystem.injected, false, 'old loop failures are not injected into a healthy workflow dispatch');
+  assert.doesNotMatch(ordinaryRunPacket.text, /AGENT SYSTEM GUIDANCE|repair-loop|replan instead of retrying/i);
 });
 
 test('packet keeps the static line (no directive) for NON-chat sessions even when multi-item', () => {
@@ -603,6 +612,12 @@ test('packet keeps the static line (no directive) for NON-chat sessions even whe
     assert.equal(packet.multiItem.offered, false, `${kind}: directive suppressed`);
     assert.match(packet.text, /Parallelism reminder:/, `${kind}: static line preserved (zero-regression)`);
     assert.ok(!/Fan-out directive/.test(packet.text), `${kind}: no directive`);
+    if (kind === 'workflow') {
+      assert.deepEqual(packet.skills, [], 'a pinned workflow node receives no ambient skill candidates');
+      assert.deepEqual(packet.workflows, [], 'a pinned workflow node receives no ambient workflow candidates');
+      assert.equal(packet.prospective.injected, false, 'proactive chat intentions do not contaminate a constrained workflow node');
+      assert.deepEqual(packet.mcp, [], 'workflow nodes rely on their authored tool scope instead of probing unrelated MCP health');
+    }
   }
 });
 

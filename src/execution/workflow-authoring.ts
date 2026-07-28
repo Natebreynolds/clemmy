@@ -461,6 +461,7 @@ const WORKFLOW_RESOURCE_KINDS = new Set<WorkflowResourceKind>([
   'api',
   'cli',
   'project',
+  'workspace',
   'other',
 ]);
 

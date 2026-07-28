@@ -79,6 +79,14 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
     selfHealAttempt: 1,
     goalAttempt: 1,
   });
+  writeWorkflowRun({
+    id: 'run-parked',
+    workflow: 'Metric Workflow',
+    status: 'parked',
+    createdAt: '2026-06-26T12:00:00.000Z',
+    startedAt: '2026-06-26T12:00:10.000Z',
+    needsAttention: true,
+  });
 
   appendWorkflowEvent('metric-wf', 'run-bad', {
     kind: 'attempt_record',
@@ -95,6 +103,11 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
   appendWorkflowEvent('metric-wf', 'run-bad', { kind: 'step_failed', stepId: 'scrape', error: 'min_items contract failed after retry' });
   appendWorkflowEvent('metric-wf', 'run-bad', { kind: 'item_completed', stepId: 'send', itemKey: 'a', output: 'ok' });
   appendWorkflowEvent('metric-wf', 'run-bad', { kind: 'item_failed', stepId: 'send', itemKey: 'b', error: 'missing email' });
+  appendWorkflowEvent('metric-wf', 'run-parked', {
+    kind: 'step_failed',
+    stepId: 'publish',
+    error: 'Workflow run parked on approval.',
+  });
 
   recordSuccessfulWorkflowPattern({
     workflow: metricWorkflow as never,
@@ -259,9 +272,9 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
   assert.equal(researcher?.comms24h.received, 1);
   assert.match(researcher?.recommendation ?? '', /last error/i);
 
-  assert.equal(metrics.loops.workflowRuns.total, 2);
+  assert.equal(metrics.loops.workflowRuns.total, 2, 'only terminal runs enter the loop-effectiveness denominator');
   assert.equal(metrics.loops.workflowRuns.clean, 1);
-  assert.equal(metrics.loops.workflowRuns.needsAttention, 1);
+  assert.equal(metrics.loops.workflowRuns.needsAttention, 1, 'an expected non-terminal approval park is not an attention-needed outcome');
   assert.equal(metrics.loops.attemptRecords, 1);
   assert.equal(metrics.loops.retryEvents, 1);
   assert.equal(metrics.loops.forEachItems.completed, 1);
@@ -312,6 +325,11 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
   const tooFewItems = metrics.loops.issueCauses.find((cause) => cause.key === 'too-few-items');
   assert.equal(tooFewItems?.count, 2);
   assert.deepEqual(tooFewItems?.sources.sort(), ['contract', 'step']);
+  assert.equal(
+    metrics.loops.issueCauses.some((cause) => /parked on approval/i.test(cause.label)),
+    false,
+    'approval parking remains durable control flow but never becomes a learned failure cause',
+  );
   assert.ok(metrics.recentWarnings.some((warning) => warning.kind === 'loop'));
   assert.ok(metrics.recommendations.some((rec) => rec.id === 'swarm-enable-peer-comms'));
   assert.ok(metrics.recommendations.some((rec) => rec.id === 'swarm-agent-scorecard-risk'));

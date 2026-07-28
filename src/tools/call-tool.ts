@@ -51,6 +51,7 @@ let schemaCache: Map<string, z.ZodTypeAny> | null = null;
 let optionalKeysCache: Map<string, ReadonlySet<string>> | null = null;
 let descriptionCache: Map<string, string> | null = null;
 let nullableRequiredKeysPromise: Promise<Map<string, ReadonlySet<string>>> | null = null;
+let strictParametersPromise: Promise<Map<string, unknown>> | null = null;
 
 async function localSchemas(): Promise<{
   schemas: Map<string, z.ZodTypeAny>;
@@ -96,6 +97,98 @@ function jsonSchemaAllowsNull(value: unknown): boolean {
   return false;
 }
 
+function jsonSchemaTypeMatches(value: unknown, schemaValue: unknown): boolean {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
+  const type = (schemaValue as { type?: unknown }).type;
+  const types = Array.isArray(type) ? type : [type];
+  if (value === null) return types.includes('null');
+  if (Array.isArray(value)) return types.includes('array');
+  if (typeof value === 'object') {
+    return types.includes('object') || Boolean((schemaValue as { properties?: unknown }).properties);
+  }
+  if (typeof value === 'string') return types.includes('string');
+  if (typeof value === 'boolean') return types.includes('boolean');
+  if (typeof value === 'number') {
+    return types.includes('number') || (Number.isInteger(value) && types.includes('integer'));
+  }
+  return false;
+}
+
+function schemaBranchForValue(schemaValue: unknown, value: unknown): unknown {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return schemaValue;
+  const schema = schemaValue as { anyOf?: unknown; oneOf?: unknown };
+  for (const alternatives of [schema.anyOf, schema.oneOf]) {
+    if (!Array.isArray(alternatives)) continue;
+    const exact = alternatives.find((candidate) => jsonSchemaTypeMatches(value, candidate));
+    if (exact) return schemaBranchForValue(exact, value);
+    const nonNull = alternatives.find((candidate) => !jsonSchemaAllowsNull(candidate));
+    if (nonNull) return schemaBranchForValue(nonNull, value);
+  }
+  return schemaValue;
+}
+
+/**
+ * Convert an ordinary, compact args_json object into the strict provider shape
+ * expected by the inner first-class tool. Missing fields are filled ONLY when
+ * that exact nested property is both required and nullable. Truly required
+ * values remain missing and are rejected by the normal validator.
+ */
+export function materializeStrictNullableFields(value: unknown, schemaValue: unknown): unknown {
+  const schema = schemaBranchForValue(schemaValue, value);
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return value;
+  const record = schema as {
+    type?: unknown;
+    properties?: unknown;
+    required?: unknown;
+    items?: unknown;
+  };
+
+  if (Array.isArray(value)) {
+    return value.map((item) => materializeStrictNullableFields(item, record.items));
+  }
+  if (!value || typeof value !== 'object') return value;
+
+  const input = value as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...input };
+  const properties = record.properties && typeof record.properties === 'object'
+    ? record.properties as Record<string, unknown>
+    : {};
+  const required = new Set(
+    Array.isArray(record.required)
+      ? record.required.filter((key): key is string => typeof key === 'string')
+      : [],
+  );
+
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (!(key in out) || out[key] === undefined) {
+      if (required.has(key) && jsonSchemaAllowsNull(propertySchema)) out[key] = null;
+      continue;
+    }
+    out[key] = materializeStrictNullableFields(out[key], propertySchema);
+  }
+  return out;
+}
+
+async function strictToolParameters(): Promise<Map<string, unknown>> {
+  if (!strictParametersPromise) {
+    strictParametersPromise = (async () => {
+      const map = new Map<string, unknown>();
+      try {
+        const { getCoreTools } = await import('./registry.js');
+        for (const runtimeTool of getCoreTools() as Array<{ name?: string; parameters?: unknown }>) {
+          if (runtimeTool?.name && runtimeTool.parameters) {
+            map.set(runtimeTool.name, runtimeTool.parameters);
+          }
+        }
+      } catch {
+        // Best effort: local validation + the inner parser remain authoritative.
+      }
+      return map;
+    })();
+  }
+  return strictParametersPromise;
+}
+
 /**
  * Strict Responses schemas encode optional/defaultable fields as required +
  * nullable. The local Zod catalog does not include computer/Composio tools, so
@@ -111,10 +204,9 @@ async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>>
     nullableRequiredKeysPromise = (async () => {
       const map = new Map<string, ReadonlySet<string>>();
       try {
-        const { getCoreTools } = await import('./registry.js');
-        for (const runtimeTool of getCoreTools() as Array<{ name?: string; parameters?: unknown }>) {
-          if (!runtimeTool?.name || !runtimeTool.parameters || typeof runtimeTool.parameters !== 'object') continue;
-          const root = runtimeTool.parameters as {
+        for (const [name, parameters] of await strictToolParameters()) {
+          if (!parameters || typeof parameters !== 'object') continue;
+          const root = parameters as {
             required?: unknown;
             properties?: unknown;
           };
@@ -123,7 +215,7 @@ async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>>
           const keys = root.required
             .filter((key): key is string => typeof key === 'string')
             .filter((key) => jsonSchemaAllowsNull(properties[key]));
-          if (keys.length > 0) map.set(runtimeTool.name, new Set(keys));
+          if (keys.length > 0) map.set(name, new Set(keys));
         }
       } catch {
         // Best effort: the strict inner parser remains the final authority.
@@ -280,6 +372,10 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         }
         dispatchArgs = strictArgs;
       }
+      const strictParameters = (await strictToolParameters()).get(target);
+      if (strictParameters) {
+        dispatchArgs = materializeStrictNullableFields(dispatchArgs, strictParameters);
+      }
 
       // 4. Dispatch through the gated inner path (gates key on the INNER name).
       const sessionId = sessionIdFromRunContext(runContext)
@@ -360,4 +456,5 @@ export function _resetCallToolSchemaCacheForTest(): void {
   optionalKeysCache = null;
   descriptionCache = null;
   nullableRequiredKeysPromise = null;
+  strictParametersPromise = null;
 }

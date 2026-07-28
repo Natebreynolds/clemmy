@@ -18,7 +18,11 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildCallTool, _resetCallToolSchemaCacheForTest } = await import('./call-tool.js');
+const {
+  buildCallTool,
+  _resetCallToolSchemaCacheForTest,
+  materializeStrictNullableFields,
+} = await import('./call-tool.js');
 const { _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await import('../runtime/harness/brackets.js');
@@ -142,6 +146,41 @@ test('deferred validation accepts omitted optional keys as well as strict-mode n
   assert.equal(recall!.safeParse({}).success, false, 'genuinely required keys remain required');
   assert.equal(getRunner!.safeParse({ slug: 'proof-cockpit', runner_path: 'tasks.mjs' }).success, true);
   assert.equal(refreshSpace!.safeParse({ slug: 'proof-cockpit' }).success, true);
+});
+
+test('deferred workflow schemas accept lean nested steps and materialize strict nulls only at dispatch', async () => {
+  _resetCallToolSchemaCacheForTest();
+  const update = getLocalToolSchemas().get('workflow_update');
+  assert.ok(update);
+  const lean = {
+    name: 'lean-workflow',
+    steps: [{
+      id: 'define',
+      deterministic: {
+        runner: 'define.mjs',
+        source: 'process.stdout.write("[]")',
+      },
+    }],
+  };
+  assert.equal(
+    update!.safeParse(lean).success,
+    true,
+    'args_json should not need dozens of nested null placeholders',
+  );
+
+  const { getCoreTools } = await import('./registry.js');
+  const strict = getCoreTools().find((tool) => tool.name === 'workflow_update')?.parameters;
+  assert.ok(strict);
+  const materialized = materializeStrictNullableFields(lean, strict) as {
+    steps: Array<Record<string, unknown>>;
+  };
+  assert.equal(materialized.steps[0].id, 'define');
+  assert.equal(materialized.steps[0].prompt, null);
+  assert.equal(materialized.steps[0].call, null);
+  assert.deepEqual(materialized.steps[0].deterministic, {
+    runner: 'define.mjs',
+    source: 'process.stdout.write("[]")',
+  });
 });
 
 test('call_tool materializes omitted optional keys before invoking the real strict inner tool', async () => {

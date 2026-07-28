@@ -15,7 +15,9 @@ import {
   filterToolsForStep,
   buildWorkflowStepAgent,
   workflowStepExternalMcpScopeForLock,
+  workflowStepToolUseBehavior,
 } from './workflow-step-agent.js';
+import { clearStepResult, recordStepResult } from '../tools/step-result-tool.js';
 
 // A representative slice of the orchestrator's tool pool, including the
 // work tools whose removal broke outlook-triage-hourly.
@@ -173,6 +175,56 @@ test('buildWorkflowStepAgent: per-step model override is honored (intent routing
 test('buildWorkflowStepAgent: structural-only lock does not attach external MCP servers', async () => {
   const agent = await buildWorkflowStepAgent({ lockTools: ['workflow_step_result'] });
   assert.equal(agent.mcpServers.length, 0);
+});
+
+test('workflow_step_result stops the SDK inner loop only after the result was accepted', async () => {
+  const sessionId = 'workflow-step-stop-test';
+  clearStepResult(sessionId);
+  const behavior = workflowStepToolUseBehavior(sessionId);
+  assert.equal(typeof behavior, 'function');
+  const toolResults = [{
+    type: 'function_output',
+    tool: { name: 'workflow_step_result' },
+    output: 'Step result captured (42 chars).',
+  }] as never;
+
+  const rejected = await behavior({} as never, toolResults);
+  assert.equal(rejected.isFinalOutput, false, 'a contract-refused submission must return to the model for repair');
+
+  recordStepResult(sessionId, { blocked: true, reason: 'upstream unavailable' });
+  const accepted = await behavior({} as never, toolResults);
+  assert.equal(accepted.isFinalOutput, true, 'an accepted structural result terminates inside the same SDK turn');
+  if (accepted.isFinalOutput) assert.match(accepted.finalOutput, /Step result captured/);
+  clearStepResult(sessionId);
+});
+
+test('buildWorkflowStepAgent: unbound steps defer schemas but keep every tool callable on demand', async () => {
+  const prior = process.env.CLEMMY_CODEX_TOOL_SEARCH;
+  process.env.CLEMMY_CODEX_TOOL_SEARCH = 'on';
+  try {
+    const agent = await buildWorkflowStepAgent({
+      sessionId: 'workflow-schema-on-demand-test',
+      userInput: 'Synthesize the supplied upstream evidence into three drafts.',
+    });
+    const names = new Set(agent.tools.map((toolRef) => toolRef.name));
+    assert.ok(names.has('workflow_step_result'));
+    assert.ok(names.has('tool_search'));
+    assert.ok(names.has('call_tool'));
+    assert.equal(names.has('task_add'), false, 'an unrelated schema is deferred, not paid on this step');
+    assert.equal(agent.mcpServers.length, 0, 'broad external MCP schemas are reached on demand too');
+
+    process.env.CLEMMY_CODEX_TOOL_SEARCH = 'off';
+    const legacy = await buildWorkflowStepAgent({
+      sessionId: 'workflow-full-surface-test',
+      userInput: 'Synthesize the supplied upstream evidence into three drafts.',
+    });
+    const legacyNames = new Set(legacy.tools.map((toolRef) => toolRef.name));
+    assert.ok(legacyNames.has('task_add'), 'the kill-switch restores the prior full surface');
+    assert.equal(legacyNames.has('call_tool'), false, 'the dispatcher is only needed on the deferred surface');
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
+    else process.env.CLEMMY_CODEX_TOOL_SEARCH = prior;
+  }
 });
 
 test('buildWorkflowStepAgent: final output stays plain text even if the old revert flag is set', async () => {

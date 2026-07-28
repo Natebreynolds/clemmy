@@ -402,6 +402,87 @@ test('autoRepair: hardens weak live-research contracts with evidence keys', () =
   assert.equal(checkWorkflowForWrite(repaired).warnings.some((w) => /live research tools/.test(w)), false);
 });
 
+test('autoRepair preserves an explicit evidence-bearing forEach item contract', () => {
+  const itemContract = {
+    type: 'object' as const,
+    required_keys: ['competitor', 'url', 'observed_positioning', 'evidence'],
+    non_empty: ['competitor', 'url', 'observed_positioning', 'evidence'],
+    verify: { url_present: ['url'] },
+    description: 'One grounded competitor record.',
+  };
+  const def = wf({
+    steps: [
+      {
+        id: 'competitors',
+        prompt: 'Return the competitor records.',
+        output: { type: 'array', non_empty: [''], min_items: { '': 3 } },
+      },
+      {
+        id: 'research_competitors',
+        prompt: 'Research the one competitor in {{item}} and return observed positioning with exact source evidence.',
+        dependsOn: ['competitors'],
+        forEach: 'competitors',
+        allowedTools: ['run_shell_command'],
+        sideEffect: 'read',
+        output: itemContract,
+      },
+    ],
+  });
+
+  const { def: repaired } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(
+    repaired.steps.find((step) => step.id === 'research_competitors')?.output,
+    itemContract,
+    'the compiler must not graft generic aggregate keys onto a concrete per-item evidence contract',
+  );
+});
+
+test('autoRepair hardens a live-research array at the root without adding object-only keys', () => {
+  const def = wf({
+    steps: [
+      {
+        id: 'research',
+        prompt: 'Research competitor positioning from official sources.',
+        allowedTools: ['run_shell_command'],
+        sideEffect: 'read',
+        output: { type: 'array' },
+      },
+    ],
+  });
+
+  const { def: repaired } = autoRepairWorkflowDefinition(def);
+  const output = repaired.steps[0].output;
+  assert.equal(output?.type, 'array');
+  assert.equal(output?.required_keys, undefined);
+  assert.ok(output?.non_empty?.includes(''));
+  assert.equal(output?.min_items?.[''], 3);
+});
+
+test('autoRepair preserves an explicitly requested root JSON array instead of inventing a rows wrapper', () => {
+  const def = wf({
+    steps: [
+      {
+        id: 'synthesize_calendar',
+        prompt: 'Converge the upstream research into ONLY a JSON array containing exactly three LinkedIn draft objects. Every object must contain date, caption, source_urls, and asset_svg. Return JSON only.',
+        dependsOn: ['research'],
+        sideEffect: 'read',
+      },
+      {
+        id: 'research',
+        prompt: 'Return the source material.',
+        output: { type: 'string', non_empty: [''] },
+      },
+    ],
+  });
+
+  const { def: repaired } = autoRepairWorkflowDefinition(def);
+  const output = repaired.steps.find((step) => step.id === 'synthesize_calendar')?.output;
+  assert.equal(output?.type, 'array');
+  assert.equal(output?.required_keys, undefined);
+  assert.deepEqual(output?.non_empty, ['']);
+  assert.equal(output?.min_items?.[''], 3);
+});
+
 test('checkWorkflowForWrite: synthesis participates in validation', () => {
   const result = checkWorkflowForWrite(wf({
     synthesis: { prompt: 'Write the final summary for {{input.sheetId}}.' },

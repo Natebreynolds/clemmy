@@ -597,6 +597,24 @@ test('Google Sheets create extracts its root id and an exact range read verifies
   assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
 });
 
+test('Google Sheets SHEET_FROM_JSON is a root create even without CREATE in the slug', () => {
+  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+    tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    arguments: JSON.stringify({
+      title: 'RC evidence',
+      sheet_name: 'Evidence',
+      sheet_json: [{ Check: 'candidate', Status: 'PASS' }],
+    }),
+  });
+  assert.deepEqual(intent, {
+    kind: 'resource',
+    provider: 'googlesheets',
+    slotKey: 'resource:primary',
+    title: 'RC evidence',
+    createShape: 'GOOGLESHEETS_SHEET_FROM_JSON',
+  });
+});
+
 test('explicit artifact keys preserve legitimate multi-document work', () => {
   const sid = session();
   const base = { kind: 'google_doc', provider: 'Google Docs', title: 'Doc', createShape: 'CREATE' } as const;
@@ -980,6 +998,14 @@ test('effect-anchored generic classifier: any CLI create and any root provider c
   // Existing precise branches keep their richer kinds (regression).
   const netlify = artifactIntentForTool('run_shell_command', { command: 'netlify sites:create --name harness-viz' });
   equal(netlify?.kind, 'site'); equal(netlify?.provider, 'Netlify');
+  const netlifyApi = artifactIntentForTool('run_shell_command', {
+    command: `CI=1 netlify api createSite --data '{"account_slug":"team","body":{"name":"rc-proof-site"}}'`,
+  });
+  equal(netlifyApi?.kind, 'site');
+  equal(netlifyApi?.provider, 'Netlify');
+  equal(netlifyApi?.slotKey, 'site:primary');
+  equal(netlifyApi?.title, 'rc-proof-site');
+  equal(netlifyApi?.createShape, 'NETLIFY_API_CREATE_SITE');
 
   // Generic extraction proves success from id/url evidence.
   const bound = extractArtifactResource(
@@ -988,6 +1014,20 @@ test('effect-anchored generic classifier: any CLI create and any root provider c
   );
   equal(bound?.resourceId, 'prj_123');
   ok(bound?.uri?.includes('vercel.app'));
+});
+
+test('an unresolved artifact denial carries the exact repair claim id', () => {
+  const sid = session();
+  const intent = ledger.artifactIntentForTool('run_shell_command', {
+    command: 'netlify sites:create --name repairable-site',
+  })!;
+  const claim = ledger.claimArtifactSlot(sid, intent, 'call-create-site');
+  ledger.markArtifactUncertain(sid, intent.slotKey, 'call-create-site');
+  const message = ledger.artifactReuseMessage(claim.artifact);
+  assert.match(message, new RegExp(`artifactId ${claim.artifact.id}`));
+  assert.match(message, /artifact_claim_resolve/);
+  assert.match(message, /resolution="bind"/);
+  assert.match(message, /resolution="absent"/);
 });
 
 test('a uniform-failure abort boundary excludes dead pre-abort rounds from fan-out coverage', async () => {

@@ -851,6 +851,76 @@ test('workflow_update keeps enabled workflows ENABLED when readiness gaps are in
   assert.equal(readWorkflow('gapful-update-wf')!.data.enabled, true, 'the edit never silently disables');
 });
 
+test('workflow_update treats strict-schema null optionals as omitted PATCH fields', async () => {
+  writeWorkflow('nullable-update-wf', {
+    name: 'nullable-update-wf',
+    description: 'Before.',
+    enabled: false,
+    project: '/tmp/preserved-project',
+    trigger: {
+      manual: true,
+      schedule: '0 9 * * 1',
+      timezone: 'America/Los_Angeles',
+      webhookPath: 'preserved-hook',
+      events: [{ type: 'crm.lead.created' }],
+    },
+    inputs: { leadId: { type: 'string', description: 'Lead id' } },
+    resources: {
+      calendar: { id: 'calendar', kind: 'other', resourceId: 'cal-123' },
+    },
+    synthesis: { prompt: 'Preserve this synthesis.' },
+    allowSends: false,
+    goal: {
+      objective: 'Preserve the existing workflow goal.',
+      successCriteria: ['The original graph remains intact.'],
+      maxAttempts: 2,
+    },
+    steps: [{ id: 'draft', prompt: 'Draft the note.', sideEffect: 'read' }],
+  });
+
+  const result = await workflowUpdate()({
+    name: 'nullable-update-wf',
+    description: 'After.',
+    steps: null,
+    project: null,
+    clear_project: null,
+    trigger_schedule: null,
+    trigger_timezone: null,
+    clear_trigger_schedule: null,
+    trigger_webhook_path: null,
+    clear_trigger_webhook_path: null,
+    trigger_events: null,
+    clear_trigger_events: null,
+    inputs: null,
+    resources: null,
+    clear_resources: null,
+    test_inputs: null,
+    synthesis_prompt: null,
+    portable_models: null,
+    allowSends: null,
+    goal: null,
+    clear_goal: null,
+  });
+
+  assert.match(resultText(result), /Workflow "nullable-update-wf" updated/);
+  const saved = readWorkflow('nullable-update-wf')!.data;
+  assert.equal(saved.description, 'After.');
+  assert.equal(saved.project, '/tmp/preserved-project');
+  assert.deepEqual(saved.trigger, {
+    manual: true,
+    schedule: '0 9 * * 1',
+    timezone: 'America/Los_Angeles',
+    webhookPath: 'preserved-hook',
+    events: [{ type: 'crm.lead.created' }],
+  });
+  assert.deepEqual(saved.inputs, { leadId: { type: 'string', description: 'Lead id' } });
+  assert.equal(saved.resources?.calendar?.resourceId, 'cal-123');
+  assert.equal(saved.synthesis?.prompt, 'Preserve this synthesis.');
+  assert.equal(saved.allowSends, false);
+  assert.equal(saved.goal?.objective, 'Preserve the existing workflow goal.');
+  assert.deepEqual(saved.steps.map((step) => step.id), ['draft']);
+});
+
 test('workflow lifecycle routes create/update/enable/run through shared workflow paths', async () => {
   const trigger = [{ type: 'crm.lifecycle.created', dedupeKey: 'lead-{{payload.leadId}}' }];
   const inputs = JSON.stringify({ leadId: { type: 'string', description: 'Lead id to process' } });

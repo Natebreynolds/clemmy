@@ -123,6 +123,23 @@ test('does NOT flag per-item prose when forEach is already set', () => {
   assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'enrich'));
 });
 
+test('does NOT turn an explicit fan-out reducer back into another forEach step', () => {
+  const def = wf({
+    steps: [
+      { id: 'research', prompt: 'Research each competitor.', forEach: 'competitors' },
+      {
+        id: 'synthesize',
+        prompt: 'Converge all three upstream research results into one JSON array containing exactly three draft rows.',
+        dependsOn: ['research'],
+      },
+    ],
+  });
+  assert.ok(
+    !analyzeWorkflowGaps(def).some((gap) => gap.stepId === 'synthesize' && /fan out|forEach/i.test(gap.question)),
+    'a convergence/reduce node must remain one graph node over the whole batch',
+  );
+});
+
 test('P1-9 flags a list-pulling step with a consumer and no emptiness contract', () => {
   const def = wf({
     steps: [

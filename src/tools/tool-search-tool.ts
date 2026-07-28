@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { rankCatalog } from '../agents/tool-catalog.js';
+import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
@@ -32,6 +33,26 @@ const DESCRIPTION = [
 interface ToolSearchMetadata {
   schema: unknown;
   description: string;
+}
+
+function stripSchemaAnnotations(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripSchemaAnnotations);
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if ([
+      '$schema',
+      'description',
+      'title',
+      'examples',
+      'default',
+      'deprecated',
+      'readOnly',
+      'writeOnly',
+    ].includes(key)) continue;
+    out[key] = stripSchemaAnnotations(nested);
+  }
+  return out;
 }
 
 /** Lazily-built, memoized name → schema/instructions map. Dynamic-imported so
@@ -107,7 +128,11 @@ export function registerToolSearchTool(
       const schemas: Record<string, unknown> = {};
       for (const name of schemaNames) {
         const metadata = metadataMap.get(name);
-        if (metadata?.schema !== undefined) schemas[name] = metadata.schema;
+        if (metadata?.schema !== undefined) {
+          schemas[name] = opts.dispatchViaCallTool
+            ? relaxJsonSchemaForDeferred(metadata.schema)
+            : metadata.schema;
+        }
       }
       // Complex tools carry critical execution contracts beyond their argument
       // shape (for example Workspace views must call clem.data()). Include the
@@ -137,13 +162,26 @@ export function registerToolSearchTool(
         schemas,
         ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
         hint: opts.dispatchViaCallTool
-          ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above.'
+          ? 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.'
           : opts.allowedNames
             ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
             : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
       });
       let text = render();
       const shownSchemaNames = [...schemaNames];
+      // Some exact authoring schemas are structurally modest but carry many
+      // long field descriptions (workflow_update is the canonical example).
+      // Never drop the ONE schema the model explicitly requested merely
+      // because annotations exceed the result budget. The selected tool's
+      // overall guidance remains present; strip JSON-Schema annotations while
+      // retaining every property, type, enum, constraint, and required key.
+      if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && exactNamedHit) {
+        const exactName = exactNamedHit.name;
+        if (schemas[exactName]) {
+          schemas[exactName] = stripSchemaAnnotations(schemas[exactName]);
+          text = render();
+        }
+      }
       while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
         const dropped = shownSchemaNames.pop()!;
         delete schemas[dropped];

@@ -1,5 +1,5 @@
 import { Agent } from '@openai/agents';
-import type { Tool } from '@openai/agents';
+import type { Tool, ToolUseBehavior } from '@openai/agents';
 import { MODELS } from '../config.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
@@ -9,6 +9,17 @@ import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brack
 import { harnessInstructions } from './harness-context.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { externalMcpScopeForAllowedToolLock } from './external-mcp-scope-lock.js';
+import {
+  allRegistryNames,
+  buildCompactToolCatalog,
+  codexToolSearchEnabled,
+  resolveHotSet,
+  TOOL_SEARCH_ALWAYS_LOADED,
+} from './tool-catalog.js';
+import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
+import { buildCallTool } from '../tools/call-tool.js';
+import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
+import { peekStepResult } from '../tools/step-result-tool.js';
 
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
 
@@ -202,6 +213,43 @@ const STEP_INSTRUCTIONS = [
   'You cannot start, author, or schedule workflows, spawn workers, or re-plan. You CAN use the work tools the step needs — read/shell/file tools, the composio_status + composio_execute_tool gateway (and named tools through it), and notify_user when the step prompt asks you to report or summarize. Always finish by calling `workflow_step_result(data)`.',
 ].join('\n\n');
 
+const NOT_FINAL_TOOL_OUTPUT = {
+  isFinalOutput: false as const,
+  isInterrupted: undefined,
+};
+
+/**
+ * End the SDK's inner tool/model cycle at the accepted structural result call.
+ * runConversation can only observe captures after an SDK turn returns; without
+ * this boundary, a model may call workflow_step_result repeatedly inside one
+ * turn. A rejected contract submission is not in the capture store, so it
+ * correctly returns to the model for repair.
+ */
+export function workflowStepToolUseBehavior(
+  sessionId?: string | null,
+): ToolUseBehavior {
+  return (_context, toolResults) => {
+    const structural = toolResults.find((result) =>
+      result.tool?.name === 'workflow_step_result');
+    if (
+      !structural
+      || structural.type !== 'function_output'
+      || !sessionId
+      || !peekStepResult(sessionId).found
+    ) {
+      return NOT_FINAL_TOOL_OUTPUT;
+    }
+    const finalOutput = typeof structural.output === 'string'
+      ? structural.output
+      : JSON.stringify(structural.output ?? null);
+    return {
+      isFinalOutput: true,
+      isInterrupted: undefined,
+      finalOutput,
+    };
+  };
+}
+
 export interface BuildWorkflowStepAgentOptions {
   userInput?: string | null;
   sessionId?: string | null;
@@ -220,24 +268,85 @@ export async function buildWorkflowStepAgent(
   options: BuildWorkflowStepAgentOptions = {},
 ): Promise<Agent<RuntimeContextValue, any>> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-  const tools = lockToolsForStep(
+  const lockedTools = lockToolsForStep(
     filterToolsForStep(all),
     options.lockTools,
   ) as Tool<RuntimeContextValue>[];
+  const surfaceLocked = stepAllowedToolsLock(options.lockTools);
+
+  // Workflow steps now have the same schema-on-demand escape hatch as chat:
+  // a tiny structural/acquisition kernel stays first-class; every other local
+  // work tool remains callable this turn through tool_search -> call_tool.
+  // This is capability-preserving, unlike semantic pruning: no guessed intent
+  // can remove a tool. Explicit allowedTools locks stay exact and bypass this
+  // layer entirely.
+  const schemaOnDemand = !surfaceLocked && codexToolSearchEnabled();
+  let tools = lockedTools;
+  let catalogBlock = '';
+  if (schemaOnDemand) {
+    const availableNames = new Set(
+      lockedTools
+        .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+        .filter(Boolean),
+    );
+    const registryNames = allRegistryNames();
+    const uncataloguedNames = [...availableNames].filter((name) => !registryNames.has(name));
+    const promoted = resolveHotSet(options.sessionId, options.userInput, { allowedNames: availableNames });
+    const surface = resolveToolSurface({
+      surface: 'workflow-step',
+      lane: 'workflow',
+      availableNames,
+      alwaysLoadedNames: [
+        ...STEP_STRUCTURAL_BASELINE_TOOLS,
+        ...TOOL_SEARCH_ALWAYS_LOADED,
+        ...uncataloguedNames,
+      ],
+      promotedNames: promoted,
+      deferralEnabled: true,
+      reason: 'workflow-step schema-on-demand surface',
+    });
+    const firstClassNames = new Set(surface.firstClass);
+    const deferredNames = new Set(surface.deferred);
+    const firstClassTools = lockedTools
+      .filter((toolRef) => firstClassNames.has((toolRef as { name?: string }).name ?? ''))
+      .map((toolRef) => (toolRef as { name?: string }).name === 'tool_search'
+        ? buildScopedLocalToolSearch(deferredNames)
+        : toolRef);
+    const dispatcher = buildCallTool({
+      reachableBuiltinNames: deferredNames,
+      firstClassNames,
+      deniedNames: WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
+    }) as Tool<RuntimeContextValue>;
+    tools = [...firstClassTools, dispatcher];
+    const compactCatalog = buildCompactToolCatalog({ allowedNames: deferredNames });
+    catalogBlock = [
+      '[workflow-tool-catalog] You retain full workflow-step capability with schemas loaded on demand. '
+        + 'Common structural tools are first-class. For any deferred local tool below, call `tool_search(query)` for its exact schema, then `call_tool(name, args_json)`. '
+        + 'For a connected external MCP tool, discover its exact `<server>__<tool>` name with `mcp_list_tools`, then invoke it through `call_tool`. '
+        + 'The inner tool keeps its normal safety/approval policy. Do not claim a listed capability is unavailable.',
+      compactCatalog,
+    ].filter(Boolean).join('\n');
+  }
   // Recall the proven tool for this step's intent — but ONLY for an UNBOUND step.
   // A step whose allowedTools LOCK the surface already has its tool chosen, so the
   // recall block would be noise; an unbound / composio step is where the model picks
   // a tool and benefits from "for this intent, X worked before" (parity with chat).
-  const surfaceLocked = stepAllowedToolsLock(options.lockTools);
   const learnedRecall = (!surfaceLocked && options.userInput)
     ? renderToolChoicesForContext(8, undefined, options.userInput)
     : '';
-  const baseInstructions = harnessInstructions(STEP_INSTRUCTIONS, { includeRememberedToolChoices: false });
+  const staticInstructions = [STEP_INSTRUCTIONS, catalogBlock].filter(Boolean).join('\n\n');
+  const baseInstructions = harnessInstructions(staticInstructions, { includeRememberedToolChoices: false });
   const instructions = learnedRecall
     ? () => `${baseInstructions()}\n\n${learnedRecall}`
     : baseInstructions;
   const externalMcpScope = workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
-  const externalMcpServers = externalMcpScope === null ? [] : [getOrCreateExternalMcpServers(externalMcpScope)];
+  // An unbound schema-on-demand step reaches external MCPs through
+  // mcp_list_tools/call_tool, so attaching every configured server (and every
+  // schema) up front is unnecessary. Explicit MCP allowedTools locks retain
+  // their narrowed native attachment.
+  const externalMcpServers = schemaOnDemand || externalMcpScope === null
+    ? []
+    : [getOrCreateExternalMcpServers(externalMcpScope)];
   return new Agent<RuntimeContextValue, any>({
     name: 'WorkflowStep',
     instructions,
@@ -250,6 +359,7 @@ export async function buildWorkflowStepAgent(
     // structured channel. A second response_format envelope only gives the
     // model another way to fail after doing useful work.
     tools: tools.map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
+    toolUseBehavior: workflowStepToolUseBehavior(options.sessionId),
     ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
     inputGuardrails: harnessInputGuardrails,
     outputGuardrails: harnessOutputGuardrails,

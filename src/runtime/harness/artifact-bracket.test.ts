@@ -86,7 +86,62 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
   mode = 'success';
   const denied = await invoke('run:ambiguous');
   assert.match(String(denied), /Verify that attempt before retrying/i);
+  assert.match(String(denied), new RegExp(`artifactId ${ledger.listRunArtifacts(sessionId, 'run:ambiguous')[0]!.id}`));
+  assert.match(String(denied), /artifact_claim_resolve/);
   assert.equal(dispatches, 3, 'an uncertain write is never blindly replayed');
+});
+
+test('Netlify API create shares the site slot and cannot bypass an uncertain sites:create claim', async () => {
+  const sessionId = eventlog.createSession({ kind: 'chat' }).id;
+  const runScope = 'run:netlify-api-create';
+  let dispatches = 0;
+  let first = true;
+  const tool = brackets.wrapToolForHarness({
+    name: 'run_shell_command',
+    async execute() {
+      dispatches += 1;
+      if (first) {
+        first = false;
+        return 'Netlify CLI terminated during an interactive team prompt; outcome unknown';
+      }
+      return {
+        id: 'site_api_123456789',
+        ssl_url: 'https://rc-proof.netlify.app',
+      };
+    },
+  });
+  const invoke = (command: string) => brackets.withHarnessRunContext(
+    runContext(sessionId, runScope),
+    () => tool.execute!({ command }),
+  );
+
+  await invoke('netlify sites:create --name rc-proof');
+  const [uncertain] = ledger.listRunArtifacts(sessionId, runScope);
+  assert.equal(uncertain?.status, 'uncertain');
+
+  const denied = await invoke(
+    `netlify api createSite --data '{"account_slug":"team","body":{"name":"rc-proof"}}'`,
+  );
+  assert.match(String(denied), new RegExp(`artifactId ${uncertain!.id}`));
+  assert.equal(dispatches, 1, 'the alternate Netlify API spelling cannot bypass the claim');
+
+  assert.equal(
+    ledger.resolveUncertainArtifactClaim(sessionId, uncertain!.id, { kind: 'absent' }).ok,
+    true,
+    'a read-only absence proof releases the exact claim',
+  );
+  await invoke(
+    `netlify api createSite --data '{"account_slug":"team","body":{"name":"rc-proof"}}'`,
+  );
+  let [bound] = ledger.listRunArtifacts(sessionId, runScope);
+  assert.equal(dispatches, 2, 'the resolved claim permits exactly one fresh create');
+  assert.equal(bound?.status, 'bound');
+  assert.equal(bound?.resourceId, 'site_api_123456789');
+
+  await invoke(`netlify api getSite --data '{"site_id":"site_api_123456789"}'`);
+  [bound] = ledger.listRunArtifacts(sessionId, runScope);
+  assert.ok(bound?.bindingVerifiedAt, 'the exact read-back closes the artifact verification node');
+  assert.equal(ledger.listUnresolvedCreateClaims(sessionId, runScope).length, 0);
 });
 
 test('execute wrapper records an exact Google Docs provider read-back but ignores mismatches', async () => {

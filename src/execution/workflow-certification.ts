@@ -309,6 +309,8 @@ function resourceSelectorName(kind: string): string {
       return 'CLI command/profile';
     case 'project':
       return 'project name or path';
+    case 'workspace':
+      return 'Workspace slug';
     default:
       return 'resource id, name, URL, or scope';
   }

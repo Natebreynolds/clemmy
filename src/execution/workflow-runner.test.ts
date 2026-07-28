@@ -69,6 +69,9 @@ const {
   decideBatchSettlement,
   ParkRunSignal,
   finalizeStepOutput,
+  forEachItemOutputContract,
+  forEachAggregateOutputContract,
+  verifyForEachItemOutput,
   inferredOutputContractAdvisory,
   sendAlreadyClaimed,
   stepExternalWriteAlreadyClaimed,
@@ -2441,8 +2444,14 @@ test('forEachNewOnly watermarks completed items and retries failed items on the 
       useHarness: false,
     } as unknown as Parameters<typeof executeStep>[0];
 
-    const first = await executeStep(step, mkCtx('fw-1')) as Array<{ itemKey: string; output: unknown }>;
-    assert.deepEqual(first.map((item) => item.itemKey), ['a', 'c'], 'failed item is absent from completed aggregate');
+    const first = await executeStep(step, mkCtx('fw-1')) as {
+      blocked: true;
+      completed_items: number;
+      failed_items: Array<{ itemKey: string; error: string }>;
+    };
+    assert.equal(first.blocked, true, 'an incomplete fan-out blocks its downstream graph');
+    assert.equal(first.completed_items, 2, 'successful work is preserved even though the node is blocked');
+    assert.deepEqual(first.failed_items.map((item) => item.itemKey), ['b']);
     assert.deepEqual([...readSeenItemKeys(workflowSlug, stepId)].sort(), ['a', 'c'], 'only completed items advance the watermark');
 
     failB = false;
@@ -2547,9 +2556,15 @@ test('forEach batching attributes item failures to their original keys across wi
     } as unknown as Parameters<typeof executeStep>[1];
     const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
 
-    const output = await executeStep(step, ctx) as Array<{ itemKey: string; output: unknown }>;
+    const output = await executeStep(step, ctx) as {
+      blocked: true;
+      completed_items: number;
+      failed_items: Array<{ itemKey: string; error: string }>;
+    };
 
-    assert.deepEqual(output.map((item) => item.itemKey), ['a', 'b', 'c', 'e']);
+    assert.equal(output.blocked, true, 'partial fan-out cannot masquerade as a completed aggregate');
+    assert.equal(output.completed_items, 4);
+    assert.deepEqual(output.failed_items.map((item) => item.itemKey), ['d']);
     assert.deepEqual(forEachFailures.map((f) => f.itemKey), ['d'], 'run-level failure summary names the failed item');
     assert.match(forEachFailures[0]?.error ?? '', /downstream d failed/);
     const itemFailed = readWorkflowEvents('foreach-batch-failure-test', 'fc-fail-1')
@@ -2558,6 +2573,19 @@ test('forEach batching attributes item failures to their original keys across wi
     const completed = readWorkflowEvents('foreach-batch-failure-test', 'fc-fail-1')
       .findLast((e) => e.kind === 'step_completed');
     assert.equal((completed as { meta?: Record<string, unknown> } | undefined)?.meta?.failed, 1);
+    assert.equal((completed as { meta?: Record<string, unknown> } | undefined)?.meta?.blocked, true);
+    const skips = planBlockedDependencySkips(
+      [
+        step,
+        { id: 'write_rows', prompt: 'Write the rows.', dependsOn: ['blast'], sideEffect: 'write' },
+      ] as never,
+      { blast: output },
+    );
+    assert.deepEqual(
+      skips.map((skip) => skip.stepId),
+      ['write_rows'],
+      'a dependent write is deterministically skipped after any fan-out item failure',
+    );
   } finally {
     if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
     else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
@@ -2781,6 +2809,60 @@ test('P1-9 finalizeStepOutput: a shape violation alongside an empty one stays ou
   const failed = readWorkflowEvents('empty-route-test', 'er-2').find((e) => e.kind === 'step_failed');
   assert.equal((failed as { meta?: { reason?: string } })?.meta?.reason, 'output_contract');
   assert.equal(findContractViolationStep(readWorkflowEvents('empty-route-test', 'er-2'))?.stepId, 'pull');
+});
+
+test('forEach object contracts validate each item while the aggregate gets an array contract', () => {
+  const itemContract = {
+    type: 'object' as const,
+    required_keys: ['competitor', 'url', 'evidence'],
+    non_empty: ['competitor', 'url', 'evidence'],
+    verify: { url_present: ['url'] },
+  };
+  const step = {
+    id: 'research_competitors',
+    prompt: 'Research one competitor.',
+    forEach: 'competitors',
+    output: itemContract,
+  };
+
+  assert.equal(forEachItemOutputContract(step), itemContract);
+  assert.deepEqual(forEachAggregateOutputContract(step), {
+    type: 'array',
+    non_empty: [''],
+    min_items: { '': 1 },
+    description: 'Fan-out aggregate for step "research_competitors" ({itemKey, output} per completed item).',
+  });
+  assert.deepEqual(
+    verifyForEachItemOutput(
+      step,
+      '```json\n{"competitor":"Hermes","url":"https://github.com/NousResearch/hermes-agent","evidence":"official repository"}\n```',
+    ),
+    {
+      competitor: 'Hermes',
+      url: 'https://github.com/NousResearch/hermes-agent',
+      evidence: 'official repository',
+    },
+  );
+  assert.throws(
+    () => verifyForEachItemOutput(step, { competitor: 'Hermes', url: 'not-a-url', evidence: '' }),
+    /item output failed its contract/,
+  );
+});
+
+test('forEach array contracts retain legacy aggregate validation semantics', () => {
+  const aggregateContract = {
+    type: 'array' as const,
+    non_empty: [''],
+    min_items: { '': 3 },
+  };
+  const step = {
+    id: 'fanout',
+    prompt: 'Process each item.',
+    forEach: 'items',
+    output: aggregateContract,
+  };
+  assert.equal(forEachItemOutputContract(step), undefined);
+  assert.equal(forEachAggregateOutputContract(step), aggregateContract);
 });
 
 // Cleanup the temp BASE_DIR.

@@ -47,6 +47,13 @@ const CADENCE_RE =
 const FOREACH_HINT_RE =
   /\b(?:for each|each of|one per|per\s+(?:prospect|lead|item|row|client|account|company|firm|record|contact)|every\s+[a-z]+s\b|all\s+(?:the\s+)?[a-z]+s\b)\b/i;
 
+// A reducer intentionally consumes the whole upstream collection in one node.
+// Treating "converge all three upstream results" as missing forEach changes the
+// graph from fan-out → reduce into another fan-out and destroys the single
+// coherent synthesis the author asked for.
+const REDUCE_HINT_RE =
+  /\b(?:converge|synthesi[sz]e|aggregate|consolidate|combine|merge|roll\s*up|summari[sz]e)\b[\s\S]{0,120}\b(?:all|whole|entire|upstream|batch|results?|outputs?|items?|rows?)\b|\b(?:all|whole|entire|upstream|batch)\b[\s\S]{0,120}\b(?:converge|synthesi[sz]e|aggregate|consolidate|combine|merge|roll\s*up|summari[sz]e)\b/i;
+
 // Visual/reference deliverables are different from ordinary reports: a prompt
 // that says "match this HTML/page" is not a durable implementation. The actual
 // template must be kept as a workflow reference, deterministic renderer, or
@@ -238,6 +245,7 @@ export function analyzeWorkflowGaps(def: WorkflowDefinition): WorkflowGap[] {
     if (step.forEach) continue;
     if (!(step.dependsOn && step.dependsOn.length > 0)) continue;
     if (!FOREACH_HINT_RE.test(step.prompt ?? '')) continue;
+    if (REDUCE_HINT_RE.test(step.prompt ?? '')) continue;
     gaps.push({
       severity: 'clarify',
       stepId: step.id,

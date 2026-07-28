@@ -932,6 +932,19 @@ function workflowRunClean(run: RawWorkflowRunRecord): boolean {
   return run.status === 'completed' && !run.needsAttention && !run.goalOutcome?.includes('repursue');
 }
 
+function workflowRunTerminal(run: RawWorkflowRunRecord): boolean {
+  return run.status === 'completed'
+    || run.status === 'completed_with_errors'
+    || run.status === 'error'
+    || run.status === 'cancelled';
+}
+
+function isExpectedApprovalParkFailure(event: WorkflowEvent): boolean {
+  return event.kind === 'step_failed'
+    && typeof event.error === 'string'
+    && /^Workflow run parked on approval\.?$/i.test(event.error.trim());
+}
+
 function normalizeCause(raw: string): { key: string; label: string } | null {
   const label = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
   if (!label) return null;
@@ -1028,6 +1041,11 @@ function scanWorkflowEvents(records: RawWorkflowRunRecord[]): {
         addLoopCause(causes, 'item', event.error, `${run.workflow}/${run.id}/${event.stepId ?? 'step'}:${event.itemKey ?? 'item'}: ${event.error ?? 'item failed'}`);
       }
       if (event.kind === 'step_failed') {
+        // Approval parking is a healthy human-in-the-loop boundary, not a
+        // failed execution attempt. Older run logs represented the control-flow
+        // park as step_failed so crash-resume could recognize it; keep that
+        // durability signal while excluding it from learning/health causes.
+        if (isExpectedApprovalParkFailure(event)) continue;
         addLoopCause(causes, 'step', event.error, `${run.workflow}/${run.id}/${event.stepId ?? 'step'}: ${event.error ?? 'step failed'}`);
       }
     }
@@ -1999,9 +2017,12 @@ export function collectAgentSystemMetrics(): AgentSystemMetrics {
   });
 
   const workflowRuns = readWorkflowRunRecords(120);
-  const terminal = workflowRuns.filter((run) => run.status === 'completed' || run.status === 'completed_with_errors' || run.status === 'error' || run.status === 'cancelled');
+  const terminal = workflowRuns.filter(workflowRunTerminal);
   const failed = workflowRuns.filter((run) => run.status === 'error' || run.status === 'cancelled').length;
-  const needsAttention = workflowRuns.filter((run) => run.needsAttention || run.status === 'completed_with_errors').length;
+  // Loop effectiveness is a terminal-outcome ratio. A queued/running/parked
+  // run can legitimately be waiting on a person and must not count as a failed
+  // result against a denominator that excludes it.
+  const needsAttention = terminal.filter((run) => run.needsAttention || run.status === 'completed_with_errors').length;
   const clean = terminal.filter(workflowRunClean).length;
   const eventStats = scanWorkflowEvents(workflowRuns);
   const durations = workflowRuns.map(runDurationSeconds).filter((value): value is number => value !== null);

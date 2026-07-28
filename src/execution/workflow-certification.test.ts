@@ -101,6 +101,28 @@ test('required resource bindings block before lifecycle actions', () => {
   assert.ok(cert.nextActions.includes('bind_resources'));
 });
 
+test('a local Clementine Workspace slug is a complete durable binding', () => {
+  const cert = certifyWorkflow(def({
+    enabled: true,
+    resources: {
+      content_calendar: {
+        id: 'social-content-calendar',
+        kind: 'workspace',
+        label: 'Content calendar Workspace',
+      },
+    },
+    steps: [{
+      id: 'update',
+      prompt: 'Update the bound Workspace with space_set_data.',
+      sideEffect: 'write',
+    }],
+  }));
+
+  assert.equal(cert.resourceGaps.length, 0);
+  assert.notEqual(cert.state, 'needs_resource_binding');
+  assert.equal(cert.canRun, true);
+});
+
 test('external-read draft asks for creation-test inputs before testing', () => {
   const cert = certifyWorkflow(def({
     inputs: { url: { type: 'string', description: 'URL to inspect' } },

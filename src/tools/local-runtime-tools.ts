@@ -188,6 +188,7 @@ export function recoverMemoryRememberRequiredPrefix(error: unknown): Record<stri
 import {
   normalizeZodForCodexStrict as normalizeZodForResponses,
   normalizeShapeForCodexStrict as normalizeShapeForResponses,
+  normalizeShapeForDeferredJson,
 } from '../runtime/schema-normalizer.js';
 export { normalizeZodForResponses, normalizeShapeForResponses };
 
@@ -363,34 +364,10 @@ export function buildScopedLocalToolSearch(allowedNames: ReadonlySet<string>): T
 export function getLocalToolSchemas(): Map<string, z.ZodTypeAny> {
   const map = new Map<string, z.ZodTypeAny>();
   for (const localTool of captureLocalTools()) {
-    const strictShape = normalizeShapeForResponses(localTool.parameters);
-    const deferredShape: Record<string, z.ZodTypeAny> = {};
-    for (const [key, raw] of Object.entries(localTool.parameters)) {
-      const normalized = strictShape[key] as z.ZodTypeAny;
-      // Codex first-class schemas must encode optional fields as required +
-      // nullable for strict JSON Schema. args_json is ordinary JSON, though:
-      // models naturally omit optional keys. Preserve null compatibility while
-      // also accepting omission so call_tool does not waste a round trip merely
-      // adding `kind:null` / `includeInactive:false` / `content:""`.
-      // On the deferred JSON-string transport, omission and explicit null are
-      // equivalent for a field whose schema accepts null. Provider-strict
-      // first-class tools still receive an explicit null below via
-      // getLocalToolOptionalKeys(). Accepting omission here prevents a
-      // schema-correction turn for ordinary calls such as
-      // space_refresh({slug}) / space_get_runner({slug, runner_path}).
-      deferredShape[key] = (
-        (raw as z.ZodTypeAny).safeParse(undefined).success
-        || (raw as z.ZodTypeAny).safeParse(null).success
-      )
-        ? normalized.optional()
-        : normalized;
-    }
+    const deferredShape = normalizeShapeForDeferredJson(localTool.parameters);
     // First-class provider schemas already declare additionalProperties:false.
-    // The deferred dispatcher must preserve that contract too: a plain
-    // z.object silently strips unknown keys. That allowed stale camelCase
-    // arguments such as space_save({dataSources, viewHtml}) to disappear while
-    // the remaining slug/title/view_path dispatched successfully, producing a
-    // static Workspace that Clementine falsely reported as data-connected.
+    // Keep it recursively here too: deferred transport may omit nullable
+    // optionals, but it may never smuggle stale/unknown keys.
     map.set(localTool.name, z.strictObject(deferredShape));
   }
   return map;

@@ -18,7 +18,7 @@ import {
 } from '../integrations/cli-catalog/catalog.js';
 import { getSavedClis } from '../runtime/saved-clis.js';
 
-export type WorkflowResourceCandidateKind = 'composio' | 'cli' | 'url' | 'project';
+export type WorkflowResourceCandidateKind = 'composio' | 'cli' | 'url' | 'project' | 'workspace';
 export type WorkflowResourceCandidateStatus = 'ready' | 'available' | 'missing' | 'unknown';
 export type WorkflowResourceProposalStatus =
   | 'bound'
@@ -323,6 +323,17 @@ function resourceCandidates(
       reason: 'Resource declares a local project binding.',
     });
   }
+  if (resource.kind === 'workspace') {
+    const selector = resource.resourceId || resource.name || resource.url || resource.id;
+    candidates.push({
+      id: `workspace:${selector}`,
+      kind: 'workspace',
+      label: resource.name || resource.resourceId || resource.id,
+      status: 'ready',
+      score: 0.9,
+      reason: 'Resource declares a local Clementine Workspace binding.',
+    });
+  }
   return dedupeCandidates(candidates).sort((a, b) => {
     const statusDelta = candidateStatusRank(b.status) - candidateStatusRank(a.status);
     return statusDelta || b.score - a.score || a.label.localeCompare(b.label);
@@ -358,6 +369,17 @@ function selectedSurfaceCandidate(
       status: 'ready',
       score: 1,
       reason: 'Selected local project resource.',
+    };
+  }
+  if (resource.kind === 'workspace') {
+    const selector = resource.resourceId || resource.name || resource.url || resource.id;
+    return {
+      id: `workspace:${selector}`,
+      kind: 'workspace',
+      label: resource.name || resource.resourceId || resource.id,
+      status: 'ready',
+      score: 1,
+      reason: 'Selected local Clementine Workspace resource.',
     };
   }
   return undefined;
@@ -485,6 +507,7 @@ export function resourceHasSurface(resource: WorkflowResourceBinding, def: Workf
   if (resource.toolkit || resource.tool || resource.cli || resource.mcpServer) return true;
   if (resource.kind === 'api' || resource.kind === 'webhook') return Boolean(resource.url);
   if (resource.kind === 'project') return Boolean(resource.resourceId || resource.name || resource.url || def.project);
+  if (resource.kind === 'workspace') return true;
   return false;
 }
 
@@ -494,6 +517,9 @@ export function resourceHasSelector(resource: WorkflowResourceBinding, def: Work
   if (resource.scope && Object.keys(resource.scope).length > 0) return true;
   if (resource.kind === 'cli') return Boolean(resource.cli);
   if (resource.kind === 'project') return Boolean(def.project);
+  // A Workspace's stable resource id is its local slug. Unlike a generic
+  // resource alias, the `workspace` kind makes that meaning unambiguous.
+  if (resource.kind === 'workspace') return Boolean(resource.id);
   return false;
 }
 
@@ -536,6 +562,7 @@ function selectorName(kind: WorkflowResourceKind): string {
     case 'channel': return 'channel';
     case 'folder': return 'folder';
     case 'repository': return 'repository';
+    case 'workspace': return 'Workspace slug';
     case 'email_account':
     case 'account': return 'account';
     default: return 'resource';

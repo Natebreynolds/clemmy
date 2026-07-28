@@ -2167,6 +2167,54 @@ function shouldUseDeclarativeStepApproval(
   return exactApprovedSendTools(workflow, step).length > 0;
 }
 
+/**
+ * Backward-compatible forEach contract semantics:
+ *   - object/scalar contract => validate EACH item result;
+ *   - array contract         => validate the final aggregate
+ *                              [{itemKey, output}, ...].
+ *
+ * Models naturally describe the object one item should return. Treating that
+ * as an aggregate contract made correct fan-out work fail with "expected
+ * object, got array". Existing workflows that explicitly contract the array
+ * aggregate keep their exact behavior.
+ */
+export function forEachItemOutputContract(
+  step: WorkflowStepInput,
+): WorkflowStepOutputContract | undefined {
+  if (!step.forEach || !step.output || step.output.type === 'array') return undefined;
+  return step.output;
+}
+
+export function forEachAggregateOutputContract(
+  step: WorkflowStepInput,
+): WorkflowStepOutputContract | undefined {
+  if (!step.forEach) return step.output;
+  if (!forEachItemOutputContract(step)) return step.output;
+  return {
+    type: 'array',
+    non_empty: [''],
+    min_items: { '': 1 },
+    description: `Fan-out aggregate for step "${step.id}" ({itemKey, output} per completed item).`,
+  };
+}
+
+export function verifyForEachItemOutput(
+  step: WorkflowStepInput,
+  output: unknown,
+): unknown {
+  const contract = forEachItemOutputContract(step);
+  if (!contract) return output;
+  const bound = coerceOutputForContract(output, contract);
+  if (isBlockedStepOutput(bound)) return bound;
+  const result = verifyStepOutput(contract, bound);
+  if (!result.ok) {
+    throw new Error(
+      `forEach step "${step.id}" item output failed its contract: ${result.problems.join('; ')} — produced ${describeOutputShape(bound)}.`,
+    );
+  }
+  return bound;
+}
+
 interface HarnessStepResult {
   /** Structured when the step emitted workflow_step_result; the agent's
    *  prose reply/summary otherwise (backward-compat fallback). */
@@ -2351,9 +2399,8 @@ async function runStepViaHarness(
   // unwind to processOneRunFile. Plain/synthesis propagate directly; forEach
   // preserves the typed reason through its bounded pool and then propagates.
   canPark = false,
-  // Workflow contract review, defect A: forEach ITEM workers must NOT get the
-  // step's AGGREGATE contract (registered or injected) — a single-item worker
-  // submitting one object would be refused against an array-of-N contract.
+  // forEach item invocations use an object/scalar item contract when declared,
+  // but never receive an array aggregate contract.
   isItemInvocation = false,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
@@ -2472,7 +2519,10 @@ async function runStepViaHarness(
     // Self-heal move 2: arm submission-time contract validation for this step
     // session (workflow_step_result refuses a wrong-shape result with the exact
     // problems while the model is still alive to fix it).
-    if (!isItemInvocation) registerStepContract(realSessionId, step.output);
+    const activeOutputContract = isItemInvocation
+      ? forEachItemOutputContract(step)
+      : step.output;
+    if (activeOutputContract) registerStepContract(realSessionId, activeOutputContract);
     const approvalIds: string[] = [];
     let hadApprovals = false;
     const startedAt = Date.now();
@@ -2486,7 +2536,7 @@ async function runStepViaHarness(
     // Self-heal move 1 (2026-07-14): the output contract rides IN the prompt,
     // rendered from the same object the reduce gate verifies — the authored
     // prose can no longer drift from what the gate demands.
-    const contractSpec = !isItemInvocation && step.output ? `\n\n${renderOutputContractSpec(step.output)}` : '';
+    const contractSpec = activeOutputContract ? `\n\n${renderOutputContractSpec(activeOutputContract)}` : '';
     // Fold 3: the step's learned tool pin (if healthy) rides in with the contract.
     const pinSpec = !isItemInvocation ? renderWorkflowToolPin(workflowName, step.id) : '';
     const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}`;
@@ -4238,7 +4288,7 @@ export async function executeStep(
                   ctx.runId,
                   itemContext,
                   true, // approval parks propagate through runWithConcurrency
-                  true, // isItemInvocation: never gate an item on the AGGREGATE contract
+                  true, // isItemInvocation: object/scalar item contract yes; aggregate array contract no
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;
@@ -4290,6 +4340,10 @@ export async function executeStep(
               },
               afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
             });
+            // The harness submission gate catches this in-turn for Codex steps;
+            // this authoritative runner check also covers Claude SDK and legacy
+            // lanes, and binds fenced JSON before the item enters the aggregate.
+            output = verifyForEachItemOutput(step, output);
             // Per-item skill-execution check (forEach): advisory, DETECTION-ONLY —
             // a `usesSkill` item that couldn't be confirmed to produce the skill's
             // deliverables records a non-failing quality advisory. The item still
@@ -4387,12 +4441,56 @@ export async function executeStep(
       ctx.forEachFailures.push({ stepId: step.id, itemKey: r.itemKey, error: r.error });
     }
     clearWorkflowRunItemProgress(ctx.runId, step.id);
+    // A partial fan-out is NOT valid upstream data by default. Previously the
+    // runner finalized only the successful items, marked the step completed,
+    // and let dependent synthesis/write/send nodes continue. That is how one
+    // failed research item could still become three polished rows in a
+    // Workspace: the downstream model filled the missing record instead of the
+    // graph stopping at the evidence gap.
+    //
+    // Preserve every successful item in the durable item_completed events (so
+    // retry/resume can reuse the work), but expose the step itself as a blocked
+    // graph node. finalizeStepOutput deliberately accepts blocked envelopes
+    // without applying the normal array/object contract; the graph scheduler
+    // then skips every dependent branch while independent branches can finish.
+    if (failed > 0) {
+      const failures = itemResults
+        .filter((result): result is Extract<SettledItemResult, { ok: false }> => !result.ok)
+        .map((result) => ({
+          itemKey: result.itemKey,
+          error: result.error.split('\n')[0].slice(0, 500),
+        }));
+      const total = aggregate.length + failures.length;
+      const sample = failures.slice(0, 3)
+        .map((failure) => `${failure.itemKey}: ${failure.error}`)
+        .join('; ');
+      return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, {
+        blocked: true,
+        reason:
+          `Fan-out step "${step.id}" is incomplete: ${failures.length} of ${total} item(s) failed. `
+          + `Downstream steps were not run with partial data.${sample ? ` ${sample}` : ''}`,
+        completed_items: aggregate.length,
+        failed_items: failures,
+        total_items: total,
+      }, {
+        mode: 'forEach',
+        completed: aggregate.length,
+        processed: successes.length,
+        resumed: alreadyCompleted.length,
+        failed,
+        partialResultsPreserved: true,
+      });
+    }
     // Stage 3 (reduce tier): shard-reduce a LARGE aggregate into a durable
     // digest artifact so the synthesis brain reads compressed content instead
     // of a content-free ref. Additive only — the step output passed downstream
     // is the full aggregate, unchanged. Best-effort: never fails the step.
     await maybeReduceForEachAggregate(ctx, step.id, aggregate);
-    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, aggregate, {
+    const aggregateContract = forEachAggregateOutputContract(step);
+    const aggregateStep = aggregateContract === step.output
+      ? step
+      : { ...step, output: aggregateContract };
+    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, aggregateStep, aggregate, {
       mode: 'forEach',
       completed: aggregate.length,
       processed: successes.length,

@@ -88,3 +88,21 @@ test('CLI resource is bound when the command is connected', () => {
   assert.equal(report.proposals[0].status, 'bound');
   assert.equal(report.proposals[0].recommended?.command, 'sf');
 });
+
+test('Workspace resource is locally bound by its stable slug without an external connector', () => {
+  const report = buildWorkflowResourceBindingReport(def({
+    resources: {
+      content_calendar: {
+        id: 'social-content-calendar',
+        kind: 'workspace',
+        label: 'Content calendar Workspace',
+      },
+    },
+  }), baseInventory);
+
+  assert.equal(report.boundCount, 1);
+  assert.equal(report.needsBindingCount, 0);
+  assert.equal(report.proposals[0].status, 'bound');
+  assert.equal(report.proposals[0].recommended?.kind, 'workspace');
+  assert.equal(report.proposals[0].recommended?.status, 'ready');
+});

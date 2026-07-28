@@ -92,6 +92,36 @@ test('an explicitly searched large schema survives the output budget instead of 
   assert.ok(text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS, 'tool_search stays within its own intact-JSON budget');
 });
 
+test('call_tool discovery removes nested nullable placeholders from required lists', async () => {
+  const t = captureToolSearch(new Set(['workflow_update']), true);
+  const out = await runSearch(t.handler, 'workflow_update exact schema');
+  const schema = out.schemas.workflow_update as {
+    required?: string[];
+    properties?: {
+      steps?: {
+        anyOf?: Array<{
+          type?: string;
+          items?: { required?: string[] };
+        }>;
+      };
+    };
+  };
+  assert.ok(schema);
+  assert.deepEqual(schema.required, ['name'], 'only the real root requirement remains');
+  const arrayBranch = schema.properties?.steps?.anyOf?.find((branch) => branch.type === 'array');
+  assert.deepEqual(
+    arrayBranch?.items?.required,
+    ['id'],
+    'nested workflow steps no longer advertise every optional field as mandatory null-filled boilerplate',
+  );
+  assert.match(
+    out.guidance?.workflow_update ?? '',
+    /steps.*REPLACES THE ENTIRE STEP GRAPH/i,
+    'exact discovery warns that steps are replacement semantics even when schema annotations are stripped',
+  );
+  assert.match(out.hint, /Omit optional\/nullable fields/);
+});
+
 test('does not promote speculative schema-bearing hits to the session hot-set', async () => {
   _resetHotSetForTest();
   const t = captureToolSearch();
