@@ -1354,7 +1354,11 @@ test('OrchestratorDecision: nextAction enum covers the harness states the loop e
 
 test('isCommitSafeWorkerFallover: mirrors the chat-lane eligibility ladder (2026-07-20 parity widening)', async () => {
   const { isCommitSafeWorkerFallover } = await import('./orchestrator.js');
-  const { ClaudeSdkProviderOverloadError, ClaudeSdkAuthExpiredError } = await import('../runtime/harness/claude-agent-sdk.js');
+  const {
+    ClaudeSdkProviderOverloadError,
+    ClaudeSdkAuthExpiredError,
+    ClaudeSdkCapacityExhaustedError,
+  } = await import('../runtime/harness/claude-agent-sdk.js');
   const { AgentRuntimeCancelledError } = await import('../runtime/provider.js');
 
   // Typed committed-aware errors trust their flag: eligible only pre-commit
@@ -1364,6 +1368,8 @@ test('isCommitSafeWorkerFallover: mirrors the chat-lane eligibility ladder (2026
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkProviderOverloadError('529 overloaded', true)), false, 'committed overload → never re-run (double-act)');
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkAuthExpiredError('401 token expired', false)), true, 'uncommitted auth-expiry → fall over to a connected brain');
   assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkAuthExpiredError('401 token expired', true)), false, 'committed auth-expiry → never re-run');
+  assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkCapacityExhaustedError('out of extra usage', false)), true, 'uncommitted scoped capacity → fall over');
+  assert.equal(isCommitSafeWorkerFallover(new ClaudeSdkCapacityExhaustedError('out of extra usage', true)), false, 'committed scoped capacity → never re-run');
   // The generic committed=true guard covers FUTURE typed errors too, not just
   // the two named classes.
   const committedish = Object.assign(new Error('flaky thing'), { committed: true });

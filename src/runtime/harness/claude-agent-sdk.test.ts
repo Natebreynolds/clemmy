@@ -32,6 +32,7 @@ const {
   setClaudeAgentSdkQueryForTest,
   setClaudeAgentSdkReflectionForTest,
   ClaudeSdkAuthExpiredError,
+  ClaudeSdkCapacityExhaustedError,
 } = mod;
 const { isAuthRecoverableError } = await import('../../execution/transient-error.js');
 
@@ -1656,6 +1657,23 @@ test('an EXPIRED Claude token throws a TYPED, auth-recoverable error (so a calle
     },
   );
   assert.equal(calls, 1, 'a dead token is not retried in-lane');
+});
+
+test('model-scoped extra-usage exhaustion is typed and never retried in-lane', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    calls++;
+    return throwingQuery("Claude Code returned an error result: You're out of extra usage. Add more at claude.ai/settings/usage and keep going.");
+  }) as any);
+  await assert.rejects(
+    runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-5' }),
+    (err: unknown) => {
+      assert.ok(err instanceof ClaudeSdkCapacityExhaustedError);
+      assert.equal((err as InstanceType<typeof ClaudeSdkCapacityExhaustedError>).committed, false);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'an exhausted model is not retried before cross-brain fallover');
 });
 
 test('a deterministic (non-overload) error is never retried', async () => {

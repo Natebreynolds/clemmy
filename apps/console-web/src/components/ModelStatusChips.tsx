@@ -1,7 +1,12 @@
 import type { ReactNode } from 'react';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
-import { getModelStatus, type ModelStatus, type QuotaWindow } from '@/lib/model-status';
+import {
+  getModelStatus,
+  type ModelStatus,
+  type QuotaWindow,
+  type ScopedQuotaWindow,
+} from '@/lib/model-status';
 
 /**
  * Compact live chips in the top bar: Codex + Claude 5h/weekly quota (the same
@@ -51,12 +56,14 @@ function QuotaChip({
   label,
   five,
   week,
+  scoped,
   capturedAt,
   extraTooltip,
 }: {
   label: string;
   five?: QuotaWindow;
   week?: QuotaWindow;
+  scoped?: ScopedQuotaWindow;
   capturedAt?: number;
   extraTooltip?: string;
 }) {
@@ -64,6 +71,9 @@ function QuotaChip({
     `${label} usage`,
     five ? `5h: ${five.usedPercent}% used${five.resetAt ? ` · resets in ${resetIn(five.resetAt)}` : ''}` : null,
     week ? `weekly: ${week.usedPercent}% used${week.resetAt ? ` · resets in ${resetIn(week.resetAt)}` : ''}` : null,
+    scoped
+      ? `${scoped.modelLabel || 'model-scoped'} weekly: ${scoped.usedPercent}% used${scoped.active ? ' · active limit' : ''}${scoped.resetAt ? ` · resets in ${resetIn(scoped.resetAt)}` : ''}`
+      : null,
     extraTooltip ?? null,
     `as of ${agoLabel(capturedAt)}`,
   ]
@@ -80,6 +90,13 @@ function QuotaChip({
       <span className="text-faint">·</span>
       <span className="text-faint">wk</span>
       <Pct window={week} />
+      {scoped && (scoped.active || scoped.usedPercent >= 90) ? (
+        <>
+          <span className="text-faint">·</span>
+          <span className="max-w-[4.5rem] truncate text-faint">{scoped.modelLabel || 'scoped'}</span>
+          <Pct window={scoped} />
+        </>
+      ) : null}
     </span>
   );
 }
@@ -120,8 +137,14 @@ export function ModelStatusChips() {
         label="Claude"
         five={data.claude.fiveHour}
         week={data.claude.weekly}
+        scoped={data.claude.scopedWeekly}
         capturedAt={data.claude.capturedAt}
-        extraTooltip={data.claude.status ? `status: ${data.claude.status}` : undefined}
+        extraTooltip={[
+          data.claude.status ? `status: ${data.claude.status}` : null,
+          data.claude.extraUsageEnabled === false
+            ? `extra usage: off${data.claude.extraUsageUserDisabled ? ' (disabled in account settings)' : ''}`
+            : null,
+        ].filter(Boolean).join('\n') || undefined}
       />,
     );
   }

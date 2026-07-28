@@ -3448,6 +3448,11 @@ test('step-boundary brain fallover is eligible for an EXPIRED brain, not just tr
   assert.equal(isWorkflowStepBrainFalloverEligible(Object.assign(new Error('x'), { name: 'ClaudeSdkAuthExpiredError' })), true);
   // Still eligible for the pre-existing classes.
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error('API Error: 529 Overloaded')), true);
+  assert.equal(
+    isWorkflowStepBrainFalloverEligible(new Error("You're out of extra usage. Add more at claude.ai/settings/usage and keep going.")),
+    true,
+    'model-scoped capacity switches brains without retrying the exhausted model',
+  );
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error("tool call could not be parsed (retry also failed)")), true);
   // A real deterministic error still fails fast (no brain-chain burn).
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error('missing required input "url"')), false);

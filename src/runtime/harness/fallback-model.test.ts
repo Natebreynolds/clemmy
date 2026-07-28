@@ -182,6 +182,26 @@ test('falloverOn429: a 429 on one provider falls over to the next (cross-provide
   assert.ok((out as any[]).some((e) => e.delta === 'from codex'));
 });
 
+test('falloverOn429: Anthropic HTTP 400 extra-usage exhaustion falls over as model capacity', async () => {
+  let limitedCalls = 0;
+  let nextCalls = 0;
+  const claude = model({ getStreamedResponse: async function* () {
+    limitedCalls++;
+    throw { status: 400, message: "You're out of extra usage. Add more at claude.ai/settings/usage and keep going." };
+  } });
+  const codex = model({ getStreamedResponse: async function* () {
+    nextCalls++;
+    yield { type: 'output_text_delta', delta: 'rescued by codex' } as any;
+  } });
+  const out = await collect(withModelFallback(
+    [target('claude-fable-5', claude), target('codex', codex)],
+    { falloverOn429: true },
+  ).getStreamedResponse(req()));
+  assert.equal(limitedCalls, 1);
+  assert.equal(nextCalls, 1);
+  assert.ok((out as any[]).some((event) => event.delta === 'rescued by codex'));
+});
+
 test('default (no opts): a 429 does NOT fall over (same-provider tier behavior preserved)', async () => {
   let nextCalls = 0;
   const opus = model({ getStreamedResponse: async function* () { throw rateLimited(); } });

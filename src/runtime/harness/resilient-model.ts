@@ -36,6 +36,7 @@ import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import type { ModelCapability } from './model-wire-registry.js';
 import { BoundaryError, type BoundaryErrorKind } from '../boundary-error.js';
+import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.resilient-model' });
@@ -64,6 +65,9 @@ interface ErrorClass {
   status?: number;
   isAuth: boolean;
   retryAfterMs?: number;
+  /** False when another attempt on this exact model cannot help (plan/model
+   * allowance exhausted). Cross-provider fallover remains eligible. */
+  sameProviderRetryable?: boolean;
 }
 
 const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefused|fetch failed|socket hang up|network|und_err|aborted|timeout/i;
@@ -73,8 +77,6 @@ const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefus
 // auth_expired → terminal run_failed with NO fallover. Detect it by message REGARDLESS of
 // status so it routes like a rate-limit: fallover to another brain, else a clean recoverable
 // "quota reached" ask — never a hard fail. (Retrying the same exhausted provider is futile.)
-const USAGE_LIMIT_RE = /usage[_ ]?limit|plan[_ ]?limit|usage_limit_reached|quota (?:exceeded|reached)|exceeded your current quota/i;
-
 /** Classify a thrown model error into a retry decision. Duck-types the AI SDK's
  *  APICallError (statusCode / responseHeaders / isRetryable) without importing
  *  it, so the wrapper stays provider-neutral. */
@@ -88,9 +90,15 @@ export function classifyModelError(err: unknown): ErrorClass {
   // Usage/plan quota exhausted — check FIRST (before the status branches), because the
   // 403/400 variants would otherwise mis-classify as auth_expired → terminal. Body text
   // (CodexRuntimeError.bodyText) carries the marker even when the message doesn't.
-  const quotaText = `${typeof e?.message === 'string' ? e.message : ''} ${typeof (e as { bodyText?: unknown })?.bodyText === 'string' ? (e as { bodyText?: string }).bodyText : ''}`;
-  if (USAGE_LIMIT_RE.test(quotaText)) {
-    return { retryable: true, kind: 'model.rate_limited', status, isAuth: false, retryAfterMs };
+  if (isProviderCapacityExhausted(err)) {
+    return {
+      retryable: true,
+      kind: 'model.rate_limited',
+      status,
+      isAuth: false,
+      retryAfterMs,
+      sameProviderRetryable: false,
+    };
   }
 
   if (status === 401 || status === 403) {
@@ -284,7 +292,9 @@ export class ResilientModel implements Model {
       logger.warn({ label: this.policy.label, path, attempt: attempt + 1, kind: cls.kind }, 'model auth expired — refreshed token, retrying');
       return true;
     }
-    if (!cls.retryable || attempt >= this.maxRetries) return false;
+    // A durable plan/model allowance cannot heal during exponential backoff.
+    // Surface it immediately to the outer cross-provider chain.
+    if (!cls.retryable || cls.sameProviderRetryable === false || attempt >= this.maxRetries) return false;
     const wait = backoffMs(attempt, cls);
     logger.warn(
       { label: this.policy.label, path, attempt: attempt + 1, maxRetries: this.maxRetries, kind: cls.kind, status: cls.status, backoffMs: wait },

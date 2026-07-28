@@ -32,6 +32,7 @@ import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, writeToolOutput } from './eventlog.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
+import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import {
   killGateVerdict,
@@ -116,6 +117,17 @@ export class ClaudeSdkProviderOverloadError extends Error {
   constructor(message: string, readonly committed: boolean) {
     super(message);
     this.name = 'ClaudeSdkProviderOverloadError';
+  }
+}
+
+/** The selected Claude subscription/model allowance is exhausted. Unlike a
+ * burst overload, retrying this same SDK query cannot heal it. `committed`
+ * preserves the same cross-brain replay boundary as overload/auth errors. */
+export class ClaudeSdkCapacityExhaustedError extends Error {
+  readonly capacityExhausted = true;
+  constructor(message: string, readonly committed: boolean) {
+    super(message);
+    this.name = 'ClaudeSdkCapacityExhaustedError';
   }
 }
 
@@ -2262,6 +2274,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           continue;
         }
         throw err;
+      } else if (isProviderCapacityExhausted(msg)) {
+        // Anthropic can surface a model-scoped weekly cap as HTTP 400:
+        // "You're out of extra usage." Same-model retry is guaranteed waste;
+        // type it so commit-safe callers switch to another connected brain.
+        throw new ClaudeSdkCapacityExhaustedError(msg, toolUses.length > 0 || streamedAny);
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
         // Safe first-byte retry: nothing committed yet and budget remains.
@@ -2372,6 +2389,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       ...(Array.isArray(errorFields.errors) ? errorFields.errors : []),
       errorFields.error,
     ].filter((v) => v !== undefined && v !== null).map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join('\n');
+    if (isProviderCapacityExhausted(errorText)) {
+      throw new ClaudeSdkCapacityExhaustedError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny);
+    }
     if (isContextOverflowMessage(errorText)) {
       // TYPED so the brain's salvage/reduced-retry path runs.
       throw new ClaudeSdkContextOverflowError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny);

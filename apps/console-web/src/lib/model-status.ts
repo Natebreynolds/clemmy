@@ -8,12 +8,19 @@ export interface QuotaWindow {
   resetAt?: number; // epoch ms
   windowMinutes?: number;
 }
+export interface ScopedQuotaWindow extends QuotaWindow {
+  modelLabel?: string;
+  active: boolean;
+}
 export interface ModelStatus {
   codex: { connected: boolean; primary?: QuotaWindow; secondary?: QuotaWindow; capturedAt?: number };
   claude: {
     connected: boolean;
     fiveHour?: QuotaWindow;
     weekly?: QuotaWindow;
+    scopedWeekly?: ScopedQuotaWindow;
+    extraUsageEnabled?: boolean;
+    extraUsageUserDisabled?: boolean;
     status?: string;
     representativeClaim?: string;
     capturedAt?: number;

@@ -13,7 +13,7 @@
  * Pure + total: classification never throws; unknown inputs read as SHORT.
  */
 
-const PLAN_LIMIT_RE = /usage[_ ]?limit|plan[_ ]?limit|usage_limit_reached|quota (?:exceeded|reached)|exceeded your current quota|weekly limit/i;
+import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
 
 export interface CapacityAdvice {
   shape: 'short_reset' | 'plan_limit';
@@ -33,11 +33,11 @@ export function capacityAdvice(opts: {
   const prepared = opts.preparedNote?.trim()
     ? `${opts.preparedNote.trim()} Nothing was lost and nothing was sent. `
     : '';
-  if (PLAN_LIMIT_RE.test(reason)) {
+  if (isProviderCapacityExhausted(reason)) {
     return {
       shape: 'plan_limit',
       copy:
-        `${prepared}Your AI plan's usage limit is reached, and on this plan it may not reset for days. `
+        `${prepared}The selected AI route has reached a plan or model-specific usage limit, even if other plan capacity remains. It may not reset for days. `
         + 'Two ways forward: (1) add a pay-per-use worker model (about a 2-minute setup: Settings → Models → add a BYO key, routing mode "worker") — your main model keeps doing the thinking while the heavy lifting runs on the new key, and this stops happening; '
         + 'or (2) wait — the work resumes automatically when your limit resets.',
     };

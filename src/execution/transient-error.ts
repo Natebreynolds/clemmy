@@ -8,6 +8,7 @@
  * = a 4xx / schema / not-found / approval error where repeating the identical
  * call returns the identical failure — that's thrash, not retry.
  */
+import { isProviderCapacityExhausted } from '../shared/provider-capacity.js';
 
 const TRANSIENT_RE = /\b(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network error|fetch failed|connection (?:error|closed|reset)|timed? ?out|timeout|rate.?limit|too many requests|temporarily unavailable|service unavailable|bad gateway|gateway timeout|overloaded|internal server error|usually temporary)\b/i;
 // Things that read as "timeout"-ish but are NOT retryable (e.g. "waiting for
@@ -27,6 +28,10 @@ const STATUS_IN_MESSAGE_RE = /\b(?:api error|http|status)\s*[:#]?\s*(\d{3})\b/i;
 export function isTransientStepError(err: unknown, depth = 0): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   if (NON_RETRYABLE_RE.test(msg)) return false;
+  // A model/plan-scoped allowance is recoverable by a DIFFERENT brain, but
+  // retrying this exact model is guaranteed waste. The workflow fallover gate
+  // handles it separately.
+  if (isProviderCapacityExhausted(err)) return false;
   const code = (err as { code?: string; status?: number; cause?: unknown } | null);
   if (code?.code && TRANSIENT_RE.test(code.code)) return true;
   if (typeof code?.status === 'number' && TRANSIENT_STATUS.has(code.status)) return true;

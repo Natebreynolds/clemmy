@@ -40,6 +40,11 @@ test('infra/network errors stay transient', () => {
   assert.equal(isTransientStepError(Object.assign(new Error('boom'), { status: 503 })), true);
 });
 
+test('model-scoped allowance exhaustion skips same-model retry (different-brain fallover owns recovery)', () => {
+  const live = new Error("You're out of extra usage. Add more at claude.ai/settings/usage and keep going.");
+  assert.equal(isTransientStepError(live), false);
+});
+
 test('deterministic failures are NOT transient (no thrash)', () => {
   for (const m of [
     'waiting for approval timed out',          // contains "timed out" but is non-retryable

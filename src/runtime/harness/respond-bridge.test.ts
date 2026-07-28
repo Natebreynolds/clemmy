@@ -36,7 +36,7 @@ const {
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
 // eslint-disable-next-line import/first
-const { ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
+const { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
 // eslint-disable-next-line import/first
 const capabilityHealth = await import('./capability-health.js');
 
@@ -826,6 +826,8 @@ test('isChatBrainFalloverEligible: ANY genuine Claude-brain failure switches bra
     // Uncommitted overload still eligible; committed overload is handled by salvage (not here).
     assert.equal(isChatBrainFalloverEligible(new ClaudeSdkProviderOverloadError('529 Overloaded', false)), true);
     assert.equal(isChatBrainFalloverEligible(new ClaudeSdkProviderOverloadError('529 Overloaded', true)), false);
+    assert.equal(isChatBrainFalloverEligible(new ClaudeSdkCapacityExhaustedError('out of extra usage', false)), true);
+    assert.equal(isChatBrainFalloverEligible(new ClaudeSdkCapacityExhaustedError('out of extra usage', true)), false);
     // Intentional stops are NOT brain failures — never switch/re-run them.
     assert.equal(isChatBrainFalloverEligible(new AgentRuntimeCancelledError('Run cancelled by caller.')), false);
     const killErr = new Error('stopped'); killErr.name = 'KillRequested';

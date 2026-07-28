@@ -6,10 +6,18 @@ test('plan-limit shape (the $20-plan weekly case) gets the guided fix in plain w
   const a = capacityAdvice({ reason: 'Codex 429 usage_limit_reached', preparedNote: 'All 30 drafts are prepared and saved.' });
   assert.equal(a.shape, 'plan_limit');
   assert.match(a.copy, /All 30 drafts are prepared and saved\. Nothing was lost/);
+  assert.match(a.copy, /model-specific usage limit/);
+  assert.match(a.copy, /other plan capacity remains/);
   assert.match(a.copy, /may not reset for days/);
   assert.match(a.copy, /2-minute setup/);
   assert.match(a.copy, /resumes automatically when your limit resets/);
   assert.doesNotMatch(a.copy, /certif|judge|fail-closed|override/i, 'no developer-speak');
+});
+
+test('Anthropic out-of-extra-usage HTTP 400 is explained as scoped plan capacity, not a short 429', () => {
+  const a = capacityAdvice({ reason: "You're out of extra usage. Add more at claude.ai/settings/usage and keep going." });
+  assert.equal(a.shape, 'plan_limit');
+  assert.match(a.copy, /model-specific/);
 });
 
 test('short-reset shape retries automatically with a human time', () => {

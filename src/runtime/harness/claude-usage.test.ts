@@ -48,3 +48,43 @@ test('garbage / empty body → null (no windows to show)', () => {
   assert.equal(parseClaudeUsage({ five_hour: { utilization: 'nope' } }, 1), null);
   assert.equal(parseClaudeUsage('not an object', 1), null);
 });
+
+test('surfaces an active model-scoped weekly cap even when overall weekly usage has headroom', () => {
+  const snap = parseClaudeUsage({
+    five_hour: { utilization: 0, resets_at: '2026-07-28T05:39:59.996529+00:00' },
+    seven_day: { utilization: 94, resets_at: '2026-07-28T02:59:59.996550+00:00' },
+    extra_usage: {
+      is_enabled: false,
+      user_disabled: true,
+      spend_limit_reached: false,
+    },
+    limits: [
+      {
+        kind: 'weekly_all',
+        group: 'weekly',
+        percent: 94,
+        resets_at: '2026-07-28T02:59:59.996550+00:00',
+        scope: null,
+        is_active: false,
+      },
+      {
+        kind: 'weekly_scoped',
+        group: 'weekly',
+        percent: 100,
+        resets_at: '2026-07-28T03:00:00.996850+00:00',
+        scope: { model: { id: null, display_name: 'Fable' }, surface: null },
+        is_active: true,
+      },
+    ],
+  }, 123);
+  assert.ok(snap);
+  assert.equal(snap!.weekly?.usedPercent, 94, 'overall weekly headroom remains visible');
+  assert.deepEqual(snap!.scopedWeekly, {
+    usedPercent: 100,
+    resetAt: Date.parse('2026-07-28T03:00:00.996850+00:00'),
+    active: true,
+    modelLabel: 'Fable',
+  });
+  assert.equal(snap!.extraUsageEnabled, false);
+  assert.equal(snap!.extraUsageUserDisabled, true);
+});

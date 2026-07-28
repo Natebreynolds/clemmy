@@ -57,7 +57,7 @@ import {
 } from './eventlog.js';
 import { listPending } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
-import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
+import { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getModelRoutingMode, getRuntimeEnv } from '../../config.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
@@ -810,6 +810,7 @@ export function isChatBrainFalloverEligible(err: unknown): boolean {
   // A COMMITTED provider overload is already handled by the SDK lane's salvage (it returns a
   // success), so a propagated overload here is the uncommitted one.
   if (err instanceof ClaudeSdkProviderOverloadError) return !err.committed;
+  if (err instanceof ClaudeSdkCapacityExhaustedError) return !err.committed;
   // Unparseable tool call — a flaky stumble a DIFFERENT brain usually doesn't reproduce.
   if (isClaudeSdkUnparseableToolCall(err)) return true;
   // GENERIC terminal Claude-brain failure (non-overload 4xx/5xx, usage-limit, tool-surface
@@ -828,7 +829,8 @@ export async function recoverChatBrainFailure(
   detach?: () => void,
 ): Promise<AssistantResponse | null> {
   if (!isChatBrainFalloverEligible(err)) return null;
-  const kind = err instanceof ClaudeSdkProviderOverloadError ? 'overload'
+  const kind = err instanceof ClaudeSdkCapacityExhaustedError ? 'capacity_exhausted'
+    : err instanceof ClaudeSdkProviderOverloadError ? 'overload'
     : isClaudeSdkUnparseableToolCall(err) ? 'parse_failure'
     : 'terminal_error';
   const recoveryModel = recoveryHarnessModelAfterClaudeFailure();

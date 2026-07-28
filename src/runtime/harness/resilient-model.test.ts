@@ -67,6 +67,15 @@ test('classifyModelError: usage/plan quota exhausted → rate_limited (fallover)
   // As a 429 it was already rate_limited — stays rate_limited (no regression).
   assert.deepEqual(pick(classifyModelError({ status: 429, message: 'usage_limit_reached' })),
     { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  // Exact Anthropic model-scoped failure observed live: overall weekly usage
+  // still had headroom, but the selected Fable allowance was exhausted.
+  const scoped = classifyModelError({
+    status: 400,
+    message: 'Bad Request',
+    responseBody: { error: { message: "You're out of extra usage. Add more at claude.ai/settings/usage and keep going." } },
+  });
+  assert.deepEqual(pick(scoped), { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  assert.equal(scoped.sameProviderRetryable, false, 'a durable scoped cap must switch routes, not back off on the same model');
   // A genuine 403 auth error (no quota marker) still classifies as auth_expired.
   assert.deepEqual(pick(classifyModelError({ status: 403, message: 'invalid api key' })),
     { retryable: true, kind: 'model.auth_expired', isAuth: true });
@@ -95,6 +104,22 @@ test('getResponse: retries a 429 then returns the eventual answer', async () => 
   const res = await withResilience(inner, policy()).getResponse(req());
   assert.equal(calls, 2);
   assert.equal(res.output.length, 1);
+});
+
+test('getResponse: model-scoped plan exhaustion is never retried on the same model', async () => {
+  let calls = 0;
+  const liveError = {
+    status: 400,
+    message: "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+  };
+  const inner = makeModel({
+    getResponse: async () => {
+      calls += 1;
+      throw liveError;
+    },
+  });
+  await assert.rejects(() => withResilience(inner, policy({ maxRetries: 3 })).getResponse(req()), (err) => err === liveError);
+  assert.equal(calls, 1, 'no exponential-backoff tax on an exhausted allowance');
 });
 
 test('getResponse: a persistently empty completion throws a retryable boundary error (always-an-output)', async () => {

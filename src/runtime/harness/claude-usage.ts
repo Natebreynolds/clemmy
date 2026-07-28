@@ -20,7 +20,21 @@ import pino from 'pino';
 const logger = pino({ name: 'clementine.claude-usage' });
 
 export interface ClaudeUsageWindow { usedPercent: number; resetAt?: number }
-export interface ClaudeUsageSnapshot { fiveHour?: ClaudeUsageWindow; weekly?: ClaudeUsageWindow; capturedAt: number }
+export interface ClaudeScopedUsageWindow extends ClaudeUsageWindow {
+  /** Provider display name for the constrained model family (for example
+   * Anthropic's "Fable"). */
+  modelLabel?: string;
+  /** Anthropic marks the limit currently blocking the selected route active. */
+  active: boolean;
+}
+export interface ClaudeUsageSnapshot {
+  fiveHour?: ClaudeUsageWindow;
+  weekly?: ClaudeUsageWindow;
+  scopedWeekly?: ClaudeScopedUsageWindow;
+  extraUsageEnabled?: boolean;
+  extraUsageUserDisabled?: boolean;
+  capturedAt: number;
+}
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 // The endpoint buckets by User-Agent: a `claude-code/<version>` UA gets the
@@ -53,8 +67,39 @@ export function parseClaudeUsage(body: unknown, now: number): ClaudeUsageSnapsho
   };
   const fiveHour = win(b.five_hour);
   const weekly = win(b.seven_day);
-  if (!fiveHour && !weekly) return null;
-  return { fiveHour, weekly, capturedAt: now };
+  const scopedLimits = (Array.isArray(b.limits) ? b.limits : [])
+    .filter((raw): raw is Record<string, unknown> => Boolean(raw) && typeof raw === 'object')
+    .filter((raw) => raw.kind === 'weekly_scoped' && typeof raw.percent === 'number' && Number.isFinite(raw.percent))
+    .map((raw): ClaudeScopedUsageWindow => {
+      const scope = raw.scope && typeof raw.scope === 'object' ? raw.scope as Record<string, unknown> : null;
+      const model = scope?.model && typeof scope.model === 'object' ? scope.model as Record<string, unknown> : null;
+      const reset = typeof raw.resets_at === 'string' ? Date.parse(raw.resets_at) : NaN;
+      const label = typeof model?.display_name === 'string' ? model.display_name.trim() : '';
+      return {
+        usedPercent: Math.max(0, Math.min(100, Math.round(raw.percent as number))),
+        resetAt: Number.isFinite(reset) ? reset : undefined,
+        active: raw.is_active === true,
+        modelLabel: label || undefined,
+      };
+    });
+  // Prefer the provider-declared active blocker. If none is active, retain the
+  // highest scoped utilization so the UI can still warn before it becomes one.
+  const scopedWeekly = scopedLimits.find((limit) => limit.active)
+    ?? scopedLimits.sort((a, b2) => b2.usedPercent - a.usedPercent)[0];
+  const extra = b.extra_usage && typeof b.extra_usage === 'object'
+    ? b.extra_usage as Record<string, unknown>
+    : null;
+  const extraUsageEnabled = typeof extra?.is_enabled === 'boolean' ? extra.is_enabled : undefined;
+  const extraUsageUserDisabled = typeof extra?.user_disabled === 'boolean' ? extra.user_disabled : undefined;
+  if (!fiveHour && !weekly && !scopedWeekly) return null;
+  return {
+    fiveHour,
+    weekly,
+    scopedWeekly,
+    extraUsageEnabled,
+    extraUsageUserDisabled,
+    capturedAt: now,
+  };
 }
 
 async function refresh(): Promise<void> {

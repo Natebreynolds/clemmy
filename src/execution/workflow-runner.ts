@@ -11,6 +11,7 @@ import {
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
+import { isProviderCapacityExhausted } from '../shared/provider-capacity.js';
 import { resolveRoleModel, defaultForRole } from '../runtime/harness/model-roles.js';
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
@@ -3463,6 +3464,7 @@ async function executeStepVerified(
  *  the decision is unit-tested, mirroring the chat lane's isChatBrainFalloverEligible. */
 export function isWorkflowStepBrainFalloverEligible(err: unknown): boolean {
   return isTransientStepError(err)
+    || isProviderCapacityExhausted(err)
     || isUnparseableToolCallError(err)
     || isWorkflowStepStructuralResultError(err)
     || isAuthRecoverableError(err);

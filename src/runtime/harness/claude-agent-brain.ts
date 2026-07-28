@@ -85,6 +85,7 @@ import {
   claudeToolSearchEnabled,
   runClaudeAgentSdk,
   ClaudeSdkProviderOverloadError,
+  ClaudeSdkCapacityExhaustedError,
   ClaudeSdkContextOverflowError,
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
@@ -1766,11 +1767,18 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       // — the user gets "N actions went through, nothing duplicated, I hit capacity"
       // rather than a bare failure. NEVER re-runs (would double-act). An UNCOMMITTED
       // overload still propagates so the existing transplant to another brain runs.
-      if (claudeSdkSalvageEnabled() && err instanceof ClaudeSdkProviderOverloadError && err.committed) {
-        const salvagedOverload = salvageCommittedResult(sessionId, salvageSinceSeq);
-        if (salvagedOverload) {
-          try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_salvaged', reason: 'provider_overload_after_commit' } }); } catch { /* best-effort */ }
-          return salvagedOverload;
+      if (
+        claudeSdkSalvageEnabled()
+        && (err instanceof ClaudeSdkProviderOverloadError || err instanceof ClaudeSdkCapacityExhaustedError)
+        && err.committed
+      ) {
+        const salvagedCapacity = salvageCommittedResult(sessionId, salvageSinceSeq);
+        if (salvagedCapacity) {
+          const reason = err instanceof ClaudeSdkCapacityExhaustedError
+            ? 'provider_capacity_after_commit'
+            : 'provider_overload_after_commit';
+          try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_salvaged', reason } }); } catch { /* best-effort */ }
+          return salvagedCapacity;
         }
         throw err; // committed but no external write to salvage — surface for the caller
       }

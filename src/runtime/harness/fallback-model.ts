@@ -313,7 +313,11 @@ const RATE_LIMIT_MAX_COOLDOWN_MS = 10 * 60_000;
 
 export function markBrainRateLimited(label: string, err: unknown): void {
   const cls = err instanceof BoundaryError
-    ? { kind: err.kind, retryAfterMs: undefined as number | undefined }
+    ? {
+        kind: err.kind,
+        retryAfterMs: undefined as number | undefined,
+        sameProviderRetryable: undefined as boolean | undefined,
+      }
     : classifyModelError(err);
   // OVERLOADED joins the memo (v2.3.0 L2): a 529-storm behaves exactly like a
   // rate limit — the provider will refuse for a window — yet only rate_limited
@@ -321,7 +325,14 @@ export function markBrainRateLimited(label: string, err: unknown): void {
   // brain before falling over (live 2026-07-22: 486 fallovers/40min on an
   // Anthropic overload, ~15s tax per call).
   if (cls.kind !== 'model.rate_limited' && cls.kind !== 'model.overloaded') return;
-  const pauseMs = Math.min(cls.retryAfterMs ?? RATE_LIMIT_DEFAULT_COOLDOWN_MS, RATE_LIMIT_MAX_COOLDOWN_MS);
+  // A burst 429 gets a short probe window. A provider-declared plan/model cap
+  // cannot heal on the next minute, so bench it for the bounded maximum and
+  // route subsequent turns straight to a healthy brain instead of repaying the
+  // same rejected request every 60 seconds.
+  const defaultPauseMs = cls.sameProviderRetryable === false
+    ? RATE_LIMIT_MAX_COOLDOWN_MS
+    : RATE_LIMIT_DEFAULT_COOLDOWN_MS;
+  const pauseMs = Math.min(cls.retryAfterMs ?? defaultPauseMs, RATE_LIMIT_MAX_COOLDOWN_MS);
   const until = Date.now() + pauseMs;
   const existing = rateLimitedBrains.get(label);
   if (!existing || until > existing.until) {
