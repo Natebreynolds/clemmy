@@ -3,7 +3,6 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   ArrowLeft, RefreshCw, Pause, Play, ExternalLink, PanelRightOpen, X,
   MessageCircle, RotateCcw, AlertCircle, Database, Zap, History, FileCode2, CheckCircle2, Share2,
-  Target, ShieldCheck,
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
@@ -17,6 +16,7 @@ import {
   spaceViewUrl, spaceSessionId, openApprovalCount, gapQuestions, latestRefreshFailures, type SpaceStatus,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
+import { PurposePanel } from '@/components/workspaces/PurposePanel';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -218,36 +218,7 @@ export function WorkspaceView() {
             <div className="min-h-0 flex-1 overflow-auto p-3">
               {tab === 'health' && (
                 <div className="space-y-3">
-                  <div className="rounded-md border border-border bg-surface p-3">
-                    <p className="mb-2 flex items-center gap-1.5 text-small font-semibold text-fg">
-                      <Target className="h-3.5 w-3.5" aria-hidden /> Purpose
-                    </p>
-                    {space.contract ? (
-                      <div className="space-y-2 text-small text-muted">
-                        <p className="text-fg">{space.contract.objective}</p>
-                        {space.contract.successCriteria.length > 0 && (
-                          <div>
-                            <p className="text-caption font-medium text-faint">Done when</p>
-                            <ul className="mt-1 list-disc space-y-1 pl-4">
-                              {space.contract.successCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}
-                            </ul>
-                          </div>
-                        )}
-                        {space.contract.invariants.length > 0 && (
-                          <div>
-                            <p className="flex items-center gap-1 text-caption font-medium text-faint">
-                              <ShieldCheck className="h-3.5 w-3.5" aria-hidden /> Always preserve
-                            </p>
-                            <ul className="mt-1 list-disc space-y-1 pl-4">
-                              {space.contract.invariants.map((invariant) => <li key={invariant}>{invariant}</li>)}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <p className="text-small text-muted">No purpose is pinned yet. Tell Clem what this workspace should accomplish and what must never drift.</p>
-                    )}
-                  </div>
+                  <PurposePanel space={space} onSaved={() => { void detail.refetch(); }} />
                   {health ? (
                     <>
                       <div className="grid grid-cols-2 gap-2">
