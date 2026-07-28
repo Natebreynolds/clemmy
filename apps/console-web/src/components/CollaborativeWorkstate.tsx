@@ -10,6 +10,7 @@ import {
 import { Link } from 'react-router-dom';
 import { StatusPill, type Tone } from './ui/StatusPill';
 import { cn } from '@/lib/cn';
+import { stripInlineMarkdown } from '@/lib/markdown-text';
 import {
   focusActionHref,
   hasWorkstateDetails,
@@ -92,9 +93,12 @@ export function CollaborativeWorkstate({
             {mode && <StatusPill tone={MODE_TONE[mode]}>{MODE_LABEL[mode]}</StatusPill>}
             {snapshot?.needsConfirm && <StatusPill tone="warning">Check context</StatusPill>}
           </div>
-          <h3 className="mt-0.5 text-body font-semibold text-fg">{focus.title}</h3>
-          <p className="mt-0.5 text-small text-muted">
-            {state?.objective || focus.summary}
+          {/* Title/summary are model-authored and sometimes arrive as markdown —
+              strip to calm plain text and clamp; the structured sections below
+              carry the detail. Raw bold/link markup must never leak. */}
+          <h3 className="mt-0.5 line-clamp-2 text-body font-semibold text-fg">{stripInlineMarkdown(focus.title)}</h3>
+          <p className="mt-0.5 line-clamp-3 text-small text-muted">
+            {stripInlineMarkdown(state?.objective || focus.summary)}
           </p>
         </div>
       </div>
@@ -118,9 +122,9 @@ export function CollaborativeWorkstate({
                       {CANDIDATE_LABEL[candidate.status]}:
                     </span>
                     <span className={cn(candidate.status === 'rejected' && 'text-faint line-through')}>
-                      {candidate.label}
+                      {stripInlineMarkdown(candidate.label)}
                     </span>
-                    {candidate.note && <span className="text-muted"> — {candidate.note}</span>}
+                    {candidate.note && <span className="text-muted"> — {stripInlineMarkdown(candidate.note)}</span>}
                   </li>
                 ))}
                 <MoreCount count={state.candidates.length - itemLimit} />
@@ -134,10 +138,10 @@ export function CollaborativeWorkstate({
                 <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> Decided
               </p>
               <ul className="space-y-1 text-small text-fg">
-                {state.decisions.slice(0, itemLimit).map((decision) => <li key={`decision:${decision}`}>• {decision}</li>)}
+                {state.decisions.slice(0, itemLimit).map((decision) => <li key={`decision:${decision}`}>• {stripInlineMarkdown(decision)}</li>)}
                 {state.constraints.slice(0, Math.max(0, itemLimit - Math.min(itemLimit, state.decisions.length))).map((constraint) => (
                   <li key={`constraint:${constraint}`} className="text-muted">
-                    <ShieldCheck className="mr-1 inline h-3.5 w-3.5" aria-hidden />{constraint}
+                    <ShieldCheck className="mr-1 inline h-3.5 w-3.5" aria-hidden />{stripInlineMarkdown(constraint)}
                   </li>
                 ))}
                 <MoreCount count={state.decisions.length + state.constraints.length - itemLimit} />
@@ -151,7 +155,7 @@ export function CollaborativeWorkstate({
                 <CircleHelp className="h-3.5 w-3.5" aria-hidden /> Still open
               </p>
               <ul className="space-y-1 text-small text-fg">
-                {state.openLoops.slice(0, itemLimit).map((loop) => <li key={`open:${loop}`}>• {loop}</li>)}
+                {state.openLoops.slice(0, itemLimit).map((loop) => <li key={`open:${loop}`}>• {stripInlineMarkdown(loop)}</li>)}
                 <MoreCount count={state.openLoops.length - itemLimit} />
               </ul>
             </div>
@@ -170,7 +174,7 @@ export function CollaborativeWorkstate({
                       <StatusPill tone={ACTION_TONE[action.status]} className="mr-1.5">
                         {ACTION_LABEL[action.status]}
                       </StatusPill>
-                      <span className="text-small text-fg">{action.label}</span>
+                      <span className="text-small text-fg">{stripInlineMarkdown(action.label)}</span>
                       {href && <ExternalLink className="ml-1 inline h-3 w-3 text-faint" aria-hidden />}
                     </>
                   );
@@ -179,7 +183,7 @@ export function CollaborativeWorkstate({
                       {href
                         ? <Link to={href} className="inline-flex items-center hover:underline">{content}</Link>
                         : <span className="inline-flex items-center">{content}</span>}
-                      {action.note && <p className="mt-0.5 text-caption text-muted">{action.note}</p>}
+                      {action.note && <p className="mt-0.5 text-caption text-muted">{stripInlineMarkdown(action.note)}</p>}
                     </li>
                   );
                 })}

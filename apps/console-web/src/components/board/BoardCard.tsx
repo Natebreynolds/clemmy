@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/Button';
 import { relativeTime } from '@/lib/inbox';
 import { cardTone, sourceLabel, runQueueRef, type BoardButtonIntent, type BoardCard as BoardCardT } from '@/lib/board';
 import { evidenceChips, blockerSummary } from '@/lib/work-status';
+import { stripInlineMarkdown } from '@/lib/markdown-text';
 import { RunQueue } from './RunQueue';
 
 const dragActions = new Set(['cancel', 'resume', 'promote']);
@@ -105,7 +106,7 @@ export function BoardCard({
       <p className="mt-2 line-clamp-2 text-body font-medium text-fg">{card.title}</p>
 
       {card.progressHint && (
-        <p className="mt-1 line-clamp-2 text-caption text-muted">{card.progressHint}</p>
+        <p className="mt-1 line-clamp-2 text-caption text-muted">{stripInlineMarkdown(card.progressHint)}</p>
       )}
 
       {(() => {
@@ -133,7 +134,7 @@ export function BoardCard({
             {card.failureSummary.failedItems > 0
               ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
               : 'Needs review'}
-            {card.failureSummary.reason && !failureReasonIsRedundant(card) ? ` · ${card.failureSummary.reason}` : ''}
+            {card.failureSummary.reason && !failureReasonIsRedundant(card) ? ` · ${stripInlineMarkdown(card.failureSummary.reason)}` : ''}
           </p>
         );
       })()}
