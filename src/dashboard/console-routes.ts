@@ -10432,13 +10432,19 @@ export function registerConsoleRoutes(
         const workflowEntry = workflowBySlug.get(pending.workflowName) ?? workflowByDisplayName.get(pending.workflowName);
         const recovery = workflowRunRecovery(pending.workflowName, pending.runId);
         const column: BoardColumnId = pending.inFlightStepId ? 'running' : 'queued';
+        // A parked run is waiting on a human (approval consumption), not
+        // working — carrying the real state through lets the board say
+        // "Waiting for your approval" instead of a false "Working" pill.
+        const parked = pending.runStatus === 'parked';
         cards.push({
           id: `wf:${pending.workflowName}:${pending.runId}`,
           sourceKind: 'workflow',
           title: workflowEntry?.data.name ?? pending.workflowName,
           column,
-          status: pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
-          progressHint: pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
+          status: parked ? 'parked' : pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
+          progressHint: parked
+            ? `Waiting for your approval on step ${pending.inFlightStepId ?? 'the gated step'}`
+            : pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
           sessionId: null,
           ageMs: ageMs(pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),

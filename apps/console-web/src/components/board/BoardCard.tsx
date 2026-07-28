@@ -12,6 +12,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { relativeTime } from '@/lib/inbox';
 import { cardTone, sourceLabel, runQueueRef, type BoardButtonIntent, type BoardCard as BoardCardT } from '@/lib/board';
+import { evidenceChips, blockerSummary } from '@/lib/work-status';
 import { RunQueue } from './RunQueue';
 
 const dragActions = new Set(['cancel', 'resume', 'promote']);
@@ -107,16 +108,52 @@ export function BoardCard({
         <p className="mt-1 line-clamp-2 text-caption text-muted">{card.progressHint}</p>
       )}
 
-      {card.failureSummary && (
-        // line-clamp keeps a verbose failure reason from turning the card into a
-        // wall of red — the FULL text lives one click away in the trace drawer.
-        <p className="mt-2 line-clamp-3 break-words rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
-          {card.failureSummary.failedItems > 0
-            ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
-            : 'Needs review'}
-          {card.failureSummary.reason && !failureReasonIsRedundant(card) ? ` · ${card.failureSummary.reason}` : ''}
-        </p>
-      )}
+      {(() => {
+        // The durable blocker beats derived failure prose: it names the exact
+        // dependency and the exact user action, and says work is saved.
+        const blocked = blockerSummary(card.raw.outcomeSnapshot);
+        if (blocked) {
+          return (
+            <div className="mt-2 space-y-1 rounded-sm bg-warning-tint px-2 py-1.5">
+              <p className="line-clamp-2 break-words text-caption font-medium text-warning">{blocked.blocker}</p>
+              {blocked.nextAction && (
+                <p className="line-clamp-2 break-words text-caption text-fg">{blocked.nextAction}</p>
+              )}
+              {blocked.resumable && (
+                <p className="text-caption text-faint">Completed work is saved — Clementine resumes from here.</p>
+              )}
+            </div>
+          );
+        }
+        if (!card.failureSummary) return null;
+        return (
+          // line-clamp keeps a verbose failure reason from turning the card into a
+          // wall of red — the FULL text lives one click away in the trace drawer.
+          <p className="mt-2 line-clamp-3 break-words rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
+            {card.failureSummary.failedItems > 0
+              ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
+              : 'Needs review'}
+            {card.failureSummary.reason && !failureReasonIsRedundant(card) ? ` · ${card.failureSummary.reason}` : ''}
+          </p>
+        );
+      })()}
+
+      {(() => {
+        // Durable evidence chips — counts, verified artifacts, send receipts —
+        // straight from the outcome snapshot the harness proved, so completion
+        // never rests on prose alone.
+        const chips = evidenceChips(card.raw.outcomeSnapshot);
+        if (chips.length === 0) return null;
+        return (
+          <div className="mt-2 flex flex-wrap gap-1">
+            {chips.map((chip) => (
+              <span key={chip} className="rounded-sm bg-subtle px-1.5 py-0.5 text-caption font-medium text-fg">
+                {chip}
+              </span>
+            ))}
+          </div>
+        );
+      })()}
 
       {artifacts && (
         <p className="mt-2 line-clamp-2 break-words rounded-sm bg-success-tint px-2 py-1 text-caption text-success">{artifacts}</p>

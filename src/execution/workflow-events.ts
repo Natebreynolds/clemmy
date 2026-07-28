@@ -555,9 +555,23 @@ export interface PendingRun {
   runId: string;
   lastEventAt?: string;
   inFlightStepId?: string;
+  /** The durable run-record status ('running' | 'parked' | 'queued' | …) so
+   *  surfaces can tell a parked-on-approval run from one actually working. */
+  runStatus?: string;
 }
 
 const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'error', 'cancelled', 'dry_run']);
+
+function readRunRecordStatus(runId: string): string | undefined {
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  if (!existsSync(file)) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown };
+    return typeof raw.status === 'string' ? raw.status : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function terminalRunRecordStatus(runId: string): boolean {
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
@@ -626,6 +640,7 @@ export function listPendingRuns(): PendingRun[] {
         runId,
         lastEventAt: state.lastEventAt,
         inFlightStepId: state.inFlightStepId,
+        runStatus: readRunRecordStatus(runId),
       });
     }
   }

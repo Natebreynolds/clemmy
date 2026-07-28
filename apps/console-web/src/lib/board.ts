@@ -8,6 +8,7 @@
  * so the card lands wherever its real status puts it (snap-back on reject).
  */
 import { apiGet, apiPost } from './api';
+import { humanStatusLabel } from './work-status';
 import type { Tone } from '@/components/ui/StatusPill';
 import type { RunEnvironmentDetail } from './run-environment';
 
@@ -624,12 +625,16 @@ export function sourceLabel(kind: BoardSourceKind): string {
   }
 }
 
-/** Map a board status/column to a semantic pill tone + label. */
+/** Map a board status/column to a semantic pill tone + label. Raw harness
+ *  states never reach the pill verbatim — everything routes through the
+ *  shared human vocabulary (work-status.ts). */
 export function cardTone(card: BoardCard): { tone: Tone; label: string } {
   const s = card.status.toLowerCase();
   if (card.column === 'done') {
-    if (s.includes('fail') || s.includes('abort') || s.includes('interrupt') || s.includes('block')) return { tone: 'danger', label: card.status };
-    if (s.includes('cancel')) return { tone: 'neutral', label: 'Cancelled' };
+    if (s.includes('fail') || s.includes('abort') || s.includes('interrupt') || s.includes('block')) {
+      return { tone: 'danger', label: humanStatusLabel(card.status) };
+    }
+    if (s.includes('cancel')) return { tone: 'neutral', label: 'Stopped' };
     return { tone: 'success', label: 'Done' };
   }
   if (card.column === 'needs_you') {
@@ -641,9 +646,16 @@ export function cardTone(card: BoardCard): { tone: Tone; label: string } {
           ? 'Input'
         : card.status === 'awaiting_continue'
           ? 'Continue'
-          : card.status,
+          : humanStatusLabel(card.status),
     };
   }
-  if (card.column === 'running') return { tone: 'live', label: s === 'cancelling' ? 'Cancelling' : 'Working' };
+  if (card.column === 'running') {
+    // A parked run is NOT working — it is waiting on a human. Showing "Working"
+    // for hours while an approval sits unanswered erodes trust in every pill.
+    if (s === 'parked' || s.startsWith('awaiting') || s.startsWith('waiting')) {
+      return { tone: 'warning', label: humanStatusLabel(card.status) };
+    }
+    return { tone: 'live', label: s === 'cancelling' ? 'Stopping…' : 'Working' };
+  }
   return { tone: 'neutral', label: 'Queued' };
 }

@@ -5,6 +5,7 @@ import {
   boardTraceSinceSeq,
   canStopCanonicalRunFromDrawer,
   findBoardCardForRun,
+  cardTone,
   intentForDrop,
   reconcileOpenBoardCard,
   rejectReason,
@@ -169,4 +170,20 @@ test('drag Needs You → Running approves a parked card; non-approvable cards sn
   // fires when the card actually carries an approvable action.
   const resumable = card({ id: 'bg-1', column: 'needs_you', status: 'awaiting_continue', actions: ['resume', 'cancel'] });
   assert.equal(intentForDrop(resumable, 'running'), 'resume');
+});
+
+// A parked run must never wear a live "Working" pill — it is waiting on a
+// human, and an hours-old false "Working" erodes trust in every other pill.
+test('cardTone: parked/awaiting runs in the Running column read as waiting, not working', () => {
+  const parked = card({ id: 'wf-parked', column: 'running', status: 'parked' });
+  assert.deepEqual(cardTone(parked), { tone: 'warning', label: 'Waiting for your approval' });
+
+  const live = card({ id: 'wf-live', column: 'running', status: 'step: publish' });
+  assert.deepEqual(cardTone(live), { tone: 'live', label: 'Working' });
+
+  // Raw harness states never leak verbatim into a pill.
+  const capability = card({ id: 'bg-cap', column: 'needs_you', status: 'awaiting_capability' });
+  assert.equal(cardTone(capability).label, 'Waiting for a connection');
+  const doneOdd = card({ id: 'bg-int', column: 'done', status: 'interrupted' });
+  assert.equal(cardTone(doneOdd).label, 'Interrupted — resumable');
 });
