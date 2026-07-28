@@ -102,6 +102,10 @@ export const cleanTurnIsolation: ScenarioDef = {
       detail: probe.text.slice(0, 120),
     });
 
-    return { sessionId: turnB.sessionId, checks };
+    return {
+      sessionId: turnB.sessionId,
+      checks,
+      latency: [{ wallMs: turnB.wallMs, ttftMs: null }],
+    };
   },
 };
