@@ -35,6 +35,11 @@ interface ToolSearchMetadata {
   description: string;
 }
 
+function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
+  const escaped = toolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(query);
+}
+
 function stripSchemaAnnotations(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripSchemaAnnotations);
   if (!value || typeof value !== 'object') return value;
@@ -110,14 +115,17 @@ export function registerToolSearchTool(
     },
     async ({ query, limit }: { query: string; limit?: number }) => {
       const ranked = await rankCatalog(query, { allowedNames: opts.allowedNames });
-      const topN = ranked.slice(0, Math.min(limit ?? TOP_RESULTS, 20));
+      // An exact tool name is an explicit selection, not another fuzzy search
+      // term. Resolve it against the complete policy-filtered ranking before
+      // applying the result limit, then keep it first even when lexical or
+      // semantic neighbors happen to score higher.
+      const exactNamedHit = ranked.find((result) => queryExplicitlyNamesTool(query, result.name));
+      const ordered = exactNamedHit
+        ? [exactNamedHit, ...ranked.filter((result) => result.name !== exactNamedHit.name)]
+        : ranked;
+      const topN = ordered.slice(0, Math.min(limit ?? TOP_RESULTS, 20));
       const metadataMap = await toolMetadataMap();
 
-      const normalizedQuery = query.toLowerCase();
-      const exactNamedHit = topN.find((result) => {
-        const escaped = result.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(normalizedQuery);
-      });
       // When the model supplied an exact tool name, it has already selected
       // the capability. Return only that schema instead of spending tokens on
       // two neighboring suggestions. Natural-language discovery still gets up

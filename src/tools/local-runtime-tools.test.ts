@@ -15,6 +15,7 @@ const {
   recoverMemoryRememberRequiredPrefix,
   describeInvalidToolInput,
   buildLocalToolErrorFunction,
+  buildScopedLocalToolSearch,
 } = await import('./local-runtime-tools.js');
 
 test('invalid tool input returns the violated paths and a tool_search pointer, never a blind retry prompt', async () => {
@@ -71,6 +72,18 @@ test('local tool catalog is the exact loaded surface without schemas', () => {
     tools.map((entry) => entry.name),
   );
   assert.ok(catalog.every((entry) => typeof entry.description === 'string'));
+});
+
+test('scoped tool_search tells the model to dispatch deferred tools through call_tool', async () => {
+  const search = buildScopedLocalToolSearch(new Set(['write_file']));
+  const output = await search.invoke(
+    new RunContext({ sessionId: 'scoped-tool-search-dispatch' }),
+    JSON.stringify({ query: 'write_file', limit: null }),
+  );
+  const payload = JSON.parse(String(output)) as { hint?: string; schemas?: Record<string, unknown> };
+  assert.ok(payload.schemas?.write_file, 'the exact deferred tool schema is returned');
+  assert.match(String(payload.hint), /call_tool\(name, args_json\)/);
+  assert.doesNotMatch(String(payload.hint), /available on this turn's active surface/);
 });
 
 before(() => {

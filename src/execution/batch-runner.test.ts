@@ -191,6 +191,28 @@ test('runBatchPlan: a composio polite-failure result counts as a FAILED item, no
   assert.equal(ledger.succeeded, 0);
 });
 
+test('runBatchPlan: a structured provider failure counts as FAILED and never earns an idempotency success receipt', async () => {
+  calls.length = 0;
+  _setCodeModeToolsForTests(new Map([
+    ['composio_execute_tool', fakeTool('composio_execute_tool', () => ({
+      successful: false,
+      error: { message: 'upstream rejected the write' },
+    }))],
+  ]) as never);
+  const ledger = await runBatchPlan({
+    tool: 'composio_execute_tool',
+    composioSlug: 'X_STRUCTURED_FAILURE',
+    sideEffect: 'write',
+    objective: 'keep structured provider failures out of the success ledger',
+    items: [{ id: 'one', args: { a: 1 } }],
+  }, 'sess-batch-structured-failure');
+
+  assert.equal(ledger.failed, 1);
+  assert.equal(ledger.succeeded, 0);
+  assert.equal(ledger.outcomes[0]?.ok, false);
+  assert.match(ledger.outcomes[0]?.error ?? '', /upstream rejected/i);
+});
+
 test('certifyBatchPlan (J1 kill-switch OFF): judge unreachable → write/send fail CLOSED, read advisory (today\'s behavior)', async () => {
   // CLEMMY_JUDGE_CHAIN=off restores the pre-J1 single-lane path: one resolved
   // judge, ONE retry on a blip, then terminal fail-closed for write/send.

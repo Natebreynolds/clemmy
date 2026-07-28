@@ -6,6 +6,7 @@ import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
 import { fanoutLedgerEnabled, recordWorkerResult } from './fanout-ledger.js';
 import { runtimeToolAccountingMetadata, type RuntimeToolEffect } from './tool-effect.js';
+import { harnessRunContextStorage } from './brackets.js';
 
 /**
  * RunHooks → event log writer.
@@ -61,6 +62,11 @@ interface ToolCallLike {
 
 interface ToolDetails {
   toolCall?: ToolCallLike;
+}
+
+export interface EffectiveToolIdentity {
+  toolName: string | null;
+  args: unknown;
 }
 
 /**
@@ -128,69 +134,93 @@ function workerItemFromDetails(details: ToolDetails | undefined): string | null 
   }
 }
 
+function decodeEffectiveToolArgs(rawArgs: unknown): unknown {
+  if (typeof rawArgs !== 'string') return rawArgs;
+  const trimmed = rawArgs.trim();
+  if (!trimmed) return rawArgs;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return rawArgs;
+  }
+}
+
+function effectiveToolTail(toolName: string): string {
+  return toolName.split('__').at(-1) ?? toolName;
+}
+
 /**
- * The tool name reflection should attribute a fact to. For the generic
- * `composio_execute_tool` wrapper the real action slug (e.g.
- * SALESFORCE_GET_RECORD) lives in the call's `tool_slug` arg, not the tool
- * name — so attributing to the wrapper hides which system of record a fact
- * came from. Unwrap it to the slug so provenance is specific AND the
- * source-trust classifier can recognize a system of record. Pure; never
- * throws; falls back to the wrapper name.
+ * Recursively peel transport-only wrappers while preserving the arguments that
+ * belong to the resulting capability. Codex, BYO, and raw-Claude all flow
+ * through these hooks, so provenance/source trust sees the same exact action
+ * whether it was first-class or discovered behind `call_tool`.
+ */
+export function unwrapEffectiveToolIdentity(
+  toolName: string | null,
+  rawArgs: unknown,
+  depth = 0,
+): EffectiveToolIdentity {
+  if (!toolName) return { toolName: null, args: rawArgs };
+  if (depth > 8) return { toolName: effectiveToolTail(toolName), args: rawArgs };
+  const args = decodeEffectiveToolArgs(rawArgs);
+  const tail = effectiveToolTail(toolName);
+
+  if (tail === 'call_tool') {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return { toolName: tail, args };
+    }
+    const record = args as Record<string, unknown>;
+    const target = typeof record.name === 'string' ? record.name.trim() : '';
+    if (!target) return { toolName: tail, args };
+    return unwrapEffectiveToolIdentity(
+      target,
+      record.args_json ?? record.args ?? {},
+      depth + 1,
+    );
+  }
+
+  if (
+    tail === 'composio_execute_tool'
+    || (tail === 'execute_tool' && /composio/i.test(toolName))
+  ) {
+    const slug = args && typeof args === 'object' && !Array.isArray(args)
+      ? (args as Record<string, unknown>).tool_slug
+      : undefined;
+    return {
+      toolName: typeof slug === 'string' && slug.trim() ? slug.trim() : tail,
+      args,
+    };
+  }
+
+  if (tail.toLowerCase().startsWith('cx_')) {
+    const slug = tail.slice(3).trim();
+    return { toolName: slug ? slug.toUpperCase() : tail, args };
+  }
+
+  return { toolName, args };
+}
+
+/**
+ * The tool name reflection should attribute a fact to. Transport wrappers are
+ * recursively unwrapped so provenance is specific and the source-trust
+ * classifier can recognize the actual system-of-record action. Pure; never
+ * throws; falls back to the nearest usable wrapper name.
  */
 export function effectiveReflectionTool(toolName: string | null, details: ToolDetails | undefined): string | null {
-  // Schema-on-demand wrapper → the exact inner tool. Without this, a
-  // call_tool(composio_search_tools) return was attributed to "call_tool", so
-  // the reflection filter could not recognize catalog/status noise and spent a
-  // full extractor call learning zero durable facts.
-  if (toolName === 'call_tool') {
-    try {
-      const raw = details?.toolCall?.arguments;
-      if (typeof raw === 'string' && raw.trim()) {
-        const parsed = JSON.parse(raw) as { name?: unknown };
-        if (typeof parsed.name === 'string' && parsed.name.trim()) {
-          return parsed.name.trim();
-        }
-      }
-    } catch {
-      // fall through to the wrapper name
-    }
-    return toolName;
-  }
-  // Composio wrapper → its action slug (SALESFORCE_*, GOOGLEDRIVE_*).
-  if (toolName === 'composio_execute_tool') {
-    try {
-      const raw = details?.toolCall?.arguments;
-      if (typeof raw === 'string' && raw.trim()) {
-        const parsed = JSON.parse(raw) as { tool_slug?: unknown };
-        if (typeof parsed.tool_slug === 'string' && parsed.tool_slug.trim()) {
-          return parsed.tool_slug.trim();
-        }
-      }
-    } catch {
-      // fall through to the wrapper name
-    }
-    return toolName;
-  }
+  const identity = unwrapEffectiveToolIdentity(toolName, details?.toolCall?.arguments);
   // Native-CLI wrapper → the recognized connector binary (sf, gh). The command
-  // lives in the `command` arg, not the tool name — same shape as composio. We
-  // only unwrap KNOWN connector CLIs, so ordinary shell stays attributed to
-  // run_shell_command (no provenance churn for ls/git/npm/etc.).
-  if (toolName === 'run_shell_command') {
-    try {
-      const raw = details?.toolCall?.arguments;
-      if (typeof raw === 'string' && raw.trim()) {
-        const parsed = JSON.parse(raw) as { command?: unknown };
-        if (typeof parsed.command === 'string') {
-          const binary = cliBinaryFromCommand(parsed.command);
-          if (binary) return binary;
-        }
-      }
-    } catch {
-      // fall through to the wrapper name
+  // lives in the `command` arg, not the tool name. Only known connector CLIs
+  // unwrap; ordinary shell stays attributed to run_shell_command.
+  if (effectiveToolTail(identity.toolName ?? '') === 'run_shell_command') {
+    const command = identity.args && typeof identity.args === 'object' && !Array.isArray(identity.args)
+      ? (identity.args as Record<string, unknown>).command
+      : undefined;
+    if (typeof command === 'string') {
+      const binary = cliBinaryFromCommand(command);
+      if (binary) return binary;
     }
-    return toolName;
   }
-  return toolName;
+  return identity.toolName;
 }
 
 /**
@@ -385,6 +415,7 @@ export function attachEventLogHooks(
           // the system of record.
           tool: effectiveReflectionTool(tool?.name ?? null, details),
           output: resultStr,
+          scopeId: harnessRunContextStorage.getStore()?.behaviorScopeId,
         });
       }
     }

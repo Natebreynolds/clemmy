@@ -130,6 +130,34 @@ export const refreshSpace = (id: string, sourceId?: string) =>
     `/api/console/spaces/${encodeURIComponent(id)}/refresh`, sourceId ? { sourceId } : {},
   );
 
+/** Narrow operations used by the parent-owned Workspace iframe RPC bridge.
+ *  Auth stays here in the trusted console; authored view code never receives a
+ *  cookie, token, API URL, or general fetch capability. */
+export const getSpaceData = (id: string) =>
+  apiGet<{ data: unknown }>(`/api/console/spaces/${encodeURIComponent(id)}/data`).then((r) => r.data);
+
+export const addSpaceNote = (
+  id: string,
+  body: { text: string; kind?: string; meta?: Record<string, unknown> },
+) =>
+  apiPost<{ note: SpaceNote }>(`/api/console/spaces/${encodeURIComponent(id)}/notes`, body).then((r) => r.note);
+
+export const composeSpace = (
+  id: string,
+  body: { instructions: string; context?: unknown; maxChars?: number },
+) =>
+  apiPost<{ text: string }>(`/api/console/spaces/${encodeURIComponent(id)}/compose`, body).then((r) => r.text);
+
+export type SpaceActionResult =
+  | { pending: true; approvalId: string; subject?: string }
+  | { ok: true; result: unknown };
+
+export const executeSpaceAction = (
+  id: string,
+  body: { actionId: string; args: Record<string, unknown> },
+) =>
+  apiPost<SpaceActionResult>(`/api/console/spaces/${encodeURIComponent(id)}/action`, body);
+
 export const rollbackSpace = (id: string, version: number) =>
   apiPost<{ space: SpaceRecord }>(`/api/console/spaces/${encodeURIComponent(id)}/rollback`, { version });
 
@@ -204,8 +232,10 @@ export function latestRefreshFailures(audit: SpaceAudit[]): SpaceAudit[] {
   return [...latestByPath.values()].filter((a) => a.outcome === 'error').slice(0, 3);
 }
 
-/** Absolute URL the daemon serves the view at (same-origin → cookie-authed). */
-export const spaceViewUrl = (id: string) => `/console/spaces/${encodeURIComponent(id)}/view`;
+/** Absolute URL the daemon serves the view at. The request is cookie-authenticated
+ *  by the parent navigation, then the response CSP forces authored HTML into an
+ *  opaque-origin sandbox. */
+export const spaceViewUrl = (id: string) => `/console/spaces/${encodeURIComponent(id)}/view/`;
 
 /** The dedicated chat thread for a workspace's floating dock + re-engage. */
 export const spaceSessionId = (id: string) => `space-${id}`;

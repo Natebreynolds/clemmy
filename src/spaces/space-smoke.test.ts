@@ -65,3 +65,20 @@ test('smoke: a source returning [] is flagged empty (stays active, becomes a gap
   assert.equal(res.failed.length, 0);
   assert.deepEqual(res.empty, ['pull']);
 });
+
+test('smoke: an explicitly allowed empty source is healthy and idempotent', async () => {
+  const slug = 'smoke-expected-empty';
+  store.spaceStore.save({
+    id: slug,
+    title: 'New content calendar',
+    dataSources: [{ id: 'drafts', runner: 'empty.mjs', allowEmpty: true }],
+  });
+  writeRunner(slug, 'empty.mjs', 'process.stdout.write(JSON.stringify({rows:[]}))');
+
+  const first = await smoke.runSpaceCreationSmoke(slug);
+  const second = await smoke.runSpaceCreationSmoke(slug);
+  assert.deepEqual(first.failed, []);
+  assert.deepEqual(first.empty, []);
+  assert.deepEqual(second.failed, []);
+  assert.deepEqual(second.empty, []);
+});

@@ -73,6 +73,27 @@ test('returns ranked names + summaries and full schemas for the top hits', async
   assert.ok(first && typeof first === 'object' && ('properties' in first || 'type' in first), 'schema looks like JSON Schema');
 });
 
+test('an explicitly named tool survives a one-result limit ahead of stronger lexical neighbors', async () => {
+  const previousDisabled = process.env.EMBEDDINGS_DISABLED;
+  process.env.EMBEDDINGS_DISABLED = 'true';
+  try {
+    const t = captureToolSearch();
+    const raw = await t.handler({
+      query: 'space_save exact input schema create Workspace with title slug HTML view and runner data source code',
+      limit: 1,
+    });
+    const out = JSON.parse(raw.content[0].text) as {
+      results: Array<{ name: string }>;
+      schemas: Record<string, unknown>;
+    };
+    assert.deepEqual(out.results.map((result) => result.name), ['space_save']);
+    assert.deepEqual(Object.keys(out.schemas), ['space_save']);
+  } finally {
+    if (previousDisabled === undefined) delete process.env.EMBEDDINGS_DISABLED;
+    else process.env.EMBEDDINGS_DISABLED = previousDisabled;
+  }
+});
+
 test('an explicitly searched large schema survives the output budget instead of forcing an invalid probe call', async () => {
   const t = captureToolSearch();
   const raw = await t.handler({

@@ -73,6 +73,45 @@ test('steady events keep the turn alive even when each gap is near the threshold
   assert.deepEqual(out.finalOutput, { ok: true });
 });
 
+test('buffered private reasoning keeps the watchdog alive without entering Runner history', async () => {
+  const { harnessRunContextStorage, withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
+  let resolveCompleted!: () => void;
+  const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+  const result = {
+    history: [],
+    lastResponseId: 'resp_private_reasoning',
+    finalOutput: { ok: true },
+    rawResponses: [],
+    completed,
+    async *[Symbol.asyncIterator]() {
+      const timer = setInterval(() => {
+        const context = harnessRunContextStorage.getStore();
+        if (context) context.privateModelActivityAt = Date.now();
+      }, 75);
+      try {
+        // More than 2x the configured 300ms first-byte window, with zero public
+        // stream events. Only the private reasoning liveness channel can keep it
+        // alive; the fallback later flushes real reasoning if a tool/text commits.
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      } finally {
+        clearInterval(timer);
+      }
+      resolveCompleted();
+    },
+  };
+  const context = {
+    sessionId: 'private-reasoning-watchdog',
+    counter: new ToolCallsCounter(8),
+  };
+
+  const out = await withHarnessRunContext(
+    context,
+    () => __defaultRunRunner(runnerFor(result), {} as never, [], {} as never),
+  );
+  assert.deepEqual(out.finalOutput, { ok: true });
+  assert.equal(typeof context.privateModelActivityAt, 'number');
+});
+
 test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Claude tool-turn hang)', async () => {
   // Tool-turn hang regression: the first model call produced ZERO events for the window
   // (a silent/wedged Claude stream). With pre-content retry, the SECOND call

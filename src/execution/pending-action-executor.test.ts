@@ -70,6 +70,44 @@ test('approved single-call executes the EXACT stored payload via the dispatcher'
   assert.match(res.resultSummary, /Outcome is already recorded.*Do not call pending_action_get or pending_action_record_result/);
 });
 
+test('five concurrent executors claim once, dispatch exactly once, and an executed retry stays inert', async () => {
+  const record = queueSingleCall();
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('concurrent single call'));
+
+  let dispatchCount = 0;
+  const dispatch = async () => {
+    dispatchCount += 1;
+    // Keep the winning attempt in EXECUTING long enough for every losing
+    // Promise to observe the durable claim.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return 'OK one authoritative send';
+  };
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => executeApprovedPendingActionCall(record.id, { dispatch })),
+  );
+
+  assert.equal(dispatchCount, 1, 'the approved payload crossed the dispatcher exactly once');
+  assert.equal(results.filter((result) => result.status === 'executed').length, 1, 'one caller owns the result');
+  const losers = results.filter((result) => result.status === 'skipped');
+  assert.equal(losers.length, 4, 'all concurrent losers are truthful skips');
+  for (const loser of losers) {
+    assert.match(loser.resultSummary, /execution claim|in progress|uncertain/i);
+    assert.match(loser.resultSummary, /no second dispatch|not be retried automatically/i);
+  }
+  assert.equal(getPendingAction(record.id)?.status, 'executed');
+
+  let retryDispatchCount = 0;
+  const retry = await executeApprovedPendingActionCall(record.id, {
+    dispatch: async () => {
+      retryDispatchCount += 1;
+      return 'must never happen';
+    },
+  });
+  assert.equal(retry.status, 'skipped');
+  assert.equal(retryDispatchCount, 0, 'an executed action is never dispatched again');
+  assert.match(retry.resultSummary, /already executed|must be APPROVED/i);
+});
+
 test('a NOT-approved pending action is not executed', async () => {
   const record = queueSingleCall(); // status stays 'queued'
   let fired = false;
@@ -116,4 +154,23 @@ test('a gate-refused dispatch is recorded FAILED, never executed (2026-07-22 fal
   assert.equal(dispatchOutputIndicatesRefusal('[provider-dispatch:not-started:execution_wrap]'), true);
   // A provider message that merely MENTIONS a block deep in content stays success.
   assert.equal(dispatchOutputIndicatesRefusal('{"data": {"text": "' + 'x'.repeat(700) + ' SEND BLOCKED — standing sender constraint"}}'), false);
+});
+
+test('a structured provider failure is recorded FAILED, never executed', async () => {
+  const record = queueSingleCall();
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('provider failed call'));
+
+  const res = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-pae',
+    dispatch: async () => ({
+      success: false,
+      error: 'provider rejected the request before creating the resource',
+    }),
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 'failed');
+  assert.match(res.resultSummary, /provider reported|provider rejected/i);
+  assert.equal(getPendingAction(record.id)?.status, 'failed', 'the durable action must not claim a failed provider result executed');
+  assert.match(getPendingAction(record.id)?.resultSummary ?? '', /provider rejected/i);
 });

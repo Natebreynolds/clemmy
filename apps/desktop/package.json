@@ -122,6 +122,7 @@
         ]
       }
     ],
+    "afterPack": "build/after-pack.cjs",
     "afterSign": "build/notarize.cjs",
     "afterAllArtifactBuild": "build/after-all-artifact-build.cjs",
     "mac": {

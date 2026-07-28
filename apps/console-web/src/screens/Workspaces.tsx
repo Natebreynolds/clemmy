@@ -6,9 +6,10 @@ import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
-import { listSpaces, spaceViewUrl, type SpaceRecord } from '@/lib/spaces';
+import { listSpaces, type SpaceRecord } from '@/lib/spaces';
 import { humanizeCron } from '@/lib/cron';
 import { CreateWorkspaceModal } from '@/components/workspaces/CreateWorkspaceModal';
+import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 
 function statusTone(status: SpaceRecord['status']): Tone {
   if (status === 'active') return 'success';
@@ -36,18 +37,23 @@ function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => vo
   const health = space.health;
   const healthStatus = healthLabel(space);
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="group flex flex-col overflow-hidden rounded-2xl border border-border bg-surface text-left shadow-xs transition-all duration-fast hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md cursor-pointer"
-    >
+    <article className="group relative flex flex-col overflow-hidden rounded-2xl border border-border bg-surface text-left shadow-xs transition-all duration-fast hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md">
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-label={`Open ${space.title} workspace`}
+        className="absolute inset-0 z-20 rounded-2xl cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset"
+      >
+        <span className="sr-only">Open {space.title} workspace</span>
+      </button>
       {/* Live preview — a scaled, non-interactive snapshot of the actual view. */}
       <div className="relative h-40 w-full overflow-hidden border-b border-border bg-subtle">
-        <iframe
+        <WorkspaceFrame
+          id={space.id}
           title={`${space.title} preview`}
-          src={spaceViewUrl(space.id)}
           tabIndex={-1}
-          aria-hidden
+          ariaHidden
+          readOnly
           className="pointer-events-none absolute left-0 top-0 origin-top-left"
           style={{ width: '250%', height: '250%', transform: 'scale(0.4)', border: 0 }}
         />
@@ -92,7 +98,7 @@ function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => vo
           </p>
         )}
       </div>
-    </button>
+    </article>
   );
 }
 

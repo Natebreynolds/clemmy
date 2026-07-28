@@ -390,7 +390,10 @@ export function buildScopedLocalToolSearch(allowedNames: ReadonlySet<string>): T
       captured.push({ name, description, parameters, handler });
     },
   };
-  registerToolSearchTool(fakeServer as unknown as McpServer, { allowedNames });
+  registerToolSearchTool(fakeServer as unknown as McpServer, {
+    allowedNames,
+    dispatchViaCallTool: true,
+  });
   const localTool = captured[0];
   if (!localTool) throw new Error('tool_search did not register');
   return localToolToRuntimeTool(localTool);

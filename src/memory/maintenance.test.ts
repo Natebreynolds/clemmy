@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-maint-test-'));
 
 const {
+  finalizeExtractedFactEntityEvidenceOnBoot,
   finalizeGroundedEntityLinksOnBoot,
   finalizeGroundedResourceLinksOnBoot,
   finalizeLegacyReflectionCandidatesOnBoot,
@@ -219,6 +220,60 @@ test('boot graph finalization backs up first and promotes only excerpt-grounded 
   const repeat = finalizeGroundedEntityLinksOnBoot();
   assert.equal(repeat.reason, 'already_finalized');
   assert.equal(repeat.ran, false, 'restart never replays the one-time migration repair');
+});
+
+test('boot extracted-link finalization backs up first and attaches one deterministic evidence episode', () => {
+  resetMemoryDb();
+  const fact = rememberFact({
+    kind: 'project',
+    content: 'Dana Smith approved the Northstar launch review.',
+    derivedFrom: {
+      sessionId: 'boot-extracted-repair-session',
+      callId: 'boot-extracted-repair-call',
+      tool: 'meeting_lookup',
+    },
+  });
+  const episode = recordMemoryEpisode({
+    kind: 'user_turn',
+    sourceApp: 'chat',
+    occurredAt: '2026-07-15T12:00:00.000Z',
+    content: 'Dana Smith approved the Northstar launch review.',
+  });
+  linkFactEvidence({
+    factId: fact.id,
+    episodeId: episode.id,
+    excerpt: 'Dana Smith approved the Northstar launch review.',
+  });
+  const dana = upsertEntity({ type: 'person', name: 'Dana Smith' });
+  setFactEntityLinks(fact.id, [dana], {
+    linkType: 'extracted',
+    confidence: 0.9,
+    evidenceExcerpt: 'legacy excerpt without its episode id',
+  });
+
+  const result = finalizeExtractedFactEntityEvidenceOnBoot();
+  assert.equal(result.reason, 'reconciled');
+  assert.equal(result.ran, true);
+  assert.equal(result.candidatesBefore, 1);
+  assert.equal(result.candidatesAfter, 0);
+  assert.equal(result.reconciliation?.repaired, 1);
+  assert.equal(result.reconciliation?.downgraded, 0);
+  assert.ok(result.backupPath && existsSync(result.backupPath), 'reversible backup exists before evidence repair');
+  assert.deepEqual(
+    openMemoryDb().prepare(`
+      SELECT link_type, evidence_episode_id, evidence_excerpt
+      FROM fact_entities WHERE fact_id = ? AND entity_id = ?
+    `).get(fact.id, dana),
+    {
+      link_type: 'extracted',
+      evidence_episode_id: episode.id,
+      evidence_excerpt: 'Dana Smith approved the Northstar launch review.',
+    },
+  );
+
+  const repeat = finalizeExtractedFactEntityEvidenceOnBoot();
+  assert.equal(repeat.reason, 'already_converged');
+  assert.equal(repeat.ran, false, 'converged restarts need neither a mutation nor another backup');
 });
 
 test('boot resource finalization backs up first and promotes only unique excerpt-grounded links once', () => {

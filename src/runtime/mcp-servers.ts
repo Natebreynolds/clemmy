@@ -6,6 +6,10 @@ import { discoverMcpServers } from './mcp-config.js';
 import { mergedSpawnEnv } from './spawn-env.js';
 import { createMcpNamespaceShim, parseNamespacedTool, slugifyServerName } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
+import {
+  mcpServerAliasMatches,
+  mcpToolAllowedByScope,
+} from './mcp-tool-authority.js';
 import { rankToolsBySemantic, semanticToolRankEnabled } from './mcp-tool-rank.js';
 import { isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { listToolChoices, type ToolChoiceRecord, type ToolChoiceRecordChoice } from '../memory/tool-choice-store.js';
@@ -199,17 +203,9 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
  * AND through registry.ts would create dup tools the model has to
  * disambiguate between (memory_remember vs clementine-local__memory_remember).
  */
-function normalizeServerSlug(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
-}
-
 function serverMatchesAllowedSlugs(server: ManagedMcpServer, allowedServerSlugs?: string[]): boolean {
   if (!allowedServerSlugs || allowedServerSlugs.length === 0) return true;
-  const name = normalizeServerSlug(server.name);
-  return allowedServerSlugs.some((slug) => {
-    const normalized = normalizeServerSlug(slug);
-    return normalized.length > 0 && (name === normalized || name.includes(normalized) || normalized.includes(name));
-  });
+  return allowedServerSlugs.some((slug) => mcpServerAliasMatches(server.name, slug));
 }
 
 function buildRawMcpServers(options: { excludeLocal?: boolean; allowedServerSlugs?: string[] } = {}): MCPServer[] {
@@ -313,6 +309,21 @@ function createScopedExternalShim(
   scope: McpToolScope,
   opts: { semantic?: boolean } = {},
 ): MCPServer {
+  let selectedToolNames: Set<string> | null = null;
+  const listScopedTools = async () => {
+    const tools = await base.listTools();
+    // T1: on the fail-open surface, rank the user's connected tools by
+    // semantic relevance to the query (returns undefined → keyword/index
+    // order, zero behavior change). Only the fresh per-query fail-open shim
+    // sets semantic:true — cached keyword shims hold a stale query and must
+    // not.
+    const semanticScores = opts.semantic
+      ? await rankToolsBySemantic(scope.queryText, tools)
+      : undefined;
+    const selected = filterMcpToolsForScope(tools, scope, semanticScores);
+    selectedToolNames = new Set(selected.map((tool) => tool.name));
+    return selected;
+  };
   return {
     cacheToolsList: base.cacheToolsList,
     toolFilter: base.toolFilter,
@@ -327,21 +338,24 @@ function createScopedExternalShim(
       // processes. Per-scope wrappers are cheap views and must not close it.
     },
     async listTools() {
-      const tools = await base.listTools();
-      // T1: on the fail-open surface, rank the user's connected tools by
-      // semantic relevance to the query (returns undefined → keyword/index
-      // order, zero behavior change). Only the fresh per-query fail-open shim
-      // sets semantic:true — cached keyword shims hold a stale query and must
-      // not.
-      const semanticScores = opts.semantic
-        ? await rankToolsBySemantic(scope.queryText, tools)
-        : undefined;
-      return filterMcpToolsForScope(tools, scope, semanticScores);
+      return listScopedTools();
     },
     async callTool(toolName, args) {
+      // Models can remember or guess a namespaced tool that was not advertised
+      // this turn. Treat the filtered list as executable authority too: server
+      // slug/pattern checks reject cheaply, while exact membership also
+      // enforces maxTools/semantic caps before the base shim can dispatch.
+      if (!mcpToolAllowedByScope(toolName, scope)) {
+        throw new Error(`external MCP tool is outside this turn's scope: ${toolName}`);
+      }
+      if (!selectedToolNames) await listScopedTools();
+      if (!selectedToolNames?.has(toolName)) {
+        throw new Error(`external MCP tool was not selected for this turn: ${toolName}`);
+      }
       return base.callTool(toolName, args);
     },
     async invalidateToolsCache() {
+      selectedToolNames = null;
       await base.invalidateToolsCache?.();
     },
   };
@@ -526,13 +540,17 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
     return ensureAllExternalBaseShim();
   }
 
-  // Fail-open BEFORE the empty-shim guard: a failOpenCandidate scope has no
-  // allowedServerSlugs (by design) but must still reach the user's servers.
+  if (scope.maxTools === 0) {
+    return emptyExternalShim;
+  }
+
+  // Fail-open BEFORE the empty-SLUG guard: a positive-width failOpenCandidate
+  // has no allowedServerSlugs (by design) but must reach the user's servers.
   if (scope.failOpenCandidate) {
     return getOrCreateFailOpenExternalShim(scope);
   }
 
-  if ((scope.maxTools ?? 0) === 0 || (scope.allowedServerSlugs ?? []).length === 0) {
+  if ((scope.allowedServerSlugs ?? []).length === 0) {
     return emptyExternalShim;
   }
 
@@ -560,9 +578,22 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
  * The exact namespace also keeps on-demand dispatch narrow: one named server is
  * connected, never every configured MCP server.
  */
-export function getOrCreateExternalMcpServerForTool(toolName: string): MCPServer {
+export function getOrCreateExternalMcpServerForTool(
+  toolName: string,
+  scope?: McpToolScope | null,
+): MCPServer {
   const parsed = parseNamespacedTool(toolName);
   if (!parsed) throw new Error(`Malformed namespaced MCP tool name: "${toolName}".`);
+  if (scope !== undefined) {
+    if (!mcpToolAllowedByScope(toolName, scope)) {
+      throw new Error(`External MCP tool is outside this turn's scope: "${toolName}".`);
+    }
+    return getOrCreateExternalMcpServers(scope ?? {
+      reason: 'explicit no-external-tools scope',
+      allowedServerSlugs: [],
+      maxTools: 0,
+    });
+  }
   const configured = enabledExternalServers().find(
     (server) => slugifyServerName(server.name) === parsed.serverSlug,
   );
@@ -669,6 +700,12 @@ export function listRawMcpServers(): MCPServer[] {
 }
 
 export const mcpServersTestHooks = {
+  scopedView(
+    base: MCPServer,
+    scope: McpToolScope,
+  ): MCPServer {
+    return createScopedExternalShim(base, scope);
+  },
   cacheState(): {
     allExternalBaseCreated: boolean;
     scopedExternalBaseKeys: string[];

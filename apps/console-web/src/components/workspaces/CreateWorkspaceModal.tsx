@@ -46,6 +46,8 @@ export function CreateWorkspaceModal({
   const [error, setError] = useState<string | null>(null);
   const [starters, setStarters] = useState<StarterRecipe[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -54,11 +56,11 @@ export function CreateWorkspaceModal({
     setError(null);
     setCreating(false);
     listStarterRecipes().then(setStarters).catch(() => setStarters([]));
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current(); };
     window.addEventListener('keydown', onKey);
     requestAnimationFrame(() => textareaRef.current?.focus());
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 

@@ -169,6 +169,128 @@ const COMM_OBJECTS: ReadonlySet<string> = new Set([
 // no add-a-communication send verb.
 const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND', 'POST']);
 
+/**
+ * Provider-catalog actions whose published operation is read-only even though
+ * the action name is noun-shaped and therefore carries no GET/LIST/SEARCH
+ * evidence. Keep this exact and intentionally small: an unfamiliar external
+ * action still fails closed, while known catalog reads do not acquire
+ * execution ceremony merely because a vendor omitted a verb.
+ *
+ * Keys are punctuation-insensitive so the same catalog action matches the
+ * Composio wrapper (`SLACK_CONVERSATIONS_HISTORY`), a dynamic tool
+ * (`cx_slack_conversations_history`), and a native MCP namespace
+ * (`mcp__slack__conversations_history`).
+ */
+const DOCUMENTED_READ_ONLY_EXTERNAL_ACTIONS: ReadonlySet<string> = new Set([
+  'SLACKCONVERSATIONSHISTORY',
+  'TWITTERUSERTIMELINE',
+  'GOOGLEDRIVEDOWNLOADFILE',
+]);
+
+interface CanonicalExternalAction {
+  /** Canonical provider action, not its transport wrapper. */
+  action?: string;
+  /** True only when the carrier is known to cross an external boundary. */
+  external: boolean;
+}
+
+function decodedArgs(rawArgs: unknown): unknown {
+  if (typeof rawArgs !== 'string') return rawArgs;
+  const trimmed = rawArgs.trim();
+  if (!trimmed) return rawArgs;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return rawArgs;
+  }
+}
+
+function mcpToolTail(toolName: string): string {
+  return toolName.split('__').at(-1) ?? toolName;
+}
+
+function isClementineLocalMcpName(toolName: string): boolean {
+  if (!toolName.startsWith('mcp__')) return false;
+  const server = toolName.slice(5).split('__')[0] ?? '';
+  return /^(?:clementine(?:-local)?|clem(?:entine)?_local)$/i.test(server);
+}
+
+/**
+ * Resolve transport wrappers before effect classification. This is the one
+ * carrier normalizer for execution safety: broker calls, dynamic `cx_*`
+ * tools, namespaced MCP tools, and deferred `call_tool` dispatch all land on
+ * the same provider action identity.
+ */
+function canonicalExternalAction(
+  toolName: string,
+  rawArgs: unknown,
+  depth = 0,
+): CanonicalExternalAction {
+  if (depth > 8) return { external: true };
+  const args = decodedArgs(rawArgs);
+  const tail = mcpToolTail(toolName);
+
+  if (tail === 'call_tool') {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return { external: false };
+    }
+    const record = args as Record<string, unknown>;
+    const target = typeof record.name === 'string' ? record.name.trim() : '';
+    if (!target) return { external: false };
+    return canonicalExternalAction(target, record.args_json ?? record.args ?? {}, depth + 1);
+  }
+
+  const namespace = toolName.startsWith('mcp__')
+    ? toolName.slice(5).split('__')
+    : [];
+  const server = namespace.slice(0, -1).join('__');
+  const composioCarrier = tail === 'composio_execute_tool'
+    || (tail === 'execute_tool' && /composio/i.test(server));
+  if (composioCarrier) {
+    return { external: true, action: extractToolSlug(args) };
+  }
+
+  if (tail.toLowerCase().startsWith('cx_')) {
+    const action = tail.slice(3).trim();
+    return { external: true, ...(action ? { action: action.toUpperCase() } : {}) };
+  }
+
+  if (toolName.startsWith('mcp__')) {
+    // Clementine's own MCP namespace contains local memory/files/control tools.
+    // Only its explicit external carriers above cross the provider boundary.
+    if (isClementineLocalMcpName(toolName)) return { external: false };
+    const action = [server, tail].filter(Boolean).join('_');
+    return { external: true, ...(action ? { action } : {}) };
+  }
+
+  // Bare native tools are not distinguishable from local runtime tools. Keep
+  // the established high-confidence send floor; every namespaced MCP action
+  // takes the fail-closed path above.
+  if (isIrreversibleSendSlug(toolName)) return { external: true, action: toolName };
+  return { external: false };
+}
+
+function documentedReadOnlyExternalAction(action: string): boolean {
+  const key = action.toUpperCase().replace(/[^A-Z0-9]+/g, '');
+  return DOCUMENTED_READ_ONLY_EXTERNAL_ACTIONS.has(key);
+}
+
+/** One shared effect classifier after transport normalization. */
+function canonicalExternalActionIsWrite(action: string | undefined): boolean {
+  // A known external carrier with no usable action identity is not provably a
+  // read. This is the safety boundary: malformed wrappers and newly introduced
+  // mutation verbs cannot bypass execution wrapping.
+  if (!action) return true;
+  const normalized = action.toUpperCase();
+  if (documentedReadOnlyExternalAction(normalized)) return false;
+  for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
+    if (pattern.test(normalized)) return false;
+  }
+  if (composioSlugIsReadOnly(normalized)) return false;
+  if (isReadOnlyCallAction(normalized)) return false;
+  return true;
+}
+
 /** THE canonical "is this an irreversible external send" predicate — the one
  *  chokepoint classifier every dispatch lane routes through. A DRAFT is
  *  reversible; a SEND/PUBLISH/CALL verb is a send; a CREATE/MAKE/RESPOND/POST
@@ -195,46 +317,12 @@ export function isMutatingExternalWrite(
   rawArgs: unknown,
 ): boolean {
   // Internal exempt tools never trigger the gate.
-  if (EXEMPT_TOOL_NAMES.has(toolName)) return false;
+  if (EXEMPT_TOOL_NAMES.has(mcpToolTail(toolName))) return false;
 
-  if (toolName === 'composio_execute_tool') {
-    // Args shape: { tool_slug: 'GOOGLESHEETS_VALUES_UPDATE', arguments: '...', connected_account_id?: '...' }
-    const slug = extractToolSlug(rawArgs);
-    if (!slug) return false; // Can't classify → don't block. Fail-open.
-    // Known-exempt slug patterns (DataForSEO task creation, Firecrawl reads).
-    for (const pattern of EXEMPT_COMPOSIO_SLUG_PATTERNS) {
-      if (pattern.test(slug)) return false;
-    }
-    // Use the provider boundary's canonical action classifier before the
-    // conservative mutation-token scan. Compound read actions such as
-    // GOOGLESHEETS_BATCH_GET contain the noun BATCH but are still reads; the
-    // old scan mislabeled their verification readback as another external
-    // write, polluting scope, approval, and completion evidence.
-    if (composioSlugIsReadOnly(slug)) return false;
-    // CALL is also a communication object. GONG_GET_CALL_TRANSCRIPT and
-    // VAPI_RETRIEVE_CALL are reads; another mutation verb still wins.
-    if (isReadOnlyCallAction(slug)) return false;
-    // Mutating verb anywhere in the slug path?
-    const parts = slug.split('_');
-    for (const part of parts) {
-      if (MUTATING_VERBS.has(part)) return true;
-    }
-    // An irreversible send whose verb isn't in MUTATING_VERBS (RESPOND_TO_EVENT
-    // RSVP, a CREATE/RESPOND + comm-object) must still be seen as mutating so
-    // the send floor gets a chance (2026-07-09 unification).
-    if (isIrreversibleSendSlug(slug)) return true;
-    return false;
-  }
-
-  // Native MCP tools (e.g. outlook_send_mail, make_outbound_call, create_call,
-  // slack post_message) bypass composio_execute_tool but are still irreversible
-  // external actions. The 2026-07-09 bypass hunt found these ungated on the MCP
-  // shim lane. Name-shape match on the bare tool name (server prefix stripped
-  // upstream): a send/publish/post/dispatch verb.
-  if (looksLikeNativeMcpSend(toolName)) return true;
-
-  // Everything else is NOT gated for now. Extension points above.
-  return false;
+  const canonical = canonicalExternalAction(toolName, rawArgs);
+  return canonical.external
+    ? canonicalExternalActionIsWrite(canonical.action)
+    : false;
 }
 
 /**

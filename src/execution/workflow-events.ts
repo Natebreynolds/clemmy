@@ -372,7 +372,12 @@ export interface ResumeState {
   completedSteps: Map<string, unknown>;
   /** Per-step Set of itemKeys that succeeded in forEach iterations. */
   completedItems: Map<string, Map<string, unknown>>;
-  /** Step that was in flight at last event (may have crashed). */
+  /** Every step whose latest lifecycle is started/failed but not completed.
+   *  Graph batches run concurrently, so crash recovery must retain the whole
+   *  set rather than whichever step_started event happened to land last. */
+  inFlightStepIds: Set<string>;
+  /** Most recently started member of inFlightStepIds. Retained as a
+   *  compatibility/UI cursor; safety decisions must use the full set. */
   inFlightStepId?: string;
   /** Step IDs whose MOST-RECENT lifecycle event is step_failed — i.e. currently
    *  sitting in a parked/failed state, NOT subsequently re-started. A later
@@ -396,6 +401,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
   const completedSteps = new Map<string, unknown>();
   const completedItems = new Map<string, Map<string, unknown>>();
   const failedSteps = new Set<string>();
+  const inFlightStepIds = new Set<string>();
   let inFlightStepId: string | undefined;
   let lastEventAt: string | undefined;
   let terminal = false;
@@ -406,6 +412,10 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
       terminal = true;
     }
     if (ev.kind === 'step_started' && ev.stepId) {
+      // Refresh insertion order on a re-start so the compatibility cursor can
+      // fall back to the most recently started remaining branch.
+      inFlightStepIds.delete(ev.stepId);
+      inFlightStepIds.add(ev.stepId);
       inFlightStepId = ev.stepId;
       // A re-start clears any prior parked/failed state: a crash AFTER this
       // step_started is a REAL crash (e.g. a post-approval send that died
@@ -421,7 +431,10 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
         : ev.output;
       completedSteps.set(ev.stepId, output);
       failedSteps.delete(ev.stepId);
-      if (inFlightStepId === ev.stepId) inFlightStepId = undefined;
+      inFlightStepIds.delete(ev.stepId);
+      if (inFlightStepId === ev.stepId) {
+        inFlightStepId = Array.from(inFlightStepIds).at(-1);
+      }
     }
     if (ev.kind === 'item_completed' && ev.stepId && ev.itemKey) {
       let inner = completedItems.get(ev.stepId);
@@ -430,7 +443,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     }
   }
 
-  return { completedSteps, completedItems, failedSteps, inFlightStepId, lastEventAt, terminal };
+  return { completedSteps, completedItems, failedSteps, inFlightStepIds, inFlightStepId, lastEventAt, terminal };
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -507,7 +520,7 @@ export function reconstructWorkflowRunQueue(
       let status: RunQueueStepStatus;
       if (state.failedSteps.has(step.id) || failedItemCount > 0) status = 'failed';
       else if (state.completedSteps.has(step.id)) status = 'done';
-      else if (state.inFlightStepId === step.id) status = 'running';
+      else if (state.inFlightStepIds.has(step.id)) status = 'running';
       else if (deps.every((d) => state.completedSteps.has(d))) status = 'queued';
       else status = 'blocked';
 

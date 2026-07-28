@@ -18,7 +18,13 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-fallover-tel-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { withModelFallback } = await import('./fallback-model.js');
+const {
+  clearRateLimitedBrainsForTest,
+  markBrainAuthDead,
+  markBrainRateLimited,
+  reviveDeadBrains,
+  withModelFallback,
+} = await import('./fallback-model.js');
 const { listOperationalEvents } = await import('../operational-telemetry.js');
 type FallbackTarget = import('./fallback-model.js').FallbackTarget;
 
@@ -40,6 +46,10 @@ function target(label: string, m: Model): FallbackTarget {
   return { label, getModel: () => m };
 }
 
+function identifiedTarget(label: string, provider: string, modelId: string, m: Model): FallbackTarget {
+  return { label, provider, model: modelId, getModel: () => m };
+}
+
 test('model_fallover telemetry carries sessionId + workflowRunId + stage=router', async () => {
   const overloaded = model({ getResponse: async () => { throw { statusCode: 529, message: 'overloaded_error' }; } });
   const healthy = model({ getResponse: async () => resp('recovered') });
@@ -57,4 +67,66 @@ test('model_fallover telemetry carries sessionId + workflowRunId + stage=router'
   assert.equal((rows[0].payload as { stage?: string }).stage, 'router');
   assert.equal((rows[0].payload as { from?: string }).from, 'primary');
   assert.equal((rows[0].payload as { to?: string }).to, 'backup');
+});
+
+test('preselected auth rescue emits fallover telemetry with the exact winning provider/model', async () => {
+  reviveDeadBrains();
+  try {
+    markBrainAuthDead('auth-primary', 'model.auth_expired');
+    let primaryCalls = 0;
+    const primary = model({ getResponse: async () => { primaryCalls += 1; return resp('must not run'); } });
+    const rescue = model({ getResponse: async () => resp('auth rescued') });
+    const out = await withModelFallback([
+      identifiedTarget('auth-primary', 'claude', 'claude-opus-4-8', primary),
+      identifiedTarget('auth-rescue', 'openai', 'gpt-5.6-mini', rescue),
+    ], { sessionId: 'sess-preselected-auth' }).getResponse(req());
+    assert.ok(out);
+    assert.equal(primaryCalls, 0);
+
+    const rows = listOperationalEvents({ sessionId: 'sess-preselected-auth', limit: 20 })
+      .filter((event) => event.type === 'model_fallover');
+    assert.equal(rows.length, 1, 'a preselected rescue is visible just like an in-call switch');
+    assert.deepEqual(rows[0].payload, {
+      from: 'auth-primary',
+      to: 'auth-rescue',
+      fromProvider: 'claude',
+      fromModel: 'claude-opus-4-8',
+      toProvider: 'openai',
+      toModel: 'gpt-5.6-mini',
+      resolvedProvider: 'openai',
+      resolvedModel: 'gpt-5.6-mini',
+      reason: 'preselected-auth-dead',
+      stage: 'router',
+      preselected: true,
+    });
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('preselected rate-limit rescue emits exact target telemetry without probing the benched lane', async () => {
+  clearRateLimitedBrainsForTest();
+  try {
+    markBrainRateLimited('rate-primary', { statusCode: 429, message: 'rate_limited' });
+    let primaryCalls = 0;
+    const primary = model({ getResponse: async () => { primaryCalls += 1; return resp('must not run'); } });
+    const rescue = model({ getResponse: async () => resp('rate rescued') });
+    await withModelFallback([
+      identifiedTarget('rate-primary', 'zai', 'glm-5.2', primary),
+      identifiedTarget('rate-rescue', 'openai', 'gpt-5.6-nano', rescue),
+    ], { sessionId: 'sess-preselected-rate', falloverOn429: true }).getResponse(req());
+    assert.equal(primaryCalls, 0);
+
+    const [row] = listOperationalEvents({ sessionId: 'sess-preselected-rate', limit: 20 })
+      .filter((event) => event.type === 'model_fallover');
+    assert.ok(row);
+    const payload = row.payload as Record<string, unknown>;
+    assert.equal(payload.reason, 'preselected-rate-limited');
+    assert.equal(payload.toProvider, 'openai');
+    assert.equal(payload.toModel, 'gpt-5.6-nano');
+    assert.equal(payload.resolvedModel, 'gpt-5.6-nano');
+    assert.equal(payload.preselected, true);
+  } finally {
+    clearRateLimitedBrainsForTest();
+  }
 });

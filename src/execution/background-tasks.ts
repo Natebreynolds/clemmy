@@ -2969,8 +2969,9 @@ async function verifyBackgroundTaskDelivery(
   // background runs (the trust-critical lane: a bound goal contract exists). The fix
   // for the 2026-07-08 "shipped 5 BLANK Google Sheets as done" — the judge only saw
   // the model's claims. A CONFIRMED probe failure blocks completion with the SPECIFIC
-  // gap. Best-effort per class (an unprobeable artifact preserves the durable
-  // creation evidence but cannot manufacture a failure). Kill:
+  // gap. Requirement-sensitive: an unprobeable existence-only artifact keeps
+  // its creation receipt, but an unprobeable REQUIRED population/readback can
+  // never manufacture proof of completion. Kill:
   // CLEMMY_DELIVERABLE_PROBES=off.
   if (deliverableProbesEnabled()) {
     try {
@@ -2988,8 +2989,10 @@ async function verifyBackgroundTaskDelivery(
         }
       }
     } catch {
-      // A probe error must NEVER manufacture a failure. The durable creation
-      // evidence above still governs whether a promised deliverable exists.
+      // The probe module converts requirement-sensitive readback failures into
+      // verdicts. This outer catch is only a module-level availability backstop;
+      // existing durable evidence continues to govern if the verifier itself
+      // could not be invoked at all.
     }
   }
 

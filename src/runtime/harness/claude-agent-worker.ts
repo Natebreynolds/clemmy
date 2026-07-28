@@ -7,6 +7,11 @@ import {
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
+import type { McpToolScope } from '../mcp-tool-scope.js';
+import {
+  externalMcpScopeFromResolvedTools,
+  intersectExternalMcpToolScopes,
+} from '../../agents/external-mcp-scope-lock.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -89,6 +94,7 @@ export async function runClaudeAgentSdkWorker(
   modelId: string,
   sessionId?: string,
   sourceUserSeq?: number,
+  parentMcpToolScope?: McpToolScope | null,
 ): Promise<ClaudeAgentSdkWorkerResult> {
   // Agentic only with the PARENT session id — the gates + plan-scope + execution
   // lane aggregate across the worker fan-out via the shared session (one batch
@@ -103,6 +109,15 @@ export async function runClaudeAgentSdkWorker(
   // is off or the intent is ordinary.
   const resolvedMaxTurns = guard ? resolveWorkerMaxTurns(input.intent, maxTurns()) : maxTurns();
   const trackerScopeId = sid ? `${sid}::worker:${workerPacketKey(input)}` : undefined;
+  const packetMcpToolScope = externalMcpScopeFromResolvedTools(input.resolvedTools);
+  // A child can narrow parent authority but never widen it. Broad parent
+  // scopes (allowAll/fail-open) yield to the packet's exact resolved server;
+  // concrete/local-only parent scopes remain the hard outer boundary.
+  const nativeMcpToolScope = intersectExternalMcpToolScopes(
+    parentMcpToolScope,
+    packetMcpToolScope,
+    'Claude SDK worker parent/packet external MCP intersection',
+  );
   const result = await runClaudeAgentSdkImpl({
     prompt: buildWorkerJobPrompt(input),
     sessionId: sid,
@@ -114,6 +129,7 @@ export async function runClaudeAgentSdkWorker(
     // slugs remain local/core — never fail-open to every external MCP child.
     nativeMcpScopeInput: input.resolvedTools,
     nativeMcpScopeMode: 'resolved_tools',
+    nativeMcpToolScope,
     agentic,
     maxTurns: resolvedMaxTurns,
     // Isolation and authority are separate: this packet-stable scope enforces

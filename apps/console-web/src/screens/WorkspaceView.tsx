@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
-  ArrowLeft, RefreshCw, Pause, Play, ExternalLink, PanelRightOpen, X,
+  ArrowLeft, RefreshCw, Pause, Play, PanelRightOpen, X,
   MessageCircle, RotateCcw, AlertCircle, Database, Zap, History, FileCode2, CheckCircle2, Share2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -13,10 +13,11 @@ import { useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  spaceViewUrl, spaceSessionId, openApprovalCount, gapQuestions, latestRefreshFailures, type SpaceStatus,
+  spaceSessionId, openApprovalCount, gapQuestions, latestRefreshFailures, type SpaceStatus,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
+import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -163,9 +164,6 @@ export function WorkspaceView() {
           >
             <Share2 className="h-4 w-4" aria-hidden /> Share
           </Button>
-          <Button variant="ghost" size="icon" aria-label="Open in new tab" onClick={() => window.open(spaceViewUrl(id), '_blank')}>
-            <ExternalLink className="h-4 w-4" aria-hidden />
-          </Button>
           <Button variant="ghost" size="icon" aria-label="Details" onClick={() => setDetailsOpen((v) => !v)}>
             <PanelRightOpen className="h-4 w-4" aria-hidden />
           </Button>
@@ -190,11 +188,12 @@ export function WorkspaceView() {
 
       {/* Body: the agent-authored view + overlays */}
       <div className="relative min-h-0 flex-1 bg-canvas">
-        <iframe
+        <WorkspaceFrame
           key={iframeKey}
+          id={id}
           title={space.title}
-          src={spaceViewUrl(id)}
           className="absolute inset-0 h-full w-full border-0"
+          onMutation={() => { void detail.refetch(); }}
         />
 
         {/* Details drawer */}

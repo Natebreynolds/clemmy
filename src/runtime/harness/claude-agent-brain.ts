@@ -1682,6 +1682,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
     // the Codex lane, without attaching all of them.
     nativeMcpScopeInput: turnObjective,
+    nativeMcpToolScope: nativeMcpScope,
     maxTurns: maxTurns(),
     maxWallClockMs: request.maxWallClockMs,
     shouldCancel: request.shouldCancel,

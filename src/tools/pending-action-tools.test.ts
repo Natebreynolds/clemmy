@@ -7,7 +7,14 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const { registerPendingActionTools } = await import('./pending-action-tools.js');
 const { appendEvent, createSession, resetEventLog, writeToolOutput } = await import('../runtime/harness/eventlog.js');
-const { listPendingActions } = await import('../runtime/harness/pending-actions.js');
+const {
+  claimPendingActionExecution,
+  getPendingAction,
+  listPendingActions,
+  markPendingActionApprovalResolved,
+  queuePendingAction,
+  recordPendingActionResult,
+} = await import('../runtime/harness/pending-actions.js');
 
 function handlerFor(name: string): (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>>();
@@ -90,4 +97,38 @@ test('pending_action_queue accepts the exact source-backed recipient set', async
   assert.match(response.content[0].text, /Pending action queued/);
   assert.match(response.content[0].text, /pending_action_execute/);
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
+});
+
+test('model-callable pending_action_record_result cannot forge completion of an executing action', async () => {
+  const record = queuePendingAction({
+    title: 'Owner-bound completion',
+    summary: 'The dispatcher alone may record terminal provider truth.',
+    kind: 'external_write',
+    toolName: 'proof__write',
+    payload: { value: 'one' },
+  });
+  markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'test' },
+  });
+  const claim = claimPendingActionExecution(record.id, 'trusted-dispatcher');
+  assert.equal(claim.claimed, true);
+  assert.ok(claim.claimToken);
+
+  const forged = await handlerFor('pending_action_record_result')({
+    id: record.id,
+    status: 'executed',
+    resultSummary: 'I say it worked.',
+  });
+  assert.match(forged.content[0].text, /marked executing/i, 'the tool reports durable truth, not the requested forgery');
+  assert.equal(getPendingAction(record.id)?.status, 'executing');
+
+  recordPendingActionResult(
+    record.id,
+    'failed',
+    'trusted dispatcher could not confirm the provider outcome',
+    'trusted-dispatcher',
+    claim.claimToken,
+  );
+  assert.equal(getPendingAction(record.id)?.status, 'failed');
 });

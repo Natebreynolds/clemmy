@@ -15,6 +15,7 @@ const TEST_HOME = '/tmp/clemmy-test-embprov';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 // No real key — selection is driven entirely by the injected provider.
 delete process.env.OPENAI_API_KEY;
+const inheritedLocalEmbeddings = process.env.CLEMMY_LOCAL_EMBEDDINGS;
 
 // eslint-disable-next-line import/first
 const { resetMemoryDb, openMemoryDb } = await import('./db.js');
@@ -58,6 +59,8 @@ afterEach(() => {
   _setLocalProviderForTest(undefined);
   globalThis.fetch = realFetch;
   delete process.env.OPENAI_API_KEY;
+  if (inheritedLocalEmbeddings === undefined) delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
+  else process.env.CLEMMY_LOCAL_EMBEDDINGS = inheritedLocalEmbeddings;
 });
 
 test('an injected provider is selected and reports enabled + model/dim', async () => {
@@ -143,6 +146,7 @@ test('loadEmbeddingsForChunks only returns vectors from the active provider spac
 });
 
 test('embedMissingFacts switches to local provider mid-tick after OpenAI demotion', async () => {
+  process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
   _setEmbeddingProviderForTest(undefined);
   _setLocalProviderForTest(fakeProvider('local', 'test-local-embedding', 4));
   process.env.OPENAI_API_KEY = 'sk-test-openai-fails';

@@ -128,12 +128,23 @@ test('saveInterruptState round-trips across reopen (approval resume)', () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   const blob = '{"$schemaVersion":1,"context":{},"items":[]}';
-  sess.saveInterruptState(blob);
+  const scope = {
+    reason: 'explicit local-only instruction',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  };
+  sess.saveInterruptState(blob, { mcpToolScope: scope });
   closeEventLog();
 
   const reloaded = HarnessSession.load(sess.id);
   assert.ok(reloaded);
   assert.equal(reloaded!.loadInterruptState(), blob);
+  assert.deepEqual(
+    reloaded!.loadInterruptMcpToolScope(),
+    scope,
+    'approval resume restores the exact connector authority that was active when the run paused',
+  );
 
   const paused = listEvents(sess.id, { types: ['run_paused'] });
   assert.equal(paused.length, 1);
@@ -141,6 +152,7 @@ test('saveInterruptState round-trips across reopen (approval resume)', () => {
 
   reloaded!.clearInterruptState();
   assert.equal(reloaded!.loadInterruptState(), null);
+  assert.equal(reloaded!.loadInterruptMcpToolScope(), null, 'scope cannot leak into a later unrelated interrupt');
   const resumed = listEvents(sess.id, { types: ['run_resumed'] });
   assert.equal(resumed.length, 1);
 });

@@ -1,5 +1,15 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 // Deliberate ESM cycle (approval-registry imports this module): bindings are
@@ -25,6 +35,7 @@ export const PENDING_ACTION_STATUSES = [
   'queued',
   'approval_requested',
   'approved',
+  'executing',
   'rejected',
   'expired',
   'executed',
@@ -73,6 +84,12 @@ export interface PendingActionRecord {
   approvalId: string | null;
   approvedBy: PendingActionApprovedBy | null;
   approvalEvidence: PendingActionApprovalEvidence | null;
+  /** SHA-256 of the opaque capability returned only to the executor that won
+   *  the approved→executing claim. The raw token is never persisted or exposed
+   *  through record reads. Optional for backwards-compatible legacy reads. */
+  executionClaimTokenHash?: string | null;
+  executionClaimedBy?: string | null;
+  executionClaimedAt?: string | null;
   resultSummary: string | null;
   history: PendingActionHistoryItem[];
 }
@@ -99,6 +116,10 @@ function recordPath(id: string): string {
   return path.join(PENDING_ACTIONS_DIR, `${id}.json`);
 }
 
+function recordLockPath(id: string): string {
+  return path.join(PENDING_ACTIONS_DIR, `${id}.execution.lock`);
+}
+
 function newPendingActionId(): string {
   return `pa-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
 }
@@ -115,6 +136,21 @@ function shortHash(value: unknown): string {
   return createHash('sha256').update(stableStringify(value), 'utf8').digest('hex').slice(0, 16);
 }
 
+function executionTokenHash(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+function executionTokenMatches(expectedHash: string | null | undefined, token: string | null | undefined): boolean {
+  if (!expectedHash || !token) return false;
+  const actualHash = executionTokenHash(token);
+  if (expectedHash.length !== actualHash.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(expectedHash, 'hex'), Buffer.from(actualHash, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
 function cleanLine(value: string | null | undefined, fallback: string, max = 1000): string {
   const cleaned = (value ?? '').replace(/\s+/g, ' ').trim();
   return (cleaned || fallback).slice(0, max);
@@ -122,8 +158,50 @@ function cleanLine(value: string | null | undefined, fallback: string, max = 100
 
 function writeRecord(record: PendingActionRecord): PendingActionRecord {
   ensurePendingActionsDir();
-  writeFileSync(recordPath(record.id), `${JSON.stringify(record, null, 2)}\n`, 'utf-8');
+  // Atomic replace: readers see the complete old record or the complete new
+  // record, never a partially-written JSON file. The unique temp name also
+  // keeps concurrent writes from sharing a scratch file.
+  const target = recordPath(record.id);
+  const temp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 });
+  renameSync(temp, target);
   return record;
+}
+
+type RecordLockResult<T> =
+  | { acquired: true; value: T }
+  | { acquired: false };
+
+/**
+ * A filesystem O_EXCL lock makes the approved→executing compare-and-swap safe
+ * across daemon processes, not only concurrent promises in one process.
+ *
+ * The lock is intentionally never considered stale automatically. If a process
+ * dies in the tiny synchronous claim section, the orphaned lock leaves the
+ * action inert and requiring manual inspection; deleting it automatically
+ * could replay an irreversible action whose dispatch boundary was uncertain.
+ */
+function withRecordExecutionLock<T>(id: string, fn: () => T): RecordLockResult<T> {
+  ensurePendingActionsDir();
+  const lockPath = recordLockPath(id);
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx', 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return { acquired: false };
+    throw err;
+  }
+  try {
+    writeFileSync(fd, `${JSON.stringify({
+      id,
+      pid: process.pid,
+      claimedAt: new Date().toISOString(),
+    })}\n`, 'utf-8');
+    return { acquired: true, value: fn() };
+  } finally {
+    try { closeSync(fd); } catch { /* best effort */ }
+    try { unlinkSync(lockPath); } catch { /* a crash leaves the lock fail-safe */ }
+  }
 }
 
 /** THE-GRANT hardening (2026-07-20 audit B4): does this approvalId resolve to
@@ -170,7 +248,7 @@ function safeReadRecord(file: string): PendingActionRecord | null {
     // and the executor honored it. Now the inferred claim is VERIFIED against
     // the registry; refuted ids read as 'policy' (inert for sends).
     if (parsed.approvedBy === undefined || parsed.approvedBy === null) {
-      if (parsed.status === 'approved' || parsed.status === 'executed') {
+      if (parsed.status === 'approved' || parsed.status === 'executing' || parsed.status === 'executed') {
         if (parsed.approvalId) {
           const consent = inferCardConsent(parsed.approvalId);
           parsed.approvedBy = consent.by;
@@ -258,8 +336,27 @@ export function listPendingActions(filter: {
  *  expired). Used for dedup: an open card for the same payload should not be
  *  minted twice (the judge-fail-approval batch-loop guard). */
 const OPEN_PENDING_STATUSES: ReadonlySet<PendingActionStatus> = new Set([
-  'queued', 'approval_requested', 'approved',
+  'queued', 'approval_requested', 'approved', 'executing',
 ]);
+
+const TERMINAL_PENDING_STATUSES: ReadonlySet<PendingActionStatus> = new Set([
+  'rejected', 'expired', 'cancelled', 'executed', 'failed',
+]);
+
+/** Explicit monotonic graph. No generic "set status" path exists: approval can
+ *  advance toward a claim or terminate before it; only the claim owner can
+ *  leave EXECUTING, and every terminal node is immutable. */
+const PENDING_ACTION_TRANSITIONS: Readonly<Record<PendingActionStatus, ReadonlySet<PendingActionStatus>>> = {
+  queued: new Set(['approval_requested', 'approved', 'rejected', 'expired', 'cancelled']),
+  approval_requested: new Set(['approved', 'rejected', 'expired', 'cancelled']),
+  approved: new Set(['executing', 'rejected', 'expired', 'cancelled']),
+  executing: new Set(['executed', 'failed']),
+  rejected: new Set(),
+  expired: new Set(),
+  cancelled: new Set(),
+  executed: new Set(),
+  failed: new Set(),
+};
 
 /** Compute the payloadHash the way queuePendingAction does (stable over key
  *  order) so callers can dedup BEFORE minting. */
@@ -286,30 +383,169 @@ function updatePendingAction(
     resultSummary?: string | null;
     approvedBy?: PendingActionApprovedBy;
     approvalEvidence?: PendingActionApprovalEvidence;
+    executionClaimToken?: string;
   } = {},
 ): PendingActionRecord | null {
-  const record = getPendingAction(id);
-  if (!record) return null;
-  const terminal = new Set<PendingActionStatus>(['executed', 'failed', 'cancelled']);
-  if (terminal.has(record.status) && record.status !== status) return record;
-  const now = new Date().toISOString();
-  record.status = status;
-  record.updatedAt = now;
-  if (opts.approvalId !== undefined) record.approvalId = opts.approvalId;
-  if (opts.resultSummary !== undefined) record.resultSummary = opts.resultSummary;
-  // Human consent is monotonic. A later policy bookkeeping call may update the
-  // status, but it can never downgrade a real card/workflow grant to policy.
-  const wouldDowngradeHuman = record.approvedBy === 'human' && opts.approvedBy === 'policy';
-  if (opts.approvedBy !== undefined && !wouldDowngradeHuman) record.approvedBy = opts.approvedBy;
-  if (opts.approvalEvidence !== undefined && !wouldDowngradeHuman) record.approvalEvidence = opts.approvalEvidence;
-  record.history = [
-    ...(Array.isArray(record.history) ? record.history : []),
-    { at: now, status, note: opts.note, actor: opts.actor },
-  ];
-  return writeRecord(record);
+  const locked = withRecordExecutionLock(id, () => {
+    const record = getPendingAction(id);
+    if (!record) return null;
+    const evidence = opts.approvalEvidence;
+    const verifiedHumanUpgrade = record.status === 'approved'
+      && status === 'approved'
+      && record.approvedBy !== 'human'
+      && opts.approvedBy === 'human'
+      && Boolean(evidence)
+      && (
+        evidence?.kind === 'workflow'
+        || (
+          evidence?.kind === 'card'
+          && opts.approvalId === evidence.approvalId
+          && verifyApprovedCard(evidence.approvalId) === 'verified'
+        )
+      );
+    // Same-state updates and every terminal rewrite are true no-ops: do not
+    // touch approval provenance, timestamps, summaries, or history.
+    if ((record.status === status && !verifiedHumanUpgrade) || TERMINAL_PENDING_STATUSES.has(record.status)) return record;
+    if (record.status !== status && !PENDING_ACTION_TRANSITIONS[record.status].has(status)) return record;
+    // EXECUTING is a capability-owned node. Neither a model-callable result
+    // tool nor a competing executor can forge terminal truth using only the
+    // public action id (or even by guessing the actor label).
+    if (
+      record.status === 'executing'
+      && (status === 'executed' || status === 'failed')
+      && (
+        cleanLine(opts.actor, 'clementine', 120) !== record.executionClaimedBy
+        || !executionTokenMatches(record.executionClaimTokenHash, opts.executionClaimToken)
+      )
+    ) {
+      return record;
+    }
+    const now = new Date().toISOString();
+    record.status = status;
+    record.updatedAt = now;
+    if (opts.approvalId !== undefined) record.approvalId = opts.approvalId;
+    if (opts.resultSummary !== undefined) record.resultSummary = opts.resultSummary;
+    // Human consent is monotonic. A later policy bookkeeping call may update the
+    // status, but it can never downgrade a real card/workflow grant to policy.
+    const wouldDowngradeHuman = record.approvedBy === 'human' && opts.approvedBy === 'policy';
+    if (opts.approvedBy !== undefined && !wouldDowngradeHuman) record.approvedBy = opts.approvedBy;
+    if (opts.approvalEvidence !== undefined && !wouldDowngradeHuman) record.approvalEvidence = opts.approvalEvidence;
+    record.history = [
+      ...(Array.isArray(record.history) ? record.history : []),
+      { at: now, status, note: opts.note, actor: opts.actor },
+    ];
+    return writeRecord(record);
+  });
+  // A live/stale lock means another executor owns (or may have owned) this
+  // transition. Returning current durable truth is safer than waiting and
+  // accidentally replaying an irreversible action.
+  return locked.acquired ? locked.value : getPendingAction(id);
+}
+
+export type PendingActionExecutionClaimReason =
+  | 'claimed'
+  | 'not_found'
+  | 'not_approved'
+  | 'claim_in_progress_or_uncertain';
+
+export interface PendingActionExecutionClaim {
+  claimed: boolean;
+  reason: PendingActionExecutionClaimReason;
+  record: PendingActionRecord | null;
+  /** Opaque one-shot capability held only by the winning executor. It is
+   *  required, with the same actor, to finalize EXECUTING. */
+  claimToken?: string;
+}
+
+/**
+ * Atomically consume an APPROVED action for execution.
+ *
+ * EXECUTING is deliberately non-retryable: if the daemon dies after this claim
+ * and before recording a result, later callers report an uncertain in-flight
+ * attempt and NEVER dispatch it automatically a second time.
+ */
+export function claimPendingActionExecution(
+  id: string,
+  actor = 'pending-action-executor',
+): PendingActionExecutionClaim {
+  const clean = id.trim();
+  if (!clean) return { claimed: false, reason: 'not_found', record: null };
+  const locked = withRecordExecutionLock(clean, () => {
+    const record = getPendingAction(clean);
+    if (!record) return { claimed: false, reason: 'not_found', record: null } satisfies PendingActionExecutionClaim;
+    if (record.status !== 'approved') {
+      return { claimed: false, reason: 'not_approved', record } satisfies PendingActionExecutionClaim;
+    }
+    const now = new Date().toISOString();
+    const claimedBy = cleanLine(actor, 'pending-action-executor', 120);
+    const claimToken = randomBytes(32).toString('base64url');
+    record.status = 'executing';
+    record.updatedAt = now;
+    record.executionClaimTokenHash = executionTokenHash(claimToken);
+    record.executionClaimedBy = claimedBy;
+    record.executionClaimedAt = now;
+    record.resultSummary = 'Execution claimed. Outcome is pending or uncertain; never retry this action automatically.';
+    record.history = [
+      ...(Array.isArray(record.history) ? record.history : []),
+      {
+        at: now,
+        status: 'executing',
+        note: 'Approved payload atomically claimed for one execution attempt.',
+        actor: claimedBy,
+      },
+    ];
+    return {
+      claimed: true,
+      reason: 'claimed',
+      record: writeRecord(record),
+      claimToken,
+    } satisfies PendingActionExecutionClaim;
+  });
+  if (locked.acquired) return locked.value;
+  return {
+    claimed: false,
+    reason: 'claim_in_progress_or_uncertain',
+    record: getPendingAction(clean),
+  };
 }
 
 export function linkPendingActionApproval(id: string, approvalId: string): PendingActionRecord | null {
+  // A policy-approved irreversible send is intentionally inert, but the user
+  // must still be able to attach a real approval card and upgrade its consent
+  // provenance. Keep the state at APPROVED (no backwards edge) while binding
+  // the exact card; the verified same-state human upgrade happens on resolve.
+  const current = getPendingAction(id);
+  if (
+    current?.status === 'approval_requested'
+    || (current?.status === 'approved' && current.approvedBy !== 'human')
+  ) {
+    const locked = withRecordExecutionLock(id, () => {
+      const record = getPendingAction(id);
+      if (
+        !record
+        || (
+          record.status !== 'approval_requested'
+          && !(record.status === 'approved' && record.approvedBy !== 'human')
+        )
+      ) return record;
+      const cleanApprovalId = cleanLine(approvalId, '', 160);
+      if (!cleanApprovalId || record.approvalId === cleanApprovalId) return record;
+      const now = new Date().toISOString();
+      record.approvalId = cleanApprovalId;
+      record.updatedAt = now;
+      record.history = [
+        ...(Array.isArray(record.history) ? record.history : []),
+        {
+          at: now,
+          status: record.status,
+          note: `Approval requested: ${cleanApprovalId}`,
+          actor: 'approval-registry',
+        },
+      ];
+      return writeRecord(record);
+    });
+    return locked.acquired ? locked.value : getPendingAction(id);
+  }
   return updatePendingAction(id, 'approval_requested', {
     approvalId,
     note: `Approval requested: ${approvalId}`,
@@ -352,11 +588,13 @@ export function recordPendingActionResult(
   status: 'executed' | 'failed' | 'cancelled',
   resultSummary: string,
   actor = 'clementine',
+  executionClaimToken?: string,
 ): PendingActionRecord | null {
   return updatePendingAction(id, status, {
     resultSummary: cleanLine(resultSummary, status, 4000),
     note: resultSummary,
     actor,
+    executionClaimToken,
   });
 }
 

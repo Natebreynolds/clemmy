@@ -46,6 +46,24 @@ test('auto-repair coerces confirm:true on a send-like action', () => {
   assert.match(prep.repairs.join(' '), /confirm:true/);
 });
 
+test('auto-repair leaves a local post-approval action ungated', () => {
+  writeRunner('local-approval', 'approve-post.mjs');
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'local-approval',
+    dataSources: [],
+    actions: [{
+      id: 'approve_post',
+      label: 'Approve locally',
+      runner: 'approve-post.mjs',
+      argsTemplate: { external: false },
+      confirm: false,
+    }],
+  });
+  assert.equal(prep.ok, true);
+  assert.equal(prep.actions[0].confirm, false);
+  assert.equal(prep.repairs.some((repair) => /confirm:true/.test(repair)), false);
+});
+
 test('auto-repair drops a bad timezone (keeps the source)', () => {
   writeRunner('tz', 'r.mjs');
   const prep = enforce.prepareSpaceForWrite({

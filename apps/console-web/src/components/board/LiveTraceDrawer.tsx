@@ -14,6 +14,7 @@ import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Play, Send
 import { runHarnessStream, humanHarnessText } from '@/lib/chat';
 import { reduceActivity, type ActivityItem } from '@/lib/useChat';
 import { LiveFeed } from '@/components/chat/ActivityFeed';
+import { activityTerminalOutcomeFromHarnessEvents } from '@/lib/activity-presentation';
 import { apiGet } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
@@ -538,6 +539,7 @@ export function LiveTraceDrawer({
   // user has scrolled up to read/interact (standard chat-feed behavior). The
   // whole panel-below-header is ONE scroll region, so we pin that container.
   const feedRunning = card.column === 'running';
+  const feedTerminalOutcome = activityTerminalOutcomeFromHarnessEvents(rawHarness, feedRunning);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
   const onFeedScroll = () => {
@@ -1063,7 +1065,12 @@ export function LiveTraceDrawer({
               )}
             </>
           ) : (
-            <LiveFeed items={feed} live={feedRunning} showDetails={showDetails} />
+            <LiveFeed
+              items={feed}
+              live={feedRunning}
+              showDetails={showDetails}
+              terminalOutcome={feedTerminalOutcome}
+            />
           )}
         </div>
         </div>

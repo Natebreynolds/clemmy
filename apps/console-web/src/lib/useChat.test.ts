@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ChatPostCancelledError,
+  createInboxOutcomeCursor,
+  createInboxOutcomeDeliveryState,
+  inboxOutcomeCursorForSession,
   postPendingChatWithRetry,
   reduceActivity,
   retainPendingChatPost,
@@ -417,7 +420,7 @@ test('reduceActivity preserves explicit BYO identity for provider-shaped model I
 // fold decides what freshly-polled session events add to the thread. ──
 test('idle inbox: a proactive report-back renders; the user\'s own turns never re-render', async () => {
   const { inboxAdditionsFromEvents } = await import('./useChat');
-  const syntheticTurns = new Map<number, { sourceId?: string; sourceLabel?: string }>();
+  const syntheticTurns = createInboxOutcomeDeliveryState();
   const additions = inboxAdditionsFromEvents([
     // A normal turn the live stream already rendered — must add NOTHING.
     { seq: 10, turn: 3, type: 'user_input_received', data: { text: 'run the update' } },
@@ -439,7 +442,7 @@ test('idle inbox: LIVE turn shapes pair — relay completion on a different turn
   // Live 2026-07-28: the outcome directive is recorded turn 0; the relay's
   // completion lands on the session's REAL next turn. Exact turn match fails —
   // the open-delivery fallback must claim it.
-  const t1 = new Map();
+  const t1 = createInboxOutcomeDeliveryState();
   const first = inboxAdditionsFromEvents([
     { seq: 20, turn: 0, type: 'user_input_received', data: { text: '[background task bg-live-1 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-live-1', sourceLabel: 'background task' } },
     { seq: 21, turn: 1, type: 'conversation_completed', data: { reply: 'Saved color-notes.md — 3 lines, verified.' } },
@@ -449,7 +452,7 @@ test('idle inbox: LIVE turn shapes pair — relay completion on a different turn
 
   // A relay that parks on a transient ("should I retry?") must SURFACE, tagged
   // with the delivery it belongs to — live it was silently dropped (turn 2).
-  const t2 = new Map();
+  const t2 = createInboxOutcomeDeliveryState();
   const parked = inboxAdditionsFromEvents([
     { seq: 30, turn: 0, type: 'user_input_received', data: { text: '[background task bg-live-2 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-live-2' } },
     { seq: 31, turn: 2, type: 'awaiting_user_input', data: { question: 'The model backend hit a transient error. Retry?' } },
@@ -460,7 +463,7 @@ test('idle inbox: LIVE turn shapes pair — relay completion on a different turn
 
   // A REAL user turn after the delivery closes it: later completions belong to
   // the user's own conversation and must not render as report-backs.
-  const t3 = new Map();
+  const t3 = createInboxOutcomeDeliveryState();
   const cutoff = inboxAdditionsFromEvents([
     { seq: 40, turn: 0, type: 'user_input_received', data: { text: '[background task bg-live-3 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-live-3' } },
     { seq: 41, turn: 5, type: 'user_input_received', data: { text: 'unrelated new question from the user' } },
@@ -469,9 +472,53 @@ test('idle inbox: LIVE turn shapes pair — relay completion on a different turn
   assert.equal(cutoff.length, 0);
 });
 
+test('idle inbox: two same-batch report-backs sharing turn zero keep their own durable identities', async () => {
+  const { inboxAdditionsFromEvents } = await import('./useChat');
+  const syntheticTurns = createInboxOutcomeDeliveryState();
+  const additions = inboxAdditionsFromEvents([
+    // Live proactive directives are commonly all stamped turn 0. A turn-keyed
+    // Map used to overwrite bg-a with bg-b before either completion was folded,
+    // dropping one report and attaching the other's evidence to the wrong text.
+    // Each real outcome also has a passive staging event; source identity must
+    // collapse passive + directive without collapsing A + B.
+    { seq: 60, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-a', sourceLabel: 'background task', deliveryPhase: 'passive' } },
+    { seq: 61, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-b', sourceLabel: 'background task', deliveryPhase: 'passive' } },
+    { seq: 62, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-a', sourceLabel: 'background task', deliveryPhase: 'directive' } },
+    { seq: 63, turn: 0, type: 'conversation_completed', data: { reply: 'Alpha workspace finished.' } },
+    { seq: 64, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-b', sourceLabel: 'background task', deliveryPhase: 'directive' } },
+    { seq: 65, turn: 0, type: 'conversation_completed', data: { reply: 'Beta workspace finished.' } },
+  ], syntheticTurns);
+
+  assert.deepEqual(additions.map((message) => ({
+    text: message.text,
+    taskRef: message.taskRef,
+  })), [
+    { text: 'Alpha workspace finished.', taskRef: { id: 'bg-a', label: 'background task' } },
+    { text: 'Beta workspace finished.', taskRef: { id: 'bg-b', label: 'background task' } },
+  ]);
+});
+
+test('idle inbox: one durable task can report needs-input and later completion without source-id suppression', async () => {
+  const { inboxAdditionsFromEvents } = await import('./useChat');
+  const deliveries = createInboxOutcomeDeliveryState();
+  const first = inboxAdditionsFromEvents([
+    { seq: 70, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-resumed', deliveryPhase: 'directive' } },
+    { seq: 71, turn: 4, type: 'awaiting_user_input', data: { question: 'Connect Railway to resume.' } },
+  ], deliveries);
+  const resumed = inboxAdditionsFromEvents([
+    { seq: 80, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-resumed', deliveryPhase: 'passive' } },
+    { seq: 81, turn: 0, type: 'user_input_received', data: { synthetic: true, source: 'outcome', sourceId: 'bg-resumed', deliveryPhase: 'directive' } },
+    { seq: 82, turn: 5, type: 'conversation_completed', data: { reply: 'Railway deployment finished and was verified.' } },
+  ], deliveries);
+
+  assert.equal(first[0]?.status, 'awaiting-reply');
+  assert.equal(resumed[0]?.status, 'complete');
+  assert.equal(resumed[0]?.taskRef?.id, 'bg-resumed');
+});
+
 test('idle inbox: approval cards and blocking questions surface; pairing survives batch splits', async () => {
   const { inboxAdditionsFromEvents } = await import('./useChat');
-  const syntheticTurns = new Map<number, { sourceId?: string; sourceLabel?: string }>();
+  const syntheticTurns = createInboxOutcomeDeliveryState();
   // Batch 1 carries only the synthetic user event…
   assert.equal(inboxAdditionsFromEvents([
     { seq: 30, turn: 7, type: 'user_input_received', data: { text: 'x', synthetic: true, source: 'outcome' } },
@@ -485,4 +532,42 @@ test('idle inbox: approval cards and blocking questions surface; pairing survive
   assert.equal(additions[0].status, 'awaiting-reply');
   assert.equal(additions[1].status, 'awaiting-approval');
   assert.equal(additions[1].approval?.approvalId, 'apr-inbox-1');
+});
+
+test('idle inbox cursor resets sequence and delivery correlation when the session identity changes', () => {
+  const previous = createInboxOutcomeCursor('session-old');
+  previous.seq = 418;
+  previous.deliveries.push({
+    sourceId: 'bg-old',
+    sourceLabel: 'background task',
+    turn: 0,
+    seq: 417,
+    open: true,
+    ready: true,
+  });
+
+  const next = inboxOutcomeCursorForSession(previous, 'session-new');
+  assert.notEqual(next, previous);
+  assert.equal(next.sessionId, 'session-new');
+  assert.equal(next.seq, 0, 'a new session must never inherit the old replay watermark');
+  assert.deepEqual(next.deliveries, [], 'source correlation must not cross session boundaries');
+  assert.equal(previous.seq, 418, 'the pure transition does not mutate its input');
+});
+
+test('idle inbox cursor preserves batch-split delivery state inside the same session and resets explicitly', () => {
+  const cursor = createInboxOutcomeCursor('session-one');
+  cursor.seq = 21;
+  cursor.deliveries.push({
+    sourceId: 'bg-split',
+    turn: 0,
+    seq: 21,
+    open: true,
+    ready: false,
+  });
+
+  assert.equal(inboxOutcomeCursorForSession(cursor, 'session-one'), cursor);
+  const reset = inboxOutcomeCursorForSession(cursor, null);
+  assert.equal(reset.sessionId, null);
+  assert.equal(reset.seq, 0);
+  assert.deepEqual(reset.deliveries, []);
 });

@@ -165,6 +165,7 @@ test('matchesBlockedText: true on blocked shapes, false on a clean result', () =
   assert.equal(matchesBlockedText("I'm stopping this run without a number."), true);
   assert.equal(matchesBlockedText('Nothing that satisfies the success criterion; no verified integer produced.'), true);
   assert.equal(matchesBlockedText('This environment has no tool access, so I cannot fetch search volumes.'), true);
+  assert.equal(matchesBlockedText('I can’t pull those accounts because there are no Salesforce tools connected in this run.'), true);
   assert.equal(matchesBlockedText('Added 5 rows to the sheet.'), false);
   assert.equal(matchesBlockedText(''), false);
   assert.equal(matchesBlockedText(undefined), false);

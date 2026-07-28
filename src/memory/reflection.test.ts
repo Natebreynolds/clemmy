@@ -17,6 +17,7 @@
  * tool_outputs storage that recall_tool_result reads from.
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -35,6 +36,7 @@ const {
   reflectOnToolReturn,
   scheduleReflection,
   _testOnly_reflectionPending,
+  _testOnly_resetReflectionScopeBudgets,
   isSelfReferentialTool,
   isWriteReceiptTool,
   REFLECTION_MIN_CONTENT_CHARS,
@@ -92,6 +94,7 @@ function withEnv(overrides: Record<string, string | undefined>, run: () => void)
 test.afterEach(() => {
   _setEmbeddingProviderForTest(undefined);
   _testOnly_setReflectionExtractor(null);
+  _testOnly_resetReflectionScopeBudgets();
 });
 
 test('reflection extractor binds to the active provider instead of a gpt-shaped global model string', () => {
@@ -517,6 +520,56 @@ test('reflection digests oversized results before extraction and preserves a raw
   } finally {
     if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
     if (prevThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = prevThreshold;
+  }
+});
+
+test('reflection bounds extractor calls per logical run without losing the raw-result pointer', async () => {
+  resetMemoryDb();
+  const prevCalls = process.env.CLEMMY_REFLECTION_MAX_CALLS_PER_SCOPE;
+  const prevChars = process.env.CLEMMY_REFLECTION_MAX_INPUT_CHARS_PER_SCOPE;
+  const prevThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_MAX_CALLS_PER_SCOPE = '2';
+  process.env.CLEMMY_REFLECTION_MAX_INPUT_CHARS_PER_SCOPE = '20000';
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  let extractorCalls = 0;
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return { facts: [], entities: [], pointers: [] };
+    });
+    const base = {
+      sessionId: 'sess-reflection-scope-budget',
+      tool: 'FIRECRAWL_SCRAPE',
+      scopeId: 'turn:42',
+    };
+    const first = await reflectOnToolReturn({
+      ...base,
+      callId: 'scope-call-1',
+      output: `First authoritative page. ${'a'.repeat(REFLECTION_MIN_CONTENT_CHARS)}`,
+    });
+    const second = await reflectOnToolReturn({
+      ...base,
+      callId: 'scope-call-2',
+      output: `Second authoritative page. ${'b'.repeat(REFLECTION_MIN_CONTENT_CHARS)}`,
+    });
+    const third = await reflectOnToolReturn({
+      ...base,
+      callId: 'scope-call-3',
+      output: `Third authoritative page. ${'c'.repeat(REFLECTION_MIN_CONTENT_CHARS)}`,
+    });
+
+    assert.equal(first.skipped, undefined);
+    assert.equal(second.skipped, undefined);
+    assert.equal(third.skipped, 'scope_budget');
+    assert.equal(third.pointersStored, 1, 'over-budget data remains recallable without another model call');
+    assert.equal(extractorCalls, 2);
+  } finally {
+    if (prevCalls === undefined) delete process.env.CLEMMY_REFLECTION_MAX_CALLS_PER_SCOPE;
+    else process.env.CLEMMY_REFLECTION_MAX_CALLS_PER_SCOPE = prevCalls;
+    if (prevChars === undefined) delete process.env.CLEMMY_REFLECTION_MAX_INPUT_CHARS_PER_SCOPE;
+    else process.env.CLEMMY_REFLECTION_MAX_INPUT_CHARS_PER_SCOPE = prevChars;
+    if (prevThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD;
+    else process.env.CLEMMY_REFLECTION_THRESHOLD = prevThreshold;
   }
 });
 
@@ -1233,6 +1286,7 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     'call_tool', 'tool_search', 'mcp_list_tools', 'mcp_status',
     'composio_search_tools', 'composio_list_tools', 'composio_status',
     'local_cli_list', 'local_cli_probe', 'harness_status',
+    'list_files', 'space_list', 'skill_read',
     'pending_action_queue', 'pending_action_execute', 'request_approval',
     'MEMORY_READ', // case-insensitive
     'FOCUS_GET',   // case-insensitive
@@ -1241,7 +1295,7 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
   }
   // Real user/external data → kept reflectable.
   for (const t of [
-    'read_file', 'run_shell_command', 'skill_read', 'workflow_run',
+    'read_file', 'run_shell_command', 'workflow_run',
     'firecrawl_search', 'OUTLOOK_SEND_EMAIL', 'SALESFORCE_GET_RECORD',
     'composio_execute_tool',
     // goal_create / goal_draft carry the user's STATED goal text — reflectable.
@@ -1249,6 +1303,51 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     null, undefined, '',
   ]) {
     assert.equal(isSelfReferentialTool(t as string | null | undefined), false, `${t} should be reflectable`);
+  }
+});
+
+test('reflectOnToolReturn: Clementine task-ledger reads skip semantic extraction while ordinary files remain reflectable', async () => {
+  resetMemoryDb();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevSelf = process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  delete process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  let extractorCalls = 0;
+  try {
+    _testOnly_setReflectionExtractor(async () => {
+      extractorCalls += 1;
+      return { facts: [], entities: [], pointers: [] };
+    });
+    const ledger = [
+      '---',
+      'type: tasks',
+      '---',
+      '',
+      '# Tasks',
+      '',
+      '## Completed',
+      ...Array.from({ length: 40 }, (_, index) => `- [x] {T-${index}} Internal task ${index}`),
+    ].join('\n');
+    const skipped = await reflectOnToolReturn({
+      sessionId: 'sess-task-ledger-reflection',
+      callId: 'call-task-ledger',
+      tool: 'read_file',
+      output: ledger,
+    });
+    assert.equal(skipped.skipped, 'self_tool');
+    assert.equal(extractorCalls, 0, 'the internal task ledger never spends a boundary-model call');
+
+    await reflectOnToolReturn({
+      sessionId: 'sess-user-file-reflection',
+      callId: 'call-user-brief',
+      tool: 'read_file',
+      output: `# Customer brief\n${'Acme prefers Tuesday launches and calls the project Northstar. '.repeat(20)}`,
+    });
+    assert.equal(extractorCalls, 1, 'ordinary user-authored file content remains reflectable');
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
   }
 });
 
@@ -1639,6 +1738,62 @@ test('replayFailedReflections re-runs failed receipts from durable tool_outputs 
     assert.equal(extractorCalls, 2);
     assert.equal(readReflectionReplayHealth().failed, 0, 'the failed receipt was recovered');
     assert.equal(readReflectionReplayHealth().completed, 1);
+  } finally {
+    _testOnly_setReflectionExtractor(null);
+    setReflectionExtractorPauseForTest(null);
+    if (priorThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = priorThreshold;
+  }
+});
+
+test('replayFailedReflections reclaims a stale processing lease from durable tool_outputs raw', async () => {
+  resetMemoryDb();
+  const { replayFailedReflections, setReflectionExtractorPauseForTest } = await import('./reflection.js');
+  const { writeToolOutput, createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
+  const priorThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '0';
+  const input = {
+    sessionId: 'sess-replay-stale-processing',
+    callId: 'call-replay-stale-processing',
+    // This tool became self-referential under newer reflection policy after
+    // the historical receipt was claimed. Recovery must settle the old lease
+    // without sending Clementine's own status payload to the extractor.
+    tool: 'composio_status',
+    output: 'durable status output abandoned by a killed reflection worker '.repeat(40),
+  };
+  try {
+    setReflectionExtractorPauseForTest(null);
+    try { createHarnessSession({ id: input.sessionId, kind: 'chat' }); } catch { /* may exist */ }
+    writeToolOutput({ sessionId: input.sessionId, callId: input.callId, tool: input.tool, output: input.output });
+    const inputHash = createHash('sha256')
+      .update(input.tool)
+      .update('\0')
+      .update(input.output)
+      .digest('hex');
+    openMemoryDb().prepare(`
+      INSERT INTO memory_reflection_receipts
+        (session_id, call_id, input_hash, status, attempts, first_seen_at, last_attempt_at)
+      VALUES (?, ?, ?, 'processing', 1, ?, ?)
+    `).run(
+      input.sessionId,
+      input.callId,
+      inputHash,
+      '2026-07-28T10:00:00.000Z',
+      '2026-07-28T10:00:00.000Z',
+    );
+    _testOnly_setReflectionExtractor(async () => ({ facts: [], entities: [], pointers: [] }));
+
+    const result = await replayFailedReflections();
+    assert.deepEqual(result, { scanned: 1, replayed: 1, rawGone: 0 });
+    assert.deepEqual(
+      openMemoryDb().prepare(`
+        SELECT status, attempts, last_error
+        FROM memory_reflection_receipts
+        WHERE session_id = ? AND call_id = ?
+      `).get(input.sessionId, input.callId),
+      { status: 'completed', attempts: 2, last_error: null },
+      'the expired lease is reclaimed once through the ordinary receipt claim path',
+    );
+    assert.equal(readReflectionReplayHealth().staleProcessing, 0);
   } finally {
     _testOnly_setReflectionExtractor(null);
     setReflectionExtractorPauseForTest(null);

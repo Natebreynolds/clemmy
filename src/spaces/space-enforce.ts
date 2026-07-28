@@ -20,17 +20,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { validateCronExpression } from '../shared/cron.js';
 import { resolveInSpace, runnerFilenameError, type SpaceDataSource, type SpaceAction, type SpaceStatus } from './store.js';
-
-/** A Composio action whose name/label implies an irreversible outbound send —
- *  it should always confirm before firing. */
-const SEND_LIKE_RE = /\b(send|reply|email|message|publish|post|tweet|dm|invite|sms|notify)\b/i;
-
-function looksLikeSend(action: SpaceAction): boolean {
-  // Normalize underscores to spaces so \b matches inside Composio slugs like
-  // OUTLOOK_OUTLOOK_SEND_EMAIL (underscores are word chars → no boundary).
-  const hay = `${action.composioSlug ?? ''} ${action.runner ?? ''} ${action.label ?? ''} ${action.id}`.replace(/_/g, ' ');
-  return SEND_LIKE_RE.test(hay);
-}
+import { workspaceActionLooksOutbound } from './space-action-semantics.js';
 
 function isValidTimezone(tz: string): boolean {
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
@@ -78,7 +68,7 @@ export function autoRepairSpaceManifest(
     const a: SpaceAction = { ...act };
     // A send-like action must confirm before firing (the costliest thing to get
     // wrong is a send to the wrong person).
-    if (looksLikeSend(a) && a.confirm !== true) {
+    if (workspaceActionLooksOutbound(a) && a.confirm !== true) {
       a.confirm = true;
       repairs.push(`Set confirm:true on action "${a.id}" — it looks like an outbound send, so the view should confirm before firing.`);
     }

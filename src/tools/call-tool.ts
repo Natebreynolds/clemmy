@@ -35,6 +35,8 @@ import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { textResult } from './shared.js';
+import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
@@ -256,6 +258,10 @@ export interface BuildCallToolOptions {
   firstClassNames?: ReadonlySet<string>;
   /** Explicit per-turn denials also apply to external MCP names. */
   deniedNames?: ReadonlySet<string>;
+  /** Exact external MCP authority for this dispatcher. `undefined` falls back
+   * to the active HarnessRunContext (and then legacy behavior); `null` is an
+   * explicit no-external-tools boundary. */
+  mcpToolScope?: McpToolScope | null;
 }
 
 export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeContextValue> {
@@ -340,7 +346,18 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // same contract as run_batch/run_tool_program. Refusing them here was a
       // live Phase-1 gap (2026-07-08): the model fell back to hand-rolling the
       // provider's REST API through shell calls, slower and less gated.
-      if (!isMcpNamespacedTool(target)) {
+      const activeMcpScope = options.mcpToolScope !== undefined
+        ? options.mcpToolScope
+        : harnessRunContextStorage.getStore()?.mcpToolScope;
+      if (isMcpNamespacedTool(target)) {
+        if (!mcpToolAllowedByScope(target, activeMcpScope)) {
+          return refuse({
+            error: 'not_reachable',
+            reason: 'mcp_scope_denied',
+            detail: `"${requestedTarget}" is outside this turn's external MCP scope.`,
+          });
+        }
+      } else {
         if (!reachableBuiltinNames.has(target) && !firstClassNames.has(target)) {
           return refuse({
             error: 'not_reachable',
@@ -413,6 +430,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         counter,
         undefined,
         { accounting: 'transport_mirror', canonicalCallId: outerCallId },
+        activeMcpScope,
       );
 
       // 5. Promote the reached tool into the session hot-set.

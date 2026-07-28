@@ -1,6 +1,7 @@
 import type { MCPServer } from '@openai/agents';
 import { parseNamespacedTool } from './mcp-namespace-shim.js';
 import type { McpToolScope } from './mcp-tool-scope.js';
+import { mcpServerAliasMatches } from './mcp-tool-authority.js';
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type RankedTool = { tool: MCPTool; index: number; score: number; serverSlug: string | null };
@@ -70,11 +71,13 @@ function toolMatchesScope(tool: MCPTool, scope: McpToolScope, patterns: RegExp[]
   // de-prioritized by scoreTool so real tools win the cap.
   if (scope.failOpenCandidate) return true;
   const parsed = parseNamespacedTool(tool.name);
-  const allowedSlugs = new Set(scope.allowedServerSlugs ?? []);
-  if (allowedSlugs.size > 0 && (!parsed || !allowedSlugs.has(parsed.serverSlug))) {
+  const allowedSlugs = scope.allowedServerSlugs ?? [];
+  if (allowedSlugs.length > 0 && (!parsed || !allowedSlugs.some(
+    (allowed) => mcpServerAliasMatches(parsed.serverSlug, allowed),
+  ))) {
     return false;
   }
-  if (allowedSlugs.size === 0 && (scope.allowedServerSlugs?.length ?? 0) === 0) {
+  if (allowedSlugs.length === 0) {
     return false;
   }
 

@@ -253,6 +253,41 @@ test('computeResumeState surfaces completed steps + items', () => {
   assert.equal(state.terminal, false);
 });
 
+test('computeResumeState preserves every concurrently in-flight step across a restart', () => {
+  appendWorkflowEvent('resume-parallel', 'r1', { kind: 'run_started' });
+  // A mutation starts first, then a slower read starts last. The legacy
+  // singular cursor points at the read, but recovery must retain BOTH steps or
+  // it can blindly replay the unreceipted mutation after a daemon kill.
+  appendWorkflowEvent('resume-parallel', 'r1', { kind: 'step_started', stepId: 'send' });
+  appendWorkflowEvent('resume-parallel', 'r1', { kind: 'step_started', stepId: 'lookup' });
+
+  const state = computeResumeState('resume-parallel', 'r1');
+  assert.equal(state.inFlightStepId, 'lookup', 'legacy/UI cursor remains the most recently started step');
+  assert.deepEqual(
+    [...state.inFlightStepIds].sort(),
+    ['lookup', 'send'],
+    'durable recovery retains the full parallel in-flight set',
+  );
+  const queue = reconstructWorkflowRunQueue(
+    'resume-parallel',
+    'r1',
+    asSteps([
+      { id: 'send', prompt: 'Send the update.' },
+      { id: 'lookup', prompt: 'Read the account.' },
+    ]),
+  );
+  assert.deepEqual(
+    queue.steps.map((step) => [step.stepId, step.status]),
+    [['send', 'running'], ['lookup', 'running']],
+    'the Tasks UI shows every concurrent branch as running',
+  );
+
+  appendWorkflowEvent('resume-parallel', 'r1', { kind: 'step_completed', stepId: 'lookup', output: 'read result' });
+  const afterRead = computeResumeState('resume-parallel', 'r1');
+  assert.deepEqual([...afterRead.inFlightStepIds], ['send'], 'completing one branch leaves its concurrent sibling in flight');
+  assert.equal(afterRead.inFlightStepId, 'send', 'legacy/UI cursor falls back to the remaining in-flight branch');
+});
+
 test('listFinalFailedItems returns only items whose latest terminal item state failed', () => {
   appendWorkflowEvent('failed-items', 'r1', { kind: 'item_failed', stepId: 'fanout', itemKey: 'a', error: 'first failure' });
   appendWorkflowEvent('failed-items', 'r1', { kind: 'item_failed', stepId: 'fanout', itemKey: 'b', error: 'still broken' });

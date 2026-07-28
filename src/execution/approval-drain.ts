@@ -61,11 +61,11 @@ export async function resolveDrainApproval(opts: {
   }
 
   const resume = opts.resumeForTest ?? (async (args: { sessionId: string; decision: 'approve' | 'reject'; resolver?: string }) => {
-    const [{ runConversationFromResume }, { buildOrchestratorAgent }] = await Promise.all([
+    const [{ runConversationFromResume }, { buildOrchestratorAgentForApprovalResume }] = await Promise.all([
       import('../runtime/harness/loop.js'),
       import('../agents/orchestrator.js'),
     ]);
-    const agent = await buildOrchestratorAgent({ sessionId: args.sessionId });
+    const agent = await buildOrchestratorAgentForApprovalResume({ sessionId: args.sessionId });
     return runConversationFromResume({ agent, sessionId: args.sessionId, decision: args.decision, resolver: args.resolver });
   });
 

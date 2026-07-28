@@ -15,6 +15,9 @@ interface ClemmyBridge {
   supervisorStatus?: () => Promise<{ running: boolean; port: number; url: string }>;
   restartDaemon?: () => Promise<unknown>;
   openLogs?: () => Promise<unknown>;
+  /** Parent-only external opener used by a trusted-click Workspace bridge.
+   * Sandboxed authored frames cannot access the preload object directly. */
+  workspaceOpenExternal?: (url: string) => Promise<unknown>;
   notchStatus?: () => Promise<unknown>;
   notchUpdate?: (patch: Record<string, unknown>) => Promise<unknown>;
   notchOpen?: () => Promise<unknown>;

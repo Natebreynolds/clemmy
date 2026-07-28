@@ -68,6 +68,9 @@ export interface SpaceDataSource {
   /** OR a stored Composio op + frozen args (creds resolve server-side). */
   composioSlug?: string;
   composioArgs?: Record<string, unknown>;
+  /** Explicit product contract: zero rows is a valid, usable state (for
+   * example a new content calendar before its first draft). */
+  allowEmpty?: boolean;
   /** Optional cron for the daily/periodic refresh (omit = on-demand only). */
   schedule?: string;
   timezone?: string;
@@ -340,6 +343,7 @@ function normDataSource(raw: unknown, manifestErrors: string[], index: number): 
   }
   const sched = asStr(d.schedule); if (sched) ds.schedule = sched;
   const tz = asStr(d.timezone); if (tz) ds.timezone = tz;
+  if (d.allowEmpty === true || d.allow_empty === true) ds.allowEmpty = true;
   return ds;
 }
 

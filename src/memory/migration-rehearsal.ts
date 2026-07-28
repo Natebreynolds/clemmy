@@ -14,6 +14,8 @@ import {
 import {
   backfillGroundedFactEntityLinksInDatabase,
   backfillGroundedFactResourceLinksInDatabase,
+  reconcileExtractedFactEntityEvidenceInDatabase,
+  type ExtractedFactEntityEvidenceReconciliationStats,
   type GroundedFactEntityBackfillStats,
   type GroundedFactResourceBackfillStats,
 } from './relations.js';
@@ -81,6 +83,7 @@ export interface MemoryMigrationRehearsalReport {
     error: string | null;
     elapsedMs: number;
     identityReconciliation: EntityIdentifierReconciliationResult | null;
+    extractedFactEntityEvidenceReconciliation: ExtractedFactEntityEvidenceReconciliationStats | null;
     groundedFactEntityBackfill: GroundedFactEntityBackfillStats | null;
     groundedFactResourceBackfill: GroundedFactResourceBackfillStats | null;
     legacyReflectionBackfill: LegacyReflectionCandidateBackfillResult | null;
@@ -199,6 +202,7 @@ export async function rehearseMemoryMigration(
     let migrationSuccess = false;
     let migrationError: string | null = null;
     let identityReconciliation: EntityIdentifierReconciliationResult | null = null;
+    let extractedFactEntityEvidenceReconciliation: ExtractedFactEntityEvidenceReconciliationStats | null = null;
     let groundedFactEntityBackfill: GroundedFactEntityBackfillStats | null = null;
     let groundedFactResourceBackfill: GroundedFactResourceBackfillStats | null = null;
     let legacyReflectionBackfill: LegacyReflectionCandidateBackfillResult | null = null;
@@ -216,6 +220,13 @@ export async function rehearseMemoryMigration(
       // after creating a reversible backup. A rehearsal copy is already
       // disposable, so run it directly and audit the resulting redirects.
       identityReconciliation = autoReconcileStrongEntityIdentifiersInDatabase(copyDb, 10_000);
+      // Pre-grounding builds could leave an extracted link's excerpt detached
+      // from its episode. Rehearse the same strict boot repair: attach one
+      // uniquely supported fact-evidence episode or downgrade to inferred.
+      extractedFactEntityEvidenceReconciliation = reconcileExtractedFactEntityEvidenceInDatabase(
+        copyDb,
+        { linkLimit: 100_000 },
+      );
       // The installed daemon performs this backup-first immediately after an
       // upgrade. Rehearse it on the same disposable copy so stored-truth graph
       // coverage is proven before release, not deferred to a nightly job.
@@ -305,6 +316,7 @@ export async function rehearseMemoryMigration(
         error: migrationError,
         elapsedMs: Date.now() - started,
         identityReconciliation,
+        extractedFactEntityEvidenceReconciliation,
         groundedFactEntityBackfill,
         groundedFactResourceBackfill,
         legacyReflectionBackfill,
@@ -336,6 +348,7 @@ export function formatMemoryMigrationRehearsalReport(report: MemoryMigrationRehe
     `Copy: ${report.copy.deleted ? 'deleted after rehearsal' : report.copy.path}`,
     `Migration: ${report.migration.success ? 'succeeded' : `failed — ${report.migration.error ?? 'unknown error'}`}`,
     `Identity finalization: ${report.migration.identityReconciliation ? `${report.migration.identityReconciliation.groupsMerged} group(s) merged, ${report.migration.identityReconciliation.entitiesRedirected} redirect(s)` : 'not run'}`,
+    `Extracted entity evidence: ${report.migration.extractedFactEntityEvidenceReconciliation ? `${report.migration.extractedFactEntityEvidenceReconciliation.repaired} repaired, ${report.migration.extractedFactEntityEvidenceReconciliation.downgraded} truthfully downgraded, ${report.migration.extractedFactEntityEvidenceReconciliation.ambiguous} ambiguous` : 'not run'}`,
     `Legacy claim ledger: ${report.migration.legacyReflectionBackfill ? `${report.migration.legacyReflectionBackfill.candidatesInserted} candidate(s) projected from ${report.migration.legacyReflectionBackfill.batchesBackfilled} extraction batch(es), ${report.migration.expiredLegacyReflectionBatches} expired` : 'not run'}`,
     `Grounded graph backfill: ${report.migration.groundedFactEntityBackfill ? `${report.migration.groundedFactEntityBackfill.promoted} fact/entity link(s) promoted` : 'fact/entity not run'}; ${report.migration.groundedFactResourceBackfill ? `${report.migration.groundedFactResourceBackfill.promoted} fact/resource link(s) promoted` : 'fact/resource not run'} from surviving excerpts`,
     '',

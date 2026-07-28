@@ -8,10 +8,32 @@ import {
   MODEL_ROUTE_METRICS_TABLES,
   recordModelRouteDecision,
   recordModelRouteOutcome,
+  successfulRouteOutcome,
   scoreModelRouteCandidate,
   selectBestRouteCandidate,
   summarizeRouteOutcomes,
 } from './model-route-metrics.js';
+
+test('successful fallback is attributed to the brain that actually served it', () => {
+  assert.deepEqual(successfulRouteOutcome({
+    initialLabel: 'claude-opus',
+    resolvedLabel: 'codex:rescue',
+    provider: 'codex',
+    model: 'gpt-5.6-mini',
+    fellOver: true,
+    reason: 'model.overloaded',
+  }, { path: 'getResponse' }), {
+    status: 'fallback',
+    falloverToModel: 'gpt-5.6-mini',
+    metadata: {
+      path: 'getResponse',
+      actualResolvedLabel: 'codex:rescue',
+      actualProvider: 'codex',
+      actualModel: 'gpt-5.6-mini',
+      falloverReason: 'model.overloaded',
+    },
+  });
+});
 
 test('model route metrics schema metadata is explicit', () => {
   assert.equal(MODEL_ROUTE_METRICS_SCHEMA_VERSION, 1);

@@ -1,11 +1,12 @@
 /**
  * Workspaces ("Spaces") daemon routes. Mounted by the caller in webhook.ts.
  *
- *  - View serving (same-origin so the agent-authored view inherits the console
- *    session cookie + CSP): GET /console/spaces/:id/view[/*] — path-safe,
- *    no-store, loopback-only. ONLY the view/ subtree is served, so data.json /
- *    notes / the manifest can never leak.
- *  - Data plane the view calls (cookie-authed): GET/PUT data, GET/POST notes.
+ *  - View serving: GET /console/spaces/:id/view[/*] — path-safe, no-store,
+ *    loopback-only, and forced into an opaque-origin CSP sandbox. Agent-authored
+ *    HTML never inherits the console's admin principal. ONLY the view/ subtree
+ *    is served, so data.json / notes / the manifest can never leak.
+ *  - Cookie-authenticated data plane called only by the trusted parent RPC host:
+ *    GET/PUT data, GET/POST notes.
  *  - Management for the console UI: list / create / get / patch / delete.
  *  - Lifecycle: refresh (server-side, NO LLM), rollback.
  *
@@ -51,16 +52,61 @@ const CONTENT_TYPES: Record<string, string> = {
   '.woff2': 'font/woff2',
 };
 
-/** Injected into every served HTML view: turn external-protocol link clicks
- *  (tel:/mailto:/sms:/facetime:) into window.open so the desktop routes them to
- *  the OS instead of navigating (and blanking) the iframe. Capture-phase so it
- *  wins over the link's own navigation; works no matter how the agent authored
- *  the link. */
-const EXTERNAL_LINK_SHIM = `<script>(function(){document.addEventListener('click',function(e){var t=e.target;var a=t&&t.closest?t.closest('a[href]'):null;if(!a)return;var h=a.getAttribute('href')||'';if(/^(tel:|callto:|sms:|mailto:|facetime:|facetime-audio:|maps:|webcal:)/i.test(h)){e.preventDefault();try{window.open(h);}catch(_){}}},true);})();</script>`;
+/**
+ * SVG is an image when embedded, but an active document when opened directly.
+ * Keep authored SVG useful as a Workspace asset while denying scripts, network,
+ * forms, frames, navigation, and a same-origin principal in document contexts.
+ */
+const WORKSPACE_SVG_CSP = [
+  "default-src 'none'",
+  "base-uri 'none'",
+  "object-src 'none'",
+  "frame-ancestors 'self'",
+  'sandbox',
+  "style-src 'unsafe-inline'",
+  "connect-src 'none'",
+  "form-action 'none'",
+  "frame-src 'none'",
+].join('; ');
 
-/** Injected into every served HTML view: a tiny same-origin helper so Clem
- *  never hand-rolls fetch() (the #1 source of broken views — wrong slug, wrong
- *  data key). The slug is baked in at serve time, so the view just calls:
+/**
+ * Agent-authored HTML is executable content and must never share the console's
+ * authenticated origin. The response-level sandbox applies even when someone
+ * opens a raw view URL outside our iframe; connect/form/frame/navigation
+ * capabilities stay closed. Relative, inert presentation assets remain usable.
+ */
+function workspaceViewCsp(req: Request, slug: string): string | null {
+  // An opaque sandbox origin has no useful `'self'`. Name only this exact
+  // loopback Workspace's /view/ subtree so multi-file views work without
+  // granting authored HTML a generic localhost fetch/source capability.
+  const host = String(req.get('host') ?? '').trim().toLowerCase();
+  if (!/^(?:127\.0\.0\.1|localhost):\d{1,5}$/.test(host)
+    && !/^\[::1\]:\d{1,5}$/.test(host)) return null;
+  const assetRoot = `http://${host}/console/spaces/${encodeURIComponent(slug)}/view/`;
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "frame-ancestors 'self'",
+    'sandbox allow-scripts',
+    `script-src 'unsafe-inline' ${assetRoot}`,
+    `style-src 'unsafe-inline' ${assetRoot}`,
+    `img-src data: ${assetRoot}`,
+    `font-src data: ${assetRoot}`,
+    `media-src data: blob: ${assetRoot}`,
+    "connect-src 'none'",
+    "form-action 'none'",
+    "frame-src 'none'",
+    "child-src 'none'",
+    "worker-src 'none'",
+    "manifest-src 'none'",
+  ].join('; ');
+}
+
+/** Injected into every served HTML view: a tiny opaque-origin RPC client. The
+ *  trusted console parent owns authentication and accepts only a fixed,
+ *  workspace-scoped operation set. Authored HTML therefore never sees a cookie,
+ *  token, API URL, or general-purpose authenticated fetch primitive:
  *    await clem.data()                       → the dataset (keyed by sourceId)
  *    await clem.refresh(sourceId?)           → re-pull server-side, returns data
  *    await clem.compose(instructions, ctx)   → a grounded draft (throws on error)
@@ -68,19 +114,35 @@ const EXTERNAL_LINK_SHIM = `<script>(function(){document.addEventListener('click
  *    await clem.note(text, kind?, meta?)     → record a note
  *  clem.action() RESOLVES the E1 approval contract: a send/write returns
  *  {pending:true, approvalId} (the user approves in the inbox; it fires then),
- *  a read returns {ok:true, result}. CSP-safe (inline, same-origin). */
+ *  a read returns {ok:true, result}. */
 const CLEM_VIEW_BRIDGE = (slug: string): string => {
-  const B = JSON.stringify(`/api/console/spaces/${slug}`);
   const S = JSON.stringify(slug);
-  return `<script>(function(){var B=${B};`
-    + `async function j(m,p,b){var r=await fetch(B+p,{method:m,headers:b?{'content-type':'application/json'}:undefined,body:b?JSON.stringify(b):undefined});var d=null;try{d=await r.json();}catch(e){}return{status:r.status,ok:r.ok,data:d};}`
-    + `window.clem={slug:${S},`
-    + `data:async function(){var r=await j('GET','/data');return r.data&&r.data.data;},`
-    + `refresh:async function(id){var r=await j('POST','/refresh',id?{sourceId:id}:{});return r.data;},`
-    + `note:async function(t,k,meta){var r=await j('POST','/notes',{text:t,kind:k,meta:meta});return r.data;},`
-    + `compose:async function(ins,ctx,mx){var r=await j('POST','/compose',{instructions:ins,context:ctx,maxChars:mx});if(!r.ok)throw new Error((r.data&&r.data.error)||'compose failed');return r.data&&r.data.text;},`
-    + `action:async function(id,args){var r=await j('POST','/action',{actionId:id,args:args||{}});if(r.status===202&&r.data&&r.data.pending)return{pending:true,approvalId:r.data.approvalId,subject:r.data.subject};if(!r.ok)throw new Error((r.data&&r.data.error)||'action failed');return{ok:true,result:r.data&&r.data.result};}`
-    + `};})();</script>`;
+  return `<script>(function(){'use strict';
+var C='clementine.workspace.rpc.v1',S=${S},N=0,P=new Map(),Q=[],PORT=null;
+var ADD=EventTarget.prototype.addEventListener,REMOVE=EventTarget.prototype.removeEventListener;
+var STOP=Event.prototype.stopImmediatePropagation,PREVENT=Event.prototype.preventDefault;
+var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response;
+function id(){try{if(crypto&&crypto.randomUUID)return crypto.randomUUID();}catch(_){}return Date.now().toString(36)+'-'+(++N).toString(36);}
+var D='doc_'+id(),nav=window.navigation,SAFE_NAV=!!(nav&&typeof nav.addEventListener==='function');
+function lock(name,value){try{Object.defineProperty(window,name,{value:value,writable:false,configurable:false});}catch(_){}}
+if(SAFE_NAV){ADD.call(nav,'navigate',function(e){if(e.hashChange)return;if(e.cancelable)PREVENT.call(e);},true);}
+function finish(m){var p;if(!m||m.channel!==C||m.version!==1||m.kind!=='response'||m.workspaceId!==S||typeof m.id!=='string')return;p=P.get(m.id);if(!p)return;P.delete(m.id);clearTimeout(p.timer);if(m.ok)p.resolve(m.result);else p.reject(new Error(typeof m.error==='string'?m.error:'Workspace request failed'));}
+function send(m){if(PORT)PORT.postMessage(m);else Q.push(m);}
+function rpc(op,payload){return new Promise(function(resolve,reject){if(!SAFE_NAV){reject(new Error('This browser cannot safely isolate Workspace navigation'));return;}if(parent===window){reject(new Error('Workspace bridge requires the Clementine shell'));return;}if(P.size>=64){reject(new Error('Too many Workspace requests'));return;}var rid=id(),timer=setTimeout(function(){P.delete(rid);reject(new Error('Workspace request timed out'));},30000);P.set(rid,{resolve:resolve,reject:reject,timer:timer});send({channel:C,version:1,kind:'request',workspaceId:S,id:rid,op:op,payload:payload||{}});});}
+function onAck(e){var m=e.data,p;if(e.source!==parent||!m||m.channel!==C||m.version!==1||m.kind!=='bootstrap_ack'||m.workspaceId!==S||m.documentId!==D||!e.ports||!e.ports[0])return;STOP.call(e);PORT=e.ports[0];PORT.onmessage=function(pe){finish(pe.data);};PORT.start();while((p=Q.shift()))PORT.postMessage(p);if(BOOT)clearInterval(BOOT);REMOVE.call(window,'message',onAck,true);}
+ADD.call(window,'message',onAck,true);
+function bootstrap(){parent.postMessage({channel:C,version:1,kind:'bootstrap',workspaceId:S,documentId:D},'*');}
+var BOOT=null;if(SAFE_NAV&&parent!==window){bootstrap();BOOT=setInterval(bootstrap,250);setTimeout(function(){if(BOOT){clearInterval(BOOT);BOOT=null;}},5000);}
+function response(body,status){return new RESPONSE_CTOR(JSON_STRINGIFY(body),{status:status||200,headers:{'content-type':'application/json'}});}
+function parsedBody(init){if(!init||init.body===undefined||init.body===null||init.body==='')return {};if(typeof init.body!=='string')throw new TypeError('Workspace compatibility fetch accepts a JSON string body only');var value=JSON_PARSE(init.body);if(!value||typeof value!=='object'||Array.isArray(value))throw new TypeError('Workspace request body must be a JSON object');return value;}
+function legacyFetch(input,init){return Promise.resolve().then(function(){var raw=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:String(input));var u=new URL_CTOR(raw,location.href),here=new URL_CTOR(location.href),prefix='/api/console/spaces/'+encodeURIComponent(S)+'/',method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase(),body=parsedBody(init),tail;if(u.origin!==here.origin||u.search||u.hash||u.pathname.indexOf(prefix)!==0)throw new TypeError('Workspace fetch is limited to this Workspace RPC surface');tail=u.pathname.slice(prefix.length);if(tail==='data'&&method==='GET')return rpc('data',{}).then(function(r){return response({data:r},200);});if(tail==='refresh'&&method==='POST')return rpc('refresh',typeof body.sourceId==='string'?{sourceId:body.sourceId}:{}).then(function(r){return response(r,200);});if(tail==='notes'&&method==='POST')return rpc('note',{text:body.text,kind:body.kind,meta:body.meta}).then(function(r){return response(r,201);});if(tail==='compose'&&method==='POST')return rpc('compose',{instructions:body.instructions,context:body.context,maxChars:body.maxChars}).then(function(r){return response({text:r},200);});if(tail==='action'&&method==='POST')return rpc('action',{actionId:body.actionId,args:body.args||{}}).then(function(r){return response(r,r&&r.pending?202:200);});throw new TypeError('Workspace fetch operation is not allowed');}).catch(function(error){return response({error:error&&error.message?String(error.message):'Workspace request failed'},500);});}
+lock('fetch',legacyFetch);
+['XMLHttpRequest','WebSocket','EventSource','WebTransport','RTCPeerConnection','webkitRTCPeerConnection'].forEach(function(name){lock(name,undefined);});
+try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;},writable:false,configurable:false});}catch(_){}
+function anchor(target){while(target&&target!==document){if(target.tagName==='A')return target;target=target.parentElement;}return null;}
+ADD.call(document,'click',function(e){var a,url,protocol;if(!e.isTrusted||(a=anchor(e.target))===null)return;if(a.hasAttribute('download')){PREVENT.call(e);STOP.call(e);rpc('download',{filename:a.getAttribute('download')||'download',dataUrl:a.getAttribute('href')||''}).catch(function(){});return;}try{url=a.href;protocol=new URL_CTOR(url).protocol;}catch(_){return;}if(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'].indexOf(protocol)<0)return;PREVENT.call(e);STOP.call(e);rpc('open_external',{url:url}).catch(function(){});},true);
+window.clem=Object.freeze({slug:S,data:function(){return rpc('data',{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
+})();</script>`;
 };
 
 /** Insert a snippet as early as possible so `window.clem` is defined before any
@@ -125,7 +187,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
   // action actually runs (a button click has no agent turn to resume). Idempotent.
   initSpaceActionApprovals();
 
-  // ---- View serving (same-origin) ----------------------------------------
+  // ---- View serving (opaque-origin sandbox) ------------------------------
   const serveView = (req: Request, res: Response): void => {
     if (!isAuthorized(req)) { res.status(401).send('Unauthorized'); return; }
     if (!isLoopback(req)) { res.status(403).send('Workspaces are loopback-only'); return; }
@@ -133,6 +195,8 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (!isValidSpaceSlug(slug)) { res.status(400).send('invalid workspace id'); return; }
     const rec = spaceStore.get(slug);
     if (!rec || rec.status === 'archived') { res.status(404).send('workspace not found'); return; }
+    const csp = workspaceViewCsp(req, slug);
+    if (!csp) { res.status(400).send('invalid loopback host'); return; }
     const sub = (req.params[0] as string | undefined) || 'index.html';
     let target: string;
     try {
@@ -144,12 +208,17 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const ext = path.extname(target).toLowerCase();
     res.setHeader('Content-Type', CONTENT_TYPES[ext] ?? 'application/octet-stream');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (ext === '.svg') {
+      res.setHeader('Content-Security-Policy', WORKSPACE_SVG_CSP);
+    }
     if (ext === '.html' || ext === '.htm') {
-      // Inject a click shim: external-protocol links (tel:/mailto:/sms:/…)
-      // must NOT navigate the iframe (Electron has no handler → the frame
-      // blanks with ERR_BLOCKED_BY_CSP). Route them through window.open, which
-      // the desktop's setWindowOpenHandler hands to the OS (the dialer/mail).
-      // Same-origin inline script — allowed by the console CSP.
+      // A response header is mandatory here: an iframe attribute protects the
+      // normal console path, but not a raw URL opened in a tab. No
+      // allow-same-origin means the authored document gets a unique opaque
+      // origin; connect-src/form-action/frame-src keep it from using the parent
+      // as a network or navigation deputy.
+      res.setHeader('Content-Security-Policy', csp);
       const html = readFileSync(target, 'utf-8');
       // Bridge FIRST — literally. It must be DEFINED before any authored
       // <script> runs, so it goes at the TOP of <head>, not before </body>.
@@ -157,17 +226,23 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // script, which runs first in document order → `clem` is undefined →
       // the surface renders empty on first load. That ordering bug forced
       // hand-rolled `waitForClem` polls in authored views.) The bridge touches
-      // no DOM, so <head> is safe. The external-link shim is a passive
-      // capture-phase click listener — order-immaterial — so it stays at
-      // </body>. Both are same-origin inline scripts (console CSP).
-      let out = injectAtDocumentStart(html, CLEM_VIEW_BRIDGE(slug));
-      out = out.includes('</body>') ? out.replace('</body>', `${EXTERNAL_LINK_SHIM}</body>`) : out + EXTERNAL_LINK_SHIM;
-      res.send(out);
+      // no DOM, so <head> is safe.
+      res.send(injectAtDocumentStart(html, CLEM_VIEW_BRIDGE(slug)));
       return;
     }
     res.send(readFileSync(target));
   };
-  app.get('/console/spaces/:id/view', serveView);
+  app.get('/console/spaces/:id/view', (req, res) => {
+    // Express is non-strict about trailing slashes, so this handler sees both
+    // `/view` and `/view/`. Serve the canonical slash form directly and only
+    // redirect the non-slash form; otherwise fetch/browser follows a loop.
+    if (req.path.endsWith('/')) { serveView(req, res); return; }
+    if (!isAuthorized(req)) { res.status(401).send('Unauthorized'); return; }
+    if (!isLoopback(req)) { res.status(403).send('Workspaces are loopback-only'); return; }
+    const slug = String(req.params.id ?? '');
+    if (!isValidSpaceSlug(slug) || !spaceStore.get(slug)) { res.status(404).send('workspace not found'); return; }
+    res.redirect(308, `/console/spaces/${encodeURIComponent(slug)}/view/`);
+  });
   app.get('/console/spaces/:id/view/*', serveView);
 
   // ---- Management --------------------------------------------------------
@@ -264,7 +339,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     }
   });
 
-  // ---- Data plane (called by the agent-authored view) --------------------
+  // ---- Data plane (called by the trusted console RPC host) ---------------
   app.get('/api/console/spaces/:id/data', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;

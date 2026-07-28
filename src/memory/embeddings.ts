@@ -1,7 +1,9 @@
 import pino from 'pino';
+import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { pathToFileURL } from 'node:url';
+import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
 
 /**
@@ -36,6 +38,19 @@ export const EMBEDDING_DIM = 1536;
 // path + cosine dim-guard below are load-bearing, not theoretical.
 export const LOCAL_EMBEDDING_MODEL = 'Xenova/bge-small-en-v1.5';
 export const LOCAL_EMBEDDING_DIM = 384;
+const INTEL_TRANSFORMERS_ENTRY = 'transformers.clementine-wasm.mjs';
+const LOCAL_EMBEDDING_CACHE_DIR = path.join(BASE_DIR, 'cache', 'transformers');
+
+export function localEmbeddingRuntime(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): 'native' | 'wasm' {
+  return platform === 'darwin' && arch === 'x64' ? 'wasm' : 'native';
+}
+
+export function localEmbeddingCacheDir(): string {
+  return LOCAL_EMBEDDING_CACHE_DIR;
+}
 
 // OpenAI accepts up to 2048 inputs per request; we stay conservative
 // so a single bad chunk can't poison too many at once.
@@ -414,11 +429,66 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
       // Lazy + optional: the package is an optionalDependency. If it isn't
       // installed (or the model can't load offline), we degrade to lexical —
       // never a crash, never a startup cost when unused.
-      const mod = await import(/* @vite-ignore */ '@huggingface/transformers' as string).catch(() => null) as
-        | { pipeline?: (task: string, model: string) => Promise<(input: string[], opts?: unknown) => Promise<{ data: ArrayLike<number> }>> }
+      const runtime = localEmbeddingRuntime();
+      let moduleSpecifier = '@huggingface/transformers';
+      if (runtime === 'wasm') {
+        // ORT 1.24.1+ no longer publishes a native macOS x64 binding. The
+        // release hook creates a fail-closed Transformers entry that keeps the
+        // Node filesystem cache but routes inference through packaged WASM.
+        const require = createRequire(import.meta.url);
+        const transformersEntry = require.resolve('@huggingface/transformers');
+        moduleSpecifier = pathToFileURL(
+          path.join(path.dirname(transformersEntry), INTEL_TRANSFORMERS_ENTRY),
+        ).href;
+      }
+      const mod = await import(/* @vite-ignore */ moduleSpecifier).catch(() => null) as
+        | {
+            env?: {
+              cacheDir?: string;
+              useWasmCache?: boolean;
+              backends?: {
+                onnx?: {
+                  wasm?: {
+                    numThreads?: number;
+                    wasmBinary?: Uint8Array;
+                    wasmPaths?: undefined;
+                  };
+                };
+              };
+            };
+            pipeline?: (
+              task: string,
+              model: string,
+              options?: unknown,
+            ) => Promise<(input: string[], opts?: unknown) => Promise<{ data: ArrayLike<number> }>>;
+          }
         | null;
       if (!mod?.pipeline) { localProvider = null; return null; }
-      const extractor = await mod.pipeline('feature-extraction', LOCAL_EMBEDDING_MODEL);
+      mkdirSync(LOCAL_EMBEDDING_CACHE_DIR, { recursive: true });
+      if (mod.env) mod.env.cacheDir = LOCAL_EMBEDDING_CACHE_DIR;
+      if (runtime === 'wasm' && mod.env?.backends?.onnx?.wasm) {
+        const require = createRequire(import.meta.url);
+        const ortEntry = require.resolve('onnxruntime-web');
+        const wasmFile = path.join(path.dirname(ortEntry), 'ort-wasm-simd-threaded.wasm');
+        // Transformers otherwise rewrites this to CDN/blob URLs at module
+        // evaluation. Node's ESM loader rejects blob: and fetch(file:) fails,
+        // so provide the packaged bytes explicitly and disable that preloader.
+        mod.env.useWasmCache = false;
+        mod.env.backends.onnx.wasm.wasmPaths = undefined;
+        mod.env.backends.onnx.wasm.wasmBinary = new Uint8Array(readFileSync(wasmFile));
+        const configuredThreads = Number.parseInt(
+          getRuntimeEnv('CLEMMY_ONNX_WASM_THREADS', '') || '',
+          10,
+        );
+        if (Number.isInteger(configuredThreads) && configuredThreads > 0) {
+          mod.env.backends.onnx.wasm.numThreads = configuredThreads;
+        }
+      }
+      const extractor = await mod.pipeline(
+        'feature-extraction',
+        LOCAL_EMBEDDING_MODEL,
+        runtime === 'wasm' ? { device: 'wasm' } : undefined,
+      );
       const provider: EmbeddingProvider = {
         name: 'local',
         model: LOCAL_EMBEDDING_MODEL,
@@ -433,7 +503,10 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
         },
       };
       localProvider = provider;
-      logger.info({ model: LOCAL_EMBEDDING_MODEL, dim: LOCAL_EMBEDDING_DIM }, 'local embedding provider loaded');
+      logger.info(
+        { model: LOCAL_EMBEDDING_MODEL, dim: LOCAL_EMBEDDING_DIM, runtime },
+        'local embedding provider loaded',
+      );
       return provider;
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'local embedding provider unavailable — semantic recall on lexical fallback');

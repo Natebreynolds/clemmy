@@ -31,6 +31,8 @@ import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
+import { recordModelUsage } from '../usage-log.js';
+import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-model' });
@@ -576,6 +578,161 @@ export function withClaudeInputSanitizer(inner: Model): Model {
   return new ClaudeInputSanitizingModel(inner);
 }
 
+/** Apply Clementine's Claude output allowance before the AI SDK adapter gets
+ * the request. The adapter defaults unknown/new Claude model ids to 4,096,
+ * which can strand a long-horizon turn in repeated reasoning-only responses.
+ * Caller-supplied values remain authoritative; only an omitted setting gets a
+ * capability-bounded default. */
+class ClaudeRequestDefaultsModel implements Model {
+  constructor(
+    private readonly inner: Model,
+    private readonly capability: ModelCapability,
+  ) {}
+
+  private apply(request: ModelRequest): ModelRequest {
+    if (typeof request.modelSettings?.maxTokens === 'number') return request;
+    const capabilityMax = Number.isFinite(this.capability.maxOutput)
+      ? Math.max(1, Math.floor(this.capability.maxOutput))
+      : CLAUDE_DEFAULT_MAX_TOKENS;
+    return {
+      ...request,
+      modelSettings: {
+        ...request.modelSettings,
+        maxTokens: Math.min(CLAUDE_DEFAULT_MAX_TOKENS, capabilityMax),
+      },
+    } as ModelRequest;
+  }
+
+  getResponse(request: ModelRequest): Promise<ModelResponse> {
+    return this.inner.getResponse(this.apply(request));
+  }
+
+  getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    return this.inner.getStreamedResponse(this.apply(request));
+  }
+}
+
+export function withClaudeRequestDefaults(inner: Model, capability: ModelCapability): Model {
+  return new ClaudeRequestDefaultsModel(inner, capability);
+}
+
+export interface RawClaudeUsageFields {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  responseId?: string;
+}
+
+/** Normalize the Agents SDK Usage object emitted by the raw Messages adapter.
+ * Different SDK versions use cached_tokens, cacheReadInputTokens, or the
+ * Anthropic snake-case spelling inside one or more detail rows. */
+export function rawClaudeUsageFields(response: ModelResponse): RawClaudeUsageFields {
+  const n = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+  const usage = response.usage as unknown as {
+    inputTokens?: unknown;
+    outputTokens?: unknown;
+    totalTokens?: unknown;
+    inputTokensDetails?: unknown;
+  };
+  const rows = Array.isArray(usage?.inputTokensDetails)
+    ? usage.inputTokensDetails
+    : usage?.inputTokensDetails && typeof usage.inputTokensDetails === 'object'
+      ? [usage.inputTokensDetails]
+      : [];
+  const cachedInputTokens = rows.reduce((sum, row) => {
+    if (!row || typeof row !== 'object') return sum;
+    const detail = row as Record<string, unknown>;
+    return sum + n(
+      detail.cacheReadInputTokens
+      ?? detail.cache_read_input_tokens
+      ?? detail.cached_tokens
+      ?? detail.cachedTokens,
+    );
+  }, 0);
+  const inputTokens = n(usage?.inputTokens);
+  const outputTokens = n(usage?.outputTokens);
+  const responseIds = response as unknown as {
+    responseId?: unknown;
+    id?: unknown;
+  };
+  const responseIdentity =
+    typeof responseIds.responseId === 'string' && responseIds.responseId
+      ? responseIds.responseId
+      : responseIds.id;
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    totalTokens: n(usage?.totalTokens) || inputTokens + outputTokens,
+    ...(typeof responseIdentity === 'string' && responseIdentity
+      ? { responseId: responseIdentity }
+      : {}),
+  };
+}
+
+/** Outermost raw-Messages accounting wrapper. It sits outside resilience so a
+ * successful logical model call is recorded once, while the returned Usage
+ * already includes the adapter's provider-reported cache details. */
+class RawClaudeUsageRecordingModel implements Model {
+  constructor(
+    private readonly inner: Model,
+    private readonly modelId: string,
+    private readonly usageRecorder: typeof recordModelUsage,
+  ) {}
+
+  private record(response: ModelResponse, startedAt: number): void {
+    try {
+      const fields = rawClaudeUsageFields(response);
+      if (fields.inputTokens === 0 && fields.outputTokens === 0) return;
+      const context = harnessRunContextStorage.getStore();
+      this.usageRecorder({
+        sessionId: context?.sessionId ?? 'unknown',
+        model: this.modelId,
+        ...fields,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        promptComponents: context?.promptComponents,
+      });
+    } catch {
+      // Usage observability must never affect the model response.
+    }
+  }
+
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    const startedAt = Date.now();
+    const response = await this.inner.getResponse(request);
+    this.record(response, startedAt);
+    return response;
+  }
+
+  async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    const startedAt = Date.now();
+    let recorded = false;
+    for await (const event of this.inner.getStreamedResponse(request)) {
+      if (!recorded && event.type === 'response_done') {
+        const response = (event as unknown as { response?: ModelResponse }).response;
+        if (response) {
+          recorded = true;
+          this.record(response, startedAt);
+        }
+      }
+      yield event;
+    }
+  }
+}
+
+/** Testable/public decorator seam for the raw Claude transport. The optional
+ * recorder keeps the streaming contract test pure while production defaults to
+ * the durable cross-brain usage log. */
+export function withRawClaudeUsageRecording(
+  inner: Model,
+  modelId: string,
+  usageRecorder: typeof recordModelUsage = recordModelUsage,
+): Model {
+  return new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder);
+}
+
 /** Per-request transport router (owner question, 2026-07-24: "why can't
  *  Claude run tools when it's its own lane?"). Headless (Claude Code print
  *  mode) is deliberately text-only; the raw Messages adapter serves the SAME
@@ -628,18 +785,21 @@ export function getClaudeModel(modelId: string): Model {
 /** The tool-capable raw Messages adapter (subscription token), with the
  *  standard resilience/parity wrapping. */
 function buildRawClaudeModel(modelId: string): Model {
-  let model: Model = withClaudeInputSanitizer(aisdk(getProvider()(modelId)));
+  const capability = resolveModelCapability(modelId);
+  let model: Model = withClaudeInputSanitizer(
+    withClaudeRequestDefaults(aisdk(getProvider()(modelId)), capability),
+  );
   // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
   // translation (effort -> output_config.effort). Wrap BEFORE caching so the
   // cache hands back the resilient model, not the bare passthrough.
   if (modelParityEnabled()) {
     model = withResilience(model, {
       label: 'claude',
-      capability: resolveModelCapability(modelId),
+      capability,
       refreshAuth: refreshClaudeAuth,
     });
   }
-  return model;
+  return withRawClaudeUsageRecording(model, modelId);
 }
 
 /** Whether the Claude model used by the standard Agents harness can execute

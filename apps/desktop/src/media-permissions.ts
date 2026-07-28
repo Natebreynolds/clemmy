@@ -1,9 +1,9 @@
 /**
  * Media capture is reserved for trusted first-party dashboard surfaces,
- * including the voice-enabled notch. Workspace HTML is intentionally rendered
- * same-origin at /console/spaces/:id/view, so origin checks alone are
- * insufficient: agent-authored content must never inherit Clementine's
- * microphone grant, even after a top-frame navigation.
+ * including the voice-enabled notch. Workspace URLs live under the dashboard
+ * origin but their response + iframe force an opaque-origin sandbox. Keep the
+ * path deny as defense in depth: agent-authored content must never inherit
+ * Clementine's microphone grant, even after a top-frame navigation.
  */
 export function isTrustedDashboardMediaUrl(
   rawUrl: string,

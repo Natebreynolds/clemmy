@@ -26,6 +26,8 @@ import { withToolOutputContext } from '../runtime/harness/tool-output-context.js
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { deriveCodeModeSets } from './tool-registry.js';
 import { runCodeModeProgram, cleanCodeModeStderr, type CodeModeResult } from './code-mode-sandbox.js';
+import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
 // buildCodeModeTool). The dynamic import resolves at first dispatch, by when the
@@ -299,20 +301,51 @@ export function isCodeModeToolAllowed(method: string): boolean {
  *  an unknown name reports allowed:false so the program can branch. */
 type ExternalMcpTool = { name: string; description?: string; inputSchema?: unknown };
 let externalMcpToolListForTest: (() => Promise<ExternalMcpTool[]>) | null = null;
+type ExternalMcpShim = {
+  listTools?: () => Promise<unknown>;
+  callTool: (name: string, args: Record<string, unknown> | null) => Promise<unknown>;
+};
+let externalMcpResolverForTest:
+  | ((toolName: string, scope: McpToolScope | null | undefined) => ExternalMcpShim | null)
+  | null = null;
 /** Test seam: inject the external MCP tool list so describe()/listTools() can be
  *  tested without spawning real MCP servers. */
 export function _setExternalMcpToolsForTests(fn: (() => Promise<ExternalMcpTool[]>) | null): void {
   externalMcpToolListForTest = fn;
+}
+/** Test seam: prove an authority refusal happens before provider resolution,
+ * listTools, or callTool. Production always uses the lazy runtime resolver. */
+export function _setCodeModeMcpResolverForTests(
+  fn: ((toolName: string, scope: McpToolScope | null | undefined) => ExternalMcpShim | null) | null,
+): void {
+  externalMcpResolverForTest = fn;
 }
 
 /** The connected external MCP tools with their real schemas, via the same shim
  *  the dispatch path uses. Best-effort + cached by the shim — never throws (an
  *  unavailable shim just yields []). Shared by describe() and listTools(). */
 async function externalMcpToolList(): Promise<ExternalMcpTool[]> {
-  if (externalMcpToolListForTest) return externalMcpToolListForTest();
+  const scope = harnessRunContextStorage.getStore()?.mcpToolScope;
+  // Fast deny before touching a test seam or provider factory.
+  if (
+    scope === null
+    || (scope !== undefined
+      && !scope.allowAll
+      && !scope.failOpenCandidate
+      && (scope.maxTools === 0 || (scope.allowedServerSlugs ?? []).length === 0))
+  ) return [];
+  if (externalMcpToolListForTest) {
+    const tools = await externalMcpToolListForTest();
+    if (scope === undefined || scope?.allowAll || scope?.failOpenCandidate) {
+      return scope?.maxTools === 0 ? [] : tools.slice(0, scope?.maxTools ?? tools.length);
+    }
+    return tools
+      .filter((tool) => mcpToolAllowedByScope(tool.name, scope))
+      .slice(0, scope?.maxTools ?? tools.length);
+  }
   try {
     const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
-    const shim = getOrCreateExternalMcpServers() as unknown as { listTools?: () => Promise<unknown> } | null;
+    const shim = getOrCreateExternalMcpServers(scope ?? undefined) as unknown as { listTools?: () => Promise<unknown> } | null;
     if (!shim || typeof shim.listTools !== 'function') return [];
     const tools = await shim.listTools();
     return Array.isArray(tools) ? (tools as Array<{ name: string; description?: string; inputSchema?: unknown }>) : [];
@@ -353,6 +386,7 @@ async function runCodeModeWorker(input: WorkerToolInput, modelId: string, sessio
     modelId,
     sessionId,
     harnessRunContextStorage.getStore()?.sourceUserSeq,
+    harnessRunContextStorage.getStore()?.mcpToolScope,
   );
   return { text: r.text, model: r.model };
 }
@@ -396,7 +430,9 @@ async function dispatchCodeModeWorker(args: unknown, sessionId: string, counter?
 export async function describeCodeModeTool(name: unknown): Promise<unknown> {
   const toolName = typeof name === 'string' ? name : String((name as { tool?: unknown; name?: unknown })?.tool ?? (name as { name?: unknown })?.name ?? '');
   if (!toolName) return { error: 'describe: pass a tool name string, e.g. clem.describe("list_files")' };
-  const allowed = isCodeModeToolAllowed(toolName);
+  const scope = harnessRunContextStorage.getStore()?.mcpToolScope;
+  const allowed = isCodeModeToolAllowed(toolName)
+    && (!isMcpNamespacedTool(toolName) || mcpToolAllowedByScope(toolName, scope));
   if (isMcpNamespacedTool(toolName)) {
     // Return the REAL schema from the shim's listTools so the model stops
     // guessing MCP arg shapes (the {directory}-vs-{path} bug class code mode is
@@ -507,6 +543,7 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   | 'recallBudget'
   | 'defaultTimeoutMs'
   | 'turnRecallRunIds'
+  | 'mcpToolScope'
 >> {
   const parent = harnessRunContextStorage.getStore();
   if (!parent || parent.sessionId !== sessionId) return {};
@@ -518,6 +555,7 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     ...(parent.behaviorScopeId ? { behaviorScopeId: parent.behaviorScopeId } : {}),
     ...(parent.guardrailScopeId ? { guardrailScopeId: parent.guardrailScopeId } : {}),
     ...(parent.suppressBackgroundOffer ? { suppressBackgroundOffer: true } : {}),
+    ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
     // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
     // protects the MODEL's context window, but a program-internal recall never
     // enters model context — only the program's clipped output does. Inheriting
@@ -591,12 +629,40 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
  *  MCP reads — without this, the block would refuse the very program it
  *  demanded (the shim mount is where discrete native-MCP serial reads are
  *  refused as of 2026-07-12). `certifiedBatch` rides along for the batch lane. */
-async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean): Promise<unknown> {
-  const { getOrCreateExternalMcpServerForTool } = await import('../runtime/mcp-servers.js');
-  const shim = getOrCreateExternalMcpServerForTool(method) as unknown as {
-    listTools?: () => Promise<unknown>;
-    callTool: (name: string, args: Record<string, unknown> | null) => Promise<unknown>;
-  } | null;
+async function dispatchCodeModeMcpTool(
+  method: string,
+  args: unknown,
+  sessionId: string,
+  counter?: ToolCallsCounter,
+  certifiedBatch?: { batchId: string; payloadHash: string },
+  batchItem?: boolean,
+  scopeOverride?: McpToolScope | null,
+): Promise<unknown> {
+  const scope = scopeOverride !== undefined
+    ? scopeOverride
+    : harnessRunContextStorage.getStore()?.mcpToolScope;
+  // Check BEFORE importing mcp-servers or resolving a shim. A remembered or
+  // guessed namespaced tool on a local-only turn must cause zero child-process
+  // construction, zero listTools, and zero dispatch.
+  if (!mcpToolAllowedByScope(method, scope)) {
+    throw new Error(`MCP_SCOPE_DENIED: code-mode tool "${method}" is outside this turn's external MCP scope`);
+  }
+  let shim: ExternalMcpShim | null;
+  if (externalMcpResolverForTest) {
+    shim = externalMcpResolverForTest(method, scope);
+  } else {
+    const {
+      getOrCreateExternalMcpServerForTool,
+      getOrCreateExternalMcpServers,
+    } = await import('../runtime/mcp-servers.js');
+    shim = (scope === undefined
+      ? getOrCreateExternalMcpServerForTool(method)
+      : getOrCreateExternalMcpServers(scope ?? {
+          reason: 'explicit no-external-tools scope',
+          allowedServerSlugs: [],
+          maxTools: 0,
+        })) as unknown as ExternalMcpShim;
+  }
   if (!shim || typeof shim.callTool !== 'function') {
     throw new Error(`code-mode: no MCP servers are configured (cannot call "${method}")`);
   }
@@ -635,6 +701,7 @@ export async function dispatchBatchItemTool(
   counter: ToolCallsCounter,
   certifiedBatch?: { batchId: string; payloadHash: string },
   telemetry?: { accounting?: 'transport_mirror'; canonicalCallId?: string },
+  mcpToolScopeOverride?: McpToolScope | null,
 ): Promise<unknown> {
   const callId = `batch-${randomUUID()}`;
   const telemetryData = {
@@ -644,7 +711,7 @@ export async function dispatchBatchItemTool(
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, ...telemetryData, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
-      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch, true)
+      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch, true, mcpToolScopeOverride)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch, true);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;

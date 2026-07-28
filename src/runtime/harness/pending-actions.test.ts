@@ -62,11 +62,188 @@ test('approval and result transitions update status without losing history', () 
   pending.markPendingActionApprovalResolved(record.id, 'approved', 'apr-1234');
   assert.equal(pending.getPendingAction(record.id)?.status, 'approved');
 
-  pending.recordPendingActionResult(record.id, 'executed', 'Deploy completed.');
+  const claim = pending.claimPendingActionExecution(record.id, 'deployment-executor');
+  assert.equal(claim.claimed, true);
+  assert.ok(claim.claimToken, 'the execution owner receives an opaque finalization capability');
+  pending.recordPendingActionResult(
+    record.id,
+    'executed',
+    'Deploy completed.',
+    'deployment-executor',
+    claim.claimToken,
+  );
   const done = pending.getPendingAction(record.id);
   assert.equal(done?.status, 'executed');
   assert.equal(done?.resultSummary, 'Deploy completed.');
-  assert.ok((done?.history.length ?? 0) >= 4);
+  assert.ok((done?.history.length ?? 0) >= 5);
+});
+
+test('execution claim is one-shot and cannot be reset to approved after an uncertain crash boundary', () => {
+  const record = pending.queuePendingAction({
+    title: 'One-shot proof write',
+    summary: 'Claim once before crossing the provider boundary.',
+    kind: 'external_write',
+    toolName: 'proof__write',
+    payload: { value: 'once' },
+  });
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'test' },
+  });
+
+  const first = pending.claimPendingActionExecution(record.id, 'test-executor');
+  assert.equal(first.claimed, true);
+  assert.equal(first.record?.status, 'executing');
+  assert.match(first.record?.resultSummary ?? '', /pending or uncertain.*never retry/i);
+
+  const second = pending.claimPendingActionExecution(record.id, 'competing-executor');
+  assert.equal(second.claimed, false);
+  assert.equal(second.reason, 'not_approved');
+  assert.equal(second.record?.status, 'executing');
+
+  // A late/duplicate approval resolution must never resurrect execution
+  // authority after the claim boundary.
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'late-duplicate-approval' },
+  });
+  assert.equal(pending.getPendingAction(record.id)?.status, 'executing');
+  assert.equal(
+    pending.findOpenPendingActionByPayload(record.toolName, record.payload)?.id,
+    record.id,
+    'executing records remain open for dedup, so a replacement card is not minted',
+  );
+});
+
+test('only the opaque claim owner can finalize; tokenless/model-callable completion is inert', () => {
+  const record = pending.queuePendingAction({
+    title: 'Claim ownership proof',
+    summary: 'Only the executor that consumed approval may record terminal truth.',
+    kind: 'external_write',
+    toolName: 'proof__write',
+    payload: { value: 'owner-only' },
+  });
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'test' },
+  });
+  const claim = pending.claimPendingActionExecution(record.id, 'trusted-executor');
+  assert.equal(claim.claimed, true);
+  assert.ok(claim.claimToken);
+  assert.equal(
+    JSON.stringify(pending.getPendingAction(record.id)).includes(claim.claimToken!),
+    false,
+    'the raw claim capability is never persisted or exposed by record reads',
+  );
+
+  pending.recordPendingActionResult(record.id, 'executed', 'forged by model');
+  assert.equal(pending.getPendingAction(record.id)?.status, 'executing', 'missing capability cannot forge success');
+  pending.recordPendingActionResult(record.id, 'failed', 'forged with wrong owner', 'other-executor', claim.claimToken);
+  assert.equal(pending.getPendingAction(record.id)?.status, 'executing', 'the right token under the wrong owner is inert');
+  pending.recordPendingActionResult(record.id, 'executed', 'forged with wrong token', 'trusted-executor', 'not-the-token');
+  assert.equal(pending.getPendingAction(record.id)?.status, 'executing', 'the owner name alone is not authority');
+
+  pending.recordPendingActionResult(record.id, 'executed', 'durable success', 'trusted-executor', claim.claimToken);
+  const done = pending.getPendingAction(record.id);
+  assert.equal(done?.status, 'executed');
+  assert.equal(done?.resultSummary, 'durable success');
+});
+
+test('state machine is monotonic: terminals are immutable and late approval cannot resurrect them', () => {
+  const terminalResolutions = ['rejected', 'expired', 'cancelled_by_user'] as const;
+  for (const resolution of terminalResolutions) {
+    const record = pending.queuePendingAction({
+      title: `Terminal ${resolution}`,
+      summary: 'Terminal states never reopen.',
+      kind: 'external_write',
+      toolName: 'proof__write',
+      payload: { resolution },
+    });
+    pending.markPendingActionApprovalResolved(record.id, resolution);
+    const before = pending.getPendingAction(record.id)!;
+    pending.linkPendingActionApproval(record.id, `apr-late-${resolution}`);
+    pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+      by: 'policy',
+      evidence: { kind: 'policy', scope: 'late' },
+    });
+    pending.recordPendingActionResult(record.id, 'executed', 'forged terminal rewrite');
+    const after = pending.getPendingAction(record.id)!;
+    assert.equal(after.status, before.status);
+    assert.equal(after.updatedAt, before.updatedAt, `${before.status} is byte-level immutable`);
+    assert.deepEqual(after.history, before.history);
+  }
+});
+
+test('cancellation is allowed only before claim and cannot overwrite executing or terminal truth', () => {
+  const record = pending.queuePendingAction({
+    title: 'Cancellation boundary',
+    summary: 'Cancellation must win before dispatch claim or not at all.',
+    kind: 'external_write',
+    toolName: 'proof__write',
+    payload: { value: 1 },
+  });
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'test' },
+  });
+  const claim = pending.claimPendingActionExecution(record.id, 'trusted-executor');
+  assert.ok(claim.claimToken);
+  pending.recordPendingActionResult(record.id, 'cancelled', 'late cancel');
+  assert.equal(pending.getPendingAction(record.id)?.status, 'executing', 'claimed dispatch cannot be cancelled');
+  pending.recordPendingActionResult(record.id, 'failed', 'provider uncertainty', 'trusted-executor', claim.claimToken);
+  assert.equal(pending.getPendingAction(record.id)?.status, 'failed');
+  const terminal = pending.getPendingAction(record.id)!;
+  pending.recordPendingActionResult(record.id, 'cancelled', 'later cancel');
+  assert.deepEqual(pending.getPendingAction(record.id), terminal);
+
+  const preclaim = pending.queuePendingAction({
+    title: 'Preclaim cancellation',
+    summary: 'Safe cancellation before dispatch.',
+    kind: 'external_write',
+    toolName: 'proof__write',
+    payload: { value: 2 },
+  });
+  pending.recordPendingActionResult(preclaim.id, 'cancelled', 'user cancelled');
+  assert.equal(pending.getPendingAction(preclaim.id)?.status, 'cancelled');
+  assert.equal(pending.claimPendingActionExecution(preclaim.id).claimed, false);
+});
+
+test('two finalizers racing with the same claim capability produce one immutable terminal result', async () => {
+  const record = pending.queuePendingAction({
+    title: 'Finalization race',
+    summary: 'The first durable terminal result wins.',
+    kind: 'external_write',
+    toolName: 'proof__write',
+    payload: { value: 'race' },
+  });
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'test' },
+  });
+  const claim = pending.claimPendingActionExecution(record.id, 'race-executor');
+  assert.ok(claim.claimToken);
+
+  await Promise.all([
+    Promise.resolve().then(() => pending.recordPendingActionResult(
+      record.id, 'executed', 'winner-success', 'race-executor', claim.claimToken,
+    )),
+    Promise.resolve().then(() => pending.recordPendingActionResult(
+      record.id, 'failed', 'winner-failure', 'race-executor', claim.claimToken,
+    )),
+  ]);
+  const final = pending.getPendingAction(record.id)!;
+  assert.ok(final.status === 'executed' || final.status === 'failed');
+  const terminalHistory = final.history.filter((entry) => entry.status === 'executed' || entry.status === 'failed');
+  assert.equal(terminalHistory.length, 1, 'only one terminal transition is durably recorded');
+  const frozen = JSON.stringify(final);
+  pending.recordPendingActionResult(
+    record.id,
+    final.status === 'executed' ? 'failed' : 'executed',
+    'late rewrite',
+    'race-executor',
+    claim.claimToken,
+  );
+  assert.equal(JSON.stringify(pending.getPendingAction(record.id)), frozen, 'terminal truth cannot be rewritten');
 });
 
 test('human approval provenance cannot be downgraded by later policy bookkeeping', async () => {
@@ -97,6 +274,44 @@ test('human approval provenance cannot be downgraded by later policy bookkeeping
   assert.equal(approved?.approvedBy, 'human');
   assert.deepEqual(approved?.approvalEvidence, { kind: 'card', approvalId: card.approvalId });
   assert.equal(approved?.approvalId, card.approvalId);
+});
+
+test('policy-approved preclaim action can attach a real card and upgrade to human without moving status backwards', async () => {
+  const record = pending.queuePendingAction({
+    title: 'Human upgrade',
+    summary: 'A policy decision is inert until a real card approves this send.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+  });
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'auto' },
+  });
+
+  const { createSession } = await import('./eventlog.js');
+  const registryMod = await import('./approval-registry.js');
+  const sess = createSession({ kind: 'chat' });
+  const card = registryMod.register({
+    sessionId: sess.id,
+    subject: 'upgrade send consent',
+    tool: 'composio_execute_tool',
+    args: { pendingActionId: record.id },
+  });
+  const linked = pending.getPendingAction(record.id);
+  assert.equal(linked?.status, 'approved', 'linking review never regresses the state graph');
+  assert.equal(linked?.approvalId, card.approvalId, 'the exact card backlink is still durably bound');
+  assert.equal(linked?.approvedBy, 'policy');
+
+  registryMod.resolve(card.approvalId, 'approved', 'test');
+  pending.markPendingActionApprovalResolved(record.id, 'approved', card.approvalId, {
+    by: 'human',
+    evidence: { kind: 'card', approvalId: card.approvalId },
+  });
+  const upgraded = pending.getPendingAction(record.id);
+  assert.equal(upgraded?.status, 'approved');
+  assert.equal(upgraded?.approvedBy, 'human');
+  assert.deepEqual(upgraded?.approvalEvidence, { kind: 'card', approvalId: card.approvalId });
 });
 
 test('parsePendingActionPayloadJson rejects malformed JSON with a corrective message', () => {

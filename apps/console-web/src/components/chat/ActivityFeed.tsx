@@ -9,6 +9,10 @@ import { useEffect, useState } from 'react';
 import { Wrench, Users, Check, X, Zap, Send, AlertCircle, CheckCircle2, Radio, Dot } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
+import {
+  settleTerminalActivity,
+  type ActivityTerminalOutcome,
+} from '@/lib/activity-presentation';
 
 export const PROVIDER_DOT: Record<NonNullable<ActivityItem['provider']>, string> = {
   claude: '#d97757',
@@ -31,6 +35,7 @@ export function StatusIcon({ status }: { status: ActivityItem['status'] }) {
     return <span className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-primary/30 border-t-primary/80" aria-hidden />;
   }
   if (status === 'failed') return <X className="h-3.5 w-3.5 shrink-0 text-danger" aria-hidden />;
+  if (status === 'interrupted') return <AlertCircle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />;
   return <Check className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden />;
 }
 
@@ -73,7 +78,11 @@ export function BatchRow({ a, now, live }: { a: ActivityItem; now: number; live:
       <div className="ml-5 flex items-center gap-2">
         <div className="h-1 flex-1 overflow-hidden rounded-full bg-border/60" role="progressbar" aria-valuenow={b.done} aria-valuemin={0} aria-valuemax={b.total}>
           <div
-            className={cn('h-full rounded-full transition-all duration-300', a.status === 'failed' ? 'bg-danger' : 'bg-primary', running && 'animate-pulse')}
+            className={cn(
+              'h-full rounded-full transition-all duration-300',
+              a.status === 'failed' ? 'bg-danger' : a.status === 'interrupted' ? 'bg-warning' : 'bg-primary',
+              running && 'animate-pulse',
+            )}
             style={{ width: `${pct}%` }}
           />
         </div>
@@ -115,7 +124,9 @@ export function ActivityRow({ a, now, live, showDetails = false }: {
       {a.kind === 'agent' ? (
         <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
       ) : a.kind === 'check' ? (
-        <Check className={cn('h-3 w-3 shrink-0', a.status === 'failed' ? 'text-warning' : 'text-success')} aria-hidden />
+        a.status === 'interrupted'
+          ? <AlertCircle className="h-3 w-3 shrink-0 text-warning" aria-hidden />
+          : <Check className={cn('h-3 w-3 shrink-0', a.status === 'failed' ? 'text-warning' : 'text-success')} aria-hidden />
       ) : isEvent ? (
         <EventIcon a={a} />
       ) : (
@@ -139,17 +150,17 @@ export function ActivityRow({ a, now, live, showDetails = false }: {
  * grows and lets the drawer's single overflow column scroll (so the panel scrolls
  * as a whole, and the drawer can keep it pinned to the bottom while live).
  */
-export function LiveFeed({ items, live, showDetails }: {
+export function LiveFeed({ items, live, showDetails, terminalOutcome }: {
   items: ActivityItem[];
   live: boolean;
   showDetails: boolean;
+  terminalOutcome?: ActivityTerminalOutcome;
 }) {
   const now = useNowTick(live && items.some((a) => a.status === 'running'));
   if (items.length === 0) {
     return <p className="text-body text-faint">No activity yet — it streams in as the agent works.</p>;
   }
-  // Turn's over → a still-'running' row reads as done (no perpetual spinners).
-  const view = live ? items : items.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const } : a));
+  const view = settleTerminalActivity(items, live ? undefined : (terminalOutcome ?? 'interrupted'));
   const agents = view.filter((a) => a.kind === 'agent');
   const doneAgents = agents.filter((a) => a.status !== 'running').length;
   return (

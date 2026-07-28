@@ -12,9 +12,10 @@
  * failure blocks completion with the SPECIFIC gap ("sheet 1tMA… exists but has 0
  * data rows"), which feeds the existing not-done/blocked machinery.
  *
- * Best-effort PER CLASS: an artifact type we cannot probe (or a probe that errors)
- * preserves its durable creation evidence — we NEVER block on a probe we cannot run.
- * Everything is injectable so tests are deterministic with no fs/network dependence.
+ * Verification is requirement-sensitive: an unprobeable artifact may preserve
+ * durable creation evidence for an existence-only objective, but it can NEVER
+ * prove a requirement to populate that artifact. Everything is injectable so
+ * tests are deterministic with no fs/network dependence.
  */
 import { existsSync, statSync } from 'node:fs';
 import { listEvents, getToolOutput, type EventRow } from '../runtime/harness/eventlog.js';
@@ -34,14 +35,15 @@ export interface Deliverable {
 export interface DeliverableVerdict {
   deliverable: Deliverable;
   pass: boolean;
-  /** 'probe' = a real readback ran; 'skipped' = unprobeable → passes through. */
-  method: 'probe' | 'skipped';
+  /** 'probe' = a real readback ran; 'skipped' = no readback was required;
+   * 'unverified' = required readback could not run and therefore blocks done. */
+  method: 'probe' | 'skipped' | 'unverified';
   detail: string;
 }
 
 export interface DeliverableProbeResult {
   probed: DeliverableVerdict[];
-  /** Only the CONFIRMED-failed deliverables (a skipped/unprobeable one is not here). */
+  /** Confirmed failures plus required deliverables whose readback is unavailable. */
   failures: Array<{ ref: string; gap: string }>;
   /** One-line block reason naming the specific gaps (empty when nothing failed). */
   summary: string;
@@ -55,7 +57,8 @@ export interface DeliverableProbeDeps {
   getToolOutputFn?: (sessionId: string, callId: string) => { output?: string } | null;
   fileStat?: (p: string) => { exists: boolean; size: number };
   /** Read a spreadsheet's populated row count. Return -1 for "unprobeable" (network
-   *  error, bad slug, no connection) → the deliverable is SKIPPED, never failed. */
+   *  error, bad slug, no connection). If population is required, this blocks done
+   *  because creation evidence alone cannot prove populated contents. */
   readSheetRowCount?: (spreadsheetId: string, sessionId: string) => Promise<number>;
 }
 
@@ -170,8 +173,8 @@ export function countSheetRows(result: unknown): number {
 }
 
 /** Default sheet reader: a composio GOOGLESHEETS_BATCH_GET readback through the
- *  gated dispatch path. Best-effort — any error/unknown shape returns -1 so the
- *  sheet is SKIPPED rather than falsely failed. Lazily
+ *  gated dispatch path. Any error/unknown shape returns -1 so the caller can
+ *  distinguish "known empty" from "required population remains unverified." Lazily
  *  imported to keep composio/harness off this module's static graph. */
 async function defaultSheetRowCount(spreadsheetId: string, sessionId: string): Promise<number> {
   try {
@@ -222,7 +225,12 @@ async function probeOne(
     rows = -1;
   }
   if (rows < 0) {
-    return { deliverable: d, pass: true, method: 'skipped', detail: `sheet ${d.ref}: unprobeable (read failed) — passed through to the judge` };
+    return {
+      deliverable: d,
+      pass: false,
+      method: 'unverified',
+      detail: `sheet ${d.ref}: required population could not be verified because authoritative readback failed`,
+    };
   }
   // Populated = more than a bare title/header row.
   return rows > 1
@@ -242,19 +250,36 @@ export async function probeDeliverables(
     try {
       probed.push(await probeOne(d, objective, sessionId, deps));
     } catch {
-      // A probe that throws is unprobeable → pass through, never block.
-      probed.push({ deliverable: d, pass: true, method: 'skipped', detail: `${d.kind} ${d.ref}: probe errored — passed through` });
+      const populationRequired = d.kind === 'google_sheet' && objectiveImpliesPopulation(objective);
+      // A probe crash cannot manufacture proof. It blocks only when readback is
+      // part of the objective's completion contract; existence-only artifacts
+      // retain their durable creation evidence.
+      probed.push(populationRequired
+        ? {
+            deliverable: d,
+            pass: false,
+            method: 'unverified',
+            detail: `sheet ${d.ref}: required population could not be verified because the readback probe errored`,
+          }
+        : {
+            deliverable: d,
+            pass: true,
+            method: 'skipped',
+            detail: `${d.kind} ${d.ref}: optional probe errored — durable creation evidence preserved`,
+          });
     }
   }
   const failed = probed.filter((v) => !v.pass);
   const failures = failed.map((v) => ({ ref: v.deliverable.ref, gap: v.detail }));
   const summary = failed.length === 0
     ? ''
-    : `Deliverable readback FAILED — the run is not done: ${failed.map((v) => v.detail).slice(0, 4).join('; ')}${failed.length > 4 ? `; +${failed.length - 4} more` : ''}.`;
+    : `Deliverable readback FAILED or remains UNVERIFIED — the run is not done: ${failed.map((v) => v.detail).slice(0, 4).join('; ')}${failed.length > 4 ? `; +${failed.length - 4} more` : ''}.`;
   const evidenceText = probed.length === 0
     ? ''
     : ['DETERMINISTIC DELIVERABLE PROBE (readback of the artifacts this run produced):',
-       ...probed.map((v) => `- ${v.pass ? (v.method === 'skipped' ? 'UNVERIFIED' : 'OK') : 'FAILED'}: ${v.detail}`),
+       ...probed.map((v) => `- ${v.pass
+         ? (v.method === 'skipped' ? 'NOT REQUIRED' : 'OK')
+         : (v.method === 'unverified' ? 'UNVERIFIED (BLOCKING)' : 'FAILED')}: ${v.detail}`),
       ].join('\n');
   return { probed, failures, summary, evidenceText };
 }

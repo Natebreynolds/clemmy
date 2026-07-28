@@ -17,7 +17,10 @@ const TOOL_CAUSAL_INABILITY_PATTERN =
   /\b(?:cannot|can't|unable\s+to|not\s+able\s+to|couldn't)\s+(?:fetch|create|read|write|search|execute|run|verify|pull|access|call)\b[\s\S]{0,140}\b(?:without|because\s+(?:there\s+)?(?:is|are)?\s*(?:no|not))\b[\s\S]{0,80}\btools?\b/i;
 
 export function looksLikeToolUnavailableSelfReport(text: string | null | undefined): boolean {
-  const t = (text ?? '').replace(/\s+/g, ' ').trim();
+  // Models frequently emit typographic apostrophes. Normalize them so natural
+  // "I can’t pull…" / "tools aren’t exposed" blockers receive the same honest
+  // paused-state handling as their ASCII equivalents.
+  const t = (text ?? '').replace(/[’‘]/g, "'").replace(/\s+/g, ' ').trim();
   if (!t) return false;
   if (!CURRENT_RUN_ANCHOR_PATTERN.test(t)) return false;
   return TOOL_SURFACE_UNAVAILABLE_PATTERN.test(t) || TOOL_CAUSAL_INABILITY_PATTERN.test(t);

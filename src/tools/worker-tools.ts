@@ -20,7 +20,7 @@ import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/
 import { maybeFanoutAlignmentBounce, maybeBounceMassExecution, maybeHeavyPerItemToolAdvisory } from '../agents/fanout-alignment-gate.js';
 import { textResult } from './shared.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
-import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { assertNotKilled, harnessRunContextStorage, KillRequested } from '../runtime/harness/brackets.js';
 import {
   checkpointPreparedWorker,
   completedPreparedWorker,
@@ -204,18 +204,25 @@ export function registerWorkerTools(server: McpServer): void {
         // real provider throttling stays with the per-item worker slots), so a
         // brain that would have serialized N calls no longer pays N× wall time.
         const outs: Array<string | null> = new Array(callItems.length).fill(null);
+        let batchCancellation: unknown;
         await runBoundedPool(
           callItems.map((item, index) => ({ input: { ...packetBase, item } as WorkerToolInput, index })),
           Math.min(callItems.length, 16),
           async ({ input: perItem, index }) => {
+            if (batchCancellation) throw batchCancellation;
             try {
               const out = await runOneWorker(perItem, manifestBinding);
               outs[index] = String((out as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '');
             } catch (err) {
+              if (err instanceof KillRequested) throw err;
               outs[index] = `ERROR: worker for "${perItem.item}" failed: ${firstLine(err)}`;
             }
           },
+          (err) => {
+            if (err instanceof KillRequested) batchCancellation ??= err;
+          },
         );
+        if (batchCancellation) throw batchCancellation;
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
           return { item, text, failed: workerResultIndicatesFailure(text) };
@@ -305,7 +312,17 @@ export function registerWorkerTools(server: McpServer): void {
       if (knownDead) {
         return textResult(`ERROR: worker for "${input.item}" was NOT started — parallel fan-out already failed uniformly this run (${knownDead}). Process this item inline; workers stay refused until the underlying failure changes.`);
       }
-      const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
+      const activeHarnessContext = harnessRunContextStorage.getStore();
+      const sourceUserSeq = activeHarnessContext?.sourceUserSeq;
+      const mcpToolScope = activeHarnessContext?.mcpToolScope;
+      const assertWorkerMayStart = (): void => {
+        assertNotKilled(
+          sessionId,
+          Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+            ? { sourceUserSeq: sourceUserSeq as number }
+            : undefined,
+        );
+      };
       // Wave 4 Stage 1: packet key identifies this exact job so a resumed run can
       // detect a worker that already completed and skip re-executing it.
       const packetKey = workerPacketKey(input);
@@ -490,7 +507,12 @@ export function registerWorkerTools(server: McpServer): void {
             payload: { item: input.item, lane: 'sdk_brain', ...info },
           });
         } catch { /* telemetry is best-effort */ }
-      }, { modelId: workerModel, provider: workerProvider });
+      }, {
+        modelId: workerModel,
+        provider: workerProvider,
+        assertCanStart: assertWorkerMayStart,
+      });
+      assertWorkerMayStart();
       // worker_spawned: a slot was acquired and the worker is about to run.
       try {
         recordOperationalEvent({
@@ -541,11 +563,12 @@ export function registerWorkerTools(server: McpServer): void {
         // (lazy import: worker-tools loads into the SDK-brain MCP child; the
         // cross-provider runner drags in the whole agent surface, so keep it out
         // of the module graph — mirrors code-mode-tool's runtime imports).
+        assertWorkerMayStart();
         const result: { text: string; model?: string } = route.claudeLane
-          ? await runClaudeAgentSdkWorker(input, workerModel, sessionId, sourceUserSeq)
+          ? await runClaudeAgentSdkWorker(input, workerModel, sessionId, sourceUserSeq, mcpToolScope)
           : await (async () => {
               const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
-              return runCrossProviderWorker(input, workerModel, sessionId, sourceUserSeq);
+              return runCrossProviderWorker(input, workerModel, sessionId, sourceUserSeq, mcpToolScope);
             })();
         const ok = !workerResultIndicatesFailure(result.text);
         // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
@@ -606,6 +629,7 @@ export function registerWorkerTools(server: McpServer): void {
           callId: `call_${subagentRunId}`,
         }));
       } catch (err) {
+        if (err instanceof KillRequested) throw err;
         recordResult(false, firstLine(err), workerModel);
         recordModelRouteOutcome({
           decisionId: routeDecisionId,

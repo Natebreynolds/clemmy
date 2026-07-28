@@ -61,8 +61,18 @@ notarizes, and staples them; and writes the artifacts under
 `apps/desktop/release/`.
 
 The release command performs code-signing, stapling, Gatekeeper, architecture,
-packaged-runtime, and updater-feed checks. To inspect the packaged application
-locations afterward:
+packaged-runtime, and updater-feed checks.
+
+The native-dependency gate is architecture-specific. Apple Silicon packages
+must contain ARM64 `better-sqlite3`, Sharp/libvips, and ONNX Runtime payloads.
+Intel packages must contain x86_64 `better-sqlite3` and Sharp/libvips; because
+upstream ONNX Runtime no longer publishes a macOS x86_64 Node binding, the
+Intel package omits that incompatible native module and uses the packaged WASM
+backend for local semantic embeddings. Packaging runs a real 384-dimensional
+embedding through the Intel executable and fails closed if that fallback does
+not work.
+
+To inspect the packaged application locations afterward:
 
 ```bash
 find apps/desktop/release -maxdepth 2 -name Clementine.app -type d -print

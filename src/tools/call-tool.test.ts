@@ -23,7 +23,10 @@ const {
   _resetCallToolSchemaCacheForTest,
   materializeStrictNullableFields,
 } = await import('./call-tool.js');
-const { _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
+const {
+  _setCodeModeToolsForTests,
+  _setCodeModeMcpResolverForTests,
+} = await import('./code-mode-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await import('../runtime/harness/brackets.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
@@ -81,6 +84,48 @@ test('explicit turn denials cannot be bypassed with an external MCP name', async
     ) as Promise<unknown>,
   );
   assert.equal(JSON.parse(String(out)).error, 'not_reachable');
+});
+
+test('an explicit local-only MCP scope rejects a guessed name before provider resolution/list/dispatch', async () => {
+  let resolverCalls = 0;
+  let listCalls = 0;
+  let dispatchCalls = 0;
+  _setCodeModeMcpResolverForTests(() => {
+    resolverCalls += 1;
+    return {
+      listTools: async () => {
+        listCalls += 1;
+        return [{ name: 'proof__read' }];
+      },
+      callTool: async () => {
+        dispatchCalls += 1;
+        return 'should-not-run';
+      },
+    };
+  });
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(),
+      mcpToolScope: {
+        reason: 'explicit local-only regression',
+        allowedServerSlugs: [],
+        maxTools: 0,
+      },
+    }) as unknown as ToolLike;
+    const out = await callTool.invoke!(
+      { context: { sessionId: 'sess-local-only-call-tool' } },
+      JSON.stringify({ name: 'proof__read', args_json: '{}' }),
+      { toolCall: { callId: 'local-only-guessed-mcp' } },
+    );
+    const refusal = JSON.parse(String(out));
+    assert.equal(refusal.error, 'not_reachable');
+    assert.equal(refusal.reason, 'mcp_scope_denied');
+    assert.equal(resolverCalls, 0, 'authority must run before provider resolution/spawn');
+    assert.equal(listCalls, 0, 'authority must run before listTools');
+    assert.equal(dispatchCalls, 0, 'authority must run before callTool');
+  } finally {
+    _setCodeModeMcpResolverForTests(null);
+  }
 });
 
 test('bad args return the schema with error=arg_validation and NO dispatch', async () => {

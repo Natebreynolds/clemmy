@@ -44,6 +44,7 @@ function sessionInputTokens(home: string, sessionId: string): { calls: number; i
 export const cleanTurnIsolation: ScenarioDef = {
   name: 'clean-turn-isolation',
   summary: 'trivial no-tools turn: zero tools, bounded prompt, declined ephemera stays out of other sessions',
+  routeExpectation: 'exact-brain',
   async run(daemon: DaemonHandle) {
     const checks: Check[] = [];
     const suffix = Date.now().toString(36);

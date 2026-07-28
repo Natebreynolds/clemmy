@@ -48,7 +48,7 @@
     "test": "node scripts/run-tests-isolated.mjs",
     "test:prospective": "tsx --test src/runtime/prospective-intentions.test.ts src/runtime/prospective-adapters.test.ts src/runtime/timers.test.ts src/runtime/harness/context-packet.test.ts src/runtime/harness/claude-agent-brain.test.ts src/agents/plan-proposals.test.ts src/execution/background-tasks.test.ts src/execution/workflow-scheduler.test.ts src/execution/workflow-trigger-engine.test.ts src/dashboard/console-goals.test.ts",
     "test:public-hygiene": "node --test scripts/check-public-hygiene.test.mjs",
-    "test:release-assets": "node --test apps/desktop/scripts/vendor-recall-native.test.mjs scripts/merge-mac-update-feeds.test.mjs scripts/refresh-notarized-dmg-metadata.test.mjs scripts/release-workflow.test.mjs scripts/vendor-whispercpp-desktop.test.mjs scripts/verify-desktop-release-assets.test.mjs",
+    "test:release-assets": "node --test apps/desktop/scripts/vendor-recall-native.test.mjs scripts/merge-mac-update-feeds.test.mjs scripts/refresh-notarized-dmg-metadata.test.mjs scripts/release-workflow.test.mjs scripts/run-tests-isolated.test.mjs scripts/vendor-whispercpp-desktop.test.mjs scripts/verify-desktop-release-assets.test.mjs",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",
     "eval:memory": "tsx scripts/eval-memory-reliability.ts",

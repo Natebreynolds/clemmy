@@ -48,6 +48,7 @@ import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
+import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 
 // Counter cap for the ambient harness run context. Most tools wrapped here are
 // reads that never touch the counter; the gated mutating tools set their OWN
@@ -55,12 +56,24 @@ import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brac
 // matters as a benign fallback.
 const AMBIENT_COUNTER_LIMIT = 1000;
 
+function resolvedMcpToolScope(
+  opts: ClementineMcpServerOptions,
+): McpToolScope | null | undefined {
+  if (opts.mcpToolScope !== undefined) return opts.mcpToolScope;
+  const raw = process.env.CLEMENTINE_MCP_TOOL_SCOPE_JSON;
+  if (!raw) return undefined;
+  try { return JSON.parse(raw) as McpToolScope | null; } catch { return undefined; }
+}
+
 export interface ClementineMcpServerOptions {
   sessionId?: string;
   runScopeId?: string;
   /** Exact accepted user event owned by this SDK attempt. The in-process and
    * stdio MCP transports must carry the same authority into nested carriers. */
   sourceUserSeq?: number;
+  /** Exact parent external-MCP authority carried through the Claude SDK's
+   * in-process or stdio local-MCP transport into nested tools/workers. */
+  mcpToolScope?: McpToolScope | null;
   gatedMutations?: boolean;
   allowedTools?: string[];
   /** Tools that must remain first-class when the client supports MCP tool
@@ -94,6 +107,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
     const value = Number.parseInt(process.env.CLEMENTINE_MCP_SOURCE_USER_SEQ ?? '', 10);
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
   })();
+  const mcpToolScope = resolvedMcpToolScope(opts);
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
@@ -116,6 +130,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
             behaviorScopeId: runScopeId,
             counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT),
             ...(sourceUserSeq ? { sourceUserSeq } : {}),
+            ...(mcpToolScope !== undefined ? { mcpToolScope } : {}),
           },
           () => handler(...handlerArgs),
         ),
@@ -305,6 +320,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
       // This Set is intentionally live: ping/tool_search/call_tool register
       // below and become valid first-class targets without rebuilding it.
       firstClassNames: registeredNames,
+      mcpToolScope: resolvedMcpToolScope(opts),
     });
   }
 

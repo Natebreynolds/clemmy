@@ -1,6 +1,7 @@
 /**
- * Per-Workspace document store — the data plane the agent-authored view talks
- * to (same-origin, cookie-authed). The one real gap the Spaces feature fills.
+ * Per-Workspace document store — the cookie-authenticated data plane the
+ * trusted console parent exposes to opaque-origin authored views through a
+ * narrow, typed RPC bridge. The one real gap the Spaces feature fills.
  *
  *  - data.json   : the dataset, single JSON doc, last-write-wins, atomic, size-capped.
  *  - notes.jsonl : append-only user notes + tracked in-view actions.

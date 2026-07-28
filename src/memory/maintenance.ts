@@ -17,8 +17,10 @@ import {
   backfillGroundedFactEntityLinks,
   backfillGroundedFactResourceLinks,
   backfillGroundedEntityRelationships,
+  reconcileExtractedFactEntityEvidence,
   syncFactEntityLinks,
   syncFactResourceLinks,
+  type ExtractedFactEntityEvidenceReconciliationStats,
   type GroundedFactEntityBackfillStats,
   type GroundedFactResourceBackfillStats,
 } from './relations.js';
@@ -373,6 +375,15 @@ export interface BootReflectionLedgerFinalizationResult {
   backfill: LegacyReflectionCandidateBackfillResult | null;
 }
 
+export interface BootExtractedFactEntityEvidenceFinalizationResult {
+  candidatesBefore: number;
+  candidatesAfter: number;
+  ran: boolean;
+  backupPath: string | null;
+  reason: 'already_converged' | 'reconciled' | 'backup_failed';
+  reconciliation: ExtractedFactEntityEvidenceReconciliationStats | null;
+}
+
 /** Project pre-v26 threshold buffers into the claim-level decision ledger on
  * the first upgraded boot. The projection reads only exact stored extractor
  * JSON. A backup is mandatory, missing source episodes remain missing, and
@@ -415,6 +426,67 @@ export function finalizeLegacyReflectionCandidatesOnBoot(
     backupPath: backup.backupPath,
     reason: 'reconciled',
     backfill,
+  };
+}
+
+/**
+ * Repair an interrupted/legacy extracted-link write before graph readiness is
+ * evaluated. This is idempotent rather than hidden behind a one-time marker: a
+ * crash or old hotpatch can surface a malformed row after a prior successful
+ * boot. Every mutating pass is backup-first; deterministic rows regain their
+ * exact fact-evidence episode and all others remain only inferred overlays.
+ */
+export function finalizeExtractedFactEntityEvidenceOnBoot(): BootExtractedFactEntityEvidenceFinalizationResult {
+  const db = openMemoryDb();
+  const countCandidates = (): number => Number((db.prepare(`
+    SELECT COUNT(*) AS count FROM fact_entities
+    WHERE link_type = 'extracted'
+      AND (
+        evidence_episode_id IS NULL
+        OR length(trim(COALESCE(evidence_excerpt, ''))) = 0
+      )
+  `).get() as { count: number }).count);
+  const candidatesBefore = countCandidates();
+  if (candidatesBefore === 0) {
+    return {
+      candidatesBefore,
+      candidatesAfter: 0,
+      ran: false,
+      backupPath: null,
+      reason: 'already_converged',
+      reconciliation: null,
+    };
+  }
+  const backup = backupMemoryDb({ retain: 14 });
+  if (!backup) {
+    return {
+      candidatesBefore,
+      candidatesAfter: candidatesBefore,
+      ran: false,
+      backupPath: null,
+      reason: 'backup_failed',
+      reconciliation: null,
+    };
+  }
+  const reconciliation = reconcileExtractedFactEntityEvidence({ linkLimit: 100_000 });
+  const candidatesAfter = countCandidates();
+  db.prepare(`
+    INSERT INTO memory_migration_audit
+      (migration_version, action, affected_rows, detail_json, created_at)
+    VALUES (?, 'extracted_fact_entity_evidence_reconciliation', ?, ?, ?)
+  `).run(
+    MEMORY_SCHEMA_VERSION,
+    reconciliation.repaired + reconciliation.downgraded,
+    JSON.stringify({ candidatesBefore, candidatesAfter, ...reconciliation }),
+    new Date().toISOString(),
+  );
+  return {
+    candidatesBefore,
+    candidatesAfter,
+    ran: true,
+    backupPath: backup.backupPath,
+    reason: 'reconciled',
+    reconciliation,
   };
 }
 

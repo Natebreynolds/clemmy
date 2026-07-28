@@ -6,6 +6,10 @@ import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
+import {
+  fallbackRouteResolution,
+  type FallbackRouteResolution,
+} from './harness/fallback-model.js';
 
 export const MODEL_ROUTE_METRICS_SCHEMA_VERSION = 1;
 
@@ -347,6 +351,31 @@ export function withModelRouteMetrics(model: Model, context: ModelRouteMetricsCo
   return new ModelRouteMetricsModel(model, context);
 }
 
+export function successfulRouteOutcome(
+  resolution: FallbackRouteResolution | undefined,
+  metadata: Record<string, unknown>,
+): {
+  status: Extract<ModelRouteOutcomeStatus, 'success' | 'fallback'>;
+  falloverToModel?: string;
+  metadata: Record<string, unknown>;
+} {
+  return {
+    status: resolution?.fellOver ? 'fallback' : 'success',
+    ...(resolution?.fellOver
+      ? { falloverToModel: resolution.model ?? resolution.resolvedLabel }
+      : {}),
+    metadata: resolution
+      ? {
+          ...metadata,
+          actualResolvedLabel: resolution.resolvedLabel,
+          ...(resolution.provider ? { actualProvider: resolution.provider } : {}),
+          ...(resolution.model ? { actualModel: resolution.model } : {}),
+          ...(resolution.reason ? { falloverReason: resolution.reason } : {}),
+        }
+      : metadata,
+  };
+}
+
 class ModelRouteMetricsModel implements Model {
   constructor(private readonly inner: Model, private readonly context: ModelRouteMetricsContext) {}
 
@@ -356,7 +385,17 @@ class ModelRouteMetricsModel implements Model {
     try {
       const response = await this.inner.getResponse(request);
       const usage = usageFromResponse(response);
-      this.finishCall(decisionId, 'success', startedAt, usage, { path: 'getResponse' });
+      const resolution = fallbackRouteResolution(response);
+      const outcome = successfulRouteOutcome(resolution, { path: 'getResponse' });
+      this.finishCall(
+        decisionId,
+        outcome.status,
+        startedAt,
+        usage,
+        outcome.metadata,
+        undefined,
+        outcome.falloverToModel,
+      );
       return response;
     } catch (err) {
       this.finishCall(decisionId, 'failed', startedAt, {}, {
@@ -373,14 +412,25 @@ class ModelRouteMetricsModel implements Model {
     let usage: UsageFields = {};
     let completed = false;
     let failed = false;
+    let resolution: FallbackRouteResolution | undefined;
     try {
       for await (const event of this.inner.getStreamedResponse(request)) {
         const doneUsage = usageFromStreamEvent(event);
         if (doneUsage) usage = doneUsage;
+        resolution = fallbackRouteResolution(event) ?? resolution;
         yield event;
       }
       completed = true;
-      this.finishCall(decisionId, 'success', startedAt, usage, { path: 'getStreamedResponse' });
+      const outcome = successfulRouteOutcome(resolution, { path: 'getStreamedResponse' });
+      this.finishCall(
+        decisionId,
+        outcome.status,
+        startedAt,
+        usage,
+        outcome.metadata,
+        undefined,
+        outcome.falloverToModel,
+      );
     } catch (err) {
       failed = true;
       this.finishCall(decisionId, 'failed', startedAt, usage, {
@@ -434,6 +484,7 @@ class ModelRouteMetricsModel implements Model {
     usage: UsageFields,
     metadata: Record<string, unknown>,
     errorClassName?: string,
+    falloverToModel?: string,
   ): void {
     recordModelRouteOutcome({
       decisionId,
@@ -444,6 +495,7 @@ class ModelRouteMetricsModel implements Model {
       cachedTokens: usage.cachedTokens,
       totalTokens: usage.totalTokens,
       errorClass: errorClassName,
+      falloverToModel,
       metadata,
     });
     if (status === 'failed') {

@@ -29,7 +29,7 @@ export interface ActivityItem {
   label: string;
   detail?: string;
   provider?: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
-  status: 'running' | 'done' | 'failed';
+  status: 'running' | 'done' | 'failed' | 'interrupted';
   /** Client-clock start, for the live per-row elapsed timer while running. */
   startedAt?: number;
   /** kind 'batch' only: live meter state from authoritative batch_progress events.
@@ -486,23 +486,27 @@ export function useChat(options?: UseChatOptions) {
   // Watermark arms on the first poll (history is the reopen path's job) and
   // only advances, so nothing renders twice. Busy turns pause the poll — the
   // run's own stream owns the conversation then.
-  const inboxSeqRef = useRef(0);
-  const inboxSyntheticTurnsRef = useRef(new Map<number, { sourceId?: string; sourceLabel?: string; open?: boolean; seq?: number }>());
+  const inboxOutcomeCursorRef = useRef(createInboxOutcomeCursor(options?.initialSessionId ?? null));
   useEffect(() => {
     if (busy) return;
     let stopped = false;
     const tick = async () => {
       const sid = sessionIdRef.current;
       if (!sid || stopped) return;
+      const cursor = inboxOutcomeCursorForSession(inboxOutcomeCursorRef.current, sid);
+      if (cursor !== inboxOutcomeCursorRef.current) inboxOutcomeCursorRef.current = cursor;
       try {
         const out = await apiGet<{ latestSeq: number; events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }> }>(
-          `/api/sessions/${encodeURIComponent(sid)}/events/recent?sinceSeq=${inboxSeqRef.current}&limit=200`,
+          `/api/sessions/${encodeURIComponent(sid)}/events/recent?sinceSeq=${cursor.seq}&limit=200`,
         );
         if (stopped) return;
-        if (inboxSeqRef.current === 0) { inboxSeqRef.current = out.latestSeq || 1; return; }
+        // The request may finish after Reset/new-session changed the cursor.
+        // Never let an old session response arm the new session's watermark.
+        if (inboxOutcomeCursorRef.current !== cursor) return;
+        if (cursor.seq === 0) { cursor.seq = out.latestSeq || 1; return; }
         if (!out.events.length) return;
-        const additions = inboxAdditionsFromEvents(out.events, inboxSyntheticTurnsRef.current);
-        inboxSeqRef.current = Math.max(inboxSeqRef.current, out.latestSeq);
+        const additions = inboxAdditionsFromEvents(out.events, cursor.deliveries);
+        cursor.seq = Math.max(cursor.seq, out.latestSeq);
         if (additions.length) {
           setMessages((prev) => {
             const seenIds = new Set(prev.map((m) => m.id));
@@ -793,6 +797,7 @@ export function useChat(options?: UseChatOptions) {
     pendingPostRef.current = null;
     pendingBackgroundRef.current = null;
     activeRunRef.current = null;
+    inboxOutcomeCursorRef.current = createInboxOutcomeCursor(null);
     setMessages([]);
     setBusy(false);
   }, []);
@@ -801,58 +806,169 @@ export function useChat(options?: UseChatOptions) {
 }
 
 
+export interface InboxOutcomeDelivery {
+  /** Stable identity of the durable work item. Passive staging + its later
+   *  proactive directive share this id and therefore remain one delivery. */
+  sourceId?: string;
+  sourceLabel?: string;
+  turn: number;
+  /** Sequence of the newest event for this delivery (normally the directive). */
+  seq: number;
+  open: boolean;
+  /** Passive outcome staging is context, not a relay awaiting an assistant
+   *  completion. Legacy events without deliveryPhase remain relay-capable. */
+  ready: boolean;
+}
+
+export type InboxOutcomeDeliveryState = InboxOutcomeDelivery[];
+
+export function createInboxOutcomeDeliveryState(): InboxOutcomeDeliveryState {
+  return [];
+}
+
+export interface InboxOutcomeCursor {
+  sessionId: string | null;
+  seq: number;
+  deliveries: InboxOutcomeDeliveryState;
+}
+
+export function createInboxOutcomeCursor(sessionId: string | null = null): InboxOutcomeCursor {
+  return {
+    sessionId,
+    seq: 0,
+    deliveries: createInboxOutcomeDeliveryState(),
+  };
+}
+
+/**
+ * Pure session-boundary transition for the idle outcome poller. Returning the
+ * existing object preserves a split passive/directive delivery inside one
+ * session; returning a fresh zero cursor prevents sequence/source state from
+ * crossing into another session.
+ */
+export function inboxOutcomeCursorForSession(
+  current: InboxOutcomeCursor,
+  sessionId: string | null,
+): InboxOutcomeCursor {
+  return current.sessionId === sessionId ? current : createInboxOutcomeCursor(sessionId);
+}
+
 /** Pure fold for the idle report-back inbox: which chat messages do these
- *  freshly-polled session events add? Mutates `syntheticTurns` (the running
- *  set of turns whose user event is a synthetic outcome delivery) so pairing
- *  survives batch splits. Exported for tests. */
+ *  freshly-polled session events add? Mutates `deliveries` so pairing survives
+ *  batch splits. Deliveries are an ordered queue keyed by durable source id
+ *  when one exists — never a Map keyed by turn, because proactive relays are
+ *  commonly all stamped turn 0. Exported for tests. */
 export function inboxAdditionsFromEvents(
   events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }>,
-  syntheticTurns: Map<number, { sourceId?: string; sourceLabel?: string; open?: boolean; seq?: number }>,
+  deliveries: InboxOutcomeDeliveryState,
 ): ChatMessage[] {
-  for (const ev of events) {
+  const additions: ChatMessage[] = [];
+  // Replay endpoints are ordered today, but sorting makes the fold deterministic
+  // if a transport ever coalesces batches out of order.
+  const orderedEvents = events
+    .map((event, index) => ({ event, index }))
+    .sort((a, b) => a.event.seq - b.event.seq || a.index - b.index)
+    .map(({ event }) => event);
+
+  const registerDelivery = (
+    ev: { seq: number; turn: number; data: Record<string, unknown> },
+  ) => {
     const d = ev.data ?? {};
-    if (ev.type === 'user_input_received' && d.synthetic === true && d.source === 'outcome') {
-      // The synthetic outcome turn names the durable work item — carry it so
-      // the rendered report can attach evidence + a board deep-link.
-      syntheticTurns.set(ev.turn, {
-        sourceId: typeof d.sourceId === 'string' ? d.sourceId : undefined,
-        sourceLabel: typeof d.sourceLabel === 'string' ? d.sourceLabel : undefined,
-        open: true,
-        seq: ev.seq,
-      });
-    } else if (ev.type === 'user_input_received' && d.synthetic !== true) {
-      // A REAL user turn ends any pending outcome relay that PRECEDED it —
-      // later completions belong to the user's own conversation.
-      for (const entry of syntheticTurns.values()) {
-        if ((entry.seq ?? 0) < ev.seq) entry.open = false;
+    const sourceId = typeof d.sourceId === 'string' && d.sourceId.trim()
+      ? d.sourceId
+      : undefined;
+    const sourceLabel = typeof d.sourceLabel === 'string' ? d.sourceLabel : undefined;
+    const ready = d.deliveryPhase !== 'passive';
+    // One outcome is written passively first and may receive a proactive
+    // directive later. Collapse those two source-identical events without
+    // collapsing a different report that happens to share the same turn.
+    // Match only the currently-open episode. One durable background task can
+    // legitimately report NEEDS INPUT and later report DONE with the same
+    // sourceId; the later passive event must start a new delivery.
+    let existing: InboxOutcomeDelivery | undefined;
+    if (sourceId) {
+      for (let index = deliveries.length - 1; index >= 0; index -= 1) {
+        const candidate = deliveries[index];
+        if (candidate.open && candidate.sourceId === sourceId) {
+          existing = candidate;
+          break;
+        }
       }
     }
-  }
-  // Live turn numbers do NOT reliably pair: the outcome directive is recorded
-  // at turn 0 while the relay's completion lands on the session's real next
-  // turn (observed live 2026-07-28). Exact turn match is the fast path; the
-  // fallback claims an open synthetic delivery that PRECEDED this event —
-  // consumed on use so one relay can never label two messages.
-  const openBefore = (seq: number) =>
-    [...syntheticTurns.values()].find((entry) => entry.open && (entry.seq ?? 0) < seq);
-  const claimRef = (turn: number, seq: number): ChatMessage['taskRef'] => {
-    const exact = syntheticTurns.get(turn);
-    const entry = exact?.open ? exact : openBefore(seq);
-    if (!entry) return undefined;
+    if (existing) {
+      existing.turn = ev.turn;
+      existing.seq = ev.seq;
+      existing.sourceLabel = sourceLabel ?? existing.sourceLabel;
+      existing.ready = existing.ready || ready;
+      return;
+    }
+    deliveries.push({
+      sourceId,
+      sourceLabel,
+      turn: ev.turn,
+      seq: ev.seq,
+      open: true,
+      ready,
+    });
+  };
+
+  const claimDelivery = (
+    ev: { seq: number; turn: number; data: Record<string, unknown> },
+  ): ChatMessage['taskRef'] | null => {
+    const eventSourceId = typeof ev.data?.sourceId === 'string' ? ev.data.sourceId : '';
+    const eligible = deliveries.filter((entry) => entry.open && entry.ready && entry.seq < ev.seq);
+    if (eligible.length === 0) return null;
+    const sourceMatch = eventSourceId
+      ? eligible.find((entry) => entry.sourceId === eventSourceId)
+      : undefined;
+    const exactTurn = eligible.filter((entry) => entry.turn === ev.turn);
+    // Source identity wins when the completion carries it. Otherwise FIFO by
+    // directive sequence is the only truthful correlation available; exact
+    // turn narrows the queue but never overwrites another turn-0 delivery.
+    const entry = sourceMatch
+      ?? (exactTurn.length > 0 ? exactTurn : eligible)
+        .slice()
+        .sort((a, b) => a.seq - b.seq)[0];
     entry.open = false;
     return entry.sourceId ? { id: entry.sourceId, label: entry.sourceLabel } : undefined;
   };
-  const hasOpenDelivery = (turn: number, seq: number): boolean =>
-    Boolean(syntheticTurns.get(turn)?.open) || Boolean(openBefore(seq));
-  const additions: ChatMessage[] = [];
-  for (const ev of events) {
+
+  for (const ev of orderedEvents) {
     const d = ev.data ?? {};
-    if (ev.type === 'conversation_completed' && (syntheticTurns.has(ev.turn) || hasOpenDelivery(ev.turn, ev.seq))) {
+    if (ev.type === 'user_input_received' && d.synthetic === true && d.source === 'outcome') {
+      registerDelivery(ev);
+      continue;
+    }
+    if (ev.type === 'user_input_received' && d.synthetic !== true) {
+      // A REAL user turn ends any pending outcome relay that PRECEDED it —
+      // later completions belong to the user's own conversation.
+      for (const entry of deliveries) {
+        if (entry.seq < ev.seq) entry.open = false;
+      }
+      continue;
+    }
+    if (ev.type === 'conversation_completed') {
       const text = humanHarnessText((d.reply ?? d.summary) as string | undefined, '');
-      if (text) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text, status: 'complete', taskRef: claimRef(ev.turn, ev.seq) });
-    } else if (ev.type === 'awaiting_user_input' && (syntheticTurns.has(ev.turn) || hasOpenDelivery(ev.turn, ev.seq))) {
+      if (!text) continue;
+      const taskRef = claimDelivery(ev);
+      if (taskRef !== null) additions.push({
+        id: `inbox-${ev.seq}`,
+        role: 'assistant',
+        text,
+        status: 'complete',
+        taskRef,
+      });
+    } else if (ev.type === 'awaiting_user_input') {
       const q = typeof d.question === 'string' ? d.question : '';
-      if (q) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text: q, status: 'awaiting-reply', taskRef: claimRef(ev.turn, ev.seq) });
+      if (!q) continue;
+      const taskRef = claimDelivery(ev);
+      if (taskRef !== null) additions.push({
+        id: `inbox-${ev.seq}`,
+        role: 'assistant',
+        text: q,
+        status: 'awaiting-reply',
+        taskRef,
+      });
     } else if (ev.type === 'approval_requested') {
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
       additions.push({

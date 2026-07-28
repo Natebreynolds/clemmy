@@ -90,7 +90,17 @@ export class RouterModelProvider implements ModelProvider {
     primary.model = maybeWrapWithFaultInjection(primary.model, primary.provider);
     let resolved: Model;
     if (!brainFalloverEnabled()) {
-      resolved = primary.model;
+      // The kill-switch disables cross-brain switching, not the completion
+      // invariant. Keep the lone primary behind the same graph boundary so a
+      // reasoning-only completion becomes a typed failure instead of an
+      // unbounded Agents SDK run-again loop.
+      resolved = withModelFallback([{
+        label: primary.label,
+        provider: primary.provider,
+        model: primary.label,
+        getModel: () => primary.model,
+        ...(primary.provider === 'claude' ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
+      }]);
     } else {
       // Wrap in a cross-provider fallover chain (primary -> other connected brains)
       // so an overloaded/rate-limited/HUNG provider switches brains instead of
@@ -101,12 +111,17 @@ export class RouterModelProvider implements ModelProvider {
       // Correlate a fallover to the run that triggered it. getModel runs inside
       // the harness run ALS (the loop wraps runner.run), so the active sessionId
       // is available here; workflow step sessions encode the run id in the id.
-      const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+      const runContext = harnessRunContextStorage.getStore();
+      const sessionId = runContext?.sessionId;
+      const runSilencedLabels = runContext
+        ? (runContext.silencedModelLabels ??= new Set<string>())
+        : undefined;
       resolved = withModelFallback(chain, {
         falloverOn429: true,
         firstByteTimeoutMs: brainFalloverFirstByteMsForProvider(primary.provider),
         sessionId,
         workflowRunId: workflowRunIdFromSessionId(sessionId),
+        runSilencedLabels,
       });
     }
     const requested = typeof modelName === 'string' && modelName.trim().length > 0 ? modelName.trim() : MODELS.primary;
@@ -183,6 +198,8 @@ export class RouterModelProvider implements ModelProvider {
   private buildBrainChain(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget[] {
     const chain: FallbackTarget[] = [{
       label: primary.label,
+      provider: primary.provider,
+      model: primary.label,
       getModel: () => primary.model,
       ...(primary.provider === 'claude' ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
     }];
@@ -199,12 +216,20 @@ export class RouterModelProvider implements ModelProvider {
       const workerScope = Boolean(harnessRunContextStorage.getStore()?.guardrailScopeId);
       if (workerScope) return chain;
       if (primary.provider !== 'codex' && codexModelsAvailable()) {
-        chain.push({ label: 'codex:rescue', getModel: () => this.codex.getModel(MODELS.primary) });
+        chain.push({
+          label: 'codex:rescue',
+          provider: 'codex',
+          model: MODELS.primary,
+          getModel: () => this.codex.getModel(MODELS.primary),
+        });
       }
       if (primary.provider !== 'claude' && claudeModelsAvailable()) {
+        const model = getClaudeBrainModel();
         chain.push({
           label: 'claude:rescue',
-          getModel: () => this.claude.getModel(getClaudeBrainModel()),
+          provider: 'claude',
+          model,
+          getModel: () => this.claude.getModel(model),
           supportsRequest: claudeHarnessSupportsRequest,
         });
       }
@@ -212,13 +237,21 @@ export class RouterModelProvider implements ModelProvider {
     }
     // Codex (OpenAI) — generally the steadiest fallback.
     if (primary.provider !== 'codex' && codexModelsAvailable()) {
-      chain.push({ label: 'codex', getModel: () => this.codex.getModel(MODELS.primary) });
+      chain.push({
+        label: 'codex',
+        provider: 'codex',
+        model: MODELS.primary,
+        getModel: () => this.codex.getModel(MODELS.primary),
+      });
     }
     // Claude subscription.
     if (primary.provider !== 'claude' && claudeModelsAvailable()) {
+      const model = getClaudeBrainModel();
       chain.push({
         label: 'claude',
-        getModel: () => this.claude.getModel(getClaudeBrainModel()),
+        provider: 'claude',
+        model,
+        getModel: () => this.claude.getModel(model),
         supportsRequest: claudeHarnessSupportsRequest,
       });
     }
@@ -226,7 +259,13 @@ export class RouterModelProvider implements ModelProvider {
     // already the primary.
     const byo = getByoBackendConfig();
     if (primary.provider !== 'byo' && byo.configured) {
-      chain.push({ label: `byo:${byo.primaryId || 'default'}`, getModel: () => getByoModel(byo.primaryId || MODELS.primary, byo) });
+      const model = byo.primaryId || MODELS.primary;
+      chain.push({
+        label: `byo:${byo.primaryId || 'default'}`,
+        provider: 'byo',
+        model,
+        getModel: () => getByoModel(model, byo),
+      });
     }
     return chain;
   }

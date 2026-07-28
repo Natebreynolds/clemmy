@@ -1,7 +1,7 @@
 name: Release Desktop App
 
-# Tag pushes publish production releases. Manual runs build a signed, notarized
-# macOS candidate and keep it private as a GitHub Actions artifact.
+# Tag pushes publish production releases. Manual runs build signed/notarized
+# macOS and Windows candidates and keep both private as GitHub Actions artifacts.
 #
 # Required repository secrets:
 #   APPLE_ID
@@ -88,6 +88,14 @@ jobs:
           }
           NODE
 
+          tag_version="${RELEASE_TAG#v}"
+          source_version="$(node -p "require('./package.json').version")"
+          desktop_source_version="$(node -p "require('./apps/desktop/package.json').version")"
+          if [[ "$source_version" != "$tag_version" || "$desktop_source_version" != "$tag_version" ]]; then
+            echo "::error::Tag $RELEASE_TAG requires package.json and apps/desktop/package.json to both be $tag_version (found $source_version and $desktop_source_version)."
+            exit 1
+          fi
+
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
           main_sha="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
@@ -96,7 +104,7 @@ jobs:
             exit 1
           fi
 
-          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "candidate=false" >> "$GITHUB_OUTPUT"
 
@@ -123,6 +131,12 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: Public repository hygiene
+        run: npm run check:public-hygiene
+
+      - name: Public hygiene self-tests
+        run: npm run test:public-hygiene
 
       - name: Release asset tests
         run: npm run test:release-assets
@@ -244,9 +258,13 @@ jobs:
     name: Build Windows artifacts
     needs: preflight
     runs-on: windows-latest
-    # Manual runs are macOS candidates. For a tag, [mac-only] on the tagged
-    # commit intentionally skips Windows.
-    if: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[mac-only]') }}
+    # Every manual candidate exercises Windows. For a production tag, [mac-only]
+    # on the tagged commit intentionally skips Windows.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && !contains(github.event.head_commit.message, '[mac-only]'))
+      }}
 
     steps:
       - name: Checkout

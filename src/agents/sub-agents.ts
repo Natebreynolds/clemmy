@@ -22,7 +22,11 @@ import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
 import { normalizeWorkerOutput } from './worker-output.js';
-import { externalMcpScopeFromResolvedTools } from './external-mcp-scope-lock.js';
+import {
+  externalMcpScopeFromResolvedTools,
+  intersectExternalMcpToolScopes,
+} from './external-mcp-scope-lock.js';
+import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 
 /**
  * Sub-agents.
@@ -140,9 +144,14 @@ function workerSlimToolsEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_SLIM_TOOLS', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; model?: string; workerInput?: WorkerToolInput } = {}): Promise<SubAgent> {
+export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope | null; model?: string; workerInput?: WorkerToolInput } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   let tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
+  const externalMcpScope = options.mcpToolScope !== undefined
+    ? options.mcpToolScope
+    : (options.workerInput
+        ? externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
+        : null);
   let workerCatalogBlock = '';
   if (workerSlimToolsEnabled()) {
     const names = tools.map((t) => (t as { name?: string }).name ?? '').filter(Boolean);
@@ -158,7 +167,11 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
     const deferredNames = new Set(surface.deferred);
     if (deferredNames.size > 0) {
       tools = tools.filter((t) => firstClassNames.has((t as { name?: string }).name ?? ''));
-      tools.push(buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames }) as Tool<RuntimeContextValue>);
+      tools.push(buildCallTool({
+        reachableBuiltinNames: deferredNames,
+        firstClassNames,
+        mcpToolScope: externalMcpScope,
+      }) as Tool<RuntimeContextValue>);
       const catalog = buildCompactToolCatalog({ allowedNames: deferredNames });
       workerCatalogBlock = [
         '',
@@ -168,9 +181,6 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
       ].join('\n');
     }
   }
-  const externalMcpScope = options.mcpToolScope ?? (options.workerInput
-    ? externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
-    : null);
   const externalMcpServers = externalMcpScope === null ? [] : [getOrCreateExternalMcpServers(externalMcpScope)];
   const baseInstructions = [
       'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
@@ -189,7 +199,7 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
       'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
     ].join('\n\n');
   const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}`;
-  return new Agent<RuntimeContextValue>({
+  const agent = new Agent<RuntimeContextValue>({
     name: 'Worker',
     handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
     // Instructions are a FUNCTION so a worker fanned out from a chat session
@@ -219,6 +229,8 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
     // tools should not cold-start every external MCP child.
     ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
   });
+  bindAgentMcpToolScope(agent, externalMcpScope);
+  return agent;
 }
 
 export interface CrossProviderWorkerResult {
@@ -262,8 +274,19 @@ export async function runCrossProviderWorker(
   modelId: string,
   sessionId: string,
   sourceUserSeq?: number,
+  mcpToolScope?: McpToolScope | null,
 ): Promise<CrossProviderWorkerResult> {
-  const worker = await buildWorkerAgent({ model: modelId, workerInput: input });
+  const packetMcpToolScope = externalMcpScopeFromResolvedTools(input.resolvedTools);
+  const effectiveMcpToolScope = intersectExternalMcpToolScopes(
+    mcpToolScope,
+    packetMcpToolScope,
+    'cross-provider worker parent/packet external MCP intersection',
+  );
+  const worker = await buildWorkerAgent({
+    model: modelId,
+    workerInput: input,
+    mcpToolScope: effectiveMcpToolScope,
+  });
   const guard = workerThrashGuardEnabled();
   // Base per-item turn budget — mirrors the orchestrator nested lane
   // (CLEMMY_WORKER_MAX_TURNS default 8, intent-aware ceiling on top).
@@ -283,6 +306,7 @@ export async function runCrossProviderWorker(
       {
         sessionId,
         counter,
+        mcpToolScope: effectiveMcpToolScope,
         ...(guard ? { guardrailScopeId: scopeId } : {}),
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
       },

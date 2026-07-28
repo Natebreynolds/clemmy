@@ -82,6 +82,7 @@ const dataSourceShape = z.object({
   runner_path: z.string().max(1000).nullish().describe(`Optional source path to the runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
   composio_slug: z.string().max(120).nullish().describe('A Composio tool slug to call server-side for data (credentials resolve server-side, never in the view). Mutually exclusive with runner.'),
   composio_args_json: z.string().max(4000).nullish().describe('JSON string of frozen args for composio_slug.'),
+  allow_empty: z.boolean().nullish().describe('Set true only when zero rows is an intentional valid product state (for example a brand-new content calendar). The creation smoke will still run, but will not mislabel that expected empty state as broken.'),
   schedule: z.string().max(60).nullish().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
   timezone: z.string().max(60).nullish().describe('IANA timezone for the schedule (e.g. "America/Los_Angeles").'),
 });
@@ -172,6 +173,7 @@ function toDataSource(
   if (composioArgs) ds.composioArgs = composioArgs;
   if (raw.schedule && raw.schedule.trim()) ds.schedule = raw.schedule.trim();
   if (raw.timezone && raw.timezone.trim()) ds.timezone = raw.timezone.trim();
+  if (raw.allow_empty === true) ds.allowEmpty = true;
   return ds;
 }
 

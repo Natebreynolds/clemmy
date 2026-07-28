@@ -359,7 +359,7 @@ import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconci
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
-import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
 import {
@@ -10746,22 +10746,26 @@ export function registerConsoleRoutes(
       return;
     }
     const approved = decision === 'approve';
-    // C (v2.3.0) grant-at-card, board/drag surface: the explicit opt-in rides
-    // the approve gesture and derives a NARROW grant (these recipients, this
-    // toolkit) from the approval's own stored args — before the branchy
-    // resolve paths below, so every approve route (queued background task,
-    // stale resolve, live resume) honors the same opt-in. Fail-closed when no
-    // recipients are extractable; the response reports what was stored.
+    // C (v2.3.0) grant-at-card, board/drag surface. Trust is derived only AFTER
+    // this exact approval has atomically resolved approved. Doing it before the
+    // branchy resolve paths let an already-rejected/replayed card mint standing
+    // send authority even though the route correctly returned 409.
+    const wantsTrustGrant = approved && req.body?.alwaysAllow === true;
     let trustGrantId: string | null = null;
-    if (approved && req.body?.alwaysAllow === true) {
+    const grantTrustFromResolvedApproval = (
+      row: ReturnType<typeof approvalRegistry.get>,
+    ): string | null => {
+      if (!wantsTrustGrant || row?.status !== 'resolved' || row.resolution !== 'approved') return null;
       try {
-        const row = approvalRegistry.get(id);
-        if (row) {
-          const g = grantSendTrustFromApprovedAction(row.tool ?? 'send', row.args, `always-allow from board: ${row.subject}`.slice(0, 120));
-          trustGrantId = g?.id ?? null;
-        }
+        const grant = grantSendTrustFromApprovedAction(
+          row.tool ?? 'send',
+          row.args,
+          `always-allow from board: ${row.subject}`.slice(0, 120),
+        );
+        return grant?.id ?? null;
       } catch { /* trust grant is additive — never block the decision */ }
-    }
+      return null;
+    };
 
     try {
       // Background tasks park the SDK run and need a queued continuation; a
@@ -10798,6 +10802,7 @@ export function registerConsoleRoutes(
             res.status(409).json({ ok: false, reason: result.reason ?? 'could not resolve approval', approval: result.row });
             return;
           }
+          trustGrantId = grantTrustFromResolvedApproval(result.row);
           res.json({
             ok: true,
             approval: result.row,
@@ -10816,6 +10821,7 @@ export function registerConsoleRoutes(
           res.status(409).json({ ok: false, reason: result.reason ?? 'could not resolve approval', approval: result.row });
           return;
         }
+        trustGrantId = grantTrustFromResolvedApproval(result.row);
 
         const sessionId = existing.sessionId;
         res.status(202).json({
@@ -10830,7 +10836,7 @@ export function registerConsoleRoutes(
 
         setImmediate(async () => {
           try {
-            const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
+            const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
             await runConversationFromResume({
               agent,
               sessionId,
@@ -10885,32 +10891,112 @@ export function registerConsoleRoutes(
     try {
       const record = getPendingAction(id);
       if (!record) { res.status(404).json({ ok: false, reason: 'pending action not found' }); return; }
-      // Resolving the card IS the human decision (GRANT INVARIANT I1). Resolve
-      // only a still-pending row; an already-resolved card is fine to execute
-      // against, and a resolve failure is surfaced rather than swallowed.
+      if (!approvalId) {
+        res.status(409).json({ ok: false, reason: 'an exact approval card is required to approve and execute this action' });
+        return;
+      }
+      // Resolving the card IS the human decision (GRANT INVARIANT I1). A card
+      // supplied by the client is only authority for the ONE pending action it
+      // was minted for. All three durable bindings must agree before anything
+      // mutates: the pending-action backlink, the registry args backlink, and
+      // (when present) the session. This prevents a valid approval for action B
+      // from approving/executing action A.
+      let validatedHumanApproval = false;
       if (approvalId) {
         const row = approvalRegistry.get(approvalId);
-        if (row && row.status === 'pending') {
-          const resolved = approvalRegistry.resolve(approvalId, 'approved', 'desktop-chat-card');
-          if (!resolved.ok) {
-            res.status(409).json({ ok: false, reason: resolved.reason ?? 'could not resolve approval' });
+        const rowPendingActionId = row
+          ? [row.args?.pendingActionId, row.args?.pending_action_id]
+            .find((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+            ?.trim() ?? null
+          : null;
+        const sameSession = !record.sessionId
+          || !row?.sessionId
+          || record.sessionId === row.sessionId;
+        if (record.approvalId !== approvalId) {
+          res.status(409).json({ ok: false, reason: 'approval card does not belong to this pending action' });
+          return;
+        }
+        if (!row) {
+          res.status(409).json({ ok: false, reason: 'approval card not found' });
+          return;
+        }
+        if (rowPendingActionId !== id) {
+          res.status(409).json({ ok: false, reason: 'approval card payload does not identify this pending action' });
+          return;
+        }
+        if (!sameSession) {
+          res.status(409).json({ ok: false, reason: 'approval card belongs to a different session' });
+          return;
+        }
+        if (['rejected', 'expired', 'cancelled'].includes(record.status)) {
+          res.status(409).json({ ok: false, reason: `pending action is already ${record.status}` });
+          return;
+        }
+        if (row.status === 'pending') {
+          // An expired-but-not-yet-reaped card is inert. Do not resolve it in
+          // this route: a rejected request must have zero card/action/trust
+          // mutation and zero chance of dispatch.
+          if (approvalRegistry.isExpired(row)) {
+            res.status(409).json({ ok: false, reason: 'approval card has expired' });
             return;
           }
+          const resolved = approvalRegistry.resolve(approvalId, 'approved', 'desktop-chat-card');
+          if (!resolved.ok) {
+            // Another approve request may have won the atomic registry update.
+            // That is the only already-resolved state which carries the same
+            // human authority; every other resolution remains terminal.
+            const raced = resolved.row ?? approvalRegistry.get(approvalId);
+            if (raced?.status !== 'resolved' || raced.resolution !== 'approved') {
+              res.status(409).json({ ok: false, reason: resolved.reason ?? 'approval card is not approved' });
+              return;
+            }
+          }
+          validatedHumanApproval = true;
+        } else if (row.status === 'resolved' && row.resolution === 'approved') {
+          // Exact-card retries are idempotent. The execution claim below is the
+          // one-shot boundary, so accepting the already-approved card cannot
+          // dispatch the stored action twice.
+          validatedHumanApproval = true;
+        } else {
+          res.status(409).json({
+            ok: false,
+            reason: `approval card is ${row.resolution ?? row.status}, not approved`,
+          });
+          return;
+        }
+        const current = getPendingAction(id);
+        if (current && ['rejected', 'expired', 'cancelled'].includes(current.status)) {
+          res.status(409).json({ ok: false, reason: `pending action is already ${current.status}` });
+          return;
         }
         // The registry listener flips the linked pending action to approved only
-        // when the card args carry its id; mark explicitly so the human-consent
-        // 'approved' state is reached before execution regardless of that back-link.
-        if (getPendingAction(id)?.status !== 'approved') {
-          markPendingActionApprovalResolved(id, 'approved', approvalId);
+        // when the card args carry its id. Mark explicitly after exact-card
+        // validation so a listener/storage hiccup cannot strand a real human
+        // approval — but never revive a terminal/claimed action.
+        const needsHumanConsentRepair = current?.status === 'approved'
+          && (current.approvedBy !== 'human'
+            || current.approvalEvidence?.kind !== 'card'
+            || current.approvalEvidence.approvalId !== approvalId);
+        if (current && (
+          current.status === 'queued'
+          || current.status === 'approval_requested'
+          || needsHumanConsentRepair
+        )) {
+          markPendingActionApprovalResolved(id, 'approved', approvalId, {
+            by: 'human',
+            evidence: { kind: 'card', approvalId },
+          });
         }
       }
       // C (v2.3.0) grant-at-card: an explicit opt-in on the approve click
       // derives a NARROW send-trust grant (these recipients, this toolkit)
       // from the approved action itself, so the next identical send skips the
       // card. Fail-closed: no extractable recipients → no grant, and we tell
-      // the caller so the UI never claims trust that wasn't stored.
+      // the caller so the UI never claims trust that wasn't stored. Critically,
+      // trust is minted only after an exact, resolved-approved HUMAN card was
+      // validated above — never from a missing/rejected/cross-card request.
       const alwaysAllow = req.body?.alwaysAllow === true;
-      const trustGrant = alwaysAllow
+      const trustGrant = alwaysAllow && validatedHumanApproval
         ? grantSendTrustFromApprovedAction(record.toolName, record.payload, `always-allow from card: ${record.title}`.slice(0, 120))
         : null;
       const exec = await executeApprovedPendingActionCall(id, { sessionId: record.sessionId ?? undefined });
@@ -11153,7 +11239,7 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
+        const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
         // v0.5.19 Bug A fix — sticky-approval auto-resume.
         // After the initial resume, the resumed turn may itself trigger
         // a fresh approval pause (e.g. a composio_execute_tool inside the
@@ -13756,7 +13842,7 @@ export function registerConsoleRoutes(
           return;
         }
         if (intent && harnessSession) {
-          const agent = await buildOrchestratorAgent({
+          const agent = await buildOrchestratorAgentForApprovalResume({
             userInput: effectiveInput,
             sessionId,
             allowToolJit: true,

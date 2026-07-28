@@ -1,11 +1,11 @@
 /**
  * Workspace publishing — export a Workspace as a STATIC, share-ready snapshot.
  *
- * The live Workspace is loopback-only by design (auth-gated, same-origin data
- * plane, gated actions). Publishing produces the SHAREABLE counterpart: a
- * self-contained directory the user (or Clem, via her normal deploy flow +
- * approval gates) can host anywhere — the answer to "send my client the live
- * dashboard" without ever exposing the daemon.
+ * The live Workspace is loopback-only by design (opaque authored view,
+ * parent-owned authenticated data plane, gated actions). Publishing produces
+ * the SHAREABLE counterpart: a self-contained directory the user (or Clem, via
+ * her normal deploy flow + approval gates) can host anywhere — the answer to
+ * "send my client the live dashboard" without ever exposing the daemon.
  *
  * Safety posture (BINDING):
  *  - SNAPSHOT-ONLY. The dataset is INLINED at export time; there is no data

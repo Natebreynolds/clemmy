@@ -138,6 +138,119 @@ test('isMutatingExternalWrite: INSTAGRAM_POST_IG_USER_MEDIA_PUBLISH is a write (
   );
 });
 
+test('isMutatingExternalWrite: canonical mutations without the legacy verb list are still gated', () => {
+  for (const slug of [
+    'ONE_DRIVE_UPLOAD_FILE',
+    'GMAIL_MARK_AS_READ',
+    'DROPBOX_MOVE_FILE',
+    'SLACK_ADD_REACTION_TO_A_MESSAGE',
+    'ACME_DO_THING',
+  ]) {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: slug }),
+      true,
+      slug,
+    );
+  }
+});
+
+test('isMutatingExternalWrite: every Composio carrier resolves to the same canonical write action', () => {
+  const wrapperArgs = { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: '{}' };
+  for (const [toolName, args] of [
+    ['composio_execute_tool', wrapperArgs],
+    ['mcp__clementine-local__composio_execute_tool', wrapperArgs],
+    ['mcp__composio__execute_tool', wrapperArgs],
+    ['cx_airtable_update_record', { record_id: 'rec_1' }],
+    ['mcp__clementine-local__cx_airtable_update_record', { record_id: 'rec_1' }],
+  ] as const) {
+    assert.equal(isMutatingExternalWrite(toolName, args), true, toolName);
+  }
+});
+
+test('isMutatingExternalWrite: every Composio carrier resolves to the same canonical read action', () => {
+  const wrapperArgs = { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{}' };
+  for (const [toolName, args] of [
+    ['composio_execute_tool', wrapperArgs],
+    ['mcp__clementine-local__composio_execute_tool', wrapperArgs],
+    ['mcp__composio__execute_tool', wrapperArgs],
+    ['cx_outlook_list_messages', { folder: 'Inbox' }],
+    ['mcp__clementine-local__cx_outlook_list_messages', { folder: 'Inbox' }],
+  ] as const) {
+    assert.equal(isMutatingExternalWrite(toolName, args), false, toolName);
+  }
+});
+
+test('isMutatingExternalWrite: documented noun-shaped reads stay reads on wrapper, dynamic, and native MCP lanes', () => {
+  for (const slug of [
+    'SLACK_CONVERSATIONS_HISTORY',
+    'TWITTER_USER_TIMELINE',
+    'GOOGLEDRIVE_DOWNLOAD_FILE',
+  ]) {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: slug }),
+      false,
+      `wrapper ${slug}`,
+    );
+    assert.equal(
+      isMutatingExternalWrite(`cx_${slug.toLowerCase()}`, {}),
+      false,
+      `dynamic ${slug}`,
+    );
+  }
+  assert.equal(
+    isMutatingExternalWrite('mcp__slack__conversations_history', {}),
+    false,
+    'native MCP Slack history is a catalog read',
+  );
+  assert.equal(
+    isMutatingExternalWrite('mcp__twitter__user_timeline', {}),
+    false,
+    'native MCP Twitter timeline is a catalog read',
+  );
+  assert.equal(
+    isMutatingExternalWrite('mcp__googledrive__download_file', {}),
+    false,
+    'native MCP Drive download is a catalog read',
+  );
+});
+
+test('isMutatingExternalWrite: catalog read exemptions are exact and cannot be borrowed by an unknown provider action', () => {
+  assert.equal(
+    isMutatingExternalWrite('composio_execute_tool', {
+      tool_slug: 'ACME_SLACK_CONVERSATIONS_HISTORY',
+    }),
+    true,
+  );
+  assert.equal(
+    isMutatingExternalWrite('mcp__acme__slack_conversations_history', {}),
+    true,
+  );
+});
+
+test('isMutatingExternalWrite: deferred call_tool dispatch inherits the inner action effect', () => {
+  assert.equal(
+    isMutatingExternalWrite('call_tool', {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: '{}' }),
+    }),
+    true,
+  );
+  assert.equal(
+    isMutatingExternalWrite('mcp__clementine-local__call_tool', {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'SLACK_CONVERSATIONS_HISTORY', arguments: '{}' }),
+    }),
+    false,
+  );
+});
+
+test('isMutatingExternalWrite: unknown external actions fail closed on every externally-dispatched lane', () => {
+  assert.equal(isMutatingExternalWrite('composio_execute_tool', {}), true, 'missing wrapper slug');
+  assert.equal(isMutatingExternalWrite('composio_execute_tool', '{not valid json'), true, 'malformed wrapper');
+  assert.equal(isMutatingExternalWrite('cx_acme_do_thing', {}), true, 'unknown dynamic action');
+  assert.equal(isMutatingExternalWrite('mcp__acme__do_thing', {}), true, 'unknown native MCP action');
+});
+
 // ─── isMutatingExternalWrite — exempt slug patterns ──────────────
 
 test('isMutatingExternalWrite: DATAFORSEO_CREATE_SERP_TASK_POST is exempt (task creation, not user data)', () => {
@@ -193,17 +306,17 @@ test('isMutatingExternalWrite: ask_user_question is exempt', () => {
 
 // ─── isMutatingExternalWrite — defensive / edge cases ────────────
 
-test('isMutatingExternalWrite: missing tool_slug → false (fail-open, don\'t block)', () => {
+test('isMutatingExternalWrite: missing tool_slug → true (unknown external dispatch fails closed)', () => {
   assert.equal(
     isMutatingExternalWrite('composio_execute_tool', {}),
-    false,
+    true,
   );
 });
 
-test('isMutatingExternalWrite: null args → false', () => {
+test('isMutatingExternalWrite: null args → true (unknown external dispatch fails closed)', () => {
   assert.equal(
     isMutatingExternalWrite('composio_execute_tool', null),
-    false,
+    true,
   );
 });
 
@@ -214,10 +327,10 @@ test('isMutatingExternalWrite: string args (legacy serialized form) parse and ch
   );
 });
 
-test('isMutatingExternalWrite: corrupt JSON string args → false (fail-open)', () => {
+test('isMutatingExternalWrite: corrupt JSON string args → true (unknown external dispatch fails closed)', () => {
   assert.equal(
     isMutatingExternalWrite('composio_execute_tool', '{not valid json'),
-    false,
+    true,
   );
 });
 

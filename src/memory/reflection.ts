@@ -200,6 +200,10 @@ export interface ReflectionInput {
   callId: string;
   tool: string | null;
   output: string;
+  /** One accepted user turn / workflow-step / worker packet. Reflection is
+   * best-effort learning beside that run, so it receives a bounded extractor
+   * budget rather than issuing one model call for every long tool return. */
+  scopeId?: string;
 }
 
 export interface ReflectionResult {
@@ -210,7 +214,7 @@ export interface ReflectionResult {
   entitiesUpserted: number;
   pointersStored: number;
   sumImportance?: number;
-  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance' | 'self_tool' | 'write_receipt';
+  skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance' | 'self_tool' | 'write_receipt' | 'scope_budget';
 }
 
 const PROMPT_PREAMBLE = buildExtractorPreamble(false);
@@ -509,14 +513,62 @@ function readDisableFlag(): boolean {
   return raw === 'off' || raw === 'false' || raw === '0';
 }
 
+interface ReflectionScopeBudget {
+  calls: number;
+  inputChars: number;
+  lastAt: number;
+}
+
+const reflectionScopeBudgets = new Map<string, ReflectionScopeBudget>();
+const REFLECTION_SCOPE_BUDGET_TTL_MS = 60 * 60 * 1000;
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(getRuntimeEnv(name, String(fallback)) ?? String(fallback), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * Reflection is background learning, not part of task completion. A single
+ * long-horizon run can return dozens of large records; blindly extracting each
+ * one competed with the foreground model and spent more tokens than the work.
+ * Reserve synchronously before the await so parallel returns cannot overshoot.
+ */
+function claimReflectionScopeBudget(input: ReflectionInput, serializedChars: number): boolean {
+  const scopeId = input.scopeId?.trim();
+  if (!scopeId) return true; // legacy/direct callers remain unmetered
+  const now = Date.now();
+  if (reflectionScopeBudgets.size > 1_024) {
+    for (const [key, budget] of reflectionScopeBudgets) {
+      if (now - budget.lastAt > REFLECTION_SCOPE_BUDGET_TTL_MS) reflectionScopeBudgets.delete(key);
+    }
+  }
+  const maxCalls = positiveIntEnv('CLEMMY_REFLECTION_MAX_CALLS_PER_SCOPE', 4);
+  const maxChars = positiveIntEnv(
+    'CLEMMY_REFLECTION_MAX_INPUT_CHARS_PER_SCOPE',
+    REFLECTION_MAX_INPUT_CHARS * 3,
+  );
+  const current = reflectionScopeBudgets.get(scopeId) ?? { calls: 0, inputChars: 0, lastAt: now };
+  if (current.calls >= maxCalls || current.inputChars + serializedChars > maxChars) return false;
+  reflectionScopeBudgets.set(scopeId, {
+    calls: current.calls + 1,
+    inputChars: current.inputChars + serializedChars,
+    lastAt: now,
+  });
+  return true;
+}
+
+export function _testOnly_resetReflectionScopeBudgets(): void {
+  reflectionScopeBudgets.clear();
+}
+
 // Self/introspective tools whose returns are Clementine's OWN internal state
 // (memory, tasks, plans, execution status), NOT external/user data. Reflecting
 // on them manufactures self-referential facts and a memory_read→fact recursion
 // at derivation_depth 0 (so the nightly recursive-depth cap does NOT guard it).
 // The 2026-06-08 memory audit found >50% of the fact store was self-referential
 // this way (59 facts derived from memory_read alone). We skip reflection on
-// these. KEEP read_file / run_shell_command / skill_read / workflow_run
-// reflectable — they surface real user/external content.
+// these. KEEP ordinary read_file / run_shell_command / workflow_run returns
+// reflectable — they can surface real user/external content.
 const SELF_TOOL_DENY_EXACT = new Set<string>([
   'recall_tool_result', 'tool_output_query', 'unified_recall',
   'draft_plan', 'task_list', 'task_get', 'task_create', 'task_update',
@@ -544,6 +596,7 @@ const SELF_TOOL_DENY_EXACT = new Set<string>([
   'call_tool', 'tool_search', 'mcp_list_tools', 'mcp_status',
   'composio_search_tools', 'composio_list_tools', 'composio_status',
   'local_cli_list', 'local_cli_probe', 'harness_status',
+  'list_files', 'space_list', 'skill_read',
   // Approval/execution envelopes contain Clementine's own queued payload,
   // hashes, status and receipts. The provider result remains lossless inside
   // the pending-action record; reflecting the envelope learns no user fact and
@@ -558,6 +611,16 @@ export function isSelfReferentialTool(toolName: string | null | undefined): bool
   if (!name) return false;
   if (SELF_TOOL_DENY_EXACT.has(name)) return true;
   return SELF_TOOL_DENY_PREFIXES.some((p) => name.startsWith(p));
+}
+
+/** `read_file` is generally valuable semantic source material, but Clementine's
+ * generated task ledger is her own operational state. The exact front matter
+ * contract distinguishes it from ordinary user documents without suppressing
+ * broad file reflection. */
+function isInternalTaskLedgerReturn(toolName: string | null | undefined, output: string): boolean {
+  if (toolName?.trim().toLowerCase() !== 'read_file') return false;
+  const head = output.slice(0, 4_096);
+  return /^---\s*\ntype:\s*tasks\s*\n---\s*\n+#\s+Tasks\b/im.test(head);
 }
 
 // Mutation acknowledgements are operational receipts, not new semantic source
@@ -695,6 +758,19 @@ function reflectionInputHash(input: ReflectionInput): string {
     .digest('hex');
 }
 
+type PreclaimReflectionSkip = 'disabled' | 'self_tool' | 'write_receipt' | 'too_short';
+
+function preclaimReflectionSkipReason(input: ReflectionInput): PreclaimReflectionSkip | null {
+  if (readDisableFlag()) return 'disabled';
+  if (
+    selfToolReflectionFilterEnabled()
+    && (isSelfReferentialTool(input.tool) || isInternalTaskLedgerReturn(input.tool, input.output))
+  ) return 'self_tool';
+  if (writeReceiptReflectionFilterEnabled() && isWriteReceiptTool(input.tool)) return 'write_receipt';
+  if (!input.output || input.output.length < REFLECTION_MIN_CONTENT_CHARS) return 'too_short';
+  return null;
+}
+
 function claimReflectionReceipt(input: ReflectionInput): { claimed: boolean; inputHash: string } {
   const db = openMemoryDb();
   const inputHash = reflectionInputHash(input);
@@ -803,57 +879,92 @@ export function readReflectionReplayHealth(now = new Date().toISOString()): Refl
   };
 }
 
-/** Bounded replay of FAILED reflection receipts. A receipt fails when the
- *  extractor was down (quota/outage) — the learning content itself is intact
- *  in the harness `tool_outputs` store (same (session_id, call_id) key,
- *  14-day TTL). This drain re-runs those extractions once the extractor is
- *  available again, so a provider outage delays learning instead of deleting
- *  it. Bounded per receipt by `attempts` (claimReflectionReceipt increments
- *  on every re-claim); raw-expired receipts are marked terminal so they stop
- *  being scanned. Called from the memory maintenance loop. */
+/** Bounded replay of FAILED or crash-abandoned reflection receipts. A receipt
+ *  fails when the extractor was down (quota/outage), while a killed daemon can
+ *  leave one in `processing` beyond its ten-minute lease. In both cases the
+ *  learning content remains in the harness `tool_outputs` store under the same
+ *  (session_id, call_id) key for 14 days. This drain re-enters the ordinary
+ *  receipt claim path, so attempt accounting and exactly-once settlement stay
+ *  centralized. Raw-expired and attempt-exhausted receipts are terminalized so
+ *  maintenance never loops forever. */
 const REFLECTION_REPLAY_MAX_ATTEMPTS = 4;
 
 export async function replayFailedReflections(
   limit = 8,
 ): Promise<{ scanned: number; replayed: number; rawGone: number }> {
   const summary = { scanned: 0, replayed: 0, rawGone: 0 };
-  if (!reflectionExtractorAvailable()) return summary;
   const db = openMemoryDb();
+  const staleCutoff = new Date(Date.now() - REFLECTION_PROCESSING_LEASE_MS).toISOString();
   const rows = db.prepare(`
-    SELECT session_id, call_id, attempts
+    SELECT session_id, call_id, attempts, status
     FROM memory_reflection_receipts
-    WHERE status = 'failed' AND attempts < ?
+    WHERE (status = 'failed' AND attempts < ?)
+       OR (status = 'processing' AND last_attempt_at <= ?)
     ORDER BY last_attempt_at ASC
     LIMIT ?
-  `).all(REFLECTION_REPLAY_MAX_ATTEMPTS, Math.max(1, limit)) as Array<{
-    session_id: string; call_id: string; attempts: number;
+  `).all(REFLECTION_REPLAY_MAX_ATTEMPTS, staleCutoff, Math.max(1, limit)) as Array<{
+    session_id: string; call_id: string; attempts: number; status: 'failed' | 'processing';
   }>;
   if (rows.length === 0) return summary;
   const { getToolOutput } = await import('../runtime/harness/eventlog.js');
   for (const row of rows) {
     summary.scanned += 1;
+    if (row.attempts >= REFLECTION_REPLAY_MAX_ATTEMPTS) {
+      db.prepare(`
+        UPDATE memory_reflection_receipts
+        SET status = 'failed', last_error = COALESCE(last_error, 'attempts_exhausted')
+        WHERE session_id = ? AND call_id = ? AND status = 'processing'
+      `).run(row.session_id, row.call_id);
+      continue;
+    }
     let raw: { output: string; tool: string | null } | null = null;
+    let eventlogUnavailable = false;
     try {
       raw = getToolOutput(row.session_id, row.call_id) as { output: string; tool: string | null } | null;
-    } catch { /* eventlog unavailable this tick — leave the receipt for later */ }
+    } catch {
+      // A transient event-log read failure is not proof that the TTL expired.
+      // Leave the receipt untouched so the next bounded maintenance pass can
+      // distinguish an outage from genuinely missing raw data.
+      eventlogUnavailable = true;
+    }
+    if (eventlogUnavailable) continue;
     if (!raw?.output) {
       // The raw outlived neither the outage nor the TTL — nothing left to
       // learn from. Terminalize so the drain stops re-scanning it.
       db.prepare(`
         UPDATE memory_reflection_receipts
-        SET attempts = ?, last_error = 'raw_expired'
-        WHERE session_id = ? AND call_id = ? AND status = 'failed'
+        SET status = 'failed', attempts = ?, last_error = 'raw_expired'
+        WHERE session_id = ? AND call_id = ? AND status IN ('failed','processing')
       `).run(REFLECTION_REPLAY_MAX_ATTEMPTS, row.session_id, row.call_id);
       summary.rawGone += 1;
       continue;
     }
+    const replayInput: ReflectionInput = {
+      sessionId: row.session_id,
+      callId: row.call_id,
+      tool: raw.tool ?? 'unknown_tool',
+      output: raw.output,
+    };
+    const skipReason = preclaimReflectionSkipReason(replayInput);
+    if (skipReason) {
+      // Policy may have become stricter after the historical claim (for
+      // example, composio_status is now recognized as Clementine's own state).
+      // Reclaim and settle the durable receipt without invoking an extractor.
+      const receipt = claimReflectionReceipt(replayInput);
+      if (receipt.claimed) {
+        settleReflectionReceipt(replayInput, receipt.inputHash, 'completed', {
+          factsWritten: 0,
+          entitiesUpserted: 0,
+          pointersStored: 0,
+          skipped: skipReason,
+        } satisfies ReflectionResult);
+      }
+      summary.replayed += 1;
+      continue;
+    }
+    if (!reflectionExtractorAvailable()) break;
     try {
-      await reflectOnToolReturn({
-        sessionId: row.session_id,
-        callId: row.call_id,
-        tool: raw.tool ?? 'unknown_tool',
-        output: raw.output,
-      });
+      await reflectOnToolReturn(replayInput);
       summary.replayed += 1;
     } catch (err) {
       logger.warn(
@@ -1719,7 +1830,7 @@ function formatApproxBytes(chars: number): string {
   return `${chars} chars`;
 }
 
-function storeFallbackPointer(input: ReflectionInput, reason: 'extractor_failed' | 'derived_fact_source'): number {
+function storeFallbackPointer(input: ReflectionInput, reason: 'extractor_failed' | 'derived_fact_source' | 'scope_budget'): number {
   try {
     storeEpisodicPointer({
       sessionId: input.sessionId,
@@ -1986,19 +2097,17 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     return result;
   };
 
-  if (readDisableFlag()) {
-    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'disabled' });
-  }
-  if (selfToolReflectionFilterEnabled() && isSelfReferentialTool(input.tool)) {
-    // Skip Clementine's own introspective tools — reflecting on them only
-    // mints self-referential facts (memory_read→fact recursion).
-    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'self_tool' });
-  }
-  if (writeReceiptReflectionFilterEnabled() && isWriteReceiptTool(input.tool)) {
-    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'write_receipt' });
-  }
-  if (!input.output || input.output.length < REFLECTION_MIN_CONTENT_CHARS) {
-    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'too_short' });
+  const preclaimSkip = preclaimReflectionSkipReason(input);
+  if (preclaimSkip) {
+    // Skip disabled, introspective, mutation-receipt, and tiny returns before
+    // creating a durable receipt. Historical receipts already claimed under
+    // older policy are settled by the bounded replay drain above.
+    return emitObservability({
+      factsWritten: 0,
+      entitiesUpserted: 0,
+      pointersStored: 0,
+      skipped: preclaimSkip,
+    });
   }
   const receipt = claimReflectionReceipt(input);
   if (!receipt.claimed) {
@@ -2015,6 +2124,18 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
         callId: input.callId,
       })
     : input.output;
+
+  if (!claimReflectionScopeBudget(input, serialized.length)) {
+    const pointersStored = storeFallbackPointer(input, 'scope_budget');
+    const result: ReflectionResult = {
+      factsWritten: 0,
+      entitiesUpserted: 0,
+      pointersStored,
+      skipped: 'scope_budget',
+    };
+    settleReflectionReceipt(input, receipt.inputHash, 'completed', result);
+    return emitObservability(result);
+  }
 
   const extraction = await runExtractor(`Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`);
   if (!extraction) {

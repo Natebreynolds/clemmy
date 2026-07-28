@@ -121,6 +121,59 @@ test('resolveMcpToolScope: an email column in a Sheet is structured data, not Ou
   assert.ok((mixed.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
 });
 
+test('resolveMcpToolScope: a social content calendar is an artifact, not Outlook intent', () => {
+  for (const userInput of [
+    'Build a social media command center with a seven-day content calendar, campaign status, channel, owner, assets, and approvals.',
+    'Create an editorial calendar in Airtable.',
+    'Build a release calendar and a deployment heatmap.',
+    'Show a calendar heatmap of website traffic.',
+    'Create a crop calendar for the community garden.',
+  ]) {
+    const scope = resolveMcpToolScope({ userInput });
+    assert.ok(
+      !(scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+      `artifact calendar must not preload Outlook: ${userInput}`,
+    );
+  }
+
+  const mixed = resolveMcpToolScope({
+    userInput: 'Build a social media content calendar, then add a review meeting to my Outlook calendar.',
+  });
+  assert.ok(
+    (mixed.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+    'a separate operational Outlook request remains reachable',
+  );
+});
+
+test('resolveMcpToolScope: creative drafts are artifacts, not Outlook mail drafts', () => {
+  for (const userInput of [
+    'Draft a local blog post.',
+    'Create three social post drafts for approval.',
+    'Review the contract draft.',
+    'Make a first draft of the landing page.',
+  ]) {
+    const scope = resolveMcpToolScope({ userInput });
+    assert.ok(
+      !(scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+      `creative draft must not preload Outlook: ${userInput}`,
+    );
+  }
+
+  for (const userInput of [
+    'Draft an email to Bob.',
+    'List my Outlook drafts.',
+    "What's on my calendar today?",
+    'Add dinners to my calendar.',
+    'Create a meeting invite for Friday.',
+  ]) {
+    const scope = resolveMcpToolScope({ userInput });
+    assert.ok(
+      (scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+      `operational Outlook/calendar request must remain reachable: ${userInput}`,
+    );
+  }
+});
+
 test('resolveMcpToolScope: a compact Sheet matrix containing email data does not preload Outlook', () => {
   const scope = resolveMcpToolScope({
     userInput: 'Read Google Sheets range A1:B4 and compare these cells exactly: company,email; Acme,acme@example.com; Beacon,beacon@example.com.',

@@ -19,6 +19,7 @@ import {
   type BatchPlan,
 } from '../execution/batch-runner.js';
 import {
+  claimPendingActionExecution,
   getPendingAction,
   queuePendingAction,
   recordPendingActionResult,
@@ -27,6 +28,23 @@ import { getToolOutputContext } from '../runtime/harness/tool-output-context.js'
 import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 
 const textResult = (text: string) => ({ content: [{ type: 'text' as const, text }] });
+
+type BatchPlanRunner = typeof runBatchPlan;
+let batchPlanRunner: BatchPlanRunner = runBatchPlan;
+
+/** Test seam for proving approval consumption without a live provider call. */
+export function _setBatchPlanRunnerForTests(fn: BatchPlanRunner | null): void {
+  batchPlanRunner = fn ?? runBatchPlan;
+}
+
+function batchExecutionSkipText(id: string, status: string | undefined, claimUncertain = false): string {
+  if (claimUncertain || status === 'executing') {
+    return `Pending action ${id} already has an execution claim. It may be in progress or its outcome may be uncertain — no second batch was started, and it must not be retried automatically.`;
+  }
+  if (status === 'executed') return `Pending action ${id} was already executed — no second batch was started.`;
+  if (status === 'failed') return `Pending action ${id} already has a failed or uncertain result — no automatic retry was started.`;
+  return `Pending action ${id} is ${status ?? 'not available'} — it must be APPROVED before execution.`;
+}
 
 const BatchItemSchema = z.object({
   id: z.string().min(1).max(120).describe('Stable per-item id the ledger reports on (e.g. the recipient domain or record id).'),
@@ -129,7 +147,7 @@ export function registerBatchTools(server: McpServer): void {
           }
           const unverified = cert.judgeUnavailable === true;
           if (planForExecution.sideEffect === 'read') {
-            const ledger = await runBatchPlan(planForExecution, sessionId);
+            const ledger = await batchPlanRunner(planForExecution, sessionId);
             const label = unverified
               ? `Unverified (judge unavailable — ${cert.reason}).`
               : `Certified (${cert.reason || 'ok'}).`;
@@ -175,7 +193,7 @@ export function registerBatchTools(server: McpServer): void {
           if (!record) return textResult(`No pending action ${pending_action_id}.`);
           if (record.toolName !== 'run_batch') return textResult(`Pending action ${pending_action_id} is not a run_batch plan.`);
           if (record.status !== 'approved') {
-            return textResult(`Pending action ${pending_action_id} is ${record.status} — it must be APPROVED before execution.`);
+            return textResult(batchExecutionSkipText(pending_action_id, record.status));
           }
           // GRANT INVARIANT I1 (Phase 1): an irreversible send batch executes
           // only on HUMAN consent. A policy-minted approval (YOLO auto-approve,
@@ -193,16 +211,58 @@ export function registerBatchTools(server: McpServer): void {
           const plan = prepared.plan;
           const errors = validateBatchPlan(plan);
           if (errors.length > 0) return textResult(`Stored plan failed re-validation (${errors.join('; ')}) — do not execute; re-propose.`);
+          // Atomically consume APPROVED immediately before the external loop.
+          // Concurrent chat/console/process callers that lose this claim see
+          // EXECUTING (or terminal truth) and never start a second batch.
+          const claim = claimPendingActionExecution(record.id, 'run_batch');
+          if (!claim.claimed || !claim.record || !claim.claimToken) {
+            return textResult(batchExecutionSkipText(
+              pending_action_id,
+              claim.record?.status,
+              claim.reason === 'claim_in_progress_or_uncertain',
+            ));
+          }
+          const claimedRecord = claim.record;
+          const claimToken = claim.claimToken;
+          // Execute only the snapshot returned by the claim. Re-validation
+          // fails safe if a record was manually edited between the first read
+          // and the compare-and-swap.
+          const claimedPrepared = prepareBatchPlanForExecution(claimedRecord.payload as BatchPlan);
+          if (claimedPrepared.errors.length > 0) {
+            const reason = `Claimed stored plan failed normalization (${claimedPrepared.errors.join('; ')}). No provider call was made.`;
+            recordPendingActionResult(claimedRecord.id, 'failed', reason, 'run_batch', claimToken);
+            return textResult(`${reason} Re-propose a corrected plan; do not retry this action.`);
+          }
+          const claimedPlan = claimedPrepared.plan;
+          const claimedErrors = validateBatchPlan(claimedPlan);
+          if (claimedErrors.length > 0) {
+            const reason = `Claimed stored plan failed re-validation (${claimedErrors.join('; ')}). No provider call was made.`;
+            recordPendingActionResult(claimedRecord.id, 'failed', reason, 'run_batch', claimToken);
+            return textResult(`${reason} Re-propose a corrected plan; do not retry this action.`);
+          }
           // Certified + approved: clean stored plans passed ONE certification
           // judge over these exact payloads and approval byte-pins them by
           // payloadHash, so the per-item LLM boundary judges are skipped. If an
           // older stored plan needed rescue normalization at execute time, do
           // NOT claim exact-payload certification; let the per-item judges run.
-          const certified = prepared.repairs.length === 0 ? { payloadHash: record.payloadHash } : undefined;
-          const ledger = await runBatchPlan(plan, sessionId, certified ? { certified } : undefined);
+          const certified = claimedPrepared.repairs.length === 0 ? { payloadHash: claimedRecord.payloadHash } : undefined;
+          let ledger: Awaited<ReturnType<BatchPlanRunner>>;
           try {
-            recordPendingActionResult(record.id, ledger.failed === 0 && !ledger.halted ? 'executed' : 'failed',
-              `${ledger.succeeded}/${ledger.total} succeeded, ${ledger.failed} failed${ledger.halted ? ', HALTED' : ''} (ledger ${ledger.batchId})`);
+            ledger = await batchPlanRunner(claimedPlan, sessionId, certified ? { certified } : undefined);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            const uncertain = `Batch execution failed or became uncertain after dispatch began: ${message}. Do not retry automatically.`;
+            recordPendingActionResult(claimedRecord.id, 'failed', uncertain, 'run_batch', claimToken);
+            return textResult(`run_batch failed or is uncertain: ${message}. No automatic retry is safe.`);
+          }
+          try {
+            recordPendingActionResult(
+              claimedRecord.id,
+              ledger.failed === 0 && !ledger.halted ? 'executed' : 'failed',
+              `${ledger.succeeded}/${ledger.total} succeeded, ${ledger.failed} failed${ledger.halted ? ', HALTED' : ''} (ledger ${ledger.batchId})`,
+              'run_batch',
+              claimToken,
+            );
           } catch { /* result note is best-effort */ }
           return textResult(formatBatchLedger(ledger));
         }

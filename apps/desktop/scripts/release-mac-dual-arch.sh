@@ -10,6 +10,8 @@ REBUILD_BIN="$DESKTOP_DIR/node_modules/.bin/electron-rebuild"
 BUILDER_BIN="$DESKTOP_DIR/node_modules/.bin/electron-builder"
 SQLITE_NODE="$ROOT_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
 ARM64_UPDATE_FEED="$(mktemp "${TMPDIR:-/tmp}/clementine-latest-mac-arm64.XXXXXX")"
+MAC_NATIVE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/clementine-mac-native-stage.XXXXXX")"
+export CLEMENTINE_MAC_NATIVE_STAGE="$MAC_NATIVE_STAGE"
 
 restore_host_native() {
   echo "-> Restoring better-sqlite3 for host Node ABI"
@@ -18,6 +20,7 @@ restore_host_native() {
 
 cleanup() {
   rm -f "$ARM64_UPDATE_FEED"
+  rm -rf "$MAC_NATIVE_STAGE"
   restore_host_native
 }
 
@@ -228,6 +231,51 @@ verify_recall_packaged() {
   fi
 }
 
+verify_local_embeddings_packaged() {
+  local arch="$1"
+  local executable="$2"
+  local daemon="$3"
+  [[ "$arch" == "x64" ]] || return 0
+
+  # ONNX Runtime 1.24 stopped publishing a native Intel-macOS Node binding.
+  # Exercise Clementine's packaged WASM adapter with the real local embedding
+  # model so a missing adapter, WASM payload, model-cache path, or inference
+  # regression blocks the release rather than silently degrading semantic
+  # memory on Intel Macs.
+  local probe_home
+  probe_home="$(mktemp -d "${TMPDIR:-/tmp}/clementine-intel-embedding-probe.XXXXXX")"
+  if ! (
+    cd "$daemon"
+    CLEMENTINE_HOME="$probe_home" \
+    CLEMMY_EMBED_PROVIDER=local \
+    CLEMMY_LOCAL_EMBEDDINGS=on \
+    CLEMMY_ONNX_WASM_THREADS=1 \
+    EMBEDDINGS_DISABLED=false \
+    OPENAI_API_KEY= \
+    ELECTRON_RUN_AS_NODE=1 "$executable" --input-type=module -e '
+      const m = await import("./dist/memory/embeddings.js");
+      const provider = await m.getEmbeddingProvider();
+      if (!provider || provider.name !== "local" || provider.dim !== 384) {
+        throw new Error(`unexpected Intel local embedding provider: ${JSON.stringify(provider && {
+          name: provider.name, model: provider.model, dim: provider.dim,
+        })}`);
+      }
+      const vectors = await provider.embed(["Clementine Intel semantic memory release probe"]);
+      const vector = vectors[0];
+      if (!(vector instanceof Float32Array)
+        || vector.length !== 384
+        || !Array.from(vector).every(Number.isFinite)) {
+        throw new Error(`Intel local embedding probe returned an invalid vector (${vector?.length ?? "missing"})`);
+      }
+      process.stdout.write(`   Intel local embeddings: WASM ${vector.length}-dim probe OK\n`);
+    '
+  ); then
+    rm -rf "$probe_home"
+    return 1
+  fi
+  rm -rf "$probe_home"
+}
+
 verify_packaged_app() {
   local arch="$1"
   local expected_arch="$2"
@@ -260,8 +308,18 @@ verify_packaged_app() {
     || { echo "::error::$arch main executable has the wrong architecture"; exit 1; }
   [[ "$(file "$daemon/node_modules/better-sqlite3/build/Release/better_sqlite3.node")" == *"$expected_arch"* ]] \
     || { echo "::error::$arch packaged better-sqlite3 has the wrong architecture"; exit 1; }
+  (cd "$ROOT_DIR" && node apps/desktop/scripts/mac-native-deps.mjs verify \
+    --daemon "$daemon" \
+    --arch "$arch")
+
+  local keytar="$app/Contents/Resources/app.asar.unpacked/node_modules/keytar/build/Release/keytar.node"
+  [[ -f "$keytar" ]] \
+    || { echo "::error::$arch packaged keytar native module is missing"; exit 1; }
+  [[ "$(file "$keytar")" == *"$expected_arch"* ]] \
+    || { echo "::error::$arch packaged keytar has the wrong architecture: $(file "$keytar")"; exit 1; }
 
   verify_recall_packaged "$arch" "$app" "$executable"
+  verify_local_embeddings_packaged "$arch" "$executable" "$daemon"
 
   if is_signed_release; then
     codesign --verify --deep --strict --verbose=2 "$app"
@@ -423,6 +481,11 @@ else
   (cd "$ROOT_DIR" && npm run vendor:whisper -- --target aarch64-apple-darwin --force)
   (cd "$ROOT_DIR" && npm run vendor:whisper -- --target x86_64-apple-darwin --force)
 fi
+
+echo "-> Staging checksum-locked Intel Sharp/libvips payloads"
+(cd "$ROOT_DIR" && node apps/desktop/scripts/mac-native-deps.mjs stage-x64 \
+  --stage "$MAC_NATIVE_STAGE" \
+  --root "$ROOT_DIR")
 
 build_arch arm64 arm64
 cp "$DESKTOP_DIR/release/latest-mac.yml" "$ARM64_UPDATE_FEED"

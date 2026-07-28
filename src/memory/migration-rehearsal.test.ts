@@ -107,12 +107,11 @@ test('migration rehearsal upgrades a consistent copy and leaves a physical v21 s
       INSERT INTO fact_entities
         (fact_id, entity_id, created_at, link_type, confidence,
          evidence_episode_id, evidence_excerpt)
-      VALUES (?, ?, ?, 'extracted', 0.98, ?, ?)
+      VALUES (?, ?, ?, 'extracted', 0.98, NULL, ?)
     `).run(
       meetingFactId,
       entityId,
       now,
-      episodeId,
       'Dana said the Northstar launch review is Friday.',
     );
     const projectEntity = db.prepare(`
@@ -170,6 +169,13 @@ test('migration rehearsal upgrades a consistent copy and leaves a physical v21 s
     assert.equal(report.migration.error, null);
     assert.equal(report.migration.identityReconciliation?.groupsMerged, 1);
     assert.equal(report.migration.identityReconciliation?.entitiesRedirected, 1);
+    assert.deepEqual(report.migration.extractedFactEntityEvidenceReconciliation, {
+      linksScanned: 1,
+      evidenceScanned: 1,
+      repaired: 0,
+      downgraded: 1,
+      ambiguous: 0,
+    });
     assert.equal(report.migration.groundedFactEntityBackfill?.promoted, 1);
     assert.equal(report.migration.groundedFactResourceBackfill?.promoted, 1);
     assert.equal(report.migration.legacyReflectionBackfill?.batchesBackfilled, 1);
@@ -219,6 +225,14 @@ test('migration rehearsal upgrades a consistent copy and leaves a physical v21 s
         `).get(meetingFactId) as { count: number }).count,
         1,
         'durable recording evidence survives the rehearsed migration',
+      );
+      assert.deepEqual(
+        migrated.prepare(`
+          SELECT link_type, evidence_episode_id FROM fact_entities
+          WHERE fact_id = ? AND entity_id = ?
+        `).get(meetingFactId, entityId),
+        { link_type: 'inferred_text', evidence_episode_id: null },
+        'an extracted legacy edge without deterministic identity support is retained only as inferred',
       );
       assert.deepEqual(
         migrated.prepare(`

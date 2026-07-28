@@ -72,7 +72,13 @@ const WEB_RE =
 const SALESFORCE_STRONG_RE = /\b(salesforce|sf cli|soql)\b/i;
 const SALESFORCE_OBJECT_RE = /\b(opportunit(?:y|ies)|account(?:s)?|lead(?:s)?|contact(?:s)?)\b/i;
 const SALESFORCE_CONTEXT_RE = /\b(crm|sales pipeline|salesforce pipeline|deal(?:s)?|prospect(?:s)?)\b/i;
-const OUTLOOK_RE = /\b(outlook|email|emails|draft(?:s)?|inbox|calendar|meeting invite)\b/i;
+const OUTLOOK_RE = /\b(outlook|email|emails|inbox|meeting invite)\b/i;
+// "Calendar" and "draft" are overloaded artifact nouns (content calendar,
+// release calendar, contract draft, post drafts). Calendar access becomes
+// Outlook intent only when the user expresses an operational scheduling cue.
+// Explicit Outlook/email/inbox language remains a strong signal above.
+const CALENDAR_OPERATION_RE =
+  /\b(?:check|show|list|read|open|view|add|put|create|update|edit|delete|remove|schedule|book|move|reschedule|block|clear)\b[^.!?\n]{0,80}\b(?:my|our|team|work|personal)\s+calendar\b|\b(?:add|put|schedule|book|move|reschedule|block)\b[^.!?\n]{0,50}\b(?:to|on)\s+(?:the\s+)?calendar\b|\b(?:my|our|team|work|personal)\s+calendar\b|\bcalendar\s+(?:event|events|invite|invites|meeting|meetings|availability)\b/i;
 const EMAIL_DATA_FIELD_RE =
   /\b(?:column|columns|field|fields|header|headers|property|properties|key|keys)\b[^.!?\n]{0,80}?\be-?mails?\b|\be-?mail\b\s+(?:column|field|address|value|missing|blank|data)\b/i;
 const EMAIL_DATA_LIST_RE =
@@ -83,6 +89,8 @@ const QUOTED_EMAIL_FIELD_RE =
   /(["'])e-?mail\1(?=\s*[,:\]}])/gi;
 const STRUCTURED_TABULAR_CONTEXT_RE =
   /\b(?:google\s+sheets?|googlesheets?|spreadsheet|worksheet|sheet\s+(?:range|row|rows|tab|cells?)|cell\s+data|matrix|tabular|headers?|columns?|value\s+range)\b/i;
+const CALENDAR_ARTIFACT_RE =
+  /\b(?:social(?:\s+media)?\s+)?(?:content|editorial|marketing|campaign|publishing|post|production|release|launch|roadmap)\s+calendar\b/gi;
 const NEGATED_OUTLOOK_ACTION_RE =
   /\b(?:do\s+not|don't|dont|never|without)\s+(?:(?:send|sending|draft|drafting|read|reading|search|searching|check|checking|use|using|open|opening|call|calling|contact|contacting|access|accessing|query|querying|invoke|invoking|create|creating|schedule|scheduling)\s+)?(?:any\s+)?(?:outlook|e-?mail(?:s|ing|ed)?|inbox|calendar|meeting\s+invites?)(?:\s+(?:or|and)\s+(?:(?:send|sending|draft|drafting|read|reading|search|searching|check|checking|use|using|open|opening|call|calling|contact|contacting|access|accessing|query|querying|invoke|invoking|create|creating|schedule|scheduling)\s+)?(?:any\s+)?(?:outlook|e-?mail(?:s|ing|ed)?|inbox|calendar|meeting\s+invites?))?/gi;
 const NO_OUTLOOK_ACTION_RE =
@@ -115,6 +123,11 @@ function withoutStructuredEmailMentions(input: string): string {
  */
 function withoutNegatedOutlookMentions(input: string): string {
   return withoutStructuredEmailMentions(input)
+    // "Content calendar" is an artifact/domain model, not a request to read or
+    // mutate the user's personal calendar. Project only that phrase away so a
+    // mixed ask ("build a content calendar, then add a meeting to Outlook")
+    // retains its separate operational Outlook clause.
+    .replace(CALENDAR_ARTIFACT_RE, ' planning_artifact ')
     .replace(NEGATED_OUTLOOK_ACTION_RE, ' prohibited_outlook_action ')
     .replace(NO_OUTLOOK_ACTION_RE, ' prohibited_outlook_action ');
 }
@@ -276,7 +289,8 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const wantsSalesforce = SALESFORCE_STRONG_RE.test(input)
     || (SALESFORCE_OBJECT_RE.test(input) && SALESFORCE_CONTEXT_RE.test(input));
   const outlookIntentInput = withoutNegatedOutlookMentions(input);
-  const mentionsOutlookFamily = OUTLOOK_RE.test(outlookIntentInput);
+  const mentionsOutlookFamily = OUTLOOK_RE.test(outlookIntentInput)
+    || CALENDAR_OPERATION_RE.test(outlookIntentInput);
   const wantsOutlook = mentionsOutlookFamily
     || (DATEISH_RE.test(input) && namesPinnedCalendarLabel(input, options.pinnedCalendarLabels));
   const wantsGoogleSheets = GOOGLE_SHEETS_RE.test(input);

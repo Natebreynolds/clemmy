@@ -98,6 +98,29 @@ test('named external scope creates only a scoped server-set base, not the all-ex
   assert.deepEqual(mcpServersTestHooks.rawExternalServerNames(['dataforseo']), ['dataforseo']);
 });
 
+test('named scope matches canonical MCP suffix aliases but never substring-confusable servers', async () => {
+  writeMcpServers({
+    'dataforseo-mcp-server': {
+      type: 'stdio',
+      command: 'node',
+      args: ['real-dataforseo.js'],
+      enabled: true,
+    },
+    'evil-dataforseo-proxy': {
+      type: 'stdio',
+      command: 'node',
+      args: ['evil-proxy.js'],
+      enabled: true,
+    },
+  });
+  invalidateMcpServerDiscoveryCache();
+  await invalidateConfiguredMcpServers();
+  assert.deepEqual(
+    mcpServersTestHooks.rawExternalServerNames(['dataforseo']),
+    ['dataforseo-mcp-server'],
+  );
+});
+
 test('multiple tool-pattern scopes for the same server set reuse one scoped base', () => {
   getOrCreateExternalMcpServers({
     reason: 'seo broad',
@@ -117,6 +140,51 @@ test('multiple tool-pattern scopes for the same server set reuse one scoped base
   assert.deepEqual(state.scopedExternalBaseKeys, ['dataforseo']);
   assert.equal(state.scopedExternalViewKeys.length, 2, 'different caps/patterns remain distinct filtered views');
   assert.equal(state.allExternalBaseCreated, false);
+});
+
+test('a named scope without maxTools still creates its scoped base', () => {
+  getOrCreateExternalMcpServers({
+    reason: 'exact workflow lock without a cap',
+    allowedServerSlugs: ['dataforseo'],
+  });
+  assert.deepEqual(mcpServersTestHooks.cacheState().scopedExternalBaseKeys, ['dataforseo']);
+});
+
+test('scoped callTool dispatches only an exact member of the selected list', async () => {
+  let listCalls = 0;
+  let dispatchCalls = 0;
+  const base = {
+    cacheToolsList: true,
+    name: 'fake-base',
+    async connect() {},
+    async close() {},
+    async listTools() {
+      listCalls += 1;
+      return [
+        { name: 'dataforseo__read_serp', description: 'read' },
+        { name: 'dataforseo__delete_task', description: 'delete' },
+      ];
+    },
+    async callTool() {
+      dispatchCalls += 1;
+      return [{ type: 'text', text: 'ok' }];
+    },
+    async invalidateToolsCache() {},
+  };
+  const scoped = mcpServersTestHooks.scopedView(base as never, {
+    reason: 'read only',
+    allowedServerSlugs: ['dataforseo'],
+    toolPatterns: ['read'],
+    maxTools: 1,
+  });
+  await assert.rejects(
+    () => scoped.callTool('dataforseo__delete_task', {}),
+    /outside this turn's scope|not selected for this turn/,
+  );
+  assert.equal(dispatchCalls, 0, 'an off-pattern guessed tool never reaches the base');
+  await scoped.callTool('dataforseo__read_serp', {});
+  assert.equal(dispatchCalls, 1);
+  assert.equal(listCalls, 1, 'the exact advertised membership is cached for dispatch');
 });
 
 test('exact on-demand tool dispatch reuses only its server-scoped base', () => {
@@ -153,6 +221,16 @@ test('fail-open and allow-all still use the all-external base by design', async 
   state = mcpServersTestHooks.cacheState();
   assert.equal(state.allExternalBaseCreated, true);
   assert.deepEqual(state.scopedExternalBaseKeys, []);
+});
+
+test('an explicit zero-width fail-open scope does not construct external providers', () => {
+  getOrCreateExternalMcpServers({
+    reason: 'zero-width fail-open',
+    failOpenCandidate: true,
+    maxTools: 0,
+  });
+  assert.equal(mcpServersTestHooks.cacheState().allExternalBaseCreated, false);
+  assert.equal(mcpServersTestHooks.cacheState().failOpenCreated, false);
 });
 
 test('empty or explicitly zero external scope stays empty and creates no base', () => {

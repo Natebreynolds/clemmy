@@ -21,6 +21,8 @@ import {
   getEmbeddingProvider,
   getEmbeddingHealth,
   isEmbeddingsEnabled,
+  localEmbeddingCacheDir,
+  localEmbeddingRuntime,
   vectorToBuffer,
   _resetEmbeddingHealthForTest,
   _resetEmbedDemotionForTest,
@@ -37,6 +39,14 @@ _setEmbeddingProviderHealthFileForTest(path.join(TEST_PROVIDER_HEALTH_DIR, 'embe
 test.after(() => {
   _resetEmbeddingProviderCooldownsForTest();
   rmSync(TEST_PROVIDER_HEALTH_DIR, { recursive: true, force: true });
+});
+
+test('Intel macOS local embeddings select WASM while all native-supported targets stay native', () => {
+  assert.equal(localEmbeddingRuntime('darwin', 'x64'), 'wasm');
+  assert.equal(localEmbeddingRuntime('darwin', 'arm64'), 'native');
+  assert.equal(localEmbeddingRuntime('linux', 'x64'), 'native');
+  assert.equal(path.isAbsolute(localEmbeddingCacheDir()), true);
+  assert.equal(localEmbeddingCacheDir().endsWith(path.join('cache', 'transformers')), true);
 });
 
 test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provider call (the per-turn double-embed)', async () => {
@@ -248,6 +258,7 @@ test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown'
   // Pin the LEGACY breaker semantics by disabling local embeddings — without a
   // local provider to demote to, a quota open keeps the cooldown instead of
   // clearing it (the demote-and-clear path is covered in embeddings-demotion.test.ts).
+  const previousLocalEmbeddings = process.env.CLEMMY_LOCAL_EMBEDDINGS;
   process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
   try {
     _resetEmbeddingHealthForTest();
@@ -258,7 +269,8 @@ test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown'
     // ~1h cooldown, not the 5-min transient one.
     assert.ok(h.cooldownUntilMs - Date.now() > 30 * 60_000, 'terminal cooldown should be far longer than transient');
   } finally {
-    delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
+    if (previousLocalEmbeddings === undefined) delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
+    else process.env.CLEMMY_LOCAL_EMBEDDINGS = previousLocalEmbeddings;
   }
 });
 
@@ -275,6 +287,7 @@ test('breaker: success resets state and records lastSuccessAt', () => {
   // Legacy semantics — disable local embeddings so a terminal open holds the
   // breaker instead of demoting to local and clearing it (that path is covered
   // in embeddings-demotion.test.ts).
+  const previousLocalEmbeddings = process.env.CLEMMY_LOCAL_EMBEDDINGS;
   process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
   try {
     _resetEmbeddingHealthForTest();
@@ -287,7 +300,8 @@ test('breaker: success resets state and records lastSuccessAt', () => {
     assert.equal(h.lastErrorClass, null);
     assert.ok(h.lastSuccessAt, 'lastSuccessAt is recorded');
   } finally {
-    delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
+    if (previousLocalEmbeddings === undefined) delete process.env.CLEMMY_LOCAL_EMBEDDINGS;
+    else process.env.CLEMMY_LOCAL_EMBEDDINGS = previousLocalEmbeddings;
   }
 });
 

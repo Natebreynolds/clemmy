@@ -37,6 +37,13 @@ import {
 import { isBenignPipeError } from './pipe-errors.js';
 import { isTrustedDashboardMediaUrl } from './media-permissions.js';
 import {
+  isPrivilegedDashboardRendererUrl,
+  isSafeWorkspaceExternalUrl,
+  workspaceFrameNavigationMustBeBlocked,
+  workspaceInitialFrameLoadMayProceed,
+  workspaceTopLevelNavigationMustBeBlocked,
+} from './workspace-navigation-policy.js';
+import {
   applyUpdate,
   checkForUpdatesNow,
   disposeAutoUpdater,
@@ -595,7 +602,7 @@ function senderSurface(url: string): RendererSurface | null {
       const setupRoot = path.join(app.getPath('userData'), 'wizard');
       if (filePath.startsWith(setupRoot + path.sep) || filePath === path.join(setupRoot, 'setup.html')) return 'setup';
     }
-    if (dashboardOrigins().has(parsed.origin)) {
+    if (isPrivilegedDashboardRendererUrl(url, dashboardOrigins())) {
       if (/^\/console\/notch(?:\/|$)/i.test(parsed.pathname)) return 'live';
       return 'dashboard';
     }
@@ -634,14 +641,47 @@ function guardWindow(win: BrowserWindow, allowed: RendererSurface[]): void {
     if (isExternalHttpUrl(url)) void shell.openExternal(url);
   };
   win.webContents.setWindowOpenHandler(({ url }) => {
+    if (workspaceTopLevelNavigationMustBeBlocked(url)) {
+      // `_blank` / window.open does not emit will-navigate. Apply the same
+      // raw-Workspace deny here so localhost authored content is never handed
+      // to the user's default browser through the popup path.
+      return { action: 'deny' };
+    }
     // A clicked link (target=_blank / window.open) → hand off to the OS.
     if (isExternalProtocol(url) || isExternalHttpUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.webContents.on('will-navigate', (event, url) => guardNav(event, url));
+  win.webContents.on('will-navigate', (event, url) => {
+    if (workspaceTopLevelNavigationMustBeBlocked(url)) {
+      // Never replace the privileged dashboard document with agent-authored
+      // content or hand that private localhost URL to the default browser.
+      event.preventDefault();
+      return;
+    }
+    guardNav(event, url);
+  });
   // Sub-frame navigations (the Workspace iframe). Without this a tel: click in a
   // Workspace view navigates the iframe to tel: and blanks it.
-  win.webContents.on('will-frame-navigate', (event) => guardNav(event, event.url));
+  win.webContents.on('will-frame-navigate', (event) => {
+    const navigation = {
+      frameUrl: event.frame?.url,
+      initiatorUrl: event.initiator?.url,
+      targetUrl: event.url,
+    };
+    if (workspaceFrameNavigationMustBeBlocked(navigation)) {
+      // Never hand a Workspace-authored URL to shell.openExternal: the URL
+      // itself could contain RPC-returned private data. Genuine user clicks
+      // use the parent-only trusted-click IPC bridge below.
+      event.preventDefault();
+      return;
+    }
+    if (workspaceInitialFrameLoadMayProceed(navigation)) {
+      // The trusted console is mounting the sandboxed iframe for the first
+      // time. It is content, not a privileged sender, but it must still load.
+      return;
+    }
+    guardNav(event, event.url);
+  });
 }
 
 function clearClementineLiveRetryTimer(): void {
@@ -3116,6 +3156,17 @@ ipcMain.handle('clemmy:open-logs', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
   await shell.openPath(LOG_FILE);
   return { opened: true };
+});
+
+ipcMain.handle('clemmy:workspace-open-external', async (
+  evt: IpcMainInvokeEvent,
+  payload: { url?: string },
+) => {
+  assertIpcSender(evt, ['dashboard']);
+  const url = String(payload?.url ?? '').trim();
+  if (!isSafeWorkspaceExternalUrl(url)) throw new Error('Invalid Workspace link');
+  await shell.openExternal(url);
+  return { ok: true };
 });
 
 ipcMain.handle('clemmy:recall-status', async (evt: IpcMainInvokeEvent) => {

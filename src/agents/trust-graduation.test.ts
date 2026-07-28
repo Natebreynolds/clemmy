@@ -76,7 +76,17 @@ function seedSend(opts: {
       toolName: 'composio_execute_tool', payload: { tool_slug: slug },
     });
     pending.linkPendingActionApproval(pa.id, row.approvalId);
-    pending.recordPendingActionResult(pa.id, action, action === 'executed' ? 'sent' : 'bounced');
+    pending.markPendingActionApprovalResolved(pa.id, 'approved', row.approvalId);
+    const claim = pending.claimPendingActionExecution(pa.id, 'trust-graduation-fixture');
+    assert.equal(claim.claimed, true);
+    assert.ok(claim.claimToken);
+    pending.recordPendingActionResult(
+      pa.id,
+      action,
+      action === 'executed' ? 'sent' : 'bounced',
+      'trust-graduation-fixture',
+      claim.claimToken,
+    );
   }
   return row.approvalId;
 }

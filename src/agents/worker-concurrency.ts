@@ -55,6 +55,12 @@ type WorkerProviderClass = 'codex' | 'claude' | 'byo';
 export interface WorkerSlotOptions {
   provider?: WorkerProviderClass | string | null;
   modelId?: string | null;
+  /**
+   * Re-check the owning run's cancellation authority at every queue hand-off.
+   * May throw (normally KillRequested). This keeps a worker that was queued
+   * before Stop from opening a provider request after capacity becomes free.
+   */
+  assertCanStart?: () => void;
 }
 
 function envDisabled(value: string | undefined): boolean {
@@ -184,6 +190,9 @@ export async function acquireWorkerSlot(
   onQueued?: (info: WorkerQueuedInfo) => void,
   opts?: WorkerSlotOptions,
 ): Promise<() => void> {
+  // Stop is independent of throttling: even with the concurrency gate disabled,
+  // a queued/caller-delayed worker must not cross the provider edge.
+  opts?.assertCanStart?.();
   if (gateDisabled()) return () => {}; // MASTER off — fully unbounded (documented escape hatch)
 
   // SESSION slot FIRST (a worker waiting for a session slot holds nothing), THEN provider,
@@ -200,20 +209,37 @@ export async function acquireWorkerSlot(
       onQueued({ queueDepth: gate.queue.length + 1, perSessionCap, globalCap, ...(provider ? { provider } : {}) });
     } catch { /* telemetry must never break the throttle */ }
   }
-  const releaseSession = await acquireOnGate(gate, perSessionCap);
   const providerGate = provider ? (providerGates.get(provider) ?? { active: 0, queue: [] }) : null;
   if (provider && providerGate && !providerGates.has(provider)) providerGates.set(provider, providerGate);
-  const releaseProvider = providerGate ? await acquireOnGate(providerGate, globalCap) : () => {};
-  const releaseGlobal = globalGateDisabled() ? () => {} : await acquireOnGate(globalGate, maxGlobalConcurrency());
+  let releaseSession: (() => void) | null = null;
+  let releaseProvider: (() => void) | null = null;
+  let releaseGlobal: (() => void) | null = null;
+  try {
+    releaseSession = await acquireOnGate(gate, perSessionCap);
+    opts?.assertCanStart?.();
+    releaseProvider = providerGate ? await acquireOnGate(providerGate, globalCap) : () => {};
+    opts?.assertCanStart?.();
+    releaseGlobal = globalGateDisabled() ? () => {} : await acquireOnGate(globalGate, maxGlobalConcurrency());
+    opts?.assertCanStart?.();
+  } catch (err) {
+    // If Stop arrived while this worker was queued at any layer, hand every
+    // claimed slot onward immediately and surface the original cancellation.
+    releaseGlobal?.();
+    releaseProvider?.();
+    releaseSession?.();
+    if (provider && providerGate && providerGate.active <= 0 && providerGate.queue.length === 0) providerGates.delete(provider);
+    if (gate.active <= 0 && gate.queue.length === 0) gates.delete(key);
+    throw err;
+  }
 
   const g = gate;
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    releaseGlobal();
-    releaseProvider();
-    releaseSession();
+    releaseGlobal?.();
+    releaseProvider?.();
+    releaseSession?.();
     if (provider && providerGate && providerGate.active <= 0 && providerGate.queue.length === 0) providerGates.delete(provider);
     if (g.active <= 0 && g.queue.length === 0) gates.delete(key); // GC the drained gate
   };

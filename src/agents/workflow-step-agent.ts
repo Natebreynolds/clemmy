@@ -20,6 +20,7 @@ import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool } from '../tools/call-tool.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import { peekStepResult } from '../tools/step-result-tool.js';
+import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
 
@@ -193,7 +194,7 @@ export function lockToolsForStep<T extends { name?: string }>(tools: T[], allowe
  */
 export function workflowStepExternalMcpScopeForLock(
   allowed?: string[] | null,
-  fallback?: McpToolScope,
+  fallback?: McpToolScope | null,
   serverNames?: string[],
 ): McpToolScope | null | undefined {
   return externalMcpScopeForAllowedToolLock({
@@ -253,7 +254,7 @@ export function workflowStepToolUseBehavior(
 export interface BuildWorkflowStepAgentOptions {
   userInput?: string | null;
   sessionId?: string | null;
-  mcpToolScope?: McpToolScope;
+  mcpToolScope?: McpToolScope | null;
   /** The step's explicit allowedTools. When it locks the surface (non-wildcard),
    *  the agent's tool list is pruned to that family + the structural baseline,
    *  so a bound step can't drift onto composio. Omit / `['*']` → full surface. */
@@ -273,6 +274,7 @@ export async function buildWorkflowStepAgent(
     options.lockTools,
   ) as Tool<RuntimeContextValue>[];
   const surfaceLocked = stepAllowedToolsLock(options.lockTools);
+  const externalMcpScope = workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
 
   // Workflow steps now have the same schema-on-demand escape hatch as chat:
   // a tiny structural/acquisition kernel stays first-class; every other local
@@ -316,6 +318,7 @@ export async function buildWorkflowStepAgent(
       reachableBuiltinNames: deferredNames,
       firstClassNames,
       deniedNames: WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
+      mcpToolScope: externalMcpScope,
     }) as Tool<RuntimeContextValue>;
     tools = [...firstClassTools, dispatcher];
     const compactCatalog = buildCompactToolCatalog({ allowedNames: deferredNames });
@@ -339,7 +342,6 @@ export async function buildWorkflowStepAgent(
   const instructions = learnedRecall
     ? () => `${baseInstructions()}\n\n${learnedRecall}`
     : baseInstructions;
-  const externalMcpScope = workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
   // An unbound schema-on-demand step reaches external MCPs through
   // mcp_list_tools/call_tool, so attaching every configured server (and every
   // schema) up front is unnecessary. Explicit MCP allowedTools locks retain
@@ -347,7 +349,7 @@ export async function buildWorkflowStepAgent(
   const externalMcpServers = schemaOnDemand || externalMcpScope === null
     ? []
     : [getOrCreateExternalMcpServers(externalMcpScope)];
-  return new Agent<RuntimeContextValue, any>({
+  const agent = new Agent<RuntimeContextValue, any>({
     name: 'WorkflowStep',
     instructions,
     // Step orchestration (OrchestratorDecisionSchema, multi-tool) stays on the
@@ -364,4 +366,6 @@ export async function buildWorkflowStepAgent(
     inputGuardrails: harnessInputGuardrails,
     outputGuardrails: harnessOutputGuardrails,
   });
+  bindAgentMcpToolScope(agent, externalMcpScope);
+  return agent;
 }

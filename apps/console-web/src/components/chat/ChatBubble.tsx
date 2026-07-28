@@ -7,8 +7,16 @@ import { TurnActivity } from '@/components/chat/TurnActivity';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
-import { approveExecutePendingAction } from '@/lib/pendingActions';
+import {
+  approveExecutePendingAction,
+  getPendingActionStatus,
+  reconcilePendingActionExecutionFailure,
+  resolvePendingActionExecutionPresentation,
+  type PendingActionExecutionPhase,
+  type PendingActionExecutionPresentation,
+} from '@/lib/pendingActions';
 import type { ChatMessage } from '@/lib/useChat';
+import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presentation';
 
 /** Inline spans within a line: **bold** and `code`; everything else is linkified
  *  plain text. No dangerouslySetInnerHTML — React escapes all text children. */
@@ -132,7 +140,7 @@ export function ChatBubble({
   // Execute-button truth (U3): a pending-action card's Execute fires the exact
   // stored call server-side and shows the DURABLE outcome — never a client-side
   // "Submitted" that outruns whether the send actually happened.
-  const [exec, setExec] = useState<{ phase: 'idle' | 'running' | 'executed' | 'failed'; note?: string }>({ phase: 'idle' });
+  const [exec, setExec] = useState<{ phase: 'idle' | PendingActionExecutionPhase; note?: string }>({ phase: 'idle' });
   // Grant-at-card (C, v2.3.0): opting in stores a NARROW standing send-trust
   // grant (exactly this card's recipients on this toolkit) so the next
   // identical send skips the card. trustNote reports the server's truth —
@@ -140,6 +148,23 @@ export function ChatBubble({
   const [alwaysAllow, setAlwaysAllow] = useState(false);
   const [trustNote, setTrustNote] = useState<string | null>(null);
   const pendingActionId = message.approval?.pendingAction?.id;
+  const showDurablePresentation = (presentation: PendingActionExecutionPresentation) => {
+    if (presentation.mode !== 'durable') return false;
+    const note = presentation.note?.trim();
+    const defaultNote: Partial<Record<PendingActionExecutionPhase, string>> = {
+      running: 'This exact queued action already has an execution claim. No second dispatch was attempted.',
+      failed: 'The action failed or its final provider outcome needs review. Check the durable action before retrying.',
+      rejected: 'You rejected this action. It was not dispatched.',
+      expired: 'This approval expired. The action was not dispatched.',
+      cancelled: 'This action was cancelled. It was not dispatched.',
+      uncertain: 'The execution outcome is not confirmed. Check the durable action before continuing; do not retry it.',
+    };
+    setExec({
+      phase: presentation.phase,
+      note: (note || defaultNote[presentation.phase])?.slice(0, 240),
+    });
+    return true;
+  };
   const runExecute = async () => {
     if (!pendingActionId) return;
     setResolved(true);
@@ -151,21 +176,24 @@ export function ChatBubble({
           ? 'Standing trust saved — identical sends to these recipients won’t ask again. Revoke anytime in Settings.'
           : 'Couldn’t save standing trust for this one (no verifiable recipients) — it will still ask next time.');
       }
-      const note = (result.resultSummary || result.record?.resultSummary || '').trim();
-      if (result.status === 'executed') {
-        setExec({ phase: 'executed', note: note ? note.slice(0, 240) : undefined });
-      } else if (result.status === 'failed') {
-        setExec({ phase: 'failed', note: (note || 'The send was refused before it left.').slice(0, 240) });
-      } else {
-        // 'skipped' — the record wasn't in an executable state (still needs
-        // approval, or a run_batch plan). Fall back to the conversational
-        // approve-text path, which drives the normal approval machinery.
+      const presentation = await resolvePendingActionExecutionPresentation(
+        result,
+        () => getPendingActionStatus(pendingActionId),
+      );
+      if (!showDurablePresentation(presentation)) {
+        // A genuinely queued/non-executable legacy card still belongs to the
+        // conversational approval path. EXECUTING / EXECUTED / FAILED skips
+        // are handled above from durable truth and can never reach this call.
         setExec({ phase: 'idle' });
         onApprove();
       }
-    } catch (err) {
-      const msg = err && typeof err === 'object' && 'message' in err ? String((err as { message: unknown }).message) : 'Execution failed.';
-      setExec({ phase: 'failed', note: msg.slice(0, 240) });
+    } catch {
+      // A lost POST response cannot prove the provider did not act. Reconcile
+      // the record; bounded failure becomes explicit do-not-retry uncertainty.
+      const presentation = await reconcilePendingActionExecutionFailure(
+        () => getPendingActionStatus(pendingActionId),
+      );
+      showDurablePresentation(presentation);
     }
   };
 
@@ -242,7 +270,12 @@ export function ChatBubble({
               GLM) with status — shown while working AND kept (collapsed) after. Falls
               back to the single rolling line only before any activity has arrived. */}
           {message.activity && message.activity.length > 0 ? (
-            <TurnActivity items={message.activity} live={thinking} traceHref={traceHref} />
+            <TurnActivity
+              items={message.activity}
+              live={thinking}
+              terminalOutcome={activityTerminalOutcomeForMessageStatus(message.status)}
+              traceHref={traceHref}
+            />
           ) : (
             thinking && message.text && message.progress && (
               <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
@@ -297,16 +330,24 @@ export function ChatBubble({
                     the "Submitted" acknowledgement (its follow-up turn carries the
                     real result). */}
                 {pendingAction ? (
-                  exec.phase === 'running' ? <span className="text-caption text-muted">Executing…</span>
-                    : exec.phase === 'executed' ? <span className="text-caption font-semibold text-success">Executed ✓</span>
-                      : exec.phase === 'failed' ? <span className="text-caption font-semibold text-danger">Refused / didn’t send</span>
-                        : null
+                  <span role="status" aria-live="polite" aria-atomic="true">
+                    {exec.phase === 'running' ? <span className="text-caption text-muted">Executing…</span>
+                      : exec.phase === 'executed' ? <span className="text-caption font-semibold text-success">Executed ✓</span>
+                        : exec.phase === 'failed' ? <span className="text-caption font-semibold text-danger">Failed / needs review</span>
+                          : exec.phase === 'rejected' ? <span className="text-caption font-semibold text-muted">Rejected — not dispatched</span>
+                            : exec.phase === 'expired' ? <span className="text-caption font-semibold text-muted">Expired — not dispatched</span>
+                              : exec.phase === 'cancelled' ? <span className="text-caption font-semibold text-muted">Cancelled — not dispatched</span>
+                                : exec.phase === 'uncertain' ? <span className="text-caption font-semibold text-warning">Outcome not confirmed</span>
+                                  : null}
+                  </span>
                 ) : (
                   resolved && <span className="text-caption text-muted">Submitted</span>
                 )}
               </div>
-              {pendingAction && exec.note && (exec.phase === 'executed' || exec.phase === 'failed') && (
-                <p className={cn('mt-1.5 whitespace-pre-wrap text-caption', exec.phase === 'failed' ? 'text-danger' : 'text-muted')}>
+              {pendingAction && exec.note && exec.phase !== 'idle' && (
+                <p
+                  className={cn('mt-1.5 whitespace-pre-wrap text-caption', exec.phase === 'failed' ? 'text-danger' : 'text-muted')}
+                >
                   {exec.note}
                 </p>
               )}

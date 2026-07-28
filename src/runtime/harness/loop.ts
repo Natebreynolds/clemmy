@@ -47,6 +47,8 @@ import {
 } from './session-transcript.js';
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildCanonicalContextPack } from './canonical-context.js';
+import type { McpToolScope } from '../mcp-tool-scope.js';
+import { boundAgentMcpToolScope } from '../mcp-tool-authority.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
 import {
@@ -1003,6 +1005,25 @@ export type RunRunnerFn = (
   opts: Record<string, unknown>,
 ) => Promise<RunOutcome>;
 
+/** Keep a hallucinated or stale deferred tool name inside the model loop. The
+ * SDK's default raises and kills the run; returning this correction lets the
+ * model discover the current schema and dispatch through the bounded generic
+ * carrier on its very next iteration. */
+export function formatMissingToolForModel(input: {
+  kind?: unknown;
+  toolName?: unknown;
+  defaultMessage?: unknown;
+}): string | undefined {
+  if (input.kind !== 'tool_not_found') return undefined;
+  const name = typeof input.toolName === 'string' && input.toolName.trim()
+    ? input.toolName.trim()
+    : 'that tool';
+  const fallback = typeof input.defaultMessage === 'string' && input.defaultMessage.trim()
+    ? input.defaultMessage.trim()
+    : `Tool '${name}' not found.`;
+  return `${fallback} Do not retry ${name} directly. Use tool_search to retrieve the current schema, then invoke it through call_tool(name, args_json). If it is not returned by tool_search, choose an advertised tool instead.`;
+}
+
 interface NativeCompactionRewrite {
   history: AgentInputItem[];
   applied: boolean;
@@ -1176,6 +1197,9 @@ export interface RunTurnOptions {
   /** Internal conversation state: the current run is acting on the answer to a
    *  prior clarification, so background-offer nudges must not add another gate. */
   suppressBackgroundOffer?: boolean;
+  /** Exact external MCP authority for this run. When omitted, the agent's
+   * construction-time binding wins, then the canonical turn scope. */
+  mcpToolScope?: McpToolScope | null;
 }
 
 export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
@@ -1266,6 +1290,8 @@ export interface RunConversationOptions {
   maxTurns?: number;
   /** Forwarded to each underlying runTurn(). */
   toolCallsPerTurn?: number;
+  /** Exact external MCP authority, forwarded to every continuation turn. */
+  mcpToolScope?: McpToolScope | null;
   /**
    * Opt-in: gate the orchestrator's self-declared completion with an
    * INDEPENDENT objective-completion judge (Hermes-style). Only interactive
@@ -2464,6 +2490,11 @@ async function runConversationCore(
 
   while (stepIndex < maxSteps) {
     stepIndex += 1;
+    // A stall judge may rescue prose that the deterministic parser rejected,
+    // but it only establishes "this is a reply", never "the objective is done".
+    // Keep the origin for telemetry while the synthesized decision traverses
+    // the same goal/objective/fresh-write/delivery doors as every other terminal.
+    let stallJudgeDelivery: { signal: string; detail: Record<string, unknown> } | null = null;
 
     // True when THIS turn's input is a harness directive that forbids tool
     // calls and demands a plain-text reply (the draft-present stall retry).
@@ -2520,6 +2551,7 @@ async function runConversationCore(
       // Defer the infra ask only while another brain is still available to try.
       deferInfraAsk: canStillFallover,
       suppressBackgroundOffer,
+      mcpToolScope: options.mcpToolScope,
     });
     falloverReattempt = false;
     lastTurn = turnResult.turn;
@@ -2823,7 +2855,7 @@ async function runConversationCore(
           turn: turnResult.turn,
         })
       : undefined;
-    if (structuredStallInfo) {
+    structuredStallResolution: if (structuredStallInfo) {
       // STALL JUDGE, structured-path twin (2026-07-24 robust-tool-call audit):
       // a structured tool-unavailable claim may be TRUE (a specific integration
       // genuinely unconnected) — honest-gap vs lie is semantic. Same
@@ -2839,27 +2871,14 @@ async function runConversationCore(
             replyText: structuredReplyText,
           });
           if (judgedStructured === 'deliver') {
-            lastDecision = { summary: structuredReplyText.slice(0, 200), reply: structuredReplyText, done: true, nextAction: 'completed', reason: null };
-            return finalizeStandardConversation({
-              sessionId: options.sessionId,
-              sourceUserSeq: activeSourceUserSeq,
-              turn: turnResult.turn,
-              eventData: {
-                steps: stepIndex,
-                reason: 'stall_judge_delivered',
-                summary: structuredReplyText.slice(0, 200),
-                reply: structuredReplyText,
-                delivered: true,
-                stallDetail: { signal: structuredStallInfo.signal, ...structuredStallInfo.detail },
-              },
-              result: {
-                sessionId: options.sessionId,
-                status: 'completed',
-                steps: stepIndex,
-                lastDecision,
-                lastTurn,
-              },
-            });
+            // The reply judge validates prose, not task completion. Preserve the
+            // model's explicit structured state (especially awaiting_*); only an
+            // unstructured salvage needs a synthesized terminal candidate.
+            stallJudgeDelivery = {
+              signal: structuredStallInfo.signal,
+              detail: structuredStallInfo.detail,
+            };
+            break structuredStallResolution;
           }
         }
       }
@@ -2943,7 +2962,7 @@ async function runConversationCore(
       }
     }
 
-    if (!decision) {
+    unstructuredDecisionResolution: if (!decision) {
       // A real ask_user_question tool call is already the canonical terminal
       // decision. Some models follow it with ordinary prose ("Waiting on your
       // answer") instead of an ASK marker; treating that prose as unparseable
@@ -3172,8 +3191,9 @@ async function runConversationCore(
         // AMBIGUOUS prose-shape stalls only (announcement/short-generic — the
         // guesses; detected-bad shapes stay deterministic), ask one
         // cross-family judge question on FIRST detection: real reply or punt?
-        // "deliver" finalizes with the text; "stall"/judge-failure proceeds
-        // through the unchanged retry → recovery-turn → human-floor chain.
+        // "deliver" promotes the text into an ordinary terminal candidate;
+        // "stall"/judge-failure proceeds through the unchanged retry →
+        // recovery-turn → human-floor chain.
         if (
           stallRetriesUsed === 0 &&
           stallIsJudgeAmbiguous(stallInfo, { userInput: String(options.input ?? '') }) &&
@@ -3186,27 +3206,19 @@ async function runConversationCore(
           });
           if (judged === 'deliver') {
             const judgeReply = turnResult.finalOutput.trim();
-            lastDecision = { summary: judgeReply.slice(0, 200), reply: judgeReply, done: true, nextAction: 'completed', reason: null };
-            return finalizeStandardConversation({
-              sessionId: options.sessionId,
-              sourceUserSeq: activeSourceUserSeq,
-              turn: turnResult.turn,
-              eventData: {
-                steps: stepIndex,
-                reason: 'stall_judge_delivered',
-                summary: judgeReply.slice(0, 200),
-                reply: judgeReply,
-                delivered: true,
-                stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
-              },
-              result: {
-                sessionId: options.sessionId,
-                status: 'completed',
-                steps: stepIndex,
-                lastDecision,
-                lastTurn,
-              },
-            });
+            decision = {
+              summary: judgeReply.slice(0, 200),
+              reply: judgeReply,
+              done: true,
+              nextAction: 'completed',
+              reason: null,
+            };
+            lastDecision = decision;
+            stallJudgeDelivery = {
+              signal: stallInfo.signal,
+              detail: stallInfo.detail,
+            };
+            break unstructuredDecisionResolution;
           }
         }
         safeAppend({
@@ -4170,6 +4182,9 @@ async function runConversationCore(
             missingReply: isCompletedAction && !hasReply ? true : undefined,
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
+            ...(stallJudgeDelivery
+              ? { stallDetail: { signal: stallJudgeDelivery.signal, ...stallJudgeDelivery.detail } }
+              : {}),
             ...(completionVerification ? { verification: completionVerification } : {}),
             ...(artifactState ? artifactVerificationProjection(artifactState) : {}),
           },
@@ -4198,6 +4213,12 @@ async function runConversationCore(
           reply: decision.reply ?? null,
           missingReply: isCompletedAction && !hasReply ? true : undefined,
           delivered: true,
+          ...(stallJudgeDelivery
+            ? {
+                reason: 'stall_judge_delivered',
+                stallDetail: { signal: stallJudgeDelivery.signal, ...stallJudgeDelivery.detail },
+              }
+            : {}),
           ...(completionVerification ? { verification: completionVerification } : {}),
         },
         result: {
@@ -5730,6 +5751,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // friendlier on external API rate limits. Does NOT change
     // provider-side parallelToolCalls (model still decides to parallelize).
     toolExecution: { maxFunctionToolConcurrency: 8 },
+    toolNotFoundBehavior: 'return_error_to_model',
+    toolErrorFormatter: formatMissingToolForModel,
   };
   if (options.onChunk) {
     (opts as unknown as { onChunk?: typeof options.onChunk }).onChunk = options.onChunk;
@@ -5819,6 +5842,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           behaviorScopeId: `${options.sessionId}::turn:${turn}`,
           recallBudget,
           suppressBackgroundOffer: options.suppressBackgroundOffer,
+          mcpToolScope: options.mcpToolScope !== undefined
+            ? options.mcpToolScope
+            : (() => {
+                const bound = boundAgentMcpToolScope(options.agent);
+                return bound.bound ? bound.scope : contextPacket.toolScope;
+              })(),
         };
         // With or without the tool-bracket wrapper, install the
         // AsyncLocalStorage context so recall_tool_result can resolve the
@@ -5841,7 +5870,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         session,
         outcome.interruptions ?? [],
       );
-      session.saveInterruptState(outcome.serializedState);
+      session.saveInterruptState(outcome.serializedState, {
+        mcpToolScope: harnessCtx?.mcpToolScope,
+      });
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
     }
@@ -6035,6 +6066,10 @@ export async function resumePendingApproval(
   const resumeSourceUserSeq = (() => {
     try { return getLatestRunAttempt(options.sessionId)?.sourceUserSeq ?? undefined; } catch { return undefined; }
   })();
+  // Agent construction happens before RunState deserialization. Capture its
+  // exact bound connector scope now so a second approval pause persists the
+  // same authority even when tool brackets are disabled.
+  const resumeAgentScopeBinding = boundAgentMcpToolScope(options.agent);
 
   if (isKillBeforeStart(options.sessionId, turn, session, resumeSourceUserSeq)) {
     return { sessionId: options.sessionId, turn, status: 'killed' };
@@ -6219,6 +6254,8 @@ export async function resumePendingApproval(
     // parallel. Keep resumed approval runs on the same bounded local
     // concurrency path so a resumed batch cannot spike tool payloads.
     toolExecution: { maxFunctionToolConcurrency: 8 },
+    toolNotFoundBehavior: 'return_error_to_model',
+    toolErrorFormatter: formatMissingToolForModel,
     // The resumed RunState replays an already-APPROVED (often side-effecting)
     // tool as the run's first act — before any stream event flips yieldedContent.
     // A pre-content stall here must NOT trigger the clean-replay retry, or that
@@ -6249,6 +6286,7 @@ export async function resumePendingApproval(
           resumeCtx = {
             sessionId: options.sessionId,
             counter: toolCounter,
+            ...(resumeAgentScopeBinding.bound ? { mcpToolScope: resumeAgentScopeBinding.scope } : {}),
             ...(resumeSourceUserSeq ? { sourceUserSeq: resumeSourceUserSeq } : {}),
           };
           return await withHarnessRunContext(
@@ -6278,7 +6316,9 @@ export async function resumePendingApproval(
         session,
         outcome.interruptions ?? [],
       );
-      session.saveInterruptState(outcome.serializedState);
+      session.saveInterruptState(outcome.serializedState, {
+        mcpToolScope: resumeAgentScopeBinding.bound ? resumeAgentScopeBinding.scope : undefined,
+      });
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
     }
@@ -8139,7 +8179,15 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       const tickMs = Math.min(15_000, Math.max(250, Math.floor(Math.min(firstByteMs, streamMs) / 4)));
       stallTimer = setInterval(() => {
         const win = yieldedContent ? streamMs : firstByteMs;
-        if (Date.now() - lastEventAt > win) {
+        // The fallback boundary buffers provider-private reasoning until an
+        // actionable text/tool item appears, so those raw frames cannot safely
+        // enter Runner history and then be replayed on another brain. It records
+        // a private activity timestamp in the run context instead; count that as
+        // liveness without counting it as committed content. If reasoning stops,
+        // the ordinary first-byte window still expires from its final timestamp.
+        const privateActivityAt = harnessRunContextStorage.getStore()?.privateModelActivityAt ?? 0;
+        const observedActivityAt = Math.max(lastEventAt, privateActivityAt);
+        if (Date.now() - observedActivityAt > win) {
           if (stallTimer) clearInterval(stallTimer);
           // Best-effort: release the underlying stream so the dangling
           // request doesn't pin sockets after we abandon the turn.

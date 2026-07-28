@@ -16,10 +16,11 @@
  * backs off + surfaces). Codex is a different provider, so it survives an
  * Anthropic-wide incident.
  *
- * Retry-safety: for a streamed turn we may only switch BEFORE any event has been
- * yielded to the Runner. The resilient wrapper buffers metadata and yields
- * nothing until it commits on real content, so "no event yielded yet" === "no
- * real content escaped" — switching then can never duplicate a reply.
+ * Retry-safety: for a streamed turn we may only switch before actionable model
+ * output (assistant text, a tool call, or another durable continuation item)
+ * has been yielded to the Runner. Metadata and private reasoning are buffered,
+ * so a reasoning-only completion can be discarded and another brain can serve
+ * the turn without duplicating a reply or a side effect.
  *
  * This is the seam the future Codex+Claude "fusion" routing will build on.
  */
@@ -33,6 +34,7 @@ import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
+import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.fallback-model' });
@@ -54,6 +56,11 @@ export function forcedOverloadDepth(): number {
 
 export interface FallbackTarget {
   label: string;
+  /** Truthful route identity for metrics/UI. `label` remains the human-facing
+   * chain name, while these fields identify the provider/model that actually
+   * served a rescued response. */
+  provider?: string;
+  model?: string;
   /** Lazily build the Model — a fallback is only constructed if it's reached. */
   getModel: () => Model;
   /** Optional request-capability guard. A target that cannot honor the request
@@ -71,12 +78,11 @@ export interface FallbackOptions {
    */
   falloverOn429?: boolean;
   /**
-   * If a brain sends NO first stream event within this many ms, treat it as a
-   * hang and fall over to the NEXT brain (the dominant real-world failure: a
-   * provider accepts the request then goes silent). Applies only to non-last
-   * brains — the last brain keeps the full per-request budget (the loop's stall
-   * watchdog is its backstop). 0/undefined disables. Set BELOW the loop's
-   * first-byte stall window so the hang becomes a fallover, not a dead-end.
+   * If a brain sends NO first REAL stream content within this many ms, treat it
+   * as a hang and fall over to the NEXT brain. Handshake/metadata frames such as
+   * response_started and keepalives neither satisfy nor reset this budget.
+   * Applies only to non-last brains — the last brain keeps the full per-request
+   * budget (the loop's stall watchdog is its backstop). 0/undefined disables.
    */
   firstByteTimeoutMs?: number;
   /** Correlation for the model_fallover telemetry — without these the emit is
@@ -85,14 +91,236 @@ export interface FallbackOptions {
    *  context; optional so non-harness callers are unaffected. */
   sessionId?: string;
   workflowRunId?: string;
+  /**
+   * Mutable set owned by one harness Runner.run. RouterModelProvider may create
+   * a fresh FallbackModel for each SDK model iteration, so instance state alone
+   * cannot remember that the primary already stayed silent. Sharing this
+   * run-local set makes later iterations start on the proven rescue lane while
+   * naturally resetting for the user's next turn.
+   */
+  runSilencedLabels?: Set<string>;
+}
+
+export interface FallbackRouteResolution {
+  initialLabel: string;
+  resolvedLabel: string;
+  provider?: string;
+  model?: string;
+  fellOver: boolean;
+  reason?: string;
+}
+
+// Response/event objects are owned by the model pipeline, so a WeakMap carries
+// Clementine-private route truth without mutating providerData or leaking our
+// bookkeeping back into a provider continuation payload.
+const fallbackRouteResolutions = new WeakMap<object, FallbackRouteResolution>();
+
+export function fallbackRouteResolution(value: unknown): FallbackRouteResolution | undefined {
+  return value !== null && typeof value === 'object'
+    ? fallbackRouteResolutions.get(value as object)
+    : undefined;
 }
 
 /** A brain went silent past the first-byte fallover budget — switch brains. */
 class FirstByteTimeoutError extends Error {
   constructor(public readonly ms: number) {
-    super(`no first stream event within ${ms}ms`);
+    super(`no first real stream content within ${ms}ms`);
     this.name = 'FirstByteTimeoutError';
   }
+}
+
+/** A stream ended (or claimed a clean completion) before any actionable text,
+ * tool call, or durable continuation item. Private reasoning may have happened,
+ * but none of it escaped, so another brain may safely serve the turn. */
+class PreContentStreamEndedError extends Error {
+  constructor(public readonly sawModelActivity = false) {
+    super(sawModelActivity
+      ? 'model completed with private reasoning but no actionable output'
+      : 'stream ended before any actionable output');
+    this.name = 'PreContentStreamEndedError';
+  }
+}
+
+type StreamRecord = Record<string, unknown>;
+
+function nonEmptyString(value: unknown): boolean {
+  return typeof value === 'string' && value.length > 0;
+}
+
+const PRIVATE_REASONING_RE = /(?:^|[._-])(reasoning|thinking)(?:$|[._-])/;
+const TOOL_CONTENT_RE = /(function_call|tool_call|tool-call|tool_use|input_json|computer_call|shell_call|apply_patch_call|mcp_call|search_call|code_interpreter_call|image_generation_call|function_call_output|tool_result)/;
+const TEXT_CONTENT_RE = /(?:^|[._-])(output_text|text|refusal)(?:$|[._-])/;
+
+function modelItemType(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  const type = (value as StreamRecord).type;
+  return typeof type === 'string' ? type.toLowerCase() : '';
+}
+
+function modelItemIsPrivateReasoning(value: unknown): boolean {
+  return PRIVATE_REASONING_RE.test(modelItemType(value));
+}
+
+function contentPartHasActionableContent(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const part = value as StreamRecord;
+  const type = modelItemType(part);
+  if (PRIVATE_REASONING_RE.test(type)) return false;
+  if (TOOL_CONTENT_RE.test(type)) return true;
+  if (TEXT_CONTENT_RE.test(type)) {
+    return nonEmptyString(part.text)
+      || nonEmptyString(part.delta)
+      || nonEmptyString(part.content)
+      || nonEmptyString(part.refusal);
+  }
+  return nonEmptyString(part.text)
+    || nonEmptyString(part.delta)
+    || nonEmptyString(part.refusal);
+}
+
+/** True once replay could duplicate a visible answer, a tool turn, or valid
+ * provider continuation state. Reasoning alone deliberately does not commit.
+ * Native Codex compaction DOES commit: it is intentional protocol progress and
+ * must stay on the same provider rather than being replayed cross-provider. */
+function modelItemHasActionableContent(value: unknown, eventType: string): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as StreamRecord;
+  const itemType = modelItemType(item);
+  if (!itemType || modelItemIsPrivateReasoning(item)) return false;
+  if (itemType === 'compaction') return true;
+  if (TOOL_CONTENT_RE.test(itemType)) return true;
+  if (TEXT_CONTENT_RE.test(itemType)) {
+    return nonEmptyString(item.text)
+      || nonEmptyString(item.delta)
+      || nonEmptyString(item.content)
+      || nonEmptyString(item.refusal);
+  }
+  if (itemType === 'message') {
+    if (nonEmptyString(item.content)) return true;
+    const content = Array.isArray(item.content) ? item.content : [];
+    return content.some((part) => {
+      if (nonEmptyString(part)) return true;
+      return contentPartHasActionableContent(part);
+    });
+  }
+  if (nonEmptyString(item.arguments) || nonEmptyString(item.arguments_delta)) return true;
+  // A completed, non-reasoning output item is durable provider output even if
+  // a new adapter spelling is not known here. An "added" empty shell remains
+  // metadata until its done event or response payload supplies substance.
+  if (eventType.includes('output_item.done')) return true;
+  return false;
+}
+
+function modelItemHasActivity(value: unknown, eventType: string): boolean {
+  if (modelItemHasActionableContent(value, eventType)) return true;
+  if (!value || typeof value !== 'object' || !modelItemIsPrivateReasoning(value)) return false;
+  const item = value as StreamRecord;
+  const content = Array.isArray(item.content) ? item.content : [];
+  return nonEmptyString(item.text)
+    || nonEmptyString(item.delta)
+    || nonEmptyString(item.summary)
+    || nonEmptyString(item.thinking)
+    || content.length > 0
+    || eventType.includes('item.added')
+    || eventType.includes('item.done');
+}
+
+function genericModelEventIsLifecycleMetadata(type: string): boolean {
+  return /(?:^|[._-])(stream-start|response-metadata|response\.created|response\.in_progress|in-progress|keepalive|ping|heartbeat|finish)(?:$|[._-])/.test(type);
+}
+
+/** Conservative retry boundary for generic provider frames. Known transport
+ * lifecycle events remain buffered. Assistant text and tool payloads commit
+ * even when a provider uses a new spelling. */
+function genericModelEventHasActionableContent(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const event = value as StreamRecord;
+  const type = typeof event.type === 'string' ? event.type.toLowerCase() : '';
+  if (!type) return modelItemHasActionableContent(event.item, '');
+  if (genericModelEventIsLifecycleMetadata(type) || PRIVATE_REASONING_RE.test(type)) return false;
+  if (modelItemHasActionableContent(event.item, type)) return true;
+  if (modelItemHasActionableContent(event.part, type)) return true;
+  if (modelItemHasActionableContent(event.content_block, type)) return true;
+  if (event.delta && typeof event.delta === 'object' && modelItemHasActionableContent(event.delta, type)) return true;
+  if (TOOL_CONTENT_RE.test(type)) return true;
+  if (
+    /(output_text|text-delta|text_delta|content_block_delta|refusal)/.test(type)
+    && (
+      nonEmptyString(event.delta)
+      || nonEmptyString(event.text)
+      || nonEmptyString(event.content)
+      || nonEmptyString(event.refusal)
+    )
+  ) {
+    return true;
+  }
+  // Function/tool argument streams sometimes omit a tool keyword from the
+  // outer event but still carry a non-empty arguments delta.
+  if (nonEmptyString(event.arguments) || nonEmptyString(event.arguments_delta)) return true;
+  return false;
+}
+
+function genericModelEventHasActivity(value: unknown): boolean {
+  if (genericModelEventHasActionableContent(value)) return true;
+  if (!value || typeof value !== 'object') return false;
+  const event = value as StreamRecord;
+  const type = typeof event.type === 'string' ? event.type.toLowerCase() : '';
+  if (genericModelEventIsLifecycleMetadata(type)) return false;
+  if (modelItemHasActivity(event.item, type)) return true;
+  if (modelItemHasActivity(event.part, type)) return true;
+  if (modelItemHasActivity(event.content_block, type)) return true;
+  if (event.delta && typeof event.delta === 'object' && modelItemHasActivity(event.delta, type)) return true;
+  if (!PRIVATE_REASONING_RE.test(type)) return false;
+  return nonEmptyString(event.delta)
+    || nonEmptyString(event.text)
+    || nonEmptyString(event.summary)
+    || nonEmptyString(event.thinking)
+    || type.includes('item.added')
+    || type.includes('item.done');
+}
+
+function modelResponseHasActionableContent(response: { output?: unknown[] } | undefined): boolean {
+  const output = response?.output;
+  return Array.isArray(output) && output.some((item) => modelItemHasActionableContent(item, 'response.output_item.done'));
+}
+
+function modelResponseHasActivity(response: { output?: unknown[] } | undefined): boolean {
+  const output = response?.output;
+  return Array.isArray(output) && output.some((item) => modelItemHasActivity(item, 'response.output_item.done'));
+}
+
+function streamEventHasActionableContent(event: StreamEvent): boolean {
+  if (event.type === 'output_text_delta') return nonEmptyString(event.delta);
+  if (event.type === 'model') return genericModelEventHasActionableContent(event.event);
+  if (event.type === 'response_done') {
+    return modelResponseHasActionableContent(event.response);
+  }
+  return false;
+}
+
+function streamEventHasModelActivity(event: StreamEvent): boolean {
+  if (streamEventHasActionableContent(event)) return true;
+  if (event.type === 'model') return genericModelEventHasActivity(event.event);
+  if (event.type === 'response_done') return modelResponseHasActivity(event.response);
+  return false;
+}
+
+function notePrivateModelActivity(): void {
+  const context = harnessRunContextStorage.getStore();
+  if (context) context.privateModelActivityAt = Date.now();
+}
+
+function emptyCompletionBoundary(label: string, cause: unknown, sawModelActivity: boolean): BoundaryError {
+  return new BoundaryError({
+    kind: 'model.empty_completion',
+    retryable: true,
+    userMessage: "Clementine's model finished without an actionable answer. Try again or switch brains.",
+    operatorMessage: `${label}: ${sawModelActivity
+      ? 'reasoning-only completion produced no assistant text or tool call'
+      : 'stream completed before any actionable output'}.`,
+    context: { label, reasoningOnly: sawModelActivity },
+    cause,
+  });
 }
 
 /** True when an error means the model is OVERLOADED (529 / overloaded_error) —
@@ -354,8 +582,9 @@ export function clearRateLimitedBrainsForTest(): void {
 
 function silentFailureReason(err: unknown): string | null {
   if (err instanceof FirstByteTimeoutError) return 'first-byte-timeout';
+  if (err instanceof PreContentStreamEndedError) return 'model.empty_completion';
   const kind = normalizedModelFailureReason(err);
-  return kind === 'model.transport_timeout' ? kind : null;
+  return kind === 'model.transport_timeout' || kind === 'model.empty_completion' ? kind : null;
 }
 
 export function isBrainSilenced(label: string): boolean {
@@ -438,7 +667,12 @@ function normalizedModelFailureReason(err: unknown): string {
 
 export function isFalloverError(err: unknown): boolean {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
-  if (kind === 'model.overloaded' || kind === 'model.http_5xx' || kind === 'model.transport_timeout') return true;
+  if (
+    kind === 'model.overloaded'
+    || kind === 'model.http_5xx'
+    || kind === 'model.transport_timeout'
+    || kind === 'model.empty_completion'
+  ) return true;
   // Auth failure on THIS brain → switch to a brain whose auth is valid rather
   // than hard-failing the turn/run.
   if (isAuthRecoverableError(err)) return true;
@@ -463,13 +697,40 @@ export class FallbackModel implements Model {
    *  or which repeatedly went silent. If every compatible brain is cooling
    *  down, probe the compatible set again; never fall through to an
    *  incompatible transport merely because it is available. */
-  private liveChain(request: ModelRequest): FallbackTarget[] {
+  private liveChain(request: ModelRequest): {
+    chain: FallbackTarget[];
+    preselected?: { from: FallbackTarget; to: FallbackTarget; reason: string };
+  } {
     const compatible = this.chain.filter((target) => target.supportsRequest?.(request) !== false);
     if (compatible.length === 0) {
       throw new Error('fallback chain has no provider compatible with this request');
     }
-    const alive = compatible.filter((t) => !isBrainAuthDead(t.label) && !isBrainSilenced(t.label) && !isBrainRateLimited(t.label));
-    return alive.length > 0 ? alive : compatible;
+    const exclusionReason = (target: FallbackTarget): string | null => {
+      if (isBrainAuthDead(target.label)) return 'preselected-auth-dead';
+      if (isBrainRateLimited(target.label)) return 'preselected-rate-limited';
+      if (isBrainSilenced(target.label)) return 'preselected-silent-cooldown';
+      return null;
+    };
+    const globallyAlive = compatible.filter((target) => exclusionReason(target) === null);
+    const runAlive = globallyAlive.filter((t) => !this.opts.runSilencedLabels?.has(t.label));
+    let chain: FallbackTarget[];
+    if (runAlive.length > 0) chain = runAlive;
+    // If every compatible lane failed in this run, probe again rather than
+    // manufacturing a zero-brain chain. The last failure remains authoritative.
+    else chain = globallyAlive.length > 0 ? globallyAlive : compatible;
+
+    const from = compatible[0];
+    const to = chain[0];
+    if (from && to && from !== to) {
+      const reason = exclusionReason(from)
+        ?? (this.opts.runSilencedLabels?.has(from.label) ? 'preselected-run-silenced' : null);
+      if (reason) return { chain, preselected: { from, to, reason } };
+    }
+    return { chain };
+  }
+
+  private rememberRunSilent(label: string, err: unknown): void {
+    if (silentFailureReason(err)) this.opts.runSilencedLabels?.add(label);
   }
 
   /** Sticky-mark a brain whose failure was an auth failure (dead until re-auth
@@ -483,28 +744,45 @@ export class FallbackModel implements Model {
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     const forced = forcedOverloadDepth();
-    const chain = this.liveChain(request);
+    const live = this.liveChain(request);
+    const chain = live.chain;
+    if (live.preselected) this.logPreselectedFallover(live.preselected);
+    let falloverReason: string | undefined = live.preselected?.reason
+      ?? (chain[0]?.label !== this.chain[0]?.label
+        ? 'preselected-rescue'
+        : undefined);
     for (let i = 0; i < chain.length; i++) {
       const isLast = i >= chain.length - 1;
       if (i < forced && !isLast) {
         logger.warn({ forced: true, from: chain[i].label, to: chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
+        falloverReason = 'forced-overload';
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
       try {
         const call = chain[i].getModel().getResponse(req);
         const result = await this.withFirstByteTimeout(call, isLast, () => cleanup(true));
+        if (!modelResponseHasActionableContent(result)) {
+          throw new PreContentStreamEndedError(modelResponseHasActivity(result));
+        }
         cleanup(false);
         clearBrainSilentFailure(chain[i].label);
+        this.tagRouteResolution(result, chain[i], falloverReason);
         return result;
       } catch (err) {
         cleanup(true); // release a hung request
+        const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true;
         this.markIfAuthDead(chain, i, err);
+        this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         markBrainRateLimited(chain[i].label, err);
-        if (this.isFalloverReason(err) && !isLast) {
+        if (!callerAborted && this.isFalloverReason(err) && !isLast) {
+          falloverReason = this.falloverReason(err);
           this.logFallover(chain, i, err);
           continue;
+        }
+        if (err instanceof PreContentStreamEndedError && !callerAborted) {
+          throw emptyCompletionBoundary(chain[i].label, err, err.sawModelActivity);
         }
         throw err;
       }
@@ -514,39 +792,83 @@ export class FallbackModel implements Model {
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     const forced = forcedOverloadDepth();
-    const chain = this.liveChain(request);
+    const live = this.liveChain(request);
+    const chain = live.chain;
+    if (live.preselected) this.logPreselectedFallover(live.preselected);
+    let falloverReason: string | undefined = live.preselected?.reason
+      ?? (chain[0]?.label !== this.chain[0]?.label
+        ? 'preselected-rescue'
+        : undefined);
     for (let i = 0; i < chain.length; i++) {
       const isLast = i >= chain.length - 1;
       if (i < forced && !isLast) {
         logger.warn({ forced: true, from: chain[i].label, to: chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
+        falloverReason = 'forced-overload';
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
-      let yieldedAny = false;
+      let sawModelActivity = false;
+      let committedActionable = false;
+      const pending: StreamEvent[] = [];
+      const firstContentDeadlineAt = !isLast && this.opts.firstByteTimeoutMs && this.opts.firstByteTimeoutMs > 0
+        ? Date.now() + this.opts.firstByteTimeoutMs
+        : undefined;
       try {
         const it = chain[i].getModel().getStreamedResponse(req)[Symbol.asyncIterator]();
-        // First event raced against the first-byte fallover budget (non-last brains).
-        const firstNext = it.next();
-        firstNext.catch(() => {}); // a lost race must not throw unhandled
-        let cur = await this.withFirstByteTimeout(firstNext, isLast, () => cleanup(true));
-        while (!cur.done) {
-          yieldedAny = true; // first yield === committed on real content; no more fallover
-          yield cur.value;
-          cur = await it.next();
+        while (true) {
+          const next = it.next();
+          next.catch(() => {}); // a lost timeout race must not throw unhandled
+          const cur = sawModelActivity
+            ? await next
+            : await this.withFirstByteTimeout(next, isLast, () => cleanup(true), firstContentDeadlineAt);
+          if (cur.done) {
+            if (!committedActionable) throw new PreContentStreamEndedError(sawModelActivity);
+            break;
+          }
+          const event = cur.value;
+          if (!committedActionable && !streamEventHasActionableContent(event)) {
+            // Handshake/keepalive/metadata and private reasoning remain private
+            // to this attempt. If it ends without text/tool output, the rescue
+            // brain starts with a clean stream and no provider reasoning state.
+            pending.push(event);
+            if (streamEventHasModelActivity(event)) {
+              sawModelActivity = true;
+              notePrivateModelActivity();
+            }
+            continue;
+          }
+          if (!committedActionable) {
+            committedActionable = true;
+            sawModelActivity = true;
+            for (const buffered of pending) {
+              this.tagRouteResolution(buffered, chain[i], falloverReason);
+              yield buffered;
+            }
+            pending.length = 0;
+          }
+          this.tagRouteResolution(event, chain[i], falloverReason);
+          yield event;
         }
         cleanup(false);
         clearBrainSilentFailure(chain[i].label);
         return; // streamed to completion
       } catch (err) {
         cleanup(true); // release a hung brain
+        const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true;
         this.markIfAuthDead(chain, i, err);
+        this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         markBrainRateLimited(chain[i].label, err);
-        // Switch only if NOTHING reached the Runner yet (else we'd duplicate a
-        // partially-streamed reply) and a next brain exists.
-        if (!yieldedAny && this.isFalloverReason(err) && !isLast) {
+        // Switch only if NO ACTIONABLE content reached the Runner (metadata and
+        // private reasoning were buffered), the caller did not cancel, and a
+        // next brain exists.
+        if (!committedActionable && !callerAborted && this.isFalloverReason(err) && !isLast) {
+          falloverReason = this.falloverReason(err);
           this.logFallover(chain, i, err);
           continue;
+        }
+        if (err instanceof PreContentStreamEndedError && !callerAborted) {
+          throw emptyCompletionBoundary(chain[i].label, err, err.sawModelActivity);
         }
         throw err;
       }
@@ -554,11 +876,32 @@ export class FallbackModel implements Model {
   }
 
   private isFalloverReason(err: unknown): boolean {
-    return err instanceof FirstByteTimeoutError || this.shouldFallover(err);
+    return err instanceof FirstByteTimeoutError
+      || err instanceof PreContentStreamEndedError
+      || this.shouldFallover(err);
+  }
+
+  private falloverReason(err: unknown): string {
+    if (err instanceof FirstByteTimeoutError) return 'first-content-timeout';
+    if (err instanceof PreContentStreamEndedError) return 'model.empty_completion';
+    return normalizedModelFailureReason(err);
+  }
+
+  private tagRouteResolution(value: unknown, target: FallbackTarget, reason?: string): void {
+    if (value === null || typeof value !== 'object') return;
+    const initialLabel = this.chain[0]?.label ?? target.label;
+    fallbackRouteResolutions.set(value as object, {
+      initialLabel,
+      resolvedLabel: target.label,
+      ...(target.provider ? { provider: target.provider } : {}),
+      ...(target.model ? { model: target.model } : {}),
+      fellOver: target.label !== initialLabel,
+      ...(reason ? { reason } : {}),
+    });
   }
 
   private logFallover(chain: FallbackTarget[], i: number, err: unknown): void {
-    const reason = err instanceof FirstByteTimeoutError ? 'first-byte-timeout' : normalizedModelFailureReason(err);
+    const reason = this.falloverReason(err);
     logger.warn(
       {
         from: chain[i].label,
@@ -577,8 +920,58 @@ export class FallbackModel implements Model {
       payload: {
         from: chain[i].label,
         to: chain[i + 1].label,
+        ...(chain[i].provider ? { fromProvider: chain[i].provider } : {}),
+        ...(chain[i].model ? { fromModel: chain[i].model } : {}),
+        ...(chain[i + 1].provider ? {
+          toProvider: chain[i + 1].provider,
+          resolvedProvider: chain[i + 1].provider,
+        } : {}),
+        ...(chain[i + 1].model ? {
+          toModel: chain[i + 1].model,
+          resolvedModel: chain[i + 1].model,
+        } : {}),
         reason,
         stage: 'router',
+      },
+    });
+  }
+
+  private logPreselectedFallover(resolution: {
+    from: FallbackTarget;
+    to: FallbackTarget;
+    reason: string;
+  }): void {
+    const { from, to, reason } = resolution;
+    logger.warn(
+      {
+        from: from.label,
+        to: to.label,
+        fromProvider: from.provider,
+        fromModel: from.model,
+        toProvider: to.provider,
+        toModel: to.model,
+        reason,
+        preselected: true,
+      },
+      'known-unavailable brain skipped — preselecting the rescue brain',
+    );
+    recordOperationalEvent({
+      source: 'model',
+      type: 'model_fallover',
+      severity: 'warn',
+      actor: 'fallback-model',
+      sessionId: this.opts.sessionId,
+      workflowRunId: this.opts.workflowRunId,
+      payload: {
+        from: from.label,
+        to: to.label,
+        ...(from.provider ? { fromProvider: from.provider } : {}),
+        ...(from.model ? { fromModel: from.model } : {}),
+        ...(to.provider ? { toProvider: to.provider, resolvedProvider: to.provider } : {}),
+        ...(to.model ? { toModel: to.model, resolvedModel: to.model } : {}),
+        reason,
+        stage: 'router',
+        preselected: true,
       },
     });
   }
@@ -586,15 +979,28 @@ export class FallbackModel implements Model {
   /** Race a model call's first result against the first-byte timeout (only for a
    *  non-last brain with a configured budget). On timeout, abort and throw
    *  FirstByteTimeoutError so the caller advances to the next brain. */
-  private async withFirstByteTimeout<T>(call: Promise<T>, isLast: boolean, abort: () => void): Promise<T> {
+  private async withFirstByteTimeout<T>(
+    call: Promise<T>,
+    isLast: boolean,
+    abort: () => void,
+    deadlineAt?: number,
+  ): Promise<T> {
     const ms = this.opts.firstByteTimeoutMs;
     if (isLast || !ms || ms <= 0) return call;
+    const remainingMs = Math.max(0, (deadlineAt ?? Date.now() + ms) - Date.now());
+    if (remainingMs <= 0) {
+      abort();
+      throw new FirstByteTimeoutError(ms);
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
         call,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => { abort(); reject(new FirstByteTimeoutError(ms)); }, ms);
+          timer = setTimeout(() => {
+            reject(new FirstByteTimeoutError(ms));
+            abort();
+          }, remainingMs);
         }),
       ]);
     } finally {
@@ -622,12 +1028,12 @@ export class FallbackModel implements Model {
   }
 }
 
-/** Wrap an ordered chain of brains with fallover. A single-element chain is
- *  returned as-is (no wrapper overhead) UNLESS a first-byte timeout is requested
- *  (a lone brain still benefits from converting a hang into a clean error). */
+/** Wrap an ordered chain of brains with fallover and the always-actionable
+ * completion invariant. A single brain is still wrapped: otherwise disabling
+ * fallover would also disable the reasoning-only escape hatch and let the
+ * Agents SDK spin the same model indefinitely. */
 export function withModelFallback(chain: FallbackTarget[], opts: FallbackOptions = {}): Model {
   if (chain.length === 0) throw new Error('withModelFallback: empty chain');
-  if (chain.length === 1 && !opts.firstByteTimeoutMs && !chain[0].supportsRequest) return chain[0].getModel();
   return new FallbackModel(chain, opts);
 }
 

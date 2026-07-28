@@ -30,6 +30,7 @@ const {
   recordEntityEdge, recordGroundedEntityRelationship, loadEntityEdges,
   resolveEntityIdsForText, loadFactEntityEdges, getNeighborEntityIds,
   setFactEntityLinks, backfillGroundedFactEntityLinks, backfillGroundedEntityRelationships, reconcileMemoryRelationships,
+  reconcileExtractedFactEntityEvidence,
   syncFactResourceLinks, loadFactResourceEdges, backfillGroundedFactResourceLinks,
 } = await import('./relations.js');
 
@@ -123,6 +124,108 @@ test('grounded fact link backfill leaves shared first-name matches inferred', ()
   assert.equal(stats.promoted, 0);
   assert.ok(stats.ambiguous >= 2);
   assert.ok(loadFactEntityEdges([fact.id]).every((edge) => edge.truth === 'inferred'));
+});
+
+test('extracted fact link reconciliation repairs a uniquely supported missing episode from exact fact evidence', () => {
+  const dana = upsertEntity({ type: 'person', name: 'Dana Smith' });
+  const content = 'Dana Smith approved the Northstar launch review.';
+  const episode = recordMemoryEpisode({
+    kind: 'tool_result',
+    sessionId: 'repair-extracted-session',
+    callId: 'repair-extracted-call',
+    content,
+  });
+  const fact = rememberFact({
+    kind: 'project',
+    content,
+    derivedFrom: {
+      sessionId: 'repair-extracted-session',
+      callId: 'repair-extracted-call',
+      tool: 'meeting_lookup',
+    },
+  });
+  linkFactEvidence({ factId: fact.id, episodeId: episode.id, excerpt: content });
+  setFactEntityLinks(fact.id, [dana], {
+    linkType: 'extracted',
+    confidence: 0.9,
+    evidenceExcerpt: 'orphaned legacy excerpt',
+  });
+
+  const stats = reconcileExtractedFactEntityEvidence();
+  assert.deepEqual(stats, {
+    linksScanned: 1,
+    evidenceScanned: 1,
+    repaired: 1,
+    downgraded: 0,
+    ambiguous: 0,
+  });
+  assert.deepEqual(
+    openMemoryDb().prepare(`
+      SELECT link_type, evidence_episode_id, evidence_excerpt
+      FROM fact_entities
+      WHERE fact_id = ? AND entity_id = ?
+    `).get(fact.id, dana),
+    { link_type: 'extracted', evidence_episode_id: episode.id, evidence_excerpt: content },
+    'repair copies the exact durable fact-evidence row rather than preserving an unattached excerpt',
+  );
+  assert.equal(
+    (openMemoryDb().prepare(`
+      SELECT COUNT(*) AS count FROM entity_observations
+      WHERE entity_id = ? AND episode_id = ?
+    `).get(dana, episode.id) as { count: number }).count,
+    1,
+  );
+});
+
+test('extracted fact link reconciliation downgrades when two source episodes support the same link', () => {
+  const dana = upsertEntity({ type: 'person', name: 'Dana Smith' });
+  const content = 'Dana Smith approved the Northstar launch review.';
+  const fact = rememberFact({
+    kind: 'project',
+    content,
+    derivedFrom: {
+      sessionId: 'ambiguous-extracted-session',
+      callId: 'ambiguous-extracted-call',
+      tool: 'meeting_lookup',
+    },
+  });
+  for (const suffix of ['a', 'b']) {
+    const episode = recordMemoryEpisode({
+      kind: 'tool_result',
+      sessionId: `ambiguous-extracted-session-${suffix}`,
+      callId: `ambiguous-extracted-call-${suffix}`,
+      content,
+    });
+    linkFactEvidence({ factId: fact.id, episodeId: episode.id, excerpt: content });
+  }
+  setFactEntityLinks(fact.id, [dana], {
+    linkType: 'extracted',
+    confidence: 0.95,
+    evidenceExcerpt: 'unattached legacy excerpt',
+  });
+
+  const stats = reconcileExtractedFactEntityEvidence();
+  assert.deepEqual(stats, {
+    linksScanned: 1,
+    evidenceScanned: 2,
+    repaired: 0,
+    downgraded: 1,
+    ambiguous: 1,
+  });
+  assert.deepEqual(
+    openMemoryDb().prepare(`
+      SELECT link_type, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_entities
+      WHERE fact_id = ? AND entity_id = ?
+    `).get(fact.id, dana),
+    {
+      link_type: 'inferred_text',
+      confidence: 0.55,
+      evidence_episode_id: null,
+      evidence_excerpt: null,
+    },
+    'an episode is never guessed; the relationship remains available only as an inferred overlay',
+  );
 });
 
 test('direct facts ground a unique named resource from durable evidence and inferred sync cannot downgrade it', () => {

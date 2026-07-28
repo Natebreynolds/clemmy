@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import { isWorkspaceViewUrl } from './workspace-navigation-policy.js';
 
 /**
  * Preload script — bridges a narrow, typed API onto window.clemmy in
@@ -28,6 +29,10 @@ const api = {
   tailLog: (maxLines?: number) => ipcRenderer.invoke('clemmy:tail-log', maxLines) as Promise<{ lines: string[] }>,
   /** Open the log file in the OS default viewer. */
   openLogs: () => ipcRenderer.invoke('clemmy:open-logs') as Promise<{ opened: boolean }>,
+  /** Open a link captured from a real click in a sandboxed Workspace. The
+   * dashboard parent validates the request before it reaches this bridge. */
+  workspaceOpenExternal: (url: string) =>
+    ipcRenderer.invoke('clemmy:workspace-open-external', { url }) as Promise<{ ok: boolean }>,
   /** macOS notch preferences are desktop-owned and only callable from the
    * Settings route. */
   notchStatus: () => ipcRenderer.invoke('clemmy:notch-status') as Promise<Record<string, unknown>>,
@@ -138,6 +143,11 @@ const api = {
   setupSaveDiscordConfig: (payload: { clientId?: string; ownerId?: string }) => ipcRenderer.invoke('clemmy:setup-save-discord-config', payload) as Promise<{ ok: boolean }>,
 };
 
-contextBridge.exposeInMainWorld('clemmy', api);
+// The same BrowserWindow can be navigated to a raw Workspace URL. Those pages
+// are agent-authored content, not the dashboard: do not expose even the method
+// stubs there. Main-process sender authorization independently denies them too.
+if (!isWorkspaceViewUrl(window.location.href)) {
+  contextBridge.exposeInMainWorld('clemmy', api);
+}
 
 export type ClemmyDesktopApi = typeof api;

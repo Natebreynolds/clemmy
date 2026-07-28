@@ -32,6 +32,7 @@ const { getPlanScope } = await import('./plan-scope.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const {
   buildOrchestratorAgent,
+  buildOrchestratorAgentForApprovalResume,
   OrchestratorDecisionSchema,
   buildRequestApprovalTool,
   buildAskUserQuestionTool,
@@ -41,6 +42,8 @@ const {
   userChoiceToolUseBehavior,
 } = await import('./orchestrator.js');
 const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-scope.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
+const { boundAgentMcpToolScope } = await import('../runtime/mcp-tool-authority.js');
 const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
@@ -134,6 +137,32 @@ test('Orchestrator instructions stay dynamic and include same-session completed 
   assert.match(instructions, /CRM_UPDATE/);
   assert.match(instructions, /record:acct-42/);
   assert.doesNotMatch(instructions, /function harnessInstructions|=> `?\$?\{?baseInstructions/);
+});
+
+test('approval-resume agent keeps the exact connector scope captured with the parked RunState', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', channel: 'test' });
+  const localOnlyScope = {
+    reason: 'explicit local-only/no-external-tools instruction',
+    allowedServerSlugs: [],
+    toolPatterns: [],
+    maxTools: 0,
+  };
+  session.saveInterruptState('opaque-run-state-for-agent-build-test', {
+    mcpToolScope: localOnlyScope,
+  });
+
+  const agent = await buildOrchestratorAgentForApprovalResume({
+    sessionId: session.id,
+    allowToolJit: true,
+  });
+  const bound = boundAgentMcpToolScope(agent);
+
+  assert.equal(bound.bound, true);
+  assert.deepEqual(bound.scope, localOnlyScope);
+  const scopeEvent = listEvents(session.id, { types: ['mcp_tool_scope'] }).at(-1);
+  assert.equal(scopeEvent?.data.allowAll, false, 'approval resume must not widen a local-only turn to allowAll');
+  assert.equal(scopeEvent?.data.maxTools, 0);
 });
 
 test('Orchestrator is built with explicit modelSettings so the SDK honors per-turn reasoning effort', async () => {

@@ -33,18 +33,11 @@ import { getSession, createSession } from '../runtime/harness/eventlog.js';
 import { resolveInSpace, spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
 import { appendNote, appendAudit } from './data-store.js';
 import { runSpaceAction } from './runner.js';
+import { workspaceActionLooksOutbound } from './space-action-semantics.js';
 
 /** Synthetic tool name stamped on the approval row so the resolve listener can
  *  recognise a Space-action approval (and tell it apart from agent tool calls). */
 export const SPACE_ACTION_TOOL = 'space_execute_action';
-
-/** Same send-like heuristic as space-enforce's auto-repair, for runner actions
- *  (which can't be statically classified by slug). */
-const SEND_LIKE_RE = /\b(send|reply|email|message|publish|post|tweet|dm|invite|sms|notify)\b/i;
-function actionLooksLikeSend(a: SpaceAction): boolean {
-  const hay = `${a.composioSlug ?? ''} ${a.runner ?? ''} ${a.label ?? ''} ${a.id}`.replace(/_/g, ' ');
-  return SEND_LIKE_RE.test(hay);
-}
 
 export function spaceActionApprovalEnabled(): boolean {
   const raw = (getRuntimeEnv('CLEMMY_SPACE_ACTION_APPROVAL', 'on') ?? 'on').trim().toLowerCase();
@@ -68,7 +61,7 @@ export function spaceActionNeedsApproval(action: SpaceAction): boolean {
       return false; // can't classify → don't block (fail-open, matches the harness)
     }
   }
-  return actionLooksLikeSend(action);
+  return workspaceActionLooksOutbound(action);
 }
 
 /** A short human preview of what the action will do, for the approval card. */
@@ -202,7 +195,7 @@ export function enqueueSpaceActionApproval(
   action: SpaceAction,
   callerArgs: Record<string, unknown>,
 ): EnqueueResult {
-  const verb = actionLooksLikeSend(action) ? 'Send' : 'Run';
+  const verb = workspaceActionLooksOutbound(action) ? 'Send' : 'Run';
   const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
   const row = register({
     sessionId: ensureSpaceSession(rec),

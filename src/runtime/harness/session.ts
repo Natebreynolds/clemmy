@@ -1,4 +1,5 @@
 import type { AgentInputItem } from '@openai/agents';
+import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
   appendEvent,
   createSession,
@@ -39,6 +40,10 @@ import {
 
 const META_CONVERSATION = '__conversation';
 const META_INTERRUPT = '__interrupt_state';
+// Exact external-connector authority in force when the SDK paused. Approval
+// resumes rebuild an Agent, so without this sibling record a scoped/local-only
+// turn silently reopened the legacy allow-all MCP surface after approval.
+const META_INTERRUPT_MCP_SCOPE = '__interrupt_mcp_scope';
 // Restart-recovery marker: set while a runConversation is in flight, cleared in
 // a finally when it returns/throws — so ONLY a hard process death (daemon crash
 // /restart mid-run) leaves it set. The boot scan uses it to surface an
@@ -237,9 +242,21 @@ export class HarnessSession {
    *   const state = RunState.fromString(harnessSession.loadInterruptState()!);
    *   await runner.run(agent, state, { context: ... });
    */
-  saveInterruptState(serialized: string): void {
+  saveInterruptState(
+    serialized: string,
+    options: { mcpToolScope?: McpToolScope | null } = {},
+  ): void {
     const meta = { ...this.row.metadata };
     meta[META_INTERRUPT] = serialized;
+    if (options.mcpToolScope && typeof options.mcpToolScope.reason === 'string') {
+      // Scopes are JSON-only records. Clone before storing so a caller cannot
+      // widen the persisted authority by mutating its live object after pause.
+      meta[META_INTERRUPT_MCP_SCOPE] = JSON.parse(JSON.stringify(options.mcpToolScope)) as McpToolScope;
+    } else {
+      // A new interrupt without a bound scope must never inherit an older
+      // interrupt's authority.
+      delete meta[META_INTERRUPT_MCP_SCOPE];
+    }
     this.row = updateSession(this.row.id, { metadata: meta });
     appendEvent({
       sessionId: this.row.id,
@@ -255,12 +272,30 @@ export class HarnessSession {
     return typeof raw === 'string' ? raw : null;
   }
 
+  /** Exact MCP scope captured beside the currently parked RunState. */
+  loadInterruptMcpToolScope(): McpToolScope | null {
+    const raw = this.row.metadata[META_INTERRUPT_MCP_SCOPE];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const scope = raw as Partial<McpToolScope>;
+    if (typeof scope.reason !== 'string' || !scope.reason.trim()) return null;
+    // Return a detached value: agent construction may add queryText, and that
+    // must not mutate the durable pause record.
+    try {
+      return JSON.parse(JSON.stringify(scope)) as McpToolScope;
+    } catch {
+      return null;
+    }
+  }
+
   clearInterruptState(options: { emitEvent?: boolean } = {}): void {
-    if (!(META_INTERRUPT in this.row.metadata)) return;
+    const hadInterrupt = META_INTERRUPT in this.row.metadata;
+    const hadScope = META_INTERRUPT_MCP_SCOPE in this.row.metadata;
+    if (!hadInterrupt && !hadScope) return;
     const meta = { ...this.row.metadata };
     delete meta[META_INTERRUPT];
+    delete meta[META_INTERRUPT_MCP_SCOPE];
     this.row = updateSession(this.row.id, { metadata: meta });
-    if (options.emitEvent === false) return;
+    if (!hadInterrupt || options.emitEvent === false) return;
     appendEvent({
       sessionId: this.row.id,
       turn: 0,

@@ -32,6 +32,7 @@ type RunRunnerFn = import('../src/runtime/harness/loop.js').RunRunnerFn;
 
 const ROOT = path.resolve(new URL('..', import.meta.url).pathname);
 const REAL_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
+const REAL_LOCAL_EMBEDDINGS = process.env.CLEMMY_LOCAL_EMBEDDINGS;
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-fusion-readiness-'));
 const args = new Set(process.argv.slice(2));
 const full = args.has('--full');
@@ -43,6 +44,10 @@ process.env.CLEMMY_TURN_MEMORY_PRIMER = 'on';
 process.env.CLEMMY_TURN_MEMORY_PRIMER_HYBRID = 'off';
 process.env.CLEMMY_SEMANTIC_RECALL = 'off';
 process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+// The offline readiness gate exercises deterministic text recall and injected
+// providers. Loading or copying the real local model adds no coverage and can
+// keep the targeted test subprocess alive after its assertions finish.
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 mkdirSync(path.join(TMP_HOME, 'vault', '02-Projects'), { recursive: true });
@@ -286,6 +291,8 @@ async function main(): Promise<void> {
     const liveEnv: NodeJS.ProcessEnv = { ...process.env };
     if (REAL_CLEMENTINE_HOME === undefined) delete liveEnv.CLEMENTINE_HOME;
     else liveEnv.CLEMENTINE_HOME = REAL_CLEMENTINE_HOME;
+    if (REAL_LOCAL_EMBEDDINGS === undefined) delete liveEnv.CLEMMY_LOCAL_EMBEDDINGS;
+    else liveEnv.CLEMMY_LOCAL_EMBEDDINGS = REAL_LOCAL_EMBEDDINGS;
     runCommand('live Claude headless provider smoke', 'npx', ['tsx', 'scripts/smoke-claude-headless-provider.ts'], liveEnv);
     runCommand('live Claude Agent SDK local MCP smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-local-mcp.ts'], liveEnv);
     runCommand('live Claude Agent SDK memory read smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-memory-read.ts'], liveEnv);

@@ -16,9 +16,9 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-test-emb-demotion-'
 const PROVIDER_HEALTH_FILE = path.join(TEST_HOME, 'state', 'embedding-provider-health.json');
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.OPENAI_API_KEY = 'sk-test-not-real';
-// Keep the local transformers model from ACTUALLY loading in this test — the
-// selection logic is what's under test, not the ONNX runtime.
-process.env.CLEMMY_LOCAL_EMBEDDINGS = process.env.CLEMMY_LOCAL_EMBEDDINGS ?? '';
+// Exercise local failover, but always inject a fake provider so the real
+// transformers model is never loaded or downloaded by this unit test.
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
 
 const {
   activeEmbeddingModel, embedQuery, getEmbeddingHealth, EMBEDDING_MODEL,
@@ -52,7 +52,7 @@ beforeEach(() => {
   _resetEmbeddingProviderCooldownsForTest();
   _resetEmbeddingHealthForTest();
   _resetEmbedDemotionForTest();
-  _setLocalProviderForTest(undefined);
+  _setLocalProviderForTest(fakeLocalProvider());
 });
 
 afterEach(() => {

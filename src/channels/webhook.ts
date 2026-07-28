@@ -1203,9 +1203,9 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
       [
         "default-src 'self'",
         "base-uri 'none'",
-        // 'self' (not 'none') so the console can embed an agent-authored
-        // Workspace view in a same-origin iframe (gallery previews + the
-        // full-bleed surface). Still blocks ALL cross-origin framing.
+        // 'self' (not 'none') so the console can embed a Workspace view URL.
+        // The view response and iframe independently force authored HTML into
+        // an opaque-origin sandbox. Still blocks ALL cross-origin framing.
         "frame-ancestors 'self'",
         "object-src 'none'",
         // Allow remote app/toolkit logos (Composio CDN, etc.) to load. Loopback

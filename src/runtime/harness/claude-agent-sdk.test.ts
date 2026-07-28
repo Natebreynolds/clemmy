@@ -1478,6 +1478,61 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
   assert.match(String(returned[0].data.preview ?? ''), /Acme Corp has 3 open opportunities/);
 });
 
+test('Claude reflection unwraps deferred call_tool to the real inner capability', async () => {
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
+    {
+      type: 'system', subtype: 'init', model: 'claude-opus-4-8',
+      session_id: 'sdk-deferred-reflect', uuid: 'u1', apiKeySource: 'none',
+      claude_code_version: '2.1.181', cwd: process.cwd(), tools: [],
+      mcp_servers: [], permissionMode: 'default', slash_commands: [],
+      output_style: 'default', skills: [], plugins: [],
+    } as any,
+    {
+      type: 'assistant', session_id: 'sdk-deferred-reflect', uuid: 'u2',
+      parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_use',
+        id: 'toolu_deferred_reflect',
+        name: 'mcp__clementine-local__call_tool',
+        input: {
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: 'SALESFORCE_QUERY',
+            arguments: { query: 'SELECT Name FROM Account' },
+          }),
+        },
+      }] },
+    } as any,
+    {
+      type: 'user', session_id: 'sdk-deferred-reflect', uuid: 'u3',
+      parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'toolu_deferred_reflect',
+        content: 'Acme Corp is active.',
+      }] },
+    } as any,
+    {
+      type: 'result', subtype: 'success', session_id: 'sdk-deferred-reflect',
+      uuid: 'u4', result: 'done', duration_ms: 1, duration_api_ms: 1,
+      is_error: false, num_turns: 1, stop_reason: 'end_turn',
+      total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 },
+      modelUsage: {}, permission_denials: [],
+    } as any,
+  ], {})) as any);
+  const reflected: Array<{ tool: string | null }> = [];
+  setClaudeAgentSdkReflectionForTest(((input: any) => { reflected.push(input); }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Look up Acme.',
+    sessionId: eventlog.createSession({ id: 'sdk-deferred-reflect-parent', kind: 'chat' }).id,
+    agentic: true,
+  });
+
+  assert.equal(reflected.length, 1);
+  assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
+});
+
 test('shared SDK stream emits one canonical call for repeated tool_use frames on allow-only lanes', async () => {
   const sess = eventlog.createSession({ id: 'sdk-canonical-allow-only', kind: 'workflow' });
   const toolUse = {

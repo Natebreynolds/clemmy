@@ -83,7 +83,7 @@ export interface AgentContextPacket {
   };
   skills: RankedContextCandidate[];
   workflows: RankedContextCandidate[];
-  toolScope: Pick<McpToolScope, 'reason' | 'allowAll' | 'allowedServerSlugs' | 'maxTools'>;
+  toolScope: McpToolScope;
   mcp: Array<Pick<MCPServerHealthSnapshot, 'slug' | 'state' | 'toolCount' | 'failureCount' | 'lastError'>>;
   healthWarnings: string[];
   agentSystem: Pick<AgentSystemGuidance, 'injected' | 'recommendationCount' | 'recommendations' | 'policy'>;
@@ -651,13 +651,7 @@ function renderCandidates(title: string, candidates: RankedContextCandidate[], i
 
 function summarizeToolScope(input: string): AgentContextPacket['toolScope'] {
   try {
-    const scope = resolveMcpToolScope({ userInput: input, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
-    return {
-      reason: scope.reason,
-      allowAll: scope.allowAll,
-      allowedServerSlugs: scope.allowedServerSlugs,
-      maxTools: scope.maxTools,
-    };
+    return resolveMcpToolScope({ userInput: input, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
   } catch {
     return { reason: 'tool scope unavailable' };
   }

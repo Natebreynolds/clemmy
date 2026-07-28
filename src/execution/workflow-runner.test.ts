@@ -3755,6 +3755,56 @@ test('P0-3 a dependsOn-less concurrent workflow still halts on any incomplete mu
   );
 });
 
+test('P0-3 mixed parallel read+send daemon-kill resume halts the send even when the read started last', () => {
+  resetEventLog();
+  const slug = 'p03-parallel-kill';
+  const runId = 'parallel-r1';
+  const wf = wfWith([
+    { id: 'send', prompt: 'Email the approved update.', sideEffect: 'send' },
+    { id: 'lookup', prompt: 'Read the account status.', sideEffect: 'read' },
+  ]);
+
+  // Both branches were launched by the same graph batch. The provider accepted
+  // the send, the read emitted the last lifecycle event, then the daemon died
+  // before either completion event could land.
+  appendWorkflowEvent(slug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(slug, runId, { kind: 'step_started', stepId: 'send' });
+  appendWorkflowEvent(slug, runId, { kind: 'step_started', stepId: 'lookup' });
+
+  const resumed = computeResumeState(slug, runId);
+  assert.equal(resumed.inFlightStepId, 'lookup', 'legacy singular cursor reproduces the unsafe last-started read');
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(wf, resumed),
+    { stepId: 'send', cls: 'send', declared: true },
+    'restart must park the incomplete send rather than dispatching it twice',
+  );
+});
+
+test('P0-3 one step-scoped recovery proof cannot hide a concurrent unreceipted mutation', () => {
+  const wf = wfWith([
+    { id: 'receipted_send', prompt: '', sideEffect: 'send', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@beta-co.example' } } },
+    { id: 'plain_write', prompt: 'Write the status to the CRM.', sideEffect: 'write' },
+  ]);
+  const resumed = {
+    ...resumeState('receipted_send'),
+    inFlightStepIds: new Set(['receipted_send', 'plain_write']),
+  };
+
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumed,
+      undefined,
+      {
+        durableMutationProtocolStepIds: new Set(['receipted_send']),
+        provenNoDispatchStepIds: new Set(['receipted_send']),
+      },
+    ),
+    { stepId: 'plain_write', cls: 'write', declared: true },
+    'only the exact proven/receipted step is exempt; its unsafe sibling still parks',
+  );
+});
+
 test('P0-3 a structured direct mutation may start after restart only under the durable receipt protocol', () => {
   const wf = wfWith([
     { id: 'send', prompt: '', sideEffect: 'send', call: { tool: 'GMAIL_SEND_EMAIL', args: { to: 'a@beta-co.example' } } },

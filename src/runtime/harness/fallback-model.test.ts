@@ -4,7 +4,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
-import { withModelFallback, isOverloadError, isFalloverError, type FallbackTarget, __test__ } from './fallback-model.js';
+import {
+  withModelFallback,
+  isOverloadError,
+  isFalloverError,
+  fallbackRouteResolution,
+  type FallbackTarget,
+  __test__,
+} from './fallback-model.js';
 import { BoundaryError } from '../boundary-error.js';
 
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-fallback-model-test-'));
@@ -34,8 +41,9 @@ beforeEach(async () => {
   // The cooldown memo is module-global; tests reuse brain labels, so a bench
   // earned in one case must never leak into the next (surfaced 2026-07-22 when
   // OVERLOADED joined the memo and test 7's opus bench rerouted test 8).
-  const { clearRateLimitedBrainsForTest } = await import('./fallback-model.js');
+  const { clearRateLimitedBrainsForTest, reviveDeadBrains } = await import('./fallback-model.js');
   clearRateLimitedBrainsForTest();
+  reviveDeadBrains();
 });
 
 test('isOverloadError: 529 yes, 429 no, BoundaryError(model.overloaded) yes', () => {
@@ -51,6 +59,7 @@ test('isFalloverError: overload/5xx/TRANSPORT-TIMEOUT yes; 429 + 4xx no (the tim
   assert.equal(isFalloverError({ statusCode: 503 }), true, '5xx');
   // The load-bearing case: Anthropic at capacity HANGS → transport_timeout.
   assert.equal(isFalloverError(new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: '' })), true);
+  assert.equal(isFalloverError(new BoundaryError({ kind: 'model.empty_completion', retryable: true, userMessage: '', operatorMessage: '' })), true);
   assert.equal(isFalloverError({ message: 'fetch failed' }), true, 'a transport error classifies as transport_timeout');
   // Excluded: a 429 is account-wide quota — switching Claude tiers won't help.
   assert.equal(isFalloverError({ statusCode: 429 }), false, '429 not a fallover');
@@ -68,9 +77,11 @@ test('getStreamedResponse: a TRANSPORT TIMEOUT (the Anthropic-hang case) falls o
   assert.ok(out.length > 0);
 });
 
-test('single-element chain returns the model as-is (no wrapper)', () => {
+test('single-element chain keeps the completion invariant instead of bypassing the wrapper', async () => {
   const m = model({});
-  assert.equal(withModelFallback([target('only', m)]), m);
+  const guarded = withModelFallback([target('only', m)]);
+  assert.notEqual(guarded, m);
+  assert.equal((await guarded.getResponse(req()).then((result) => (result.output[0] as any).content)), 'ok');
 });
 
 test('request capability: a tool-bearing turn skips a text-only fallback target', async () => {
@@ -104,10 +115,21 @@ test('getResponse: overload on primary falls back to the next brain', async () =
   let opusCalls = 0, sonnetCalls = 0;
   const opus = model({ getResponse: async () => { opusCalls++; throw overload(); } });
   const sonnet = model({ getResponse: async () => { sonnetCalls++; return resp('from sonnet'); } });
-  const res = await withModelFallback([target('opus', opus), target('sonnet', sonnet)]).getResponse(req());
+  const res = await withModelFallback([
+    { ...target('opus', opus), provider: 'claude', model: 'claude-opus' },
+    { ...target('sonnet', sonnet), provider: 'claude', model: 'claude-sonnet' },
+  ]).getResponse(req());
   assert.equal(opusCalls, 1);
   assert.equal(sonnetCalls, 1);
   assert.equal((res.output[0] as any).content, 'from sonnet');
+  assert.deepEqual(fallbackRouteResolution(res), {
+    initialLabel: 'opus',
+    resolvedLabel: 'sonnet',
+    provider: 'claude',
+    model: 'claude-sonnet',
+    fellOver: true,
+    reason: 'model.overloaded',
+  }, 'the response carries truthful winner metadata for outer route accounting');
 });
 
 test('getResponse: a NON-overload error (400) does NOT fall back — it throws', async () => {
@@ -135,6 +157,322 @@ test('getStreamedResponse: overload before any yield falls back and streams the 
   } });
   const events = await collect(withModelFallback([target('opus', opus), target('sonnet', sonnet)]).getStreamedResponse(req()));
   assert.ok((events as any[]).some((e) => e.type === 'output_text_delta' && e.delta === 'sonnet says hi'));
+  assert.ok(events.every((event) => fallbackRouteResolution(event)?.resolvedLabel === 'sonnet'));
+  assert.ok(events.every((event) => fallbackRouteResolution(event)?.fellOver === true));
+});
+
+test('stream metadata and response_started are buffered: failure before real content may fall over', async () => {
+  let rescueCalls = 0;
+  const metadataThenFailure = model({ getStreamedResponse: async function* () {
+    yield { type: 'response_started', providerData: { responseId: 'do-not-leak' } } as any;
+    yield { type: 'model', event: { type: 'response.in_progress', sequence_number: 1 } } as any;
+    throw overload();
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'rescued after metadata-only failure' } as any;
+  } });
+  const events = await collect(withModelFallback([
+    target('metadata-primary', metadataThenFailure),
+    target('metadata-rescue', rescue),
+  ]).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 1);
+  assert.deepEqual(
+    events.map((event) => (event as { type?: string }).type),
+    ['output_text_delta'],
+    'uncommitted primary metadata is discarded instead of leaking across the rescue response',
+  );
+});
+
+test('first-content deadline is not satisfied or reset by response_started/keepalive metadata', async () => {
+  let rescueCalls = 0;
+  const metadataThenHang = model({ getStreamedResponse: async function* (request: any) {
+    yield { type: 'response_started' } as any;
+    yield { type: 'model', event: { type: 'response.in_progress' } } as any;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 5_000);
+      request?.signal?.addEventListener?.('abort', () => {
+        clearTimeout(timer);
+        reject(new Error('aborted metadata-only stream'));
+      }, { once: true });
+    });
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'deadline rescue' } as any;
+  } });
+  const startedAt = Date.now();
+  const events = await collect(withModelFallback([
+    target('metadata-hang', metadataThenHang),
+    target('deadline-rescue', rescue),
+  ], { firstByteTimeoutMs: 50 }).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 1);
+  assert.ok(Date.now() - startedAt < 1_000, 'metadata cannot extend a 50ms first-content budget into a hang');
+  assert.deepEqual(events.map((event) => (event as any).delta), ['deadline rescue']);
+});
+
+test('reasoning-only work stays private and may fall over before any actionable output escapes', async () => {
+  let rescueCalls = 0;
+  const reasoningThenFailure = model({ getStreamedResponse: async function* () {
+    yield { type: 'response_started' } as any;
+    yield {
+      type: 'model',
+      event: { type: 'response.reasoning_summary_text.delta', delta: 'considering the safe tool' },
+    } as any;
+    throw overload();
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'rescued' } as any;
+  } });
+  const got = await collect(withModelFallback([
+    target('reasoning-primary', reasoningThenFailure),
+    target('reasoning-rescue', rescue),
+  ]).getStreamedResponse(req()));
+  assert.equal(rescueCalls, 1);
+  assert.deepEqual(
+    got.map((event) => (event as any).delta).filter(Boolean),
+    ['rescued'],
+    'discarded private reasoning never leaks or duplicates across the rescue',
+  );
+});
+
+test('a reasoning-only completed response falls over instead of entering the Agents SDK run-again loop', async () => {
+  let rescueCalls = 0;
+  const reasoningOnly = model({ getStreamedResponse: async function* () {
+    yield { type: 'response_started' } as any;
+    yield {
+      type: 'model',
+      event: { type: 'response.reasoning_summary_text.delta', delta: 'private analysis' },
+    } as any;
+    yield {
+      type: 'response_done',
+      response: {
+        output: [{ type: 'reasoning', content: [{ type: 'reasoning_text', text: 'private analysis' }] }],
+        usage: { outputTokens: 4_096 },
+      },
+    } as any;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'actionable answer' } as any;
+  } });
+
+  const got = await collect(withModelFallback([
+    target('reasoning-only', reasoningOnly),
+    target('rescue', rescue),
+  ]).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 1);
+  assert.deepEqual(got.map((event) => (event as any).delta).filter(Boolean), ['actionable answer']);
+});
+
+test('a lone reasoning-only brain surfaces typed model.empty_completion instead of a clean loop', async () => {
+  const reasoningOnly = model({ getStreamedResponse: async function* () {
+    yield {
+      type: 'model',
+      event: { type: 'reasoning-delta', delta: 'still thinking' },
+    } as any;
+    yield {
+      type: 'response_done',
+      response: { output: [{ type: 'reasoning', content: [{ text: 'still thinking' }] }] },
+    } as any;
+  } });
+
+  await assert.rejects(
+    () => collect(withModelFallback([target('only', reasoningOnly)]).getStreamedResponse(req())),
+    (err: unknown) => err instanceof BoundaryError && err.kind === 'model.empty_completion',
+  );
+});
+
+test('private reasoning updates run liveness without escaping before an actionable item', async () => {
+  const { harnessRunContextStorage, ToolCallsCounter } = await import('./brackets.js');
+  const context = {
+    sessionId: 'private-reasoning-liveness',
+    counter: new ToolCallsCounter(8),
+    privateModelActivityAt: undefined as number | undefined,
+  };
+  const reasoningOnly = model({ getStreamedResponse: async function* () {
+    yield {
+      type: 'model',
+      event: { type: 'reasoning-delta', delta: 'active private work' },
+    } as any;
+  } });
+
+  await assert.rejects(
+    () => harnessRunContextStorage.run(
+      context,
+      () => collect(withModelFallback([target('liveness-only', reasoningOnly)]).getStreamedResponse(req())),
+    ),
+    (err: unknown) => err instanceof BoundaryError && err.kind === 'model.empty_completion',
+  );
+  assert.equal(typeof context.privateModelActivityAt, 'number');
+  assert.ok((context.privateModelActivityAt ?? 0) > 0);
+});
+
+test('reasoning may run past the first-byte budget when it eventually yields a tool', async () => {
+  let rescueCalls = 0;
+  const slowReasoningThenTool = model({ getStreamedResponse: async function* () {
+    yield {
+      type: 'model',
+      event: { type: 'reasoning-delta', delta: 'working' },
+    } as any;
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.output_item.added',
+        item: { type: 'function_call', call_id: 'call-slow', name: 'read_file', arguments: '{}' },
+      },
+    } as any;
+    yield {
+      type: 'response_done',
+      response: { output: [{ type: 'function_call', call_id: 'call-slow', name: 'read_file', arguments: '{}' }] },
+    } as any;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'should not run' } as any;
+  } });
+
+  const got = await collect(withModelFallback([
+    target('reasoning-then-tool', slowReasoningThenTool),
+    target('rescue', rescue),
+  ], { firstByteTimeoutMs: 40 }).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 0);
+  assert.ok(got.some((event) => (event as any).event?.item?.type === 'function_call'));
+});
+
+test('non-streamed reasoning-only response falls over to an actionable brain', async () => {
+  let rescueCalls = 0;
+  const reasoningOnly = model({
+    getResponse: async () => ({
+      output: [{ type: 'reasoning', content: [{ type: 'reasoning_text', text: 'private' }] }],
+      usage: { outputTokens: 4_096 },
+    } as never),
+  });
+  const rescue = model({
+    getResponse: async () => {
+      rescueCalls += 1;
+      return resp('actionable');
+    },
+  });
+  const result = await withModelFallback([
+    target('reasoning-only', reasoningOnly),
+    target('rescue', rescue),
+  ]).getResponse(req());
+  assert.equal(rescueCalls, 1);
+  assert.equal((result.output[0] as any).content, 'actionable');
+});
+
+test('reasoning-only silence is remembered across fresh wrappers in one Runner.run', async () => {
+  const runSilencedLabels = new Set<string>();
+  let primaryCalls = 0;
+  let rescueCalls = 0;
+  const reasoningOnly = model({
+    getResponse: async () => {
+      primaryCalls += 1;
+      return {
+        output: [{ type: 'reasoning', content: [{ type: 'reasoning_text', text: 'private' }] }],
+        usage: { outputTokens: 4_096 },
+      } as never;
+    },
+  });
+  const rescue = model({
+    getResponse: async () => {
+      rescueCalls += 1;
+      return resp('actionable');
+    },
+  });
+  const chain = [target('reasoning-run-primary', reasoningOnly), target('reasoning-run-rescue', rescue)];
+
+  await withModelFallback(chain, { runSilencedLabels }).getResponse(req());
+  await withModelFallback(chain, { runSilencedLabels }).getResponse(req());
+
+  assert.equal(primaryCalls, 1, 'later SDK iterations skip the lane that already completed reasoning-only');
+  assert.equal(rescueCalls, 2);
+  assert.deepEqual([...runSilencedLabels], ['reasoning-run-primary']);
+});
+
+test('native compaction is durable continuation progress and never switches providers', async () => {
+  let rescueCalls = 0;
+  const compacting = model({ getStreamedResponse: async function* () {
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.output_item.added',
+        item: { type: 'compaction', encryptedContent: 'opaque-provider-state' },
+      },
+    } as any;
+    yield {
+      type: 'response_done',
+      response: { output: [{ type: 'compaction', encryptedContent: 'opaque-provider-state' }] },
+    } as any;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'incorrect replay' } as any;
+  } });
+
+  const got = await collect(withModelFallback([
+    target('codex-compaction', compacting),
+    target('other-provider', rescue),
+  ]).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 0);
+  assert.ok(got.some((event) => (event as any).event?.item?.type === 'compaction'));
+});
+
+test('caller abort during buffered reasoning never dispatches a rescue brain', async () => {
+  const controller = new AbortController();
+  let rescueCalls = 0;
+  const reasoningUntilAbort = model({ getStreamedResponse: async function* (request: any) {
+    yield {
+      type: 'model',
+      event: { type: 'reasoning-delta', delta: 'working until cancelled' },
+    } as any;
+    await new Promise<void>((_resolve, reject) => {
+      request?.signal?.addEventListener?.('abort', () => reject(new Error('caller aborted')), { once: true });
+    });
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'must not run' } as any;
+  } });
+
+  setTimeout(() => controller.abort(), 20);
+  await assert.rejects(() => collect(withModelFallback([
+    target('abort-primary', reasoningUntilAbort),
+    target('abort-rescue', rescue),
+  ]).getStreamedResponse({ ...req(), signal: controller.signal } as never)));
+  assert.equal(rescueCalls, 0);
+});
+
+test('tool-call content commits the stream, so a later failure is not replayed on another model', async () => {
+  let rescueCalls = 0;
+  const toolThenFailure = model({ getStreamedResponse: async function* () {
+    yield { type: 'response_started' } as any;
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.output_item.added',
+        item: { type: 'function_call', call_id: 'call-1', name: 'write_record', arguments: '' },
+      },
+    } as any;
+    throw overload();
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'duplicate tool turn' } as any;
+  } });
+  await assert.rejects(() => collect(withModelFallback([
+    target('tool-primary', toolThenFailure),
+    target('tool-rescue', rescue),
+  ]).getStreamedResponse(req())));
+  assert.equal(rescueCalls, 0);
 });
 
 test('force-overload knob (dev-gated) skips the primary so the next brain answers', async () => {
@@ -233,6 +571,41 @@ test('firstByteTimeoutMs: a brain that answers quickly is NOT falsely failed ove
   const out = await collect(withModelFallback([target('fast', fast), target('codex', codex)], { firstByteTimeoutMs: 50 }).getStreamedResponse(req()));
   assert.equal(nextCalls, 0, 'a prompt brain is never failed over');
   assert.ok((out as any[]).some((e) => e.delta === 'fast reply'));
+});
+
+test('run-scoped silent memory avoids paying the same first-byte timeout twice in one harness turn', async () => {
+  const runSilencedLabels = new Set<string>();
+  let hungCalls = 0;
+  let rescueCalls = 0;
+  const hung = model({ getResponse: async () => {
+    hungCalls += 1;
+    throw new BoundaryError({
+      kind: 'model.transport_timeout',
+      retryable: true,
+      userMessage: '',
+      operatorMessage: 'provider stayed silent',
+    });
+  } });
+  const rescue = model({ getResponse: async () => {
+    rescueCalls += 1;
+    return resp('rescued');
+  } });
+
+  // RouterModelProvider resolves a fresh FallbackModel for each SDK model turn.
+  // Both wrappers share the harness run's set, so the second turn must start on
+  // the already-proven rescue lane instead of burning another timeout.
+  await withModelFallback(
+    [target('silent-primary', hung), target('healthy-rescue', rescue)],
+    { runSilencedLabels },
+  ).getResponse(req());
+  await withModelFallback(
+    [target('silent-primary', hung), target('healthy-rescue', rescue)],
+    { runSilencedLabels },
+  ).getResponse(req());
+
+  assert.equal(hungCalls, 1, 'one silent probe per harness turn, not one per model iteration');
+  assert.equal(rescueCalls, 2);
+  assert.deepEqual([...runSilencedLabels], ['silent-primary']);
 });
 
 test('isFalloverError: a brain AUTH failure is recoverable → fall over to a valid brain (not terminal)', () => {

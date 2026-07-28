@@ -20,6 +20,9 @@ import {
   parseShellToolOutput,
   runCodeModeForSession,
   _setCodeModeToolsForTests,
+  _setCodeModeMcpResolverForTests,
+  _setExternalMcpToolsForTests,
+  listCodeModeTools,
 } from './code-mode-tool.js';
 
 test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () => {
@@ -94,6 +97,59 @@ test('MCP tools are allowed in-sandbox even when local writes are OFF (gated by 
     assert.equal(isCodeModeToolAllowed('totally_made_up_tool'), false, 'a non-namespaced unknown is refused');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
+  }
+});
+
+test('local-only scope is a hard code-mode authority wall before discovery or provider dispatch', async () => {
+  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  let discoveryCalls = 0;
+  let resolverCalls = 0;
+  let listCalls = 0;
+  let dispatchCalls = 0;
+  _setExternalMcpToolsForTests(async () => {
+    discoveryCalls += 1;
+    return [{ name: 'proof__read', description: 'must stay unreachable' }];
+  });
+  _setCodeModeMcpResolverForTests(() => {
+    resolverCalls += 1;
+    return {
+      listTools: async () => {
+        listCalls += 1;
+        return [{ name: 'proof__read' }];
+      },
+      callTool: async () => {
+        dispatchCalls += 1;
+        return 'should-not-run';
+      },
+    };
+  });
+  try {
+    await withHarnessRunContext(
+      {
+        sessionId: 'sess-local-only-code-mode',
+        counter: new ToolCallsCounter(20),
+        mcpToolScope: {
+          reason: 'explicit local-only regression',
+          allowedServerSlugs: [],
+          maxTools: 0,
+        },
+      },
+      async () => {
+        const inventory = await listCodeModeTools() as { mcp: unknown[] };
+        assert.deepEqual(inventory.mcp, [], 'discovery surface is empty inside local-only scope');
+        await assert.rejects(
+          () => dispatchCodeModeTool('proof__read', {}, 'sess-local-only-code-mode'),
+          /MCP_SCOPE_DENIED/,
+        );
+      },
+    );
+    assert.equal(discoveryCalls, 0, 'local-only listTools must not touch the external inventory seam');
+    assert.equal(resolverCalls, 0, 'provider factory/spawn must not be resolved');
+    assert.equal(listCalls, 0, 'provider listTools must not run');
+    assert.equal(dispatchCalls, 0, 'provider callTool must not run');
+  } finally {
+    _setExternalMcpToolsForTests(null);
+    _setCodeModeMcpResolverForTests(null);
   }
 });
 

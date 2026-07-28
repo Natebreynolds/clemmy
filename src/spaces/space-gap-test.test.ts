@@ -83,6 +83,41 @@ test('send action WITH a recipient key in template → no recipient question', (
   assert.equal(gaps.filter((g) => g.actionId === 'send_email').length, 0);
 });
 
+test('local post approval is not misclassified as an outbound recipient send', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({
+      actions: [{
+        id: 'approve_post',
+        label: 'Approve locally',
+        runner: 'approve-post.mjs',
+        argsTemplate: { external: false },
+      }],
+    }),
+    '<html><script>clem.action("approve_post", { postId: "synthetic-1" })</script></html>',
+  );
+  assert.equal(
+    gaps.some((g) => g.actionId === 'approve_post' && /recipient|outside world/i.test(g.question)),
+    false,
+  );
+});
+
+test('broadcast publishing does not ask for an email-style recipient', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({
+      actions: [{
+        id: 'publish_post',
+        label: 'Publish post',
+        composioSlug: 'LINKEDIN_CREATE_POST',
+      }],
+    }),
+    '<html><script>clem.action("publish_post", { text: "approved copy" })</script></html>',
+  );
+  assert.equal(
+    gaps.some((g) => g.actionId === 'publish_post' && /recipient/i.test(g.question)),
+    false,
+  );
+});
+
 test('zero-row source from the smoke → a question', () => {
   const gaps = analyzeSpaceGaps(
     rec({ dataSources: [{ id: 'contacts', runner: 'r.mjs' }] }),
@@ -90,6 +125,15 @@ test('zero-row source from the smoke → a question', () => {
     ['contacts'],
   );
   assert.ok(gaps.some((g) => g.sourceId === 'contacts' && /0 rows/.test(g.question)));
+});
+
+test('an explicitly valid empty product state does not become a fake failure', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'content-calendar', runner: 'r.mjs', allowEmpty: true }] }),
+    '<html><script>clem.data().then(data => render(data["content-calendar"]))</script></html>',
+    ['content-calendar'],
+  );
+  assert.equal(gaps.length, 0);
 });
 
 test('report is capped at 5 questions', () => {

@@ -13,6 +13,7 @@ import {
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
+import { externalMcpScopeForAllowedToolLock } from '../../agents/external-mcp-scope-lock.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -253,6 +254,10 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   parkApprovals?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
   const fullLane = Boolean(args.fullLane);
+  const nativeMcpToolScope = externalMcpScopeForAllowedToolLock({
+    allowed: args.step.allowedTools,
+    reason: 'Claude workflow step allowedTools lock',
+  });
   // Subagent visibility: a workflow STEP (and each forEach item — this runs per
   // item) IS a specialized agent. Workflow steps run the 'worker' tool profile,
   // which deliberately EXCLUDES run_worker, so the run_worker choke-point never
@@ -310,6 +315,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     // its tool schemas bloated the step's input context. Spreads into the
     // auto-continue call below too, so the continuation keeps the same scope.
     nativeMcpScopeInput: args.prompt,
+    ...(nativeMcpToolScope !== undefined ? { nativeMcpToolScope } : {}),
     agentic: fullLane,
     approvalMode: args.parkApprovals ? 'park' as const : 'wait' as const,
     maxTurns: maxTurns(args.step, fullLane),

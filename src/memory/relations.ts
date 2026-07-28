@@ -1198,6 +1198,160 @@ function exactIdentifierMatch(text: string, value: string): boolean {
   return text.toLowerCase().includes(value.toLowerCase());
 }
 
+export interface ExtractedFactEntityEvidenceReconciliationStats {
+  linksScanned: number;
+  evidenceScanned: number;
+  repaired: number;
+  downgraded: number;
+  ambiguous: number;
+}
+
+/**
+ * Repair legacy `extracted` fact→entity rows that predate mandatory episode
+ * provenance. A row remains stored graph truth only when one usable
+ * fact-evidence episode deterministically supports the same unique identity in
+ * both the canonical fact and its exact persisted excerpt. If no such episode
+ * exists—or more than one could be the source—the link is preserved only as an
+ * `inferred_text` overlay. We never guess an episode merely to make readiness
+ * green.
+ */
+export function reconcileExtractedFactEntityEvidence(
+  opts: { linkLimit?: number } = {},
+): ExtractedFactEntityEvidenceReconciliationStats {
+  return reconcileExtractedFactEntityEvidenceInDatabase(openMemoryDb(), opts);
+}
+
+export function reconcileExtractedFactEntityEvidenceInDatabase(
+  db: Database.Database,
+  opts: { linkLimit?: number } = {},
+): ExtractedFactEntityEvidenceReconciliationStats {
+  const linkLimit = Math.max(1, Math.min(100_000, Math.floor(opts.linkLimit ?? 50_000)));
+  const rows = db.prepare(`
+    SELECT fe.fact_id, fe.entity_id, fe.confidence, fe.evidence_episode_id,
+           cf.content, e.entity_type
+    FROM fact_entities fe
+    JOIN consolidated_facts cf ON cf.id = fe.fact_id
+    JOIN entities e ON e.id = fe.entity_id
+    WHERE fe.link_type = 'extracted'
+      AND (
+        fe.evidence_episode_id IS NULL
+        OR length(trim(COALESCE(fe.evidence_excerpt, ''))) = 0
+      )
+    ORDER BY cf.active DESC, cf.updated_at DESC, fe.fact_id DESC, fe.entity_id
+    LIMIT ?
+  `).all(linkLimit) as Array<{
+    fact_id: number;
+    entity_id: number;
+    confidence: number;
+    evidence_episode_id: string | null;
+    content: string;
+    entity_type: string;
+  }>;
+  const stats: ExtractedFactEntityEvidenceReconciliationStats = {
+    linksScanned: rows.length,
+    evidenceScanned: 0,
+    repaired: 0,
+    downgraded: 0,
+    ambiguous: 0,
+  };
+  if (rows.length === 0) return stats;
+
+  const readEvidence = db.prepare(`
+    SELECT fve.episode_id, fve.excerpt,
+           COALESCE(fve.source_uri, me.source_uri) AS source_uri
+    FROM fact_evidence fve
+    JOIN memory_episodes me ON me.id = fve.episode_id
+    WHERE fve.fact_id = ?
+      AND length(trim(fve.excerpt)) > 0
+      AND me.status IN ('available','partial')
+    ORDER BY me.occurred_at DESC, fve.ordinal ASC, fve.episode_id
+  `);
+  const readIdentifiers = db.prepare(`
+    SELECT scheme, value_norm FROM entity_identifiers
+    WHERE entity_id = ? AND scheme IN ('email','domain')
+    ORDER BY confidence DESC
+  `);
+  const repair = db.prepare(`
+    UPDATE fact_entities
+    SET evidence_episode_id = ?, evidence_excerpt = ?
+    WHERE fact_id = ? AND entity_id = ? AND link_type = 'extracted'
+  `);
+  const downgrade = db.prepare(`
+    UPDATE fact_entities
+    SET link_type = 'inferred_text',
+        confidence = MIN(confidence, 0.55),
+        evidence_episode_id = NULL,
+        evidence_excerpt = NULL
+    WHERE fact_id = ? AND entity_id = ? AND link_type = 'extracted'
+  `);
+  const index = buildEntityGroundingIndex(db);
+
+  db.transaction(() => {
+    for (const row of rows) {
+      const evidence = (readEvidence.all(row.fact_id) as Array<{
+        episode_id: string;
+        excerpt: string;
+        source_uri: string | null;
+      }>).filter((item) =>
+        row.evidence_episode_id == null || item.episode_id === row.evidence_episode_id);
+      stats.evidenceScanned += evidence.length;
+
+      const names = entityNamesForBackfill(db, row.entity_id);
+      const strongNames = names.filter((name) => {
+        const normalized = normalizedGroundingName(name);
+        const specificEnough = row.entity_type === 'person'
+          ? normalized.split(' ').length >= 2
+          : normalized.length >= 3;
+        return specificEnough && (index.nameOwners.get(normalized)?.size ?? 0) === 1;
+      });
+      const identifiers = readIdentifiers.all(row.entity_id) as Array<{
+        scheme: string;
+        value_norm: string;
+      }>;
+      const supporting = evidence.filter((item) => {
+        const nameSupported = strongNames.some((name) =>
+          exactGroundingNameMatch(row.content, name)
+          && exactGroundingNameMatch(item.excerpt, name));
+        const identifierSupported = identifiers.some((identifier) =>
+          (index.identifierOwners.get(`${identifier.scheme}:${identifier.value_norm}`)?.size ?? 0) === 1
+          && exactIdentifierMatch(row.content, identifier.value_norm)
+          && exactIdentifierMatch(item.excerpt, identifier.value_norm));
+        return nameSupported || identifierSupported;
+      });
+      const episodes = new Map<string, typeof supporting[number]>();
+      for (const item of supporting) {
+        if (!episodes.has(item.episode_id)) episodes.set(item.episode_id, item);
+      }
+
+      if (episodes.size === 1) {
+        const supported = episodes.values().next().value as typeof supporting[number];
+        repair.run(
+          supported.episode_id,
+          supported.excerpt.trim().slice(0, 1_500),
+          row.fact_id,
+          row.entity_id,
+        );
+        observeEntityFromEpisodeInDatabase(db, {
+          entityId: row.entity_id,
+          episodeId: supported.episode_id,
+          sourceFactId: row.fact_id,
+          sourceUri: supported.source_uri ?? undefined,
+          confidence: row.confidence,
+          sourceKind: 'fact_backfill',
+          incrementMention: false,
+        });
+        stats.repaired += 1;
+        continue;
+      }
+
+      if (episodes.size > 1) stats.ambiguous += 1;
+      downgrade.run(row.fact_id, row.entity_id);
+      stats.downgraded += 1;
+    }
+  })();
+  return stats;
+}
+
 function normalizedResourceGroundingName(value: string): string {
   return value.toLowerCase().replace(/\s+/g, ' ').trim();
 }

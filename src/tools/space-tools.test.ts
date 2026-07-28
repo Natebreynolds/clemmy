@@ -15,6 +15,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-too
 
 const { registerSpaceTools, deriveRunnerProvenance } = await import('./space-tools.js');
 const store = await import('../spaces/store.js');
+const { spaceActionNeedsApproval } = await import('../spaces/space-action-gate.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 function captureTools(): Record<string, Handler> {
@@ -161,6 +162,54 @@ test('space_save installs a newly-authored runner_path in one call', async () =>
     'process.stdout.write(JSON.stringify([]))',
   );
   assert.ok(existsSync(store.resolveInSpace('one-pass', 'data.json')), 'creation smoke runs the staged runner');
+});
+
+test('space_save preserves an exact local post-approval action without fake outbound remediation', async () => {
+  const slug = 'local-post-approval';
+  const viewDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-local-post-approval.html');
+  const dataDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-synthetic-posts.mjs');
+  const actionDraft = path.join(process.env.CLEMENTINE_HOME!, 'approve-post.mjs');
+  writeFileSync(
+    viewDraft,
+    '<html><script>clem.data().then(data => render(data.synthetic_posts)); function approve(id){return clem.action("approve_post", {postId:id})}</script></html>',
+    'utf-8',
+  );
+  writeFileSync(
+    dataDraft,
+    'process.stdout.write(JSON.stringify({posts:[{id:"synthetic-1",title:"Synthetic post"}]}))',
+    'utf-8',
+  );
+  writeFileSync(
+    actionDraft,
+    'process.stdout.write(JSON.stringify({ok:true,external:false}))',
+    'utf-8',
+  );
+
+  const out = text(await tools.space_save({
+    slug,
+    title: 'Local Post Approval',
+    view_path: viewDraft,
+    data_sources: [{
+      id: 'synthetic_posts',
+      runner_path: dataDraft,
+      allow_empty: false,
+    }],
+    actions: [{
+      id: 'approve_post',
+      label: 'Approve locally',
+      runner_path: actionDraft,
+      args_template_json: '{"external":false}',
+      confirm: false,
+    }],
+  }));
+
+  assert.match(out, /Created workspace "Local Post Approval"/);
+  assert.doesNotMatch(out, /confirm:true|outside world|recipient/i);
+  const rec = store.spaceStore.get(slug);
+  assert.equal(rec?.actions.length, 1, 'the valid local action remains declared');
+  assert.equal(rec?.actions[0].id, 'approve_post');
+  assert.notEqual(rec?.actions[0].confirm, true);
+  assert.equal(spaceActionNeedsApproval(rec!.actions[0]), false, 'the local click runs without an external approval card');
 });
 
 test('space_save preserves a newer installed runner repair over a stale runner_path', async () => {

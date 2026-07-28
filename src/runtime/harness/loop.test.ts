@@ -140,6 +140,53 @@ function makeApprovalRunStateWithInterruptions(
   return JSON.stringify(json);
 }
 
+test('fresh and approval-resume runs return unknown tools to the model with deferred-dispatch guidance', async () => {
+  resetEventLog();
+  const fresh = HarnessSession.create({ kind: 'chat' });
+  let freshOpts: Record<string, unknown> | null = null;
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: fresh.id,
+    input: 'Use the deferred file writer.',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items, opts) => {
+      freshOpts = opts;
+      return { history: items, lastResponseId: undefined, finalOutput: 'Done.' };
+    },
+  });
+
+  const agent = new Agent({ name: 'ResumeToolRecovery', instructions: 'test' });
+  const resumed = HarnessSession.create({ kind: 'chat' });
+  resumed.saveInterruptState(makeApprovalRunState(agent, 'approved_tool'));
+  let resumeOpts: Record<string, unknown> | null = null;
+  await resumePendingApproval({
+    agent,
+    sessionId: resumed.id,
+    decision: 'approve',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items, opts) => {
+      resumeOpts = opts;
+      return { history: items, lastResponseId: undefined, finalOutput: { ok: true } };
+    },
+  });
+
+  for (const [lane, opts] of [['fresh', freshOpts], ['resume', resumeOpts]] as const) {
+    assert.equal(opts?.toolNotFoundBehavior, 'return_error_to_model', `${lane} run must stay alive`);
+    const formatter = opts?.toolErrorFormatter as ((input: Record<string, unknown>) => unknown) | undefined;
+    assert.equal(typeof formatter, 'function', `${lane} run carries actionable recovery guidance`);
+    const message = String(await formatter?.({
+      kind: 'tool_not_found',
+      toolType: 'function',
+      toolName: 'write_file',
+      callId: 'missing-1',
+      defaultMessage: "Tool 'write_file' not found.",
+    }));
+    assert.match(message, /tool_search/);
+    assert.match(message, /call_tool/);
+    assert.match(message, /do not retry .* directly/i);
+  }
+});
+
 const COMPLEX_INPUT =
   'Pull my unread Outlook emails and the open Salesforce leads, then update each Airtable contact record and draft outreach for the warm ones';
 
@@ -5871,6 +5918,7 @@ test('stall judge: "deliver" verdict finalizes the ambiguous reply with no stuck
     const runner = scriptedRunner([{ finalOutput: `I’ll weave it in. ${novelReply}` }]);
     const result = await runConversation({
       agent: makeAgentStub(), sessionId: sess.id, input: 'ill send the copy over soon',
+      judgeFn: async () => ({ done: true, reason: 'the conversational reply is deliverable' }),
       makeRunner: makeRunnerStub, runRunner: runner,
     });
     assert.equal(result.status, 'completed');
@@ -5879,6 +5927,226 @@ test('stall judge: "deliver" verdict finalizes the ambiguous reply with no stuck
     assert.ok(completed.some((e) => (e.data as { reason?: string }).reason === 'stall_judge_delivered'));
     assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0, 'no stuck event on judge delivery');
     assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0, 'no retries burned');
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});
+
+test('stall judge: unstructured delivery still passes the zero-tool objective blocker before completion', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  let objectiveJudgeCalls = 0;
+  _setStallJudgeForTests(async () => 'deliver');
+  try {
+    const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+      runs += 1;
+      if (runs === 1) {
+        return {
+          history: items,
+          lastResponseId: undefined,
+          finalOutput: 'I’ll compile the complete launch brief now and return the validated risks and recommendations here shortly.',
+        };
+      }
+      const ee = runner as unknown as EventEmitter;
+      const runContext = { context: opts.context };
+      const tool = { name: 'web_search' };
+      const details = { toolCall: { callId: 'launch-research', arguments: '{"query":"launch risks"}' } };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+      ee.emit(
+        'agent_tool_end',
+        runContext,
+        { name: 'Orchestrator' },
+        tool,
+        'Verified research evidence for audience, positioning, channel risks, and mitigations.',
+        details,
+      );
+      const decision = {
+        summary: 'Launch brief completed from verified research.',
+        reply: 'The launch brief now covers the audience, positioning, channel risks, and concrete mitigations.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      };
+      ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+      return { history: items, lastResponseId: undefined, finalOutput: decision };
+    };
+
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Research the launch and produce a complete brief with risks and recommendations.',
+      judgeCompletion: true,
+      judgeFn: async () => {
+        objectiveJudgeCalls += 1;
+        return { done: false, reason: 'Zero tool calls and no launch brief evidence were produced.' };
+      },
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(runs, 2, 'judge salvage cannot turn a zero-tool action promise into an early completion');
+    assert.equal(objectiveJudgeCalls, 1, 'the ordinary objective gate audits the salvaged first turn');
+    const completionVerdicts = listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+      .filter((event) => event.data.door === 'completion');
+    assert.equal(completionVerdicts[0]?.data.pass, false);
+    assert.match(String(completionVerdicts[0]?.data.reason ?? ''), /zero tool calls/i);
+    const completions = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.equal(completions.some((event) => event.turn === 1), false, 'the salvaged promise is never banked as delivered');
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});
+
+test('stall judge: structured delivery cannot certify a fresh external write with only stale evidence', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['Sheet1!E1:G5'], receipt: 'stale-write-before-request' },
+  });
+  let runs = 0;
+  let stallJudgeCalls = 0;
+  let objectiveJudgeCalls = 0;
+  _setStallJudgeForTests(async () => {
+    stallJudgeCalls += 1;
+    return 'deliver';
+  });
+  try {
+    const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+      runs += 1;
+      if (runs === 1) {
+        const blockedDecision = {
+          summary: 'Google Sheets tools are not available in this run.',
+          reply: 'I cannot complete the requested Google Sheets write because its tools are not available in this run.',
+          done: true,
+          nextAction: 'completed',
+          reason: 'Google Sheets tool access is unavailable.',
+        };
+        return { history: items, lastResponseId: undefined, finalOutput: blockedDecision };
+      }
+
+      const ee = runner as unknown as EventEmitter;
+      const runContext = { context: opts.context };
+      const writeTool = { name: 'composio_execute_tool' };
+      const writeDetails = {
+        toolCall: {
+          callId: 'stall-salvage-fresh-write',
+          arguments: '{"tool_slug":"GOOGLESHEETS_VALUES_UPDATE","arguments":{"range":"Sheet1!E1:G5"}}',
+        },
+      };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, writeTool, writeDetails);
+      appendEvent({
+        sessionId: sess.id,
+        turn: 2,
+        role: 'system',
+        type: 'external_write',
+        data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['Sheet1!E1:G5'], receipt: 'fresh-write-after-request' },
+      });
+      ee.emit(
+        'agent_tool_end',
+        runContext,
+        { name: 'Orchestrator' },
+        writeTool,
+        'fresh write receipt fresh-write-after-request',
+        writeDetails,
+      );
+      const readDetails = {
+        toolCall: {
+          callId: 'stall-salvage-readback',
+          arguments: '{"tool_slug":"GOOGLESHEETS_BATCH_GET","arguments":{"ranges":["Sheet1!E1:G5"]}}',
+        },
+      };
+      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, writeTool, readDetails);
+      ee.emit(
+        'agent_tool_end',
+        runContext,
+        { name: 'Orchestrator' },
+        writeTool,
+        'read-back matched the fresh write receipt',
+        readDetails,
+      );
+      const completedDecision = {
+        summary: 'Fresh Google Sheets write and read-back verified.',
+        reply: 'The requested Google Sheets range now has a fresh write receipt, and the immediate read-back matched.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      };
+      ee.emit('agent_end', runContext, { name: 'Orchestrator' }, completedDecision);
+      return { history: items, lastResponseId: undefined, finalOutput: completedDecision };
+    };
+
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Perform exactly one fresh Google Sheets value write to Sheet1!E1:G5 and read it back.',
+      judgeCompletion: true,
+      judgeFn: async () => {
+        objectiveJudgeCalls += 1;
+        return { done: true, reason: 'the reply claims the task is resolved' };
+      },
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(stallJudgeCalls, 1);
+    assert.equal(objectiveJudgeCalls, 1, 'the structured salvage reaches the ordinary completion judge');
+    assert.equal(runs, 2, 'stale evidence cannot let the structured salvage finalize');
+    const completionVerdicts = listEventsForConv(sess.id, { types: ['verdict_recorded'] })
+      .filter((event) => event.data.door === 'completion');
+    assert.equal(completionVerdicts[0]?.data.pass, false, 'freshness overrides the language-model PASS');
+    assert.match(String(completionVerdicts[0]?.data.reason ?? ''), /no external-write receipt after the user event/i);
+    const completions = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.equal(completions.some((event) => event.turn === 1), false, 'the stale structured salvage is never banked');
+    assert.equal(listEventsForConv(sess.id, { types: ['external_write'] }).length, 2, 'one stale fixture plus one request-bound write');
+  } finally {
+    _setStallJudgeForTests(null);
+  }
+});
+
+test('stall judge: structured delivery preserves an explicit blocked state instead of manufacturing completed', async () => {
+  const { _setStallJudgeForTests } = await import('./stall-judge.js');
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let objectiveJudgeCalls = 0;
+  _setStallJudgeForTests(async () => 'deliver');
+  try {
+    const blockedDecision = {
+      summary: 'Salesforce is not connected.',
+      reply: 'I cannot complete this pull because Salesforce tools are not available in this run. Connect Salesforce in the Connections screen, then I can continue.',
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'Salesforce connection is required.',
+    };
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Pull the prospects from Salesforce.',
+      judgeCompletion: true,
+      judgeFn: async () => {
+        objectiveJudgeCalls += 1;
+        return { done: true, reason: 'reply is readable' };
+      },
+      makeRunner: makeRunnerStub,
+      runRunner: scriptedRunner([{ finalOutput: blockedDecision }]),
+    });
+
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.lastDecision?.nextAction, 'awaiting_user_input');
+    assert.equal(objectiveJudgeCalls, 0, 'a reply judge cannot rewrite an explicit pause into a completion candidate');
+    const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+    assert.ok(asks.some((event) => /Connections screen/i.test(String(event.data.question ?? ''))));
+    const falseGreens = listEventsForConv(sess.id, { types: ['conversation_completed'] })
+      .filter((event) => event.data.delivered === true && event.data.reason === 'stall_judge_delivered');
+    assert.equal(falseGreens.length, 0);
   } finally {
     _setStallJudgeForTests(null);
   }
@@ -5982,23 +6250,25 @@ test('stall judge: an instructional "show me the command" answer is judged, not 
   }
 });
 
-test('stall judge: an honest "integration not connected" report is judged and deliverable; judge stall keeps the retry', async () => {
+test('stall judge: an honest "integration not connected" report is visible but parked as blocked', async () => {
   const { _setStallJudgeForTests } = await import('./stall-judge.js');
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   let judgeCalls = 0;
   _setStallJudgeForTests(async () => { judgeCalls += 1; return 'deliver'; });
   try {
-    const honestGap = 'I can’t pull those accounts because there are no Salesforce tools connected in this run — connect Salesforce in the Connections screen and I’ll run the pull immediately after.';
+    const honestGap = 'I cannot complete this Salesforce pull because there are no Salesforce tools connected in this run — connect Salesforce in the Connections screen and I’ll run it immediately after.';
     const runner = scriptedRunner([{ finalOutput: honestGap }]);
     const result = await runConversation({
       agent: makeAgentStub(), sessionId: sess.id, input: 'pull the 15 prospects from salesforce',
       makeRunner: makeRunnerStub, runRunner: runner,
     });
-    assert.equal(result.status, 'completed');
+    assert.equal(result.status, 'awaiting_user_input');
     assert.equal(judgeCalls, 1, 'the tool-unavailable claim is judged, not auto-condemned');
     const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
     assert.ok(completed.some((e) => /Connections screen/.test(String((e.data as { reply?: string }).reply ?? ''))), 'the honest gap report reaches the user');
+    assert.ok(completed.every((e) => (e.data as { delivered?: boolean }).delivered === false), 'visible blocker is never banked as delivered');
+    assert.ok(completed.every((e) => (e.data as { reason?: string }).reason !== 'stall_judge_delivered'));
   } finally {
     _setStallJudgeForTests(null);
   }

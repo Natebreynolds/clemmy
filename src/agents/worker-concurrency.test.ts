@@ -83,6 +83,32 @@ test('queued acquires wait until a slot frees (FIFO hand-off)', async () => {
   });
 });
 
+test('a queued worker re-checks cancellation after slot hand-off and never enters provider work', async () => {
+  await withEnv({ CLEMMY_WORKER_MAX_CONCURRENCY: '1' }, async () => {
+    _resetWorkerConcurrencyForTest();
+    const holder = await acquireWorkerSlot('sess-stop');
+    let stopped = false;
+    let enteredProviderWork = false;
+    const queued = acquireWorkerSlot('sess-stop', undefined, {
+      assertCanStart: () => {
+        if (stopped) throw new Error('stop requested');
+      },
+    }).then((release) => {
+      enteredProviderWork = true;
+      release();
+    });
+
+    await Promise.resolve();
+    stopped = true;
+    holder();
+
+    await assert.rejects(queued, /stop requested/);
+    assert.equal(enteredProviderWork, false, 'cancelled waiter must not cross the provider-dispatch edge');
+    assert.equal(_activeWorkerSlots('sess-stop'), 0, 'a cancelled hand-off releases its claimed slot');
+    assert.equal(_activeGlobalWorkerSlots(), 0, 'global capacity is not leaked by cancellation');
+  });
+});
+
 test('onQueued fires ONLY when the caller actually waits, with the queue depth + caps', async () => {
   await withEnv({ CLEMMY_WORKER_MAX_CONCURRENCY: '1', CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: '5' }, async () => {
     _resetWorkerConcurrencyForTest();

@@ -46,6 +46,43 @@ test('effectiveReflectionTool unwraps schema-on-demand call_tool to its exact in
   assert.equal(effectiveReflectionTool('call_tool', details as never), 'composio_search_tools');
 });
 
+test('effectiveReflectionTool recursively unwraps deferred call_tool to the actual Composio action', () => {
+  const details = {
+    toolCall: {
+      arguments: JSON.stringify({
+        name: 'call_tool',
+        args_json: JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: 'GOOGLEDRIVE_DOWNLOAD_FILE',
+            arguments: '{"file_id":"file_1"}',
+          }),
+        }),
+      }),
+    },
+  };
+  assert.equal(effectiveReflectionTool('call_tool', details as never), 'GOOGLEDRIVE_DOWNLOAD_FILE');
+});
+
+test('effectiveReflectionTool unwraps namespaced and dynamic Composio carriers to the canonical action', () => {
+  const namespaced = {
+    toolCall: {
+      arguments: JSON.stringify({
+        tool_slug: 'SLACK_CONVERSATIONS_HISTORY',
+        arguments: '{}',
+      }),
+    },
+  };
+  assert.equal(
+    effectiveReflectionTool('mcp__clementine-local__composio_execute_tool', namespaced as never),
+    'SLACK_CONVERSATIONS_HISTORY',
+  );
+  assert.equal(
+    effectiveReflectionTool('mcp__clementine-local__cx_twitter_user_timeline', undefined),
+    'TWITTER_USER_TIMELINE',
+  );
+});
+
 test('effectiveReflectionTool passes through non-composio tools unchanged', () => {
   assert.equal(effectiveReflectionTool('read_file', undefined), 'read_file');
   assert.equal(effectiveReflectionTool(null, undefined), null);

@@ -14,6 +14,10 @@ import { Link } from 'react-router-dom';
 import { Users, ArrowUpRight } from 'lucide-react';
 import { ActivityRow, BatchRow, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
 import type { ActivityItem } from '@/lib/useChat';
+import {
+  settleTerminalActivity,
+  type ActivityTerminalOutcome,
+} from '@/lib/activity-presentation';
 
 function summarize(toolCount: number, agentCount: number, batchCount: number): string {
   const parts: string[] = [];
@@ -23,9 +27,10 @@ function summarize(toolCount: number, agentCount: number, batchCount: number): s
   return parts.length ? `Used ${parts.join(' · ')}` : 'Activity';
 }
 
-export function TurnActivity({ items, live, traceHref }: {
+export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
   items: ActivityItem[];
   live: boolean;
+  terminalOutcome?: ActivityTerminalOutcome;
   /** Deep link to this run's card on the Tasks board (the ONE expanded live-run
    *  view). The inline strip is the compact summary of the SAME run — this link
    *  is the seam that keeps the two surfaces from reading as duplicates. */
@@ -39,8 +44,7 @@ export function TurnActivity({ items, live, traceHref }: {
 
   if (items.length === 0) return null;
 
-  // Turn's over → a still-'running' row reads as done (no perpetual spinners).
-  const view = live ? items : items.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const } : a));
+  const view = settleTerminalActivity(items, live ? undefined : (terminalOutcome ?? 'interrupted'));
   const agents = view.filter((a) => a.kind === 'agent');
   const tools = view.filter((a) => a.kind === 'tool');
   const batches = view.filter((a) => a.kind === 'batch');

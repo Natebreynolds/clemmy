@@ -28,6 +28,14 @@ const dmgHookText = readFileSync(
   new URL('../apps/desktop/build/after-all-artifact-build.cjs', import.meta.url),
   'utf-8',
 );
+const afterPackHookText = readFileSync(
+  new URL('../apps/desktop/build/after-pack.cjs', import.meta.url),
+  'utf-8',
+);
+const macNativeDepsText = readFileSync(
+  new URL('../apps/desktop/scripts/mac-native-deps.mjs', import.meta.url),
+  'utf-8',
+);
 
 function runScripts(job) {
   return (job?.steps ?? [])
@@ -36,18 +44,22 @@ function runScripts(job) {
     .join('\n');
 }
 
-test('manual desktop candidates require a prerelease version and cannot publish', () => {
+test('manual desktop candidates require a prerelease version, retain both platforms, and cannot publish', () => {
   const input = workflow.on?.workflow_dispatch?.inputs?.candidate_version;
   assert.equal(input?.required, true);
   assert.match(String(input?.description ?? ''), /prerelease SemVer/i);
 
   const publisher = workflow.jobs?.['publish-release'];
   assert.match(String(publisher?.if ?? ''), /github\.event_name == 'push'/);
-  assert.doesNotMatch(runScripts(workflow.jobs?.['release-mac']), /gh release (?:create|upload|edit)/);
-  assert.match(
-    (workflow.jobs?.['release-mac']?.steps ?? []).map((step) => step?.uses ?? '').join('\n'),
-    /actions\/upload-artifact@v4/,
-  );
+  for (const jobName of ['release-mac', 'release-windows']) {
+    const job = workflow.jobs?.[jobName];
+    assert.doesNotMatch(runScripts(job), /gh release (?:create|upload|edit)/);
+    assert.match(
+      (job?.steps ?? []).map((step) => step?.uses ?? '').join('\n'),
+      /actions\/upload-artifact@v4/,
+    );
+  }
+  assert.match(String(workflow.jobs?.['release-windows']?.if ?? ''), /workflow_dispatch/);
 });
 
 test('candidate dispatcher defaults to the next patch prerelease and rejects downgrade candidates', () => {
@@ -80,6 +92,19 @@ test('desktop releases securely vendor Recall and rebuild self-validating Whispe
   assert.match(windowsReleaseText, /vendor:whisper.*x86_64-pc-windows-msvc.*--force/);
   assert.match(String(desktopPackage.scripts?.['package:dist'] ?? ''), /vendor:recall-native/);
   assert.match(String(desktopPackage.scripts?.['package:mac:unsigned'] ?? ''), /WHISPER_ALLOW_VALIDATED_CACHE=true/);
+});
+
+test('dual-architecture macOS packages stage and fail-closed verify target native dependencies', () => {
+  assert.equal(desktopPackage.build?.afterPack, 'build/after-pack.cjs');
+  assert.match(dualArchScriptText, /mac-native-deps\.mjs stage-x64/);
+  assert.match(dualArchScriptText, /mac-native-deps\.mjs verify/);
+  assert.match(dualArchScriptText, /verify_local_embeddings_packaged/);
+  assert.match(afterPackHookText, /preparePackagedMacDaemon/);
+  assert.match(macNativeDepsText, /@img\/sharp-darwin-x64/);
+  assert.match(macNativeDepsText, /@img\/sharp-libvips-darwin-x64/);
+  assert.match(macNativeDepsText, /onnxruntime-node/);
+  assert.match(macNativeDepsText, /transformers\.clementine-wasm\.mjs/);
+  assert.match(macNativeDepsText, /assertMachOArchitecture/);
 });
 
 test('macOS releases build, sign, package, and probe the native notch click helper', () => {
@@ -121,6 +146,8 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   const preflight = workflow.jobs?.preflight;
   const scripts = runScripts(preflight);
   assert.match(scripts, /npm test/);
+  assert.match(scripts, /npm run check:public-hygiene/);
+  assert.match(scripts, /npm run test:public-hygiene/);
   assert.match(scripts, /npm run test:release-assets/);
   assert.match(scripts, /npm run typecheck/);
   assert.match(scripts, /npm run bench:gates/);
@@ -129,6 +156,9 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   assert.match(scripts, /npm run eval:jobs/);
   assert.match(scripts, /refs\/remotes\/origin\/main/);
   assert.match(scripts, /tag_sha.*main_sha/s);
+  assert.match(scripts, /source_version.*package\.json/s);
+  assert.match(scripts, /desktop_source_version.*apps\/desktop\/package\.json/s);
+  assert.match(scripts, /source_version.*tag_version.*desktop_source_version.*tag_version/s);
   assert.equal(workflow.jobs?.['release-mac']?.needs, 'preflight');
   assert.equal(workflow.jobs?.['release-windows']?.needs, 'preflight');
   assert.equal(workflow.concurrency?.['cancel-in-progress'], false);

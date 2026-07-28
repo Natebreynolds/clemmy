@@ -50,6 +50,7 @@ import { normalizeComposioBatchItemArgs, validateComposioArgs } from '../tools/c
 import { getCachedToolSchema } from '../tools/composio-schema-cache.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { isCallToolAliasName, resolveCallToolAlias } from '../tools/call-tool-alias.js';
+import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 
 const logger = pino({ name: 'clementine-next.batch-runner' });
 
@@ -512,6 +513,10 @@ function previewOf(value: unknown): string {
   return (s ?? '').slice(0, 200);
 }
 
+function textOf(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value ?? '');
+}
+
 function errorLooksTransient(message: string): boolean {
   // "NOT FOUND (slug=…)" is composio's COLD-START version-resolve race: the
   // resolve step 404s once before any side effect, then the warm registry
@@ -681,18 +686,20 @@ export async function runBatchPlan(
       attempts += 1;
       try {
         const out = await dispatchBatchItemTool(dispatchTool, args, sessionId, counter, certifiedBatch);
-        const text = previewOf(out);
+        const fullText = textOf(out);
+        const text = fullText.slice(0, 200);
+        const structuredFailure = detectStructuredToolFailure(fullText);
         // A "polite failure" comes back as a NORMAL result whose text is an
         // error banner — composio's ⚠️ banners AND the @openai/agents SDK's
         // defaultToolErrorFunction ("An error occurred while running the
         // tool…"), which swallowed InvalidToolInputError for all 5 items of the
         // 2026-07-08 sheet batch while the ledger said 5/5 succeeded. Anchored
         // at the START of the text so results merely MENTIONING errors pass.
-        if (/^⚠️|^An error occurred while running the tool|^\s*(Error|InvalidToolInputError)\b|^Tool call (?:refused|blocked) by harness|_CHECK_FAILED:|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
-          lastError = text.slice(0, 200);
-          const rl = detectRateLimit(text);
+        if (structuredFailure.failed || /^⚠️|^An error occurred while running the tool|^\s*(Error|InvalidToolInputError)\b|^Tool call (?:refused|blocked) by harness|_CHECK_FAILED:|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
+          lastError = (structuredFailure.failed ? structuredFailure.summary : text).slice(0, 200);
+          const rl = detectRateLimit(fullText);
           if (rl) return { rateLimit: rl };
-          if (attempts < 2 && errorLooksTransient(text)) continue;
+          if (attempts < 2 && errorLooksTransient(fullText)) continue;
           return { outcome: { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError, idempotencyKey: key } };
         }
         return { outcome: { id: item.id, ok: true, attempts, ms: Date.now() - t0, resultPreview: text, idempotencyKey: key } };

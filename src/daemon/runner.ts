@@ -54,6 +54,7 @@ import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } f
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import {
+  finalizeExtractedFactEntityEvidenceOnBoot,
   finalizeGroundedEntityLinksOnBoot,
   finalizeGroundedResourceLinksOnBoot,
   finalizeLegacyReflectionCandidatesOnBoot,
@@ -1240,6 +1241,20 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot reflection-ledger finalization failed');
+  }
+  // Some pre-grounding builds could persist an extracted fact/entity excerpt
+  // before attaching its episode id. Repair only a uniquely supported exact
+  // fact-evidence episode; otherwise preserve the relationship as an inferred
+  // overlay instead of overstating it as stored truth.
+  try {
+    const extractedEvidenceFinalization = finalizeExtractedFactEntityEvidenceOnBoot();
+    if (extractedEvidenceFinalization.reason === 'backup_failed') {
+      logger.warn(extractedEvidenceFinalization, 'Withheld extracted-link evidence reconciliation because the safety backup failed');
+    } else if (extractedEvidenceFinalization.ran) {
+      logger.info(extractedEvidenceFinalization, 'Reconciled extracted fact/entity evidence on boot');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot extracted-link evidence reconciliation failed');
   }
   // The migration labels every legacy text match as inferred. Promote only
   // links whose canonical fact and surviving source excerpt name the same

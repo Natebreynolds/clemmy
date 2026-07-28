@@ -95,6 +95,7 @@ import {
   verifyArtifactBindingFromToolResult,
   type ArtifactIntent,
 } from './artifact-ledger.js';
+import type { McpToolScope } from '../mcp-tool-scope.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -756,12 +757,25 @@ export class RecallBudget {
 export interface HarnessRunContext {
   sessionId: string;
   counter: ToolCallsCounter;
+  /** Exact external MCP authority for this run. `undefined` preserves legacy
+   * callers; `null` is an explicit no-external-tools boundary. Nested carriers
+   * must inherit this field so a remembered/guessed namespaced tool cannot
+   * widen a local-only orchestrator, workflow, or worker turn. */
+  mcpToolScope?: McpToolScope | null;
   /** Exact accepted user event for this attempt. Deterministic preflight gates
    * must not consult whichever session input happens to be newest. */
   sourceUserSeq?: number;
   /** One active model/tool run; loop/discovery counters key here so a long-lived
    * chat session does not accumulate unrelated calls across user turns. */
   behaviorScopeId?: string;
+  /** Provider labels that already stayed silent during this Runner.run. Shared
+   * across RouterModelProvider resolutions so later model iterations use the
+   * proven fallback without repaying the same first-byte timeout. */
+  silencedModelLabels?: Set<string>;
+  /** Last private reasoning activity observed inside a fallback boundary.
+   * Reasoning is buffered until text/tool output makes the attempt replay-unsafe,
+   * but the outer stream watchdog still needs to know the model is alive. */
+  privateModelActivityAt?: number;
   /** Inc A2 — set once per runTurn after the mid-step background-offer nudge has
    *  been evaluated, so a long grind nudges AT MOST once per step (the context is
    *  rebuilt per Runner.run, so this naturally resets each runTurn). */

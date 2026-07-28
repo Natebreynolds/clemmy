@@ -27,6 +27,9 @@ function approvalRow(approvalId: string): registry.PendingApprovalRow {
 test('spaceActionNeedsApproval: composio writes/sends gate, reads do not', () => {
   assert.equal(gate.spaceActionNeedsApproval({ id: 'a', composioSlug: 'OUTLOOK_SEND_EMAIL' }), true);
   assert.equal(gate.spaceActionNeedsApproval({ id: 'b', composioSlug: 'SALESFORCE_CREATE_RECORD' }), true);
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'upload', composioSlug: 'ONE_DRIVE_UPLOAD_FILE' }), true);
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'mark', composioSlug: 'GMAIL_MARK_AS_READ' }), true);
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'unknown', composioSlug: 'ACME_DO_THING' }), true);
   assert.equal(gate.spaceActionNeedsApproval({ id: 'c', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS' }), false);
   assert.equal(gate.spaceActionNeedsApproval({ id: 'd', composioSlug: 'SALESFORCE_GET_CONTACTS' }), false);
 });
@@ -34,6 +37,31 @@ test('spaceActionNeedsApproval: composio writes/sends gate, reads do not', () =>
 test('spaceActionNeedsApproval: runner gates only when it looks like a send (or confirm:true)', () => {
   assert.equal(gate.spaceActionNeedsApproval({ id: 'send', label: 'Send email', runner: 'r.mjs' }), true);
   assert.equal(gate.spaceActionNeedsApproval({ id: 'refresh', label: 'Refresh rows', runner: 'r.mjs' }), false);
+  assert.equal(gate.spaceActionNeedsApproval({
+    id: 'approve_post',
+    label: 'Approve locally',
+    runner: 'approve-post.mjs',
+    argsTemplate: { external: false },
+  }), false);
+  assert.equal(gate.spaceActionNeedsApproval({
+    id: 'post_to_linkedin',
+    label: 'Post to LinkedIn',
+    runner: 'publish.mjs',
+  }), true);
+  for (const id of ['review_post', 'post_draft', 'email_draft', 'message_preview']) {
+    assert.equal(
+      gate.spaceActionNeedsApproval({ id, runner: `${id}.mjs` }),
+      false,
+      `${id} is a local artifact operation, not delivery`,
+    );
+  }
+  for (const id of ['send_email', 'publish_post']) {
+    assert.equal(
+      gate.spaceActionNeedsApproval({ id, runner: `${id}.mjs` }),
+      true,
+      `${id} is explicit outbound delivery`,
+    );
+  }
   assert.equal(gate.spaceActionNeedsApproval({ id: 'wipe', label: 'Wipe', runner: 'r.mjs', confirm: true }), true);
 });
 

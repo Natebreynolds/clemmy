@@ -1,5 +1,6 @@
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { mcpServerAliasMatches } from '../runtime/mcp-tool-authority.js';
 
 function scopeLockEnabled(allowed?: string[] | null): boolean {
   if (!allowed || allowed.length === 0) return false;
@@ -69,7 +70,7 @@ function toolPatternFromTail(tail: string): string | null {
 
 export function externalMcpScopeForAllowedToolLock(args: {
   allowed?: string[] | null;
-  fallback?: McpToolScope;
+  fallback?: McpToolScope | null;
   serverNames?: string[];
   reason: string;
 }): McpToolScope | null | undefined {
@@ -129,4 +130,106 @@ export function externalMcpScopeFromResolvedTools(
     serverNames,
     reason: 'worker resolvedTools external MCP lock',
   }) ?? null;
+}
+
+function optionalCapMin(...values: Array<number | undefined>): number | undefined {
+  const finite = values.filter((value): value is number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0);
+  return finite.length > 0 ? Math.min(...finite.map((value) => Math.floor(value))) : undefined;
+}
+
+function matchingServerCap(scope: McpToolScope, serverSlug: string): number | undefined {
+  const matches = Object.entries(scope.serverMaxTools ?? {})
+    .filter(([candidate]) => mcpServerAliasMatches(candidate, serverSlug))
+    .map(([, cap]) => cap);
+  return optionalCapMin(...matches);
+}
+
+function andPattern(left: string, right: string): string {
+  // McpToolScope patterns are OR'd by the filter. Encode one parent×child pair
+  // as two positive lookaheads so the resulting OR-of-pairs is a true
+  // intersection rather than an accidental union.
+  return `(?=[\\s\\S]*(?:${left}))(?=[\\s\\S]*(?:${right}))[\\s\\S]*`;
+}
+
+function intersectPatterns(parent: string[] | undefined, child: string[] | undefined): string[] | undefined {
+  const p = [...new Set((parent ?? []).filter(Boolean))];
+  const c = [...new Set((child ?? []).filter(Boolean))];
+  if (p.length === 0) return c.length > 0 ? c : undefined;
+  if (c.length === 0) return p;
+  return [...new Set(p.flatMap((left) => c.map((right) => andPattern(left, right))))];
+}
+
+/**
+ * Compose a worker packet's exact external-MCP request with the parent's
+ * authority. This is a real intersection:
+ *
+ * - null on either side stays local-only;
+ * - broad allowAll/fail-open authority yields to the packet but retains caps;
+ * - concrete server families must overlap by alias;
+ * - concrete tool patterns are ANDed, not ORed;
+ * - every global/per-server cap takes the smaller value.
+ *
+ * A child can therefore narrow a parent but can never drift to another tool in
+ * the same server or widen to a sibling server.
+ */
+export function intersectExternalMcpToolScopes(
+  parent: McpToolScope | null | undefined,
+  child: McpToolScope | null | undefined,
+  reason = 'worker parent/packet external MCP intersection',
+): McpToolScope | null | undefined {
+  if (parent === null || child === null) return null;
+  if (parent === undefined) return child;
+  if (child === undefined) return parent;
+
+  const parentBroad = parent.allowAll === true || parent.failOpenCandidate === true;
+  const childBroad = child.allowAll === true || child.failOpenCandidate === true;
+  let allowedServerSlugs: string[] | undefined;
+  if (parentBroad && childBroad) {
+    allowedServerSlugs = child.allowedServerSlugs ?? parent.allowedServerSlugs;
+  } else if (parentBroad) {
+    allowedServerSlugs = child.allowedServerSlugs;
+  } else if (childBroad) {
+    allowedServerSlugs = parent.allowedServerSlugs;
+  } else {
+    const parentServers = parent.allowedServerSlugs ?? [];
+    const childServers = child.allowedServerSlugs ?? [];
+    allowedServerSlugs = childServers.filter((childSlug) =>
+      parentServers.some((parentSlug) => mcpServerAliasMatches(parentSlug, childSlug)));
+    if (allowedServerSlugs.length === 0) return null;
+  }
+
+  // A broad×broad composition stays broad. Worker packet scopes are normally
+  // concrete, but preserving this case makes the helper safe for other callers.
+  const remainsBroad = parentBroad && childBroad && (!allowedServerSlugs || allowedServerSlugs.length === 0);
+  const toolPatterns = parentBroad
+    ? child.toolPatterns
+    : childBroad
+      ? parent.toolPatterns
+      : intersectPatterns(parent.toolPatterns, child.toolPatterns);
+  const maxTools = optionalCapMin(parent.maxTools, child.maxTools);
+  const priorityKeywords = [...new Set([
+    ...(parent.priorityKeywords ?? []),
+    ...(child.priorityKeywords ?? []),
+  ])];
+  const serverMaxTools: Record<string, number> = {};
+  for (const serverSlug of allowedServerSlugs ?? []) {
+    const cap = optionalCapMin(
+      matchingServerCap(parent, serverSlug),
+      matchingServerCap(child, serverSlug),
+    );
+    if (cap !== undefined) serverMaxTools[serverSlug] = cap;
+  }
+
+  return {
+    reason,
+    ...(remainsBroad
+      ? (parent.allowAll && child.allowAll ? { allowAll: true } : { failOpenCandidate: true })
+      : { allowedServerSlugs: [...new Set(allowedServerSlugs ?? [])].sort() }),
+    ...(toolPatterns && toolPatterns.length > 0 ? { toolPatterns } : {}),
+    ...(priorityKeywords.length > 0 ? { priorityKeywords } : {}),
+    ...(maxTools !== undefined ? { maxTools } : {}),
+    ...(Object.keys(serverMaxTools).length > 0 ? { serverMaxTools } : {}),
+    ...(child.queryText || parent.queryText ? { queryText: child.queryText ?? parent.queryText } : {}),
+  };
 }

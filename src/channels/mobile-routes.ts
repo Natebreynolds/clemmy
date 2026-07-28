@@ -93,7 +93,7 @@ import { processBackgroundTasks } from '../execution/background-tasks.js';
 import type { AssistantRouteDiagnostics } from '../types.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { HarnessSession } from '../runtime/harness/session.js';
-import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
 
@@ -1247,7 +1247,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
     setImmediate(async () => {
       try {
-        const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
+        const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
         const MAX_STICKY_RESUMES = 5;
         let resumeIter = 0;
         while (resumeIter < MAX_STICKY_RESUMES) {

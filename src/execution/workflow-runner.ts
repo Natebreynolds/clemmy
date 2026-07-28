@@ -103,7 +103,10 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import { countDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
-import { buildWorkflowStepAgent } from '../agents/workflow-step-agent.js';
+import {
+  buildWorkflowStepAgent,
+  workflowStepExternalMcpScopeForLock,
+} from '../agents/workflow-step-agent.js';
 import {
   detectBlockedSteps,
   deepSelfReportedFailure,
@@ -2680,8 +2683,18 @@ async function runStepViaHarness(
     }
     const route = workflowHarnessRoute(step, stepModel);
     appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
-    const agent = useWorkflowStepAgent()
-      ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools, model: stepModel })
+    const scopedWorkflowStepAgent = useWorkflowStepAgent();
+    const workflowMcpToolScope = scopedWorkflowStepAgent
+      ? workflowStepExternalMcpScopeForLock(step.allowedTools)
+      : undefined;
+    const agent = scopedWorkflowStepAgent
+      ? await buildWorkflowStepAgent({
+          userInput: message,
+          sessionId: realSessionId,
+          lockTools: step.allowedTools,
+          model: stepModel,
+          mcpToolScope: workflowMcpToolScope,
+        })
       : await buildWorkflowOrchestratorAgentImpl({ userInput: message, sessionId: realSessionId, model: stepModel });
     let result: RunConversationResult;
     if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {
@@ -2697,6 +2710,7 @@ async function runStepViaHarness(
         sessionId: realSessionId,
         input: message,
         sourceUserSeq: sourceUserEvent.seq,
+        mcpToolScope: workflowMcpToolScope,
         reuseRecordedUserInput: true,
         // P2-10: bound the step on the harness path too. The legacy path passes
         // this (see below); without it a harness step fell back to the 120-min
@@ -5622,7 +5636,12 @@ function reachableResumeFrontier(
 
 export function shouldHaltResumeForSideEffect(
   workflow: WorkflowDefinition,
-  resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },
+  resume: {
+    inFlightStepIds?: ReadonlySet<string>;
+    inFlightStepId?: string;
+    completedSteps: Map<string, unknown>;
+    failedSteps?: Set<string>;
+  },
   _targetStepId?: string,
   evidence?: {
     claimedExternalWrite?: boolean;
@@ -5636,10 +5655,18 @@ export function shouldHaltResumeForSideEffect(
      * Defer their recovery decision to that ledger instead of the prose/harness
      * heuristic, which cannot replay a successful direct-call result. */
     mutationReceiptProtected?: boolean;
+    /** Capability recovery may prove that one exact step never crossed its
+     * provider dispatch boundary. This is step-scoped: it must never exempt a
+     * concurrent mutation that was also in flight. */
+    provenNoDispatchStepIds?: ReadonlySet<string>;
   },
 ): { stepId: string; cls: 'write' | 'send'; declared: boolean } | null {
-  const id = resume.inFlightStepId;
-  if (!id && evidence?.resumedRun) {
+  const inFlightIds = new Set(resume.inFlightStepIds ?? []);
+  // Backward compatibility for callers/tests and journals reconstructed by an
+  // older build: the singular cursor is also a member when present.
+  if (resume.inFlightStepId) inFlightIds.add(resume.inFlightStepId);
+
+  if (inFlightIds.size === 0 && evidence?.resumedRun) {
     // The lifecycle journal is best-effort. A lost/corrupt step_started event
     // must not turn a crash-resumed run into permission to repeat a plain or
     // harness mutation. Structured direct calls are the exception: their
@@ -5665,21 +5692,31 @@ export function shouldHaltResumeForSideEffect(
       return { stepId: uncertain.id, cls, declared: uncertain.sideEffect === cls };
     }
   }
-  if (!id || resume.completedSteps.has(id) || resume.failedSteps?.has(id)) return null;
-  const crashed = workflow.steps.find((s) => s.id === id);
-  if (!crashed || crashed.requiresApproval === true) return null;
-  const cls = stepSideEffectClass(crashed);
-  // `declared` distinguishes an explicit sideEffect from a prose-heuristic
-  // guess — the halt message uses it to teach the one-line fix when the
-  // class was only inferred (inferred read-only steps parking on crash was
-  // the acme-facebook-trends failure mode, 2026-06-11).
-  if (cls === 'read') return null;
-  if (evidence?.mutationReceiptProtected === true) return null;
-  // Harness external_write telemetry is useful positive evidence, but its
-  // writers are best-effort. Absence cannot prove that provider dispatch never
-  // happened, so only the fail-closed structured receipt protocol may bypass
-  // this crash guard.
-  return { stepId: id, cls, declared: crashed.sideEffect === cls };
+
+  for (const id of inFlightIds) {
+    if (resume.completedSteps.has(id) || resume.failedSteps?.has(id)) continue;
+    const crashed = workflow.steps.find((s) => s.id === id);
+    if (!crashed || crashed.requiresApproval === true) continue;
+    const cls = stepSideEffectClass(crashed);
+    if (cls === 'read') continue;
+    if (evidence?.provenNoDispatchStepIds?.has(id)) continue;
+    if (evidence?.durableMutationProtocolStepIds?.has(id)) continue;
+    // Compatibility for the former singular-call contract. Only the exact
+    // legacy cursor may inherit this boolean; applying it to the whole batch
+    // would let one receipted call hide a concurrent unreceipted mutation.
+    if (evidence?.mutationReceiptProtected === true && id === resume.inFlightStepId) continue;
+    // `declared` distinguishes an explicit sideEffect from a prose-heuristic
+    // guess — the halt message uses it to teach the one-line fix when the
+    // class was only inferred (inferred read-only steps parking on crash was
+    // the acme-facebook-trends failure mode, 2026-06-11).
+    //
+    // Harness external_write telemetry is useful positive evidence, but its
+    // writers are best-effort. Absence cannot prove that provider dispatch
+    // never happened, so only a step-scoped durable protocol/proof may bypass
+    // this crash guard.
+    return { stepId: id, cls, declared: crashed.sideEffect === cls };
+  }
+  return null;
 }
 
 async function executeWorkflow(
@@ -5791,31 +5828,32 @@ async function executeWorkflow(
       }
     }
   }
-  const capabilityResumeProvesNoDispatch = Boolean(
+  const provenNoDispatchStepIds = new Set<string>();
+  if (
     crashResume
     && capabilityResume?.state === 'retrying'
     && capabilityResume.provenNoDispatch === true
-    && inFlightStep
-    && capabilityResume.stepId === inFlightStep.id,
+    && resume.inFlightStepIds.has(capabilityResume.stepId)
+  ) {
+    provenNoDispatchStepIds.add(capabilityResume.stepId);
+  }
+  const resumeHalt = shouldHaltResumeForSideEffect(
+    workflow,
+    resume,
+    targetStepId,
+    {
+      resumedRun: crashResume,
+      durableMutationProtocolStepIds,
+      provenNoDispatchStepIds,
+      ...(inFlightStep
+        ? {
+            claimedExternalWrite,
+            harnessEnabled: workflowHarnessEnabled(inFlightStep),
+            mutationReceiptProtected,
+          }
+        : {}),
+    },
   );
-  const resumeHalt = capabilityResumeProvesNoDispatch
-    ? null
-    : shouldHaltResumeForSideEffect(
-      workflow,
-      resume,
-      targetStepId,
-      {
-        resumedRun: crashResume,
-        durableMutationProtocolStepIds,
-        ...(inFlightStep
-          ? {
-              claimedExternalWrite,
-              harnessEnabled: workflowHarnessEnabled(inFlightStep),
-              mutationReceiptProtected,
-            }
-          : {}),
-      },
-    );
   if (resumeHalt) {
     throw new Error(
       `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +

@@ -13,6 +13,7 @@
  * formed Workspace saves with zero questions.
  */
 import type { SpaceRecord } from './store.js';
+import { workspaceActionExpectsRecipient } from './space-action-semantics.js';
 
 export interface SpaceGap {
   severity: 'clarify';
@@ -26,15 +27,7 @@ export interface SpaceGap {
 
 const MAX_GAPS = 5;
 
-const SEND_LIKE_RE = /\b(send|reply|email|message|publish|post|tweet|dm|invite|sms|notify)\b/i;
 const RECIPIENT_KEY_RE = /\b(to|to_email|toemail|recipient|recipients|email|address|toaddress|to_address)\b/i;
-
-function actionLooksLikeSend(a: SpaceRecord['actions'][number]): boolean {
-  // Normalize underscores to spaces so \b matches inside slugs like
-  // OUTLOOK_OUTLOOK_SEND_EMAIL (underscores are word chars → no boundary).
-  const hay = `${a.composioSlug ?? ''} ${a.runner ?? ''} ${a.label ?? ''} ${a.id}`.replace(/_/g, ' ');
-  return SEND_LIKE_RE.test(hay);
-}
 
 function templateHasRecipient(a: SpaceRecord['actions'][number]): boolean {
   const tpl = a.argsTemplate ?? {};
@@ -185,7 +178,7 @@ export function analyzeSpaceGaps(
   // 3: a send-like action whose args template carries no recipient — confirm the
   // view supplies it, so it can't go to the wrong person (or nobody).
   for (const a of record.actions ?? []) {
-    if (!actionLooksLikeSend(a)) continue;
+    if (!workspaceActionExpectsRecipient(a)) continue;
     if (templateHasRecipient(a)) continue;
     gaps.push({
       severity: 'clarify',
@@ -198,6 +191,7 @@ export function analyzeSpaceGaps(
 
   // 4: a source that returned ZERO rows in the creation smoke.
   for (const id of zeroRowSourceIds) {
+    if (sources.find((source) => source.id === id)?.allowEmpty === true) continue;
     gaps.push({
       severity: 'clarify',
       resolution: 'clarify',

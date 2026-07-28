@@ -17,6 +17,7 @@ const SLUG = 'proof-cockpit';
 export const workspaceBuild: ScenarioDef = {
   name: 'workspace-build',
   summary: 'one ask → a live, data-connected workspace (creation pipeline end-to-end)',
+  routeExpectation: 'exact-brain',
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-wsbuild-${Date.now().toString(36)}`;
 

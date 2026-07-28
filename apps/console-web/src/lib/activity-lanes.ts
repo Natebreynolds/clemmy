@@ -30,6 +30,9 @@ export interface ActivityLane {
   workflowRunId?: string;
   /** From model_route_decided, when present — may never arrive; tolerate absence. */
   model?: string;
+  /** Exact provider when telemetry carries it. Kept separately so a generic
+   *  provider label can never overwrite the actual model id. */
+  provider?: string;
   /** The most recent still-open tool call (started without a matching end). */
   openTool?: { name: string; sinceTs: string };
   /** Internal: open tool calls by toolCallId, from which openTool is derived. */
@@ -50,6 +53,22 @@ function firstString(payload: Record<string, unknown>, keys: string[]): string |
     const v = payload[k];
     if (typeof v === 'string' && v.trim()) return v;
   }
+  return undefined;
+}
+
+function nestedRecord(payload: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = payload[key];
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function genericFalloverProvider(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'codex' || normalized === 'codex:rescue') return 'codex';
+  if (normalized === 'claude' || normalized === 'claude:rescue') return 'claude';
+  if (normalized === 'byo' || normalized.startsWith('byo:')) return 'byo';
   return undefined;
 }
 
@@ -135,7 +154,17 @@ export function foldOperationalEvent(
 
   switch (event.type) {
     case 'model_route_decided': {
-      const model = firstString(event.payload, ['model', 'effectiveModel', 'modelId', 'chosenModel', 'route']);
+      const model = firstString(event.payload, ['resolvedModel', 'model', 'effectiveModel', 'modelId', 'chosenModel', 'route']);
+      const provider = firstString(event.payload, ['actualProvider', 'resolvedProvider', 'provider']);
+      if (model) lane.model = model;
+      if (provider) lane.provider = provider;
+      break;
+    }
+    case 'model_call_completed': {
+      // Usage telemetry is emitted by the model that actually returned, after
+      // fallback. It is the truthful floor when the earlier switch advisory
+      // carried only a generic provider label.
+      const model = firstString(event.payload, ['actualModel', 'resolvedModel', 'model']);
       if (model) lane.model = model;
       break;
     }
@@ -188,9 +217,20 @@ export function foldOperationalEvent(
       lane.badges.capped += 1;
       updateWorkerRow(lane, event, 'capped');
       break;
-    case 'model_fallover':
+    case 'model_fallover': {
       lane.badges.fallover += 1;
+      const meta = nestedRecord(event.payload, 'meta');
+      const exactModel = firstString(event.payload, ['toModel', 'falloverToModel', 'actualModel', 'resolvedModel'])
+        ?? firstString(meta, ['toModel', 'falloverToModel', 'actualModel', 'resolvedModel']);
+      const provider = firstString(event.payload, ['toProvider', 'actualProvider', 'resolvedProvider'])
+        ?? firstString(meta, ['toProvider', 'actualProvider', 'resolvedProvider'])
+        ?? genericFalloverProvider(firstString(meta, ['to']))
+        ?? genericFalloverProvider(firstString(event.payload, ['to']));
+      if (exactModel) lane.model = exactModel;
+      else if (provider) lane.model = undefined;
+      if (provider) lane.provider = provider;
       break;
+    }
     case 'workflow_node_retried':
       lane.badges.retries += 1;
       break;

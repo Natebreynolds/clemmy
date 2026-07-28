@@ -60,11 +60,23 @@ test('probe: a populated sheet (rows > 1) PASSES', async () => {
   assert.match(res.evidenceText, /OK: sheet .* 42 rows/);
 });
 
-test('probe: an UNPROBEABLE sheet (reader returns -1) falls through — never blocks', async () => {
+test('probe: required population with an UNPROBEABLE sheet blocks truthful completion', async () => {
   const deps: DeliverableProbeDeps = { ...sheetCreatedEvents(), readSheetRowCount: async () => -1 };
   const res = await probeSessionDeliverables('s', 'Create and populate the sheet', deps);
-  assert.equal(res.failures.length, 0, 'a probe we cannot run must not block');
-  assert.match(res.evidenceText, /UNVERIFIED/);
+  assert.equal(res.failures.length, 1, 'creation alone cannot prove required contents');
+  assert.match(res.failures[0].gap, /could not be verified/i);
+  assert.match(res.summary, /not done/i);
+  assert.match(res.evidenceText, /UNVERIFIED \(BLOCKING\)/);
+});
+
+test('probe: a thrown required-population readback also blocks instead of silently greening', async () => {
+  const deps: DeliverableProbeDeps = {
+    ...sheetCreatedEvents(),
+    readSheetRowCount: async () => { throw new Error('connection unavailable'); },
+  };
+  const res = await probeSessionDeliverables('s', 'Fill the sheet with every prospect row', deps);
+  assert.equal(res.failures.length, 1);
+  assert.match(res.evidenceText, /UNVERIFIED \(BLOCKING\)/);
 });
 
 test('probe: a CREATE-only objective (no population) does not fail an empty sheet', async () => {

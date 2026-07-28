@@ -69,7 +69,7 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { listPlanProposals, approvePlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
-import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { parseGoalCommand, handleGoalContractCommand } from '../agents/goal-commands.js';
 import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
@@ -2947,7 +2947,7 @@ async function runDiscordHarnessResume(opts: {
 
   void (async () => {
     try {
-      const agent = await buildOrchestratorAgent({ sessionId, allowToolJit: true });
+      const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
       const result = await runConversationFromResume({
         agent,
         sessionId,

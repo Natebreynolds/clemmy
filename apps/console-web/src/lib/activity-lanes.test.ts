@@ -136,7 +136,17 @@ test('openTool tracks a started tool call until it completes', () => {
 
 test('badges accumulate fallover / retries / gate verdicts / auto-continues', () => {
   const lanes = fold([
-    ev({ type: 'model_fallover', source: 'model', sessionId: 's1' }),
+    ev({
+      type: 'model_fallover',
+      source: 'model',
+      sessionId: 's1',
+      payload: {
+        from: 'claude',
+        to: 'codex',
+        toProvider: 'codex',
+        toModel: 'gpt-5.6-mini',
+      },
+    }),
     ev({ type: 'workflow_node_retried', source: 'workflow', sessionId: 's1' }),
     ev({ type: 'gate_verdict', source: 'safety', sessionId: 's1' }),
     ev({ type: 'auto_continue', sessionId: 's1' }),
@@ -144,6 +154,8 @@ test('badges accumulate fallover / retries / gate verdicts / auto-continues', ()
   ]);
   const b = lanes.get('s1')!.badges;
   assert.equal(b.fallover, 1);
+  assert.equal(lanes.get('s1')!.model, 'gpt-5.6-mini');
+  assert.equal(lanes.get('s1')!.provider, 'codex');
   assert.equal(b.retries, 1);
   assert.equal(b.gateVerdicts, 1);
   assert.equal(b.autoContinues, 2);
@@ -167,8 +179,69 @@ test('terminal is set on run completion and cleared when the lane resumes a turn
 });
 
 test('model is captured from model_route_decided', () => {
-  const lanes = fold([ev({ type: 'model_route_decided', source: 'model', sessionId: 's1', payload: { model: 'claude-opus-4-8' } })]);
+  const lanes = fold([ev({
+    type: 'model_route_decided',
+    source: 'model',
+    sessionId: 's1',
+    payload: { resolvedModel: 'claude-opus-4-8' },
+  })]);
   assert.equal(lanes.get('s1')!.model, 'claude-opus-4-8');
+});
+
+test('fallover reads exact model/provider from workflow nested meta and never replaces a model with a generic lane label', () => {
+  const lanes = fold([
+    ev({
+      type: 'model_route_decided',
+      source: 'model',
+      workflowRunId: 'wf-1',
+      payload: { resolvedModel: 'gpt-5.6', provider: 'codex' },
+    }),
+    ev({
+      type: 'model_fallover',
+      source: 'model',
+      workflowRunId: 'wf-1',
+      payload: {
+        workflowName: 'Research',
+        meta: {
+          reason: 'brain_fallover',
+          from: 'codex',
+          to: 'claude',
+          toModel: 'claude-sonnet-4-6',
+        },
+      },
+    }),
+  ]);
+  const lane = lanes.get('wf-1')!;
+  assert.equal(lane.model, 'claude-sonnet-4-6');
+  assert.equal(lane.provider, 'claude');
+});
+
+test('generic router fallover waits for actual model completion instead of displaying codex/claude as a model id', () => {
+  const lanes = fold([
+    ev({
+      type: 'model_route_decided',
+      source: 'model',
+      sessionId: 's-actual',
+      payload: { resolvedModel: 'claude-opus-4-8', provider: 'claude' },
+    }),
+    ev({
+      type: 'model_fallover',
+      source: 'model',
+      sessionId: 's-actual',
+      payload: { from: 'claude-opus-4-8', to: 'codex' },
+    }),
+  ]);
+  assert.equal(lanes.get('s-actual')!.model, undefined, 'a failed prior model must not remain displayed as the fallback winner');
+  assert.equal(lanes.get('s-actual')!.provider, 'codex');
+
+  foldOperationalEvent(lanes, ev({
+    type: 'model_call_completed',
+    source: 'model',
+    sessionId: 's-actual',
+    payload: { model: 'gpt-5.6-mini', channel: 'codex' },
+  }));
+  assert.equal(lanes.get('s-actual')!.model, 'gpt-5.6-mini');
+  assert.equal(lanes.get('s-actual')!.provider, 'codex');
 });
 
 test('a workflow lane keys off workflowRunId and labels itself workflow', () => {

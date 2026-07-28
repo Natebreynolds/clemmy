@@ -57,6 +57,9 @@ try {
       CLEMENTINE_HOME: testHome,
       CLEMMY_TEST_ISOLATED_HOME: '1',
       CLEMMY_TEST_DISABLE_LIVE_MODELS: '1',
+      // Unit tests must never warm or download the real local embedding model.
+      // Provider-specific tests opt back in explicitly with injected fakes.
+      CLEMMY_LOCAL_EMBEDDINGS: 'off',
     },
     stdio: 'inherit',
   });

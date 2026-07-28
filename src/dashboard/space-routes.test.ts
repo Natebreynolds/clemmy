@@ -127,21 +127,125 @@ test('POST creates a workspace with a placeholder view; GET list shows it', asyn
   assert.match(await view.text(), /Test Board/);
 });
 
-test('C2: served view injects the window.clem bridge (slug baked in) + keeps the link shim', async () => {
+test('C2: served view injects a document-pinned opaque-origin bridge and exact legacy compatibility shim', async () => {
   const slug = 'bridge-rt';
   store.spaceStore.save({ id: slug, title: 'Bridge RT' });
   const viewFile = store.resolveInSpace(slug, 'view/index.html');
   mkdirSync(path.dirname(viewFile), { recursive: true });
   writeFileSync(viewFile, '<html><body><h1>Hi</h1></body></html>', 'utf-8');
-  const html = await (await fetch(`${base}/console/spaces/${slug}/view`)).text();
-  // Bridge present, slug baked into the base path, action helper wired.
+  const response = await fetch(`${base}/console/spaces/${slug}/view`);
+  const html = await response.text();
+  assert.match(response.url, /\/view\/$/, 'canonical view URL keeps relative assets under view/');
+  // Bridge present, slug + document scoped into its bootstrap, action helper wired.
   assert.match(html, /window\.clem=/);
-  assert.match(html, new RegExp(`/api/console/spaces/${slug}`));
-  assert.match(html, /action:async function/);
-  // The external-link shim is still injected (capture-phase click handler).
-  assert.match(html, /addEventListener\('click'/);
+  assert.match(html, new RegExp(`S=${JSON.stringify(slug)}`));
+  assert.match(html, /kind:'bootstrap'/);
+  assert.match(html, /documentId:D/);
+  assert.match(html, /action:function/);
+  assert.match(html, /parent\.postMessage/);
+  // Existing saved views keep working, but their fetch is replaced with an
+  // exact same-workspace RPC adapter. There is no native/general fetch escape.
+  assert.match(html, /legacyFetch/);
+  assert.match(html, /lock\('fetch',legacyFetch\)/);
+  assert.doesNotMatch(html, /\/api\/console\/approvals/);
+  assert.match(html, /navigation/);
+  assert.match(html, /preventDefault/);
+  assert.match(html, /RTCPeerConnection/);
+  const csp = response.headers.get('content-security-policy') ?? '';
+  assert.match(csp, /(?:^|;\s*)sandbox allow-scripts(?:;|$)/);
+  assert.doesNotMatch(csp, /allow-same-origin|allow-forms|allow-popups|allow-top-navigation/);
+  assert.match(csp, /connect-src 'none'/);
+  assert.match(csp, /form-action 'none'/);
+  assert.match(csp, new RegExp(`${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/console\\/spaces\\/${slug}\\/view\\/`));
   // Injection lands inside the document body.
   assert.ok(html.indexOf('window.clem') < html.indexOf('</body>'));
+});
+
+test('C2 security: malicious authored HTML stays sandboxed and cannot turn its view response into an admin principal', async () => {
+  const slug = 'bridge-adversarial';
+  store.spaceStore.save({ id: slug, title: 'Bridge Adversarial' });
+  const viewFile = store.resolveInSpace(slug, 'view/index.html');
+  mkdirSync(path.dirname(viewFile), { recursive: true });
+  writeFileSync(
+    viewFile,
+    '<!doctype html><html><head></head><body>'
+      + '<script>fetch("/api/console/approvals/anything",{method:"POST"});'
+      + 'top.location="/console/settings";window.open("/console");</script>'
+      + '<form action="/api/console/spaces/other/data" method="post"><button>steal</button></form>'
+      + '<iframe src="/console"></iframe></body></html>',
+    'utf-8',
+  );
+  const response = await fetch(`${base}/console/spaces/${slug}/view`);
+  assert.equal(response.status, 200);
+  const csp = response.headers.get('content-security-policy') ?? '';
+  const sandbox = csp.split(';').map((part) => part.trim()).find((part) => part.startsWith('sandbox'));
+  assert.equal(sandbox, 'sandbox allow-scripts');
+  assert.match(csp, /connect-src 'none'/);
+  assert.match(csp, /form-action 'none'/);
+  assert.match(csp, /frame-src 'none'/);
+  assert.match(csp, /base-uri 'none'/);
+  // The attack source remains authored content; the response policy, rather
+  // than a brittle sanitizer, removes its principal and capabilities.
+  const html = await response.text();
+  assert.match(html, /fetch\("\/api\/console\/approvals/);
+  assert.ok(html.indexOf('window.clem=') < html.indexOf('fetch("/api/console/approvals'));
+  assert.ok(html.indexOf("addEventListener.call(nav,'navigate'") < html.indexOf('fetch("/api/console/approvals'));
+});
+
+test('C2 security: authored SVG stays inert when opened as a top-level document', async () => {
+  const slug = 'svg-adversarial';
+  store.spaceStore.save({ id: slug, title: 'SVG Adversarial' });
+  const viewDir = store.resolveInSpace(slug, 'view');
+  mkdirSync(viewDir, { recursive: true });
+  writeFileSync(
+    path.join(viewDir, 'attack.svg'),
+    '<svg xmlns="http://www.w3.org/2000/svg" onload="fetch(\'/api/console/spaces\')">'
+      + '<script>top.location="/console/settings"</script><circle r="10"/></svg>',
+    'utf-8',
+  );
+
+  const response = await fetch(`${base}/console/spaces/${slug}/view/attack.svg`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/svg+xml');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  const csp = response.headers.get('content-security-policy') ?? '';
+  const sandbox = csp.split(';').map((part) => part.trim()).find((part) => part.startsWith('sandbox'));
+  assert.equal(sandbox, 'sandbox');
+  assert.match(csp, /default-src 'none'/);
+  assert.match(csp, /connect-src 'none'/);
+  assert.match(csp, /form-action 'none'/);
+  assert.doesNotMatch(csp, /allow-scripts|allow-same-origin/);
+  assert.match(await response.text(), /onload=/, 'the policy, not a brittle sanitizer, removes authority');
+});
+
+test('C2c: canonical trailing-slash view URL serves relative multi-file assets from only this Workspace', async () => {
+  const slug = 'multi-file-view';
+  store.spaceStore.save({ id: slug, title: 'Multi file' });
+  const viewDir = store.resolveInSpace(slug, 'view');
+  mkdirSync(viewDir, { recursive: true });
+  writeFileSync(
+    path.join(viewDir, 'index.html'),
+    '<!doctype html><html><head><link rel="stylesheet" href="./styles.css"></head>'
+      + '<body><script src="./app.js"></script></body></html>',
+    'utf-8',
+  );
+  writeFileSync(path.join(viewDir, 'app.js'), 'window.assetLoaded=true;', 'utf-8');
+  writeFileSync(path.join(viewDir, 'styles.css'), 'body{color:rgb(1,2,3)}', 'utf-8');
+
+  const redirect = await fetch(`${base}/console/spaces/${slug}/view`, { redirect: 'manual' });
+  assert.equal(redirect.status, 308);
+  assert.equal(redirect.headers.get('location'), `/console/spaces/${slug}/view/`);
+
+  const root = await fetch(`${base}/console/spaces/${slug}/view/`);
+  assert.equal(root.status, 200);
+  assert.match(await root.text(), /\.\/app\.js/);
+  const script = await fetch(`${base}/console/spaces/${slug}/view/app.js`);
+  assert.equal(script.status, 200);
+  assert.match(script.headers.get('content-type') ?? '', /javascript/);
+  assert.equal(await script.text(), 'window.assetLoaded=true;');
+  const style = await fetch(`${base}/console/spaces/${slug}/view/styles.css`);
+  assert.equal(style.status, 200);
+  assert.match(style.headers.get('content-type') ?? '', /text\/css/);
 });
 
 test('C2b: bridge is DEFINED before the view\'s own script that calls clem.data()', async () => {

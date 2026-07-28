@@ -1,10 +1,81 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyClaudeEnvelope, withIdentityPrefix, ClaudeModelProvider, sanitizeClaudeInput, aisdkAcceptsReasoning, withClaudeInputSanitizer, getClaudeModel, resetClaudeModelCache, ClaudeTransportRoutingModel } from './claude-model.js';
+import {
+  applyClaudeEnvelope,
+  withIdentityPrefix,
+  ClaudeModelProvider,
+  sanitizeClaudeInput,
+  aisdkAcceptsReasoning,
+  withClaudeInputSanitizer,
+  withClaudeRequestDefaults,
+  getClaudeModel,
+  resetClaudeModelCache,
+  ClaudeTransportRoutingModel,
+  rawClaudeUsageFields,
+  withRawClaudeUsageRecording,
+} from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
+import { resolveModelCapability } from './model-wire-registry.js';
 
 const ID = "You are Claude Code, Anthropic's official CLI for Claude.".replace('Claude', 'Claude'); // exact identity
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+test('raw Claude usage normalizes cached tokens for run budgets and efficiency telemetry', () => {
+  const fields = rawClaudeUsageFields({
+    usage: {
+      inputTokens: 120,
+      outputTokens: 8,
+      totalTokens: 128,
+      inputTokensDetails: [
+        { cacheCreationInputTokens: 30 },
+        { cacheReadInputTokens: 70 },
+      ],
+    },
+    output: [],
+    responseId: 'msg_raw_1',
+  } as never);
+  assert.deepEqual(fields, {
+    inputTokens: 120,
+    cachedInputTokens: 70,
+    outputTokens: 8,
+    totalTokens: 128,
+    responseId: 'msg_raw_1',
+  });
+});
+
+test('raw Claude streamed usage records the response.id correlation used by response_done events', async () => {
+  const recorded: Array<Record<string, unknown>> = [];
+  const response = {
+    id: 'msg_stream_raw_1',
+    usage: {
+      inputTokens: 42,
+      outputTokens: 7,
+      totalTokens: 49,
+    },
+    output: [],
+  };
+  const inner = {
+    getResponse: async () => response,
+    getStreamedResponse: async function* () {
+      yield { type: 'response_started' };
+      yield { type: 'response_done', response };
+    },
+  };
+  const wrapped = withRawClaudeUsageRecording(
+    inner as never,
+    'claude-opus-4-8',
+    (entry) => recorded.push(entry as unknown as Record<string, unknown>),
+  );
+
+  const seen: unknown[] = [];
+  for await (const event of wrapped.getStreamedResponse({} as never)) seen.push(event);
+
+  assert.equal(seen.length, 2, 'the accounting decorator is stream-transparent');
+  assert.equal(recorded.length, 1, 'one completed stream produces one usage event');
+  assert.equal(recorded[0]?.responseId, 'msg_stream_raw_1');
+  assert.equal(recorded[0]?.inputTokens, 42);
+  assert.equal(recorded[0]?.outputTokens, 7);
+});
 
 test('envelope: x-api-key is STRIPPED and OAuth Bearer is set (the billing guard)', () => {
   const { headers } = applyClaudeEnvelope({ headers: { 'x-api-key': 'sk-ant-api03-would-bill-api', 'content-type': 'application/json' } }, 'sk-ant-oat01-good');
@@ -34,6 +105,38 @@ test('envelope: a missing max_tokens is filled (Anthropic requires it); a presen
   assert.ok(filled.max_tokens > 0);
   const kept = JSON.parse(applyClaudeEnvelope({ body: JSON.stringify({ model: 'x', messages: [], max_tokens: 512 }) }, 'sk-ant-oat01-x').body as string);
   assert.equal(kept.max_tokens, 512, 'harness-set max_tokens is not overridden');
+});
+
+test('Claude request defaults reach the adapter on both paths, preserve explicit values, and honor capability caps', async () => {
+  const seen: Array<{ maxTokens?: number; temperature?: number }> = [];
+  const inner = {
+    getResponse: async (request: { modelSettings?: { maxTokens?: number; temperature?: number } }) => {
+      seen.push({ ...request.modelSettings });
+      return { output: [], usage: {} };
+    },
+    getStreamedResponse: async function* (request: { modelSettings?: { maxTokens?: number; temperature?: number } }) {
+      seen.push({ ...request.modelSettings });
+      yield { type: 'response_started' };
+    },
+  };
+
+  const normal = withClaudeRequestDefaults(inner as never, resolveModelCapability('claude-sonnet-5'));
+  await normal.getResponse({ input: 'default me' } as never);
+  await normal.getResponse({
+    input: 'preserve me',
+    modelSettings: { maxTokens: 512, temperature: 0.2 },
+  } as never);
+
+  const capped = withClaudeRequestDefaults(inner as never, { maxOutput: 8_192 } as never);
+  for await (const _ of capped.getStreamedResponse({ input: 'cap me' } as never)) {
+    void _;
+  }
+
+  assert.deepEqual(seen, [
+    { maxTokens: 16_384 },
+    { maxTokens: 512, temperature: 0.2 },
+    { maxTokens: 8_192 },
+  ]);
 });
 
 test('withIdentityPrefix: string / empty / array / already-prefixed', () => {

@@ -74,7 +74,7 @@ export async function runSpaceCreationSmoke(slug: string): Promise<SpaceSmokeRes
     if (!r || !r.ok) { failed.push({ id: source.id, error: r?.error ?? 'unknown error' }); continue; }
     const data = readData(slug);
     const val = data && typeof data === 'object' ? (data as Record<string, unknown>)[source.id] : undefined;
-    if (looksEmpty(val)) empty.push(source.id);
+    if (looksEmpty(val) && source.allowEmpty !== true) empty.push(source.id);
   }
 
   // Verify each action's Composio toolkit is connected (read-only; never fire).

@@ -17,7 +17,11 @@ import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import { discoverMcpServers } from '../mcp-config.js';
-import { resolveMcpToolScope } from '../mcp-tool-scope.js';
+import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import {
+  mcpServerAliasMatches,
+  mcpToolAllowedByScope,
+} from '../mcp-tool-authority.js';
 import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import type { ManagedMcpServer } from '../../types.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
@@ -441,7 +445,14 @@ export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
   mcpToolAllowlist?: string[],
-  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string; runScopeId?: string; sourceUserSeq?: number },
+  attribution?: {
+    workflowRunId?: string;
+    workflowName?: string;
+    stepId?: string;
+    runScopeId?: string;
+    sourceUserSeq?: number;
+    mcpToolScope?: McpToolScope | null;
+  },
   loading?: { alwaysLoadTools?: string[]; deferUnlistedTools?: boolean; deferredTools?: string[] },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
@@ -463,6 +474,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
           sessionId,
           runScopeId: attribution?.runScopeId,
           sourceUserSeq: attribution?.sourceUserSeq,
+          mcpToolScope: attribution?.mcpToolScope,
           gatedMutations,
           allowedTools: allowlist,
           alwaysLoadTools: loading?.alwaysLoadTools,
@@ -480,6 +492,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
     ...(attribution?.runScopeId?.trim() ? { CLEMENTINE_MCP_RUN_SCOPE_ID: attribution.runScopeId.trim() } : {}),
     ...(Number.isSafeInteger(attribution?.sourceUserSeq) && (attribution?.sourceUserSeq ?? 0) > 0
       ? { CLEMENTINE_MCP_SOURCE_USER_SEQ: String(attribution?.sourceUserSeq) }
+      : {}),
+    ...(attribution?.mcpToolScope !== undefined
+      ? { CLEMENTINE_MCP_TOOL_SCOPE_JSON: JSON.stringify(attribution.mcpToolScope) }
       : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
@@ -554,11 +569,7 @@ export function claudeToolSearchEnabled(): boolean {
  *  serverMatchesAllowedSlugs). Empty/undefined slugs ⇒ match all. */
 function nativeServerMatchesScope(serverName: string, allowedServerSlugs?: string[]): boolean {
   if (!allowedServerSlugs || allowedServerSlugs.length === 0) return true;
-  const name = normalizeToolName(serverName);
-  return allowedServerSlugs.some((slug) => {
-    const n = normalizeToolName(slug);
-    return n.length > 0 && (name === n || name.includes(n) || n.includes(name));
-  });
+  return allowedServerSlugs.some((slug) => mcpServerAliasMatches(serverName, slug));
 }
 
 function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
@@ -581,7 +592,7 @@ function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
  */
 export function buildScopedNativeMcpServers(
   scopeInput?: string,
-  opts: { mode?: 'prompt' | 'resolved_tools' } = {},
+  opts: { mode?: 'prompt' | 'resolved_tools'; scope?: McpToolScope | null } = {},
 ): Record<string, McpServerConfig> {
   if (!claudeSdkNativeMcpEnabled()) return {};
   // Empty/absent scope ⇒ we don't know what THIS query needs. For the SDK native
@@ -592,13 +603,16 @@ export function buildScopedNativeMcpServers(
   // (brain: request.message; worker: objective+tools; step: prompt). Scoped to
   // this function only — the shared resolveMcpToolScope default is untouched, and
   // the LOCAL in-process clementine server is spread separately (unaffected).
-  if (!scopeInput || !scopeInput.trim()) return {};
+  const explicitScope = Object.prototype.hasOwnProperty.call(opts, 'scope');
+  if ((!scopeInput || !scopeInput.trim()) && !explicitScope) return {};
   try {
     const all = discoverMcpServers().filter((s) => s.enabled);
     if (all.length === 0) return {};
-    const scope = opts.mode === 'resolved_tools'
-      ? externalMcpScopeFromResolvedTools(scopeInput, all.map((server) => server.name))
-      : resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
+    const scope = explicitScope
+      ? opts.scope
+      : opts.mode === 'resolved_tools'
+        ? externalMcpScopeFromResolvedTools(scopeInput, all.map((server) => server.name))
+        : resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     if (!scope) return {};
     // A deliberate zero-tool prompt scope is represented by maxTools:0 + an
     // empty slug list (allowAll is intentionally undefined), while the bounded
@@ -977,6 +991,11 @@ export interface ClaudeAgentSdkRunOptions {
   /** Interpret nativeMcpScopeInput as exact worker-packet resolvedTools instead
    *  of a free-form prompt. This disables fail-open for "none needed" workers. */
   nativeMcpScopeMode?: 'prompt' | 'resolved_tools';
+  /** Exact parent/run authority for native external MCP. When present it wins
+   * over text inference and is also enforced in canUseTool, so a remembered
+   * tool name cannot call outside the attached/authorized scope. `null` denies
+   * every native external MCP. */
+  nativeMcpToolScope?: McpToolScope | null;
   /** Mount the deterministic read-fanout block on this run's canUseTool gate —
    *  native external MCP tools dispatch INSIDE the SDK (outside wrapToolForHarness
    *  and outside the harness AsyncLocalStorage), so canUseTool is the only harness
@@ -1192,6 +1211,19 @@ function terminalToolStoppedReason(rawName: string): RunStoppedReason | undefine
 function reflectionToolName(rawName: string | null, input: unknown): string | null {
   if (!rawName) return null;
   const bare = bareMcpToolName(rawName);
+  if (bare === 'call_tool') {
+    const deferred = (input as { name?: unknown; args_json?: unknown } | null | undefined)?.name;
+    if (typeof deferred !== 'string' || !deferred.trim()) return bare;
+    let deferredInput: unknown = undefined;
+    const argsJson = (input as { args_json?: unknown } | null | undefined)?.args_json;
+    if (typeof argsJson === 'string' && argsJson.trim()) {
+      try { deferredInput = JSON.parse(argsJson); } catch { /* attribution still uses the inner name */ }
+    }
+    // Recurse so call_tool(composio_execute_tool) receives the same exact action
+    // attribution as a first-class Composio call. This also lets the reflection
+    // deny-list suppress catalog/status tools instead of learning wrapper noise.
+    return reflectionToolName(deferred.trim(), deferredInput);
+  }
   if (bare === 'composio_execute_tool') {
     const slug = (input as { tool_slug?: unknown } | null | undefined)?.tool_slug;
     return typeof slug === 'string' && slug.trim() ? slug.trim() : bare;
@@ -1621,6 +1653,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         strippedToolName = toolName.replace(/^mcp__/, '');
         nativeExternal = strippedToolName.includes('__') && !/clement/i.test(strippedToolName);
       }
+      if (
+        nativeExternal
+        && options.nativeMcpToolScope !== undefined
+        && !mcpToolAllowedByScope(strippedToolName, options.nativeMcpToolScope)
+      ) {
+        return {
+          behavior: 'deny',
+          interrupt: false,
+          message: `MCP_SCOPE_DENIED: ${strippedToolName} is outside this run's external MCP scope.`,
+        } as PermissionResult;
+      }
 
       // A durable artifact slot is admission authority, not an attempted tool
       // call. Claim it before economy/grind/ceiling/approval so an existing
@@ -1811,11 +1854,19 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         stepId: options.stepId,
         runScopeId,
         sourceUserSeq: options.sourceUserSeq,
+        mcpToolScope: options.nativeMcpToolScope,
       }, localMcpLoading),
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
       // with the Codex lane instead of being blind to native MCPs.
-      ...(agentic ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, { mode: options.nativeMcpScopeMode }) : {}),
+      ...(agentic
+        ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, {
+            mode: options.nativeMcpScopeMode,
+            ...(options.nativeMcpToolScope !== undefined
+              ? { scope: options.nativeMcpToolScope }
+              : {}),
+          })
+        : {}),
     },
     // Keep SDK preapproval empty for both modes. Non-agentic runs use the local
     // MCP allowlist above to advertise only read/local schemas, then the same
@@ -2197,7 +2248,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           }
           if (reflectLearning && tr.output) {
             const tool = source ? reflectionToolName(source.name, source.input) : null;
-            reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
+            reflectImpl({
+              sessionId: reflectSessionId as string,
+              callId: tr.callId,
+              tool,
+              output: tr.output,
+              scopeId: options.trackerScopeId
+                ?? (options.sourceUserSeq !== undefined && options.sessionId
+                  ? `${options.sessionId}:user:${options.sourceUserSeq}`
+                  : undefined),
+            });
           }
           if (!tr.isError && source && isTerminalAfterTool(source.name)) {
             if (!terminalToolShouldHalt(source.name, tr.output)) continue;

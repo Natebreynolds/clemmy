@@ -25,6 +25,7 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
@@ -64,7 +65,7 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { DEFAULT_MAX_TURNS, harnessRunContextStorage, wrapToolForHarness, workerThrashGuardEnabled, withHarnessRunContext, ToolCallsCounter, defaultToolCallsPerTurn, type WrappableTool } from '../runtime/harness/brackets.js';
+import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, wrapToolForHarness, workerThrashGuardEnabled, withHarnessRunContext, ToolCallsCounter, defaultToolCallsPerTurn, type WrappableTool } from '../runtime/harness/brackets.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
@@ -75,6 +76,7 @@ import {
   formatAutoResolvedAskUserQuestionOutput,
   terminalToolShouldHalt,
 } from '../runtime/harness/terminal-tool.js';
+import { HarnessSession } from '../runtime/harness/session.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -173,6 +175,23 @@ export interface BuildOrchestratorAgentOptions {
    * caller is safe-by-omission.
    */
   allowToolJit?: boolean;
+}
+
+/**
+ * Rebuild the orchestrator for a parked approval using the connector authority
+ * captured beside that exact RunState. A plain build with no userInput preserves
+ * the legacy allow-all surface; that is correct for old/internal callers but
+ * wrong for a scoped run resuming after approval. Legacy pauses created before
+ * scope persistence still fall back to the prior construction behavior.
+ */
+export async function buildOrchestratorAgentForApprovalResume(
+  options: Omit<BuildOrchestratorAgentOptions, 'mcpToolScope'> & { sessionId: string },
+): Promise<Agent<RuntimeContextValue, any>> {
+  const pausedScope = HarnessSession.load(options.sessionId)?.loadInterruptMcpToolScope() ?? undefined;
+  return buildOrchestratorAgent({
+    ...options,
+    ...(pausedScope ? { mcpToolScope: pausedScope } : {}),
+  });
 }
 
 /** Schema-on-demand already exposes mcp_status + mcp_list_tools + call_tool, so
@@ -1139,10 +1158,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // N× wall time. Per-item worker slots keep provider throttling honest;
         // per-item callId suffixes keep tool_outputs/reduce-tier rows distinct.
         const outs: Array<string | null> = new Array(callItems.length).fill(null);
+        let batchCancellation: unknown;
         await runBoundedPool(
           callItems.map((item, index) => ({ item, index })),
           Math.min(callItems.length, 16),
           async ({ item, index }) => {
+            if (batchCancellation) throw batchCancellation;
             const perDetails = details?.toolCall?.callId
               ? { ...details, toolCall: { ...details.toolCall, callId: `${details.toolCall.callId}-i${index}` } }
               : details;
@@ -1151,10 +1172,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 { ...packetBase, item } as WorkerToolInput, runContext, perDetails, manifestBinding,
               ) ?? '');
             } catch (err) {
+              if (err instanceof KillRequested || err instanceof AgentRuntimeCancelledError) throw err;
               outs[index] = `ERROR: worker for "${item}" failed: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
             }
           },
+          (err) => {
+            if (err instanceof KillRequested || err instanceof AgentRuntimeCancelledError) {
+              batchCancellation ??= err;
+            }
+          },
         );
+        if (batchCancellation) throw batchCancellation;
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
           return { item, text, failed: workerResultIndicatesFailure(text) };
@@ -1251,6 +1279,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         sessionId,
         counter,
         ...(parent?.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
+        ...(parent?.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
         ...(workerThrashGuardEnabled()
           ? { guardrailScopeId: `${sessionId}::wkr:${Date.now()}-${(workerBudgetScopeSeq = (workerBudgetScopeSeq + 1) % 1_000_000)}` }
           : {}),
@@ -1274,6 +1303,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
+      const assertWorkerMayStart = (): void => {
+        if (!sessionId) return;
+        assertNotKilled(
+          sessionId,
+          Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+            ? { sourceUserSeq: sourceUserSeq as number }
+            : undefined,
+        );
+      };
       const turn = extractTurn(runContext);
       const toolCallId = details?.toolCall?.callId ?? null;
       // Workflow-level worker pin (owner ask, 2026-07-24): a step session
@@ -1315,7 +1353,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             payload: { item: input.item, lane: 'orchestrator', ...info },
           });
         } catch { /* telemetry is best-effort */ }
-      }, { modelId: workerModel, provider: workerProvider });
+      }, {
+        modelId: workerModel,
+        provider: workerProvider,
+        assertCanStart: assertWorkerMayStart,
+      });
       try {
       const appendWorkerRoute = (data: Record<string, unknown>) => {
         if (!sessionId) return;
@@ -1574,6 +1616,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
       }
+      // The slot may have been acquired before the durable pre-run checks above.
+      // Stop must still win at the final provider-dispatch edge.
+      assertWorkerMayStart();
       // Announce a real spawn only after every pre-run reuse/refusal gate. A
       // restart replay that reuses a persisted result must not look like the
       // worker ran twice in the UI or proof ledger.
@@ -1603,7 +1648,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // plan-scope + execution lane aggregate across the fan-out (one batch
         // approval covers all workers).
         try {
-          const sdkResult = await runClaudeAgentSdkWorker(input, workerModel, sessionId, sourceUserSeq);
+          assertWorkerMayStart();
+          const sdkResult = await runClaudeAgentSdkWorker(
+            input,
+            workerModel,
+            sessionId,
+            sourceUserSeq,
+            harnessRunContextStorage.getStore()?.mcpToolScope,
+          );
           appendWorkerRoute({
             ...(route.trace ?? {
               seam: 'chat',
@@ -1660,6 +1712,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             : runWorkerAsToolOptions;
           if (!runContext) throw new Error('run_worker requires an SDK run context');
           try {
+            assertWorkerMayStart();
             const output = await invokeWorkerWithOwnBudget(worker.clone({ model: next.modelId }).asTool(fbOptions), runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
             appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
@@ -1686,6 +1739,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const nestedWorkerTool = workerForCall.asTool(nestedAsToolOptions);
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       try {
+        assertWorkerMayStart();
         const output = await invokeWorkerWithOwnBudget(nestedWorkerTool, runContext, JSON.stringify(input), details, resolveWorkerMaxTurns(input.intent, workerMaxTurns));
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), route.model ?? workerModel);
         appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
@@ -1906,7 +1960,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // first-class-wrap fallback that avoids the not_reachable loop.
       callTool = localMemoryScope
         ? null
-        : buildCallTool({ reachableBuiltinNames: deferredNames, firstClassNames, deniedNames: excludes });
+        : buildCallTool({
+            reachableBuiltinNames: deferredNames,
+            firstClassNames,
+            deniedNames: excludes,
+            mcpToolScope,
+          });
       const catalogText = buildCompactToolCatalog({ allowedNames: deferredNames });
       searchCatalogCount = deferredNames.size;
       searchCatalogTokens = Math.round(catalogText.length / 4);
@@ -1998,7 +2057,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
-  return new Agent<RuntimeContextValue, any>({
+  const agent = new Agent<RuntimeContextValue, any>({
     name: 'Clem',
     handoffDescription:
       'Routes work. Plans, decides, and hands off to sub-agents. Cannot mutate state directly.',
@@ -2053,6 +2112,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     inputGuardrails: harnessInputGuardrails,
     outputGuardrails: harnessOutputGuardrails,
   });
+  bindAgentMcpToolScope(agent, mcpToolScope);
+  return agent;
 }
 
 /** Default max turns for the orchestrator role. */

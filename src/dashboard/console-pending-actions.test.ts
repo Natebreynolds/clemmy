@@ -24,9 +24,15 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
-const { queuePendingAction, markPendingActionApprovalResolved, getPendingAction } = await import('../runtime/harness/pending-actions.js');
+const {
+  queuePendingAction,
+  linkPendingActionApproval,
+  markPendingActionApprovalResolved,
+  getPendingAction,
+} = await import('../runtime/harness/pending-actions.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
+const { listSendTrustGrants } = await import('../agents/plan-scope.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -43,22 +49,44 @@ async function boot(authorized = { v: true }) {
   return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => server.close(() => r())) };
 }
 
-/** A registered, still-PENDING approval card the route will resolve. */
-function pendingCardId(subject: string): string {
-  const sess = createSession({ kind: 'chat' });
-  const card = approvalRegistry.register({ sessionId: sess.id, subject, tool: 'composio_execute_tool', args: {} });
-  return card.approvalId;
+function trustGrantIds(): string[] {
+  return listSendTrustGrants().map((grant) => grant.id).sort();
+}
+
+/** Queue an action and mint the exact, durable approval card bound to it. */
+function linkedRunBatch(subject: string, opts: {
+  actionSessionId?: string;
+  cardSessionId?: string;
+  ttlMs?: number;
+} = {}) {
+  const actionSessionId = opts.actionSessionId ?? createSession({ kind: 'chat' }).id;
+  const record = queuePendingAction({
+    title: subject,
+    summary: 'run_batch plan',
+    kind: 'external_send',
+    toolName: 'run_batch',
+    payload: {
+      tool: 'composio_execute_tool',
+      items: [{ tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'approval-test@example.test' } }],
+    },
+    sessionId: actionSessionId,
+  });
+  const card = approvalRegistry.register({
+    sessionId: opts.cardSessionId ?? actionSessionId,
+    subject,
+    tool: 'run_batch',
+    args: { pendingActionId: record.id },
+    ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
+  });
+  return { record, card };
 }
 
 test('approve-execute resolves the human card and defers a run_batch plan (skipped, never dispatched)', async () => {
   // A run_batch record never reaches the real dispatcher — it defers to the
   // run_batch executor — so this exercises resolve → mark-human → executor
   // without firing a live tool.
-  const record = queuePendingAction({
-    title: 'Batch send', summary: 'run_batch plan', kind: 'external_send',
-    toolName: 'run_batch', payload: { tool: 'composio_execute_tool', items: [] }, sessionId: 'sess-u3',
-  });
-  const approvalId = pendingCardId('batch send');
+  const { record, card } = linkedRunBatch('Batch send');
+  const approvalId = card.approvalId;
 
   const h = await boot();
   try {
@@ -75,12 +103,210 @@ test('approve-execute resolves the human card and defers a run_batch plan (skipp
     const durable = getPendingAction(record.id);
     assert.equal(durable?.status, 'approved', 'the card resolution flipped the record to approved');
     assert.equal(durable?.approvedBy, 'human', 'resolving the card IS the human decision (I1)');
+
+    // Retrying the same exact already-approved card is accepted, but the
+    // executor remains idempotent (run_batch stays delegated and inert here).
+    const retry = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId }),
+    });
+    assert.equal(retry.status, 200);
+    const retryBody = await retry.json() as { status: string };
+    assert.equal(retryBody.status, 'skipped');
+    assert.equal(getPendingAction(record.id)?.status, 'approved');
   } finally {
     await h.close();
   }
 });
 
-test('approve-execute on a not-yet-approved action without a card is skipped, never dispatched', async () => {
+test('approve-execute rejects a cross-card approval with zero action, card, or trust mutation', async () => {
+  const target = linkedRunBatch('Target action');
+  const other = linkedRunBatch('Other action');
+  const beforeTarget = getPendingAction(target.record.id);
+  const beforeOther = getPendingAction(other.record.id);
+  const beforeTrust = trustGrantIds();
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/pending-actions/${target.record.id}/approve-execute`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ approvalId: other.card.approvalId, alwaysAllow: true }),
+    });
+    assert.equal(res.status, 409);
+    assert.match((await res.json() as { reason: string }).reason, /does not belong/i);
+    assert.equal(getPendingAction(target.record.id)?.status, beforeTarget?.status);
+    assert.equal(getPendingAction(target.record.id)?.approvalId, target.card.approvalId);
+    assert.equal(getPendingAction(other.record.id)?.status, beforeOther?.status);
+    assert.equal(approvalRegistry.get(other.card.approvalId)?.status, 'pending', 'the unrelated card was not consumed');
+    assert.deepEqual(trustGrantIds(), beforeTrust, 'invalid approval cannot mint always-allow trust');
+  } finally {
+    await h.close();
+  }
+});
+
+test('approve-execute requires the registry payload backlink and matching session', async () => {
+  const target = linkedRunBatch('Backlink target');
+  const other = linkedRunBatch('Backlink other');
+  // Simulate a forged/stale pending-action backlink: the record names the card,
+  // but that card's immutable registry args name a different action.
+  linkPendingActionApproval(target.record.id, other.card.approvalId);
+  const forgedBefore = getPendingAction(target.record.id);
+
+  const h = await boot();
+  try {
+    const backlink = await fetch(`${h.url}/api/console/pending-actions/${target.record.id}/approve-execute`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ approvalId: other.card.approvalId }),
+    });
+    assert.equal(backlink.status, 409);
+    assert.match((await backlink.json() as { reason: string }).reason, /payload does not identify/i);
+    assert.equal(getPendingAction(target.record.id)?.status, forgedBefore?.status);
+    assert.equal(approvalRegistry.get(other.card.approvalId)?.status, 'pending');
+
+    const actionSession = createSession({ kind: 'chat' }).id;
+    const cardSession = createSession({ kind: 'chat' }).id;
+    const mismatched = linkedRunBatch('Session mismatch', {
+      actionSessionId: actionSession,
+      cardSessionId: cardSession,
+    });
+    const sessionBefore = getPendingAction(mismatched.record.id);
+    const sessionRes = await fetch(`${h.url}/api/console/pending-actions/${mismatched.record.id}/approve-execute`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ approvalId: mismatched.card.approvalId }),
+    });
+    assert.equal(sessionRes.status, 409);
+    assert.match((await sessionRes.json() as { reason: string }).reason, /different session/i);
+    assert.equal(getPendingAction(mismatched.record.id)?.status, sessionBefore?.status);
+    assert.equal(approvalRegistry.get(mismatched.card.approvalId)?.status, 'pending');
+  } finally {
+    await h.close();
+  }
+});
+
+test('approve-execute rejects rejected, expired, and cancelled cards without reviving or granting trust', async () => {
+  const cases = [
+    { resolution: 'rejected' as const, expectedStatus: 'rejected' },
+    { resolution: 'expired' as const, expectedStatus: 'expired' },
+    { resolution: 'cancelled_by_user' as const, expectedStatus: 'cancelled' },
+  ];
+  const h = await boot();
+  try {
+    for (const item of cases) {
+      const { record, card } = linkedRunBatch(`Terminal ${item.resolution}`);
+      const resolved = approvalRegistry.resolve(card.approvalId, item.resolution, 'exploit-regression');
+      assert.equal(resolved.ok, true);
+      assert.equal(getPendingAction(record.id)?.status, item.expectedStatus);
+      const beforeTrust = trustGrantIds();
+
+      const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ approvalId: card.approvalId, alwaysAllow: true }),
+      });
+      assert.equal(res.status, 409, item.resolution);
+      assert.equal(getPendingAction(record.id)?.status, item.expectedStatus, `${item.resolution} action stayed terminal`);
+      assert.equal(approvalRegistry.get(card.approvalId)?.resolution, item.resolution);
+      assert.deepEqual(trustGrantIds(), beforeTrust, `${item.resolution} card granted no trust`);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('Tasks-board always-allow cannot mint trust from an already-rejected approval card', async () => {
+  const card = approvalRegistry.register({
+    sessionId: createSession({ kind: 'chat' }).id,
+    subject: 'Rejected board send',
+    tool: 'composio_execute_tool',
+    args: {
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: {
+        to: 'rejected-board@example.test',
+        subject: 'Must stay rejected',
+      },
+    },
+  });
+  const resolved = approvalRegistry.resolve(card.approvalId, 'rejected', 'board-trust-exploit-regression');
+  assert.equal(resolved.ok, true);
+  const beforeTrust = trustGrantIds();
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/approval/${card.approvalId}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ alwaysAllow: true }),
+    });
+    assert.equal(res.status, 409);
+    assert.deepEqual(
+      trustGrantIds(),
+      beforeTrust,
+      'a failed/replayed board approval must not grant standing send authority',
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test('approve-execute treats an unreaped expired card as inert with zero mutation', async () => {
+  const { record, card } = linkedRunBatch('Expired pending card', { ttlMs: -1_000 });
+  const before = getPendingAction(record.id);
+  const beforeTrust = trustGrantIds();
+  assert.equal(card.status, 'pending');
+  assert.equal(approvalRegistry.isExpired(card), true);
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ approvalId: card.approvalId, alwaysAllow: true }),
+    });
+    assert.equal(res.status, 409);
+    assert.match((await res.json() as { reason: string }).reason, /expired/i);
+    assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending', 'route did not reap or approve the card');
+    assert.equal(getPendingAction(record.id)?.status, before?.status, 'route did not alter the pending action');
+    assert.deepEqual(trustGrantIds(), beforeTrust);
+  } finally {
+    await h.close();
+  }
+});
+
+test('approve-execute rejects a missing registry row and cannot grant always-allow trust', async () => {
+  const actionSessionId = createSession({ kind: 'chat' }).id;
+  const record = queuePendingAction({
+    title: 'Missing registry card',
+    summary: 'must stay inert',
+    kind: 'external_send',
+    toolName: 'run_batch',
+    payload: { items: [{ to: 'missing-card@example.test' }] },
+    sessionId: actionSessionId,
+  });
+  const missingApprovalId = 'apr-missing-route-regression';
+  linkPendingActionApproval(record.id, missingApprovalId);
+  const before = getPendingAction(record.id);
+  const beforeTrust = trustGrantIds();
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ approvalId: missingApprovalId, alwaysAllow: true }),
+    });
+    assert.equal(res.status, 409);
+    assert.match((await res.json() as { reason: string }).reason, /not found/i);
+    assert.equal(getPendingAction(record.id)?.status, before?.status);
+    assert.equal(getPendingAction(record.id)?.approvalId, missingApprovalId);
+    assert.deepEqual(trustGrantIds(), beforeTrust, 'a dangling card cannot create a trust grant');
+  } finally {
+    await h.close();
+  }
+});
+
+test('approve-execute rejects a not-yet-approved action without an exact card, never dispatching', async () => {
   const record = queuePendingAction({
     title: 'Send email', summary: 'queued', kind: 'external_send',
     toolName: 'composio_execute_tool', payload: { tool_slug: 'X', arguments: '{}' }, sessionId: 'sess-u3',
@@ -90,10 +316,10 @@ test('approve-execute on a not-yet-approved action without a card is skipped, ne
     const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
     });
-    assert.equal(res.status, 200);
-    const body = await res.json() as { ok: boolean; status: string };
+    assert.equal(res.status, 409);
+    const body = await res.json() as { ok: boolean; reason: string };
     assert.equal(body.ok, false);
-    assert.equal(body.status, 'skipped', 'an unapproved record is refused before any dispatch');
+    assert.match(body.reason, /exact approval card is required/i);
     assert.equal(getPendingAction(record.id)?.status, 'queued', 'still queued — nothing executed');
   } finally {
     await h.close();
