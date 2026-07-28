@@ -99,6 +99,18 @@ function jsonSchemaAllowsNull(value: unknown): boolean {
 
 function jsonSchemaTypeMatches(value: unknown, schemaValue: unknown): boolean {
   if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
+  // zod's nullish() emits a NESTED wrapper — anyOf[anyOf[T,null],null] — with
+  // no `type` on the wrapper itself. A wrapper matches when any branch does;
+  // without this recursion the branch resolver loses the array/object branch
+  // (live: space_save data_sources items were never null-materialized).
+  const wrapper = schemaValue as { type?: unknown; anyOf?: unknown; oneOf?: unknown };
+  if (wrapper.type === undefined) {
+    for (const alternatives of [wrapper.anyOf, wrapper.oneOf]) {
+      if (Array.isArray(alternatives)) {
+        return alternatives.some((candidate) => jsonSchemaTypeMatches(value, candidate));
+      }
+    }
+  }
   const type = (schemaValue as { type?: unknown }).type;
   const types = Array.isArray(type) ? type : [type];
   if (value === null) return types.includes('null');

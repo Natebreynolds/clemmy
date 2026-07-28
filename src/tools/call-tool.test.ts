@@ -183,6 +183,28 @@ test('deferred workflow schemas accept lean nested steps and materialize strict 
   });
 });
 
+test('materialization survives a nullish (double-anyOf) wrapper around a nested array', async () => {
+  _resetCallToolSchemaCacheForTest();
+  // Live failure (proof workspace-build, 2026-07-27): space_save's
+  // data_sources is nullish → JSON schema anyOf[anyOf[array,null],null].
+  // The branch resolver did not recurse through the nested wrapper, so the
+  // items schema was lost and nested required-nullable keys (composio_slug,
+  // schedule, timezone, …) stayed omitted — the strict inner parser then
+  // rejected the call three times and the model degraded to a static page.
+  const { getCoreTools } = await import('./registry.js');
+  const strict = getCoreTools().find((tool) => tool.name === 'space_save')?.parameters;
+  assert.ok(strict);
+  const materialized = materializeStrictNullableFields(
+    { slug: 'proof-cockpit', title: 'Proof Cockpit', data_sources: [{ id: 'local_tasks', runner: 'tasks.mjs' }] },
+    strict,
+  ) as { data_sources: Array<Record<string, unknown>> };
+  assert.equal(materialized.data_sources[0].id, 'local_tasks');
+  assert.equal(materialized.data_sources[0].runner, 'tasks.mjs');
+  assert.equal(materialized.data_sources[0].composio_slug, null);
+  assert.equal(materialized.data_sources[0].schedule, null);
+  assert.equal(materialized.data_sources[0].timezone, null);
+});
+
 test('call_tool materializes omitted optional keys before invoking the real strict inner tool', async () => {
   _resetCallToolSchemaCacheForTest();
   const out = String(await invokeCallTool(
