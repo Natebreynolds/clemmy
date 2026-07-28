@@ -36,6 +36,7 @@ import { blockedAuthTruth } from './scenarios/blocked-auth-truth.js';
 import { capabilityReconnectResume } from './scenarios/capability-reconnect-resume.js';
 import { fusionBoundedVerifier } from './scenarios/fusion-bounded-verifier.js';
 import { schemaOnDemand } from './scenarios/schema-on-demand.js';
+import { cleanTurnIsolation } from './scenarios/clean-turn-isolation.js';
 import type { BrainKind, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
 const DEFAULT_SCENARIOS: ScenarioDef[] = [
@@ -57,6 +58,7 @@ const DEFAULT_SCENARIOS: ScenarioDef[] = [
   blockedAuthTruth,
   capabilityReconnectResume,
   schemaOnDemand,
+  cleanTurnIsolation,
 ];
 const SCENARIO_CATALOG: ScenarioDef[] = [...DEFAULT_SCENARIOS, fusionBoundedVerifier];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
