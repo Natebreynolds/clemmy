@@ -83,7 +83,7 @@ const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
-const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
+const { getPlanScope } = await import('../../agents/plan-scope.js');
 const { rememberFact } = await import('../../memory/facts.js');
 const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
 const artifactLedger = await import('./artifact-ledger.js');
@@ -158,6 +158,12 @@ test('fresh and approval-resume runs return unknown tools to the model with defe
   const agent = new Agent({ name: 'ResumeToolRecovery', instructions: 'test' });
   const resumed = HarnessSession.create({ kind: 'chat' });
   resumed.saveInterruptState(makeApprovalRunState(agent, 'approved_tool'));
+  approvalRegistry.register({
+    sessionId: resumed.id,
+    subject: 'approve exact tool recovery',
+    tool: 'approved_tool',
+    args: {},
+  });
   let resumeOpts: Record<string, unknown> | null = null;
   await resumePendingApproval({
     agent,
@@ -1414,6 +1420,7 @@ test('resume resolves the approval rows present before the resumed run requests 
     sessionId: sess.id,
     subject: 'old pending approval',
     tool: 'old_tool',
+    args: {},
   });
 
   const runRunner: RunRunnerFn = async () => ({
@@ -1459,7 +1466,126 @@ test('resume resolves the approval rows present before the resumed run requests 
   ]);
 });
 
-test('resume opens a slug-scoped plan scope after approving a Composio external mutation batch', async () => {
+test('an exact approval ID resolves only its matching interruption and leaves a different pending write inert', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ExactApprovalResumeTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'exact approval resume' });
+  const approvedArgs = {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: { to: 'approved@example.com', subject: 'Approved', body: 'A' },
+  };
+  const otherArgs = {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: { to: 'other@example.com', subject: 'Other', body: 'B' },
+  };
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [
+    {
+      toolName: 'composio_execute_tool',
+      callId: 'call-approved',
+      argumentsJson: JSON.stringify(approvedArgs),
+    },
+    {
+      toolName: 'composio_execute_tool',
+      callId: 'call-other',
+      argumentsJson: JSON.stringify(otherArgs),
+    },
+  ]));
+  const approvedCard = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Send approved email',
+    tool: 'composio_execute_tool',
+    args: approvedArgs,
+  });
+  const otherCard = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Send other email',
+    tool: 'composio_execute_tool',
+    args: otherArgs,
+  });
+
+  let approvedCallIds: string[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, state) => {
+    const serialized = (state as unknown as RunState).toJSON() as {
+      context?: { approvals?: Record<string, { approved?: string[] }> };
+    };
+    approvedCallIds = serialized.context?.approvals?.composio_execute_tool?.approved ?? [];
+    return {
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: undefined,
+      hasInterruptions: true,
+      serializedState: makeApprovalRunStateWithInterruptions(agent, [{
+        toolName: 'composio_execute_tool',
+        callId: 'call-other',
+        argumentsJson: JSON.stringify(otherArgs),
+      }]),
+      interruptions: [{
+        toolName: 'composio_execute_tool',
+        rawArgs: JSON.stringify(otherArgs),
+        args: otherArgs,
+      }],
+    };
+  };
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    approvalId: approvedCard.approvalId,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_approval');
+  assert.deepEqual(approvedCallIds, ['call-approved'], 'the different recipient never receives SDK execution authority');
+  assert.equal(approvalRegistry.get(approvedCard.approvalId)?.resolution, 'approved');
+  assert.equal(approvalRegistry.get(otherCard.approvalId)?.status, 'pending');
+  const pendingOther = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' })
+    .filter((row) => row.tool === 'composio_execute_tool'
+      && (row.args as { arguments?: { to?: string } } | null)?.arguments?.to === 'other@example.com');
+  assert.equal(pendingOther.length, 1, 'the existing different-write card is reused, not resolved or duplicated');
+});
+
+test('an approval ID that does not match the serialized interruption executes nothing and remains pending', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'MismatchedApprovalResumeTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'mismatched approval resume' });
+  const cardArgs = { to: 'approved@example.com', body: 'approved payload' };
+  const interruptedArgs = { to: 'different@example.com', body: 'different payload' };
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'gmail_send_email',
+    callId: 'call-different',
+    argumentsJson: JSON.stringify(interruptedArgs),
+  }]));
+  const card = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'Send approved payload',
+    tool: 'gmail_send_email',
+    args: cardArgs,
+  });
+  let executions = 0;
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    approvalId: card.approvalId,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner: async () => {
+      executions += 1;
+      return { history: [], lastResponseId: undefined, finalOutput: { ok: true } };
+    },
+  });
+
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(executions, 0, 'mismatched approval authority never reaches the SDK runner');
+  assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+  assert.ok(HarnessSession.load(sess.id)?.loadInterruptState(), 'the paused state remains recoverable');
+});
+
+test('a bare resume cannot turn multiple Composio cards into a batch-wide approval scope', async () => {
   resetEventLog();
   const agent = new Agent({ name: 'ResumeBatchApprovalTest', instructions: 'test' });
   const sess = HarnessSession.create({ kind: 'chat', title: 'resume-batch-approval' });
@@ -1481,11 +1607,11 @@ test('resume opens a slug-scoped plan scope after approving a Composio external 
     });
   }
 
-  const runRunner: RunRunnerFn = async () => ({
-    history: [],
-    lastResponseId: undefined,
-    finalOutput: { ok: true },
-  });
+  let executions = 0;
+  const runRunner: RunRunnerFn = async () => {
+    executions += 1;
+    return { history: [], lastResponseId: undefined, finalOutput: { ok: true } };
+  };
 
   const result = await resumePendingApproval({
     agent,
@@ -1496,21 +1622,13 @@ test('resume opens a slug-scoped plan scope after approving a Composio external 
     runRunner,
   });
 
-  assert.equal(result.status, 'completed');
-  const scope = getPlanScope(sess.id);
-  assert.deepEqual(scope?.allowedTools, ['composio_execute_tool']);
-  assert.deepEqual(scope?.allowedComposioSlugs, ['SALESFORCE_CREATE_TASK']);
-  assert.equal(
-    isAutoApprovedByScope(sess.id, 'composio_execute_tool', { tool_slug: 'SALESFORCE_CREATE_TASK' }),
-    true,
-  );
-  assert.equal(
-    isAutoApprovedByScope(sess.id, 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL' }),
-    false,
-  );
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(executions, 0);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 2);
+  assert.equal(getPlanScope(sess.id), null);
 });
 
-test('resume opens an exact-tool scope after approving a direct external mutation batch', async () => {
+test('a bare resume cannot turn multiple direct writes into a tool-wide approval scope', async () => {
   resetEventLog();
   const agent = new Agent({ name: 'ResumeDirectExternalBatchTest', instructions: 'test' });
   const sess = HarnessSession.create({ kind: 'chat', title: 'resume-direct-external-batch' });
@@ -1528,11 +1646,11 @@ test('resume opens an exact-tool scope after approving a direct external mutatio
     });
   }
 
-  const runRunner: RunRunnerFn = async () => ({
-    history: [],
-    lastResponseId: undefined,
-    finalOutput: { ok: true },
-  });
+  let executions = 0;
+  const runRunner: RunRunnerFn = async () => {
+    executions += 1;
+    return { history: [], lastResponseId: undefined, finalOutput: { ok: true } };
+  };
 
   const result = await resumePendingApproval({
     agent,
@@ -1543,11 +1661,10 @@ test('resume opens an exact-tool scope after approving a direct external mutatio
     runRunner,
   });
 
-  assert.equal(result.status, 'completed');
-  const scope = getPlanScope(sess.id);
-  assert.deepEqual(scope?.allowedTools, [toolName]);
-  assert.equal(isAutoApprovedByScope(sess.id, toolName, { channel: 'sales', text: 'C' }), true);
-  assert.equal(isAutoApprovedByScope(sess.id, 'run_shell_command', { command: 'echo nope' }), false);
+  assert.equal(result.status, 'awaiting_approval');
+  assert.equal(executions, 0);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 2);
+  assert.equal(getPlanScope(sess.id), null);
 });
 
 test('resume does not open a scoped plan scope for non-external or single-call approvals', async () => {
@@ -1596,7 +1713,7 @@ test('resume does not open a scoped plan scope for non-external or single-call a
       sessionId: shellSess.id,
       subject: `Run shell command ${index + 1}`,
       tool: 'run_shell_command',
-      args: { command: `touch ${index}` },
+      args: { command: `touch ${index === 0 ? 'a' : 'b'}` },
     });
   }
 
@@ -1609,7 +1726,7 @@ test('resume does not open a scoped plan scope for non-external or single-call a
     runRunner,
   });
 
-  assert.equal(shellResult.status, 'completed');
+  assert.equal(shellResult.status, 'awaiting_approval');
   assert.equal(getPlanScope(shellSess.id), null);
 });
 
@@ -3092,7 +3209,12 @@ test('honest-completion: the live RESUME path (runConversationFromResume) also g
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
   }]));
-  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'one draft',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
   const runRunner: RunRunnerFn = async () => ({
     history: [], lastResponseId: undefined,
     finalOutput: { done: true, nextAction: 'completed', reply: 'I am blocked — I need your approval to proceed.', summary: 'blocked', reason: null },
@@ -3112,7 +3234,12 @@ test('runConversationFromResume: completed decision with empty reply is retried 
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
   }]));
-  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'one draft',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
   let calls = 0;
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
     calls += 1;
@@ -3170,7 +3297,12 @@ test('honest-completion: RESUME path judges promise-shaped final replies before 
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
   }]));
-  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'one draft',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
   const runRunner: RunRunnerFn = async () => ({
     history: [], lastResponseId: undefined,
     finalOutput: { done: true, nextAction: 'completed', reply: "I'll pull those records next.", summary: 'promised', reason: null },
@@ -3199,7 +3331,12 @@ test('resume budget exit emits the PAIRED conversation_completed (bare limit eve
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
   }]));
-  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'one draft',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
   // The resumed turn (and every continuation) keeps working → the loop runs to maxSteps.
   const recurseForever = scriptedRunner([
     { finalOutput: { summary: 'still working', done: false, nextAction: 'awaiting_handoff_result', reason: null } },
@@ -3232,7 +3369,12 @@ test('resume path: narration-deferral in a continuation turn is force-corrected 
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
   }]));
-  approvalRegistry.register({ sessionId: sess.id, subject: 'the pull', tool: 'composio_execute_tool', args: {} });
+  approvalRegistry.register({
+    sessionId: sess.id,
+    subject: 'the pull',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'X', arguments: '{}' },
+  });
   let i = 0;
   const scripted: unknown[] = [
     // #1 the approved turn resumes; not done yet → drives the continuation loop.

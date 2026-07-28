@@ -14,6 +14,7 @@ import { AddressInfo } from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
+import { Agent, RunContext, RunState } from '@openai/agents';
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mobile-routes-test-'));
 process.env.CLEMENTINE_HOME = TMP_ROOT;
@@ -25,8 +26,21 @@ test.after(() => {
 const { createMobileRouter, MOBILE_SESSION_COOKIE } = await import('./mobile-routes.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
-const { appendEvent, createSession: createHarnessSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent,
+  createSession: createHarnessSession,
+  listEvents,
+  resetEventLog,
+} = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
+const { queuePendingAction, getPendingAction } = await import('../runtime/harness/pending-actions.js');
+const {
+  createBackgroundTask,
+  getBackgroundTask,
+  markBackgroundTaskAwaitingApproval,
+  markBackgroundTaskRunning,
+} = await import('../execution/background-tasks.js');
 const { resetMemoryDb } = await import('../memory/db.js');
 const { rememberFact } = await import('../memory/facts.js');
 
@@ -87,6 +101,27 @@ async function loginMobile(h: Harness, label = 'Test phone'): Promise<string> {
   const cookie = extractCookie(login.headers.get('set-cookie'));
   assert.ok(cookie, 'login should issue a session cookie');
   return cookie;
+}
+
+function matchingApprovalInterrupt(tool: string, args: Record<string, unknown>): string {
+  const agent = new Agent({ name: 'MobilePendingActionOwnershipTest', instructions: 'test' });
+  const state = new RunState(new RunContext({}), 'approve the exact queued action', agent, null);
+  const json = state.toJSON() as Record<string, unknown>;
+  json.currentStep = {
+    type: 'next_step_interruption',
+    data: {
+      interruptions: [{
+        rawItem: {
+          type: 'function_call',
+          name: tool,
+          callId: `${tool}_mobile_pending_action_call`,
+          arguments: JSON.stringify(args),
+        },
+        toolName: tool,
+      }],
+    },
+  };
+  return JSON.stringify(json);
 }
 
 test('login fails with PIN_NOT_CONFIGURED before any PIN is set', async () => {
@@ -271,9 +306,90 @@ test('mobile approvals reject and expire correctly', async () => {
       method: 'POST',
       headers: { cookie },
     });
-    assert.equal(expire.status, 410);
-    const expireBody = await expire.json() as { approval: { resolution: string } };
-    assert.equal(expireBody.approval.resolution, 'expired');
+    assert.equal(expire.status, 409);
+    const expireBody = await expire.json() as { approval: { status: string; resolution: string | null } };
+    assert.equal(expireBody.approval.status, 'pending', 'an unreaped expired card remains inert');
+    assert.equal(expireBody.approval.resolution, null);
+    assert.equal(approvalRegistry.get(expired.approvalId)?.status, 'pending', 'mobile made no registry mutation');
+  } finally { await h.close(); }
+});
+
+test('mobile approval queues a background-task continuation without stealing registry ownership', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Background approval phone');
+    const task = createBackgroundTask({ title: 'Mobile parked task', prompt: 'send exact report' });
+    markBackgroundTaskRunning(task.id);
+    const approval = approvalRegistry.register({
+      sessionId: task.runSessionId,
+      subject: 'Resume parked background task?',
+      tool: 'run_shell_command',
+      args: { command: 'echo exact' },
+    });
+    markBackgroundTaskAwaitingApproval(task.id, approval.approvalId, 'needs exact approval');
+
+    const res = await fetch(`${h.url}/m/api/approvals/${approval.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { status: string; queuedTaskId: string };
+    assert.equal(body.status, 'queued-background-task');
+    assert.equal(body.queuedTaskId, task.id);
+    assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending', 'daemon drain still owns resolution');
+  } finally { await h.close(); }
+});
+
+test('mobile keeps an exact pending-action owner inert when its session has a matching SDK interrupt', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Pending action ownership phone');
+    const session = HarnessSession.create({
+      kind: 'chat',
+      channel: 'mobile',
+      title: 'Mobile pending action owner',
+    });
+    const record = queuePendingAction({
+      title: 'Mobile exact queued send',
+      summary: 'send one exact payload',
+      kind: 'external_send',
+      toolName: 'run_batch',
+      payload: {
+        tool: 'composio_execute_tool',
+        items: [{ tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'mobile-owner@example.test' } }],
+      },
+      sessionId: session.id,
+    });
+    const approval = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'mobile',
+      subject: 'Approve exact mobile queued send?',
+      tool: 'run_batch',
+      args: { pendingActionId: record.id },
+    });
+    const interrupt = matchingApprovalInterrupt(approval.tool!, approval.args!);
+    session.saveInterruptState(interrupt);
+
+    const res = await fetch(`${h.url}/m/api/approvals/${approval.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(res.status, 200, 'mobile must not enter the SDK resume path');
+    const body = await res.json() as { status: string; message?: string };
+    assert.equal(body.status, 'resolved-pending-action-approval-only');
+    assert.match(body.message ?? '', /execution (?:is )?not confirmed/i);
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      HarnessSession.load(session.id)?.loadInterruptState(),
+      interrupt,
+      'mobile left the serialized runtime owner untouched',
+    );
+    assert.equal(listEvents(session.id, { types: ['run_resumed'] }).length, 0, 'mobile never started the SDK runner');
+    assert.equal(getPendingAction(record.id)?.status, 'approved');
+    assert.notEqual(getPendingAction(record.id)?.status, 'executing');
+    assert.notEqual(getPendingAction(record.id)?.status, 'executed');
   } finally { await h.close(); }
 });
 

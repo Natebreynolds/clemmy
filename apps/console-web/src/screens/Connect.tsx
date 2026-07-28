@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { cn } from '@/lib/cn';
 import { MobilePanel } from '@/components/connect/MobilePanel';
 import { McpManager } from '@/components/connect/McpManager';
@@ -68,6 +69,7 @@ export function Connect() {
   const snap = toolkits.data;
   const connected = connectedToolkits(snap);
   const results = searchToolkits(snap, appQuery);
+  const appsUnavailable = composio.isError || toolkits.isError;
   // Internal plumbing never renders as a user row: the Codex refresh token is
   // half of the SAME sign-in as the access token (one "Codex sign-in" row
   // represents the pair; storage keeps both), and the webhook secret is the
@@ -175,7 +177,18 @@ export function Connect() {
           </div>
         )}
       >
-        {appNotice && (
+        {appsUnavailable && (
+          <QueryUnavailable
+            title="Connected apps are unavailable"
+            description="Clementine couldn’t verify Composio or its connection catalog. This is not an empty-app state."
+            onRetry={() => {
+              void composio.refetch();
+              void toolkits.refetch();
+            }}
+            className="mb-4 py-10"
+          />
+        )}
+        {!appsUnavailable && appNotice && (
           <p className={cn('mb-3 rounded-md border px-3 py-2 text-small',
             appNotice.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : 'border-border bg-subtle text-muted')}>
             {appNotice.text}
@@ -183,14 +196,14 @@ export function Connect() {
         )}
         {/* Composio API key — the ONE thing you get from composio.dev. Enter/reset
             it here; everything else (connect, add accounts, label) stays in-app. */}
-        {composio.data && (
+        {!appsUnavailable && composio.data && (
           <ComposioApiKeyCard
             present={Boolean(composio.data.apiKeyPresent)}
             onSaved={() => { void refreshApps(); }}
           />
         )}
         {/* Search to find + connect a new app from the full catalog. */}
-        <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3">
+        {!appsUnavailable && <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3">
           <Search className="h-4 w-4 text-faint" aria-hidden />
           <input
             value={appQuery}
@@ -200,28 +213,35 @@ export function Connect() {
             className="h-11 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint"
           />
           {appQuery && <button type="button" onClick={() => setAppQuery('')} aria-label="Clear" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
-        </div>
+        </div>}
 
-        {toolkits.isLoading ? (
+        {!appsUnavailable && (toolkits.isLoading || composio.isLoading) ? (
           <TileSkeleton />
-        ) : appQuery ? (
+        ) : !appsUnavailable && appQuery ? (
           results.length === 0
             ? <Card className="p-4 text-body text-muted">No apps match “{appQuery}”.</Card>
             : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
               </div>
-        ) : connected.length === 0 ? (
+        ) : !appsUnavailable && connected.length === 0 ? (
           <Card className="p-5 text-body text-muted">No apps connected yet — search above to connect Gmail, Slack, your CRM, and more.</Card>
-        ) : (
+        ) : !appsUnavailable ? (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {connected.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
           </div>
-        )}
+        ) : null}
       </Section>
 
       {/* Keys & accounts — uniform single-line rows, not an uneven card grid */}
       <Section icon={KeyRound} title="Keys & accounts" subtitle="API keys and sign-ins Clementine uses">
-        {creds.isLoading ? <TileSkeleton /> : (
+        {creds.isLoading ? <TileSkeleton /> : creds.isError ? (
+          <QueryUnavailable
+            title="Keys and accounts are unavailable"
+            description="Clementine couldn’t verify the credential inventory. Nothing has been removed."
+            onRetry={() => { void creds.refetch(); }}
+            className="py-10"
+          />
+        ) : (
           <div className="space-y-2">
             {credentialRows.length === 0 && <Card className="p-4 text-body text-muted">Nothing configured yet.</Card>}
             {credentialRows.map((row, i) => (

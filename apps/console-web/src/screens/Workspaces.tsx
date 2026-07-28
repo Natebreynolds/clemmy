@@ -5,6 +5,7 @@ import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import { listSpaces, type SpaceRecord } from '@/lib/spaces';
 import { humanizeCron } from '@/lib/cron';
@@ -132,6 +133,12 @@ export function Workspaces() {
             <div key={i} className="h-64 animate-pulse rounded-2xl border border-border bg-subtle" />
           ))}
         </div>
+      ) : spaces.isError ? (
+        <QueryUnavailable
+          title="Workspaces are unavailable"
+          description="Clementine couldn’t load the workspace index. No workspace has been removed."
+          onRetry={() => { void spaces.refetch(); }}
+        />
       ) : items.length === 0 ? (
         <EmptyState
           title="No workspaces yet"

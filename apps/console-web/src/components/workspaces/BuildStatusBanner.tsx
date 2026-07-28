@@ -29,6 +29,11 @@ export function BuildStatusBanner({
 }) {
   const navigate = useNavigate();
   if (!paused && gaps.length === 0 && openApprovals === 0 && failures.length === 0) return null;
+  const askLabel = paused || failures.length > 0
+    ? 'Ask Clem to fix'
+    : gaps.length > 0
+      ? 'Ask Clem to resolve'
+      : 'Ask Clem to review';
 
   return (
     <div className="border-b border-border bg-subtle px-4 py-3">
@@ -76,7 +81,7 @@ export function BuildStatusBanner({
             </Button>
           )}
           <Button size="sm" onClick={onAskClem}>
-            <Wrench className="h-4 w-4" aria-hidden /> Ask Clem to fix
+            <Wrench className="h-4 w-4" aria-hidden /> {askLabel}
           </Button>
         </div>
       </div>

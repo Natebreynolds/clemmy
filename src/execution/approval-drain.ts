@@ -33,7 +33,7 @@ export async function resolveDrainApproval(opts: {
     resolve: (id: string, resolution: string, resolver: string) => { ok: boolean; reason?: string };
     listPending: (filter: { sessionId?: string }) => Array<{ approvalId: string }>;
   };
-  resumeForTest?: (args: { sessionId: string; decision: 'approve' | 'reject'; resolver?: string }) => Promise<{
+  resumeForTest?: (args: { sessionId: string; approvalId: string; decision: 'approve' | 'reject'; resolver?: string }) => Promise<{
     status: string;
     error?: string;
     lastDecision?: { reply?: string; summary?: string };
@@ -60,16 +60,27 @@ export async function resolveDrainApproval(opts: {
     return { approvalId: opts.approvalId, status: 'rejected', text: `Approval ${opts.approvalId} rejected.`, sessionId: row.sessionId };
   }
 
-  const resume = opts.resumeForTest ?? (async (args: { sessionId: string; decision: 'approve' | 'reject'; resolver?: string }) => {
+  const resume = opts.resumeForTest ?? (async (args: { sessionId: string; approvalId: string; decision: 'approve' | 'reject'; resolver?: string }) => {
     const [{ runConversationFromResume }, { buildOrchestratorAgentForApprovalResume }] = await Promise.all([
       import('../runtime/harness/loop.js'),
       import('../agents/orchestrator.js'),
     ]);
     const agent = await buildOrchestratorAgentForApprovalResume({ sessionId: args.sessionId });
-    return runConversationFromResume({ agent, sessionId: args.sessionId, decision: args.decision, resolver: args.resolver });
+    return runConversationFromResume({
+      agent,
+      sessionId: args.sessionId,
+      approvalId: args.approvalId,
+      decision: args.decision,
+      resolver: args.resolver,
+    });
   });
 
-  const result = await resume({ sessionId: row.sessionId, decision: 'approve', resolver });
+  const result = await resume({
+    sessionId: row.sessionId,
+    approvalId: opts.approvalId,
+    decision: 'approve',
+    resolver,
+  });
   if (result.status === 'failed') {
     throw new Error(result.error ?? `Approval ${opts.approvalId} resume failed.`);
   }

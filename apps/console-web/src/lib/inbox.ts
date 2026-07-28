@@ -16,6 +16,13 @@ export interface ApprovalRow {
   pendingAction?: PendingActionApprovalView;
 }
 
+export interface ApprovalDecisionResponse {
+  ok: boolean;
+  status?: string;
+  message?: string;
+  reason?: string;
+}
+
 export interface RunRow {
   id: string;
   sessionId?: string;
@@ -103,8 +110,50 @@ export const decideApproval = (
   const path = opts?.kind === 'runtime'
     ? `/api/approvals/${encodeURIComponent(id)}/${decision}`
     : `/api/console/harness-approvals/${encodeURIComponent(id)}/${decision}`;
-  return apiPost(path, opts?.modifiedArgs ? { modifiedArgs: opts.modifiedArgs } : undefined);
+  return apiPost<ApprovalDecisionResponse>(
+    path,
+    opts?.modifiedArgs ? { modifiedArgs: opts.modifiedArgs } : undefined,
+  );
 };
+
+export function approvalDecisionSuccessText(
+  row: ApprovalRow,
+  decision: 'approve' | 'reject',
+  response?: ApprovalDecisionResponse,
+): string {
+  if (decision === 'reject') return 'Rejected — this action will not be dispatched.';
+  if (row.pendingAction) {
+    const status = response?.status ?? '';
+    if (/workflow.*resume/i.test(status)) {
+      return 'Approved — the workflow runner will resume the exact queued action. Execution is not confirmed yet.';
+    }
+    if (/resum/i.test(status)) {
+      return 'Approved — Clementine is resuming the exact queued action. Execution is not confirmed yet.';
+    }
+    return 'Approved — the exact queued action is authorized, but execution is not confirmed yet.';
+  }
+  const status = response?.status ?? '';
+  if (/workflow.*resume/i.test(status)) return 'Approved — the workflow runner will resume.';
+  if (/resum/i.test(status)) return 'Approved — Clementine is resuming the paused work.';
+  if (/stale/i.test(status)) return 'Approved — the decision was recorded; no resumed execution is confirmed.';
+  return 'Approved.';
+}
+
+export function summarizeApprovalDecisionBatch(input: {
+  decision: 'approve' | 'reject';
+  total: number;
+  succeeded: number;
+  errors: string[];
+}): string {
+  const verb = input.decision === 'approve' ? 'Approved' : 'Rejected';
+  const failed = Math.max(0, input.total - input.succeeded);
+  if (failed === 0) return `${verb} ${input.succeeded} of ${input.total}.`;
+  const firstError = input.errors.find((error) => error.trim())?.trim();
+  const errorClause = firstError
+    ? `: ${firstError.replace(/[.\s]+$/, '')}.`
+    : '.';
+  return `${verb} ${input.succeeded} of ${input.total}; ${failed} failed${errorClause} Failed items remain selected.`;
+}
 
 export const cancelStaleApprovals = () => apiPost('/api/console/approvals/cancel-stale');
 

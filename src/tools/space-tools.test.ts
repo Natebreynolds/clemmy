@@ -129,6 +129,37 @@ test('space_save refuses a data-backed view that only reads an imaginary window 
   assert.equal(existsSync(store.resolveInSpace('imaginary-seed', 'data/tmp-imaginary-seed.mjs')), false);
 });
 
+test('space_save refuses legacy {{source}} binding before activating a dynamic Workspace', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-legacy-binding.html');
+  const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-legacy-tasks.mjs');
+  writeFileSync(
+    draft,
+    `<html>
+      <script id="dataset" type="application/json">{{tasks}}</script>
+      <script>
+        const raw = document.getElementById("dataset").textContent;
+        const data = raw !== "{{tasks}}" ? JSON.parse(raw) : [];
+        render(data);
+      </script>
+    </html>`,
+    'utf-8',
+  );
+  writeFileSync(runnerDraft, 'process.stdout.write(JSON.stringify([]))', 'utf-8');
+
+  const out = text(await tools.space_save({
+    slug: 'legacy-binding',
+    title: 'Legacy Binding',
+    view_path: draft,
+    data_sources: [{ id: 'tasks', runner_path: runnerDraft, allow_empty: true }],
+  }));
+
+  assert.match(out, /was NOT saved/);
+  assert.match(out, /clem\.data\(\)/);
+  assert.match(out, /not expanded|legacy/i);
+  assert.equal(store.spaceStore.get('legacy-binding'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('legacy-binding', 'data/tmp-legacy-tasks.mjs')), false);
+});
+
 test('space_save installs a newly-authored runner_path in one call', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-one-pass.html');
   const runnerDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-open-tasks.mjs');

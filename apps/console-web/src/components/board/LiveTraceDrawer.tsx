@@ -274,7 +274,7 @@ export function LiveTraceDrawer({
 }: {
   card: BoardCard;
   onClose: () => void;
-  onAction?: (card: BoardCard, intent: BoardButtonIntent) => void;
+  onAction?: (card: BoardCard, intent: BoardButtonIntent) => void | Promise<void>;
 }) {
   const [rawHarness, setRawHarness] = useState<HarnessEvent[]>([]);
   const [rawWorkflow, setRawWorkflow] = useState<Array<Record<string, unknown>>>([]);
@@ -297,6 +297,7 @@ export function LiveTraceDrawer({
   const [revisionPolicy, setRevisionPolicy] = useState<'preserve' | 'revalidate' | 'invalidate'>('revalidate');
   const [revisionState, setRevisionState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
   const [revisionNotice, setRevisionNotice] = useState('');
+  const [actionBusy, setActionBusy] = useState<BoardButtonIntent | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // A finished run loses its `sourceKind === 'workflow'` tag but still carries a
@@ -314,6 +315,17 @@ export function LiveTraceDrawer({
     setRevisionState('idle');
     setRevisionNotice('');
   }, [card.id, card.progressHint]);
+  useEffect(() => { setActionBusy(null); }, [card.id]);
+
+  const runCardAction = async (intent: BoardButtonIntent) => {
+    if (!onAction || actionBusy !== null) return;
+    setActionBusy(intent);
+    try {
+      await onAction(card, intent);
+    } finally {
+      setActionBusy(null);
+    }
+  };
 
   const backgroundDetail = usePoll(
     ['background-task-detail', card.id],
@@ -671,13 +683,24 @@ export function LiveTraceDrawer({
               {onAction && (
                 <div className="flex flex-wrap gap-2">
                   {card.primaryAction === 'continue' && (
-                    <Button size="sm" onClick={() => onAction(card, 'resume')}>
-                      <Play className="h-4 w-4" aria-hidden /> Continue
+                    <Button
+                      size="sm"
+                      disabled={actionBusy !== null}
+                      onClick={() => { void runCardAction('resume'); }}
+                    >
+                      <Play className="h-4 w-4" aria-hidden />
+                      {actionBusy === 'resume' ? 'Continuing…' : 'Continue'}
                     </Button>
                   )}
                   {card.actions.includes('cancel') && (
-                    <Button size="sm" variant="secondary" onClick={() => onAction(card, 'cancel')}>
-                      <X className="h-4 w-4" aria-hidden /> Cancel
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={actionBusy !== null}
+                      onClick={() => { void runCardAction('cancel'); }}
+                    >
+                      <X className="h-4 w-4" aria-hidden />
+                      {actionBusy === 'cancel' ? 'Cancelling…' : 'Cancel'}
                     </Button>
                   )}
                 </div>

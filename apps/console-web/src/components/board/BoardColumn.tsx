@@ -28,7 +28,7 @@ export function BoardColumn({
   activeCard: BoardCardT | null;
   onOpen: (card: BoardCardT) => void;
   onArchive?: (card: BoardCardT) => void;
-  onAction?: (card: BoardCardT, intent: BoardButtonIntent) => void;
+  onAction?: (card: BoardCardT, intent: BoardButtonIntent) => void | Promise<void>;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const [showAll, setShowAll] = useState(false);

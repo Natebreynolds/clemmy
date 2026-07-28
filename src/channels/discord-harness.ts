@@ -2951,6 +2951,7 @@ async function runDiscordHarnessResume(opts: {
       const result = await runConversationFromResume({
         agent,
         sessionId,
+        approvalId,
         decision,
         resolver: 'discord-user',
         onChunk,

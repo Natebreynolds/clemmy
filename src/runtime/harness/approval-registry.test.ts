@@ -103,6 +103,36 @@ test('resolve is atomic — only one of two racing resolves wins', () => {
   assert.equal(second.row?.resolution, 'approved');
 });
 
+test('resolving a superseded card cannot overwrite the pending action owned by its replacement', () => {
+  const session = createSession({ kind: 'chat' });
+  const action = pending.queuePendingAction({
+    title: 'Send exact email',
+    summary: 'Waiting for the current card.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: session.id,
+  });
+  const oldCard = reg.register({
+    sessionId: session.id,
+    subject: 'Old card',
+    tool: 'composio_execute_tool',
+    args: { pendingActionId: action.id },
+  });
+  const replacement = reg.register({
+    sessionId: session.id,
+    subject: 'Replacement card',
+    tool: 'composio_execute_tool',
+    args: { pendingActionId: action.id },
+  });
+  assert.equal(pending.getPendingAction(action.id)?.approvalId, replacement.approvalId);
+
+  assert.equal(reg.resolve(oldCard.approvalId, 'rejected', 'late-old-card').ok, true);
+  const after = pending.getPendingAction(action.id);
+  assert.equal(after?.approvalId, replacement.approvalId);
+  assert.equal(after?.status, 'approval_requested', 'old-card resolution is audit-only for the superseded action link');
+});
+
 test('resolve marks matching approval notifications read', () => {
   const session = createSession({ kind: 'chat' });
   const r = reg.register({ sessionId: session.id, subject: 'notify cleanup' });

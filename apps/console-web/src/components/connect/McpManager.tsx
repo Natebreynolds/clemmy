@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import {
   getMcpServers,
@@ -93,6 +94,13 @@ export function McpManager() {
 
       {mcp.isLoading ? (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{[0, 1].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
+      ) : mcp.isError ? (
+        <QueryUnavailable
+          title="MCP servers are unavailable"
+          description="Clementine couldn’t verify the local MCP catalog. This is not an empty server list."
+          onRetry={() => { void mcp.refetch(); }}
+          className="py-10"
+        />
       ) : servers.length === 0 ? (
         <Card className="p-4 text-body text-muted">No MCP servers yet. Add one above.</Card>
       ) : (

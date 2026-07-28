@@ -1,7 +1,12 @@
 /** Run: npx tsx --test apps/console-web/src/lib/inbox.test.ts */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { collapseAttentionRows, type NotificationRow } from './inbox.js';
+import {
+  approvalDecisionSuccessText,
+  collapseAttentionRows,
+  summarizeApprovalDecisionBatch,
+  type NotificationRow,
+} from './inbox.js';
 
 const row = (id: string, title: string, createdAt: string): NotificationRow => ({ id, title, createdAt });
 
@@ -30,4 +35,56 @@ test('unrelated titles never merge; ordering is newest-first across groups', () 
   ]);
   assert.deepEqual(collapsed.map((c) => c.row.id), ['b', 'c']);
   assert.equal(collapsed[0].collapsedCount, 1);
+});
+
+test('queued-action approval copy never claims the external action executed', () => {
+  const text = approvalDecisionSuccessText({
+    approvalId: 'apr-queued',
+    subject: 'Publish approved post',
+    status: 'pending',
+    pendingAction: {
+      id: 'pa-queued',
+      title: 'Publish post',
+      summary: 'Prepared post',
+      kind: 'external_send',
+      toolName: 'SOCIALS_PUBLISH_POST',
+      payload: { body: 'hello' },
+      payloadHash: 'hash',
+      targetSummary: 'LinkedIn',
+      preview: 'hello',
+      risk: 'Publishes externally',
+      rollback: 'Delete the post',
+      status: 'approval_requested',
+      idempotencyKey: 'one',
+      approvalId: 'apr-queued',
+      resultSummary: null,
+      createdAt: '2026-07-28T00:00:00.000Z',
+      updatedAt: '2026-07-28T00:00:00.000Z',
+    },
+  }, 'approve');
+
+  assert.match(text, /approved/i);
+  assert.match(text, /execution is not confirmed/i);
+  assert.doesNotMatch(text, /\bexecuted\b|\bpublished\b|\bsent\b/i);
+});
+
+test('bulk approval summary exposes partial failure and keeps failed items actionable', () => {
+  assert.equal(
+    summarizeApprovalDecisionBatch({
+      decision: 'approve',
+      total: 3,
+      succeeded: 2,
+      errors: ['Provider rejected one payload.'],
+    }),
+    'Approved 2 of 3; 1 failed: Provider rejected one payload. Failed items remain selected.',
+  );
+  assert.equal(
+    summarizeApprovalDecisionBatch({
+      decision: 'reject',
+      total: 2,
+      succeeded: 2,
+      errors: [],
+    }),
+    'Rejected 2 of 2.',
+  );
 });

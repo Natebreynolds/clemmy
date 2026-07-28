@@ -1,14 +1,17 @@
 name: Release Desktop App
 
 # Tag pushes publish production releases. Manual runs build signed/notarized
-# macOS and Windows candidates and keep both private as GitHub Actions artifacts.
+# macOS and private Windows candidates and keep both as GitHub Actions artifacts.
+# Manual Windows candidates may be unsigned; public Windows tag builds may not.
 #
-# Required repository secrets:
+# Required repository secrets for production:
 #   APPLE_ID
 #   APPLE_APP_PASSWORD
 #   APPLE_TEAM_ID
 #   CSC_LINK
 #   CSC_KEY_PASSWORD
+#   WINDOWS_CSC_LINK (unless the tagged commit explicitly uses [mac-only])
+#   WINDOWS_CSC_KEY_PASSWORD (unless the tagged commit explicitly uses [mac-only])
 
 on:
   push:
@@ -267,6 +270,37 @@ jobs:
       }}
 
     steps:
+      - name: Verify production Windows signing secrets
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WINDOWS_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Private manual Windows candidates may be unsigned."
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" != "push" ]]; then
+            echo "::error::Unsupported Windows release event: $EVENT_NAME"
+            exit 1
+          fi
+
+          missing=()
+          for name in WINDOWS_CSC_LINK WINDOWS_CSC_KEY_PASSWORD; do
+            value="${!name-}"
+            if [[ -z "$value" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required Windows signing secrets for production release: ${missing[*]}"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v5
 

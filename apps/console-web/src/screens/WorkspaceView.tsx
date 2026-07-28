@@ -13,7 +13,7 @@ import { useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  spaceSessionId, openApprovalCount, gapQuestions, latestRefreshFailures, type SpaceStatus,
+  spaceSessionId, openApprovalCount, gapQuestions, latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
@@ -107,19 +107,14 @@ export function WorkspaceView() {
   // the user shouldn't have to re-type an error the banner is already showing.
   const askClemToFix = () => {
     setDockOpen(true);
-    const lines: string[] = [];
-    for (const f of refreshFailures) {
-      lines.push(`- ${f.path.replace('/refresh/', '')}: ${(f.note ?? 'failed to refresh').slice(0, 600)}`);
-    }
-    if (lines.length > 0) {
-      void chat.send({
-        text: `Fix the failing data sources in this workspace:\n${lines.join('\n')}\nDiagnose each runner, apply the fix, and confirm the re-pull succeeds.`,
-      });
-    } else if (space.status === 'paused') {
-      void chat.send({
-        text: 'This workspace is paused because a data source didn’t return data when it was built. Diagnose and fix it, then resume the workspace.',
-      });
-    }
+    void chat.send({
+      text: buildWorkspaceFixPrompt({
+        paused: space.status === 'paused',
+        failures: refreshFailures,
+        gaps,
+        openApprovals,
+      }),
+    });
   };
 
   return (

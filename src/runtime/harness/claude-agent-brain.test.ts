@@ -28,6 +28,7 @@ const {
   invalidateStableMemorySnapshot,
   claudeAgentSdkAdvertisedToolUniverse,
   partitionClaudeAgentSdkJitSurface,
+  resolveClaudeAgentBrainMaxTurns,
 } = brain;
 const {
   accrueSessionTokens,
@@ -423,6 +424,42 @@ test('Claude brain records a zero-authority external MCP scope for explicit loca
   assert.equal(scope.lane, 'claude_sdk');
   assert.equal(scope.maxTools, 0);
   assert.deepEqual(scope.allowedServerSlugs, []);
+});
+
+test('Claude brain preserves precise connector scope across a bare execution follow-up', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sessionId = 'brain-continuation-mcp-scope';
+  createSession({ id: sessionId, kind: 'chat', title: 'Outlook planning' });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Draft the Outlook emails to the contacts we just reviewed.' },
+  });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'I am continuing the approved Outlook task.',
+    sessionId: 'sdk',
+    model: 'm',
+    toolUses: [],
+  }));
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Do it.',
+    sessionId,
+  });
+
+  const scopeEvent = listEvents(sessionId, { types: ['mcp_tool_scope'] }).at(-1);
+  assert.ok(scopeEvent);
+  const scope = scopeEvent!.data as {
+    reason?: string;
+    maxTools?: number;
+    allowedServerSlugs?: string[];
+  };
+  assert.ok((scope.maxTools ?? 0) > 0);
+  assert.ok((scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.match(scope.reason ?? '', /continuity/i);
 });
 
 test('Move 4: a judge-failed-open completion is TAGGED verification.failedOpen (no silent green check)', async () => {
@@ -892,6 +929,26 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   const workingMemory = readFileSync(workingMemoryPathForSession('brain-run'), 'utf-8');
   assert.match(workingMemory, /search memory/);
   assert.match(workingMemory, /Claude brain reply/, 'Claude-lane writeback runs after the terminal assistant reply is durable');
+});
+
+test('Claude SDK turn cap adapts only for execution-ready complex artifact work', () => {
+  assert.equal(resolveClaudeAgentBrainMaxTurns('search memory'), 24);
+  assert.equal(
+    resolveClaudeAgentBrainMaxTurns('Build me a workspace called Proof Cockpit with a local task runner.'),
+    36,
+  );
+  assert.equal(
+    resolveClaudeAgentBrainMaxTurns('Let’s brainstorm how we might build a workspace for this someday.'),
+    24,
+    'exploration is not execution and does not widen the provider runway',
+  );
+  assert.equal(
+    resolveClaudeAgentBrainMaxTurns('Build it now.', [
+      'Let’s brainstorm a social media command-center workspace with a local content calendar.',
+    ]),
+    36,
+    'an execution follow-up inherits the bounded artifact runway from recent conversation context',
+  );
 });
 
 test('brain tracker scope survives a settled retry with the same durable run id and rotates for a new run', async () => {
@@ -2321,7 +2378,7 @@ test('respondViaClaudeAgentSdkBrain persists a material plain-text clarification
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   setClaudeAgentSdkBrainRunForTest(async () => ({
-    text: 'Which audience should this rollout brief target?',
+    text: 'Before I draft this, who should the rollout brief target — which audience?',
     sessionId: 'sdk-session',
     model: 'claude-sonnet-5',
     toolUses: [],
@@ -2335,7 +2392,11 @@ test('respondViaClaudeAgentSdkBrain persists a material plain-text clarification
   assert.equal(res.stoppedReason, 'awaiting-input');
   const awaiting = listEvents('brain-plain-material-ask', { types: ['awaiting_user_input'] });
   assert.equal(awaiting.length, 1);
-  assert.equal(awaiting[0].data.question, 'Which audience should this rollout brief target?');
+  assert.equal(
+    awaiting[0].data.question,
+    'Before I draft this, who should the rollout brief target — which audience?',
+    'the exact live Claude wording gets a canonical awaiting-input event',
+  );
   const completed = listEvents('brain-plain-material-ask', { types: ['conversation_completed'] }).at(-1);
   assert.equal(completed?.data.reason, 'awaiting_user_input');
   assert.equal(completed?.data.awaitingUser, true);

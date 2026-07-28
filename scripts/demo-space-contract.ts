@@ -39,7 +39,7 @@ function seed(slug: string, opts: { view: string; runner?: string }) {
     writeFileSync(resolveInSpace(slug, 'data/refresh.mjs'), opts.runner, 'utf-8');
   }
 }
-const GOOD_VIEW = `<html><script>fetch('/api/console/spaces/x/contacts'+'/data').then(r=>r.json()).then(j=>render(j.data.contacts.contacts))</script></html>`;
+const GOOD_VIEW = '<html><script>clem.data().then(data=>render(data.contacts.contacts))</script></html>';
 const ROWS = 'process.stdout.write(JSON.stringify({contacts:[{name:"Dana",email:"d@site.example"}]}))';
 const EMPTY = 'process.stdout.write(JSON.stringify({contacts:[]}))';
 

@@ -49,6 +49,18 @@ test('finish phase preserves batching, deliverable writes, render work, and exac
       arguments: JSON.stringify({ document_id: 'doc_123' }),
     }],
     ['mcp__clementine-local__run_shell_command', { command: 'npm run render' }],
+    ['mcp__clementine-local__call_tool', {
+      name: 'run_shell_command',
+      args_json: JSON.stringify({ command: 'node /tmp/proof/open-tasks.mjs' }),
+    }],
+    ['mcp__clementine-local__call_tool', {
+      name: 'space_save',
+      args_json: JSON.stringify({ slug: 'proof-cockpit', title: 'Proof Cockpit' }),
+    }],
+    ['mcp__clementine-local__call_tool', {
+      name: 'space_refresh',
+      args_json: JSON.stringify({ slug: 'proof-cockpit' }),
+    }],
     ['mcp__clementine-local__offer_background', { objective: 'finish research' }],
   ] as const;
   for (const [toolName, args] of allowed) assert.equal(isFinishPhaseTool(toolName, args), true, toolName);
@@ -57,6 +69,130 @@ test('finish phase preserves batching, deliverable writes, render work, and exac
   assert.equal(isFinishPhaseTool('mcp__googledocs__get_document', {}), false, 'read-back needs an exact id');
   assert.equal(isFinishPhaseTool('mcp__googledocs__get_documents_list', { page_size: 50 }), false, 'list is exploration');
   assert.equal(isFinishPhaseTool('mcp__clementine-local__run_worker', { objective: 'research more' }), false, 'new exploratory helpers are not a finish action');
+});
+
+test('workspace builds get bounded artifact headroom instead of the generic interactive rail', () => {
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'Build me a workspace called Proof Cockpit with a local task runner.',
+    }),
+    { kind: 'artifact_build', softLimit: 16, hardLimit: 24 },
+  );
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'Let’s brainstorm how we might build a workspace for this someday.',
+    }),
+    { kind: 'interactive', softLimit: 12, hardLimit: 20 },
+    'artifact vocabulary plus a hypothetical build must remain exploration',
+  );
+  assert.deepEqual(
+    interactiveToolEconomyPolicy({
+      message: 'Build it now.',
+      priorMessages: ['Let’s brainstorm a social media command-center workspace.'],
+    }),
+    { kind: 'artifact_build', softLimit: 16, hardLimit: 24 },
+    'an explicit execution follow-up inherits artifact shape without inheriting the old hypothetical stance',
+  );
+});
+
+test('goal-advancing artifact execution clears stale finish refusals and has a bounded hard-limit reserve', () => {
+  const state = createToolEconomyState({
+    kind: 'artifact_build',
+    softLimit: 1,
+    hardLimit: 4,
+  });
+  assert.equal(evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__read_file',
+    args: { path: '/tmp/source-a' },
+    callId: 'read-a',
+  }), null);
+  assert.equal(evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__read_file',
+    args: { path: '/tmp/source-b' },
+    callId: 'read-b',
+  })?.kind, 'finish_phase');
+  assert.equal(evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__tool_search',
+    args: { query: 'one more schema' },
+    callId: 'search',
+  })?.kind, 'finish_phase');
+  assert.equal(state.softRefusals, 2);
+
+  assert.equal(evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__call_tool',
+    args: {
+      name: 'run_shell_command',
+      args_json: JSON.stringify({ command: 'cat > /tmp/open-tasks.mjs <<EOF\nconsole.log([])\nEOF' }),
+    },
+    callId: 'author-runner',
+  }), null);
+  assert.equal(state.softRefusals, 0, 'real execution progress resets stale exploration refusals');
+
+  assert.equal(evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__call_tool',
+    args: {
+      name: 'space_save',
+      args_json: JSON.stringify({ slug: 'proof-cockpit', title: 'Proof Cockpit' }),
+    },
+    callId: 'save-space',
+  }), null, 'the requested terminal artifact write may consume the bounded completion reserve');
+  assert.equal(evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__call_tool',
+    args: {
+      name: 'space_refresh',
+      args_json: JSON.stringify({ slug: 'proof-cockpit' }),
+    },
+    callId: 'refresh-space',
+  }), null, 'exact artifact refresh remains goal-advancing');
+
+  for (let i = 0; i < 4; i += 1) {
+    evaluateToolEconomy({
+      state,
+      toolName: 'mcp__clementine-local__call_tool',
+      args: {
+        name: 'space_refresh',
+        args_json: JSON.stringify({ slug: `proof-cockpit-${i}` }),
+      },
+      callId: `extra-${i}`,
+    });
+  }
+  const exhausted = evaluateToolEconomy({
+    state,
+    toolName: 'mcp__clementine-local__call_tool',
+    args: {
+      name: 'space_refresh',
+      args_json: JSON.stringify({ slug: 'one-too-many' }),
+    },
+    callId: 'reserve-exhausted',
+  });
+  assert.equal(exhausted?.kind, 'hard_stop');
+  assert.equal(exhausted?.interrupt, true, 'artifact headroom is a reserve, not an unbounded bypass');
+
+  const sendState = createToolEconomyState({
+    kind: 'artifact_build',
+    softLimit: 1,
+    hardLimit: 1,
+  });
+  assert.equal(evaluateToolEconomy({
+    state: sendState,
+    toolName: 'mcp__clementine-local__read_file',
+    args: { path: '/tmp/source' },
+    callId: 'send-prelude',
+  }), null);
+  const send = evaluateToolEconomy({
+    state: sendState,
+    toolName: 'mcp__gmail__send_email',
+    args: { to: 'person@example.com', subject: 'Not an artifact completion' },
+    callId: 'send-after-hard-limit',
+  });
+  assert.equal(send?.kind, 'hard_stop');
+  assert.equal(send?.interrupt, true, 'the reserve never widens sends or unrelated external mutations');
 });
 
 test('call ids are canonical: replayed permission frames do not consume budget twice', () => {

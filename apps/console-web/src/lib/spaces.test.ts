@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { latestRefreshFailures, type SpaceAudit } from './spaces';
+import { buildWorkspaceFixPrompt, latestRefreshFailures, type SpaceAudit } from './spaces';
 
 const entry = (ts: string, path: string, outcome: string, note?: string): SpaceAudit =>
   ({ ts, method: 'REFRESH', path, outcome, ...(note ? { note } : {}) });
@@ -36,4 +36,24 @@ test('latestRefreshFailures ignores non-REFRESH audit entries', () => {
     entry('t2', '/refresh/pipeline', 'ok'),
   ];
   assert.deepEqual(latestRefreshFailures(audit), []);
+});
+
+test('workspace fix prompt is actionable for gaps-only and approval-only banners', () => {
+  const gapPrompt = buildWorkspaceFixPrompt({
+    paused: false,
+    failures: [],
+    gaps: [{ question: 'Which timezone should the calendar use?' }],
+    openApprovals: 0,
+  });
+  assert.match(gapPrompt, /Which timezone should the calendar use/);
+  assert.match(gapPrompt, /help me resolve/i);
+
+  const approvalPrompt = buildWorkspaceFixPrompt({
+    paused: false,
+    failures: [],
+    gaps: [],
+    openApprovals: 2,
+  });
+  assert.match(approvalPrompt, /2 actions waiting/i);
+  assert.match(approvalPrompt, /do not approve or execute/i);
 });

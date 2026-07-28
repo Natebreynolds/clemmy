@@ -89,9 +89,14 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
-import { processBackgroundTasks } from '../execution/background-tasks.js';
+import {
+  processBackgroundTasks,
+  queueBackgroundTaskApprovalResolution,
+} from '../execution/background-tasks.js';
 import type { AssistantRouteDiagnostics } from '../types.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
+import { exactPendingActionApprovalPreflight } from '../runtime/harness/pending-action-approval.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
@@ -1199,18 +1204,38 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
     if (approvalRegistry.isExpired(existing)) {
-      const expired = approvalRegistry.resolve(id, 'expired', 'mobile-inbox');
-      res.status(410).json({
+      res.status(409).json({
         error: 'approval expired',
-        approval: expired.row ? serializeApprovalForMobile(expired.row) : serializeApprovalForMobile(existing),
+        approval: serializeApprovalForMobile(existing),
       });
+      return;
+    }
+    const pendingActionPreflight = exactPendingActionApprovalPreflight(existing, decision);
+    if (pendingActionPreflight.kind === 'error') {
+      res.status(pendingActionPreflight.status).json({ error: pendingActionPreflight.reason });
       return;
     }
 
     const auditResolution: approvalRegistry.ApprovalResolution = decision === 'reject' ? 'rejected' : 'approved';
+    // Background tasks retain first claim on execution ownership. Only after
+    // that lane declines the card may generic mobile approval authorize a
+    // pending action without resuming its serialized SDK state.
+    const queued = queueBackgroundTaskApprovalResolution(id, decision === 'approve');
+    if (queued) {
+      res.json({
+        ok: true,
+        approvalId: id,
+        status: 'queued-background-task',
+        queuedTaskId: queued.id,
+        sessionId: queued.runSessionId,
+      });
+      return;
+    }
     const sessionRowForKind = harnessGetSession(existing.sessionId);
     const harnessSession = HarnessSession.load(existing.sessionId);
-    const shouldResume = sessionRowForKind?.kind !== 'workflow' && !!harnessSession?.loadInterruptState();
+    const shouldResume = pendingActionPreflight.kind !== 'ok'
+      && sessionRowForKind?.kind !== 'workflow'
+      && !!harnessSession?.loadInterruptState();
     if (!shouldResume) {
       const result = approvalRegistry.resolve(id, auditResolution, 'mobile-inbox');
       if (!result.ok || !result.row) {
@@ -1220,7 +1245,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.json({
         ok: true,
         approval: serializeApprovalForMobile(result.row),
-        status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
+        status: sessionRowForKind?.kind === 'workflow'
+          ? 'resolved-workflow-runner-resumes'
+          : pendingActionPreflight.kind === 'ok'
+            ? 'resolved-pending-action-approval-only'
+            : 'resolved-stale',
+        message: pendingActionPreflight.kind === 'ok'
+          ? decision === 'approve'
+            ? `Approved ${id}; the exact queued action is authorized, but execution is not confirmed and remains with its runtime owner.`
+            : `Rejected ${id}; the exact queued action will not execute.`
+          : `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}.`,
       });
       return;
     }
@@ -1248,31 +1282,44 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     setImmediate(async () => {
       try {
         const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
-        const MAX_STICKY_RESUMES = 5;
+        const MAX_EXACT_DUPLICATE_RESUMES = 5;
         let resumeIter = 0;
-        while (resumeIter < MAX_STICKY_RESUMES) {
+        let currentApprovalId = id;
+        let hitExactDuplicateResumeCap = false;
+        while (resumeIter < MAX_EXACT_DUPLICATE_RESUMES) {
           resumeIter += 1;
           await runConversationFromResume({
             agent,
             sessionId,
+            approvalId: currentApprovalId,
             decision,
             resolver: 'mobile-inbox',
           });
           const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
           if (pending.length === 0) break;
-          for (const row of pending) {
-            approvalRegistry.resolve(row.approvalId, auditResolution, 'mobile-inbox');
+          const exactDuplicate = selectSoleExactApprovalDuplicate(existing, pending);
+          if (!exactDuplicate || !approvalRegistry.isActionable(exactDuplicate)) break;
+          if (resumeIter >= MAX_EXACT_DUPLICATE_RESUMES) {
+            hitExactDuplicateResumeCap = true;
+            break;
           }
+          const duplicateResolution = approvalRegistry.resolve(
+            exactDuplicate.approvalId,
+            auditResolution,
+            'mobile-inbox:exact-duplicate',
+          );
+          if (!duplicateResolution.ok) break;
+          currentApprovalId = exactDuplicate.approvalId;
         }
-        if (resumeIter === MAX_STICKY_RESUMES) {
+        if (hitExactDuplicateResumeCap) {
           appendHarnessEvent({
             sessionId,
             turn: 0,
             role: 'system',
             type: 'run_failed',
             data: {
-              error: `Sticky-resume safety cap (${MAX_STICKY_RESUMES}) reached — agent kept creating new approvals every turn`,
-              stage: 'mobile_sticky_resume_cap',
+              error: `Exact-duplicate approval resume safety cap (${MAX_EXACT_DUPLICATE_RESUMES}) reached — the action remains pending`,
+              stage: 'mobile_exact_duplicate_resume_cap',
               resumeIter,
             },
           });

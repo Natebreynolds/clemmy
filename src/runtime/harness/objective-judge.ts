@@ -789,7 +789,7 @@ const DIRECTION_QUESTION_RE = new RegExp(
 // conversational sign-offs that do not carry a decision. This is intentionally
 // domain-neutral: clarification nouns should not require curated regex entries.
 const MATERIAL_CLOSING_QUESTION_RE =
-  /(?:^|[.!]\s+|\n+)(?:which|what|who|where|when|how|is|are|was|were|do|does|did|can|could|would|should|will|shall|may)\b[^?]{0,300}\?\s*$/i;
+  /(?:^|[.!]\s+|\n+)[^?]{0,180}\b(?:which|what|who|where|when|how|is|are|was|were|do|does|did|can|could|would|should|will|shall|may)\b[^?]{0,300}\?\s*$/i;
 const COURTESY_CLOSING_QUESTION_RE =
   /(?:anything else|something else|(?:what|how) else can i help(?: with)?|does that (?:help|work|make sense)|sound good)\?\s*$/i;
 

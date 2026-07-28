@@ -89,6 +89,64 @@ function providerFor(d: Record<string, unknown>, model: string): ActivityItem['p
 }
 
 const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
+const EMPTY_COMPLETION_ERROR = 'The run ended without a usable answer, so I haven’t marked it complete. Check the activity above or try again.';
+
+function meaningfulCompletionText(value: unknown): string {
+  const text = humanHarnessText(value, '');
+  // A bare terminal placeholder is not work-product. Treating it as evidence
+  // made an empty/reasoning-only provider turn look successfully completed.
+  return /^(?:\(?done[.!]?\)?|complete[.!]?)$/i.test(text) ? '' : text;
+}
+
+/** Project a terminal event into user-visible truth. A completion event proves
+ * that the stream ended; it does not, by itself, prove that the user received
+ * an answer. Only explicit/streamed human output earns the success state. */
+export function terminalCompletionPresentation(
+  data: Record<string, unknown>,
+  currentText: string,
+  currentStatus?: MessageStatus,
+): Pick<ChatMessage, 'text' | 'status' | 'progress'> {
+  const reason = typeof data.reason === 'string' ? data.reason : '';
+  const reasonKey = reason
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .replace(/[\s-]+/g, '_')
+    .toLowerCase();
+  const eventText = meaningfulCompletionText(data);
+  const streamedText = meaningfulCompletionText(currentText);
+  const text = eventText || streamedText;
+  const awaitingContinue = reasonKey === 'awaiting_continue' || reasonKey === 'limit_exceeded';
+  const awaitingUser = currentStatus === 'awaiting-reply'
+    || /awaiting_(?:user(?:_(?:input|reply))?|input|reply)|needs_user_(?:input|reply)/.test(reasonKey);
+  const stopped = awaitingContinue || /cancelled|canceled|aborted|stopped/.test(reasonKey);
+  const failed = /fail|error|abandon|stall|exhaust|invalid|blocked|unavailable|timed?_?out|no_structured/.test(reasonKey);
+
+  if (text) {
+    const status: MessageStatus = awaitingUser ? 'awaiting-reply' : stopped ? 'stopped' : failed ? 'failed' : 'complete';
+    return { text, status, progress: undefined };
+  }
+  if (awaitingUser) {
+    return {
+      text: 'I need your input before I can continue.',
+      status: 'awaiting-reply',
+      progress: undefined,
+    };
+  }
+  if (reasonKey === 'no_structured_output') {
+    return {
+      text: 'That step finished but my reply didn’t come through — say “continue” and I’ll pick it right back up.',
+      status: 'failed',
+      progress: undefined,
+    };
+  }
+  if (awaitingContinue) {
+    return {
+      text: 'I reached this run’s current limit before I had a usable answer. Say “continue” and I’ll keep working.',
+      status: 'stopped',
+      progress: undefined,
+    };
+  }
+  return { text: EMPTY_COMPLETION_ERROR, status: stopped ? 'stopped' : 'failed', progress: undefined };
+}
 
 export interface PendingChatPost {
   fingerprint: string;
@@ -535,20 +593,15 @@ export function useChat(options?: UseChatOptions) {
       const text = humanHarnessText((d.reply ?? d.summary), '');
       const reason = typeof d.reason === 'string' ? d.reason : '';
       const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : '';
-      const awaitingContinue = reason === 'awaiting_continue' || reason === 'limit_exceeded';
       if (reason === 'plan_first' && planProposalId) {
         patch(assistantId, { text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined });
       } else {
-        // Placeholder extinction (2026-07-24): the server now floors empty
-        // completions with a turn report or honest fallback; anything that
-        // still arrives empty gets a HUMAN line, never "(Done.)" scaffolding.
-        patch(assistantId, {
-          text: text || (reason === 'no_structured_output'
-            ? 'That step finished but my reply didn’t come through — say “continue” and I’ll pick it right back up.'
-            : 'Done.'),
-          status: awaitingContinue ? 'stopped' : 'complete',
-          progress: undefined,
-        });
+        // Keep already-streamed human output when the terminal envelope omits
+        // its duplicate reply. With neither source present, fail closed: an
+        // empty/reasoning-only terminal event is not a successful answer.
+        setMessages((prev) => prev.map((m) => (
+          m.id === assistantId ? { ...m, ...terminalCompletionPresentation(d, m.text, m.status) } : m
+        )));
       }
     } else if (ev.type === 'stall_retry_attempted') {
       // The streamed draft was a DETECTED-BAD reply (e.g. the model claiming it
@@ -948,14 +1001,13 @@ export function inboxAdditionsFromEvents(
       continue;
     }
     if (ev.type === 'conversation_completed') {
-      const text = humanHarnessText((d.reply ?? d.summary) as string | undefined, '');
-      if (!text) continue;
+      const presentation = terminalCompletionPresentation(d, '');
       const taskRef = claimDelivery(ev);
       if (taskRef !== null) additions.push({
         id: `inbox-${ev.seq}`,
         role: 'assistant',
-        text,
-        status: 'complete',
+        text: presentation.text,
+        status: presentation.status,
         taskRef,
       });
     } else if (ev.type === 'awaiting_user_input') {

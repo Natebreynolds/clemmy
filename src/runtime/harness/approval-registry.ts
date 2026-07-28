@@ -33,7 +33,11 @@ import { randomBytes } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
 import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
-import { linkPendingActionApproval, markPendingActionApprovalResolved } from './pending-actions.js';
+import {
+  getPendingAction,
+  linkPendingActionApproval,
+  markPendingActionApprovalResolved,
+} from './pending-actions.js';
 import { appendAuditRecord } from '../audit-ledger.js';
 
 /**
@@ -551,7 +555,15 @@ export function resolve(
   const publicRow = rowToPublic(row);
   try {
     const pendingActionId = pendingActionIdFromArgs(publicRow.args);
-    if (pendingActionId) markPendingActionApprovalResolved(pendingActionId, resolution, publicRow.approvalId);
+    // A pending action may have been rebound to a replacement card while an
+    // older card remained pending. Resolve the old registry row for audit, but
+    // never let it overwrite/terminalize the action owned by the newer card.
+    if (pendingActionId) {
+      const pendingAction = getPendingAction(pendingActionId);
+      if (pendingAction?.approvalId === publicRow.approvalId) {
+        markPendingActionApprovalResolved(pendingActionId, resolution, publicRow.approvalId);
+      }
+    }
   } catch {
     // Pending-action status is auxiliary; never break approval resolution.
   }

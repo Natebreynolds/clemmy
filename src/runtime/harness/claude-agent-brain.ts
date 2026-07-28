@@ -101,7 +101,10 @@ import {
   type FreshExternalWriteEvidenceStatus,
 } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
-import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import {
+  resolveMcpToolScopeWithRecall,
+  type McpToolScope,
+} from '../mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import {
   listRunArtifacts,
@@ -114,6 +117,7 @@ import {
   createToolEconomyState,
   interactiveToolEconomyEnabled,
   interactiveToolEconomyPolicy,
+  isComplexArtifactExecutionObjective,
 } from './tool-economy.js';
 import {
   buildProspectiveIntentionContext,
@@ -455,7 +459,10 @@ export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAg
   }
 }
 
-function maxTurns(): number {
+export function resolveClaudeAgentBrainMaxTurns(
+  objective: string,
+  recentUserInputs: readonly string[] = [],
+): number {
   // Each SDK "turn" is one assistant message (which may carry tool calls). Real
   // agentic work needs headroom: a single gated send alone is execution_create →
   // composio_execute_tool → execution_complete → final (~5 turns), and a
@@ -464,8 +471,17 @@ function maxTurns(): number {
   // maximum number of turns" error, and the brain thrashed (retrying the same
   // send) trying to finish in time. The loop-guard + duplicate-write gates bound
   // any runaway, so a generous cap is safe.
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS', '24') ?? '24', 10);
-  return Number.isFinite(raw) && raw >= 1 ? raw : 24;
+  const configured = (getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS', '') ?? '').trim();
+  if (configured) {
+    const raw = Number.parseInt(configured, 10);
+    return Number.isFinite(raw) && raw >= 1 ? raw : 24;
+  }
+  // SDK turns include assistant/tool-result message cycles, not only canonical
+  // top-level tool calls. A 24-turn provider cap therefore stopped the live
+  // Workspace proof at only 16 calls, before its already-discovered space_save.
+  // Widen only execution-ready complex artifacts; the independent 24-call
+  // economy rail, mutation gates, wall clock, and kill switch remain intact.
+  return isComplexArtifactExecutionObjective(objective, recentUserInputs) ? 36 : 24;
 }
 
 /** The SDK brain's final reply was SHAPED like a printed tool call with zero
@@ -1484,7 +1500,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let jitDropped = 0;
   let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
   const schemaOnDemandAcquisition = mode === 'full' && claudeToolSearchEnabled();
-  const jitQuery = [request.message, ...recentPriorBrainInputs(sessionId, request.message)]
+  const priorBrainInputs = recentPriorBrainInputs(sessionId, request.message);
+  const jitQuery = [request.message, ...priorBrainInputs]
     .filter((s) => s.trim().length > 0)
     .join('\n');
   if (schemaOnDemandAcquisition) {
@@ -1603,8 +1620,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // contract as the Codex lane. This is also the auditable proof that an
   // explicit local-only boundary resolved to zero external authority.
   const nativeMcpScope: McpToolScope = mode === 'full'
-    ? resolveMcpToolScope({
+    ? resolveMcpToolScopeWithRecall({
         userInput: turnObjective,
+        priorUserInputs: priorBrainInputs,
         pinnedCalendarLabels: pinnedCalendarRuleLabels(),
       })
     : {
@@ -1647,6 +1665,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       budget: economyBudget,
     }));
   })();
+  const sdkMaxTurns = resolveClaudeAgentBrainMaxTurns(turnObjective, priorBrainInputs);
   const runOptions = {
     sessionId,
     // Stable for the whole durable attempt: retries/continuations must share
@@ -1683,7 +1702,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     // the Codex lane, without attaching all of them.
     nativeMcpScopeInput: turnObjective,
     nativeMcpToolScope: nativeMcpScope,
-    maxTurns: maxTurns(),
+    maxTurns: sdkMaxTurns,
     maxWallClockMs: request.maxWallClockMs,
     shouldCancel: request.shouldCancel,
     // One object for the whole logical foreground run. Corrective retries and
@@ -2335,7 +2354,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         turn: 0,
         role: 'system',
         type: 'conversation_limit_exceeded',
-        data: { reason: 'max_turns', maxTurns: maxTurns(), transport: 'claude_agent_sdk_brain' },
+        data: { reason: 'max_turns', maxTurns: sdkMaxTurns, transport: 'claude_agent_sdk_brain' },
       });
     } catch { /* limit telemetry is best-effort */ }
   }
@@ -2401,7 +2420,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         // Move 4: surface degraded verification so a self-judged / judge-failed-open
         // completion is distinguishable from an independently-verified one.
         ...(completionVerification ? { verification: completionVerification } : {}),
-        ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: maxTurns() } : {}),
+        ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: sdkMaxTurns } : {}),
       },
     }, `brain:${attempt.attemptId}`);
     terminalEventRecorded = true;
@@ -2528,6 +2547,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
               hardLimit: toolEconomyState.policy.hardLimit,
               attempts: toolEconomyState.attempts,
               allowed: toolEconomyState.allowed,
+              completionReserveUsed: toolEconomyState.completionReserveUsed,
               finishPhase: toolEconomyState.finishPhase,
             },
           }

@@ -64,8 +64,6 @@ import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, wa
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { synthesizeTurnReport } from './work-report.js';
 import { armFirstContactBeat } from '../../agents/fanout-alignment-gate.js';
-import { classifyExternalWrite } from './confirm-first-gate.js';
-import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
 import {
   getActiveGoalForSession,
@@ -85,6 +83,7 @@ import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroun
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
+import { approvalAuthorityMatchesToolCall, exactApprovalAuthorityMatches } from './approval-authority.js';
 import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
 import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
@@ -158,8 +157,6 @@ export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText 
 import { looksLikeDispatchHandoffReply, steerTurnReplySalvage, textAwaitsUserMaterial, recoverySummaryReplyIsDeliverable } from './turn-decision.js';
 import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
-import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
-import { classifyTool } from '../../agents/tool-taxonomy.js';
 import { peekStepResult, recordStepResultFromTranscript } from '../../tools/step-result-tool.js';
 import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 
@@ -753,7 +750,21 @@ function registerAndEmitApprovals(
     const subject = groundingNote ? `${baseSubject}\n${groundingNote}` : baseSubject;
     let approvalId: string | null = null;
     try {
-      const row = approvalRegistry.register({
+      const authority = {
+        approvalId: '',
+        sessionId: options.sessionId,
+        tool: interruption.toolName,
+        args: interruption.args ?? null,
+        resumeKey: null,
+      };
+      // A partial RunState resume can surface the still-unresolved sibling
+      // interruption again. Reuse its exact pending card instead of minting a
+      // duplicate; a changed payload intentionally receives a fresh card.
+      const existingExact = approvalRegistry.listPending({
+        sessionId: options.sessionId,
+        status: 'pending',
+      }).find((candidate) => exactApprovalAuthorityMatches(candidate, authority));
+      const row = existingExact ?? approvalRegistry.register({
         sessionId: options.sessionId,
         channel,
         channelId,
@@ -768,41 +779,43 @@ function registerAndEmitApprovals(
       // dedupe in addNotification keys on the stable approvalId
       // metadata so multiple harness turns registering the same
       // approval don't spam.
-      try {
-        addNotification({
-          id: `approval-${row.approvalId}`,
-          kind: 'approval',
-          title: 'Approval pending',
-          body: subject || (interruption.toolName ? `${interruption.toolName} needs approval` : 'A tool call is paused waiting for your decision.'),
-          createdAt: new Date().toISOString(),
-          read: false,
-          metadata: {
+      if (!existingExact) {
+        try {
+          addNotification({
+            id: `approval-${row.approvalId}`,
+            kind: 'approval',
+            title: 'Approval pending',
+            body: subject || (interruption.toolName ? `${interruption.toolName} needs approval` : 'A tool call is paused waiting for your decision.'),
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: {
+              approvalId: row.approvalId,
+              tool: interruption.toolName,
+              sessionId: options.sessionId,
+              workflowName,
+              stepId,
+              // When this approval came from a live Discord conversation,
+              // the Discord harness transport already attaches Approve/
+              // Reject buttons INLINE on the conversational reply
+              // (discord-harness.ts `approval_requested`). Flag the
+              // notification so the notification-delivery queue does NOT
+              // post a SECOND Discord approval card for the same id — that
+              // duplicate is what produced "double approvals in Discord"
+              // (desktop only renders the notification surface, so it never
+              // doubled). Other destinations (web_push/PWA, dashboard) and
+              // non-Discord channels are unaffected.
+              discordInlineHandled: channel === 'discord' && Boolean(channelId),
+            },
+          });
+        } catch (notifyErr) {
+          // Notification failures must not break the approval pause —
+          // the approval still lives in approvalRegistry and the
+          // dashboard surfaces it.
+          console.error('[harness] addNotification for approval failed', {
             approvalId: row.approvalId,
-            tool: interruption.toolName,
-            sessionId: options.sessionId,
-            workflowName,
-            stepId,
-            // When this approval came from a live Discord conversation,
-            // the Discord harness transport already attaches Approve/
-            // Reject buttons INLINE on the conversational reply
-            // (discord-harness.ts `approval_requested`). Flag the
-            // notification so the notification-delivery queue does NOT
-            // post a SECOND Discord approval card for the same id — that
-            // duplicate is what produced "double approvals in Discord"
-            // (desktop only renders the notification surface, so it never
-            // doubled). Other destinations (web_push/PWA, dashboard) and
-            // non-Discord channels are unaffected.
-            discordInlineHandled: channel === 'discord' && Boolean(channelId),
-          },
-        });
-      } catch (notifyErr) {
-        // Notification failures must not break the approval pause —
-        // the approval still lives in approvalRegistry and the
-        // dashboard surfaces it.
-        console.error('[harness] addNotification for approval failed', {
-          approvalId: row.approvalId,
-          error: notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
-        });
+            error: notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+          });
+        }
       }
     } catch (err) {
       // Best-effort. The hot-patch flow today exercises a DB where the
@@ -831,123 +844,6 @@ function registerAndEmitApprovals(
     });
   }
   return approvalIds;
-}
-
-function extractComposioSlugFromApprovalArgs(args: Record<string, unknown> | null | undefined): string | null {
-  if (!args || typeof args !== 'object') return null;
-  const slug = args.tool_slug ?? args.toolSlug;
-  return typeof slug === 'string' && slug.length > 0 ? slug : null;
-}
-
-function collectBatchScopeCandidate(row: approvalRegistry.PendingApprovalRow): {
-  key: string;
-  allowedTool: string;
-  allowedComposioSlug?: string;
-  label: string;
-} | null {
-  if (!row.tool) return null;
-  const kind = classifyTool(row.tool, { args: row.args ?? undefined });
-  if (kind !== 'send') return null;
-
-  if (row.tool === 'composio_execute_tool') {
-    const slug = extractComposioSlugFromApprovalArgs(row.args);
-    if (!slug) return null;
-    return {
-      key: `composio:${slug}`,
-      allowedTool: 'composio_execute_tool',
-      allowedComposioSlug: slug,
-      label: slug,
-    };
-  }
-
-  return {
-    key: `tool:${row.tool}`,
-    allowedTool: row.tool,
-    label: row.tool,
-  };
-}
-
-function openScopedApprovalForApprovedBatch(
-  rows: approvalRegistry.PendingApprovalRow[],
-  decision: 'approve' | 'reject' | 'approve_with_edits',
-): void {
-  if (decision !== 'approve' || rows.length < 2) return;
-
-  const counts = new Map<string, {
-    count: number;
-    allowedTool: string;
-    allowedComposioSlug?: string;
-    label: string;
-  }>();
-  const sessionId = rows[0]?.sessionId;
-  if (!sessionId) return;
-
-  for (const row of rows) {
-    if (row.sessionId !== sessionId) continue;
-    const candidate = collectBatchScopeCandidate(row);
-    if (!candidate) continue;
-    const existing = counts.get(candidate.key);
-    counts.set(candidate.key, {
-      count: (existing?.count ?? 0) + 1,
-      allowedTool: candidate.allowedTool,
-      allowedComposioSlug: candidate.allowedComposioSlug,
-      label: candidate.label,
-    });
-  }
-
-  const eligible = [...counts.values()].filter((candidate) => candidate.count >= 2);
-  if (eligible.length === 0) return;
-
-  const currentScope = getPlanScope(sessionId);
-  const allowedTools = new Set(currentScope && !currentScope.closedAt ? currentScope.allowedTools : []);
-  const allowedComposioSlugs = new Set(
-    currentScope && !currentScope.closedAt ? currentScope.allowedComposioSlugs ?? [] : [],
-  );
-  const labels: string[] = [];
-  for (const candidate of eligible) {
-    allowedTools.add(candidate.allowedTool);
-    if (candidate.allowedComposioSlug) allowedComposioSlugs.add(candidate.allowedComposioSlug);
-    labels.push(candidate.label);
-  }
-
-  try {
-    openPlanScope({
-      sessionId,
-      planProposalId: `tool_batch_approval:${Date.now()}`,
-      approvedPlanObjective: `Approved batch of external mutations: ${labels.join(', ')}`,
-      allowedTools: [...allowedTools],
-      allowedComposioSlugs: allowedComposioSlugs.size > 0 ? [...allowedComposioSlugs] : undefined,
-      ttlMs: 60 * 60 * 1000,
-    });
-  } catch (err) {
-    console.error('[harness] failed to open scoped approval for approved batch', {
-      sessionId,
-      allowedTools: [...allowedTools],
-      allowedComposioSlugs: [...allowedComposioSlugs],
-      error: normalizeError(err),
-    });
-  }
-}
-
-function resolveSnapshotApprovalsForResume(
-  rows: approvalRegistry.PendingApprovalRow[],
-  decision: 'approve' | 'reject' | 'approve_with_edits',
-  resolver: string,
-): void {
-  const resolution: approvalRegistry.ApprovalResolution =
-    decision === 'reject' ? 'rejected' : 'approved';
-  for (const row of rows) {
-    try {
-      approvalRegistry.resolve(row.approvalId, resolution, resolver);
-    } catch (err) {
-      console.error('[harness] approval-registry.resolve failed during resume', {
-        approvalId: row.approvalId,
-        sessionId: row.sessionId,
-        error: normalizeError(err),
-      });
-    }
-  }
-  openScopedApprovalForApprovedBatch(rows, decision);
 }
 
 /**
@@ -5963,6 +5859,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 export interface ResumePendingApprovalOptions {
   agent: Agent<any, any>;
   sessionId: string;
+  /** Exact durable card the human acted on. When supplied, only the SDK
+   * interruption whose tool and full payload match this row may inherit the
+   * decision; every sibling interruption remains pending. */
+  approvalId?: string;
   /**
    * 'approve'              — run the paused tool call with the args the
    *                          agent originally proposed.
@@ -6112,8 +6012,98 @@ export async function resumePendingApproval(
   const approvalRowsAtResume = pending.length > 0
     ? approvalRegistry.listPending({ sessionId: options.sessionId, status: 'pending' })
     : [];
-  const resolvedApprovals: Array<{ tool: string; }> = [];
-  for (const item of pending) {
+  const wantedResolution: approvalRegistry.ApprovalResolution =
+    options.decision === 'reject' ? 'rejected' : 'approved';
+  const authorityRefusal = (reason: string): RunTurnResult => {
+    safeAppend({
+      sessionId: options.sessionId,
+      turn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'approval_authority_mismatch',
+        approvalId: options.approvalId ?? null,
+        reason,
+        pendingInterruptions: pending.length,
+        pendingApprovalRows: approvalRowsAtResume.length,
+      },
+    });
+    return {
+      sessionId: options.sessionId,
+      turn,
+      status: 'awaiting_approval',
+      error: reason,
+    };
+  };
+
+  let selectedApproval: approvalRegistry.PendingApprovalRow | undefined;
+  if (options.approvalId) {
+    selectedApproval = approvalRegistry.get(options.approvalId);
+    if (!selectedApproval || selectedApproval.sessionId !== options.sessionId) {
+      return authorityRefusal('The selected approval card does not belong to this paused session.');
+    }
+  } else if (pending.length === 1 && approvalRowsAtResume.length === 1) {
+    selectedApproval = approvalRowsAtResume[0];
+  } else if (pending.length > 0) {
+    return authorityRefusal('Multiple approval interruptions require one exact approval ID; no decision was applied.');
+  }
+
+  let selectedInterruption: unknown;
+  if (pending.length > 0) {
+    if (!selectedApproval) {
+      return authorityRefusal('No durable approval card identifies the interrupted action.');
+    }
+    const matches = pending.filter((item) => {
+      const raw = (item as {
+        rawItem?: { name?: unknown; arguments?: unknown };
+        toolName?: unknown;
+      } | null)?.rawItem;
+      const tool = raw?.name
+        ?? (item as { toolName?: unknown } | null)?.toolName;
+      return approvalAuthorityMatchesToolCall(selectedApproval!, tool, raw?.arguments);
+    });
+    if (matches.length !== 1) {
+      return authorityRefusal(
+        matches.length === 0
+          ? 'The selected approval does not match any serialized tool payload.'
+          : 'The selected approval ambiguously matches multiple serialized tool calls.',
+      );
+    }
+    selectedInterruption = matches[0];
+  }
+
+  if (selectedApproval) {
+    if (selectedApproval.status === 'pending') {
+      if (!approvalRegistry.isActionable(selectedApproval)) {
+        return authorityRefusal('The selected approval card has expired; no decision was applied.');
+      }
+      const resolved = approvalRegistry.resolve(
+        selectedApproval.approvalId,
+        wantedResolution,
+        options.resolver ?? 'harness-resume',
+      );
+      if (!resolved.ok || !resolved.row) {
+        const raced = resolved.row ?? approvalRegistry.get(selectedApproval.approvalId);
+        if (raced?.status !== 'resolved' || raced.resolution !== wantedResolution) {
+          return authorityRefusal('The selected approval card could not be resolved with this decision.');
+        }
+        selectedApproval = raced;
+      } else {
+        selectedApproval = resolved.row;
+      }
+    } else if (
+      selectedApproval.status !== 'resolved'
+      || selectedApproval.resolution !== wantedResolution
+    ) {
+      return authorityRefusal(
+        `The selected approval is ${selectedApproval.resolution ?? selectedApproval.status}, not ${wantedResolution}.`,
+      );
+    }
+  }
+
+  const resolvedApprovals: Array<{ tool: string; approvalId: string | null }> = [];
+  if (selectedInterruption) {
+    const item = selectedInterruption;
     if (options.decision === 'approve' || options.decision === 'approve_with_edits') {
       // EDIT-AND-APPROVE: when the user supplied modifiedArgs (e.g.
       // changed the calendar time in the dashboard / Discord edit
@@ -6154,45 +6144,19 @@ export async function resumePendingApproval(
           }
           (rawItem as { arguments: string }).arguments = nextArgsJson;
         }
-        stateApi.approve(item);
-      } else {
-        // STICKY APPROVAL caches the decision keyed on the TOOL NAME only —
-        // so for the composio multiplexer, approving one send would auto-
-        // approve every later composio_execute_tool call (different slug,
-        // different recipient) with no card (2026-07-09 Lane 1: one consent →
-        // N irreversible sends). NEVER make an irreversible send sticky —
-        // approve just this call so send #2 re-parks. Reversible/other tools
-        // keep the sticky convenience.
-        const rawItem = (item as { rawItem?: { name?: string; arguments?: unknown } } | null)?.rawItem;
-        const rawName = rawItem?.name ?? '';
-        const isSend = (() => {
-          try { return classifyExternalWrite(rawName, rawItem?.arguments).irreversible; }
-          catch { return false; }
-        })();
-        // alwaysApprove keys on the bare TOOL NAME. For the composio gateway that
-        // name is the slug-blind multiplexer `composio_execute_tool` — making it
-        // sticky on a reversible DRAFT would auto-approve a LATER send of a
-        // different slug with no card. The multiplexer name NEVER counts as
-        // consent (mirrors the Hole-A guard in brackets.ts / plan-scope.ts) —
-        // so only non-send, non-multiplexer tools keep the sticky convenience
-        // (2026-07-09 re-hunt Lane 1).
-        const sticky = !isSend && !isUngrantableMultiplexer(rawName);
-        stateApi.approve(item, sticky ? { alwaysApprove: true } : undefined);
       }
+      // SDK `alwaysApprove` is keyed only by tool name. One exact card must
+      // never authorize a sibling/future call with a different payload.
+      stateApi.approve(item);
     } else {
-      // Symmetric for rejections: future identical invocations stay
-      // rejected without re-asking the user.
-      stateApi.reject(item, { alwaysReject: true });
+      // A rejection is exact too: a later payload deserves its own decision.
+      stateApi.reject(item);
     }
     const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
-    resolvedApprovals.push({ tool: raw?.name ?? 'unknown' });
-  }
-  if (approvalRowsAtResume.length > 0) {
-    resolveSnapshotApprovalsForResume(
-      approvalRowsAtResume,
-      options.decision,
-      options.resolver ?? 'harness-resume',
-    );
+    resolvedApprovals.push({
+      tool: raw?.name ?? 'unknown',
+      approvalId: selectedApproval?.approvalId ?? null,
+    });
   }
   for (const resolvedApproval of resolvedApprovals) {
     safeAppend({
@@ -6203,7 +6167,8 @@ export async function resumePendingApproval(
       data: {
         decision: options.decision,
         tool: resolvedApproval.tool,
-        sticky: options.decision !== 'approve_with_edits',
+        approvalId: resolvedApproval.approvalId,
+        sticky: false,
         edited: options.decision === 'approve_with_edits',
       },
     });
@@ -6213,7 +6178,12 @@ export async function resumePendingApproval(
     turn,
     role: 'system',
     type: 'run_resumed',
-    data: { pending: pending.length, decision: options.decision },
+    data: {
+      pending: selectedInterruption ? 1 : 0,
+      totalPending: pending.length,
+      approvalId: selectedApproval?.approvalId ?? null,
+      decision: options.decision,
+    },
   });
   session.clearInterruptState({ emitEvent: false });
 
@@ -6430,6 +6400,7 @@ export async function resumePendingApproval(
 export async function runConversationFromResume(opts: {
   agent: Agent<any, any>;
   sessionId: string;
+  approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   /** Required when decision === 'approve_with_edits'. JSON-encoded args. */
   modifiedArgs?: string;
@@ -6456,6 +6427,7 @@ export async function runConversationFromResume(opts: {
 async function runConversationFromResumeCore(opts: {
   agent: Agent<any, any>;
   sessionId: string;
+  approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   modifiedArgs?: string;
   resolver?: string;
@@ -6517,6 +6489,7 @@ async function runConversationFromResumeCore(opts: {
   const firstResult = await resumePendingApproval({
     agent: opts.agent,
     sessionId: opts.sessionId,
+    approvalId: opts.approvalId,
     decision: opts.decision,
     modifiedArgs: opts.modifiedArgs,
     resolver: opts.resolver,

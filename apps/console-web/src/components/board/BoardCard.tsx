@@ -4,6 +4,7 @@
  * trace drawer. Source-kind chip + status pill + relative age + a one-line
  * progress hint.
  */
+import { useState } from 'react';
 import { useDraggable } from '@dnd-kit/core';
 import { CSS } from '@dnd-kit/utilities';
 import { Radio, Archive, Check, X, RotateCcw, Play, ExternalLink } from 'lucide-react';
@@ -62,15 +63,26 @@ export function BoardCard({
   card: BoardCardT;
   onOpen: (card: BoardCardT) => void;
   onArchive?: (card: BoardCardT) => void;
-  onAction?: (card: BoardCardT, intent: BoardButtonIntent) => void;
+  onAction?: (card: BoardCardT, intent: BoardButtonIntent) => void | Promise<void>;
 }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: card.id, data: { card } });
+  const [busyIntent, setBusyIntent] = useState<BoardButtonIntent | null>(null);
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: card.id,
+    data: { card },
+    disabled: busyIntent !== null,
+  });
   const tone = cardTone(card);
-  const draggable = card.actions.some((a) => dragActions.has(a));
+  const draggable = busyIntent === null && card.actions.some((a) => dragActions.has(a));
   const artifacts = artifactsLine(card);
 
-  const runAction = (intent: BoardButtonIntent) => {
-    if (onAction) onAction(card, intent);
+  const runAction = async (intent: BoardButtonIntent) => {
+    if (!onAction || busyIntent !== null) return;
+    setBusyIntent(intent);
+    try {
+      await onAction(card, intent);
+    } finally {
+      setBusyIntent(null);
+    }
   };
 
   return (
@@ -200,27 +212,32 @@ export function BoardCard({
             <>
               <Button
                 size="sm"
-                onClick={(e) => { e.stopPropagation(); runAction('approve'); }}
+                disabled={busyIntent !== null}
+                onClick={(e) => { e.stopPropagation(); void runAction('approve'); }}
                 onPointerDown={(e) => e.stopPropagation()}
                 className="h-7 px-2 text-caption"
               >
-                <Check className="h-3.5 w-3.5" aria-hidden /> Approve
+                <Check className="h-3.5 w-3.5" aria-hidden />
+                {busyIntent === 'approve' ? 'Approving…' : 'Approve'}
               </Button>
               <Button
                 size="sm"
                 variant="secondary"
-                onClick={(e) => { e.stopPropagation(); runAction('reject'); }}
+                disabled={busyIntent !== null}
+                onClick={(e) => { e.stopPropagation(); void runAction('reject'); }}
                 onPointerDown={(e) => e.stopPropagation()}
                 className="h-7 px-2 text-caption"
               >
-                <X className="h-3.5 w-3.5" aria-hidden /> Reject
+                <X className="h-3.5 w-3.5" aria-hidden />
+                {busyIntent === 'reject' ? 'Rejecting…' : 'Reject'}
               </Button>
             </>
           )}
           {onAction && card.primaryAction === 'retry_failed_items' && (
             <Button
               size="sm"
-              onClick={(e) => { e.stopPropagation(); runAction('retry_failed_items'); }}
+              disabled={busyIntent !== null}
+              onClick={(e) => { e.stopPropagation(); void runAction('retry_failed_items'); }}
               onPointerDown={(e) => e.stopPropagation()}
               className="h-7 px-2 text-caption"
             >
@@ -230,7 +247,8 @@ export function BoardCard({
           {onAction && card.primaryAction === 'continue' && (
             <Button
               size="sm"
-              onClick={(e) => { e.stopPropagation(); runAction(continueIntent(card)); }}
+              disabled={busyIntent !== null}
+              onClick={(e) => { e.stopPropagation(); void runAction(continueIntent(card)); }}
               onPointerDown={(e) => e.stopPropagation()}
               className="h-7 px-2 text-caption"
             >

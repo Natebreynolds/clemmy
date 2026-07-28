@@ -40,7 +40,7 @@ test('registry miss falls back to the legacy runtime store', async () => {
 
 test('pending registry row + approve → resolves the row then resumes the parked run', async () => {
   const registry = makeRegistry({ sessionId: 'background:bg-1', status: 'pending' });
-  const resumes: Array<{ sessionId: string; decision: string }> = [];
+  const resumes: Array<{ sessionId: string; approvalId?: string; decision: string; resolver?: string }> = [];
   const result = await resolveDrainApproval({
     approvalId: 'apr-1',
     approved: true,
@@ -49,7 +49,12 @@ test('pending registry row + approve → resolves the row then resumes the parke
     resumeForTest: async (args) => { resumes.push(args); return { status: 'completed', lastDecision: { reply: 'sent it' } }; },
   });
   assert.deepEqual(registry.calls.find((c) => c.fn === 'resolve')?.args, ['apr-1', 'approved', 'background-task-drain']);
-  assert.deepEqual(resumes, [{ sessionId: 'background:bg-1', decision: 'approve', resolver: 'background-task-drain' }]);
+  assert.deepEqual(resumes, [{
+    sessionId: 'background:bg-1',
+    approvalId: 'apr-1',
+    decision: 'approve',
+    resolver: 'background-task-drain',
+  }]);
   assert.equal(result.status, 'approved');
   assert.equal(result.text, 'sent it');
   assert.equal(result.nextApprovalId, undefined);

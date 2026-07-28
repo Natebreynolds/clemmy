@@ -3,6 +3,10 @@ import { Plus, Sparkles, AlertCircle, Plug } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/lib/cn';
 import { createSpace, listStarterRecipes, type StarterRecipe } from '@/lib/spaces';
+import {
+  resolveWorkspaceCreation,
+  type WorkspaceCreationMode,
+} from '@/lib/workspace-creation';
 
 /**
  * Seed-prompt creation modal. Instead of dropping the user on an EMPTY
@@ -22,13 +26,6 @@ const EXAMPLES: { label: string; prompt: string }[] = [
   { label: 'Daily plan', prompt: "A daily planner that pulls today's calendar and my open tasks and lets me check things off." },
 ];
 
-function deriveTitle(title: string, description: string): string {
-  const t = title.trim();
-  if (t) return t;
-  const fromDesc = description.trim().split(/\s+/).slice(0, 6).join(' ');
-  return fromDesc || 'New workspace';
-}
-
 export function CreateWorkspaceModal({
   open,
   onClose,
@@ -42,6 +39,7 @@ export function CreateWorkspaceModal({
 }) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  const [titleWasManuallyEdited, setTitleWasManuallyEdited] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [starters, setStarters] = useState<StarterRecipe[]>([]);
@@ -53,6 +51,7 @@ export function CreateWorkspaceModal({
     if (!open) return;
     setTitle('');
     setDescription('');
+    setTitleWasManuallyEdited(false);
     setError(null);
     setCreating(false);
     listStarterRecipes().then(setStarters).catch(() => setStarters([]));
@@ -64,16 +63,20 @@ export function CreateWorkspaceModal({
 
   if (!open) return null;
 
-  const submit = async () => {
+  const submit = async (mode: WorkspaceCreationMode = 'build') => {
     if (creating) return;
     setCreating(true);
     setError(null);
     try {
-      // Persist the user's north star before the first model turn. The same
-      // description still seeds the dock so Clem can build immediately, but it
-      // can no longer disappear if the turn compacts, fails, or changes brains.
-      const space = await createSpace(deriveTitle(title, description), description);
-      onCreated(space.id, description.trim() || undefined);
+      const intent = resolveWorkspaceCreation(
+        { title, description, titleWasManuallyEdited },
+        mode,
+      );
+      // Build mode persists the north star before the first model turn and
+      // seeds the dock. Blank mode resolves to no objective/build, even when a
+      // recipe populated the visible fields.
+      const space = await createSpace(intent.title, intent.objective);
+      onCreated(space.id, intent.build);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not create a workspace.');
       setCreating(false);
@@ -122,7 +125,12 @@ export function CreateWorkspaceModal({
                     key={r.id}
                     type="button"
                     title={r.connected ? r.pitch : `${r.pitch}\n(Connect ${r.connects.join(' / ')} first — or pick it anyway and Clem will walk you through connecting.)`}
-                    onClick={() => { setDescription(r.buildPrompt); setTitle(r.title); textareaRef.current?.focus(); }}
+                    onClick={() => {
+                      setDescription(r.buildPrompt);
+                      setTitle(r.title);
+                      setTitleWasManuallyEdited(false);
+                      textareaRef.current?.focus();
+                    }}
                     className={cn(
                       'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-caption transition-colors cursor-pointer',
                       r.connected
@@ -156,7 +164,10 @@ export function CreateWorkspaceModal({
             <span className="text-small font-medium text-fg">Name <span className="text-faint">(optional)</span></span>
             <input
               value={title}
-              onChange={(e) => setTitle(e.target.value)}
+              onChange={(e) => {
+                setTitle(e.target.value);
+                setTitleWasManuallyEdited(true);
+              }}
               placeholder="Derived from your description if left blank"
               className="w-full rounded-lg border border-border bg-canvas px-3 py-2 text-body text-fg outline-none placeholder:text-faint focus:border-border-strong"
             />
@@ -172,7 +183,7 @@ export function CreateWorkspaceModal({
         <div className="flex items-center justify-between gap-2 border-t border-border px-5 py-3">
           <button
             type="button"
-            onClick={() => { void submit(); }}
+            onClick={() => { void submit('blank'); }}
             disabled={creating}
             className={cn('text-small text-muted hover:text-fg cursor-pointer', creating && 'pointer-events-none opacity-50')}
           >

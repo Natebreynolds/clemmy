@@ -18,6 +18,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
+import { Agent, RunContext, RunState } from '@openai/agents';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-console-pa-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -31,7 +32,8 @@ const {
   getPendingAction,
 } = await import('../runtime/harness/pending-actions.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-const { createSession } = await import('../runtime/harness/eventlog.js');
+const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { HarnessSession } = await import('../runtime/harness/session.js');
 const { listSendTrustGrants } = await import('../agents/plan-scope.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
@@ -51,6 +53,27 @@ async function boot(authorized = { v: true }) {
 
 function trustGrantIds(): string[] {
   return listSendTrustGrants().map((grant) => grant.id).sort();
+}
+
+function matchingApprovalInterrupt(tool: string, args: Record<string, unknown>): string {
+  const agent = new Agent({ name: 'PendingActionOwnershipTest', instructions: 'test' });
+  const state = new RunState(new RunContext({}), 'approve the exact queued action', agent, null);
+  const json = state.toJSON() as Record<string, unknown>;
+  json.currentStep = {
+    type: 'next_step_interruption',
+    data: {
+      interruptions: [{
+        rawItem: {
+          type: 'function_call',
+          name: tool,
+          callId: `${tool}_pending_action_call`,
+          arguments: JSON.stringify(args),
+        },
+        toolName: tool,
+      }],
+    },
+  };
+  return JSON.stringify(json);
 }
 
 /** Queue an action and mint the exact, durable approval card bound to it. */
@@ -269,6 +292,126 @@ test('approve-execute treats an unreaped expired card as inert with zero mutatio
     assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending', 'route did not reap or approve the card');
     assert.equal(getPendingAction(record.id)?.status, before?.status, 'route did not alter the pending action');
     assert.deepEqual(trustGrantIds(), beforeTrust);
+  } finally {
+    await h.close();
+  }
+});
+
+test('Inbox and Tasks generic approval routes reject an unreaped expired card with zero mutation', async () => {
+  for (const route of ['harness-approvals', 'board'] as const) {
+    const { record, card } = linkedRunBatch(`Expired ${route} card`, { ttlMs: -1_000 });
+    const beforeAction = getPendingAction(record.id);
+    const h = await boot();
+    try {
+      const endpoint = route === 'harness-approvals'
+        ? `/api/console/harness-approvals/${card.approvalId}/approve`
+        : `/api/console/board/approval/${card.approvalId}/approve`;
+      const res = await fetch(`${h.url}${endpoint}`, { method: 'POST' });
+      assert.equal(res.status, 409, route);
+      assert.match(JSON.stringify(await res.json()), /expired/i);
+      assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending', `${route} leaves the card untouched`);
+      assert.deepEqual(getPendingAction(record.id), beforeAction, `${route} leaves the durable action untouched`);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test('Inbox exact pending-action approval is approval-only and reports execution as unconfirmed', async () => {
+  const { record, card } = linkedRunBatch('Inbox approval-only action');
+  const h = await boot();
+  try {
+    const res = await fetch(
+      `${h.url}/api/console/harness-approvals/${card.approvalId}/approve`,
+      { method: 'POST' },
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ok: boolean; status: string; message: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.status, 'resolved-pending-action-approval-only');
+    assert.match(body.message, /execution (?:is )?not confirmed/i);
+    const durable = getPendingAction(record.id);
+    assert.equal(durable?.status, 'approved');
+    assert.equal(durable?.approvedBy, 'human');
+    assert.notEqual(durable?.status, 'executed', 'generic Inbox approval never steals execution ownership');
+  } finally {
+    await h.close();
+  }
+});
+
+test('Tasks and Inbox keep an exact pending-action owner inert even when its session has a matching SDK interrupt', async () => {
+  for (const route of ['board', 'harness-approvals'] as const) {
+    const { record, card } = linkedRunBatch(`Serialized owner ${route}`);
+    const session = HarnessSession.load(card.sessionId);
+    assert.ok(session);
+    const interrupt = matchingApprovalInterrupt(card.tool!, card.args!);
+    session.saveInterruptState(interrupt);
+
+    const h = await boot();
+    try {
+      const endpoint = route === 'board'
+        ? `/api/console/board/approval/${card.approvalId}/approve`
+        : `/api/console/harness-approvals/${card.approvalId}/approve`;
+      const res = await fetch(`${h.url}${endpoint}`, { method: 'POST' });
+      assert.equal(res.status, 200, `${route} must not enter the SDK resume path`);
+      const body = await res.json() as { status: string; message?: string };
+      assert.equal(body.status, 'resolved-pending-action-approval-only');
+      assert.match(body.message ?? '', /execution (?:is )?not confirmed/i);
+
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        HarnessSession.load(card.sessionId)?.loadInterruptState(),
+        interrupt,
+        `${route} left the serialized runtime owner untouched`,
+      );
+      assert.equal(
+        listEvents(card.sessionId, { types: ['run_resumed'] }).length,
+        0,
+        `${route} never started the SDK runner`,
+      );
+      assert.equal(getPendingAction(record.id)?.status, 'approved');
+      assert.notEqual(getPendingAction(record.id)?.status, 'executing');
+      assert.notEqual(getPendingAction(record.id)?.status, 'executed');
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test('Inbox refuses a superseded pending-action card and approve-with-edits before any mutation', async () => {
+  const { record, card: oldCard } = linkedRunBatch('Superseded Inbox card');
+  const newCard = approvalRegistry.register({
+    sessionId: oldCard.sessionId,
+    subject: 'Replacement exact card',
+    tool: oldCard.tool,
+    args: { pendingActionId: record.id },
+  });
+  assert.equal(getPendingAction(record.id)?.approvalId, newCard.approvalId, 'new card owns the durable backlink');
+
+  const beforeAction = getPendingAction(record.id);
+  const h = await boot();
+  try {
+    const old = await fetch(
+      `${h.url}/api/console/harness-approvals/${oldCard.approvalId}/approve`,
+      { method: 'POST' },
+    );
+    assert.equal(old.status, 409);
+    assert.match(JSON.stringify(await old.json()), /does not belong|superseded/i);
+    assert.equal(approvalRegistry.get(oldCard.approvalId)?.status, 'pending');
+    assert.deepEqual(getPendingAction(record.id), beforeAction);
+
+    const edited = await fetch(
+      `${h.url}/api/console/harness-approvals/${newCard.approvalId}/approve_with_edits`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ modifiedArgs: JSON.stringify({ to: 'changed@example.com' }) }),
+      },
+    );
+    assert.equal(edited.status, 409);
+    assert.match(JSON.stringify(await edited.json()), /queued payload|edits/i);
+    assert.equal(approvalRegistry.get(newCard.approvalId)?.status, 'pending');
+    assert.deepEqual(getPendingAction(record.id), beforeAction);
   } finally {
     await h.close();
   }

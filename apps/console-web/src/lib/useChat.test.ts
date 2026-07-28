@@ -8,6 +8,7 @@ import {
   postPendingChatWithRetry,
   reduceActivity,
   retainPendingChatPost,
+  terminalCompletionPresentation,
   type ActivityItem,
 } from './useChat';
 import {
@@ -24,6 +25,72 @@ function ev(type: string, data: Record<string, unknown>): HarnessEvent {
   seq += 1;
   return { seq, turn: 0, role: 'Clem', type, data };
 }
+
+test('empty or reason-only conversation completion never fabricates Done or success', () => {
+  const empty = terminalCompletionPresentation({}, '');
+  assert.equal(empty.status, 'failed');
+  assert.doesNotMatch(empty.text, /^done[.!]?$/i);
+  assert.match(empty.text, /without a usable answer/i);
+
+  const reasonOnly = terminalCompletionPresentation({ reason: 'model_exhausted' }, '');
+  assert.equal(reasonOnly.status, 'failed');
+  assert.doesNotMatch(reasonOnly.text, /^done[.!]?$/i);
+
+  const placeholder = terminalCompletionPresentation({ reply: 'Done.' }, '');
+  assert.equal(placeholder.status, 'failed');
+  assert.doesNotMatch(placeholder.text, /^done[.!]?$/i);
+
+  const malformed = terminalCompletionPresentation({ reason: 'no_structured_output' }, '');
+  assert.equal(malformed.status, 'failed');
+  assert.match(malformed.text, /reply didn.t come through/i);
+});
+
+test('conversation completion preserves streamed evidence and only marks explicit output complete', () => {
+  const streamed = terminalCompletionPresentation({}, 'Here is the verified result.');
+  assert.deepEqual(streamed, {
+    text: 'Here is the verified result.',
+    status: 'complete',
+    progress: undefined,
+  });
+
+  const explicit = terminalCompletionPresentation({ summary: 'Saved and read back 12 rows.' }, '');
+  assert.equal(explicit.status, 'complete');
+  assert.equal(explicit.text, 'Saved and read back 12 rows.');
+
+  const summaryAfterBlankReply = terminalCompletionPresentation({
+    reply: '',
+    summary: 'Verified the local artifact.',
+  }, '');
+  assert.equal(summaryAfterBlankReply.status, 'complete');
+  assert.equal(summaryAfterBlankReply.text, 'Verified the local artifact.');
+
+  const continuable = terminalCompletionPresentation({ reason: 'awaiting_continue' }, '');
+  assert.equal(continuable.status, 'stopped');
+  assert.doesNotMatch(continuable.text, /^done[.!]?$/i);
+});
+
+test('paired awaiting-input and explicit failure completions keep truthful terminal states', () => {
+  const paired = terminalCompletionPresentation(
+    { reason: 'awaiting_user_input' },
+    'Which calendar should I update?',
+    'awaiting-reply',
+  );
+  assert.equal(paired.status, 'awaiting-reply');
+  assert.equal(paired.text, 'Which calendar should I update?');
+
+  const camelCase = terminalCompletionPresentation({
+    reason: 'awaitingUser',
+    reply: 'Which timezone should I use?',
+  }, '');
+  assert.equal(camelCase.status, 'awaiting-reply');
+
+  const failed = terminalCompletionPresentation({
+    reason: 'provider_failed',
+    summary: 'The provider rejected the request; no records were written.',
+  }, '');
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.text, /no records were written/i);
+});
 
 test('chat Stop uses the exact accepted attempt instead of a reusable session id', () => {
   const projected = '/api/console/harness-sessions/sess-1/cancel?attemptId=attempt-1&runScopeId=scope-1';

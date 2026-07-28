@@ -346,6 +346,7 @@ import {
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { buildActivitySnapshot, formatElapsed, isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -386,7 +387,14 @@ import {
   pendingActionApprovalViewFromArgs,
   type PendingActionApprovalView,
 } from '../runtime/harness/pending-action-view.js';
-import { getPendingAction, markPendingActionApprovalResolved } from '../runtime/harness/pending-actions.js';
+import {
+  getPendingAction,
+  markPendingActionApprovalResolved,
+} from '../runtime/harness/pending-actions.js';
+import {
+  exactPendingActionApprovalPreflight,
+  type PendingActionApprovalPreflight,
+} from '../runtime/harness/pending-action-approval.js';
 import { executeApprovedPendingActionCall } from '../execution/pending-action-executor.js';
 import {
   listOperationalEvents,
@@ -10768,6 +10776,23 @@ export function registerConsoleRoutes(
     };
 
     try {
+      const existing = approvalRegistry.get(id);
+      let pendingActionPreflight: PendingActionApprovalPreflight = { kind: 'none' };
+      if (existing) {
+        if (existing.status !== 'pending') {
+          res.status(409).json({ ok: false, reason: 'approval already resolved', approval: existing });
+          return;
+        }
+        if (approvalRegistry.isExpired(existing)) {
+          res.status(409).json({ ok: false, reason: 'approval card has expired', approval: existing });
+          return;
+        }
+        pendingActionPreflight = exactPendingActionApprovalPreflight(existing, decision);
+        if (pendingActionPreflight.kind === 'error') {
+          res.status(pendingActionPreflight.status).json({ ok: false, reason: pendingActionPreflight.reason });
+          return;
+        }
+      }
       // Background tasks park the SDK run and need a queued continuation; a
       // direct resolve would skip the task state machine and strand the card.
       const queued = queueBackgroundTaskApprovalResolution(id, approved);
@@ -10784,16 +10809,12 @@ export function registerConsoleRoutes(
         return;
       }
 
-      const existing = approvalRegistry.get(id);
       if (existing) {
-        if (existing.status !== 'pending') {
-          res.status(409).json({ ok: false, reason: 'approval already resolved', approval: existing });
-          return;
-        }
         const auditResolution = approved ? 'approved' : 'rejected';
         const harnessSession = HarnessSession.load(existing.sessionId);
         const sessionRowForKind = getHarnessSession(existing.sessionId);
-        const shouldResume = sessionRowForKind?.kind !== 'workflow'
+        const shouldResume = pendingActionPreflight.kind !== 'ok'
+          && sessionRowForKind?.kind !== 'workflow'
           && !!harnessSession?.loadInterruptState();
 
         if (!shouldResume) {
@@ -10807,8 +10828,16 @@ export function registerConsoleRoutes(
             ok: true,
             approval: result.row,
             ...(trustGrantId ? { trustGrantId } : {}),
-            status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
-            message: `${approved ? 'Approved' : 'Rejected'} ${id}.`,
+            status: sessionRowForKind?.kind === 'workflow'
+              ? 'resolved-workflow-runner-resumes'
+              : pendingActionPreflight.kind === 'ok'
+                ? 'resolved-pending-action-approval-only'
+                : 'resolved-stale',
+            message: pendingActionPreflight.kind === 'ok'
+              ? approved
+                ? `Approved ${id}; the exact queued action is authorized, but execution is not confirmed and remains with its runtime owner.`
+                : `Rejected ${id}; the exact queued action will not execute.`
+              : `${approved ? 'Approved' : 'Rejected'} ${id}.`,
           });
           return;
         }
@@ -10840,6 +10869,7 @@ export function registerConsoleRoutes(
             await runConversationFromResume({
               agent,
               sessionId,
+              approvalId: id,
               decision,
               resolver: 'desktop-tasks-board',
             });
@@ -11181,12 +11211,39 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'approval already resolved', approval: existing });
       return;
     }
+    if (approvalRegistry.isExpired(existing)) {
+      res.status(409).json({ error: 'approval card has expired', approval: existing });
+      return;
+    }
+    const pendingActionPreflight = exactPendingActionApprovalPreflight(existing, decision);
+    if (pendingActionPreflight.kind === 'error') {
+      res.status(pendingActionPreflight.status).json({ error: pendingActionPreflight.reason });
+      return;
+    }
 
     // Map any approve-shaped decision to the audit-log "approved"
     // resolution. The `approve_with_edits` flavor still resolves the
     // approval row as approved — the edits are an in-flight
     // substitution, not a separate trust state.
     const auditResolution = decision === 'reject' ? 'rejected' : 'approved';
+
+    // Background ownership is durable and must stay in the daemon lane. The
+    // HTTP route queues the exact decision; the drain resolves/replays it with
+    // task cancellation, evidence, and report-back accounting intact.
+    if (decision !== 'approve_with_edits') {
+      const queued = queueBackgroundTaskApprovalResolution(id, decision === 'approve');
+      if (queued) {
+        res.json({
+          ok: true,
+          approvalId: id,
+          status: 'queued-background-task',
+          queuedTaskId: queued.id,
+          sessionId: queued.runSessionId,
+          message: `Queued ${decision === 'approve' ? 'approval' : 'rejection'} for background task ${queued.id}; execution is not confirmed yet.`,
+        });
+        return;
+      }
+    }
 
     const harnessSession = HarnessSession.load(existing.sessionId);
     // Workflow sessions must NOT be resumed from here: their RunState was
@@ -11197,7 +11254,8 @@ export function registerConsoleRoutes(
     // resumes (reapResolvedParkedRuns / its in-place approval poll rebuilds
     // the correct agent); resolving the approval row here is sufficient.
     const sessionRowForKind = getHarnessSession(existing.sessionId);
-    const shouldResume = sessionRowForKind?.kind !== 'workflow'
+    const shouldResume = pendingActionPreflight.kind !== 'ok'
+      && sessionRowForKind?.kind !== 'workflow'
       && !!harnessSession?.loadInterruptState();
     if (!shouldResume) {
       const result = approvalRegistry.resolve(
@@ -11212,8 +11270,16 @@ export function registerConsoleRoutes(
       res.json({
         ok: true,
         approval: result.row,
-        message: `Approval ${decision === 'reject' ? 'rejected' : (decision === 'approve_with_edits' ? 'approved with edits' : 'approved')}: ${id}`,
-        status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
+        message: pendingActionPreflight.kind === 'ok'
+          ? decision === 'approve'
+            ? `Approved ${id}; the exact queued action is authorized, but execution is not confirmed and remains with its runtime owner.`
+            : `Rejected ${id}; the exact queued action will not execute.`
+          : `Approval ${decision === 'reject' ? 'rejected' : (decision === 'approve_with_edits' ? 'approved with edits' : 'approved')}: ${id}`,
+        status: sessionRowForKind?.kind === 'workflow'
+          ? 'resolved-workflow-runner-resumes'
+          : pendingActionPreflight.kind === 'ok'
+            ? 'resolved-pending-action-approval-only'
+            : 'resolved-stale',
       });
       return;
     }
@@ -11240,47 +11306,57 @@ export function registerConsoleRoutes(
     setImmediate(async () => {
       try {
         const agent = await buildOrchestratorAgentForApprovalResume({ sessionId, allowToolJit: true });
-        // v0.5.19 Bug A fix — sticky-approval auto-resume.
-        // After the initial resume, the resumed turn may itself trigger
-        // a fresh approval pause (e.g. a composio_execute_tool inside the
-        // same logical workflow). Previously we resolved those new
-        // pending approvals here but never re-entered the runtime,
-        // leaving the session paused with all approvals resolved — a
-        // state inconsistency that needed a "/continue" nudge to escape.
-        // Now: loop resume → auto-resolve → resume until either no new
-        // pending approvals remain OR we hit a safety cap of 5 iterations
-        // (defense-in-depth against pathological prompts that approve
-        // unboundedly). Each iteration's auto-resolve uses the same
-        // decision the user originally chose for the first approval —
-        // that's the "sticky" semantic the audit event already records.
-        const MAX_STICKY_RESUMES = 5;
+        // A resume can reproduce the SAME durable approval when RunState
+        // recovery replays its interrupted call. Reuse the human decision only
+        // for that exact duplicate. A different tool, recipient, nested payload,
+        // pending-action id, or resumable key is fresh authority and stays
+        // pending. The duplicate must also be the sole pending row because the
+        // SDK resume decision applies session-wide to all interruptions.
+        //
+        // Edited approval is intentionally one-shot: the original registry args
+        // do not describe the edited payload the human approved, so no later
+        // card can safely inherit that decision.
+        const MAX_EXACT_DUPLICATE_RESUMES = 5;
         let resumeIter = 0;
+        let hitExactDuplicateResumeCap = false;
         // First resume always runs with the user's decision + modifiedArgs.
+        let currentApprovalId = id;
         let currentDecision = decision;
         let currentModifiedArgs = modifiedArgs;
-        while (resumeIter < MAX_STICKY_RESUMES) {
+        while (resumeIter < MAX_EXACT_DUPLICATE_RESUMES) {
           resumeIter += 1;
           await runConversationFromResume({
             agent,
             sessionId,
+            approvalId: currentApprovalId,
             decision: currentDecision,
             modifiedArgs: currentModifiedArgs,
             resolver: 'desktop-command-center',
           });
           const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
           if (pending.length === 0) break;
-          // Auto-resolve new pending approvals using the same audit
-          // resolution as the user's original choice, then loop to
-          // re-enter the runtime. After the first auto-resume,
-          // modifiedArgs no longer applies (the edit was a one-shot for
-          // the specific call the user reviewed).
-          for (const row of pending) {
-            approvalRegistry.resolve(row.approvalId, auditResolution, 'desktop-command-center');
+
+          if (decision === 'approve_with_edits') break;
+          const exactDuplicate = selectSoleExactApprovalDuplicate(existing, pending);
+          if (!exactDuplicate || !approvalRegistry.isActionable(exactDuplicate)) break;
+          // Never consume the duplicate unless another loop iteration is
+          // available to resume it. Leaving a resolved card beside a still-
+          // paused RunState recreates the original stranded-session defect.
+          if (resumeIter >= MAX_EXACT_DUPLICATE_RESUMES) {
+            hitExactDuplicateResumeCap = true;
+            break;
           }
-          currentDecision = decision === 'approve_with_edits' ? 'approve' : decision;
+          const duplicateResolution = approvalRegistry.resolve(
+            exactDuplicate.approvalId,
+            auditResolution,
+            'desktop-command-center:exact-duplicate',
+          );
+          if (!duplicateResolution.ok) break;
+          currentApprovalId = exactDuplicate.approvalId;
+          currentDecision = decision;
           currentModifiedArgs = undefined;
         }
-        if (resumeIter === MAX_STICKY_RESUMES) {
+        if (hitExactDuplicateResumeCap) {
           try {
             appendHarnessEvent({
               sessionId,
@@ -11288,8 +11364,8 @@ export function registerConsoleRoutes(
               role: 'system',
               type: 'run_failed',
               data: {
-                error: `Sticky-resume safety cap (${MAX_STICKY_RESUMES}) reached — agent kept creating new approvals every turn`,
-                stage: 'sticky_resume_cap',
+                error: `Exact-duplicate approval resume safety cap (${MAX_EXACT_DUPLICATE_RESUMES}) reached — the action remains pending`,
+                stage: 'exact_duplicate_resume_cap',
                 resumeIter,
               },
             });
@@ -13850,6 +13926,7 @@ export function registerConsoleRoutes(
           await runConversationFromResume({
             agent,
             sessionId,
+            approvalId: intent.approvalId,
             decision: intent.decision,
             resolver: 'chat-dock-user',
             onChunk,

@@ -13,13 +13,15 @@ import { getRuntimeEnv } from '../../config.js';
  * phase, and leaves explicit batch/background execution on their own rails.
  */
 
-export type ToolEconomyKind = 'single_deliverable' | 'interactive' | 'deep' | 'multi_item';
+export type ToolEconomyKind = 'single_deliverable' | 'artifact_build' | 'interactive' | 'deep' | 'multi_item';
 
 export interface ToolEconomyPolicy {
   kind: ToolEconomyKind;
   /** After this many top-level attempts, exploratory reads are refused. */
   softLimit: number;
-  /** After this many top-level calls, the next attempt is terminally refused. */
+  /** After this many top-level calls, ordinary attempts are terminally
+   * refused. A tiny, separately-counted artifact-completion reserve may admit
+   * only terminal writes/exact verification. */
   hardLimit: number;
 }
 
@@ -28,6 +30,9 @@ export interface ToolEconomyState {
   attempts: number;
   allowed: number;
   softRefusals: number;
+  /** Goal-advancing completion calls admitted after the ordinary hard limit.
+   * This is deliberately a tiny reserve, not a second general-purpose runway. */
+  completionReserveUsed: number;
   finishPhase: boolean;
   /** Canonical provider-call decisions. SDK permission callbacks can replay,
    * including after a deny. Keeping the decision (not only a seen bit) makes a
@@ -51,12 +56,33 @@ export interface ToolEconomyVerdict {
 
 const SINGLE_DELIVERABLE_RE =
   /\b(?:google\s+doc(?:ument)?|docx?|document|report|proposal|deck|presentation|pdf|spreadsheet|google\s+sheet|website|web\s*site|landing\s+page)\b/i;
+const COMPLEX_ARTIFACT_RE =
+  /\b(?:workspace|dashboard|portal|cockpit|command\s+center|interactive\s+(?:app|application|tracker|calendar|board))\b/i;
+const ARTIFACT_EXPLORATION_RE =
+  /\b(?:brainstorm|ideate|talk\s+through|discuss\s+(?:what|how|whether)|explore\s+(?:what|how|whether|options)|(?:how|whether)\s+(?:we|i|you)\s+(?:might|could|would))\b/i;
 const EXECUTION_RE =
   /\b(?:create|make|build|write|draft|generate|turn|transform|convert|publish|deploy|host|prepare|produce|assemble)\b/i;
 const DEEP_RE =
   /\b(?:deep(?:ly)?|exhaustive(?:ly)?|comprehensive(?:ly)?|everything|take\s+your\s+time|thorough(?:ly)?|all\s+available)\b/i;
 const MULTI_ITEM_RE =
   /\b(?:batch|bulk|for\s+each|each\s+of|all\s+of\s+them|\d{1,3}\s+(?:[a-z][\w'-]*\s+){0,3}[a-z][a-z'-]*s)\b/i;
+const COMPLETION_RESERVE = 4;
+
+/** True only for an execution-ready complex artifact request. Mentioning or
+ * brainstorming a Workspace does not widen either rail. */
+export function isComplexArtifactExecutionObjective(
+  text: string,
+  recentContext: readonly string[] = [],
+): boolean {
+  if (!EXECUTION_RE.test(text) || ARTIFACT_EXPLORATION_RE.test(text)) return false;
+  if (COMPLEX_ARTIFACT_RE.test(text)) return true;
+  // A short execution follow-up ("build it", "create that now") can inherit
+  // WHAT is being built, but not the execution decision, from recent user
+  // context. Prior brainstorming language must not cancel today's explicit
+  // command, and a prior artifact mention alone cannot widen a non-execution
+  // turn.
+  return recentContext.slice(0, 4).some((prior) => COMPLEX_ARTIFACT_RE.test(prior));
+}
 
 export function interactiveToolEconomyEnabled(): boolean {
   const value = (getRuntimeEnv('CLEMMY_INTERACTIVE_TOOL_ECONOMY', 'on') ?? 'on').trim().toLowerCase();
@@ -83,6 +109,13 @@ export function interactiveToolEconomyPolicy(input: {
       return { kind: 'multi_item', softLimit: 16, hardLimit: 28 };
     }
     if (DEEP_RE.test(text)) return { kind: 'deep', softLimit: 14, hardLimit: 24 };
+    if (isComplexArtifactExecutionObjective(input.message, input.priorMessages ?? [])) {
+      // Complex local artifacts normally require schema acquisition, source
+      // authoring, a local proof, the durable save, and a refresh/read-back.
+      // Keep that sequence bounded by the same 24-call ceiling used for deep
+      // work, but begin steering only after enough room for acquisition.
+      return { kind: 'artifact_build', softLimit: 16, hardLimit: 24 };
+    }
     if (SINGLE_DELIVERABLE_RE.test(text) && EXECUTION_RE.test(text)) {
       return { kind: 'single_deliverable', softLimit: 10, hardLimit: 15 };
     }
@@ -113,6 +146,7 @@ export function createToolEconomyState(policy: ToolEconomyPolicy): ToolEconomySt
     attempts: 0,
     allowed: 0,
     softRefusals: 0,
+    completionReserveUsed: 0,
     finishPhase: false,
     callDecisions: new Map(),
   };
@@ -148,6 +182,23 @@ function toolTail(toolName: string): string {
   return toolName.replace(/^mcp__/, '').split('__').at(-1)?.toLowerCase() ?? toolName.toLowerCase();
 }
 
+function decodeJsonValue(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
+  try { return JSON.parse(trimmed) as unknown; } catch { return value; }
+}
+
+function resolvedInvocation(toolName: string, args: unknown): { toolName: string; args: unknown } {
+  if (toolTail(toolName) !== 'call_tool') return { toolName, args };
+  const decoded = decodeJsonValue(args);
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return { toolName, args };
+  const input = decoded as Record<string, unknown>;
+  const target = typeof input.name === 'string' ? input.name.trim() : '';
+  if (!target || toolTail(target) === 'call_tool') return { toolName, args };
+  return { toolName: target, args: decodeJsonValue(input.args_json ?? input.arguments ?? {}) };
+}
+
 function shellCommand(args: unknown): string {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const command = (args as Record<string, unknown>).command;
@@ -173,9 +224,10 @@ function argumentRecord(args: unknown): Record<string, unknown> {
 }
 
 function dispatchedAction(toolName: string, args: unknown): string {
-  const tail = toolTail(toolName);
-  if (tail === 'composio_execute_tool' && args && typeof args === 'object' && !Array.isArray(args)) {
-    const slug = (args as Record<string, unknown>).tool_slug;
+  const resolved = resolvedInvocation(toolName, args);
+  const tail = toolTail(resolved.toolName);
+  if (tail === 'composio_execute_tool' && resolved.args && typeof resolved.args === 'object' && !Array.isArray(resolved.args)) {
+    const slug = (resolved.args as Record<string, unknown>).tool_slug;
     return typeof slug === 'string' ? slug.toLowerCase() : tail;
   }
   return tail.startsWith('cx_') ? tail.slice(3) : tail;
@@ -207,19 +259,41 @@ function isExactReadBack(toolName: string, args: unknown): boolean {
  * verify/read it back, synthesize cached results in one program, render/test the
  * local artifact, ask the blocking question, or move the work to background. */
 export function isFinishPhaseTool(toolName: string, args: unknown): boolean {
-  const tail = toolTail(toolName);
+  const resolved = resolvedInvocation(toolName, args);
+  const tail = toolTail(resolved.toolName);
   if (tail === 'run_worker') return false;
   if (
     /^(?:run_tool_program|run_batch|recall_tool_result|tool_output_query|workspace_artifact_query|ask_user_question|offer_background|dispatch_background_task)$/.test(tail)
   ) return true;
-  if (isExactReadBack(toolName, args)) return true;
+  if (isExactReadBack(resolved.toolName, resolved.args)) return true;
   const effect = classifyRuntimeToolEffect(toolName, args);
   if (effect.effect === 'local_write' || effect.effect === 'external_write') return true;
   if (tail === 'run_shell_command') {
-    const command = shellCommand(args);
-    return /\b(?:build|render|test|typecheck|lint|pandoc|libreoffice|ffmpeg|playwright|netlify\s+api\s+getSite)\b/i.test(command);
+    const command = shellCommand(resolved.args);
+    return /\b(?:build|render|test|typecheck|lint|pandoc|libreoffice|ffmpeg|playwright|netlify\s+api\s+getSite)\b/i.test(command)
+      || /(?:^|[;&|\n]\s*)(?:node|tsx|python3?|bash|sh)\s+(?:--[\w-]+(?:=\S+)?\s+)*[^\s;&|]+\.(?:[cm]?js|ts|py|sh)(?:\s|$)/i.test(command);
   }
   return false;
+}
+
+/** Narrow subset allowed to consume the post-limit completion reserve. It
+ * covers durable artifact authoring and exact verification, but not sends,
+ * publishing, deletion, broad discovery, or arbitrary external mutations. */
+function isCompletionReserveTool(toolName: string, args: unknown): boolean {
+  const resolved = resolvedInvocation(toolName, args);
+  const tail = toolTail(resolved.toolName);
+  if (isExactReadBack(resolved.toolName, resolved.args)) return true;
+  if (
+    /^(?:write_file|space_(?:save|refresh|set_data|edit_view|edit_runner|try_runner)|workflow_(?:create|update))$/.test(tail)
+  ) return true;
+  if (tail === 'run_shell_command') {
+    const effect = classifyRuntimeToolEffect(toolName, args);
+    if (effect.effect === 'local_write') return true;
+    return isFinishPhaseTool(toolName, args);
+  }
+  const action = dispatchedAction(resolved.toolName, resolved.args);
+  return /^(?:create|update|write|save|edit|append|replace)_(?:document|doc|spreadsheet|sheet|presentation|deck|pdf|site|page|file|artifact)$/i.test(action)
+    || /^(?:(?:google)?docs?|sheets?|netlify)_(?:create|update|write|save|edit|append|replace)_(?:document|doc|spreadsheet|sheet|presentation|deck|pdf|site|page|file|artifact)$/i.test(action);
 }
 
 /** One permission-boundary decision. The provider call id makes replayed SDK
@@ -254,8 +328,16 @@ export function evaluateToolEconomy(input: {
     }
   }
   state.attempts += 1;
+  const finishTool = isFinishPhaseTool(input.toolName, input.args);
   if (state.attempts > state.policy.hardLimit) {
     state.finishPhase = true;
+    if (finishTool && isCompletionReserveTool(input.toolName, input.args) && state.completionReserveUsed < COMPLETION_RESERVE) {
+      state.completionReserveUsed += 1;
+      state.softRefusals = 0;
+      state.allowed += 1;
+      cacheDecision(state, id, signature, null);
+      return null;
+    }
     const verdict: ToolEconomyVerdict = {
       kind: 'hard_stop',
       behavior: 'deny',
@@ -270,7 +352,7 @@ export function evaluateToolEconomy(input: {
   }
   if (state.attempts > state.policy.softLimit) {
     state.finishPhase = true;
-    if (!isFinishPhaseTool(input.toolName, input.args)) {
+    if (!finishTool) {
       state.softRefusals += 1;
       const terminal = state.softRefusals >= 3;
       const verdict: ToolEconomyVerdict = {
@@ -286,6 +368,10 @@ export function evaluateToolEconomy(input: {
       cacheDecision(state, id, signature, verdict);
       return verdict;
     }
+    // A successful transition from exploration into concrete execution means
+    // the model followed the steer. Old refusals must not later combine with a
+    // verification call to manufacture a "three ignored steers" interrupt.
+    state.softRefusals = 0;
   }
   state.allowed += 1;
   cacheDecision(state, id, signature, null);

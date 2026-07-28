@@ -97,26 +97,28 @@ export function analyzeSpaceGaps(
     });
   }
 
-  // 1: the view never consumes its data at all. GENEROUS by design — a
-  // workspace can be anything the user dreams up, so EVERY legitimate
-  // consumption pattern counts: the injected clem bridge (clem.data() /
-  // clem.refresh() — the pattern our own tool guidance tells the model to
-  // PREFER), a hand-rolled fetch of the /data or /refresh routes, or data
-  // embedded/inlined into the HTML at build time. Before this, a correct
-  // clem.data() view failed the check (no '/data' literal), and models
-  // "fixed" working views for hours by bolting on redundant raw fetches
-  // (2026-07-16 james-english-pipeline incident).
-  const consumesDataPlane = /\/data\b/.test(html)
-    || /\/refresh\b/.test(html)
-    || /\bclem\s*\.\s*(data|refresh)\s*\(/.test(html)
-    || /<script[^>]*\btype\s*=\s*["']?application\/json/i.test(html) // inlined dataset
-    || /\bwindow\.__[A-Z_]*DATA\s*=/i.test(html); // actual embedded seed assignment (not merely a read)
-  if (sources.length > 0 && !consumesDataPlane) {
+  // 1: a DYNAMIC view must use the scoped bridge we inject into every served
+  // Workspace. Prefer the direct helper:
+  //
+  //   const data = await clem.data()
+  //
+  // clem.refresh() and the legacy absolute Workspace route are also backed by
+  // the same parent-owned RPC boundary and remain valid for existing authored
+  // views. Embedded seeds and {{source}} placeholders are not live bindings.
+  // Keeping those distinctions prevents the GLM proof failure without making
+  // one coding style a persistence requirement.
+  const usesScopedDataBridge = /\bclem\s*\.\s*(?:data|refresh)\s*\(/.test(html)
+    || /\bfetch\s*\(\s*['"`]\/api\/console\/spaces\/[^'"`?#]+\/(?:data|refresh)(?:['"`?#])/i.test(html);
+  if (sources.length > 0 && !usesScopedDataBridge) {
+    const hasLegacyBinding = /\{\{\s*[^{}\r\n]+\s*\}\}/.test(html);
+    const sourceExample = sources[0]?.id ?? '<sourceId>';
     gaps.push({
       severity: 'clarify',
       resolution: 'fix',
-      question: `The view declares ${sources.length} data source${sources.length === 1 ? '' : 's'} but its HTML never reads them — no clem.data()/clem.refresh(), no GET …/data, and no embedded dataset. How does the surface get populated?`,
-      why: 'The Workspace will render empty on load — the data is fetched, not embedded.',
+      question: hasLegacyBinding
+        ? `The dynamic view uses a legacy {{source}} binding, but Workspace placeholders are not expanded. Replace it with \`const data = await clem.data()\` and render the declared source from \`data["${sourceExample}"]\`.`
+        : `The view declares ${sources.length} data source${sources.length === 1 ? '' : 's'} but never reads them through the scoped Workspace bridge. Add \`const data = await clem.data()\` and render each declared source from \`data["<sourceId>"]\`; an embedded seed is not a live binding.`,
+      why: 'A dynamic view needs the injected helper (or its scoped compatibility route) to reach the Workspace data plane.',
     });
   }
 

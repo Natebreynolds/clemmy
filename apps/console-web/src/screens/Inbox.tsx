@@ -6,6 +6,7 @@ import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
@@ -15,7 +16,8 @@ import {
   listNotifications, markNotificationRead, retryNotification,
   listTrustProposals, decideTrustProposal,
   relativeTime,
-  collapseAttentionRows, notifTone, notifFailed,
+  approvalDecisionSuccessText, collapseAttentionRows, notifTone, notifFailed,
+  summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow,
 } from '@/lib/inbox';
 
@@ -27,6 +29,16 @@ function needsAttentionNotif(n: NotificationRow): boolean {
 }
 
 type Tab = 'needs' | 'notifications';
+type DecisionNotice = { tone: 'success' | 'error'; text: string };
+type RowDecisionState = {
+  busy: boolean;
+  intent?: 'approve' | 'reject';
+  notice?: DecisionNotice;
+};
+
+function actionError(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim() ? error.message.trim() : fallback;
+}
 
 export function Inbox() {
   const qc = useQueryClient();
@@ -45,6 +57,8 @@ export function Inbox() {
   // side effects preserved), so bulk changes nothing about WHAT gets approved.
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [decisionStates, setDecisionStates] = useState<Record<string, RowDecisionState>>({});
+  const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
   // Re-apply when the deep link changes while the screen stays mounted
   // (e.g. Home card → Inbox already open in the router tree).
   useEffect(() => {
@@ -74,14 +88,42 @@ export function Inbox() {
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
-  const hasRows = (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
+  const queryUnavailable = tab === 'needs'
+    ? approvals.isError || notifications.isError || trustProposals.isError
+    : notifications.isError;
+  const hasRows = !queryUnavailable && (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
 
   const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
 
   const onDecide = async (id: string, decision: 'approve' | 'reject') => {
     const row = approvalRows.find((a) => a.approvalId === id);
-    try { await decideApproval(id, decision, { kind: row?.kind }); } finally { invalidate('approvals', 'approvals-count', 'command-center'); }
+    if (!row || decisionStates[id]?.busy || bulkBusy) return;
+    setDecisionStates((prev) => ({ ...prev, [id]: { busy: true, intent: decision } }));
+    setDecisionNotice(null);
+    try {
+      const result = await decideApproval(id, decision, { kind: row.kind });
+      const notice: DecisionNotice = {
+        tone: 'success',
+        text: approvalDecisionSuccessText(row, decision, result),
+      };
+      setDecisionStates((prev) => ({ ...prev, [id]: { busy: false, notice } }));
+      setDecisionNotice(notice);
+      setChecked((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    } catch (error) {
+      const notice: DecisionNotice = {
+        tone: 'error',
+        text: actionError(error, `Could not ${decision} this approval.`),
+      };
+      setDecisionStates((prev) => ({ ...prev, [id]: { busy: false, notice } }));
+      setDecisionNotice(notice);
+    } finally {
+      invalidate('approvals', 'approvals-count', 'command-center');
+    }
   };
   const toggleChecked = (id: string) => setChecked((prev) => {
     const next = new Set(prev);
@@ -94,27 +136,100 @@ export function Inbox() {
     const targets = approvalRows.filter((a) => checked.has(a.approvalId));
     if (targets.length === 0) return;
     setBulkBusy(true);
+    setDecisionNotice(null);
+    setDecisionStates((prev) => {
+      const next = { ...prev };
+      for (const row of targets) next[row.approvalId] = { busy: true, intent: decision };
+      return next;
+    });
+    const failedIds = new Set<string>();
+    const errors: string[] = [];
+    let succeeded = 0;
     try {
       // Sequential, not Promise.all: a rejected send that resumes a run must not
       // race a sibling on the same session; one-at-a-time matches the single-card
       // path exactly and keeps the resume/queue state machine deterministic.
       for (const row of targets) {
-        try { await decideApproval(row.approvalId, decision, { kind: row.kind }); } catch { /* skip the failures, resolve the rest */ }
+        try {
+          const result = await decideApproval(row.approvalId, decision, { kind: row.kind });
+          succeeded += 1;
+          setDecisionStates((prev) => ({
+            ...prev,
+            [row.approvalId]: {
+              busy: false,
+              notice: { tone: 'success', text: approvalDecisionSuccessText(row, decision, result) },
+            },
+          }));
+        } catch (error) {
+          failedIds.add(row.approvalId);
+          const message = actionError(error, `Could not ${decision} this approval.`);
+          errors.push(message);
+          setDecisionStates((prev) => ({
+            ...prev,
+            [row.approvalId]: { busy: false, notice: { tone: 'error', text: message } },
+          }));
+        }
       }
     } finally {
-      setChecked(new Set());
+      setChecked(new Set(failedIds));
+      setDecisionNotice({
+        tone: failedIds.size > 0 ? 'error' : 'success',
+        text: summarizeApprovalDecisionBatch({
+          decision,
+          total: targets.length,
+          succeeded,
+          errors,
+        }),
+      });
       setBulkBusy(false);
       invalidate('approvals', 'approvals-count', 'command-center');
     }
   };
   const onCancelStale = async () => {
-    try { await cancelStaleApprovals(); } finally { invalidate('approvals', 'approvals-count'); }
+    setDecisionNotice(null);
+    try {
+      await cancelStaleApprovals();
+      setDecisionNotice({ tone: 'success', text: 'Stale approval cards were cleared.' });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not clear stale approvals.') });
+    } finally {
+      invalidate('approvals', 'approvals-count');
+    }
   };
   const onDecideTrust = async (id: string, decision: 'approve' | 'decline') => {
-    try { await decideTrustProposal(id, decision); } finally { invalidate('trust-proposals', 'approvals-count', 'command-center'); }
+    setDecisionNotice(null);
+    try {
+      await decideTrustProposal(id, decision);
+      setDecisionNotice({
+        tone: 'success',
+        text: decision === 'approve' ? 'Standing trust saved.' : 'Standing-trust suggestion declined.',
+      });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not update that trust decision.') });
+    } finally {
+      invalidate('trust-proposals', 'approvals-count', 'command-center');
+    }
   };
-  const onRead = async (id: string) => { try { await markNotificationRead(id); } finally { invalidate('notifications'); } };
-  const onRetry = async (id: string) => { try { await retryNotification(id); } finally { invalidate('notifications'); } };
+  const onRead = async (id: string) => {
+    try {
+      await markNotificationRead(id);
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not mark that notification as read.') });
+    } finally {
+      invalidate('notifications');
+    }
+  };
+  const onRetry = async (id: string) => {
+    setDecisionNotice(null);
+    try {
+      await retryNotification(id);
+      setDecisionNotice({ tone: 'success', text: 'Notification delivery retry was queued.' });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not retry notification delivery.') });
+    } finally {
+      invalidate('notifications');
+    }
+  };
 
   const tabs: { key: Tab; label: string; icon: typeof Mail; count: number }[] = [
     { key: 'needs', label: 'Needs you', icon: Mail, count: needsCount },
@@ -127,6 +242,13 @@ export function Inbox() {
   const loading =
     (tab === 'needs' && (approvals.isLoading || notifications.isLoading || trustProposals.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
+  const retryCurrentTab = () => {
+    if (tab === 'needs') {
+      void approvals.refetch();
+      void trustProposals.refetch();
+    }
+    void notifications.refetch();
+  };
 
   return (
     <Page
@@ -162,6 +284,21 @@ export function Inbox() {
         })}
       </div>
 
+      {decisionNotice && (
+        <div
+          role={decisionNotice.tone === 'error' ? 'alert' : 'status'}
+          aria-live="polite"
+          className={cn(
+            'mb-4 rounded-md border px-3.5 py-2.5 text-small',
+            decisionNotice.tone === 'error'
+              ? 'border-danger/35 bg-danger-tint text-danger'
+              : 'border-success/35 bg-success-tint text-success',
+          )}
+        >
+          {decisionNotice.text}
+        </div>
+      )}
+
       {/* Hide the reading pane when the current tab has nothing to select — an
           empty list beside an empty "select an item" box reads as a broken page. */}
       <div className={cn('grid gap-4', hasRows && 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]')}>
@@ -169,7 +306,16 @@ export function Inbox() {
         <div className="space-y-2">
           {loading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
 
-          {!loading && tab === 'needs' && (needsCount === 0
+          {!loading && queryUnavailable && (
+            <QueryUnavailable
+              title="Inbox is unavailable"
+              description="Clementine couldn’t verify what needs your attention. This is not an all-caught-up state."
+              onRetry={retryCurrentTab}
+              className="py-10"
+            />
+          )}
+
+          {!loading && !queryUnavailable && tab === 'needs' && (needsCount === 0
             ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
             : (
               <>
@@ -200,6 +346,8 @@ export function Inbox() {
                 {approvalRows.map((a) => (
                   <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
                     checked={checked.has(a.approvalId)}
+                    decisionState={decisionStates[a.approvalId]}
+                    disabled={bulkBusy}
                     onToggleCheck={() => toggleChecked(a.approvalId)}
                     onSelect={() => setSelected(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
@@ -219,7 +367,7 @@ export function Inbox() {
               </>
             ))}
 
-          {!loading && tab === 'notifications' && (plainNotifRows.length === 0
+          {!loading && !queryUnavailable && tab === 'notifications' && (plainNotifRows.length === 0
             ? <EmptyState title="No notifications" description="Updates from completed work will appear here." />
             : plainNotifRows.map((n) => (
               <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
@@ -231,7 +379,15 @@ export function Inbox() {
         {/* Reading pane — only rendered when the tab has selectable rows. */}
         {hasRows && (
           <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
-            {selApproval && <ApprovalDetail row={selApproval} onApprove={() => onDecide(selApproval.approvalId, 'approve')} onReject={() => onDecide(selApproval.approvalId, 'reject')} />}
+            {selApproval && (
+              <ApprovalDetail
+                row={selApproval}
+                decisionState={decisionStates[selApproval.approvalId]}
+                disabled={bulkBusy}
+                onApprove={() => onDecide(selApproval.approvalId, 'approve')}
+                onReject={() => onDecide(selApproval.approvalId, 'reject')}
+              />
+            )}
             {selNotif && <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />}
             {!selApproval && !selNotif && (
               <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
@@ -260,17 +416,30 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
   );
 }
 
-function ApprovalCard({ row, selected, checked, onToggleCheck, onSelect, onApprove, onReject }: {
+function ApprovalCard({
+  row,
+  selected,
+  checked,
+  decisionState,
+  disabled,
+  onToggleCheck,
+  onSelect,
+  onApprove,
+  onReject,
+}: {
   row: ApprovalRow; selected: boolean; checked: boolean; onToggleCheck: () => void;
+  decisionState?: RowDecisionState; disabled?: boolean;
   onSelect: () => void; onApprove: () => void; onReject: () => void;
 }) {
   const queued = row.pendingAction;
+  const busy = disabled || decisionState?.busy === true;
   return (
     <div className={cn('rounded-md border px-3.5 py-3 transition-colors',
       selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
       <div className="flex w-full items-start gap-3">
         <input type="checkbox" aria-label="Select for bulk action"
           className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary"
+          disabled={busy}
           checked={checked} onChange={onToggleCheck} onClick={(e) => e.stopPropagation()} />
         <button type="button" onClick={onSelect} className="flex min-w-0 flex-1 items-start gap-3 text-left cursor-pointer">
           <StatusPill tone="warning">{queued ? 'Ready' : 'Approve'}</StatusPill>
@@ -284,12 +453,28 @@ function ApprovalCard({ row, selected, checked, onToggleCheck, onSelect, onAppro
         </div>
       )}
       <div className="mt-2.5 flex gap-2">
-        <Button size="sm" onClick={onApprove}>
+        <Button size="sm" disabled={busy} onClick={onApprove}>
           {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-          {queued ? 'Execute' : 'Approve'}
+          {decisionState?.busy && decisionState.intent === 'approve'
+            ? 'Approving…'
+            : queued ? 'Approve & continue' : 'Approve'}
         </Button>
-        <Button size="sm" variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
+        <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
+          <X className="h-4 w-4" aria-hidden />
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : 'Reject'}
+        </Button>
       </div>
+      {decisionState?.notice && (
+        <p
+          role={decisionState.notice.tone === 'error' ? 'alert' : 'status'}
+          className={cn(
+            'mt-2 text-caption',
+            decisionState.notice.tone === 'error' ? 'text-danger' : 'text-success',
+          )}
+        >
+          {decisionState.notice.text}
+        </p>
+      )}
     </div>
   );
 }
@@ -335,23 +520,52 @@ function Mono({ value }: { value: unknown }) {
   return <pre className="max-h-72 overflow-auto rounded-md bg-subtle p-3 font-mono text-caption text-muted">{text}</pre>;
 }
 
-function ApprovalDetail({ row, onApprove, onReject }: { row: ApprovalRow; onApprove: () => void; onReject: () => void }) {
+function ApprovalDetail({
+  row,
+  decisionState,
+  disabled,
+  onApprove,
+  onReject,
+}: {
+  row: ApprovalRow;
+  decisionState?: RowDecisionState;
+  disabled?: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
   const queued = row.pendingAction;
+  const busy = disabled || decisionState?.busy === true;
   return (
     <div>
-      <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready to execute: ${queued.title}` : row.subject}</h3>
+      <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready for approval: ${queued.title}` : row.subject}</h3>
       {queued && <PendingActionDetail action={queued} />}
       <Field label="Tool">{row.tool || '—'}</Field>
       {row.sessionId && <Field label="From session">{row.sessionId}</Field>}
       <Field label="Requested">{relativeTime(row.requestedAt) || '—'}</Field>
       <Field label="Details"><Mono value={row.args} /></Field>
       <div className="mt-4 flex gap-2">
-        <Button onClick={onApprove}>
+        <Button disabled={busy} onClick={onApprove}>
           {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-          {queued ? 'Execute queued action' : 'Approve'}
+          {decisionState?.busy && decisionState.intent === 'approve'
+            ? 'Approving…'
+            : queued ? 'Approve & continue' : 'Approve'}
         </Button>
-        <Button variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
+        <Button variant="secondary" disabled={busy} onClick={onReject}>
+          <X className="h-4 w-4" aria-hidden />
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : 'Reject'}
+        </Button>
       </div>
+      {decisionState?.notice && (
+        <p
+          role={decisionState.notice.tone === 'error' ? 'alert' : 'status'}
+          className={cn(
+            'mt-2 text-small',
+            decisionState.notice.tone === 'error' ? 'text-danger' : 'text-success',
+          )}
+        >
+          {decisionState.notice.text}
+        </p>
+      )}
     </div>
   );
 }

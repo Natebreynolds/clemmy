@@ -420,6 +420,11 @@ test('isDirectionSeekingQuestion: catches the batch-approval question; ignores p
   assert.equal(isDirectionSeekingQuestion('Should I send these to the full list or just the top 10?'), true);
   assert.equal(isDirectionSeekingQuestion('Which account should I use for the export?'), true);
   assert.equal(isDirectionSeekingQuestion('Which audience should this rollout brief target?'), true);
+  assert.equal(
+    isDirectionSeekingQuestion('Before I draft this, who should the rollout brief target — which audience?'),
+    true,
+    'a natural lead-in before the interrogative still creates a durable clarification pause',
+  );
   assert.equal(isDirectionSeekingQuestion('Where should I save the finished brief?'), true);
   assert.equal(isDirectionSeekingQuestion('Is this intended for engineers or executives?'), true);
   assert.equal(isDirectionSeekingQuestion('The report is ready at /tmp/report.md. OK to publish it to the site?'), true);

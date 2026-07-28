@@ -19,7 +19,7 @@ function rec(partial: Partial<SpaceRecord>): SpaceRecord {
 }
 
 const GOOD_VIEW = `<html><script>
-fetch('/api/console/spaces/x/data').then(r=>r.json()).then(j=>{const rows=j.data.contacts.contacts;render(rows)});
+clem.data().then(data=>{const rows=data.contacts.contacts;render(rows)});
 function go(row){ clem.action('send_email', { to_email: row.email }); }
 </script></html>`;
 
@@ -38,6 +38,44 @@ test('view that never consumes its data (no bridge, no fetch, no embed) → a qu
     '<html><body>static, no fetch</body></html>',
   );
   assert.ok(gaps.some((g) => g.question.includes('never reads them')));
+});
+
+test('data-backed Workspace rejects a legacy mustache seed instead of activating an empty dynamic view', () => {
+  // Fresh GLM live proof, 2026-07-28: application/json was treated as an
+  // embedded dataset even though {{tasks}} is never expanded by the Workspace
+  // runtime. The saved surface activated with no authored bridge call.
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'tasks', runner: 'tasks.mjs' }] }),
+    `<html>
+      <script id="dataset" type="application/json">{{tasks}}</script>
+      <script>
+        const raw = document.getElementById("dataset").textContent;
+        const data = raw !== "{{tasks}}" ? JSON.parse(raw) : [];
+        render(data);
+      </script>
+    </html>`,
+  );
+  const bridgeGap = gaps.find((g) => /clem\.data\(\)/.test(g.question));
+  assert.equal(bridgeGap?.resolution, 'fix');
+  assert.match(bridgeGap?.question ?? '', /not expanded|legacy/i);
+});
+
+test('data-backed Workspace preserves the scoped compatibility data route', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'contacts', runner: 'r.mjs' }] }),
+    `<html><script>
+      fetch('/api/console/spaces/x/data').then(r => r.json()).then(({data}) => render(data.contacts));
+    </script></html>`,
+  );
+  assert.equal(gaps.length, 0);
+});
+
+test('static Workspace remains valid without clem.data()', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [] }),
+    '<html><body><h1>Reference board</h1><p>No dynamic data.</p></body></html>',
+  );
+  assert.deepEqual(gaps, []);
 });
 
 test('view that never references a declared source → a question (the nesting class)', () => {
@@ -169,18 +207,29 @@ test('C1: an action the view never wires → a question', () => {
   assert.ok(gaps.some((g) => /never fires one|never references "send_email"/.test(g.question)));
 });
 
-test('check 1 is GENEROUS: every legitimate consumption pattern passes (workspaces are unlimited)', () => {
+test('check 1 accepts canonical bridge calls and rejects non-canonical dynamic loading shapes', () => {
   const record = { dataSources: [{ id: 'pipeline' }], actions: [] } as never;
-  const shapes: Array<[string, string]> = [
-    ['clem bridge data()', '<script>async function load(){ const d = await clem.data(); render(d.pipeline); }</script>'],
-    ['clem bridge refresh()', '<script>document.getElementById("r").onclick = () => clem.refresh("pipeline");</script>'],
-    ['hand-rolled /data fetch', '<script>fetch("/api/console/spaces/x/data").then(r=>r.json()).then(d=>render(d.pipeline));</script>'],
+  const canonical = [
+    '<script>async function load(){ const d = await clem.data(); render(d.pipeline); }</script>',
+    '<script>clem . data ( ).then(d => render(d.pipeline));</script>',
+    '<script>clem.refresh("pipeline").then(({data}) => render(data.pipeline));</script>',
+    '<script>fetch("/api/console/spaces/x/data").then(r => r.json()).then(({data}) => render(data.pipeline));</script>',
+  ];
+  for (const html of canonical) {
+    const gaps = analyzeSpaceGaps(record, `<html><body>${html}</body></html>`, []);
+    assert.ok(!gaps.some((g) => /canonical bridge/.test(g.question)), `${html} must pass the bridge check`);
+  }
+
+  const legacyShapes: Array<[string, string]> = [
     ['inlined JSON dataset', '<script type="application/json" id="dataset">{"pipeline":[]}</script><script>render(JSON.parse(document.getElementById("dataset").textContent).pipeline)</script>'],
     ['embedded window seed', '<script>window.__PIPELINE_DATA = {"pipeline":[]}; render(window.__PIPELINE_DATA.pipeline);</script>'],
   ];
-  for (const [label, html] of shapes) {
+  for (const [label, html] of legacyShapes) {
     const gaps = analyzeSpaceGaps(record, `<html><body>${html}</body></html>`, []);
-    assert.ok(!gaps.some((g) => g.question.includes('never reads them')), `${label} must not trip check 1`);
+    assert.ok(
+      gaps.some((g) => g.resolution === 'fix' && /clem\.data\(\)/.test(g.question)),
+      `${label} must require the canonical bridge`,
+    );
   }
 });
 

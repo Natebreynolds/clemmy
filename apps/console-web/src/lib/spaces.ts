@@ -232,6 +232,38 @@ export function latestRefreshFailures(audit: SpaceAudit[]): SpaceAudit[] {
   return [...latestByPath.values()].filter((a) => a.outcome === 'error').slice(0, 3);
 }
 
+/** Build the handoff behind WorkspaceView's "Ask Clem to fix" button. Every
+ * banner-only state gets real context; approval-only deliberately requests a
+ * review, never an implicit approval or execution. */
+export function buildWorkspaceFixPrompt(input: {
+  paused: boolean;
+  failures: SpaceAudit[];
+  gaps: GapQuestion[];
+  openApprovals: number;
+}): string {
+  const sections: string[] = [];
+  if (input.failures.length > 0) {
+    const lines = input.failures.map((failure) => (
+      `- ${failure.path.replace('/refresh/', '')}: ${(failure.note ?? 'failed to refresh').slice(0, 600)}`
+    ));
+    sections.push(`Fix the failing data sources in this workspace:\n${lines.join('\n')}\nDiagnose each runner, apply the fix, and confirm the re-pull succeeds.`);
+  } else if (input.paused) {
+    sections.push('This workspace is paused because a data source didn’t return data when it was built. Diagnose and fix it, verify the source returns real data, then resume the workspace.');
+  }
+  if (input.gaps.length > 0) {
+    sections.push(
+      `Help me resolve these workspace validation gaps before I rely on it:\n${input.gaps.map((gap) => `- ${gap.question}`).join('\n')}\n`
+      + 'Explain what you can determine from the workspace and ask only for decisions that genuinely require me.',
+    );
+  }
+  if (input.openApprovals > 0) {
+    sections.push(
+      `Review the ${input.openApprovals} actions waiting for approval in this workspace. Explain the target, effect, and risk of each, and recommend what I should do. Do not approve or execute them.`,
+    );
+  }
+  return sections.join('\n\n') || 'Inspect this workspace for the issue shown in its status banner, explain what is wrong, and fix only what can be verified safely.';
+}
+
 /** Absolute URL the daemon serves the view at. The request is cookie-authenticated
  *  by the parent navigation, then the response CSP forces authored HTML into an
  *  opaque-origin sandbox. */

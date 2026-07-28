@@ -20,6 +20,7 @@ import { X, Archive } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
@@ -49,6 +50,7 @@ export function BackgroundTasks() {
   const [pinnedSelection, setPinnedSelection] = useState<BoardRunSelection | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [keptStale, setKeptStale] = useState(false); // "Keep them" dismisses the banner for this view
+  const [archiveAllBusy, setArchiveAllBusy] = useState(false);
 
   const requestedSelection = useMemo<BoardRunSelection | null>(() => {
     const select = searchParams.get('select')?.trim() || '';
@@ -133,16 +135,38 @@ export function BackgroundTasks() {
     }
     const verb = intent === 'cancel' ? 'Cancelling' : intent === 'resume' ? 'Resuming' : intent === 'approve' ? 'Approving' : 'Starting';
     flash({ tone: 'success', text: `${verb} “${card.title}”…` });
-    const res = await runBoardAction(card, intent);
-    if (!res.ok) flash({ tone: 'danger', text: res.reason || 'That action didn’t go through.' });
-    void qc.invalidateQueries({ queryKey: ['board'] });
+    try {
+      const res = await runBoardAction(card, intent);
+      if (!res.ok) flash({ tone: 'danger', text: res.reason || 'That action didn’t go through.' });
+    } catch (error) {
+      flash({
+        tone: 'danger',
+        text: error instanceof Error && error.message.trim()
+          ? error.message
+          : 'That action didn’t go through.',
+      });
+    } finally {
+      void qc.invalidateQueries({ queryKey: ['board'] });
+    }
   };
 
   const onArchive = async (card: BoardCard) => {
-    flash({ tone: 'success', text: `Archived “${card.title}”.` });
-    const res = await runBoardAction(card, 'archive');
-    if (!res.ok) flash({ tone: 'danger', text: res.reason || 'Couldn’t archive that task.' });
-    void qc.invalidateQueries({ queryKey: ['board'] });
+    flash({ tone: 'success', text: `Archiving “${card.title}”…` });
+    try {
+      const res = await runBoardAction(card, 'archive');
+      flash(res.ok
+        ? { tone: 'success', text: `Archived “${card.title}”.` }
+        : { tone: 'danger', text: res.reason || 'Couldn’t archive that task.' });
+    } catch (error) {
+      flash({
+        tone: 'danger',
+        text: error instanceof Error && error.message.trim()
+          ? error.message
+          : 'Couldn’t archive that task.',
+      });
+    } finally {
+      void qc.invalidateQueries({ queryKey: ['board'] });
+    }
   };
 
   const onCardAction = async (card: BoardCard, intent: BoardButtonIntent) => {
@@ -153,18 +177,36 @@ export function BackgroundTasks() {
             : intent === 'cancel' ? 'Cancelling'
               : 'Updating';
     flash({ tone: 'success', text: `${label} “${card.title}”…` });
-    const res = await runBoardAction(card, intent);
-    if (!res.ok) flash({ tone: 'danger', text: res.reason || 'That action didn’t go through.' });
-    void qc.invalidateQueries({ queryKey: ['board'] });
+    try {
+      const res = await runBoardAction(card, intent);
+      if (!res.ok) flash({ tone: 'danger', text: res.reason || 'That action didn’t go through.' });
+    } catch (error) {
+      flash({
+        tone: 'danger',
+        text: error instanceof Error && error.message.trim()
+          ? error.message
+          : 'That action didn’t go through.',
+      });
+    } finally {
+      void qc.invalidateQueries({ queryKey: ['board'] });
+    }
   };
 
   const onArchiveAll = async (tasks: BoardCard[]) => {
-    const results = await Promise.all(tasks.map((t) => runBoardAction(t, 'archive')));
-    const failed = results.filter((r) => !r.ok).length;
-    flash(failed
-      ? { tone: 'danger', text: `Archived ${tasks.length - failed} of ${tasks.length}; ${failed} couldn’t be archived.` }
-      : { tone: 'success', text: `Archived ${tasks.length} old task${tasks.length > 1 ? 's' : ''}.` });
-    void qc.invalidateQueries({ queryKey: ['board'] });
+    if (archiveAllBusy) return;
+    setArchiveAllBusy(true);
+    try {
+      const results = await Promise.allSettled(tasks.map((t) => runBoardAction(t, 'archive')));
+      const failed = results.filter(
+        (result) => result.status === 'rejected' || !result.value.ok,
+      ).length;
+      flash(failed
+        ? { tone: 'danger', text: `Archived ${tasks.length - failed} of ${tasks.length}; ${failed} couldn’t be archived.` }
+        : { tone: 'success', text: `Archived ${tasks.length} old task${tasks.length > 1 ? 's' : ''}.` });
+    } finally {
+      setArchiveAllBusy(false);
+      void qc.invalidateQueries({ queryKey: ['board'] });
+    }
   };
 
   return (
@@ -193,21 +235,42 @@ export function BackgroundTasks() {
             </div>
           </div>
           <div className="flex gap-2">
-            <Button onClick={() => void onArchiveAll(staleCards)}>
-              <Archive className="h-4 w-4" aria-hidden /> Archive all
+            <Button disabled={archiveAllBusy} onClick={() => void onArchiveAll(staleCards)}>
+              <Archive className="h-4 w-4" aria-hidden />
+              {archiveAllBusy ? 'Archiving…' : 'Archive all'}
             </Button>
-            <Button variant="secondary" onClick={() => setKeptStale(true)}>Keep them</Button>
+            <Button variant="secondary" disabled={archiveAllBusy} onClick={() => setKeptStale(true)}>Keep them</Button>
           </div>
         </div>
       )}
 
-      {/* Live "running now" rail — rides the telemetry SSE, independent of the
-          board poll, so swarms / tool calls / brain switches show as they happen. */}
-      <CollaborativeWorkstate snapshot={focus.data} className="mb-4" />
+      {board.isError ? (
+        <QueryUnavailable
+          title="Tasks are unavailable"
+          description="Clementine couldn’t load the task board, so this is not an empty-work state."
+          onRetry={() => {
+            void board.refetch();
+            if (focus.isError) void focus.refetch();
+          }}
+        />
+      ) : (
+        <>
+          {/* Live "running now" rail — rides the telemetry SSE, independent of
+              the board poll, so swarms and tool calls show as they happen. */}
+          {focus.isError ? (
+            <QueryUnavailable
+              title="Live activity is unavailable"
+              description="The task board is still current, but Clementine couldn’t verify the live agent and tool feed."
+              onRetry={() => { void focus.refetch(); }}
+              className="mb-4 py-6"
+            />
+          ) : (
+            <CollaborativeWorkstate snapshot={focus.data} className="mb-4" />
+          )}
 
-      <NowStrip cards={cards} onOpen={setOpen} />
+          <NowStrip cards={cards} onOpen={setOpen} />
 
-      {board.isLoading ? (
+          {board.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
           {COLUMNS.map((c) => <Skeleton key={c.id} className="h-64" />)}
         </div>
@@ -233,7 +296,7 @@ export function BackgroundTasks() {
                 activeCard={active}
                 onOpen={setOpen}
                 onArchive={(card) => void onArchive(card)}
-                onAction={(card, intent) => void onCardAction(card, intent)}
+                onAction={onCardAction}
               />
             ))}
           </div>
@@ -241,9 +304,11 @@ export function BackgroundTasks() {
             {active ? <DragPreview card={active} /> : null}
           </DragOverlay>
         </DndContext>
+          )}
+        </>
       )}
 
-      {openCard && <LiveTraceDrawer card={openCard} onClose={closeTrace} onAction={(card, intent) => void onCardAction(card, intent)} />}
+      {openCard && <LiveTraceDrawer card={openCard} onClose={closeTrace} onAction={onCardAction} />}
 
       {toast && (
         <div

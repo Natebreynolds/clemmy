@@ -10,7 +10,15 @@ import { groupSessions, collectTags } from '../lib/groupSessions';
 import { ConversationListItem } from './ConversationListItem';
 import type { SessionFilters } from '../types';
 
-export function ConversationSidebar({ onCollapse }: { onCollapse?: () => void } = {}) {
+export function ConversationSidebar({
+  onCollapse,
+  className,
+  autoFocusSearch = false,
+}: {
+  onCollapse?: () => void;
+  className?: string;
+  autoFocusSearch?: boolean;
+} = {}) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const mutations = useSessionMutations();
@@ -67,7 +75,10 @@ export function ConversationSidebar({ onCollapse }: { onCollapse?: () => void } 
   };
 
   return (
-    <aside className="flex h-full w-[300px] shrink-0 flex-col border-r border-border bg-surface">
+    <aside
+      aria-label="Conversation history"
+      className={cn('flex h-full w-[300px] shrink-0 flex-col border-r border-border bg-surface', className)}
+    >
       <div className="space-y-2 border-b border-border p-3">
         <div className="flex items-center gap-1.5">
           <Button className="min-w-0 flex-1" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
@@ -88,6 +99,7 @@ export function ConversationSidebar({ onCollapse }: { onCollapse?: () => void } 
         <div className="flex items-center gap-2 rounded-md border border-border bg-canvas px-2.5">
           <Search className="h-4 w-4 shrink-0 text-faint" aria-hidden />
           <input
+            autoFocus={autoFocusSearch}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search conversations"

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { load } from 'js-yaml';
 import {
@@ -44,6 +45,16 @@ function runScripts(job) {
     .join('\n');
 }
 
+function runBash(script, env) {
+  return spawnSync('bash', ['-c', script], {
+    encoding: 'utf-8',
+    env: {
+      PATH: process.env.PATH,
+      ...env,
+    },
+  });
+}
+
 test('manual desktop candidates require a prerelease version, retain both platforms, and cannot publish', () => {
   const input = workflow.on?.workflow_dispatch?.inputs?.candidate_version;
   assert.equal(input?.required, true);
@@ -60,6 +71,73 @@ test('manual desktop candidates require a prerelease version, retain both platfo
     );
   }
   assert.match(String(workflow.jobs?.['release-windows']?.if ?? ''), /workflow_dispatch/);
+});
+
+test('Windows production builds fail closed without signing secrets while private candidates may remain unsigned', () => {
+  const windowsJob = workflow.jobs?.['release-windows'];
+  const signingGate = (windowsJob?.steps ?? []).find(
+    (step) => step?.name === 'Verify production Windows signing secrets',
+  );
+  assert.ok(signingGate, 'release-windows must verify signing credentials before building');
+  assert.equal(signingGate?.shell, 'bash');
+  assert.equal(signingGate?.env?.EVENT_NAME, '${{ github.event_name }}');
+  assert.equal(signingGate?.env?.WINDOWS_CSC_LINK, '${{ secrets.WINDOWS_CSC_LINK }}');
+  assert.equal(
+    signingGate?.env?.WINDOWS_CSC_KEY_PASSWORD,
+    '${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}',
+  );
+
+  const gateScript = String(signingGate?.run ?? '');
+  assert.match(gateScript, /EVENT_NAME.*workflow_dispatch/s);
+  assert.match(gateScript, /WINDOWS_CSC_LINK/);
+  assert.match(gateScript, /WINDOWS_CSC_KEY_PASSWORD/);
+  assert.match(gateScript, /Missing required Windows signing secrets/);
+  assert.match(gateScript, /exit 1/);
+
+  const privateCandidate = runBash(gateScript, { EVENT_NAME: 'workflow_dispatch' });
+  assert.equal(privateCandidate.status, 0, privateCandidate.stderr);
+  assert.match(privateCandidate.stdout, /may be unsigned/);
+
+  const unsignedProduction = runBash(gateScript, { EVENT_NAME: 'push' });
+  assert.equal(unsignedProduction.status, 1);
+  assert.match(
+    `${unsignedProduction.stdout}\n${unsignedProduction.stderr}`,
+    /WINDOWS_CSC_LINK.*WINDOWS_CSC_KEY_PASSWORD/,
+  );
+
+  const partiallySignedProduction = runBash(gateScript, {
+    EVENT_NAME: 'push',
+    WINDOWS_CSC_LINK: 'private-certificate',
+  });
+  assert.equal(partiallySignedProduction.status, 1);
+  assert.match(
+    `${partiallySignedProduction.stdout}\n${partiallySignedProduction.stderr}`,
+    /WINDOWS_CSC_KEY_PASSWORD/,
+  );
+
+  const signedProduction = runBash(gateScript, {
+    EVENT_NAME: 'push',
+    WINDOWS_CSC_LINK: 'private-certificate',
+    WINDOWS_CSC_KEY_PASSWORD: 'private-password',
+  });
+  assert.equal(signedProduction.status, 0, signedProduction.stderr);
+
+  const signingGateIndex = windowsJob.steps.indexOf(signingGate);
+  const checkoutIndex = windowsJob.steps.findIndex((step) => step?.name === 'Checkout');
+  const buildIndex = windowsJob.steps.findIndex((step) => step?.name === 'Build Windows installer');
+  assert.ok(signingGateIndex < checkoutIndex);
+  assert.ok(signingGateIndex < buildIndex);
+  const buildStep = windowsJob.steps[buildIndex];
+  assert.equal(buildStep?.env?.CSC_LINK, '${{ secrets.WINDOWS_CSC_LINK }}');
+  assert.equal(
+    buildStep?.env?.CSC_KEY_PASSWORD,
+    '${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}',
+  );
+
+  const jobCondition = String(windowsJob?.if ?? '');
+  assert.match(jobCondition, /workflow_dispatch/);
+  assert.match(jobCondition, /github\.event_name == 'push'/);
+  assert.match(jobCondition, /\[mac-only\]/);
 });
 
 test('candidate dispatcher defaults to the next patch prerelease and rejects downgrade candidates', () => {
