@@ -121,6 +121,16 @@ function callIdFromDetails(details: ToolDetails | undefined): string | undefined
   return call?.callId ?? call?.id;
 }
 
+function currentSourceAttribution(): { sourceUserSeq?: number; runScopeId?: string } {
+  const ctx = harnessRunContextStorage.getStore();
+  return {
+    ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: ctx?.sourceUserSeq as number }
+      : {}),
+    ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+  };
+}
+
 /** Best-effort `item` label from a run_worker call's arguments (the worker
  *  packet's `item` field) for the fan-out ledger. Pure; never throws. */
 function workerItemFromDetails(details: ToolDetails | undefined): string | null {
@@ -314,6 +324,7 @@ export function attachEventLogHooks(
         role: agent?.name ?? 'agent',
         type: 'tool_called',
         data: {
+          ...currentSourceAttribution(),
           tool: tool?.name ?? null,
           callId: callId ?? null,
           canonicalCallId: callId ?? null,
@@ -464,6 +475,7 @@ export function attachEventLogHooks(
         role: agent?.name ?? 'agent',
         type: 'tool_returned',
         data: {
+          ...currentSourceAttribution(),
           tool: tool?.name ?? null,
           callId: callId ?? null,
           canonicalCallId: callId ?? null,

@@ -32,6 +32,11 @@ export interface CompactTaskLedgerResult {
   compactedTaskRows: number;
 }
 
+export interface ReopenTaskLedgerResult {
+  body: string;
+  reopenedTaskRows: number;
+}
+
 function loadExecutions(): ExecutionRecord[] {
   if (!existsSync(EXECUTIONS_FILE)) return [];
   try {
@@ -87,6 +92,10 @@ function isCheckedTaskLine(line: string): boolean {
 
 function checkTaskLine(line: string): string {
   return line.replace(/^(\s*-\s+\[) (\])/, '$1x$2');
+}
+
+function uncheckTaskLine(line: string): string {
+  return line.replace(/^(\s*-\s+\[)[xX](\])/, '$1 $2');
 }
 
 function trimBlankEdges(lines: string[]): string[] {
@@ -162,6 +171,71 @@ export function closeAndCompactTaskLedgerBody(body: string, taskIdsToClose: Set<
     body: `${nextLines.join('\n').replace(/\n+$/, '')}\n`,
     checkedTaskRows,
     compactedTaskRows,
+  };
+}
+
+/**
+ * Reverse only the task rows that execution completion auto-closed. This is
+ * used when late durable evidence proves the execution was not actually a
+ * clean success. Matching completed rows move back to Pending and are
+ * unchecked; unrelated completed work is untouched.
+ */
+export function reopenTaskLedgerBody(body: string, taskIdsToReopen: Set<string>): ReopenTaskLedgerResult {
+  if (taskIdsToReopen.size === 0) return { body, reopenedTaskRows: 0 };
+  const lines = body.split('\n');
+  const pendingHeaderIndex = lines.findIndex((line) => line.trim() === '## Pending');
+  const completedHeaderIndex = lines.findIndex((line) => line.trim() === '## Completed');
+  if (pendingHeaderIndex === -1 || completedHeaderIndex === -1 || completedHeaderIndex <= pendingHeaderIndex) {
+    let reopenedTaskRows = 0;
+    const next = lines.map((line) => {
+      const id = taskLineId(line);
+      if (!id || !taskIdsToReopen.has(id) || !isCheckedTaskLine(line)) return line;
+      reopenedTaskRows += 1;
+      return uncheckTaskLine(line);
+    });
+    return {
+      body: `${next.join('\n').replace(/\n+$/, '')}\n`,
+      reopenedTaskRows,
+    };
+  }
+
+  const beforePending = lines.slice(0, pendingHeaderIndex + 1);
+  const pendingBody = lines.slice(pendingHeaderIndex + 1, completedHeaderIndex);
+  const completedBody = lines.slice(completedHeaderIndex + 1);
+  const existingPendingIds = new Set(
+    pendingBody.map(taskLineId).filter((id): id is string => Boolean(id)),
+  );
+  const reopened: string[] = [];
+  const completedKeep: string[] = [];
+  let reopenedTaskRows = 0;
+
+  for (const line of completedBody) {
+    const id = taskLineId(line);
+    if (!id || !taskIdsToReopen.has(id) || !isTaskLine(line)) {
+      completedKeep.push(line);
+      continue;
+    }
+    if (!existingPendingIds.has(id)) {
+      reopened.push(uncheckTaskLine(line));
+      existingPendingIds.add(id);
+    }
+    reopenedTaskRows += 1;
+  }
+
+  const nextLines = [
+    ...trimBlankEdges(beforePending),
+    '',
+    ...trimBlankEdges(pendingBody),
+    ...(trimBlankEdges(pendingBody).length > 0 && reopened.length > 0 ? [''] : []),
+    ...reopened,
+    '',
+    '## Completed',
+    '',
+    ...trimBlankEdges(completedKeep),
+  ];
+  return {
+    body: `${nextLines.join('\n').replace(/\n+$/, '')}\n`,
+    reopenedTaskRows,
   };
 }
 

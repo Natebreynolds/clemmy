@@ -7,14 +7,33 @@ import { isUserFacingExecution } from './scope.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { addNotification } from '../runtime/notifications.js';
 import { TASKS_FILE, ensureTasksFile } from '../tools/shared.js';
-import { closeAndCompactTaskLedgerBody } from '../tasks/task-ledger-hygiene.js';
+import {
+  closeAndCompactTaskLedgerBody,
+  reopenTaskLedgerBody,
+} from '../tasks/task-ledger-hygiene.js';
 // v0.5.19 Bug F — pause-aware sweep needs these. Static ESM imports
 // (no circular dep: neither module imports from execution/store).
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
-import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
+import {
+  listEvents as listHarnessEvents,
+  type EventRow,
+} from '../runtime/harness/eventlog.js';
+import {
+  freshExternalWriteEvidenceStatus,
+  type FreshExternalWriteEvidenceStatus,
+} from '../runtime/harness/tool-evidence.js';
 
 const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
+const EXTERNAL_WRITE_EVENT_TYPES = [
+  'external_write',
+  'external_write_failed',
+  'external_write_orphaned',
+] as const;
+const EXTERNAL_WRITE_OWNERSHIP_EVENT_TYPES = [
+  ...EXTERNAL_WRITE_EVENT_TYPES,
+  'user_input_received',
+] as const;
 
 function ensureStateDir(): void {
   if (!existsSync(STATE_DIR)) {
@@ -27,7 +46,8 @@ function loadExecutions(): ExecutionRecord[] {
   if (!existsSync(EXECUTIONS_FILE)) return [];
   try {
     const parsed = JSON.parse(readFileSync(EXECUTIONS_FILE, 'utf-8'));
-    return Array.isArray(parsed) ? parsed as ExecutionRecord[] : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed as ExecutionRecord[];
   } catch {
     return [];
   }
@@ -40,6 +60,250 @@ function saveExecutions(executions: ExecutionRecord[]): void {
 
 function clean(value: string, maxChars = 220): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+export interface ExecutionExternalWriteTruth {
+  status: FreshExternalWriteEvidenceStatus;
+  execution: ExecutionRecord;
+}
+
+function executionExternalWriteStatus(
+  execution: ExecutionRecord,
+  prefetchedOwnershipEvents?: readonly EventRow[],
+): {
+  status: FreshExternalWriteEvidenceStatus;
+  latestNegativeSeq?: number;
+} {
+  const sourceUserSeq = execution.sourceUserSeq;
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+    return { status: 'missing' };
+  }
+  try {
+    const ownershipEvents = (
+      prefetchedOwnershipEvents
+        ?? listHarnessEvents(execution.sessionId, {
+          sinceSeq: sourceUserSeq,
+          types: [...EXTERNAL_WRITE_OWNERSHIP_EVENT_TYPES],
+        })
+    ).filter((event) => event.seq > (sourceUserSeq as number));
+    const completedAt = execution.status === 'completed'
+      ? execution.completedAt
+        ?? [...(execution.activity ?? [])]
+          .reverse()
+          .find((item) => item.type === 'completed')?.createdAt
+        ?? execution.updatedAt
+      : undefined;
+    const nextUserRequest = completedAt
+      ? ownershipEvents.find((event) =>
+          event.type === 'user_input_received'
+          && event.createdAt >= completedAt
+        )
+      : undefined;
+    // A late timeout/orphan resolution may arrive after the model marked the
+    // execution complete, so keep same-request evidence until the next user
+    // request. Nothing after that request can retroactively belong to this
+    // already-completed execution.
+    const events = ownershipEvents.filter((event) =>
+      event.type !== 'user_input_received'
+      && (!nextUserRequest || event.seq < nextUserRequest.seq)
+    );
+    const status = freshExternalWriteEvidenceStatus(events, sourceUserSeq);
+    const latestNegativeSeq = events
+      .filter((event) =>
+        event.type === 'external_write_failed'
+        || event.type === 'external_write_orphaned'
+      )
+      .reduce<number | undefined>(
+        (latest, event) => latest === undefined || event.seq > latest ? event.seq : latest,
+        undefined,
+      );
+    return { status, latestNegativeSeq };
+  } catch {
+    // Event storage is best-effort for legacy/non-harness executions. Missing
+    // evidence must not invent a blocker for work that never performed a write.
+    return { status: 'missing' };
+  }
+}
+
+function externalWriteTruthCopy(
+  status: Extract<FreshExternalWriteEvidenceStatus, 'failed' | 'ambiguous'>,
+): { blocker: string; nextStep: string } {
+  return status === 'ambiguous'
+    ? {
+        blocker: 'An external-write outcome remains ambiguous. The exact target requires read-only reconciliation before this execution can be called complete.',
+        nextStep: 'Reconcile the ambiguous external write read-only; do not repeat it.',
+      }
+    : {
+        blocker: 'At least one required external write failed. Repair that exact action before claiming this execution complete.',
+        nextStep: 'Repair or safely retry the failed external write, then verify it.',
+      };
+}
+
+function applyExternalWriteTruthBlock(
+  execution: ExecutionRecord,
+  status: Extract<FreshExternalWriteEvidenceStatus, 'failed' | 'ambiguous'>,
+  latestNegativeSeq?: number,
+): boolean {
+  const copy = externalWriteTruthCopy(status);
+  const activityKey = [
+    'external-write-truth',
+    execution.sourceUserSeq ?? 'unknown',
+    status,
+    latestNegativeSeq ?? 'unknown',
+  ].join(':');
+  const alreadyRecorded = (execution.activity ?? []).some((item) => item.key === activityKey);
+  const alreadyBlocked = execution.status === 'blocked'
+    && execution.blocker === copy.blocker
+    && execution.nextStep === copy.nextStep;
+  if (alreadyBlocked && alreadyRecorded) return false;
+
+  const now = new Date().toISOString();
+  reopenCompletionClosedTasks(execution, now);
+  execution.status = 'blocked';
+  execution.blocker = copy.blocker;
+  execution.nextStep = copy.nextStep;
+  execution.nextReviewAt = undefined;
+  execution.updatedAt = now;
+  execution.lastActivityAt = now;
+  execution.lastAssistantSummary = execution.lastAssistantSummary
+    ? clean(`${execution.lastAssistantSummary} | ${copy.blocker}`, 400)
+    : copy.blocker;
+  execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+  if (!alreadyRecorded) {
+    execution.activity.push({
+      id: randomUUID(),
+      key: activityKey,
+      type: 'blocked',
+      message: copy.blocker,
+      createdAt: now,
+      metadata: {
+        source: 'deterministic_external_write_truth',
+        status,
+        sourceUserSeq: execution.sourceUserSeq,
+        latestNegativeSeq,
+      },
+    });
+    execution.activity = execution.activity.slice(-60);
+  }
+  return true;
+}
+
+function reopenCompletionClosedTasks(execution: ExecutionRecord, now: string): number {
+  const taskIds = new Set<string>();
+  for (const item of execution.activity ?? []) {
+    if (!item.key.startsWith('task-bindings:closed:')) continue;
+    const ids = item.metadata?.taskIds;
+    if (!Array.isArray(ids)) continue;
+    for (const id of ids) {
+      if (typeof id === 'string' && id.trim()) taskIds.add(id);
+    }
+  }
+  if (taskIds.size === 0) return 0;
+
+  const completedBindings = (execution.taskBindings ?? [])
+    .filter((binding) => taskIds.has(binding.taskId) && binding.status === 'completed');
+  if (completedBindings.length === 0) return 0;
+  let reopenedVaultRows = 0;
+  try {
+    ensureTasksFile();
+    const reopened = reopenTaskLedgerBody(readFileSync(TASKS_FILE, 'utf-8'), taskIds);
+    reopenedVaultRows = reopened.reopenedTaskRows;
+    if (reopenedVaultRows > 0) writeFileSync(TASKS_FILE, reopened.body, 'utf-8');
+  } catch {
+    // The execution record remains the dashboard source of truth even if the
+    // optional Markdown task mirror cannot be repaired.
+  }
+
+  execution.taskBindings = (execution.taskBindings ?? []).map((binding) =>
+    taskIds.has(binding.taskId) && binding.status === 'completed'
+      ? { ...binding, status: 'pending', completedAt: undefined }
+      : binding,
+  );
+  execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+  const key = `task-bindings:reopened:${now}`;
+  execution.activity.push({
+    id: randomUUID(),
+    key,
+    type: 'status',
+    message: clean(
+      `Reopened ${completedBindings.length} linked task row${completedBindings.length === 1 ? '' : 's'} because late external-write evidence invalidated clean completion.`,
+      500,
+    ),
+    createdAt: now,
+    metadata: {
+      taskIds: [...taskIds],
+      reopenedVaultRows,
+      source: 'deterministic_external_write_truth',
+    },
+  });
+  execution.activity = execution.activity.slice(-60);
+  return completedBindings.length;
+}
+
+function reconcileCompletedExternalWriteTruth(executions: ExecutionRecord[]): boolean {
+  const candidates = executions.filter((execution) =>
+    execution.status === 'completed' && !execution.blocker
+  );
+  const eventsBySession = new Map<string, EventRow[]>();
+  for (const execution of candidates) {
+    if (eventsBySession.has(execution.sessionId)) continue;
+    const sessionCandidates = candidates.filter((candidate) => candidate.sessionId === execution.sessionId);
+    const firstSource = sessionCandidates.reduce(
+      (lowest, candidate) => (
+        Number.isSafeInteger(candidate.sourceUserSeq)
+        && (candidate.sourceUserSeq ?? 0) > 0
+        && (lowest === undefined || (candidate.sourceUserSeq as number) < lowest)
+          ? candidate.sourceUserSeq as number
+          : lowest
+      ),
+      undefined as number | undefined,
+    );
+    if (firstSource === undefined) {
+      eventsBySession.set(execution.sessionId, []);
+      continue;
+    }
+    try {
+      eventsBySession.set(
+        execution.sessionId,
+        listHarnessEvents(execution.sessionId, {
+          sinceSeq: firstSource,
+          types: [...EXTERNAL_WRITE_OWNERSHIP_EVENT_TYPES],
+        }),
+      );
+    } catch {
+      eventsBySession.set(execution.sessionId, []);
+    }
+  }
+
+  let changed = false;
+  for (const execution of candidates) {
+    const evidence = executionExternalWriteStatus(
+      execution,
+      eventsBySession.get(execution.sessionId),
+    );
+    if (evidence.status !== 'failed' && evidence.status !== 'ambiguous') continue;
+    changed = applyExternalWriteTruthBlock(
+      execution,
+      evidence.status,
+      evidence.latestNegativeSeq,
+    ) || changed;
+  }
+  return changed;
+}
+
+function persistReconciledExecutions(
+  allExecutions: ExecutionRecord[],
+  candidates: ExecutionRecord[],
+): boolean {
+  const changed = reconcileCompletedExternalWriteTruth(candidates);
+  if (!changed) return false;
+  try {
+    saveExecutions(allExecutions);
+  } catch {
+    // Preserve the parsed truth-reconciled view for this read. A transient
+    // persistence failure must not turn explicit negative evidence green.
+  }
+  return true;
 }
 
 function closeLinkedVaultTasks(execution: ExecutionRecord, now: string): number {
@@ -84,6 +348,7 @@ function closeLinkedVaultTasks(execution: ExecutionRecord, now: string): number 
 
 export interface CreateExecutionInput {
   sessionId: string;
+  sourceUserSeq?: number;
   userId?: string;
   channel?: string;
   title: string;
@@ -103,19 +368,32 @@ export interface CreateExecutionInput {
 
 export class ExecutionStore {
   list(limit = 20, status?: ExecutionRecord['status']): ExecutionRecord[] {
-    return loadExecutions()
+    const executions = loadExecutions();
+    const select = () => executions
       .filter((execution) => !status || execution.status === status)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .slice(0, limit);
+    // Reconcile only records that can actually be returned. If a selected
+    // completion reopens, select again to backfill a status-filtered page.
+    for (let pass = 0; pass <= executions.length; pass += 1) {
+      const selected = select();
+      if (!persistReconciledExecutions(executions, selected)) return selected;
+    }
+    return select();
   }
 
   get(id: string): ExecutionRecord | undefined {
-    return loadExecutions().find((execution) => execution.id === id);
+    const executions = loadExecutions();
+    const execution = executions.find((entry) => entry.id === id);
+    if (execution) persistReconciledExecutions(executions, [execution]);
+    return execution;
   }
 
   getActiveForSession(sessionId: string): ExecutionRecord | undefined {
-    return loadExecutions()
-      .filter((execution) => execution.sessionId === sessionId)
+    const executions = loadExecutions();
+    const sessionExecutions = executions.filter((execution) => execution.sessionId === sessionId);
+    persistReconciledExecutions(executions, sessionExecutions);
+    return sessionExecutions
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .find((execution) => execution.status === 'active' || execution.status === 'blocked');
   }
@@ -126,6 +404,9 @@ export class ExecutionStore {
     const execution: ExecutionRecord = {
       id: randomUUID(),
       sessionId: input.sessionId,
+      ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+        ? { sourceUserSeq: input.sourceUserSeq }
+        : {}),
       userId: input.userId,
       channel: input.channel,
       title: clean(input.title, 120),
@@ -204,10 +485,49 @@ export class ExecutionStore {
       lastActivityAt: patch.lastActivityAt ?? now,
     });
     if (patch.status === 'completed') {
-      closeLinkedVaultTasks(execution, now);
+      const evidence = executionExternalWriteStatus(execution);
+      if (
+        !execution.blocker
+        && (evidence.status === 'failed' || evidence.status === 'ambiguous')
+      ) {
+        applyExternalWriteTruthBlock(execution, evidence.status, evidence.latestNegativeSeq);
+      } else if (execution.status === 'completed') {
+        execution.completedAt = now;
+        closeLinkedVaultTasks(execution, now);
+      }
     }
     saveExecutions(executions);
     return execution;
+  }
+
+  /**
+   * Persist the exact accepted request boundary (for legacy records that
+   * predate it) and deterministically block unresolved failed/ambiguous writes.
+   * No model or completion judge participates in this decision.
+   */
+  reconcileExternalWriteTruth(id: string, sourceUserSeq?: number): ExecutionExternalWriteTruth | undefined {
+    const executions = loadExecutions();
+    const execution = executions.find((entry) => entry.id === id);
+    if (!execution) return undefined;
+    let changed = false;
+    if (
+      !execution.sourceUserSeq
+      && Number.isSafeInteger(sourceUserSeq)
+      && (sourceUserSeq ?? 0) > 0
+    ) {
+      execution.sourceUserSeq = sourceUserSeq;
+      changed = true;
+    }
+    const evidence = executionExternalWriteStatus(execution);
+    if (evidence.status === 'failed' || evidence.status === 'ambiguous') {
+      changed = applyExternalWriteTruthBlock(
+        execution,
+        evidence.status,
+        evidence.latestNegativeSeq,
+      ) || changed;
+    }
+    if (changed) saveExecutions(executions);
+    return { status: evidence.status, execution };
   }
 
   listDue(now = new Date(), limit = 20): ExecutionRecord[] {

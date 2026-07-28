@@ -142,6 +142,8 @@ import {
 } from './turn-decision.js';
 import {
   completionEvidenceToolName,
+  eventBelongsToSourceUserSeq,
+  freshExternalWriteEvidenceIsVerified,
   freshExternalWriteEvidenceStatus,
   hasMeaningfulSuccessfulToolNames,
   isAcceptedExecutionCompletionOutput,
@@ -477,6 +479,7 @@ function requestHasAcceptedExecutionCompletion(
   try {
     return listEvents(sessionId, { types: ['tool_returned'] }).some((event) => {
       if (event.seq <= (sourceUserSeq as number)) return false;
+      if (!eventBelongsToSourceUserSeq(event, sourceUserSeq as number)) return false;
       if ((event.data as { tool?: unknown } | undefined)?.tool !== 'execution_complete') return false;
       const data = event.data as { result?: unknown; output?: unknown; preview?: unknown };
       // Direct tools persist `result`; schema-on-demand call_tool dispatch
@@ -512,7 +515,7 @@ function freshExternalWriteGapReason(status: Exclude<FreshExternalWriteEvidenceS
     return 'this request has an ambiguous external-write outcome, so it must be reconciled read-only and must not be repeated or claimed complete';
   }
   if (status === 'failed') {
-    return 'this request has only a compensated failed external-write attempt and no successful current-request write receipt';
+    return 'at least one external write required by this request failed; a successful receipt for a different action does not resolve that failure';
   }
   return 'there is no external-write receipt after the user event that owns this request; historical execution summaries and receipts do not count';
 }
@@ -3504,8 +3507,10 @@ async function runConversationCore(
         ? requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq)
         : 'confirmed';
       const freshExternalWriteVerified = !freshExternalWriteRequired
-        || currentExternalWriteStatus === 'confirmed'
-        || acceptedExecutionEvidenceThisRequest;
+        || freshExternalWriteEvidenceIsVerified(
+          currentExternalWriteStatus,
+          acceptedExecutionEvidenceThisRequest,
+        );
       if (activeGoal && goalGate && freshExternalWriteVerified) {
         const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
         const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
@@ -3630,8 +3635,10 @@ async function runConversationCore(
               0,
             ),
             externalWriteRequired: freshExternalWriteRequired,
-            externalWriteReceipts: currentExternalWriteStatus === 'confirmed'
-              || acceptedExecutionEvidenceThisRequest
+            externalWriteReceipts: freshExternalWriteEvidenceIsVerified(
+              currentExternalWriteStatus,
+              acceptedExecutionEvidenceThisRequest,
+            )
               ? 1
               : 0,
           };
@@ -3900,8 +3907,8 @@ async function runConversationCore(
                   ].join(' ')
                 : currentExternalWriteStatus === 'failed'
                   ? [
-                      'The current request has no successful external-write receipt; its attempted write was explicitly recorded as failed.',
-                      'Inspect the current-request failure and either repair it safely or report the exact blocker. Honor any user instruction not to retry. Never reuse historical receipts to claim success.',
+                      'At least one external write required by the current request was explicitly recorded as failed. A successful sibling action does not make the whole request complete.',
+                      'Inspect the failed current-request action and either repair that exact target safely or report the exact blocker. Honor any user instruction not to retry. Never reuse another action or historical receipt to claim success.',
                     ].join(' ')
                   : [
                       `This accepted request asks for a NEW external write, but no external-write receipt exists after source user event ${activeSourceUserSeq ?? 'unknown'}.`,
@@ -3993,10 +4000,16 @@ async function runConversationCore(
       const terminalExternalWriteStatus = terminalExternalWriteRequired
         ? requestFreshExternalWriteStatus(options.sessionId, activeSourceUserSeq)
         : 'confirmed';
+      const terminalExecutionAccepted = requestHasAcceptedExecutionCompletion(
+        options.sessionId,
+        activeSourceUserSeq,
+      );
       const terminalFreshWriteGap = isCompletedAction
         && terminalExternalWriteRequired
-        && terminalExternalWriteStatus !== 'confirmed'
-        && !requestHasAcceptedExecutionCompletion(options.sessionId, activeSourceUserSeq);
+        && !freshExternalWriteEvidenceIsVerified(
+          terminalExternalWriteStatus,
+          terminalExecutionAccepted,
+        );
       const terminalFreshWriteReason = terminalFreshWriteGap
         ? freshExternalWriteGapReason(
             terminalExternalWriteStatus as Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>,
@@ -4006,7 +4019,7 @@ async function runConversationCore(
         userVisibleSummary = terminalExternalWriteStatus === 'ambiguous'
           ? 'I cannot honestly confirm this external write: the current request has an ambiguous outcome. I did not repeat it, and I did not treat an older receipt as proof. The exact target needs a read-only reconciliation before this can be called complete.'
           : terminalExternalWriteStatus === 'failed'
-            ? 'The external write attempted for this request was recorded as failed, so I cannot call the task complete or substitute an older receipt. The current failure needs to be resolved before any success claim.'
+            ? 'At least one external write required by this request was recorded as failed, so I cannot call the task complete or substitute another action’s receipt. That exact failure needs to be resolved before any full-success claim.'
             : 'I cannot honestly confirm a new external write for this request: no write receipt exists after your current request. I did not treat an older focus summary or execution receipt as proof.';
         safeAppend({
           sessionId: options.sessionId,
@@ -5456,6 +5469,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       role: 'system',
       type: 'fanout_policy_decision',
       data: {
+        sourceUserSeq,
         inputPreview: contextPacket.inputPreview,
         sessionKind: session.sessionRow.kind,
         complexity: contextPacket.complexity,

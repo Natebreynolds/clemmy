@@ -6,8 +6,9 @@ operator-specific account, certificate, or signing identity.
 ## Release channels
 
 - macOS releases are signed, notarized, and stapled.
-- Windows packaging produces an NSIS installer. Public distribution should use
-  a configured Windows code-signing certificate.
+- Windows packaging produces an NSIS installer. Production Windows releases
+  require a configured code-signing certificate and post-build Authenticode
+  verification.
 - Manual workflow runs create private candidate artifacts. Stable `v*` tags on
   the exact `main` commit publish a GitHub Release.
 
@@ -24,11 +25,19 @@ real values in this repository or its documentation.
 | Developer ID Application identity | Local macOS releases | Certificate and private key installed in the current macOS Keychain |
 | `CSC_LINK` | GitHub macOS releases | Base64-encoded Developer ID certificate (`.p12`) imported by the runner |
 | `CSC_KEY_PASSWORD` | GitHub macOS releases | Password for the exported Developer ID certificate |
-| `WINDOWS_CSC_LINK` | Optional for GitHub Windows releases | Base64-encoded Windows signing certificate |
-| `WINDOWS_CSC_KEY_PASSWORD` | Optional for GitHub Windows releases | Password for the Windows signing certificate |
+| `WINDOWS_CSC_LINK` | Required for production GitHub Windows releases; optional for private manual candidates | Base64-encoded Windows signing certificate |
+| `WINDOWS_CSC_KEY_PASSWORD` | Required for production GitHub Windows releases; optional for private manual candidates | Password for the Windows signing certificate |
 
-Windows packaging still produces artifacts when the optional Windows signing
-inputs are absent, but those artifacts are unsigned.
+A private manual release candidate still exercises Windows packaging and may be
+unsigned when the Windows signing inputs are absent. A production tag fails
+before packaging unless both inputs are present. After packaging, the workflow
+also verifies valid Authenticode signatures and signer certificates on both the
+installer and packaged application before accepting or uploading the artifacts.
+
+The only production exception is an explicit `[mac-only]` marker in the tagged
+commit message. That marker skips the entire Windows job, so the published
+release contains only the macOS assets. Use it deliberately for a release that
+is intentionally unavailable on Windows, not to bypass a signing failure.
 
 Use placeholders in examples:
 
@@ -84,9 +93,10 @@ Configure the five required macOS secrets (`APPLE_ID`, `APPLE_APP_PASSWORD`,
 `APPLE_TEAM_ID`, `CSC_LINK`, and `CSC_KEY_PASSWORD`) in GitHub Actions. The
 workflow in `.github/workflows/release-desktop.yml` validates tests, type checks,
 release assets, and evaluation gates before packaging. Production tags must be
-stable SemVer tags on the exact `origin/main` commit. Windows certificate
-secrets remain optional; without them, the Windows job produces unsigned
-artifacts.
+stable SemVer tags on the exact `origin/main` commit. Production Windows signing
+inputs are required unless the exact tagged commit deliberately opts into the
+documented `[mac-only]` release exception. Private manual candidates may remain
+unsigned so the full packaging path can still be rehearsed safely.
 
 Do not paste credential values into workflow logs, issues, pull requests, or
 release notes. If a credential is ever committed, revoke it immediately before

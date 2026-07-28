@@ -484,7 +484,7 @@ test('artifact admission: a duplicate create neither executes nor records/counts
   process.env.CLEMMY_CONFIRM_FIRST = 'on';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  appendEvent({
+  const source = appendEvent({
     sessionId: sess.id,
     turn: 1,
     role: 'user',
@@ -517,7 +517,12 @@ test('artifact admission: a duplicate create neither executes nor records/counts
     );
 
     await withHarnessRunContext(
-      { sessionId: sess.id, behaviorScopeId: 'artifact-denial-run', counter },
+      {
+        sessionId: sess.id,
+        sourceUserSeq: source.seq,
+        behaviorScopeId: 'artifact-denial-run',
+        counter,
+      },
       async () => {
         const created = await invoke('native-create-1');
         assert.equal((created as { document_id?: string }).document_id, 'doc-provider-123');
@@ -532,6 +537,7 @@ test('artifact admission: a duplicate create neither executes nor records/counts
     const writes = listEvents(sess.id, { types: ['external_write'] });
     assert.equal(writes.length, 1, 'durable write truth contains only the dispatched create');
     assert.equal(writes[0]?.data.toolName, 'composio_execute_tool');
+    assert.equal(writes[0]?.data.sourceUserSeq, source.seq);
     assert.equal(
       listEvents(sess.id, { types: ['external_write_failed'] }).length,
       0,

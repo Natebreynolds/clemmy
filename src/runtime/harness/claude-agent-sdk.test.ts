@@ -439,7 +439,13 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
   let run = 0;
   setClaudeAgentSdkQueryForTest(((params: any) => {
     run += 1;
-    const callId = run === 1 ? 'toolu_native_failed' : 'toolu_native_orphan';
+    const callId = run === 1
+      ? 'toolu_native_failed'
+      : run === 2
+        ? 'toolu_native_orphan'
+        : run === 3
+          ? 'toolu_native_structured_failed'
+          : 'toolu_native_structured_ambiguous';
     const gen = (async function* () {
       yield {
         type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: `sdk-write-${run}`,
@@ -453,14 +459,25 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
         { signal: new AbortController().signal, toolUseID: callId },
       );
       assert.equal(verdict.behavior, 'allow');
-      if (run === 1) {
+      if (run !== 2) {
         yield {
-          type: 'assistant', session_id: `sdk-write-${run}`, uuid: 'use-failed', parent_tool_use_id: null,
+          type: 'assistant', session_id: `sdk-write-${run}`, uuid: `use-${run}`, parent_tool_use_id: null,
           message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__outlook__send_email', input }] },
         } as any;
         yield {
-          type: 'user', session_id: `sdk-write-${run}`, uuid: 'result-failed', parent_tool_use_id: null,
-          message: { content: [{ type: 'tool_result', tool_use_id: callId, is_error: true, content: 'provider rejected payload' }] },
+          type: 'user', session_id: `sdk-write-${run}`, uuid: `result-${run}`, parent_tool_use_id: null,
+          message: {
+            content: [{
+              type: 'tool_result',
+              tool_use_id: callId,
+              is_error: run === 1,
+              content: run === 1
+                ? 'provider rejected payload'
+                : run === 3
+                  ? JSON.stringify({ successful: false, error: 'invalid required field: recipient' })
+                  : JSON.stringify({ successful: false, error: 'provider rejected request after dispatch' }),
+            }],
+          },
         } as any;
       }
       yield {
@@ -479,16 +496,34 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
 
   const options = {
     prompt: 'Send the email.', sessionId: session.id, modelId: 'claude-sonnet-4-6',
-    trackerScopeId: 'native-write-truth', allowedLocalMcpTools: ['mcp__outlook__send_email'],
+    trackerScopeId: 'native-write-truth', sourceUserSeq: 42,
+    allowedLocalMcpTools: ['mcp__outlook__send_email'],
   };
+  await runClaudeAgentSdk(options);
+  await runClaudeAgentSdk(options);
   await runClaudeAgentSdk(options);
   await runClaudeAgentSdk(options);
   const writes = eventlog.listEvents(session.id, { types: ['external_write'] });
   const failed = eventlog.listEvents(session.id, { types: ['external_write_failed'] });
   const orphaned = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
-  assert.deepEqual(writes.map((event) => (event.data as any).callId), ['toolu_native_failed', 'toolu_native_orphan']);
-  assert.equal((failed[0]?.data as any)?.callId, 'toolu_native_failed');
-  assert.equal((orphaned[0]?.data as any)?.callId, 'toolu_native_orphan');
+  assert.deepEqual(writes.map((event) => (event.data as any).callId), [
+    'toolu_native_failed',
+    'toolu_native_orphan',
+    'toolu_native_structured_failed',
+    'toolu_native_structured_ambiguous',
+  ]);
+  assert.deepEqual(failed.map((event) => (event.data as any).callId), [
+    'toolu_native_failed',
+    'toolu_native_structured_failed',
+  ]);
+  assert.deepEqual(orphaned.map((event) => (event.data as any).callId), [
+    'toolu_native_orphan',
+    'toolu_native_structured_ambiguous',
+  ]);
+  assert.ok(
+    [...writes, ...failed, ...orphaned].every((event) => event.data.sourceUserSeq === 42),
+    'native SDK write attempts and resolutions retain exact request ownership',
+  );
 });
 
 test('explicit multi-document objective permits distinct native creates and settles reversed results by call id', async () => {

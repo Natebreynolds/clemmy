@@ -27,6 +27,7 @@ import { EventEmitter } from 'node:events';
 // Dynamic imports — see eventlog.test.ts for why.
 const { resetEventLog, createSession, listEvents } = await import('./eventlog.js');
 const { attachEventLogHooks, extractSessionIdFromContext, effectiveReflectionTool } = await import('./hooks.js');
+const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
 type RunHooksLike = import('./hooks.js').RunHooksLike;
 
 test('effectiveReflectionTool unwraps composio_execute_tool to its action slug', () => {
@@ -126,6 +127,32 @@ function makeStub(): RunHooksLike & { emit: EventEmitter['emit'] } {
 function ctx(sessionId: string, turn = 0): unknown {
   return { context: { sessionId, turn } };
 }
+
+test('tool hooks persist exact request ownership on calls and returns', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const details = { toolCall: { callId: 'owned-call', arguments: '{}' } };
+
+  withHarnessRunContext(
+    {
+      sessionId: sess.id,
+      sourceUserSeq: 17,
+      behaviorScopeId: 'owned-run',
+      counter: new ToolCallsCounter(),
+    },
+    () => {
+      stub.emit('agent_tool_start', ctx(sess.id), { name: 'orchestrator' }, { name: 'execution_complete' }, details);
+      stub.emit('agent_tool_end', ctx(sess.id), { name: 'orchestrator' }, { name: 'execution_complete' }, 'Execution exec-1 completed.', details);
+    },
+  );
+
+  const events = listEvents(sess.id, { types: ['tool_called', 'tool_returned'] });
+  assert.equal(events.length, 2);
+  assert.ok(events.every((event) => event.data.sourceUserSeq === 17));
+  assert.ok(events.every((event) => event.data.runScopeId === 'owned-run'));
+});
 
 test('agent_start emits turn_started with the agent name', () => {
   resetEventLog();

@@ -454,6 +454,71 @@ test('run_worker requires a structured parent-planned job packet', async () => {
   assert.equal(Object.hasOwn(runWorker.parameters?.properties ?? {}, 'input'), false);
 });
 
+test('orchestrator run_worker refuses a quantified successful subset before dispatch', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'execution', title: 'quantified subset' });
+  const inputEvent = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Research these 10 prospects and summarize each one.' },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'turn_started',
+    data: { sourceUserSeq: inputEvent.seq },
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'fanout_policy_decision',
+    data: { sourceUserSeq: inputEvent.seq, detected: true, itemCount: 10 },
+  });
+
+  const agent = await buildOrchestratorAgent();
+  const runWorker = (agent.tools ?? []).find((tool) => (tool as { name?: string }).name === 'run_worker') as {
+    invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+  } | undefined;
+  assert.ok(runWorker);
+  const packet = {
+    objective: 'Research each prospect for the parent batch.',
+    item: null,
+    items: Array.from({ length: 7 }, (_, index) => `prospect-${index + 1}`),
+    resolvedTools: 'none needed',
+    context: 'Fictional prospect identifiers.',
+    instructions: 'Return one compact observation per assigned prospect.',
+    expectedOutput: 'prospect id | observation',
+    intent: null,
+    workManifest: {
+      id: 'prospects',
+      contractVersion: '1',
+      phase: 'research',
+      mode: 'declare',
+      phases: [{ id: 'research' }],
+    },
+  };
+  const encoded = JSON.stringify(packet);
+  const result = await runWorker.invoke(
+    new RunContext({ sessionId: session.id, sourceUserSeq: inputEvent.seq }),
+    encoded,
+    {
+      toolCall: {
+        name: 'run_worker',
+        callId: 'call_quantified_subset',
+        arguments: encoded,
+      },
+    },
+  );
+
+  assert.match(String(result), /^ERROR:/);
+  assert.match(String(result), /7\/10/);
+  assert.equal(listEvents(session.id, { types: ['worker_started'] }).length, 0);
+});
+
 test('chat run_worker intent routing resolves the per-intent worker model', () => {
   const prev: Record<string, string | undefined> = {
     AUTH_MODE: process.env.AUTH_MODE,

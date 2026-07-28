@@ -25,7 +25,7 @@ import type { MCPServer } from '@openai/agents';
 
 const { createMcpNamespaceShim, namespaceToolName, slugifyServerName, classifyMcpIntegrityScope } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
-const { createSession, listEvents } = await import('./harness/eventlog.js');
+const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
 const { openPlanScope } = await import('../agents/plan-scope.js');
 type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
 
@@ -46,7 +46,26 @@ function throwingServer(name: string, toolName: string, errMessage: string): MCP
   } as unknown as MCPServer;
 }
 
-const ctx = (sessionId: string): HarnessRunContext => ({ sessionId, counter: new ToolCallsCounter(100) });
+function returnedFailureServer(name: string, toolName: string, message: string): MCPServer {
+  return {
+    name, cacheToolsList: false, toolFilter: undefined,
+    async connect() {}, async close() {}, async invalidateToolsCache() {},
+    async listTools() {
+      return [{ name: toolName, description: 'write', inputSchema: { type: 'object' } }] as unknown as Awaited<ReturnType<MCPServer['listTools']>>;
+    },
+    async callTool() {
+      const content = [{ type: 'text', text: message }] as unknown as Awaited<ReturnType<MCPServer['callTool']>> & { isError?: boolean };
+      content.isError = true;
+      return content;
+    },
+  } as unknown as MCPServer;
+}
+
+const ctx = (sessionId: string, sourceUserSeq?: number): HarnessRunContext => ({
+  sessionId,
+  counter: new ToolCallsCounter(100),
+  ...(sourceUserSeq ? { sourceUserSeq } : {}),
+});
 
 test('a native send tool name classifies as an irreversible send', () => {
   assert.equal(classifyMcpIntegrityScope('send_email', 'read').isIrreversibleSend, true);
@@ -66,9 +85,16 @@ test('G: an AMBIGUOUS send throw (timeout / dropped response) records external_w
   const shim = createMcpNamespaceShim({ servers: [throwingServer(slug, tool, 'ETIMEDOUT: request timed out; response dropped after send')] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
   const sid = createSession({ kind: 'execution' }).id;
+  const source = appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved email.' },
+  });
   authorizeSend(sid, namespaced, tool);
 
-  await withHarnessRunContext(ctx(sid), async () => {
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
     await shim.listTools();
     await assert.rejects(
       () => shim.callTool(namespaced, { to: 'lead@example.com', subject: 'Hi' }),
@@ -81,6 +107,7 @@ test('G: an AMBIGUOUS send throw (timeout / dropped response) records external_w
   const w = writes[0].data as { irreversible?: boolean; preDispatch?: boolean; targets?: string[] };
   assert.equal(w.irreversible, true);
   assert.equal(w.preDispatch, true, 'recorded PRE-dispatch (so a throw-after-commit is still counted)');
+  assert.equal((writes[0].data as { sourceUserSeq?: number }).sourceUserSeq, source.seq);
   assert.ok((w.targets ?? []).some((t) => String(t).toLowerCase().includes('lead@example.com')), 'target captured for the duplicate wall');
 
   // Ambiguous → orphan (NOT compensated); the pre-record stays counted so a resume
@@ -95,9 +122,16 @@ test('G: a DEMONSTRABLY-never-sent throw (auth 401 / DNS / bad-params) COMPENSAT
   const shim = createMcpNamespaceShim({ servers: [throwingServer(slug, tool, 'Request failed: 401 Unauthorized — permission denied')] });
   const namespaced = namespaceToolName(slugifyServerName(slug), tool);
   const sid = createSession({ kind: 'execution' }).id;
+  const source = appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved email.' },
+  });
   authorizeSend(sid, namespaced, tool);
 
-  await withHarnessRunContext(ctx(sid), async () => {
+  await withHarnessRunContext(ctx(sid, source.seq), async () => {
     await shim.listTools();
     await assert.rejects(() => shim.callTool(namespaced, { to: 'lead@example.com', subject: 'Hi' }));
   });
@@ -108,6 +142,67 @@ test('G: a DEMONSTRABLY-never-sent throw (auth 401 / DNS / bad-params) COMPENSAT
   assert.equal(listEvents(sid, { types: ['external_write'] }).length, 1, 'pre-record present');
   assert.equal(listEvents(sid, { types: ['external_write_failed'] }).length, 1, 'a demonstrable failure compensates (parity with composio)');
   assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0, 'a demonstrable failure is not an orphan');
+  assert.ok(
+    listEvents(sid, { types: ['external_write', 'external_write_failed'] })
+      .every((event) => event.data.sourceUserSeq === source.seq),
+    'both the attempt and its resolution retain exact request ownership',
+  );
+});
+
+test('returned native MCP failure envelopes never become successful write receipts', async () => {
+  const cases = [
+    {
+      slug: 'gmail-returned-failure',
+      tool: 'send_email',
+      args: { to: 'lead@example.com', subject: 'Hi' },
+      expectedAttempts: 1,
+    },
+    {
+      slug: 'browser',
+      tool: 'request',
+      args: {
+        method: 'PATCH',
+        url: 'https://example.test/records/1',
+        body: { status: 'reviewed' },
+      },
+      expectedAttempts: 0,
+    },
+  ] as const;
+
+  for (const [index, entry] of cases.entries()) {
+    const shim = createMcpNamespaceShim({
+      servers: [returnedFailureServer(entry.slug, entry.tool, '400 validation failed: missing required field')],
+    });
+    const namespaced = namespaceToolName(slugifyServerName(entry.slug), entry.tool);
+    const sid = createSession({ kind: 'execution' }).id;
+    const source = appendEvent({
+      sessionId: sid,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: `Run returned-failure write ${index + 1}.` },
+    });
+    openPlanScope({
+      sessionId: sid,
+      planProposalId: `p-returned-${index}`,
+      approvedPlanObjective: 'perform the approved test write',
+      goalScoped: { goalId: `g-returned-${index}` },
+      allowedSends: [namespaced, entry.tool],
+      allowedTools: [namespaced, entry.tool],
+    });
+
+    await withHarnessRunContext(ctx(sid, source.seq), async () => {
+      await shim.listTools();
+      await shim.callTool(namespaced, entry.args as unknown as Record<string, unknown>);
+    });
+
+    const attempts = listEvents(sid, { types: ['external_write'] });
+    const failed = listEvents(sid, { types: ['external_write_failed'] });
+    assert.equal(attempts.length, entry.expectedAttempts, namespaced);
+    assert.equal(failed.length, 1, namespaced);
+    assert.equal(failed[0]?.data.sourceUserSeq, source.seq, namespaced);
+    assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0, namespaced);
+  }
 });
 
 test('G negative: a READ tool whose dispatch throws records NO external_write (only sends are pre-recorded)', async () => {

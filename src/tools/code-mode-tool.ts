@@ -73,6 +73,16 @@ const programWorkerCounts = new WeakMap<ToolCallsCounter, number>();
  *  (one ToolCallsCounter spans one program). WeakMap → no cleanup needed. */
 const programMutationCounts = new WeakMap<ToolCallsCounter, number>();
 
+function currentEventAttribution(): { sourceUserSeq?: number; runScopeId?: string } {
+  const ctx = harnessRunContextStorage.getStore();
+  return {
+    ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: ctx?.sourceUserSeq as number }
+      : {}),
+    ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+  };
+}
+
 /**
  * Per-turn Code Mode steering directive, or '' when not applicable (so the prompt
  * is byte-identical on non-data turns). Fires only when the turn already has
@@ -518,16 +528,16 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
   // Observability: emit tool_called/tool_returned for each in-program call so the
   // trace drawer / Tasks board shows what a code-mode program did (parity with
   // discrete calls; `codeMode:true` tags them for adoption measurement).
-  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, codeMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
+  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { ...currentEventAttribution(), tool: method, callId, codeMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
       ? await dispatchCodeModeMcpTool(method, args, sessionId, counter)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
     const normalized = normalizeCodeModeToolResult(method, out, { sessionId, callId });
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok: true, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     return normalized;
   } catch (err) {
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...currentEventAttribution(), tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
     throw err;
   }
 }
@@ -705,6 +715,7 @@ export async function dispatchBatchItemTool(
 ): Promise<unknown> {
   const callId = `batch-${randomUUID()}`;
   const telemetryData = {
+    ...currentEventAttribution(),
     ...(telemetry?.accounting ? { accounting: telemetry.accounting } : {}),
     ...(telemetry?.canonicalCallId ? { canonicalCallId: telemetry.canonicalCallId } : {}),
   };

@@ -33,6 +33,7 @@ const { ExecutionStore } = await import('../execution/store.js');
 const {
   appendEvent,
   createSession,
+  resetEventLog,
   writeToolOutput,
 } = await import('../runtime/harness/eventlog.js');
 const {
@@ -48,6 +49,7 @@ test.after(() => {
 test.beforeEach(() => {
   mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
   writeFileSync(EXECUTIONS_FILE, '[]', 'utf-8');
+  resetEventLog();
   _setExecutionToolCompletionJudgeForTests(null);
 });
 
@@ -243,6 +245,73 @@ test('execution_complete closes only after completion validation passes', async 
   const updated = new ExecutionStore().get(execution.id);
   assert.equal(updated?.status, 'completed');
   assert.match(updated?.lastAssistantSummary ?? '', /msg_123/);
+});
+
+test('execution_complete cannot persist success when one current-request write remains orphaned', async () => {
+  const sessionId = `sess-exec-mixed-write-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'mixed write truth' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send both approved reports.' },
+  });
+  const execution = createTrackedExecution({
+    sessionId,
+    sourceUserSeq: source.seq,
+  } as never);
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-a', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@example.com'] },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+  let judgeCalls = 0;
+  _setExecutionToolCompletionJudgeForTests(async () => {
+    judgeCalls += 1;
+    return {
+      done: true,
+      reason: 'the summary claims both sends completed',
+    };
+  });
+
+  const handler = registeredToolHandlers().get('execution_complete');
+  assert.ok(handler, 'execution_complete should be registered');
+  const result = await withHarnessRunContext(
+    { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(10) },
+    () => handler({
+      id: execution.id,
+      summary: 'Both approved reports were sent successfully with receipts.',
+    }),
+  );
+
+  assert.match(result.content[0].text, /Completion not accepted/i);
+  assert.match(result.content[0].text, /ambiguous/i);
+  assert.equal(judgeCalls, 0, 'explicit negative evidence is reconciled without an LM judge call');
+  const persisted = new ExecutionStore().get(execution.id);
+  assert.equal(persisted?.status, 'blocked');
+  assert.match(persisted?.blocker ?? '', /read-only reconciliation/i);
+  assert.equal(
+    new ExecutionStore().list(20).find((item) => item.id === execution.id)?.status,
+    'blocked',
+    'the dashboard-facing store contract must not expose a clean completed state',
+  );
 });
 
 test('execution_complete gives the judge exact durable readback receipts without making the summary repeat every cell', async () => {

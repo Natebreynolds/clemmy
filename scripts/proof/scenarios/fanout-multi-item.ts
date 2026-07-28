@@ -7,7 +7,7 @@
  */
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck, tokenCeilingCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
-import { dispatchBackground, waitForTerminal } from './background-proof-helpers.js';
+import { dispatchBackground, manifestFor, waitForTerminal } from './background-proof-helpers.js';
 
 const FIRMS = [
   'Auric & Vale Law',
@@ -16,11 +16,12 @@ const FIRMS = [
   'Harborlight Estate Law',
   'Bluegrass Family Legal',
 ];
+const MANIFEST_ID = 'proof-fanout-multi-item';
 
 const PROMPT = `For EACH of these 5 (fictional) law firms, produce an SEO snapshot: 3 bullet strengths, 3 bullet gaps, and a one-line recommended focus keyword. Firms:
 ${FIRMS.map((f, i) => `${i + 1}. ${f}`).join('\n')}
 
-This is same-shape work per firm — parallelize it rather than grinding through serially. Finish ALL 5 firms in this run (do not stop early or ask to continue), then close with a comparison table ranking all five by SEO opportunity. Everything is fictional — invent plausible details; do not use external tools or live data.`;
+This is same-shape work per firm — use ONE batched run_worker call with the full 5-item items array rather than grinding serially. Bind it to this exact workManifest: {"id":"${MANIFEST_ID}","contractVersion":"1","phase":"snapshot","mode":"declare","phases":[{"id":"snapshot"}]}. Finish ALL 5 firms in this run (do not stop early or ask to continue), then close with a comparison table ranking all five by SEO opportunity. Everything is fictional — invent plausible details; do not use external tools or live data.`;
 
 export const fanoutMultiItem: ScenarioDef = {
   name: 'fanout-multi-item',
@@ -33,6 +34,7 @@ export const fanoutMultiItem: ScenarioDef = {
     const settled = await waitForTerminal(daemon, dispatched.taskId, 20 * 60_000);
     const task = settled.detail.task;
     const result = task.resultFull ?? task.result ?? '';
+    const manifest = manifestFor(settled.detail, MANIFEST_ID);
 
     const checks: Check[] = [];
     checks.push({ name: 'HTTP 200', pass: dispatched.turn.httpStatus === 200, detail: `status ${dispatched.turn.httpStatus}` });
@@ -48,6 +50,21 @@ export const fanoutMultiItem: ScenarioDef = {
       name: 'all 5 firms covered',
       pass: missing.length === 0,
       detail: missing.length ? `missing: ${missing.join(', ')}` : undefined,
+    });
+    checks.push({
+      name: 'durable manifest proves the exact 5-item universe',
+      pass: Boolean(
+        manifest
+        && manifest.total === FIRMS.length
+        && manifest.completed === FIRMS.length
+        && manifest.remaining === 0
+        && manifest.phases.length === 1
+        && manifest.phases[0]?.succeeded === FIRMS.length
+        && manifest.anomalies.length === 0,
+      ),
+      detail: manifest
+        ? `${manifest.completed}/${manifest.total}; remaining ${manifest.remaining}; anomalies ${manifest.anomalies.length}`
+        : 'manifest missing',
     });
     checks.push({
       name: 'no park / continue ask',

@@ -142,6 +142,143 @@ export type FreshExternalWriteEvidenceStatus =
 interface SequencedEvidenceEvent {
   seq: number;
   type: string;
+  data?: unknown;
+}
+
+/**
+ * New runtime evidence carries the exact accepted user row that owns it. Keep
+ * untagged historical/test rows on the legacy ordered path, but never let a
+ * differently tagged overlapping request certify or poison this one.
+ */
+export function eventBelongsToSourceUserSeq(
+  event: SequencedEvidenceEvent,
+  sourceUserSeq: number,
+): boolean {
+  const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+    ? event.data as { sourceUserSeq?: unknown }
+    : {};
+  return !Number.isSafeInteger(data.sourceUserSeq)
+    || data.sourceUserSeq === sourceUserSeq;
+}
+
+type ExternalWriteAttemptState = 'confirmed' | 'failed' | 'ambiguous';
+
+interface ExternalWriteAttempt {
+  callId: string;
+  identity: string;
+  state: ExternalWriteAttemptState;
+  /** Sequence at which this attempt's current outcome became known. A retry
+   * only supersedes a failure/orphan when it started AFTER that resolution. */
+  outcomeSeq: number;
+}
+
+function externalWriteEventData(event: SequencedEvidenceEvent): Record<string, unknown> {
+  return event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+    ? event.data as Record<string, unknown>
+    : {};
+}
+
+function firstEvidenceText(data: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === 'string' && value.trim()) return value.trim().toLowerCase();
+  }
+  return '';
+}
+
+function externalWriteCallId(event: SequencedEvidenceEvent): string {
+  return firstEvidenceText(externalWriteEventData(event), ['canonicalCallId', 'callId']);
+}
+
+/**
+ * Stable logical destination identity across a failed/orphaned attempt and its
+ * later corrected retry. Provider call ids intentionally do not lead here:
+ * retries receive new ids. Shape + normalized targets lets a retry resolve only
+ * its own destination, while a successful sibling cannot hide it.
+ */
+function externalWriteIdentity(event: SequencedEvidenceEvent): string {
+  const data = externalWriteEventData(event);
+  const shape = firstEvidenceText(data, ['shapeKey', 'slug', 'toolName', 'tool']);
+  const rawTargets = Array.isArray(data.targets)
+    ? data.targets
+    : typeof data.target === 'string'
+      ? [data.target]
+      : [];
+  const targets = rawTargets
+    .filter((target): target is string => typeof target === 'string' && target.trim().length > 0)
+    .map((target) => target.trim().toLowerCase())
+    .sort();
+  const callId = externalWriteCallId(event);
+  if (shape && targets.length > 0) return `shape:${shape}\0targets:${targets.join('\0')}`;
+  // Without a concrete destination, two same-shape creates are not proven to
+  // be retries of one logical action. Keep provider attempts independent so a
+  // later unrelated create cannot clear an earlier failure/orphan.
+  if (callId) return `call:${callId}`;
+  if (shape) return `shape:${shape}\0targets:unknown`;
+  // Legacy rows without structured identity still retain the old ordered
+  // retry semantics instead of becoming permanently unresolvable.
+  return 'legacy:unknown';
+}
+
+function resolveCurrentExternalWriteAttempts(
+  events: readonly SequencedEvidenceEvent[],
+): ExternalWriteAttempt[] {
+  const attempts: ExternalWriteAttempt[] = [];
+  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+    if (event.type === 'external_write') {
+      attempts.push({
+        callId: externalWriteCallId(event),
+        identity: externalWriteIdentity(event),
+        state: 'confirmed',
+        outcomeSeq: event.seq,
+      });
+      continue;
+    }
+    if (event.type !== 'external_write_failed' && event.type !== 'external_write_orphaned') continue;
+
+    const callId = externalWriteCallId(event);
+    const identity = externalWriteIdentity(event);
+    let match = -1;
+    // Exact provider attempt id wins. If a producer omitted it, fall back to
+    // the latest unresolved attempt for the same logical destination.
+    if (callId) {
+      for (let index = attempts.length - 1; index >= 0; index -= 1) {
+        if (attempts[index]?.state === 'confirmed' && attempts[index]?.callId === callId) {
+          match = index;
+          break;
+        }
+      }
+    }
+    if (match < 0) {
+      for (let index = attempts.length - 1; index >= 0; index -= 1) {
+        if (attempts[index]?.state === 'confirmed' && attempts[index]?.identity === identity) {
+          match = index;
+          break;
+        }
+      }
+    }
+    const state: ExternalWriteAttemptState =
+      event.type === 'external_write_orphaned' ? 'ambiguous' : 'failed';
+    if (match >= 0) {
+      attempts[match] = { ...attempts[match]!, state, outcomeSeq: event.seq };
+    } else {
+      // Best-effort logging can lose the provisional row while retaining the
+      // resolution. Keep the negative evidence instead of silently dropping it.
+      attempts.push({ callId, identity, state, outcomeSeq: event.seq });
+    }
+  }
+
+  // Only the newest outcome per logical destination governs. Because
+  // `outcomeSeq` moves to the failure/orphan row, an already-in-flight sibling
+  // write cannot masquerade as a later corrective retry.
+  const latestByIdentity = new Map<string, ExternalWriteAttempt>();
+  for (const attempt of attempts) {
+    const prior = latestByIdentity.get(attempt.identity);
+    if (!prior || attempt.outcomeSeq > prior.outcomeSeq) {
+      latestByIdentity.set(attempt.identity, attempt);
+    }
+  }
+  return [...latestByIdentity.values()];
 }
 
 /**
@@ -155,14 +292,27 @@ export function freshExternalWriteEvidenceStatus(
   sourceUserSeq: number | undefined,
 ): FreshExternalWriteEvidenceStatus {
   if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return 'missing';
-  const current = events.filter((event) => event.seq > (sourceUserSeq as number));
-  const writes = current.filter((event) => event.type === 'external_write').length;
-  if (writes === 0) return 'missing';
-  const failed = current.filter((event) => event.type === 'external_write_failed').length;
-  const ambiguous = current.filter((event) => event.type === 'external_write_orphaned').length;
-  if (writes - failed - ambiguous > 0) return 'confirmed';
-  if (ambiguous > 0) return 'ambiguous';
-  return failed > 0 ? 'failed' : 'missing';
+  const current = events.filter((event) =>
+    event.seq > (sourceUserSeq as number)
+    && eventBelongsToSourceUserSeq(event, sourceUserSeq as number)
+  );
+  const outcomes = resolveCurrentExternalWriteAttempts(current);
+  if (outcomes.some((attempt) => attempt.state === 'ambiguous')) return 'ambiguous';
+  if (outcomes.some((attempt) => attempt.state === 'failed')) return 'failed';
+  return outcomes.some((attempt) => attempt.state === 'confirmed') ? 'confirmed' : 'missing';
+}
+
+/**
+ * A controller certificate may backfill a missing best-effort write ledger, but
+ * it can never erase explicit negative evidence from this request. Both
+ * foreground brains use this one precedence rule.
+ */
+export function freshExternalWriteEvidenceIsVerified(
+  status: FreshExternalWriteEvidenceStatus,
+  acceptedExecutionCompletion = false,
+): boolean {
+  return status === 'confirmed'
+    || (status === 'missing' && acceptedExecutionCompletion);
 }
 
 export function isReadOnlyCompletionEvidence(rawName: string): boolean {

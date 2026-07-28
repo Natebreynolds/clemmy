@@ -1372,6 +1372,142 @@ test('full mode: exhausted completion retries never false-green a stale external
   );
 });
 
+test('full mode: the fresh-write terminal floor is phrase-independent and request-bound', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS = '0';
+  const sessionId = 'brain-overlapping-completion-owner';
+  createSession({ id: sessionId, kind: 'chat', title: 'overlapping completion owner' });
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    const foreignSource = appendEvent({
+      sessionId,
+      turn: 2,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Unrelated overlapping request B.' },
+    });
+    appendEvent({
+      sessionId,
+      turn: 2,
+      role: 'tool',
+      type: 'tool_returned',
+      data: {
+        sourceUserSeq: foreignSource.seq,
+        tool: 'execution_complete',
+        callId: 'foreign-execution-complete',
+        preview: 'Execution exec-b completed. Request B has verified receipts.',
+      },
+    });
+    assert.notEqual(foreignSource.seq, options.sourceUserSeq);
+    return {
+      text: 'The fresh Sheet write is complete.',
+      sessionId: 'sdk',
+      model: 'claude-opus-4-8',
+      toolUses: ['mcp__clementine-local__execution_complete'],
+      successfulToolUses: ['execution_complete'],
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({
+    done: true,
+    reason: 'accepted foreign execution certificate',
+  }));
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Perform one fresh Google Sheets write for request A.',
+    sessionId,
+  });
+
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  assert.match(res.text, /no write receipt exists after your current request/i);
+  assert.doesNotMatch(res.text, /fresh Sheet write is complete/i);
+});
+
+test('full mode: an accepted execution cannot hide a mixed orphaned write', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS = '0';
+  const sessionId = 'brain-mixed-orphaned-write';
+  createSession({ id: sessionId, kind: 'chat', title: 'mixed orphaned write' });
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write',
+      data: {
+        callId: 'send-a',
+        shapeKey: 'OUTLOOK_SEND_EMAIL',
+        targets: ['a@example.com'],
+      },
+    });
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write',
+      data: {
+        callId: 'send-b',
+        shapeKey: 'OUTLOOK_SEND_EMAIL',
+        targets: ['b@example.com'],
+      },
+    });
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write_orphaned',
+      data: {
+        callId: 'send-b',
+        shapeKey: 'OUTLOOK_SEND_EMAIL',
+        targets: ['b@example.com'],
+      },
+    });
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'tool_returned',
+      data: {
+        tool: 'execution_complete',
+        callId: 'execution-complete-mixed',
+        preview: 'Execution exec-mixed completed. All requested sends passed validation.',
+      },
+    });
+    return {
+      text: 'Sent both emails successfully.',
+      sessionId: 'sdk',
+      model: 'claude-opus-4-8',
+      toolUses: [
+        'mcp__clementine-local__composio_execute_tool',
+        'mcp__clementine-local__execution_complete',
+      ],
+      successfulToolUses: ['OUTLOOK_SEND_EMAIL', 'execution_complete'],
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({
+    done: true,
+    reason: 'accepted execution certificate',
+  }));
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Send one email to a@example.com and one email to b@example.com.',
+    sessionId,
+  });
+
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  assert.match(res.text, /ambiguous/i);
+  assert.doesNotMatch(res.text, /Sent both emails successfully/i);
+  const trip = listEvents(sessionId, { types: ['guardrail_tripped'] })
+    .find((event) => event.data.kind === 'request_bound_external_write_missing');
+  assert.equal(trip?.data.status, 'ambiguous');
+  assert.equal(
+    listEvents(sessionId, { types: ['learning_candidate_evaluated'] })
+      .some((event) => event.data.eligible === true),
+    false,
+    'the mixed write cannot become a reusable learned procedure',
+  );
+});
+
 test('artifact completion performs one exact-ID read-back before reporting success', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

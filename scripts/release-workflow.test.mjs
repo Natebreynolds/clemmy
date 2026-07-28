@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { load } from 'js-yaml';
 import {
   assertValidCandidateVersion,
@@ -37,6 +37,11 @@ const macNativeDepsText = readFileSync(
   new URL('../apps/desktop/scripts/mac-native-deps.mjs', import.meta.url),
   'utf-8',
 );
+const desktopReleaseGuideText = readFileSync(
+  new URL('../docs/guides/desktop-releases.md', import.meta.url),
+  'utf-8',
+);
+const v3ReleaseNotesPath = new URL('../docs/releases/v3.0.0.md', import.meta.url);
 
 function runScripts(job) {
   return (job?.steps ?? [])
@@ -137,7 +142,82 @@ test('Windows production builds fail closed without signing secrets while privat
   const jobCondition = String(windowsJob?.if ?? '');
   assert.match(jobCondition, /workflow_dispatch/);
   assert.match(jobCondition, /github\.event_name == 'push'/);
-  assert.match(jobCondition, /\[mac-only\]/);
+  assert.match(jobCondition, /needs\.preflight\.outputs\.mac_only != 'true'/);
+  assert.doesNotMatch(jobCondition, /head_commit/);
+
+  const preflight = workflow.jobs?.preflight;
+  assert.equal(preflight?.outputs?.mac_only, '${{ steps.release-metadata.outputs.mac_only }}');
+  const metadataScript = String(
+    (preflight?.steps ?? []).find((step) => step?.id === 'release-metadata')?.run ?? '',
+  );
+  assert.match(metadataScript, /git log -1 --format=%B "\$tag_sha"/);
+  assert.match(metadataScript, /grep -Fq '\[mac-only\]'/);
+  assert.match(metadataScript, /mac_only=true/);
+  assert.match(metadataScript, /mac_only=false/);
+  assert.match(metadataScript, /mac_only=\$mac_only.*GITHUB_OUTPUT/);
+});
+
+test('production Windows verifies Authenticode after packaging while private candidates remain unsigned-compatible', () => {
+  const windowsJob = workflow.jobs?.['release-windows'];
+  const signatureStep = (windowsJob?.steps ?? []).find(
+    (step) => step?.name === 'Verify production Windows signatures',
+  );
+  assert.ok(signatureStep, 'release-windows must verify the artifacts actually carry valid signatures');
+  assert.equal(signatureStep?.shell, 'pwsh');
+  assert.match(String(signatureStep?.if ?? ''), /github\.event_name == 'push'/);
+  assert.equal(signatureStep?.env?.VERSION, '${{ needs.preflight.outputs.version }}');
+
+  const script = String(signatureStep?.run ?? '');
+  assert.match(script, /Get-AuthenticodeSignature/);
+  assert.match(script, /SignatureStatus\]::Valid|Status\s+-ne\s+['"]?Valid/i);
+  assert.match(script, /Clementine-Setup-\$env:VERSION\.exe/);
+  assert.match(script, /win-unpacked.*Clementine\.exe/s);
+  assert.match(script, /SignerCertificate/);
+
+  const buildIndex = windowsJob.steps.findIndex((step) => step?.name === 'Build Windows installer');
+  const signatureIndex = windowsJob.steps.indexOf(signatureStep);
+  const feedIndex = windowsJob.steps.findIndex(
+    (step) => step?.name === 'Verify Windows release assets and updater feed',
+  );
+  const uploadIndex = windowsJob.steps.findIndex(
+    (step) => step?.name === 'Upload private Windows build artifact',
+  );
+  assert.ok(buildIndex < signatureIndex, 'signature verification must inspect built artifacts');
+  assert.ok(signatureIndex < feedIndex, 'signature verification must fail before feed acceptance');
+  assert.ok(signatureIndex < uploadIndex, 'unsigned production artifacts must never upload');
+});
+
+test('release guide matches fail-closed Windows production signing and the explicit mac-only exception', () => {
+  assert.match(desktopReleaseGuideText, /WINDOWS_CSC_LINK/);
+  assert.match(desktopReleaseGuideText, /WINDOWS_CSC_KEY_PASSWORD/);
+  assert.match(desktopReleaseGuideText, /private manual.*unsigned/is);
+  assert.match(desktopReleaseGuideText, /production.*required/is);
+  assert.match(desktopReleaseGuideText, /\[mac-only\]/);
+  assert.doesNotMatch(desktopReleaseGuideText, /Windows certificate\s+secrets remain optional/i);
+});
+
+test('v3.0.0 publishes curated major-release notes and other versions retain generated-note fallback', () => {
+  assert.equal(existsSync(v3ReleaseNotesPath), true, 'the required v3.0.0 notes source must be checked in');
+  const notes = existsSync(v3ReleaseNotesPath) ? readFileSync(v3ReleaseNotesPath, 'utf-8') : '';
+  assert.match(notes, /^# Clementine 3\.0\.0/m);
+  assert.match(notes, /long-horizon/i);
+  assert.match(notes, /workspace/i);
+  assert.match(notes, /memory/i);
+  assert.match(notes, /Fusion/i);
+  assert.match(notes, /approval/i);
+
+  const publisher = runScripts(workflow.jobs?.['publish-release']);
+  assert.match(publisher, /v3\.0\.0/);
+  assert.match(publisher, /docs\/releases\/v3\.0\.0\.md/);
+  assert.match(publisher, /release_note_args=\(--generate-notes\)/);
+  assert.match(publisher, /release_note_args=\(--notes-file "\$curated_notes_file"\)/);
+  assert.match(publisher, /gh release create[\s\S]*"\$\{release_note_args\[@\]\}"/);
+  assert.match(
+    publisher,
+    /gh release edit "\$RELEASE_TAG" --notes-file "\$curated_notes_file"/,
+    'a retried v3 publication must replace generic notes on an existing release',
+  );
+  assert.match(publisher, /Missing required curated release notes/);
 });
 
 test('candidate dispatcher defaults to the next patch prerelease and rejects downgrade candidates', () => {

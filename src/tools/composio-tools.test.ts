@@ -538,6 +538,7 @@ test('grind guard (thrown shape): a thrown auth error trips the same breaker', a
 
 test('grind guard isolation: the breaker is scoped to session+toolkit — it never blocks a different toolkit or a different session (healthy lanes stay open)', async () => {
   const { resolveComposioDispatch, __gatewayTest__ } = await import('./composio-tools.js');
+  const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
   const sid = 'sess-iso';
   __gatewayTest__.recordReconnectBreaker(sid, 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS');
 
@@ -545,9 +546,20 @@ test('grind guard isolation: the breaker is scoped to session+toolkit — it nev
   assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, 'FIRECRAWL_SEARCH'), false);
   // Same toolkit, different session → NOT tripped.
   assert.equal(__gatewayTest__.reconnectBreakerTripped('sess-other', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS'), false);
-  // The gateway does not short-circuit the healthy toolkit for this session.
-  const healthy = await resolveComposioDispatch('FIRECRAWL_SEARCH', { query: 'x' }, undefined, { sessionId: sid });
-  assert.notEqual(healthy.ok === false && healthy.reason, 'not-connected');
+  // Give the other toolkit an explicit healthy account. This assertion is about
+  // breaker isolation, so it must not depend on whether a developer's local
+  // Composio CLI happens to answer its auth probe under full-suite load.
+  composioClientTest.setConnectedAccountsLoader(async () => [{
+    id: 'ca_firecrawl_healthy',
+    toolkit: { slug: 'firecrawl' },
+    status: 'ACTIVE',
+  }]);
+  try {
+    const healthy = await resolveComposioDispatch('FIRECRAWL_SEARCH', { query: 'x' }, undefined, { sessionId: sid });
+    assert.equal(healthy.ok, true, 'a connected toolkit in the same session stays open');
+  } finally {
+    composioClientTest.setConnectedAccountsLoader(null);
+  }
 });
 
 test('formatComposioExecuteOutput: a genuine record-not-found STILL gets the id-discovery corrective (characterization)', () => {

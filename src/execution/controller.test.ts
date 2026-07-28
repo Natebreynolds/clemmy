@@ -20,6 +20,11 @@ const {
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
+const {
+  appendEvent,
+  createSession,
+  resetEventLog,
+} = await import('../runtime/harness/eventlog.js');
 
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
@@ -32,6 +37,7 @@ test.beforeEach(() => {
   writeFileSync(EXECUTIONS_FILE, '[]', 'utf-8');
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
+  resetEventLog();
   _setExecutionCompletionJudgeForTests(null);
 });
 
@@ -120,6 +126,67 @@ test('controller mark_completed closes the execution when the completion judge p
   assert.equal(updated?.status, 'completed');
   assert.equal(updated?.blocker, undefined);
   assert.match(updated?.lastAssistantSummary ?? '', /msg_123/);
+});
+
+test('controller completion deterministically blocks unresolved writes without calling its judge', async () => {
+  const sessionId = `sess-controller-write-${Math.random().toString(36).slice(2, 8)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'controller write truth' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send both reports.' },
+  });
+  const execution = createExecution({
+    sessionId,
+    sourceUserSeq: source.seq,
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-a', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@example.com'] },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+  let judgeCalls = 0;
+  _setExecutionCompletionJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'summary claims success' };
+  });
+  const { assistant } = assistantWithResponses([
+    JSON.stringify({
+      summary: 'Both reports sent.',
+      actions: [{ type: 'mark_completed', summary: 'Both reports sent with receipts.' }],
+    }),
+    JSON.stringify({
+      summary: 'The failed write remains blocked pending a safe repair.',
+      status: 'blocked',
+      blocker: 'The second report send failed.',
+      nextReviewMinutes: 30,
+    }),
+  ]);
+
+  await processExecutionController(assistant as never);
+
+  assert.equal(judgeCalls, 0);
+  const updated = new ExecutionStore().get(execution.id);
+  assert.equal(updated?.status, 'blocked');
+  assert.match(updated?.blocker ?? '', /failed/i);
 });
 
 test('controller queue_workflow writes through the shared workflow queue', async () => {

@@ -41,6 +41,7 @@ jobs:
       version: ${{ steps.release-metadata.outputs.version }}
       tag: ${{ steps.release-metadata.outputs.tag }}
       candidate: ${{ steps.release-metadata.outputs.candidate }}
+      mac_only: ${{ steps.release-metadata.outputs.mac_only }}
 
     steps:
       - name: Checkout exact source
@@ -79,6 +80,7 @@ jobs:
             echo "version=$CANDIDATE_VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
             echo "candidate=true" >> "$GITHUB_OUTPUT"
+            echo "mac_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -106,10 +108,16 @@ jobs:
             echo "::error::Tag $RELEASE_TAG resolves to $tag_sha, but origin/main is $main_sha. Production tags must point at the exact origin/main commit."
             exit 1
           fi
+          if git log -1 --format=%B "$tag_sha" | grep -Fq '[mac-only]'; then
+            mac_only=true
+          else
+            mac_only=false
+          fi
 
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "candidate=false" >> "$GITHUB_OUTPUT"
+          echo "mac_only=$mac_only" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -266,7 +274,7 @@ jobs:
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'push' && !contains(github.event.head_commit.message, '[mac-only]'))
+        (github.event_name == 'push' && needs.preflight.outputs.mac_only != 'true')
       }}
 
     steps:
@@ -344,6 +352,37 @@ jobs:
           CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
         run: npm run package:win
+
+      - name: Verify production Windows signatures
+        if: ${{ github.event_name == 'push' }}
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifacts = @(
+            "apps/desktop/release/Clementine-Setup-$env:VERSION.exe",
+            "apps/desktop/release/win-unpacked/Clementine.exe"
+          )
+
+          foreach ($artifact in $artifacts) {
+            if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+              throw "Required signed Windows artifact is missing: $artifact"
+            }
+
+            $signature = Get-AuthenticodeSignature -LiteralPath $artifact
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "Invalid Authenticode signature for ${artifact}: $($signature.Status) — $($signature.StatusMessage)"
+            }
+            if (
+              $null -eq $signature.SignerCertificate -or
+              [string]::IsNullOrWhiteSpace($signature.SignerCertificate.Thumbprint)
+            ) {
+              throw "Authenticode verification returned no signer certificate for: $artifact"
+            }
+
+            Write-Host "Verified Authenticode signature for $artifact (thumbprint $($signature.SignerCertificate.Thumbprint))."
+          }
 
       - name: Verify Windows release assets and updater feed
         env:
@@ -452,12 +491,25 @@ jobs:
             mark_latest=true
           fi
 
+          curated_notes_file=""
+          release_note_args=(--generate-notes)
+          if [[ "$RELEASE_TAG" == "v3.0.0" ]]; then
+            curated_notes_file="docs/releases/v3.0.0.md"
+            if [[ ! -s "$curated_notes_file" ]]; then
+              echo "::error::Missing required curated release notes: $curated_notes_file"
+              exit 1
+            fi
+            release_note_args=(--notes-file "$curated_notes_file")
+          fi
+
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --verify-tag \
               --draft \
               --title "$RELEASE_TAG" \
-              --generate-notes
+              "${release_note_args[@]}"
+          elif [[ -n "$curated_notes_file" ]]; then
+            gh release edit "$RELEASE_TAG" --notes-file "$curated_notes_file"
           fi
 
           gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber

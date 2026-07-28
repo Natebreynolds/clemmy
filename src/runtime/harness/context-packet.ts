@@ -30,6 +30,22 @@ import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
+import {
+  BATCH_RE,
+  READ_RE,
+  SEQUENCE_RE,
+  WRITE_RE,
+  detectMultiItemIntent,
+  detectMultiItemIntentFromConversation,
+  positiveActionSignalText,
+  type MultiItemIntent,
+} from './multi-item-intent.js';
+
+export {
+  detectMultiItemIntent,
+  detectMultiItemIntentFromConversation,
+  type MultiItemIntent,
+} from './multi-item-intent.js';
 
 export interface MemoryPrimerSummary {
   enabled: boolean;
@@ -44,25 +60,6 @@ export interface RankedContextCandidate {
   description: string;
   score: number;
   reason: string;
-}
-
-/**
- * Result of the pure, turn-start multi-item detector. `isMultiItem` is true
- * only when the user's OWN words name N>=3 independent, same-shape items that
- * each warrant their own per-item tool work (so fanning out preserves context
- * and cuts the O(N^2) token leak). Conservative by construction: every
- * ambiguity resolves to NOT multi-item so we never wrongly push fan-out.
- */
-export interface MultiItemIntent {
-  isMultiItem: boolean;
-  itemCount: number;
-  itemKind: string | null;
-  sameShapeWork: boolean;
-  explicitParallelRequest: boolean;
-  /** True when the multi-item signal came from a PRIOR conversation turn
-   *  (e.g. the assistant proposed "research these 18 firms?" and the user
-   *  answered "yes") rather than the current input itself. */
-  carriedFromPrior?: boolean;
 }
 
 export interface AgentContextPacket {
@@ -152,68 +149,6 @@ const DOMAIN_PATTERNS: RegExp[] = [
   /\bnetlify|vercel|railway|deploy|host\b/i,
 ];
 
-const READ_RE = /\b(?:find|pull|query|search|scrape|crawl|research|audit|summarize|analyze|gather|inspect)\b/i;
-const WRITE_RE =
-  /\b(?:create|draft|send|write|produce|generate|compile|assemble|update|append|post|publish|host|deploy|file|sheet|email|proposal|report|edit)\b/i;
-const BATCH_RE = /\b(?:\d+|top\s+\d+|several|many|multiple|batch|bulk|list of|all of them|for each|each one)\b/i;
-const SEQUENCE_RE = /\b(?:then|after that|afterward|before .* then|once .* then|first .* then)\b/i;
-
-// ─── Turn-start multi-item detector (fan-out directive, P0) ─────────────────
-//
-// Pure helpers, reusing the existing READ_RE/WRITE_RE/SEQUENCE_RE family. The
-// extra structural regexes below are NOT curated tool/domain lists — they are
-// stopword-style filters (like STOPWORDS above) that keep the detector from
-// firing on single-collection reads, internal cardinality, or chit-chat.
-
-// Explicit count immediately governing a plural noun: "10 prospects",
-// "44 law firms" (skips up to 3 modifier words, anchors on the plural noun).
-const COUNT_PLURAL_RE = /\b(\d{1,3})\s+(?:[a-z][\w'-]+\s+){0,3}?((?:people|men|women|children)|[a-z][a-z'-]*s)\b/i;
-// Enumerated list lines (numbered / bulleted), e.g. a pasted firm list.
-const LIST_ITEM_RE = /^[ \t]*(?:\d+[.)]|[-*•–])\s+\S/gim;
-// Aggregate / single-collection RETRIEVAL verbs — a paginated read of one
-// collection, not N independent same-shape jobs ("show my last 5 emails").
-const AGGREGATE_RETRIEVAL_RE = /\b(?:show|list|display|view|print|read out|pull up|give me|show me|tell me)\b/i;
-// Genuine per-item WORK verbs (multi-step work, not mere retrieval/display).
-// When one of these is present, an INCIDENTAL aggregate verb elsewhere in the
-// prompt ("…then tell me which failed") must NOT suppress fan-out — the live
-// 2026-06-02 batch ("research these 8 sites … tell me which") was wrongly
-// suppressed by "tell me". The aggregate guard only bites when the request is
-// retrieval-only (no deep work), e.g. "show my last 5 emails".
-const DEEP_WORK_RE = /\b(?:research|audit|scrape|crawl|analy[sz]e|enrich|profile|investigate|draft|compose|create|build|generate|write|redesign|compile|produce|assemble|summari[sz]e|deploy|publish)\b/i;
-// Internal cardinality — the N items belong to ONE parent, so there is only one
-// job ("this firm's 10 competitors"): a possessive owner immediately governing
-// the count. Tight by design: anchored to "<owner>'s <N>". The looser
-// "N <noun> of the X" variant was REMOVED — it false-matched incidental phrases
-// like "write a 2-3 sentence analysis of that firm" (live 2026-06-02), wrongly
-// suppressing a legit per-firm fan-out. Its only unique target ("10 competitors
-// of this firm") is itself fan-out-able, so dropping it favors reliable firing.
-const INTERNAL_OWNER_RE = /\b(?:this|that|the|a|an|each|every|its|his|her|their|our|my|one|same)\s+[a-z][\w-]*['’]s\s+(?:top\s+|first\s+)?\d{1,3}\b/i;
-// Distinct-items markers that override the sequence guard ("these 10 ...").
-const DISTINCT_MARKER_RE = /\b(?:these|those|each|every|all (?:of )?(?:the|these|those|my|them)|the following|following|below|listed|respectively)\b/i;
-const EXPLICIT_PARALLEL_RE = /\b(?:parallel(?:ize|ise|ized|ised)?|concurrent(?:ly)?|fan[- ]?out|same[- ]shape|same shape|per[- ]item|one per)\b/i;
-// Nouns that are units/pagination/chit-chat, never independent fan-out items.
-// Catches "30 days", paginated "200 rows", and "3 options" / "5 ideas".
-const NON_ITEM_NOUNS = new Set([
-  'days', 'weeks', 'months', 'years', 'hours', 'minutes', 'mins', 'seconds', 'secs', 'times',
-  'results', 'rows', 'records', 'entries', 'items', 'fields', 'columns', 'cells', 'lines',
-  'words', 'characters', 'chars', 'bytes', 'pages', 'dollars', 'cents', 'miles', 'points', 'percent',
-  'options', 'ideas', 'examples', 'reasons', 'tips', 'ways', 'jokes', 'suggestions', 'names',
-  'questions', 'thoughts', 'steps', 'versions', 'things', 'ones', 'others',
-  // Validation/result cardinality belongs to one parent task, not N workers.
-  // These also block checksum prose such as "SHA-256 equals …" from treating
-  // the verb "equals" as a plural item noun.
-  'checks', 'assertions', 'criteria', 'requirements', 'statuses', 'hashes', 'codes', 'equals', 'matches',
-]);
-const COUNT_CONNECTOR_WORDS = new Set(['a', 'an', 'and', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'with']);
-
-/** Boundaries such as "do not write memory" are not positive work signals,
- *  and negative nouns such as "no emails" must not open a domain or fan-out. */
-function positiveActionSignalText(text: string): string {
-  return text
-    .replace(/\b(?:do\s+not|don'?t|never|without)\b[^.!?\n]*/gi, ' ')
-    .replace(/\bno\s+(?:emails?|external\s+(?:connector|connectors|tool|tools|mcp|service|services)|writes?|changes?)\b/gi, ' ');
-}
-
 function rankingSignalText(text: string): string {
   return positiveActionSignalText(text)
     // A URL or absolute filesystem path is task payload/provenance. Tokenizing
@@ -237,138 +172,6 @@ function rankingSignalText(text: string): string {
     .replace(/\b(?:report|return|respond\s+with)\s+(?:only\s+)?(?:pass|fail|blocked)\b[^.!?\n]*/gi, ' result_status ');
 }
 
-const NO_MULTI_ITEM: MultiItemIntent = Object.freeze({
-  isMultiItem: false,
-  itemCount: 0,
-  itemKind: null,
-  sameShapeWork: false,
-  explicitParallelRequest: false,
-});
-
-/**
- * Detect whether the user's input describes N>=3 independent, same-shape items
- * that each warrant their own per-item tool work. Pure + total: never throws,
- * always returns a result, and resolves every ambiguity to NOT multi-item so a
- * false positive can never wrongly push fan-out onto correct serial work.
- */
-export function detectMultiItemIntent(input: string): MultiItemIntent {
-  try {
-    const text = (typeof input === 'string' ? input : '').trim();
-    if (text.length < 4) return NO_MULTI_ITEM;
-    const actionText = positiveActionSignalText(text);
-
-    // 1. Cardinality — an enumerated list, or an explicit count + plural noun.
-    const listMatches = text.match(LIST_ITEM_RE);
-    const enumerated = (listMatches?.length ?? 0) >= 3;
-    let count = 0;
-    let kind: string | null = null;
-    if (enumerated) {
-      count = listMatches!.length;
-    } else {
-      // A message can carry SEVERAL counts ("Found 20 accounts … research
-      // these 18 email-ready firms next?" / "audit these 8 firms … write a
-      // 2-3 sentence analysis"). Rule: the LAST count introduced by a
-      // distinct-items marker ("these/those/each of N …") names the batch
-      // being acted on; with no marked count anywhere, keep the legacy
-      // first-valid-match behavior (live 2026-07-07).
-      const globalCountRe = new RegExp(COUNT_PLURAL_RE.source, 'gi');
-      const MARKED_PREFIX_RE = /\b(?:these|those|each of|all(?: of)?(?: the)?|the following)\s*$/i;
-      let firstValid: { n: number; noun: string } | null = null;
-      let lastMarked: { n: number; noun: string } | null = null;
-      let m: RegExpExecArray | null;
-      while ((m = globalCountRe.exec(text)) !== null) {
-        const n = Number.parseInt(m[1], 10);
-        const noun = m[2].toLowerCase();
-        if (!Number.isFinite(n) || n < 3 || n > 500 || NON_ITEM_NOUNS.has(noun)) continue;
-        // A count must be a standalone cardinality. Hyphen/slash/dot/hash
-        // prefixes mean a checksum, range, version, date, or identifier:
-        // `SHA-256`, `2-3 sentences`, `HTTP/2`, `issue #12`. The live Netlify
-        // verification prompt otherwise became a fictitious 256-worker batch.
-        const priorChar = m.index > 0 ? text[m.index - 1] : '';
-        if (/[-./:#]/.test(priorChar)) continue;
-        // "8 people on James" used to bind the proper name "James" as the
-        // plural noun. A connector between the count and candidate noun proves
-        // the noun is not actually governed by that count.
-        const modifiers = m[0].trim().split(/\s+/).slice(1, -1).map((word) => word.toLowerCase());
-        if (modifiers.some((word) => COUNT_CONNECTOR_WORDS.has(word))) continue;
-        if (!firstValid) firstValid = { n, noun };
-        if (MARKED_PREFIX_RE.test(text.slice(Math.max(0, m.index - 16), m.index))) {
-          lastMarked = { n, noun };
-        }
-      }
-      const picked = lastMarked ?? firstValid;
-      if (picked) {
-        count = picked.n;
-        kind = picked.noun;
-      }
-    }
-    if (count < 3) return NO_MULTI_ITEM;
-
-    // 2. Per-item work verb — there must be real per-item tool work, not just
-    //    a quantity ("3 options" already filtered above as a non-item noun).
-    const explicitParallelRequest = EXPLICIT_PARALLEL_RE.test(actionText);
-    const sameShapeWork = READ_RE.test(actionText) || WRITE_RE.test(actionText) || explicitParallelRequest;
-    if (!sameShapeWork) return NO_MULTI_ITEM;
-
-    // 3. Zero-regression guards — each resolves ambiguity to NOT multi-item.
-    // Aggregate-retrieval ("show/list/tell me …") suppresses ONLY when the
-    // request is retrieval-only; a genuine per-item work verb (research/
-    // enrich/draft/…) means an incidental aggregate phrase shouldn't block.
-    if (AGGREGATE_RETRIEVAL_RE.test(actionText) && !DEEP_WORK_RE.test(actionText)) return NO_MULTI_ITEM; // single-collection read
-    if (INTERNAL_OWNER_RE.test(text)) return NO_MULTI_ITEM; // internal cardinality
-    const hasDistinct = enumerated || DISTINCT_MARKER_RE.test(text);
-    if (SEQUENCE_RE.test(text) && !hasDistinct) return NO_MULTI_ITEM; // A->B->C chain
-
-    return {
-      isMultiItem: true,
-      itemCount: count,
-      itemKind: kind,
-      sameShapeWork: true,
-      explicitParallelRequest,
-    };
-  } catch {
-    return NO_MULTI_ITEM; // fail-open: detection must never break a turn
-  }
-}
-
-// Continuation/affirmation markers: the current input approves or refers back
-// to work the conversation already framed ("yes", "go ahead", "scrape those").
-// Deliberately broad — it only OPENS the door to scanning prior turns; the
-// prior turn itself must still pass the full detector to carry a count.
-const CONTINUATION_REFERENCE_RE =
-  /\b(?:yes|yea|yeah|yep|sure|ok(?:ay)?|go ahead|do it|do that|proceed|please|let'?s|lets|start|run(?: it| them)?|go|them|those|these|all of (?:them|those|these))\b/i;
-
-/**
- * Multi-item detection over the CONVERSATION, not just the current message.
- * The count usually lives a turn back — the assistant proposes "run research
- * on these 18 email-ready firms?" and the user answers "yes" / "scrape those"
- * (live 2026-07-07: that exact shape produced a serial 18-firm grind because
- * the current-message detector saw no count). Rules:
- *   1. The current input wins when it is itself multi-item (unchanged path).
- *   2. Otherwise, only a continuation/affirmation-shaped input may inherit:
- *      scan the most recent conversation texts (both roles, newest first) and
- *      carry the first prior turn that passes the FULL detector.
- * Pure + total like the base detector; empty/absent history degrades to the
- * current-message behavior exactly.
- */
-export function detectMultiItemIntentFromConversation(
-  input: string,
-  recentConversationTexts: readonly string[] | undefined,
-  maxPriorTexts = 6,
-): MultiItemIntent {
-  const direct = detectMultiItemIntent(input);
-  if (direct.isMultiItem) return direct;
-  try {
-    const text = (typeof input === 'string' ? input : '').trim();
-    if (!text || !CONTINUATION_REFERENCE_RE.test(text)) return direct;
-    for (const prior of (recentConversationTexts ?? []).slice(0, maxPriorTexts)) {
-      const carried = detectMultiItemIntent(prior);
-      if (carried.isMultiItem) return { ...carried, carriedFromPrior: true };
-    }
-  } catch { /* fail-open to the direct result — detection must never break a turn */ }
-  return direct;
-}
-
 /**
  * Build the size-aware fan-out line for the context packet. N>=8 gets an
  * imperative "do NOT serialize" + a one-line forEach-workflow suggestion (P2);
@@ -378,11 +181,18 @@ export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): stri
   const kind = intent.itemKind ? ` ${intent.itemKind}` : ' items';
   const n = intent.itemCount;
   const cappedWaveSize = Math.max(1, Math.min(8, Math.round(waveSize || 8)));
+  if (n > 256) {
+    return (
+      `Fan-out directive: this turn names ${n} independent same-shape${kind}, above run_worker's 256-item structural limit. `
+      + 'Use or author a durable workflow with forEach so the complete item universe, bounded concurrency, resume state, and per-item evidence are preserved. '
+      + 'Do not send a partial subset to run_worker and do not report a subset as complete.'
+    );
+  }
   if (n >= 8 || intent.explicitParallelRequest) {
     return (
       `Fan-out directive: this turn names ${n} independent same-shape${kind} to process. `
       + 'Do NOT serialize them in this context — that balloons tokens and forces the harness to clip your freshly-fetched data mid-run. '
-      + `Resolve any shared tool/connection ONCE, then call run_worker once per item in parallel waves of up to ${cappedWaveSize} so each worker keeps its own lean context. `
+      + `Resolve any shared tool/connection ONCE, then call run_worker with the full ${n}-item \`items\` array and a workManifest declaring that canonical universe; the harness will execute it in parallel waves of up to ${cappedWaveSize}. `
       + (n >= 8
         ? 'This is a large/recurring shape: after you finish, offer in ONE line to save it as a forEach workflow — do not create or run a workflow unless the user says yes.'
         : 'The user explicitly asked for parallel/same-shape execution, so do not collapse this into one aggregate program or one inline batch.')

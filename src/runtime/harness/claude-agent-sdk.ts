@@ -59,6 +59,7 @@ import {
   terminalToolShouldHalt,
 } from './terminal-tool.js';
 import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-evidence.js';
+import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
@@ -819,6 +820,31 @@ interface NativeExternalWriteAttempt {
   toolName: string;
   shapeKey: string;
   targets: string[];
+}
+
+function nativeExternalWriteReturnedFailure(output: unknown): {
+  type: 'external_write_failed' | 'external_write_orphaned';
+  summary: string;
+} | null {
+  const text = typeof output === 'string'
+    ? output
+    : (() => {
+        try { return JSON.stringify(output ?? ''); } catch { return String(output ?? ''); }
+      })();
+  const failure = detectStructuredToolFailure(text);
+  if (!failure.failed) return null;
+  const kind = classifyToolError(failure.summary);
+  const demonstrablyNoEffect = failure.notFound
+    || kind === 'permission_denied'
+    || kind === 'not_found'
+    || kind === 'rate_limit'
+    || /invalid|validation|bad request|missing required|schema|unauthoriz|forbidden|not connected/i.test(
+      failure.summary,
+    );
+  return {
+    type: demonstrablyNoEffect ? 'external_write_failed' : 'external_write_orphaned',
+    summary: failure.summary,
+  };
 }
 
 function nativeExternalWriteAttempt(toolName: string, input: unknown, callId: string): NativeExternalWriteAttempt | null {
@@ -1757,6 +1783,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             nativeExternalWrites.set(providerCallId, write);
             appendNativeExternalWriteEvent(options.sessionId, write, 'external_write', {
               irreversible: classifyExternalWrite(toolName, input).irreversible,
+              sourceUserSeq: options.sourceUserSeq,
             });
           }
         }
@@ -2214,11 +2241,25 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             }
             const nativeWrite = nativeExternalWrites.get(tr.callId);
             if (nativeWrite) {
-              if (tr.isError || artifactOutputProvesNoDispatch(tr.output)) {
-                appendNativeExternalWriteEvent(options.sessionId, nativeWrite, 'external_write_failed', {
-                  providerError: tr.isError,
-                  dispatchProvenAbsent: artifactOutputProvesNoDispatch(tr.output),
-                });
+              const dispatchProvenAbsent = artifactOutputProvesNoDispatch(tr.output);
+              const returnedFailure = tr.isError
+                ? null
+                : nativeExternalWriteReturnedFailure(tr.output);
+              if (tr.isError || dispatchProvenAbsent || returnedFailure) {
+                appendNativeExternalWriteEvent(
+                  options.sessionId,
+                  nativeWrite,
+                  dispatchProvenAbsent
+                    ? 'external_write_failed'
+                    : returnedFailure?.type ?? 'external_write_failed',
+                  {
+                    providerError: tr.isError,
+                    dispatchProvenAbsent,
+                    structuredFailure: returnedFailure !== null,
+                    ...(returnedFailure?.summary ? { reason: returnedFailure.summary.slice(0, 240) } : {}),
+                    sourceUserSeq: options.sourceUserSeq,
+                  },
+                );
               }
               nativeExternalWrites.delete(tr.callId);
             }
@@ -2281,6 +2322,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         for (const write of nativeExternalWrites.values()) {
           appendNativeExternalWriteEvent(options.sessionId, write, 'external_write_orphaned', {
             reason: 'sdk_stream_ended_without_tool_result',
+            sourceUserSeq: options.sourceUserSeq,
           });
         }
         nativeExternalWrites.clear();
@@ -2301,6 +2343,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         for (const write of nativeExternalWrites.values()) {
           appendNativeExternalWriteEvent(options.sessionId, write, 'external_write_orphaned', {
             reason: 'sdk_stream_failed_without_tool_result',
+            sourceUserSeq: options.sourceUserSeq,
           });
         }
         nativeExternalWrites.clear();

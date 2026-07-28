@@ -3071,6 +3071,151 @@ test('request-bound write evidence: exhausted verification never false-greens a 
   }
 });
 
+test('request-bound write evidence: an overlapping request completion cannot certify this request', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+      const foreignSource = appendEvent({
+        sessionId: sess.id,
+        turn: 2,
+        role: 'user',
+        type: 'user_input_received',
+        data: { text: 'Unrelated overlapping request B.' },
+      });
+      appendEvent({
+        sessionId: sess.id,
+        turn: 2,
+        role: 'tool',
+        type: 'tool_returned',
+        data: {
+          sourceUserSeq: foreignSource.seq,
+          tool: 'execution_complete',
+          callId: 'foreign-execution-complete',
+          preview: 'Execution exec-b completed. Request B has verified receipts.',
+        },
+      });
+      assert.notEqual(
+        foreignSource.seq,
+        (opts.context as { sourceUserSeq?: number }).sourceUserSeq,
+      );
+      const decision = {
+        summary: 'PASS using request B',
+        reply: 'PASS — the execution certificate proves the requested write completed.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      };
+      return { history: items, lastResponseId: undefined, finalOutput: decision };
+    };
+
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Perform one fresh Google Sheets write for request A.',
+      judgeCompletion: true,
+      judgeFn: async () => ({ done: true, reason: 'accepted foreign execution certificate' }),
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'awaiting_user_input');
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.delivered, false);
+    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
+  }
+});
+
+test('request-bound write evidence: an accepted execution cannot hide a mixed orphaned write', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'external_write',
+        data: {
+          callId: 'send-a',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['a@example.com'],
+        },
+      });
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'external_write',
+        data: {
+          callId: 'send-b',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['b@example.com'],
+        },
+      });
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'external_write_orphaned',
+        data: {
+          callId: 'send-b',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['b@example.com'],
+        },
+      });
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'tool_returned',
+        data: {
+          tool: 'execution_complete',
+          callId: 'execution-complete-mixed',
+          preview: 'Execution exec-mixed completed. All requested sends passed validation.',
+        },
+      });
+      const decision = {
+        summary: 'sent both emails',
+        reply: 'Sent both emails successfully.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      };
+      return { history: items, lastResponseId: undefined, finalOutput: decision };
+    };
+
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Send one email to a@example.com and one email to b@example.com.',
+      judgeCompletion: true,
+      judgeFn: async () => ({ done: true, reason: 'accepted execution certificate' }),
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+
+    assert.equal(result.status, 'awaiting_user_input');
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.delivered, false);
+    assert.match(String(terminal.data.summary), /ambiguous outcome/i);
+    assert.doesNotMatch(String(terminal.data.reply), /Sent both emails successfully/i);
+    const trip = listEventsForConv(sess.id, { types: ['guardrail_tripped'] })
+      .find((event) => event.data.kind === 'request_bound_external_write_missing');
+    assert.equal(trip?.data.status, 'ambiguous');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
+  }
+});
+
 test('objective judge: fail-open accepted completions are tagged in conversation_completed', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([

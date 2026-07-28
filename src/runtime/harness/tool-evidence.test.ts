@@ -10,6 +10,7 @@ import {
   objectiveMayRequireMultipleResults,
   objectiveRequiresFreshExternalWrite,
   objectiveRequiresMutatingEvidence,
+  freshExternalWriteEvidenceIsVerified,
   freshExternalWriteEvidenceStatus,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
@@ -212,5 +213,179 @@ test('fresh external-write evidence is bound to the current user sequence and ne
       { seq: 8, type: 'external_write' },
     ], 5),
     'confirmed',
+  );
+});
+
+test('overlapping request evidence is isolated by its durable source user sequence', () => {
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      {
+        seq: 12,
+        type: 'external_write',
+        data: {
+          sourceUserSeq: 10,
+          callId: 'request-a',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['a@example.com'],
+        },
+      },
+      {
+        seq: 13,
+        type: 'external_write_failed',
+        data: {
+          sourceUserSeq: 11,
+          callId: 'request-b',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['b@example.com'],
+        },
+      },
+    ], 10),
+    'confirmed',
+    'request B cannot poison request A even when their event sequences overlap',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      {
+        seq: 12,
+        type: 'external_write',
+        data: {
+          sourceUserSeq: 10,
+          callId: 'request-a',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['a@example.com'],
+        },
+      },
+      {
+        seq: 13,
+        type: 'external_write',
+        data: {
+          sourceUserSeq: 11,
+          callId: 'request-b',
+          shapeKey: 'OUTLOOK_SEND_EMAIL',
+          targets: ['b@example.com'],
+        },
+      },
+    ], 11),
+    'confirmed',
+    'request B still sees its own receipt',
+  );
+});
+
+test('fresh external-write evidence never lets one successful target mask a different failed or orphaned target', () => {
+  const write = (
+    seq: number,
+    target: string,
+    type: 'external_write' | 'external_write_failed' | 'external_write_orphaned' = 'external_write',
+  ) => ({
+    seq,
+    type,
+    data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: [target] },
+  });
+
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'a@example.com'),
+      write(7, 'b@example.com'),
+      write(8, 'b@example.com', 'external_write_orphaned'),
+    ], 5),
+    'ambiguous',
+    'a confirmed A cannot hide B whose outcome is uncertain',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'a@example.com'),
+      write(7, 'b@example.com'),
+      write(8, 'b@example.com', 'external_write_failed'),
+    ], 5),
+    'failed',
+    'a confirmed A cannot hide B whose write failed',
+  );
+});
+
+test('fresh external-write evidence resolves a retry only for the same logical identity', () => {
+  const write = (
+    seq: number,
+    target: string,
+    type: 'external_write' | 'external_write_failed' | 'external_write_orphaned' = 'external_write',
+  ) => ({
+    seq,
+    type,
+    data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: [target] },
+  });
+
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'a@example.com'),
+      write(7, 'a@example.com', 'external_write_orphaned'),
+      write(8, 'b@example.com'),
+    ], 5),
+    'ambiguous',
+    'a later write to B does not resolve A',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'a@example.com'),
+      write(7, 'a@example.com', 'external_write_orphaned'),
+      write(8, 'a@example.com'),
+    ], 5),
+    'confirmed',
+    'a later reconciled retry of A becomes A’s current outcome',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'a@example.com'),
+      write(7, 'a@example.com', 'external_write_failed'),
+      write(8, 'a@example.com'),
+    ], 5),
+    'confirmed',
+    'a corrected retry after a demonstrable failure remains legitimate',
+  );
+});
+
+test('same-shape writes without concrete targets remain independent by call id', () => {
+  const write = (
+    seq: number,
+    callId: string,
+    type: 'external_write' | 'external_write_failed' | 'external_write_orphaned' = 'external_write',
+  ) => ({
+    seq,
+    type,
+    data: { callId, shapeKey: 'AIRTABLE_CREATE_RECORD', targets: [] },
+  });
+
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'create-a'),
+      write(7, 'create-b'),
+      write(8, 'create-a', 'external_write_orphaned'),
+      write(9, 'create-c'),
+    ], 5),
+    'ambiguous',
+    'an unrelated same-shape create cannot resolve an unknown-target orphan',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceStatus([
+      write(6, 'create-a'),
+      write(7, 'create-a', 'external_write_failed'),
+      write(8, 'create-b'),
+    ], 5),
+    'failed',
+    'a distinct call id cannot masquerade as a retry when no target identity exists',
+  );
+});
+
+test('accepted execution completion can fill missing evidence but never override explicit failure or ambiguity', () => {
+  assert.equal(freshExternalWriteEvidenceIsVerified('confirmed', false), true);
+  assert.equal(freshExternalWriteEvidenceIsVerified('missing', true), true);
+  assert.equal(freshExternalWriteEvidenceIsVerified('missing', false), false);
+  assert.equal(
+    freshExternalWriteEvidenceIsVerified('failed', true),
+    false,
+    'an accepted controller summary cannot erase a current failed write',
+  );
+  assert.equal(
+    freshExternalWriteEvidenceIsVerified('ambiguous', true),
+    false,
+    'an accepted controller summary cannot erase a maybe-landed write',
   );
 });

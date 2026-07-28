@@ -93,6 +93,8 @@ import {
 } from './claude-agent-sdk.js';
 import { resolveEffectiveToolNames, type ToolNamePolicyResult } from './tool-policy.js';
 import {
+  eventBelongsToSourceUserSeq,
+  freshExternalWriteEvidenceIsVerified,
   freshExternalWriteEvidenceStatus,
   hasMeaningfulSuccessfulToolNames,
   isAcceptedExecutionCompletionOutput,
@@ -301,7 +303,13 @@ function salvageCommittedResult(sessionId: string, sinceSeq = 0): ClaudeAgentSdk
   if (uncertain.length > 0) {
     const completedPrefix = landed.length > 0 ? `${landed.length} completed; ` : '';
     const text = `⚠️ The model errored after external work started. ${completedPrefix}${uncertain.length} ${noun} may have gone through${targetList}, but its provider result was lost. I did not replay it because that could duplicate the action. Please verify the target; then tell me what remains.`;
-    return { text, toolUses: relevant.map((w) => w.toolName ?? 'tool'), limitHit: false, sessionId };
+    return {
+      text,
+      toolUses: relevant.map((w) => w.toolName ?? 'tool'),
+      limitHit: false,
+      sessionId,
+      stoppedReason: 'awaiting-input',
+    };
   }
   // HONEST salvage: we know N writes LANDED, but NOT whether the task was fully
   // complete (the model errored before confirming). Do not over-claim "Done" — say
@@ -609,6 +617,7 @@ function claudeRequestHasAcceptedExecutionCompletion(
   try {
     return listEvents(sessionId, { types: ['tool_returned'] }).some((event) => {
       if (event.seq <= sourceUserSeq || event.data.tool !== 'execution_complete') return false;
+      if (!eventBelongsToSourceUserSeq(event, sourceUserSeq)) return false;
       return isAcceptedExecutionCompletionOutput(event.data.result ?? event.data.output);
     });
   } catch {
@@ -617,8 +626,10 @@ function claudeRequestHasAcceptedExecutionCompletion(
 }
 
 function claudeFreshWriteVerified(sessionId: string, sourceUserSeq: number): boolean {
-  return claudeRequestFreshExternalWriteStatus(sessionId, sourceUserSeq) === 'confirmed'
-    || claudeRequestHasAcceptedExecutionCompletion(sessionId, sourceUserSeq);
+  return freshExternalWriteEvidenceIsVerified(
+    claudeRequestFreshExternalWriteStatus(sessionId, sourceUserSeq),
+    claudeRequestHasAcceptedExecutionCompletion(sessionId, sourceUserSeq),
+  );
 }
 
 function claudeFreshWriteGapReason(status: Exclude<FreshExternalWriteEvidenceStatus, 'confirmed'>): string {
@@ -626,7 +637,7 @@ function claudeFreshWriteGapReason(status: Exclude<FreshExternalWriteEvidenceSta
     return 'the current request has an ambiguous external-write outcome; reconcile the exact target read-only and do not repeat the write';
   }
   if (status === 'failed') {
-    return 'the current request has only a failed compensated write and no successful current-request receipt';
+    return 'at least one external write required by the current request failed; a successful receipt for a different action does not resolve that failure';
   }
   return 'no external-write receipt exists after the current user request; historical focus summaries and prior execution receipts are not evidence';
 }
@@ -1982,8 +1993,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             : 'confirmed';
           freshnessGap = done
             && freshExternalWriteRequired
-            && freshnessStatus !== 'confirmed'
-            && !claudeRequestHasAcceptedExecutionCompletion(sessionId, userInputEvent.seq);
+            && !freshExternalWriteEvidenceIsVerified(
+              freshnessStatus,
+              claudeRequestHasAcceptedExecutionCompletion(sessionId, userInputEvent.seq),
+            );
           if (freshnessGap) {
             done = false;
             reason = claudeFreshWriteGapReason(
@@ -2226,7 +2239,6 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       && freshExternalWriteRequired
       && !result.limitHit
       && !resultIsAwaitingInput()
-      && looksLikeActionCompletionClaim(turnObjective, result.text)
       && !claudeFreshWriteVerified(sessionId, userInputEvent.seq)
     ) {
       const status = claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq);
@@ -2238,7 +2250,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         text: status === 'ambiguous'
           ? 'I cannot honestly confirm this external write: its current-request outcome is ambiguous. I did not repeat it or use an older receipt as proof; the exact target needs a read-only reconciliation.'
           : status === 'failed'
-            ? 'The external write attempted for this request was recorded as failed, so I cannot call it complete or substitute an older receipt.'
+            ? 'At least one external write required by this request was recorded as failed, so I cannot call the request complete or substitute another action’s receipt.'
             : 'I cannot honestly confirm a new external write for this request: no write receipt exists after your current request, and I did not treat an older focus or execution receipt as proof.',
         stoppedReason: 'awaiting-input',
       };
@@ -2492,7 +2504,10 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         0,
       ),
       externalWriteRequired: freshExternalWriteRequired,
-      externalWriteReceipts: learningExternalWriteStatus === 'confirmed' || controllerVerified ? 1 : 0,
+      externalWriteReceipts: freshExternalWriteEvidenceIsVerified(
+        learningExternalWriteStatus,
+        controllerVerified,
+      ) ? 1 : 0,
     };
     const learningDecision = evaluateLearningCandidate(learningInput);
     recordLearningDecision(learningInput, learningDecision, {

@@ -189,6 +189,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
             role: 'Clem',
             type: 'tool_called',
             data: {
+              ...(sourceUserSeq ? { sourceUserSeq } : {}),
               tool: name,
               callId,
               args: previewArgs(input),
@@ -208,7 +209,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
           );
           const text = typeof out === 'string' ? out : out == null ? '' : JSON.stringify(out);
           try {
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: true, preview: text.slice(0, 400), accounting: 'transport_mirror' } });
+            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), tool: name, callId, ok: true, preview: text.slice(0, 400), accounting: 'transport_mirror' } });
           } catch { /* best-effort */ }
           // Token efficiency (parity with the Codex lane, computer-tools.ts): digest a
           // large result + park the full payload in tool_outputs keyed by this
@@ -220,7 +221,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {
-            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: false, error: message.slice(0, 400), accounting: 'transport_mirror' } });
+            appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { ...(sourceUserSeq ? { sourceUserSeq } : {}), tool: name, callId, ok: false, error: message.slice(0, 400), accounting: 'transport_mirror' } });
           } catch { /* best-effort */ }
           throw err;
         }

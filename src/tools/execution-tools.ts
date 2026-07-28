@@ -154,6 +154,7 @@ export function registerExecutionTools(server: McpServer): void {
         : successCriteria;
       const created = store.create({
         sessionId,
+        sourceUserSeq: ctx?.sourceUserSeq,
         title,
         objective,
         reason: reason ?? 'Audited execution lane opened by Clem to wrap mutating work.',
@@ -386,9 +387,25 @@ export function registerExecutionTools(server: McpServer): void {
       summary: z.string().min(8).max(1200),
     },
     async ({ id, summary }) => {
-      const e = store.get(id);
+      let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
       if (e.status === 'completed') return textResult(`Execution ${id} was already completed.`);
+      const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+      const ctx = harnessRunContextStorage.getStore();
+      const requestSourceUserSeq = ctx?.sessionId === e.sessionId
+        ? ctx.sourceUserSeq
+        : undefined;
+      const writeTruth = store.reconcileExternalWriteTruth(
+        id,
+        e.sourceUserSeq ?? requestSourceUserSeq,
+      );
+      if (writeTruth) e = writeTruth.execution;
+      if (writeTruth?.status === 'failed' || writeTruth?.status === 'ambiguous') {
+        return textResult(
+          `Completion not accepted: ${e.blocker ?? 'explicit negative external-write evidence remains.'}\n` +
+          `Execution ${id} remains blocked.`,
+        );
+      }
       const validation = await validateExecutionToolCompletion(e, summary);
       if (!validation.pass) {
         const message = completionRejectionText(validation);
@@ -417,13 +434,19 @@ export function registerExecutionTools(server: McpServer): void {
       }
       const updated = store.update(id, {
         status: 'completed',
+        sourceUserSeq: e.sourceUserSeq ?? requestSourceUserSeq,
         lastAssistantSummary: summary,
         lastActivityAt: new Date().toISOString(),
         blocker: undefined,
       });
-      return updated
-        ? textResult(`Execution ${id} completed. ${summary}`)
-        : textResult(`Failed to complete execution ${id}.`);
+      if (!updated) return textResult(`Failed to complete execution ${id}.`);
+      if (updated.status !== 'completed') {
+        return textResult(
+          `Completion not accepted: ${updated.blocker ?? 'explicit negative external-write evidence remains.'}\n` +
+          `Execution ${id} remains ${updated.status}.`,
+        );
+      }
+      return textResult(`Execution ${id} completed. ${summary}`);
     },
   );
 }

@@ -558,6 +558,7 @@ function recordExternalWriteOrphan(
       role: 'system',
       type: 'external_write_orphaned',
       data: {
+        ...currentExternalWriteEventAttribution(),
         tool: toolName,
         slug: shape.shapeKey ?? null,
         targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
@@ -869,6 +870,19 @@ function workerScopeIdFromDetails(sessionId: string, details: unknown): string {
  *  every tool invocation underneath can read the active counter +
  *  sessionId without explicit threading through SDK options. */
 export const harnessRunContextStorage = new AsyncLocalStorage<HarnessRunContext>();
+
+function currentExternalWriteEventAttribution(): {
+  sourceUserSeq?: number;
+  runScopeId?: string;
+} {
+  const ctx = harnessRunContextStorage.getStore();
+  return {
+    ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: ctx?.sourceUserSeq as number }
+      : {}),
+    ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+  };
+}
 
 /** Sugar around AsyncLocalStorage.run for the loop call site. */
 export function withHarnessRunContext<T>(
@@ -1311,6 +1325,7 @@ function compensateFailedExternalWrite(
         role: 'system',
         type: 'external_write_failed',
         data: {
+          ...currentExternalWriteEventAttribution(),
           shapeKey: shape.shapeKey,
           toolName,
           targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
@@ -1342,6 +1357,7 @@ function compensateFailedExternalWrite(
           role: 'system',
           type: 'external_write_failed',
           data: {
+            ...currentExternalWriteEventAttribution(),
             shapeKey: mutation.shapeKey,
             toolName,
             targets: Array.from(new Set([
@@ -2252,7 +2268,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
           try {
             appendEvent({
               sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'external_write',
-              data: { shapeKey: mutation.shapeKey, toolName: tool.name, irreversible: true, shell: true, targets: ledgerTargets.slice(0, 8) },
+              data: {
+                ...currentExternalWriteEventAttribution(),
+                shapeKey: mutation.shapeKey,
+                toolName: tool.name,
+                irreversible: true,
+                shell: true,
+                targets: ledgerTargets.slice(0, 8),
+              },
             });
           } catch { /* telemetry must never block */ }
         }
@@ -2467,6 +2490,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 role: 'system',
                 type: 'external_write',
                 data: {
+                  ...currentExternalWriteEventAttribution(),
                   shapeKey: shape.shapeKey,
                   toolName: tool.name,
                   irreversible: shape.irreversible,

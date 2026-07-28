@@ -332,6 +332,12 @@ export interface PlanRecord {
 export interface ExecutionRecord {
   id: string;
   sessionId: string;
+  /**
+   * Exact accepted user event that opened this execution. External-write
+   * completion truth is evaluated only after this boundary so an older
+   * failure from the same chat cannot contaminate the current execution.
+   */
+  sourceUserSeq?: number;
   userId?: string;
   channel?: string;
   title: string;
@@ -350,6 +356,12 @@ export interface ExecutionRecord {
   pausedBy?: 'user' | 'focus';
   createdAt: string;
   updatedAt: string;
+  /**
+   * Immutable boundary for the most recent accepted clean completion. Unlike
+   * updatedAt, later activity rows do not move it, so late write evidence can
+   * be attributed only until the next user request.
+   */
+  completedAt?: string;
   lastActivityAt: string;
   startedFromMessage: string;
   planId?: string;

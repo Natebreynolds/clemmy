@@ -61,6 +61,7 @@ import {
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
+import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantified-work-manifest.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -362,6 +363,15 @@ function extractSessionId(runContext: unknown): string | undefined {
   const ctx = (runContext as { context?: { sessionId?: unknown } }).context;
   if (!ctx) return undefined;
   return typeof ctx.sessionId === 'string' ? ctx.sessionId : undefined;
+}
+
+function extractSourceUserSeq(runContext: unknown): number | undefined {
+  if (!runContext || typeof runContext !== 'object') return undefined;
+  const ctx = (runContext as { context?: { sourceUserSeq?: unknown } }).context;
+  const value = ctx?.sourceUserSeq;
+  return Number.isSafeInteger(value) && (value as number) > 0
+    ? value as number
+    : undefined;
 }
 
 function extractTurn(runContext: unknown): number {
@@ -880,40 +890,33 @@ export function shouldExposePlannerTool(
 }
 
 /**
- * Recent conversation texts (BOTH roles, newest first) for multi-item/fan-out
- * detection. The item count usually lives in the ASSISTANT's own proposal
- * ("run research on these 18 email-ready firms?"), so user inputs alone miss
- * it — read `user_input_received` texts AND `conversation_step` replies from
- * this session's eventlog. Best-effort: any failure returns [].
+ * The immediately preceding assistant proposal for multi-item/fan-out
+ * detection. The item count often lives in that proposal ("run research on
+ * these 18 firms?"), but arbitrary older user/assistant turns are not safe
+ * scope: a polite new request must never inherit a stale batch contract.
+ * Best-effort: any failure returns [].
  */
 export function recentConversationTextsForFanout(
   sessionId: string,
   currentInput?: string | null,
-  limit = 6,
+  _limit = 1,
 ): string[] {
   try {
     const rows = listEvents(sessionId, {
-      types: ['user_input_received', 'conversation_step'],
+      types: ['conversation_step'],
       desc: true,
-      limit: 16,
+      limit: 1,
     });
     const current = (currentInput ?? '').trim();
-    const out: string[] = [];
-    // desc:true returns chronological (oldest→newest); walk backwards → newest-first.
-    for (const ev of [...rows].reverse()) {
-      const data = ev.data as { text?: unknown; decision?: { reply?: unknown; summary?: unknown } };
-      const text = typeof data?.text === 'string'
-        ? data.text.trim()
-        : typeof data?.decision?.reply === 'string'
-          ? data.decision.reply.trim()
-          : typeof data?.decision?.summary === 'string'
-            ? data.decision.summary.trim()
-            : '';
-      if (!text || text === current) continue;
-      out.push(text);
-      if (out.length >= limit) break;
-    }
-    return out;
+    const data = rows.at(-1)?.data as {
+      decision?: { reply?: unknown; summary?: unknown };
+    } | undefined;
+    const text = typeof data?.decision?.reply === 'string'
+      ? data.decision.reply.trim()
+      : typeof data?.decision?.summary === 'string'
+        ? data.decision.summary.trim()
+        : '';
+    return text && text !== current ? [text] : [];
   } catch {
     return [];
   }
@@ -1122,6 +1125,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
       }
       const manifestSessionId = extractSessionId(runContext) ?? '';
+      const quantifiedManifestGate = evaluateQuantifiedWorkManifestGate({
+        sessionId: manifestSessionId,
+        sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq
+          ?? extractSourceUserSeq(runContext),
+        items: callItems,
+        workManifest: call.workManifest as WorkerManifestDescriptor | null | undefined,
+      });
+      if (!quantifiedManifestGate.ok) return `ERROR: ${quantifiedManifestGate.error}`;
       let manifestBinding: PreparedWorkerManifest | undefined;
       if (call.workManifest && manifestSessionId) {
         const prepared = prepareWorkerManifest({

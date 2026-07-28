@@ -124,7 +124,12 @@ writeFileSync(
   'utf-8',
 );
 
-const { buildAgentContextPacket, detectMultiItemIntent, detectMultiItemIntentFromConversation } = await import('./context-packet.js');
+const {
+  buildAgentContextPacket,
+  detectMultiItemIntent,
+  detectMultiItemIntentFromConversation,
+  fanoutDirectiveLine,
+} = await import('./context-packet.js');
 const { __resetAgentSystemGuidanceCacheForTests } = await import('../agent-system-guidance.js');
 const capabilityHealth = await import('./capability-health.js');
 const {
@@ -255,6 +260,61 @@ test('conversation carry: a NEW unrelated request does not inherit a stale batch
   assert.equal(noHist.isMultiItem, false);
   const undefHist = detectMultiItemIntentFromConversation('yes', undefined);
   assert.equal(undefHist.isMultiItem, false);
+  const politeNewWork = detectMultiItemIntentFromConversation(
+    'Please rewrite this one headline.',
+    history,
+  );
+  assert.equal(
+    politeNewWork.isMultiItem,
+    false,
+    'generic politeness is not an affirmation or anaphoric continuation',
+  );
+  const completedWorkIsNotProposal = detectMultiItemIntentFromConversation(
+    'Use these findings to write one report.',
+    ['I completed research on these 12 prospects and saved every summary.'],
+  );
+  assert.equal(
+    completedWorkIsNotProposal.isMultiItem,
+    false,
+    'a completed batch report is not an assistant proposal for more batch work',
+  );
+  const synthesisProposalDoesNotCarryOldCount = detectMultiItemIntentFromConversation(
+    'Yes.',
+    ['I completed research on these 12 prospects. Would you like me to create one combined report?'],
+  );
+  assert.equal(
+    synthesisProposalDoesNotCarryOldCount.isMultiItem,
+    false,
+    'only the assistant proposal clause may carry scope, not its completed-batch prefix',
+  );
+  const countedSynthesisProposal = detectMultiItemIntentFromConversation(
+    'Yes.',
+    ['Would you like me to create one combined report using these 12 prospect summaries?'],
+  );
+  assert.equal(
+    countedSynthesisProposal.isMultiItem,
+    false,
+    'source cardinality inside a one-artifact proposal is not output cardinality',
+  );
+  for (const prior of [
+    'I found these 18 firms. Should I research them next?',
+    'There are 18 firms ready; shall I research them?',
+  ]) {
+    const anaphoricProposal = detectMultiItemIntentFromConversation('Yes.', [prior]);
+    assert.equal(anaphoricProposal.isMultiItem, true, prior);
+    assert.equal(anaphoricProposal.itemCount, 18, prior);
+    assert.equal(anaphoricProposal.carriedFromPrior, true, prior);
+  }
+  for (const prior of [
+    'I researched these 18 firms. Should I combine them into one report?',
+    'There are 18 summaries ready. Shall I synthesize them into one report?',
+  ]) {
+    assert.equal(
+      detectMultiItemIntentFromConversation('Yes.', [prior]).isMultiItem,
+      false,
+      prior,
+    );
+  }
 });
 
 // ─── P0: detectMultiItemIntent unit table ──────────────────────────────────
@@ -283,6 +343,127 @@ test('detectMultiItemIntent FIRES on independent same-shape multi-item work', ()
   assert.equal(listed.itemCount, 4);
 });
 
+test('detectMultiItemIntent distinguishes per-row work from aggregate retrieval and bullet requirements', () => {
+  for (const [text, count] of [
+    ['Analyze these 10 records and validate each one.', 10],
+    ['Research each of these 120 rows and summarize them.', 120],
+    ['Process these 20 items in parallel.', 20],
+    ['Process each of these 20 items.', 20],
+    ['Validate each of these 20 rows against the contract.', 20],
+    ['Update each of these 20 rows with the validated status.', 20],
+  ] as const) {
+    const detected = detectMultiItemIntent(text);
+    assert.equal(detected.isMultiItem, true, text);
+    assert.equal(detected.itemCount, count, text);
+  }
+  assert.equal(
+    detectMultiItemIntent('Pull 200 rows from the customer table.').isMultiItem,
+    false,
+    'one collection read is not 200 independent worker jobs',
+  );
+  for (const oneArtifact of [
+    [
+      'Create one report:',
+      '- Include an introduction',
+      '- Use brand colors',
+      '- Export as PDF',
+    ],
+    [
+      'Create a report with:',
+      '- Executive summary',
+      '- Competitive analysis',
+      '- Recommendations',
+    ],
+    [
+      'Create a report:',
+      '1. Research the market',
+      '2. Analyze competitors',
+      '3. Present recommendations',
+    ],
+    [
+      'Create one presentation:',
+      '- Cover slide',
+      '- Market context',
+      '- Recommendations',
+    ],
+    [
+      'Make me a report:',
+      '- Executive summary',
+      '- Risks',
+      '- Recommendations',
+    ],
+    [
+      'Create the report with:',
+      '- Executive summary',
+      '- Competitive analysis',
+      '- Recommendations',
+    ],
+    [
+      'Draft my report:',
+      '- Executive summary',
+      '- Risks',
+      '- Recommendations',
+    ],
+  ]) {
+    assert.equal(
+      detectMultiItemIntent(oneArtifact.join('\n')).isMultiItem,
+      false,
+      `one artifact's requirements are not independent targets: ${oneArtifact[0]}`,
+    );
+  }
+  for (const synthesis of [
+    'Using these 12 completed prospect summaries, create one combined report.',
+    'Create one combined report using these 12 completed prospect summaries.',
+    'Create the report from these 12 interview summaries.',
+    'Create a report summarizing these 12 interviews.',
+    'Create one report that summarizes these 12 interviews.',
+    'Create one report that covers these 12 interviews.',
+    'Create one report which summarizes these 12 interviews.',
+    'Create one report about these 12 interviews.',
+    'Create one report about these 12 interviews, then publish the report.',
+    'Summarize these 12 interviews in one report.',
+    'Summarize these 12 interviews in the report.',
+    'Combine these 12 completed summaries into one report.',
+    'Turn these 12 findings into a single report.',
+    'Synthesize these 12 interviews into one report.',
+    'Write up these 12 summaries as one report.',
+    'Write the following 3 sections in one report.',
+  ]) {
+    assert.equal(
+      detectMultiItemIntent(synthesis).isMultiItem,
+      false,
+      synthesis,
+    );
+  }
+  assert.equal(
+    detectMultiItemIntent('Create one report for each of these 12 prospects.').isMultiItem,
+    true,
+    'explicit per-target wording overrides the single-artifact source guard',
+  );
+  for (const compound of [
+    'Create one workspace, then research these 12 prospects.',
+    'Build one Airtable base, then draft emails for these 12 prospects.',
+    'Create one workspace for these 12 prospects, then research each one.',
+    'Create one workspace for these 12 prospects, and research them all.',
+    'Create one workspace for these 12 prospects, then research those prospects.',
+    'Create one workspace for these 12 prospects, then research the prospects.',
+  ]) {
+    const detected = detectMultiItemIntent(compound);
+    assert.equal(detected.isMultiItem, true, compound);
+    assert.equal(detected.itemCount, 12, compound);
+  }
+  for (const multipleArtifacts of [
+    ['Create the following reports:', '- North report', '- South report', '- West report'],
+    ['Draft the following emails:', '- North email', '- South email', '- West email'],
+    ['Create the following reports for one client:', '- North report', '- South report', '- West report'],
+    ['Draft the following emails for one account:', '- North email', '- South email', '- West email'],
+  ]) {
+    const detected = detectMultiItemIntent(multipleArtifacts.join('\n'));
+    assert.equal(detected.isMultiItem, true, multipleArtifacts[0]);
+    assert.equal(detected.itemCount, 3, multipleArtifacts[0]);
+  }
+});
+
 test('detectMultiItemIntent uses size-aware boundaries (soft < 8, imperative >= 8)', () => {
   const small = detectMultiItemIntent('Draft outreach emails for these 4 prospects.');
   assert.equal(small.isMultiItem, true);
@@ -291,6 +472,61 @@ test('detectMultiItemIntent uses size-aware boundaries (soft < 8, imperative >= 
   const large = detectMultiItemIntent('Draft outreach emails for these 12 prospects.');
   assert.equal(large.isMultiItem, true);
   assert.equal(large.itemCount, 12);
+  assert.match(
+    fanoutDirectiveLine(large),
+    /full 12-item `items` array.*workManifest/i,
+    'only a detected large batch pays the durable structural-guidance cost',
+  );
+  const aboveWorkerCap = detectMultiItemIntent('Research these 300 prospects and summarize each one.');
+  assert.equal(aboveWorkerCap.itemCount, 300);
+  assert.equal(
+    detectMultiItemIntent('Research these 501 prospects and summarize each one.').itemCount,
+    501,
+  );
+  assert.equal(
+    detectMultiItemIntent('Research these 1000 prospects and summarize each one.').itemCount,
+    1000,
+  );
+  assert.equal(
+    detectMultiItemIntent('Research these 1,000 prospects and summarize each one.').itemCount,
+    1000,
+  );
+  assert.equal(
+    detectMultiItemIntent("Research this firm's 1,000 competitors.").isMultiItem,
+    false,
+  );
+  for (const perTarget of [
+    'Create one report per client for these 12 clients.',
+    'Create one report per case for these 12 cases.',
+    'Create one report per-case for these 12 cases.',
+    'Create one report for every client across these 12 clients.',
+    'Create one report per house for these 12 houses.',
+    'Create one label per box for these 12 boxes.',
+    'Convert these 12 files to one PDF per file.',
+    'Transform these 12 records into one normalized record each.',
+  ]) {
+    assert.equal(detectMultiItemIntent(perTarget).isMultiItem, true, perTarget);
+    assert.equal(detectMultiItemIntent(perTarget).itemCount, 12, perTarget);
+  }
+  for (const [prompt, expected] of [
+    ['Research these 12 Fortune 500 companies and summarize each one.', 12],
+    ['Review these 15 ISO 27001 controls and validate each one.', 15],
+    ['Analyze these 10 2025 reports and summarize each one.', 10],
+    ['Research the top 12 Fortune 500 companies and summarize each one.', 12],
+    ['Research the first 12 Fortune 500 companies and summarize each one.', 12],
+    ['Research these 12 S&P 500 companies and summarize each one.', 12],
+    ['Review these 15 ISO/IEC 27001 controls and validate each one.', 15],
+    ['Design these 12 social assets and save each one.', 12],
+    ['Tag each of these 12 records.', 12],
+    ['Tag every one of these 12 records.', 12],
+    ['Illustrate one icon per feature for these 12 features.', 12],
+  ] as const) {
+    const detected = detectMultiItemIntent(prompt);
+    assert.equal(detected.isMultiItem, true, prompt);
+    assert.equal(detected.itemCount, expected, prompt);
+  }
+  assert.match(fanoutDirectiveLine(aboveWorkerCap), /workflow.*forEach/i);
+  assert.match(fanoutDirectiveLine(aboveWorkerCap), /do not.*subset/i);
 });
 
 test('detectMultiItemIntent marks explicit parallel/same-shape requests', () => {

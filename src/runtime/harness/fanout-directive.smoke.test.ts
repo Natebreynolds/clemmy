@@ -138,9 +138,15 @@ test('SMOKE: chat multi-item turn injects the fan-out directive into the real mo
   assert.equal((packet?.data as any).multiItem.offered, true);
   assert.equal((packet?.data as any).multiItem.itemCount, 10);
   const decision = listEvents(sess.id, { types: ['fanout_policy_decision'] }).at(-1);
+  const sourceInput = listEvents(sess.id, { types: ['user_input_received'] }).at(-1);
   assert.equal((decision?.data as any).offered, true);
   assert.equal((decision?.data as any).itemCount, 10);
   assert.equal((decision?.data as any).recommendedWorkerWaveSize, 4);
+  assert.equal(
+    (decision?.data as any).sourceUserSeq,
+    sourceInput?.seq,
+    'the policy contract is owned by the exact accepted user event',
+  );
   // 3. Coverage: every item fanned out + delivered.
   assert.equal(workersDelivered.size, N, 'fan-out coverage N/N');
 });

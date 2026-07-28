@@ -98,6 +98,19 @@ type McpContentBlock = { type: string; [key: string]: unknown };
 
 const MCP_INVALID_RESULT_PREFIX = 'ERROR: MCP_RESULT_INVALID';
 
+function currentExternalWriteEventAttribution(): {
+  sourceUserSeq?: number;
+  runScopeId?: string;
+} {
+  const ctx = harnessRunContextStorage.getStore();
+  return {
+    ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
+      ? { sourceUserSeq: ctx?.sourceUserSeq as number }
+      : {}),
+    ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+  };
+}
+
 // Audit #6: an MCP EXECUTE/write tool can perform a network mutation through its
 // args — kernel `exec_command({command:'curl', args:['-X','POST',…]})` or
 // `browser_curl({method:'POST', url, body})`. These classify as execute/write,
@@ -1333,6 +1346,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             role: 'system',
             type: 'external_write',
             data: {
+              ...currentExternalWriteEventAttribution(),
               shapeKey: integrityShapeKey,
               toolName,
               irreversible: true,
@@ -1359,12 +1373,39 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, normalized.result);
-        // Record the write in the SHARED external_write ledger so a later
-        // same-shape send (composio OR MCP) to the same target gets the duplicate
-        // bump. An irreversible send was already recorded PRE-dispatch above
-        // (finding G) — skip the double-record for it; reversible integrity writes
-        // record here on the return path. Best-effort; must never affect the result.
-        if (needsIntegrityChecks && integritySessionId && !preRecordedSend) {
+        // Resolve the write ledger from the provider's actual return. A
+        // structured failure is negative evidence, never a successful write.
+        // Irreversible sends were recorded pre-dispatch and therefore receive a
+        // matching failed/orphaned resolution; reversible writes emit their
+        // success only after a clean provider result.
+        if (needsIntegrityChecks && integritySessionId && failure.failed) {
+          try {
+            const failureText = failure.summary || rawText;
+            const failureKind = classifyToolError(failureText);
+            const demonstrablyNoEffect = normalized.invalid
+              || failure.notFound
+              || failureKind === 'permission_denied'
+              || failureKind === 'not_found'
+              || failureKind === 'rate_limit'
+              || /invalid|validation|bad request|missing required|schema|unauthoriz|forbidden|not connected/i.test(failureText);
+            appendEvent({
+              sessionId: integritySessionId,
+              turn: 0,
+              role: 'system',
+              type: demonstrablyNoEffect ? 'external_write_failed' : 'external_write_orphaned',
+              data: {
+                ...currentExternalWriteEventAttribution(),
+                shapeKey: integrityShapeKey,
+                toolName,
+                slug: parsed.serverSlug,
+                irreversible: isIrreversibleSend,
+                mcp: true,
+                targets: extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8),
+                reason: failureText.slice(0, 200),
+              },
+            });
+          } catch { /* telemetry write must never block */ }
+        } else if (needsIntegrityChecks && integritySessionId && !preRecordedSend) {
           try {
             appendEvent({
               sessionId: integritySessionId,
@@ -1372,6 +1413,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               role: 'system',
               type: 'external_write',
               data: {
+                ...currentExternalWriteEventAttribution(),
                 shapeKey: integrityShapeKey,
                 toolName,
                 irreversible: isIrreversibleSend,
@@ -1417,6 +1459,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               role: 'system',
               type: demonstrablyNeverSent ? 'external_write_failed' : 'external_write_orphaned',
               data: {
+                ...currentExternalWriteEventAttribution(),
                 shapeKey: integrityShapeKey,
                 toolName,
                 slug: parsed.serverSlug,

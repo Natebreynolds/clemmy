@@ -29,6 +29,7 @@ import {
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
+import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantified-work-manifest.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -171,6 +172,13 @@ export function registerWorkerTools(server: McpServer): void {
         JSON.stringify(call),
       );
       const manifestSessionId = getToolOutputContext()?.sessionId ?? '';
+      const quantifiedManifestGate = evaluateQuantifiedWorkManifestGate({
+        sessionId: manifestSessionId,
+        sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq,
+        items: callItems,
+        workManifest: call.workManifest as WorkerManifestDescriptor | null | undefined,
+      });
+      if (!quantifiedManifestGate.ok) return textResult(`ERROR: ${quantifiedManifestGate.error}`);
       let manifestBinding: PreparedWorkerManifest | undefined;
       if (call.workManifest && manifestSessionId) {
         const prepared = prepareWorkerManifest({

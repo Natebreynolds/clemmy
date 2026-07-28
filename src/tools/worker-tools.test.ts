@@ -109,6 +109,7 @@ const { registerWorkerTools } = await import('./worker-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
 const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
+const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
 
 // The EXACT ok-gate the run_worker handler applies to a worker's result text
 // (worker-tools.ts): an `ERROR:`-prefixed envelope is a FAILED item.
@@ -224,6 +225,62 @@ test('handler no-session branch: without a live session context the item is a vi
   assert.match(text, /^ERROR:/);
   assert.ok(text.trim().length > 0);
   assert.equal(handlerOkGate(text), false);
+});
+
+test('SDK-brain handler refuses a quantified successful subset before spawning any worker', async () => {
+  const sessionId = 'sess-handler-quantified-subset';
+  createSession({ id: sessionId, kind: 'execution' });
+  const input = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Research these 10 prospects and summarize each one.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'turn_started',
+    data: { sourceUserSeq: input.seq },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'fanout_policy_decision',
+    data: { sourceUserSeq: input.seq, detected: true, itemCount: 10 },
+  });
+
+  const handler = captureRunWorker();
+  const res = await withHarnessRunContext(
+    {
+      sessionId,
+      sourceUserSeq: input.seq,
+      counter: new ToolCallsCounter(20),
+    },
+    () => withToolOutputContext({ sessionId }, () => handler({
+      ...packet('unused'),
+      item: null,
+      items: Array.from({ length: 7 }, (_, index) => `prospect-${index + 1}`),
+      workManifest: {
+        id: 'prospects',
+        contractVersion: '1',
+        phase: 'research',
+        mode: 'declare',
+        phases: [{ id: 'research' }],
+      },
+    })),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /^ERROR:/);
+  assert.match(text, /7\/10/);
+  assert.match(text, /full 10-item `items` array/);
+  assert.equal(
+    listEvents(sessionId, { types: ['worker_started'] }).length,
+    0,
+    'the Claude/SDK lane cannot spend on or report a partial universe',
+  );
 });
 
 test('SDK-brain handler reuses a completed logical manifest item when the resumed packet changes', async () => {

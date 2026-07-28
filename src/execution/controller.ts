@@ -911,6 +911,10 @@ async function applySynthesisDecision(
 ): Promise<ExecutionRecord> {
   const nextStatus = decision.status ?? execution.status;
   if (nextStatus === 'completed' && execution.status !== 'completed') {
+    const writeTruth = store.reconcileExternalWriteTruth(execution.id);
+    if (writeTruth?.status === 'failed' || writeTruth?.status === 'ambiguous') {
+      return writeTruth.execution;
+    }
     const validation = await validateExecutionCompletion(execution, plan, decision.summary);
     if (!validation.pass) {
       return rejectExecutionCompletion(store, execution, decision.summary, validation, 'synthesis');
@@ -937,27 +941,28 @@ async function applySynthesisDecision(
   };
 
   let updatedExecution = store.update(execution.id, patch) ?? execution;
+  const effectiveStatus = updatedExecution.status;
   updatedExecution = appendExecutionActivity(store, updatedExecution, {
     key: `synthesis:${observedThrough}`,
     type: 'synthesis',
     message: clean(decision.summary, 500),
     metadata: {
-      status: nextStatus,
-      nextStep: patch.nextStep,
-      blocker: patch.blocker,
+      status: effectiveStatus,
+      nextStep: updatedExecution.nextStep,
+      blocker: updatedExecution.blocker,
     },
   });
 
-  if (nextStatus === 'blocked' && execution.status !== 'blocked') {
+  if (effectiveStatus === 'blocked' && execution.status !== 'blocked') {
     updatedExecution = appendExecutionActivity(store, updatedExecution, {
       key: `blocked:${observedThrough}`,
       type: 'blocked',
-      message: patch.blocker ?? 'Execution became blocked.',
-      metadata: { blocker: patch.blocker },
+      message: updatedExecution.blocker ?? 'Execution became blocked.',
+      metadata: { blocker: updatedExecution.blocker },
     });
   }
 
-  if (nextStatus === 'completed' && execution.status !== 'completed') {
+  if (effectiveStatus === 'completed' && execution.status !== 'completed') {
     updatedExecution = appendExecutionActivity(store, updatedExecution, {
       key: `completed:${observedThrough}`,
       type: 'completed',
@@ -965,7 +970,7 @@ async function applySynthesisDecision(
     });
   }
 
-  if (decision.notifyUser && nextStatus !== 'completed') {
+  if (decision.notifyUser && effectiveStatus !== 'completed') {
     addNotification({
       id: `${Date.now()}-execution-${updatedExecution.id}-synthesis`,
       kind: 'execution',
@@ -982,7 +987,7 @@ async function applySynthesisDecision(
     executionId: updatedExecution.id,
     title: updatedExecution.title,
     previousState: execution.status,
-    nextState: nextStatus,
+    nextState: effectiveStatus,
     summary: clean(decision.summary, 400),
     nextReviewAt: updatedExecution.nextReviewAt,
   });
@@ -1230,6 +1235,11 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
       case 'mark_completed':
         {
           const summary = action.summary ? clean(action.summary, 400) : decision.summary;
+          const writeTruth = store.reconcileExternalWriteTruth(currentExecution.id);
+          if (writeTruth?.status === 'failed' || writeTruth?.status === 'ambiguous') {
+            currentExecution = writeTruth.execution;
+            break;
+          }
           const validation = await validateExecutionCompletion(currentExecution, plan, summary);
           if (!validation.pass) {
             currentExecution = rejectExecutionCompletion(store, currentExecution, summary, validation, 'controller');
@@ -1241,7 +1251,9 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
             lastAssistantSummary: summary,
             nextReviewAt: undefined,
           }) ?? currentExecution;
-          maybeNotifyExecutionCompleted(currentExecution);
+          if (currentExecution.status === 'completed') {
+            maybeNotifyExecutionCompleted(currentExecution);
+          }
         }
         break;
       case 'noop':

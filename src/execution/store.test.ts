@@ -130,6 +130,201 @@ test('ExecutionStore.update closes linked vault task rows when an execution comp
   assert.ok(updated?.activity?.some((item) => item.type === 'status' && /Closed 1 linked task row/.test(item.message)));
 });
 
+test('ExecutionStore reconciles a late orphan before UI reads and allows a later same-target success', () => {
+  resetEventLog();
+  const sessionId = `sess-late-write-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'late write reconciliation' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send both approved reports.' },
+  });
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const execution = store.create({
+    sessionId,
+    title: 'Send both reports',
+    objective: 'Send both approved reports to their exact recipients',
+    reason: 'test',
+    startedFromMessage: 'send both reports',
+    confidence: 0.9,
+    reasons: ['test'],
+    successCriteria: 'Both sends have confirmed receipts',
+    sourceUserSeq: source.seq,
+  } as never);
+  ensureTasksFile();
+  writeFileSync(
+    TASKS_FILE,
+    [
+      '---',
+      'type: tasks',
+      '---',
+      '',
+      '# Tasks',
+      '',
+      '## Pending',
+      '',
+      '- [ ] {T-099} Send both approved reports !!high',
+      '',
+      '## Completed',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  store.update(execution.id, {
+    taskBindings: [{
+      taskId: 'T-099',
+      description: 'Send both approved reports',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    }],
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-a', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@example.com'] },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+
+  assert.equal(
+    store.update(execution.id, {
+      status: 'completed',
+      blocker: undefined,
+      lastAssistantSummary: 'Both reports sent.',
+    })?.status,
+    'completed',
+  );
+  assert.equal(
+    new ExecutionStore().get(execution.id)?.taskBindings?.[0]?.status,
+    'completed',
+    'clean completion initially closes its linked task',
+  );
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+
+  const uiRecord = new ExecutionStore().list(20).find((item) => item.id === execution.id);
+  assert.equal(uiRecord?.status, 'blocked');
+  assert.match(uiRecord?.blocker ?? '', /read-only reconciliation/i);
+  assert.equal(
+    uiRecord?.taskBindings?.[0]?.status,
+    'pending',
+    'a blocked execution cannot retain a misleading completed task binding',
+  );
+  const taskBodyAfterReconcile = readFileSync(TASKS_FILE, 'utf-8');
+  const pendingAfterReconcile = taskBodyAfterReconcile.slice(
+    taskBodyAfterReconcile.indexOf('## Pending'),
+    taskBodyAfterReconcile.indexOf('## Completed'),
+  );
+  const completedAfterReconcile = taskBodyAfterReconcile.slice(
+    taskBodyAfterReconcile.indexOf('## Completed'),
+  );
+  assert.match(pendingAfterReconcile, /\[ \] \{T-099\}/);
+  assert.doesNotMatch(completedAfterReconcile, /T-099/);
+  assert.equal(
+    readExecutions().find((item) => item.id === execution.id)?.status,
+    'blocked',
+    'read reconciliation is persisted, not merely projected in memory',
+  );
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: { callId: 'send-b-reconciled', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+  });
+  const retried = store.update(execution.id, {
+    status: 'completed',
+    blocker: undefined,
+    lastAssistantSummary: 'Recipient B was reconciled and the corrected retry now has a receipt.',
+  });
+  assert.equal(retried?.status, 'completed', 'a later success for the same logical target clears the negative outcome');
+});
+
+test('an overlapping unrelated user request cannot contaminate a completed execution', () => {
+  resetEventLog();
+  const sessionId = `sess-write-owner-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'write ownership boundary' });
+  const sourceA = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved North report.' },
+  });
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const execution = store.create({
+    sessionId,
+    title: 'Send North report',
+    objective: 'Send the approved North report to the exact recipient',
+    reason: 'test',
+    startedFromMessage: 'send north report',
+    confidence: 0.9,
+    reasons: ['test'],
+    successCriteria: 'The North send has a confirmed receipt',
+    sourceUserSeq: sourceA.seq,
+  } as never);
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'north-send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['north@example.com'],
+    },
+  });
+  const sourceB = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Now send an unrelated South report.' },
+  });
+  const completed = store.update(execution.id, {
+    status: 'completed',
+    blocker: undefined,
+    lastAssistantSummary: 'North report sent.',
+  });
+  assert.equal(completed?.status, 'completed');
+  assert.ok(completed?.completedAt, 'completion persists an immutable evidence boundary');
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: sourceB.seq,
+      callId: 'south-send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['south@example.com'],
+    },
+  });
+
+  const reread = new ExecutionStore().get(execution.id);
+  assert.equal(reread?.status, 'completed');
+  assert.equal(reread?.blocker, undefined);
+});
+
 test('sweepCrashedExecutions: active with stale heartbeat is auto-failed', () => {
   seedExecutions([
     baseExecution({
