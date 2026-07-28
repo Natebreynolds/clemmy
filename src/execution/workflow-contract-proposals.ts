@@ -91,15 +91,6 @@ const EVIDENCE_CONTRACT_KEYS = new Set([
   'items',
   'rows',
   'records',
-  // Domain collections are evidence-bearing workflow payloads just like
-  // generic rows/records. Requiring an extra top-level sources/key_findings
-  // wrapper around `{ accounts: [...] }` or `{ contacts: [...] }` adds token
-  // weight without improving proof when each item already carries its source
-  // fields and the collection has a non-empty/min-items contract.
-  'accounts',
-  'contacts',
-  'leads',
-  'prospects',
   'metrics',
   'data',
   'ranked_keywords',
@@ -186,8 +177,20 @@ function contractEvidenceKeys(contract: WorkflowStepOutputContract | undefined):
 }
 
 function hasEvidenceKey(contract: WorkflowStepOutputContract | undefined): boolean {
+  // A domain collection ({accounts}, {invoices}, {patients}) is an evidence-
+  // bearing payload just like generic rows/records when the author declared it
+  // must carry data (non_empty / min_items ≥ 1). Structural, so it works for
+  // every user's domain instead of an enumerated noun list; identity/metadata
+  // keys stay excluded so a bare non-empty url/date cannot satisfy it.
+  const declaredNonEmpty = new Set<string>([
+    ...(contract?.non_empty ?? []),
+    ...Object.entries(contract?.min_items ?? {})
+      .filter(([, minimum]) => minimum >= 1)
+      .map(([key]) => key),
+  ]);
   for (const key of contractEvidenceKeys(contract)) {
     if (EVIDENCE_CONTRACT_KEYS.has(key)) return true;
+    if (key && key !== '.' && declaredNonEmpty.has(key) && !IDENTITY_CONTRACT_KEYS.has(key)) return true;
   }
   return false;
 }

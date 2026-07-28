@@ -214,6 +214,27 @@ test('does not add generic research-summary keys to evidence-bearing account col
   assert.deepEqual(warnings, [], 'the account records are the evidence payload; top-level sources/key_findings would be redundant');
 });
 
+test('any domain collection declared must-carry-data is evidence-bearing, not just enumerated nouns', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'enrich_invoices',
+        prompt: 'Research each vendor and enrich the open invoices with competitor pricing analysis.',
+        allowedTools: ['firecrawl'],
+        output: {
+          type: 'object',
+          required_keys: ['invoices'],
+          non_empty: ['invoices'],
+          min_items: { invoices: 1 },
+        },
+        sideEffect: 'read',
+      },
+    ],
+  }));
+
+  assert.deepEqual(warnings, [], 'a non-empty invoices collection is the evidence payload — no noun list required');
+});
+
 test('does not mistake a write that preserves SEO fields for a live-research step', () => {
   const warnings = workflowAuthoringAdvisories(wf({
     steps: [

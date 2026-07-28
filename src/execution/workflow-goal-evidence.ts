@@ -6,6 +6,34 @@
  * arrays to count + sample, prioritize identity/proof fields in nested objects,
  * and preserve both ends if the compact JSON still exceeds the budget.
  */
+/**
+ * Rank keys by SHAPE class, never by a specific workflow's field names — the
+ * projector serves every user's domain (CRM, invoicing, logistics, research)
+ * equally. Keys are normalized (camelCase → snake_case) before matching.
+ *
+ *   0 proof     — outcome/verification facts: blocked, status, *error*,
+ *                 *verified*, receipts/commits/confirmations, unchanged/reused
+ *   1 identity  — what the item IS: ids, keys, names, domains, urls,
+ *                 row/index/reference numbers
+ *   2 metric    — counts, totals, batches, sources, capture timestamps
+ *   3 the rest
+ */
+const PROOF_KEY_RE = /(^|_)(blocked|ok|success|succeeded|failed|failure|status|error|errors)($|_)|verif|receipt|commit|confirm|unchanged|reused/;
+const IDENTITY_KEY_RE = /^(id|name|key|slug|domain|url|link|email)$|_(id|ids|key|keys|url|urls|number|numbers|index)$|(^|_)row(_|$)|(^|_)rows?(_|$)/;
+const METRIC_KEY_RE = /(^|_)(count|counts|total|totals|batch)($|_)|_at$|source|captured/;
+
+function normalizedEvidenceKey(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[-\s]+/g, '_').toLowerCase();
+}
+
+function evidenceKeyRank(key: string): number {
+  const normalized = normalizedEvidenceKey(key);
+  if (PROOF_KEY_RE.test(normalized)) return 0;
+  if (IDENTITY_KEY_RE.test(normalized)) return 1;
+  if (METRIC_KEY_RE.test(normalized)) return 2;
+  return 3;
+}
+
 export function workflowGoalEvidenceProjection(value: unknown, depth = 0): unknown {
   if (typeof value === 'string' && value.length > 180) {
     return `${value.slice(0, 145)}…${value.slice(-24)}`;
@@ -30,16 +58,9 @@ export function workflowGoalEvidenceProjection(value: unknown, depth = 0): unkno
 
   const entries = Object.entries(value as Record<string, unknown>);
   const keyLimit = depth === 0 ? 30 : 12;
-  const proofKey = /^(?:blocked|error|status|seoWasReused|enrichmentError|verifiedCount|verifiedRows|protectedFieldsUnchanged|writeBatchCount|readbackBatchCount|ignoredDuplicateRowsTouched)$/i;
-  const identityKey = /^(?:id|name|domain|rowNumber|accountId|stableKey|canonicalRowNumber|ignoredRowNumbers)$/i;
-  const salientKey = /^(?:id|name|domain|rowNumber|accountId|stableKey|canonicalRowNumber|ignoredRowNumbers|status|blocked|error|existingSeo|seoCapturedAt|domainAuthority|organicTraffic|topKeywords|seoSource|seoWasReused|enrichmentError|verifiedCount|verifiedRows|protectedFieldsUnchanged|writeBatchCount|readbackBatchCount|ignoredDuplicateRowsTouched)$/i;
   const selectedEntries = [...entries]
-    .sort(([left], [right]) => {
-      const rank = (key: string): number =>
-        proofKey.test(key) ? 0 : identityKey.test(key) ? 1 : salientKey.test(key) ? 2 : 3;
-      return rank(left) - rank(right);
-    })
-    .slice(0, keyLimit);
+    .sort(([left], [right]) => evidenceKeyRank(left) - evidenceKeyRank(right));
+  selectedEntries.splice(keyLimit);
   const projected: Record<string, unknown> = {};
   for (const [key, nested] of selectedEntries) {
     projected[key] = depth >= 3 && nested && typeof nested === 'object'
