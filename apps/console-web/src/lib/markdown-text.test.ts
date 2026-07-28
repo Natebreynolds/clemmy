@@ -17,6 +17,14 @@ test('headings, italics, newlines, and bare long URLs read as one calm line', ()
   assert.equal(out, 'Summary · See this and clementine-rc-48da4d1e-1785191709149.netlify.app now');
 });
 
+test('a truncated preview with an UNCLOSED bold marker still comes out clean', () => {
+  // Live leak: the server truncates previews before any client strip runs.
+  assert.equal(
+    stripInlineMarkdown('HTTP status: 200 - **Resp…'),
+    'HTTP status: 200 - Resp…',
+  );
+});
+
 test('plain text and empty input pass through unchanged', () => {
   assert.equal(stripInlineMarkdown('Ship the Friday scorecard.'), 'Ship the Friday scorecard.');
   assert.equal(stripInlineMarkdown(''), '');

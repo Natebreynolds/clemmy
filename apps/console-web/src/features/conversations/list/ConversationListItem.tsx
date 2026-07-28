@@ -3,21 +3,14 @@ import { NavLink } from 'react-router-dom';
 import { Pin, MoreVertical, Pencil, Tag, Archive, ArchiveRestore, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { originMeta } from '../lib/origin';
+import { stripInlineMarkdown } from '@/lib/markdown-text';
 import type { Session } from '../types';
 
-/** One-line preview hygiene: previews are raw message text, which for assistant
- *  replies can open with markdown ("## Heading", "**bold**", backticks) — noise
- *  in a truncated single line. Strip the syntax, keep the words. */
+/** One-line preview hygiene: previews are raw (server-truncated) message text.
+ *  The shared strip handles links, dangling bold from mid-span truncation, and
+ *  long URLs — one implementation, tested in lib/markdown-text. */
 function stripMarkdown(text: string | null | undefined): string {
-  if (!text) return '';
-  return text
-    .replace(/```[a-z]*\n?/gi, '')       // fence markers
-    .replace(/^#{1,6}\s+/gm, '')          // heading hashes
-    .replace(/\*\*([^*]+)\*\*/g, '$1')    // bold
-    .replace(/`([^`]+)`/g, '$1')          // inline code
-    .replace(/^\s*[-*]\s+/gm, '')         // list bullets
-    .replace(/\s+/g, ' ')
-    .trim();
+  return stripInlineMarkdown(text ?? '');
 }
 
 function relativeTime(iso: string): string {

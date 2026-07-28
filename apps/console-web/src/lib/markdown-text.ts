@@ -17,6 +17,10 @@ export function stripInlineMarkdown(text: string): string {
   out = out.replace(/~~(.*?)~~/g, '$1');
   // Heading markers at line starts.
   out = out.replace(/^#{1,6}\s+/gm, '');
+  // Truncated previews can cut a bold span in half, leaving a dangling "**" no
+  // pair-regex can close — in these one-line surfaces a marker run is always
+  // noise, never content.
+  out = out.replace(/\*{2,}|__+/g, '');
   // A bare long URL reads as noise in a one-liner — show its host.
   out = out.replace(/https?:\/\/[^\s)]{28,}/g, (url) => {
     try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; }
