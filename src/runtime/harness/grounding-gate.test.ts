@@ -75,6 +75,25 @@ test('extractDuplicateIdentityKeys: recipient fields exclude email-shaped messag
   assert.deepEqual(keys, ['recipient@oakridge-law.example']);
 });
 
+test('extractDuplicateIdentityKeys: camelCase recipient keys are recipients (Graph/Outlook shapes)', () => {
+  // Microsoft Graph: toRecipients[].emailAddress.address — the recipient
+  // context must survive both the camelCase key and the nested object.
+  const keys = extractDuplicateIdentityKeys({
+    toRecipients: [{ emailAddress: { address: 'person@oakridge-law.example', name: 'A Person' } }],
+    body: 'Reference-only address: source@example.invalid',
+  });
+  assert.deepEqual(keys, ['person@oakridge-law.example']);
+
+  const flat = extractDuplicateIdentityKeys({
+    recipientEmail: 'flat@oakridge-law.example',
+    contactId: 'contact-424242',
+    connectedAccountId: 'ca_fixture',
+  });
+  assert.ok(flat.includes('flat@oakridge-law.example'));
+  assert.ok(flat.includes('contact-424242'));
+  assert.ok(!flat.includes('ca_fixture'));
+});
+
 test('extractDuplicateIdentityKeys: Sheet cell values and provider connection are not recipients', () => {
   const keys = extractDuplicateIdentityKeys({
     tool_slug: 'GOOGLESHEETS_VALUES_UPDATE',

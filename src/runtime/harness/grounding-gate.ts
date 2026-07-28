@@ -137,22 +137,29 @@ const DUP_ID_KEY_RE = /(^|_)(contact_id|record_id|lead_id|account_id|to_number|p
 const PROVIDER_CONNECTION_KEY_RE = /(^|_)(connected_account_id|connection_id|connector_id|user_id)$/i;
 export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
   const keys = new Set<string>();
-  const visit = (value: unknown, keyHint?: string, rootString = false): void => {
+  // Keys are matched in normalized (snake_case) form so camelCase provider
+  // payloads (Graph/Outlook toRecipients, recipientEmail, contactId) get the
+  // same duplicate protection as snake_case ones. A recipient-keyed field
+  // marks its whole subtree: Graph nests the address two objects down
+  // (toRecipients[].emailAddress.address), and an email inside an explicit
+  // recipient field is a target regardless of the leaf key's name.
+  const visit = (value: unknown, keyHint?: string, rootString = false, inRecipientField = false): void => {
     if (value === null || value === undefined) return;
+    const normalizedHint = keyHint === undefined ? undefined : normalizedArgKey(keyHint);
     if (typeof value === 'string') {
       if ((value.startsWith('{') || value.startsWith('[')) && value.length < 50_000) {
-        try { visit(JSON.parse(value)); return; } catch { /* plain string */ }
+        try { visit(JSON.parse(value), undefined, false, inRecipientField); return; } catch { /* plain string */ }
       }
       // A root string is usually a shell command, where field context is not
       // available. Structured calls mine addresses only from recipient fields;
       // an email in a body, Sheet cell, or other payload is data—not a target.
-      if (rootString || (keyHint && RECIPIENT_EMAIL_KEY_RE.test(keyHint))) {
+      if (rootString || inRecipientField || (normalizedHint && RECIPIENT_EMAIL_KEY_RE.test(normalizedHint))) {
         for (const m of value.match(EMAIL_RE) ?? []) keys.add(m.toLowerCase());
       }
       if (
-        keyHint
-        && DUP_ID_KEY_RE.test(keyHint)
-        && !PROVIDER_CONNECTION_KEY_RE.test(keyHint)
+        normalizedHint
+        && DUP_ID_KEY_RE.test(normalizedHint)
+        && !PROVIDER_CONNECTION_KEY_RE.test(normalizedHint)
         && value.length >= 3
         && value.length <= 80
       ) {
@@ -160,9 +167,11 @@ export function extractDuplicateIdentityKeys(rawArgs: unknown): string[] {
       }
       return;
     }
-    if (Array.isArray(value)) { for (const v of value) visit(v, keyHint); return; }
+    const enteringRecipientField =
+      inRecipientField || (normalizedHint !== undefined && RECIPIENT_EMAIL_KEY_RE.test(normalizedHint));
+    if (Array.isArray(value)) { for (const v of value) visit(v, keyHint, false, enteringRecipientField); return; }
     if (typeof value === 'object') {
-      for (const [k, v] of Object.entries(value as Record<string, unknown>)) visit(v, k);
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) visit(v, k, false, enteringRecipientField);
     }
   };
   visit(rawArgs, undefined, typeof rawArgs === 'string');
