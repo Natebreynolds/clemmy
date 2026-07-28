@@ -63,6 +63,7 @@ import {
   renderRecentActionsForHarnessHistory,
   renderCrossSessionPrefixesForModel,
 } from './session-transcript.js';
+import { resolveWriteEvidence } from './work-report.js';
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../../memory/skill-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput } from './context-packet.js';
@@ -255,45 +256,21 @@ function salvageCommittedResult(sessionId: string, sinceSeq = 0): ClaudeAgentSdk
     shapeKey?: string;
     targets?: string[];
   };
-  let writes: WriteTruth[] = [];
-  let failed: WriteTruth[] = [];
-  let orphaned: WriteTruth[] = [];
+  let landed: WriteTruth[] = [];
+  let uncertain: WriteTruth[] = [];
   try {
     const events = listEvents(sessionId, {
-      types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+      types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
       ...(sinceSeq > 0 ? { sinceSeq } : {}),
     });
-    const mapped = events.map((event) => ({ seq: event.seq, ...(event.data as Omit<WriteTruth, 'seq'>) }));
-    writes = mapped.filter((_row, index) => events[index]?.type === 'external_write');
-    failed = mapped.filter((_row, index) => events[index]?.type === 'external_write_failed');
-    orphaned = mapped.filter((_row, index) => events[index]?.type === 'external_write_orphaned');
+    const resolved = resolveWriteEvidence(events);
+    const mapWrite = (event: (typeof events)[number]): WriteTruth => ({
+      seq: event.seq,
+      ...(event.data as Omit<WriteTruth, 'seq'>),
+    });
+    landed = resolved.confirmed.map(mapWrite);
+    uncertain = resolved.uncertain.map(mapWrite);
   } catch { return null; }
-  if (writes.length === 0) return null;
-
-  const matches = (write: WriteTruth, resolution: WriteTruth): boolean => {
-    if (write.seq >= resolution.seq) return false;
-    if (write.callId && resolution.callId) return write.callId === resolution.callId;
-    if (write.shapeKey !== resolution.shapeKey) return false;
-    const left = new Set((write.targets ?? []).map((target) => String(target).toLowerCase()));
-    const right = (resolution.targets ?? []).map((target) => String(target).toLowerCase());
-    return left.size === 0 || right.length === 0 || right.some((target) => left.has(target));
-  };
-  const consumed = new Set<number>();
-  const consumePrior = (resolution: WriteTruth): WriteTruth | null => {
-    for (let index = writes.length - 1; index >= 0; index -= 1) {
-      if (consumed.has(index) || !matches(writes[index], resolution)) continue;
-      consumed.add(index);
-      return writes[index];
-    }
-    return null;
-  };
-  for (const row of failed) consumePrior(row);
-  const uncertain: WriteTruth[] = [];
-  for (const row of orphaned) {
-    const write = consumePrior(row);
-    if (write) uncertain.push(write);
-  }
-  const landed = writes.filter((_write, index) => !consumed.has(index));
   if (landed.length === 0 && uncertain.length === 0) return null;
   const relevant = [...landed, ...uncertain];
   const targets = [...new Set(relevant.flatMap((w) => (w.targets ?? []).filter((t): t is string => typeof t === 'string')))];
@@ -601,7 +578,7 @@ function claudeRequestFreshExternalWriteStatus(
   try {
     return freshExternalWriteEvidenceStatus(
       listEvents(sessionId, {
-        types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+        types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
       }),
       sourceUserSeq,
     );

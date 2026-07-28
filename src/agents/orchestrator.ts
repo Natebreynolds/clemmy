@@ -1125,10 +1125,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
       }
       const manifestSessionId = extractSessionId(runContext) ?? '';
+      const manifestSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq
+        ?? extractSourceUserSeq(runContext);
       const quantifiedManifestGate = evaluateQuantifiedWorkManifestGate({
         sessionId: manifestSessionId,
-        sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq
-          ?? extractSourceUserSeq(runContext),
+        sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
         workManifest: call.workManifest as WorkerManifestDescriptor | null | undefined,
       });
@@ -1137,6 +1138,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (call.workManifest && manifestSessionId) {
         const prepared = prepareWorkerManifest({
           sessionId: manifestSessionId,
+          sourceUserSeq: manifestSourceUserSeq,
           items: callItems,
           descriptor: call.workManifest as WorkerManifestDescriptor,
           objective: call.objective,

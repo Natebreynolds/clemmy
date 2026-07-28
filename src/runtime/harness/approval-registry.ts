@@ -39,6 +39,10 @@ import {
   markPendingActionApprovalResolved,
 } from './pending-actions.js';
 import { appendAuditRecord } from '../audit-ledger.js';
+import {
+  canonicalExternalWriteActionKey,
+  externalWriteSemanticFingerprint,
+} from './external-write-admission.js';
 
 /**
  * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
@@ -139,6 +143,7 @@ interface ApprovalSqlRow {
   resolved_at: string | null;
   resume_key: string | null;
   consumed_at: string | null;
+  resend_consumed_at: string | null;
 }
 
 function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
@@ -170,6 +175,184 @@ function safeParse(json: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+const RESEND_APPROVAL_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const RESEND_APPROVAL_RECIPIENT_KEY_RE =
+  /(^|_)(to|to_email|recipient|recipients|email|emails|cc|bcc)$/i;
+const RESEND_APPROVAL_SENDER_KEY_RE =
+  /(^|_)(from|sender|reply_to|return_path|on_behalf_of)(_email|_emails|_address|_addresses)?$/i;
+const RESEND_APPROVAL_ID_KEY_RE =
+  /(^|_)(contact_id|record_id|lead_id|account_id|to_number|phone)$/i;
+const RESEND_APPROVAL_PROVIDER_KEY_RE =
+  /(^|_)(connected_account_id|connection_id|connector_id|user_id)$/i;
+
+function normalizedResendApprovalKey(key: string): string {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[-\s]+/g, '_')
+    .toLowerCase();
+}
+
+function decodedApprovalArgs(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') return null;
+  return safeParse(value);
+}
+
+/**
+ * Derive authority from the action the human actually approved. The registry's
+ * wrapper name is not enough for Composio/call_tool approvals: their concrete
+ * action lives in the byte-pinned args. Unknown or malformed wrappers fail
+ * closed instead of becoming session-wide resend consent.
+ */
+function approvedResendActionKey(
+  tool: string | null,
+  args: Record<string, unknown> | null,
+): string | null {
+  const approvedTool = tool?.trim();
+  if (!approvedTool) return null;
+  const normalizedTool = approvedTool.replace(/^mcp__/, '');
+  const tail = normalizedTool.split('__').at(-1)?.toLowerCase() ?? normalizedTool.toLowerCase();
+
+  if (approvedTool === 'composio_execute_tool' || tail === 'composio_execute_tool') {
+    const slug = typeof args?.tool_slug === 'string' ? args.tool_slug.trim() : '';
+    return slug ? canonicalExternalWriteActionKey(approvedTool, slug) : null;
+  }
+
+  if (tail === 'call_tool') {
+    const delegatedTool = typeof args?.name === 'string' ? args.name.trim() : '';
+    if (!delegatedTool || delegatedTool === approvedTool) return null;
+    const delegatedArgs = decodedApprovalArgs(args?.args_json ?? args?.arguments ?? {});
+    return approvedResendActionKey(delegatedTool, delegatedArgs);
+  }
+
+  if (tail.startsWith('cx_')) {
+    return canonicalExternalWriteActionKey(approvedTool, tail.slice('cx_'.length));
+  }
+
+  return canonicalExternalWriteActionKey(approvedTool, approvedTool);
+}
+
+/**
+ * Extract only the same concrete identities used by the duplicate wall. Body
+ * prose and subjects are deliberately excluded: an address mentioned in copy
+ * is not approval to send to it. Values are normalized exactly, so
+ * `notcasey@example.com` can never authorize `casey@example.com`.
+ */
+function approvedResendIdentityKeys(
+  tool: string | null,
+  args: Record<string, unknown>,
+): Set<string> {
+  const identities = new Set<string>();
+  const visit = (
+    value: unknown,
+    keyHint?: string,
+    rootString = false,
+    inRecipientField = false,
+  ): void => {
+    if (value === null || value === undefined) return;
+    const normalizedHint = keyHint === undefined
+      ? undefined
+      : normalizedResendApprovalKey(keyHint);
+    const senderContext = normalizedHint !== undefined
+      && RESEND_APPROVAL_SENDER_KEY_RE.test(normalizedHint);
+    const recipientContext = !senderContext && inRecipientField;
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (
+        (trimmed.startsWith('{') || trimmed.startsWith('['))
+        && trimmed.length < 50_000
+      ) {
+        try {
+          visit(JSON.parse(trimmed), undefined, false, recipientContext);
+          return;
+        } catch { /* plain string */ }
+      }
+      if (
+        rootString
+        || recipientContext
+        || (
+          normalizedHint
+          && !senderContext
+          && RESEND_APPROVAL_RECIPIENT_KEY_RE.test(normalizedHint)
+        )
+      ) {
+        for (const match of value.match(RESEND_APPROVAL_EMAIL_RE) ?? []) {
+          identities.add(match.toLowerCase());
+        }
+      }
+      if (
+        normalizedHint
+        && RESEND_APPROVAL_ID_KEY_RE.test(normalizedHint)
+        && !RESEND_APPROVAL_PROVIDER_KEY_RE.test(normalizedHint)
+        && trimmed.length >= 3
+        && trimmed.length <= 80
+      ) {
+        identities.add(trimmed.toLowerCase());
+      }
+      return;
+    }
+
+    const enteringRecipientField = recipientContext
+      || (
+        normalizedHint !== undefined
+        && !senderContext
+        && RESEND_APPROVAL_RECIPIENT_KEY_RE.test(normalizedHint)
+      );
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        visit(child, keyHint, false, enteringRecipientField);
+      }
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        visit(child, key, false, enteringRecipientField);
+      }
+    }
+  };
+
+  visit(args);
+  const normalizedTool = tool?.replace(/^mcp__/, '').toLowerCase() ?? '';
+  if (normalizedTool.split('__').at(-1) === 'run_shell_command') {
+    const command = typeof args.command === 'string' ? args.command : '';
+    if (command) visit(command, undefined, true);
+  }
+  identities.delete('me');
+  return identities;
+}
+
+interface ResendApprovalCandidate {
+  tool: string | null;
+  args_json: string | null;
+  resolved_at: string | null;
+}
+
+function resendApprovalMatches(
+  candidate: ResendApprovalCandidate,
+  needle: string,
+  priorSendAtIso: string | undefined,
+  requestedActionKey: string,
+): boolean {
+  if (
+    priorSendAtIso
+    && (!candidate.resolved_at || candidate.resolved_at <= priorSendAtIso)
+  ) return false;
+  if (!candidate.args_json) return false;
+  const args = safeParse(candidate.args_json);
+  if (!args) return false;
+
+  const approvedActionKey = approvedResendActionKey(candidate.tool, args);
+  if (!approvedActionKey || approvedActionKey !== requestedActionKey) return false;
+
+  if (needle.startsWith('payload:semantic-v1:')) {
+    return `payload:${externalWriteSemanticFingerprint(approvedActionKey, args)}` === needle;
+  }
+  return approvedResendIdentityKeys(candidate.tool, args).has(needle);
 }
 
 function pendingActionIdFromArgs(args: Record<string, unknown> | null): string | null {
@@ -390,26 +573,89 @@ export function hasApprovedResendConsent(
   sessionId: string,
   target: string,
   priorSendAtIso: string | undefined,
+  actionKey?: string,
 ): boolean {
   const needle = target.trim().toLowerCase();
-  if (!needle) return false;
+  const requestedActionKey = actionKey?.trim().toLowerCase() ?? '';
+  if (!needle || !requestedActionKey) return false;
   try {
     const db = openEventLog();
     const rows = db.prepare(`
-      SELECT subject, args_json, resolved_at FROM pending_approvals
+      SELECT tool, args_json, resolved_at FROM pending_approvals
        WHERE session_id = ?
          AND status = 'resolved'
          AND resolution = 'approved'
-       ORDER BY resolved_at DESC
+         AND resend_consumed_at IS NULL
+       ORDER BY resolved_at DESC, rowid DESC
        LIMIT 25
-    `).all(sessionId) as Array<{ subject: string | null; args_json: string | null; resolved_at: string | null }>;
+    `).all(sessionId) as ResendApprovalCandidate[];
     for (const row of rows) {
-      if (priorSendAtIso && (!row.resolved_at || row.resolved_at <= priorSendAtIso)) continue;
-      const haystack = `${row.subject ?? ''}\n${row.args_json ?? ''}`.toLowerCase();
-      if (haystack.includes(needle)) return true;
+      if (resendApprovalMatches(
+        row,
+        needle,
+        priorSendAtIso,
+        requestedActionKey,
+      )) return true;
     }
   } catch { /* fail toward the wall — no consent found */ }
   return false;
+}
+
+/**
+ * Atomically claim one fresh human approval for a deliberate duplicate send.
+ * `consumed_at` belongs to the approval/replay gate and may already be set for
+ * this same call; `resend_consumed_at` is the duplicate wall's independent
+ * one-shot. The conditional UPDATE makes the claim safe across processes.
+ */
+export function claimApprovedResendConsent(
+  sessionId: string,
+  target: string,
+  priorSendAtIso: string | undefined,
+  actionKey?: string,
+): boolean {
+  const needle = target.trim().toLowerCase();
+  const requestedActionKey = actionKey?.trim().toLowerCase() ?? '';
+  if (!needle || !requestedActionKey) return false;
+  try {
+    const db = openEventLog();
+    const claim = db.transaction((): boolean => {
+      const rows = db.prepare(`
+        SELECT approval_id, tool, args_json, resolved_at
+          FROM pending_approvals
+         WHERE session_id = ?
+           AND status = 'resolved'
+           AND resolution = 'approved'
+           AND resend_consumed_at IS NULL
+         ORDER BY resolved_at DESC, rowid DESC
+         LIMIT 25
+      `).all(sessionId) as Array<{
+        approval_id: string;
+        tool: string | null;
+        args_json: string | null;
+        resolved_at: string | null;
+      }>;
+      const row = rows.find((candidate) => resendApprovalMatches(
+        candidate,
+        needle,
+        priorSendAtIso,
+        requestedActionKey,
+      ));
+      if (!row) return false;
+      const changes = db.prepare(`
+        UPDATE pending_approvals
+           SET resend_consumed_at = ?
+         WHERE approval_id = ?
+           AND resend_consumed_at IS NULL
+           AND status = 'resolved'
+           AND resolution = 'approved'
+      `).run(new Date().toISOString(), row.approval_id).changes;
+      return changes === 1;
+    });
+    return claim();
+  } catch {
+    // Fail toward the duplicate wall.
+    return false;
+  }
 }
 
 /**

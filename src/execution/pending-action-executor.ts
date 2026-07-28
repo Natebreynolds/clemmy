@@ -43,12 +43,22 @@ export type ApprovedCallDispatch = (
 const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, certifiedBatch) =>
   dispatchBatchItemTool(toolName, payload, sessionId, new ToolCallsCounter(50), certifiedBatch);
 
-/** Pure: does a dispatch RETURN read as a pre-provider refusal? Effect-anchored
- *  markers only — the harness's own gate/guard refusal shapes, all of which
- *  mean "the provider was never called": the [provider-dispatch:not-started:*]
- *  envelope, the standing-constraint block banner, and harness refusal
- *  prefixes (EXECUTION_WRAP_REQUIRED / DUPLICATE_EXTERNAL_WRITE / "Tool call
- *  refused by harness"). Genuine provider results never carry these. */
+/** Nominal local refusal for dispatcher implementations that can establish the
+ * provider thunk was never invoked. Text returned from a dispatch is never
+ * upgraded into this type: providers can echo local-looking marker prose after
+ * a remote change committed. */
+export class PendingActionPreDispatchError extends Error {
+  readonly provenNoDispatch = true;
+
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = 'PendingActionPreDispatchError';
+  }
+}
+
+/** Pure detection of refusal-shaped RETURN text. This is presentation
+ * classification only, not proof of no-dispatch. A matching result is parked as
+ * uncertain and remains non-replayable. */
 export function dispatchOutputIndicatesRefusal(text: string): boolean {
   const head = (text ?? '').slice(0, 600);
   return /\[provider-dispatch:not-started:/i.test(head)
@@ -119,22 +129,26 @@ export async function executeApprovedPendingActionCall(
     });
     const outText = typeof out === 'string' ? out : JSON.stringify(out ?? '');
     const structuredFailure = detectStructuredToolFailure(outText);
-    // A gate/guard refusal comes back as a RETURNED STRING, not a throw — the
-    // provider was never called. Recording that as 'executed' is a false
-    // success (live 2026-07-22: a constraint-blocked Slack send was stamped
-    // executed with the block buried in resultSummary, and the brain told the
-    // user it posted). Classify refusal-shaped returns as FAILED so the
-    // record, the card, and the brain all see the truth.
+    // A gate/guard refusal commonly comes back as a returned string. It is not
+    // safe to call that pre-dispatch solely from its text: the provider may
+    // echo the marker after a mutation or a downstream step may fail after a
+    // partial commit. Park it as FAILED/uncertain so it is neither a false
+    // success nor replay authority.
     if (dispatchOutputIndicatesRefusal(outText)) {
       const reason = outText.slice(0, 400);
       const updated = recordPendingActionResult(
         claimedRecord.id,
         'failed',
-        `Dispatch refused before the provider was called: ${reason}`.slice(0, 4000),
+        `Dispatch returned refusal-shaped text after the execution claim began; provider outcome is uncertain and no retry is safe: ${reason}`.slice(0, 4000),
         'pending-action-executor',
         claimToken,
       );
-      return { ok: false, status: 'failed', resultSummary: `Dispatch of ${claimedRecord.toolName} was refused: ${reason}`, record: updated ?? getPendingAction(id) };
+      return {
+        ok: false,
+        status: 'failed',
+        resultSummary: `Dispatch of ${claimedRecord.toolName} returned refusal-shaped text, but text alone cannot prove no provider commit. Outcome is uncertain; no automatic retry is safe. ${reason}`,
+        record: updated ?? getPendingAction(id),
+      };
     }
     // MCP/Composio providers can return a normal JSON value whose envelope says
     // the operation failed. That is still a terminal provider result, not an
@@ -147,14 +161,14 @@ export async function executeApprovedPendingActionCall(
       const updated = recordPendingActionResult(
         claimedRecord.id,
         'failed',
-        `The provider reported that the approved ${claimedRecord.toolName} call failed: ${reason}`.slice(0, 4000),
+        `The provider returned a failure after dispatch began for the approved ${claimedRecord.toolName} call; outcome may be partial or uncertain: ${reason}`.slice(0, 4000),
         'pending-action-executor',
         claimToken,
       );
       return {
         ok: false,
         status: 'failed',
-        resultSummary: `The provider reported that ${claimedRecord.toolName} failed: ${reason}. No automatic retry was attempted.`,
+        resultSummary: `The provider reported that ${claimedRecord.toolName} failed after dispatch began: ${reason}. It may have partially committed; no automatic retry is safe.`,
         record: updated ?? getPendingAction(id),
       };
     }
@@ -179,6 +193,21 @@ export async function executeApprovedPendingActionCall(
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (err instanceof PendingActionPreDispatchError) {
+      const updated = recordPendingActionResult(
+        claimedRecord.id,
+        'failed',
+        `Dispatch was refused locally before the provider call started: ${msg}`.slice(0, 4000),
+        'pending-action-executor',
+        claimToken,
+      );
+      return {
+        ok: false,
+        status: 'failed',
+        resultSummary: `Dispatch of ${claimedRecord.toolName} was refused locally before the provider call started: ${msg}. No provider commit occurred.`,
+        record: updated ?? getPendingAction(id),
+      };
+    }
     const uncertain = `Execution attempt failed or became uncertain after dispatch began: ${msg}. Do not retry automatically.`;
     const updated = recordPendingActionResult(
       claimedRecord.id,

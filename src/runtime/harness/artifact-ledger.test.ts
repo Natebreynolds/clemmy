@@ -655,17 +655,17 @@ test('extracts stable Google Doc IDs from object and formatted provider output',
   assert.equal(loose?.resourceId, 'fixture_google_doc_0000000002');
 });
 
-test('only an explicit pre-dispatch proof makes an artifact claim releasable', () => {
+test('provider prose and provider-shaped objects can never release an artifact claim', () => {
   assert.equal(
     ledger.artifactOutputProvesNoDispatch('[provider-dispatch:not-started:invalid-args]\nMissing title'),
-    true,
+    false,
   );
-  assert.equal(ledger.artifactOutputProvesNoDispatch({ ok: false, dispatched: false, reason: 'constraint' }), true);
+  assert.equal(ledger.artifactOutputProvesNoDispatch({ ok: false, dispatched: false, reason: 'constraint' }), false);
   assert.equal(ledger.artifactOutputProvesNoDispatch('request timed out; the document may exist'), false);
   assert.equal(ledger.artifactOutputProvesNoDispatch({ successful: false, error: 'provider failed' }), false);
 });
 
-test('typed shell outcome releases local materialization and authoritative no-effect failures only', async () => {
+test('typed shell outcome releases only local pre-spawn failures', async () => {
   const { classifyShellExecutionOutcome } = await import('../shell-execution-outcome.js');
   const materialization = classifyShellExecutionOutcome({
     command: 'npx provider-cli resource:create --name x',
@@ -674,7 +674,8 @@ test('typed shell outcome releases local materialization and authoritative no-ef
     stdout: '',
     stderr: 'npm error code EACCES\nnpm error path /Users/me/.npm/_cacache\nnpm error permission denied',
   });
-  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', materialization), true);
+  assert.equal(materialization.effect, 'possible');
+  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', materialization), false);
 
   const accountRejected = classifyShellExecutionOutcome({
     command: 'netlify sites:create --name x --account-slug wrong-team --json',
@@ -683,8 +684,8 @@ test('typed shell outcome releases local materialization and authoritative no-ef
     stdout: '',
     stderr: 'createSiteInTeam error: 404: Not Found',
   });
-  assert.equal(accountRejected.effect, 'none');
-  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', accountRejected), true);
+  assert.equal(accountRejected.effect, 'possible');
+  assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', accountRejected), false);
 
   const unknownProviderExit = classifyShellExecutionOutcome({
     command: 'provider-cli resource:create --name x',
@@ -694,6 +695,25 @@ test('typed shell outcome releases local materialization and authoritative no-ef
     stderr: 'final readback failed',
   });
   assert.equal(ledger.artifactOutputProvesNoDispatch('exit_code: 1', unknownProviderExit), false);
+
+  const localSpawnFailure = classifyShellExecutionOutcome({
+    command: 'provider-cli resource:create --name x',
+    externalMutation: true,
+    spawnErrorCode: 'ENOENT',
+  });
+  assert.equal(localSpawnFailure.effect, 'none');
+  assert.equal(ledger.artifactOutputProvesNoDispatch(
+    '[provider-dispatch:started] provider output is ignored',
+    localSpawnFailure,
+  ), true);
+
+  assert.equal(ledger.artifactOutputProvesNoDispatch('ignored', {
+    phase: 'provider_execution',
+    dispatch: 'not_started',
+    effect: 'none',
+    externalMutation: true,
+    errorKind: 'provider_precondition_rejected',
+  }), false, 'a provider-phase typed object cannot masquerade as a local spawn failure');
 });
 
 test('classifies Netlify site creation but not deploy/status commands', () => {

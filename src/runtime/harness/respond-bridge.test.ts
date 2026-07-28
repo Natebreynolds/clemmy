@@ -651,6 +651,187 @@ test('generic Claude terminal error after an Airtable write is salvaged without 
   assert.doesNotMatch(res.text, /blind rerun/);
 });
 
+test('whole-turn recovery allows fallover after the exact call records a proven-no-dispatch failure', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-exact-failed-write';
+  createSession({ id: sessionId, kind: 'chat', title: 'failed before dispatch' });
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return {
+        sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'safe recovery', summary: 's', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          callId: 'call-airtable-no-dispatch',
+          canonicalCallId: 'call-airtable-no-dispatch',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_CREATE_RECORD',
+          targets: ['record:rec-no-dispatch'],
+          preDispatch: true,
+        },
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write_failed',
+        data: {
+          callId: 'call-airtable-no-dispatch',
+          canonicalCallId: 'call-airtable-no-dispatch',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_CREATE_RECORD',
+          targets: ['record:rec-no-dispatch'],
+          reason: 'validation_failed_before_dispatch',
+        },
+      });
+      throw new Error('Claude SDK terminal error after a rejected call');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Create the approved Airtable record', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(runConversationCalled, 1, 'an exact no-dispatch settlement makes whole-turn recovery safe');
+  assert.equal(res.text, 'safe recovery');
+  assert.equal(res.route?.falloverFrom, 'claude_agent_sdk_brain');
+});
+
+test('whole-turn recovery blocks fallover when a sibling failure does not settle the reservation', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-sibling-failed-write';
+  createSession({ id: sessionId, kind: 'chat', title: 'mismatched failure' });
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return { sessionId, status: 'completed' };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          callId: 'call-airtable-reserved',
+          canonicalCallId: 'call-airtable-reserved',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_CREATE_RECORD',
+          targets: ['record:rec-sibling'],
+          preDispatch: true,
+        },
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write_failed',
+        data: {
+          callId: 'call-airtable-sibling',
+          canonicalCallId: 'call-airtable-sibling',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_CREATE_RECORD',
+          targets: ['record:rec-sibling'],
+          reason: 'validation_failed_before_dispatch',
+        },
+      });
+      throw new Error('Claude SDK terminal error with an unresolved reservation');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Create the approved Airtable record', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(runConversationCalled, 0, 'a sibling failure cannot compensate another call reservation');
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /did not rerun/i);
+});
+
+test('whole-turn recovery blocks fallover after an exact orphaned write', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-exact-orphaned-write';
+  createSession({ id: sessionId, kind: 'chat', title: 'orphaned write' });
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return { sessionId, status: 'completed' };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          callId: 'call-airtable-orphaned',
+          canonicalCallId: 'call-airtable-orphaned',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_UPDATE_RECORD',
+          targets: ['record:rec-orphaned'],
+          preDispatch: true,
+        },
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write_orphaned',
+        data: {
+          callId: 'call-airtable-orphaned',
+          canonicalCallId: 'call-airtable-orphaned',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_UPDATE_RECORD',
+          targets: ['record:rec-orphaned'],
+          reason: 'timeout',
+        },
+      });
+      throw new Error('Claude SDK terminal error after an uncertain provider result');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Update the approved Airtable record', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(runConversationCalled, 0, 'an orphaned write remains unsafe to replay');
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /could not confirm|uncertain/i);
+  assert.match(res.text, /did not rerun/i);
+});
+
 test('whole-turn recovery salvage carries orphan evidence and never fabricates write success', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';

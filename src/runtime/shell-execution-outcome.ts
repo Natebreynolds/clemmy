@@ -2,10 +2,10 @@
  * Provider-neutral execution truth for `run_shell_command`.
  *
  * The model still receives the familiar rendered stdout/stderr string, but the
- * harness must not infer safety from that prose.  In particular, a package
- * runner can fail while resolving/materializing a CLI before the provider CLI
- * ever starts, while a provider CLI can exit non-zero after a remote write may
- * already have landed.  Those cases need opposite retry/artifact treatment.
+ * harness must not infer safety from that prose. Once a child process starts,
+ * neither package-runner text nor provider rejection text can prove that an
+ * external mutation did not land. Only a typed local spawn failure is safe
+ * no-dispatch evidence.
  */
 import { classifyShellProviderFailure } from './shell-provider-outcome-adapters.js';
 
@@ -69,9 +69,9 @@ function commandExecutable(command: string): string | undefined {
 
 /**
  * Classify one completed/failed shell process without claiming knowledge the
- * harness does not have.  Only local failures with strong structural evidence
- * are `not_started`; every non-zero external mutation after the provider CLI
- * may have run remains `unknown`/`possible`.
+ * harness does not have. Only a typed spawn error is `not_started`; every
+ * non-zero external mutation after a child may have run remains
+ * `unknown`/`possible`.
  */
 export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput): ShellExecutionOutcome {
   const stdout = input.stdout ?? '';
@@ -80,13 +80,18 @@ export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput
   const executable = commandExecutable(input.command);
 
   if (input.spawnErrorCode) {
-    const permission = input.spawnErrorCode === 'EACCES' || input.spawnErrorCode === 'EPERM';
+    const code = input.spawnErrorCode.trim().toUpperCase();
+    const errorKind: ShellExecutionErrorKind = code === 'ENOENT'
+      ? 'command_not_found'
+      : code === 'EACCES' || code === 'EPERM'
+        ? 'permission_denied'
+        : 'spawn_failed';
     return {
       phase: 'resolve',
       dispatch: 'not_started',
       effect: 'none',
       externalMutation: input.externalMutation,
-      errorKind: permission ? 'permission_denied' : 'spawn_failed',
+      errorKind,
       executable,
     };
   }
@@ -104,10 +109,33 @@ export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput
 
   const exitCode = input.exitCode ?? null;
   if (exitCode !== 0) {
+    if (input.externalMutation) {
+      // A close/exit event means a child existed. At that point stdout/stderr,
+      // exit codes, and provider adapters are diagnostic only: wrappers can
+      // emit misleading text, providers can commit before returning a
+      // rejection, and a response can be forged or replayed. Adapters may
+      // retain a useful error category, but never narrow dispatch/effect.
+      const providerEvidence = classifyShellProviderFailure({
+        command: input.command,
+        exitCode,
+        stdout,
+        stderr,
+      });
+      return {
+        phase: 'provider_execution',
+        dispatch: 'unknown',
+        effect: 'possible',
+        externalMutation: true,
+        exitCode,
+        errorKind: providerEvidence?.errorKind ?? 'nonzero_exit',
+        executable,
+        ...(providerEvidence ? { providerAdapterId: providerEvidence.adapterId } : {}),
+      };
+    }
+
     // A package runner's own fatal error, before it launched the requested CLI,
-    // is local materialization failure.  Require empty stdout plus a package-
-    // manager-prefixed fatal shape; arbitrary provider stderr mentioning npm or
-    // a cache remains conservatively unknown.
+    // is useful diagnostic information for non-mutating shell work. It is never
+    // consulted above for an external mutation.
     if (!stdout.trim() && isPackageRunnerMaterializationFailure(input.command, stderr)) {
       return {
         phase: 'materialize',
@@ -132,26 +160,11 @@ export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput
         executable,
       };
     }
-    const providerEvidence = input.externalMutation
-      ? classifyShellProviderFailure({ command: input.command, exitCode, stdout, stderr })
-      : null;
-    if (providerEvidence) {
-      return {
-        phase: providerEvidence.phase,
-        dispatch: providerEvidence.dispatch,
-        effect: providerEvidence.effect,
-        externalMutation: true,
-        exitCode,
-        errorKind: providerEvidence.errorKind,
-        executable,
-        providerAdapterId: providerEvidence.adapterId,
-      };
-    }
     return {
-      phase: input.externalMutation ? 'provider_execution' : 'complete',
-      dispatch: input.externalMutation ? 'unknown' : 'not_applicable',
-      effect: input.externalMutation ? 'possible' : 'none',
-      externalMutation: input.externalMutation,
+      phase: 'complete',
+      dispatch: 'not_applicable',
+      effect: 'none',
+      externalMutation: false,
       exitCode,
       errorKind: 'nonzero_exit',
       executable,

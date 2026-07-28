@@ -152,19 +152,23 @@ interface SequencedEvidenceEvent {
  */
 export function eventBelongsToSourceUserSeq(
   event: SequencedEvidenceEvent,
-  sourceUserSeq: number,
+  sourceUserSeq: number | readonly number[],
 ): boolean {
   const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
     ? event.data as { sourceUserSeq?: unknown }
     : {};
+  const accepted = Array.isArray(sourceUserSeq) ? sourceUserSeq : [sourceUserSeq];
   return !Number.isSafeInteger(data.sourceUserSeq)
-    || data.sourceUserSeq === sourceUserSeq;
+    || accepted.includes(data.sourceUserSeq as number);
 }
 
 type ExternalWriteAttemptState = 'confirmed' | 'failed' | 'ambiguous';
 
 interface ExternalWriteAttempt {
   callId: string;
+  actionKey: string;
+  correlationFingerprint: string;
+  destinationIdentity: string;
   identity: string;
   state: ExternalWriteAttemptState;
   /** Sequence at which this attempt's current outcome became known. A retry
@@ -178,6 +182,10 @@ function externalWriteEventData(event: SequencedEvidenceEvent): Record<string, u
     : {};
 }
 
+function externalWriteIsPreDispatch(event: SequencedEvidenceEvent): boolean {
+  return externalWriteEventData(event).preDispatch === true;
+}
+
 function firstEvidenceText(data: Record<string, unknown>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = data[key];
@@ -186,19 +194,42 @@ function firstEvidenceText(data: Record<string, unknown>, keys: readonly string[
   return '';
 }
 
+function firstEvidenceId(data: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
 function externalWriteCallId(event: SequencedEvidenceEvent): string {
-  return firstEvidenceText(externalWriteEventData(event), ['canonicalCallId', 'callId']);
+  return firstEvidenceId(externalWriteEventData(event), ['canonicalCallId', 'callId']);
+}
+
+function externalWriteCorrelationFingerprint(event: SequencedEvidenceEvent): string {
+  return firstEvidenceText(externalWriteEventData(event), [
+    'correlationFingerprint',
+    'payloadFingerprint',
+  ]);
+}
+
+function externalWriteRetryOfCallId(event: SequencedEvidenceEvent): string {
+  return firstEvidenceId(externalWriteEventData(event), ['retryOfCallId']);
+}
+
+function externalWriteActionKey(event: SequencedEvidenceEvent): string {
+  return firstEvidenceText(externalWriteEventData(event), ['actionKey']);
 }
 
 /**
- * Stable logical destination identity across a failed/orphaned attempt and its
- * later corrected retry. Provider call ids intentionally do not lead here:
- * retries receive new ids. Shape + normalized targets lets a retry resolve only
- * its own destination, while a successful sibling cannot hide it.
+ * Destination identity is useful for pairing legacy pre-dispatch and outcome
+ * rows that predate call/payload correlation. It is deliberately NOT sufficient
+ * to prove a retry: two requested emails can share a recipient while carrying
+ * different subjects and bodies.
  */
-function externalWriteIdentity(event: SequencedEvidenceEvent): string {
+function externalWriteDestinationIdentity(event: SequencedEvidenceEvent): string {
   const data = externalWriteEventData(event);
-  const shape = firstEvidenceText(data, ['shapeKey', 'slug', 'toolName', 'tool']);
+  const shape = firstEvidenceText(data, ['actionKey', 'shapeKey', 'slug', 'toolName', 'tool']);
   const rawTargets = Array.isArray(data.targets)
     ? data.targets
     : typeof data.target === 'string'
@@ -208,67 +239,139 @@ function externalWriteIdentity(event: SequencedEvidenceEvent): string {
     .filter((target): target is string => typeof target === 'string' && target.trim().length > 0)
     .map((target) => target.trim().toLowerCase())
     .sort();
-  const callId = externalWriteCallId(event);
   if (shape && targets.length > 0) return `shape:${shape}\0targets:${targets.join('\0')}`;
-  // Without a concrete destination, two same-shape creates are not proven to
-  // be retries of one logical action. Keep provider attempts independent so a
-  // later unrelated create cannot clear an earlier failure/orphan.
-  if (callId) return `call:${callId}`;
   if (shape) return `shape:${shape}\0targets:unknown`;
-  // Legacy rows without structured identity still retain the old ordered
-  // retry semantics instead of becoming permanently unresolvable.
-  return 'legacy:unknown';
+  return 'destination:unknown';
+}
+
+/**
+ * One logical action identity. Fingerprints pair an outcome with its own pre-dispatch row;
+ * they never prove that a later start is a retry (an intentional identical
+ * resend has the same fingerprint). Only a validated retryOfCallId edge may
+ * inherit a prior failed attempt's identity.
+ */
+function externalWriteIdentity(event: SequencedEvidenceEvent): string {
+  const callId = externalWriteCallId(event);
+  if (callId) return `call:${callId}`;
+  return `legacy:${event.seq}`;
 }
 
 function resolveCurrentExternalWriteAttempts(
   events: readonly SequencedEvidenceEvent[],
 ): ExternalWriteAttempt[] {
   const attempts: ExternalWriteAttempt[] = [];
+  const consumedRetryCallIds = new Set<string>();
   for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
     if (event.type === 'external_write') {
+      let identity = externalWriteIdentity(event);
+      const retryOfCallId = externalWriteRetryOfCallId(event);
+      const actionKey = externalWriteActionKey(event);
+      const destinationIdentity = externalWriteDestinationIdentity(event);
+      if (retryOfCallId && !consumedRetryCallIds.has(retryOfCallId)) {
+        const prior = [...attempts].reverse().find((attempt) =>
+          attempt.callId === retryOfCallId
+          && attempt.state === 'failed'
+          && actionKey.length > 0
+          && attempt.actionKey === actionKey
+          && attempt.destinationIdentity === destinationIdentity
+        );
+        if (prior) {
+          identity = prior.identity;
+          consumedRetryCallIds.add(retryOfCallId);
+        }
+      }
       attempts.push({
         callId: externalWriteCallId(event),
-        identity: externalWriteIdentity(event),
-        state: 'confirmed',
+        actionKey,
+        correlationFingerprint: externalWriteCorrelationFingerprint(event),
+        destinationIdentity,
+        identity,
+        // New rows are durable reservations, not receipts. Legacy rows that
+        // predate the explicit flag retain their historical success meaning.
+        state: externalWriteIsPreDispatch(event) ? 'ambiguous' : 'confirmed',
         outcomeSeq: event.seq,
       });
       continue;
     }
-    if (event.type !== 'external_write_failed' && event.type !== 'external_write_orphaned') continue;
+    if (
+      event.type !== 'external_write_succeeded'
+      && event.type !== 'external_write_failed'
+      && event.type !== 'external_write_orphaned'
+    ) continue;
 
     const callId = externalWriteCallId(event);
+    const actionKey = externalWriteActionKey(event);
+    const correlationFingerprint = externalWriteCorrelationFingerprint(event);
+    const destinationIdentity = externalWriteDestinationIdentity(event);
     const identity = externalWriteIdentity(event);
     let match = -1;
-    // Exact provider attempt id wins. If a producer omitted it, fall back to
-    // the latest unresolved attempt for the same logical destination.
+    // Exact provider attempt id wins.
     if (callId) {
       for (let index = attempts.length - 1; index >= 0; index -= 1) {
-        if (attempts[index]?.state === 'confirmed' && attempts[index]?.callId === callId) {
+        if (attempts[index]?.callId === callId) {
           match = index;
           break;
         }
       }
     }
-    if (match < 0) {
+    // Fingerprint fallback is only for a resolution row whose producer lost
+    // its call id. A different call id is a different attempt unless the later
+    // external_write start carried an explicit retryOfCallId edge.
+    if (match < 0 && !callId && correlationFingerprint) {
       for (let index = attempts.length - 1; index >= 0; index -= 1) {
-        if (attempts[index]?.state === 'confirmed' && attempts[index]?.identity === identity) {
+        if (
+          attempts[index]?.correlationFingerprint === correlationFingerprint
+        ) {
+          match = index;
+          break;
+        }
+      }
+    }
+    // Legacy producers emitted neither call nor payload identity. Pair their
+    // negative resolution to the latest provisional destination row, but keep
+    // every later provisional write as a distinct action. Destination equality
+    // alone is never evidence that a later success retried an earlier failure.
+    if (match < 0 && !callId && !correlationFingerprint) {
+      for (let index = attempts.length - 1; index >= 0; index -= 1) {
+        if (
+          attempts[index]?.destinationIdentity === destinationIdentity
+          && !attempts[index]?.callId
+          && !attempts[index]?.correlationFingerprint
+        ) {
           match = index;
           break;
         }
       }
     }
     const state: ExternalWriteAttemptState =
-      event.type === 'external_write_orphaned' ? 'ambiguous' : 'failed';
+      event.type === 'external_write_succeeded'
+        ? 'confirmed'
+        : event.type === 'external_write_orphaned'
+          ? 'ambiguous'
+          : 'failed';
     if (match >= 0) {
-      attempts[match] = { ...attempts[match]!, state, outcomeSeq: event.seq };
+      attempts[match] = {
+        ...attempts[match]!,
+        ...(actionKey ? { actionKey } : {}),
+        state,
+        outcomeSeq: event.seq,
+      };
     } else {
       // Best-effort logging can lose the provisional row while retaining the
       // resolution. Keep the negative evidence instead of silently dropping it.
-      attempts.push({ callId, identity, state, outcomeSeq: event.seq });
+      attempts.push({
+        callId,
+        actionKey,
+        correlationFingerprint,
+        destinationIdentity,
+        identity,
+        state,
+        outcomeSeq: event.seq,
+      });
     }
   }
 
-  // Only the newest outcome per logical destination governs. Because
+  // Only the newest outcome per proven logical action governs. Because
   // `outcomeSeq` moves to the failure/orphan row, an already-in-flight sibling
   // write cannot masquerade as a later corrective retry.
   const latestByIdentity = new Map<string, ExternalWriteAttempt>();
@@ -289,12 +392,16 @@ function resolveCurrentExternalWriteAttempts(
  */
 export function freshExternalWriteEvidenceStatus(
   events: readonly SequencedEvidenceEvent[],
-  sourceUserSeq: number | undefined,
+  sourceUserSeq: number | readonly number[] | undefined,
 ): FreshExternalWriteEvidenceStatus {
-  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return 'missing';
+  const acceptedSourceUserSeqs = (
+    Array.isArray(sourceUserSeq) ? sourceUserSeq : [sourceUserSeq]
+  ).filter((seq): seq is number => Number.isSafeInteger(seq) && (seq ?? 0) > 0);
+  if (acceptedSourceUserSeqs.length === 0) return 'missing';
+  const firstSourceUserSeq = Math.min(...acceptedSourceUserSeqs);
   const current = events.filter((event) =>
-    event.seq > (sourceUserSeq as number)
-    && eventBelongsToSourceUserSeq(event, sourceUserSeq as number)
+    event.seq > firstSourceUserSeq
+    && eventBelongsToSourceUserSeq(event, acceptedSourceUserSeqs)
   );
   const outcomes = resolveCurrentExternalWriteAttempts(current);
   if (outcomes.some((attempt) => attempt.state === 'ambiguous')) return 'ambiguous';
@@ -399,17 +506,36 @@ export function objectiveMayRequireMultipleResults(objectiveText: string): boole
     || /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/.test(required);
 }
 
+function structuredTrue(value: unknown): boolean {
+  return value === true
+    || value === 1
+    || (typeof value === 'string' && /^(?:1|true|yes)$/i.test(value.trim()));
+}
+
+function structuredFalse(value: unknown): boolean {
+  return value === false
+    || value === 0
+    || (typeof value === 'string' && /^(?:0|false|no)$/i.test(value.trim()));
+}
+
 function recordLooksFailed(record: Record<string, unknown>): boolean {
-  const explicitSuccess = record.successful === true || record.success === true || record.ok === true;
+  const explicitSuccess =
+    structuredTrue(record.successful)
+    || structuredTrue(record.success)
+    || structuredTrue(record.ok);
   if (
-    record.successful === false
-    || record.success === false
-    || record.ok === false
-    || record.failed === true
+    structuredFalse(record.successful)
+    || structuredFalse(record.success)
+    || structuredFalse(record.ok)
+    || structuredTrue(record.failed)
   ) return true;
 
   const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : '';
-  if (/^(?:error|failed|failure|not[_ -]?connected)$/.test(status)) return true;
+  if (
+    /^(?:aborted|cancelled|canceled|declined|denied|error|failed|failure|no[_ -]?op|noop|not[_ -]?connected|rejected|refused|reverted|rolled[_ -]?back|skipped|unchanged)$/.test(
+      status,
+    )
+  ) return true;
   if (explicitSuccess) return false;
 
   const error = record.error;
@@ -463,6 +589,504 @@ export function toolOutputLooksSuccessful(output: unknown, explicitOk?: unknown)
     }
   }
   return true;
+}
+
+const EXTERNAL_WRITE_FAILURE_PROSE_RE =
+  /(?:\[provider-dispatch:[^\]]+\]|DATA-QUALITY CHECKPOINT|(?:^|[\r\n])\s*HTTP\s+[45]\d{2}\b|(?:^|[\r\n])\s*(?:ERROR|FAILED|FAILURE)\s*:|\b(?:an?\s+error\s+occurred|invalid\s+(?:field|json|input|request|arguments?|parameters?|payload)|unauthori[sz]ed|forbidden|permission denied|not[_ -]?connected|authentication required|rate limit(?:ed)?|timed out|timeout|missing required|schema validation|could(?:\s+not|n't)|unable\s+to|not\s+(?:committed|completed|executed|successful)|uncommitted|unsuccessful|no\s+changes?\s+(?:was|were)\s+made|nothing\s+(?:changed|created|deleted|sent|updated)|rolled\s+back|rollback|reverted)\b|\b(?:create|delete|deliver|delivery|dispatch|operation|post|provider|publish|request|save|schedule|send|service|tool|update|upload|upstream|write)\b[\s\S]{0,48}\b(?:aborted|cancelled|canceled|declined|denied|disconnected|failed|rejected|refused|unavailable)\b|\b(?:aborted|cancelled|canceled|declined|denied|disconnected|failed|rejected|refused|unavailable)\b[\s\S]{0,48}\b(?:create|delete|deliver|delivery|dispatch|operation|post|provider|publish|request|save|schedule|send|service|tool|update|upload|upstream|write)\b)/i;
+const EXTERNAL_WRITE_AMBIGUOUS_PROSE_RE =
+  /\b(?:(?:request|operation|job|task|write|delivery)\s+(?:was\s+)?(?:accepted|dispatched|in[_ -]?progress|pending|processing|queued|running|started|submitted)|accepted\s+for\s+(?:delivery|processing)|will\s+be\s+(?:processed|sent|delivered))\b/i;
+const EXTERNAL_WRITE_CONTRADICTED_SUCCESS_RE =
+  /^(?:(?:successfully\s+)?(?:created|deleted|delivered|posted|published|saved|scheduled|sent|updated|uploaded)\b[\s\S]{0,220}\b(?:(?:commit|validation)\s+failed|changes?\s+(?:were\s+)?discarded|in\s+(?:dry[- ]?run|simulation)\s+mode))[\s\S]*$/i;
+const EXTERNAL_WRITE_ZERO_EFFECT_PROSE_RE =
+  /^(?:success(?:fully)?[:\s-]+)?(?:changed|created|deleted|delivered|inserted|modified|posted|published|removed|saved|sent|updated|uploaded)\s+0+\s+(?:cells?|documents?|emails?|files?|items?|messages?|posts?|records?|rows?|uploads?)\b/i;
+const EXTERNAL_WRITE_ADVISORY_ERROR_RE =
+  /\b(?:advisory|deprecat(?:ed|ion)|notice|warning)\b/i;
+const EXTERNAL_WRITE_NEGATED_ACK_RE =
+  /\b(?:did\s+not|didn't|never|not|was\s+not|wasn't|were\s+not|weren't)\s+(?:create|created|delete|deleted|deliver|delivered|publish|published|post|posted|save|saved|schedule|scheduled|send|sent|update|updated|upload|uploaded)\b/i;
+
+const EXTERNAL_WRITE_PLAIN_ACK_RE =
+  /^(?:(?:ok|success|succeeded|complete|completed|created|updated|sent|published|posted|delivered|deleted|removed|saved|uploaded|scheduled|invited)[.!]?)$/i;
+const EXTERNAL_WRITE_ACTION_ACK_RE =
+  /^(?:success(?:fully)?[:\s-]+)?(?:created|updated|sent|published|posted|delivered|deleted|removed|saved|uploaded|scheduled|invited)\s+(?:(?:an?|the)\s+)?(?:\d+\s+)?(?:branch(?:es)?|calendar\s+events?|commits?|deployments?|documents?|drafts?|emails?|events?|files?|invites?|messages?|pages?|posts?|pull\s+requests?|records?|reply|replies|repository|repositories|rows?|sites?|tags?|texts?|tweets?|uploads?)\b[\s\S]{0,180}$/i;
+const EXTERNAL_WRITE_SUBJECT_ACK_RE =
+  /^(?:(?:an?|the)\s+)?(?:branch(?:es)?|calendar\s+events?|commits?|deployments?|documents?|drafts?|emails?|events?|files?|invites?|messages?|pages?|posts?|pull\s+requests?|records?|reply|replies|repository|repositories|rows?|sites?|tags?|texts?|tweets?|uploads?)\s+(?:was\s+)?(?:created|updated|sent|published|posted|delivered|deleted|removed|saved|uploaded|scheduled|invited)[.!]?$/i;
+const EXTERNAL_WRITE_SUCCESS_SUFFIX_RE =
+  /^[\s\S]{1,160}\b(?:created|updated|sent|published|posted|delivered|deleted|removed|saved|uploaded|scheduled|invited)\s+successfully[.!]?$/i;
+const EXTERNAL_WRITE_PROSE_RECEIPT_RE =
+  /\b(?:created|updated|sent|published|posted|delivered|deleted|removed|saved|uploaded|scheduled|invited)\b[\s\S]{0,160}\b(?:confirmation|document|draft|event|file|message|page|post|record|reply|resource|row|transaction|upload)?[ _-]?(?:id|identifier|number|receipt)\s*[:=#]\s*[A-Za-z0-9][A-Za-z0-9._:/-]{2,}/i;
+const EXTERNAL_WRITE_AMBIGUOUS_STATUS_RE =
+  /^(?:accepted|building|deploying|in[_ -]?progress|initializing|pending|processing|provisioning|queued|running|scheduled|started|submitted|waiting)$/;
+const EXTERNAL_WRITE_SUCCESS_STATUS_RE =
+  /^(?:ok|success|succeeded|complete|completed|created|updated|sent|published|posted|delivered|deleted|removed|saved|uploaded)$/;
+const EXTERNAL_WRITE_ECHO_CONTAINER_KEYS = new Set([
+  'arg',
+  'args',
+  'argument',
+  'arguments',
+  'body',
+  'input',
+  'inputs',
+  'parameters',
+  'payload',
+  'request',
+]);
+const EXTERNAL_WRITE_RECEIPT_URL_KEYS = new Set([
+  'deploy_url',
+  'display_url',
+  'html_url',
+  'location',
+  'permalink',
+  'resource_url',
+  'urn',
+  'web_url',
+]);
+const EXTERNAL_WRITE_MUTATION_ID_KEYS = new Set([
+  'arn',
+  'attachment_id',
+  'calendar_event_id',
+  'comment_id',
+  'confirmation_id',
+  'contact_id',
+  'deploy_id',
+  'deployment_id',
+  'document_id',
+  'draft_id',
+  'email_id',
+  'event_id',
+  'file_id',
+  'gid',
+  'invite_id',
+  'inserted_id',
+  'issue_id',
+  'lead_id',
+  'message_id',
+  'node_id',
+  'note_id',
+  'page_id',
+  'post_id',
+  'pull_request_id',
+  'receipt_id',
+  'record_id',
+  'reply_id',
+  'resource_id',
+  'row_id',
+  'last_insert_rowid',
+  'spreadsheet_id',
+  'task_id',
+  'thread_id',
+  'transaction_id',
+  'tweet_id',
+  'uid',
+  'upload_id',
+  'upserted_id',
+]);
+const EXTERNAL_WRITE_NON_RECEIPT_ID_KEYS = new Set([
+  'account_id',
+  'client_id',
+  'connected_account_id',
+  'connection_id',
+  'connector_id',
+  'correlation_id',
+  'execution_id',
+  'integration_id',
+  'job_id',
+  'operation_id',
+  'request_id',
+  'run_id',
+  'session_id',
+  'span_id',
+  'tenant_id',
+  'trace_id',
+  'user_id',
+  'workspace_id',
+]);
+const EXTERNAL_WRITE_MUTATION_VALUE_KEYS = new Set([
+  'cleared_range',
+  'updated_range',
+]);
+const EXTERNAL_WRITE_MUTATION_BOOLEAN_KEY_RE =
+  /^(?:changed|cleared|created|deleted|delivered|invited|merged|posted|published|removed|saved|scheduled|sent|updated|uploaded)$/;
+const EXTERNAL_WRITE_MUTATION_COUNT_KEY_RE =
+  /^(?:changes|(?:(?:affected|changed|created|deleted|inserted|modified|published|sent|updated)(?:_(?:cells?|columns?|documents?|items?|records?|rows?))?(?:_count)?|row_count|rows_affected))$/;
+
+function normalizedAcknowledgementKey(key: string): string {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^a-z0-9]+/gi, '_')
+    .replace(/^_+|_+$/g, '')
+    .toLowerCase();
+}
+
+function parseWrappedExternalWriteJson(text: string): unknown | undefined {
+  let candidate = text.trim();
+  if (/^HTTP\s+\d{3}\b/i.test(candidate)) {
+    const lines = candidate.split(/\r?\n/);
+    const bodyStart = lines.findIndex((line, index) =>
+      index > 0 && /^\s*(?:```|\{|\[)/.test(line));
+    if (bodyStart >= 0) candidate = lines.slice(bodyStart).join('\n').trim();
+  }
+  const fenced = candidate.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) candidate = fenced[1]?.trim() ?? '';
+  const labelled = candidate.match(/^(?:output|response|result)\s*:\s*([\s\S]+)$/i);
+  if (labelled) candidate = labelled[1]?.trim() ?? '';
+  if (
+    !(
+      (candidate.startsWith('{') && candidate.endsWith('}'))
+      || (candidate.startsWith('[') && candidate.endsWith(']'))
+    )
+  ) return undefined;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function acknowledgementReceiptValue(key: string, value: unknown): boolean {
+  const normalizedKey = normalizedAcknowledgementKey(key);
+  const idKey = !EXTERNAL_WRITE_NON_RECEIPT_ID_KEYS.has(normalizedKey)
+    && (
+      normalizedKey === 'id'
+      || EXTERNAL_WRITE_MUTATION_ID_KEYS.has(normalizedKey)
+      || /^(?:etag|receipt|receipt_number|confirmation_number)$/.test(normalizedKey)
+    );
+  const urlKey = EXTERNAL_WRITE_RECEIPT_URL_KEYS.has(normalizedKey);
+  const mutationValueKey = EXTERNAL_WRITE_MUTATION_VALUE_KEYS.has(normalizedKey);
+  const countKey = EXTERNAL_WRITE_MUTATION_COUNT_KEY_RE.test(normalizedKey);
+
+  if (countKey) {
+    if (typeof value === 'number') return Number.isFinite(value) && value > 0;
+    if (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())) {
+      return Number(value) > 0;
+    }
+    return false;
+  }
+  if (!idKey && !urlKey && !mutationValueKey) return false;
+  if (typeof value === 'number') return idKey && Number.isFinite(value) && value > 0;
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (!text || /^(?:0|false|null|none|undefined)$/i.test(text)) return false;
+  if (urlKey) {
+    return /^(?:https?:\/\/|urn:)[^\s]+$/i.test(text)
+      || (normalizedKey === 'location' && /^\/[^\s]*$/.test(text));
+  }
+  if (mutationValueKey) return text.length >= 3;
+  return text.length >= 3;
+}
+
+function externalWriteValueContainsFailure(
+  value: unknown,
+  depth = 0,
+  keyHint = '',
+): boolean {
+  if (depth > 6 || value === null || value === undefined) return false;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return false;
+    if (
+      /^(?:false|null|undefined|not ok|0)$/i.test(text)
+      && (
+        depth === 0
+        || /^(?:ok|status|success|successful)$/.test(keyHint)
+      )
+    ) return true;
+    if (
+      EXTERNAL_WRITE_FAILURE_PROSE_RE.test(text)
+      || EXTERNAL_WRITE_AMBIGUOUS_PROSE_RE.test(text)
+      || EXTERNAL_WRITE_CONTRADICTED_SUCCESS_RE.test(text)
+      || EXTERNAL_WRITE_ZERO_EFFECT_PROSE_RE.test(text)
+      || EXTERNAL_WRITE_NEGATED_ACK_RE.test(text)
+    ) return true;
+    const parsed = parseWrappedExternalWriteJson(text);
+    if (parsed !== undefined) {
+      return externalWriteValueContainsFailure(parsed, depth + 1, keyHint);
+    }
+    return false;
+  }
+  if (typeof value === 'boolean') {
+    return value === false
+      && (
+        depth === 0
+        || /^(?:ok|success|successful)$/.test(keyHint)
+      );
+  }
+  if (typeof value === 'number') {
+    return depth === 0 && (!Number.isFinite(value) || value <= 0);
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => externalWriteValueContainsFailure(item, depth + 1, keyHint));
+  }
+  if (typeof value !== 'object') return false;
+
+  const record = value as Record<string, unknown>;
+  if (recordLooksFailed(record) || structuredTrue(record.isError)) return true;
+  const recordExplicitSuccess =
+    structuredTrue(record.successful)
+    || structuredTrue(record.success)
+    || structuredTrue(record.ok)
+    || structuredTrue(record.isSuccess)
+    || structuredTrue(record.is_success);
+  const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : '';
+  if (EXTERNAL_WRITE_AMBIGUOUS_STATUS_RE.test(status)) return true;
+  const hasUpsertReceipt = Object.entries(record).some(([rawKey, child]) =>
+    normalizedAcknowledgementKey(rawKey) === 'upserted_id'
+    && acknowledgementReceiptValue(rawKey, child));
+  for (const [rawKey, child] of Object.entries(record)) {
+    const key = normalizedAcknowledgementKey(rawKey);
+    if (
+      key === 'type'
+      || key === 'mime_type'
+      || EXTERNAL_WRITE_ECHO_CONTAINER_KEYS.has(key)
+    ) continue;
+    if (
+      (key === 'failed' || key === 'is_error')
+      && structuredTrue(child)
+    ) return true;
+    if (
+      EXTERNAL_WRITE_MUTATION_BOOLEAN_KEY_RE.test(key)
+      && structuredFalse(child)
+    ) return true;
+    if (
+      EXTERNAL_WRITE_MUTATION_COUNT_KEY_RE.test(key)
+      && (
+        (
+          typeof child === 'number'
+          && (!Number.isFinite(child) || child <= 0)
+        )
+        || (
+          typeof child === 'string'
+          && /^\s*0+(?:\.0+)?\s*$/.test(child)
+        )
+      )
+      && !(hasUpsertReceipt && key === 'modified_count')
+    ) return true;
+    if (
+      /^(?:dry_run|no_op|noop|simulate_only|simulation|skipped)$/.test(key)
+      && (
+        child === true
+        || (typeof child === 'string' && /^(?:1|on|true|yes)$/i.test(child.trim()))
+      )
+    ) return true;
+    if (
+      /^(?:tasks?_error|error_count|failed_count)$/.test(key)
+      && (
+        (
+          typeof child === 'number'
+          && Number.isFinite(child)
+          && child > 0
+        )
+        || (
+          typeof child === 'string'
+          && /^\d+(?:\.\d+)?$/.test(child.trim())
+          && Number(child) > 0
+        )
+      )
+    ) return true;
+    if (
+      /^(?:phase|ready_state|state|status)$/.test(key)
+      && typeof child === 'string'
+      && (
+        EXTERNAL_WRITE_AMBIGUOUS_STATUS_RE.test(child.trim().toLowerCase())
+        || /^(?:aborted|cancelled|canceled|declined|denied|error|failed|failure|no[_ -]?op|noop|rejected|refused|reverted|rolled[_ -]?back|skipped|unchanged)$/.test(
+          child.trim().toLowerCase(),
+        )
+      )
+    ) return true;
+    if (
+      /^(?:status_message|status_text)$/.test(key)
+      && typeof child === 'string'
+      && /\b(?:denied|error|failed|failure|forbidden|invalid|not found|rejected|unauthori[sz]ed)\b/i.test(child)
+    ) return true;
+    if (
+      (key === 'error' || key === 'errors')
+      && (
+        child === true
+        || (
+          typeof child === 'string'
+          && child.trim().length > 0
+          && !(
+            recordExplicitSuccess
+            && EXTERNAL_WRITE_ADVISORY_ERROR_RE.test(child)
+          )
+        )
+        || (Array.isArray(child) && child.length > 0)
+        || (
+          child !== null
+          && typeof child === 'object'
+          && Object.keys(child).length > 0
+        )
+      )
+    ) return true;
+    const numericStatus = typeof child === 'number'
+      ? child
+      : (
+          typeof child === 'string'
+          && /^\d+$/.test(child.trim())
+            ? Number(child)
+            : undefined
+        );
+    if (
+      (key === 'status' || key === 'status_code' || key === 'statuscode')
+      && numericStatus !== undefined
+      && (
+        (
+          numericStatus >= 100
+          && numericStatus <= 599
+          && ![200, 201, 204].includes(numericStatus)
+        )
+        || (numericStatus >= 40_000 && numericStatus < 60_000)
+      )
+    ) return true;
+    if (externalWriteValueContainsFailure(child, depth + 1, key)) return true;
+  }
+  return false;
+}
+
+function externalWriteValueHasAcknowledgement(value: unknown, depth = 0): boolean {
+  if (depth > 6 || value === null || value === undefined) return false;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (
+      !text
+      || /^(?:false|null|undefined|no|not ok|0)$/i.test(text)
+      || EXTERNAL_WRITE_FAILURE_PROSE_RE.test(text)
+      || EXTERNAL_WRITE_AMBIGUOUS_PROSE_RE.test(text)
+      || EXTERNAL_WRITE_CONTRADICTED_SUCCESS_RE.test(text)
+      || EXTERNAL_WRITE_ZERO_EFFECT_PROSE_RE.test(text)
+      || EXTERNAL_WRITE_NEGATED_ACK_RE.test(text)
+    ) return false;
+    const parsed = parseWrappedExternalWriteJson(text);
+    if (parsed !== undefined) {
+      return externalWriteValueHasAcknowledgement(parsed, depth + 1);
+    }
+    return EXTERNAL_WRITE_PLAIN_ACK_RE.test(text)
+      || EXTERNAL_WRITE_ACTION_ACK_RE.test(text)
+      || EXTERNAL_WRITE_SUBJECT_ACK_RE.test(text)
+      || EXTERNAL_WRITE_SUCCESS_SUFFIX_RE.test(text)
+      || EXTERNAL_WRITE_PROSE_RECEIPT_RE.test(text);
+  }
+  // Only a top-level true is itself an explicit acknowledgement. Nested
+  // booleans require a success/ok key, handled in the object branch.
+  if (typeof value === 'boolean') return depth === 0 && value;
+  if (typeof value === 'number') return false;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return false;
+    // MCP content blocks are a transport envelope, not acknowledgement by
+    // themselves. At least one non-empty block must carry clean evidence and
+    // no block may carry a failure marker.
+    let acknowledged = false;
+    for (const item of value) {
+      if (
+        item
+        && typeof item === 'object'
+        && !Array.isArray(item)
+        && (item as Record<string, unknown>).type === 'text'
+      ) {
+        const text = (item as Record<string, unknown>).text;
+        if (
+          typeof text !== 'string'
+          || !text.trim()
+          || EXTERNAL_WRITE_FAILURE_PROSE_RE.test(text)
+          || EXTERNAL_WRITE_AMBIGUOUS_PROSE_RE.test(text)
+          || EXTERNAL_WRITE_CONTRADICTED_SUCCESS_RE.test(text)
+          || EXTERNAL_WRITE_ZERO_EFFECT_PROSE_RE.test(text)
+        ) {
+          return false;
+        }
+        acknowledged = externalWriteValueHasAcknowledgement(text, depth + 1) || acknowledged;
+        continue;
+      }
+      acknowledged = externalWriteValueHasAcknowledgement(item, depth + 1) || acknowledged;
+    }
+    return acknowledged;
+  }
+  if (typeof value !== 'object') return false;
+
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).length === 0 || recordLooksFailed(record)) return false;
+  if (structuredTrue(record.isError)) return false;
+
+  const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : '';
+  if (EXTERNAL_WRITE_AMBIGUOUS_STATUS_RE.test(status)) return false;
+
+  let acknowledged =
+    structuredTrue(record.successful)
+    || structuredTrue(record.success)
+    || structuredTrue(record.ok)
+    || structuredTrue(record.isSuccess)
+    || structuredTrue(record.is_success)
+    || EXTERNAL_WRITE_SUCCESS_STATUS_RE.test(status);
+  for (const [rawKey, child] of Object.entries(record)) {
+    const key = normalizedAcknowledgementKey(rawKey);
+    if (key === 'type' || key === 'mime_type') continue;
+    if (
+      typeof child === 'string'
+      && (
+        EXTERNAL_WRITE_FAILURE_PROSE_RE.test(child)
+        || EXTERNAL_WRITE_AMBIGUOUS_PROSE_RE.test(child)
+        || EXTERNAL_WRITE_CONTRADICTED_SUCCESS_RE.test(child)
+        || EXTERNAL_WRITE_ZERO_EFFECT_PROSE_RE.test(child)
+      )
+    ) return false;
+    if (EXTERNAL_WRITE_ECHO_CONTAINER_KEYS.has(key)) continue;
+    if (acknowledgementReceiptValue(key, child)) {
+      acknowledged = true;
+      continue;
+    }
+    if (
+      (key === 'successful' || key === 'success' || key === 'ok' || key === 'is_success')
+      && structuredTrue(child)
+    ) {
+      acknowledged = true;
+      continue;
+    }
+    if (
+      EXTERNAL_WRITE_MUTATION_BOOLEAN_KEY_RE.test(key)
+      && structuredTrue(child)
+    ) {
+      acknowledged = true;
+      continue;
+    }
+    const numericStatus = typeof child === 'number'
+      ? child
+      : (
+          typeof child === 'string'
+          && /^\d+$/.test(child.trim())
+            ? Number(child)
+            : undefined
+        );
+    if (
+      (key === 'status' || key === 'status_code' || key === 'statuscode')
+      && numericStatus !== undefined
+      && [200, 201, 204].includes(numericStatus)
+    ) {
+      acknowledged = true;
+      continue;
+    }
+    acknowledged = externalWriteValueHasAcknowledgement(child, depth + 1) || acknowledged;
+  }
+  return acknowledged;
+}
+
+/**
+ * External writes need positive provider acknowledgement, not merely the
+ * absence of a parseable error flag. Empty envelopes, malformed/failure prose,
+ * and dispatch-status markers remain ambiguous and can never certify a write.
+ */
+export function toolOutputProvesExternalWriteAcknowledgement(
+  output: unknown,
+  explicitOk?: unknown,
+): boolean {
+  if (
+    explicitOk === false
+    || !toolOutputLooksSuccessful(output, explicitOk)
+    || externalWriteValueContainsFailure(output)
+  ) return false;
+  if (
+    typeof output === 'string'
+    && /^HTTP\s+(?:200|201|204)\b(?:\s+(?:OK|Created|No Content))?[.!]?(?:\r?\n|$)/i.test(output.trim())
+  ) return true;
+  return externalWriteValueHasAcknowledgement(output);
 }
 
 /**

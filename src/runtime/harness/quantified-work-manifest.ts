@@ -143,12 +143,26 @@ function manifestTouchedByRequest(
   manifestId: string,
   sourceUserSeq: number,
 ): boolean {
-  return listEvents(sessionId, {
+  const events = listEvents(sessionId, {
     sinceSeq: sourceUserSeq,
-    types: ['work_manifest_declared'],
-  }).some((event) => (
-    (event.data as { manifestId?: unknown }).manifestId === manifestId
-  ));
+    types: ['user_input_received', 'work_manifest_declared'],
+  });
+  const nextUserSeq = events.find((event) => (
+    event.type === 'user_input_received' && event.seq > sourceUserSeq
+  ))?.seq;
+  return events.some((event) => {
+    if (event.type !== 'work_manifest_declared') return false;
+    const data = event.data as { manifestId?: unknown; sourceUserSeq?: unknown };
+    if (data.manifestId !== manifestId) return false;
+    if (Number.isSafeInteger(data.sourceUserSeq)) {
+      return data.sourceUserSeq === sourceUserSeq;
+    }
+    // Historical manifests had no request owner. Preserve their ordered
+    // behavior only while this request is still the newest user boundary;
+    // once another user row exists, a legacy declaration cannot be assigned
+    // safely to either overlapping request.
+    return nextUserSeq === undefined || event.seq < nextUserSeq;
+  });
 }
 
 /**

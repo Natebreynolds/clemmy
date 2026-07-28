@@ -72,6 +72,52 @@ test('renderRecentSessionActions keeps a later successful retry after an earlier
   assert.equal((block.match(/casey@example\.com/g) ?? []).length, 1);
 });
 
+test('renderRecentSessionActions keeps reservations uncertain until the exact call succeeds', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  const writeData = {
+    callId: 'write-session-a',
+    canonicalCallId: 'write-session-a',
+    preDispatch: true,
+    shapeKey: 'OUTLOOK_SEND_EMAIL',
+    targets: ['casey@example.com'],
+  };
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: writeData,
+  });
+
+  const pending = renderRecentSessionActions(openEventLog(), sid);
+  assert.match(pending, /uncertain|not confirmed/i);
+  assert.doesNotMatch(pending, /ALREADY DONE|SUCCEEDED earlier/i);
+
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: { ...writeData, callId: 'write-session-other', canonicalCallId: 'write-session-other' },
+  });
+  const wrongCall = renderRecentSessionActions(openEventLog(), sid);
+  assert.match(wrongCall, /uncertain|not confirmed/i);
+  assert.doesNotMatch(wrongCall, /ALREADY DONE|SUCCEEDED earlier/i);
+
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: writeData,
+  });
+  const confirmed = renderRecentSessionActions(openEventLog(), sid);
+  assert.match(confirmed, /ALREADY DONE/);
+  assert.match(confirmed, /SUCCEEDED earlier/i);
+  assert.doesNotMatch(confirmed, /uncertain|not confirmed/i);
+});
+
 test('renderRecentSessionActions is empty when nothing was sent (byte-identical no-op)', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;

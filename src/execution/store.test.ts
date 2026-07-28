@@ -130,7 +130,7 @@ test('ExecutionStore.update closes linked vault task rows when an execution comp
   assert.ok(updated?.activity?.some((item) => item.type === 'status' && /Closed 1 linked task row/.test(item.message)));
 });
 
-test('ExecutionStore reconciles a late orphan before UI reads and allows a later same-target success', () => {
+test('ExecutionStore reconciles a late orphan before UI reads and never lets a retry erase ambiguity', () => {
   resetEventLog();
   const sessionId = `sess-late-write-${Math.random().toString(36).slice(2, 10)}`;
   createSession({ id: sessionId, kind: 'chat', title: 'late write reconciliation' });
@@ -186,14 +186,24 @@ test('ExecutionStore reconciles a late orphan before UI reads and allows a later
     turn: 1,
     role: 'system',
     type: 'external_write',
-    data: { callId: 'send-a', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@example.com'] },
+    data: {
+      callId: 'send-a',
+      correlationFingerprint: 'payload:send-a',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['a@example.com'],
+    },
   });
   appendEvent({
     sessionId,
     turn: 1,
     role: 'system',
     type: 'external_write',
-    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+    data: {
+      callId: 'send-b',
+      correlationFingerprint: 'payload:send-b',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['b@example.com'],
+    },
   });
 
   assert.equal(
@@ -214,7 +224,12 @@ test('ExecutionStore reconciles a late orphan before UI reads and allows a later
     turn: 1,
     role: 'system',
     type: 'external_write_orphaned',
-    data: { callId: 'send-b', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+    data: {
+      callId: 'send-b',
+      correlationFingerprint: 'payload:send-b',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['b@example.com'],
+    },
   });
 
   const uiRecord = new ExecutionStore().list(20).find((item) => item.id === execution.id);
@@ -246,14 +261,146 @@ test('ExecutionStore reconciles a late orphan before UI reads and allows a later
     turn: 2,
     role: 'system',
     type: 'external_write',
-    data: { callId: 'send-b-reconciled', shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['b@example.com'] },
+    data: {
+      callId: 'send-b-reconciled',
+      retryOfCallId: 'send-b',
+      correlationFingerprint: 'payload:send-b',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['b@example.com'],
+    },
   });
   const retried = store.update(execution.id, {
     status: 'completed',
     blocker: undefined,
     lastAssistantSummary: 'Recipient B was reconciled and the corrected retry now has a receipt.',
   });
-  assert.equal(retried?.status, 'completed', 'a later success for the same logical target clears the negative outcome');
+  assert.equal(
+    retried?.status,
+    'blocked',
+    'a later send cannot prove the orphan did not already land; read-only reconciliation is still required',
+  );
+  assert.match(retried?.blocker ?? '', /read-only reconciliation/i);
+});
+
+test('exact-tagged late write evidence survives a newer user request and reopens its completed execution', () => {
+  resetEventLog();
+  const sessionId = `sess-late-tagged-write-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'late tagged write reconciliation' });
+  const sourceA = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved North report.' },
+  });
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const execution = store.create({
+    sessionId,
+    title: 'Send North report',
+    objective: 'Send the approved North report to the exact recipient',
+    reason: 'test',
+    startedFromMessage: 'send north report',
+    confidence: 0.9,
+    reasons: ['test'],
+    successCriteria: 'The North send has a confirmed receipt',
+    sourceUserSeq: sourceA.seq,
+  } as never);
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'north-send-late-resolution',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['north@example.com'],
+    },
+  });
+  assert.equal(store.update(execution.id, {
+    status: 'completed',
+    blocker: undefined,
+    lastAssistantSummary: 'North report sent.',
+  })?.status, 'completed');
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'While that settles, draft an unrelated South report.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'north-send-late-resolution',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['north@example.com'],
+    },
+  });
+
+  const reconciled = new ExecutionStore().get(execution.id);
+  assert.equal(reconciled?.status, 'blocked');
+  assert.match(reconciled?.blocker ?? '', /read-only reconciliation/i);
+});
+
+test('untagged legacy write evidence remains bounded by the next user request', () => {
+  resetEventLog();
+  const sessionId = `sess-late-legacy-write-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'legacy write boundary' });
+  const sourceA = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved North report.' },
+  });
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const execution = store.create({
+    sessionId,
+    title: 'Send North report',
+    objective: 'Send the approved North report to the exact recipient',
+    reason: 'test',
+    startedFromMessage: 'send north report',
+    confidence: 0.9,
+    reasons: ['test'],
+    successCriteria: 'The North send has a confirmed receipt',
+    sourceUserSeq: sourceA.seq,
+  } as never);
+  assert.equal(store.update(execution.id, {
+    status: 'completed',
+    blocker: undefined,
+    lastAssistantSummary: 'North report sent.',
+  })?.status, 'completed');
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Now send an unrelated South report.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      callId: 'legacy-untagged-send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['south@example.com'],
+    },
+  });
+
+  const reread = new ExecutionStore().get(execution.id);
+  assert.equal(reread?.status, 'completed');
+  assert.equal(reread?.blocker, undefined);
 });
 
 test('an overlapping unrelated user request cannot contaminate a completed execution', () => {
@@ -323,6 +470,123 @@ test('an overlapping unrelated user request cannot contaminate a completed execu
   const reread = new ExecutionStore().get(execution.id);
   assert.equal(reread?.status, 'completed');
   assert.equal(reread?.blocker, undefined);
+});
+
+test('an explicitly bound auth continuation can repair a proven failed write without borrowing unrelated turns', () => {
+  resetEventLog();
+  const sessionId = `sess-write-continuation-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'write continuation lineage' });
+  const sourceA = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved report after validating the recipient.' },
+  });
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const execution = store.create({
+    sessionId,
+    title: 'Send approved report',
+    objective: 'Send the approved report to the exact validated recipient',
+    reason: 'test',
+    startedFromMessage: 'send approved report',
+    confidence: 0.9,
+    reasons: ['test'],
+    successCriteria: 'The send has a confirmed provider receipt',
+    sourceUserSeq: sourceA.seq,
+  } as never);
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-before-auth',
+      actionKey: 'email:send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['north@example.com'],
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-before-auth',
+      actionKey: 'email:send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['north@example.com'],
+    },
+  });
+  assert.equal(store.update(execution.id, {
+    status: 'completed',
+    blocker: undefined,
+    lastAssistantSummary: 'The first send did not dispatch because authentication was missing.',
+  })?.status, 'blocked');
+
+  const sourceB = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Railway and Outlook are authenticated now; continue this execution.' },
+  });
+  assert.ok(
+    store.bindSourceUserSeq(execution.id, sessionId, sourceB.seq, 'execution_update_step'),
+    'an exact execution-scoped continuation binds its user row',
+  );
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceB.seq,
+      callId: 'send-after-auth',
+      retryOfCallId: 'send-before-auth',
+      actionKey: 'email:send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['north@example.com'],
+    },
+  });
+  const completed = store.update(execution.id, {
+    status: 'completed',
+    blocker: undefined,
+    lastAssistantSummary: 'Authentication was repaired and the exact send returned a receipt.',
+  });
+  assert.equal(completed?.status, 'completed');
+  assert.deepEqual(completed?.sourceUserSeqs, [sourceB.seq]);
+
+  const sourceC = appendEvent({
+    sessionId,
+    turn: 3,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send an unrelated South report.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 3,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: sourceC.seq,
+      callId: 'unrelated-south-send',
+      actionKey: 'email:send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      targets: ['south@example.com'],
+    },
+  });
+  assert.equal(new ExecutionStore().get(execution.id)?.status, 'completed');
+  assert.equal(
+    store.bindSourceUserSeq(execution.id, 'another-session', sourceC.seq, 'execution_update_step'),
+    undefined,
+    'a foreign session cannot attach evidence to this execution',
+  );
 });
 
 test('sweepCrashedExecutions: active with stale heartbeat is auto-failed', () => {

@@ -333,6 +333,56 @@ test('cross-turn retry slices and one exact extension delta preserve the existin
   }).ok, true, 'an undeclared phase may extend the graph over existing canonical items');
 });
 
+test('a concurrent request cannot satisfy another request manifest boundary', () => {
+  const sessionId = openTurn(
+    'quantified-overlapping-manifest-owner',
+    'execution',
+    'Analyze these 10 records and validate each one.',
+  );
+  const ten = Array.from({ length: 10 }, (_, index) => `record-${index + 1}`);
+  assert.equal(prepareWorkerManifest({
+    sessionId,
+    items: ten,
+    descriptor: descriptor('overlapping-records'),
+  }).ok, true);
+
+  const retryInput = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Retry these 3 failed records and validate each one.' },
+  });
+  sourceSeqBySession.set(sessionId, retryInput.seq);
+  eventlog.appendEvent({
+    sessionId,
+    turn: 3,
+    role: 'system',
+    type: 'work_manifest_declared',
+    data: {
+      sourceUserSeq: retryInput.seq + 999,
+      manifestId: 'overlapping-records',
+      contractVersion: '1',
+      mode: 'declare',
+      phases: [{ id: 'research' }],
+      items: ten.map((id) => ({ id })),
+    },
+  });
+
+  const decision = gate({
+    sessionId,
+    items: ['record-1'],
+    workManifest: {
+      id: 'overlapping-records',
+      contractVersion: '1',
+      phase: 'research',
+      mode: 'reconcile',
+    },
+  });
+  assert.equal(decision.ok, false);
+  assert.match(decision.error ?? '', /first call for this request supplied only 1\/3 items/i);
+});
+
 test('one report with bullet requirements is not hardened into a fictitious 3-item batch', () => {
   const prompts = [
     ['Create a report with:', '- Executive summary', '- Competitive analysis', '- Recommendations'],

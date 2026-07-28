@@ -17,7 +17,7 @@ import {
 } from './tool-evidence.js';
 import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 
-interface ResolvedWriteEvidence {
+export interface ResolvedWriteEvidence {
   confirmed: EventRow[];
   uncertain: EventRow[];
 }
@@ -50,6 +50,13 @@ function writeTargets(event: EventRow): string[] {
 function sameWriteAttempt(attempt: EventRow, resolution: EventRow): boolean {
   const attemptCallId = writeCallId(attempt);
   const resolutionCallId = writeCallId(resolution);
+  // A new reservation must settle the exact call it reserved. Falling back to
+  // shape/targets can let a terminal event from another invocation settle it.
+  if (attempt.data.preDispatch === true) {
+    return Boolean(attemptCallId && resolutionCallId && attemptCallId === resolutionCallId);
+  }
+  // Legacy rows predate reliable correlation ids. Preserve their historical
+  // shape/target reconciliation when one side lacks an id.
   if (attemptCallId && resolutionCallId) return attemptCallId === resolutionCallId;
 
   const attemptShape = writeShape(attempt);
@@ -63,30 +70,46 @@ function sameWriteAttempt(attempt: EventRow, resolution: EventRow): boolean {
 }
 
 /**
- * External-write rows are conservative pre-dispatch claims. A later failure
- * removes exactly one matching claim; an orphan changes it to "uncertain."
- * Process in sequence order so a failed first attempt cannot erase a later
- * successful retry of the same action.
+ * New `preDispatch` external-write rows are reservations, not completion
+ * evidence. They become confirmed only when the exact same call records
+ * `external_write_succeeded`; failure proves no dispatch, while an orphan
+ * remains uncertain. Legacy rows without `preDispatch` keep their historical
+ * success meaning. Process in sequence order so one invocation cannot settle
+ * another retry of the same action.
  */
-function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWriteEvidence {
-  const attempts: Array<{ event: EventRow; state: 'confirmed' | 'failed' | 'uncertain' }> = [];
+export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWriteEvidence {
+  const attempts: Array<{
+    event: EventRow;
+    state: 'pending' | 'confirmed' | 'failed' | 'uncertain';
+  }> = [];
   const unmatchedOrphans: EventRow[] = [];
   for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
     if (event.type === 'external_write') {
-      attempts.push({ event, state: 'confirmed' });
+      attempts.push({
+        event,
+        state: event.data.preDispatch === true ? 'pending' : 'confirmed',
+      });
       continue;
     }
-    if (event.type !== 'external_write_failed' && event.type !== 'external_write_orphaned') continue;
+    if (
+      event.type !== 'external_write_succeeded'
+      && event.type !== 'external_write_failed'
+      && event.type !== 'external_write_orphaned'
+    ) continue;
     let match = -1;
     for (let index = attempts.length - 1; index >= 0; index -= 1) {
-      if (attempts[index]?.state !== 'confirmed') continue;
+      if (attempts[index]?.state === 'failed') continue;
       if (sameWriteAttempt(attempts[index]!.event, event)) {
         match = index;
         break;
       }
     }
     if (match >= 0) {
-      attempts[match]!.state = event.type === 'external_write_failed' ? 'failed' : 'uncertain';
+      attempts[match]!.state = event.type === 'external_write_succeeded'
+        ? 'confirmed'
+        : event.type === 'external_write_failed'
+          ? 'failed'
+          : 'uncertain';
     } else if (event.type === 'external_write_orphaned') {
       // A few legacy transports emitted only the timeout row. Preserve that
       // uncertainty instead of dropping the only durable evidence.
@@ -96,7 +119,9 @@ function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWriteEvidenc
   return {
     confirmed: attempts.filter((attempt) => attempt.state === 'confirmed').map((attempt) => attempt.event),
     uncertain: [
-      ...attempts.filter((attempt) => attempt.state === 'uncertain').map((attempt) => attempt.event),
+      ...attempts
+        .filter((attempt) => attempt.state === 'pending' || attempt.state === 'uncertain')
+        .map((attempt) => attempt.event),
       ...unmatchedOrphans,
     ],
   };
@@ -132,11 +157,10 @@ export function describeExternalWrite(shapeKey: string | undefined, toolName: st
 
 /**
  * Build a report from the COMPLETE external-write evidence window for one
- * turn/run: `external_write`, `external_write_failed`, and
- * `external_write_orphaned`. Passing only provisional `external_write` rows
- * cannot net later failures/timeouts and is safe only when the caller already
- * performed that resolution. Returns null when there is nothing durable to
- * report.
+ * turn/run: `external_write`, `external_write_succeeded`,
+ * `external_write_failed`, and `external_write_orphaned`. A pre-dispatch row
+ * without its exact success is reported as uncertain, never completed.
+ * Returns null when there is nothing durable to report.
  */
 export function synthesizeWorkReport(evidence: readonly EventRow[]): string | null {
   if (!evidence || evidence.length === 0) return null;
@@ -196,6 +220,7 @@ export function synthesizeTurnReport(sessionId: string, afterSeq?: number): stri
     inScope(event)
     && (
       event.type === 'external_write'
+      || event.type === 'external_write_succeeded'
       || event.type === 'external_write_failed'
       || event.type === 'external_write_orphaned'
     )));

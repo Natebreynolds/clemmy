@@ -46,7 +46,22 @@ import {
 import { classifyRuntimeToolEffect, runtimeToolAccountingMetadata } from './tool-effect.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
-import { extractExternalWriteIdentityKeys } from './grounding-gate.js';
+import {
+  detectDuplicateTarget,
+  duplicateResendConsented,
+  extractDuplicateIdentityKeys,
+  extractExternalWriteIdentityKeys,
+  DuplicateExternalWriteError,
+} from './grounding-gate.js';
+import {
+  canonicalExternalWriteActionKey,
+  consumeExternalWriteRetryAuthorization,
+  externalWriteAdmissionKey,
+  externalWriteDuplicateIdentityKeys,
+  externalWriteSemanticFingerprint,
+  uncompensatedExternalWriteEvents,
+  withExternalWriteAdmissionLock,
+} from './external-write-admission.js';
 import {
   evaluateToolEconomy,
   type ToolEconomyState,
@@ -58,7 +73,11 @@ import {
   isTerminalToolName,
   terminalToolShouldHalt,
 } from './terminal-tool.js';
-import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-evidence.js';
+import {
+  completionEvidenceToolName,
+  toolOutputLooksSuccessful,
+  toolOutputProvesExternalWriteAcknowledgement,
+} from './tool-evidence.js';
 import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
@@ -819,11 +838,17 @@ interface NativeExternalWriteAttempt {
   callId: string;
   toolName: string;
   shapeKey: string;
+  actionKey: string;
   targets: string[];
+  duplicateTargets: string[];
+  duplicateIdentityKeys: string[];
+  correlationFingerprint: string;
+  retryOfCallId?: string;
+  retryAuthorizationSeq?: number;
+  executionId?: string;
 }
 
-function nativeExternalWriteReturnedFailure(output: unknown): {
-  type: 'external_write_failed' | 'external_write_orphaned';
+function nativeExternalWriteReturnedFailure(output: unknown, providerError = false): {
   summary: string;
 } | null {
   const text = typeof output === 'string'
@@ -831,58 +856,159 @@ function nativeExternalWriteReturnedFailure(output: unknown): {
     : (() => {
         try { return JSON.stringify(output ?? ''); } catch { return String(output ?? ''); }
       })();
-  const failure = detectStructuredToolFailure(text);
-  if (!failure.failed) return null;
-  const kind = classifyToolError(failure.summary);
-  const demonstrablyNoEffect = failure.notFound
-    || kind === 'permission_denied'
-    || kind === 'not_found'
-    || kind === 'rate_limit'
-    || /invalid|validation|bad request|missing required|schema|unauthoriz|forbidden|not connected/i.test(
-      failure.summary,
+  let failure = providerError
+    ? {
+        failed: true,
+        summary: text.replace(/\s+/g, ' ').trim().slice(0, 240) || 'the provider returned an error',
+        notFound: false,
+      }
+    : detectStructuredToolFailure(text);
+  // A transport may prefix its JSON error envelope with a dispatch marker.
+  // The marker is never trusted as proof that dispatch did not start, but it
+  // does mean the result is not a clean success acknowledgement. Parse any
+  // trailing structured payload for a useful reason and settle as ambiguous.
+  const dispatchMarker = /\[provider-dispatch:[^\]]+\]/i.test(text);
+  if (!failure.failed && dispatchMarker) {
+    const withoutMarker = text.replace(/\[provider-dispatch:[^\]]+\]/i, '').trim();
+    const structuredStart = withoutMarker.search(/[{\[]/);
+    const nested = detectStructuredToolFailure(
+      structuredStart >= 0
+        ? withoutMarker.slice(structuredStart)
+        : withoutMarker,
     );
-  return {
-    type: demonstrablyNoEffect ? 'external_write_failed' : 'external_write_orphaned',
-    summary: failure.summary,
-  };
+    failure = nested.failed
+      ? nested
+      : {
+          failed: true,
+          summary: withoutMarker.replace(/\s+/g, ' ').slice(0, 240)
+            || 'the provider returned a dispatch-status marker without a clean acknowledgement',
+          notFound: false,
+        };
+  }
+  if (!failure.failed) return null;
+  return { summary: failure.summary };
 }
 
 function nativeExternalWriteAttempt(toolName: string, input: unknown, callId: string): NativeExternalWriteAttempt | null {
   const effect = classifyRuntimeToolEffect(toolName, input);
   if (effect.source !== 'native_mcp' || effect.effect !== 'external_write') return null;
   const shape = classifyExternalWrite(toolName, input);
+  const correlationFingerprint = toolCallCorrelationFingerprint(toolName, input);
+  const duplicateTargets = extractDuplicateIdentityKeys(input);
+  const shapeKey = shape.shapeKey ?? toolName.replace(/^mcp__/, '');
+  const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
   return {
     callId,
     toolName,
-    shapeKey: shape.shapeKey ?? toolName.replace(/^mcp__/, ''),
-    targets: extractExternalWriteIdentityKeys(input).slice(0, 8),
+    shapeKey,
+    actionKey,
+    // These identities enforce duplicate safety, not UI preview. Preserve the
+    // complete recipient set; rendering layers may clip their own display.
+    targets: extractExternalWriteIdentityKeys(input),
+    duplicateTargets,
+    duplicateIdentityKeys: externalWriteDuplicateIdentityKeys(
+      duplicateTargets,
+      externalWriteSemanticFingerprint(actionKey, input),
+    ),
+    correlationFingerprint,
   };
 }
 
-function appendNativeExternalWriteEvent(
-  sessionId: string | undefined,
+function nativeExternalWriteDuplicateDenial(
+  sessionId: string,
   attempt: NativeExternalWriteAttempt,
-  type: 'external_write' | 'external_write_failed' | 'external_write_orphaned',
-  extra: Record<string, unknown> = {},
-): void {
-  if (!sessionId) return;
+): PermissionResult | null {
+  if (attempt.duplicateIdentityKeys.length === 0) return null;
+  const priorWrites = uncompensatedExternalWriteEvents(
+    listEvents(sessionId, {
+      types: ['external_write', 'external_write_failed'],
+    }),
+  ).map((event) => ({
+    ...(() => {
+      const data = event.data as {
+        actionKey?: string;
+        shapeKey?: string;
+        toolName?: string;
+        tool?: string;
+        targets?: string[];
+        duplicateIdentityKeys?: string[];
+        correlationFingerprint?: string;
+      };
+      return {
+        ...data,
+        shapeKey: data.actionKey
+          ?? canonicalExternalWriteActionKey(data.toolName ?? data.tool, data.shapeKey),
+        targets: data.duplicateIdentityKeys
+          ?? externalWriteDuplicateIdentityKeys(data.targets ?? [], data.correlationFingerprint),
+      };
+    })(),
+    at: event.createdAt,
+  }));
+  const duplicate = detectDuplicateTarget({
+    sessionId,
+    shapeKey: attempt.actionKey,
+    targets: attempt.duplicateIdentityKeys,
+    priorWrites,
+  });
+  if (
+    !duplicate.duplicate
+    || duplicateResendConsented(sessionId, duplicate.target, duplicate.priorAt, attempt.actionKey)
+  ) return null;
+
+  const error = new DuplicateExternalWriteError({
+    toolName: attempt.toolName,
+    shapeKey: attempt.shapeKey,
+    target: duplicate.target ?? 'unknown',
+  });
   try {
     appendEvent({
       sessionId,
       turn: 0,
       role: 'system',
-      type,
+      type: 'guardrail_tripped',
       data: {
-        shapeKey: attempt.shapeKey,
+        kind: 'duplicate_external_write',
         toolName: attempt.toolName,
-        targets: attempt.targets,
-        callId: attempt.callId,
+        shapeKey: attempt.shapeKey,
+        actionKey: attempt.actionKey,
+        target: duplicate.target ?? null,
         canonicalCallId: attempt.callId,
-        nativeMcp: true,
-        ...extra,
       },
     });
-  } catch { /* durable safety telemetry fails conservative via artifact claim */ }
+  } catch { /* the deterministic deny never depends on telemetry */ }
+  return { behavior: 'deny', message: error.message, interrupt: false } as PermissionResult;
+}
+
+function appendNativeExternalWriteEvent(
+  sessionId: string | undefined,
+  attempt: NativeExternalWriteAttempt,
+  type: 'external_write' | 'external_write_succeeded' | 'external_write_failed' | 'external_write_orphaned',
+  extra: Record<string, unknown> = {},
+): void {
+  if (!sessionId) return;
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type,
+    data: {
+      shapeKey: attempt.shapeKey,
+      actionKey: attempt.actionKey,
+      toolName: attempt.toolName,
+      targets: attempt.targets,
+      duplicateIdentityKeys: attempt.duplicateIdentityKeys,
+      callId: attempt.callId,
+      canonicalCallId: attempt.callId,
+      correlationFingerprint: attempt.correlationFingerprint,
+      nativeMcp: true,
+      ...(attempt.retryOfCallId ? {
+        retryOfCallId: attempt.retryOfCallId,
+        retryAuthorizationSeq: attempt.retryAuthorizationSeq,
+        executionId: attempt.executionId,
+      } : {}),
+      ...extra,
+    },
+  });
 }
 
 function sdkPreapprovedToolsForMode(tools: string[], agentic: boolean): string[] {
@@ -1261,33 +1387,61 @@ function reflectionToolName(rawName: string | null, input: unknown): string | nu
   return bare;
 }
 
-function normalizeToolResultContent(content: unknown): string {
-  if (typeof content === 'string') return content;
+interface NormalizedToolResultContent {
+  output: string;
+  valid: boolean;
+}
+
+function normalizeToolResultContent(content: unknown): NormalizedToolResultContent {
+  if (typeof content === 'string') {
+    return { output: content, valid: content.trim().length > 0 };
+  }
   if (Array.isArray(content)) {
-    return content
+    const text = content
       .map((c) => {
         const cc = c as { type?: unknown; text?: unknown };
         return cc.type === 'text' && typeof cc.text === 'string' ? cc.text : '';
       })
       .filter(Boolean)
       .join('\n');
+    const valid = text.trim().length > 0 && content.every((c) => {
+      if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+      const cc = c as { type?: unknown; text?: unknown };
+      return cc.type === 'text' && typeof cc.text === 'string';
+    });
+    return { output: text, valid };
   }
-  if (content == null) return '';
-  try { return JSON.stringify(content); } catch { return String(content); }
+  if (content == null) return { output: '', valid: false };
+  try {
+    return { output: JSON.stringify(content), valid: false };
+  } catch {
+    return { output: String(content), valid: false };
+  }
 }
 
 /** Pull tool_result blocks (callId + flattened text) from a user message — the
  *  Agent SDK feeds MCP tool results back as a user turn carrying
  *  `{ type: 'tool_result', tool_use_id, content }` blocks. */
-function extractToolResults(message: SDKMessage): Array<{ callId: string; output: string; isError: boolean }> {
+function extractToolResults(message: SDKMessage): Array<{
+  callId: string;
+  output: string;
+  isError: boolean;
+  valid: boolean;
+}> {
   if (message.type !== 'user') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
   if (!Array.isArray(content)) return [];
-  const out: Array<{ callId: string; output: string; isError: boolean }> = [];
+  const out: Array<{ callId: string; output: string; isError: boolean; valid: boolean }> = [];
   for (const block of content) {
     const b = block as { type?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown };
     if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
-      out.push({ callId: b.tool_use_id, output: normalizeToolResultContent(b.content), isError: b.is_error === true });
+      const normalized = normalizeToolResultContent(b.content);
+      out.push({
+        callId: b.tool_use_id,
+        output: normalized.output,
+        isError: b.is_error === true,
+        valid: normalized.valid,
+      });
     }
   }
   return out;
@@ -1690,6 +1844,19 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           message: `MCP_SCOPE_DENIED: ${strippedToolName} is outside this run's external MCP scope.`,
         } as PermissionResult;
       }
+      const nativeEffect = nativeExternal
+        ? classifyRuntimeToolEffect(toolName, input)
+        : null;
+      if (
+        nativeEffect?.effect === 'external_write'
+        && !providerCallId
+      ) {
+        return {
+          behavior: 'deny',
+          interrupt: true,
+          message: 'NATIVE_WRITE_CORRELATION_REQUIRED: the provider omitted its tool-use id, so Clementine stopped before dispatch rather than create an untraceable external write.',
+        } as PermissionResult;
+      }
 
       // A durable artifact slot is admission authority, not an attempted tool
       // call. Claim it before economy/grind/ceiling/approval so an existing
@@ -1770,25 +1937,58 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           }
         }
 
-        const permission = await ceilingGated(toolName, input, opts);
-        if (permission?.behavior !== 'allow') return permission;
+        const pendingNativeWrite = nativeExternal && options.sessionId && providerCallId
+          ? nativeExternalWriteAttempt(toolName, input, providerCallId)
+          : null;
+        const irreversibleNativeWrite = Boolean(
+          pendingNativeWrite && classifyExternalWrite(toolName, input).irreversible,
+        );
+        const authorizeAndReserve = async (): Promise<PermissionResult | null> => {
+          const permission = await ceilingGated(toolName, input, opts);
+          if (permission?.behavior !== 'allow') return permission;
 
-        if (artifactAdmission) {
-          if (providerCallId) nativeArtifactClaims.set(providerCallId, artifactAdmission);
-          else markClaimedArtifactUncertain(artifactAdmission.artifactId);
-        }
-        if (nativeExternal && options.sessionId && providerCallId) {
-          const write = nativeExternalWriteAttempt(toolName, input, providerCallId);
-          if (write && !nativeExternalWrites.has(providerCallId)) {
-            nativeExternalWrites.set(providerCallId, write);
-            appendNativeExternalWriteEvent(options.sessionId, write, 'external_write', {
-              irreversible: classifyExternalWrite(toolName, input).irreversible,
-              sourceUserSeq: options.sourceUserSeq,
-            });
+          if (artifactAdmission) {
+            if (providerCallId) nativeArtifactClaims.set(providerCallId, artifactAdmission);
+            else markClaimedArtifactUncertain(artifactAdmission.artifactId);
           }
-        }
-        admittedForDispatch = true;
-        return permission;
+          if (pendingNativeWrite && !nativeExternalWrites.has(providerCallId)) {
+            const duplicateDenial = await withExternalWriteAdmissionLock(
+              externalWriteAdmissionKey(options.sessionId as string),
+              async (): Promise<PermissionResult | null> => {
+                if (irreversibleNativeWrite) {
+                  const denial = nativeExternalWriteDuplicateDenial(
+                    options.sessionId as string,
+                    pendingNativeWrite,
+                  );
+                  if (denial) return denial;
+                }
+                const retry = consumeExternalWriteRetryAuthorization({
+                  sessionId: options.sessionId as string,
+                  sourceUserSeq: options.sourceUserSeq,
+                  actionKey: pendingNativeWrite.actionKey,
+                  duplicateIdentityKeys: pendingNativeWrite.duplicateIdentityKeys,
+                });
+                if (retry) {
+                  pendingNativeWrite.retryOfCallId = retry.retryOfCallId;
+                  pendingNativeWrite.retryAuthorizationSeq = retry.authorizationSeq;
+                  pendingNativeWrite.executionId = retry.executionId;
+                }
+                appendNativeExternalWriteEvent(options.sessionId, pendingNativeWrite, 'external_write', {
+                  irreversible: irreversibleNativeWrite,
+                  preDispatch: true,
+                  sourceUserSeq: options.sourceUserSeq,
+                });
+                nativeExternalWrites.set(providerCallId, pendingNativeWrite);
+                return null;
+              },
+            );
+            if (duplicateDenial) return duplicateDenial;
+          }
+          admittedForDispatch = true;
+          return permission;
+        };
+
+        return await authorizeAndReserve();
       } finally {
         // Every post-admission deny/throw is provably pre-dispatch: canUseTool
         // has not returned allow yet. Release only the exact call-owned pending
@@ -2216,7 +2416,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                     source.input,
                     tr.output,
                     tr.callId,
-                    !tr.isError,
+                    !tr.isError && tr.valid,
                   );
                 }
               } catch { /* the artifact remains unverified; never break the tool stream */ }
@@ -2227,7 +2427,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                 if (artifactOutputProvesNoDispatch(tr.output)) {
                   releaseClaimedArtifact(artifactClaim.artifactId, tr.callId);
                 } else {
-                  const resource = !tr.isError ? extractArtifactResource(artifactClaim.intent, tr.output) : null;
+                  const resource = !tr.isError && tr.valid
+                    ? extractArtifactResource(artifactClaim.intent, tr.output)
+                    : null;
                   if (resource) {
                     bindClaimedArtifact(artifactClaim.artifactId, tr.callId, resource);
                   } else {
@@ -2241,48 +2443,56 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             }
             const nativeWrite = nativeExternalWrites.get(tr.callId);
             if (nativeWrite) {
-              const dispatchProvenAbsent = artifactOutputProvesNoDispatch(tr.output);
-              const returnedFailure = tr.isError
-                ? null
-                : nativeExternalWriteReturnedFailure(tr.output);
-              if (tr.isError || dispatchProvenAbsent || returnedFailure) {
-                appendNativeExternalWriteEvent(
-                  options.sessionId,
-                  nativeWrite,
-                  dispatchProvenAbsent
-                    ? 'external_write_failed'
-                    : returnedFailure?.type ?? 'external_write_failed',
-                  {
-                    providerError: tr.isError,
-                    dispatchProvenAbsent,
-                    structuredFailure: returnedFailure !== null,
-                    ...(returnedFailure?.summary ? { reason: returnedFailure.summary.slice(0, 240) } : {}),
-                    sourceUserSeq: options.sourceUserSeq,
-                  },
-                );
-              }
+              const returnedFailure = nativeExternalWriteReturnedFailure(tr.output, tr.isError);
+              const succeeded = tr.valid
+                && !tr.isError
+                && returnedFailure === null
+                && toolOutputProvesExternalWriteAcknowledgement(tr.output);
+              appendNativeExternalWriteEvent(
+                options.sessionId,
+                nativeWrite,
+                succeeded ? 'external_write_succeeded' : 'external_write_orphaned',
+                {
+                  providerError: tr.isError,
+                  malformedResult: !tr.valid,
+                  structuredFailure: !tr.isError && returnedFailure !== null,
+                  ...(!succeeded
+                    ? {
+                        reason: returnedFailure?.summary.slice(0, 240)
+                          ?? (tr.valid
+                            ? 'provider result did not carry a trusted clean acknowledgement'
+                            : 'provider returned a malformed tool-result envelope'),
+                      }
+                    : {}),
+                  sourceUserSeq: options.sourceUserSeq,
+                },
+              );
               nativeExternalWrites.delete(tr.callId);
             }
           }
           // On failure, carry the cause into telemetry — SDK-lane failures were
           // emitted with no error detail (151/172 tool_call_failed rows had no
           // cause), making the reliability signal unusable.
-          const failExtra = tr.isError
+          const resultFailed = tr.isError || !tr.valid;
+          const failExtra = resultFailed
             ? (() => {
-                const msg = String(typeof tr.output === 'string' ? tr.output : JSON.stringify(tr.output ?? '')).slice(0, 600);
+                const msg = (!tr.valid
+                  ? `Malformed tool-result envelope${tr.output ? `: ${tr.output}` : ''}`
+                  : String(typeof tr.output === 'string' ? tr.output : JSON.stringify(tr.output ?? '')))
+                  .slice(0, 600);
                 return { error: msg, error_class: coarseToolErrorClass(msg) };
               })()
             : {};
-          emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
-          if (source?.name && !tr.isError && toolOutputLooksSuccessful(tr.output)) {
+          emitSdkToolCallEvent(options.sessionId, resultFailed ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
+          if (source?.name && !resultFailed && toolOutputLooksSuccessful(tr.output)) {
             successfulToolUses.push(completionEvidenceToolName(source.name, source.input));
           }
-          appendSdkTopLevelToolEvent(options.sessionId, 'tool_returned', tr.callId, source, { isError: tr.isError, output: tr.output });
+          appendSdkTopLevelToolEvent(options.sessionId, 'tool_returned', tr.callId, source, { isError: resultFailed, output: tr.output });
           // A3 recall contract: park every result under the SDK's OWN tool_use id
           // (toolu_…) — the id the continuation ledger hands out. Without this,
           // outputs live only under harness-generated mcp-<uuid> ids (and only
           // when clipped), so every tool_output_query(toolu_…) would miss.
-          if (options.sessionId && tr.output && !tr.isError) {
+          if (options.sessionId && tr.output && !resultFailed) {
             try {
               writeToolOutput({ sessionId: options.sessionId, callId: tr.callId, tool: source ? mcpToolTail(source.name) : null, output: tr.output });
             } catch { /* recall parking must never break the run */ }
@@ -2300,7 +2510,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                   : undefined),
             });
           }
-          if (!tr.isError && source && isTerminalAfterTool(source.name)) {
+          if (!resultFailed && source && isTerminalAfterTool(source.name)) {
             if (!terminalToolShouldHalt(source.name, tr.output)) continue;
             terminalToolReply = renderTerminalToolReply(source.name, source.input, tr.output);
             terminalToolReason = terminalToolStoppedReason(source.name);

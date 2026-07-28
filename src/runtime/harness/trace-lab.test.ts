@@ -50,6 +50,60 @@ test('buildTraceDetail classifies events, computes metrics, and links tool/appro
   assert.ok(trace.edges.some((edge) => edge.kind === 'approval_resolution' && edge.label === 'apr-1'));
 });
 
+test('Trace Lab distinguishes reserved, exactly-succeeded, and uncertain external writes', () => {
+  resetEventLog();
+  const pendingSession = createSession({ id: 'trace-write-pending', kind: 'chat' });
+  const reservation = {
+    preDispatch: true,
+    callId: 'trace-write-a',
+    canonicalCallId: 'trace-write-a',
+    shapeKey: 'email:send',
+    targets: ['casey@example.com'],
+  };
+  appendEvent({
+    sessionId: pendingSession.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: reservation,
+  });
+  appendEvent({
+    sessionId: pendingSession.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: { ...reservation, callId: 'trace-write-other', canonicalCallId: 'trace-write-other' },
+  });
+
+  const pending = buildTraceDetail(pendingSession.id);
+  assert.ok(pending);
+  assert.equal(pending.metrics.externalWrites, 0);
+  assert.equal(pending.metrics.externalWriteUncertain, 1);
+  assert.equal(pending.replay.riskLevel, 'high');
+  assert.ok(pending.nodes.some((node) => /reserved/i.test(node.label)));
+  assert.ok(pending.nodes.some((node) => node.type === 'external_write_succeeded'));
+
+  const confirmedSession = createSession({ id: 'trace-write-confirmed', kind: 'chat' });
+  appendEvent({
+    sessionId: confirmedSession.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: reservation,
+  });
+  appendEvent({
+    sessionId: confirmedSession.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: reservation,
+  });
+  const confirmed = buildTraceDetail(confirmedSession.id);
+  assert.ok(confirmed);
+  assert.equal(confirmed.metrics.externalWrites, 1);
+  assert.equal(confirmed.metrics.externalWriteUncertain, 0);
+});
+
 test('buildTraceReplayPreview produces a safe replay prompt with risks and key timeline', () => {
   resetEventLog();
   const sess = createSession({ id: 'trace-fail', kind: 'chat', title: 'Trace Failure' });

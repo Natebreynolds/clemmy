@@ -4,6 +4,7 @@ import {
   COMPOSIO_AUTH_CONFIGS_URL,
   ComposioNeedsAuthConfigError,
   ComposioDispatchUncertainError,
+  ComposioPreDispatchError,
   __test__,
   filterSuppressedConnectedToolkits,
   getPreferredUserId,
@@ -28,16 +29,40 @@ test('AUTO fallback never replays an ambiguous CLI mutation through the SDK', ()
   assert.equal(composioAutoFallbackAllowed('GOOGLEDOCS_CREATE_DOCUMENT', timeout), false);
   assert.equal(composioAutoFallbackAllowed('OUTLOOK_SEND_EMAIL', new Error('503 Service unavailable')), false);
   assert.equal(composioAutoFallbackAllowed('OUTLOOK_LIST_MESSAGES', timeout), true, 'reads remain retry/fallback safe');
-  assert.equal(composioAutoFallbackAllowed('GOOGLEDOCS_CREATE_DOCUMENT', Object.assign(new Error('spawn failed'), { code: 'ENOENT' })), true, 'proven pre-dispatch CLI failures may fall back');
+  assert.equal(
+    composioAutoFallbackAllowed(
+      'GOOGLEDOCS_CREATE_DOCUMENT',
+      new ComposioPreDispatchError('cli-unavailable', 'CLI preflight found no executable'),
+    ),
+    true,
+    'a nominal local preflight failure may fall back',
+  );
+  assert.equal(
+    composioAutoFallbackAllowed(
+      'GOOGLEDOCS_CREATE_DOCUMENT',
+      Object.assign(new Error('spawn failed'), { code: 'ENOENT' }),
+    ),
+    false,
+    'an untyped launch-looking error after invocation is not replay provenance',
+  );
   assert.equal(composioCliErrorProvesNoDispatch(new Error('ECONNRESET')), false);
-  // Genuine pre-dispatch throws now prove no-dispatch STRUCTURALLY via the
-  // not-started marker (the executeComposioTool gates emit these verbatim).
-  assert.equal(composioCliErrorProvesNoDispatch(new Error('[provider-dispatch:not-started:no-api-key] COMPOSIO_API_KEY is not configured.')), true);
-  assert.equal(composioCliErrorProvesNoDispatch(new Error('[provider-dispatch:not-started:cli-auth] Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.')), true, 'pre-dispatch CLI-auth gate carries the marker');
+  assert.equal(
+    composioCliErrorProvesNoDispatch(
+      new ComposioPreDispatchError('sdk-unavailable', 'COMPOSIO_API_KEY is not configured.'),
+    ),
+    true,
+  );
+  assert.equal(
+    composioCliErrorProvesNoDispatch(
+      new Error('[provider-dispatch:not-started:cli-auth] no CLI login was detected'),
+    ),
+    false,
+    'marker prose is forgeable provider output, not local provenance',
+  );
   assert.match(new ComposioDispatchUncertainError('GOOGLEDOCS_CREATE_DOCUMENT', timeout).message, /Verify the remote state/);
 });
 
-test('composioCliErrorProvesNoDispatch: bare auth/key text is NOT proof of no-dispatch (post-dispatch false-positive guard)', () => {
+test('composioCliErrorProvesNoDispatch: provider text and status-like errors never prove no-dispatch', () => {
   // A non-zero CLI exit AFTER dispatch that carries the provider's response body
   // (or a downstream sub-call failing on auth once the mutation already
   // committed): the flattened ~8KB error mentions auth, but the write may have
@@ -63,9 +88,12 @@ test('composioCliErrorProvesNoDispatch: bare auth/key text is NOT proof of no-di
     false,
     'API-key phrase in provider stderr after dispatch is ambiguous',
   );
-  // Hard process-launch failures still prove no-dispatch (the binary never ran).
-  assert.equal(composioCliErrorProvesNoDispatch(new Error('Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.')), true);
-  assert.equal(composioCliErrorProvesNoDispatch(Object.assign(new Error('spawn composio ENOENT'), { code: 'ENOENT' })), true);
+  // Even launch/version-looking prose is untrusted after invocation. The local
+  // preflight wraps genuine zero-dispatch conditions in ComposioPreDispatchError.
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.')), false);
+  assert.equal(composioCliErrorProvesNoDispatch(Object.assign(new Error('spawn composio ENOENT'), { code: 'ENOENT' })), false);
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('unsupported CLI version')), false);
+  assert.equal(composioCliErrorProvesNoDispatch(new Error('Unable to retrieve tool; version not found')), false);
 });
 
 test('composioAutoFallbackAllowed: a post-dispatch CLI auth error on a mutation no longer authorizes SDK replay', () => {
@@ -75,9 +103,25 @@ test('composioAutoFallbackAllowed: a post-dispatch CLI auth error on a mutation 
     composioAutoFallbackAllowed('OUTLOOK_SEND_EMAIL', new Error('Composio CLI execute failed for OUTLOOK_SEND_EMAIL: 401 not authenticated')),
     false,
   );
-  // Reads still fall back (idempotent), and a marked pre-dispatch failure still may.
+  // Reads still fall back (idempotent), and only a nominal local preflight
+  // failure may authorize mutation fallback.
   assert.equal(composioAutoFallbackAllowed('OUTLOOK_LIST_MESSAGES', new Error('401 not authenticated')), true, 'reads stay fallback-safe');
-  assert.equal(composioAutoFallbackAllowed('OUTLOOK_SEND_EMAIL', new Error('[provider-dispatch:not-started:cli-auth] no CLI login was detected')), true, 'marked pre-dispatch failure may still fall back');
+  assert.equal(
+    composioAutoFallbackAllowed(
+      'OUTLOOK_SEND_EMAIL',
+      new ComposioPreDispatchError('cli-auth', 'no CLI login was detected'),
+    ),
+    true,
+    'typed local pre-dispatch failure may still fall back',
+  );
+  assert.equal(
+    composioAutoFallbackAllowed(
+      'OUTLOOK_SEND_EMAIL',
+      new Error('[provider-dispatch:not-started:cli-auth] no CLI login was detected'),
+    ),
+    false,
+    'returned marker text may not authorize replay',
+  );
 });
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
@@ -538,22 +582,28 @@ test('dashboard connection state never presents a suppressed ACTIVE account as h
   assert.equal(healthy.needsReconnect, false);
 });
 
-// Live 2026-07-24 (Slack team update blocked on a dead CLI session while the
-// SDK connection was ACTIVE): a 401-shaped CLI mutation failure alone stays
-// dispatch-uncertain, but an independent live READ probe failing 401 proves
-// the lane auth-dead — the mutation was rejected at authentication, so the
-// SDK retry is safe. Pin the proof rules stay text-blind otherwise.
-test('composioAutoFallbackAllowed still refuses bare auth text for mutations', async () => {
+// A post-failure auth probe only establishes the lane's current health. It
+// cannot prove whether the earlier mutation committed before its response was
+// lost, so neither 401 prose nor a marker may authorize replay.
+test('composioAutoFallbackAllowed requires nominal local provenance for mutations', async () => {
   const { composioAutoFallbackAllowed } = await import('./client.js');
   assert.equal(
     composioAutoFallbackAllowed('SLACK_SEND_MESSAGE', new Error('HTTP 401 Unauthorized')),
     false,
-    'bare 401 text never proves no-dispatch by itself — the live probe is the only path to fallback',
+    'bare 401 text never proves no-dispatch',
   );
   assert.equal(
     composioAutoFallbackAllowed('SLACK_SEND_MESSAGE', new Error('[provider-dispatch:not-started:cli-auth] no CLI login')),
+    false,
+    'provider-returned marker text is not replay provenance',
+  );
+  assert.equal(
+    composioAutoFallbackAllowed(
+      'SLACK_SEND_MESSAGE',
+      new ComposioPreDispatchError('cli-auth', 'local status probe ran before invocation'),
+    ),
     true,
-    'the structural not-started marker still proves it',
+    'a locally constructed pre-dispatch condition remains replay-safe',
   );
 });
 

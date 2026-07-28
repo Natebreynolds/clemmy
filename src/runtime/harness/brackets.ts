@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput, type KillRequestTarget } from './eventlog.js';
 import {
   backgroundOfferEnabled as spineBackgroundOfferEnabled,
@@ -11,9 +11,28 @@ import {
   type ShellExecutionOutcome,
 } from '../shell-execution-outcome.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
+import { toolCallCorrelationFingerprint } from './tool-correlation.js';
+import {
+  canonicalExternalWriteActionKey,
+  consumeExternalWriteRetryAuthorization,
+  ExternalWritePreDispatchError,
+  externalWriteAdmissionKey,
+  externalWriteDuplicateIdentityKeys,
+  externalWriteSemanticFingerprint,
+  uncompensatedExternalWriteEvents,
+  withExternalWriteAdmissionLock,
+} from './external-write-admission.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode, noteGuardrailToolResult } from './tool-guardrail.js';
 import { normalizeWorkerOutput } from '../../agents/worker-output.js';
+import {
+  toolOutputLooksSuccessful,
+  toolOutputProvesExternalWriteAcknowledgement,
+} from './tool-evidence.js';
+import {
+  classifyRuntimeToolEffect,
+  projectCanonicalTopLevelToolEvents,
+} from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 import { sessionHasBackgroundOffer } from './convergence-steer.js';
 import {
@@ -34,6 +53,7 @@ import {
   extractExternalWriteIdentityKeys,
   evaluateGrounding,
   detectDuplicateTarget,
+  duplicateResendConsentAvailable,
   duplicateResendConsented,
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
@@ -529,52 +549,189 @@ function timeoutCorrectiveFor(toolName: string, parsedInput: unknown, timeoutMs:
 // DUPLICATE_EXTERNAL_WRITE hard wall covers only for SEND/PUBLISH — first gets a
 // verify-before-retry corrective. Informs, never hard-blocks (house doctrine).
 
-/** Short, stable digest of a tool call's args for the orphan audit record. */
-function shortArgsDigest(parsedInput: unknown): string {
-  try {
-    const text = typeof parsedInput === 'string' ? parsedInput : JSON.stringify(parsedInput);
-    return createHash('sha256').update(text ?? '').digest('hex').slice(0, 12);
-  } catch {
-    return 'unknown';
-  }
-}
-
-/** Record that a mutating external write TIMED OUT (durable audit of a
- *  maybe-landed write). No-ops for reads/non-writes and when there is no
- *  session. Telemetry only — never throws into the corrective path. */
-function recordExternalWriteOrphan(
-  sessionId: string | undefined,
-  toolName: string,
-  parsedInput: unknown,
-  timeoutMs: number,
-): void {
-  if (!sessionId) return;
-  try {
-    const shape = classifyExternalWrite(toolName, parsedInput);
-    if (!shape.mutating) return;
-    appendEvent({
-      sessionId,
-      turn: 0,
-      role: 'system',
-      type: 'external_write_orphaned',
-      data: {
-        ...currentExternalWriteEventAttribution(),
-        tool: toolName,
-        slug: shape.shapeKey ?? null,
-        targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
-        argsDigest: shortArgsDigest(parsedInput),
-        timeoutMs,
-        aborted: true,
-      },
-    });
-  } catch { /* telemetry write must never block the corrective */ }
-}
-
 /** (session, shape, target) combos whose orphaned-retry corrective already
- *  surfaced once — a speed bump, not a wall: the CONSCIOUS retry after the model
- *  verified via read-back passes. In-memory by design (a daemon restart fails
- *  toward letting the write through, which is the non-blocking default). */
+ *  surfaced. This de-duplicates telemetry only; it must never become authority
+ *  to dispatch another maybe-duplicate write. A successful provider read-back
+ *  is the authority that clears the retry gate. */
 const orphanRetryWarned = new Set<string>();
+
+function decodedOrphanVerificationArgs(data: Record<string, unknown>): unknown {
+  const raw = data.arguments ?? data.args ?? data.input ?? {};
+  if (typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) return raw;
+  try { return JSON.parse(trimmed) as unknown; } catch { return raw; }
+}
+
+function orphanVerificationCallId(data: Record<string, unknown>): string {
+  const value = data.canonicalCallId ?? data.callId;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizedOrphanIdentity(value: unknown): string {
+  return String(value).trim().toLowerCase();
+}
+
+/** Provider-neutral exact identities from read arguments. Known destination
+ *  fields use the shared write extractor; generic nested scalar values cover
+ *  provider-specific read schemas. Quoted values and email tokens let exact
+ *  identities survive filter expressions without authorizing substrings. */
+function orphanReadIdentityKeys(args: unknown): Set<string> {
+  const identities = new Set(
+    extractExternalWriteIdentityKeys(args)
+      .map(normalizedOrphanIdentity)
+      .filter(Boolean),
+  );
+  const visit = (value: unknown): void => {
+    if (value === null || value === undefined) return;
+    if (typeof value === 'number' || typeof value === 'bigint') {
+      identities.add(normalizedOrphanIdentity(value));
+      return;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      if (
+        trimmed.length < 50_000
+        && (
+          (trimmed.startsWith('{') && trimmed.endsWith('}'))
+          || (trimmed.startsWith('[') && trimmed.endsWith(']'))
+        )
+      ) {
+        try { visit(JSON.parse(trimmed) as unknown); return; } catch { /* opaque provider filter */ }
+      }
+      identities.add(normalizedOrphanIdentity(trimmed));
+      for (const match of trimmed.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []) {
+        identities.add(normalizedOrphanIdentity(match));
+      }
+      for (const match of trimmed.matchAll(/["']([^"'\\]{1,2048})["']/g)) {
+        identities.add(normalizedOrphanIdentity(match[1] ?? ''));
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const child of value) visit(child);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const child of Object.values(value as Record<string, unknown>)) visit(child);
+    }
+  };
+  visit(args);
+  identities.delete('');
+  return identities;
+}
+
+const ORPHAN_READ_RESULT_WRAPPERS = new Set([
+  'data',
+  'output',
+  'payload',
+  'response',
+  'result',
+]);
+const ORPHAN_READ_RESULT_METADATA = new Set([
+  'code',
+  'error',
+  'errors',
+  'message',
+  'ok',
+  'request_id',
+  'status',
+  'status_code',
+  'success',
+  'successful',
+]);
+
+/** Empty envelopes and status-only acknowledgements do not prove the provider
+ *  was actually read. An explicitly named provider result (including
+ *  `records: []`, which meaningfully proves absence) does. */
+function meaningfulOrphanReadResult(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return false;
+    if (
+      (trimmed.startsWith('{') && trimmed.endsWith('}'))
+      || (trimmed.startsWith('[') && trimmed.endsWith(']'))
+    ) {
+      try { return meaningfulOrphanReadResult(JSON.parse(trimmed) as unknown); } catch { /* plain result text */ }
+    }
+    return true;
+  }
+  if (typeof value !== 'object') return true;
+  if (Array.isArray(value)) return value.length > 0;
+  for (const [rawKey, child] of Object.entries(value as Record<string, unknown>)) {
+    const key = rawKey
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .replace(/[-\s]+/g, '_')
+      .toLowerCase();
+    if (ORPHAN_READ_RESULT_METADATA.has(key) || child === null || child === undefined) continue;
+    if (ORPHAN_READ_RESULT_WRAPPERS.has(key)) {
+      if (meaningfulOrphanReadResult(child)) return true;
+      continue;
+    }
+    // A provider result key is itself meaningful. In particular, an empty
+    // named collection is valid evidence that a same-target lookup found none.
+    return true;
+  }
+  return false;
+}
+
+function orphanReadResult(data: Record<string, unknown>): { present: boolean; value?: unknown } {
+  for (const key of ['result', 'output', 'preview'] as const) {
+    if (Object.prototype.hasOwnProperty.call(data, key)) {
+      return { present: true, value: data[key] };
+    }
+  }
+  return { present: false };
+}
+
+/** A timeout corrective, an unrelated return, or another write is not a
+ *  read-back. Require a canonical top-level READ call and its own later,
+ *  successful return after the orphan before another write may dispatch. */
+function hasSuccessfulReadBackAfter(
+  sessionId: string,
+  orphanSeq: number,
+  orphanTarget: string,
+): boolean {
+  const events = projectCanonicalTopLevelToolEvents(
+    listEvents(sessionId, { types: ['tool_called', 'tool_returned'] }),
+  )
+    .filter((event) => event.seq > orphanSeq)
+    .sort((left, right) => left.seq - right.seq);
+  const successfulReadCallIds = new Set<string>();
+  const normalizedTarget = normalizedOrphanIdentity(orphanTarget);
+
+  for (const event of events) {
+    const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+      ? event.data as Record<string, unknown>
+      : {};
+    const callId = orphanVerificationCallId(data);
+    if (!callId) continue;
+
+    if (event.type === 'tool_called') {
+      const toolName = typeof data.tool === 'string' ? data.tool : '';
+      const args = decodedOrphanVerificationArgs(data);
+      if (
+        toolName
+        && classifyRuntimeToolEffect(toolName, args).effect === 'read'
+        && orphanReadIdentityKeys(args).has(normalizedTarget)
+      ) {
+        successfulReadCallIds.add(callId);
+      }
+      continue;
+    }
+
+    if (event.type !== 'tool_returned' || !successfulReadCallIds.has(callId)) continue;
+    const output = orphanReadResult(data);
+    if (
+      output.present
+      && meaningfulOrphanReadResult(output.value)
+      && toolOutputLooksSuccessful(output.value, data.ok)
+    ) return true;
+  }
+  return false;
+}
 
 /** Does this mutating write hit a (shape, target) whose prior attempt is on the
  *  orphan ledger for this session? Returns the matching target or null. */
@@ -584,10 +741,22 @@ function findOrphanedWriteMatch(
   targets: string[],
 ): { target: string } | null {
   if (!shapeKey || targets.length === 0) return null;
-  let orphans: Array<{ seq: number; slug?: string | null; targets?: string[] }>;
+  let orphans: Array<{
+    seq: number;
+    shapeKey?: string | null;
+    slug?: string | null;
+    targets?: string[];
+  }>;
   try {
     orphans = listEvents(sessionId, { types: ['external_write_orphaned'] })
-      .map((ev) => ({ seq: ev.seq, ...(ev.data as { slug?: string | null; targets?: string[] }) }));
+      .map((ev) => ({
+        seq: ev.seq,
+        ...(ev.data as {
+          shapeKey?: string | null;
+          slug?: string | null;
+          targets?: string[];
+        }),
+      }));
   } catch {
     return null;
   }
@@ -595,20 +764,12 @@ function findOrphanedWriteMatch(
   for (const target of targets) {
     const t = target.toLowerCase();
     const hit = orphans.filter((o) =>
-      (o.slug ?? undefined) === shapeKey &&
+      (o.shapeKey ?? o.slug ?? undefined) === shapeKey &&
       (o.targets ?? []).some((x) => String(x).toLowerCase() === t));
     if (hit.length === 0) continue;
-    // Verified-retry pass-through: the timeout corrective ALREADY told the
-    // model to read the target back before retrying. Any tool activity AFTER
-    // the orphan means it did exactly that (or otherwise acted deliberately) —
-    // bouncing again would stack a redundant verify→retry cycle on top of the
-    // one it just completed (review finding). Only a BLIND immediate retry
-    // (zero intervening tool returns) gets the speed bump.
     const latestOrphanSeq = Math.max(...hit.map((o) => o.seq));
     try {
-      const verified = listEvents(sessionId, { types: ['tool_returned'] })
-        .some((ev) => ev.seq > latestOrphanSeq);
-      if (verified) return null;
+      if (hasSuccessfulReadBackAfter(sessionId, latestOrphanSeq, t)) return null;
     } catch { /* can't tell — keep the speed bump */ }
     return { target: t };
   }
@@ -766,6 +927,10 @@ export interface HarnessRunContext {
   /** Exact accepted user event for this attempt. Deterministic preflight gates
    * must not consult whichever session input happens to be newest. */
   sourceUserSeq?: number;
+  /** Exact execution lane explicitly opened/advanced by this turn. External
+   * write receipts use this to stay attached to one durable objective even
+   * when a chat later contains unrelated work. */
+  executionId?: string;
   /** One active model/tool run; loop/discovery counters key here so a long-lived
    * chat session does not accumulate unrelated calls across user turns. */
   behaviorScopeId?: string;
@@ -871,9 +1036,21 @@ function workerScopeIdFromDetails(sessionId: string, details: unknown): string {
  *  sessionId without explicit threading through SDK options. */
 export const harnessRunContextStorage = new AsyncLocalStorage<HarnessRunContext>();
 
+export class ExternalWriteReservationError extends Error {
+  constructor(toolName: string, cause?: unknown) {
+    super(
+      `Durable external-write admission failed for ${toolName}; no provider dispatch was allowed. `
+      + 'Retry after Clementine storage is healthy.',
+      { cause },
+    );
+    this.name = 'ExternalWriteReservationError';
+  }
+}
+
 function currentExternalWriteEventAttribution(): {
   sourceUserSeq?: number;
   runScopeId?: string;
+  executionId?: string;
 } {
   const ctx = harnessRunContextStorage.getStore();
   return {
@@ -881,6 +1058,7 @@ function currentExternalWriteEventAttribution(): {
       ? { sourceUserSeq: ctx?.sourceUserSeq as number }
       : {}),
     ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+    ...(ctx?.executionId ? { executionId: ctx.executionId } : {}),
   };
 }
 
@@ -1293,82 +1471,186 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
   };
 }
 
-/** Duplicate-ledger compensation: the external_write event is recorded
- *  PRE-dispatch (conservative — a crash mid-send must still count), but a
- *  dispatch that demonstrably FAILED never wrote anything. Without this, a
- *  schema-rejected send counts as a prior write and the model's corrected
- *  retry trips DUPLICATE_EXTERNAL_WRITE (live false positive, audit
- *  2026-06-12: `to` vs `to_email`). Only the explicit hard-failure shape
- *  compensates; anything ambiguous stays counted (the safe direction). */
-function compensateFailedExternalWrite(
+/**
+ * Settle one durable pre-dispatch reservation. Provider-visible prose is never
+ * no-dispatch authority: after invocation starts, a returned/thrown failure is
+ * ambiguous unless a local typed outcome proves dispatch=not_started AND
+ * effect=none. A clean resolved result gets an exact-call success receipt.
+ */
+function recordExternalWriteSettlement(
   sessionId: string | undefined,
   toolName: string,
   parsedInput: unknown,
   result: unknown,
   shellOutcome?: ShellExecutionOutcome,
-): void {
-  if (!sessionId) return;
+  callId?: string,
+  threw = false,
+): 'external_write_succeeded' | 'external_write_failed' | 'external_write_orphaned' | undefined {
+  if (!sessionId || !callId) return undefined;
+
+  let shapeKey: string | undefined;
+  let targets: string[] = [];
+  let irreversible = false;
+  if (toolName === 'run_shell_command') {
+    const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+      ? (parsedInput as { command: string }).command
+      : '';
+    const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
+    if (!mutation.isNetworkMutation || !mutation.shapeKey) return undefined;
+    shapeKey = mutation.shapeKey;
+    irreversible = true;
+    targets = Array.from(new Set([
+      ...extractDuplicateIdentityKeys(command),
+      ...extractExplicitPublishTargets(command),
+    ]));
+  } else {
+    const shape = classifyExternalWrite(toolName, parsedInput);
+    if (!shape.mutating || !shape.shapeKey) return undefined;
+    shapeKey = shape.shapeKey;
+    irreversible = shape.irreversible;
+    targets = extractExternalWriteIdentityKeys(parsedInput);
+  }
+
+  const trustedNotStarted = result instanceof ExternalWritePreDispatchError
+    || (
+      shellOutcome?.dispatch === 'not_started'
+      && shellOutcome.effect === 'none'
+    );
+  const resultCarriesAcknowledgement = result !== undefined
+    && result !== null
+    && (
+      typeof result !== 'string'
+      || result.trim().length > 0
+    );
+  const cleanAcknowledgement = !threw && resultCarriesAcknowledgement && (
+    toolName === 'run_shell_command'
+      ? shellOutcome?.dispatch === 'acknowledged' && shellOutcome.exitCode === 0
+      : toolOutputProvesExternalWriteAcknowledgement(result)
+  );
+  const type = trustedNotStarted
+    ? 'external_write_failed'
+    : cleanAcknowledgement
+      ? 'external_write_succeeded'
+      : 'external_write_orphaned';
+  const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
+  const correlationFingerprint = toolCallCorrelationFingerprint(toolName, parsedInput);
+  const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
+  appendEvent({
+    sessionId,
+    turn: 0,
+    role: 'system',
+    type,
+    data: {
+      ...currentExternalWriteEventAttribution(),
+      shapeKey,
+      actionKey,
+      toolName,
+      callId,
+      canonicalCallId: callId,
+      correlationFingerprint,
+      irreversible,
+      targets,
+      duplicateIdentityKeys: externalWriteDuplicateIdentityKeys(
+        toolName === 'run_shell_command'
+          ? extractDuplicateIdentityKeys(
+              typeof (parsedInput as { command?: unknown })?.command === 'string'
+                ? (parsedInput as { command: string }).command
+                : '',
+            )
+          : extractDuplicateIdentityKeys(parsedInput),
+        semanticFingerprint,
+      ),
+      ...(type !== 'external_write_succeeded'
+        ? {
+            reason: String(
+              result instanceof Error
+                ? result.message
+                : typeof result === 'string'
+                  ? result
+                  : 'provider result did not carry a trusted clean acknowledgement',
+            ).replace(/\s+/g, ' ').slice(0, 240),
+          }
+        : {}),
+    },
+  });
+  return type;
+}
+
+function assertNoDuplicateExternalWrite(input: {
+  sessionId: string;
+  toolName: string;
+  shapeKey: string | undefined;
+  targets: string[];
+  duplicateFingerprint?: string;
+  consumeResendConsent?: boolean;
+}): void {
+  if (!input.shapeKey) return;
+  const actionKey = canonicalExternalWriteActionKey(input.toolName, input.shapeKey);
+  const duplicateIdentityKeys = externalWriteDuplicateIdentityKeys(
+    input.targets,
+    input.duplicateFingerprint,
+  );
+  if (duplicateIdentityKeys.length === 0) return;
+  let priorWrites: Array<{ shapeKey?: string; targets?: string[]; at?: string }> = [];
   try {
-    const resultStr = typeof result === 'string' ? result : '';
-    // Composio hard-failure (the 2026-06-12 to/to_email case) — and the
-    // cold-start resolve NOT FOUND (ask-first batch regression item 1: the slug 404s at the
-    // RESOLVE step, before any send, so the pre-recorded external_write must
-    // compensate or the batch runner's side-effect-safe retry trips the
-    // duplicate-target gate and the recipient is silently skipped).
-    if (resultStr.startsWith('⚠️ composio_execute_tool FAILED')
-      || /^⚠️ composio_execute_tool NOT FOUND \(slug=/.test(resultStr)) {
-      const shape = classifyExternalWrite(toolName, parsedInput);
-      if (!shape.mutating) return;
-      appendEvent({
-        sessionId,
-        turn: 0,
-        role: 'system',
-        type: 'external_write_failed',
-        data: {
-          ...currentExternalWriteEventAttribution(),
-          shapeKey: shape.shapeKey,
-          toolName,
-          targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
-        },
-      });
-      return;
-    }
-    // Shell network-mutation failure (review 2026-06-14): the 2c4 gate records a
-    // shell send's external_write PRE-dispatch (shapeKey shell:<bin>); if the
-    // command then FAILS (non-zero exit / ERROR stub), compensate so the model's
-    // retry isn't a false DUPLICATE_EXTERNAL_WRITE. Mirrors the composio path,
-    // using the same shell classifier + shapeKey the 2c4 gate emitted.
-    if (toolName === 'run_shell_command') {
-      const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
-        ? (parsedInput as { command: string }).command
-        : '';
-      if (!command) return;
-      const mutation = classifyShellNetworkMutation(command);
-      // A generic non-zero provider CLI exit is NOT proof the write did not
-      // land. Compensate only typed execution evidence that proves no effect
-      // (local resolve/materialization failure or an authoritative provider
-      // precondition adapter). Unknown/possible remains counted and must be
-      // reconciled before retry.
-      const demonstrablyNoEffect = shellOutcome?.effect === 'none';
-      if (mutation.isNetworkMutation && mutation.shapeKey && demonstrablyNoEffect) {
-        appendEvent({
-          sessionId,
-          turn: 0,
-          role: 'system',
-          type: 'external_write_failed',
-          data: {
-            ...currentExternalWriteEventAttribution(),
-            shapeKey: mutation.shapeKey,
-            toolName,
-            targets: Array.from(new Set([
-              ...extractDuplicateIdentityKeys(command),
-              ...extractExplicitPublishTargets(command),
-            ])).slice(0, 8),
-          },
-        });
-      }
-    }
-  } catch { /* compensation must never break the tool result */ }
+    priorWrites = uncompensatedExternalWriteEvents(
+      listEvents(input.sessionId, {
+        types: ['external_write', 'external_write_failed'],
+      }),
+    ).map((event) => {
+      const data = event.data as {
+        actionKey?: string;
+        shapeKey?: string;
+        toolName?: string;
+        tool?: string;
+        targets?: string[];
+        duplicateIdentityKeys?: string[];
+        correlationFingerprint?: string;
+      };
+      return {
+        ...data,
+        shapeKey: data.actionKey
+          ?? canonicalExternalWriteActionKey(data.toolName ?? data.tool, data.shapeKey),
+        targets: data.duplicateIdentityKeys
+          ?? externalWriteDuplicateIdentityKeys(data.targets ?? [], data.correlationFingerprint),
+        at: event.createdAt,
+      };
+    });
+  } catch { /* fail toward not-a-duplicate */ }
+  const duplicate = detectDuplicateTarget({
+    sessionId: input.sessionId,
+    shapeKey: actionKey,
+    targets: duplicateIdentityKeys,
+    priorWrites,
+  });
+  if (
+    !duplicate.duplicate
+    || (
+      input.consumeResendConsent
+        ? duplicateResendConsented(input.sessionId, duplicate.target, duplicate.priorAt, actionKey)
+        : duplicateResendConsentAvailable(input.sessionId, duplicate.target, duplicate.priorAt, actionKey)
+    )
+  ) return;
+  try {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'duplicate_external_write',
+        toolName: input.toolName,
+        shapeKey: input.shapeKey,
+        actionKey,
+        target: duplicate.target ?? null,
+      },
+    });
+  } catch { /* telemetry must never block the deterministic refusal */ }
+  throw new DuplicateExternalWriteError({
+    toolName: input.toolName,
+    shapeKey: input.shapeKey,
+    target: duplicate.target ?? 'unknown',
+  });
 }
 
 /**
@@ -1460,16 +1742,6 @@ function creditRecallFromToolResult(
 // read prior<threshold in the await gap and none trip the batch floor — the
 // exact 10-email incident on the worker lane. This chains the gate's critical
 // section per session so each send sees the prior's append.
-const sessionSendGateLocks = new Map<string, Promise<unknown>>();
-function withSendGateLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
-  const prev = sessionSendGateLocks.get(sessionId) ?? Promise.resolve();
-  const run = prev.then(fn, fn);
-  // Store a non-rejecting tail so a thrown gate (ConfirmFirstRequiredError)
-  // doesn't poison the chain for the next send.
-  sessionSendGateLocks.set(sessionId, run.then(() => undefined, () => undefined));
-  return run;
-}
-
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -1747,8 +2019,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // server-side (the orphan ledger). The DUPLICATE_EXTERNAL_WRITE hard wall
     // covers only irreversible SEND/PUBLISH, so a blindly-retried reversible
     // *_CREATE_* can silently duplicate. Surface a verify-before-retry corrective
-    // ONCE (soft tool error → the model reads the target back, then re-issues the
-    // conscious retry, which passes). Fail-open; warn-once so it can never loop.
+    // (soft tool error → the model reads the target back, then re-issues the
+    // conscious retry, which passes). The warning event is de-duplicated, but
+    // dispatch remains refused until a paired successful READ is on the ledger.
     try {
       const shape = classifyExternalWrite(tool.name, parsedInput);
       if (shape.mutating) {
@@ -1767,8 +2040,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 data: { kind: 'orphaned_write_retry', toolName: tool.name, shapeKey: shape.shapeKey ?? null, target: match.target },
               });
             } catch { /* telemetry write must never block */ }
-            throw new OrphanedWriteRetryError({ toolName: tool.name, shapeKey: shape.shapeKey, target: match.target });
           }
+          throw new OrphanedWriteRetryError({ toolName: tool.name, shapeKey: shape.shapeKey, target: match.target });
         }
       }
     } catch (err) {
@@ -1883,44 +2156,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
         const shape = classifyExternalWrite(tool.name, parsedInput);
         if (shape.mutating && shape.irreversible) {
           const dupTargets = extractDuplicateIdentityKeys(parsedInput);
-          // Duplicate-target speed bump: one same-shape write per target
-          // per session unless consciously confirmed (second attempt
-          // passes). Approval of a batch is not idempotency.
-          let priorWrites: Array<{ shapeKey?: string; targets?: string[] }> = [];
-          try {
-            priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
-              .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
-            // Net out demonstrably-failed dispatches (external_write_failed
-            // compensation events, emitted post-invoke): each failure cancels
-            // ONE matching prior, so a corrected retry after a schema
-            // rejection is not a "duplicate" of a send that never happened.
-            const failures = listEvents(ctx.sessionId, { types: ['external_write_failed'] })
-              .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
-            for (const failure of failures) {
-              const failTargets = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
-              const idx = priorWrites.findIndex((w) =>
-                w.shapeKey === failure.shapeKey &&
-                (w.targets ?? []).some((t) => failTargets.has(String(t).toLowerCase())));
-              if (idx >= 0) priorWrites.splice(idx, 1);
-            }
-          } catch { /* fail toward not-a-duplicate */ }
-          const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: shape.shapeKey, targets: dupTargets, priorWrites });
-          if (dup.duplicate) {
-            try {
-              appendEvent({
-                sessionId: ctx.sessionId,
-                turn: 0,
-                role: 'system',
-                type: 'guardrail_tripped',
-                data: { kind: 'duplicate_external_write', toolName: tool.name, shapeKey: shape.shapeKey ?? null, target: dup.target ?? null },
-              });
-            } catch { /* telemetry write must never block */ }
-            // S2: a FRESH human approval naming this target (resolved after the
-            // prior send) authorizes exactly this resend — the wall honors it.
-            if (!duplicateResendConsented(ctx.sessionId, dup.target, dup.priorAt)) {
-              throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: shape.shapeKey, target: dup.target ?? 'unknown' });
-            }
-          }
+          // Fast pre-check before the slower judges. The same assertion runs
+          // again inside the atomic reservation below to close the TOCTOU gap.
+          assertNoDuplicateExternalWrite({
+            sessionId: ctx.sessionId,
+            toolName: tool.name,
+            shapeKey: shape.shapeKey,
+            targets: dupTargets,
+          });
           // Grounding: verify the payload against this target's own
           // session artifacts via an independent fast judge. A CERTIFIED batch
           // item skips it — certification already judged these exact byte-pinned
@@ -2221,36 +2464,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
         const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
         if (mutation.isNetworkMutation && mutation.shapeKey) {
           const dupTargets = extractDuplicateIdentityKeys(command);
-          if (dupTargets.length > 0) {
-            let priorWrites: Array<{ shapeKey?: string; targets?: string[] }> = [];
-            try {
-              priorWrites = listEvents(ctx.sessionId, { types: ['external_write'] })
-                .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
-              const failures = listEvents(ctx.sessionId, { types: ['external_write_failed'] })
-                .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
-              for (const failure of failures) {
-                const ft = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
-                const idx = priorWrites.findIndex((w) => w.shapeKey === failure.shapeKey
-                  && (w.targets ?? []).some((t) => ft.has(String(t).toLowerCase())));
-                if (idx >= 0) priorWrites.splice(idx, 1);
-              }
-            } catch { /* fail toward not-a-duplicate */ }
-            const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: mutation.shapeKey, targets: dupTargets, priorWrites });
-            if (dup.duplicate) {
-              // S2: a FRESH human approval naming this target (resolved after the
-              // prior send) authorizes exactly this resend — the wall honors it.
-              if (!duplicateResendConsented(ctx.sessionId, dup.target, dup.priorAt)) {
-                throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: mutation.shapeKey, target: dup.target ?? 'unknown' });
-              }
-            }
-          }
-          // The duplicate gate intentionally stays recipient-focused, but the
-          // durable ledger must still name a publish resource such as --site or
-          // --project. Otherwise a successful deploy is audited as targets=[].
-          const ledgerTargets = Array.from(new Set([
-            ...dupTargets,
-            ...extractExplicitPublishTargets(command),
-          ]));
+          assertNoDuplicateExternalWrite({
+            sessionId: ctx.sessionId,
+            toolName: tool.name,
+            shapeKey: mutation.shapeKey,
+            targets: dupTargets,
+          });
           const verdict = await evaluateGrounding(ctx.sessionId, tool.name, command);
           if (verdict.action === 'block') {
             try {
@@ -2264,20 +2483,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
               sourceCallIds: verdict.sourceCallIds, failureCount: verdict.failureCount ?? 1,
             });
           }
-          // Record the shell send in the SHARED external_write ledger.
-          try {
-            appendEvent({
-              sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'external_write',
-              data: {
-                ...currentExternalWriteEventAttribution(),
-                shapeKey: mutation.shapeKey,
-                toolName: tool.name,
-                irreversible: true,
-                shell: true,
-                targets: ledgerTargets.slice(0, 8),
-              },
-            });
-          } catch { /* telemetry must never block */ }
         }
       }
     } catch (err) {
@@ -2355,134 +2560,181 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] shell-send output-grounding threw (fail-open)', err instanceof Error ? err.message : err);
     }
-    // 2d. Confirm-first gate — a BATCH of same-shape external writes
-    // needs an instruction-reviewed plan scope before it proceeds. Runs
-    // for chat sessions only and aggregates across workers (they share
-    // ctx.sessionId via AsyncLocalStorage). Counts durable external_write
-    // events the gate itself emits, so worker writes are counted even if
-    // they don't log tool_called under the parent session.
-    try {
-      if (isConfirmFirstEnabled()) {
-        const sessionRow = getSession(ctx.sessionId);
-        const shape = classifyExternalWrite(tool.name, parsedInput);
-        // GLOBAL SEND FLOOR (2026-07-09 bypass hunt): an IRREVERSIBLE send/
-        // publish batch gates on EVERY session kind — chat, workflow,
-        // execution (background/cron), agent (worker fan-out). The batch-
-        // consent floor is a property of the ACTION, not the chat surface; the
-        // chat-only guard let workflow default-scope sends and run_worker
-        // fan-out reconstitute the unapproved-batch incident on other lanes.
-        // Reversible writes stay chat-scoped (the 2026-05-30 anti-deadlock
-        // rationale below) so capable non-chat runs aren't wedged on undoable
-        // edits.
-        const gateThisSession = sessionRow?.kind === 'chat' || shape.irreversible;
-        if (gateThisSession && shape.mutating && shape.shapeKey) {
-          // Irreversible sends run the count→decide→append critical section
-          // under a per-session lock so a concurrent fan-out can't all read a
-          // stale count (Hole 4); reversible writes don't need it.
-          const runCriticalSection = async (): Promise<void> => {
-            // Count prior same-shape writes already allowed this session.
-            let prior = 0;
+    // Shell network writes bypass classifyExternalWrite, so give them the same
+    // always-on atomic reservation after every optional judge has passed.
+    if (tool.name === 'run_shell_command') {
+      const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+        ? (parsedInput as { command: string }).command
+        : '';
+      const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
+      if (mutation.isNetworkMutation && mutation.shapeKey) {
+        await withExternalWriteAdmissionLock(
+          externalWriteAdmissionKey(ctx.sessionId),
+          async () => {
+            const correlationFingerprint = toolCallCorrelationFingerprint(tool.name, parsedInput);
+            const duplicateTargets = extractDuplicateIdentityKeys(command);
+            const ledgerTargets = Array.from(new Set([
+              ...duplicateTargets,
+              ...extractExplicitPublishTargets(command),
+            ]));
+            const actionKey = canonicalExternalWriteActionKey(tool.name, mutation.shapeKey);
+            const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
+            const duplicateIdentityKeys = externalWriteDuplicateIdentityKeys(duplicateTargets, semanticFingerprint);
+            assertNoDuplicateExternalWrite({
+              sessionId: ctx.sessionId,
+              toolName: tool.name,
+              shapeKey: mutation.shapeKey,
+              targets: duplicateTargets,
+              duplicateFingerprint: semanticFingerprint,
+              consumeResendConsent: true,
+            });
+            const retry = consumeExternalWriteRetryAuthorization({
+              sessionId: ctx.sessionId,
+              sourceUserSeq: ctx.sourceUserSeq,
+              actionKey,
+              duplicateIdentityKeys,
+            });
             try {
-              for (const ev of listEvents(ctx.sessionId, { types: ['external_write'] })) {
-                const d = ev.data as { shapeKey?: string } | undefined;
-                if (d?.shapeKey === shape.shapeKey) prior += 1;
-              }
-            } catch { /* count is best-effort; fail toward not-a-batch */ }
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'external_write',
+                data: {
+                  ...currentExternalWriteEventAttribution(),
+                  shapeKey: mutation.shapeKey,
+                  actionKey,
+                  toolName: tool.name,
+                  callId,
+                  canonicalCallId: callId,
+                  correlationFingerprint,
+                  irreversible: true,
+                  shell: true,
+                  preDispatch: true,
+                  targets: ledgerTargets,
+                  duplicateIdentityKeys,
+                  ...(retry ? {
+                    retryOfCallId: retry.retryOfCallId,
+                    retryAuthorizationSeq: retry.authorizationSeq,
+                    executionId: retry.executionId,
+                  } : {}),
+                },
+              });
+            } catch (cause) {
+              throw new ExternalWriteReservationError(tool.name, cause);
+            }
+          },
+        );
+      }
+    }
+    // 2d. Always-on durable write admission. Confirmation and grounding are
+    // optional policy/judge layers; neither switch may disable idempotency,
+    // reservation, or exact request ownership.
+    try {
+      const sessionRow = getSession(ctx.sessionId);
+      const shape = classifyExternalWrite(tool.name, parsedInput);
+      if (shape.mutating && shape.shapeKey) {
+        await withExternalWriteAdmissionLock(
+          externalWriteAdmissionKey(ctx.sessionId),
+          async () => {
+            const actionKey = canonicalExternalWriteActionKey(tool.name, shape.shapeKey);
+            const correlationFingerprint = toolCallCorrelationFingerprint(tool.name, parsedInput);
+            const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
+            const targets = extractExternalWriteIdentityKeys(parsedInput);
+            const duplicateIdentityKeys = externalWriteDuplicateIdentityKeys(
+              extractDuplicateIdentityKeys(parsedInput),
+              semanticFingerprint,
+            );
 
-            const { loadProactivityPolicy } = await import('../../agents/proactivity-policy.js');
-            const policy = loadProactivityPolicy();
-            const threshold = policy.batchConfirmThreshold;
-            const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
-
-            // YOLO = the user has granted STANDING approval ("auto-approve
-            // everything except the hard danger denylist"). For REVERSIBLE
-            // writes the 2026-06-02 rationale stands: this approval gate is
-            // pure friction under YOLO — skip it, still RECORD the write.
-            // But YOLO never extends to an IRREVERSIBLE batch (2026-07-09,
-            // Ask-first regression: yolo waved 10 outbound emails through while
-            // batchConfirmThreshold sat unread). Irreversible batches at/over
-            // the threshold require ONE reviewed approval regardless of scope.
-            const yoloStandingApproval = policy.autoApproveScope === 'yolo' && !shape.irreversible;
-
-            // A certified batch item executes a HUMAN-approved, byte-pinned
-            // plan (run_batch: approval pins the payload hash; the yolo
-            // auto-approve hole at the request_approval surface is closed in
-            // orchestrator.ts) — that approval IS the reviewed plan, so the
-            // gate is satisfied without a separate plan scope.
-            const approvedCertifiedBatch = Boolean(ctx.certifiedBatch);
-
-            // An instruction-reviewed plan scope satisfies the gate — but for
-            // an IRREVERSIBLE send, only a scope that ENUMERATED the send
-            // (goalScoped + allowedSends) counts. A bare wildcard `['*']` scope
-            // (opened by the workflow/background lanes) must NOT satisfy the
-            // send floor (2026-07-09 Hole 2); it still satisfies reversible
-            // writes as before.
-            const { getPlanScope } = await import('../../agents/plan-scope.js');
-            const scope = getPlanScope(ctx.sessionId);
-            const scopeOpen = !!scope && !scope.closedAt;
-            // For an irreversible send, a scope only counts as reviewed if it
-            // EXPLICITLY covers the send — enumerated in allowedSends, or the
-            // tool/slug named (NOT via wildcard '*') in allowedTools. A bare
-            // `['*']` scope (workflow/background launch) does not (Hole 2).
-            // Reversible writes keep the any-open-scope behavior.
-            const { isUngrantableMultiplexer } = await import('../../agents/plan-scope.js');
-            const hasReviewedScope = shape.irreversible
-              ? Boolean(scopeOpen && scope && (
-                  // The slug (shapeKey) enumerated in the scope's send/slug lists.
-                  (scope.allowedSends ?? []).some((s) => s === shape.shapeKey)
-                  || (scope.allowedComposioSlugs ?? []).some((s) => s === shape.shapeKey)
-                  // OR a NON-multiplexer send tool named directly (native MCP).
-                  // The composio gateway name never counts (Hole A).
-                  || (!isUngrantableMultiplexer(tool.name) && scope.allowedTools.includes(tool.name))
-                ))
-              : scopeOpen;
-
-            // SEVERITY GATE (2026-05-30): only genuinely IRREVERSIBLE
-            // batches (SEND/PUBLISH — emails sent, posts published) must
-            // wait for a reviewed plan scope. A reversible write
-            // (GOOGLESHEETS_UPDATE/BATCH, a spreadsheet edit you can undo)
-            // is NOT worth deadlocking a capable agent over — it kept the
-            // confirm-first gate firing in chat sessions where nothing
-            // opens a scope, wedging the agent with no reachable exit
-            // (live: the 48-row Closed-Won sheet, email-analysis dropped).
-            // The runaway-loop guard (2b) + the per-tool SDK approval are
-            // the safety floor for reversible writes; this gate now only
-            // adds friction where the blast radius is truly irreversible.
-            // Philosophy: prevent irreversible mistakes, don't over-gate
-            // reversible execution. Env escape hatch keeps the old
-            // gate-everything behavior available if ever needed.
-            const gateAllMutating =
-              (getRuntimeEnv('CLEMMY_CONFIRM_FIRST_ALL_WRITES', 'off') ?? 'off').toLowerCase() === 'on';
-            const severityRequiresGate = gateAllMutating || shape.irreversible;
-
-            if (!yoloStandingApproval && !approvedCertifiedBatch && review.required && severityRequiresGate && !hasReviewedScope) {
-              try {
-                appendEvent({
-                  sessionId: ctx.sessionId,
-                  turn: 0,
-                  role: 'system',
-                  type: 'guardrail_tripped',
-                  data: {
-                    kind: 'confirm_first_required',
-                    toolName: tool.name,
-                    shapeKey: shape.shapeKey,
-                    count: review.count,
-                    threshold,
-                    irreversible: shape.irreversible,
-                  },
-                });
-              } catch { /* telemetry write must never block */ }
-              throw new ConfirmFirstRequiredError({
+            if (shape.irreversible) {
+              assertNoDuplicateExternalWrite({
+                sessionId: ctx.sessionId,
                 toolName: tool.name,
                 shapeKey: shape.shapeKey,
-                count: review.count,
-                threshold,
-                sessionId: ctx.sessionId,
+                targets: extractDuplicateIdentityKeys(parsedInput),
+                duplicateFingerprint: semanticFingerprint,
+                consumeResendConsent: true,
               });
             }
 
-            // Allowed through — record the write so subsequent same-shape
-            // calls (including worker fan-out) count toward the batch.
+            let count = 1;
+            let underScope = false;
+            const gateThisSession = sessionRow?.kind === 'chat' || shape.irreversible;
+            if (isConfirmFirstEnabled() && gateThisSession) {
+              let prior = 0;
+              try {
+                for (const ev of listEvents(ctx.sessionId, { types: ['external_write'] })) {
+                  const data = ev.data as {
+                    actionKey?: string;
+                    shapeKey?: string;
+                    toolName?: string;
+                    tool?: string;
+                  } | undefined;
+                  const priorActionKey = data?.actionKey
+                    ?? canonicalExternalWriteActionKey(data?.toolName ?? data?.tool, data?.shapeKey);
+                  if (priorActionKey === actionKey) prior += 1;
+                }
+              } catch { /* count is best-effort; reservation below is not */ }
+
+              const { loadProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+              const policy = loadProactivityPolicy();
+              const threshold = policy.batchConfirmThreshold;
+              const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
+              count = review.count;
+              const yoloStandingApproval = policy.autoApproveScope === 'yolo' && !shape.irreversible;
+              const approvedCertifiedBatch = Boolean(ctx.certifiedBatch);
+              const { getPlanScope, isUngrantableMultiplexer } = await import('../../agents/plan-scope.js');
+              const scope = getPlanScope(ctx.sessionId);
+              const scopeOpen = Boolean(scope && !scope.closedAt);
+              underScope = shape.irreversible
+                ? Boolean(scopeOpen && scope && (
+                    (scope.allowedSends ?? []).some((value) => value === shape.shapeKey)
+                    || (scope.allowedComposioSlugs ?? []).some((value) => value === shape.shapeKey)
+                    || (!isUngrantableMultiplexer(tool.name) && scope.allowedTools.includes(tool.name))
+                  ))
+                : scopeOpen;
+              const gateAllMutating =
+                (getRuntimeEnv('CLEMMY_CONFIRM_FIRST_ALL_WRITES', 'off') ?? 'off').toLowerCase() === 'on';
+              const severityRequiresGate = gateAllMutating || shape.irreversible;
+              if (
+                !yoloStandingApproval
+                && !approvedCertifiedBatch
+                && review.required
+                && severityRequiresGate
+                && !underScope
+              ) {
+                try {
+                  appendEvent({
+                    sessionId: ctx.sessionId,
+                    turn: 0,
+                    role: 'system',
+                    type: 'guardrail_tripped',
+                    data: {
+                      kind: 'confirm_first_required',
+                      toolName: tool.name,
+                      shapeKey: shape.shapeKey,
+                      count: review.count,
+                      threshold,
+                      irreversible: shape.irreversible,
+                    },
+                  });
+                } catch { /* ordinary telemetry remains best-effort */ }
+                throw new ConfirmFirstRequiredError({
+                  toolName: tool.name,
+                  shapeKey: shape.shapeKey,
+                  count: review.count,
+                  threshold,
+                  sessionId: ctx.sessionId,
+                });
+              }
+            }
+
+            const retry = consumeExternalWriteRetryAuthorization({
+              sessionId: ctx.sessionId,
+              sourceUserSeq: ctx.sourceUserSeq,
+              actionKey,
+              duplicateIdentityKeys,
+            });
             try {
               appendEvent({
                 sessionId: ctx.sessionId,
@@ -2492,28 +2744,37 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 data: {
                   ...currentExternalWriteEventAttribution(),
                   shapeKey: shape.shapeKey,
+                  actionKey,
                   toolName: tool.name,
+                  callId,
+                  canonicalCallId: callId,
+                  correlationFingerprint,
                   irreversible: shape.irreversible,
-                  count: review.count,
-                  underScope: hasReviewedScope,
-                  // Target identity (recipient email/domain/ids) — read by
-                  // the duplicate-target gate so a later same-shape write
-                  // to the same target gets a conscious-confirmation bump.
-                  targets: extractExternalWriteIdentityKeys(parsedInput).slice(0, 8),
+                  preDispatch: true,
+                  count,
+                  underScope,
+                  targets,
+                  duplicateIdentityKeys,
+                  ...(retry ? {
+                    retryOfCallId: retry.retryOfCallId,
+                    retryAuthorizationSeq: retry.authorizationSeq,
+                    executionId: retry.executionId,
+                  } : {}),
                 },
               });
-            } catch { /* telemetry write must never block */ }
-          };
-          // Serialize irreversible sends per session (Hole 4); reversible
-          // writes run directly (no batch-consent race to protect).
-          if (shape.irreversible) await withSendGateLock(ctx.sessionId, runCriticalSection);
-          else await runCriticalSection();
-        }
+            } catch (cause) {
+              throw new ExternalWriteReservationError(tool.name, cause);
+            }
+          },
+        );
       }
     } catch (err) {
-      if (err instanceof ConfirmFirstRequiredError) throw err;
-      // eslint-disable-next-line no-console
-      console.warn('[harness] confirm-first gate threw (fail-open)', err instanceof Error ? err.message : err);
+      if (
+        err instanceof ConfirmFirstRequiredError
+        || err instanceof DuplicateExternalWriteError
+        || err instanceof ExternalWriteReservationError
+      ) throw err;
+      throw new ExternalWriteReservationError(tool.name, err);
     }
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
@@ -2641,9 +2902,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const failArtifact = (
     dispatch: ArtifactDispatch | undefined,
     shellOutcome?: ShellExecutionOutcome,
+    error?: unknown,
   ): void => {
     if (!dispatch) return;
-    if (shellOutcome?.effect === 'none' || shellOutcome?.dispatch === 'not_started') {
+    if (
+      error instanceof ExternalWritePreDispatchError
+      || (shellOutcome?.effect === 'none' && shellOutcome?.dispatch === 'not_started')
+    ) {
       try { releaseClaimedArtifact(dispatch.artifactId, dispatch.callId); } catch { /* keep pending fail-closed */ }
       return;
     }
@@ -2704,7 +2969,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // SDK call_id for THIS invocation — lets the within-task fetch-memory nudge
       // correlate a future identical call back to this one's tool_outputs row.
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
-      const invokeCallId = invokeCall?.callId ?? invokeCall?.id;
+      const invokeCallId = invokeCall?.callId ?? invokeCall?.id ?? `harness-${randomUUID()}`;
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
       // field comes from a trusted source, never model-authored text (the class of
@@ -2784,7 +3049,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : undefined;
         settleArtifact(artifact.dispatch, result, shellOutcome);
         settleArtifactReadback(ctx, parsedInput, result, invokeCallId);
-        compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
+        recordExternalWriteSettlement(
+          ctx?.sessionId,
+          tool.name,
+          parsedInput,
+          result,
+          shellOutcome,
+          invokeCallId,
+        );
         recordPublishIfSucceeded(tool.name, parsedInput, result, shellOutcome);
         creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result, shellOutcome);
         // Poll-vs-loop discrimination: record the result fingerprint so the
@@ -2796,8 +3068,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
         const shellOutcome = tool.name === 'run_shell_command'
           ? takeShellExecutionOutcome(invokeCallId)
           : undefined;
-        failArtifact(artifact.dispatch, shellOutcome);
-        compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, err, shellOutcome);
+        failArtifact(artifact.dispatch, shellOutcome, err);
+        recordExternalWriteSettlement(
+          ctx?.sessionId,
+          tool.name,
+          parsedInput,
+          err,
+          shellOutcome,
+          invokeCallId,
+          true,
+        );
+        const soft = softToolError(err);
+        if (soft !== null) return soft;
         throw err;
       });
       // run_worker (Agent.asTool fan-out leaf) MUST return something into the
@@ -2859,9 +3141,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
           return result;
         } catch (err) {
           if (err instanceof ToolTimeout) {
-            // S3 orphan ledger: a mutating write in this long-job class timed out
-            // and may have landed — record it before self-correcting. No-ops for reads.
-            recordExternalWriteOrphan(ctx?.sessionId, tool.name, parsedInput, timeoutMs);
             return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
           }
           throw err;
@@ -2883,6 +3162,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const originalExecute = tool.execute!;
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
+    const executeCallId = `harness-${randomUUID()}`;
     // Layer 1 — bind $fromToolOutput references to real store values before gates
     // + execution (mirror of the invoke path). No-op without the syntax.
     if (toolOutputReferenceResolutionEnabled() && hasToolOutputReference(input)) {
@@ -2899,8 +3179,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
     let fanoutNudge: string | undefined;
     let artifact: ArtifactAdmission = {};
     try {
-      fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input, undefined, () => {
-        artifact = claimArtifact(ctx, input);
+      fanoutNudge = await runBrackets(ctx?.sessionId ?? '', input, executeCallId, () => {
+        artifact = claimArtifact(ctx, input, executeCallId);
         return artifact;
       });
     } catch (err) {
@@ -2929,7 +3209,19 @@ export function wrapToolForHarness<T extends WrappableTool>(
         },
       );
     } catch (err) {
-      failArtifact(artifact.dispatch);
+      const shellOutcome = tool.name === 'run_shell_command'
+        ? takeShellExecutionOutcome(executeCallId)
+        : undefined;
+      failArtifact(artifact.dispatch, shellOutcome, err);
+      recordExternalWriteSettlement(
+        ctx?.sessionId,
+        tool.name,
+        input,
+        err,
+        shellOutcome,
+        executeCallId,
+        true,
+      );
       // Same general self-correction as the invoke path: a long-job timeout on an
       // external-API / MCP tool returns the async/verify corrective as the result
       // (run continues) instead of propagating ToolTimeout to the ask-user pause.
@@ -2937,16 +3229,27 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (err instanceof ToolTimeout && isTimeoutSelfCorrectTool(tool.name)) {
         // S3 orphan ledger — mirrors the invoke path (records a maybe-landed
         // write before self-correcting). No-ops for reads.
-        recordExternalWriteOrphan(ctx?.sessionId, tool.name, input, timeoutMs);
         return timeoutCorrectiveFor(tool.name, input, timeoutMs);
       }
+      const soft = softToolError(err);
+      if (soft !== null) return soft;
       throw err;
     }
-    settleArtifact(artifact.dispatch, result);
-    settleArtifactReadback(ctx, input, result);
-    compensateFailedExternalWrite(ctx?.sessionId, tool.name, input, result);
-    recordPublishIfSucceeded(tool.name, input, result);
-    creditRecallFromToolResult(ctx?.sessionId, tool.name, input, result);
+    const shellOutcome = tool.name === 'run_shell_command'
+      ? takeShellExecutionOutcome(executeCallId)
+      : undefined;
+    settleArtifact(artifact.dispatch, result, shellOutcome);
+    settleArtifactReadback(ctx, input, result, executeCallId);
+    recordExternalWriteSettlement(
+      ctx?.sessionId,
+      tool.name,
+      input,
+      result,
+      shellOutcome,
+      executeCallId,
+    );
+    recordPublishIfSucceeded(tool.name, input, result, shellOutcome);
+    creditRecallFromToolResult(ctx?.sessionId, tool.name, input, result, shellOutcome);
     if (fanoutNudge && typeof result === 'string') return `${result}\n\n${fanoutNudge}`;
     return result;
     // NOTE: A tool-return truncator used to live here as part of
@@ -2977,6 +3280,8 @@ export function softToolError(err: unknown): string | null {
     err instanceof GoalFidelityCheckFailedError ||
     err instanceof OutputGroundingCheckFailedError ||
     err instanceof DuplicateExternalWriteError ||
+    err instanceof ExternalWriteReservationError ||
+    err instanceof ExternalWritePreDispatchError ||
     err instanceof OrphanedWriteRetryError ||
     err instanceof ImplicitDestinationError ||
     err instanceof UnverifiedDestinationError

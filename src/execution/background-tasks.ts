@@ -51,6 +51,7 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import { resolveWriteEvidence } from '../runtime/harness/work-report.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
@@ -1973,16 +1974,24 @@ function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
   const durationMs = updated.startedAt && updated.completedAt
     ? Math.max(0, Date.parse(updated.completedAt) - Date.parse(updated.startedAt))
     : 0;
-  // WHERE the deliverable went: the latest external_write's first target(s)
-  // (file path, sheet, mailbox). Without this a later session cannot answer
-  // "find those 30 emails we drafted" and guesses at mailboxes (2026-07-23).
+  // WHERE the deliverable went: the latest exactly-settled external write's
+  // first target(s) (file path, sheet, mailbox). A pre-dispatch reservation is
+  // not a deliverable; a failed one must never replace the last confirmed
+  // target in learned strategy memory.
   let deliverable: string | undefined;
   try {
-    const writeRow = db.prepare(
-      "SELECT data_json FROM events WHERE session_id = ? AND type = 'external_write' ORDER BY seq DESC LIMIT 1",
-    ).get(updated.runSessionId) as { data_json?: string } | undefined;
-    if (writeRow?.data_json) {
-      const data = JSON.parse(writeRow.data_json) as { targets?: unknown };
+    const evidence = listHarnessEventsForRefute(updated.runSessionId, {
+      types: [
+        'external_write',
+        'external_write_succeeded',
+        'external_write_failed',
+        'external_write_orphaned',
+      ],
+    });
+    const latestConfirmed = resolveWriteEvidence(evidence).confirmed
+      .sort((left, right) => right.seq - left.seq)[0];
+    if (latestConfirmed) {
+      const data = latestConfirmed.data as { targets?: unknown };
       const targets = Array.isArray(data.targets) ? data.targets.filter((t): t is string => typeof t === 'string') : [];
       if (targets.length > 0) deliverable = targets.slice(0, 2).join(', ');
     }
@@ -2622,34 +2631,63 @@ export function backgroundCompletionEvidence(
   try { extractedDeliverables = extractDeliverables(task.runSessionId).length; } catch { /* unreadable evidence stays absent */ }
   try {
     const writes = assessBackgroundTaskRestartSafety(task);
-    externalWriteReceipts = writes.externalWriteCount;
     ambiguousExternalWrites = writes.ambiguousWriteCount;
-    // Restart safety deliberately treats a lone external-write return as
-    // "write touched" even when its result failed, because replay must fail
-    // closed. Completion authority is stricter: only a successful return can
-    // stand in for a missing canonical external_write receipt.
     const writeEvents = listHarnessEventsForRefute(task.runSessionId, {
-      types: ['external_write', 'tool_returned'],
+      types: [
+        'external_write',
+        'external_write_succeeded',
+        'external_write_failed',
+        'external_write_orphaned',
+        'tool_returned',
+      ],
     });
-    if (!writeEvents.some((event) => event.type === 'external_write')) {
-      const successfulReturnKeys = new Set<string>();
-      for (const event of writeEvents) {
-        if (event.type !== 'tool_returned') continue;
-        const data = (event.data ?? {}) as Record<string, unknown>;
-        if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
-        const resultText = [data.result, data.preview, data.output, data.error]
-          .filter((value): value is string => typeof value === 'string')
-          .join('\n');
-        const failed = data.ok === false
-          || data.isError === true
-          || (typeof data.error === 'string' && data.error.trim().length > 0)
-          || detectStructuredToolFailure(resultText).failed;
-        if (failed) continue;
-        const callId = typeof data.callId === 'string' ? data.callId : '';
-        successfulReturnKeys.add(callId ? `call:${callId}` : `event:${event.seq}`);
-      }
-      externalWriteReceipts = successfulReturnKeys.size;
+    const lifecycleEvents = writeEvents.filter((event) => (
+      event.type === 'external_write'
+      || event.type === 'external_write_succeeded'
+      || event.type === 'external_write_failed'
+      || event.type === 'external_write_orphaned'
+    ));
+    const receiptKeys = new Set<string>();
+    const lifecycleCallIds = new Set<string>();
+    for (const event of lifecycleEvents) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      const callId = typeof data.canonicalCallId === 'string' && data.canonicalCallId.trim()
+        ? data.canonicalCallId.trim()
+        : typeof data.callId === 'string'
+          ? data.callId.trim()
+          : '';
+      if (callId) lifecycleCallIds.add(callId);
     }
+    for (const event of resolveWriteEvidence(lifecycleEvents).confirmed) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      const callId = typeof data.canonicalCallId === 'string' && data.canonicalCallId.trim()
+        ? data.canonicalCallId.trim()
+        : typeof data.callId === 'string'
+          ? data.callId.trim()
+          : '';
+      receiptKeys.add(callId ? `call:${callId}` : `event:${event.seq}`);
+    }
+    // Restart safety deliberately treats a lone external-write return as
+    // write-touched even when its result failed. Completion is stricter: only
+    // a successful return for a call whose canonical lifecycle is absent can
+    // stand in for a missing receipt.
+    for (const event of writeEvents) {
+      if (event.type !== 'tool_returned') continue;
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
+      const callId = typeof data.callId === 'string' ? data.callId.trim() : '';
+      if (callId && lifecycleCallIds.has(callId)) continue;
+      const resultText = [data.result, data.preview, data.output, data.error]
+        .filter((value): value is string => typeof value === 'string')
+        .join('\n');
+      const failed = data.ok === false
+        || data.isError === true
+        || (typeof data.error === 'string' && data.error.trim().length > 0)
+        || detectStructuredToolFailure(resultText).failed;
+      if (failed) continue;
+      receiptKeys.add(callId ? `call:${callId}` : `event:${event.seq}`);
+    }
+    externalWriteReceipts = receiptKeys.size;
   } catch { /* unreadable evidence stays absent */ }
   return { artifactBindings, extractedDeliverables, externalWriteReceipts, ambiguousExternalWrites };
 }
@@ -3144,12 +3182,12 @@ export interface BackgroundRestartSafetyAssessment {
  * see the old duplicate-write ledger. The current harness event producers are
  * best-effort, so an EMPTY ledger is never proof that no mutation was attempted
  * — it parks as `receipt_history_unavailable`. But a ledger that DID record
- * tool activity, all of it read-only (no committed, compensated, failed, or
- * unreturned external write), is positive evidence the producers were running
- * and the run never touched an external system: it reattaches automatically as
- * `safe_no_external_write`. Committed writes park as `external_write_history`;
- * unreturned external calls and explicit orphan markers are the stronger,
- * ambiguous class (`ambiguous_external_write`).
+ * tool activity or an exactly-failed no-dispatch write is positive evidence
+ * the producers were running and no mutation landed: it reattaches
+ * automatically as `safe_no_external_write`. Legacy write receipts and new
+ * reservations with exact same-call success park as `external_write_history`;
+ * unsettled reservations, unreturned external calls, and explicit orphan
+ * markers are the stronger ambiguous class (`ambiguous_external_write`).
  */
 export function assessBackgroundTaskRestartSafety(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,
@@ -3169,6 +3207,7 @@ export function assessBackgroundTaskRestartSafety(
         'tool_called',
         'tool_returned',
         'external_write',
+        'external_write_succeeded',
         'external_write_failed',
         'external_write_orphaned',
         'orphaned_tool_inflight',
@@ -3191,56 +3230,60 @@ export function assessBackgroundTaskRestartSafety(
       }
     }
 
-    type WriteEvidence = {
-      seq: number;
-      callId?: string;
-      shapeKey?: string;
-      targets: string[];
-    };
-    const asWriteEvidence = (event: (typeof events)[number]): WriteEvidence => {
+    const writeKey = (event: (typeof events)[number]): string => {
       const data = (event.data ?? {}) as Record<string, unknown>;
-      return {
-        seq: event.seq,
-        ...(typeof data.callId === 'string' ? { callId: data.callId } : {}),
-        ...(typeof data.shapeKey === 'string' ? { shapeKey: data.shapeKey } : {}),
-        targets: Array.isArray(data.targets)
-          ? data.targets.filter((target): target is string => typeof target === 'string').map((target) => target.toLowerCase())
-          : [],
-      };
+      const callId = typeof data.canonicalCallId === 'string' && data.canonicalCallId.trim()
+        ? data.canonicalCallId.trim()
+        : typeof data.callId === 'string'
+          ? data.callId.trim()
+          : '';
+      return callId ? `call:${callId}` : `event:${event.seq}`;
     };
-    const canonicalWrites = events.filter((event) => event.type === 'external_write').map(asWriteEvidence);
-    const failedWrites = events.filter((event) => event.type === 'external_write_failed').map(asWriteEvidence);
-    const failureMatchesWrite = (write: WriteEvidence, failure: WriteEvidence): boolean => {
-      if (write.seq >= failure.seq) return false;
-      if (write.callId && failure.callId) return write.callId === failure.callId;
-      if (write.shapeKey !== failure.shapeKey) return false;
-      return write.targets.length === 0
-        || failure.targets.length === 0
-        || failure.targets.some((target) => write.targets.includes(target));
-    };
-    const compensatedWriteIndexes = new Set<number>();
-    for (const failure of failedWrites) {
-      for (let index = canonicalWrites.length - 1; index >= 0; index -= 1) {
-        if (compensatedWriteIndexes.has(index) || !failureMatchesWrite(canonicalWrites[index], failure)) continue;
-        compensatedWriteIndexes.add(index);
-        break;
+    const lifecycleEvents = events.filter((event) => (
+      event.type === 'external_write'
+      || event.type === 'external_write_succeeded'
+      || event.type === 'external_write_failed'
+      || event.type === 'external_write_orphaned'
+    ));
+    const canonicalWrites = lifecycleEvents.filter((event) => event.type === 'external_write');
+    const resolvedWrites = resolveWriteEvidence(lifecycleEvents);
+    const ledgerWriteEvidence = new Set(resolvedWrites.confirmed.map(writeKey));
+    const returnedWriteEvidence = new Set<string>();
+    const ambiguousEvidence = new Set(resolvedWrites.uncertain.map(writeKey));
+    const lifecycleCallIds = new Set<string>();
+    for (const event of lifecycleEvents) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      const callId = typeof data.canonicalCallId === 'string' && data.canonicalCallId.trim()
+        ? data.canonicalCallId.trim()
+        : typeof data.callId === 'string'
+          ? data.callId.trim()
+          : '';
+      if (callId) lifecycleCallIds.add(callId);
+    }
+    const hasUncorrelatedCanonicalWrite = canonicalWrites.some((event) => {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      return !(
+        (typeof data.canonicalCallId === 'string' && data.canonicalCallId.trim())
+        || (typeof data.callId === 'string' && data.callId.trim())
+      );
+    });
+    // A succeeded terminal without any reservation cannot certify a physical
+    // dispatch. Preserve it as one ambiguous write-history fact. When a
+    // reservation is already pending, that pending call is the actionable
+    // ambiguity and an unrelated terminal need not inflate the count.
+    if (canonicalWrites.length === 0) {
+      for (const event of lifecycleEvents) {
+        if (event.type === 'external_write_succeeded') ambiguousEvidence.add(writeKey(event));
       }
     }
-    const ledgerWriteEvidence = new Set(
-      canonicalWrites
-        .filter((_write, index) => !compensatedWriteIndexes.has(index))
-        .map((write) => write.callId ? `call:${write.callId}` : `event:${write.seq}`),
-    );
-    const returnedWriteEvidence = new Set<string>();
-    const ambiguousEvidence = new Set<string>();
     for (const event of events) {
       const data = (event.data ?? {}) as Record<string, unknown>;
-      if (event.type === 'external_write' || event.type === 'external_write_failed') {
-        continue;
-      }
-      if (event.type === 'external_write_orphaned') {
-        const callId = typeof data.callId === 'string' ? data.callId : '';
-        ambiguousEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
+      if (
+        event.type === 'external_write'
+        || event.type === 'external_write_succeeded'
+        || event.type === 'external_write_failed'
+        || event.type === 'external_write_orphaned'
+      ) {
         continue;
       }
       if (event.type === 'tool_returned') {
@@ -3253,7 +3296,9 @@ export function assessBackgroundTaskRestartSafety(
         // ordinary read-return (no `effect`) is untouched, so this never
         // double-counts the normal paired case.
         if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
+        if (hasUncorrelatedCanonicalWrite) continue;
         const callId = typeof data.callId === 'string' ? data.callId : '';
+        if (callId && lifecycleCallIds.has(callId)) continue;
         returnedWriteEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
         continue;
       }
@@ -3262,6 +3307,16 @@ export function assessBackgroundTaskRestartSafety(
         // describes the same physical dispatch and must not inflate/risk-split it.
         if (data.accounting === 'transport_mirror' || data.effect !== 'external_write') continue;
         const callId = typeof data.callId === 'string' ? data.callId : '';
+        if (hasUncorrelatedCanonicalWrite) {
+          // A returned legacy call is already represented by the uncorrelated
+          // canonical row. An unreturned call remains ambiguous: it could be a
+          // different dispatch, and assuming correlation would risk replay.
+          if (!callId || !returnedCallIds.has(callId)) {
+            ambiguousEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
+          }
+          continue;
+        }
+        if (callId && lifecycleCallIds.has(callId)) continue;
         if (!callId || !returnedCallIds.has(callId)) {
           ambiguousEvidence.add(callId ? `call:${callId}` : `event:${event.seq}`);
         } else {
@@ -3271,19 +3326,19 @@ export function assessBackgroundTaskRestartSafety(
       }
       if (event.type === 'orphaned_tool_inflight') {
         const callId = typeof data.callId === 'string' ? data.callId : '';
-        if (callId && externalCallIds.has(callId)) {
+        if (callId && externalCallIds.has(callId) && !lifecycleCallIds.has(callId)) {
           ambiguousEvidence.add(`call:${callId}`);
         }
       }
     }
 
-    // external_write is the canonical pre-dispatch ledger. Fall back to a
-    // completed external-write tool boundary only if that ledger append was
-    // unavailable, avoiding a misleading double-count for the ordinary case
-    // where one physical mutation emitted both rows.
-    const externalWriteCount = canonicalWrites.length > 0
-      ? ledgerWriteEvidence.size
-      : returnedWriteEvidence.size;
+    // The lifecycle is canonical per call. Tool-boundary evidence for a
+    // different call still matters when that call's lifecycle append was lost;
+    // lifecycleCallIds above prevents ordinary paired rows from double-counting.
+    const externalWriteCount = new Set([
+      ...ledgerWriteEvidence,
+      ...returnedWriteEvidence,
+    ]).size;
 
     if (ambiguousEvidence.size > 0) {
       return {
@@ -3302,31 +3357,12 @@ export function assessBackgroundTaskRestartSafety(
       };
     }
 
-    // Reaching here means: no committed writes and no ambiguous/unreturned
-    // external calls. Two histories look identical on those two counters yet
-    // must diverge:
-    //
-    //   (a) The producers recorded real tool activity for this run and ALL of
-    //       it was read-only — no external_write ledger row (even a compensated
-    //       one), no external_write_failed, no external-effect tool_called. The
-    //       non-empty ledger is positive evidence the best-effort producers WERE
-    //       functioning, so the absence of write rows is now meaningful: the run
-    //       provably never touched an external system. Read-only work reattaches
-    //       automatically (`safe_no_external_write`).
-    //
-    //   (b) An empty best-effort ledger (nothing recorded), or a history that
-    //       DID attempt a write which then failed/compensated to a net-zero
-    //       remainder. Neither proves the run stayed read-only, so both stay
-    //       fail-closed as `receipt_history_unavailable` and park for manual
-    //       verification.
-    //
-    // external_write_orphaned and unreturned external-effect tool_called are
-    // already routed to `ambiguous_external_write` above, so the only lingering
-    // write evidence to exclude here is a compensated canonical write or a bare
-    // external_write_failed row.
+    // Reaching here means no write landed and no provider outcome is
+    // ambiguous. Any non-empty producer history—including an exact failed
+    // no-dispatch lifecycle—proves the evidence seam was active and is safe to
+    // resume. Only a truly empty best-effort ledger remains unavailable.
     const historyRecordedToolActivity = events.length > 0;
-    const historyHasWriteEvidence = canonicalWrites.length > 0 || failedWrites.length > 0;
-    if (historyRecordedToolActivity && !historyHasWriteEvidence) {
+    if (historyRecordedToolActivity) {
       return {
         safeToAutoResume: true,
         reason: 'safe_no_external_write',

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { MCPServer } from '@openai/agents';
 import pino from 'pino';
 import { decideToolApproval } from '../agents/tool-taxonomy.js';
@@ -10,6 +11,7 @@ import {
   isGroundingGateEnabled,
   evaluateGrounding,
   detectDuplicateTarget,
+  duplicateResendConsentAvailable,
   duplicateResendConsented,
   extractDuplicateIdentityKeys,
   extractExternalWriteIdentityKeys,
@@ -31,8 +33,20 @@ import { looksLikeNativeMcpSend } from './harness/execution-gate.js';
 import { isConfirmFirstEnabled } from './harness/confirm-first-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
 import { evaluateToolCall, applyMode } from './harness/tool-guardrail.js';
+import { toolCallCorrelationFingerprint } from './harness/tool-correlation.js';
+import {
+  canonicalExternalWriteActionKey,
+  consumeExternalWriteRetryAuthorization,
+  externalWriteAdmissionKey,
+  externalWriteDuplicateIdentityKeys,
+  externalWriteSemanticFingerprint,
+  uncompensatedExternalWriteEvents,
+  withExternalWriteAdmissionLock,
+} from './harness/external-write-admission.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
+import { toolOutputProvesExternalWriteAcknowledgement } from './harness/tool-evidence.js';
+import { classifyRuntimeToolEffect } from './harness/tool-effect.js';
 import {
   classifyToolError,
   detectStructuredToolFailure,
@@ -101,6 +115,7 @@ const MCP_INVALID_RESULT_PREFIX = 'ERROR: MCP_RESULT_INVALID';
 function currentExternalWriteEventAttribution(): {
   sourceUserSeq?: number;
   runScopeId?: string;
+  executionId?: string;
 } {
   const ctx = harnessRunContextStorage.getStore();
   return {
@@ -108,6 +123,7 @@ function currentExternalWriteEventAttribution(): {
       ? { sourceUserSeq: ctx?.sourceUserSeq as number }
       : {}),
     ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
+    ...(ctx?.executionId ? { executionId: ctx.executionId } : {}),
   };
 }
 
@@ -147,9 +163,20 @@ export function classifyMcpIntegrityScope(
   const argMutation = detectMcpArgsNetworkMutation(args);
   const nameIsSend = looksLikeNativeMcpSend(toolName);
   const isIrreversibleSend = decisionKind === 'send' || nameIsSend;
+  const runtimeEffect = classifyRuntimeToolEffect(toolName, args);
+  const isExternalWrite = runtimeEffect.effect === 'external_write';
+  // The unified MCP taxonomy is the dispatch authority. Opaque provider tool
+  // names deliberately classify conservatively as `write`; never let weaker
+  // name/argument inference downgrade that decision and bypass the durable
+  // reservation/settlement lifecycle.
+  const taxonomyWrite = decisionKind === 'write';
   return {
     isIrreversibleSend,
-    needsIntegrityChecks: isIrreversibleSend || argMutation.isNetworkMutation,
+    needsIntegrityChecks:
+      taxonomyWrite
+      || isExternalWrite
+      || isIrreversibleSend
+      || argMutation.isNetworkMutation,
     shapeKey: isIrreversibleSend ? toolName : (argMutation.shapeKey ?? toolName),
   };
 }
@@ -1121,20 +1148,95 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       const integrityScope = classifyMcpIntegrityScope(toolName, decision.kind, args);
       const { isIrreversibleSend, needsIntegrityChecks } = integrityScope;
       const integrityShapeKey = integrityScope.shapeKey;
+      const integrityActionKey = canonicalExternalWriteActionKey(toolName, integrityShapeKey);
+      const integrityTargets = extractDuplicateIdentityKeys(args ?? {});
+      const correlationFingerprint = toolCallCorrelationFingerprint(toolName, args ?? {});
+      const semanticFingerprint = externalWriteSemanticFingerprint(
+        integrityActionKey,
+        args ?? {},
+      );
+      const integrityDuplicateIdentityKeys = externalWriteDuplicateIdentityKeys(
+        integrityTargets,
+        semanticFingerprint,
+      );
+      const assertNoDuplicateIntegrityWrite = (consumeResendConsent: boolean): void => {
+        if (!integritySessionId || integrityDuplicateIdentityKeys.length === 0) return;
+        const priorWrites = uncompensatedExternalWriteEvents(
+          listEvents(integritySessionId, {
+            types: ['external_write', 'external_write_failed'],
+          }),
+        ).map((event) => {
+          const data = event.data as {
+            actionKey?: string;
+            shapeKey?: string;
+            toolName?: string;
+            tool?: string;
+            targets?: string[];
+            duplicateIdentityKeys?: string[];
+            correlationFingerprint?: string;
+          };
+          return {
+            ...data,
+            shapeKey: data.actionKey
+              ?? canonicalExternalWriteActionKey(data.toolName ?? data.tool, data.shapeKey),
+            targets: data.duplicateIdentityKeys
+              ?? externalWriteDuplicateIdentityKeys(data.targets ?? [], data.correlationFingerprint),
+            at: event.createdAt,
+          };
+        });
+        const duplicate = detectDuplicateTarget({
+          sessionId: integritySessionId,
+          shapeKey: integrityActionKey,
+          targets: integrityDuplicateIdentityKeys,
+          priorWrites,
+        });
+        if (
+          duplicate.duplicate
+          && !(
+            consumeResendConsent
+              ? duplicateResendConsented(
+                  integritySessionId,
+                  duplicate.target,
+                  duplicate.priorAt,
+                  integrityActionKey,
+                )
+              : duplicateResendConsentAvailable(
+                  integritySessionId,
+                  duplicate.target,
+                  duplicate.priorAt,
+                  integrityActionKey,
+                )
+          )
+        ) {
+          throw new DuplicateExternalWriteError({
+            toolName,
+            shapeKey: integrityShapeKey,
+            target: duplicate.target ?? 'unknown',
+          });
+        }
+      };
 
-      // BATCH-CONSENT FLOOR for native MCP sends (bypass-hunt lane 3): the shim
-      // dispatches OUTSIDE wrapToolForHarness, so the brackets confirm-first gate
-      // never sees these. Mirror it here — an irreversible-send batch at/over the
-      // threshold requires ONE human approval regardless of YOLO, unless it
-      // rides a human-approved certified batch or a reviewed plan scope.
-      if (isIrreversibleSend && integritySessionId && isConfirmFirstEnabled()) {
+      // BATCH-CONSENT FLOOR for native MCP sends (bypass-hunt lane 3). This
+      // function is intentionally invoked from the shared reservation lock
+      // below: counting here and reserving later lets concurrent distinct
+      // recipients all observe prior=0 and bypass the threshold.
+      const assertNativeBatchConsent = async (): Promise<void> => {
+        if (!isIrreversibleSend || !integritySessionId || !isConfirmFirstEnabled()) return;
         try {
           const { loadProactivityPolicy } = await import('../agents/proactivity-policy.js');
           const { decideInstructionReview } = await import('./harness/confirm-first-gate.js');
           const { getPlanScope } = await import('../agents/plan-scope.js');
           let prior = 0;
           for (const ev of listEvents(integritySessionId, { types: ['external_write'] })) {
-            if ((ev.data as { shapeKey?: string } | undefined)?.shapeKey === integrityShapeKey) prior += 1;
+            const data = ev.data as {
+              actionKey?: string;
+              shapeKey?: string;
+              toolName?: string;
+              tool?: string;
+            } | undefined;
+            const priorActionKey = data?.actionKey
+              ?? canonicalExternalWriteActionKey(data?.toolName ?? data?.tool, data?.shapeKey);
+            if (priorActionKey === integrityActionKey) prior += 1;
           }
           const threshold = loadProactivityPolicy().batchConfirmThreshold;
           const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
@@ -1169,30 +1271,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           if (err instanceof BoundaryError) throw err;
           // count failure → fail toward not-a-batch (never wedge a legit send).
         }
-      }
+      };
       if (needsIntegrityChecks && isGroundingGateEnabled() && integritySessionId) {
         try {
           // Duplicate-target speed bump: a same-shape send to a target already
           // written this session bumps ONCE (approval is not idempotency).
-          const dupTargets = extractDuplicateIdentityKeys(args ?? {});
-          if (dupTargets.length > 0) {
-            const priorWrites = listEvents(integritySessionId, { types: ['external_write'] })
-              .map((ev) => ({ ...(ev.data as { shapeKey?: string; targets?: string[] }), at: ev.createdAt }));
-            const failures = listEvents(integritySessionId, { types: ['external_write_failed'] })
-              .map((ev) => ev.data as { shapeKey?: string; targets?: string[] });
-            for (const failure of failures) {
-              const failTargets = new Set((failure.targets ?? []).map((t) => String(t).toLowerCase()));
-              const idx = priorWrites.findIndex((w) => w.shapeKey === failure.shapeKey
-                && (w.targets ?? []).some((t) => failTargets.has(String(t).toLowerCase())));
-              if (idx >= 0) priorWrites.splice(idx, 1);
-            }
-            const dup = detectDuplicateTarget({ sessionId: integritySessionId, shapeKey: integrityShapeKey, targets: dupTargets, priorWrites });
-            // S2: a FRESH human approval naming this target (resolved after
-            // the prior send) authorizes exactly this resend.
-            if (dup.duplicate && !duplicateResendConsented(integritySessionId, dup.target, dup.priorAt)) {
-              throw new DuplicateExternalWriteError({ toolName, shapeKey: integrityShapeKey, target: dup.target ?? 'unknown' });
-            }
-          }
+          assertNoDuplicateIntegrityWrite(false);
           // Grounding: verify the outgoing payload against this target's own
           // session artifacts (fail-open on no-target / no-sources / judge error).
           const verdict = await evaluateGrounding(integritySessionId, toolName, args ?? {});
@@ -1317,14 +1401,6 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         }
       }
 
-      const finish = beginToolEvent({
-        sessionId: integritySessionId,
-        toolName,
-        kind: decision.kind,
-        approvalReason: decision.reason,
-        args,
-        mcp: true,
-      });
       // Wave 4 Stage 1 (adversarial review finding G): record an irreversible SEND
       // in the SHARED external_write ledger PRE-dispatch — mirroring the composio
       // and shell paths — so a throw AFTER the backend already committed (timeout /
@@ -1337,9 +1413,33 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // compensateFailedExternalWrite's "anything ambiguous stays counted"). Only
       // irreversible sends are pre-recorded; reversible integrity writes keep the
       // post-dispatch record. Best-effort — telemetry must never block the send.
-      let preRecordedSend = false;
-      if (needsIntegrityChecks && isIrreversibleSend && integritySessionId) {
-        try {
+      const externalWriteCallId = `mcp-${randomUUID()}`;
+      const finish = beginToolEvent({
+        sessionId: integritySessionId,
+        toolName,
+        kind: decision.kind,
+        approvalReason: decision.reason,
+        args,
+        mcp: true,
+      });
+      let preRecordedWrite = false;
+      const reserveWrite = async (): Promise<void> => {
+        // Earlier model judges intentionally run outside this critical section.
+        // Every transport shares this short read-ledger → reserve-write lock;
+        // provider dispatch begins only after it is released.
+        if (isIrreversibleSend) {
+          await assertNativeBatchConsent();
+          assertNoDuplicateIntegrityWrite(true);
+        }
+        if (needsIntegrityChecks && integritySessionId) {
+          const retry = consumeExternalWriteRetryAuthorization({
+            sessionId: integritySessionId,
+            sourceUserSeq: activeRunContext?.sourceUserSeq,
+            actionKey: integrityActionKey,
+            duplicateIdentityKeys: integrityDuplicateIdentityKeys,
+          });
+          // This is admission state, not telemetry. If persistence fails, the
+          // provider must not receive an untracked mutation.
           appendEvent({
             sessionId: integritySessionId,
             turn: 0,
@@ -1348,15 +1448,33 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             data: {
               ...currentExternalWriteEventAttribution(),
               shapeKey: integrityShapeKey,
+              actionKey: integrityActionKey,
               toolName,
-              irreversible: true,
+              callId: externalWriteCallId,
+              canonicalCallId: externalWriteCallId,
+              correlationFingerprint,
+              irreversible: isIrreversibleSend,
               mcp: true,
               preDispatch: true,
-              targets: extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8),
+              targets: extractExternalWriteIdentityKeys(args ?? {}),
+              duplicateIdentityKeys: integrityDuplicateIdentityKeys,
+              ...(retry ? {
+                retryOfCallId: retry.retryOfCallId,
+                retryAuthorizationSeq: retry.authorizationSeq,
+                executionId: retry.executionId,
+              } : {}),
             },
           });
-          preRecordedSend = true;
-        } catch { /* telemetry write must never block the send */ }
+          preRecordedWrite = true;
+        }
+      };
+      if (needsIntegrityChecks && integritySessionId) {
+        await withExternalWriteAdmissionLock(
+          externalWriteAdmissionKey(integritySessionId),
+          reserveWrite,
+        );
+      } else {
+        await reserveWrite();
       }
       try {
         // Forward to the underlying server with the ORIGINAL tool name.
@@ -1373,55 +1491,38 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, normalized.result);
-        // Resolve the write ledger from the provider's actual return. A
-        // structured failure is negative evidence, never a successful write.
-        // Irreversible sends were recorded pre-dispatch and therefore receive a
-        // matching failed/orphaned resolution; reversible writes emit their
-        // success only after a clean provider result.
-        if (needsIntegrityChecks && integritySessionId && failure.failed) {
-          try {
-            const failureText = failure.summary || rawText;
-            const failureKind = classifyToolError(failureText);
-            const demonstrablyNoEffect = normalized.invalid
-              || failure.notFound
-              || failureKind === 'permission_denied'
-              || failureKind === 'not_found'
-              || failureKind === 'rate_limit'
-              || /invalid|validation|bad request|missing required|schema|unauthoriz|forbidden|not connected/i.test(failureText);
-            appendEvent({
-              sessionId: integritySessionId,
-              turn: 0,
-              role: 'system',
-              type: demonstrablyNoEffect ? 'external_write_failed' : 'external_write_orphaned',
-              data: {
-                ...currentExternalWriteEventAttribution(),
-                shapeKey: integrityShapeKey,
-                toolName,
-                slug: parsed.serverSlug,
-                irreversible: isIrreversibleSend,
-                mcp: true,
-                targets: extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8),
-                reason: failureText.slice(0, 200),
-              },
-            });
-          } catch { /* telemetry write must never block */ }
-        } else if (needsIntegrityChecks && integritySessionId && !preRecordedSend) {
-          try {
-            appendEvent({
-              sessionId: integritySessionId,
-              turn: 0,
-              role: 'system',
-              type: 'external_write',
-              data: {
-                ...currentExternalWriteEventAttribution(),
-                shapeKey: integrityShapeKey,
-                toolName,
-                irreversible: isIrreversibleSend,
-                mcp: true,
-                targets: extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8),
-              },
-            });
-          } catch { /* telemetry write must never block */ }
+        // A returned provider failure is post-boundary and therefore ambiguous,
+        // regardless of marker/auth/404/rate-limit wording. Only a clean,
+        // structurally valid result settles the exact reservation as success.
+        if (preRecordedWrite && integritySessionId) {
+          const type = failure.failed
+            || normalized.invalid
+            || !toolOutputProvesExternalWriteAcknowledgement(normalized.result)
+            ? 'external_write_orphaned'
+            : 'external_write_succeeded';
+          appendEvent({
+            sessionId: integritySessionId,
+            turn: 0,
+            role: 'system',
+            type,
+            data: {
+              ...currentExternalWriteEventAttribution(),
+              shapeKey: integrityShapeKey,
+              actionKey: integrityActionKey,
+              toolName,
+              callId: externalWriteCallId,
+              canonicalCallId: externalWriteCallId,
+              correlationFingerprint,
+              slug: parsed.serverSlug,
+              irreversible: isIrreversibleSend,
+              mcp: true,
+              targets: extractExternalWriteIdentityKeys(args ?? {}),
+              duplicateIdentityKeys: integrityDuplicateIdentityKeys,
+              ...(type === 'external_write_orphaned'
+                ? { reason: (failure.summary || rawText || 'invalid MCP result').slice(0, 200) }
+                : {}),
+            },
+          });
         }
         // Parity with shell/Composio: prepend a self-correcting header when the
         // result is a failure envelope (best-effort; success is byte-identical).
@@ -1432,43 +1533,31 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
-        // Finding G (+ re-review): the pre-recorded external_write must be resolved
-        // by whether the send DEMONSTRABLY never left vs. MIGHT have committed.
-        //   - Demonstrably-never-sent (auth / 404-not-found / rate-limit-rejected /
-        //     bad-params / connection-refused / DNS) → compensate with
-        //     external_write_failed, which BOTH the shim's own duplicate check
-        //     (:1158) AND the workflow forEach resume guards (sendAlreadyClaimed =
-        //     writes>fails) net out — so a legit retry / resume isn't blocked and a
-        //     genuinely-failed send isn't dropped on resume. Parity with composio's
-        //     compensateFailedExternalWrite; without it a native send that 401'd or
-        //     ECONNREFUSED'd mid-batch was silently skipped for that recipient.
-        //   - Genuinely ambiguous (timeout / dropped response / transient) → stays
-        //     counted as an external_write_orphaned (the send may have landed → a
-        //     resume re-send is refused, the safe direction for an irreversible send).
-        if (preRecordedSend && integritySessionId && !(err instanceof BoundaryError)) {
+        // Once the reservation has crossed into server.callTool, every thrown
+        // error is ambiguous. Provider text cannot prove that nothing landed.
+        if (preRecordedWrite && integritySessionId) {
           const errMsg = (err instanceof Error ? err.message : String(err));
-          const kind = classifyToolError(errMsg, err);
-          const demonstrablyNeverSent = kind === 'permission_denied' || kind === 'not_found'
-            || kind === 'rate_limit' || isInvalidMcpCallResultValidationError(err)
-            || /econnrefused|enotfound|eai_again|getaddrinfo|dns|connection refused/i.test(errMsg);
-          const targets = extractExternalWriteIdentityKeys(args ?? {}).slice(0, 8);
-          try {
-            appendEvent({
-              sessionId: integritySessionId,
-              turn: 0,
-              role: 'system',
-              type: demonstrablyNeverSent ? 'external_write_failed' : 'external_write_orphaned',
-              data: {
-                ...currentExternalWriteEventAttribution(),
-                shapeKey: integrityShapeKey,
-                toolName,
-                slug: parsed.serverSlug,
-                targets,
-                mcp: true,
-                reason: errMsg.slice(0, 200),
-              },
-            });
-          } catch { /* telemetry write must never block */ }
+          const targets = extractExternalWriteIdentityKeys(args ?? {});
+          appendEvent({
+            sessionId: integritySessionId,
+            turn: 0,
+            role: 'system',
+            type: 'external_write_orphaned',
+            data: {
+              ...currentExternalWriteEventAttribution(),
+              shapeKey: integrityShapeKey,
+              actionKey: integrityActionKey,
+              toolName,
+              callId: externalWriteCallId,
+              canonicalCallId: externalWriteCallId,
+              correlationFingerprint,
+              slug: parsed.serverSlug,
+              targets,
+              duplicateIdentityKeys: integrityDuplicateIdentityKeys,
+              mcp: true,
+              reason: errMsg.slice(0, 200),
+            },
+          });
         }
         if (!(err instanceof BoundaryError) && isInvalidMcpCallResultValidationError(err)) {
           const msg = err instanceof Error ? err.message : String(err);

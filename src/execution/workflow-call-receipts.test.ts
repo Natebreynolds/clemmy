@@ -119,13 +119,13 @@ test('mutation receipt: a no-auth toolkit (undefined connectionId) records inten
   );
 });
 
-test('mutation receipt: a no-auth dispatch that hits "no connected account" is recorded failed, never a false success', async () => {
+test('mutation receipt: provider-returned "not connected" is ambiguous and never re-dispatched', async () => {
   // The gateway only refuses an auth-required route as a typed block (never
   // reaching this ledger) for the AMBIGUOUS/BREAKER cases. A single unconnected
-  // toolkit instead resolves ok with no connectionId and the PROVIDER rejects at
-  // the door ("no connected account found"). Wired with the same real
-  // classifiers the call-node boundary uses, that must be recorded as a proven
-  // no-commit failure — refused, retryable, and never committed as success.
+  // toolkit instead resolves ok with no connectionId and the PROVIDER returns
+  // "no connected account found". That result arrived after invocation and is
+  // not local pre-dispatch provenance: it may follow a partial/committed remote
+  // action, so the slot must park and refuse a second dispatch.
   const { detectComposioFailure, composioFailureProvesNoCommit } = await import('../tools/composio-tools.js');
   const input = mutation('no-auth-provider-not-connected', { account: undefined });
   const classifyFailure = (result: unknown) => {
@@ -141,11 +141,20 @@ test('mutation receipt: a no-auth dispatch that hits "no connected account" is r
       dispatches += 1;
       return { successful: false, error: 'no connected account found' };
     }, { classifyFailure }),
-    (err: unknown) => err instanceof WorkflowCallMutationProvenFailureError,
+    (err: unknown) => err instanceof WorkflowCallMutationAmbiguousError,
   );
   const failed = inspectWorkflowCallMutation(input);
-  assert.equal(failed.status, 'failed');
-  assert.equal(dispatches, 1, 'a no-auth call still dispatches once so the provider can reject it');
+  assert.equal(failed.status, 'ambiguous');
+  assert.equal(dispatches, 1, 'the provider boundary was crossed exactly once');
+
+  await assert.rejects(
+    executeWorkflowCallMutation(input, async () => {
+      dispatches += 1;
+      return { successful: true, data: { duplicate: true } };
+    }, { classifyFailure }),
+    (err: unknown) => err instanceof WorkflowCallMutationAmbiguousError,
+  );
+  assert.equal(dispatches, 1, 'a provider-returned not-connected result never reopens the mutation slot');
 });
 
 test('mutation receipt: a non-serializable provider success parks as ambiguous after dispatch', async () => {

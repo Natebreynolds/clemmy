@@ -93,6 +93,7 @@ export interface WorkflowRunGraphStepOverlay {
   judgeVerdicts: number;
   externalWrites: number;
   externalWriteFailures: number;
+  externalWriteUncertain: number;
   workerBranches: number;
   workerFailures: number;
   workerCapped: number;
@@ -124,6 +125,7 @@ export interface WorkflowRunGraphOverlaySummary {
   toolCalls: number;
   workerBranches: number;
   externalWrites: number;
+  externalWriteUncertain: number;
   judgeVerdicts: number;
   goalStatus: WorkflowRunGoalStatus | null;
   goalAttempt?: number;
@@ -254,6 +256,13 @@ interface MutableStepOverlay extends WorkflowRunGraphStepOverlay {
   explicitToolEvents: number;
   attemptToolCalls: number;
   harnessToolEvents: number;
+  externalWriteAttempts: HarnessWriteAttempt[];
+}
+
+interface HarnessWriteAttempt {
+  scope: string;
+  data: Record<string, unknown>;
+  state: 'pending' | 'confirmed' | 'failed' | 'uncertain';
 }
 
 interface ExecutionEfficiencyDiagnosis {
@@ -313,6 +322,7 @@ export function buildWorkflowRunGraphOverlay(
       judgeVerdicts: 0,
       externalWrites: 0,
       externalWriteFailures: 0,
+      externalWriteUncertain: 0,
       workerBranches: 0,
       workerFailures: 0,
       workerCapped: 0,
@@ -324,6 +334,7 @@ export function buildWorkflowRunGraphOverlay(
       explicitToolEvents: 0,
       attemptToolCalls: 0,
       harnessToolEvents: 0,
+      externalWriteAttempts: [],
     };
     byStep.set(stepId, row);
     order.push(stepId);
@@ -448,7 +459,7 @@ export function buildWorkflowRunGraphOverlay(
     const step = ensureStep(stepId);
     pushUnique(step.sessionIds, session.sessionId);
     for (const event of session.events ?? []) {
-      applyHarnessEventToStep(step, event);
+      applyHarnessEventToStep(step, event, session.sessionId);
     }
   }
 
@@ -494,6 +505,7 @@ export function buildWorkflowRunGraphOverlay(
       judgeVerdicts: row.judgeVerdicts,
       externalWrites: row.externalWrites,
       externalWriteFailures: row.externalWriteFailures,
+      externalWriteUncertain: row.externalWriteUncertain,
       workerBranches: row.workerBranches,
       workerFailures: row.workerFailures,
       workerCapped: row.workerCapped,
@@ -551,6 +563,7 @@ function deriveStepOperations(
   if (row.deferredByConcurrency && row.status === 'pending') attentionReasons.push('deferred by concurrency cap');
   if (row.itemsFailed > 0) attentionReasons.push(`${row.itemsFailed} failed item${row.itemsFailed === 1 ? '' : 's'}`);
   if (row.externalWriteFailures > 0) attentionReasons.push(`${row.externalWriteFailures} external write failure${row.externalWriteFailures === 1 ? '' : 's'}`);
+  if (row.externalWriteUncertain > 0) attentionReasons.push(`${row.externalWriteUncertain} external write outcome${row.externalWriteUncertain === 1 ? '' : 's'} uncertain`);
   if (row.workerFailures > 0) attentionReasons.push(`${row.workerFailures} worker failure${row.workerFailures === 1 ? '' : 's'}`);
   if (row.workerCapped > 0) attentionReasons.push(`${row.workerCapped} worker capped`);
   if (row.retries > 0) attentionReasons.push(`${row.retries} retr${row.retries === 1 ? 'y' : 'ies'}`);
@@ -666,7 +679,7 @@ function runtimeVerdictPrimaryAction(
     if ((comparison?.runtimeOnlyTools?.length ?? 0) > 0 || (comparison?.unconfirmedLaunchTools?.length ?? 0) > 0) {
       return 'Review tool preflight';
     }
-    if (step.externalWriteFailures > 0 || step.workerFailures > 0 || step.workerCapped > 0) return 'Review run evidence';
+    if (step.externalWriteFailures > 0 || step.externalWriteUncertain > 0 || step.workerFailures > 0 || step.workerCapped > 0) return 'Review run evidence';
     if (step.advisories > 0 || step.judgeVerdicts > 0) return 'Review judge evidence';
     return 'Review run evidence';
   }
@@ -680,6 +693,7 @@ function bottleneckForStep(row: MutableStepOverlay): string | null {
   if (row.deferredByConcurrency && row.status === 'pending') return 'concurrency cap';
   if (row.itemsFailed > 0) return 'failed items';
   if (row.externalWriteFailures > 0) return 'external write failure';
+  if (row.externalWriteUncertain > 0) return 'external write outcome uncertain';
   if (row.workerFailures > 0) return 'worker failure';
   if (row.workerCapped > 0) return 'worker cap';
   if (row.retries > 0) return 'retry loop';
@@ -702,6 +716,7 @@ function summarizeOverlaySteps(steps: WorkflowRunGraphStepOverlay[], goal: Workf
     toolCalls: 0,
     workerBranches: 0,
     externalWrites: 0,
+    externalWriteUncertain: 0,
     judgeVerdicts: 0,
     goalStatus: goal?.status && goal.status !== 'unknown' ? goal.status : null,
     goalAttempt: goal?.attempt,
@@ -726,6 +741,7 @@ function summarizeOverlaySteps(steps: WorkflowRunGraphStepOverlay[], goal: Workf
     summary.toolCalls += step.toolCalls;
     summary.workerBranches += step.workerBranches;
     summary.externalWrites += step.externalWrites;
+    summary.externalWriteUncertain += step.externalWriteUncertain;
     summary.judgeVerdicts += step.judgeVerdicts;
     if (!summary.bottleneckStepId && step.bottleneck) {
       summary.bottleneckStepId = step.stepId;
@@ -1042,7 +1058,11 @@ function toolNameFromEvent(event: WorkflowEvent): string {
     ?? '';
 }
 
-function applyHarnessEventToStep(step: MutableStepOverlay, event: WorkflowRunHarnessEventEvidence): void {
+function applyHarnessEventToStep(
+  step: MutableStepOverlay,
+  event: WorkflowRunHarnessEventEvidence,
+  scope: string,
+): void {
   const type = event.type;
   const data = event.data ?? {};
   if (type === 'tool_called') {
@@ -1064,12 +1084,49 @@ function applyHarnessEventToStep(step: MutableStepOverlay, event: WorkflowRunHar
     return;
   }
   if (type === 'external_write') {
-    step.externalWrites += 1;
+    step.externalWriteAttempts.push({
+      scope,
+      data,
+      state: data.preDispatch === true ? 'pending' : 'confirmed',
+    });
+    syncExternalWriteCounts(step);
     return;
   }
-  if (type === 'external_write_failed' || type === 'external_write_orphaned') {
-    step.externalWriteFailures += 1;
-    pushUnique(step.failedTools, toolNameFromHarnessRecord(data));
+  if (
+    type === 'external_write_succeeded'
+    || type === 'external_write_failed'
+    || type === 'external_write_orphaned'
+  ) {
+    let matched: HarnessWriteAttempt | undefined;
+    for (let index = step.externalWriteAttempts.length - 1; index >= 0; index -= 1) {
+      const attempt = step.externalWriteAttempts[index]!;
+      if (attempt.scope !== scope || !sameHarnessWriteAttempt(attempt.data, data)) continue;
+      matched = attempt;
+      break;
+    }
+    if (matched) {
+      // A demonstrable no-dispatch terminal is final. Contradictory later
+      // telemetry cannot quietly repaint it green.
+      if (matched.state !== 'failed') {
+        matched.state = type === 'external_write_succeeded'
+          ? 'confirmed'
+          : type === 'external_write_failed'
+            ? 'failed'
+            : 'uncertain';
+      }
+    } else if (type !== 'external_write_succeeded') {
+      // Some legacy transports emitted only the terminal row. Preserve the
+      // failure/ambiguity instead of dropping the only durable evidence.
+      step.externalWriteAttempts.push({
+        scope,
+        data,
+        state: type === 'external_write_failed' ? 'failed' : 'uncertain',
+      });
+    }
+    syncExternalWriteCounts(step);
+    if (type === 'external_write_failed') {
+      pushUnique(step.failedTools, toolNameFromHarnessRecord(data));
+    }
     return;
   }
   if (type === 'worker_result') {
@@ -1100,6 +1157,58 @@ function applyHarnessEventToStep(step: MutableStepOverlay, event: WorkflowRunHar
   if (type === 'guardrail_tripped' || type === 'stuck_detected') {
     step.advisories += 1;
   }
+}
+
+function harnessWriteCallId(data: Record<string, unknown>): string {
+  return stringFromRecord(data, 'canonicalCallId') ?? stringFromRecord(data, 'callId') ?? '';
+}
+
+function harnessWriteShape(data: Record<string, unknown>): string {
+  return (
+    stringFromRecord(data, 'shapeKey')
+    ?? stringFromRecord(data, 'slug')
+    ?? stringFromRecord(data, 'toolName')
+    ?? stringFromRecord(data, 'tool')
+    ?? ''
+  ).toLowerCase();
+}
+
+function harnessWriteTargets(data: Record<string, unknown>): string[] {
+  const targets = data.targets;
+  if (!Array.isArray(targets)) return [];
+  return targets
+    .filter((target): target is string => typeof target === 'string' && target.trim().length > 0)
+    .map((target) => target.trim().toLowerCase())
+    .sort();
+}
+
+function sameHarnessWriteAttempt(
+  attempt: Record<string, unknown>,
+  resolution: Record<string, unknown>,
+): boolean {
+  const attemptCallId = harnessWriteCallId(attempt);
+  const resolutionCallId = harnessWriteCallId(resolution);
+  if (attempt.preDispatch === true) {
+    return Boolean(attemptCallId && resolutionCallId && attemptCallId === resolutionCallId);
+  }
+  if (attemptCallId && resolutionCallId) return attemptCallId === resolutionCallId;
+  const attemptShape = harnessWriteShape(attempt);
+  const resolutionShape = harnessWriteShape(resolution);
+  if (!attemptShape || !resolutionShape || attemptShape !== resolutionShape) return false;
+  const attemptTargets = harnessWriteTargets(attempt);
+  const resolutionTargets = harnessWriteTargets(resolution);
+  if (attemptTargets.length === 0 || resolutionTargets.length === 0) return true;
+  return attemptTargets.length === resolutionTargets.length
+    && attemptTargets.every((target, index) => target === resolutionTargets[index]);
+}
+
+function syncExternalWriteCounts(step: MutableStepOverlay): void {
+  step.externalWrites = step.externalWriteAttempts
+    .filter((attempt) => attempt.state === 'confirmed').length;
+  step.externalWriteFailures = step.externalWriteAttempts
+    .filter((attempt) => attempt.state === 'failed').length;
+  step.externalWriteUncertain = step.externalWriteAttempts
+    .filter((attempt) => attempt.state === 'pending' || attempt.state === 'uncertain').length;
 }
 
 function looksLikeJudgeVerdict(meta: Record<string, unknown> | undefined): boolean {

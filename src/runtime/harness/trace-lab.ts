@@ -9,6 +9,7 @@ import {
   type SessionStatus,
 } from './eventlog.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
+import { resolveWriteEvidence } from './work-report.js';
 
 export type TraceNodeCategory =
   | 'user'
@@ -63,6 +64,7 @@ export interface TraceMetrics {
   approvalsResolved: number;
   handoffs: number;
   externalWrites: number;
+  externalWriteUncertain: number;
   modelRoutes: number;
   memoryWrites: number;
   failures: number;
@@ -160,7 +162,12 @@ function eventCategory(type: EventType): TraceNodeCategory {
     || type === 'tool_policy_resolved'
     || type === 'sdk_tool_surface_retry'
   ) return 'tool';
-  if (type === 'external_write' || type === 'external_write_failed' || type === 'external_write_orphaned') return 'external_write';
+  if (
+    type === 'external_write'
+    || type === 'external_write_succeeded'
+    || type === 'external_write_failed'
+    || type === 'external_write_orphaned'
+  ) return 'external_write';
   if (type === 'guardrail_tripped' || type === 'goal_alignment_judged' || type === 'output_grounding_judged') return 'guardrail';
   if (type === 'approval_requested' || type === 'approval_resolved' || type === 'autonomy_note') return 'approval';
   if (type === 'handoff') return 'handoff';
@@ -212,9 +219,11 @@ function eventLabel(type: EventType, data: Record<string, unknown>): string {
     case 'turn_ended': return 'Turn ended';
     case 'tool_called': return `Tool called: ${str(data, 'tool', 'toolName') ?? 'unknown'}`;
     case 'tool_returned': return `Tool returned: ${str(data, 'tool', 'toolName') ?? 'unknown'}`;
-    case 'external_write': return 'External write allowed';
+    case 'external_write':
+      return data.preDispatch === true ? 'External write reserved' : 'External write recorded';
+    case 'external_write_succeeded': return 'External write succeeded';
     case 'external_write_failed': return 'External write failed';
-    case 'external_write_orphaned': return 'External write timed out';
+    case 'external_write_orphaned': return 'External write outcome uncertain';
     case 'guardrail_tripped': return `Guardrail: ${str(data, 'kind', 'reason') ?? 'tripped'}`;
     case 'approval_requested': return 'Approval requested';
     case 'approval_resolved': return `Approval ${str(data, 'resolution', 'status') ?? 'resolved'}`;
@@ -273,7 +282,7 @@ function eventTarget(data: Record<string, unknown>): string | undefined {
 }
 
 function eventCallId(data: Record<string, unknown>): string | undefined {
-  return str(data, 'callId', 'call_id', 'toolCallId', 'approvalId');
+  return str(data, 'canonicalCallId', 'callId', 'call_id', 'toolCallId', 'approvalId');
 }
 
 function eventTool(data: Record<string, unknown>): string | undefined {
@@ -317,6 +326,7 @@ function emptyMetrics(events = 0): TraceMetrics {
     approvalsResolved: 0,
     handoffs: 0,
     externalWrites: 0,
+    externalWriteUncertain: 0,
     modelRoutes: 0,
     memoryWrites: 0,
     failures: 0,
@@ -325,6 +335,14 @@ function emptyMetrics(events = 0): TraceMetrics {
 
 function computeMetrics(events: EventRow[]): TraceMetrics {
   const metrics = emptyMetrics(events.length);
+  const writeEvidence = resolveWriteEvidence(events.filter((event) => (
+    event.type === 'external_write'
+    || event.type === 'external_write_succeeded'
+    || event.type === 'external_write_failed'
+    || event.type === 'external_write_orphaned'
+  )));
+  metrics.externalWrites = writeEvidence.confirmed.length;
+  metrics.externalWriteUncertain = writeEvidence.uncertain.length;
   const turns = new Set<number>();
   for (const ev of events) {
     turns.add(ev.turn);
@@ -334,7 +352,6 @@ function computeMetrics(events: EventRow[]): TraceMetrics {
     if (ev.type === 'approval_requested') metrics.approvalsRequested += 1;
     if (ev.type === 'approval_resolved') metrics.approvalsResolved += 1;
     if (ev.type === 'handoff') metrics.handoffs += 1;
-    if (eventCategory(ev.type) === 'external_write') metrics.externalWrites += 1;
     if (ev.type === 'worker_model_routed' || ev.type === 'reasoning_effort' || ev.type === 'brain_fallover') metrics.modelRoutes += 1;
     if (ev.type === 'memory_signals_captured') metrics.memoryWrites += 1;
     if (eventSeverity(ev.type, ev.data) === 'error') metrics.failures += 1;
@@ -352,12 +369,20 @@ function replayStatus(session: SessionRow, events: EventRow[], metrics: TraceMet
   const risks: string[] = [];
   if (events.length === 0) risks.push('No harness events were recorded for this session.');
   if (metrics.externalWrites > 0) risks.push(`${metrics.externalWrites} external write event(s) occurred; replay must stay dry-run until explicitly approved.`);
+  if (metrics.externalWriteUncertain > 0) {
+    risks.push(`${metrics.externalWriteUncertain} external write outcome(s) remain uncertain; verify the destination before any retry.`);
+  }
   if (metrics.approvalsRequested > metrics.approvalsResolved) risks.push('At least one approval request was not resolved in this trace.');
   if (metrics.failures > 0 || session.status === 'failed') risks.push('The run contains failure events; replay should compare behavior, not assume success.');
   if (metrics.guardrails > 0) risks.push(`${metrics.guardrails} guardrail/verdict event(s) should be checked for regressions.`);
   if (metrics.toolCalls > 0) risks.push(`${metrics.toolCalls} tool call(s) may depend on external state that has changed since the original run.`);
   let riskLevel: TraceRiskLevel = 'none';
-  if (metrics.externalWrites > 0 || metrics.failures > 0 || session.status === 'failed') riskLevel = 'high';
+  if (
+    metrics.externalWrites > 0
+    || metrics.externalWriteUncertain > 0
+    || metrics.failures > 0
+    || session.status === 'failed'
+  ) riskLevel = 'high';
   else if (metrics.guardrails > 0 || metrics.approvalsRequested > metrics.approvalsResolved) riskLevel = 'medium';
   else if (metrics.toolCalls > 0) riskLevel = 'low';
   return { ready: events.length > 0, mode: 'safe_prompt', riskLevel, risks };
@@ -451,6 +476,7 @@ function keyEventsForPrompt(nodes: TraceNode[]): TraceNode[] {
     || node.type === 'approval_requested'
     || node.type === 'approval_resolved'
     || node.type === 'external_write'
+    || node.type === 'external_write_succeeded'
     || node.type === 'external_write_failed'
     || node.type === 'external_write_orphaned'
     || node.type === 'conversation_completed'
@@ -474,7 +500,7 @@ function renderReplayPrompt(detail: TraceDetail): string {
     `Kind/status: ${detail.kind}/${detail.status}`,
     detail.title ? `Title: ${detail.title}` : '',
     detail.objective ? `Objective: ${detail.objective}` : '',
-    `Events: ${detail.metrics.events}; tools: ${detail.metrics.toolCalls}; guardrails: ${detail.metrics.guardrails}; approvals: ${detail.metrics.approvalsRequested}/${detail.metrics.approvalsResolved}; external writes: ${detail.metrics.externalWrites}; failures: ${detail.metrics.failures}`,
+    `Events: ${detail.metrics.events}; tools: ${detail.metrics.toolCalls}; guardrails: ${detail.metrics.guardrails}; approvals: ${detail.metrics.approvalsRequested}/${detail.metrics.approvalsResolved}; external writes: ${detail.metrics.externalWrites}; uncertain writes: ${detail.metrics.externalWriteUncertain}; failures: ${detail.metrics.failures}`,
     `Replay risk: ${detail.replay.riskLevel}`,
     ...(detail.replay.risks.length ? ['Risks:', ...detail.replay.risks.map((risk) => `- ${risk}`)] : ['Risks: none recorded']),
     '',

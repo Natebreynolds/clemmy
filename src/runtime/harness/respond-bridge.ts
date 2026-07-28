@@ -64,7 +64,7 @@ import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
-import { synthesizeTurnReport, synthesizeWorkReport } from './work-report.js';
+import { resolveWriteEvidence, synthesizeTurnReport, synthesizeWorkReport } from './work-report.js';
 import { nonFilterableToolExcludes } from './tool-policy.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import pino from 'pino';
@@ -814,9 +814,23 @@ function checkRecoveryLedger(
   try {
     const evidence = recoveryListEventsImpl(sessionId, {
       sinceSeq: baseline.afterSeq,
-      types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+      types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
     });
-    return evidence.length > 0
+    const resolved = resolveWriteEvidence(evidence);
+    // A pre-dispatch reservation is compensated only by an exact matching
+    // failure, which proves that invocation never reached the provider.
+    // Successful and orphaned terminal rows remain unsafe even when their
+    // reservation is absent or later contradicted: they are durable evidence
+    // that the failed turn may have changed external state. A failure for a
+    // sibling call cannot settle another invocation's reservation.
+    const hasUnsafeTerminal = evidence.some((event) =>
+      event.type === 'external_write_succeeded'
+      || event.type === 'external_write_orphaned'
+      // Legacy external_write rows were emitted only after confirmed success.
+      // A later failure-shaped row must not retroactively make that historical
+      // write safe to replay.
+      || (event.type === 'external_write' && event.data.preDispatch !== true));
+    return hasUnsafeTerminal || resolved.confirmed.length > 0 || resolved.uncertain.length > 0
       ? { safeToRerun: false, reason: 'external_write', evidence }
       : { safeToRerun: true };
   } catch {

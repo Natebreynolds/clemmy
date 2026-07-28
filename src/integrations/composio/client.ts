@@ -8,9 +8,8 @@ import { getMachineId } from '../../runtime/machine-id.js';
 import { getSecretStore } from '../../runtime/secrets/index.js';
 import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import { cachedIdentityEmail, cachedConnectionOwner, recordConnectionOwner } from './identity-cache.js';
+import { ExternalWritePreDispatchError } from '../../runtime/harness/external-write-admission.js';
 import {
-  benchComposioCliAuth,
-  composioCliAuthDead,
   executeComposioCliTool,
   getComposioCliStatus,
   invalidateComposioCliStatusCache,
@@ -42,10 +41,9 @@ const DERIVED_USER_ID_PREFIX = 'clementine-';
 // (invalidate snapshot → re-resolve FRESH → retry once) and, if still
 // unresolved, surface a "reconnect <app>, do not retry" signal instead of
 // returning an opaque ERROR the model retries turn after turn until its budget
-// is spent. Safe to retry: an auth-config miss is a PRE-execution failure, so no
-// mutation was committed (live 2026-07-24: an isolated-worker research fan-out
-// ground its whole token budget on repeated AuthSchemeNotFound instead of
-// stopping to say the lane needed reconnecting).
+// is spent. Reconnect-shaped provider output is useful diagnosis, not replay
+// provenance: reads may self-heal, while mutations remain ambiguous unless a
+// local typed preflight proves the provider boundary was never crossed.
 const RECONNECT_REQUIRED_RE =
   /ConnectedAccountEntityIdMismatch|connected account[^\n]{0,100}(?:user|entity)[ _-]?id[^\n]{0,80}(?:does not match|mismatch)|user[ _-]?id[^\n]{0,80}does not match[^\n]{0,80}provided user[ _-]?id|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b|Auth[_ ]?Config[_ ]?AuthSchemeNotFound|\bAuthSchemeNotFound\b|unsupported OAuth2/i;
 const CONNECTIONS_TTL_MS = 60_000;
@@ -435,46 +433,35 @@ export class ComposioDispatchUncertainError extends Error {
   }
 }
 
-function errorText(value: unknown): string {
-  const parts: string[] = [];
-  const seen = new Set<unknown>();
-  const visit = (entry: unknown, depth: number): void => {
-    if (entry == null || depth > 3 || seen.has(entry)) return;
-    if (typeof entry === 'string' || typeof entry === 'number') { parts.push(String(entry)); return; }
-    if (typeof entry !== 'object') return;
-    seen.add(entry);
-    const row = entry as Record<string, unknown>;
-    if (entry instanceof Error) parts.push(entry.name, entry.message);
-    for (const key of ['code', 'message', 'stderr', 'cause']) visit(row[key], depth + 1);
-  };
-  visit(value, 0);
-  return parts.join(' ').slice(0, 8_000);
+/** Locally-created proof that a Composio provider call never started.
+ *
+ * This class is deliberately nominal: replay authority comes from
+ * `instanceof`, never from a message, status, marker, or structurally similar
+ * provider payload. A remote response can echo any of those fields after a
+ * mutation committed; it cannot become an instance created by this process
+ * before dispatch. */
+export class ComposioPreDispatchError extends ExternalWritePreDispatchError {
+  readonly reason: 'cli-unavailable' | 'cli-auth' | 'sdk-unavailable';
+
+  constructor(
+    reason: ComposioPreDispatchError['reason'],
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = 'ComposioPreDispatchError';
+    this.reason = reason;
+  }
 }
 
 /** True only when the CLI could not have crossed the provider boundary. Keep
- * this intentionally narrow; provider timeouts, 5xx, broken pipes, and generic
- * non-zero exits are ambiguous for writes.
- *
- * The ONLY reliable pre-dispatch signals are (1) the explicit
- * `[provider-dispatch:not-started:…]` marker that the pre-dispatch gates emit
- * before crossing the boundary (the gateway block in composio-tools, and the
- * CLI-status / no-API-key throws that used to be recognized by their auth/key
- * PROSE), and (2) hard process-launch failures where the CLI binary never ran.
- *
- * Bare auth/key text ("not authenticated", "run composio login", "API key
- * required") was REMOVED: `errorText` flattens the ~8KB error including nested
- * cause/stderr, and that same auth phrasing leaks into POST-dispatch errors — a
- * non-zero CLI exit carrying the provider's response body, or Composio's own
- * "produced no output; run composio login" wrapper thrown AFTER runComposioCli
- * already dispatched. Matching it there falsely proved no-dispatch and
- * authorized an auto-fallback retry / proven-no-commit receipt that could
- * DOUBLE-WRITE. Genuine pre-dispatch auth/key failures now carry the
- * not-started marker instead, so they are still proven — structurally. */
+ * this intentionally nominal. Provider timeouts, 4xx/5xx responses, broken
+ * pipes, CLI error text, and even `[provider-dispatch:not-started:*]` prose are
+ * ambiguous for writes: all can be returned or echoed after a remote commit.
+ * Only a class instance constructed by a local preflight before invocation may
+ * authorize replay. */
 export function composioCliErrorProvesNoDispatch(error: unknown): boolean {
-  const text = errorText(error);
-  return /\[provider-dispatch:not-started:/i.test(text)
-    || /\bENOENT\b|command not found|executable not found|failed to spawn|spawn[^\n]*not found/i.test(text)
-    || /CLI is not installed|unsupported CLI version|version mismatch|unknown (?:command|option)|invalid CLI invocation/i.test(text);
+  return error instanceof ComposioPreDispatchError;
 }
 
 export function composioAutoFallbackAllowed(toolSlug: string, error: unknown): boolean {
@@ -1842,40 +1829,33 @@ export async function executeComposioTool(
         // timeout/5xx/generic exit may have committed remotely; replaying it
         // through the SDK would duplicate the write under one logical call.
         if (!composioAutoFallbackAllowed(toolSlug, error)) {
-          // 401-shaped mutation failure (live 2026-07-24: the Slack team
-          // update blocked for hours on a dead CLI session while the SDK
-          // connection was ACTIVE): auth text alone never proves no-dispatch,
-          // but an independent live READ probe failing 401 through the same
-          // session does — the lane is auth-dead, the mutation was rejected
-          // at authentication, and the SDK retry is safe.
-          const authShaped = /\b401\b|unauthorized/i.test(errorText(error));
-          if (!(authShaped && await composioCliAuthDead(cliOptions))) {
-            throw new ComposioDispatchUncertainError(toolSlug, error);
-          }
-          console.warn(`[composio] CLI lane proven auth-dead by live probe — ${toolSlug} was rejected at auth; retrying via SDK backend and benching the CLI lane`);
-          try { benchComposioCliAuth(); } catch { /* bench is best-effort */ }
+          // An independent auth/read probe describes the lane NOW; it cannot
+          // establish whether the earlier mutation committed before losing its
+          // response. Never use a post-failure probe to authorize SDK replay.
+          throw new ComposioDispatchUncertainError(toolSlug, error);
         }
       }
     } else if (backend === 'cli') {
-      // Pre-dispatch gate: the CLI status check ran BEFORE executeComposioCliTool,
-      // so nothing crossed the provider boundary. Carry the not-started marker so
-      // composioCliErrorProvesNoDispatch proves no-dispatch STRUCTURALLY (via the
-      // marker) rather than off the bare "run composio login" text — the same
-      // auth phrase leaks into POST-dispatch errors (a non-zero CLI exit whose
-      // stderr mentions auth, or the "produced no output; run composio login"
-      // wrapper), which must stay ambiguous.
-      throw new Error(cliStatus.installed
-        ? '[provider-dispatch:not-started:cli-auth] Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.'
-        : '[provider-dispatch:not-started:cli-missing] Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.');
+      // This status check completed before executeComposioCliTool was invoked,
+      // so its nominal local error is valid replay provenance.
+      throw new ComposioPreDispatchError(
+        cliStatus.installed ? 'cli-auth' : 'cli-unavailable',
+        cliStatus.installed
+          ? 'Composio CLI is installed, but no CLI login was detected. Run composio login or switch the backend to AUTO/SDK.'
+          : 'Composio CLI is not installed. Install it or switch the backend to AUTO/SDK.',
+      );
     }
   }
 
   const composio = getComposio();
-  // No API key ⇒ no SDK client was ever constructed, so this throw is strictly
-  // pre-dispatch. Carry the not-started marker so the no-dispatch proof is
-  // structural, not reliant on the bare "COMPOSIO_API_KEY" text (which also
-  // appears in provider/stderr bodies AFTER a real dispatch attempt).
-  if (!composio) throw new Error('[provider-dispatch:not-started:no-api-key] COMPOSIO_API_KEY is not configured.');
+  // No SDK client was constructed, so this nominal local error is strictly
+  // pre-dispatch. The same API-key prose inside a provider error is not proof.
+  if (!composio) {
+    throw new ComposioPreDispatchError(
+      'sdk-unavailable',
+      'COMPOSIO_API_KEY is not configured.',
+    );
+  }
   // "Know about the connection, then query the right one": when the caller
   // didn't pin a connection, resolve the toolkit's live connection by IDENTITY
   // (selectToolkitConnection) rather than relying on a stale baked id or the
@@ -1917,10 +1897,13 @@ export async function executeComposioTool(
   // spawned worker whose snapshot was cold) — means the live connection wasn't
   // used. Bust the cache, re-resolve FRESH once, and retry only if we land on a
   // DIFFERENT connection. Never fires for a caller-pinned account (the user's
-  // explicit choice); at most one extra round-trip; safe because an auth-config
-  // miss is PRE-execution so nothing was committed (live 2026-07-24: a worker
-  // research fan-out ground its whole budget on returned AuthSchemeNotFound).
-  const reResolveFreshRetry = async (): Promise<{ retried: true; result: unknown } | { retried: false }> => {
+  // explicit choice); at most one extra round-trip. Reads may self-heal. A
+  // mutation may not: reconnect-shaped provider errors/results are not proof
+  // that the first remote call failed before committing.
+  const reResolveFreshRetry = async (
+    failure: unknown,
+  ): Promise<{ retried: true; result: unknown } | { retried: false }> => {
+    if (!composioAutoFallbackAllowed(toolSlug, failure)) return { retried: false };
     if (!(connSwrEnabled() && pinnedAccountId === undefined && !selfHealedConnection)) return { retried: false };
     selfHealedConnection = true;
     invalidateConnectedAccountSnapshot();
@@ -1941,19 +1924,23 @@ export async function executeComposioTool(
     result = await (composio as any).tools.execute(toolSlug, body);
   } catch (err) {
     if (isComposioReconnectRequiredError(err)) {
-      const healed = await reResolveFreshRetry();
+      const healed = await reResolveFreshRetry(err);
       if (healed.retried) return healed.result;
       throw new ComposioReconnectRequiredError(toolSlug, err);
     }
     // v0.5.65 — discover/execute version split. The SDK resolves a slug under
     // toolkit_versions=latest, but CURATED slugs (now discoverable via the
     // version-free broker fetch) live in the PUBLISHED namespace and 404 under
-    // 'latest' → "Unable to retrieve tool". That failure is at the RESOLVE step,
-    // BEFORE any side effect, so it is safe to retry: resolve the slug's own
-    // version and run once more pinned to it. Guarded to the not-found case only
-    // (never a real execution error) and a single retry (body.version unset).
+    // 'latest' → "Unable to retrieve tool". That text is not execution
+    // provenance: a provider or post-commit sub-call can return the same phrase.
+    // Reads may retry pinned to the resolved version; mutations must surface the
+    // first outcome as ambiguous instead of crossing the boundary twice.
     const msg = err instanceof Error ? err.message : String(err);
-    if (body.version === undefined && /unable to retrieve tool|tool not found|ComposioToolNotFound/i.test(msg)) {
+    if (
+      composioAutoFallbackAllowed(toolSlug, err)
+      && body.version === undefined
+      && /unable to retrieve tool|tool not found|ComposioToolNotFound/i.test(msg)
+    ) {
       const version = await resolveComposioToolVersion(toolSlug);
       if (version) return await (composio as any).tools.execute(toolSlug, { ...body, version });
     }
@@ -1966,7 +1953,7 @@ export async function executeComposioTool(
   // grinds on. A genuinely unresolvable toolkit falls through and the returned
   // reconnect error surfaces its "reconnect <app>" guidance downstream.
   if (isComposioReconnectRequiredError(result)) {
-    const healed = await reResolveFreshRetry();
+    const healed = await reResolveFreshRetry(result);
     if (healed.retried) return healed.result;
   }
   return result;

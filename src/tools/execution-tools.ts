@@ -6,6 +6,12 @@ import { textResult } from './shared.js';
 import type { ExecutionRecord } from '../types.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { recentExecutionToolEvidence } from '../execution/completion-evidence.js';
+import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import {
+  externalWriteAdmissionKey,
+  externalWriteDuplicateIdentityKeys,
+  withExternalWriteAdmissionLock,
+} from '../runtime/harness/external-write-admission.js';
 
 /**
  * Pure focus-matcher: given a `query` (an execution id OR a
@@ -121,6 +127,140 @@ function completionRejectionText(validation: GoalValidationResult): string {
     : `Completion not accepted: ${advice}`;
 }
 
+async function bindCurrentRequestToExecution(
+  execution: ExecutionRecord,
+  sourceTool: string,
+): Promise<{ execution: ExecutionRecord; sourceUserSeq?: number; error?: string }> {
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const ctx = harnessRunContextStorage.getStore();
+  if (!ctx) return { execution };
+  if (ctx.sessionId !== execution.sessionId) {
+    return {
+      execution,
+      error: `Execution ${execution.id} belongs to a different session and was not changed.`,
+    };
+  }
+  ctx.executionId = execution.id;
+  if (!ctx.sourceUserSeq) return { execution };
+  const bound = store.bindSourceUserSeq(
+    execution.id,
+    ctx.sessionId,
+    ctx.sourceUserSeq,
+    sourceTool,
+  );
+  return bound
+    ? { execution: bound, sourceUserSeq: ctx.sourceUserSeq }
+    : {
+        execution,
+        error: `Execution ${execution.id} could not bind this exact user request, so it was not changed.`,
+      };
+}
+
+function evidenceCallId(data: unknown): string {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return '';
+  const row = data as { canonicalCallId?: unknown; callId?: unknown };
+  const value = row.canonicalCallId ?? row.callId;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function authorizeExternalWriteRetryUnlocked(input: {
+  execution: ExecutionRecord;
+  sourceUserSeq: number | undefined;
+  retryOfCallId: string;
+}): string | undefined {
+  if (!input.sourceUserSeq) {
+    return 'Retry authorization requires an exact harness user-request boundary.';
+  }
+  const acceptedSources = new Set([
+    input.execution.sourceUserSeq,
+    ...(input.execution.sourceUserSeqs ?? []),
+  ].filter((seq): seq is number => Number.isSafeInteger(seq) && (seq ?? 0) > 0));
+  const events = listEvents(input.execution.sessionId, {
+    types: [
+      'external_write',
+      'external_write_succeeded',
+      'external_write_failed',
+      'external_write_orphaned',
+      'external_write_retry_authorized',
+    ],
+  });
+  const sameCall = events.filter((event) => evidenceCallId(event.data) === input.retryOfCallId);
+  const latestOutcome = [...sameCall].reverse().find((event) =>
+    event.type === 'external_write_succeeded'
+    || event.type === 'external_write_failed'
+    || event.type === 'external_write_orphaned'
+  );
+  if (latestOutcome?.type !== 'external_write_failed') {
+    return `Retry authorization refused: ${input.retryOfCallId} is not a currently proven failed write. Ambiguous/orphaned writes require read-only reconciliation.`;
+  }
+  const failure = latestOutcome.data as {
+    sourceUserSeq?: unknown;
+    actionKey?: unknown;
+    targets?: unknown;
+    duplicateIdentityKeys?: unknown;
+    correlationFingerprint?: unknown;
+  };
+  if (
+    !Number.isSafeInteger(failure.sourceUserSeq)
+    || !acceptedSources.has(failure.sourceUserSeq as number)
+  ) {
+    return `Retry authorization refused: ${input.retryOfCallId} is outside this execution's explicit request lineage.`;
+  }
+  if (typeof failure.actionKey !== 'string' || !failure.actionKey.trim()) {
+    return `Retry authorization refused: ${input.retryOfCallId} has no canonical action identity.`;
+  }
+  if (events.some((event) =>
+    event.type === 'external_write_retry_authorized'
+    && (event.data as { retryOfCallId?: unknown } | undefined)?.retryOfCallId === input.retryOfCallId
+  )) {
+    return `Retry authorization refused: ${input.retryOfCallId} already has a one-shot retry authorization.`;
+  }
+  const recordedDuplicateIdentityKeys = Array.isArray(failure.duplicateIdentityKeys)
+    ? failure.duplicateIdentityKeys.filter(
+        (value): value is string => typeof value === 'string',
+      )
+    : [];
+  const targets = Array.isArray(failure.targets)
+    ? failure.targets.filter((value): value is string => typeof value === 'string')
+    : [];
+  const duplicateIdentityKeys = recordedDuplicateIdentityKeys.length > 0
+    ? externalWriteDuplicateIdentityKeys(recordedDuplicateIdentityKeys, undefined)
+    : externalWriteDuplicateIdentityKeys(
+        targets,
+        typeof failure.correlationFingerprint === 'string'
+          ? failure.correlationFingerprint
+          : undefined,
+      );
+  appendEvent({
+    sessionId: input.execution.sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'external_write_retry_authorized',
+    data: {
+      sourceUserSeq: input.sourceUserSeq,
+      executionId: input.execution.id,
+      retryOfCallId: input.retryOfCallId,
+      actionKey: failure.actionKey.trim(),
+      duplicateIdentityKeys,
+    },
+  });
+  return undefined;
+}
+
+async function authorizeExternalWriteRetry(input: {
+  execution: ExecutionRecord;
+  sourceUserSeq: number | undefined;
+  retryOfCallId: string;
+}): Promise<string | undefined> {
+  // Minting and consuming retry capabilities share the same durable
+  // cross-process admission lock. The list→check→append sequence is therefore
+  // one CAS domain across desktop, CLI, MCP child, and worker processes.
+  return withExternalWriteAdmissionLock(
+    externalWriteAdmissionKey(input.execution.sessionId),
+    async () => authorizeExternalWriteRetryUnlocked(input),
+  );
+}
+
 export function registerExecutionTools(server: McpServer): void {
   server.tool(
     'execution_create',
@@ -164,6 +304,7 @@ export function registerExecutionTools(server: McpServer): void {
         nextStep,
         successCriteria: durableCriteria,
       });
+      if (ctx) ctx.executionId = created.id;
       return textResult(
         `Created execution ${created.id} for session ${sessionId}.\n` +
           `Title: ${created.title}\n` +
@@ -229,17 +370,29 @@ export function registerExecutionTools(server: McpServer): void {
 
   server.tool(
     'execution_update_step',
-    'Advance an execution: record the next concrete step and an optional summary of what just happened. Use this every cycle you make progress on a tracked execution so the work compounds.',
+    'Advance an execution: record the next concrete step and an optional summary of what just happened. Use this every cycle you make progress on a tracked execution so the work compounds. When correcting a write that is proven not to have dispatched, pass its exact failed call id as retryOfCallId; this authorizes exactly one same-action retry. Never use it for a timeout/orphan.',
     {
       id: z.string().min(1),
       nextStep: z.string().min(3).max(400),
       summary: z.string().max(800).optional().describe('What you did this cycle. Becomes lastAssistantSummary on the execution.'),
+      retryOfCallId: z.string().min(1).max(200).optional().describe('Exact call id of one proven external_write_failed attempt. Authorizes one matching corrected retry; orphaned/ambiguous attempts are refused.'),
     },
-    async ({ id, nextStep, summary }) => {
-      const e = store.get(id);
+    async ({ id, nextStep, summary, retryOfCallId }) => {
+      let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
       if (e.status === 'completed' || e.status === 'paused') {
         return textResult(`Execution ${id} is ${e.status} — re-open it before updating.`);
+      }
+      const binding = await bindCurrentRequestToExecution(e, 'execution_update_step');
+      if (binding.error) return textResult(binding.error);
+      e = binding.execution;
+      if (retryOfCallId) {
+        const retryError = await authorizeExternalWriteRetry({
+          execution: e,
+          sourceUserSeq: binding.sourceUserSeq,
+          retryOfCallId,
+        });
+        if (retryError) return textResult(retryError);
       }
       const updated = store.update(id, {
         nextStep,
@@ -261,9 +414,12 @@ export function registerExecutionTools(server: McpServer): void {
       blocker: z.string().min(3).max(400),
     },
     async ({ id, blocker }) => {
-      const e = store.get(id);
+      let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
       if (e.status === 'completed') return textResult(`Execution ${id} is completed — nothing to block.`);
+      const binding = await bindCurrentRequestToExecution(e, 'execution_mark_blocked');
+      if (binding.error) return textResult(binding.error);
+      e = binding.execution;
       const updated = store.update(id, {
         status: 'blocked',
         blocker,
@@ -306,9 +462,12 @@ export function registerExecutionTools(server: McpServer): void {
       id: z.string().min(1),
     },
     async ({ id }) => {
-      const e = store.get(id);
+      let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
       if (e.status !== 'paused') return textResult(`Execution ${id} is ${e.status} — only paused executions can be resumed.`);
+      const binding = await bindCurrentRequestToExecution(e, 'execution_resume');
+      if (binding.error) return textResult(binding.error);
+      e = binding.execution;
       const updated = store.update(id, {
         status: 'active',
         pausedBy: undefined,
@@ -390,15 +549,10 @@ export function registerExecutionTools(server: McpServer): void {
       let e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
       if (e.status === 'completed') return textResult(`Execution ${id} was already completed.`);
-      const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
-      const ctx = harnessRunContextStorage.getStore();
-      const requestSourceUserSeq = ctx?.sessionId === e.sessionId
-        ? ctx.sourceUserSeq
-        : undefined;
-      const writeTruth = store.reconcileExternalWriteTruth(
-        id,
-        e.sourceUserSeq ?? requestSourceUserSeq,
-      );
+      const binding = await bindCurrentRequestToExecution(e, 'execution_complete');
+      if (binding.error) return textResult(binding.error);
+      e = binding.execution;
+      const writeTruth = store.reconcileExternalWriteTruth(id);
       if (writeTruth) e = writeTruth.execution;
       if (writeTruth?.status === 'failed' || writeTruth?.status === 'ambiguous') {
         return textResult(
@@ -434,7 +588,6 @@ export function registerExecutionTools(server: McpServer): void {
       }
       const updated = store.update(id, {
         status: 'completed',
-        sourceUserSeq: e.sourceUserSeq ?? requestSourceUserSeq,
         lastAssistantSummary: summary,
         lastActivityAt: new Date().toISOString(),
         blocker: undefined,

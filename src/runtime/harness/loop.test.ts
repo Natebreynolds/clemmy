@@ -484,6 +484,64 @@ test('W1a: a transient error AFTER an external_write does NOT switch brains (no 
   assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 0, 'no fallover advisory');
 });
 
+test('W1a: an exact proven-no-effect write failure still permits brain fallover', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const agentFor = (id: string) => ({ __brain: id }) as unknown as import('@openai/agents').Agent<any, any>;
+  let rebuilds = 0;
+  const runRunner: RunRunnerFn = async (_runner, agent, items) => {
+    if ((agent as { __brain?: string }).__brain === 'brain-1') {
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'external_write',
+        data: { tool: 'send_email', callId: 'failed-send-1', preDispatch: true },
+      });
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'system',
+        type: 'external_write_failed',
+        data: { tool: 'send_email', callId: 'failed-send-1', effect: 'none' },
+      });
+      throw BoundaryError.from(new Error('backend 529 after rejected dispatch'), {
+        kind: 'model.overloaded',
+        retryable: true,
+        userMessage: 'transient',
+      });
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'recovered',
+        reply: 'Recovered on brain 2.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    } as never;
+  };
+
+  const result = await runConversation({
+    agent: agentFor('brain-1'),
+    sessionId: sess.id,
+    input: 'send the email',
+    makeRunner: makeRunnerStub,
+    runRunner,
+    falloverModelIds: ['brain-2'],
+    rebuildAgentForBrain: async (id) => {
+      rebuilds += 1;
+      return agentFor(id);
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(rebuilds, 1);
+  assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 1);
+});
+
 test('runTurn replays eventlog transcript when a Claude-only session has no SDK snapshot', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

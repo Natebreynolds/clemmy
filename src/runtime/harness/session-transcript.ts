@@ -13,8 +13,10 @@ import {
   getSession as getHarnessSession,
   listSessions as listHarnessSessions,
   openEventLog,
+  type EventRow,
   type SessionRow,
 } from './eventlog.js';
+import { resolveWriteEvidence } from './work-report.js';
 
 export interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
 
@@ -24,9 +26,11 @@ export interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string
  * transcript (user_input/conversation_completed) does NOT include tool results, so
  * without this the brain is blind to its own completed sends — the 2026-06-29
  * double-send (it re-ran a send because the prior turn's text didn't record it,
- * and an errored turn emits no conversation_completed at all). Reads external_write
- * events, netting out explicit external_write_failed compensation rows; deduped
- * by (shape, target), newest first. '' when nothing was sent.
+ * and an errored turn emits no conversation_completed at all). Legacy write rows
+ * retain their historical success meaning; new pre-dispatch reservations are
+ * complete only after the exact call succeeds. Failed rows prove no dispatch and
+ * orphaned/unsettled rows render separately as uncertain. Dedupe is by
+ * (shape, target), newest first. '' when there is no write evidence.
  */
 interface RawActionRow { seq: number; type: string; data_json: string }
 interface RawTranscriptRow {
@@ -72,7 +76,12 @@ function readRecentActionRowsForSession(
   return db.prepare(
     `SELECT seq, type, data_json FROM events
        WHERE session_id = ?
-         AND type IN ('external_write', 'external_write_failed')
+         AND type IN (
+           'external_write',
+           'external_write_succeeded',
+           'external_write_failed',
+           'external_write_orphaned'
+         )
          ${boundedThroughSeq === undefined ? '' : 'AND seq <= ?'}
        ORDER BY seq DESC
        LIMIT ?`,
@@ -97,40 +106,57 @@ function renderRecentActionsForSessions(
       .slice(0, rowLimit);
   } catch { return ''; }
   if (rows.length === 0) return '';
-  const seen = new Set<string>();
-  const failed = new Map<string, number>();
-  const lines: string[] = [];
+
+  const evidence: EventRow[] = [];
   for (const row of rows) {
     try {
-      const d = JSON.parse(row.data_json) as { shapeKey?: string; toolName?: string; targets?: string[] };
+      evidence.push({
+        seq: row.seq,
+        type: row.type,
+        data: JSON.parse(row.data_json) as Record<string, unknown>,
+      } as EventRow);
+    } catch { /* skip malformed rows */ }
+  }
+  const resolved = resolveWriteEvidence(evidence);
+  const renderLines = (events: EventRow[]): string[] => {
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const event of [...events].sort((left, right) => right.seq - left.seq)) {
+      const d = event.data as { shapeKey?: string; toolName?: string; targets?: string[] };
       const shape = String(d.shapeKey ?? d.toolName ?? 'action');
-      const targets = (d.targets ?? []).filter((t): t is string => typeof t === 'string' && t.trim().length > 0);
-      for (const t of (targets.length ? targets : ['(no target)'])) {
+      const targets = (d.targets ?? [])
+        .filter((target): target is string => typeof target === 'string' && target.trim().length > 0);
+      for (const target of (targets.length ? targets : ['(no target)'])) {
+        const t = target.trim();
         const key = `${shape}::${t.toLowerCase()}`;
-        if (row.type === 'external_write_failed') {
-          failed.set(key, (failed.get(key) ?? 0) + 1);
-          continue;
-        }
-        const failedCount = failed.get(key) ?? 0;
-        if (failedCount > 0) {
-          if (failedCount === 1) failed.delete(key);
-          else failed.set(key, failedCount - 1);
-          continue;
-        }
         if (seen.has(key)) continue;
         seen.add(key);
         lines.push(`- ${shape} → ${t}`);
         if (lines.length >= limit) break;
       }
       if (lines.length >= limit) break;
-    } catch { /* skip malformed rows */ }
-  }
-  if (lines.length === 0) return '';
+    }
+    return lines;
+  };
+  const confirmedLines = renderLines(resolved.confirmed);
+  const uncertainLines = renderLines(resolved.uncertain);
+  if (confirmedLines.length === 0 && uncertainLines.length === 0) return '';
+
   const scopeBody = scopeLabel === 'THIS conversation' ? 'this same session' : scopeLabel.toLowerCase();
-  return [
-    `ALREADY DONE in ${scopeLabel} — these external actions SUCCEEDED earlier in ${scopeBody}. Do NOT repeat any of them unless the user EXPLICITLY asks you to do it AGAIN. A prior turn that errored AFTER one of these still COUNTS as done — it was NOT cancelled:`,
-    ...lines,
-  ].join('\n');
+  const blocks: string[] = [];
+  if (confirmedLines.length > 0) {
+    blocks.push([
+      `ALREADY DONE in ${scopeLabel} — these external actions SUCCEEDED earlier in ${scopeBody}. Do NOT repeat any of them unless the user EXPLICITLY asks you to do it AGAIN. A prior turn that errored AFTER one of these still COUNTS as done — it was NOT cancelled:`,
+      ...confirmedLines,
+    ].join('\n'));
+  }
+  if (uncertainLines.length > 0) {
+    blocks.push([
+      `OUTCOME UNCERTAIN in ${scopeLabel} — these external actions were reserved or crossed a provider boundary, but completion was NOT confirmed. Do NOT repeat them blindly; verify the destination first:`,
+      ...uncertainLines,
+    ].join('\n'));
+  }
+  return blocks.join('\n\n');
 }
 
 export function renderRecentSessionActions(

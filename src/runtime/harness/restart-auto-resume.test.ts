@@ -2,8 +2,8 @@
  * Run: npx tsx --test src/runtime/harness/restart-auto-resume.test.ts
  *
  * 2026-07-09 — auto-resume of restart-interrupted chat runs. Safety bar:
- * no external_write in the interrupted window, fresh, bounded per boot,
- * kill-switch. Ineligible runs keep the manual banner exactly as before.
+ * no landed or unresolved external write in the interrupted window, fresh,
+ * bounded per boot, kill-switch. Ineligible runs keep the manual banner.
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -233,6 +233,93 @@ test('an interrupted run WITH an external write keeps the manual banner (double-
       bootResumeOrdinal: null,
     },
   );
+});
+
+test('an exactly matched proven-no-effect write failure remains safe to auto-resume', async () => {
+  const id = interruptedChatSession();
+  appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'Clem',
+    type: 'external_write',
+    data: { tool: 'composio_execute_tool', callId: 'failed-write-1' },
+  });
+  appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { tool: 'composio_execute_tool', callId: 'failed-write-1', effect: 'none' },
+  });
+
+  const dispatched: string[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => {
+    dispatched.push(sessionId);
+  });
+
+  assert.equal(summary.records[0].autoResumed, true);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(dispatched, [id]);
+  const decision = listEvents(id, { types: ['restart_recovery_decision'] }).at(-1);
+  assert.equal(decision?.data.externalWritesSinceInterrupt, 0);
+});
+
+test('a failure compensates only its exact write; a sibling reservation still blocks replay', async () => {
+  const id = interruptedChatSession();
+  appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'Clem',
+    type: 'external_write',
+    data: { tool: 'composio_execute_tool', callId: 'failed-write-a' },
+  });
+  appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'Clem',
+    type: 'external_write',
+    data: { tool: 'composio_execute_tool', callId: 'unresolved-write-b' },
+  });
+  appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { tool: 'composio_execute_tool', callId: 'failed-write-a', effect: 'none' },
+  });
+
+  const dispatched: string[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => {
+    dispatched.push(sessionId);
+  });
+
+  assert.equal(summary.records[0].autoResumeSkipped, 'external_write');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(dispatched, []);
+  const decision = listEvents(id, { types: ['restart_recovery_decision'] }).at(-1);
+  assert.equal(decision?.data.externalWritesSinceInterrupt, 1);
+});
+
+test('an orphan outcome without a reservation still blocks automatic replay', async () => {
+  const id = interruptedChatSession();
+  appendEvent({
+    sessionId: id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: { tool: 'composio_execute_tool', callId: 'orphan-write-1' },
+  });
+
+  const dispatched: string[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId) => {
+    dispatched.push(sessionId);
+  });
+
+  assert.equal(summary.records[0].autoResumeSkipped, 'external_write');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(dispatched, []);
+  const decision = listEvents(id, { types: ['restart_recovery_decision'] }).at(-1);
+  assert.equal(decision?.data.externalWritesSinceInterrupt, 1);
 });
 
 test('kill-switch CLEMMY_CHAT_AUTO_RESUME=off restores banner-only for everyone', async () => {

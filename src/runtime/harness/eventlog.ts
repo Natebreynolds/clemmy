@@ -188,12 +188,21 @@ export const EVENT_TYPES = [
   // FAILED (e.g. composio schema rejection) — the duplicate-target gate nets
   // one matching prior per failure so corrected retries aren't "duplicates".
   'external_write_failed',
+  // Exact terminal receipt for a pre-dispatch external_write reservation. A
+  // reservation alone is never completion evidence: only this same-call
+  // settlement proves the provider returned cleanly.
+  'external_write_succeeded',
   // S3 orphan ledger: a MUTATING external write TIMED OUT. The harness stops
   // waiting but the request MAY have landed server-side (it is aborted at the
   // network layer — recorded in `aborted`). Durable audit of maybe-landed
   // writes, and the signal the orphaned-write retry corrective consults before
   // a blind same-shape retry.
   'external_write_orphaned',
+  // Explicit, execution-owned retry lineage. Authorization names one proven
+  // failed call; consumption is a durable one-shot CAS recorded before a
+  // corrected provider attempt is reserved.
+  'external_write_retry_authorized',
+  'external_write_retry_consumed',
   // Always-on telemetry: a run_worker sub-agent hit its turn ceiling
   // (MaxTurnsExceeded). Worker nested runs carry no harness hooks, so this is
   // the only signal of worker turn-cap hits — used to recalibrate
@@ -1010,6 +1019,43 @@ const MIGRATIONS: EventLogMigration[] = [
     version: 13,
     sql: 'DROP TABLE IF EXISTS session_locks;',
   },
+  {
+    // A fresh human approval may authorize one deliberate duplicate send, but
+    // it is not standing permission for unlimited later replays. Keep this
+    // consumption independent from the workflow payload-consumption column:
+    // the approval gate may consume `consumed_at` immediately before the
+    // duplicate wall evaluates the same approved call.
+    version: 14,
+    sql: '',
+    backfill(db) {
+      const table = db.prepare(`
+        SELECT 1 AS present
+          FROM sqlite_master
+         WHERE type = 'table' AND name = 'pending_approvals'
+      `).get() as { present: number } | undefined;
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(pending_approvals)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('resend_consumed_at')) {
+        db.exec('ALTER TABLE pending_approvals ADD COLUMN resend_consumed_at TEXT');
+        columns.add('resend_consumed_at');
+      }
+      if (
+        ['session_id', 'resolved_at', 'status', 'resolution', 'resend_consumed_at']
+          .every((column) => columns.has(column))
+      ) {
+        db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_pending_approvals_resend_consent
+            ON pending_approvals(session_id, resolved_at DESC)
+            WHERE status = 'resolved'
+              AND resolution = 'approved'
+              AND resend_consumed_at IS NULL
+        `);
+      }
+    },
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -1474,13 +1520,81 @@ export function appendEvent(input: AppendEventInput): EventRow {
       });
     } catch { /* the ledger never blocks the event write */ }
   }
-  // Deliverable index tee (2026-07-23): every lane's external writes flow
-  // through THIS seam, so one tee gives "where did I put the user's work"
+  // Deliverable index tee (2026-07-23): every lane's settled external writes
+  // flow through THIS seam, so one tee gives "where did I put the user's work"
   // durable memory (memory.db — it must survive an evidence-store wipe; see
-  // deliverable-index.ts). Fire-and-forget: the memory write never blocks or
-  // fails the event append.
-  if (input.type === 'external_write') {
-    const d = (input.data ?? {}) as { shapeKey?: unknown; targets?: unknown };
+  // deliverable-index.ts). A new pre-dispatch row is only a reservation; index
+  // it after the exact call succeeds. Legacy rows keep their historical
+  // success meaning. Fire-and-forget: memory never blocks the event append.
+  let deliverableData: Record<string, unknown> | null = null;
+  const eventDataRecord = (input.data ?? {}) as Record<string, unknown>;
+  if (input.type === 'external_write' && eventDataRecord.preDispatch !== true) {
+    deliverableData = eventDataRecord;
+  } else if (input.type === 'external_write_succeeded') {
+    const successCallId = typeof eventDataRecord.canonicalCallId === 'string'
+      ? eventDataRecord.canonicalCallId.trim()
+      : typeof eventDataRecord.callId === 'string'
+        ? eventDataRecord.callId.trim()
+        : '';
+    if (successCallId) {
+      try {
+        const candidates = db.prepare(
+          `SELECT seq, data_json
+             FROM events
+            WHERE session_id = ?
+              AND type = 'external_write'
+              AND seq < ?
+            ORDER BY seq DESC
+            LIMIT 500`,
+        ).all(input.sessionId, event.seq) as Array<{ seq: number; data_json: string }>;
+        for (const candidate of candidates) {
+          let reserved: Record<string, unknown>;
+          try { reserved = JSON.parse(candidate.data_json) as Record<string, unknown>; } catch { continue; }
+          if (reserved.preDispatch !== true) continue;
+          const reservedCallId = typeof reserved.canonicalCallId === 'string'
+            ? reserved.canonicalCallId.trim()
+            : typeof reserved.callId === 'string'
+              ? reserved.callId.trim()
+              : '';
+          if (reservedCallId !== successCallId) continue;
+          const failedRows = db.prepare(
+            `SELECT data_json
+               FROM events
+              WHERE session_id = ?
+                AND type = 'external_write_failed'
+                AND seq > ?
+                AND seq < ?
+              ORDER BY seq DESC
+              LIMIT 100`,
+          ).all(input.sessionId, candidate.seq, event.seq) as Array<{ data_json: string }>;
+          const alreadyFailed = failedRows.some((failedRow) => {
+            try {
+              const failed = JSON.parse(failedRow.data_json) as Record<string, unknown>;
+              const failedCallId = typeof failed.canonicalCallId === 'string'
+                ? failed.canonicalCallId.trim()
+                : typeof failed.callId === 'string'
+                  ? failed.callId.trim()
+                  : '';
+              return failedCallId === successCallId;
+            } catch {
+              return false;
+            }
+          });
+          if (alreadyFailed) break;
+          deliverableData = {
+            ...reserved,
+            ...eventDataRecord,
+            targets: Array.isArray(eventDataRecord.targets) && eventDataRecord.targets.length > 0
+              ? eventDataRecord.targets
+              : reserved.targets,
+          };
+          break;
+        }
+      } catch { /* exact settlement lookup is best-effort */ }
+    }
+  }
+  if (deliverableData) {
+    const d = deliverableData as { shapeKey?: unknown; targets?: unknown };
     const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : undefined;
     const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
     if (targets.length > 0) {

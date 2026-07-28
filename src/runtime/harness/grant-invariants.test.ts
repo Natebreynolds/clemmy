@@ -25,7 +25,7 @@ const { queuePendingAction, markPendingActionApprovalResolved, getPendingAction 
 const { executeApprovedPendingActionCall } = await import('../../execution/pending-action-executor.js');
 const { shouldRunObjectiveJudge } = await import('./objective-judge.js');
 const { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
-const { createSession, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -208,6 +208,186 @@ test('Hole 4 (TOCTOU): concurrent fan-out of irreversible sends is counted as a 
     saveProactivityPolicy({ autoApproveScope: 'balanced', batchConfirmThreshold: 5 });
     process.env.CLEMMY_CONFIRM_FIRST = prevGate;
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
+});
+
+test('same-target Composio fan-out reserves exactly one irreversible dispatch', async () => {
+  const prevGate = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  process.env.CLEMMY_CONFIRM_FIRST = 'on';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+  saveProactivityPolicy({ autoApproveScope: 'balanced', batchConfirmThreshold: 20 });
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  let dispatched = 0;
+  try {
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async () => {
+        dispatched += 1;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return 'sent';
+      },
+    });
+    const send = () => withHarnessRunContext(
+      {
+        sessionId: sess.id,
+        counter: new ToolCallsCounter(50),
+        certifiedBatch: { batchId: 'same-target-race', payloadHash: 'one-payload' },
+      },
+      () => wrapped.execute!({
+        tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+        arguments: JSON.stringify({
+          to_email: 'same-target@example.com',
+          subject: 'Send once',
+          body: 'This payload must dispatch only once.',
+        }),
+      }),
+    );
+
+    const settled = await Promise.allSettled([send(), send()]);
+    assert.equal(dispatched, 1, 'the second concurrent duplicate is refused before provider dispatch');
+    assert.deepEqual(
+      settled.map((entry) => entry.status).sort(),
+      ['fulfilled', 'fulfilled'],
+      'the harness returns one soft duplicate refusal instead of crashing the run',
+    );
+    assert.equal(
+      settled.filter((entry) => entry.status === 'fulfilled' && String(entry.value).startsWith('sent')).length,
+      1,
+    );
+    assert.equal(
+      settled.filter((entry) => entry.status === 'fulfilled' && /duplicate|already sent|refused/i.test(String(entry.value))).length,
+      1,
+    );
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced', batchConfirmThreshold: 5 });
+    if (prevGate === undefined) delete process.env.CLEMMY_CONFIRM_FIRST;
+    else process.env.CLEMMY_CONFIRM_FIRST = prevGate;
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE;
+    else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
+test('same-target shell send fan-out reserves exactly one irreversible dispatch', async () => {
+  const previous = {
+    brackets: process.env.HARNESS_TOOL_BRACKETS,
+    grounding: process.env.CLEMMY_GROUNDING_GATE,
+    destination: process.env.CLEMMY_DESTINATION_GATE,
+    fidelity: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    output: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  resetEventLog();
+  const sess = createSession({ kind: 'execution' });
+  let dispatched = 0;
+  try {
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async () => {
+        dispatched += 1;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return 'exit_code: 0\nsent';
+      },
+    });
+    const command = "curl -X POST https://api.example.com/send -d 'to_email=same-shell@example.com&body=send-once'";
+    const send = () => withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(50) },
+      () => wrapped.execute!({ command }),
+    );
+
+    const settled = await Promise.allSettled([send(), send()]);
+    assert.equal(dispatched, 1);
+    assert.equal(
+      settled.filter((entry) => entry.status === 'fulfilled' && String(entry.value).includes('exit_code: 0')).length,
+      1,
+    );
+    assert.equal(
+      settled.filter((entry) => entry.status === 'fulfilled' && /duplicate|already sent|refused/i.test(String(entry.value))).length,
+      1,
+    );
+  } finally {
+    const restore = (name: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+    restore('HARNESS_TOOL_BRACKETS', previous.brackets);
+    restore('CLEMMY_GROUNDING_GATE', previous.grounding);
+    restore('CLEMMY_DESTINATION_GATE', previous.destination);
+    restore('CLEMMY_GOAL_FIDELITY_GATE', previous.fidelity);
+    restore('CLEMMY_OUTPUT_GROUNDING_GATE', previous.output);
+  }
+});
+
+test('Composio refuses a same-recipient email already reserved through native MCP', async () => {
+  const previous = {
+    brackets: process.env.HARNESS_TOOL_BRACKETS,
+    grounding: process.env.CLEMMY_GROUNDING_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
+  saveProactivityPolicy({ autoApproveScope: 'balanced', batchConfirmThreshold: 20 });
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send this email exactly once.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: source.seq,
+      toolName: 'mcp__outlook__send_email',
+      shapeKey: 'mcp__outlook__send_email',
+      targets: ['native-first@example.com'],
+    },
+  });
+  let dispatched = 0;
+  try {
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async () => { dispatched += 1; return 'sent'; },
+    });
+    const result = await withHarnessRunContext(
+      {
+        sessionId: sess.id,
+        sourceUserSeq: source.seq,
+        counter: new ToolCallsCounter(50),
+        certifiedBatch: { batchId: 'cross-transport', payloadHash: 'one-email' },
+      },
+      () => wrapped.execute!({
+        tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+        arguments: JSON.stringify({
+          to_email: 'native-first@example.com',
+          subject: 'Do not send twice',
+          body: 'One action across both transports.',
+        }),
+      }),
+    );
+    assert.match(String(result), /duplicate|already sent|refused/i);
+    assert.equal(dispatched, 0);
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced', batchConfirmThreshold: 5 });
+    if (previous.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previous.brackets;
+    if (previous.grounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE;
+    else process.env.CLEMMY_GROUNDING_GATE = previous.grounding;
   }
 });
 

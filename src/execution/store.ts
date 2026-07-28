@@ -27,6 +27,7 @@ const STATE_DIR = path.join(BASE_DIR, 'state');
 const EXECUTIONS_FILE = path.join(STATE_DIR, 'executions.json');
 const EXTERNAL_WRITE_EVENT_TYPES = [
   'external_write',
+  'external_write_succeeded',
   'external_write_failed',
   'external_write_orphaned',
 ] as const;
@@ -67,6 +68,14 @@ export interface ExecutionExternalWriteTruth {
   execution: ExecutionRecord;
 }
 
+function executionSourceUserSeqs(execution: ExecutionRecord): number[] {
+  return [...new Set([
+    execution.sourceUserSeq,
+    ...(execution.sourceUserSeqs ?? []),
+  ].filter((seq): seq is number => Number.isSafeInteger(seq) && (seq ?? 0) > 0))]
+    .sort((left, right) => left - right);
+}
+
 function executionExternalWriteStatus(
   execution: ExecutionRecord,
   prefetchedOwnershipEvents?: readonly EventRow[],
@@ -74,40 +83,47 @@ function executionExternalWriteStatus(
   status: FreshExternalWriteEvidenceStatus;
   latestNegativeSeq?: number;
 } {
-  const sourceUserSeq = execution.sourceUserSeq;
-  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+  const sourceUserSeqs = executionSourceUserSeqs(execution);
+  if (sourceUserSeqs.length === 0) {
     return { status: 'missing' };
   }
+  const firstSourceUserSeq = sourceUserSeqs[0] as number;
+  const acceptedSources = new Set(sourceUserSeqs);
   try {
     const ownershipEvents = (
       prefetchedOwnershipEvents
         ?? listHarnessEvents(execution.sessionId, {
-          sinceSeq: sourceUserSeq,
+          sinceSeq: firstSourceUserSeq,
           types: [...EXTERNAL_WRITE_OWNERSHIP_EVENT_TYPES],
         })
-    ).filter((event) => event.seq > (sourceUserSeq as number));
-    const completedAt = execution.status === 'completed'
-      ? execution.completedAt
-        ?? [...(execution.activity ?? [])]
-          .reverse()
-          .find((item) => item.type === 'completed')?.createdAt
-        ?? execution.updatedAt
-      : undefined;
-    const nextUserRequest = completedAt
-      ? ownershipEvents.find((event) =>
-          event.type === 'user_input_received'
-          && event.createdAt >= completedAt
-        )
-      : undefined;
-    // A late timeout/orphan resolution may arrive after the model marked the
-    // execution complete, so keep same-request evidence until the next user
-    // request. Nothing after that request can retroactively belong to this
-    // already-completed execution.
-    const events = ownershipEvents.filter((event) =>
-      event.type !== 'user_input_received'
-      && (!nextUserRequest || event.seq < nextUserRequest.seq)
-    );
-    const status = freshExternalWriteEvidenceStatus(events, sourceUserSeq);
+    ).filter((event) => event.seq > firstSourceUserSeq);
+    // `listEvents(..., { sinceSeq })` is exclusive, so the origin row itself is
+    // not present in ownershipEvents. Seed every explicitly accepted source
+    // boundary here; otherwise legacy untagged writes immediately after the
+    // origin have no preceding owner and disappear from completion truth.
+    const userBoundaries = [...new Set([
+      ...sourceUserSeqs,
+      ...ownershipEvents
+        .filter((event) => event.type === 'user_input_received')
+        .map((event) => event.seq),
+    ])].sort((left, right) => left - right);
+    const events = ownershipEvents.filter((event) => {
+      if (event.type === 'user_input_received') return false;
+      const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+        ? event.data as { sourceUserSeq?: unknown }
+        : {};
+      if (Number.isSafeInteger(data.sourceUserSeq)) {
+        return acceptedSources.has(data.sourceUserSeq as number);
+      }
+      // Historical rows had no exact owner. Attribute them only to their
+      // nearest preceding accepted user boundary; never let an unrelated
+      // follow-up contaminate a long-lived execution.
+      const precedingUserSeq = [...userBoundaries]
+        .reverse()
+        .find((seq) => seq < event.seq);
+      return precedingUserSeq !== undefined && acceptedSources.has(precedingUserSeq);
+    });
+    const status = freshExternalWriteEvidenceStatus(events, sourceUserSeqs);
     const latestNegativeSeq = events
       .filter((event) =>
         event.type === 'external_write_failed'
@@ -147,7 +163,7 @@ function applyExternalWriteTruthBlock(
   const copy = externalWriteTruthCopy(status);
   const activityKey = [
     'external-write-truth',
-    execution.sourceUserSeq ?? 'unknown',
+    executionSourceUserSeqs(execution).join(',') || 'unknown',
     status,
     latestNegativeSeq ?? 'unknown',
   ].join(':');
@@ -180,6 +196,7 @@ function applyExternalWriteTruthBlock(
         source: 'deterministic_external_write_truth',
         status,
         sourceUserSeq: execution.sourceUserSeq,
+        sourceUserSeqs: executionSourceUserSeqs(execution),
         latestNegativeSeq,
       },
     });
@@ -249,13 +266,13 @@ function reconcileCompletedExternalWriteTruth(executions: ExecutionRecord[]): bo
     if (eventsBySession.has(execution.sessionId)) continue;
     const sessionCandidates = candidates.filter((candidate) => candidate.sessionId === execution.sessionId);
     const firstSource = sessionCandidates.reduce(
-      (lowest, candidate) => (
-        Number.isSafeInteger(candidate.sourceUserSeq)
-        && (candidate.sourceUserSeq ?? 0) > 0
-        && (lowest === undefined || (candidate.sourceUserSeq as number) < lowest)
-          ? candidate.sourceUserSeq as number
-          : lowest
-      ),
+      (lowest, candidate) => {
+        const candidateFirst = executionSourceUserSeqs(candidate)[0];
+        return candidateFirst !== undefined
+          && (lowest === undefined || candidateFirst < lowest)
+          ? candidateFirst
+          : lowest;
+      },
       undefined as number | undefined,
     );
     if (firstSource === undefined) {
@@ -436,6 +453,71 @@ export class ExecutionStore {
     return execution;
   }
 
+  /**
+   * Attach one exact follow-up user request to an existing execution. This is
+   * deliberately explicit: ambient "latest user" state and generic continue
+   * prose must never lend an unrelated turn's write receipts to an execution.
+   */
+  bindSourceUserSeq(
+    id: string,
+    sessionId: string,
+    sourceUserSeq: number,
+    sourceTool: string,
+  ): ExecutionRecord | undefined {
+    if (
+      !sessionId
+      || !Number.isSafeInteger(sourceUserSeq)
+      || sourceUserSeq <= 0
+    ) return undefined;
+
+    const executions = loadExecutions();
+    const execution = executions.find((entry) => entry.id === id);
+    if (!execution || execution.sessionId !== sessionId) return undefined;
+
+    let ownsExactUserRow = false;
+    try {
+      ownsExactUserRow = listHarnessEvents(sessionId, {
+        sinceSeq: Math.max(0, sourceUserSeq - 1),
+        types: ['user_input_received'],
+      }).some((event) => event.seq === sourceUserSeq);
+    } catch {
+      return undefined;
+    }
+    if (!ownsExactUserRow) return undefined;
+
+    if (!execution.sourceUserSeq) {
+      execution.sourceUserSeq = sourceUserSeq;
+    } else if (execution.sourceUserSeq !== sourceUserSeq) {
+      execution.sourceUserSeqs = [...new Set([
+        ...(execution.sourceUserSeqs ?? []),
+        sourceUserSeq,
+      ])].sort((left, right) => left - right);
+    }
+
+    execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+    const activityKey = `source-user-bound:${sourceUserSeq}`;
+    if (!execution.activity.some((item) => item.key === activityKey)) {
+      const now = new Date().toISOString();
+      execution.activity.push({
+        id: randomUUID(),
+        key: activityKey,
+        type: 'status',
+        message: clean('Linked this exact follow-up request to the execution audit trail.', 500),
+        createdAt: now,
+        metadata: {
+          source: 'explicit_execution_tool',
+          sourceTool: clean(sourceTool, 80),
+          sourceUserSeq,
+        },
+      });
+      execution.activity = execution.activity.slice(-60);
+      execution.updatedAt = now;
+      execution.lastActivityAt = now;
+    }
+    saveExecutions(executions);
+    return execution;
+  }
+
   addActivity(input: {
     executionId: string;
     key: string;
@@ -505,19 +587,11 @@ export class ExecutionStore {
    * predate it) and deterministically block unresolved failed/ambiguous writes.
    * No model or completion judge participates in this decision.
    */
-  reconcileExternalWriteTruth(id: string, sourceUserSeq?: number): ExecutionExternalWriteTruth | undefined {
+  reconcileExternalWriteTruth(id: string): ExecutionExternalWriteTruth | undefined {
     const executions = loadExecutions();
     const execution = executions.find((entry) => entry.id === id);
     if (!execution) return undefined;
     let changed = false;
-    if (
-      !execution.sourceUserSeq
-      && Number.isSafeInteger(sourceUserSeq)
-      && (sourceUserSeq ?? 0) > 0
-    ) {
-      execution.sourceUserSeq = sourceUserSeq;
-      changed = true;
-    }
     const evidence = executionExternalWriteStatus(execution);
     if (evidence.status === 'failed' || evidence.status === 'ambiguous') {
       changed = applyExternalWriteTruthBlock(

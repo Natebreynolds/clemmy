@@ -551,7 +551,7 @@ test('artifact admission: a duplicate create neither executes nor records/counts
   }
 });
 
-test('artifact settlement: local npx failure and authoritative account rejection release the slot for same-turn recovery', async () => {
+test('artifact settlement: only a typed local spawn failure releases; provider rejection remains uncertain', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
     CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
@@ -601,10 +601,9 @@ test('artifact settlement: local npx failure and authoritative account rejection
       const callId = (details as { toolCall?: { callId?: string } } | undefined)?.toolCall?.callId;
       if (attempt === 1) {
         recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
-          command, externalMutation: true, exitCode: 1, stdout: '',
-          stderr: 'npm error code EACCES\nnpm error path /Users/example/.npm/_cacache\nnpm error permission denied',
+          command, externalMutation: true, spawnErrorCode: 'EACCES',
         }));
-        return 'exit_code: 1\n\nstderr:\nnpm error code EACCES';
+        return 'spawn_error: EACCES';
       }
       if (attempt === 2) {
         recordShellExecutionOutcome(callId, classifyShellExecutionOutcome({
@@ -628,7 +627,7 @@ test('artifact settlement: local npx failure and authoritative account rejection
     const counter = new ToolCallsCounter(20);
     await withHarnessRunContext({ sessionId: sess.id, behaviorScopeId: 'typed-shell-artifact', counter }, async () => {
       assert.match(String(await invoke('npx-local-failure')), /EACCES/);
-      assert.equal(listRunArtifacts(sess.id).length, 0, 'local materialization never parks an uncertain artifact');
+      assert.equal(listRunArtifacts(sess.id).length, 0, 'typed pre-spawn failure never parks an uncertain artifact');
       assert.equal(
         peekToolChoice(procedureIntent)?.choice?.failureCount ?? 0,
         0,
@@ -636,18 +635,20 @@ test('artifact settlement: local npx failure and authoritative account rejection
       );
 
       assert.match(String(await invoke('account-rejected')), /404/);
-      assert.equal(listRunArtifacts(sess.id).length, 0, 'authoritative provider no-effect rejection releases the slot');
+      assert.equal(listRunArtifacts(sess.id).length, 1, 'provider-phase rejection keeps one conservative claim');
+      assert.equal(listRunArtifacts(sess.id)[0]?.status, 'uncertain');
       assert.equal(
         peekToolChoice(procedureIntent)?.choice?.failureCount ?? 0,
         1,
-        'the later provider-acknowledged rejection does exercise and score the procedure',
+        'the provider-phase rejection exercises and scores the procedure',
       );
 
-      assert.match(String(await invoke('created-after-discovery')), /site_fixture_provider/);
-      assert.equal(listRunArtifacts(sess.id)[0]?.status, 'bound');
-      assert.equal(listRunArtifacts(sess.id)[0]?.resourceId, 'site_fixture_provider');
+      assert.match(
+        String(await invoke('blind-retry-refused')),
+        /unresolved uncertain create claim|Do not create another resource blindly/i,
+      );
     });
-    assert.equal(attempt, 3, 'both proven-no-effect failures permit the corrected strategy');
+    assert.equal(attempt, 2, 'the unresolved provider attempt blocks a blind third dispatch');
   } finally {
     deleteToolChoice(procedureIntent);
     _resetProceduralRecallLinkForTests();
@@ -1006,10 +1007,11 @@ async function runTscTimeout(opts: {
   try {
     const counter = new ToolCallsCounter(10);
     const slow = async () => { await tscSleep(200); return 'ran'; };
+    const sessionId = createSession({ kind: 'chat' }).id;
     if (opts.path === 'invoke') {
       const wrapped = wrapToolForHarness({ name: opts.name, invoke: slow }, { timeoutMs: 50 });
       const argStr = JSON.stringify(opts.input ?? {});
-      return await withHarnessRunContext({ sessionId: `tsc-inv-${opts.name}`, counter }, async () => {
+      return await withHarnessRunContext({ sessionId, counter }, async () => {
         try {
           const result = await (wrapped as unknown as {
             invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown>;
@@ -1019,7 +1021,7 @@ async function runTscTimeout(opts: {
       });
     }
     const wrapped = wrapToolForHarness({ name: opts.name, execute: slow }, { timeoutMs: 50 });
-    return await withHarnessRunContext({ sessionId: `tsc-${opts.name}`, counter }, async () => {
+    return await withHarnessRunContext({ sessionId, counter }, async () => {
       try { return { result: await wrapped.execute!(opts.input ?? {}) }; }
       catch (error) { return { error }; }
     });
@@ -1122,17 +1124,237 @@ test('orphan ledger: a mutating composio timeout records external_write_orphaned
   await runComposioTimeoutInSession(writeSess, { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'orphan@example.com' } });
   const orphans = listEvents(writeSess, { types: ['external_write_orphaned'] });
   assert.equal(orphans.length, 1, 'mutating write timeout records exactly one orphan');
-  assert.equal(orphans[0].data.slug, 'AIRTABLE_CREATE_RECORD');
+  assert.equal(orphans[0].data.shapeKey, 'AIRTABLE_CREATE_RECORD');
+  assert.equal(orphans[0].data.actionKey, 'shape:airtable:create:record');
   assert.ok((orphans[0].data.targets as string[]).includes('orphan@example.com'), 'target captured');
-  assert.equal(typeof orphans[0].data.argsDigest, 'string');
-  assert.equal(orphans[0].data.aborted, true, 'aborted flag reflects the default-on kill-switch');
+  assert.equal(typeof orphans[0].data.correlationFingerprint, 'string');
+  assert.equal(typeof orphans[0].data.reason, 'string');
+  const reservation = listEvents(writeSess, { types: ['external_write'] })[0];
+  assert.equal(orphans[0].data.callId, reservation?.data.callId, 'the outcome settles the exact reservation');
 
   const readSess = createSession({ kind: 'chat' }).id;
   await runComposioTimeoutInSession(readSess, { tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: { datasetId: 'ds1' } });
   assert.equal(listEvents(readSess, { types: ['external_write_orphaned'] }).length, 0, 'a read timeout records no orphan');
 });
 
-test('orphaned-write retry: a same-shape retry after an orphan gets the verify-first corrective; a different shape does not', async () => {
+async function withActualOrphan<T>(
+  run: (fixture: {
+    sessionId: string;
+    invoke: (args: unknown, callId: string) => Promise<unknown>;
+    dispatchCount: () => number;
+  }) => Promise<T>,
+): Promise<T> {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  try {
+    const sess = createSession({ kind: 'chat' }).id;
+    const counter = new ToolCallsCounter(20);
+    let dispatches = 0;
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      invoke: async () => {
+        dispatches += 1;
+        if (dispatches === 1) await tscSleep(200);
+        return { successful: true, data: { id: `rec-${dispatches}` } };
+      },
+    }, { timeoutMs: 50 });
+    const invoke = (args: unknown, callId: string) =>
+      (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+        .invoke(null, JSON.stringify(args), { toolCall: { callId } });
+    return await withHarnessRunContext({ sessionId: sess, counter }, () =>
+      run({ sessionId: sess, invoke, dispatchCount: () => dispatches }));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+function appendCanonicalToolPair(input: {
+  sessionId: string;
+  callId: string;
+  tool: string;
+  args: unknown;
+  result: unknown;
+  ok?: boolean;
+}): void {
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      tool: input.tool,
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      accounting: 'top_level',
+      arguments: JSON.stringify(input.args),
+    },
+  });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: 0,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: input.tool,
+      callId: input.callId,
+      canonicalCallId: input.callId,
+      accounting: 'top_level',
+      ...(input.ok === undefined ? {} : { ok: input.ok }),
+      result: input.result,
+    },
+  });
+}
+
+test('orphaned-write retry: an actual timeout blocks the immediate same-target retry before provider dispatch', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    const input = { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'dup@example.com', n: 1 } };
+    const timedOut = String(await invoke(input, 'timeout-write'));
+    assert.match(timedOut, /WRITE TIMED OUT/);
+    assert.equal(dispatchCount(), 1);
+    const orphan = listEvents(sessionId, { types: ['external_write_orphaned'] })[0];
+    assert.equal(orphan?.data.shapeKey, 'AIRTABLE_CREATE_RECORD', 'composed test uses the current writer shape');
+
+    const retry = String(await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'dup@example.com', n: 2 } },
+      'immediate-retry',
+    ));
+    assert.match(retry, /ORPHANED_WRITE_RETRY|READ THE TARGET BACK|verify/i);
+    assert.equal(dispatchCount(), 1, 'the immediate retry never reached provider code');
+  });
+});
+
+test('orphaned-write retry: unpaired/arbitrary returns and successful WRITE pairs do not unlock dispatch', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'still-orphaned@example.com', n: 1 } },
+      'timeout-write',
+    );
+
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'tool',
+      type: 'tool_returned',
+      data: { tool: 'memory_search', callId: 'unpaired', accounting: 'top_level', ok: true, result: 'anything' },
+    });
+    const afterArbitraryReturn = String(await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'still-orphaned@example.com', n: 2 } },
+      'retry-after-arbitrary-return',
+    ));
+    assert.match(afterArbitraryReturn, /ORPHANED_WRITE_RETRY/);
+
+    appendCanonicalToolPair({
+      sessionId,
+      callId: 'write-corrective',
+      tool: 'composio_execute_tool',
+      args: {
+        tool_slug: 'AIRTABLE_CREATE_RECORD',
+        arguments: { email: 'still-orphaned@example.com', n: 3 },
+      },
+      result: { successful: true, data: { id: 'maybe-created' } },
+      ok: true,
+    });
+    const afterWriteReturn = String(await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'still-orphaned@example.com', n: 4 } },
+      'retry-after-write-return',
+    ));
+    assert.match(afterWriteReturn, /ORPHANED_WRITE_RETRY/);
+    assert.equal(dispatchCount(), 1, 'neither unrelated activity nor another write bypasses the orphan gate');
+  });
+});
+
+test('orphaned-write retry: an empty same-target READ result does not unlock dispatch', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'empty-read@example.com', n: 1 } },
+      'timeout-write',
+    );
+    appendCanonicalToolPair({
+      sessionId,
+      callId: 'empty-read-back',
+      tool: 'composio_execute_tool',
+      args: {
+        tool_slug: 'AIRTABLE_LIST_RECORDS',
+        arguments: { filter: { email: 'empty-read@example.com' } },
+      },
+      result: {},
+      ok: true,
+    });
+
+    const retry = String(await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'empty-read@example.com', n: 2 } },
+      'retry-after-empty-read',
+    ));
+    assert.match(retry, /ORPHANED_WRITE_RETRY/);
+    assert.equal(dispatchCount(), 1, 'an empty success envelope is not read-back evidence');
+  });
+});
+
+test('orphaned-write retry: a successful READ for an unrelated target does not unlock dispatch', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'intended@example.com', n: 1 } },
+      'timeout-write',
+    );
+    appendCanonicalToolPair({
+      sessionId,
+      callId: 'unrelated-read-back',
+      tool: 'composio_execute_tool',
+      args: {
+        tool_slug: 'AIRTABLE_LIST_RECORDS',
+        arguments: { filter: { email: 'someone-else@example.com' } },
+      },
+      result: { successful: true, data: { records: [{ id: 'rec-unrelated' }] } },
+      ok: true,
+    });
+
+    const retry = String(await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'intended@example.com', n: 2 } },
+      'retry-after-unrelated-read',
+    ));
+    assert.match(retry, /ORPHANED_WRITE_RETRY/);
+    assert.equal(dispatchCount(), 1, 'read-back authority is scoped to the exact orphan target');
+  });
+});
+
+test('orphaned-write retry: a paired successful canonical READ after the orphan unlocks one conscious retry', async () => {
+  await withActualOrphan(async ({ sessionId, invoke, dispatchCount }) => {
+    await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'verified@example.com', n: 1 } },
+      'timeout-write',
+    );
+    appendCanonicalToolPair({
+      sessionId,
+      callId: 'read-back',
+      tool: 'composio_execute_tool',
+      args: {
+        tool_slug: 'AIRTABLE_LIST_RECORDS',
+        arguments: { filter_by_formula: '{email}="verified@example.com"' },
+      },
+      result: { successful: true, data: { records: [] } },
+      ok: true,
+    });
+
+    const retry = await invoke(
+      { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'verified@example.com', n: 2 } },
+      'verified-retry',
+    );
+    assert.deepEqual(retry, { successful: true, data: { id: 'rec-2' } });
+    assert.equal(dispatchCount(), 2, 'a real successful provider read-back unlocks the retry');
+  });
+});
+
+test('orphaned-write retry: legacy orphan rows keyed by slug remain protected', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
     CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
@@ -1142,31 +1364,41 @@ test('orphaned-write retry: a same-shape retry after an orphan gets the verify-f
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_CONFIRM_FIRST = 'off';
   try {
-    const sess = createSession({ kind: 'chat' }).id;
-    // Seed the orphan ledger: a prior AIRTABLE_CREATE_RECORD to dup@example.com timed out.
+    const sessionId = createSession({ kind: 'chat' }).id;
     appendEvent({
-      sessionId: sess, turn: 0, role: 'system', type: 'external_write_orphaned',
-      data: { tool: 'composio_execute_tool', slug: 'AIRTABLE_CREATE_RECORD', targets: ['dup@example.com'], argsDigest: 'seed', timeoutMs: 50, aborted: true },
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write_orphaned',
+      data: {
+        tool: 'composio_execute_tool',
+        slug: 'AIRTABLE_CREATE_RECORD',
+        targets: ['legacy@example.com'],
+        argsDigest: 'legacy',
+      },
     });
-    const counter = new ToolCallsCounter(10);
-    const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => 'OK' }, {});
-    const invoke = (args: unknown, callId: string) =>
-      (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
-        .invoke(null, JSON.stringify(args), { toolCall: { callId } });
-    await withHarnessRunContext({ sessionId: sess, counter }, async () => {
-      // 1) matching same-shape/target retry → soft verify-first corrective (NOT executed)
-      const first = String(await invoke({ tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'dup@example.com', n: 1 } }, 'r1'));
-      assert.match(first, /refused by harness/i);
-      assert.match(first, /ORPHANED_WRITE_RETRY|READ THE TARGET BACK|verify/i);
-      // 2) the CONSCIOUS retry (same shape+target) now passes — warn-once speed bump
-      const second = String(await invoke({ tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'dup@example.com', n: 2 } }, 'r2'));
-      assert.doesNotMatch(second, /ORPHANED_WRITE_RETRY/);
-      assert.match(second, /OK/);
-      // 3) a DIFFERENT target (no matching orphan) is unaffected
-      const other = String(await invoke({ tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'fresh@example.com', n: 3 } }, 'r3'));
-      assert.doesNotMatch(other, /ORPHANED_WRITE_RETRY/);
-      assert.match(other, /OK/);
-    });
+    let dispatches = 0;
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      invoke: async () => {
+        dispatches += 1;
+        return { successful: true };
+      },
+    }, {});
+    const result = await withHarnessRunContext(
+      { sessionId, counter: new ToolCallsCounter(5) },
+      () => (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+        .invoke(
+          null,
+          JSON.stringify({
+            tool_slug: 'AIRTABLE_CREATE_RECORD',
+            arguments: { email: 'legacy@example.com' },
+          }),
+          { toolCall: { callId: 'legacy-retry' } },
+        ),
+    );
+    assert.match(String(result), /ORPHANED_WRITE_RETRY/);
+    assert.equal(dispatches, 0);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
@@ -1859,7 +2091,7 @@ test('shell-send compensation: a generic nonzero provider exit remains possible 
   }
 });
 
-test('duplicate-target gate: a FAILED dispatch is netted out — the corrected retry is not a "duplicate" (2026-06-12 live replay)', async () => {
+test('duplicate-target gate: provider failure prose remains ambiguous and blocks a blind retry', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
@@ -1869,7 +2101,6 @@ test('duplicate-target gate: a FAILED dispatch is netted out — the corrected r
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_GROUNDING_GATE = 'on';
   resetEventLog();
-  const { appendEvent, listEvents } = await import('./eventlog.js');
   const grounding = await import('./grounding-gate.js');
   grounding._resetGroundingStateForTests();
   grounding._resetDuplicateStateForTests();
@@ -1889,31 +2120,19 @@ test('duplicate-target gate: a FAILED dispatch is netted out — the corrected r
           arguments: JSON.stringify({ to_email: 'alex@corp.example', subject: 'Gate test', body: 'b' }),
         }),
       ));
-    const recordWrite = () => appendEvent({
-      sessionId: sess.id, turn: 0, role: 'system', type: 'external_write',
-      data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', irreversible: true, count: 1, underScope: false, targets: ['alex@corp.example', 'example.com'] },
-    });
-
-    // 1. The dispatch FAILS HARD at composio validation. The external_write
-    //    record still lands (confirm-first emits it pre-dispatch, after the
-    //    dup gate passed for that same call — so record it post-call here).
+    // Provider-visible validation prose arrives after the invocation boundary.
+    // It cannot prove the provider did not act, so the exact reservation stays
+    // ambiguous and must block a blind retry.
     nextResult = "⚠️ composio_execute_tool FAILED (slug=OUTLOOK_OUTLOOK_SEND_EMAIL): Invalid request data provided - Following fields are missing: {'to_email'}";
     const r1 = String(await send());
-    recordWrite();
     assert.match(r1, /FAILED/);
-    const failures = listEvents(sess.id, { types: ['external_write_failed'] });
-    assert.equal(failures.length, 1, 'hard failure emits the compensation event');
+    assert.equal(listEvents(sess.id, { types: ['external_write'] }).length, 1);
+    assert.equal(listEvents(sess.id, { types: ['external_write_orphaned'] }).length, 1);
+    assert.equal(listEvents(sess.id, { types: ['external_write_failed'] }).length, 0);
 
-    // 2. The corrected retry must NOT be duplicate-blocked — the only prior
-    //    write demonstrably never happened.
     nextResult = 'sent';
-    assert.equal(await send(), 'sent', 'corrected retry sails through');
-
-    // 3. A real prior (successful send) STILL trips the bump — netting only
-    //    cancels failures, one-for-one.
-    recordWrite();
     await assert.rejects(() => Promise.resolve(send()), (err: Error) => {
-      assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/);
+      assert.match(err.message, /ORPHANED_WRITE_RETRY|DUPLICATE_EXTERNAL_WRITE/);
       return true;
     });
   } finally {
@@ -1922,6 +2141,214 @@ test('duplicate-target gate: a FAILED dispatch is netted out — the corrected r
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
+test('nominal local pre-dispatch errors release the exact reservation and permit a repaired retry', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved note after I connect the provider.' },
+  });
+  const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
+  let providerReady = false;
+  let dispatches = 0;
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      if (!providerReady) {
+        throw new ExternalWritePreDispatchError('COMPOSIO_API_KEY is not configured.');
+      }
+      dispatches += 1;
+      return JSON.stringify({ successful: true, data: { id: 'msg-repaired-1' } });
+    },
+  });
+  const input = JSON.stringify({
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: {
+      to: 'repair@example.com',
+      subject: 'Approved note',
+      body: 'Hello',
+    },
+  });
+  const invoke = (callId: string) => (wrapped as unknown as {
+    invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+  }).invoke(null, input, { toolCall: { callId } });
+
+  try {
+    const counter = new ToolCallsCounter(20);
+    await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: 'typed-predispatch-retry',
+      counter,
+    }, async () => {
+      const blocked = String(await invoke('typed-predispatch-failed'));
+      assert.match(blocked, /COMPOSIO_API_KEY is not configured/i);
+      assert.equal(dispatches, 0);
+      assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 1);
+      assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 1);
+      assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
+      assert.equal(
+        listEvents(session.id, { types: ['external_write_failed'] })[0]?.data.callId,
+        'typed-predispatch-failed',
+      );
+
+      providerReady = true;
+      assert.match(String(await invoke('typed-predispatch-repaired')), /msg-repaired-1/);
+      assert.equal(dispatches, 1, 'the exact corrected retry reaches the provider once');
+      assert.equal(listEvents(session.id, { types: ['external_write_succeeded'] }).length, 1);
+    });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('external-write settlement requires a positive acknowledgement, never failure prose or empty envelopes', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  try {
+    for (const [label, providerResult] of [
+      ['invalid-json-prose', 'Invalid JSON input'],
+      ['http-auth-prose', 'HTTP 401 Unauthorized: provider rejected the request'],
+      ['uncertain-marker', '[provider-dispatch:uncertain]\nThe write may have landed'],
+      ['empty-object', {}],
+      ['empty-array', []],
+      ['nested-failure', { detail: 'Invalid JSON input' }],
+    ] as const) {
+      resetEventLog();
+      const session = createSession({ kind: 'chat' });
+      const wrapped = wrapToolForHarness({
+        name: 'composio_execute_tool',
+        execute: async () => providerResult,
+      });
+      await withHarnessRunContext({
+        sessionId: session.id,
+        sourceUserSeq: 1,
+        behaviorScopeId: `ack-${label}`,
+        counter: new ToolCallsCounter(20),
+      }, () => wrapped.execute!({
+        tool_slug: 'AIRTABLE_CREATE_RECORD',
+        arguments: { base_id: 'app1', table_id: 'tbl1', fields: { Name: label } },
+      }));
+      assert.equal(
+        listEvents(session.id, { types: ['external_write_succeeded'] }).length,
+        0,
+        label,
+      );
+      assert.equal(
+        listEvents(session.id, { types: ['external_write_orphaned'] }).length,
+        1,
+        label,
+      );
+    }
+
+    resetEventLog();
+    const successSession = createSession({ kind: 'chat' });
+    const successful = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async () => ({ successful: true, data: { id: 'rec-clean-1' } }),
+    });
+    await withHarnessRunContext({
+      sessionId: successSession.id,
+      sourceUserSeq: 1,
+      behaviorScopeId: 'ack-clean',
+      counter: new ToolCallsCounter(20),
+    }, () => successful.execute!({
+      tool_slug: 'AIRTABLE_CREATE_RECORD',
+      arguments: { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } },
+    }));
+    assert.equal(listEvents(successSession.id, { types: ['external_write_succeeded'] }).length, 1);
+    assert.equal(listEvents(successSession.id, { types: ['external_write_orphaned'] }).length, 0);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('typed non-shell pre-dispatch errors release an artifact create claim', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create one Google Doc named Client brief.' },
+  });
+  const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
+  const { listRunArtifacts } = await import('./artifact-ledger.js');
+  const wrapped = wrapToolForHarness({
+    name: 'composio_execute_tool',
+    execute: async () => {
+      throw new ExternalWritePreDispatchError('Google Docs is not connected.');
+    },
+  });
+  try {
+    const output = await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      behaviorScopeId: 'artifact-non-shell-preflight',
+      counter: new ToolCallsCounter(20),
+    }, () => wrapped.execute!({
+      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+      arguments: { title: 'Client brief', markdown_text: '# Client brief' },
+    }));
+    assert.match(String(output), /Google Docs is not connected/);
+    assert.equal(listRunArtifacts(session.id).length, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 1);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

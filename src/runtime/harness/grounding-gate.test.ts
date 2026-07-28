@@ -308,6 +308,7 @@ test('duplicate wall: fresh approval after the prior send authorizes the resend'
   const reg = await import('./approval-registry.js');
   const sess = createSession({ kind: 'chat' });
   const target = 'casey@example.com';
+  const actionKey = 'email:send';
   const priorSendAt = '2026-07-23T01:00:00.000Z';
   const dup = detectDuplicateTarget({
     sessionId: sess.id,
@@ -319,7 +320,31 @@ test('duplicate wall: fresh approval after the prior send authorizes the resend'
   assert.equal(dup.priorAt, priorSendAt);
 
   // No approval at all → the wall stands.
-  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt), false);
+  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt, actionKey), false);
+
+  // Recipient consent is exact, never a substring: approving a different
+  // address that merely contains the attempted recipient cannot authorize it.
+  const substring = reg.register({
+    sessionId: sess.id,
+    subject: 'Send a follow-up email to notcasey@example.com',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', to: 'notcasey@example.com' },
+    ttlMs: 60_000,
+  });
+  reg.resolve(substring.approvalId, 'approved', 's2-substring-test');
+  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt, actionKey), false);
+
+  // The exact target under a different approved action is not resend consent
+  // for email. Authority is action + identity, not arbitrary session prose.
+  const wrongAction = reg.register({
+    sessionId: sess.id,
+    subject: `Create a Notion page about ${target}`,
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'NOTION_CREATE_PAGE', arguments: { to: target } },
+    ttlMs: 60_000,
+  });
+  reg.resolve(wrongAction.approvalId, 'approved', 's2-wrong-action-test');
+  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt, actionKey), false);
 
   // Fresh approval naming the target, resolved after the prior send → consented.
   const row = reg.register({
@@ -330,13 +355,60 @@ test('duplicate wall: fresh approval after the prior send authorizes the resend'
     ttlMs: 60_000,
   });
   reg.resolve(row.approvalId, 'approved', 's2-test');
-  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt), true);
+  assert.equal(duplicateResendConsented(sess.id, target, dup.priorAt, actionKey), true);
+  assert.equal(
+    duplicateResendConsented(sess.id, target, dup.priorAt, actionKey),
+    false,
+    'the fresh approval is one-shot and cannot authorize unlimited later replays',
+  );
 
   // The same approval cannot authorize a send that happened AFTER it resolved
   // (i.e. it is the ORIGINAL batch approval for a later duplicate).
   const futurePrior = new Date(Date.now() + 60_000).toISOString();
-  assert.equal(duplicateResendConsented(sess.id, target, futurePrior), false);
+  assert.equal(duplicateResendConsented(sess.id, target, futurePrior, actionKey), false);
 
   // And it never covers a different target.
-  assert.equal(duplicateResendConsented(sess.id, 'other@example.com', dup.priorAt), false);
+  assert.equal(duplicateResendConsented(sess.id, 'other@example.com', dup.priorAt, actionKey), false);
+});
+
+test('duplicate wall: targetless resend approval matches the semantic payload once', async () => {
+  const { duplicateResendConsented } = await import('./grounding-gate.js');
+  const { externalWriteSemanticFingerprint } = await import('./external-write-admission.js');
+  const reg = await import('./approval-registry.js');
+  const sess = createSession({ kind: 'chat' });
+  const actionKey = 'social:publish';
+  const payload = { text: 'Clementine 3.0 launches today.', visibility: 'PUBLIC' };
+  const target = `payload:${externalWriteSemanticFingerprint(actionKey, payload)}`;
+  const priorSendAt = '2026-07-23T01:00:00.000Z';
+
+  // Same bytes approved for a different action are not authority to republish.
+  const wrongAction = reg.register({
+    sessionId: sess.id,
+    subject: 'Create this Notion page',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'NOTION_CREATE_PAGE', arguments: payload },
+    ttlMs: 60_000,
+  });
+  reg.resolve(wrongAction.approvalId, 'approved', 'semantic-wrong-action-test');
+  assert.equal(
+    duplicateResendConsented(sess.id, target, priorSendAt, actionKey),
+    false,
+  );
+
+  const row = reg.register({
+    sessionId: sess.id,
+    subject: 'Publish this exact LinkedIn post a second time',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'LINKEDIN_CREATE_POST', arguments: payload },
+    ttlMs: 60_000,
+  });
+  reg.resolve(row.approvalId, 'approved', 'semantic-resend-test');
+  assert.equal(
+    duplicateResendConsented(sess.id, target, priorSendAt, actionKey),
+    true,
+  );
+  assert.equal(
+    duplicateResendConsented(sess.id, target, priorSendAt, actionKey),
+    false,
+  );
 });

@@ -488,7 +488,7 @@ test('write-touched restart parks; explicit resume preserves the original receip
   assert.equal(listBackgroundTasks({ includeArchived: true }).length, before + 1, 'manual resume creates no clone');
 });
 
-test('a proven failed write is netted, but an empty best-effort remainder still requires verification', () => {
+test('a proven failed write is netted as no-dispatch and can resume safely', () => {
   const task = createBackgroundTask({ title: 'Rejected update', prompt: 'update it', source: 'desktop' });
   markBackgroundTaskRunning(task.id);
   appendEvent({
@@ -508,12 +508,13 @@ test('a proven failed write is netted, but an empty best-effort remainder still 
   markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
 
   assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
-    safeToAutoResume: false,
-    reason: 'receipt_history_unavailable',
+    safeToAutoResume: true,
+    reason: 'safe_no_external_write',
     externalWriteCount: 0,
     ambiguousWriteCount: 0,
   });
-  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0);
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 1);
+  assert.equal(getBackgroundTask(task.id)?.status, 'pending');
 });
 
 test('an unresolved external-write call is ambiguous and always parks on boot', () => {
@@ -663,7 +664,7 @@ test('boot recovery never clobbers a user abort that lands before reattach (find
   }
 });
 
-test('a read-only history that also attempted a compensated write stays parked (write evidence blocks safe)', () => {
+test('a read-only history plus a proven no-dispatch write remains safe to resume', () => {
   const task = createBackgroundTask({ title: 'Read then failed-write', prompt: 'read then try a write', source: 'desktop' });
   markBackgroundTaskRunning(task.id);
   // A genuine read (returned) …
@@ -681,9 +682,8 @@ test('a read-only history that also attempted a compensated write stays parked (
     type: 'tool_returned',
     data: { tool: 'airtable_list_records', callId: 'read-1', result: 'rows' },
   });
-  // … plus a write that was ATTEMPTED then compensated to a net-zero remainder.
-  // It nets externalWriteCount to 0, but the write-attempt evidence must keep the
-  // run fail-closed rather than letting the clean read flip it to safe.
+  // … plus a write that was attempted but carries an explicit no-dispatch
+  // terminal. It nets externalWriteCount to 0 and is safe to retry.
   appendEvent({
     sessionId: task.runSessionId,
     turn: 1,
@@ -701,13 +701,13 @@ test('a read-only history that also attempted a compensated write stays parked (
   markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
 
   assert.deepEqual(assessBackgroundTaskRestartSafety(task), {
-    safeToAutoResume: false,
-    reason: 'receipt_history_unavailable',
+    safeToAutoResume: true,
+    reason: 'safe_no_external_write',
     externalWriteCount: 0,
     ambiguousWriteCount: 0,
   });
-  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 0, 'a compensated write attempt never auto-resumes');
-  assert.equal(getBackgroundTask(task.id)?.restartRecovery?.disposition, 'parked_for_verification');
+  assert.equal(resumeInterruptedBackgroundTasks({ cap: 2 }), 1, 'a proven no-dispatch attempt is safe to retry');
+  assert.equal(getBackgroundTask(task.id)?.restartRecovery?.disposition, 'auto_resumed_in_place');
 });
 
 test('missing original receipt session fails closed instead of cloning onto a blank session', () => {
@@ -2275,6 +2275,103 @@ test('background completion evidence reduces committed, compensated, and ambiguo
   );
 });
 
+test('background completion and restart safety require exact settlement for pre-dispatch writes', () => {
+  const reservationData = {
+    preDispatch: true,
+    callId: 'background-settlement-a',
+    canonicalCallId: 'background-settlement-a',
+    shapeKey: 'OUTLOOK_SEND_EMAIL',
+    targets: ['casey@example.com'],
+  };
+  const createLifecycleTask = (suffix: string) => {
+    const task = createBackgroundTask({
+      title: `Settlement lifecycle ${suffix}`,
+      prompt: 'Send the approved update.',
+      source: 'desktop',
+    });
+    markBackgroundTaskRunning(task.id);
+    appendEvent({
+      sessionId: task.runSessionId,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: reservationData,
+    });
+    return task;
+  };
+
+  const pendingTask = createLifecycleTask('pending');
+  assert.deepEqual(backgroundCompletionEvidence(pendingTask), {
+    artifactBindings: 0,
+    extractedDeliverables: 0,
+    externalWriteReceipts: 0,
+    ambiguousExternalWrites: 1,
+  });
+  assert.deepEqual(assessBackgroundTaskRestartSafety(pendingTask), {
+    safeToAutoResume: false,
+    reason: 'ambiguous_external_write',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 1,
+  });
+
+  const wrongSuccessTask = createLifecycleTask('wrong-success');
+  appendEvent({
+    sessionId: wrongSuccessTask.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: {
+      ...reservationData,
+      callId: 'background-settlement-other',
+      canonicalCallId: 'background-settlement-other',
+    },
+  });
+  assert.equal(backgroundCompletionEvidence(wrongSuccessTask).externalWriteReceipts, 0);
+  assert.equal(backgroundCompletionEvidence(wrongSuccessTask).ambiguousExternalWrites, 1);
+  assert.equal(assessBackgroundTaskRestartSafety(wrongSuccessTask).reason, 'ambiguous_external_write');
+
+  const succeededTask = createLifecycleTask('succeeded');
+  appendEvent({
+    sessionId: succeededTask.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: reservationData,
+  });
+  assert.equal(backgroundCompletionEvidence(succeededTask).externalWriteReceipts, 1);
+  assert.equal(backgroundCompletionEvidence(succeededTask).ambiguousExternalWrites, 0);
+  assert.equal(assessBackgroundTaskRestartSafety(succeededTask).reason, 'external_write_history');
+
+  const failedTask = createLifecycleTask('failed');
+  appendEvent({
+    sessionId: failedTask.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: reservationData,
+  });
+  assert.equal(backgroundCompletionEvidence(failedTask).externalWriteReceipts, 0);
+  assert.equal(backgroundCompletionEvidence(failedTask).ambiguousExternalWrites, 0);
+  assert.deepEqual(assessBackgroundTaskRestartSafety(failedTask), {
+    safeToAutoResume: true,
+    reason: 'safe_no_external_write',
+    externalWriteCount: 0,
+    ambiguousWriteCount: 0,
+  });
+
+  const orphanedTask = createLifecycleTask('orphaned');
+  appendEvent({
+    sessionId: orphanedTask.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: reservationData,
+  });
+  assert.equal(backgroundCompletionEvidence(orphanedTask).externalWriteReceipts, 0);
+  assert.equal(backgroundCompletionEvidence(orphanedTask).ambiguousExternalWrites, 1);
+  assert.equal(assessBackgroundTaskRestartSafety(orphanedTask).reason, 'ambiguous_external_write');
+});
+
 test('an ambiguous external send blocks once and never auto-replays the mutation', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({
@@ -3173,4 +3270,69 @@ test('awaiting-input terminal truth cannot be learned as a successful background
   assert.ok(learning);
   assert.equal(learning!.data.eligible, false);
   assert.match(JSON.stringify(learning!.data.reasons), /awaiting user input|artifact binding/);
+});
+
+test('strategy capture remembers only exactly-settled deliverables, never a later failed reservation', () => {
+  const task = createBackgroundTask({
+    title: 'Compile the lunar kelp settlement atlas',
+    prompt: 'Create a Google Sheet containing the lunar kelp settlement atlas.',
+    source: 'desktop',
+  });
+  markBackgroundTaskRunning(task.id);
+  writeToolOutput({
+    sessionId: task.runSessionId,
+    callId: 'strategy-tool-output',
+    tool: 'composio_execute_tool',
+    output: 'sheet operation completed',
+  });
+
+  const confirmed = {
+    preDispatch: true,
+    callId: 'strategy-write-confirmed',
+    canonicalCallId: 'strategy-write-confirmed',
+    shapeKey: 'GOOGLESHEETS_VALUES_UPDATE',
+    targets: ['spreadsheet:lunar-kelp-confirmed'],
+  };
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: confirmed,
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: confirmed,
+  });
+
+  const failed = {
+    preDispatch: true,
+    callId: 'strategy-write-failed',
+    canonicalCallId: 'strategy-write-failed',
+    shapeKey: 'GOOGLESHEETS_VALUES_UPDATE',
+    targets: ['spreadsheet:lunar-kelp-failed-reservation'],
+  };
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: failed,
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: failed,
+  });
+
+  markBackgroundTaskDone(task.id, 'The lunar kelp settlement atlas was saved.');
+
+  const strategy = renderRunStrategiesForContext('lunar kelp settlement atlas');
+  assert.match(strategy, /spreadsheet:lunar-kelp-confirmed/);
+  assert.doesNotMatch(strategy, /spreadsheet:lunar-kelp-failed-reservation/);
 });

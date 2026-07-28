@@ -37,6 +37,8 @@ export interface WorkManifestItem {
 
 export interface DeclareWorkManifestInput {
   sessionId: string;
+  /** Exact accepted user row that owns this declaration. */
+  sourceUserSeq?: number;
   manifestId: string;
   contractVersion: string | number;
   objective?: string;
@@ -654,6 +656,9 @@ export function declareWorkManifest(input: DeclareWorkManifestInput): EventRow {
     role: 'system',
     type: 'work_manifest_declared',
     data: {
+      ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+        ? { sourceUserSeq: input.sourceUserSeq }
+        : {}),
       manifestId,
       contractVersion,
       ...(input.objective?.trim() ? { objective: input.objective.trim() } : {}),
@@ -751,6 +756,8 @@ export function resolveWorkItemId(
  */
 export function prepareWorkerManifest(input: {
   sessionId: string;
+  /** Exact accepted user row that owns this worker wave. */
+  sourceUserSeq?: number;
   items: string[];
   descriptor: WorkerManifestDescriptor;
   objective?: string;
@@ -803,6 +810,9 @@ export function prepareWorkerManifest(input: {
       }
       declareWorkManifest({
         sessionId: input.sessionId,
+        ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+          ? { sourceUserSeq: input.sourceUserSeq }
+          : {}),
         manifestId,
         contractVersion,
         ...(input.objective?.trim() ? { objective: input.objective.trim() } : {}),
@@ -858,6 +868,9 @@ export function prepareWorkerManifest(input: {
       : canonicalPhases;
     declareWorkManifest({
       sessionId: input.sessionId,
+      ...(Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
+        ? { sourceUserSeq: input.sourceUserSeq }
+        : {}),
       manifestId,
       contractVersion,
       ...(existing.objective ? { objective: existing.objective } : {}),

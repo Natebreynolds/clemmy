@@ -143,6 +143,62 @@ test('buildWorkflowRunGraphOverlay joins harness evidence for tools, models, wor
   assert.equal(overlay.summary.bottleneck, 'external write failure');
 });
 
+test('buildWorkflowRunGraphOverlay counts only exact settled writes and surfaces pending/orphaned outcomes as uncertain', () => {
+  const events: WorkflowEvent[] = [
+    { t: '2026-07-04T10:00:00.000Z', kind: 'run_started' },
+    { t: '2026-07-04T10:00:01.000Z', kind: 'step_started', stepId: 'send' },
+  ];
+  const reservation = {
+    preDispatch: true,
+    callId: 'overlay-write-a',
+    canonicalCallId: 'overlay-write-a',
+    shapeKey: 'OUTLOOK_SEND_EMAIL',
+    targets: ['casey@example.com'],
+  };
+  const build = (writeEvents: Array<{ type: string; data: Record<string, unknown> }>) =>
+    buildWorkflowRunGraphOverlay(events, {
+      stepIds: ['send'],
+      harnessSessions: [{
+        sessionId: 'workflow:overlay-write-truth:send',
+        stepId: 'send',
+        status: 'running',
+        events: writeEvents,
+      }],
+    }).steps[0]!;
+
+  const pending = build([{ type: 'external_write', data: reservation }]);
+  assert.equal(pending.externalWrites, 0);
+  assert.equal(pending.externalWriteFailures, 0);
+  assert.equal(pending.externalWriteUncertain, 1);
+  assert.ok(pending.attentionReasons.some((reason) => /uncertain|unconfirmed/i.test(reason)));
+
+  const wrongSuccess = build([
+    { type: 'external_write', data: reservation },
+    {
+      type: 'external_write_succeeded',
+      data: { ...reservation, callId: 'overlay-write-other', canonicalCallId: 'overlay-write-other' },
+    },
+  ]);
+  assert.equal(wrongSuccess.externalWrites, 0);
+  assert.equal(wrongSuccess.externalWriteUncertain, 1);
+
+  const confirmed = build([
+    { type: 'external_write', data: reservation },
+    { type: 'external_write_succeeded', data: reservation },
+  ]);
+  assert.equal(confirmed.externalWrites, 1);
+  assert.equal(confirmed.externalWriteFailures, 0);
+  assert.equal(confirmed.externalWriteUncertain, 0);
+
+  const orphaned = build([
+    { type: 'external_write', data: reservation },
+    { type: 'external_write_orphaned', data: reservation },
+  ]);
+  assert.equal(orphaned.externalWrites, 0);
+  assert.equal(orphaned.externalWriteFailures, 0);
+  assert.equal(orphaned.externalWriteUncertain, 1);
+});
+
 test('buildWorkflowRunGraphOverlay marks completed judged steps as proven', () => {
   const events: WorkflowEvent[] = [
     { t: '2026-07-04T10:00:00.000Z', kind: 'run_started' },

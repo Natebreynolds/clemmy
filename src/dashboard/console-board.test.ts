@@ -2272,7 +2272,29 @@ test('GET /api/console/workflows/:name/runs/:runId/graph-overlay replays run evi
   appendHarnessEvent({ sessionId: harnessSession.id, turn: 1, role: 'system', type: 'worker_model_routed', data: { modelId: 'claude-opus-4-8', provider: 'claude', routeKind: 'intent' } });
   appendHarnessEvent({ sessionId: harnessSession.id, turn: 1, role: 'Clem', type: 'tool_called', data: { tool: 'SLACK_SEND_MESSAGE' } });
   appendHarnessEvent({ sessionId: harnessSession.id, turn: 1, role: 'system', type: 'worker_result', data: { ok: true, model: 'claude-opus-4-8', toolUses: 1 } });
-  appendHarnessEvent({ sessionId: harnessSession.id, turn: 1, role: 'system', type: 'external_write', data: { tool: 'SLACK_SEND_MESSAGE' } });
+  appendHarnessEvent({
+    sessionId: harnessSession.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      tool: 'SLACK_SEND_MESSAGE',
+      preDispatch: true,
+      callId: 'console-overlay-write',
+      canonicalCallId: 'console-overlay-write',
+    },
+  });
+  appendHarnessEvent({
+    sessionId: harnessSession.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: {
+      tool: 'SLACK_SEND_MESSAGE',
+      callId: 'console-overlay-write',
+      canonicalCallId: 'console-overlay-write',
+    },
+  });
   appendHarnessEvent({ sessionId: harnessSession.id, turn: 1, role: 'system', type: 'goal_alignment_judged', data: { fulfills: true } });
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({

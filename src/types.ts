@@ -338,6 +338,13 @@ export interface ExecutionRecord {
    * failure from the same chat cannot contaminate the current execution.
    */
   sourceUserSeq?: number;
+  /**
+   * Exact follow-up user rows explicitly linked to this same execution by an
+   * execution tool call. The origin remains sourceUserSeq; this lineage lets a
+   * later auth/correction turn repair the original work without borrowing
+   * evidence from unrelated conversation turns.
+   */
+  sourceUserSeqs?: number[];
   userId?: string;
   channel?: string;
   title: string;

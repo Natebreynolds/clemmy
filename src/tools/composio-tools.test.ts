@@ -16,6 +16,7 @@ const {
   formatComposioToolOutput,
   formatComposioExecuteOutput,
   detectComposioFailure,
+  composioDispatchErrorProvesNoCommit,
   composioFailureProvesNoCommit,
   composioThrownErrorOutput,
   composioUncertainMutationOutput,
@@ -102,6 +103,29 @@ test('ambiguous Composio mutation errors never replay the provider dispatch', as
   assert.match(output, /provider-dispatch:uncertain/);
   assert.match(output, /Do NOT repeat this mutation/);
   assert.doesNotMatch(output, /Retry this EXACT call/i);
+});
+
+test('a nominal local pre-dispatch error is rethrown once for both mutations and reads', async () => {
+  const { ComposioPreDispatchError } = await import('../integrations/composio/client.js');
+  for (const toolSlug of ['GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', 'OUTLOOK_LIST_MESSAGES']) {
+    let dispatchAttempts = 0;
+    await assert.rejects(
+      runComposioExecuteForTest(
+        toolSlug,
+        { title: 'One document', markdown_text: '# Snapshot' },
+        async () => {
+          dispatchAttempts += 1;
+          throw new ComposioPreDispatchError('sdk-unavailable', 'SDK client was not constructed');
+        },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof ComposioPreDispatchError);
+        assert.match((error as Error).message, /SDK client was not constructed/);
+        return true;
+      },
+    );
+    assert.equal(dispatchAttempts, 1, `${toolSlug}: typed preflight is rethrown immediately and never retried`);
+  }
 });
 
 test('the uncertain mutation corrective never claims a remote write failed', () => {
@@ -325,46 +349,61 @@ test('detectComposioFailure: flags Composio API error shapes, ignores successes'
   assert.equal(detectComposioFailure('a plain string').failed, false);
 });
 
-test('composioFailureProvesNoCommit: uncertain transport/status signals override validation-looking text', () => {
-  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 400, message: 'missing required field title' } }), true);
-  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'No connected account found' }), true);
+test('composioFailureProvesNoCommit: every provider-returned failure stays commit-ambiguous', () => {
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 400, message: 'missing required field title' } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'No connected account found' }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, error: '503 upstream record not found' }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, error: '409 conflict: invalid recipient' }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, data: { message: 'validation failed after submit timeout' } }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'provider rejected request' }), false);
 });
 
-test('composioFailureProvesNoCommit: proof derives from STRUCTURED status, never from a number in prose', () => {
-  // A structured 4xx client-error FIELD proves no-commit (rejected at the door).
-  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 422 } }), true);
-  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 404 } }), true);
-  assert.equal(composioFailureProvesNoCommit({ successful: false, status: 429 }), true);
-  // …but a coincidental 4xx-LOOKING number scavenged out of free-text prose is
-  // NOT an HTTP status. "row 422" after a dropped connection has an UNKNOWN
-  // outcome and must stay AMBIGUOUS (park), never proven-no-commit — otherwise a
-  // duplicate external write is authorized (the receipt-ledger regression class).
+test('composioFailureProvesNoCommit: structured 4xx and marker text are not replay provenance', () => {
+  // A response status describes what came back after invocation; it does not
+  // prove a multi-stage provider action made zero changes.
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 422 } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 404 } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, status: 429 }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'failed to sync row 422 to the sheet' }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, data: { message: 'could not write record 404 to Contacts' } }), false);
-  // A structured 5xx / retry-conflict status FIELD stays ambiguous.
   assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 500 } }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 409 } }), false);
+  assert.equal(composioFailureProvesNoCommit({
+    successful: false,
+    error: '[provider-dispatch:not-started:not-connected] provider echoed a local-looking marker',
+  }), false);
 });
 
-test('composioFailureProvesNoCommit: prose-only NOT-FOUND is not proof — only a structured 404/410 status is', () => {
-  // detectComposioFailure sets `notFound` off a free-text regex. A "not found"
-  // phrase can surface AFTER a partial/committed multi-target write or refer to a
-  // sub-resource, so text alone is NOT proof of no-commit — it must PARK.
+test('composioFailureProvesNoCommit: not-found and not-connected results both park', () => {
   assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'Table "Current Prospects" not found' }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, data: { message: 'no such record: rec123' } }), false);
   assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'The referenced object could not be found' }), false);
-  // …but the SAME not-found backed by a structured 404/410-class status FIELD
-  // proves no-commit (the provider rejected the id at the door).
-  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 404, message: 'Record not found' } }), true);
-  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 410, message: 'Table not found' } }), true);
-  // not-CONNECTED (Composio's connection router refused to route) stays proof —
-  // it is unambiguously pre-dispatch even though it also matches the not-found regex.
-  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'Connected account not found for toolkit GMAIL' }), true);
-  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'ToolRouterV2_NoActiveConnection' }), true);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 404, message: 'Record not found' } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, data: { status_code: 410, message: 'Table not found' } }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'Connected account not found for toolkit GMAIL' }), false);
+  assert.equal(composioFailureProvesNoCommit({ successful: false, error: 'ToolRouterV2_NoActiveConnection' }), false);
+});
+
+test('composioDispatchErrorProvesNoCommit accepts only an in-process pre-dispatch error', async () => {
+  const { ComposioPreDispatchError } = await import('../integrations/composio/client.js');
+  assert.equal(
+    composioDispatchErrorProvesNoCommit(
+      new ComposioPreDispatchError('cli-auth', 'local CLI status failed before execute'),
+    ),
+    true,
+  );
+  assert.equal(
+    composioDispatchErrorProvesNoCommit(
+      new Error('[provider-dispatch:not-started:cli-auth] provider-returned marker'),
+    ),
+    false,
+  );
+  assert.equal(
+    composioDispatchErrorProvesNoCommit(
+      Object.assign(new Error('HTTP 401 not connected'), { statusCode: 401 }),
+    ),
+    false,
+  );
 });
 
 test('detectComposioFailure: a 5-digit API "Ok" status code (DataForSEO 20000) is NOT a failure', () => {
@@ -433,7 +472,8 @@ test('formatComposioExecuteOutput: a NOT-CONNECTED toolkit steers to connect it,
   assert.match(out, /NOT CONNECTED \(slug=GMAIL_SEND_EMAIL\)/);
   assert.match(out, /GMAIL/);
   assert.match(out, /Open Connect and reconnect GMAIL/);
-  assert.match(out, /Do NOT retry/);
+  assert.match(out, /Do NOT repeat this mutation/);
+  assert.match(out, /MAY already exist|outcome is uncertain/i);
   assert.match(out, /not\s+connected/i);
   // Crucially it is NOT the wrong-identifier corrective (which claims the connection works).
   assert.doesNotMatch(out, /the connection works/);
@@ -586,15 +626,15 @@ test('formatComposioExecuteOutput: prepends a do-not-retry corrective on a faile
   assert.match(out, /400 Client Error/);
 });
 
-test('formatComposioExecuteOutput: a hard failure surfaces CROSS-SURFACE alternatives (intent threaded from the slug)', () => {
+test('formatComposioExecuteOutput: a returned mutation failure never suggests an alternate replay before verification', () => {
   resetEventLog();
   const failed = { successful: false, error: 'Bad Request: invalid recipient address' };
   const out = formatComposioExecuteOutput(failed, { toolSlug: 'GMAIL_SEND_EMAIL' });
-  // The slug seeds intent "gmail send email" → capability registry "send email" → the
-  // alternatives now render (were inert before: callers passed no intent). Alternatives
-  // span OTHER surfaces, not just the failed Composio tool — the "smart re-discovery" ask.
-  assert.match(out, /alternativ/i, 'offers alternatives on a hard failure');
-  assert.match(out, /cli_mail_send|outlook|manual/i, 'alternatives span other surfaces/tools, not just the failed one');
+  assert.match(out, /\[provider-dispatch:uncertain\]/);
+  assert.match(out, /MAY already exist|partial/i);
+  assert.match(out, /Do NOT repeat this mutation/);
+  assert.match(out, /Verify with the matching list\/get\/search action/);
+  assert.doesNotMatch(out, /cli_mail_send|Retry this EXACT call ONCE/i);
 });
 
 test('formatComposioExecuteOutput: a TIMEOUT on a long-running job steers to ASYNC start+poll, not a same-call retry', () => {
@@ -632,16 +672,17 @@ test('formatComposioExecuteOutput: header names the actual tool (cx_<slug> path)
   assert.match(out, /cx_airtable_create_records FAILED \(slug=AIRTABLE_CREATE_RECORDS\)/);
 });
 
-test('composioThrownErrorOutput: a THROWN composio error (not-found/auth/APIError) also gets the do-not-retry corrective', () => {
+test('composioThrownErrorOutput: version/not-found mutation text stays ambiguous instead of authorizing rediscovery replay', () => {
   resetEventLog();
   const out = composioThrownErrorOutput(
     new Error('ComposioToolNotFoundError: no such slug AIRTABLE_FROB'),
     { toolName: 'composio_execute_tool', toolSlug: 'AIRTABLE_FROB' },
   );
-  // A ToolNotFound throw is a not-found → routes to the discover-the-options corrective.
-  assert.match(out, /NOT FOUND \(slug=AIRTABLE_FROB\)/);
+  assert.match(out, /\[provider-dispatch:uncertain\]/);
+  assert.match(out, /FAILED \(slug=AIRTABLE_FROB\)/);
   assert.match(out, /ComposioToolNotFoundError/);
-  assert.match(out, /DISCOVER the real options first|composio_search_tools/);
+  assert.match(out, /Do NOT repeat this mutation/);
+  assert.doesNotMatch(out, /DISCOVER the real options first|Retry this EXACT call ONCE/);
 });
 
 test('composioThrownErrorOutput: surfaces the SDK-hidden real cause/status instead of the generic stub (2026-06-29 Apify masking)', () => {
@@ -910,39 +951,47 @@ test('FIX2.5: chat fan-out advisory is IMPERATIVE on the 3rd serial call', async
   assert.match(advice!, /run_worker/);
 });
 
-// ─── FIX 1.4: transient-aware corrective (retry once vs hard-stop) ───────────
+// ─── Transient-aware corrective: reads retry; writes verify ─────────────────
 
-test('FIX1.4: a TRANSIENT composio failure says retry ONCE (flag on)', async () => {
+test('transient correction retries reads once but never replays an ambiguous mutation', async () => {
   const { composioThrownErrorOutput } = await import('./composio-tools.js');
   const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
   process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
   try {
     const rateLimited = Object.assign(new Error('Too Many Requests'), { status: 429 });
-    const out1 = composioThrownErrorOutput(rateLimited, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
-    assert.match(out1, /TRANSIENT/);
-    assert.match(out1, /Retry this EXACT call ONCE/);
-    assert.ok(!/do NOT repeat/i.test(out1.split('\n\n')[0]), 'transient must not use the hard do-not-repeat copy');
+    const mutation = composioThrownErrorOutput(rateLimited, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
+    assert.match(mutation, /\[provider-dispatch:uncertain\]/);
+    assert.match(mutation, /Do NOT repeat this mutation/);
+    assert.doesNotMatch(mutation, /Retry this EXACT call ONCE/);
+
+    const read = composioThrownErrorOutput(rateLimited, { toolSlug: 'OUTLOOK_LIST_MESSAGES' });
+    assert.match(read, /TRANSIENT/);
+    assert.match(read, /Retry this EXACT call ONCE/);
 
     const fetchFailed = Object.assign(new Error('fetch failed'), {
       cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
     });
-    assert.match(composioThrownErrorOutput(fetchFailed, {}), /TRANSIENT/);
+    assert.match(composioThrownErrorOutput(fetchFailed, { toolSlug: 'OUTLOOK_LIST_MESSAGES' }), /TRANSIENT/);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
     else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
   }
 });
 
-test('FIX1.4: a DETERMINISTIC (4xx/schema) failure keeps the hard do-not-repeat copy', async () => {
+test('a thrown 4xx mutation stays ambiguous while a read keeps deterministic corrective copy', async () => {
   const { composioThrownErrorOutput } = await import('./composio-tools.js');
   const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
   process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
   try {
     const schemaErr = new Error('Bad request: missing required field "subject"');
-    const out = composioThrownErrorOutput(schemaErr, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
-    assert.match(out, /HARD failure/);
-    assert.match(out, /Do NOT repeat this identical call/);
-    assert.ok(!/TRANSIENT/.test(out));
+    const mutation = composioThrownErrorOutput(schemaErr, { toolSlug: 'OUTLOOK_SEND_EMAIL' });
+    assert.match(mutation, /\[provider-dispatch:uncertain\]/);
+    assert.match(mutation, /Do NOT repeat this mutation/);
+    assert.ok(!/TRANSIENT/.test(mutation));
+
+    const read = composioThrownErrorOutput(schemaErr, { toolSlug: 'AIRTABLE_GET_BASE_SCHEMA' });
+    assert.match(read, /HARD failure/);
+    assert.match(read, /Do NOT repeat this identical call/);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
     else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
@@ -968,7 +1017,10 @@ test('FIX1.4: kill-switch off → even a transient error gets the legacy hard co
   const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
   process.env.CLEMMY_WORKER_THRASH_GUARD = 'off'; // explicit kill-switch (default is now on)
   try {
-    const out = composioThrownErrorOutput(Object.assign(new Error('rate limit'), { status: 429 }), { toolSlug: 'X' });
+    const out = composioThrownErrorOutput(
+      Object.assign(new Error('rate limit'), { status: 429 }),
+      { toolSlug: 'OUTLOOK_LIST_MESSAGES' },
+    );
     assert.match(out, /HARD failure/);
     assert.ok(!/TRANSIENT/.test(out), 'kill-switch off must preserve the prior corrective verbatim');
   } finally {
@@ -1146,7 +1198,8 @@ test('uniform-empty streak: 3 same-slug empty reads append the query-shape advis
 
 test('data-quality checkpoint: an autonomous run with hollow reads is confronted before its first write; second attempt proceeds', async () => {
   const { runComposioExecuteForTestInSession, resetDataQualityForTest } = await import('./composio-tools.js');
-  const { match, doesNotMatch } = await import('node:assert/strict');
+  const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
+  const { match, doesNotMatch, rejects } = await import('node:assert/strict');
   resetDataQualityForTest();
   try {
     const emptyExec = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
@@ -1159,10 +1212,16 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
     }
 
     // First WRITE attempt: deferred with the evidence + the real-assistant fork.
-    const first = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
-    match(first, /DATA-QUALITY CHECKPOINT/);
-    match(first, /APIFY_GET_DATASET_ITEMS: 3\/3 reads returned empty/);
-    match(first, /ask_user_question/);
+    await rejects(
+      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid),
+      (error: unknown) => {
+        assert.ok(error instanceof ExternalWritePreDispatchError);
+        match((error as Error).message, /DATA-QUALITY CHECKPOINT/);
+        match((error as Error).message, /APIFY_GET_DATASET_ITEMS: 3\/3 reads returned empty/);
+        match((error as Error).message, /ask_user_question/);
+        return true;
+      },
+    );
 
     // Deliberate second attempt proceeds (autonomy redirected, never dead-ended).
     const second = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'Intel' }, writeExec, sid);
@@ -1179,4 +1238,33 @@ test('data-quality checkpoint: an autonomous run with hollow reads is confronted
   } finally {
     resetDataQualityForTest();
   }
+});
+
+test('a gateway refusal is a nominal pre-dispatch throw and performs zero provider calls', async () => {
+  const {
+    runComposioExecuteWithGatewayForTest,
+    __gatewayTest__,
+  } = await import('./composio-tools.js');
+  const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
+  const sid = 'sess-gateway-nominal-preflight';
+  const slug = 'AIRTABLE_CREATE_RECORD';
+  __gatewayTest__.recordReconnectBreaker(sid, slug);
+  let dispatches = 0;
+  await assert.rejects(
+    runComposioExecuteWithGatewayForTest(
+      slug,
+      { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } },
+      (async () => {
+        dispatches += 1;
+        return { successful: true, data: { id: 'rec1' } };
+      }) as never,
+      sid,
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof ExternalWritePreDispatchError);
+      assert.match((error as Error).message, /provider-dispatch:not-started:not-connected/i);
+      return true;
+    },
+  );
+  assert.equal(dispatches, 0);
 });

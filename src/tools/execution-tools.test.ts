@@ -33,6 +33,7 @@ const { ExecutionStore } = await import('../execution/store.js');
 const {
   appendEvent,
   createSession,
+  listEvents,
   resetEventLog,
   writeToolOutput,
 } = await import('../runtime/harness/eventlog.js');
@@ -201,6 +202,201 @@ test('execution_create accepts natural criteria arrays and preserves the full au
   const created = new ExecutionStore().getActiveForSession(sessionId);
   assert.match(created?.successCriteria ?? '', /1\. Exactly one resource/);
   assert.match(created?.successCriteria ?? '', /3\. The exact sentinel/);
+});
+
+test('execution_update_step authorizes exactly one retry from proven failed write lineage', async () => {
+  const sessionId = `sess-exec-retry-${Math.random().toString(36).slice(2, 10)}`;
+  createSession({ id: sessionId, kind: 'chat', title: 'retry lineage' });
+  const sourceA = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send the approved reports to these exact recipients.' },
+  });
+  const recipients = Array.from({ length: 10 }, (_, index) => `recipient-${index + 1}@example.com`);
+  const execution = createTrackedExecution({
+    sessionId,
+    sourceUserSeq: sourceA.seq,
+    status: 'active',
+  } as never);
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-proven-not-started',
+      canonicalCallId: 'send-proven-not-started',
+      actionKey: 'email:send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      correlationFingerprint: 'send-payload-a',
+      targets: recipients,
+      preDispatch: true,
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-proven-not-started',
+      canonicalCallId: 'send-proven-not-started',
+      actionKey: 'email:send',
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      correlationFingerprint: 'send-payload-a',
+      targets: recipients,
+    },
+  });
+  const sourceB = appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Authentication is repaired; continue this exact execution.' },
+  });
+  const handler = registeredToolHandlers().get('execution_update_step');
+  assert.ok(handler, 'execution_update_step should be registered');
+  const callUpdate = (retryOfCallId: string) => withHarnessRunContext(
+    {
+      sessionId,
+      sourceUserSeq: sourceB.seq,
+      counter: new ToolCallsCounter(20),
+    },
+    () => handler({
+      id: execution.id,
+      nextStep: 'Retry the exact corrected send once.',
+      summary: 'Authentication is now available.',
+      retryOfCallId,
+    }),
+  );
+
+  const concurrent = await Promise.all([
+    callUpdate('send-proven-not-started'),
+    callUpdate('send-proven-not-started'),
+  ]);
+  assert.equal(
+    concurrent.filter((result) => /advanced/i.test(result.content[0].text)).length,
+    1,
+  );
+  assert.equal(
+    concurrent.filter((result) => /already has a one-shot retry authorization/i.test(result.content[0].text)).length,
+    1,
+    'the list→check→mint path is one admission CAS even when callers race',
+  );
+  const [authorization] = listEvents(sessionId, {
+    types: ['external_write_retry_authorized'],
+  });
+  assert.equal(authorization?.data.sourceUserSeq, sourceB.seq);
+  assert.equal(authorization?.data.executionId, execution.id);
+  assert.equal(authorization?.data.retryOfCallId, 'send-proven-not-started');
+  assert.equal(authorization?.data.actionKey, 'email:send');
+  assert.deepEqual(
+    authorization?.data.duplicateIdentityKeys,
+    [...recipients].sort(),
+    'the complete recipient set is retained beyond eight identities',
+  );
+  assert.ok(
+    new ExecutionStore().get(execution.id)?.sourceUserSeqs?.includes(sourceB.seq),
+    'the exact continuation request is durably bound to the execution',
+  );
+
+  const repeated = await callUpdate('send-proven-not-started');
+  assert.match(repeated.content[0].text, /already has a one-shot retry authorization/i);
+  assert.equal(
+    listEvents(sessionId, { types: ['external_write_retry_authorized'] }).length,
+    1,
+  );
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'targetless-post-not-started',
+      canonicalCallId: 'targetless-post-not-started',
+      actionKey: 'social:publish',
+      correlationFingerprint: 'transport-specific-fingerprint-must-not-win',
+      targets: [],
+      duplicateIdentityKeys: ['payload:semantic-v1:exact-post'],
+    },
+  });
+  const targetlessAccepted = await callUpdate('targetless-post-not-started');
+  assert.match(targetlessAccepted.content[0].text, /advanced/i);
+  const targetlessAuthorization = listEvents(sessionId, {
+    types: ['external_write_retry_authorized'],
+  }).find((event) => event.data.retryOfCallId === 'targetless-post-not-started');
+  assert.deepEqual(
+    targetlessAuthorization?.data.duplicateIdentityKeys,
+    ['payload:semantic-v1:exact-post'],
+    'retry lineage preserves the provider-neutral identity recorded by the failed attempt',
+  );
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-ambiguous',
+      canonicalCallId: 'send-ambiguous',
+      actionKey: 'email:send',
+      targets: ['ambiguous@example.com'],
+    },
+  });
+  const orphanRefusal = await callUpdate('send-ambiguous');
+  assert.match(orphanRefusal.content[0].text, /not a currently proven failed write/i);
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: 999_999,
+      callId: 'send-foreign-lineage',
+      canonicalCallId: 'send-foreign-lineage',
+      actionKey: 'email:send',
+      targets: ['foreign@example.com'],
+    },
+  });
+  const lineageRefusal = await callUpdate('send-foreign-lineage');
+  assert.match(lineageRefusal.content[0].text, /outside this execution's explicit request lineage/i);
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_failed',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-later-succeeded',
+      canonicalCallId: 'send-later-succeeded',
+      actionKey: 'email:send',
+      targets: ['settled@example.com'],
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      callId: 'send-later-succeeded',
+      canonicalCallId: 'send-later-succeeded',
+      actionKey: 'email:send',
+      targets: ['settled@example.com'],
+    },
+  });
+  const settledRefusal = await callUpdate('send-later-succeeded');
+  assert.match(settledRefusal.content[0].text, /not a currently proven failed write/i);
 });
 
 test('execution_complete rejects completion when the judge finds no deliverable evidence', async () => {

@@ -434,7 +434,95 @@ test('native artifact admission releases an exact pending claim when a later app
   }
 });
 
-test('native MCP mutations emit durable failed and orphan truth keyed by provider call id', async () => {
+test('concurrent native MCP sends reserve one same-target write without blocking independent recipients', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const toolName = 'mcp__outlook__send_email';
+  const input = { to: 'race@example.com', subject: 'One message', body: 'Send this once.' };
+  let verdicts: Array<{ behavior?: string; message?: string }> = [];
+  let independentVerdicts: Array<{ behavior?: string; message?: string }> = [];
+  let bulkVerdicts: Array<{ behavior?: string; message?: string }> = [];
+  let reservedAfterRace = 0;
+
+  setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+    yield {
+      type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 'sdk-native-race',
+      uuid: 'init-native-race', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(),
+      tools: [toolName], mcp_servers: [{ name: 'outlook', status: 'connected' }],
+      permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+    } as any;
+    const canUse = params.options.canUseTool as (
+      name: string,
+      args: unknown,
+      options: { signal: AbortSignal; toolUseID: string },
+    ) => Promise<{ behavior?: string; message?: string }>;
+    verdicts = await Promise.all([
+      canUse(toolName, input, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_native_race_a',
+      }),
+      canUse(toolName, input, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_native_race_b',
+      }),
+    ]);
+    reservedAfterRace = eventlog.listEvents(session.id, { types: ['external_write'] }).length;
+    independentVerdicts = await Promise.all([
+      canUse(toolName, { ...input, to: 'left@example.com' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_native_independent_left',
+      }),
+      canUse(toolName, { ...input, to: 'right@example.com' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_native_independent_right',
+      }),
+    ]);
+    const recipients = Array.from({ length: 10 }, (_, index) => `bulk-${index + 1}@example.com`);
+    bulkVerdicts = [
+      await canUse(toolName, { ...input, to: recipients }, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_native_bulk_ten',
+      }),
+      await canUse(toolName, { ...input, to: recipients[8] }, {
+        signal: new AbortController().signal,
+        toolUseID: 'toolu_native_bulk_ninth_retry',
+      }),
+    ];
+    yield successResultMessage('permission race settled');
+  })())) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Send this exact email once.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: [toolName],
+    sourceUserSeq: 91,
+  });
+
+  assert.deepEqual(
+    verdicts.map((verdict) => verdict.behavior).sort(),
+    ['allow', 'deny'],
+    'the durable reservation makes the second distinct provider id a duplicate',
+  );
+  assert.match(verdicts.find((verdict) => verdict.behavior === 'deny')?.message ?? '', /duplicate|already sent/i);
+  assert.equal(reservedAfterRace, 1, 'the second same-target callback is denied before unrelated work starts');
+  assert.deepEqual(
+    independentVerdicts.map((verdict) => verdict.behavior),
+    ['allow', 'allow'],
+    'the short shared reservation lock does not refuse independent recipients',
+  );
+  assert.deepEqual(
+    bulkVerdicts.map((verdict) => verdict.behavior),
+    ['allow', 'deny'],
+    'recipient nine remains protected after a ten-recipient send',
+  );
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['external_write'] }).length,
+    4,
+    'one raced target, two independent recipients, and the ten-recipient action reserve once each',
+  );
+});
+
+test('native MCP provider failures remain ambiguous regardless of returned prose', async () => {
   const session = eventlog.createSession({ kind: 'chat' });
   let run = 0;
   setClaudeAgentSdkQueryForTest(((params: any) => {
@@ -445,7 +533,15 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
         ? 'toolu_native_orphan'
         : run === 3
           ? 'toolu_native_structured_failed'
-          : 'toolu_native_structured_ambiguous';
+          : run === 4
+            ? 'toolu_native_structured_ambiguous'
+            : run === 5
+              ? 'toolu_native_accepted_timeout'
+              : run === 6
+                ? 'toolu_native_auth_rejected'
+                : run === 7
+                  ? 'toolu_native_not_found'
+                  : 'toolu_native_invalid_response_after_commit';
     const gen = (async function* () {
       yield {
         type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: `sdk-write-${run}`,
@@ -453,7 +549,11 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
         tools: ['mcp__outlook__send_email'], mcp_servers: [{ name: 'outlook', status: 'connected' }],
         permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [],
       } as any;
-      const input = { to: 'client@example.com', subject: 'Hello', body: 'Test' };
+      const input = {
+        to: `client-${run}@example.com`,
+        subject: 'Hello',
+        body: 'Test',
+      };
       const verdict = await params.options.canUseTool(
         'mcp__outlook__send_email', input,
         { signal: new AbortController().signal, toolUseID: callId },
@@ -470,12 +570,21 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
             content: [{
               type: 'tool_result',
               tool_use_id: callId,
-              is_error: run === 1,
+              is_error: run === 1 || run >= 5,
               content: run === 1
-                ? 'provider rejected payload'
+                ? '[provider-dispatch:not-started:invalid-args]\nHTTP 400 validation failed: recipient is required'
                 : run === 3
-                  ? JSON.stringify({ successful: false, error: 'invalid required field: recipient' })
-                  : JSON.stringify({ successful: false, error: 'provider rejected request after dispatch' }),
+                  ? '[provider-dispatch:not-started:invalid-args]\n'
+                    + JSON.stringify({ successful: false, error: 'invalid required field: recipient' })
+                  : run === 4
+                    ? JSON.stringify({ successful: false, error: 'provider rejected request after dispatch' })
+                    : run === 5
+                      ? 'HTTP 504 Gateway Timeout after provider accepted the request; final outcome is unknown'
+                      : run === 6
+                        ? 'HTTP 401 Unauthorized: provider rejected the request'
+                        : run === 7
+                          ? 'HTTP 404 Not Found: recipient resource does not exist'
+                          : 'Invalid response envelope after provider accepted and committed the request',
             }],
           },
         } as any;
@@ -496,13 +605,15 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
 
   const options = {
     prompt: 'Send the email.', sessionId: session.id, modelId: 'claude-sonnet-4-6',
-    trackerScopeId: 'native-write-truth', sourceUserSeq: 42,
     allowedLocalMcpTools: ['mcp__outlook__send_email'],
   };
-  await runClaudeAgentSdk(options);
-  await runClaudeAgentSdk(options);
-  await runClaudeAgentSdk(options);
-  await runClaudeAgentSdk(options);
+  for (let index = 0; index < 8; index += 1) {
+    await runClaudeAgentSdk({
+      ...options,
+      trackerScopeId: `native-write-truth-${index + 1}`,
+      sourceUserSeq: 42,
+    });
+  }
   const writes = eventlog.listEvents(session.id, { types: ['external_write'] });
   const failed = eventlog.listEvents(session.id, { types: ['external_write_failed'] });
   const orphaned = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
@@ -511,19 +622,219 @@ test('native MCP mutations emit durable failed and orphan truth keyed by provide
     'toolu_native_orphan',
     'toolu_native_structured_failed',
     'toolu_native_structured_ambiguous',
+    'toolu_native_accepted_timeout',
+    'toolu_native_auth_rejected',
+    'toolu_native_not_found',
+    'toolu_native_invalid_response_after_commit',
   ]);
-  assert.deepEqual(failed.map((event) => (event.data as any).callId), [
-    'toolu_native_failed',
-    'toolu_native_structured_failed',
-  ]);
+  assert.deepEqual(failed.map((event) => (event.data as any).callId), []);
   assert.deepEqual(orphaned.map((event) => (event.data as any).callId), [
+    'toolu_native_failed',
     'toolu_native_orphan',
+    'toolu_native_structured_failed',
     'toolu_native_structured_ambiguous',
+    'toolu_native_accepted_timeout',
+    'toolu_native_auth_rejected',
+    'toolu_native_not_found',
+    'toolu_native_invalid_response_after_commit',
   ]);
+  assert.equal(
+    orphaned.filter((event) => (event.data as any).callId === 'toolu_native_accepted_timeout').length,
+    1,
+  );
+  assert.equal(
+    failed.filter((event) => (event.data as any).callId === 'toolu_native_accepted_timeout').length,
+    0,
+  );
+  assert.equal(
+    failed.filter((event) => (event.data as any).callId === 'toolu_native_invalid_response_after_commit').length,
+    0,
+  );
   assert.ok(
     [...writes, ...failed, ...orphaned].every((event) => event.data.sourceUserSeq === 42),
     'native SDK write attempts and resolutions retain exact request ownership',
   );
+});
+
+test('native external writes settle only from a clean positive acknowledgement', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const cases = [
+    { id: 'toolu_plain_invalid', output: 'Invalid JSON input', success: false },
+    { id: 'toolu_plain_401', output: 'HTTP 401 Unauthorized: provider rejected the request', success: false },
+    { id: 'toolu_empty_object', output: '{}', success: false },
+    { id: 'toolu_nested_invalid', output: JSON.stringify({ detail: 'Invalid JSON input' }), success: false },
+    { id: 'toolu_clean_ack', output: JSON.stringify({ successful: true, data: { id: 'msg-clean-1' } }), success: true },
+  ];
+  let run = 0;
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    const current = cases[run++]!;
+    return stubsFor((async function* () {
+      yield {
+        ...initOnlyMessage(),
+        tools: ['mcp__outlook__send_email'],
+        mcp_servers: [{ name: 'outlook', status: 'connected' }],
+      } as any;
+      const input = {
+        to: `${current.id}@example.com`,
+        subject: 'Acknowledgement test',
+        body: 'Hello',
+      };
+      const verdict = await params.options.canUseTool(
+        'mcp__outlook__send_email',
+        input,
+        { signal: new AbortController().signal, toolUseID: current.id },
+      );
+      assert.equal(verdict.behavior, 'allow');
+      yield {
+        type: 'assistant',
+        session_id: `sdk-ack-${current.id}`,
+        uuid: `use-${current.id}`,
+        parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: current.id,
+            name: 'mcp__outlook__send_email',
+            input,
+          }],
+        },
+      } as any;
+      yield {
+        type: 'user',
+        session_id: `sdk-ack-${current.id}`,
+        uuid: `result-${current.id}`,
+        parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: current.id,
+            is_error: false,
+            content: current.output,
+          }],
+        },
+      } as any;
+      yield successResultMessage(current.success ? 'clean acknowledgement observed' : 'ambiguous acknowledgement observed');
+    })());
+  }) as any);
+
+  for (const current of cases) {
+    await runClaudeAgentSdk({
+      prompt: 'Send one test email.',
+      sessionId: session.id,
+      modelId: 'claude-sonnet-4-6',
+      allowedLocalMcpTools: ['mcp__outlook__send_email'],
+      sourceUserSeq: 84,
+      trackerScopeId: `native-ack-${current.id}`,
+    });
+  }
+
+  assert.deepEqual(
+    eventlog.listEvents(session.id, { types: ['external_write_orphaned'] })
+      .map((event) => event.data.callId),
+    cases.filter((entry) => !entry.success).map((entry) => entry.id),
+  );
+  assert.deepEqual(
+    eventlog.listEvents(session.id, { types: ['external_write_succeeded'] })
+      .map((event) => event.data.callId),
+    ['toolu_clean_ack'],
+  );
+});
+
+test('native targetless writes require call ids, race by payload, and keep malformed results ambiguous', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const toolName = 'mcp__linkedin__create_post';
+  const input = { text: 'Clementine launch note', visibility: 'PUBLIC' };
+  let queryRun = 0;
+  let idlessVerdict: { behavior?: string; message?: string; interrupt?: boolean } | undefined;
+  let raceVerdicts: Array<{ behavior?: string; message?: string }> = [];
+  let allowedCallId = '';
+
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    queryRun += 1;
+    const thisRun = queryRun;
+    return stubsFor((async function* () {
+      yield {
+        ...initOnlyMessage(),
+        tools: [toolName],
+        mcp_servers: [{ name: 'linkedin', status: 'connected' }],
+      } as any;
+      const canUse = params.options.canUseTool as (
+        name: string,
+        args: unknown,
+        options: { signal: AbortSignal; toolUseID: string },
+      ) => Promise<{ behavior?: string; message?: string; interrupt?: boolean }>;
+      if (thisRun === 1) {
+        idlessVerdict = await canUse(toolName, input, {
+          signal: new AbortController().signal,
+          toolUseID: '',
+        });
+        yield successResultMessage('correlation refusal observed');
+        return;
+      }
+
+      const calls = ['toolu_targetless_a', 'toolu_targetless_b'];
+      raceVerdicts = await Promise.all(calls.map((callId) => canUse(toolName, input, {
+        signal: new AbortController().signal,
+        toolUseID: callId,
+      })));
+      const allowedIndex = raceVerdicts.findIndex((verdict) => verdict.behavior === 'allow');
+      allowedCallId = calls[allowedIndex] ?? '';
+      yield {
+        type: 'assistant', session_id: 'sdk-targetless', uuid: 'use-targetless', parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: allowedCallId,
+            name: toolName,
+            input,
+          }],
+        },
+      } as any;
+      yield {
+        type: 'user', session_id: 'sdk-targetless', uuid: 'result-targetless', parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: allowedCallId,
+            is_error: false,
+            content: [{ type: 'text' }],
+          }],
+        },
+      } as any;
+      yield successResultMessage('malformed result observed');
+    })());
+  }) as any);
+
+  const options = {
+    prompt: 'Publish this exact LinkedIn post once.',
+    sessionId: session.id,
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: [toolName],
+    sourceUserSeq: 77,
+  };
+  await runClaudeAgentSdk({ ...options, trackerScopeId: 'targetless-idless' });
+  await runClaudeAgentSdk({ ...options, trackerScopeId: 'targetless-race' });
+
+  assert.equal(idlessVerdict?.behavior, 'deny');
+  assert.equal(idlessVerdict?.interrupt, true);
+  assert.match(idlessVerdict?.message ?? '', /correlation|required|tool-use id/i);
+  assert.deepEqual(
+    raceVerdicts.map((verdict) => verdict.behavior).sort(),
+    ['allow', 'deny'],
+    'the exact payload fingerprint serializes a recipient-less publish race',
+  );
+  const [reservation] = eventlog.listEvents(session.id, { types: ['external_write'] });
+  assert.equal(reservation?.data.callId, allowedCallId);
+  assert.ok(
+    (reservation?.data.duplicateIdentityKeys as string[] | undefined)?.every(
+      (key) => key.startsWith('payload:'),
+    ),
+  );
+  const [orphan] = eventlog.listEvents(session.id, { types: ['external_write_orphaned'] });
+  assert.equal(orphan?.data.callId, allowedCallId);
+  assert.equal(orphan?.data.malformedResult, true);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_succeeded'] }).length, 0);
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
 });
 
 test('explicit multi-document objective permits distinct native creates and settles reversed results by call id', async () => {

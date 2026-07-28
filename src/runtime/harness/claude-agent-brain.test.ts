@@ -2625,6 +2625,43 @@ test('salvage reconciles explicit native failures instead of calling them landed
   assert.doesNotMatch(response.text, /already went through|nothing was duplicated/i);
 });
 
+test('salvage treats a pre-dispatch reservation as ambiguous until that exact call succeeds', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const sid = 'salvage-native-reserved';
+  createSession({ id: sid, kind: 'chat', title: 'reserved write' });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    appendEvent({
+      sessionId: sid,
+      turn: 0,
+      role: 'system',
+      type: 'external_write',
+      data: {
+        callId: 'toolu-reserved',
+        canonicalCallId: 'toolu-reserved',
+        preDispatch: true,
+        shapeKey: 'outlook__send_email',
+        toolName: 'mcp__outlook__send_email',
+        targets: ['a@site.example'],
+      },
+    });
+    throw new Error("The model's tool call could not be parsed (retry also failed).");
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'honest uncertainty' }));
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'send the email',
+    sessionId: sid,
+  });
+
+  assert.equal(calls, 1, 'an unsettled reservation is never replayed blindly');
+  assert.match(response.text, /may have gone through|could not confirm/i);
+  assert.match(response.text, /did not replay|verify/i);
+  assert.doesNotMatch(response.text, /already went through|nothing was duplicated/i);
+});
+
 test('salvage reports an orphan as uncertain and never blindly replays it', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

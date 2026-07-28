@@ -80,6 +80,69 @@ test('synthesizeWorkReport requires the complete evidence window to net failures
   assert.doesNotMatch(uncertain!, /Sent a message|I finished/i);
 });
 
+test('synthesizeWorkReport keeps a pre-dispatch reservation uncertain until its exact call succeeds', () => {
+  const reserved = {
+    ...writeEvent('OUTLOOK_SEND_EMAIL', ['casey@example.com']),
+    data: {
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      toolName: 'composio_execute_tool',
+      targets: ['casey@example.com'],
+      callId: 'write-exact-a',
+      canonicalCallId: 'write-exact-a',
+      preDispatch: true,
+    },
+  } as EventRow;
+  const pending = synthesizeWorkReport([reserved]);
+  assert.match(pending ?? '', /could not confirm|uncertain/i);
+  assert.doesNotMatch(pending ?? '', /I finished|Sent a message/i);
+
+  const wrongSuccess = {
+    ...reserved,
+    seq: 2,
+    type: 'external_write_succeeded',
+    data: { ...reserved.data, callId: 'write-other', canonicalCallId: 'write-other' },
+  } as EventRow;
+  const stillPending = synthesizeWorkReport([reserved, wrongSuccess]);
+  assert.match(stillPending ?? '', /could not confirm|uncertain/i);
+  assert.doesNotMatch(stillPending ?? '', /I finished|Sent a message/i);
+
+  const uncorrelatedReservation = {
+    ...reserved,
+    data: {
+      shapeKey: 'OUTLOOK_SEND_EMAIL',
+      toolName: 'composio_execute_tool',
+      targets: ['casey@example.com'],
+      preDispatch: true,
+    },
+  } as EventRow;
+  const uncorrelatedSuccess = {
+    ...uncorrelatedReservation,
+    seq: 2,
+    type: 'external_write_succeeded',
+  } as EventRow;
+  assert.match(
+    synthesizeWorkReport([uncorrelatedReservation, uncorrelatedSuccess]) ?? '',
+    /could not confirm|uncertain/i,
+    'shape similarity cannot replace exact call correlation for new reservations',
+  );
+
+  const exactSuccess = {
+    ...reserved,
+    seq: 3,
+    type: 'external_write_succeeded',
+  } as EventRow;
+  const confirmed = synthesizeWorkReport([reserved, wrongSuccess, exactSuccess]);
+  assert.match(confirmed ?? '', /I finished/i);
+  assert.match(confirmed ?? '', /Sent a message to casey@example\.com/i);
+  assert.doesNotMatch(confirmed ?? '', /could not confirm|uncertain/i);
+
+  assert.match(
+    synthesizeWorkReport([writeEvent('OUTLOOK_SEND_EMAIL', ['legacy@example.com'])]) ?? '',
+    /I finished/,
+    'legacy rows without preDispatch retain their historical success meaning',
+  );
+});
+
 test('truncates a long recipient list', () => {
   const many = Array.from({ length: 8 }, (_, i) => `p${i}@x.com`);
   assert.match(describeExternalWrite('OUTLOOK_SEND_EMAIL', 'composio', many), /\(\+3 more\)/);
@@ -114,7 +177,8 @@ test('synthesizeTurnReport: only a matched successful tool return earns an activ
   assert.match(toolReport!, /web search/i);
   assert.doesNotMatch(toolReport!, /results are saved|finished the work/i);
   // A write outranks the tool note.
-  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@b.com'] } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@b.com'], callId: 'turn-write', preDispatch: true } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write_succeeded', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['a@b.com'], callId: 'turn-write' } });
   const writeReport = synthesizeTurnReport(sid, 0);
   assert.match(writeReport!, /Sent a message to a@b\.com/);
 });
@@ -183,19 +247,38 @@ test('synthesizeTurnReport: failed writes are netted and orphaned writes are exp
   assert.doesNotMatch(orphanReport!, /I finished|Sent a message|Created a record/i);
 });
 
-test('synthesizeTurnReport: a failed first attempt does not hide a later confirmed retry', () => {
+test('synthesizeTurnReport: a failed first attempt does not hide a later exactly-confirmed retry', () => {
   resetEventLog();
   const sid = 'turn-report-write-retry';
   createSession({ id: sid, kind: 'chat', title: 't' });
-  for (const type of ['external_write', 'external_write_failed', 'external_write'] as const) {
-    appendEvent({
-      sessionId: sid,
-      turn: 1,
-      role: 'system',
-      type,
-      data: { shapeKey: 'AIRTABLE_CREATE_RECORD', targets: ['record:prospect'] },
-    });
-  }
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'AIRTABLE_CREATE_RECORD', targets: ['record:prospect'], callId: 'first', preDispatch: true },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: { shapeKey: 'AIRTABLE_CREATE_RECORD', targets: ['record:prospect'], callId: 'first' },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'AIRTABLE_CREATE_RECORD', targets: ['record:prospect'], callId: 'retry', preDispatch: true },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: { shapeKey: 'AIRTABLE_CREATE_RECORD', targets: ['record:prospect'], callId: 'retry' },
+  });
   const report = synthesizeTurnReport(sid, 0);
   assert.ok(report);
   assert.equal((report!.match(/Created a record/g) ?? []).length, 1);

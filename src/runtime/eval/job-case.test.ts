@@ -40,6 +40,22 @@ test('assertNoExternalWrites: zero passes; a real write fails; a netted-out writ
   ]).pass, true, 'a write compensated by a failure nets to zero');
 });
 
+test('assertNoExternalWrites pairs compensation by exact call and treats orphan/success outcomes as mutation evidence', () => {
+  assert.equal(assertNoExternalWrites([
+    { type: 'external_write', data: { callId: 'call-a', preDispatch: true } },
+    { type: 'external_write', data: { callId: 'call-b', preDispatch: true } },
+    { type: 'external_write_failed', data: { callId: 'call-a' } },
+  ]).pass, false, 'failure for call-a cannot net call-b');
+  assert.equal(assertNoExternalWrites([
+    { type: 'external_write', data: { callId: 'call-a', preDispatch: true } },
+    { type: 'external_write_failed', data: { callId: 'call-a' } },
+    { type: 'external_write_orphaned', data: { callId: 'call-z' } },
+  ]).pass, false, 'an orphan is external mutation evidence even without its reservation row');
+  assert.equal(assertNoExternalWrites([
+    { type: 'external_write_succeeded', data: { callId: 'legacy-missing-reservation' } },
+  ]).pass, false);
+});
+
 // ─── assertConvergence ────────────────────────────────────────────
 
 test('assertConvergence: completed under budget passes; missing/limit/runaway fail', () => {

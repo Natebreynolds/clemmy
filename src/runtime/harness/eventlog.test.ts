@@ -107,13 +107,14 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   const columns = migrated.prepare('PRAGMA table_info(pending_approvals)').all() as Array<{ name: string }>;
   assert.ok(columns.some((column) => column.name === 'resume_key'));
   assert.ok(columns.some((column) => column.name === 'consumed_at'));
+  assert.ok(columns.some((column) => column.name === 'resend_consumed_at'));
   assert.equal(
     (migrated.prepare("SELECT subject FROM pending_approvals WHERE approval_id = 'apr-old1'").get() as { subject: string }).subject,
     'existing approval',
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
+    14, // v14: one-shot duplicate-resend consent
   );
   resetEventLog();
 });
@@ -157,7 +158,7 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   );
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
+    14, // v14: one-shot duplicate-resend consent
   );
   resetEventLog();
 });
@@ -261,7 +262,7 @@ test('fresh schema v12 creates artifact truth and pre-ack cancellation tables ea
   ]) assert.ok(columns.has(name), name);
   assert.equal(
     (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
+    14, // v14: one-shot duplicate-resend consent
   );
   resetEventLog();
 });
@@ -328,7 +329,7 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   assert.equal(root.root_scope_id, 'root-first');
   assert.equal(
     (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    13, // v13: DROP TABLE session_locks (dead since the sqlite approval registry replaced file locking)
+    14, // v14: one-shot duplicate-resend consent
   );
   resetEventLog();
 });

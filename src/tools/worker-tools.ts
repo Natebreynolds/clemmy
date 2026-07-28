@@ -172,9 +172,10 @@ export function registerWorkerTools(server: McpServer): void {
         JSON.stringify(call),
       );
       const manifestSessionId = getToolOutputContext()?.sessionId ?? '';
+      const manifestSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       const quantifiedManifestGate = evaluateQuantifiedWorkManifestGate({
         sessionId: manifestSessionId,
-        sourceUserSeq: harnessRunContextStorage.getStore()?.sourceUserSeq,
+        sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
         workManifest: call.workManifest as WorkerManifestDescriptor | null | undefined,
       });
@@ -183,6 +184,7 @@ export function registerWorkerTools(server: McpServer): void {
       if (call.workManifest && manifestSessionId) {
         const prepared = prepareWorkerManifest({
           sessionId: manifestSessionId,
+          sourceUserSeq: manifestSourceUserSeq,
           items: callItems,
           descriptor: call.workManifest as WorkerManifestDescriptor,
           objective: call.objective,

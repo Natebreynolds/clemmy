@@ -1476,25 +1476,24 @@ export function artifactReuseMessage(artifact: RunArtifact): string {
   ].join(' ');
 }
 
-/** A provider gateway can prove that execution stopped before the network
- * mutation boundary (bad args, missing/ambiguous connection, standing-rule
- * block). Only that explicit proof makes releasing a pending claim safe. Any
- * timeout, thrown error, or unmarked failure remains uncertain. */
+/**
+ * Only an internally typed local spawn failure can prove that a shell-backed
+ * artifact create never crossed the dispatch boundary. Model-visible strings,
+ * provider result objects, exit codes, and provider-phase classifications are
+ * untrusted after a child starts and can never release a pending claim.
+ */
 export function artifactOutputProvesNoDispatch(
-  output: unknown,
+  _output: unknown,
   executionOutcome?: ShellExecutionOutcome,
 ): boolean {
-  // Typed execution truth outranks rendered shell prose. `effect:none` includes
-  // local no-start failures and narrow provider-adapter precondition rejections;
-  // either makes retrying this artifact slot safe.
-  if (executionOutcome?.effect === 'none') return true;
-  if (executionOutcome?.dispatch === 'not_started') return true;
-  if (typeof output === 'string') {
-    return /\[provider-dispatch:not-started:[a-z0-9_-]+\]/i.test(output);
-  }
-  if (!output || typeof output !== 'object' || Array.isArray(output)) return false;
-  const row = output as Record<string, unknown>;
-  return row.ok === false && row.dispatched === false;
+  if (
+    executionOutcome?.phase !== 'resolve'
+    || executionOutcome.dispatch !== 'not_started'
+    || executionOutcome.effect !== 'none'
+  ) return false;
+  return executionOutcome.errorKind === 'command_not_found'
+    || executionOutcome.errorKind === 'permission_denied'
+    || executionOutcome.errorKind === 'spawn_failed';
 }
 
 /** Stable digest for UI/telemetry without exposing full artifact contents. */

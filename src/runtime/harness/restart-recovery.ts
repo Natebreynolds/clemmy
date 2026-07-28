@@ -30,6 +30,7 @@ import {
   type RunAttemptRecord,
   type SessionRow,
 } from './eventlog.js';
+import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import { HarnessSession } from './session.js';
 import { addNotification } from '../notifications.js';
 
@@ -43,8 +44,8 @@ function enabled(): boolean {
 // used to sit parked until the user noticed and typed `continue` — verified
 // live that the resume itself works on a healthy daemon. Resume AUTOMATICALLY
 // when it is provably safe:
-//   - the interrupted turn recorded NO external_write since the in-flight
-//     marker (a resume can never double-act a send/write it can't see), and
+//   - the interrupted turn has NO landed or unresolved external write since
+//     the in-flight marker (a resume can never double-act a send/write), and
 //   - the interruption is fresh (age cap — don't resurrect ancient runs), and
 //   - bounded per boot (a restart loop must not fan out resumes).
 // Ineligible runs keep today's banner + manual `continue` exactly as-is.
@@ -70,13 +71,50 @@ export const AUTO_RESUME_DIRECTIVE = [
   'A successful space_save can be the final action or an intermediate checkpoint. If the durable results already satisfy the request, use at most read-only verification and report the result now. Otherwise continue only work that the objective and event trail show is clearly unfinished, starting from the last durable boundary.',
 ].join('\n');
 
-/** External-write count in the interrupted window. Any count >0 blocks
- *  auto-resume (double-act risk); null means the check failed, which also
- *  blocks auto-resume because safety could not be proven. */
+function externalWriteRiskIdentity(event: {
+  seq: number;
+  data: Record<string, unknown>;
+}): string {
+  const data = event.data;
+  for (const key of ['canonicalCallId', 'callId']) {
+    const value = data[key];
+    if (typeof value === 'string' && value.trim()) return `call:${value.trim()}`;
+  }
+  for (const key of ['correlationFingerprint', 'payloadFingerprint']) {
+    const value = data[key];
+    if (typeof value === 'string' && value.trim()) {
+      return `fingerprint:${value.trim().toLowerCase()}`;
+    }
+  }
+  return `event:${event.seq}`;
+}
+
+/** Landed-or-unresolved external-write count in the interrupted window. Exact
+ *  proven-no-effect failures compensate only their matching reservation.
+ *  Explicit success/orphan outcomes independently block replay, including when
+ *  older telemetry omitted the reservation. Any count >0 blocks auto-resume
+ *  (double-act risk); null means the check failed and therefore also blocks. */
 function countExternalWritesSince(sessionId: string, sinceIso: string): number | null {
   try {
-    const writes = listEvents(sessionId, { types: ['external_write'] });
-    return writes.filter((ev) => String(ev.createdAt ?? '') >= sinceIso).length;
+    const window = listEvents(sessionId, {
+      types: [
+        'external_write',
+        'external_write_failed',
+        'external_write_succeeded',
+        'external_write_orphaned',
+      ],
+    }).filter((event) => String(event.createdAt ?? '') >= sinceIso);
+    const unresolvedReservations = uncompensatedExternalWriteEvents(
+      window.filter((event) =>
+        event.type === 'external_write' || event.type === 'external_write_failed'),
+    );
+    const risks = new Set(unresolvedReservations.map(externalWriteRiskIdentity));
+    for (const event of window) {
+      if (event.type === 'external_write_succeeded' || event.type === 'external_write_orphaned') {
+        risks.add(externalWriteRiskIdentity(event));
+      }
+    }
+    return risks.size;
   } catch {
     return null; // can't prove safety → keep the manual banner
   }

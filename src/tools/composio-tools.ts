@@ -66,6 +66,7 @@ import {
   type ComposioConnectionSuppressionState,
 } from '../agents/composio-connection-suppression.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -189,81 +190,20 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
   return { failed: true, summary, notFound, notConnected };
 }
 
-/** Narrow proof that a returned failure envelope could not have committed a
- * mutation. Timeouts, conflicts, 5xx, and generic `successful:false` remain
- * ambiguous even though they are visible failures.
+/** A provider-returned failure envelope never proves a mutation did not commit.
  *
- * INVARIANT: a `true` (proven-no-commit) verdict marks the mutation slot safe
- * for a fresh run, so it may ONLY derive from STRUCTURED evidence —
- *   1. a numeric status/code FIELD in the provider envelope
- *      (data.status_code / data.statusCode / status_code / statusCode / status), or
- *   2. detectComposioFailure's typed not-found / not-connected classification.
- * It must NEVER derive from a number scavenged out of free-text prose. A
- * coincidental 4xx-looking digit run ("failed to sync row 422 to the sheet"
- * after a dropped connection) is not an HTTP 422; treating it as one flipped an
- * AMBIGUOUS failure to proven-no-commit and authorized a DUPLICATE external
- * write — the exact class the receipt ledger exists to prevent.
+ * Even a structured 4xx, `notConnected`, or not-found result was produced on
+ * the far side of our dispatch boundary. Providers can partially commit,
+ * execute a downstream sub-call, or lose/replace the original response before
+ * returning those shapes. Treating any of them as replay authority can
+ * duplicate an external write.
  *
- * Prose IS still scanned, but only to force MORE caution (return false /
- * ambiguous) on 5xx-, retry-, or transport-shaped language. Scanning text in
- * the fail-closed direction can only ever park a run instead of re-dispatching
- * it, which is always the safe error. The previous free-text validation-phrase
- * path ("invalid recipient", "validation failed", …) was removed for the same
- * reason: a partial multi-target write can surface such prose after committing,
- * so a text-only match is not proof of no-commit — those failures now park. */
+ * Local pre-dispatch refusals do not enter this function: the gateway returns
+ * a typed block before the workflow receipt boundary, and thrown local
+ * preflight failures are classified by composioDispatchErrorProvesNoCommit.
+ * Therefore every value handled here is commit-ambiguous by construction. */
 export function composioFailureProvesNoCommit(value: unknown): boolean {
-  const failure = detectComposioFailure(value);
-  if (!failure.failed) return false;
-  const row = isRecord(value) ? value : {};
-  const data = isRecord(row.data) ? row.data : {};
-  const httpError = typeof data.http_error === 'string' ? data.http_error : '';
-  const topError = typeof row.error === 'string' ? row.error : '';
-  const dataMessage = typeof data.message === 'string' ? data.message : '';
-  const prose = `${failure.summary} ${httpError} ${topError} ${dataMessage}`;
-
-  // Structured statuses: numeric status/code FIELDS from the envelope only.
-  const structuredStatuses = [data.status_code, data.statusCode, row.status_code, row.statusCode, row.status]
-    .filter((candidate): candidate is number => typeof candidate === 'number' && candidate >= 400 && candidate < 600);
-
-  // Fail-closed uncertainty guard. Any 5xx / retry-conflict status (from a field
-  // OR from prose — scanning text here only ever parks, never authorizes) or
-  // transport/timeout language means the outcome is genuinely unknown → ambiguous.
-  const uncertaintyStatuses = [
-    ...structuredStatuses,
-    ...Array.from(prose.matchAll(/\b([45]\d{2})\b/g), (match) => Number.parseInt(match[1], 10)),
-  ];
-  if (
-    uncertaintyStatuses.some((statusCode) => statusCode >= 500 || [408, 409, 425, 499].includes(statusCode))
-    || /timeout|timed out|deadline|connection reset|ECONNRESET|broken pipe|response lost|unknown outcome|after submit/i.test(prose)
-  ) {
-    return false;
-  }
-
-  // Typed not-connected: Composio's connection router refused to route to the
-  // provider (ConnectedAccountNotFound / NoActiveConnection / reconnect codes
-  // 1810·1812 — see COMPOSIO_NOT_CONNECTED_RE + isComposioReconnectRequiredError).
-  // That rejection is UNAMBIGUOUSLY pre-dispatch for a direct mutation call, so no
-  // commit occurred.
-  if (failure.notConnected) return true;
-
-  // notFound is DELIBERATELY not trusted from prose here. detectComposioFailure
-  // sets `notFound` off a free-text regex (COMPOSIO_NOT_FOUND_RE) over the message/
-  // error fields, and a "not found" phrase can surface AFTER a partial/committed
-  // multi-target write or refer to a sub-resource — a text-only match is not proof
-  // of no-commit. A genuine wrong-id rejection carries a structured 404/410-class
-  // status FIELD, which the safeClientStatuses path below proves. So notFound
-  // proves no-commit ONLY when backed by that structured status; prose-only
-  // not-found falls through to the ambiguous `return false` (park), the safe error.
-  //
-  // A structured client-error status in the "rejected at the door" set proves
-  // no-commit. Nothing else does: with no structured status and no typed
-  // not-connected classification, prose is all we have, so the outcome stays
-  // AMBIGUOUS.
-  const safeClientStatuses = new Set([
-    400, 401, 403, 404, 405, 406, 410, 411, 412, 413, 414, 415, 416, 417,
-    422, 423, 424, 426, 428, 429, 431,
-  ]);
-  if (structuredStatuses.length > 0) return structuredStatuses.every((statusCode) => safeClientStatuses.has(statusCode));
+  void value;
   return false;
 }
 
@@ -495,6 +435,20 @@ export function formatComposioExecuteOutput(
   const body = formatComposioToolOutput(value, options);
   const { failed, summary, notFound, notConnected } = detectComposioFailure(value);
   if (!failed) return body; // success: the GLOBAL id-index (formatRecallableToolText) handles resource lists
+  if (options.toolSlug && !composioSlugIsReadOnly(options.toolSlug)) {
+    const label = options.toolName || 'composio_execute_tool';
+    const where = ` (slug=${options.toolSlug})`;
+    const toolkit = toolkitOfSlug(options.toolSlug).toUpperCase();
+    return [
+      '[provider-dispatch:uncertain]',
+      `⚠️ ${label} ${notConnected ? 'NOT CONNECTED' : 'FAILED'}${where}: ${summary}. Dispatch may have started; the external change MAY already exist or be partial.`,
+      'Do NOT repeat this mutation from the failure envelope. Verify with the matching list/get/search action and reuse or repair the existing resource. If verification is impossible, tell the user the outcome is uncertain.',
+      ...(notConnected
+        ? [`The connection also appears unavailable. Open Connect and reconnect ${toolkit} before further work, but reconnecting does not make replay of this unverified mutation safe.`]
+        : []),
+      body,
+    ].join('\n\n');
+  }
   const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(summary);
   return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, notConnected, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
 }
@@ -550,6 +504,13 @@ export function composioThrownErrorOutput(
   err: unknown,
   options: FormatComposioToolOutputOptions = {},
 ): string {
+  if (
+    options.toolSlug
+    && !composioSlugIsReadOnly(options.toolSlug)
+    && !composioDispatchErrorProvesNoCommit(err)
+  ) {
+    return composioUncertainMutationOutput(err, options);
+  }
   const rawMessage = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
   const message = enrichComposioErrorMessage(err, rawMessage).replace(/\s+/g, ' ').trim();
   const summary = message.slice(0, 240) || 'unknown error';
@@ -572,7 +533,10 @@ export function composioUncertainMutationOutput(
 ): string {
   const rawMessage = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
   const message = enrichComposioErrorMessage(err, rawMessage).replace(/\s+/g, ' ').trim();
-  const label = options.toolSlug || options.toolName || 'Composio mutation';
+  const label = options.toolName || 'composio_execute_tool';
+  const where = options.toolSlug ? ` (slug=${options.toolSlug})` : '';
+  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(message) || isComposioReconnectRequiredError(err);
+  const toolkit = options.toolSlug ? toolkitOfSlug(options.toolSlug).toUpperCase() : 'this toolkit';
   const body = formatComposioToolOutput({
     error: message || 'unknown provider error',
     toolSlug: options.toolSlug ?? null,
@@ -580,8 +544,11 @@ export function composioUncertainMutationOutput(
   }, options);
   return [
     '[provider-dispatch:uncertain]',
-    `⚠️ ${label} returned an ambiguous error after dispatch may have started. The external change MAY already exist.`,
+    `⚠️ ${label} ${notConnected ? 'NOT CONNECTED' : 'FAILED'}${where}: an ambiguous error returned after dispatch may have started. The external change MAY already exist.`,
     'Do NOT repeat this mutation. Verify with the matching list/get/search action and reuse or repair the existing resource. If verification is impossible, tell the user the outcome is uncertain.',
+    ...(notConnected
+      ? [`Open Connect and reconnect ${toolkit} before further work, but reconnecting does not make replay of this unverified mutation safe.`]
+      : []),
     body,
   ].join('\n\n');
 }
@@ -1746,8 +1713,9 @@ async function runComposioExecute(
   const dispatch = hooks.execute ?? executeComposioTool;
   const wait = hooks.delay ?? delayMs;
 
-  // THE gateway: owner-first resolution + typed blocks (ledgered). A block is
-  // returned verbatim as the tool output — deterministic, zero dispatch.
+  // THE gateway: owner-first resolution + typed blocks (ledgered). Preserve a
+  // nominal in-process error so the shared write boundary can prove that no
+  // provider dispatch started and release the exact reservation safely.
   const resolved: ComposioGatewayResolution = hooks.skipGateway
     ? { ok: true, args, connectionId: connectedAccountId, senderVerified: false, notes: [] }
     : await resolveComposioDispatch(toolSlug, args, connectedAccountId, {
@@ -1755,12 +1723,9 @@ async function runComposioExecute(
       userInput: latestUserInputForContext(options.context),
     });
   if (!resolved.ok) {
-    // Machine-readable proof for the artifact transaction wrapper: every
-    // gateway block above happens before executeComposioTool, so a pending
-    // create claim may be safely released and retried with corrected input.
-    // Do not use this marker for provider errors/timeouts; those may have
-    // crossed the write boundary and must remain uncertain.
-    return `[provider-dispatch:not-started:${resolved.reason}]\n${resolved.message}`;
+    throw new ExternalWritePreDispatchError(
+      `[provider-dispatch:not-started:${resolved.reason}] ${resolved.message}`,
+    );
   }
   args = resolved.args;
   const effectiveConnectionId = resolved.connectionId;
@@ -1772,7 +1737,7 @@ async function runComposioExecute(
   // of shipping false negatives (2026-07-22 Phoenix Airtable audit). Fires
   // once; a deliberate second attempt proceeds.
   const checkpoint = dataQualityWriteCheckpoint(runSid, toolSlug);
-  if (checkpoint) return checkpoint;
+  if (checkpoint) throw new ExternalWritePreDispatchError(checkpoint);
 
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of
@@ -1965,6 +1930,12 @@ async function runComposioExecute(
       const errorMsg = err instanceof Error ? err.message : String(err ?? '');
       recentErrors.push(errorMsg);
 
+      // Preserve nominal pre-dispatch provenance for the shared write boundary.
+      // Formatting this as a returned string would erase the only trustworthy
+      // proof that no provider call started and strand the durable reservation
+      // as ambiguous. The bracket soft-surfaces this exact typed error.
+      if (err instanceof ExternalWritePreDispatchError) throw err;
+
       // Entity/user mismatches and NoActiveConnection are deterministic. In
       // particular, do not spend the generic retry budget repeating a call
       // that can only be repaired by reconnecting the app under this user.
@@ -2026,6 +1997,22 @@ export function runComposioExecuteForTestInSession(
     undefined,
     { toolName: 'composio_execute_tool', toolSlug, context: { context: { sessionId } } as never },
     { execute, delay: async () => {}, skipGateway: true },
+  );
+}
+
+/** Test twin that keeps the real owner/connection gateway enabled. */
+export function runComposioExecuteWithGatewayForTest(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  execute: typeof executeComposioTool,
+  sessionId: string,
+): Promise<string> {
+  return runComposioExecute(
+    toolSlug,
+    args,
+    undefined,
+    { toolName: 'composio_execute_tool', toolSlug, context: { context: { sessionId } } as never },
+    { execute, delay: async () => {} },
   );
 }
 

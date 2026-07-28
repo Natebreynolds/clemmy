@@ -1506,6 +1506,7 @@ const WORKFLOW_GRAPH_HARNESS_EVENT_TYPES: EventType[] = [
   'approval_requested',
   'approval_resolved',
   'external_write',
+  'external_write_succeeded',
   'external_write_failed',
   'external_write_orphaned',
   'worker_result',

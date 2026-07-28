@@ -3857,6 +3857,48 @@ test('Lane B (bug #8): sendAlreadyClaimed — more external_writes than failures
   assert.equal(sendAlreadyClaimed(2, 1), true, '2 writes, 1 failed → 1 net send claimed');
 });
 
+test('plain-step write recovery nets failures by exact call, never by aggregate count', () => {
+  resetEventLog();
+  const runId = 'r-step-exact-settlement';
+  const stepId = 'notify_two';
+  const sid = `workflow:${runId}:${stepId}`;
+  HarnessSession.create({ id: sid, kind: 'workflow', channel: 'workflow', title: runId, metadata: { source: 'workflow' } });
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'tool',
+    type: 'external_write',
+    data: { callId: 'call-a', shapeKey: 'GMAIL_SEND', targets: ['a@example.com'], preDispatch: true },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'tool',
+    type: 'external_write',
+    data: { callId: 'call-b', shapeKey: 'GMAIL_SEND', targets: ['b@example.com'], preDispatch: true },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'tool',
+    type: 'external_write_failed',
+    data: { callId: 'call-a', shapeKey: 'GMAIL_SEND', targets: ['a@example.com'] },
+  });
+  assert.equal(
+    stepExternalWriteAlreadyClaimed(runId, stepId),
+    true,
+    'failure for call-a cannot release call-b',
+  );
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'tool',
+    type: 'external_write_failed',
+    data: { callId: 'call-b', shapeKey: 'GMAIL_SEND', targets: ['b@example.com'] },
+  });
+  assert.equal(stepExternalWriteAlreadyClaimed(runId, stepId), false);
+});
+
 test('P0-3 approval-gated step is exempt (parking emits step_started before the gate)', () => {
   const wf = wfWith([
     { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', requiresApproval: true },

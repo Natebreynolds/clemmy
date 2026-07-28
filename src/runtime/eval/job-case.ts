@@ -26,6 +26,7 @@ import type { EvalCase, EvalRunOutcome } from './eval-case.js';
 import { extractNumericClaims, deterministicallyVerify } from '../harness/output-grounding-gate.js';
 import { rankSources, type GroundingSource } from '../harness/grounding-gate.js';
 import { projectCanonicalTopLevelToolEvents } from '../harness/tool-effect.js';
+import { uncompensatedExternalWriteEvents } from '../harness/external-write-admission.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Fixture shape
@@ -87,12 +88,24 @@ type Ev = { type: EventType; data: Record<string, unknown> };
 /** Read-only contract: a pure-analysis job mutated nothing. external_write
  *  events that were later compensated by an external_write_failed don't count. */
 export function assertNoExternalWrites(events: Ev[]): EvalRunOutcome {
-  const writes = events.filter((e) => e.type === 'external_write').length;
-  const failed = events.filter((e) => e.type === 'external_write_failed').length;
-  const net = writes - failed;
-  return net <= 0
+  const unsettledOrLanded = uncompensatedExternalWriteEvents(
+    events.filter((event) =>
+      event.type === 'external_write'
+      || event.type === 'external_write_failed'
+    ).map((event, index) => ({
+      seq: index + 1,
+      type: event.type,
+      data: event.data,
+    })),
+  );
+  const explicitOutcome = events.some((event) =>
+    event.type === 'external_write_succeeded'
+    || event.type === 'external_write_orphaned'
+  );
+  const mutationEvidence = unsettledOrLanded.length + (explicitOutcome ? 1 : 0);
+  return mutationEvidence === 0
     ? { pass: true, detail: 'zero net external writes (read-only)' }
-    : { pass: false, detail: `${net} external_write event(s) on a read-only job` };
+    : { pass: false, detail: `${mutationEvidence} external_write event(s) on a read-only job` };
 }
 
 /** Convergence: reached a clean completion, no limit/failure, no tool runaway. */

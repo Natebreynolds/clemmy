@@ -92,6 +92,7 @@ import {
 import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
+import { uncompensatedExternalWriteEvents } from '../runtime/harness/external-write-admission.js';
 import {
   runConversation,
   runConversationFromResume,
@@ -3542,7 +3543,9 @@ function canSwitchBrainForStep(step: WorkflowStepInput, ctx: StepExecutionContex
   if (stepSideEffectClass(step) === 'read') return true;
   try {
     const sid = getWorkflowHarnessSession(ctx.workflow.name, step.id, ctx.runId, `${ctx.runId}:${step.id}`).id;
-    return listHarnessEvents(sid, { types: ['external_write'] }).length === 0;
+    return uncompensatedExternalWriteEvents(
+      listHarnessEvents(sid, { types: ['external_write', 'external_write_failed'] }),
+    ).length === 0;
   } catch {
     // If we can't prove it's clean, be conservative: don't re-run a mutating step.
     return false;
@@ -5416,9 +5419,9 @@ export function sendAlreadyClaimed(externalWriteCount: number, failedCount: numb
 function itemSendAlreadyFired(runId: string, stepId: string, itemKey: string): boolean {
   try {
     const sid = `workflow:${runId}:${stepId}:${itemKey}`;
-    const writes = listHarnessEvents(sid, { types: ['external_write'] }).length;
-    const fails = listHarnessEvents(sid, { types: ['external_write_failed'] }).length;
-    return sendAlreadyClaimed(writes, fails);
+    return uncompensatedExternalWriteEvents(
+      listHarnessEvents(sid, { types: ['external_write', 'external_write_failed'] }),
+    ).length > 0;
   } catch {
     return false;
   }
@@ -5435,9 +5438,9 @@ function itemSendAlreadyFired(runId: string, stepId: string, itemKey: string): b
 export function stepExternalWriteAlreadyClaimed(runId: string, stepId: string): boolean {
   try {
     const sid = `workflow:${runId}:${stepId}`;
-    const writes = listHarnessEvents(sid, { types: ['external_write'] }).length;
-    const fails = listHarnessEvents(sid, { types: ['external_write_failed'] }).length;
-    return sendAlreadyClaimed(writes, fails);
+    return uncompensatedExternalWriteEvents(
+      listHarnessEvents(sid, { types: ['external_write', 'external_write_failed'] }),
+    ).length > 0;
   } catch {
     return false;
   }

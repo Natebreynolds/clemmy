@@ -33,6 +33,33 @@ test('external_write events mirror to the ledger automatically from the appendEv
   assert.ok(existsSync(AUDIT_DIR) && readdirSync(AUDIT_DIR).some((f) => /^audit-\d{4}-\d{2}\.jsonl$/.test(f)));
 });
 
+test('external-write terminal outcomes mirror so reservation truth remains reconstructable after GC', () => {
+  const sess = createSession({ id: 'audit-write-lifecycle', kind: 'chat' });
+  const data = {
+    preDispatch: true,
+    shapeKey: 'email:send',
+    toolName: 'composio_execute_tool',
+    targets: ['client@example.com'],
+    callId: 'call_lifecycle',
+    canonicalCallId: 'call_lifecycle',
+  };
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write', data });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write_succeeded', data });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    data: { ...data, callId: 'call_orphan', canonicalCallId: 'call_orphan' },
+  });
+
+  const records = readAuditRecords({ sessionPrefix: sess.id });
+  assert.deepEqual(
+    records.map((record) => record.kind),
+    ['external_write', 'external_write_succeeded', 'external_write_orphaned'],
+  );
+});
+
 test('approval resolutions ledger from the registry seam with who/what/when', () => {
   const sess = createSession({ kind: 'chat' });
   const card = approvalRegistry.register({ sessionId: sess.id, subject: 'Send retainer letter', tool: 'composio_execute_tool', args: {} });

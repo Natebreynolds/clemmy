@@ -40,7 +40,10 @@
  * gates irreversible writes.
  */
 import { getRuntimeEnv } from '../../config.js';
-import { hasApprovedResendConsent } from './approval-registry.js';
+import {
+  claimApprovedResendConsent,
+  hasApprovedResendConsent,
+} from './approval-registry.js';
 import { searchToolOutputs } from './eventlog.js';
 
 // ─────────────────────────────────────────────────────────────────
@@ -577,9 +580,25 @@ export function detectDuplicateTarget(input: DuplicateCheckInput): { duplicate: 
  * artifact — effect-anchored, no text matching of user turns. Fail-closed:
  * registry unreadable or no matching row → the wall stands.
  */
-export function duplicateResendConsented(sessionId: string, target: string | undefined, priorAt: string | undefined): boolean {
+export function duplicateResendConsented(
+  sessionId: string,
+  target: string | undefined,
+  priorAt: string | undefined,
+  actionKey?: string,
+): boolean {
   if (!target) return false;
-  return hasApprovedResendConsent(sessionId, target, priorAt);
+  return claimApprovedResendConsent(sessionId, target, priorAt, actionKey);
+}
+
+/** Read-only preview for prechecks that run before slower gates. */
+export function duplicateResendConsentAvailable(
+  sessionId: string,
+  target: string | undefined,
+  priorAt: string | undefined,
+  actionKey?: string,
+): boolean {
+  if (!target) return false;
+  return hasApprovedResendConsent(sessionId, target, priorAt, actionKey);
 }
 
 export class DuplicateExternalWriteError extends Error {

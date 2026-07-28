@@ -2,7 +2,7 @@
  * Durable audit ledger (2026-07-20, attorney-bar integrity audit B3/B1) —
  * the "audit Clementine like an employee" record.
  *
- * The raw trust records (external_write events, approval cards/resolutions)
+ * The raw trust records (external-write lifecycle events, approval cards/resolutions)
  * lived only in harness.db sessions, which are REAPED at 14 days (events +
  * pending_approvals are ON DELETE CASCADE), and workflow run records unlink
  * at 7 — so "who did Clem write to, when, under whose approval" was GONE two
@@ -12,9 +12,9 @@
  *
  * This ledger is:
  *  - WRITTEN AT EVENT TIME from the two canonical seams (eventlog.appendEvent
- *    for external_write/external_write_failed/approval_requested; the approval
- *    registry's resolve() for resolutions) — every lane, present and future,
- *    inherits it automatically.
+ *    for external_write reservations and their succeeded/failed/orphaned
+ *    outcomes plus approval_requested; the approval registry's resolve() for
+ *    resolutions) — every lane, present and future, inherits it automatically.
  *  - APPEND-ONLY JSONL, one file per month under BASE_DIR/audit/ — outside
  *    every session/run GC path; nothing in the codebase deletes it.
  *  - JOINABLE: each line carries sessionId (run-scoped step sessions share the
@@ -38,7 +38,9 @@ export const AUDIT_DIR = path.join(BASE_DIR, 'audit');
  *  so a surface that also emits an approval_resolved event never duplicates. */
 export const AUDIT_MIRRORED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'external_write',
+  'external_write_succeeded',
   'external_write_failed',
+  'external_write_orphaned',
   'approval_requested',
 ]);
 

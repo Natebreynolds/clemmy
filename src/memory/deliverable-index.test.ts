@@ -89,6 +89,97 @@ test('capture seam: an external_write event tees into the index for every lane',
   assert.match(hit!.why, /weekly digest/);
 });
 
+test('capture seam: pre-dispatch reservations enter durable memory only after exact success', async () => {
+  const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+  const sess = createSession({ kind: 'chat', title: 'settlement truth canary ledger' });
+  const target = 'spreadsheet:settlement-truth-canary-7788';
+  const reservation = {
+    shapeKey: 'GOOGLESHEETS_VALUES_UPDATE',
+    targets: [target],
+    preDispatch: true,
+    callId: 'deliverable-call-a',
+    canonicalCallId: 'deliverable-call-a',
+  };
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: reservation,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(
+    searchDeliverables('settlement truth canary ledger').some((hit) => hit.target === target),
+    false,
+    'a reservation is not a delivered artifact',
+  );
+
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: { ...reservation, callId: 'deliverable-call-other', canonicalCallId: 'deliverable-call-other' },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(
+    searchDeliverables('settlement truth canary ledger').some((hit) => hit.target === target),
+    false,
+    'a different call cannot settle this reservation',
+  );
+
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: reservation,
+  });
+  for (let i = 0; i < 40; i += 1) {
+    if (searchDeliverables('settlement truth canary ledger').some((hit) => hit.target === target)) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(
+    searchDeliverables('settlement truth canary ledger').some((hit) => hit.target === target),
+    'the exact success records the durable deliverable',
+  );
+
+  const failedTarget = 'spreadsheet:settlement-truth-failed-8899';
+  const failedReservation = {
+    ...reservation,
+    targets: [failedTarget],
+    callId: 'deliverable-call-failed',
+    canonicalCallId: 'deliverable-call-failed',
+  };
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: failedReservation,
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_failed',
+    data: failedReservation,
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    data: failedReservation,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(
+    searchDeliverables('settlement truth canary ledger').some((hit) => hit.target === failedTarget),
+    false,
+    'a demonstrable no-dispatch terminal cannot later be repainted as delivered',
+  );
+});
+
 // Known-artifacts block for planning surfaces (live 2026-07-24): the planner
 // asked "where is the banked research stored?" while this ledger held the
 // research files, the target sheet, and the template — every question it

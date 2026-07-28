@@ -132,9 +132,10 @@ test('a run_batch pending action defers to the run_batch executor', async () => 
   assert.match(res.resultSummary, /run_batch action=execute/);
 });
 
-test('a gate-refused dispatch is recorded FAILED, never executed (2026-07-22 false-success class)', async () => {
+test('returned refusal marker is FAILED/uncertain, never proof of no provider commit', async () => {
   const { dispatchOutputIndicatesRefusal } = await import('./pending-action-executor.js');
-  // The live shape: constraint block RETURNED as a string, provider never called.
+  // A local gate commonly returns this shape, but a provider can echo the exact
+  // same text. Returned prose therefore cannot authorize a replay.
   const record = queueSingleCall();
   markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('blocked call'));
   const res = await executeApprovedPendingActionCall(record.id, {
@@ -143,17 +144,37 @@ test('a gate-refused dispatch is recorded FAILED, never executed (2026-07-22 fal
   });
   assert.equal(res.ok, false);
   assert.equal(res.status, 'failed');
-  assert.match(res.resultSummary, /refused/i);
+  assert.match(res.resultSummary, /text alone cannot prove|uncertain/i);
+  assert.match(res.resultSummary, /no automatic retry is safe/i);
   assert.equal(getPendingAction(record.id)?.status, 'failed', 'the durable record tells the truth');
-  assert.match(getPendingAction(record.id)?.resultSummary ?? '', /SEND BLOCKED|refused/i);
+  assert.match(getPendingAction(record.id)?.resultSummary ?? '', /uncertain|no retry is safe/i);
 
-  // Classifier boundaries: genuine results never match; refusal shapes always do.
+  // Classifier detects the suspicious shape, but does not establish provenance.
   assert.equal(dispatchOutputIndicatesRefusal('{"successful": true, "data": {"message": "Email sent successfully."}}'), false);
   assert.equal(dispatchOutputIndicatesRefusal('OK sent'), false);
   assert.equal(dispatchOutputIndicatesRefusal('Tool call refused by harness: DUPLICATE_EXTERNAL_WRITE (REFUSED): already sent'), true);
   assert.equal(dispatchOutputIndicatesRefusal('[provider-dispatch:not-started:execution_wrap]'), true);
   // A provider message that merely MENTIONS a block deep in content stays success.
   assert.equal(dispatchOutputIndicatesRefusal('{"data": {"text": "' + 'x'.repeat(700) + ' SEND BLOCKED — standing sender constraint"}}'), false);
+});
+
+test('only a nominal local pre-dispatch error can prove an approved call never reached the provider', async () => {
+  const { PendingActionPreDispatchError } = await import('./pending-action-executor.js');
+  const record = queueSingleCall();
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId('local pre-dispatch refusal'));
+
+  const res = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-pae',
+    dispatch: async () => {
+      throw new PendingActionPreDispatchError('local standing constraint refused before invoking dispatch');
+    },
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 'failed');
+  assert.match(res.resultSummary, /refused locally before the provider call started/i);
+  assert.match(res.resultSummary, /No provider commit occurred/i);
+  assert.equal(getPendingAction(record.id)?.status, 'failed');
 });
 
 test('a structured provider failure is recorded FAILED, never executed', async () => {

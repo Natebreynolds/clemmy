@@ -2,6 +2,7 @@ import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import { HarnessSession } from './session.js';
 import { markRunInFlight } from './restart-recovery.js';
+import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
   appendEvent,
   clearKill,
@@ -499,7 +500,7 @@ function requestFreshExternalWriteStatus(
   try {
     return freshExternalWriteEvidenceStatus(
       listEvents(sessionId, {
-        types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+        types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
       }),
       sourceUserSeq,
     );
@@ -507,6 +508,35 @@ function requestFreshExternalWriteStatus(
     // External writes must never become a silent green when their durable
     // request-bound ledger is unavailable.
     return 'missing';
+  }
+}
+
+const EXTERNAL_WRITE_LIFECYCLE_TYPES = [
+  'external_write',
+  'external_write_succeeded',
+  'external_write_failed',
+  'external_write_orphaned',
+] as const;
+
+/** True when events after this turn boundary prove or may imply an external
+ * mutation. A reservation compensated by its exact proven-no-effect failure is
+ * safe to retry on another brain; success, orphan, and unresolved reservation
+ * evidence are not. Ledger read failure stays conservative. */
+function externalWriteReplayRiskAfter(sessionId: string, boundarySeq: number): boolean {
+  try {
+    const events = listEvents(sessionId, {
+      types: [...EXTERNAL_WRITE_LIFECYCLE_TYPES],
+    }).filter((event) => event.seq > boundarySeq);
+    if (events.some((event) =>
+      event.type === 'external_write_succeeded' || event.type === 'external_write_orphaned')) {
+      return true;
+    }
+    return uncompensatedExternalWriteEvents(
+      events.filter((event) =>
+        event.type === 'external_write' || event.type === 'external_write_failed'),
+    ).length > 0;
+  } catch {
+    return true;
   }
 }
 
@@ -2400,10 +2430,13 @@ async function runConversationCore(
     // The zero-tool stall detectors must not fire on a turn that complied.
     const plainTextContractTurn = isPlainTextContractDirective(nextInput);
 
-    // Baseline for the canSwitch guard: if this turn records an external_write,
-    // we must NOT re-dispatch it to another brain (would double-act).
-    const extWritesBefore = falloverCapable
-      ? listEvents(options.sessionId, { types: ['external_write'] }).length
+    // Baseline for the canSwitch guard: if this turn lands or may have landed
+    // an external write, we must NOT re-dispatch it to another brain. Exact
+    // proven-no-effect failures remain eligible for useful fallover.
+    const externalWriteBoundarySeq = falloverCapable
+      ? (listEvents(options.sessionId, {
+          types: [...EXTERNAL_WRITE_LIFECYCLE_TYPES],
+        }).at(-1)?.seq ?? 0)
       : 0;
     const canStillFallover = falloverCapable
       && triedFalloverModelIds.size < (options.falloverModelIds?.length ?? 0);
@@ -2486,8 +2519,10 @@ async function runConversationCore(
     // error (infraTransientKind set, ask NOT yet written) → re-attempt on the next
     // brain, guarded so a turn that already wrote externally is never re-run.
     if (turnResult.infraTransientKind && falloverCapable) {
-      const extWritesAfter = listEvents(options.sessionId, { types: ['external_write'] }).length;
-      const canSwitch = extWritesAfter === extWritesBefore;
+      const canSwitch = !externalWriteReplayRiskAfter(
+        options.sessionId,
+        externalWriteBoundarySeq,
+      );
       const nextModelId = canSwitch
         ? (options.falloverModelIds ?? []).find((m) => !triedFalloverModelIds.has(m))
         : undefined;

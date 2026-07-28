@@ -1,10 +1,9 @@
 /**
- * Conservative provider-specific evidence behind a provider-neutral seam.
+ * Provider-specific diagnostics behind a provider-neutral seam.
  *
- * Core shell execution cannot know whether an arbitrary non-zero CLI process
- * committed remotely. Adapters may narrow that uncertainty only for an
- * authoritative rejection shape whose provider contract guarantees no effect.
- * Unknown providers and unknown messages remain possible/unknown.
+ * Core shell execution cannot know whether any non-zero CLI process committed
+ * remotely. Adapters may classify a useful recovery reason, but their
+ * provider-controlled stdout/stderr can never narrow dispatch or effect.
  */
 import type {
   ShellDispatchState,
@@ -52,10 +51,10 @@ const netlifyAccountPreconditionAdapter: ShellProviderOutcomeAdapter = {
     if (!NETLIFY_ACCOUNT_REJECTION_RE.test(`${input.stdout}\n${input.stderr}`)) return null;
     return {
       phase: 'provider_execution',
-      // The CLI reached Netlify, but Netlify authoritatively rejected the
-      // account/team precondition before creating the site.
-      dispatch: 'acknowledged',
-      effect: 'none',
+      // Diagnostic only. A provider process existed, so even a familiar
+      // account-rejection transcript cannot prove that no create landed.
+      dispatch: 'unknown',
+      effect: 'possible',
       errorKind: 'provider_precondition_rejected',
       adapterId: 'netlify.account_precondition',
     };
@@ -68,10 +67,20 @@ export function classifyShellProviderFailure(input: ShellProviderFailureInput): 
   for (const adapter of adapters) {
     try {
       const evidence = adapter.classifyFailure(input);
-      if (evidence) return evidence;
+      if (evidence) {
+        // Adapters consume provider-controlled output and are therefore
+        // diagnostic only. Normalize even third-party/test adapters at this
+        // trust boundary so none can forge retry-safe no-dispatch evidence.
+        return {
+          phase: 'provider_execution',
+          dispatch: 'unknown',
+          effect: 'possible',
+          errorKind: evidence.errorKind,
+          adapterId: adapter.id,
+        };
+      }
     } catch {
-      // An adapter can only narrow uncertainty. Failure means the generic core
-      // classifier keeps its conservative unknown/possible result.
+      // Adapter failure leaves the generic unknown/possible result intact.
     }
   }
   return null;
