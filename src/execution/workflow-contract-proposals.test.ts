@@ -235,6 +235,29 @@ test('any domain collection declared must-carry-data is evidence-bearing, not ju
   assert.deepEqual(warnings, [], 'a non-empty invoices collection is the evidence payload — no noun list required');
 });
 
+test('an unknown key with only non_empty (no min_items) is NOT collection evidence', () => {
+  // A required non-empty scalar ("vibe": "good") must not satisfy the
+  // evidence requirement — only a declared collection (min_items >= 1) or an
+  // enumerated evidence key does.
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'research_vendors',
+        prompt: 'Research each vendor with live SERP analysis and competitor audit data.',
+        allowedTools: ['dataforseo__serp_organic_live_advanced'],
+        output: {
+          type: 'object',
+          required_keys: ['assessment'],
+          non_empty: ['assessment'],
+        },
+        sideEffect: 'read',
+      },
+    ],
+  }));
+
+  assert.ok(warnings.length >= 1, 'a non_empty scalar alone must still trigger the weak-contract advisory');
+});
+
 test('does not mistake a write that preserves SEO fields for a live-research step', () => {
   const warnings = workflowAuthoringAdvisories(wf({
     steps: [

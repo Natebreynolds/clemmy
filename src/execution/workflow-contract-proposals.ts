@@ -178,19 +178,19 @@ function contractEvidenceKeys(contract: WorkflowStepOutputContract | undefined):
 
 function hasEvidenceKey(contract: WorkflowStepOutputContract | undefined): boolean {
   // A domain collection ({accounts}, {invoices}, {patients}) is an evidence-
-  // bearing payload just like generic rows/records when the author declared it
-  // must carry data (non_empty / min_items ≥ 1). Structural, so it works for
-  // every user's domain instead of an enumerated noun list; identity/metadata
-  // keys stay excluded so a bare non-empty url/date cannot satisfy it.
-  const declaredNonEmpty = new Set<string>([
-    ...(contract?.non_empty ?? []),
-    ...Object.entries(contract?.min_items ?? {})
+  // bearing payload just like generic rows/records — but ONLY when the author
+  // declared it a non-empty COLLECTION (min_items ≥ 1). non_empty alone is not
+  // enough: a required non-empty scalar ("assessment") is prose, not evidence.
+  // Structural, so it works for every user's domain instead of an enumerated
+  // noun list; identity/metadata keys stay excluded.
+  const declaredCollections = new Set<string>(
+    Object.entries(contract?.min_items ?? {})
       .filter(([, minimum]) => minimum >= 1)
       .map(([key]) => key),
-  ]);
+  );
   for (const key of contractEvidenceKeys(contract)) {
     if (EVIDENCE_CONTRACT_KEYS.has(key)) return true;
-    if (key && key !== '.' && declaredNonEmpty.has(key) && !IDENTITY_CONTRACT_KEYS.has(key)) return true;
+    if (key && key !== '.' && declaredCollections.has(key) && !IDENTITY_CONTRACT_KEYS.has(key)) return true;
   }
   return false;
 }
