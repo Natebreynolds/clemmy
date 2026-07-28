@@ -19,7 +19,11 @@ const ERROR_PREFIX_RE = /^\s*ERROR:/i;
 const PARTIAL_PREFIX_RE = /^\s*PARTIAL:/i;
 // The string defaultToolErrorFunction returns when a worker run throws
 // (MaxTurnsExceeded from the turn cap, or any internal tool error).
-const SDK_GENERIC_ERROR_RE = /An error occurred while running the tool/i;
+// This is an envelope classifier, not a substring detector. A batch-level
+// result can honestly contain one failed item's SDK error after a useful
+// "Batch finished with FAILURES: ..." header; collapsing that whole result
+// would erase the successful-item count and failed-item identity.
+const SDK_GENERIC_ERROR_RE = /^\s*An error occurred while running the tool/i;
 
 function extractText(res: unknown): string {
   if (typeof res === 'string') return res;
@@ -29,6 +33,18 @@ function extractText(res: unknown): string {
     for (const key of ['finalOutput', 'rawOutputText', 'finalOutputText', 'output', 'text']) {
       const v = r[key];
       if (typeof v === 'string') return v;
+    }
+    // MCP/SDK tool results commonly wrap their text in content blocks. Extract
+    // that text before the JSON fallback so envelope classification applies to
+    // the actual result, not to a serialization that merely contains it.
+    if (Array.isArray(r.content)) {
+      const blocks = r.content.flatMap((block) => {
+        if (typeof block === 'string') return [block];
+        if (!block || typeof block !== 'object') return [];
+        const text = (block as Record<string, unknown>).text;
+        return typeof text === 'string' ? [text] : [];
+      });
+      if (blocks.length > 0) return blocks.join('\n');
     }
     try {
       return JSON.stringify(res);

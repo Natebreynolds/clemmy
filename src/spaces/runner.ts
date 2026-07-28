@@ -22,6 +22,11 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript,
 } from '../runtime/sandboxed-script.js';
+import {
+  executeWorkflowCallMutation,
+  replayWorkflowCallMutationSlot,
+  type WorkflowCallMutationSlotInput,
+} from '../execution/workflow-call-receipts.js';
 
 // Tunable so a heavy data pull can be given more room without a code change.
 const RUNNER_TIMEOUT_MS = (() => {
@@ -32,8 +37,81 @@ const RUNNER_TIMEOUT_MS = (() => {
 const RUNNER_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 export interface RunSourceOk { ok: true; data: unknown }
-export interface RunSourceErr { ok: false; error: string }
+export interface RunSourceErr {
+  ok: false;
+  error: string;
+  /** Nominal executor proof; never inferred from runner-controlled output. */
+  provenNoDispatch?: true;
+}
 export type RunSourceResult = RunSourceOk | RunSourceErr;
+
+/** Reuse the structured-workflow mutation ledger for approved Workspace
+ * actions. Approval ids are globally unique, and itemKey keeps equal action ids
+ * in different Workspaces in distinct durable slots. */
+export const SPACE_ACTION_MUTATION_WORKFLOW_SLUG = '__clementine-space-actions';
+
+export interface SpaceActionRunOptions {
+  /** Present only after the canonical approval registry resolved this action. */
+  approvalId?: string;
+}
+
+type SpaceComposioDispatch = typeof import('../tools/composio-tools.js').dispatchComposioTool;
+let spaceComposioDispatchForTest: SpaceComposioDispatch | null = null;
+
+/** Focused-test seam at the already-resolved Composio gateway boundary. */
+export function _setSpaceComposioDispatchForTests(
+  dispatch: SpaceComposioDispatch | null,
+): void {
+  spaceComposioDispatchForTest = dispatch;
+}
+
+function spaceActionMutationSlot(
+  slug: string,
+  actionId: string,
+  approvalId: string,
+): WorkflowCallMutationSlotInput {
+  return {
+    workflowSlug: SPACE_ACTION_MUTATION_WORKFLOW_SLUG,
+    runId: approvalId,
+    stepId: actionId,
+    itemKey: slug,
+  };
+}
+
+function replayedRunnerResult(value: unknown): RunSourceResult {
+  if (
+    value
+    && typeof value === 'object'
+    && (value as { ok?: unknown }).ok === true
+    && 'data' in value
+  ) {
+    return value as RunSourceOk;
+  }
+  return {
+    ok: false,
+    error: 'The durable Workspace action receipt was unreadable; the action was NOT dispatched again.',
+  };
+}
+
+/** Recovery probe that never crosses a provider/script boundary. A committed
+ * result must remain replayable even if the Workspace was edited or archived
+ * after dispatch but before its UI outcome was projected. */
+export function replaySpaceActionMutation(
+  slug: string,
+  action: SpaceAction,
+  approvalId: string,
+): { replayed: false } | { replayed: true; result: RunSourceResult } {
+  const replay = replayWorkflowCallMutationSlot(
+    spaceActionMutationSlot(slug, action.id, approvalId),
+  );
+  if (!replay.replayed) return replay;
+  return {
+    replayed: true,
+    result: action.composioSlug
+      ? { ok: true, data: replay.result }
+      : replayedRunnerResult(replay.result),
+  };
+}
 
 /** Run a runner script under the workspace data/ dir and return its parsed JSON
  *  (or an error) WITHOUT persisting. Uses the shared sandboxed-script substrate
@@ -42,17 +120,25 @@ export type RunSourceResult = RunSourceOk | RunSourceErr;
  *  use, so the dry-run is byte-identical to a real pull, minus the write. */
 export async function runScript(slug: string, runner: string, extra?: Record<string, unknown>): Promise<RunSourceResult> {
   const runnerError = runnerFilenameError(runner);
-  if (runnerError) return { ok: false, error: runnerError };
+  if (runnerError) return { ok: false, error: runnerError, provenNoDispatch: true };
   let target: string;
   try {
     target = resolveInSpace(slug, path.join('data', runner));
   } catch (err) {
-    return { ok: false, error: (err as Error).message };
+    return { ok: false, error: (err as Error).message, provenNoDispatch: true };
   }
-  if (!existsSync(target)) return { ok: false, error: `runner script not found: data/${runner}` };
+  if (!existsSync(target)) {
+    return { ok: false, error: `runner script not found: data/${runner}`, provenNoDispatch: true };
+  }
   const augmentedPath = augmentPath(process.env.PATH);
   const interp = interpreterFor(target, augmentedPath);
-  if (!interp) return { ok: false, error: `unsupported runner extension for data/${runner} (use .mjs/.js/.cjs/.ts/.py/.sh or an executable)` };
+  if (!interp) {
+    return {
+      ok: false,
+      error: `unsupported runner extension for data/${runner} (use .mjs/.js/.cjs/.ts/.py/.sh or an executable)`,
+      provenNoDispatch: true,
+    };
+  }
 
   const spaceDir = resolveInSpace(slug, 'data');
   const payload = JSON.stringify({ ...(extra ?? {}), slug, runner });
@@ -64,7 +150,13 @@ export async function runScript(slug: string, runner: string, extra?: Record<str
     command: interp.command, args: interp.args, cwd: spaceDir, env,
     stdinPayload: payload, timeoutMs: RUNNER_TIMEOUT_MS, maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
   });
-  if (outcome.launchError) return { ok: false, error: `runner failed to launch: ${outcome.launchError.message}` };
+  if (outcome.launchError) {
+    return {
+      ok: false,
+      error: `runner failed to launch: ${outcome.launchError.message}`,
+      provenNoDispatch: true,
+    };
+  }
   if (outcome.overflowed) return { ok: false, error: `runner output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes (print a single JSON document to stdout)` };
   if (outcome.timedOut) return { ok: false, error: `runner timed out after ${RUNNER_TIMEOUT_MS}ms` };
   if (outcome.code !== 0) {
@@ -83,9 +175,50 @@ export async function runScript(slug: string, runner: string, extra?: Record<str
  *  resolution, sender constraints, typed blocks). A blocked resolution surfaces
  *  as the source/action error with the gateway's deterministic message, so a
  *  Space can never dispatch under an ambiguous or non-compliant account. */
-async function runSpaceComposio(slug: string, toolSlug: string, args: Record<string, unknown>): Promise<RunSourceResult> {
-  const { dispatchComposioTool } = await import('../tools/composio-tools.js');
-  const outcome = await dispatchComposioTool(toolSlug, args, { sessionId: `space:${slug}` });
+async function runSpaceComposio(
+  slug: string,
+  toolSlug: string,
+  args: Record<string, unknown>,
+  mutationSlot?: WorkflowCallMutationSlotInput,
+): Promise<RunSourceResult> {
+  const {
+    composioDispatchErrorProvesNoCommit,
+    composioFailureProvesNoCommit,
+    detectComposioFailure,
+    dispatchComposioTool,
+  } = await import('../tools/composio-tools.js');
+  const dispatchThroughGateway = spaceComposioDispatchForTest ?? dispatchComposioTool;
+  const outcome = await dispatchThroughGateway(toolSlug, args, {
+    sessionId: `space:${slug}`,
+    ...(mutationSlot
+      ? {
+        dispatchBoundary: (resolved, dispatch) => executeWorkflowCallMutation({
+          ...mutationSlot,
+          tool: resolved.toolSlug,
+          account: {
+            ...(resolved.connectionId ? { connectionId: resolved.connectionId } : {}),
+            ...(resolved.identity ? { identity: resolved.identity } : {}),
+          },
+          args: resolved.args,
+        }, dispatch, {
+          classifyFailure: (result) => {
+            const failure = detectComposioFailure(result);
+            return failure.failed
+              ? {
+                summary: failure.summary || 'provider reported failure',
+                provenNoCommit: composioFailureProvesNoCommit(result),
+              }
+              : null;
+          },
+          classifyThrownFailure: (error) => (
+            composioDispatchErrorProvesNoCommit(error)
+              ? (error instanceof Error ? error.message : String(error))
+              : null
+          ),
+        }),
+      }
+      : {}),
+  });
   if (!outcome.ok) return { ok: false, error: `blocked (${outcome.reason}): ${outcome.message}` };
   return { ok: true, data: outcome.result };
 }
@@ -106,17 +239,50 @@ export async function runSpaceDataSource(slug: string, source: SpaceDataSource):
 }
 
 /** Execute one declared action with caller-supplied args merged over its template. */
-export async function runSpaceAction(slug: string, action: SpaceAction, callerArgs: Record<string, unknown>): Promise<RunSourceResult> {
+export async function runSpaceAction(
+  slug: string,
+  action: SpaceAction,
+  callerArgs: Record<string, unknown>,
+  opts: SpaceActionRunOptions = {},
+): Promise<RunSourceResult> {
   const args = { ...(action.argsTemplate ?? {}), ...(callerArgs ?? {}) };
+  const approvalId = opts.approvalId?.trim() ?? '';
+  const mutationSlot = approvalId
+    ? spaceActionMutationSlot(slug, action.id, approvalId)
+    : undefined;
   if (action.composioSlug && action.composioSlug.trim()) {
     try {
-      return await runSpaceComposio(slug, action.composioSlug.trim(), args);
+      if (mutationSlot) {
+        const replay = replaySpaceActionMutation(slug, action, approvalId);
+        if (replay.replayed) return replay.result;
+      }
+      return await runSpaceComposio(slug, action.composioSlug.trim(), args, mutationSlot);
     } catch (err) {
       return { ok: false, error: `action failed: ${(err as Error).message}` };
     }
   }
   if (action.runner && action.runner.trim()) {
-    return runScript(slug, action.runner.trim(), { args });
+    if (!mutationSlot) return runScript(slug, action.runner.trim(), { args });
+    try {
+      const replay = replaySpaceActionMutation(slug, action, approvalId);
+      if (replay.replayed) return replay.result;
+      return await executeWorkflowCallMutation({
+        ...mutationSlot,
+        tool: `space-runner:${action.runner.trim()}`,
+        args,
+      }, () => runScript(slug, action.runner!.trim(), { args }), {
+        classifyFailure: (result) => (
+          result.ok
+            ? null
+            : {
+              summary: result.error,
+              provenNoCommit: result.provenNoDispatch === true,
+            }
+        ),
+      });
+    } catch (err) {
+      return { ok: false, error: `action failed: ${(err as Error).message}` };
+    }
   }
   return { ok: false, error: `action "${action.id}" declares neither a runner nor a composio_slug` };
 }

@@ -119,3 +119,33 @@ test('runBrackets keys the guard by guardrailScopeId when set (plumbing)', async
     else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
   }
 });
+
+test('run_worker bracket preserves a truthful partial-batch result with an embedded SDK error', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevGuard = process.env.CLEMMY_WORKER_THRASH_GUARD;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_WORKER_THRASH_GUARD = 'on';
+  const batch = [
+    'Batch finished with FAILURES: 23/24 succeeded; FAILED items: account-02. Report these honestly — they were NOT done.',
+    '--- item: account-02 ---',
+    'An error occurred while running the tool. Please try again. Error: CodexModelError: 503 Service Unavailable',
+  ].join('\n');
+  try {
+    const wrapped = wrapToolForHarness({
+      name: 'run_worker',
+      invoke: async () => ({ content: [{ type: 'text', text: batch }] }),
+    } as never) as unknown as {
+      invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+    };
+    assert.equal(
+      await wrapped.invoke(undefined, {}),
+      batch,
+      'the outer bracket must not replace the batch ledger with a generic one-item error',
+    );
+  } finally {
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    if (prevGuard === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+    else process.env.CLEMMY_WORKER_THRASH_GUARD = prevGuard;
+  }
+});

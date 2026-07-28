@@ -41,6 +41,33 @@ test('the SDK generic tool-error string (turn-cap / internal error) → ERROR:',
   assert.match(r, /turn cap|errored internally/i);
 });
 
+test('a partial batch keeps its coverage truth when one item embeds the SDK generic error', () => {
+  const batch = [
+    'Batch finished with FAILURES: 23/24 succeeded; FAILED items: account-02. Report these honestly — they were NOT done.',
+    '--- item: account-01 ---',
+    'account-01 | BASELINE | complete',
+    '--- item: account-02 ---',
+    'An error occurred while running the tool. Please try again. Error: CodexModelError: 503 Service Unavailable',
+  ].join('\n');
+
+  assert.equal(normalizeWorkerOutput(batch), batch, 'an embedded item failure must not erase the batch ledger');
+  assert.equal(
+    normalizeWorkerOutput({ content: [{ type: 'text', text: batch }] }),
+    batch,
+    'the MCP content-block shape seen by wrapToolForHarness must preserve the same batch result',
+  );
+  assert.match(
+    normalizeWorkerOutput({
+      content: [{
+        type: 'text',
+        text: '\n  An error occurred while running the tool. Please try again. Error: Max turns (8) exceeded',
+      }],
+    }),
+    /^ERROR:/,
+    'a genuinely generic MCP-wrapped worker error is still normalized',
+  );
+});
+
 test('extracts from an SDK result object (finalOutput) and classifies it', () => {
   assert.equal(
     normalizeWorkerOutput({ finalOutput: 'Done: created record rec123' }),

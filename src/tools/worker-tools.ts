@@ -554,6 +554,26 @@ export function registerWorkerTools(server: McpServer): void {
           ...(benchFalloverFrom ? { falloverFrom: benchFalloverFrom } : {}),
         },
       });
+      try {
+        // Match the orchestrator/workflow lanes' canonical route evidence. The
+        // release proof separately requires a completed-call usage row, so this
+        // pre-dispatch marker is attribution—not a success claim.
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'worker_model_routed',
+          data: {
+            item: input.item,
+            model: workerModel,
+            effectiveModel: workerModel,
+            provider: workerProvider,
+            transport,
+            lane: 'sdk_brain',
+            source: benchFalloverFrom ? 'fallback' : route.source ?? 'default',
+          },
+        });
+      } catch { /* routing telemetry is best-effort */ }
       // Live-visibility: announce the agent STARTING (the chat/board render it as a
       // running specialist immediately, not only when worker_result lands). Cheap,
       // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).

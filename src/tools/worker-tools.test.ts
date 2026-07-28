@@ -353,6 +353,15 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
 
     assert.equal(dispatches, 3, 'one single item and two batch items executed exactly once each');
     assert.equal(listEvents(sessionId, { types: ['worker_started'] }).length, 3);
+    const routes = listEvents(sessionId, { types: ['worker_model_routed'] });
+    assert.equal(routes.length, 3, 'every real SDK-brain worker emits canonical exact-model route evidence');
+    for (const route of routes) {
+      const data = route.data as { model?: string; effectiveModel?: string; provider?: string; lane?: string };
+      assert.ok(data.model, 'worker route names the model');
+      assert.equal(data.effectiveModel, data.model);
+      assert.ok(data.provider, 'worker route names the explicit provider');
+      assert.equal(data.lane, 'sdk_brain');
+    }
     const results = listEvents(sessionId, { types: ['worker_result'] });
     assert.equal(results.length, 6, 'single + batch no-op reuse remain observable');
     assert.match(String((results[1].data as { reason?: string }).reason), /durable manifest success/i);
