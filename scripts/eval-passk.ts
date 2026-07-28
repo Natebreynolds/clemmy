@@ -29,21 +29,28 @@ const K = Math.max(1, Number(process.env.EVAL_PASSK_K) || 3);
 const STRICT = process.argv.includes('--strict') || (process.env.EVAL_PASSK_STRICT || '').toLowerCase() === 'on';
 const THRESHOLD = Number(process.env.EVAL_PASSK_THRESHOLD) || 0.85;
 
-// Gate traps → EvalCases. A trial PASSES iff gate ON prevents the violation AND
-// gate OFF commits it (the existing scoreTrap contract) — both halves prove the
-// GATE is the cause, deterministically (stub judges, fixed args).
+// Gate traps → EvalCases. Switch-controlled trials require ON to prevent the
+// violation and OFF to commit it. Always-on safety trials require a valid
+// control write to pass and the duplicate to be refused with the adjacent
+// policy both ON and OFF. Both contracts are deterministic (stub judges, fixed
+// args), and no eval ever asks production idempotency to become disableable.
 const cases: EvalCase[] = TRAPS.map((trap) => ({
   id: trap.id,
   label: 'gate',
   run: async () => {
     const s = await scoreTrap(trap);
     if (s.error) return { pass: false, detail: `error: ${s.error}` };
-    const pass = s.prevented && s.committed;
+    const pass = s.passed;
+    const invariant = trap.contract === 'always-on-invariant';
     return {
       pass,
       detail: pass
-        ? `ON prevented (${trap.kind}); OFF committed`
-        : `prevented=${s.prevented} committed=${s.committed} (${trap.kind})`,
+        ? invariant
+          ? `valid control allowed; duplicate blocked with adjacent policy ON and OFF (${trap.kind})`
+          : `ON prevented (${trap.kind}); OFF committed`
+        : invariant
+          ? `controlAllowed=${s.controlAllowed} onBlocked=${s.prevented} offBlocked=${s.offBlocked} (${trap.kind})`
+          : `prevented=${s.prevented} committed=${s.committed} (${trap.kind})`,
     };
   },
 }));

@@ -61,6 +61,7 @@ const {
   runComposioExecuteForTestInSession,
   resetDataQualityForTest,
 } = await import('../tools/composio-tools.js');
+const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { setProactiveReportFireForTest } = await import('../runtime/outcome.js');
 
@@ -212,7 +213,11 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
   try {
     const sid = 'background:bg-journey-j3';
     const deadSource = (async () => ({ data: { items: [] }, error: null, successful: true })) as never;
-    const writeExec = (async () => ({ data: { id: 'appJ3' }, error: null, successful: true })) as never;
+    let writeDispatches = 0;
+    const writeExec = (async () => {
+      writeDispatches += 1;
+      return { data: { id: 'appJ3' }, error: null, successful: true };
+    }) as never;
 
     let advisorySeen = '';
     for (const firm of ['firm-1', 'firm-2', 'firm-3', 'firm-4']) {
@@ -220,13 +225,21 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
     }
     assert.match(advisorySeen, /empty-result advisory/, 'the model was steered before the write');
 
-    const intercepted = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid);
-    assert.match(intercepted, /DATA-QUALITY CHECKPOINT/);
-    assert.match(intercepted, /4\/4 reads returned empty/);
-    assert.match(intercepted, /ask_user_question/, 'the check-in fork is offered');
+    await assert.rejects(
+      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid),
+      (error: unknown) => {
+        assert.ok(error instanceof ExternalWritePreDispatchError);
+        assert.match(error.message, /DATA-QUALITY CHECKPOINT/);
+        assert.match(error.message, /4\/4 reads returned empty/);
+        assert.match(error.message, /ask_user_question/, 'the check-in fork is offered');
+        return true;
+      },
+    );
+    assert.equal(writeDispatches, 0, 'the typed checkpoint proves no provider write started');
 
     // A deliberate second attempt proceeds — autonomy redirected, never dead-ended.
     const proceeded = await runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid);
+    assert.equal(writeDispatches, 1, 'the repaired retry crosses the provider boundary exactly once');
     assert.doesNotMatch(proceeded, /DATA-QUALITY CHECKPOINT/);
     assert.match(proceeded, /appJ3/);
   } finally {

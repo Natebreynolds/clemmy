@@ -10,6 +10,7 @@ process.env.CLEMENTINE_HOME = home;
 const eventlog = await import('./eventlog.js');
 const ledger = await import('./artifact-ledger.js');
 const brackets = await import('./brackets.js');
+const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
 
 beforeEach(() => {
   eventlog.resetEventLog();
@@ -63,7 +64,9 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
     name: 'googledocs__create_document',
     async execute() {
       dispatches += 1;
-      if (mode === 'blocked') return '[provider-dispatch:not-started:invalid-args]\nMissing title';
+      if (mode === 'blocked') {
+        throw new ExternalWritePreDispatchError('Missing title; provider dispatch did not start.');
+      }
       if (mode === 'ambiguous') return 'provider connection closed before a response; creation is unknown';
       return { documentId: 'doc_retry_123456789' };
     },

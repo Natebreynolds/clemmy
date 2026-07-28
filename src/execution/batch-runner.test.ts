@@ -27,6 +27,8 @@ const { validateBatchPlan, prepareBatchPlanForExecution, runBatchPlan, certifyBa
 const { getJudgeChainFallovers, resetJudgeChainFalloversForTests } = await import('../runtime/harness/judge-family.js');
 // eslint-disable-next-line import/first
 const { rememberToolSchema, resetToolSchemaCache } = await import('../tools/composio-schema-cache.js');
+// eslint-disable-next-line import/first
+const { createSession } = await import('../runtime/harness/eventlog.js');
 
 type FakeCall = { name: string; input: unknown };
 const calls: FakeCall[] = [];
@@ -44,6 +46,11 @@ function fakeTool(name: string, impl: (input: Record<string, unknown>) => unknow
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
+  // Write admission is deliberately fail-closed and events are FK-bound to a
+  // real durable session. These fixtures dispatch provider writes directly, so
+  // give them the same session parent the production batch executor always has.
+  createSession({ id: 'sess-batch-test', kind: 'execution' });
+  createSession({ id: 'sess-batch-structured-failure', kind: 'execution' });
 });
 
 test('validateBatchPlan: catches the shapes that must never execute', () => {
@@ -211,6 +218,7 @@ test('runBatchPlan: a structured provider failure counts as FAILED and never ear
   assert.equal(ledger.succeeded, 0);
   assert.equal(ledger.outcomes[0]?.ok, false);
   assert.match(ledger.outcomes[0]?.error ?? '', /upstream rejected/i);
+  assert.equal(calls.length, 1, 'the provider was reached before its structured failure was classified');
 });
 
 test('certifyBatchPlan (J1 kill-switch OFF): judge unreachable → write/send fail CLOSED, read advisory (today\'s behavior)', async () => {
@@ -439,6 +447,7 @@ test('composio items: connected_account_id is ALWAYS present (strict nullable-re
   }, 'sess-batch-test');
   assert.equal(ledger.succeeded, 2, 'both items must dispatch with the full strict key set');
   assert.equal(ledger.failed, 0);
+  assert.equal(calls.length, 2, 'durable admission must not prevent either valid batch item from dispatching');
 
   // Now the classifier: a tool that ALWAYS returns the SDK banner must be an
   // honest failure, never a fake success (the 2026-07-08 "5/5 succeeded" lie).
