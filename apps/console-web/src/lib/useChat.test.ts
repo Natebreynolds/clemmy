@@ -434,6 +434,41 @@ test('idle inbox: a proactive report-back renders; the user\'s own turns never r
   assert.deepEqual(additions[0].taskRef, { id: 'bg-report-1', label: 'background task' });
 });
 
+test('idle inbox: LIVE turn shapes pair — relay completion on a different turn, parked retry question, and user-turn cutoff', async () => {
+  const { inboxAdditionsFromEvents } = await import('./useChat');
+  // Live 2026-07-28: the outcome directive is recorded turn 0; the relay's
+  // completion lands on the session's REAL next turn. Exact turn match fails —
+  // the open-delivery fallback must claim it.
+  const t1 = new Map();
+  const first = inboxAdditionsFromEvents([
+    { seq: 20, turn: 0, type: 'user_input_received', data: { text: '[background task bg-live-1 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-live-1', sourceLabel: 'background task' } },
+    { seq: 21, turn: 1, type: 'conversation_completed', data: { reply: 'Saved color-notes.md — 3 lines, verified.' } },
+  ], t1);
+  assert.equal(first.length, 1);
+  assert.deepEqual(first[0].taskRef, { id: 'bg-live-1', label: 'background task' });
+
+  // A relay that parks on a transient ("should I retry?") must SURFACE, tagged
+  // with the delivery it belongs to — live it was silently dropped (turn 2).
+  const t2 = new Map();
+  const parked = inboxAdditionsFromEvents([
+    { seq: 30, turn: 0, type: 'user_input_received', data: { text: '[background task bg-live-2 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-live-2' } },
+    { seq: 31, turn: 2, type: 'awaiting_user_input', data: { question: 'The model backend hit a transient error. Retry?' } },
+  ], t2);
+  assert.equal(parked.length, 1);
+  assert.equal(parked[0].status, 'awaiting-reply');
+  assert.equal(parked[0].taskRef?.id, 'bg-live-2');
+
+  // A REAL user turn after the delivery closes it: later completions belong to
+  // the user's own conversation and must not render as report-backs.
+  const t3 = new Map();
+  const cutoff = inboxAdditionsFromEvents([
+    { seq: 40, turn: 0, type: 'user_input_received', data: { text: '[background task bg-live-3 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-live-3' } },
+    { seq: 41, turn: 5, type: 'user_input_received', data: { text: 'unrelated new question from the user' } },
+    { seq: 42, turn: 5, type: 'conversation_completed', data: { reply: 'Answer to the unrelated question.' } },
+  ], t3);
+  assert.equal(cutoff.length, 0);
+});
+
 test('idle inbox: approval cards and blocking questions surface; pairing survives batch splits', async () => {
   const { inboxAdditionsFromEvents } = await import('./useChat');
   const syntheticTurns = new Map<number, { sourceId?: string; sourceLabel?: string }>();

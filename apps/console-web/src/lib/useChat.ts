@@ -487,7 +487,7 @@ export function useChat(options?: UseChatOptions) {
   // only advances, so nothing renders twice. Busy turns pause the poll — the
   // run's own stream owns the conversation then.
   const inboxSeqRef = useRef(0);
-  const inboxSyntheticTurnsRef = useRef(new Map<number, { sourceId?: string; sourceLabel?: string }>());
+  const inboxSyntheticTurnsRef = useRef(new Map<number, { sourceId?: string; sourceLabel?: string; open?: boolean; seq?: number }>());
   useEffect(() => {
     if (busy) return;
     let stopped = false;
@@ -807,7 +807,7 @@ export function useChat(options?: UseChatOptions) {
  *  survives batch splits. Exported for tests. */
 export function inboxAdditionsFromEvents(
   events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }>,
-  syntheticTurns: Map<number, { sourceId?: string; sourceLabel?: string }>,
+  syntheticTurns: Map<number, { sourceId?: string; sourceLabel?: string; open?: boolean; seq?: number }>,
 ): ChatMessage[] {
   for (const ev of events) {
     const d = ev.data ?? {};
@@ -817,22 +817,42 @@ export function inboxAdditionsFromEvents(
       syntheticTurns.set(ev.turn, {
         sourceId: typeof d.sourceId === 'string' ? d.sourceId : undefined,
         sourceLabel: typeof d.sourceLabel === 'string' ? d.sourceLabel : undefined,
+        open: true,
+        seq: ev.seq,
       });
+    } else if (ev.type === 'user_input_received' && d.synthetic !== true) {
+      // A REAL user turn ends any pending outcome relay that PRECEDED it —
+      // later completions belong to the user's own conversation.
+      for (const entry of syntheticTurns.values()) {
+        if ((entry.seq ?? 0) < ev.seq) entry.open = false;
+      }
     }
   }
-  const taskRefFor = (turn: number): ChatMessage['taskRef'] => {
-    const src = syntheticTurns.get(turn);
-    return src?.sourceId ? { id: src.sourceId, label: src.sourceLabel } : undefined;
+  // Live turn numbers do NOT reliably pair: the outcome directive is recorded
+  // at turn 0 while the relay's completion lands on the session's real next
+  // turn (observed live 2026-07-28). Exact turn match is the fast path; the
+  // fallback claims an open synthetic delivery that PRECEDED this event —
+  // consumed on use so one relay can never label two messages.
+  const openBefore = (seq: number) =>
+    [...syntheticTurns.values()].find((entry) => entry.open && (entry.seq ?? 0) < seq);
+  const claimRef = (turn: number, seq: number): ChatMessage['taskRef'] => {
+    const exact = syntheticTurns.get(turn);
+    const entry = exact?.open ? exact : openBefore(seq);
+    if (!entry) return undefined;
+    entry.open = false;
+    return entry.sourceId ? { id: entry.sourceId, label: entry.sourceLabel } : undefined;
   };
+  const hasOpenDelivery = (turn: number, seq: number): boolean =>
+    Boolean(syntheticTurns.get(turn)?.open) || Boolean(openBefore(seq));
   const additions: ChatMessage[] = [];
   for (const ev of events) {
     const d = ev.data ?? {};
-    if (ev.type === 'conversation_completed' && syntheticTurns.has(ev.turn)) {
+    if (ev.type === 'conversation_completed' && (syntheticTurns.has(ev.turn) || hasOpenDelivery(ev.turn, ev.seq))) {
       const text = humanHarnessText((d.reply ?? d.summary) as string | undefined, '');
-      if (text) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text, status: 'complete', taskRef: taskRefFor(ev.turn) });
-    } else if (ev.type === 'awaiting_user_input' && syntheticTurns.has(ev.turn)) {
+      if (text) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text, status: 'complete', taskRef: claimRef(ev.turn, ev.seq) });
+    } else if (ev.type === 'awaiting_user_input' && (syntheticTurns.has(ev.turn) || hasOpenDelivery(ev.turn, ev.seq))) {
       const q = typeof d.question === 'string' ? d.question : '';
-      if (q) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text: q, status: 'awaiting-reply', taskRef: taskRefFor(ev.turn) });
+      if (q) additions.push({ id: `inbox-${ev.seq}`, role: 'assistant', text: q, status: 'awaiting-reply', taskRef: claimRef(ev.turn, ev.seq) });
     } else if (ev.type === 'approval_requested') {
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
       additions.push({
