@@ -44,13 +44,25 @@ test('space_save creates a workspace, installs the view, returns the URL', async
   mkdirSync(path.dirname(draft), { recursive: true });
   writeFileSync(draft, '<html><body>CRM v1</body></html>', 'utf-8');
 
-  const res = await tools.space_save({ slug: 'crm', title: 'CRM Board', view_path: draft });
+  const res = await tools.space_save({
+    slug: 'crm',
+    title: 'CRM Board',
+    objective: 'Keep the sales team focused on the deals that need action.',
+    success_criteria: ['Every risky deal has a current next step'],
+    invariants: ['Never update the CRM without approval'],
+    view_path: draft,
+  });
   const out = text(res);
   assert.match(out, /Created workspace "CRM Board"/);
   assert.match(out, /\/workspaces\/crm/);
 
   const rec = store.spaceStore.get('crm');
   assert.equal(rec?.title, 'CRM Board');
+  assert.deepEqual(rec?.contract, {
+    objective: 'Keep the sales team focused on the deals that need action.',
+    successCriteria: ['Every risky deal has a current next step'],
+    invariants: ['Never update the CRM without approval'],
+  });
   const canonical = store.resolveInSpace('crm', 'view/index.html');
   assert.ok(existsSync(canonical));
   assert.match(readFileSync(canonical, 'utf-8'), /CRM v1/);
@@ -69,6 +81,11 @@ test('space_save updates in place + snapshots the prior view (revert path)', asy
   const rec = store.spaceStore.get('crm');
   assert.equal(rec?.version, 2);
   assert.equal(rec?.revisions.length, 1);
+  assert.equal(
+    rec?.contract?.objective,
+    'Keep the sales team focused on the deals that need action.',
+    'later saves preserve an omitted contract',
+  );
   // canonical now holds v2; the snapshot holds v1.
   assert.match(readFileSync(store.resolveInSpace('crm', 'view/index.html'), 'utf-8'), /CRM v2/);
   assert.match(readFileSync(store.resolveInSpace('crm', rec!.revisions[0].file), 'utf-8'), /CRM v1/);
@@ -302,6 +319,9 @@ test('space_list + space_get read back', async () => {
   const got = text(await tools.space_get({ slug: 'crm' }));
   assert.match(got, /Workspace "CRM Board"/);
   assert.match(got, /v2/);
+  assert.match(got, /Objective: Keep the sales team focused/);
+  assert.match(got, /Success criteria:.*Every risky deal/);
+  assert.match(got, /Invariants:.*Never update the CRM/);
 });
 
 test('space_edit_view applies a targeted change + bumps version + snapshots', async () => {

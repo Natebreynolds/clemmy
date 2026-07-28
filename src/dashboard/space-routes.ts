@@ -16,6 +16,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from 'no
 import path from 'node:path';
 import {
   spaceStore, resolveInSpace, resolveSpaceDir, isValidSpaceSlug, buildSpaceHealthSnapshot,
+  mergeSpaceContract,
 } from '../spaces/store.js';
 import {
   readData, writeData, appendNote, listNotes, appendAudit, listAudit,
@@ -181,10 +182,18 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const title = typeof req.body?.title === 'string' && req.body.title.trim() ? req.body.title.trim() : 'New workspace';
     const slug = typeof req.body?.slug === 'string' && isValidSpaceSlug(req.body.slug) ? req.body.slug : slugify(title);
     if (spaceStore.get(slug)) { res.status(409).json({ error: 'slug already exists' }); return; }
+    const contract = mergeSpaceContract(undefined, {
+      objective: req.body?.objective,
+      successCriteria: req.body?.successCriteria ?? req.body?.success_criteria,
+      invariants: req.body?.invariants,
+    });
     const canonical = resolveInSpace(slug, 'view/index.html');
     mkdirSync(path.dirname(canonical), { recursive: true });
     writeFileSync(canonical, PLACEHOLDER_VIEW(title), 'utf-8');
-    const rec = spaceStore.save({ id: slug, title, viewEntry: 'view/index.html' });
+    const rec = spaceStore.save({
+      id: slug, title, viewEntry: 'view/index.html',
+      ...(contract ? { contract } : {}),
+    });
     res.status(201).json({ space: rec });
   });
 
@@ -219,6 +228,19 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (typeof req.body?.title === 'string') patch.title = req.body.title.trim().slice(0, 200);
     if (req.body?.status === 'active' || req.body?.status === 'paused' || req.body?.status === 'archived') {
       patch.status = req.body.status;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'objective')
+      || Object.prototype.hasOwnProperty.call(req.body ?? {}, 'successCriteria')
+      || Object.prototype.hasOwnProperty.call(req.body ?? {}, 'success_criteria')
+      || Object.prototype.hasOwnProperty.call(req.body ?? {}, 'invariants')
+    ) {
+      const contract = mergeSpaceContract(rec.contract, {
+        objective: req.body?.objective,
+        successCriteria: req.body?.successCriteria ?? req.body?.success_criteria,
+        invariants: req.body?.invariants,
+      });
+      if (contract) patch.contract = contract;
     }
     const updated = spaceStore.update(slug, patch);
     res.json({ space: updated });

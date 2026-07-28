@@ -5,7 +5,8 @@ import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
 import { resolveHotSet } from '../../agents/tool-catalog.js';
 import {
-  buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_TOOLS,
+  buildWorkspaceContextPrimer, workspaceSlugFromSessionId,
+  WORKSPACE_DOCK_HOT_TOOLS, WORKSPACE_DOCK_TOOLS,
 } from '../../spaces/workspace-context.js';
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
@@ -1492,10 +1493,13 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       const hot = resolveHotSet(sessionId, jitQuery, {
         allowedNames: new Set(advertisedUniverse),
       });
-      // A dock chat IS editing a Workspace. Keep its structural workspace
-      // controls first-class; every other allowed tool remains native-searchable.
+      // A dock chat IS editing a Workspace. Keep only its common read/targeted-
+      // edit kernel first-class; every runner/publish/revert/save schema remains
+      // same-turn reachable through tool_search → call_tool. Pinning the entire
+      // feature group here defeated schema-on-demand specifically in Workspace
+      // chats—the surface where the prompt is already carrying a living brief.
       if (isSpaceSession) {
-        for (const toolName of WORKSPACE_DOCK_TOOLS) {
+        for (const toolName of WORKSPACE_DOCK_HOT_TOOLS) {
           if (advertisedUniverse.includes(toolName)) hot.add(toolName);
         }
       }

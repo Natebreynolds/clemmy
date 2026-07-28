@@ -67,7 +67,10 @@ export function CreateWorkspaceModal({
     setCreating(true);
     setError(null);
     try {
-      const space = await createSpace(deriveTitle(title, description));
+      // Persist the user's north star before the first model turn. The same
+      // description still seeds the dock so Clem can build immediately, but it
+      // can no longer disappear if the turn compacts, fails, or changes brains.
+      const space = await createSpace(deriveTitle(title, description), description);
       onCreated(space.id, description.trim() || undefined);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not create a workspace.');

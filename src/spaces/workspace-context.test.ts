@@ -14,7 +14,10 @@ import path from 'node:path';
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-wsctx-test-'));
 
 const store = await import('./store.js');
-const { buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_TOOLS } = await import('./workspace-context.js');
+const {
+  buildWorkspaceContextPrimer, workspaceSlugFromSessionId,
+  WORKSPACE_DOCK_HOT_TOOLS, WORKSPACE_DOCK_TOOLS,
+} = await import('./workspace-context.js');
 const sdk = await import('../runtime/harness/claude-agent-sdk.js');
 
 test('workspaceSlugFromSessionId parses "space-<slug>" sessions only', () => {
@@ -26,10 +29,23 @@ test('workspaceSlugFromSessionId parses "space-<slug>" sessions only', () => {
 });
 
 test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a sandbox)', () => {
-  store.spaceStore.save({ id: 'deal-risk', title: 'Deal Risk', actions: [], dataSources: [{ id: 'deals', runner: 'r.mjs' }] });
+  store.spaceStore.save({
+    id: 'deal-risk',
+    title: 'Deal Risk',
+    contract: {
+      objective: 'Help the sales manager act on risky deals before the close date slips.',
+      successCriteria: ['Every open deal shows a current risk signal and next step.'],
+      invariants: ['Salesforce remains read-only.'],
+    },
+    actions: [],
+    dataSources: [{ id: 'deals', runner: 'r.mjs' }],
+  });
   const primer = buildWorkspaceContextPrimer('deal-risk');
   assert.ok(primer);
   assert.match(primer!, /Deal Risk/);
+  assert.match(primer!, /Help the sales manager act on risky deals/);
+  assert.match(primer!, /Every open deal shows a current risk signal/);
+  assert.match(primer!, /Salesforce remains read-only/);
   assert.match(primer!, /space_edit_view\('deal-risk'/);
   assert.match(primer!, /space_refresh\('deal-risk'/);
   assert.match(primer!, /NEVER write the workspace HTML to a sandbox/i);
@@ -42,6 +58,12 @@ test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a s
   // The DATA line names the dry-run (space_try_runner) so the model tests a runner
   // inside the surface instead of `node data/x.mjs` in the shell.
   assert.match(primer!, /space_try_runner\('deal-risk'/);
+  // Schema-on-demand is capability-preserving: an omitted first-class schema
+  // must trigger acquisition, never the old generic "capability missing; stop".
+  assert.match(primer!, /tool_search then call_tool/);
+  assert.doesNotMatch(primer!, /tool you need is unavailable.*stop/i);
+  // Keep the always-injected guide small enough to let the model drive.
+  assert.ok(primer!.length < 2_400, `workspace primer grew to ${primer!.length} chars`);
 });
 
 test('buildWorkspaceContextPrimer is null for a missing workspace', () => {
@@ -54,6 +76,12 @@ test('WORKSPACE_DOCK_TOOLS lists the tools a dock turn needs to edit', () => {
     'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
     'space_publish',
   ]);
+});
+
+test('WORKSPACE_DOCK_HOT_TOOLS is a strict common-operation subset', () => {
+  assert.deepEqual([...WORKSPACE_DOCK_HOT_TOOLS], ['space_get', 'space_get_view', 'space_edit_view']);
+  assert.ok(WORKSPACE_DOCK_HOT_TOOLS.every((name) => WORKSPACE_DOCK_TOOLS.includes(name)));
+  assert.ok(WORKSPACE_DOCK_HOT_TOOLS.length < WORKSPACE_DOCK_TOOLS.length);
 });
 
 test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () => {

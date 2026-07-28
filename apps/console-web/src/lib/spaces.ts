@@ -22,6 +22,11 @@ export interface SpaceAction {
   confirm?: boolean;
 }
 export interface SpaceRevision { version: number; ts: string; bytes: number; file: string }
+export interface SpaceContract {
+  objective: string;
+  successCriteria: string[];
+  invariants: string[];
+}
 export type SpaceStatus = 'active' | 'paused' | 'archived';
 export type SpaceFreshnessState = 'no_sources' | 'fresh' | 'stale' | 'never_refreshed';
 export interface SpaceRunnerHealth {
@@ -62,6 +67,7 @@ export interface SpaceRecord {
   id: string;
   title: string;
   status: SpaceStatus;
+  contract?: SpaceContract;
   viewEntry: string;
   dataSources: SpaceDataSource[];
   actions: SpaceAction[];
@@ -95,10 +101,22 @@ export const listSpaces = () =>
 export const getSpace = (id: string) =>
   apiGet<SpaceDetail>(`/api/console/spaces/${encodeURIComponent(id)}`);
 
-export const createSpace = (title: string) =>
-  apiPost<{ space: SpaceRecord }>('/api/console/spaces', { title }).then((r) => r.space);
+export const createSpace = (title: string, objective?: string) =>
+  apiPost<{ space: SpaceRecord }>('/api/console/spaces', {
+    title,
+    ...(objective?.trim() ? { objective: objective.trim() } : {}),
+  }).then((r) => r.space);
 
-export const patchSpace = (id: string, patch: { title?: string; status?: SpaceStatus }) =>
+export const patchSpace = (
+  id: string,
+  patch: {
+    title?: string;
+    status?: SpaceStatus;
+    objective?: string;
+    successCriteria?: string[];
+    invariants?: string[];
+  },
+) =>
   apiPatch<{ space: SpaceRecord }>(`/api/console/spaces/${encodeURIComponent(id)}`, patch).then((r) => r.space);
 
 export const archiveSpace = (id: string) =>

@@ -102,12 +102,26 @@ export interface SpaceRevision {
   file: string;
 }
 
+/**
+ * The Workspace's durable north star. Unlike a transient chat plan, this lives
+ * with the surface and survives compaction, brain changes, scheduled refreshes,
+ * and later edits. It is deliberately small: the model owns the implementation;
+ * the harness only preserves what "good" means and what must not drift.
+ */
+export interface SpaceContract {
+  objective: string;
+  successCriteria: string[];
+  invariants: string[];
+}
+
 export type SpaceStatus = 'active' | 'paused' | 'archived';
 
 export interface SpaceRecord {
   id: string;
   title: string;
   status: SpaceStatus;
+  /** Living objective/spec for this long-lived collaboration surface. */
+  contract?: SpaceContract;
   /** Relative to the Space dir; the served entry point. */
   viewEntry: string;
   dataSources: SpaceDataSource[];
@@ -212,6 +226,72 @@ function asStr(v: unknown): string | undefined { return typeof v === 'string' &&
 function asObj(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
 }
+
+const CONTRACT_OBJECTIVE_MAX_CHARS = 1_200;
+const CONTRACT_LIST_MAX_ITEMS = 12;
+const CONTRACT_ITEM_MAX_CHARS = 500;
+
+function contractText(v: unknown, maxChars: number): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const text = v.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+  return text || undefined;
+}
+
+function contractList(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of v) {
+    const text = contractText(raw, CONTRACT_ITEM_MAX_CHARS);
+    if (!text) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= CONTRACT_LIST_MAX_ITEMS) break;
+  }
+  return out;
+}
+
+/**
+ * Merge a partial contract without inventing requirements. `undefined`/`null`
+ * preserves the prior field; an explicit [] clears a list. A contract only
+ * exists when it has a real objective, so legacy/blank Workspaces stay valid.
+ */
+export function mergeSpaceContract(
+  current: SpaceContract | undefined,
+  patch: {
+    objective?: unknown;
+    successCriteria?: unknown;
+    invariants?: unknown;
+  },
+): SpaceContract | undefined {
+  const objective = patch.objective == null
+    ? current?.objective
+    : contractText(patch.objective, CONTRACT_OBJECTIVE_MAX_CHARS);
+  if (!objective) return current;
+  const successCriteria = patch.successCriteria == null
+    ? [...(current?.successCriteria ?? [])]
+    : (contractList(patch.successCriteria) ?? [...(current?.successCriteria ?? [])]);
+  const invariants = patch.invariants == null
+    ? [...(current?.invariants ?? [])]
+    : (contractList(patch.invariants) ?? [...(current?.invariants ?? [])]);
+  return { objective, successCriteria, invariants };
+}
+
+function normalizeContract(m: Record<string, unknown>): SpaceContract | undefined {
+  const nested = asObj(m.contract);
+  return mergeSpaceContract(undefined, {
+    objective: nested?.objective ?? m.objective,
+    successCriteria:
+      nested?.successCriteria
+      ?? nested?.success_criteria
+      ?? m.successCriteria
+      ?? m.success_criteria,
+    invariants: nested?.invariants ?? nested?.guardrails ?? m.invariants ?? m.guardrails,
+  });
+}
+
 function parseJsonObjField(
   v: unknown,
   label: string,
@@ -308,6 +388,7 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
     id: slug,
     title: asStr(m.title) ?? slug,
     status,
+    contract: normalizeContract(m),
     viewEntry: asStr(m.viewEntry) ?? 'view/index.html',
     dataSources: Array.isArray(m.dataSources) ? m.dataSources.map((src, index) => normDataSource(src, manifestErrors, index)) : [],
     actions: Array.isArray(m.actions) ? m.actions.map((act, index) => normAction(act, manifestErrors, index)) : [],
@@ -509,6 +590,7 @@ export interface SaveSpaceInput {
   id: string;
   title: string;
   status?: SpaceStatus;
+  contract?: SpaceContract;
   viewEntry?: string;
   dataSources?: SpaceDataSource[];
   actions?: SpaceAction[];
@@ -569,6 +651,7 @@ export class SpaceStore {
       id: input.id,
       title: input.title.trim().slice(0, 200) || input.id,
       status: input.status ?? existing?.status ?? 'active',
+      contract: input.contract ?? existing?.contract,
       viewEntry: input.viewEntry ?? existing?.viewEntry ?? 'view/index.html',
       dataSources: input.dataSources ?? existing?.dataSources ?? [],
       actions: input.actions ?? existing?.actions ?? [],

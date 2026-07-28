@@ -27,6 +27,16 @@ export const WORKSPACE_DOCK_TOOLS = [
 ] as const;
 
 /**
+ * Common dock operations worth a first-class schema on schema-on-demand lanes.
+ * Every WORKSPACE_DOCK_TOOL remains callable through tool_search → call_tool;
+ * keeping this kernel small prevents a Workspace conversation from paying for
+ * every runner/publish/revert schema before it needs one.
+ */
+export const WORKSPACE_DOCK_HOT_TOOLS = [
+  'space_get', 'space_get_view', 'space_edit_view',
+] as const satisfies readonly (typeof WORKSPACE_DOCK_TOOLS)[number][];
+
+/**
  * Build the workspace-context primer for a slug, or null when no such Workspace.
  */
 export function buildWorkspaceContextPrimer(slug: string): string | null {
@@ -34,12 +44,22 @@ export function buildWorkspaceContextPrimer(slug: string): string | null {
   if (!rec) return null;
   const ds = rec.dataSources.map((d) => d.id).join(', ') || 'none';
   const acts = rec.actions.map((a) => a.label ?? a.id).join(', ') || 'none';
+  const contract = rec.contract
+    ? [
+      `Objective: ${rec.contract.objective}`,
+      ...(rec.contract.successCriteria.length > 0
+        ? [`Done when: ${rec.contract.successCriteria.map((item) => `• ${item}`).join(' ')}`]
+        : []),
+      ...(rec.contract.invariants.length > 0
+        ? [`Never drift: ${rec.contract.invariants.map((item) => `• ${item}`).join(' ')}`]
+        : []),
+    ].join('\n')
+    : 'Objective: not pinned yet. Infer it from the conversation; when the user commits to the purpose, persist it with space_save instead of inventing requirements.';
   return [
-    `[workspace-context] You are working inside the user's "${rec.title}" Workspace (slug: ${slug}) — a live interactive surface you built and maintain. This is a CONVERSATION about the user's Workspace, not a background job: talk like a colleague. NEVER show file paths, "/tmp/..." files, "Evidence produced", or "verified artifact" — those are internal plumbing, not for the user.`,
-    `It has: a view at ~/.clementine-next/spaces/${slug}/view/index.html (served at /console/spaces/${slug}/view); data source(s): ${ds}; action(s): ${acts}.`,
-    `CHANGE THE DATA (better/different rows, a tighter filter, fewer/more fields, or the data SOURCE a runner pulls from — e.g. "read email from Salesforce not Composio"): FIRST READ THE RUNNER — call space_get_runner('${slug}') to see which runner backs each source/action + its real data source (the connector/query it actually uses), then space_get_runner('${slug}', '<runner>') to read that runner's exact line-numbered source. For a TARGETED change (a query, field, filter, connector) use space_edit_runner('${slug}', '<runner>', [{find, replace}]) — copy the find VERBATIM from space_get_runner; it snapshots a revert, re-pulls, and reports the new rows. For a brand-NEW runner or a from-scratch rewrite, write_file the runner then space_try_runner('${slug}', '<runner>') to dry-run it (no persist) and space_refresh('${slug}') to land it. For a one-row fix you already have in hand, space_set_data('${slug}', '<source_id>', '<json>'). NEVER ls/read_file/grep the runner from the shell, write the dataset to /tmp, or run \`node data/x.mjs\` — space_get_runner IS how you read a runner; space_edit_runner / space_try_runner is how you change it. The open Workspace auto-refreshes, so never tell the user to refresh.`,
-    `CHANGE THE VIEW (layout, copy, a button, a color): ALWAYS use space_edit_view('${slug}', [{find, replace}]) — call space_get_view('${slug}', '<nearby text>') first to read the exact current lines (it returns the view HTML; space_get does NOT), then pass ONLY the snippet that changes. Never read_file/grep the view from the shell — space_get_view IS how you read it. Reserve write_file + space_save for a brand-new view, a from-scratch rewrite, or changing which data sources/actions exist. NEVER write the workspace HTML to a sandbox or scratch file — it only lands via space_edit_view / space_save.`,
-    `REPLY STYLE: lead with what the user asked for and what you did about it, in plain business language — no field names, slugs, file paths, or step-by-step narration. ALWAYS state the new outcome clearly, e.g. "I added a close-date filter and pulled richer per-deal context — the board now filters by month." A sentence or two, then ask any clarifier. Never reply just "done", and never reply with an evidence/blocker dump.`,
-    `IF A SPACE TOOL YOU NEED IS UNAVAILABLE this turn (e.g. space_save / space_refresh): say in ONE plain sentence which capability is missing and stop — do NOT work around it by writing JSON to /tmp or pasting file paths and blockers.`,
+    `[workspace-context] Live Workspace: "${rec.title}" (slug: ${slug}). This is an ongoing collaboration about the surface, not a one-shot background job. Current sources: ${ds}. Current actions: ${acts}.`,
+    `[workspace-contract — user-owned outcome, not a rigid procedure]\n${contract}\nPreserve this north star across view, data, actions, fan-out, and later edits. The model chooses the method; ask only when a material product choice is genuinely unresolved.`,
+    `Operate through Workspace tools, never shell/file-system paths. NEVER write the Workspace HTML to a sandbox or scratch copy. Read manifest/data with space_get('${slug}'). For a view change, read the exact region with space_get_view('${slug}', '<nearby text>') then make a targeted space_edit_view('${slug}', [{find, replace}]). For a data/query change, inspect with space_get_runner('${slug}') and edit the exact runner with space_edit_runner; dry-run/refresh with space_try_runner('${slug}', '<runner>') and space_refresh('${slug}'). Use write_file + space_save only for a new/full rewrite or contract/source/action changes.`,
+    `Ground completion in the real tool result: a saved view is not proof that a data pull worked, and an empty/failed pull is not success. Workspace edits are versioned and reversible. If a schema is deferred, use tool_search then call_tool; report a missing capability only after that real dispatch says it is unavailable.`,
+    `Reply like a colleague: lead with the user-visible outcome, then any honest blocker or open product choice. Keep slugs, file paths, evidence plumbing, and step narration internal. Never answer only "done", and never tell the user to refresh—the open surface updates itself.`,
   ].join('\n\n');
 }

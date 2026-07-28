@@ -37,7 +37,16 @@ test('resolveInSpace rejects traversal out of the space dir', () => {
 });
 
 test('save creates a manifest; get + list read it back; idempotent update', () => {
-  const created = store.spaceStore.save({ id: 'demo', title: 'Demo Board', originSessionId: 'sess-1' });
+  const created = store.spaceStore.save({
+    id: 'demo',
+    title: 'Demo Board',
+    originSessionId: 'sess-1',
+    contract: {
+      objective: 'Keep the team focused on deals that need action.',
+      successCriteria: ['Every risky deal has an owner and next step.'],
+      invariants: ['Never mutate the CRM without approval.'],
+    },
+  });
   assert.equal(created.id, 'demo');
   assert.equal(created.status, 'active');
   assert.equal(created.viewEntry, 'view/index.html');
@@ -46,14 +55,56 @@ test('save creates a manifest; get + list read it back; idempotent update', () =
   const got = store.spaceStore.get('demo');
   assert.equal(got?.title, 'Demo Board');
   assert.equal(got?.originSessionId, 'sess-1');
+  assert.deepEqual(got?.contract, created.contract);
 
   // Update preserves id/createdAt, bumps updatedAt, keeps it a single record.
   const updated = store.spaceStore.save({ id: 'demo', title: 'Demo Board v2' });
   assert.equal(updated.title, 'Demo Board v2');
   assert.equal(updated.createdAt, created.createdAt);
+  assert.deepEqual(updated.contract, created.contract, 'metadata-only saves preserve the operating contract');
 
   const list = store.spaceStore.list();
   assert.equal(list.filter((s) => s.id === 'demo').length, 1);
+});
+
+test('mergeSpaceContract is bounded, deduplicated, and supports explicit list clearing', () => {
+  const initial = store.mergeSpaceContract(undefined, {
+    objective: '  Keep   the content calendar ready for approval.  ',
+    successCriteria: ['Drafts have sources', 'drafts have sources', 'Approved posts are scheduled'],
+    invariants: ['Never publish without approval'],
+  });
+  assert.deepEqual(initial, {
+    objective: 'Keep the content calendar ready for approval.',
+    successCriteria: ['Drafts have sources', 'Approved posts are scheduled'],
+    invariants: ['Never publish without approval'],
+  });
+  const revised = store.mergeSpaceContract(initial, {
+    successCriteria: [],
+    invariants: undefined,
+  });
+  assert.deepEqual(revised?.successCriteria, []);
+  assert.deepEqual(revised?.invariants, ['Never publish without approval']);
+  assert.equal(revised?.objective, initial?.objective);
+});
+
+test('hand-written manifests accept canonical and snake-case contract fields', () => {
+  const slug = 'contract-manifest';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Contract Manifest',
+    contract: {
+      objective: 'Keep the weekly report decision-ready.',
+      success_criteria: ['All figures cite the refreshed source'],
+      guardrails: ['Never replace a real value with a placeholder'],
+    },
+  }), 'utf-8');
+  assert.deepEqual(store.spaceStore.get(slug)?.contract, {
+    objective: 'Keep the weekly report decision-ready.',
+    successCriteria: ['All figures cite the refreshed source'],
+    invariants: ['Never replace a real value with a placeholder'],
+  });
 });
 
 test('recordRevision snapshots the view + bumps version', () => {

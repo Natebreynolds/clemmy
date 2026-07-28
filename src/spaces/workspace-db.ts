@@ -194,6 +194,7 @@ function upsertWorkspace(db: Database.Database, record: SpaceRecord, rootDir: st
     focusId: record.focusId ?? null,
     recipeJson: record.recipe ? JSON.stringify({ text: record.recipe }) : null,
     metadataJson: JSON.stringify({
+      contract: record.contract,
       reengage: record.reengage,
       manifestErrors: record.manifestErrors,
       version: record.version,

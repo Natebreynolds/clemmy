@@ -1158,6 +1158,34 @@ test('full mode: schema-on-demand loads a bounded hot set without pruning permis
   assert.equal(scope?.data.reason, 'schema-on-demand-dispatch');
 });
 
+test('Workspace dock: schema-on-demand loads the common edit kernel and defers specialized schemas', async () => {
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.AUTH_MODE = 'claude_oauth';
+  const { spaceStore } = await import('../../spaces/store.js');
+  spaceStore.save({ id: 'schema-lean-space', title: 'Schema Lean Space' });
+  let captured: any;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured = options;
+    return { text: 'The workspace is ready.', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [], usage: { input_tokens: 1, output_tokens: 1 } };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Can we make this easier to scan?',
+    sessionId: 'space-schema-lean-space',
+  });
+
+  for (const common of ['space_get', 'space_get_view', 'space_edit_view']) {
+    assert.ok(captured.mcpToolAllowlist.includes(common), `${common} stays first-class in a dock`);
+  }
+  for (const specialized of ['space_get_runner', 'space_edit_runner', 'space_try_runner', 'space_publish', 'space_save']) {
+    assert.ok(captured.allowedLocalMcpTools.includes(specialized), `${specialized} remains permitted`);
+    assert.ok(captured.localMcpToolUniverse.includes(specialized), `${specialized} remains call_tool-reachable`);
+    assert.equal(captured.mcpToolAllowlist.includes(specialized), false, `${specialized} schema is deferred until needed`);
+  }
+});
+
 test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

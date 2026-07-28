@@ -42,10 +42,22 @@ const j = async (res: Response) => ({ status: res.status, body: await res.json()
 
 test('POST creates a workspace with a placeholder view; GET list shows it', async () => {
   const c = await j(await fetch(`${base}/api/console/spaces`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Test Board' }),
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      title: 'Test Board',
+      objective: 'Keep the test pipeline decision-ready.',
+      successCriteria: ['Every row is sourced'],
+      invariants: ['Never send automatically'],
+    }),
   }));
   assert.equal(c.status, 201);
   assert.ok(c.body.space.id);
+  assert.deepEqual(c.body.space.contract, {
+    objective: 'Keep the test pipeline decision-ready.',
+    successCriteria: ['Every row is sourced'],
+    invariants: ['Never send automatically'],
+  });
   const slug = c.body.space.id;
 
   const list = await j(await fetch(`${base}/api/console/spaces`));
@@ -59,6 +71,21 @@ test('POST creates a workspace with a placeholder view; GET list shows it', asyn
   assert.equal(detail.status, 200);
   assert.equal(detail.body.health.id, slug);
   assert.equal(detail.body.space.health.view.exists, true);
+
+  const patched = await j(await fetch(`${base}/api/console/spaces/${slug}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      successCriteria: ['Every row is sourced', 'The board is ready before standup'],
+      invariants: [],
+    }),
+  }));
+  assert.equal(patched.status, 200);
+  assert.deepEqual(patched.body.space.contract, {
+    objective: 'Keep the test pipeline decision-ready.',
+    successCriteria: ['Every row is sourced', 'The board is ready before standup'],
+    invariants: [],
+  });
 
   // The placeholder view is served as HTML.
   const view = await fetch(`${base}/console/spaces/${slug}/view`);

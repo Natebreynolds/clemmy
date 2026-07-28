@@ -19,7 +19,7 @@ import { BASE_DIR } from '../config.js';
 import { textResult } from './shared.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
-  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError,
+  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, mergeSpaceContract,
   type SpaceDataSource, type SpaceAction, type SpaceRecord,
 } from '../spaces/store.js';
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
@@ -300,12 +300,16 @@ export function registerSpaceTools(server: McpServer): void {
       'Optionally declare data_sources (a deterministic script that prints JSON, or a Composio op) so the workspace can refresh its data server-side without spending tokens. For a new script, write it anywhere inside the Clementine home and pass that file as runner_path in the SAME space_save call; space_save installs it. Do not pre-create or guess the hidden Workspace data/ directory.',
       'RUNNER CONTRACT (when a data source is a script — .mjs/.js/.ts/.py/.sh): it runs SERVER-SIDE with NO LLM and a SCRUBBED env (PATH/HOME/locale only — NO API keys or daemon secrets). It receives a JSON payload on stdin and MUST print the dataset as JSON to stdout and NOTHING else (a stray console.log/print corrupts the parse). Exit non-zero on failure. Use only language built-ins + (node) global fetch — there is NO node_modules, so no npm imports. It MAY shell out to CLIs on PATH (e.g. `sf`, `gh`), which read their own auth from $HOME. For anything that needs a secret/OAuth, declare a Composio op (composio_slug) instead of a runner. The view reads each source at data["<sourceId>"] from GET /api/console/spaces/<slug>/data.',
       'PROACTIVE WAKE (optional): a SCHEDULED runner can ping the user when something crosses a threshold — include `_reengage: { fire: true, message: "<what changed>", key: "<stable-condition-id>" }` in its JSON output. The scheduler fires a re-engage when `fire` is true and dedups by `key` (a persistent condition pings ONCE, not every refresh; it can re-fire after the condition clears). Requires reengage_triggers to include "threshold"; omit `_reengage` (or set fire:false) when nothing is notable.',
+      'OPERATING CONTRACT: persist the Workspace\'s user-owned objective, concrete success criteria, and semantic invariants (things later edits/refreshes must never drift). This is a compact north star, not a procedure or an extra judge. Omit fields on later saves to preserve them.',
       'Changing a data source (or editing its runner file) auto-refreshes on save and reports the row count, so you can confirm the new data before telling the user it is done.',
       'Returns the workspace URL and a summary. The prior view is snapshotted for one-click revert.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('Workspace id, lowercase kebab-case (e.g. "sf-daily-report"). Reuse to update.'),
       title: z.string().min(1).max(200).describe('Human title shown in the Workspaces gallery.'),
+      objective: z.string().min(4).max(1200).nullish().describe('Durable user outcome this Workspace exists to advance. Set from the agreed request; omit on later saves to preserve it.'),
+      success_criteria: z.array(z.string().min(1).max(500)).max(12).nullish().describe('Optional observable definition of good/done (counts, freshness, required views/actions, quality checks). An explicit [] clears the list; omit to preserve it.'),
+      invariants: z.array(z.string().min(1).max(500)).max(12).nullish().describe('Optional user/product rules that later edits must never violate, e.g. "Salesforce remains read-only" or "Never publish without approval". An explicit [] clears; omit to preserve.'),
       view_path: z.string().max(1000).nullish().describe(`Path to the HTML file you wrote with write_file (inside ${BASE_DIR}). Required when first creating; omit to update only metadata.`),
       data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh.'),
       actions: z.array(actionShape).nullish().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
@@ -313,7 +317,10 @@ export function registerSpaceTools(server: McpServer): void {
       reengage_guidance: z.string().max(2000).nullish().describe('What you should do when re-engaged (e.g. "draft a follow-up for any deal stalled >14 days").'),
       origin_session_id: z.string().max(200).nullish().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
     },
-    async ({ slug, title, view_path, data_sources, actions, reengage_triggers, reengage_guidance, origin_session_id }) => {
+    async ({
+      slug, title, objective, success_criteria, invariants, view_path, data_sources, actions,
+      reengage_triggers, reengage_guidance, origin_session_id,
+    }) => {
       if (!isValidSpaceSlug(slug)) {
         return textResult(`Error: "${slug}" is not a valid workspace slug. Use lowercase kebab-case, 2-63 chars (e.g. "sf-daily-report").`);
       }
@@ -383,12 +390,21 @@ export function registerSpaceTools(server: McpServer): void {
         try { candidateView = readFileSync(resolveInSpace(slug, existing.viewEntry), 'utf-8'); } catch { /* gap test reports it */ }
       }
       const now = new Date().toISOString();
+      const contract = mergeSpaceContract(existing?.contract, {
+        objective,
+        successCriteria: success_criteria,
+        invariants,
+      });
       const prospective: SpaceRecord = existing
-        ? { ...existing, title, dataSources: prep.dataSources, actions: prep.actions }
+        ? {
+          ...existing, title, dataSources: prep.dataSources, actions: prep.actions,
+          ...(contract ? { contract } : {}),
+        }
         : {
           id: slug,
           title,
           status: 'active',
+          ...(contract ? { contract } : {}),
           viewEntry: 'view/index.html',
           dataSources: prep.dataSources,
           actions: prep.actions,
@@ -462,6 +478,7 @@ export function registerSpaceTools(server: McpServer): void {
         // A fresh validated save is a candidate to be live — start 'active'
         // (unless archived), then the creation smoke decides if it stays active.
         status: existing?.status === 'archived' ? 'archived' : 'active',
+        ...(contract ? { contract } : {}),
         viewEntry: 'view/index.html',
         dataSources: prep.dataSources,
         actions: prep.actions,
@@ -533,9 +550,12 @@ export function registerSpaceTools(server: McpServer): void {
         meta: { gaps: gaps.map((g) => ({ resolution: g.resolution, question: g.question, why: g.why })) },
       });
       const gapQuestions = renderSpaceGapQuestions(gaps);
+      const contractNote = record.contract
+        ? ` Operating contract pinned: "${record.contract.objective}".`
+        : ' Operating contract is not pinned yet; preserve the user\'s stated purpose on the next substantive save.';
       return textResult(
         `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
-        + ` The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`,
+        + `${contractNote} The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`,
       );
     },
   );
@@ -675,6 +695,17 @@ export function registerSpaceTools(server: McpServer): void {
       } catch { dataPreview = '(unreadable)'; }
       const parts = [
         `Workspace "${rec.title}" (${slug}) — ${rec.status}, v${rec.version}.`,
+        rec.contract
+          ? [
+            `Objective: ${rec.contract.objective}`,
+            ...(rec.contract.successCriteria.length > 0
+              ? [`Success criteria: ${rec.contract.successCriteria.map((item) => `• ${item}`).join(' ')}`]
+              : []),
+            ...(rec.contract.invariants.length > 0
+              ? [`Invariants: ${rec.contract.invariants.map((item) => `• ${item}`).join(' ')}`]
+              : []),
+          ].join('\n')
+          : 'Operating contract: not pinned yet.',
         rec.manifestErrors && rec.manifestErrors.length > 0
           ? `Manifest errors: fix with space_save before refresh/actions run.\n  - ${rec.manifestErrors.join('\n  - ')}`
           : '',
