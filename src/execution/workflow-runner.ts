@@ -7115,9 +7115,19 @@ function buildGoalEvidenceText(
   stepOutputs: Record<string, unknown>,
   opts?: StepContextRenderOptions,
 ): string {
-  const stepLines = Object.entries(stepOutputs)
-    .slice(0, 20)
-    .map(([id, out]) => `- ${id}: ${formatStepOutputEvidence(id, out, opts)}`);
+  const listed = Object.entries(stepOutputs).slice(0, 20);
+  const stepLines = listed.map(([id, out]) => `- ${id}: ${formatStepOutputEvidence(id, out, opts)}`);
+  // Derive the blocked/error statement from the outputs actually listed —
+  // never assert it as a static string. The main completion path gates this
+  // builder on blockedSteps.length === 0, but a future caller (or a detection
+  // miss) must not hand the judge an unearned "everything succeeded" claim.
+  const blockedFindings = detectBlockedSteps(Object.fromEntries(listed));
+  const blockedClaim = blockedFindings.length === 0
+    ? 'No listed step result carries blocked:true, an unresolved error envelope, or a per-item failure report.'
+    : [
+        `${blockedFindings.length} of the listed step results carry a blocked or self-reported failure envelope — they are NOT verified successes:`,
+        ...blockedFindings.slice(0, 6).map((b) => `  - ${b.stepId}: ${b.reason.slice(0, 200)}`),
+      ].join('\n');
   const nonEmptyFinalLines = countNonEmptyLines(finalOutput || '');
   return [
     `FINAL OUTPUT (${nonEmptyFinalLines} non-empty line${nonEmptyFinalLines === 1 ? '' : 's'}):`,
@@ -7125,7 +7135,7 @@ function buildGoalEvidenceText(
     '',
     'RUN ENGINE EVIDENCE:',
     `${stepLines.length} step result${stepLines.length === 1 ? '' : 's'} reached step_completed after blocked/error detection and declared output-contract verification. An unresolved blocked/error result does not reach this goal-validation path as a successful step result.`,
-    'No listed step returned blocked:true, an unresolved error envelope, an empty value forbidden by non_empty/min_items, or an output outside its declared URL/path checks.',
+    blockedClaim,
     '',
     'STEP RESULTS (bounded structural projections; arrays show count + sample):',
     ...stepLines,

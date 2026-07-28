@@ -1521,6 +1521,22 @@ test('goal evidence prioritizes proof fields after more than thirty top-level fi
   assert.match(evidence, /"protectedFieldsUnchanged": true/);
 });
 
+test('goal evidence derives its blocked/error claim from the step outputs it lists', () => {
+  const blockedEvidence = workflowRunnerInternalsForTest.buildGoalEvidenceText('Partial.', {
+    pull: { rows: [{ id: 1 }] },
+    upsert: { blocked: true, reason: 'tracker has zero data rows' },
+  });
+  assert.doesNotMatch(blockedEvidence, /No listed step (returned|result carries) blocked:true/);
+  assert.match(blockedEvidence, /upsert/);
+  assert.match(blockedEvidence, /NOT verified successes/i);
+
+  const cleanEvidence = workflowRunnerInternalsForTest.buildGoalEvidenceText('Done.', {
+    pull: { rows: [{ id: 1 }] },
+    upsert: { verifiedCount: 1 },
+  });
+  assert.match(cleanEvidence, /No listed step result carries blocked:true/);
+});
+
 test('workflow step model route uses the intent-bound worker model and trace metadata', () => {
   withEnv({
     AUTH_MODE: 'codex_oauth',
