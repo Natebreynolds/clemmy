@@ -4,7 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
-import { useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
+import { chatApprovalReply, useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
@@ -112,8 +112,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
             <ChatBubble
               key={m.id}
               message={m}
-              onApprove={() => chat.send({ text: 'approve', attachmentIds: [], attachmentNames: [] })}
-              onReject={() => chat.send({ text: 'not now', attachmentIds: [], attachmentNames: [] })}
+              onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId), attachmentIds: [], attachmentNames: [] })}
+              onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId), attachmentIds: [], attachmentNames: [] })}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
           ))}

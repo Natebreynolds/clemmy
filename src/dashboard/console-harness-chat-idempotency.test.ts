@@ -637,3 +637,69 @@ test('conversation reply while ONE background task is parked routes as its answe
     await harness.close();
   }
 });
+
+test('desktop chat approval buttons resolve one exact card; bare decisions never fan out', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    claudeAgentBrain: (async () => {
+      brainCalls += 1;
+      return { text: 'approval decisions must not start a model turn', sessionId: 'none', stoppedReason: 'success' };
+    }) as never,
+  });
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const harness = await boot();
+  const waitFor = async (predicate: () => boolean): Promise<void> => {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.fail('timed out waiting for the accepted approval decision');
+  };
+  try {
+    const session = createSession({ id: 'sess-desktop-exact-approval', kind: 'chat', channel: 'desktop' });
+    const first = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'desktop',
+      subject: 'Create the Airtable record',
+      tool: 'airtable_create_record',
+      args: { table: 'content', title: 'Launch post' },
+    });
+    const second = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'desktop',
+      subject: 'Update the calendar event',
+      tool: 'google_calendar_update_event',
+      args: { eventId: 'event-2', title: 'Launch review' },
+    });
+    const postDecision = async (input: string, clientRequestId: string) => {
+      const response = await fetch(`${harness.url}/api/harness/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input, sessionId: session.id, clientRequestId }),
+      });
+      assert.equal(response.status, 202);
+    };
+
+    await postDecision('approve', 'approval-bare-must-pick');
+    await waitFor(() => listEvents(session.id, { types: ['awaiting_user_input'] })
+      .some((event) => (event.data as { reason?: string }).reason === 'approval_choice_required'));
+    assert.equal(approvalRegistry.get(first.approvalId)?.status, 'pending');
+    assert.equal(approvalRegistry.get(second.approvalId)?.status, 'pending');
+
+    await postDecision(`approve ${first.approvalId}`, 'approval-exact-first');
+    await waitFor(() => approvalRegistry.get(first.approvalId)?.status === 'resolved');
+    assert.equal(approvalRegistry.get(first.approvalId)?.resolution, 'approved');
+    assert.equal(approvalRegistry.get(second.approvalId)?.status, 'pending');
+
+    await postDecision(`reject ${second.approvalId}`, 'approval-exact-second');
+    await waitFor(() => approvalRegistry.get(second.approvalId)?.status === 'resolved');
+    assert.equal(approvalRegistry.get(second.approvalId)?.resolution, 'rejected');
+    assert.equal(brainCalls, 0);
+  } finally {
+    await harness.close();
+  }
+});

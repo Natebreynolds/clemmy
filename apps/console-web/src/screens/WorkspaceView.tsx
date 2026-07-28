@@ -9,7 +9,7 @@ import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { DogMark } from '@/components/DogMark';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { Composer } from '@/components/chat/Composer';
-import { useChat } from '@/lib/useChat';
+import { chatApprovalReply, useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
@@ -339,8 +339,8 @@ export function WorkspaceView() {
                   <ChatBubble
                     key={m.id}
                     message={m}
-                    onApprove={() => chat.send({ text: 'approve' })}
-                    onReject={() => chat.send({ text: 'not now' })}
+                    onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId) })}
+                    onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId) })}
                   />
                 ))
               )}

@@ -64,7 +64,7 @@ import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
-import { synthesizeTurnReport } from './work-report.js';
+import { synthesizeTurnReport, synthesizeWorkReport } from './work-report.js';
 import { nonFilterableToolExcludes } from './tool-policy.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 import pino from 'pino';
@@ -274,20 +274,24 @@ type RunConversationFn = typeof runConversation;
 type BuildAgentFn = typeof buildOrchestratorAgent;
 type ConfigureFn = typeof configureHarnessRuntime;
 type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
+type RecoveryListEventsFn = typeof listEvents;
 let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
+let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
 export function _setBridgeImplsForTests(impls: {
   runConversation?: RunConversationFn | null;
   buildAgent?: BuildAgentFn | null;
   configure?: ConfigureFn | null;
   claudeAgentBrain?: ClaudeAgentBrainFn | null;
+  recoveryListEvents?: RecoveryListEventsFn | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
   configureImpl = impls.configure ?? configureHarnessRuntime;
   claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
+  recoveryListEventsImpl = impls.recoveryListEvents ?? listEvents;
 }
 
 /** Poll cadence for mapping the legacy `shouldCancel` callback onto the
@@ -724,6 +728,10 @@ export async function respondPreferHarness(
   }
   if (claudeAgentSdkBrainEnabled(surface)) {
     const detachProgressRelay = attachLegacyProgressRelay(request);
+    // Whole-turn recovery may re-drive every tool call on another brain. Bind
+    // its safety check to THIS Claude attempt so old writes in the same session
+    // neither block a clean recovery nor hide a new write.
+    const recoveryBaseline = captureRecoveryLedgerBaseline(request.sessionId);
     let detached = false;
     const detach = (): void => {
       if (detached) return;
@@ -753,7 +761,7 @@ export async function respondPreferHarness(
       } catch { /* telemetry only */ }
       return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     } catch (err) {
-      const recovered = await recoverChatBrainFailure(surface, request, err, detach);
+      const recovered = await recoverChatBrainFailure(surface, request, err, detach, recoveryBaseline);
       if (recovered) return recovered;
       // Narration give-up with no fallover available: the error's message IS the
       // graceful user-facing copy — ship it as a normal reply, never a raw error
@@ -771,11 +779,85 @@ export async function respondPreferHarness(
 
 const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
 
+type RecoveryLedgerBaseline =
+  | { readable: true; afterSeq: number }
+  | { readable: false };
+
+type RecoveryLedgerCheck =
+  | { safeToRerun: true }
+  | { safeToRerun: false; reason: 'external_write'; evidence: EventRow[] }
+  | { safeToRerun: false; reason: 'ledger_unreadable'; evidence: [] };
+
+function captureRecoveryLedgerBaseline(sessionId: string): RecoveryLedgerBaseline {
+  try {
+    // One indexed tail row is enough to bind the recovery check to this
+    // attempt; do not load a long session's full history into memory.
+    const events = recoveryListEventsImpl(sessionId, { limit: 1, desc: true });
+    return {
+      readable: true,
+      afterSeq: events[0]?.seq ?? 0,
+    };
+  } catch {
+    return { readable: false };
+  }
+}
+
+function checkRecoveryLedger(
+  sessionId: string,
+  baseline: RecoveryLedgerBaseline | undefined,
+): RecoveryLedgerCheck {
+  // Whole-turn recovery is destructive if its safety ledger is unavailable.
+  // An absent baseline is therefore "do not rerun", never "assume clean".
+  if (!baseline?.readable) {
+    return { safeToRerun: false, reason: 'ledger_unreadable', evidence: [] };
+  }
+  try {
+    const evidence = recoveryListEventsImpl(sessionId, {
+      sinceSeq: baseline.afterSeq,
+      types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+    });
+    return evidence.length > 0
+      ? { safeToRerun: false, reason: 'external_write', evidence }
+      : { safeToRerun: true };
+  } catch {
+    return { safeToRerun: false, reason: 'ledger_unreadable', evidence: [] };
+  }
+}
+
+function blockedWholeTurnRecoveryResponse(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  check: Exclude<RecoveryLedgerCheck, { safeToRerun: true }>,
+): AssistantResponse {
+  const recorded = check.reason === 'external_write'
+    ? synthesizeWorkReport(check.evidence)?.replace(
+        /^I finished — here's what I did this turn:/,
+        'Before Claude stopped, the action ledger recorded:',
+      )
+    : null;
+  const text = check.reason === 'external_write'
+    ? `${recorded ?? 'The action ledger recorded an external write attempt but did not confirm a completed change.'}\n\nClaude stopped before it finished the turn. I did not rerun the task on another model because that could repeat or conflict with the external action.`
+    : 'Claude stopped before it finished the turn. I could not verify the external-write ledger for this attempt, so I did not rerun the task on another model. The recovery path made no additional changes.';
+  const response: AssistantResponse = {
+    text,
+    sessionId: request.sessionId,
+    stoppedReason: 'error',
+    raw: {
+      recoverySkipped: check.reason,
+      transport: 'claude_agent_sdk_brain',
+      recordedExternalWrites: check.reason === 'external_write'
+        ? check.evidence.filter((event) => event.type === 'external_write').length
+        : undefined,
+    },
+  };
+  return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
+}
+
 function chatBrainFalloverEnabled(): boolean {
   // Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) — parity with the router +
   // workflow lanes. A terminal Claude-brain failure (overload, hang, expired auth)
-  // re-runs the turn on a connected non-Claude brain; the duplicate-send HARD WALL
-  // protects any already-committed external write on the re-run.
+  // can re-run on a connected non-Claude brain only when the per-attempt write
+  // ledger proves that no external action occurred.
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
@@ -796,8 +878,9 @@ function recoveryHarnessModelAfterClaudeFailure(): string | undefined {
  *  - unparseable-tool-call ("could not be parsed (retry also failed)") — a flaky
  *    model stumble a DIFFERENT brain usually doesn't reproduce. The SDK lane's
  *    salvage already returns a success for the COMMITTED case (so a propagated
- *    parse-failure is the uncommitted one), and the duplicate-send HARD WALL blocks
- *    any re-send on the re-run, so the switch is safe.
+ *    parse-failure is normally the uncommitted one).
+ * Eligibility is only the first check: recoverChatBrainFailure separately
+ * requires a readable per-attempt ledger with zero new external writes.
  * Kill-switch: CLEMMY_BRAIN_FALLOVER=off.
  */
 export function isChatBrainFalloverEligible(err: unknown): boolean {
@@ -815,9 +898,9 @@ export function isChatBrainFalloverEligible(err: unknown): boolean {
   if (isClaudeSdkUnparseableToolCall(err)) return true;
   // GENERIC terminal Claude-brain failure (non-overload 4xx/5xx, usage-limit, tool-surface
   // error, SDK internal throw, runtime.unknown): a DIFFERENT brain often succeeds where this
-  // one dead-ended. Safe to re-run the whole turn — the duplicate-send HARD WALL blocks any
-  // re-send of an already-committed external write on the re-run, so switching brains can't
-  // double-act. Broadened 2026-07-01 (brain-switching-when-needed): previously every
+  // one dead-ended. This marks the error as eligible only; recoverChatBrainFailure
+  // still requires a readable, write-free per-attempt ledger before it reruns.
+  // Broadened 2026-07-01 (brain-switching-when-needed): previously every
   // non-overload / non-parse Claude-brain error HARD-FAILED the turn with no fallover.
   return err instanceof Error;
 }
@@ -827,15 +910,30 @@ export async function recoverChatBrainFailure(
   request: AssistantRequest,
   err: unknown,
   detach?: () => void,
+  recoveryBaseline?: RecoveryLedgerBaseline,
 ): Promise<AssistantResponse | null> {
   if (!isChatBrainFalloverEligible(err)) return null;
   const kind = err instanceof ClaudeSdkCapacityExhaustedError ? 'capacity_exhausted'
     : err instanceof ClaudeSdkProviderOverloadError ? 'overload'
     : isClaudeSdkUnparseableToolCall(err) ? 'parse_failure'
     : 'terminal_error';
+  const recoveryCheck = checkRecoveryLedger(request.sessionId, recoveryBaseline);
+  if (!recoveryCheck.safeToRerun) {
+    bridgeLogger.warn({
+      surface,
+      kind,
+      recoverySkipped: recoveryCheck.reason,
+      recordedExternalWrites: recoveryCheck.reason === 'external_write'
+        ? recoveryCheck.evidence.filter((event) => event.type === 'external_write').length
+        : undefined,
+      err: err instanceof Error ? err.message : String(err),
+    }, 'Claude brain terminal failure — whole-turn recovery skipped because the attempt is not proven write-free');
+    detach?.();
+    return blockedWholeTurnRecoveryResponse(surface, request, recoveryCheck);
+  }
   const recoveryModel = recoveryHarnessModelAfterClaudeFailure();
   bridgeLogger.warn({ surface, kind, recoveryModel, err: err instanceof Error ? err.message : String(err) },
-    'Claude brain terminal failure — switching the turn over to a non-Claude harness brain when available; the duplicate-send wall protects any committed write');
+    'Claude brain terminal failure — write-free attempt verified; switching the turn over to a non-Claude harness brain when available');
   detach?.();
   try {
     const recovered = await respondViaHarness(surface, request, {

@@ -347,6 +347,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
+import { selectAddressedApproval } from '../runtime/harness/approval-addressing.js';
 import { buildActivitySnapshot, formatElapsed, isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -13702,6 +13703,55 @@ export function registerConsoleRoutes(
       }, HARNESS_CHAT_LEASE_RENEW_MS);
       leaseHeartbeat.unref?.();
       try {
+        // A chat decision grants one card, never the session. Re-evaluate the
+        // registry inside the accepted attempt so a row resolved between the
+        // 202 and this executor cannot inherit authority. A bare approve/reject
+        // remains convenient only when one actionable card exists.
+        let addressedApprovalId = intent?.approvalId;
+        if (intent) {
+          const actionable = approvalRegistry.listPending({ sessionId, status: 'pending' })
+            .filter((row) => approvalRegistry.isActionable(row));
+          const selection = selectAddressedApproval(actionable, intent.approvalId);
+          const choiceLines = actionable
+            .slice(0, 12)
+            .map((row) => `${intent.decision} ${row.approvalId} — ${row.subject}`);
+          if (selection.kind === 'ambiguous') {
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'Clem',
+              type: 'awaiting_user_input',
+              data: {
+                reason: 'approval_choice_required',
+                question: [
+                  `You have ${selection.rows.length} pending approvals. Choose the exact card; I did not approve or reject any of them.`,
+                  ...choiceLines,
+                ].join('\n'),
+                options: choiceLines,
+              },
+            });
+            return;
+          }
+          if (selection.kind === 'missing') {
+            const reply = actionable.length > 0
+              ? [
+                  `Approval ${selection.approvalId} is no longer pending. I did not apply your decision to another card.`,
+                  ...choiceLines,
+                ].join('\n')
+              : `Approval ${selection.approvalId} is no longer pending. Nothing was approved or rejected.`;
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'Clem',
+              type: actionable.length > 0 ? 'awaiting_user_input' : 'conversation_completed',
+              data: actionable.length > 0
+                ? { reason: 'approval_not_pending', question: reply, options: choiceLines }
+                : { reason: 'approval_not_pending', summary: reply, reply, steps: 0 },
+            });
+            return;
+          }
+          if (selection.kind === 'selected') addressedApprovalId = selection.row.approvalId;
+        }
         // /goal slash command (goal-contract P3): pin/inspect/cancel the
         // session's parked goal. status/cancel are reply-only; start/resume
         // swap the run input so work begins immediately on the normal loop.
@@ -13830,11 +13880,11 @@ export function registerConsoleRoutes(
           // the runner resume with the right agent (same rule as Discord's
           // tryHandleHarnessApprovalReply and the /harness-approvals route).
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
-          const resolvedIds: string[] = [];
-          for (const row of approvalRegistry.listPending({ sessionId, status: 'pending' })) {
-            const r = approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user');
-            if (r.ok) resolvedIds.push(row.approvalId);
-          }
+          const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
+          const resolved = !!row
+            && row.sessionId === sessionId
+            && row.status === 'pending'
+            && approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user').ok;
           appendHarnessEvent({
             sessionId,
             turn: 0,
@@ -13842,8 +13892,12 @@ export function registerConsoleRoutes(
             type: 'conversation_completed',
             data: {
               reason: 'workflow_approval_resolved',
-              summary: `${resolution} ${resolvedIds.join(', ') || '(no pending approvals)'} — the workflow resumes on its own`,
-              reply: `${resolution === 'approved' ? 'Approved' : 'Rejected'} — the workflow picks this up and resumes by itself.`,
+              summary: resolved
+                ? `${resolution} ${addressedApprovalId} — the workflow resumes on its own`
+                : '(no pending approval was resolved)',
+              reply: resolved
+                ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId} — the workflow picks this up and resumes by itself.`
+                : 'That approval was no longer pending. Nothing else was approved or rejected.',
               steps: 0,
             },
           });
@@ -13856,11 +13910,11 @@ export function registerConsoleRoutes(
         // there is no RunState to rehydrate (that would fail + clear state).
         if (intent && sdkApprovalPending) {
           const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
-          let resolved = 0;
-          for (const row of approvalRegistry.listPending({ sessionId, status: 'pending' })) {
-            const r = approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user');
-            if (r.ok) resolved += 1;
-          }
+          const row = addressedApprovalId ? approvalRegistry.get(addressedApprovalId) : null;
+          const resolved = !!row
+            && row.sessionId === sessionId
+            && row.status === 'pending'
+            && approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user').ok;
           appendHarnessEvent({
             sessionId,
             turn: 0,
@@ -13868,8 +13922,8 @@ export function registerConsoleRoutes(
             type: 'conversation_step',
             data: {
               reason: 'sdk_approval_resolved',
-              summary: resolved > 0
-                ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} — continuing.`
+              summary: resolved
+                ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} ${addressedApprovalId} — continuing.`
                 : '(no pending approval to resolve)',
               steps: 0,
             },
@@ -13926,7 +13980,7 @@ export function registerConsoleRoutes(
           await runConversationFromResume({
             agent,
             sessionId,
-            approvalId: intent.approvalId,
+            approvalId: addressedApprovalId,
             decision: intent.decision,
             resolver: 'chat-dock-user',
             onChunk,

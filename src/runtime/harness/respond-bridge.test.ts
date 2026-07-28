@@ -600,6 +600,196 @@ test('Claude SDK brain overload AFTER committing surfaces the error (no double-a
   assert.equal(runConversationCalled, 0, 'no fallover once the turn committed work');
 });
 
+test('generic Claude terminal error after an Airtable write is salvaged without whole-turn fallover', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-generic-write-gate';
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return {
+        sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'blind rerun', summary: 's', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      if (!getSession(req.sessionId)) {
+        createSession({ id: req.sessionId, kind: 'chat', title: 'write-gated fallover' });
+      }
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_CREATE_RECORD',
+          targets: ['record:rec-42'],
+        },
+      });
+      throw new Error('Claude SDK terminal error after the Airtable call returned');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Create the approved Airtable record', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(runConversationCalled, 0, 'a completed non-send write forbids re-driving the whole turn');
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /Created a record/);
+  assert.match(res.text, /did not rerun/i);
+  assert.doesNotMatch(res.text, /blind rerun/);
+});
+
+test('whole-turn recovery salvage carries orphan evidence and never fabricates write success', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-orphaned-write-truth';
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return { sessionId, status: 'completed' };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      if (!getSession(req.sessionId)) {
+        createSession({ id: req.sessionId, kind: 'chat', title: 'uncertain write' });
+      }
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write',
+        data: {
+          callId: 'call-airtable-timeout',
+          toolName: 'composio_execute_tool',
+          shapeKey: 'AIRTABLE_UPDATE_RECORD',
+          targets: ['record:rec-uncertain'],
+        },
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'tool',
+        type: 'external_write_orphaned',
+        data: {
+          callId: 'call-airtable-timeout',
+          slug: 'AIRTABLE_UPDATE_RECORD',
+          targets: ['record:rec-uncertain'],
+          reason: 'timeout',
+        },
+      });
+      throw new Error('Claude SDK terminal error after an uncertain Airtable update');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Update the Airtable record', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(runConversationCalled, 0);
+  assert.match(res.text, /could not confirm|uncertain/i);
+  assert.match(res.text, /did not rerun/i);
+  assert.doesNotMatch(res.text, /I finished|Updated a record/);
+});
+
+test('whole-turn recovery uses a per-attempt write baseline, so an old write does not block a clean generic-error fallover', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-attempt-write-baseline';
+  createSession({ id: sessionId, kind: 'chat', title: 'prior write' });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'external_write',
+    data: { toolName: 'composio_execute_tool', shapeKey: 'AIRTABLE_UPDATE_RECORD', targets: ['record:old'] },
+  });
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return {
+        sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'clean recovery', summary: 's', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+    claudeAgentBrain: (async () => {
+      throw new Error('clean generic Claude terminal error');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Read the current Airtable view', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(runConversationCalled, 1, 'only writes added by this failed attempt block recovery');
+  assert.equal(res.text, 'clean recovery');
+  assert.equal(res.route?.falloverFrom, 'claude_agent_sdk_brain');
+});
+
+test('whole-turn recovery fails closed when the attempt write ledger cannot be checked', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const sessionId = 'fallover-ledger-unreadable';
+  createSession({ id: sessionId, kind: 'chat', title: 'ledger unavailable' });
+  let ledgerReads = 0;
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    recoveryListEvents: ((id: string, options?: Parameters<typeof listEvents>[1]) => {
+      ledgerReads += 1;
+      if (ledgerReads === 1) return listEvents(id, options);
+      throw new Error('ledger unavailable');
+    }) as never,
+    runConversation: (async () => {
+      runConversationCalled += 1;
+      return { sessionId, status: 'completed' };
+    }) as never,
+    claudeAgentBrain: (async () => {
+      throw new Error('generic Claude terminal error');
+    }) as never,
+  });
+
+  const res = await respondPreferHarness(
+    'home',
+    { message: 'Update Airtable if needed', sessionId },
+    async (req) => ({ text: 'legacy', sessionId: req.sessionId }),
+  );
+
+  assert.equal(ledgerReads, 2, 'baseline and terminal check are both attempt-scoped');
+  assert.equal(runConversationCalled, 0, 'unreadable safety evidence can never authorize a whole-turn rerun');
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /could not verify the external-write ledger/i);
+  assert.match(res.text, /did not rerun/i);
+  assert.equal((res.raw as { recoverySkipped?: string }).recoverySkipped, 'ledger_unreadable');
+});
+
 test('CLEMMY_BRAIN_FALLOVER=off disables the chat-brain fallover (overload surfaces)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';

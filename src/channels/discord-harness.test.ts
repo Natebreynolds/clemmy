@@ -346,6 +346,7 @@ test('parseApprovalIntent: strong verbs match without an apr-xxxx', () => {
   assert.deepEqual(parseApprovalIntent('deny'), { decision: 'reject' });
   assert.deepEqual(parseApprovalIntent('abort'), { decision: 'reject' });
   assert.deepEqual(parseApprovalIntent('nevermind'), { decision: 'reject' });
+  assert.deepEqual(parseApprovalIntent('not now'), { decision: 'reject' });
   assert.deepEqual(parseApprovalIntent("don't do it"), { decision: 'reject' });
   assert.deepEqual(parseApprovalIntent('👎'), { decision: 'reject' });
 });

@@ -250,6 +250,7 @@ export function runHarnessStream(
   let sawTerminal = false;
   let streamError = '';
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let approvalSettleTimer: ReturnType<typeof setTimeout> | null = null;
   let resolveFn: (r: { ok: boolean; error: string | null }) => void;
 
   const promise = new Promise<{ ok: boolean; error: string | null }>((resolve) => { resolveFn = resolve; });
@@ -259,6 +260,7 @@ export function runHarnessStream(
     closed = true;
     try { es?.close(); } catch { /* ignore */ }
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (approvalSettleTimer) { clearTimeout(approvalSettleTimer); approvalSettleTimer = null; }
     resolveFn({ ok: !streamError, error: streamError || null });
   };
 
@@ -273,6 +275,21 @@ export function runHarnessStream(
     idleTimer = setTimeout(() => failStream('no progress event received'), IDLE_TIMEOUT_MS);
   };
 
+  // One SDK turn may surface several independent approval cards back-to-back.
+  // The first card is terminal for composer/busy state, but closing EventSource
+  // synchronously used to discard its siblings. Debounce briefly, replay once,
+  // then settle; ordinary completed/failed/question terminals remain instant.
+  function scheduleApprovalSettle(): void {
+    if (approvalSettleTimer) clearTimeout(approvalSettleTimer);
+    approvalSettleTimer = setTimeout(() => {
+      approvalSettleTimer = null;
+      void pollReplayFallback().finally(() => {
+        // A sibling discovered by replay schedules a fresh settle window.
+        if (!closed && !approvalSettleTimer) finish();
+      });
+    }, 75);
+  }
+
   const handleEvent = (ev: HarnessEvent) => {
     if (closed) return;
     resetIdle();
@@ -285,7 +302,11 @@ export function runHarnessStream(
     }
     sawEvent = true;
     try { opts.onEvent(ev); } catch { /* render errors shouldn't kill the stream */ }
-    if (isTerminalEvent(ev.type)) { sawTerminal = true; finish(); }
+    if (isTerminalEvent(ev.type)) {
+      sawTerminal = true;
+      if (ev.type === 'approval_requested') scheduleApprovalSettle();
+      else finish();
+    }
   };
 
   const pollReplayFallback = async () => {

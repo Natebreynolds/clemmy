@@ -992,7 +992,7 @@ export interface ParsedApprovalIntent {
 // the caller, keeps each clean and well-tested.
 const STRONG_APPROVE = /^(approve(d)?|proceed|go ahead|lgtm|do it|confirm(ed)?)\b/;
 const STRONG_APPROVE_EMOJI = /^👍/;
-const STRONG_REJECT = /^(reject(ed)?|deny|denied|abort|nevermind|never mind|don'?t do (it|that))\b/;
+const STRONG_REJECT = /^(reject(ed)?|deny|denied|abort|nevermind|never mind|not now|don'?t do (it|that))\b/;
 const STRONG_REJECT_EMOJI = /^👎/;
 // Loose verbs — require an apr-xxxx in the message to disambiguate
 // from regular conversation. "yes apr-26ba" reads as approval; bare

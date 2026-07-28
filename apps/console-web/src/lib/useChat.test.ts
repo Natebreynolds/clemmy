@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ChatPostCancelledError,
+  appendLiveApprovalCard,
+  chatApprovalReply,
   createInboxOutcomeCursor,
   createInboxOutcomeDeliveryState,
   inboxOutcomeCursorForSession,
@@ -43,6 +45,39 @@ test('empty or reason-only conversation completion never fabricates Done or succ
   const malformed = terminalCompletionPresentation({ reason: 'no_structured_output' }, '');
   assert.equal(malformed.status, 'failed');
   assert.match(malformed.text, /reply didn.t come through/i);
+});
+
+test('approval buttons address the exact card and use a real reject intent', () => {
+  assert.equal(chatApprovalReply('approve', 'apr-A1b2'), 'approve apr-a1b2');
+  assert.equal(chatApprovalReply('reject', 'apr-c3d4'), 'reject apr-c3d4');
+  assert.equal(chatApprovalReply('reject', null), 'reject');
+  assert.equal(chatApprovalReply('approve', 'not-an-approval'), 'approve');
+});
+
+test('live approval bursts keep independently addressable cards without overwriting the assistant turn', () => {
+  const assistant = {
+    id: 'assistant-live',
+    role: 'assistant' as const,
+    text: '',
+    status: 'thinking' as const,
+  };
+  const first = ev('approval_requested', {
+    approvalId: 'apr-a111',
+    subject: 'Create the Airtable record',
+  });
+  const second = ev('approval_requested', {
+    approvalId: 'apr-b222',
+    subject: 'Update the calendar event',
+  });
+  const afterFirst = appendLiveApprovalCard([assistant], first);
+  const afterSecond = appendLiveApprovalCard(afterFirst, second);
+  assert.equal(afterSecond.length, 3);
+  assert.equal(afterSecond[0], assistant, 'the streaming assistant bubble is preserved');
+  assert.deepEqual(
+    afterSecond.slice(1).map((message) => message.approval?.approvalId),
+    ['apr-a111', 'apr-b222'],
+  );
+  assert.equal(appendLiveApprovalCard(afterSecond, second), afterSecond, 'SSE replay is idempotent');
 });
 
 test('conversation completion preserves streamed evidence and only marks explicit output complete', () => {

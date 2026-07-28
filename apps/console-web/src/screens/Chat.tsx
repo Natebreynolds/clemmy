@@ -5,7 +5,7 @@ import { ArrowRight, Sparkles, X } from 'lucide-react';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { dismissInboxItem } from '@/lib/inbox';
-import { useChat } from '@/lib/useChat';
+import { chatApprovalReply, useChat } from '@/lib/useChat';
 import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import { DogMark } from '@/components/DogMark';
 import { Composer } from '@/components/chat/Composer';
@@ -172,9 +172,6 @@ export function Chat() {
     }
   }, [searchParams, chat, setSearchParams]);
 
-  const approveLast = () => chat.send({ text: 'approve' });
-  const rejectLast = () => chat.send({ text: 'not now' });
-
   if (!hasThread) {
     return (
       <div className="mx-auto flex h-full w-full max-w-3xl flex-col justify-center px-8 py-8">
@@ -225,8 +222,8 @@ export function Chat() {
             <ChatBubble
               key={m.id}
               message={m}
-              onApprove={approveLast}
-              onReject={rejectLast}
+              onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId) })}
+              onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId) })}
               onBackground={chat.background}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />

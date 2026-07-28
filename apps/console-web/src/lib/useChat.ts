@@ -61,6 +61,52 @@ export interface ChatMessage {
   taskRef?: { id: string; label?: string };
 }
 
+export type ChatApprovalDecision = 'approve' | 'reject';
+
+/** Button clicks carry the exact card identity back through the same chat
+ * parser as typed decisions. A legacy/id-less plan remains a bare decision;
+ * malformed server data is never echoed as authority. */
+export function chatApprovalReply(
+  decision: ChatApprovalDecision,
+  approvalId?: string | null,
+): string {
+  const id = typeof approvalId === 'string' && /^apr-[a-z0-9]{4}$/i.test(approvalId.trim())
+    ? approvalId.trim().toLowerCase()
+    : null;
+  return id ? `${decision} ${id}` : decision;
+}
+
+/** Preserve every independently addressable approval emitted during one live
+ * turn. Approval bursts must not overwrite the single streaming assistant
+ * bubble: each card gets its own stable key and duplicate SSE replay is inert. */
+export function appendLiveApprovalCard(
+  messages: readonly ChatMessage[],
+  event: HarnessEvent,
+): ChatMessage[] {
+  const d = (event.data ?? {}) as Record<string, unknown>;
+  const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
+  const id = `approval-${approvalId ?? event.seq}`;
+  if (messages.some((message) => message.id === id
+    || (!!approvalId && message.approval?.approvalId === approvalId))) {
+    return messages as ChatMessage[];
+  }
+  return [
+    ...messages,
+    {
+      id,
+      role: 'assistant',
+      text: '',
+      status: 'awaiting-approval',
+      approval: {
+        subject: String(d.subject ?? d.tool ?? 'this action'),
+        reason: typeof d.reason === 'string' ? d.reason : undefined,
+        approvalId,
+        pendingAction: pendingActionFromEvent(d.pendingAction),
+      },
+    },
+  ];
+}
+
 let idSeq = 0;
 const nextId = () => `m${++idSeq}-${performance.now().toFixed(0)}`;
 const EMPTY_ACTIVITY: ActivityItem[] = [];
@@ -619,16 +665,7 @@ export function useChat(options?: UseChatOptions) {
     } else if (ev.type === 'awaiting_user_input') {
       patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined });
     } else if (ev.type === 'approval_requested') {
-      patch(assistantId, {
-        status: 'awaiting-approval',
-        progress: undefined,
-        approval: {
-          subject: String(d.subject ?? d.tool ?? 'this action'),
-          reason: typeof d.reason === 'string' ? d.reason : undefined,
-          approvalId: typeof d.approvalId === 'string' ? d.approvalId : null,
-          pendingAction: pendingActionFromEvent(d.pendingAction),
-        },
-      });
+      setMessages((prev) => appendLiveApprovalCard(prev, ev));
     } else {
       const label = progressLabel(ev);
       setMessages((prev) => prev.map((m) => {
