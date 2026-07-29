@@ -1631,7 +1631,27 @@ async function consolidateFactInner(
   // M1 (2026-07-20): a fail-open ADD leaves the conflict LIVE (both
   // contradictory facts active + recallable). Record it durably so the
   // nightly retry re-resolves once a resolver is available. Best-effort.
-  if (decision.decision === 'ADD' && decision.unresolved && similar.length > 0) {
+  //
+  // Extended (live, 2026-07-29): a CONFIDENT ADD over a high-similarity pair
+  // is the other half of the same class — a correction the resolver judged
+  // "new fact" leaves the superseded belief active with NOTHING tracking it
+  // (proven on both brains: correction stored, stale fact active, queue
+  // empty). High-similarity confident ADDs now also queue for the nightly
+  // re-review. Reversible bookkeeping only: the ADD itself stands, pinned
+  // facts are never touched, entries self-expire.
+  const HIGH_SIM_RE_REVIEW = 0.8; // matches GROUND_TRUTH_CONFLICT_SIM territory
+  const confidentAddOverNearDuplicate =
+    decision.decision === 'ADD'
+    && (
+      // Semantic path: measurably near-duplicate.
+      (topSim !== null && topSim >= HIGH_SIM_RE_REVIEW)
+      // Lexical fallback: retrieval surfaced related facts but could not
+      // score them (sim=null — cold embed pool, ENOSPC, circuit breaker).
+      // This is the LIVE condition for a fresh session's correction, and it
+      // is precisely the ambiguity the nightly re-review exists to settle.
+      || topSim === null
+    );
+  if (decision.decision === 'ADD' && similar.length > 0 && (decision.unresolved || confidentAddOverNearDuplicate)) {
     try {
       const { recordUnresolvedConflict } = await import('./conflict-retry.js');
       recordUnresolvedConflict({ candidateFactId: added.id, similarFactIds: similar.map((f) => f.id) });

@@ -81,3 +81,49 @@ test('a conflict resolved elsewhere (fact already retired) drops from the queue'
   assert.equal(result.dropped, 1);
   assert.equal(result.resolved, 0);
 });
+
+// ─── Confident-ADD over a near-duplicate also queues (live, 2026-07-29) ───
+// The queue previously recorded ONLY resolver-failure ADDs. Live on both
+// brains: a correction the resolver confidently judged "new fact" left the
+// superseded belief active with NOTHING tracking it — stale recallable
+// forever, queue empty. High-similarity confident ADDs must queue for the
+// nightly re-review; low-similarity confident ADDs must NOT (ordinary novel
+// facts cannot churn the queue).
+
+test('confident ADD over a near-duplicate records a pending conflict', async () => {
+  const { consolidateFact, _drainEmbedAtWriteForTest } = await import('./reflection.js');
+  const first = await consolidateFact({ kind: 'user', text: 'My deploy freeze codeword is Zubrowka-7741.' });
+  assert.equal(first.action, 'add');
+  await _drainEmbedAtWriteForTest(); // vector exists → the semantic path sees the pair
+
+  const second = await consolidateFact(
+    { kind: 'user', text: 'My deploy freeze codeword is Marzipan-9214.' },
+    {},
+    { resolver: async () => ({ decision: 'ADD' }) }, // confident, NOT unresolved
+  );
+  assert.equal(second.action, 'add', 'the ADD itself stands — bookkeeping only');
+
+  const result = await retryPendingMemoryConflicts({
+    resolver: async () => ({ decision: 'DELETE', target_id: first.factId }),
+  });
+  assert.equal(result.scanned, 1, 'the confident near-duplicate ADD was queued');
+  assert.equal(result.resolved, 1);
+  assert.equal(getFact(first.factId!)?.active, false, 'nightly pass retires the stale belief');
+  assert.equal(getFact(second.factId!)?.active, true, 'the correction survives');
+});
+
+test('confident ADD over an UNRELATED fact does not churn the queue', async () => {
+  const { consolidateFact, _drainEmbedAtWriteForTest } = await import('./reflection.js');
+  await consolidateFact({ kind: 'user', text: 'My deploy freeze codeword is Zubrowka-7741.' });
+  await _drainEmbedAtWriteForTest();
+
+  const other = await consolidateFact(
+    { kind: 'user', text: 'The office espresso machine is descaled on the first Monday of each month.' },
+    {},
+    { resolver: async () => ({ decision: 'ADD' }) },
+  );
+  assert.equal(other.action, 'add');
+
+  const result = await retryPendingMemoryConflicts({ resolver: async () => ({ decision: 'NOOP' }) });
+  assert.equal(result.scanned, 0, 'novel facts never enter the re-review queue');
+});
