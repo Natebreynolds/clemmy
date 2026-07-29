@@ -32,6 +32,7 @@ import { correctionSticks } from './scenarios/correction-sticks.js';
 import { agentAutonomyLive } from './scenarios/agent-autonomy-live.js';
 import { correctionSupersedesStore } from './scenarios/correction-supersedes-store.js';
 import { businessDayLive } from './scenarios/business-day-live.js';
+import { growsWithUserLive } from './scenarios/grows-with-user-live.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
 import { approvalParkResume } from './scenarios/approval-park-resume.js';
 import { cronReportBack } from './scenarios/cron-report-back.js';
@@ -92,6 +93,7 @@ const SCENARIO_CATALOG: ScenarioDef[] = [
   workspaceTemporalHistory,
   correctionSupersedesStore,
   businessDayLive,
+  growsWithUserLive,
 ];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
