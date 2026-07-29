@@ -67,10 +67,29 @@ export interface Delegation {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  /** Who actually recorded the result — not assumed to be the assignee. */
+  completedBy?: string;
+  /** Set when Clementine closed work that was queued for someone else. */
+  onBehalfOf?: string;
   createdAt: string;
   updatedAt: string;
 }
 export interface AgentComms { messages: TeamMessage[]; delegations: Delegation[] }
+
+/**
+ * Plain-language attribution for a finished delegation.
+ *
+ * The timeline draws delegations as `from → to`, which on its own reads as
+ * "the assignee did this". When Clementine closed the work herself that would
+ * be a quiet lie, so say it outright.
+ */
+export function describeDelegationOutcome(delegation: Delegation): string | null {
+  if (delegation.status !== 'completed') return null;
+  const actor = delegation.completedBy;
+  if (!actor) return 'Completed';
+  if (delegation.onBehalfOf) return `Completed by Clementine, on behalf of ${delegation.onBehalfOf}`;
+  return `Completed by ${actor}`;
+}
 
 export interface AgentRunEvent {
   id: string;

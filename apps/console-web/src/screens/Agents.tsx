@@ -22,6 +22,7 @@ import { AgentForm } from '@/components/agents/AgentForm';
 import {
   listAgents, getAgentGraph, getAgentComms, getAgentCatalog, latestCommsKey,
   listAgentProposals, approveAgentProposal, rejectAgentProposal,
+  describeDelegationOutcome,
   type AgentSummary, type TeamMessage, type Delegation, type AgentProposal,
 } from '@/lib/agents';
 import {
@@ -114,6 +115,8 @@ interface TimelineItem {
   text: string;
   time: string;
   status?: string;
+  outcome?: string;
+  result?: string;
 }
 
 function buildTimeline(messages: TeamMessage[], delegations: Delegation[]): TimelineItem[] {
@@ -123,6 +126,8 @@ function buildTimeline(messages: TeamMessage[], delegations: Delegation[]): Time
     })),
     ...delegations.map((d) => ({
       key: `d-${d.id}`, kind: 'delegation' as const, from: d.fromAgent, to: d.toAgent, text: d.task, time: d.updatedAt, status: d.status,
+      outcome: describeDelegationOutcome(d) ?? undefined,
+      result: d.result,
     })),
   ];
   return items.sort((a, b) => (a.time < b.time ? 1 : -1)).slice(0, 60);
@@ -778,8 +783,12 @@ export function Agents() {
                             <span className="text-faint">{relativeTime(item.time)}</span>
                           </div>
                           <p className="mt-1 line-clamp-2 text-small text-muted">{item.text}</p>
-                          <div className="mt-1">
+                          {item.result && (
+                            <p className="mt-1 line-clamp-3 border-l-2 border-border pl-2 text-small text-fg">{item.result}</p>
+                          )}
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
                             <StatusPill tone={badge.tone}>{item.status ? `${badge.label} · ${item.status}` : badge.label}</StatusPill>
+                            {item.outcome && <span className="text-caption text-faint">{item.outcome}</span>}
                           </div>
                         </li>
                       );

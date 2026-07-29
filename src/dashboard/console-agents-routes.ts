@@ -86,6 +86,8 @@ interface DelegationRecord {
   expectedOutput: string;
   status: 'pending' | 'in_progress' | 'completed';
   result?: string;
+  completedBy?: string;
+  onBehalfOf?: string;
   createdAt: string;
   updatedAt: string;
 }
