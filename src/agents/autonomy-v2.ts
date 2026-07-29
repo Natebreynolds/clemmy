@@ -21,6 +21,7 @@ import {
   peerCommsEnabled,
   resetCommsCycle,
 } from './agent-comms.js';
+import { buildAgentDelegationTools, renderOpenDelegations } from './agent-delegations.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -340,6 +341,7 @@ function buildAgentInput(agent: TeamAgentRecord, inboxItems: AgentInboxItem[], s
     executionsText,
     checkInsText,
     `Pending inbox items:\n${inboxText}`,
+    renderOpenDelegations(agent.slug),
     `Relevant open tasks:\n${taskText}`,
   ].filter(Boolean).join('\n\n');
 }
@@ -525,7 +527,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
     ].join('\n'),
     peerCommsEnabled()
       ? commsInstructionBlock(agent.slug)
-      : 'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
+      : 'Peer messaging (messages, requests, replies) is not available this cycle — surface the intent in your summary so the user can act. Work delegated TO you is separate and always actionable: it appears in your input with its id.',
     proposalFeedbackBlock,
     'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
   ].filter(Boolean).join('\n\n');
@@ -676,7 +678,11 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
   // Peer-comms tools are bound to THIS agent's slug (correct attribution
   // in the shared daemon). Gated default-off → tool set is unchanged.
   const commsTools = peerCommsEnabled() ? buildAgentCommsTools(record.slug) : [];
-  const allTools = [...getCoreTools(), buildPlannerTool(), ...commsTools];
+  // Delegation tools are slug-bound too, and always present: a delegation only
+  // exists because someone explicitly assigned it, so letting the assignee
+  // finish it is the assigned-work path working — not a new autonomy category.
+  const delegationTools = buildAgentDelegationTools(record.slug);
+  const allTools = [...getCoreTools(), buildPlannerTool(), ...commsTools, ...delegationTools];
   const tools = filterToolsByPolicy(allTools, policy);
 
   // Orchestrator agents get handoffs configured so they can delegate
