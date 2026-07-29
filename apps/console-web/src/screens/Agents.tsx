@@ -22,6 +22,7 @@ import { AgentForm } from '@/components/agents/AgentForm';
 import {
   listAgents, getAgentGraph, getAgentComms, getAgentCatalog, latestCommsKey,
   listAgentProposals, approveAgentProposal, rejectAgentProposal,
+  describeAgentWakeState,
   describeDelegationOutcome,
   type AgentSummary, type TeamMessage, type Delegation, type AgentProposal,
 } from '@/lib/agents';
@@ -103,6 +104,15 @@ function AgentCard({ agent, onOpen }: { agent: AgentSummary; onOpen: () => void 
           {agent.lastSummary}
         </p>
       )}
+
+      {/* Wake state — derived from durable record fields only. An erroring
+          agent shows its retry window instead of silently looking idle. */}
+      <p className={`pt-1 text-caption ${agent.lastError ? 'text-warning' : 'text-faint'}`}>
+        {describeAgentWakeState(agent)}
+        {agent.lastError && (
+          <span className="ml-1 text-faint" title={agent.lastError}>· {agent.lastError.slice(0, 60)}</span>
+        )}
+      </p>
     </button>
   );
 }

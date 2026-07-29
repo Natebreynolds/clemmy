@@ -98,6 +98,39 @@ export function describeDelegationOutcome(delegation: Delegation): string | null
   return `Completed by ${actor}${evidence}`;
 }
 
+
+/**
+ * Honest wake-state line for an agent card. Derived ONLY from durable record
+ * fields — it never claims the engine is running, only what the record says:
+ * when the agent last worked, when it will next be considered, and whether the
+ * last cycle ended in an error it is backing off from.
+ */
+export function describeAgentWakeState(
+  agent: Pick<AgentSummary, 'proactive' | 'autonomyEnabled' | 'nextWakeAt' | 'lastError' | 'lastRunAt'>,
+  now: number = Date.now(),
+): string {
+  if (!agent.autonomyEnabled) return 'Autonomy off';
+  if (!agent.proactive) return 'On demand only';
+  const wakeAt = agent.nextWakeAt ? Date.parse(agent.nextWakeAt) : NaN;
+  const wakeIn = Number.isFinite(wakeAt) && wakeAt > now
+    ? formatWakeDelta(wakeAt - now)
+    : null;
+  if (agent.lastError) {
+    return wakeIn ? `Retrying in ${wakeIn} after an error` : 'Retrying after an error';
+  }
+  if (wakeIn) return `Next wake in ${wakeIn}`;
+  if (agent.lastRunAt) return 'Due on next cycle';
+  return 'Waiting for first cycle';
+}
+
+function formatWakeDelta(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return 'under a minute';
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
 export interface AgentRunEvent {
   id: string;
   type: string;
