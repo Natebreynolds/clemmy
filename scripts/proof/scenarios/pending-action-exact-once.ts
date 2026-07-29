@@ -494,23 +494,29 @@ async function waitForModelTurnsSettled(
   sessionId: string,
   expectedTurns: number,
   timeoutMs: number,
-): Promise<{ routes: number; conversationSteps: number }> {
+): Promise<{ routes: number; completedTurns: number }> {
   const deadline = Date.now() + timeoutMs;
   let routes = 0;
-  let conversationSteps = 0;
+  let completedTurns = 0;
   while (Date.now() < deadline) {
     try {
       routes = sessionEventCount(home, sessionId, 'turn_model_routed');
-      conversationSteps = sessionEventCount(home, sessionId, 'conversation_step');
-      if (routes >= expectedTurns && conversationSteps >= expectedTurns) {
-        return { routes, conversationSteps };
+      // `conversation_completed` is the settle signal — one per finished turn.
+      // `conversation_step` is only emitted by the structured multi-step
+      // conversation loop, which these turns never enter: a full proof home
+      // with 8 completed turns records 8 `conversation_completed` and 0
+      // `conversation_step`, so waiting on it always burned the full timeout
+      // and then scored a turn that had in fact settled long before.
+      completedTurns = sessionEventCount(home, sessionId, 'conversation_completed');
+      if (routes >= expectedTurns && completedTurns >= expectedTurns) {
+        return { routes, completedTurns };
       }
     } catch {
       // The daemon may be between SQLite commits; retry within the bound.
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  return { routes, conversationSteps };
+  return { routes, completedTurns };
 }
 
 function actionDetail(action: PendingActionFile | null): string {
@@ -764,7 +770,7 @@ export const pendingActionExactOnce: ScenarioDef = {
     });
     checks.push({
       name: 'approval-resume model turn settled before scoring',
-      pass: settledResume.routes >= 3 && settledResume.conversationSteps >= 3,
+      pass: settledResume.routes >= 3 && settledResume.completedTurns >= 3,
       detail: JSON.stringify(settledResume),
     });
     checks.push({
