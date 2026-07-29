@@ -263,20 +263,26 @@ test('a configured-but-keyless autonomy pass does no work and does not throw', a
 // fake brain runtime — the same interface Claude OAuth and Codex OAuth serve —
 // and assert the delegated work actually completes with correct attribution.
 
+// The engine routes cycles through respondPreferHarness('cron', …) — the same
+// gated path cron jobs use. Tests kill that surface and enable the explicit
+// legacy fallback so the fake assistant.respond below serves the turn without
+// spinning the full harness loop.
+process.env.CLEMMY_HARNESS_CRON = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+
 function fakeAssistant(responses: string[]): { assistant: unknown; prompts: string[] } {
   const prompts: string[] = [];
   return {
     prompts,
     assistant: {
+      async respond(request: { message: string; sessionId?: string }) {
+        prompts.push(request.message);
+        const text = responses.shift();
+        if (text === undefined) throw new Error('unexpected respond call');
+        return { text, sessionId: request.sessionId ?? 'agent:test' };
+      },
       getRuntime() {
-        return {
-          async run(request: { prompt: string; sessionId?: string }) {
-            prompts.push(request.prompt);
-            const text = responses.shift();
-            if (text === undefined) throw new Error('unexpected runtime call');
-            return { text, sessionId: request.sessionId ?? 'agent:test' };
-          },
-        };
+        return { async run() { throw new Error('runtime.run must not be used — it is the codex-native lane'); } };
       },
     },
   };

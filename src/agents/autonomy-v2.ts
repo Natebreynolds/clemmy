@@ -24,6 +24,7 @@ import {
 import { buildAgentDelegationTools, claimDelegationFor, completeDelegationFor, renderOpenDelegations } from './agent-delegations.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { addNotification } from '../runtime/notifications.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -1074,28 +1075,26 @@ async function runAgentCycleViaRuntime(
 
   try {
     const input = buildAgentInput(record, inboxItems, state, policySnapshot.policy);
-    // Mirror the execution controller's proven decision shape exactly:
-    // explicit JSON-only instructions plus one retry with a harder nudge.
-    // Without instructions the runtime returned EMPTY text on both OAuth
-    // brains (live, 2026-07-29) and the cycle failed with "no usable
-    // decision output".
+    // Run the cycle exactly the way cron runs jobs: respondPreferHarness on the
+    // 'cron' surface routes through the gated harness loop with whatever brain
+    // is configured — Claude OAuth, Codex OAuth, or BYO. The low-level
+    // runtime.run() looked equivalent but is the CODEX-NATIVE tool loop and
+    // hard-requires a ChatGPT sign-in (proven by local repro, live date):
+    // on a Claude-only install it cannot serve at all.
     const baseRequest = {
-      instructions: 'You are a strict internal agent-cycle decider. Return the decision as JSON only — no prose, no code fences.',
-      model: MODELS.fast,
-      prompt: buildRuntimeCyclePrompt(record, input),
       sessionId: `agent:${record.slug}`,
-      userId: record.slug,
-      channel: 'agent',
+      channel: 'cron' as const,
+      message: buildRuntimeCyclePrompt(record, input),
       maxWallClockMs: RUNTIME_CYCLE_TIMEOUT_MS,
     };
-    let run = await assistant.getRuntime().run(baseRequest);
+    let run = await respondPreferHarness('cron', baseRequest, (req) => assistant.respond(req));
     let parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
     let decision = sanitizeAgentDecisionOutput(run.text);
     if (!decision) {
-      run = await assistant.getRuntime().run({
+      run = await respondPreferHarness('cron', {
         ...baseRequest,
-        prompt: `${baseRequest.prompt}\n\nYour previous reply was not parseable JSON. Reply with ONLY the JSON object described above.`,
-      });
+        message: `${baseRequest.message}\n\nYour previous reply was not parseable JSON. Reply with ONLY the JSON object described above.`,
+      }, (req) => assistant.respond(req));
       parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
       decision = sanitizeAgentDecisionOutput(run.text);
     }
