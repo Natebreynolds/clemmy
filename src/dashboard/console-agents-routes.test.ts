@@ -63,6 +63,14 @@ writeFileSync(
   JSON.stringify({ id: 'd1', fromAgent: 'clementine', toAgent: 'researcher', task: 'pull SEO metrics', expectedOutput: 'a table', status: 'pending', createdAt: '2026-06-22T09:00:00.000Z', updatedAt: '2026-06-22T09:00:00.000Z' }),
   'utf-8',
 );
+// A finished one whose result the primary agent recorded on the assignee's
+// behalf — the console must be able to say so rather than imply the assignee
+// did the work.
+writeFileSync(
+  path.join(DELEGATIONS_DIR, 'researcher', 'd2.json'),
+  JSON.stringify({ id: 'd2', fromAgent: 'clementine', toAgent: 'researcher', task: 'summarize risks', expectedOutput: 'a list', status: 'completed', result: 'Three risks: a, b, c', completedBy: 'clementine', onBehalfOf: 'researcher', createdAt: '2026-06-22T09:00:00.000Z', updatedAt: '2026-06-22T10:00:00.000Z' }),
+  'utf-8',
+);
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
 
@@ -140,9 +148,8 @@ test('GET /api/console/agents/comms returns messages + delegations, skips malfor
     };
     assert.equal(body.messages.length, 1, 'malformed line skipped, one good message');
     assert.equal(body.messages[0].id, 'm1');
-    assert.equal(body.delegations.length, 1);
-    assert.equal(body.delegations[0].id, 'd1');
-    assert.equal(body.delegations[0].status, 'pending');
+    assert.equal(body.delegations.length, 2);
+    assert.ok(body.delegations.some((d) => d.id === 'd1' && d.status === 'pending'));
   } finally {
     await h.close();
   }
@@ -292,6 +299,33 @@ test('slice 4: skills + workflows round-trip and appear as graph nodes/edges; ca
     // Catalog endpoint returns arrays (empty in this temp home — no installs).
     const cat = await (await fetch(`${h.url}/api/console/agents/catalog`)).json() as { skills: unknown[]; workflows: unknown[] };
     assert.ok(Array.isArray(cat.skills) && Array.isArray(cat.workflows), 'catalog has skills + workflows arrays');
+  } finally {
+    await h.close();
+  }
+});
+
+// The console renders delegations as `from → to`, which on its own reads as
+// "the assignee did this". Whenever the primary agent recorded the result
+// instead, the API has to carry that provenance or the screen quietly
+// misattributes the work — the same failure the live proof guards against in
+// the model's prose.
+test('GET /api/console/agents/comms carries delegation result and attribution', async () => {
+  const h = await boot();
+  try {
+    const body = await (await fetch(`${h.url}/api/console/agents/comms`)).json() as {
+      delegations: Array<{
+        id: string; status: string; result?: string; completedBy?: string; onBehalfOf?: string;
+      }>;
+    };
+    const done = body.delegations.find((d) => d.id === 'd2');
+    assert.ok(done, 'the completed delegation must be returned');
+    assert.equal(done.status, 'completed');
+    assert.equal(done.result, 'Three risks: a, b, c', 'the payoff the user actually wants to read');
+    assert.equal(done.completedBy, 'clementine', 'who really produced it');
+    assert.equal(done.onBehalfOf, 'researcher', 'and whose queue it came from');
+
+    const open = body.delegations.find((d) => d.id === 'd1');
+    assert.equal(open?.completedBy, undefined, 'an open delegation invents no author');
   } finally {
     await h.close();
   }
