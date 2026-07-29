@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { advisoryLabel, advisoryTone, buildWorkflowRunDetail } from './workflow-run-detail';
+import { advisoryLabel, advisoryTone, buildWorkflowRunDetail, describeReshape } from './workflow-run-detail';
 
 type Ev = Record<string, unknown>;
 
@@ -266,4 +266,59 @@ test('capability parking renders as waiting for connection and returns to runnin
   assert.equal(resumed.runStatus, 'running');
   assert.equal(resumed.steps[0].status, 'running');
   assert.equal(resumed.steps[0].error, '');
+});
+
+// ── Graph reshapes (Clementine 3): the model changing its own run shape ──
+test('applied and refused reshapes both surface, and a bare proposal claims nothing', () => {
+  const detail = buildWorkflowRunDetail([
+    { kind: 'run_started', t: '2026-07-29T10:00:00Z' },
+    // A proposal alone must NOT appear as an outcome.
+    { kind: 'workflow_graph_patch_proposed', t: '2026-07-29T10:01:00Z', meta: { operations: ['add_node'] } },
+    {
+      kind: 'workflow_graph_patch_applied',
+      t: '2026-07-29T10:01:01Z',
+      meta: {
+        reason: 'two sources rate-limited',
+        operations: ['add_node', 'add_node', 'add_edge'],
+        proposedByNodeId: 'research',
+        nodeCount: 6,
+        edgeCount: 7,
+      },
+    },
+    {
+      kind: 'workflow_graph_patch_rejected',
+      t: '2026-07-29T10:02:00Z',
+      meta: {
+        reason: 'skip the wait',
+        operations: ['disable_edge'],
+        errors: ['Disabling "dependency:publish->confirm" would let "confirm" run without waiting for approval-gated "publish".'],
+      },
+    },
+  ]);
+
+  assert.equal(detail.reshapes.length, 2, 'a proposal without an outcome is not a reshape');
+  const [applied, refused] = detail.reshapes;
+
+  assert.equal(applied.status, 'applied');
+  assert.equal(applied.proposedByNodeId, 'research');
+  assert.equal(applied.nodeCount, 6);
+  assert.equal(
+    describeReshape(applied),
+    'Clementine added 2 branches, linked 1 dependency — two sources rate-limited',
+  );
+
+  assert.equal(refused.status, 'refused');
+  assert.match(refused.errors[0], /approval-gated "publish"/);
+  assert.match(describeReshape(refused), /^Reshape refused — withheld 1 route/);
+});
+
+test('a reshape with no model reason describes only what changed, never a cause', () => {
+  assert.equal(
+    describeReshape({ at: 't', status: 'applied', operations: ['enable_edge'], errors: [] }),
+    'Clementine restored 1 route',
+  );
+  assert.equal(
+    describeReshape({ at: 't', status: 'applied', operations: [], errors: [] }),
+    'Clementine changed the run shape',
+  );
 });

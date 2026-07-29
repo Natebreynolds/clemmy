@@ -10,13 +10,14 @@
  * Presentational only — all folding lives in lib/workflow-run-detail.ts.
  */
 import { useMemo } from 'react';
-import { CheckCircle2, AlertCircle, AlertTriangle, Radio, Circle, MinusCircle, Package, PauseCircle } from 'lucide-react';
+import { CheckCircle2, AlertCircle, AlertTriangle, Radio, Circle, MinusCircle, Package, PauseCircle, GitBranch } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import {
   advisoryLabel,
   advisoryTone,
   buildWorkflowRunDetail,
+  describeReshape,
   type WorkflowRunStep,
   type WorkflowStepStatus,
 } from '@/lib/workflow-run-detail';
@@ -145,6 +146,29 @@ export function WorkflowRunDetail({ events }: { events: ReadonlyArray<Record<str
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {detail.reshapes.length > 0 && (
+        <div className="rounded-md border border-border border-l-2 border-l-info px-3 py-2.5">
+          <div className="mb-1.5 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint">
+            <GitBranch className="h-3.5 w-3.5" aria-hidden /> Clementine reshaped this run
+          </div>
+          <ul className="space-y-1.5">
+            {detail.reshapes.map((reshape, i) => (
+              <li key={`reshape-${i}`} className="text-small">
+                <span className={reshape.status === 'refused' ? 'text-warning' : 'text-fg'}>
+                  {describeReshape(reshape)}
+                </span>
+                {/* A refusal states the deterministic rule that stopped it, so a
+                    reshape that did not happen is never mistaken for one that did. */}
+                {reshape.errors.map((error, j) => (
+                  <p key={`reshape-${i}-err-${j}`} className="mt-0.5 text-caption text-muted">{error}</p>
+                ))}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1.5 text-caption text-faint">Completed work is never changed by a reshape.</p>
         </div>
       )}
 

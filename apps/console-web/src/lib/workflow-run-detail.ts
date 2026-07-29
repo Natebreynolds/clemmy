@@ -86,6 +86,43 @@ export interface WorkflowRunDetail {
   verdicts: WorkflowRunVerdict[];
   /** Mid-run watcher steers, in event order. */
   watcherSteers: WorkflowWatcherSteer[];
+  /** Structural reshapes the model made (or was refused) while the run was
+   *  in flight, in event order. */
+  reshapes: WorkflowGraphReshape[];
+}
+
+/** One model-proposed change to the run's own shape. Refusals are kept, not
+ *  hidden: a rejected reshape is part of the honest account of the run. */
+export interface WorkflowGraphReshape {
+  at: string;
+  status: 'applied' | 'refused';
+  /** The model's own sentence for why the shape had to change. */
+  reason?: string;
+  /** Operation kinds in order, e.g. ['add_node','add_edge']. */
+  operations: string[];
+  /** Node that proposed it, when the harness recorded one. */
+  proposedByNodeId?: string;
+  /** Why the harness refused (deterministic rules only). */
+  errors: string[];
+  nodeCount?: number;
+  edgeCount?: number;
+}
+
+/** Plain-language summary of a reshape for the cockpit feed. Never invents a
+ *  cause: without the model's reason it describes only what changed. */
+export function describeReshape(reshape: WorkflowGraphReshape): string {
+  const counts = reshape.operations.reduce<Record<string, number>>((acc, op) => {
+    acc[op] = (acc[op] ?? 0) + 1;
+    return acc;
+  }, {});
+  const parts: string[] = [];
+  if (counts.add_node) parts.push(`added ${counts.add_node} branch${counts.add_node === 1 ? '' : 'es'}`);
+  if (counts.add_edge) parts.push(`linked ${counts.add_edge} dependenc${counts.add_edge === 1 ? 'y' : 'ies'}`);
+  if (counts.disable_edge) parts.push(`withheld ${counts.disable_edge} route${counts.disable_edge === 1 ? '' : 's'}`);
+  if (counts.enable_edge) parts.push(`restored ${counts.enable_edge} route${counts.enable_edge === 1 ? '' : 's'}`);
+  const what = parts.length > 0 ? parts.join(', ') : 'changed the run shape';
+  const lead = reshape.status === 'applied' ? `Clementine ${what}` : `Reshape refused — ${what}`;
+  return reshape.reason ? `${lead} — ${reshape.reason}` : lead;
 }
 
 type Ev = Record<string, unknown>;
@@ -158,6 +195,7 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
   let runFinishedAt: string | undefined;
   const verdicts: WorkflowRunVerdict[] = [];
   const watcherSteers: WorkflowWatcherSteer[] = [];
+  const reshapes: WorkflowGraphReshape[] = [];
 
   const ensure = (stepId: string): WorkflowRunStep => {
     let s = byStep.get(stepId);
@@ -207,6 +245,24 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
       });
       continue;
     }
+    // Structural reshapes are run-level too. The 'proposed' event is the
+    // model's intent; only applied/refused are outcomes worth showing, so a
+    // proposal that never resolved never claims to have changed anything.
+    if (kind === 'workflow_graph_patch_applied' || kind === 'workflow_graph_patch_rejected') {
+      const meta = asMeta(ev.meta);
+      reshapes.push({
+        at: t,
+        status: kind === 'workflow_graph_patch_applied' ? 'applied' : 'refused',
+        ...(str(meta.reason) ? { reason: str(meta.reason) } : {}),
+        operations: asStringArray(meta.operations),
+        ...(str(meta.proposedByNodeId) ? { proposedByNodeId: str(meta.proposedByNodeId) } : {}),
+        errors: asStringArray(meta.errors),
+        ...(num(meta.nodeCount) !== undefined ? { nodeCount: num(meta.nodeCount) } : {}),
+        ...(num(meta.edgeCount) !== undefined ? { edgeCount: num(meta.edgeCount) } : {}),
+      });
+      continue;
+    }
+
     const stepId = str(ev.stepId);
     if (!stepId) continue;
     // Watcher steers ride step_advisory with the synthetic '(watcher)' stepId —
@@ -329,7 +385,7 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
       })()
     : undefined;
 
-  return { steps, summary, runStatus, runStartedAt, runFinishedAt, durationMs, tokensTotal, verdicts, watcherSteers };
+  return { steps, summary, runStatus, runStartedAt, runFinishedAt, durationMs, tokensTotal, verdicts, watcherSteers, reshapes };
 }
 
 /** Friendly, human labels for the advisory reasons the runner emits (incl. the
