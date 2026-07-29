@@ -90,7 +90,15 @@ export const agentAutonomyLive: ScenarioDef = {
       if (record?.status === 'completed') break;
       await new Promise((resolve) => setTimeout(resolve, POLL_MS));
     }
-    const state = readAgentState(daemon.home);
+    // The cycle writes agent state AFTER its turn finishes; the delegation
+    // completes DURING the turn. Give the state file a bounded grace window so
+    // the audit-trail checks measure the engine, not this race.
+    let state = readAgentState(daemon.home);
+    const stateDeadline = Date.now() + 60_000;
+    while ((!state?.lastRunAt) && Date.now() < stateDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+      state = readAgentState(daemon.home);
+    }
 
     const checks: Check[] = [];
     checks.push(stormCheck(daemon.log()));

@@ -1086,6 +1086,14 @@ async function runAgentCycleViaRuntime(
       channel: 'cron' as const,
       message: buildRuntimeCyclePrompt(record, input),
       maxWallClockMs: RUNTIME_CYCLE_TIMEOUT_MS,
+      // The harness surface exposes the registry team tools, which attribute
+      // the actor from the PROCESS-GLOBAL agent slug — in the shared daemon a
+      // cycle using them records the work as 'clementine' (proven live: the
+      // first harness-lane cycle completed its delegation by calling
+      // complete_delegation directly, attributed to the wrong actor). Close
+      // that door for cycle turns: the model must return the JSON actions,
+      // which execute with the slug bound in code.
+      excludeToolNames: ['complete_delegation', 'delegation_inbox', 'check_delegation', 'delegate_task', 'team_reply', 'team_request', 'team_message'],
     };
     let run = await respondPreferHarness('cron', baseRequest, (req) => assistant.respond(req));
     let parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
