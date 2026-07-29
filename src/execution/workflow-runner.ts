@@ -7229,7 +7229,15 @@ export function renderGoalFeedback(verdict: GoalValidationResult): string {
 
 export interface CreationTestStepResult {
   stepId: string;
-  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error';
+  /**
+   * 'unverifiable' is distinct from 'failed' on purpose. A step downstream of a
+   * PREVIEWED mutation cannot be contract-checked during authoring — the write
+   * it verifies deliberately never happened — so calling it a failure would
+   * make write-then-verify workflows permanently un-enablable. That shape
+   * (append a row, read it back; upsert a record, confirm it) is the exact
+   * pattern the evidence architecture asks users to build.
+   */
+  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable';
   detail?: string;
 }
 export interface CreationTestResult {
@@ -7282,6 +7290,12 @@ export async function runCreationTest(
   const steps = workflow.steps;
   const results: CreationTestStepResult[] = [];
   const completed = new Set<string>();
+  // Steps whose result depends on a mutation that was deliberately not
+  // executed. Their contracts describe post-write reality, so they are
+  // reported honestly as unverifiable rather than judged as broken.
+  const previewTainted = new Set<string>();
+  const dependsOnPreview = (step: WorkflowStepInput): boolean =>
+    (step.dependsOn ?? []).some((dep) => previewTainted.has(dep));
   let guard = 0;
   while (completed.size < steps.length && guard++ < steps.length + 2) {
     const readyIds = new Set(resolveWorkflowReadiness(steps, completed).readyStepIds);
@@ -7294,6 +7308,17 @@ export async function runCreationTest(
         // read-only steps still get a stub so they can run.
         stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
         results.push({ stepId: step.id, status: 'previewed' });
+        previewTainted.add(step.id);
+      } else if (dependsOnPreview(step)) {
+        // Verifying a write that was intentionally skipped is not possible.
+        // Run nothing, claim nothing, and do not hold activation hostage.
+        previewTainted.add(step.id);
+        stepOutputs[step.id] = { previewed: true, reason: 'verifies a previewed mutation — not checked in the creation test' };
+        results.push({
+          stepId: step.id,
+          status: 'unverifiable',
+          detail: 'verifies a step that was previewed, so its contract cannot be checked until the first real run',
+        });
       } else {
         try {
           const out = await executeStepVerified(step, {
@@ -7312,7 +7337,7 @@ export async function runCreationTest(
     }
   }
   const pass = forEachFailures.length === 0
-    && results.every((r) => r.status === 'ok' || r.status === 'previewed');
+    && results.every((r) => r.status === 'ok' || r.status === 'previewed' || r.status === 'unverifiable');
   return { pass, steps: results };
 }
 
@@ -7539,8 +7564,12 @@ async function processOneRunFile(
       }
       const creationReady = result.pass && activationCompatible;
       const lines = result.steps.map((s) => {
-        const icon = s.status === 'ok' ? '✅' : s.status === 'previewed' ? '⏭️ previewed (mutating — not run)' : '⚠️';
-        return `- ${s.stepId}: ${s.status === 'ok' ? '✅ returned data' : s.status === 'previewed' ? '⏭️ previewed (mutating step — not run)' : `${icon} ${s.status}${s.detail ? ` — ${s.detail}` : ''}`}`;
+        if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
+        if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
+        // Unverifiable is honest, not alarming: it names WHY the check could
+        // not run so the report never implies a broken step.
+        if (s.status === 'unverifiable') return `- ${s.stepId}: 🔍 not checked — ${s.detail ?? 'verifies a previewed mutation'}`;
+        return `- ${s.stepId}: ⚠️ ${s.status}${s.detail ? ` — ${s.detail}` : ''}`;
       });
       const body = creationReady
         ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
