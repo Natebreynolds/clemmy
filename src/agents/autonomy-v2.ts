@@ -952,16 +952,51 @@ export interface AutonomyV2RunSummary {
  * Safe to call repeatedly; idempotent within a cycle thanks to the
  * inbox `processed` flag and `lastRunAt` cadence check.
  */
+
+/**
+ * One-shot warning for the configured-but-inert case. Bounded to a single
+ * emission per process so a 15s daemon tick cannot turn it into a log storm.
+ */
+let autonomyUnavailableWarned = false;
+export function _testOnly_resetAutonomyUnavailableWarning(): void {
+  autonomyUnavailableWarned = false;
+}
+/** Latch the one-shot. Exported so the once-only rule is testable without
+ *  depending on the log transport. Returns true only on the first call. */
+export function claimAutonomyUnavailableWarning(): boolean {
+  if (autonomyUnavailableWarned) return false;
+  autonomyUnavailableWarned = true;
+  return true;
+}
+function warnAutonomyEngineUnavailableOnce(optIn: Set<string>): void {
+  if (!claimAutonomyUnavailableWarning()) return;
+  logger.warn(
+    {
+      optedInAgents: [...optIn].sort(),
+      reason: 'no_openai_api_key',
+      remedy: 'Autonomy cycles need a raw OPENAI_API_KEY. OAuth-only installs (Claude/Codex OAuth) cannot run them.',
+    },
+    'agent autonomy is configured but cannot run — opted-in agents will not wake',
+  );
+}
+
 export async function processAgentAutonomyV2(): Promise<AutonomyV2RunSummary> {
   const start = Date.now();
   const summary: AutonomyV2RunSummary = { attempted: 0, succeeded: 0, failed: 0, skipped: 0, durationMs: 0 };
 
+  const optIn = readOptInSlugs();
+
   if (!getOpenAiApiKey()) {
+    // Silent no-op is the trap: a user who set AUTONOMY_V2_AGENTS has opted
+    // agents in and will reasonably assume they run. This engine is built on
+    // the OpenAI Agents SDK and needs a raw OpenAI key, which OAuth-only
+    // installs (Claude / Codex OAuth, BYO third-party providers) do not have.
+    // Say so once per process rather than returning quietly every tick.
+    if (optIn.size > 0) warnAutonomyEngineUnavailableOnce(optIn);
     summary.durationMs = Date.now() - start;
     return summary;
   }
 
-  const optIn = readOptInSlugs();
   if (optIn.size === 0) {
     summary.durationMs = Date.now() - start;
     return summary;

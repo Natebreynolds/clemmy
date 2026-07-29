@@ -218,3 +218,41 @@ test('WIRING: an agent with no delegated work gains no empty section', async () 
   const input = _testOnly_buildAgentInput(record, [], { slug: 'idle-agent' });
   assert.doesNotMatch(input, /delegated to you/i, 'quiet agents pay no prompt cost');
 });
+
+// ─── Configured-but-inert must not be silent ───
+// Nathan had AUTONOMY_V2_AGENTS set and reasonably assumed his agents were
+// running. They were not: this engine needs a raw OpenAI key, which an
+// OAuth-only install does not have, and it returned quietly on every tick.
+// A capability that is configured but cannot run has to say so.
+
+test('autonomy warns exactly once when configured but unable to run', async () => {
+  const mod = await import('./autonomy-v2.js');
+  mod._testOnly_resetAutonomyUnavailableWarning();
+
+  // The once-only latch is the property that keeps a 15s daemon tick from
+  // turning an honest warning into a log storm.
+  assert.equal(mod.claimAutonomyUnavailableWarning(), true, 'first tick reports');
+  assert.equal(mod.claimAutonomyUnavailableWarning(), false, 'later ticks stay quiet');
+
+  mod._testOnly_resetAutonomyUnavailableWarning();
+  assert.equal(mod.claimAutonomyUnavailableWarning(), true, 'a fresh process reports again');
+});
+
+test('a configured-but-keyless autonomy pass does no work and does not throw', async () => {
+  const mod = await import('./autonomy-v2.js');
+  mod._testOnly_resetAutonomyUnavailableWarning();
+
+  const prevAgents = process.env.AUTONOMY_V2_AGENTS;
+  const prevKey = process.env.OPENAI_API_KEY;
+  process.env.AUTONOMY_V2_AGENTS = 'proof-analyst';
+  delete process.env.OPENAI_API_KEY;
+  try {
+    const summary = await mod.processAgentAutonomyV2();
+    assert.equal(summary.attempted, 0, 'no agent cycle is attempted without a key');
+    assert.equal(summary.failed, 0, 'and it is not reported as a failure');
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+    if (prevKey !== undefined) process.env.OPENAI_API_KEY = prevKey;
+  }
+});
