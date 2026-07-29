@@ -1,3 +1,9 @@
+import {
+  classifyMessageIntent,
+  MUTATION_ACTION_CUES,
+} from '../../assistant/message-intent.js';
+import { classifyExternalEffectRequest } from '../../assistant/external-effect-taxonomy.js';
+
 const TOOL_SURFACE_PROBE_TOOLS = new Set([
   'check_capability',
   'list_capabilities',
@@ -27,13 +33,29 @@ const CONTROL_ONLY_TOOLS = new Set([
   'working_memory',
 ]);
 
-const MUTATING_OBJECTIVE_RE =
-  /\b(?:add|build|call|change|configure|create|delete|deploy|draft|edit|email|execute|generate|install|make|post|publish|remove|run|save|schedule|send|set up|update|write)\b/i;
+function regexAlternation(terms: readonly string[]): string {
+  return terms
+    .map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'))
+    .sort((a, b) => b.length - a.length)
+    .join('|');
+}
+
+const MUTATION_ACTION_SOURCE = regexAlternation(MUTATION_ACTION_CUES);
+const MUTATING_OBJECTIVE_RE = new RegExp(`\\b(?:${MUTATION_ACTION_SOURCE})\\b`, 'i');
+// Many mutation verbs are also ordinary nouns ("the launch", "the email",
+// "this post"). If a separate non-mutating deliverable makes the whole request
+// action-shaped, those noun references must not suddenly demand write evidence.
+// A real imperative still has its verb elsewhere ("publish the post"), so
+// projecting the determiner+noun reference is conservative.
+const MUTATION_NOUN_REFERENCE_RE = new RegExp(
+  `\\b(?:a|an|the|this|that|these|those|my|our|your|its)\\s+(?:${MUTATION_ACTION_SOURCE})\\b`,
+  'gi',
+);
 
 const NEGATED_ACTION_CLAUSE_RE =
-  /\b(?:do\s+not|don't|dont|never|without)\b[^.!?\n;]*/gi;
+  /\b(?:do\s+not|don't|dont|never|without)\b(?:(?!,\s*(?:but|however|instead|then|yet)\b)[^.!?\n;])*/gi;
 const NEGATED_NO_ACTION_CLAUSE_RE =
-  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^.!?\n;]*/gi;
+  /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b(?:(?!,\s*(?:but|however|instead|then|yet)\b)[^.!?\n;])*/gi;
 // Mutation evidence uses a tighter, comma-bounded form. A prohibition such as
 // "do not run shell commands" must not turn a lookup into a mutation, while a
 // positive clause after it ("do not send email, but write the local report")
@@ -43,19 +65,85 @@ const NEGATED_MUTATION_SEGMENT_RE =
 const NEGATED_NO_MUTATION_SEGMENT_RE =
   /\bno\s+(?:external\s+)?(?:writes?|changes?|sends?|posts?|publishes?|deployments?|uploads?)\b[^,.!?\n;]*/gi;
 const INHERENT_EXTERNAL_WRITE_RE =
-  /\b(?:deploy|invite|publish|send|submit|upload)\b/i;
+  /\b(?:deploy|invite|publish|send|submit|unsubscribe|upload)\b/i;
 const CONTEXTUAL_EXTERNAL_WRITE_VERB_RE =
   /\b(?:host|post|schedule|reschedule)\s+(?:a|an|the|this|that|it|them|to|on|for)\b/i;
 const LOCAL_SCHEDULE_TARGET_RE =
   /\b(?:workflow|automation|cron|scheduled job)\b/i;
-const EXTERNAL_DESTINATION_RE =
-  /\b(?:airtable|box|calendar|figma|gmail|google\s+(?:docs?|drive|sheets?)|googledocs?|googledrive|googlesheets?|github|heroku|hubspot|netlify|notion|outlook|railway|salesforce|sharepoint|slack|stripe|supabase|teams|vercel|external\s+(?:app|service|system)|connected\s+(?:app|service|system)|sheet\s+(?:cell|cells|range|row|rows|tab)|spreadsheet)\b/i;
-const EXTERNAL_WRITE_ACTION_RE =
-  /\b(?:add|append|change|create|delete|draft|edit|insert|make|modify|remove|rename|replace|set|update|write)\b/i;
+const EXTERNAL_PROVIDER_SOURCE =
+  'airtable|asana|box|crm|discord|facebook|figma|gmail|google\\s+(?:ads?|calendar|docs?|drive|sheets?)|googledocs?|googledrive|googlesheets?|github|heroku|hubspot|instagram|jira|linear|linkedin|meta|netlify|notion|one\\s*drive|onedrive|outlook|railway|salesforce|sharepoint|slack|stripe|supabase|teams|tiktok|trello|twitter|vercel|x|youtube|zoom|external\\s+(?:app|service|system)|connected\\s+(?:app|service|system)';
+const EXTERNAL_OPERATIONAL_OBJECT_SOURCE =
+  'accounts?|bases?|boards?|branches?|campaigns?|cards?|cells?|channels?|charges?|comments?|contacts?|customers?|databases?|deals?|docs?|documents?|drafts?|events?|files?|folders?|gists?|invoices?|issues?|leads?|lists?|meetings?|messages?|pages?|payments?|posts?|projects?|pull\\s+requests?|prs?|ranges?|records?|refunds?|releases?|reminders?|repositories?|repos?|rows?|services?|sites?|spreadsheets?|subscriptions?|tasks?|threads?|tickets?|transactions?|values?|views?';
+const EXTERNAL_DESTINATION_RE = new RegExp(
+  `\\b(?:${EXTERNAL_PROVIDER_SOURCE}|calendar|email|sheet\\s+(?:cell|cells|range|row|rows|tab)|spreadsheet)\\b`,
+  'i',
+);
+const NON_EXTERNAL_MUTATION_ACTIONS = new Set([
+  'build',
+  'call',
+  'execute',
+  'generate',
+  'install',
+  'run',
+]);
+const EXTERNAL_MUTATION_ACTION_SOURCE = regexAlternation(
+  MUTATION_ACTION_CUES.filter((term) => !NON_EXTERNAL_MUTATION_ACTIONS.has(term)),
+);
+const EXTERNAL_WRITE_ACTION_RE = new RegExp(
+  `\\b(?:${EXTERNAL_MUTATION_ACTION_SOURCE})\\b`,
+  'i',
+);
+const DIRECT_EXTERNAL_PROVIDER_TARGET_RE = new RegExp(
+  `\\b(?:${EXTERNAL_MUTATION_ACTION_SOURCE})\\b\\s+(?:(?:a|an|my|our|the|this|that|these|those|your)\\s+)?(?:${EXTERNAL_PROVIDER_SOURCE}|calendar|spreadsheet)\\b`,
+  'i',
+);
+const EXTERNAL_TARGET_PREPOSITION_RE = new RegExp(
+  `\\b(?:${EXTERNAL_MUTATION_ACTION_SOURCE})\\b[^.!?\\n;]{0,160}\\b(?:as|in|into|on|through|to|via|within)\\s+(?:(?:my|our|the)\\s+)?(?:${EXTERNAL_PROVIDER_SOURCE})\\b`,
+  'i',
+);
+const EXTERNAL_PROVIDER_OBJECT_RE = new RegExp(
+  `\\b(?:${EXTERNAL_PROVIDER_SOURCE})\\b[^.!?\\n;]{0,80}\\b(?:${EXTERNAL_OPERATIONAL_OBJECT_SOURCE})\\b`,
+  'i',
+);
+const EXTERNAL_PROVIDER_PRODUCT_OBJECT_RE =
+  /\b(?:google\s+docs?|google\s+drive|google\s+sheets?|one\s*drive|onedrive)\b/i;
+const GENERIC_EXTERNAL_OBJECT_ACTION_RE =
+  /\b(?:(?:accept|cancel|create|decline|delete|edit|modify|remove|reschedule|update)\b[^.!?\n;]{0,100}\b(?:calendar\s+)?(?:appointment|event|invitation|meeting|reservation)|(?:forward|reply\s+to)\b[^.!?\n;]{0,100}\bemail)\b/i;
 const EXPLICIT_EXTERNAL_WRITE_RE =
   /\bexternal[-\s]+write\b/i;
 const URL_TARGETED_WRITE_RE =
   /\b(?:add|append|create|delete|deploy|edit|modify|post|publish|remove|send|submit|update|upload|write)\b[^.!?\n]{0,100}\b(?:https?:\/\/|api\s+endpoint)\b/i;
+const STAGED_EXTERNAL_ACTION_RE =
+  /\b(?:automation|configure|define|draft|prepare|preview|queue|queued|queueing|simulation|stage|staged|staging|workflow|workspace)\b/i;
+const EXPLICIT_EXTERNAL_ACTION_DEFERRAL_RE =
+  /(?:\b(?:do\s+not|don't|dont|never)\b[^.!?\n;]{0,160}\b(?:call|deploy|execute|invoke|post|publish|run|send|submit|upload|write)\b|\b(?:only\s+after|pending|unless|until)\b[^.!?\n;]{0,120}\b(?:approv(?:al|e|ed)|confirmation|permission)\b|\bask\b[^.!?\n;]{0,120}\b(?:if|whether)\b[^.!?\n;]{0,80}\b(?:deploy|execute|invoke|post|publish|run|send|submit|upload|write)\b|\b(?:send|deploy|post|publish|submit|upload|write)\s+nothing\s+(?:yet|now)\b|\b(?:queue|stage|prepare|draft)\b[^.!?\n;]{0,180}\bfor\s+(?:approval|confirmation|permission|later)\b|\bi\s+(?:might|may|could|would)\b[^.!?\n;]{0,120}\b(?:deploy|post|publish|send|submit|upload|write)\b[^.!?\n;]{0,60}\blater\b)/i;
+const STAGED_ACTION_METADATA_RE =
+  /\b(?:action(?:\s+id)?|arguments?|payload(?:json)?|tool(?:name|_slug)?)\b/i;
+const STAGED_ACTION_METADATA_ONLY_RE =
+  /^\s*(?:the\s+)?(?:action(?:\s+id)?|arguments?|payload(?:json)?|tool(?:name|_slug)?)\b/i;
+const STAGED_CLAUSE_IMMEDIATE_EXECUTION_RE =
+  new RegExp(
+    `\\b(?:(?:and|then)\\s+(?:actually\\s+)?(?:${EXTERNAL_MUTATION_ACTION_SOURCE}|invoke)|(?:${EXTERNAL_MUTATION_ACTION_SOURCE}|invoke)\\b[^.!?\\n;]{0,40}\\b(?:immediately|now|right\\s+away))\\b`,
+    'i',
+  );
+const LOCAL_ARTIFACT_WRITE_RE =
+  /\b(?:build|create|draft|save|write)\b[^.!?\n;]{0,120}\b(?:local(?:ly)?|mock)\b/i;
+const DISCUSSION_ARTIFACT_RE =
+  /\b(?:analysis|brief|checklist|comparison|guide|mock|notes?|plan|proposal|recommendations?|report|response|summary)\b[^.!?\n;]{0,60}\b(?:about|comparing|of|regarding)\b/i;
+const PROVIDER_REFERENCING_ARTIFACT_SOURCE =
+  'analysis|brief|checklist|comparison|drafts?|guide|migration\\s+plan|notes?|plan|proposal|recommendations?|report|response|summary';
+const PROVIDER_REFERENCING_ARTIFACT_RE = new RegExp(
+  `\\b(?:${PROVIDER_REFERENCING_ARTIFACT_SOURCE})\\b`,
+  'i',
+);
+const EXPLICIT_ARTIFACT_PROVIDER_DESTINATION_RE = new RegExp(
+  `(?:\\b(?:${EXTERNAL_MUTATION_ACTION_SOURCE})\\b[^.!?\\n;]{0,100}\\b(?:${PROVIDER_REFERENCING_ARTIFACT_SOURCE})\\b[^.!?\\n;]{0,50}\\b(?:in|into|within)\\s+(?:(?:my|our|the)\\s+)?(?:${EXTERNAL_PROVIDER_SOURCE})\\b|\\b(?:add|append|copy|move|save|send|share|submit|upload)\\b[^.!?\\n;]{0,100}\\b(?:${PROVIDER_REFERENCING_ARTIFACT_SOURCE})\\b[^.!?\\n;]{0,50}\\b(?:on|through|to|via)\\s+(?:(?:my|our|the)\\s+)?(?:${EXTERNAL_PROVIDER_SOURCE})\\b|\\bsave\\b[^.!?\\n;]{0,100}\\bas\\s+(?:(?:a|an|my|our|the)\\s+)?(?:${EXTERNAL_PROVIDER_SOURCE})\\b[^.!?\\n;]{0,50}\\b(?:${PROVIDER_REFERENCING_ARTIFACT_SOURCE})\\b|\\b(?:create|save)\\s+(?:(?:a|an|my|our|the)\\s+)?(?:${EXTERNAL_PROVIDER_SOURCE})\\b[^.!?\\n;]{0,50}\\bdrafts?\\b)`,
+  'i',
+);
+const DRAFT_ONLY_CLAUSE_RE =
+  /^\s*(?:(?:please|kindly)\s+)?draft\b/i;
+const DRAFT_EXTERNAL_TARGET_RE =
+  /\bdraft\b[^.!?\n;]{0,120}\b(?:in|into|on|within)\s+(?:gmail|google\s+docs?|notion|outlook|slack)\b/i;
 
 const READ_ONLY_TOOL_RE =
   /(?:^|_)(?:check|fetch|find|get|history|info|inspect|list|lookup|probe|query|read|recall|search|status)(?:_|$)/i;
@@ -98,16 +186,57 @@ export function completionEvidenceToolName(rawName: string, input?: unknown): st
 }
 
 export function objectiveRequiresMutatingEvidence(objectiveText: string): boolean {
-  const positive = objectiveText
+  const nonNegated = objectiveText
     .replace(NEGATED_MUTATION_SEGMENT_RE, ' ')
     .replace(NEGATED_NO_MUTATION_SEGMENT_RE, ' ');
-  return MUTATING_OBJECTIVE_RE.test(positive);
+  const directExternalEffect = classifyExternalEffectRequest(nonNegated).requested;
+  const positive = nonNegated
+    .replace(MUTATION_NOUN_REFERENCE_RE, ' referenced item ');
+  return directExternalEffect
+    || classifyMessageIntent(positive).intent === 'action'
+    && MUTATING_OBJECTIVE_RE.test(positive);
 }
 
 function positiveObjectiveActionText(objectiveText: string): string {
   return objectiveText
     .replace(NEGATED_ACTION_CLAUSE_RE, ' ')
     .replace(NEGATED_NO_ACTION_CLAUSE_RE, ' ');
+}
+
+function externalDestinationIsOnlyArtifactContext(
+  clause: string,
+  immediateExecution: boolean,
+): boolean {
+  if (immediateExecution) return false;
+  if (LOCAL_ARTIFACT_WRITE_RE.test(clause)) return true;
+  if (DRAFT_ONLY_CLAUSE_RE.test(clause) && !DRAFT_EXTERNAL_TARGET_RE.test(clause)) return true;
+  if (DRAFT_EXTERNAL_TARGET_RE.test(clause)) return false;
+  // Provider names frequently describe the subject of a local artifact
+  // ("GitHub release checklist", "Salesforce contact report"). Do not turn
+  // that mention into a provider-write requirement. An explicit destination
+  // ("create the report in Notion") still binds the provider as the target.
+  if (
+    PROVIDER_REFERENCING_ARTIFACT_RE.test(clause)
+    && EXTERNAL_DESTINATION_RE.test(clause)
+    && !EXPLICIT_ARTIFACT_PROVIDER_DESTINATION_RE.test(clause)
+    && !INHERENT_EXTERNAL_WRITE_RE.test(clause)
+  ) return true;
+  const discussion = DISCUSSION_ARTIFACT_RE.exec(clause);
+  if (!discussion) return false;
+  const destinationContext = clause.slice(discussion.index + discussion[0].length);
+  return EXTERNAL_DESTINATION_RE.test(destinationContext);
+}
+
+function externalDestinationIsBoundMutationTarget(
+  clause: string,
+  immediateExecution: boolean,
+): boolean {
+  if (immediateExecution && EXTERNAL_DESTINATION_RE.test(clause)) return true;
+  return EXTERNAL_TARGET_PREPOSITION_RE.test(clause)
+    || DIRECT_EXTERNAL_PROVIDER_TARGET_RE.test(clause)
+    || EXTERNAL_PROVIDER_OBJECT_RE.test(clause)
+    || EXTERNAL_PROVIDER_PRODUCT_OBJECT_RE.test(clause)
+    || GENERIC_EXTERNAL_OBJECT_ACTION_RE.test(clause);
 }
 
 /**
@@ -119,18 +248,39 @@ function positiveObjectiveActionText(objectiveText: string): string {
  */
 export function objectiveRequiresFreshExternalWrite(objectiveText: string): boolean {
   const positive = positiveObjectiveActionText(objectiveText);
-  if (!positive.trim()) return false;
-  if (EXPLICIT_EXTERNAL_WRITE_RE.test(positive) || URL_TARGETED_WRITE_RE.test(positive)) return true;
-  if (INHERENT_EXTERNAL_WRITE_RE.test(positive)) return true;
-  if (
-    CONTEXTUAL_EXTERNAL_WRITE_VERB_RE.test(positive)
-    && !(
-      /\b(?:schedule|reschedule)\b/i.test(positive)
-      && LOCAL_SCHEDULE_TARGET_RE.test(positive)
-      && !EXTERNAL_DESTINATION_RE.test(positive)
-    )
-  ) return true;
-  return EXTERNAL_WRITE_ACTION_RE.test(positive) && EXTERNAL_DESTINATION_RE.test(positive);
+  return positive
+    .split(/[.!?\n;]+/)
+    .some((clause) => {
+      if (!clause.trim()) return false;
+      const immediateExecution = STAGED_CLAUSE_IMMEDIATE_EXECUTION_RE.test(clause);
+      if (
+        EXPLICIT_EXTERNAL_ACTION_DEFERRAL_RE.test(clause)
+        && !immediateExecution
+      ) return false;
+      const stagedMetadataOnly = (
+        STAGED_ACTION_METADATA_ONLY_RE.test(clause)
+        || (
+          STAGED_ACTION_METADATA_RE.test(clause)
+          && STAGED_EXTERNAL_ACTION_RE.test(clause)
+        )
+      ) && !immediateExecution;
+      if (stagedMetadataOnly) return false;
+      if (classifyMessageIntent(clause).intent !== 'action') return false;
+      if (externalDestinationIsOnlyArtifactContext(clause, immediateExecution)) return false;
+      if (EXPLICIT_EXTERNAL_WRITE_RE.test(clause) || URL_TARGETED_WRITE_RE.test(clause)) return true;
+      if (INHERENT_EXTERNAL_WRITE_RE.test(clause)) return true;
+      if (classifyExternalEffectRequest(clause).requested) return true;
+      if (
+        CONTEXTUAL_EXTERNAL_WRITE_VERB_RE.test(clause)
+        && !(
+          /\b(?:schedule|reschedule)\b/i.test(clause)
+          && LOCAL_SCHEDULE_TARGET_RE.test(clause)
+          && !EXTERNAL_DESTINATION_RE.test(clause)
+        )
+      ) return true;
+      return EXTERNAL_WRITE_ACTION_RE.test(clause)
+        && externalDestinationIsBoundMutationTarget(clause, immediateExecution);
+    });
 }
 
 export type FreshExternalWriteEvidenceStatus =

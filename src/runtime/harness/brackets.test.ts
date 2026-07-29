@@ -43,6 +43,7 @@ const {
   softToolError,
   parallelPreWriteGatesEnabled,
   startGate,
+  mintJudgeFailApproval,
   OrphanedWriteRetryError,
 } = await import('./brackets.js');
 const { classifyTurnPreflight, recordTurnPreflightDecision } = await import('./turn-control.js');
@@ -2549,10 +2550,14 @@ async function runJudgeFailSendProbe(opts: {
     CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
     CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
     CLEMMY_JUDGE_FAIL_APPROVAL: process.env.CLEMMY_JUDGE_FAIL_APPROVAL,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    COMPOSIO_BACKEND: process.env.COMPOSIO_BACKEND,
   };
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   process.env.CLEMMY_GROUNDING_GATE = 'off';
   process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.COMPOSIO_BACKEND = 'sdk';
   if (opts.killSwitchOff) process.env.CLEMMY_JUDGE_FAIL_APPROVAL = 'off';
   else delete process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
   _resetGoalFidelityStateForTests();
@@ -2560,7 +2565,7 @@ async function runJudgeFailSendProbe(opts: {
     appendEvent({ sessionId: sess, turn: 0, role: 'orchestrator', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: cid, arguments: JSON.stringify({ tool_slug: slug, arguments: JSON.stringify({ to_email: toEmail, subject: 's', body: OPENING }) }) } });
   try {
     const sess = createSession({ kind: 'chat' }).id;
-    appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send the 10 approved intro emails to the prospect list.' } });
+    const source = appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send the 10 approved intro emails to the prospect list.' } });
     if (opts.judge === 'timeout') {
       // Two prior byte-identical sends to DISTINCT targets → a burst is in flight,
       // so a judge OUTAGE fails CLOSED (the exact live scenario).
@@ -2579,11 +2584,22 @@ async function runJudgeFailSendProbe(opts: {
     const args = { tool_slug: SEND, arguments: JSON.stringify({ to_email: opts.targetEmail ?? 'c@firm-c.example', subject: 's', body: OPENING }) };
     const counter = new ToolCallsCounter(100);
     const result = String(await withHarnessRunContext(
-      { sessionId: sess, counter },
+      { sessionId: sess, counter, sourceUserSeq: source.seq },
       () => (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
         .invoke({ context: { sessionId: sess } }, JSON.stringify(args), { toolCall: { callId: 'c-jf' } }),
     ));
-    return { invoked, result, pending: listPendingActions({ status: 'all', limit: 100 }), sess };
+    const { listPending: listPendingApprovals } = await import('./approval-registry.js');
+    return {
+      invoked,
+      result,
+      pending: listPendingActions({ status: 'all', limit: 100 }),
+      approvals: listPendingApprovals({ sessionId: sess, status: 'pending' }),
+      approvalEvents: listEvents(sess, {
+        types: ['approval_requested', 'approval_parked'],
+        sinceSeq: source.seq,
+      }),
+      sess,
+    };
   } finally {
     _setGoalFidelityJudgeForTests(null);
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
@@ -2594,9 +2610,20 @@ test('P0c: a goal-fidelity judge OUTAGE on an irreversible send refuses AND mint
   const r = await runJudgeFailSendProbe({ judge: 'timeout' });
   assert.equal(r.invoked, 0, 'the send was refused (not fired unjudged)');
   assert.match(r.result, /Tool call refused by harness/i, 'still a refusal');
-  assert.equal(r.pending.length, 1, 'exactly one pending-approval card was minted');
+  assert.equal(
+    r.pending.length,
+    1,
+    `exactly one pending-approval card was minted; result=${r.result}; approvals=${JSON.stringify(r.approvals)}; events=${JSON.stringify(r.approvalEvents)}`,
+  );
   assert.equal(r.pending[0].toolName, 'composio_execute_tool');
   assert.match(r.pending[0].title, /Judge couldn't verify/i);
+  assert.equal(r.approvals.length, 1, 'the queued action is linked to one formal approval');
+  assert.equal(r.pending[0].approvalId, r.approvals[0].approvalId);
+  assert.deepEqual(
+    r.approvalEvents.map((event) => event.type),
+    ['approval_requested', 'approval_parked'],
+    'the canonical approval and parked events are durable before the error claims a card is waiting',
+  );
   assert.match(r.result, new RegExp(r.pending[0].id), 'the tool result names the pending action id so the model can tell the user');
   assert.match(r.result, /do NOT retry the send yourself/i);
 });
@@ -2615,6 +2642,128 @@ test('P0c: a repeated judge-fail on the SAME payload dedups — no second card',
   const again = findOpenPendingActionByPayload(r.pending[0].toolName, r.pending[0].payload);
   assert.ok(again && again.id === r.pending[0].id, 'the open card is reused for an identical payload');
   assert.equal(listPendingActions({ status: 'all', limit: 100 }).length, 1, 'still exactly one card');
+});
+
+test('P0c: judge-fail dedup is session-scoped and never lends another session its approval', async () => {
+  resetEventLog();
+  rmSync(path.join(TMP_HOME, 'pending-actions'), { recursive: true, force: true });
+  const previous = process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  delete process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  const payload = {
+    tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    arguments: JSON.stringify({
+      to_email: 'same-target@example.test',
+      subject: 'Same payload',
+      body: 'Exact reviewed body.',
+    }),
+  };
+  try {
+    const firstSession = createSession({ kind: 'chat' });
+    const firstSource = appendEvent({
+      sessionId: firstSession.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Send the reviewed message.' },
+    });
+    const secondSession = createSession({ kind: 'chat' });
+    const secondSource = appendEvent({
+      sessionId: secondSession.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Send the reviewed message.' },
+    });
+    const mint = (sessionId: string, sourceUserSeq: number) => mintJudgeFailApproval({
+      sessionId,
+      sourceUserSeq,
+      toolName: 'composio_execute_tool',
+      payload,
+      judge: 'goal-fidelity',
+      judgeFailureReason: 'judge unavailable',
+    });
+    const first = mint(firstSession.id, firstSource.seq);
+    const repeat = mint(firstSession.id, firstSource.seq);
+    const second = mint(secondSession.id, secondSource.seq);
+    assert.ok(first);
+    assert.equal(repeat, first, 'same request reuses its exact pending action');
+    assert.ok(second);
+    assert.notEqual(second, first, 'another session gets separate approval authority');
+
+    const { listPendingActions } = await import('./pending-actions.js');
+    const { listPending: listPendingApprovals } = await import('./approval-registry.js');
+    assert.equal(listPendingActions({ status: 'all', limit: 100 }).length, 2);
+    assert.equal(listPendingApprovals({ sessionId: firstSession.id, status: 'pending' }).length, 1);
+    assert.equal(listPendingApprovals({ sessionId: secondSession.id, status: 'pending' }).length, 1);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
+    else process.env.CLEMMY_JUDGE_FAIL_APPROVAL = previous;
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
+});
+
+test('P0c: judge-outage mint shares account admission — unbound social publish gets no card, exact SDK account remains valid', async () => {
+  resetEventLog();
+  rmSync(path.join(TMP_HOME, 'pending-actions'), { recursive: true, force: true });
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousGate = process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  delete process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Publish the reviewed launch post.' },
+  });
+  const basePayload = {
+    tool_slug: 'INSTAGRAM_CREATE_POST',
+    arguments: JSON.stringify({
+      caption: 'Launch day',
+      image_url: 'https://assets.example/launch.png',
+    }),
+  };
+  try {
+    const unbound = mintJudgeFailApproval({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      toolName: 'composio_execute_tool',
+      payload: { ...basePayload, connected_account_id: null },
+      judge: 'goal-fidelity',
+      judgeFailureReason: 'judge unavailable',
+    });
+    assert.equal(unbound, null, 'judge outage cannot bypass account-destination admission');
+    const { listPendingActions } = await import('./pending-actions.js');
+    const { listPending } = await import('./approval-registry.js');
+    assert.equal(listPendingActions({ sessionId: session.id, status: 'all' }).length, 0);
+    assert.equal(listPending({ sessionId: session.id, status: 'pending' }).length, 0);
+
+    const pinned = mintJudgeFailApproval({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      toolName: 'composio_execute_tool',
+      payload: { ...basePayload, connected_account_id: 'ca_instagram_brand' },
+      judge: 'goal-fidelity',
+      judgeFailureReason: 'judge unavailable',
+    });
+    assert.ok(pinned, 'an exact SDK account route keeps the judge-outage approval path usable');
+    const [record] = listPendingActions({ sessionId: session.id, status: 'all' });
+    assert.equal(
+      (record.payload as { connected_account_id?: string }).connected_account_id,
+      'ca_instagram_brand',
+    );
+    assert.equal(record.executionAuthority, null);
+    assert.equal(listPending({ sessionId: session.id, status: 'pending' }).length, 1);
+  } finally {
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    if (previousGate === undefined) delete process.env.CLEMMY_JUDGE_FAIL_APPROVAL;
+    else process.env.CLEMMY_JUDGE_FAIL_APPROVAL = previousGate;
+  }
 });
 
 test('P0c: a GENUINE fidelity gap (not a judge failure) refuses with NO pending card (unchanged)', async () => {

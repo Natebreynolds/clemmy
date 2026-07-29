@@ -85,7 +85,11 @@ import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
 import { approvalAuthorityMatchesToolCall, exactApprovalAuthorityMatches } from './approval-authority.js';
-import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
+import {
+  pendingActionApprovalViewFromArgs,
+  pendingActionIdFromArgs,
+  type PendingActionApprovalView,
+} from './pending-action-view.js';
 import {
   isQueuedActionApprovalQuestion,
   materializeQueuedApprovals,
@@ -768,6 +772,53 @@ export function recipientGroundingNote(sessionId: string, interruption: Interrup
   }
 }
 
+/**
+ * Reuse only the card currently linked to this exact queued action. The
+ * display fields on the pending-action record change when registration links
+ * the card (queued → approval_requested, approvalId null → populated), so
+ * regenerating the view before exact-args dedupe would mint a second card for
+ * the same payload. The card's stored snapshot is the immutable authority;
+ * id/session/tool/payloadHash must all still match the live record.
+ */
+function exactLinkedPendingActionApproval(
+  sessionId: string,
+  toolName: string,
+  pendingActionId: string | null,
+  current: PendingActionApprovalView | undefined,
+): approvalRegistry.PendingApprovalRow | null {
+  if (
+    !pendingActionId
+    || !current
+    || current.id !== pendingActionId
+    || typeof current.approvalId !== 'string'
+    || !current.approvalId.trim()
+  ) return null;
+
+  try {
+    const row = approvalRegistry.get(current.approvalId);
+    const pinned = row?.args?.pendingAction;
+    if (
+      !row
+      || !approvalRegistry.isActionable(row)
+      || row.sessionId !== sessionId
+      || row.tool !== toolName
+      || row.approvalId !== current.approvalId
+      || pendingActionIdFromArgs(row.args) !== pendingActionId
+      || !pinned
+      || typeof pinned !== 'object'
+      || Array.isArray(pinned)
+    ) return null;
+    const snapshot = pinned as Record<string, unknown>;
+    return snapshot.id === pendingActionId
+      && snapshot.toolName === current.toolName
+      && snapshot.payloadHash === current.payloadHash
+      ? row
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function registerAndEmitApprovals(
   options: { sessionId: string; turn: number },
   session: HarnessSession,
@@ -784,6 +835,28 @@ function registerAndEmitApprovals(
   const workflowName = typeof metadata.workflowName === 'string' ? metadata.workflowName : null;
   const stepId = typeof metadata.stepId === 'string' ? metadata.stepId : null;
   for (const interruption of interruptions) {
+    const pendingActionId = pendingActionIdFromArgs(interruption.args);
+    const pendingActionSnapshot = pendingActionId
+      ? pendingActionApprovalViewFromArgs(interruption.args)
+      : undefined;
+    const linkedExactApproval = exactLinkedPendingActionApproval(
+      options.sessionId,
+      interruption.toolName,
+      pendingActionId,
+      pendingActionSnapshot,
+    );
+    // request_approval is an SDK interruption: its tool body never executes.
+    // Enrich the raw model args here, before dedupe or persistence, so the
+    // registry owns an independent immutable copy of the exact queued action.
+    // The executor verifies this snapshot under the APPROVED→EXECUTING lock.
+    const approvalArgs = linkedExactApproval?.args ?? (
+      interruption.args && pendingActionSnapshot?.id === pendingActionId
+        ? {
+            ...interruption.args,
+            pendingAction: pendingActionSnapshot,
+          }
+        : interruption.args
+    );
     const baseSubject = extractApprovalSubject(interruption);
     const groundingNote = recipientGroundingNote(options.sessionId, interruption);
     const subject = groundingNote ? `${baseSubject}\n${groundingNote}` : baseSubject;
@@ -793,13 +866,13 @@ function registerAndEmitApprovals(
         approvalId: '',
         sessionId: options.sessionId,
         tool: interruption.toolName,
-        args: interruption.args ?? null,
+        args: approvalArgs ?? null,
         resumeKey: null,
       };
       // A partial RunState resume can surface the still-unresolved sibling
       // interruption again. Reuse its exact pending card instead of minting a
       // duplicate; a changed payload intentionally receives a fresh card.
-      const existingExact = approvalRegistry.listPending({
+      const existingExact = linkedExactApproval ?? approvalRegistry.listPending({
         sessionId: options.sessionId,
         status: 'pending',
       }).find((candidate) => exactApprovalAuthorityMatches(candidate, authority));
@@ -809,7 +882,7 @@ function registerAndEmitApprovals(
         channelId,
         subject,
         tool: interruption.toolName,
-        args: interruption.args ?? null,
+        args: approvalArgs ?? null,
       });
       approvalId = row.approvalId;
       // Fan out to the notification delivery queue so every enabled
@@ -874,9 +947,11 @@ function registerAndEmitApprovals(
       data: {
         tool: interruption.toolName,
         subject,
-        args: interruption.args,
+        args: approvalArgs,
         rawArgs: interruption.rawArgs,
-        pendingAction: pendingActionApprovalViewFromArgs(interruption.args),
+        pendingAction: linkedExactApproval?.args?.pendingAction
+          ?? pendingActionSnapshot
+          ?? pendingActionApprovalViewFromArgs(approvalArgs),
         approvalId, // null when registry write failed; consumers fall
                     // back to old "single pending approval" routing.
       },

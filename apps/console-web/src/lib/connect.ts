@@ -4,7 +4,25 @@ import { getAuthToken } from './bootstrap';
 /** Shapes here are intentionally loose — several daemon payloads are
  *  internal snapshots; we read fields defensively and degrade gracefully. */
 
-export interface ComposioStatus { connected?: boolean; configured?: boolean; enabled?: boolean; apiKeyPresent?: boolean; userId?: string; [k: string]: unknown }
+export interface ComposioStatus {
+  connected?: boolean;
+  configured?: boolean;
+  enabled?: boolean;
+  apiKeyPresent?: boolean;
+  userId?: string;
+  executionBackend?: 'auto' | 'sdk' | 'cli';
+  cli?: { installed?: boolean; authenticated?: boolean; authStatus?: string; authMessage?: string | null };
+  [k: string]: unknown;
+}
+
+export interface ComposioCliDefaultAccountAuthority {
+  kind: 'composio_cli_default_account';
+  toolkit: string;
+  label: string;
+  grantId: string;
+  grantedAt: string;
+  grantedBy: string;
+}
 
 export interface ComposioConnection {
   id?: string;
@@ -128,6 +146,17 @@ export interface CliRow { command?: string; path?: string; isLikelyCli?: boolean
 
 export const getComposioStatus = () => apiGet<ComposioStatus>('/api/composio/status');
 export const getComposioToolkits = () => apiGet<ComposioSnapshot>('/api/composio/toolkits');
+export const getComposioCliDefaultAccounts = () =>
+  apiGet<{ authorities: ComposioCliDefaultAccountAuthority[] }>('/api/composio/cli-default-accounts');
+export const authorizeComposioCliDefaultAccount = (slug: string, label: string) =>
+  apiPost<{ ok: true; authority: ComposioCliDefaultAccountAuthority }>(
+    `/api/composio/cli-default-accounts/${encodeURIComponent(slug)}`,
+    { label, confirmed: true },
+  );
+export const revokeComposioCliDefaultAccount = (slug: string) =>
+  apiPost<{ ok: true; revoked: boolean }>(
+    `/api/composio/cli-default-accounts/${encodeURIComponent(slug)}/revoke`,
+  );
 export const authorizeComposio = (slug: string) =>
   apiPost<ComposioConnectResult>(`/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`);
 export const setupComposioCredentials = (slug: string, credentials: Record<string, string>) =>

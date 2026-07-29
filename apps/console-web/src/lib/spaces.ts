@@ -95,6 +95,60 @@ export interface SpaceDetail {
 }
 export interface RefreshResult { ok: boolean; sourceId: string; error?: string }
 
+export type SpaceObservationStatus = 'ok' | 'error' | 'awaiting_approval';
+
+/** Safe, bounded observation metadata. Dataset documents, provider errors, and
+ * raw provenance remain server-side. */
+export interface SpaceObservationSummary {
+  id: string;
+  sourceKey: string;
+  status: SpaceObservationStatus;
+  changed: boolean | null;
+  cause: string;
+  observedAt: string;
+  previousObservationId: string | null;
+  isCurrent: boolean;
+}
+
+export interface SpaceHistoryResponse {
+  observations: SpaceObservationSummary[];
+  hasMore: boolean;
+  nextCursor?: string;
+  /** Compatibility boundary for pre-3.0 clients. Prefer nextCursor. */
+  nextBefore?: string;
+  sourceKey?: string;
+}
+
+export interface SpaceObservationChange {
+  op: 'add' | 'remove' | 'replace';
+  path: string;
+  entityKey?: string;
+  before?: string;
+  after?: string;
+}
+
+export interface SpaceObservationDiff {
+  changed: boolean;
+  summary: string;
+  counts: { add: number; remove: number; replace: number };
+  changes: SpaceObservationChange[];
+  truncated: boolean;
+}
+
+export type SpaceDiffResponse =
+  | {
+    status: 'ok';
+    sourceKey: string;
+    from: SpaceObservationSummary;
+    to: SpaceObservationSummary;
+    diff: SpaceObservationDiff;
+  }
+  | {
+    status: 'insufficient_history';
+    sourceKey?: string;
+    observations: number;
+  };
+
 export const listSpaces = () =>
   apiGet<{ spaces: SpaceRecord[] }>('/api/console/spaces').then((r) => r.spaces);
 
@@ -135,6 +189,43 @@ export const refreshSpace = (id: string, sourceId?: string) =>
  *  cookie, token, API URL, or general fetch capability. */
 export const getSpaceData = (id: string) =>
   apiGet<{ data: unknown }>(`/api/console/spaces/${encodeURIComponent(id)}/data`).then((r) => r.data);
+
+function observationQuery(options: {
+  sourceKey?: string;
+  limit?: number;
+  cursor?: string;
+  before?: string;
+  from?: string;
+  to?: string;
+} = {}): string {
+  const query = new URLSearchParams();
+  if (options.sourceKey) query.set('sourceKey', options.sourceKey);
+  if (options.limit !== undefined) query.set('limit', String(options.limit));
+  if (options.cursor) query.set('cursor', options.cursor);
+  if (options.before) query.set('before', options.before);
+  if (options.from) query.set('from', options.from);
+  if (options.to) query.set('to', options.to);
+  const rendered = query.toString();
+  return rendered ? `?${rendered}` : '';
+}
+
+/** Temporal history is intentionally fetched on demand instead of joining the
+ * hot Workspace detail/data response. */
+export const getSpaceHistory = (
+  id: string,
+  options: { sourceKey?: string; limit?: number; cursor?: string; before?: string } = {},
+) =>
+  apiGet<SpaceHistoryResponse>(
+    `/api/console/spaces/${encodeURIComponent(id)}/history${observationQuery(options)}`,
+  );
+
+export const getSpaceDiff = (
+  id: string,
+  options: { sourceKey?: string; from?: string; to?: string } = {},
+) =>
+  apiGet<SpaceDiffResponse>(
+    `/api/console/spaces/${encodeURIComponent(id)}/diff${observationQuery(options)}`,
+  );
 
 export const addSpaceNote = (
   id: string,

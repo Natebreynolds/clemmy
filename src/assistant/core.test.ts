@@ -81,6 +81,40 @@ test('legacy assistant prompt prefers canonical harness transcript over same-id 
   assert.doesNotMatch(runtime.request!.prompt, /core-ghost/);
 });
 
+test('punctuation-free acknowledgement plus action keeps the antecedent transcript', async () => {
+  resetEventLog();
+  const sessionId = 'assistant-core-ack-action';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', userId: 'core-user', title: 'Core follow-up' });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Draft the launch email for Alice but do not send it yet.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reply: 'The draft for Alice is ready for your approval.' },
+  });
+  const runtime = new CapturingRuntime();
+  const assistant = new ClementineAssistant(runtime as never);
+
+  await assistant.respond({
+    sessionId,
+    userId: 'core-user',
+    channel: 'desktop',
+    message: 'ok send it',
+  });
+
+  assert.ok(runtime.request);
+  assert.match(runtime.request!.prompt, /Draft the launch email for Alice/);
+  assert.match(runtime.request!.prompt, /The draft for Alice is ready/);
+  assert.match(runtime.request!.prompt, /Latest user message:\nok send it/);
+});
+
 test('legacy assistant fallback uses unified evidence recall for local in-person meetings', async () => {
   resetEventLog();
   const sourceUri = 'meeting://local/live-2026-07-15';

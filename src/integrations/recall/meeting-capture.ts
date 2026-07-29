@@ -161,6 +161,28 @@ export interface RecallMeetingAnalysis {
   source: 'agent' | 'manual';
 }
 
+export type RecallMeetingPresentationStatus =
+  | 'detected'
+  | 'recording'
+  | 'processing'
+  | 'ready'
+  | 'failed'
+  | 'timed_out'
+  | 'unavailable'
+  | 'cancelled';
+
+/**
+ * Transcript-aware state shown to users. Capture completion only means that
+ * the desktop recorder stopped; it must never be presented as successful
+ * transcript ingestion when the SDK handoff or canonical transcript failed.
+ */
+export interface RecallMeetingPresentation {
+  status: RecallMeetingPresentationStatus;
+  label: string;
+  error?: string;
+  retryable: boolean;
+}
+
 export interface RecallUploadInput {
   liveTranscript?: boolean;
   /** Region already initialized by the Desktop SDK for this capture. This is
@@ -1481,6 +1503,10 @@ export interface RecallMeetingSummary {
   analysisError?: string;
   sdkUploadStatus?: RecallMeetingRecord['sdkUploadStatus'];
   sdkUploadError?: string;
+  canonicalStatus?: RecallMeetingRecord['canonicalStatus'];
+  canonicalError?: string;
+  /** Omitted for local meetings, whose existing transcriptionStatus remains authoritative. */
+  presentation?: RecallMeetingPresentation;
 }
 
 /**
@@ -1509,6 +1535,120 @@ function loadAnalysisFileSet(): Set<string> {
   } catch { /* dir disappeared mid-read */ }
   analysisExistsCache = { at: now, set };
   return set;
+}
+
+function recallTranscriptCanRetry(record: RecallMeetingRecord): boolean {
+  if (record.provider === 'local' || record.status !== 'completed') return false;
+  if (
+    record.sdkUploadId
+    && (record.sdkUploadStatus === 'failed' || record.sdkUploadStatus === 'timed_out')
+  ) {
+    return true;
+  }
+  if (record.recallRetentionMode === 'zero' || !record.recordingId) return false;
+  return record.canonicalStatus === undefined
+    || record.canonicalStatus === 'failed'
+    || record.canonicalStatus === 'timed_out'
+    || record.canonicalStatus === 'not_started'
+    || (record.canonicalStatus === 'ready' && (record.segments?.length ?? 0) === 0);
+}
+
+/** Derive the honest user-facing state of a Recall meeting's transcript. */
+export function deriveRecallMeetingPresentation(record: RecallMeetingRecord): RecallMeetingPresentation {
+  if (record.status === 'cancelled') {
+    return { status: 'cancelled', label: 'Cancelled', retryable: false };
+  }
+  if (record.status === 'recording') {
+    return { status: 'recording', label: 'Recording', retryable: false };
+  }
+  if (record.status === 'detected') {
+    return { status: 'detected', label: 'Detected', retryable: false };
+  }
+
+  const retryable = recallTranscriptCanRetry(record);
+  if (record.sdkUploadStatus === 'failed') {
+    return {
+      status: 'failed',
+      label: 'Upload failed',
+      error: record.sdkUploadError ?? record.canonicalError ?? 'Recall could not finish uploading this meeting.',
+      retryable,
+    };
+  }
+  if (record.sdkUploadStatus === 'timed_out') {
+    return {
+      status: 'timed_out',
+      label: 'Upload timed out',
+      error: record.sdkUploadError ?? record.canonicalError ?? 'Recall did not finish uploading this meeting in time.',
+      retryable,
+    };
+  }
+  if (
+    record.sdkUploadStatus === 'pending'
+    || (record.sdkUploadId && !record.sdkUploadStatus && !record.recordingId)
+  ) {
+    return { status: 'processing', label: 'Processing upload', retryable: false };
+  }
+  if (record.sdkUploadStatus === 'complete' && !record.recordingId) {
+    return {
+      status: 'failed',
+      label: 'Upload incomplete',
+      error: record.sdkUploadError ?? 'Recall completed the upload without returning a recording ID.',
+      retryable: Boolean(record.sdkUploadId),
+    };
+  }
+
+  if (record.canonicalStatus === 'pending') {
+    return { status: 'processing', label: 'Processing transcript', retryable: false };
+  }
+  if (record.canonicalStatus === 'failed') {
+    return {
+      status: 'failed',
+      label: 'Transcript failed',
+      error: record.canonicalError ?? 'Recall could not produce the canonical transcript.',
+      retryable,
+    };
+  }
+  if (record.canonicalStatus === 'timed_out') {
+    return {
+      status: 'timed_out',
+      label: 'Transcript timed out',
+      error: record.canonicalError ?? 'Recall did not produce the canonical transcript in time.',
+      retryable,
+    };
+  }
+  if (record.canonicalStatus === 'ready') {
+    if ((record.segments?.length ?? 0) > 0) {
+      return { status: 'ready', label: 'Transcribed', retryable: false };
+    }
+    return {
+      status: 'failed',
+      label: 'Transcript empty',
+      error: record.canonicalError ?? 'Recall returned an empty transcript.',
+      retryable,
+    };
+  }
+
+  // Zero-retention captures can only use transcript events received live.
+  // Once the call ends there is no cloud media to backfill.
+  if ((record.segments?.length ?? 0) > 0) {
+    return { status: 'ready', label: 'Transcribed', retryable: false };
+  }
+  if (record.recallRetentionMode === 'zero') {
+    return {
+      status: 'unavailable',
+      label: 'Transcript unavailable',
+      error: 'No live transcript was captured. Zero-retention meetings cannot be recovered after the call.',
+      retryable: false,
+    };
+  }
+  return {
+    status: 'unavailable',
+    label: 'Transcript unavailable',
+    error: record.recordingId
+      ? 'The canonical transcript has not been retrieved yet.'
+      : 'No transcript or recoverable Recall recording was captured.',
+    retryable,
+  };
 }
 
 export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeetingSummary {
@@ -1553,6 +1693,11 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
     analysisError: record.analysisError,
     sdkUploadStatus: record.sdkUploadStatus,
     sdkUploadError: record.sdkUploadError,
+    canonicalStatus: record.canonicalStatus,
+    canonicalError: record.canonicalError,
+    presentation: record.provider === 'local'
+      ? undefined
+      : deriveRecallMeetingPresentation(record),
   };
 }
 

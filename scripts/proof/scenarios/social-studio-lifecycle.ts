@@ -28,8 +28,9 @@ import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 const SLUG = 'proof-social-studio';
 const SOURCE_ID = 'content-plan';
 const ACTION_ID = 'publish-approved';
-const DATA_TOOL = 'PROOF_SOCIAL_CONTENT_PLAN';
-const PUBLISH_TOOL = 'PROOF_SOCIAL_PUBLISH';
+const DATA_TOOL = 'PROOF_SOCIAL_GET_CONTENT_PLAN';
+const PUBLISH_TOOL = 'INSTAGRAM_CREATE_POST';
+const PROOF_IMAGE_URL = 'https://proof.invalid/social-studio.jpg';
 
 const CAMPAIGN = {
   sourceMarker: 'SOCIAL_SOURCE:PROOF_ONLY',
@@ -102,13 +103,38 @@ function readJsonLines<T>(file: string): T[] {
     });
 }
 
-function dispatches(daemon: DaemonHandle, tool = PUBLISH_TOOL): string[] {
+function allDispatches(daemon: DaemonHandle): string[] {
   const file = path.join(daemon.home, 'proof-composio-dispatches.log');
   if (!existsSync(file)) return [];
   return readFileSync(file, 'utf-8')
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line === tool);
+    .filter(Boolean);
+}
+
+function dispatches(daemon: DaemonHandle, tool = PUBLISH_TOOL): string[] {
+  return allDispatches(daemon).filter((line) => line === tool);
+}
+
+export function socialStudioProviderDispatchesValid(slugs: readonly string[]): boolean {
+  return slugs.filter((slug) => slug === PUBLISH_TOOL).length === 1
+    && slugs.every((slug) => slug === DATA_TOOL || slug === PUBLISH_TOOL);
+}
+
+export function socialStudioComposeInstructions(draftMarker: string): string {
+  return [
+    'Return exactly eight plain-text lines and nothing else.',
+    'Read every campaign value from the supplied context object; do not use placeholders or outside knowledge.',
+    `Line 1 must be exactly: ${draftMarker}`,
+    'Line 2 must be the literal prefix "Brand: " followed by the exact context.brand value.',
+    'Line 3 must be the literal prefix "Handle: " followed by the exact context.handle value.',
+    'Line 4 must be the literal prefix "Campaign: " followed by the exact context.campaign value.',
+    'Line 5 must be the literal prefix "Offer: " followed by the exact context.offer value.',
+    'Line 6 must be the literal prefix "Hashtag: " followed by the exact context.hashtag value.',
+    'Line 7 must be the literal prefix "Source: " followed by the exact context.sourceMarker value.',
+    'Line 8 must be exactly: APPROVAL_REQUIRED',
+    'Do not add Markdown fences, commentary, punctuation, or any other claim.',
+  ].join('\n');
 }
 
 function mutationPhaseCounts(
@@ -249,13 +275,13 @@ export const socialStudioLifecycle: ScenarioDef = {
       [
         `Build an ACTIVE dynamic Workspace now with the EXACT slug ${JSON.stringify(SLUG)} and title "Proof Social Studio".`,
         'This is an isolated proof. Do not use shell, a runner, runner_path, MCP, a network request, or any real service.',
-        `Write one self-contained HTML view to ${JSON.stringify(viewSourcePath)}. It must call clem.data(), unwrap the ${JSON.stringify(SOURCE_ID)} result, display its campaign fields, call clem.compose() to draft from that selected campaign, retain the returned draft text, and call clem.action(${JSON.stringify(ACTION_ID)}, {draftMarker:${JSON.stringify(draftMarker)}, draft}) only from a user-controlled Publish button. Pending state must visibly say it is waiting for approval.`,
+        `Write one self-contained HTML view to ${JSON.stringify(viewSourcePath)}. It must call clem.data(), unwrap the ${JSON.stringify(SOURCE_ID)} result, display its campaign fields, call clem.compose() to draft from that selected campaign, retain the returned draft text, and call clem.action(${JSON.stringify(ACTION_ID)}, {caption: draft}) only from a user-controlled Publish button. Pending state must visibly say it is waiting for approval.`,
         'Then call space_save exactly once with:',
         `- objective exactly ${JSON.stringify(objective)}`,
         '- success criteria including "Drafts use only content-plan facts." and "Approved simulation dispatches once."',
         `- invariant exactly ${JSON.stringify(invariant)}`,
         `- data source id ${JSON.stringify(SOURCE_ID)}, composio_slug ${JSON.stringify(DATA_TOOL)}, composio_args_json ${JSON.stringify(JSON.stringify({ scope: 'isolated-proof' }))}`,
-        `- action id ${JSON.stringify(ACTION_ID)}, label "Publish approved draft", composio_slug ${JSON.stringify(PUBLISH_TOOL)}, composio_args_json ${JSON.stringify(JSON.stringify({ destination: 'proof-only' }))}, and confirm true`,
+        `- action id ${JSON.stringify(ACTION_ID)}, label "Publish approved draft", composio_slug ${JSON.stringify(PUBLISH_TOOL)}, composio_args_json ${JSON.stringify(JSON.stringify({ image_url: PROOF_IMAGE_URL }))}, and confirm true`,
         `- view_path ${JSON.stringify(viewSourcePath)}`,
         'Build and validate it in this turn. Do not ask a question first and do not invoke the action.',
       ].join('\n'),
@@ -329,11 +355,7 @@ export const socialStudioLifecycle: ScenarioDef = {
 
     const composeStartedAt = Date.now();
     const compose = await daemon.request('POST', `/api/console/spaces/${SLUG}/compose`, {
-      instructions: [
-        'Return exactly the following eight plain-text lines and nothing else.',
-        'Do not add Markdown fences, commentary, punctuation, or any other claim.',
-        expectedDraft,
-      ].join('\n'),
+      instructions: socialStudioComposeInstructions(draftMarker),
       context: campaign,
       maxChars: 1200,
     });
@@ -352,7 +374,7 @@ export const socialStudioLifecycle: ScenarioDef = {
 
     const first = await daemon.request('POST', `/api/console/spaces/${SLUG}/action`, {
       actionId: ACTION_ID,
-      args: { draftMarker, draft: composedText },
+      args: { caption: composedText },
     });
     const rejectedId = String((first.json as { approvalId?: unknown } | null)?.approvalId ?? '');
     checks.push({
@@ -370,7 +392,7 @@ export const socialStudioLifecycle: ScenarioDef = {
 
     const second = await daemon.request('POST', `/api/console/spaces/${SLUG}/action`, {
       actionId: ACTION_ID,
-      args: { draftMarker, draft: composedText },
+      args: { caption: composedText },
     });
     const approvedId = String((second.json as { approvalId?: unknown } | null)?.approvalId ?? '');
     checks.push({
@@ -394,8 +416,8 @@ export const socialStudioLifecycle: ScenarioDef = {
     });
     checks.push({
       name: 'approved publish dispatched exactly once through the proof shim',
-      pass: dispatches(daemon).length === 1,
-      detail: JSON.stringify(dispatches(daemon)),
+      pass: socialStudioProviderDispatchesValid(allDispatches(daemon)),
+      detail: JSON.stringify(allDispatches(daemon)),
     });
     const mutationPhases = mutationPhaseCounts(daemon, approvedId);
     const committedCall = mutationPhases.calls[0];
@@ -405,9 +427,8 @@ export const socialStudioLifecycle: ScenarioDef = {
         && mutationPhases.commits === 1
         && mutationPhases.calls.length === 1
         && committedCall?.tool === PUBLISH_TOOL
-        && committedCall.args?.destination === 'proof-only'
-        && committedCall.args?.draftMarker === draftMarker
-        && committedCall.args?.draft === expectedDraft,
+        && committedCall.args?.image_url === PROOF_IMAGE_URL
+        && committedCall.args?.caption === expectedDraft,
       detail: JSON.stringify(mutationPhases),
     });
 

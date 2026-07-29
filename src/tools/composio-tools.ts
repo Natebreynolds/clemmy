@@ -9,6 +9,7 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
   composioCliErrorProvesNoDispatch,
+  composioExecutionUsesCliOnlyLane,
   CURATED_TOOLKITS,
   getComposioCredentialStatus,
   getComposioExecutionBackend,
@@ -25,7 +26,10 @@ import {
   type ConnectedToolkit,
 } from '../integrations/composio/client.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
-import { argsHaveSendTarget } from '../runtime/harness/grounding-gate.js';
+import {
+  irreversibleSendRequiresExplicitTarget,
+  validateIrreversibleSendPayload,
+} from '../runtime/harness/grounding-gate.js';
 import { recallComposioAccountIdentity } from '../memory/tool-choice-store.js';
 import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter, type JobReceipt } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
@@ -45,7 +49,7 @@ import {
 } from '../memory/tool-choice-store.js';
 import { harnessRunContextStorage, workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
-import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
+import { maybeDiscoveryAdvisory, isDescribeSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
 import { asyncJobTimeoutCorrective } from '../runtime/harness/tool-error-corrective.js';
 import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, findOutlookCalendarReadConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
@@ -67,6 +71,10 @@ import {
 } from '../agents/composio-connection-suppression.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
+import { getComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
+import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+
+export { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -329,9 +337,12 @@ function composioFailureCorrective(
   // toolkit X" ALSO matches the not-found regex, but the not-found corrective
   // ("the connection works, the id doesn't") is WRONG here and sends the model
   // hunting for table/field ids that never resolve. The real cure is to connect
-  // the toolkit. Derive the toolkit from the slug's first segment when present.
+  // the toolkit. Resolve against the registered longest prefix so multiword
+  // providers such as OneDrive never collapse to a generic "ONE".
   if (opts.notConnected) {
-    const toolkit = (opts.toolSlug?.split('_')[0] || '').toUpperCase() || 'this toolkit';
+    const toolkit = opts.toolSlug
+      ? registeredToolkitOfSlug(opts.toolSlug).toUpperCase()
+      : 'this toolkit';
     return [
       `⚠️ ${label} NOT CONNECTED${where}: ${summary}`,
       `The saved ${toolkit} connection is missing or belongs to a different Composio user. This is NOT an argument or schema problem.`,
@@ -438,7 +449,7 @@ export function formatComposioExecuteOutput(
   if (options.toolSlug && !composioSlugIsReadOnly(options.toolSlug)) {
     const label = options.toolName || 'composio_execute_tool';
     const where = ` (slug=${options.toolSlug})`;
-    const toolkit = toolkitOfSlug(options.toolSlug).toUpperCase();
+    const toolkit = registeredToolkitOfSlug(options.toolSlug).toUpperCase();
     return [
       '[provider-dispatch:uncertain]',
       `⚠️ ${label} ${notConnected ? 'NOT CONNECTED' : 'FAILED'}${where}: ${summary}. Dispatch may have started; the external change MAY already exist or be partial.`,
@@ -536,7 +547,7 @@ export function composioUncertainMutationOutput(
   const label = options.toolName || 'composio_execute_tool';
   const where = options.toolSlug ? ` (slug=${options.toolSlug})` : '';
   const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(message) || isComposioReconnectRequiredError(err);
-  const toolkit = options.toolSlug ? toolkitOfSlug(options.toolSlug).toUpperCase() : 'this toolkit';
+  const toolkit = options.toolSlug ? registeredToolkitOfSlug(options.toolSlug).toUpperCase() : 'this toolkit';
   const body = formatComposioToolOutput({
     error: message || 'unknown provider error',
     toolSlug: options.toolSlug ?? null,
@@ -587,11 +598,14 @@ const lastComposioSearchBySession = new Map<string, {
 // (no network) until a successful execute or a cache invalidation clears it.
 const RECONNECT_BREAKER_TTL_MS = 3 * 60 * 1000;
 const reconnectBreakerBySession = new Map<string, number>();
+type ComposioRuntimeStatus = Awaited<ReturnType<typeof getComposioRuntimeStatus>>;
+let composioRuntimeStatusLoader: () => Promise<ComposioRuntimeStatus> = getComposioRuntimeStatus;
+
 function reconnectBreakerEnabled(): boolean {
   return (process.env.CLEMMY_COMPOSIO_RECONNECT_BREAKER ?? 'on').toLowerCase() !== 'off';
 }
 function reconnectBreakerKey(sid: string, toolSlug: string): string {
-  return `${sid}::${toolkitOfSlug(toolSlug)}`;
+  return `${sid}::${registeredToolkitOfSlug(toolSlug)}`;
 }
 function recordReconnectBreaker(sid: string | undefined, toolSlug: string): void {
   if (!sid) return;
@@ -614,6 +628,9 @@ export const __gatewayTest__ = {
   recordReconnectBreaker,
   reconnectBreakerTripped,
   clearReconnectBreaker,
+  setRuntimeStatusLoader(loader: (() => Promise<ComposioRuntimeStatus>) | null): void {
+    composioRuntimeStatusLoader = loader ?? getComposioRuntimeStatus;
+  },
 };
 
 /** Record the discovery query (and, when known, the candidate slugs the search
@@ -673,13 +690,18 @@ export function executionIntentForSession(sessionId: string | undefined, toolSlu
  *  knownToolkits are runtime-discovered (connected accounts), never hardcoded.
  *  Exported for tests. */
 export function isCrossServiceToolkitMismatch(query: string, slug: string, knownToolkits: string[]): boolean {
-  const slugToolkit = (slug.split('_')[0] ?? '').toLowerCase();
+  const slugToolkit = registeredToolkitOfSlug(slug);
   if (!slugToolkit) return false;
-  const q = query.toLowerCase();
-  if (q.includes(slugToolkit)) return false; // names its own toolkit → consistent
+  const q = query.toLowerCase().replace(/[-\s]+/g, '_');
+  const qCompact = q.replace(/_/g, '');
+  const queryNamesToolkit = (toolkit: string): boolean => {
+    const normalized = toolkit.toLowerCase().replace(/[-\s]+/g, '_');
+    return q.includes(normalized) || qCompact.includes(normalized.replace(/_/g, ''));
+  };
+  if (queryNamesToolkit(slugToolkit)) return false; // names its own toolkit → consistent
   return knownToolkits.some((t) => {
-    const tk = (t ?? '').toLowerCase();
-    return tk.length > 0 && tk !== slugToolkit && q.includes(tk);
+    const tk = (t ?? '').toLowerCase().replace(/[-\s]+/g, '_');
+    return tk.length > 0 && tk !== slugToolkit && queryNamesToolkit(tk);
   });
 }
 
@@ -855,7 +877,7 @@ async function enforceStandingConstraints(
       // VERIFIED mailbox matches the rule; block only when none complies.
       let connections: { connectionId: string; accountEmail?: string; status?: string }[] = [];
       try {
-        const toolkit = toolkitOfSlug(toolSlug);
+        const toolkit = registeredToolkitOfSlug(toolSlug);
         connections = (await listUsableConnectedToolkits())
           .filter((c) => c.slug.toLowerCase() === toolkit)
           .map((c) => ({ connectionId: c.connectionId, accountEmail: c.accountEmail, status: c.status }));
@@ -921,7 +943,7 @@ export function applySuppressedComposioConnectionPolicy(
   if (!Number.isFinite(untilMs) || untilMs <= nowMs) return { connectedAccountId };
 
   const reason = suppression.reason ?? 'suppressed';
-  const toolkit = toolkitOfSlug(toolSlug).toUpperCase();
+  const toolkit = registeredToolkitOfSlug(toolSlug).toUpperCase();
   const mutating = classifyComposioSlugEffect(toolSlug) !== 'read';
   if (mutating) {
     return {
@@ -1063,7 +1085,7 @@ function composioMultiAccountAskMessage(
   toolSlug: string,
   outcome: { kind: 'ambiguous' | 'identity-absent'; want?: string; candidates: Array<{ email?: string; wordId?: string; connectionId: string }> },
 ): string {
-  const toolkit = toolkitOfSlug(toolSlug);
+  const toolkit = registeredToolkitOfSlug(toolSlug);
   const mailboxes = outcome.candidates
     .map((c, i) => {
       const label = aliasLabelFor(toolkit, c.email, c.connectionId);
@@ -1194,13 +1216,36 @@ export function composioDispatchLaneAvailable(status: ComposioDispatchLaneStatus
   return status.apiKeyPresent || cliMayRun;
 }
 
-function toolkitRequiresConnectedAccount(toolkit: string): boolean {
+/**
+ * An empty SDK connected-account snapshot is not proof that the CLI provider
+ * default is unusable. Keep this narrower than generic lane availability:
+ * provider-side default resolution is eligible only for an explicitly
+ * CLI-backed configuration (or AUTO with no SDK key) whose harmless `whoami`
+ * probe positively authenticated. The separate, toolkit-scoped authority gate
+ * decides whether using that unidentified default account is permitted.
+ */
+export function composioCliCanResolveUnlistedConnectedAccount(
+  status: ComposioDispatchLaneStatus,
+): boolean {
+  if (status.executionBackend === 'sdk') return false;
+  if (status.executionBackend === 'auto' && status.apiKeyPresent) return false;
+  return status.cli.installed && status.cli.authenticated;
+}
+
+function toolkitAuthMode(
+  toolkit: string,
+): 'managed' | 'byo' | 'none' | undefined {
   const normalized = toolkit.trim().toLowerCase();
   const known = [
     ...CURATED_TOOLKITS,
     ...listCachedToolkits(),
   ].find((entry) => entry.slug.trim().toLowerCase() === normalized);
-  return Boolean(known && known.authMode !== 'none');
+  return known?.authMode;
+}
+
+function toolkitRequiresConnectedAccount(toolkit: string): boolean {
+  const authMode = toolkitAuthMode(toolkit);
+  return authMode === 'managed' || authMode === 'byo';
 }
 
 function emitComposioGatewayBlock(
@@ -1216,7 +1261,7 @@ function emitComposioGatewayBlock(
       turn: 0,
       role: 'tool',
       type: 'guardrail_tripped',
-      data: { guardrail: 'composio_gateway', reason, toolSlug, toolkit: toolkitOfSlug(toolSlug), ...extra },
+      data: { guardrail: 'composio_gateway', reason, toolSlug, toolkit: registeredToolkitOfSlug(toolSlug), ...extra },
     });
   } catch { /* ledger write must never break the block path */ }
 }
@@ -1292,12 +1337,16 @@ export async function resolveComposioDispatch(
   opts: ComposioGatewayOptions = {},
 ): Promise<ComposioGatewayResolution> {
   revalidateStaleSuppressionsOnce();
-  const toolkit = toolkitOfSlug(toolSlug);
+  const toolkit = registeredToolkitOfSlug(toolSlug);
   const normalized = normalizeInlineConnectedAccountId(rawArgs, connectedAccountId);
   let args = normalized.args;
   const pinned = normalized.connectedAccountId;
   const sid = opts.sessionId;
   const notes: string[] = [];
+  const credentials = getComposioCredentialStatus();
+  const cliOnlyLane = composioExecutionUsesCliOnlyLane(credentials);
+  const cliDefaultAuthority = getComposioCliDefaultAccountAuthority(toolkit);
+  const cliDefaultWrite = classifyComposioSlugEffect(toolSlug) !== 'read';
 
   // `account_alias` meta-arg (never reaches the provider): WITH a pinned
   // connection it is the "remember this one by name" gesture; alone it means
@@ -1307,31 +1356,121 @@ export async function resolveComposioDispatch(
     : undefined;
   delete (args as Record<string, unknown>).account_alias;
 
+  // The published CLI has no connected-account selector on execute. Its
+  // `whoami` response proves only that a CLI session exists; it proves neither
+  // which mailbox/account is the provider-side default nor that an SDK-visible
+  // connection id can be targeted. Therefore:
+  //   - an explicit account-specific route can never be claimed as honored;
+  //   - writes to the unidentified default need durable operator authority;
+  //   - reads may use the authenticated CLI default without turning that
+  //     convenience into write authority;
+  //   - only a positively cataloged authMode:none toolkit may use CLI auth
+  //     without that account authority.
+  // Standard SDK and AUTO-with-key routing does not enter this branch.
+  const recalledIdentity = recallComposioAccountIdentity(toolSlug);
+  const preferredIdentity = opts.preferredIdentity?.trim();
+  const cliAccountRoute = pinned
+    ? {
+      description: `connected_account_id "${pinned}"`,
+      recovery: 'remove connected_account_id and retry',
+    }
+    : aliasArg
+      ? {
+        description: `account_alias "${aliasArg}"`,
+        recovery: 'remove account_alias and retry',
+      }
+      : preferredIdentity
+        ? {
+          description: `preferred account identity "${preferredIdentity}"`,
+          recovery: 'clear the preferred identity for this request and retry without it',
+        }
+        : recalledIdentity
+          ? {
+            description: `remembered account identity "${recalledIdentity}" from Tool Memory`,
+            recovery:
+              'remove this action route from Tool Memory (for example, use tool_choice_forget for the matching intent) and retry',
+          }
+          : undefined;
+  if (cliOnlyLane && cliAccountRoute) {
+    const message =
+      `⚠️ NEEDS-YOUR-CHOICE: ${toolkit} was not started because this call selected ${cliAccountRoute.description}. ` +
+      `The Composio CLI can execute only against its provider-side default account; it cannot honor connected_account_id, ` +
+      `account_alias, or a remembered/preferred identity, and therefore cannot prove or honor that selector. ` +
+      `To target that specific account, use COMPOSIO_BACKEND=sdk (or AUTO) with COMPOSIO_API_KEY. If the CLI default is ` +
+      `intended instead, ${cliAccountRoute.recovery}; writes also require an operator to authorize the named ${toolkit} ` +
+      `CLI default in Connect. No provider dispatch was started.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'ambiguous-account', {
+      guard: 'cli-cannot-target-connected-account',
+    });
+    return { ok: false, reason: 'ambiguous-account', message, toolkit };
+  }
+  if (cliOnlyLane && cliDefaultWrite && toolkitAuthMode(toolkit) !== 'none' && !cliDefaultAuthority) {
+    const message =
+      `⚠️ NEEDS-CONFIGURATION: ${toolkit} was not started. Composio CLI authentication does not identify which ` +
+      `provider-side account its default route will mutate. An operator must first verify and authorize that named ` +
+      `${toolkit} CLI default in Connect, or use COMPOSIO_BACKEND=sdk (or AUTO) with COMPOSIO_API_KEY for ` +
+      `account-addressable routing. Reads remain available through the authenticated CLI default; this write does not. ` +
+      `No provider dispatch was started.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'ambiguous-account', {
+      guard: 'cli-default-account-authority-required',
+    });
+    return { ok: false, reason: 'ambiguous-account', message, toolkit };
+  }
+  if (cliOnlyLane && cliDefaultWrite && cliDefaultAuthority) {
+    notes.push(
+      `[account-route] Using the Composio CLI default "${cliDefaultAuthority.label}" under operator authority scoped specifically to ${toolkit}; the CLI cannot target a connected_account_id.`,
+    );
+  } else if (cliOnlyLane && !cliDefaultWrite) {
+    notes.push(
+      `[account-route] Read through the authenticated Composio CLI's provider-side ${toolkit} default; no connected_account_id was selected or claimed.`,
+    );
+  }
+
   // One SWR snapshot reused by every stage below (breaker verify + identity).
   let conns: ConnectedToolkit[] = [];
   try { conns = await listUsableConnectedToolkits(); } catch { conns = []; }
+  // SDK inventory is not a routable account map for a CLI-only execute. Keep it
+  // out of owner selection so a lone SDK row can never produce a false
+  // `connectionId` that executeComposioTool cannot honor.
+  if (cliOnlyLane) conns = [];
   const toolkitConns = conns.filter((c) => {
     const s = (c.slug ?? '').toLowerCase();
     const t = toolSlug.toLowerCase();
     return s && (t === s || t.startsWith(`${s}_`));
   });
   const usable = toolkitConns.filter((c) => /active|enabled|initiat/i.test(c.status ?? ''));
+  let emptySnapshotRuntime: Awaited<ReturnType<typeof getComposioRuntimeStatus>> | null = null;
 
   // FIRST-CALL connection gate. A managed/BYO toolkit with no usable account is
-  // provably unable to dispatch; do not make one doomed provider call merely to
-  // arm the session-local reconnect breaker. This is what lets an exact workflow
-  // write park safely on its first attempt instead of becoming a terminal error.
+  // provably unable to dispatch only when the configured lane owns an
+  // authoritative account inventory. A CLI-only installation has no SDK
+  // snapshot by design, so a positive CLI auth probe plus the scoped authority
+  // checked above may use its provider-side default. Do not conflate "not
+  // visible to the SDK" with "not connected."
   if (!pinned && usable.length === 0 && toolkitRequiresConnectedAccount(toolkit)) {
-    const message = `⚠️ ${toolkit} is not connected: no usable ${toolkit} account is available. Reconnect ${toolkit} in Connect, then resume this same task. No provider dispatch was started.`;
-    emitComposioGatewayBlock(sid, toolSlug, 'not-connected');
-    return { ok: false, reason: 'not-connected', message, toolkit };
+    const cliOwnsConnectionInventory = credentials.executionBackend === 'cli'
+      || (credentials.executionBackend === 'auto' && !credentials.apiKeyPresent);
+    if (cliOwnsConnectionInventory) {
+      emptySnapshotRuntime = await composioRuntimeStatusLoader();
+    }
+    if (
+      !emptySnapshotRuntime
+      || !composioCliCanResolveUnlistedConnectedAccount(emptySnapshotRuntime)
+    ) {
+      const message = `⚠️ ${toolkit} is not connected: no usable ${toolkit} account is available. Reconnect ${toolkit} in Connect, then resume this same task. No provider dispatch was started.`;
+      emitComposioGatewayBlock(sid, toolSlug, 'not-connected');
+      return { ok: false, reason: 'not-connected', message, toolkit };
+    }
+    notes.push(cliDefaultWrite
+      ? `[account-route] The authenticated Composio CLI will use the operator-authorized ${toolkit} default; no targetable SDK account snapshot is configured.`
+      : `[account-route] The authenticated Composio CLI will read its ${toolkit} default; no targetable SDK account snapshot is configured.`);
   }
 
   // Unknown/no-auth toolkits can still run through an authenticated CLI or SDK
   // without a connected-account row. When neither execution lane is usable,
   // that absence is also structurally pre-dispatch and recoverable immediately.
   if (!pinned && usable.length === 0) {
-    const runtime = await getComposioRuntimeStatus();
+    const runtime = emptySnapshotRuntime ?? await composioRuntimeStatusLoader();
     if (!composioDispatchLaneAvailable({
       executionBackend: getComposioExecutionBackend(),
       apiKeyPresent: runtime.apiKeyPresent,
@@ -1408,13 +1547,35 @@ export async function resolveComposioDispatch(
       notes.push(`[account-route] Routed Outlook calendar read to connection ${calendarRoute.routeConnectionId} from standing rule #${calendarRoute.constraint.id}.`);
     }
   }
+  if (cliOnlyLane && owner) {
+    const message =
+      `⚠️ NEEDS-YOUR-CHOICE: ${toolkit} was not started. A standing rule selected connected account ${owner}, ` +
+      `but the Composio CLI cannot target connected_account_id. Use COMPOSIO_BACKEND=sdk (or AUTO) with ` +
+      `COMPOSIO_API_KEY to honor this route. The configured CLI default account was not substituted. ` +
+      `No provider dispatch was started.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'ambiguous-account', {
+      guard: 'cli-cannot-honor-standing-account-route',
+    });
+    return { ok: false, reason: 'ambiguous-account', message, toolkit };
+  }
   // A send governed by a standing sender rule is RULE-owned: the constraint
   // stage below resolves it probe-verified (snapshot emails can be stale/absent,
   // the profile probe is authoritative) — so identity resolution must not
   // pre-block it. Everything else resolves by identity here.
   const ruleOwnedSend = !owner && isIrreversibleSendSlug(toolSlug) && Boolean(findEmailSendConstraint(toolSlug, args));
+  if (cliOnlyLane && ruleOwnedSend && args.sender_override_confirmed !== true) {
+    const message =
+      `⚠️ NEEDS-YOUR-CHOICE: ${toolkit} was not started. A standing sender rule requires a specific verified ` +
+      `account, but the Composio CLI cannot target or prove a connected_account_id. Use COMPOSIO_BACKEND=sdk ` +
+      `(or AUTO) with COMPOSIO_API_KEY to honor that sender rule. The configured CLI default account was not ` +
+      `substituted. No provider dispatch was started.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'constraint', {
+      guard: 'cli-cannot-honor-standing-sender-route',
+    });
+    return { ok: false, reason: 'constraint', message, toolkit };
+  }
   if (!owner && !ruleOwnedSend) {
-    const hint = opts.preferredIdentity ?? aliasHint ?? recallComposioAccountIdentity(toolSlug);
+    const hint = opts.preferredIdentity ?? aliasHint ?? recalledIdentity;
     let outcome = selectToolkitConnection(toolSlug, conns, hint);
     if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
       // Identity enrichment before blocking: probe unidentified candidates ONCE
@@ -1462,6 +1623,16 @@ export async function resolveComposioDispatch(
   if (gate.routeConnectedAccountId) {
     owner = gate.routeConnectedAccountId;
     senderVerified = true;
+  }
+  if (cliOnlyLane && owner) {
+    const message =
+      `⚠️ NEEDS-YOUR-CHOICE: ${toolkit} was not started. Account policy selected connected account ${owner}, ` +
+      `but the Composio CLI cannot target connected_account_id. Use COMPOSIO_BACKEND=sdk (or AUTO) with ` +
+      `COMPOSIO_API_KEY to honor the verified route. No provider dispatch was started.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'constraint', {
+      guard: 'cli-cannot-honor-verified-account-route',
+    });
+    return { ok: false, reason: 'constraint', message, toolkit };
   }
 
   // Suppression policy (skipped when the sender rule owns the route, as before).
@@ -1519,16 +1690,35 @@ export async function resolveComposioDispatch(
   const recipientAlias = applyEmailRecipientAliases(toolSlug, args, getCachedToolSchema(toolSlug));
   args = recipientAlias.args;
   if (recipientAlias.repairs.length > 0) notes.push(...recipientAlias.repairs);
-  // Validate the write by its EFFECT, not by tool: ANY irreversible send must
-  // carry a resolvable recipient/target. A target-less send can't be validated and
-  // is exactly what misroutes (the provider delivers to the authenticated mailbox),
-  // so ask for the target instead of dispatching blind. Generic across email / chat
-  // / SMS / CRM — no tool names (argsHaveSendTarget reuses the grounding gate's
-  // target-key notion). Runs AFTER recipient normalization so `to`→`to_email` counts.
-  if (isIrreversibleSendSlug(toolSlug) && !argsHaveSendTarget(args)) {
-    const message = `⚠️ Not sent: this send has no resolvable recipient/target in its arguments. I won't dispatch a target-less send — it can't be validated and would misroute (with no target the provider falls back to your own account). Add the recipient/target and retry.`;
-    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', { field: 'recipient', validationReason: 'missing-send-target' });
-    return { ok: false, reason: 'invalid-args', message, toolkit };
+  // Directed sends (email/SMS/chat/DM/call) require a recipient/channel. Social
+  // broadcasts are different: the positively resolved SDK owner, or a deliberate
+  // CLI default-account authority, IS the destination. Do not invent a synthetic
+  // `target` field that the provider schema does not accept.
+  const accountScopedBroadcastDestination =
+    !irreversibleSendRequiresExplicitTarget(toolSlug)
+    && (Boolean(owner) || (cliOnlyLane && Boolean(cliDefaultAuthority)));
+  if (isIrreversibleSendSlug(toolSlug)) {
+    const sendValidation = validateIrreversibleSendPayload(toolSlug, args);
+    if (!sendValidation.ok) {
+      const message = sendValidation.reason === 'target_missing'
+        ? `⚠️ Not sent: this send has no resolvable recipient/target in its arguments. I won't dispatch a target-less send — it can't be validated and would misroute (with no target the provider falls back to your own account). Add the recipient/target and retry.`
+        : `⚠️ Not sent: ${sendValidation.detail ?? 'this account-scoped publish has no meaningful provider payload.'}`;
+      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+        field: sendValidation.reason === 'target_missing' ? 'recipient' : 'arguments',
+        validationReason: sendValidation.reason === 'target_missing'
+          ? 'missing-send-target'
+          : 'missing-send-arguments',
+      });
+      return { ok: false, reason: 'invalid-args', message, toolkit };
+    }
+    if (!irreversibleSendRequiresExplicitTarget(toolSlug) && !accountScopedBroadcastDestination) {
+      const message = `⚠️ Not sent: this account-scoped publish has no positively resolved owner account. Connect or select the destination account and retry; no provider dispatch was started.`;
+      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+        field: 'account',
+        validationReason: 'missing-account-scoped-destination',
+      });
+      return { ok: false, reason: 'invalid-args', message, toolkit };
+    }
   }
 
   // Arg validation — provably-incomplete args never dispatch (any path).
@@ -1742,7 +1932,7 @@ async function runComposioExecute(
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of
   // whether memory recall surfaced them this turn.
-  const constraintBanner = renderToolkitConstraintBanner(toolkitOfSlug(toolSlug));
+  const constraintBanner = renderToolkitConstraintBanner(registeredToolkitOfSlug(toolSlug));
 
   const recentErrors: string[] = [];
   let lastError: unknown;
@@ -1884,7 +2074,7 @@ async function runComposioExecute(
                 sessionId: sid,
                 payload: {
                   slug: toolSlug,
-                  toolkit: toolkitOfSlug(toolSlug),
+                  toolkit: registeredToolkitOfSlug(toolSlug),
                   jobId: receipt.jobId,
                   status: receipt.status,
                   outcome: parked ? 'parked' : 'banner',
@@ -1910,7 +2100,7 @@ async function runComposioExecute(
         if (isDescribeSlug(toolSlug)) {
           const advisory = maybeDiscoveryAdvisory({
             kind: 'describe',
-            toolkit: toolkitOfSlug(toolSlug),
+            toolkit: registeredToolkitOfSlug(toolSlug),
             signature: describeSignature(toolSlug, args),
             sessionId: runScopeIdFromRunContext(options.context) ?? sid,
           });
@@ -2268,7 +2458,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
               fromMemory: true,
               count: remembered.length,
               matches: remembered.map((m) => ({
-                toolkit: m.slug.split('_')[0]?.toLowerCase() ?? '',
+                toolkit: registeredToolkitOfSlug(m.slug),
                 slug: m.slug,
                 name: m.slug,
                 score: 1,

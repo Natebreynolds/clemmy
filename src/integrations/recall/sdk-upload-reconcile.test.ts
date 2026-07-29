@@ -300,3 +300,220 @@ test('two pending uploads from one reused window reconcile independently', async
   const records = meetings.listAllRecallMeetingRecords().filter((record) => record.windowId === windowId);
   assert.equal(records.length, 2);
 });
+
+test('explicit retry resets a terminal SDK handoff once and delegates to the bounded reconciler', () => {
+  const seeded = seedMeeting();
+  meetings.patchMeetingRecord(seeded.record.id, {
+    sdkUploadStatus: 'timed_out',
+    sdkUploadAttempts: 180,
+    sdkUploadDeadlineAt: '2026-07-20T12:15:00.000Z',
+    sdkUploadNextAttemptAt: '2026-07-20T12:14:55.000Z',
+    sdkUploadError: 'Recall SDK upload reconciliation timed out after 180 attempts',
+    canonicalStatus: 'timed_out',
+    canonicalError: 'Recall SDK upload reconciliation timed out after 180 attempts',
+  });
+
+  const starts: string[] = [];
+  const result = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, {
+    startSdk: ({ meetingId }) => { starts.push(meetingId); },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(result.mode, 'sdk_upload');
+  assert.deepEqual(starts, [seeded.record.id]);
+  const reset = meetings.loadRecallMeetingById(seeded.record.id)!;
+  assert.equal(reset.sdkUploadStatus, 'pending');
+  assert.equal(reset.sdkUploadAttempts, 0);
+  assert.equal(reset.sdkUploadDeadlineAt, undefined);
+  assert.equal(reset.sdkUploadNextAttemptAt, undefined);
+  assert.equal(reset.sdkUploadError, undefined);
+  assert.equal(reset.canonicalStatus, 'pending');
+  assert.equal(reset.canonicalError, undefined);
+});
+
+test('explicit retry re-runs canonical backfill after upload completion without resetting the upload', () => {
+  const seeded = seedMeeting({ recordingId: 'recording-canonical-retry' });
+  meetings.patchMeetingRecord(seeded.record.id, {
+    sdkUploadStatus: 'complete',
+    canonicalStatus: 'failed',
+    canonicalError: 'canonical transcript came back empty',
+  });
+
+  const starts: string[] = [];
+  const result = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, {
+    startSdk: ({ meetingId }) => { starts.push(meetingId); },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(result.mode, 'canonical');
+  assert.deepEqual(starts, [seeded.record.id]);
+  const reset = meetings.loadRecallMeetingById(seeded.record.id)!;
+  assert.equal(reset.sdkUploadStatus, 'complete');
+  assert.equal(reset.recordingId, 'recording-canonical-retry');
+  assert.equal(reset.canonicalStatus, 'pending');
+  assert.equal(reset.canonicalError, undefined);
+});
+
+test('legacy recording ids retry canonical backfill even when sdkUploadStatus was never persisted', () => {
+  const seeded = seedMeeting({ recordingId: 'legacy-recording-canonical-retry' });
+  meetings.patchMeetingRecord(seeded.record.id, {
+    sdkUploadStatus: undefined,
+    canonicalStatus: 'failed',
+    canonicalError: 'legacy canonical failure',
+  });
+
+  const starts: string[] = [];
+  const result = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, {
+    startCanonical: (record) => { starts.push(record.id); },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(result.mode, 'canonical');
+  assert.deepEqual(starts, [seeded.record.id]);
+  const reset = meetings.loadRecallMeetingById(seeded.record.id)!;
+  assert.equal(reset.sdkUploadStatus, undefined);
+  assert.equal(reset.recordingId, 'legacy-recording-canonical-retry');
+  assert.equal(reset.canonicalStatus, 'pending');
+});
+
+test('legacy recording ids with no canonical or retention fields can retry and recover after restart', () => {
+  const seeded = seedMeeting({ recordingId: 'legacy-recording-without-state' });
+  meetings.patchMeetingRecord(seeded.record.id, {
+    sdkUploadId: undefined,
+    sdkUploadStatus: undefined,
+    recallRetentionMode: undefined,
+    canonicalStatus: undefined,
+  });
+
+  const requestedStarts: string[] = [];
+  const requested = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, {
+    startCanonical: (record) => { requestedStarts.push(record.id); },
+  });
+  assert.equal(requested.status, 'started');
+  assert.equal(requested.mode, 'canonical');
+  assert.deepEqual(requestedStarts, [seeded.record.id]);
+  assert.equal(meetings.loadRecallMeetingById(seeded.record.id)?.canonicalStatus, 'pending');
+
+  const recoveredStarts: string[] = [];
+  const recovered = reconcile.recoverPendingRecallSdkUploads({
+    start: () => undefined,
+    startCanonical: (record) => { recoveredStarts.push(record.id); },
+  });
+  assert.ok(recovered.includes(seeded.record.id));
+  assert.ok(recoveredStarts.includes(seeded.record.id));
+});
+
+test('a synchronous retry starter failure restores an honest terminal state', () => {
+  const seeded = seedMeeting();
+  meetings.patchMeetingRecord(seeded.record.id, {
+    sdkUploadStatus: 'timed_out',
+    sdkUploadAttempts: 180,
+    sdkUploadError: 'original timeout',
+    canonicalStatus: 'timed_out',
+    canonicalError: 'original timeout',
+  });
+
+  const result = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, {
+    startSdk: () => { throw new Error('worker dispatch unavailable'); },
+  });
+
+  assert.equal(result.status, 'start_failed');
+  assert.match(result.reason ?? '', /worker dispatch unavailable/);
+  const failed = meetings.loadRecallMeetingById(seeded.record.id)!;
+  assert.equal(failed.sdkUploadStatus, 'failed');
+  assert.equal(failed.canonicalStatus, 'failed');
+  assert.match(failed.sdkUploadError ?? '', /worker dispatch unavailable/);
+  assert.match(failed.canonicalError ?? '', /worker dispatch unavailable/);
+});
+
+test('an immediate duplicate retry joins the active worker instead of becoming not-retryable', () => {
+  const seeded = seedMeeting();
+  meetings.patchMeetingRecord(seeded.record.id, {
+    sdkUploadStatus: 'timed_out',
+    sdkUploadError: 'original timeout',
+    canonicalStatus: 'timed_out',
+    canonicalError: 'original timeout',
+  });
+
+  let active = false;
+  let starts = 0;
+  const options = {
+    isSdkActive: () => active,
+    startSdk: () => {
+      starts += 1;
+      active = true;
+    },
+  };
+  const first = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, options);
+  const second = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, options);
+
+  assert.equal(first.status, 'started');
+  assert.equal(second.status, 'already_running');
+  assert.equal(starts, 1);
+});
+
+test('a pending direct canonical retry is recovered after a daemon restart', () => {
+  const seeded = meetings.finalizeRecallMeeting({
+    windowId: 'legacy-direct-restart-window',
+    recordingId: 'legacy-direct-restart-recording',
+    retentionMode: 'timed',
+    canonicalBackfill: true,
+  });
+  meetings.patchMeetingRecord(seeded.record.id, {
+    canonicalStatus: 'failed',
+    canonicalError: 'temporary canonical failure',
+  });
+  const requested = reconcile.requestRecallMeetingTranscriptRetry(seeded.record.id, {
+    startCanonical: () => { /* simulate process exit before worker ownership */ },
+  });
+  assert.equal(requested.status, 'started');
+  assert.equal(meetings.loadRecallMeetingById(seeded.record.id)?.canonicalStatus, 'pending');
+
+  const canonicalStarts: string[] = [];
+  const recovered = reconcile.recoverPendingRecallSdkUploads({
+    start: () => undefined,
+    startCanonical: (record) => { canonicalStarts.push(record.id); },
+  });
+  assert.ok(recovered.includes(seeded.record.id));
+  assert.ok(canonicalStarts.includes(seeded.record.id));
+});
+
+test('explicit retry rejects local, healthy, and already-running meetings without dispatching', () => {
+  const healthy = seedMeeting({ recordingId: 'recording-healthy-no-retry' });
+  meetings.patchMeetingRecord(healthy.record.id, {
+    sdkUploadStatus: 'complete',
+    canonicalStatus: 'ready',
+    segments: [{
+      id: 'healthy-segment',
+      windowId: healthy.record.windowId,
+      recordingId: 'recording-healthy-no-retry',
+      event: 'transcript.canonical',
+      text: 'Already transcribed.',
+      timestamp: healthy.record.startedAt,
+      isFinal: true,
+    }],
+  });
+
+  let starts = 0;
+  const notRetryable = reconcile.requestRecallMeetingTranscriptRetry(healthy.record.id, {
+    startSdk: () => { starts += 1; },
+  });
+  assert.equal(notRetryable.status, 'not_retryable');
+
+  meetings.patchMeetingRecord(healthy.record.id, {
+    canonicalStatus: 'failed',
+    canonicalError: 'temporary failure',
+    segments: [],
+  });
+  const alreadyRunning = reconcile.requestRecallMeetingTranscriptRetry(healthy.record.id, {
+    isSdkActive: () => true,
+    startSdk: () => { starts += 1; },
+  });
+  assert.equal(alreadyRunning.status, 'already_running');
+  assert.equal(starts, 0);
+  assert.equal(
+    meetings.loadRecallMeetingById(healthy.record.id)?.canonicalStatus,
+    'failed',
+    'an already-running response must not rewrite durable progress',
+  );
+});

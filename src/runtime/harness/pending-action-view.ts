@@ -12,6 +12,7 @@ export interface PendingActionApprovalView {
   risk: string;
   rollback: string;
   payload: unknown;
+  executionAuthority: PendingActionRecord['executionAuthority'];
   payloadHash: string;
   idempotencyKey: string;
   approvalId: string | null;
@@ -40,6 +41,7 @@ export function pendingActionApprovalView(record: PendingActionRecord): PendingA
     risk: record.risk,
     rollback: record.rollback,
     payload: record.payload,
+    executionAuthority: record.executionAuthority ?? null,
     payloadHash: record.payloadHash,
     idempotencyKey: record.idempotencyKey,
     approvalId: record.approvalId,
@@ -92,6 +94,7 @@ function synthesizedViewFromBatchPlan(args: unknown): PendingActionApprovalView 
       : `Approving executes ${items.length} ${sideEffect} call(s) with no further review.`,
     rollback: sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
     payload: plan,
+    executionAuthority: null,
     payloadHash: '',
     idempotencyKey: '',
     approvalId: null,

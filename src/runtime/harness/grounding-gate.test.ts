@@ -19,6 +19,9 @@ import assert from 'node:assert/strict';
 
 const { resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
 const {
+  argsHaveSendTarget,
+  isMeaningfulPayloadValue,
+  irreversibleSendRequiresExplicitTarget,
   extractTargetKeys,
   extractDuplicateIdentityKeys,
   extractExternalWriteIdentityKeys,
@@ -39,6 +42,134 @@ test.after(() => {
 });
 
 // ─── extractTargetKeys ────────────────────────────────────────────
+
+test('argsHaveSendTarget recognizes generic social publish destinations without mining content', () => {
+  assert.equal(argsHaveSendTarget({ destination: 'linkedin-company-page', body: 'draft' }), true);
+  assert.equal(argsHaveSendTarget({ target: 'social-profile', body: 'draft' }), true);
+  assert.equal(argsHaveSendTarget({ channel_id: 'channel-123', text: 'draft' }), true);
+  assert.equal(argsHaveSendTarget({ recipients: [{ email: 'person@example.com' }] }), true);
+  assert.equal(argsHaveSendTarget({ toRecipients: [{ emailAddress: { address: 'person@example.com' } }] }), true);
+  assert.equal(argsHaveSendTarget({ recipientEmail: 'person@example.com' }), true);
+  assert.equal(argsHaveSendTarget({ channelId: 'channel-123' }), true);
+  assert.equal(argsHaveSendTarget({ target: {} }), false);
+  assert.equal(argsHaveSendTarget({ destination: false }), false);
+  assert.equal(argsHaveSendTarget({ channel_id: 0 }), false);
+  assert.equal(argsHaveSendTarget({ recipients: [] }), false);
+  assert.equal(argsHaveSendTarget({ target: { enabled: true } }), false);
+  assert.equal(argsHaveSendTarget({ replyTo: [{ emailAddress: { address: 'sender@example.com' } }] }), false);
+  assert.equal(argsHaveSendTarget({ fromEmail: 'sender@example.com' }), false);
+  assert.equal(argsHaveSendTarget({ senderEmail: 'sender@example.com' }), false);
+  assert.equal(argsHaveSendTarget({ onBehalfOf: 'sender@example.com' }), false);
+  assert.equal(argsHaveSendTarget({ connectedAccountId: 'ca_sender_context' }), false);
+  for (const [key, value] of Object.entries({
+    ownerEmail: 'owner@example.com',
+    accountEmail: 'account@example.com',
+    profileEmail: 'profile@example.com',
+    authenticatedUserEmail: 'auth@example.com',
+    currentUserEmail: 'current@example.com',
+    sourceEmail: 'source@example.com',
+    mailboxEmail: 'mailbox@example.com',
+    loginEmail: 'login@example.com',
+    actorEmail: 'actor@example.com',
+    userEmail: 'user@example.com',
+    providerEmail: 'provider@example.com',
+    accountId: 'acct-owner',
+    pageAccountId: 'acct-page',
+    workspaceAccountId: 'acct-workspace',
+    businessAccountId: 'acct-business',
+    socialAccountId: 'acct-social',
+    adAccountId: 'acct-ad',
+    organizationAccountId: 'acct-organization',
+    tenantAccountId: 'acct-tenant',
+  })) {
+    assert.equal(
+      argsHaveSendTarget({ [key]: value, subject: 'Context only', body: 'No recipient.' }),
+      false,
+      `${key} is sender/provider context, not the recipient`,
+    );
+  }
+  assert.equal(argsHaveSendTarget({ targetUserId: 'user-recipient-42', text: 'Directed message' }), true);
+  assert.equal(argsHaveSendTarget({ toEmail: 'to@example.com', body: 'Directed email' }), true);
+  assert.equal(argsHaveSendTarget({ recipientEmail: 'recipient@example.com', body: 'Directed email' }), true);
+  assert.equal(argsHaveSendTarget({ channelId: 'channel-recipient', text: 'Directed message' }), true);
+  for (const [key, value] of Object.entries({
+    conversationId: 'conversation-recipient',
+    chatId: 'chat-recipient',
+    roomId: 'room-recipient',
+    threadId: 'thread-recipient',
+    phoneNumber: '+15555550123',
+    recipientId: 'recipient-42',
+    participantId: 'participant-42',
+    destinationId: 'destination-42',
+    peerId: 'peer-42',
+  })) {
+    assert.equal(
+      argsHaveSendTarget({ [key]: value, text: 'Directed message' }),
+      true,
+      `${key} is a legitimate directed destination`,
+    );
+  }
+  assert.equal(
+    argsHaveSendTarget({
+      tool_slug: 'PROOF_SOCIAL_PUBLISH',
+      arguments: JSON.stringify({ destination: 'proof-only', draft: 'exact text' }),
+    }),
+    true,
+  );
+  assert.equal(
+    argsHaveSendTarget({
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: JSON.stringify({
+        ownerEmail: 'owner@example.com',
+        accountId: 'acct-owner',
+        subject: 'Context only',
+        body: 'No recipient.',
+      }),
+    }),
+    false,
+    'provider context inside a Composio carrier cannot satisfy the target floor',
+  );
+  assert.equal(argsHaveSendTarget({ body: 'Mention target: social-profile only in content.' }), false);
+});
+
+test('meaningful payload values stay provider-agnostic while rejecting blank structures', () => {
+  assert.equal(isMeaningfulPayloadValue({ creation_id: 'ig-container-123' }), true);
+  assert.equal(isMeaningfulPayloadValue({ caption: ' ', image_url: '' }), false);
+  assert.equal(isMeaningfulPayloadValue({ media: [{ id: 'asset-1' }] }), true);
+  assert.equal(isMeaningfulPayloadValue({ nested: { empty: [] } }), false);
+});
+
+test('irreversibleSendRequiresExplicitTarget separates owner-scoped broadcasts from directed communications', () => {
+  for (const slug of [
+    'INSTAGRAM_CREATE_POST',
+    'LINKEDIN_PUBLISH_ARTICLE',
+    'X_POST_TWEET',
+    'TIKTOK_PUBLISH_VIDEO',
+    'YOUTUBE_PUBLISH_SHORT',
+    'PINTEREST_CREATE_PIN',
+  ]) {
+    assert.equal(
+      irreversibleSendRequiresExplicitTarget(slug),
+      false,
+      `${slug} is addressed by the authenticated social account`,
+    );
+  }
+  for (const slug of [
+    'INSTAGRAM_SEND_DM',
+    'TWITTER_REPLY_TO_MESSAGE',
+    'FACEBOOK_CREATE_COMMENT',
+    'LINKEDIN_SEND_INVITE',
+    'SLACK_CHAT_POST_MESSAGE',
+    'GMAIL_SEND_EMAIL',
+    'UNKNOWN_PUBLISH_THING',
+  ]) {
+    assert.equal(
+      irreversibleSendRequiresExplicitTarget(slug),
+      true,
+      `${slug} needs an explicit target or must fail conservatively`,
+    );
+  }
+});
 
 test('extractTargetKeys: pulls recipient email + org domain from nested composio args', () => {
   const keys = extractTargetKeys({

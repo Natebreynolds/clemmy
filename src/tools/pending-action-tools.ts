@@ -26,131 +26,22 @@ import {
   RecipientSetIntegrityError,
 } from '../runtime/harness/recipient-integrity-gate.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
-import { isDirectComposioActionSlug } from '../execution/workflow-direct-call.js';
-import { TOOL_REGISTRY } from './tool-registry.js';
-import { listDynamicToolNames } from './dynamic-tools.js';
+import {
+  admitPendingActionCall,
+  type AdmittedPendingActionCall,
+} from './pending-action-admission.js';
+export {
+  admitPendingActionCall,
+  canonicalizePendingActionCall,
+  type AdmittedPendingActionCall,
+  type CanonicalPendingActionCall,
+} from './pending-action-admission.js';
 
 const statusEnum = z.enum(PENDING_ACTION_STATUSES);
 const kindEnum = z.enum(PENDING_ACTION_KINDS);
 const approvalIntentEnum = z.enum(['request_now', 'queue_only']);
-const BUILT_IN_TOOL_NAMES = new Set(TOOL_REGISTRY.map((tool) => tool.name));
 
 export type PendingActionApprovalIntent = z.infer<typeof approvalIntentEnum>;
-
-interface CanonicalPendingActionCall {
-  toolName: string;
-  payload: unknown;
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isWrappedComposioActionSlug(value: string): boolean {
-  return !BUILT_IN_TOOL_NAMES.has(value) && isDirectComposioActionSlug(value);
-}
-
-/**
- * A bare tool name is ambiguous with local/custom tools, so only Composio's
- * canonical SCREAMING_SNAKE action form may use the convenience spelling.
- * Lowercase or custom identifiers must keep their original executor; an
- * explicit composio_execute_tool wrapper remains available for provider slugs.
- */
-function isBareComposioActionSlug(value: string): boolean {
-  return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(value)
-    && !listDynamicToolNames().includes(value)
-    && isWrappedComposioActionSlug(value);
-}
-
-/**
- * Normalize the two model-facing Composio spellings into the one executable
- * broker call stored in the immutable approval snapshot. A card must never be
- * minted for a payload that the approved executor cannot invoke.
- */
-export function canonicalizePendingActionCall(
-  toolNameInput: string,
-  payloadInput: unknown,
-): CanonicalPendingActionCall {
-  const toolName = toolNameInput.trim();
-  if (toolName === 'composio_execute_tool') {
-    if (!isPlainRecord(payloadInput)) {
-      throw new Error(
-        'composio_execute_tool payloadJson must be an object with tool_slug and arguments.',
-      );
-    }
-    const allowed = new Set(['tool_slug', 'arguments', 'connected_account_id']);
-    const unexpected = Object.keys(payloadInput).filter((key) => !allowed.has(key));
-    if (unexpected.length > 0) {
-      throw new Error(
-        `composio_execute_tool payloadJson contains unsupported transport field(s): ${unexpected.join(', ')}. `
-        + 'Put action fields inside arguments.',
-      );
-    }
-    const slug = typeof payloadInput.tool_slug === 'string'
-      ? payloadInput.tool_slug.trim()
-      : '';
-    if (!slug || !isWrappedComposioActionSlug(slug)) {
-      throw new Error(
-        'composio_execute_tool payloadJson requires a concrete Composio action slug in tool_slug.',
-      );
-    }
-    let argumentsJson: string;
-    if (typeof payloadInput.arguments === 'string') {
-      try {
-        const parsed = JSON.parse(payloadInput.arguments) as unknown;
-        if (!isPlainRecord(parsed)) throw new Error('not an object');
-      } catch {
-        throw new Error(
-          'composio_execute_tool arguments must be a valid JSON-object string or a plain object.',
-        );
-      }
-      // Preserve already-canonical provider bytes exactly.
-      argumentsJson = payloadInput.arguments;
-    } else if (isPlainRecord(payloadInput.arguments)) {
-      argumentsJson = JSON.stringify(payloadInput.arguments);
-    } else {
-      throw new Error(
-        'composio_execute_tool arguments must be a valid JSON-object string or a plain object.',
-      );
-    }
-    const rawConnection = payloadInput.connected_account_id;
-    if (
-      rawConnection !== undefined
-      && rawConnection !== null
-      && (typeof rawConnection !== 'string' || !rawConnection.trim())
-    ) {
-      throw new Error('composio_execute_tool connected_account_id must be a non-empty string or null.');
-    }
-    return {
-      toolName: 'composio_execute_tool',
-      payload: {
-        tool_slug: slug,
-        arguments: argumentsJson,
-        connected_account_id: typeof rawConnection === 'string'
-          ? rawConnection.trim()
-          : null,
-      },
-    };
-  }
-
-  if (isBareComposioActionSlug(toolName)) {
-    if (!isPlainRecord(payloadInput)) {
-      throw new Error(
-        `Direct Composio action ${toolName} requires a plain JSON-object payload.`,
-      );
-    }
-    return {
-      toolName: 'composio_execute_tool',
-      payload: {
-        tool_slug: toolName,
-        arguments: JSON.stringify(payloadInput),
-        connected_account_id: null,
-      },
-    };
-  }
-
-  return { toolName, payload: payloadInput };
-}
 
 function normalizeSessionId(value?: string | null): string | null {
   const clean = value?.trim();
@@ -337,14 +228,16 @@ export function registerPendingActionTools(server: McpServer): void {
       } catch (err) {
         return textResult(`pending_action_queue failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-      let canonical: CanonicalPendingActionCall;
+      let admitted: AdmittedPendingActionCall;
+      const approvalIntent = input.approvalIntent as PendingActionApprovalIntent | undefined;
       try {
-        canonical = canonicalizePendingActionCall(input.toolName, parsedPayload);
+        admitted = admitPendingActionCall(input.toolName, parsedPayload, {
+          approvalIntent: approvalIntent ?? 'legacy',
+        });
       } catch (err) {
         return textResult(`pending_action_queue refused: ${err instanceof Error ? err.message : String(err)}`);
       }
-      const { toolName, payload } = canonical;
-      const approvalIntent = input.approvalIntent as PendingActionApprovalIntent | undefined;
+      const { toolName, payload, executionAuthority } = admitted;
       const sessionId = ownedSessionId();
       if (getToolOutputContext() && !sessionId) {
         return textResult('pending_action_queue refused: the active harness context has no authoritative session owner.');
@@ -383,7 +276,11 @@ export function registerPendingActionTools(server: McpServer): void {
         }
       }
       const attribution = currentRequestAttribution();
-      const payloadHash = pendingActionPayloadHash(toolName, payload);
+      const payloadHash = pendingActionPayloadHash(toolName, payload, executionAuthority);
+      const targetSummary = input.targetSummary
+        ?? (executionAuthority
+          ? `${executionAuthority.toolkit} CLI default — ${executionAuthority.label}`
+          : undefined);
       let record = requestOwnedQueueRetry({
         sessionId,
         sourceUserSeq: attribution.sourceUserSeq,
@@ -399,7 +296,8 @@ export function registerPendingActionTools(server: McpServer): void {
           kind,
           toolName,
           payload,
-          targetSummary: input.targetSummary,
+          executionAuthority,
+          targetSummary,
           preview: input.preview,
           risk: input.risk,
           rollback: input.rollback,

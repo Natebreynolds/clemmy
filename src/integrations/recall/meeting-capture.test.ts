@@ -24,6 +24,7 @@ const {
   noteRecallMeetingDetected,
   recordMeetingTitle,
   renameMeeting,
+  summarizeRecallMeeting,
 } = await import('./meeting-capture.js');
 const { reindexVault } = await import('../../memory/indexer.js');
 const { openMemoryDb, closeMemoryDb } = await import('../../memory/db.js');
@@ -384,4 +385,169 @@ test('two SDK uploads in one reused window remain distinct before reconciliation
     '2026-07-13T10:00:00.000Z',
     '2026-07-13T11:00:00.000Z',
   ]));
+});
+
+test('Recall summary derives transcript truth instead of presenting failed canonical work as Done', () => {
+  const failed = summarizeRecallMeeting({
+    id: 'recall-failed-summary',
+    windowId: 'failed-summary-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-20T12:00:00.000Z',
+    endedAt: '2026-07-20T12:30:00.000Z',
+    sdkUploadId: 'sdk-failed-summary',
+    sdkUploadStatus: 'complete',
+    recordingId: 'recording-failed-summary',
+    recallRetentionMode: 'timed',
+    canonicalStatus: 'failed',
+    canonicalError: 'canonical transcript came back empty',
+    segments: [],
+  });
+
+  assert.deepEqual(failed.presentation, {
+    status: 'failed',
+    label: 'Transcript failed',
+    error: 'canonical transcript came back empty',
+    retryable: true,
+  });
+
+  const timedOut = summarizeRecallMeeting({
+    id: 'recall-timeout-summary',
+    windowId: 'timeout-summary-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-20T13:00:00.000Z',
+    endedAt: '2026-07-20T13:30:00.000Z',
+    sdkUploadId: 'sdk-timeout-summary',
+    sdkUploadStatus: 'timed_out',
+    sdkUploadError: 'Recall SDK upload reconciliation timed out after 180 attempts',
+    canonicalStatus: 'timed_out',
+    canonicalError: 'Recall SDK upload reconciliation timed out after 180 attempts',
+    segments: [],
+  });
+
+  assert.deepEqual(timedOut.presentation, {
+    status: 'timed_out',
+    label: 'Upload timed out',
+    error: 'Recall SDK upload reconciliation timed out after 180 attempts',
+    retryable: true,
+  });
+
+  const emptyReady = summarizeRecallMeeting({
+    id: 'recall-empty-ready-summary',
+    windowId: 'empty-ready-summary-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-20T13:30:00.000Z',
+    endedAt: '2026-07-20T13:45:00.000Z',
+    sdkUploadId: 'sdk-empty-ready-summary',
+    sdkUploadStatus: 'complete',
+    recordingId: 'recording-empty-ready-summary',
+    recallRetentionMode: 'timed',
+    canonicalStatus: 'ready',
+    segments: [],
+  });
+  assert.deepEqual(emptyReady.presentation, {
+    status: 'failed',
+    label: 'Transcript empty',
+    error: 'Recall returned an empty transcript.',
+    retryable: true,
+  });
+
+  const legacyCanonicalFailure = summarizeRecallMeeting({
+    id: 'recall-legacy-failed-summary',
+    windowId: 'legacy-failed-summary-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-20T13:45:00.000Z',
+    endedAt: '2026-07-20T14:00:00.000Z',
+    sdkUploadId: 'legacy-sdk-without-status',
+    recordingId: 'legacy-recording-without-sdk-status',
+    canonicalStatus: 'failed',
+    canonicalError: 'legacy canonical failure',
+    segments: [],
+  });
+  assert.equal(legacyCanonicalFailure.presentation?.status, 'failed');
+  assert.equal(legacyCanonicalFailure.presentation?.error, 'legacy canonical failure');
+});
+
+test('legacy Recall recordings without canonical state remain recoverable unless zero retention was explicit', () => {
+  const legacy = summarizeRecallMeeting({
+    id: 'recall-legacy-missing-canonical-state',
+    windowId: 'legacy-missing-canonical-state-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-19T12:00:00.000Z',
+    endedAt: '2026-07-19T12:30:00.000Z',
+    recordingId: 'legacy-recording-without-canonical-state',
+    segments: [],
+  });
+  assert.deepEqual(legacy.presentation, {
+    status: 'unavailable',
+    label: 'Transcript unavailable',
+    error: 'The canonical transcript has not been retrieved yet.',
+    retryable: true,
+  });
+
+  const zeroRetention = summarizeRecallMeeting({
+    id: 'recall-zero-retention-missing-canonical-state',
+    windowId: 'zero-retention-missing-canonical-state-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-19T13:00:00.000Z',
+    endedAt: '2026-07-19T13:30:00.000Z',
+    recordingId: 'zero-retention-recording-without-canonical-state',
+    recallRetentionMode: 'zero',
+    segments: [],
+  });
+  assert.equal(zeroRetention.presentation?.retryable, false);
+  assert.match(zeroRetention.presentation?.error ?? '', /Zero-retention meetings cannot be recovered/);
+});
+
+test('Recall summary reports ready only for a usable transcript and leaves local presentation unchanged', () => {
+  const ready = summarizeRecallMeeting({
+    id: 'recall-ready-summary',
+    windowId: 'ready-summary-window',
+    provider: 'recall',
+    source: 'recall-desktop-sdk',
+    status: 'completed',
+    startedAt: '2026-07-20T14:00:00.000Z',
+    endedAt: '2026-07-20T14:30:00.000Z',
+    sdkUploadId: 'sdk-ready-summary',
+    sdkUploadStatus: 'complete',
+    recordingId: 'recording-ready-summary',
+    recallRetentionMode: 'timed',
+    canonicalStatus: 'ready',
+    segments: [{
+      id: 'segment-ready-summary',
+      windowId: 'ready-summary-window',
+      recordingId: 'recording-ready-summary',
+      event: 'transcript.canonical',
+      text: 'The canonical transcript is usable.',
+      timestamp: '2026-07-20T14:00:00.000Z',
+      isFinal: true,
+    }],
+  });
+  assert.equal(ready.presentation?.status, 'ready');
+  assert.equal(ready.presentation?.label, 'Transcribed');
+  assert.equal(ready.presentation?.retryable, false);
+
+  const local = summarizeRecallMeeting({
+    id: 'local-ready-summary',
+    windowId: 'local:ready-summary',
+    provider: 'local',
+    source: 'local-audio',
+    status: 'completed',
+    startedAt: '2026-07-20T15:00:00.000Z',
+    endedAt: '2026-07-20T15:30:00.000Z',
+    transcriptionStatus: 'ready',
+    segments: [],
+  });
+  assert.equal(local.presentation, undefined, 'local meeting UI remains driven by local transcriptionStatus');
 });

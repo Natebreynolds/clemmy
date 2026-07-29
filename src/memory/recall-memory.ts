@@ -898,7 +898,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     const tokenList = Array.from(queryTokens).slice(0, 8);
     const topicalTokens = temporalWindow ? temporalTopicTokens(objective) : queryTokens;
     const broadTemporalQuery = Boolean(temporalWindow && topicalTokens.size === 0);
-    const lexicalClauses = tokenList.map(() => `LOWER(COALESCE(title, '') || ' ' || COALESCE(source_app, '') || ' ' || evidence_excerpt) LIKE ?`);
+    const lexicalClauses = tokenList.map(() => `LOWER(COALESCE(title, '') || ' ' || COALESCE(source_app, '') || ' ' || COALESCE(source_uri, '') || ' ' || evidence_excerpt) LIKE ?`);
     // A temporal meeting query is type-constrained. The previous `1 = 1`
     // temporal widening admitted every episode from that day, allowing an
     // unrelated manual memory to answer "what was my meeting about?" with
@@ -975,7 +975,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     const rankedEpisodes = rows.map((row) => {
       const lexical = overlapScore(
         temporalWindow && !broadTemporalQuery ? topicalTokens : queryTokens,
-        `${row.title ?? ''} ${row.source_app ?? ''} ${row.evidence_excerpt}`,
+        `${row.title ?? ''} ${row.source_app ?? ''} ${row.source_uri ?? ''} ${row.evidence_excerpt}`,
       );
       const occurredAtMs = Date.parse(row.occurred_at);
       const temporalMatch = Boolean(temporalWindow && Number.isFinite(occurredAtMs)

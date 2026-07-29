@@ -12,8 +12,14 @@ import { Composer } from '@/components/chat/Composer';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
+  isCurrentWorkspaceDiffScope,
+  type WorkspaceDiffScope,
+} from '@/lib/workspace-history-state';
+import {
   getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
-  spaceSessionId, openApprovalCount, gapQuestions, latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus,
+  getSpaceDiff, getSpaceHistory, spaceSessionId, openApprovalCount, gapQuestions,
+  latestRefreshFailures, buildWorkspaceFixPrompt, type SpaceStatus, type SpaceDiffResponse,
+  type SpaceObservationSummary,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
@@ -25,10 +31,16 @@ function statusTone(status: SpaceStatus): Tone {
   return 'neutral';
 }
 
-type DetailTab = 'health' | 'code' | 'history' | 'audit';
+type DetailTab = 'health' | 'dataHistory' | 'code' | 'history' | 'audit';
+type ScopedHistoryDiff = { scope: WorkspaceDiffScope; value: SpaceDiffResponse };
+type ScopedHistoryDiffBusy = { scope: WorkspaceDiffScope; observationId: string };
 
 export function WorkspaceView() {
   const { id = '' } = useParams();
+  return <WorkspaceViewForId key={id} id={id} />;
+}
+
+function WorkspaceViewForId({ id }: { id: string }) {
   const navigate = useNavigate();
   const location = useLocation();
   const detail = usePoll(['space', id], () => getSpace(id), 5000, { enabled: !!id });
@@ -54,6 +66,59 @@ export function WorkspaceView() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [tab, setTab] = useState<DetailTab>('health');
   const [error, setError] = useState<string | null>(null);
+  const history = usePoll(
+    ['space-history', id],
+    () => getSpaceHistory(id, { limit: 60 }),
+    0,
+    { enabled: !!id && detailsOpen && tab === 'dataHistory' },
+  );
+  const [historyItems, setHistoryItems] = useState<SpaceObservationSummary[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | undefined>();
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyPageBusy, setHistoryPageBusy] = useState(false);
+  const [historyPageError, setHistoryPageError] = useState<string | null>(null);
+  const [historyDiffState, setHistoryDiffState] = useState<ScopedHistoryDiff | null>(null);
+  const [diffBusyState, setDiffBusyState] = useState<ScopedHistoryDiffBusy | null>(null);
+  const workspaceIdRef = useRef(id);
+  const historyPageRef = useRef(history.data);
+  const diffRequestIdRef = useRef(0);
+  workspaceIdRef.current = id;
+  historyPageRef.current = history.data;
+  const currentDiffScope: WorkspaceDiffScope = {
+    workspaceId: id,
+    pageToken: history.data,
+    requestId: diffRequestIdRef.current,
+  };
+  const historyDiff = historyDiffState
+    && isCurrentWorkspaceDiffScope(historyDiffState.scope, currentDiffScope)
+    ? historyDiffState.value
+    : null;
+  const diffBusyId = diffBusyState
+    && isCurrentWorkspaceDiffScope(diffBusyState.scope, currentDiffScope)
+    ? diffBusyState.observationId
+    : null;
+
+  useEffect(() => {
+    diffRequestIdRef.current += 1;
+    setHistoryItems([]);
+    setHistoryCursor(undefined);
+    setHistoryHasMore(false);
+    setHistoryPageBusy(false);
+    setHistoryPageError(null);
+    setHistoryDiffState(null);
+    setDiffBusyState(null);
+  }, [id]);
+
+  useEffect(() => {
+    if (!history.data) return;
+    diffRequestIdRef.current += 1;
+    setHistoryItems(history.data.observations);
+    setHistoryCursor(history.data.nextCursor);
+    setHistoryHasMore(history.data.hasMore);
+    setHistoryPageError(null);
+    setHistoryDiffState(null);
+    setDiffBusyState(null);
+  }, [history.data]);
 
   // Seed the dock with the build request passed from the creation modal, so a
   // brand-new workspace starts building immediately (no cold context-switch).
@@ -68,6 +133,32 @@ export function WorkspaceView() {
   }, []);
 
   const space = detail.data?.space;
+
+  const loadMoreHistory = async () => {
+    if (!historyCursor || historyPageBusy) return;
+    const requestedWorkspaceId = id;
+    const requestedPage = history.data;
+    const isCurrent = () => workspaceIdRef.current === requestedWorkspaceId
+      && historyPageRef.current === requestedPage;
+    setHistoryPageBusy(true);
+    setHistoryPageError(null);
+    try {
+      const page = await getSpaceHistory(id, { limit: 60, cursor: historyCursor });
+      if (!isCurrent()) return;
+      setHistoryItems((current) => {
+        const seen = new Set(current.map((item) => item.id));
+        return [...current, ...page.observations.filter((item) => !seen.has(item.id))];
+      });
+      setHistoryCursor(page.nextCursor);
+      setHistoryHasMore(page.hasMore);
+    } catch (err) {
+      if (isCurrent()) {
+        setHistoryPageError(err instanceof Error ? err.message : 'Could not load more history.');
+      }
+    } finally {
+      if (isCurrent()) setHistoryPageBusy(false);
+    }
+  };
 
   const act = async (fn: () => Promise<unknown>, reloadView = false) => {
     setBusy(true);
@@ -117,6 +208,38 @@ export function WorkspaceView() {
     });
   };
 
+  const compareWithPrevious = async (observation: SpaceObservationSummary) => {
+    if (!observation.previousObservationId) return;
+    const requestScope: WorkspaceDiffScope = {
+      workspaceId: id,
+      pageToken: history.data,
+      requestId: diffRequestIdRef.current + 1,
+    };
+    diffRequestIdRef.current = requestScope.requestId;
+    const isCurrent = () => isCurrentWorkspaceDiffScope(requestScope, {
+      workspaceId: workspaceIdRef.current,
+      pageToken: historyPageRef.current,
+      requestId: diffRequestIdRef.current,
+    });
+    setDiffBusyState({ scope: requestScope, observationId: observation.id });
+    setHistoryDiffState(null);
+    setError(null);
+    try {
+      const result = await getSpaceDiff(id, {
+        sourceKey: observation.sourceKey,
+        from: observation.previousObservationId,
+        to: observation.id,
+      });
+      if (isCurrent()) setHistoryDiffState({ scope: requestScope, value: result });
+    } catch (err) {
+      if (isCurrent()) {
+        setError(err instanceof Error ? err.message : 'Couldn’t compare these observations.');
+      }
+    } finally {
+      if (isCurrent()) setDiffBusyState(null);
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
@@ -134,7 +257,15 @@ export function WorkspaceView() {
         )}
         <div className="ml-auto flex items-center gap-1.5">
           {space.dataSources.length > 0 && (
-            <Button variant="secondary" size="sm" disabled={busy} onClick={() => act(() => refreshSpace(id), true)}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={busy}
+              onClick={() => act(async () => {
+                await refreshSpace(id);
+                await history.refetch();
+              }, true)}
+            >
               <RefreshCw className={`h-4 w-4 ${busy ? 'animate-spin' : ''}`} aria-hidden /> Refresh
             </Button>
           )}
@@ -195,14 +326,14 @@ export function WorkspaceView() {
         {detailsOpen && (
           <aside className="absolute right-0 top-0 flex h-full w-full max-w-[440px] flex-col border-l border-border bg-surface shadow-lg">
             <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-              {(['health', 'code', 'history', 'audit'] as DetailTab[]).map((t) => (
+              {(['health', 'dataHistory', 'code', 'history', 'audit'] as DetailTab[]).map((t) => (
                 <button
                   key={t}
                   type="button"
                   onClick={() => setTab(t)}
                   className={`rounded-md px-2.5 py-1 text-small capitalize transition-colors cursor-pointer ${tab === t ? 'bg-primary-tint text-fg' : 'text-muted hover:text-fg'}`}
                 >
-                  {t}
+                  {t === 'dataHistory' ? 'data history' : t === 'history' ? 'view versions' : t}
                 </button>
               ))}
               <button type="button" className="ml-auto text-muted hover:text-fg cursor-pointer" onClick={() => setDetailsOpen(false)} aria-label="Close details">
@@ -281,6 +412,21 @@ export function WorkspaceView() {
                   {detail.data?.viewSource || '(no view yet)'}
                 </pre>
               )}
+              {tab === 'dataHistory' && (
+                <DataHistoryPanel
+                  observations={historyItems}
+                  hasMore={historyHasMore}
+                  loading={history.isLoading}
+                  failed={history.isError}
+                  pageBusy={historyPageBusy}
+                  pageError={historyPageError}
+                  diff={historyDiff}
+                  diffBusyId={diffBusyId}
+                  onCompare={compareWithPrevious}
+                  onRetry={() => { void history.refetch(); }}
+                  onLoadMore={() => { void loadMoreHistory(); }}
+                />
+              )}
               {tab === 'history' && (
                 space.revisions.length === 0
                   ? <p className="text-small text-muted">No prior versions yet.</p>
@@ -332,7 +478,7 @@ export function WorkspaceView() {
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
               {chat.messages.length === 0 ? (
                 <p className="px-1 pt-6 text-center text-small text-muted">
-                  Ask about anything in this workspace — “what changed today?”, “draft a follow-up for the stalled deals”.
+                  Ask about anything in this workspace — “what changed since the last refresh?”, “draft a follow-up for the stalled deals”.
                 </p>
               ) : (
                 chat.messages.map((m) => (
@@ -359,6 +505,174 @@ export function WorkspaceView() {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+function observationState(observation: SpaceObservationSummary): {
+  label: string;
+  className: string;
+} {
+  if (observation.status === 'error') {
+    return { label: 'failed', className: 'bg-danger/10 text-danger' };
+  }
+  if (observation.status === 'awaiting_approval') {
+    return { label: 'awaiting approval', className: 'bg-warning/10 text-warning' };
+  }
+  if (!observation.previousObservationId) {
+    return { label: 'baseline', className: 'bg-subtle text-muted' };
+  }
+  if (observation.changed === true) {
+    return { label: 'changed', className: 'bg-primary-tint text-primary' };
+  }
+  return { label: 'unchanged', className: 'bg-subtle text-muted' };
+}
+
+function DataHistoryPanel({
+  observations,
+  hasMore,
+  loading,
+  failed,
+  pageBusy,
+  pageError,
+  diff,
+  diffBusyId,
+  onCompare,
+  onRetry,
+  onLoadMore,
+}: {
+  observations: SpaceObservationSummary[];
+  hasMore: boolean;
+  loading: boolean;
+  failed: boolean;
+  pageBusy: boolean;
+  pageError: string | null;
+  diff: SpaceDiffResponse | null;
+  diffBusyId: string | null;
+  onCompare: (observation: SpaceObservationSummary) => void;
+  onRetry: () => void;
+  onLoadMore: () => void;
+}) {
+  if (loading) return <p className="text-small text-muted">Loading data history…</p>;
+  if (failed) {
+    return (
+      <div className="rounded-md border border-danger/30 bg-danger/5 p-3">
+        <p className="text-small text-danger">Data history is temporarily unavailable.</p>
+        <Button variant="ghost" size="sm" className="mt-2" onClick={onRetry}>Try again</Button>
+      </div>
+    );
+  }
+  if (observations.length === 0) {
+    return (
+      <div className="rounded-md border border-border bg-subtle p-3">
+        <p className="text-small font-medium text-fg">No observations yet</p>
+        <p className="mt-1 text-caption text-muted">
+          Refresh a data source to establish its baseline. A second observation makes “what changed?” available.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="text-small font-semibold text-fg">Data history</p>
+        <p className="mt-0.5 text-caption text-muted">
+          Exact refresh observations, separate from authored view versions.
+        </p>
+      </div>
+
+      {diff && (
+        <div className="rounded-md border border-primary/30 bg-primary-tint p-3">
+          {diff.status === 'insufficient_history' ? (
+            <>
+              <p className="text-small font-semibold text-fg">One more observation needed</p>
+              <p className="mt-1 text-caption text-muted">
+                {diff.sourceKey ? `“${diff.sourceKey}”` : 'This source'} has {diff.observations} comparable observation{diff.observations === 1 ? '' : 's'}.
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-small font-semibold text-fg">Changes in {diff.sourceKey}</p>
+                  <p className="mt-0.5 text-caption text-muted">{diff.diff.summary}</p>
+                </div>
+                <span className="shrink-0 rounded-full bg-surface px-2 py-0.5 text-caption text-muted">
+                  {diff.diff.changed ? 'changed' : 'same'}
+                </span>
+              </div>
+              {diff.diff.changes.length > 0 && (
+                <ul className="mt-2 flex flex-col gap-1.5">
+                  {diff.diff.changes.map((change, index) => (
+                    <li key={`${change.op}-${change.path}-${index}`} className="rounded border border-border bg-surface px-2 py-1.5">
+                      <div className="flex items-center gap-2 text-caption">
+                        <span className="font-semibold uppercase text-primary">{change.op}</span>
+                        <code className="min-w-0 break-all text-fg">{change.path || '/'}</code>
+                      </div>
+                      {(change.before !== undefined || change.after !== undefined) && (
+                        <div className="mt-1 grid grid-cols-2 gap-1 font-mono text-[11px] text-muted">
+                          <span className="break-all rounded bg-subtle px-1.5 py-1">{change.before ?? '—'}</span>
+                          <span className="break-all rounded bg-subtle px-1.5 py-1">{change.after ?? '—'}</span>
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <ul className="flex flex-col gap-2">
+        {observations.map((observation) => {
+          const state = observationState(observation);
+          const comparable = observation.status === 'ok' && Boolean(observation.previousObservationId);
+          return (
+            <li key={observation.id} className="rounded-md border border-border bg-surface px-3 py-2.5">
+              <div className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="truncate font-mono text-small text-fg">{observation.sourceKey}</span>
+                    {observation.isCurrent && (
+                      <span className="rounded-full bg-success/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-success">current</span>
+                    )}
+                    <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase ${state.className}`}>
+                      {state.label}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-caption text-muted">
+                    {observation.cause.replaceAll('_', ' ')} · {new Date(observation.observedAt).toLocaleString()}
+                  </p>
+                </div>
+                {comparable && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={diffBusyId !== null}
+                    onClick={() => onCompare(observation)}
+                  >
+                    {diffBusyId === observation.id
+                      ? <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                      : <History className="h-3.5 w-3.5" aria-hidden />}
+                    Compare
+                  </Button>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      {hasMore && (
+        <div className="flex flex-col items-center gap-1.5">
+          <Button variant="ghost" size="sm" disabled={pageBusy} onClick={onLoadMore}>
+            {pageBusy && <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden />}
+            Load more
+          </Button>
+          {pageError && <p className="text-caption text-danger">{pageError}</p>}
+        </div>
+      )}
     </div>
   );
 }

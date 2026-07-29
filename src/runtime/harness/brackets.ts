@@ -46,7 +46,17 @@ import {
   isConfirmFirstEnabled,
   ConfirmFirstRequiredError,
 } from './confirm-first-gate.js';
-import { queuePendingAction, findOpenPendingActionByPayload } from './pending-actions.js';
+import {
+  queuePendingAction,
+  findOpenPendingActionByPayload,
+  getPendingAction,
+} from './pending-actions.js';
+import { pendingActionIdFromArgs } from './pending-action-view.js';
+import {
+  materializeQueuedApprovals,
+  queuedApprovalTransitionsForRequest,
+} from './pending-action-transition.js';
+import { admitPendingActionCall } from '../../tools/pending-action-admission.js';
 import {
   isGroundingGateEnabled,
   extractDuplicateIdentityKeys,
@@ -1164,30 +1174,107 @@ export function mintJudgeFailApproval(input: {
   judge: string;
   judgeFailureReason: string;
   targetSummary?: string;
+  /** Exact user request that owns this card. Normal harness calls always pass
+   * this; the latest non-synthetic user event is a compatibility fallback. */
+  sourceUserSeq?: number;
 }): string | null {
   if (!judgeFailApprovalEnabled()) return null;
   try {
-    const existing = findOpenPendingActionByPayload(input.toolName, input.payload);
-    if (existing) return existing.id; // dedup — one card per payload
-    const shape = classifyExternalWrite(input.toolName, input.payload);
-    const isSend = /SEND|EMAIL|PUBLISH|POST|MESSAGE|SLACK|TWEET|DM\b/i.test(shape.shapeKey ?? input.toolName);
-    const targetSummary = input.targetSummary
-      || extractDuplicateIdentityKeys(input.payload).slice(0, 5).join(', ')
-      || 'this action';
-    const record = queuePendingAction({
-      title: `Judge couldn't verify: ${targetSummary}`.slice(0, 160),
-      summary: `The ${input.judge} judge couldn't run (${input.judgeFailureReason}), so this irreversible ${input.toolName} was NOT sent unverified — approve to fire the exact queued call, or deny to drop it.`,
-      kind: isSend ? 'external_send' : 'external_write',
-      toolName: input.toolName,
-      payload: input.payload,
-      targetSummary,
-      preview: JSON.stringify(input.payload).slice(0, 800),
-      risk: 'Irreversible external action that the automated fidelity judge could not verify before sending.',
-      rollback: isSend ? 'Sends are irreversible once delivered.' : 'Depends on the target tool.',
-      sessionId: input.sessionId,
-      createdBy: 'judge_fail_approval',
+    const sessionId = input.sessionId.trim();
+    if (!sessionId || !getSession(sessionId)) return null;
+    const sourceUserSeq = Number.isSafeInteger(input.sourceUserSeq)
+      && Number(input.sourceUserSeq) > 0
+      ? Number(input.sourceUserSeq)
+      : listEvents(sessionId, { types: ['user_input_received'] })
+        .filter((event) => event.data.synthetic !== true)
+        .at(-1)?.seq;
+    if (!sourceUserSeq) return null;
+    // Judge outage is an alternate queue producer, not an alternate authority
+    // model. Canonicalize and admit through the same trusted boundary as
+    // pending_action_queue before deduping or minting any formal card.
+    const admitted = admitPendingActionCall(input.toolName, input.payload, {
+      approvalIntent: 'request_now',
     });
-    return record.id;
+    const toolName = admitted.toolName;
+    const payload = admitted.payload;
+
+    // Dedup is request-owner scoped. Equal payloads in two user sessions must
+    // never share approval authority.
+    const existing = findOpenPendingActionByPayload(
+      toolName,
+      payload,
+      { sessionId, executionAuthority: admitted.executionAuthority },
+    );
+    const shape = classifyExternalWrite(toolName, payload);
+    const isSend = /SEND|EMAIL|PUBLISH|POST|MESSAGE|SLACK|TWEET|DM\b/i.test(shape.shapeKey ?? toolName);
+    const targetSummary = input.targetSummary
+      || extractDuplicateIdentityKeys(payload).slice(0, 5).join(', ')
+      || (admitted.executionAuthority
+        ? `${admitted.executionAuthority.toolkit} CLI default — ${admitted.executionAuthority.label}`
+        : '')
+      || 'this action';
+    const record = existing ?? queuePendingAction({
+        title: `Judge couldn't verify: ${targetSummary}`.slice(0, 160),
+        summary: `The ${input.judge} judge couldn't run (${input.judgeFailureReason}), so this irreversible ${toolName} was NOT sent unverified — approve to fire the exact queued call, or deny to drop it.`,
+        kind: isSend ? 'external_send' : 'external_write',
+        toolName,
+        payload,
+        executionAuthority: admitted.executionAuthority,
+        targetSummary,
+        preview: JSON.stringify(payload).slice(0, 800),
+        risk: 'Irreversible external action that the automated fidelity judge could not verify before sending.',
+        rollback: isSend ? 'Sends are irreversible once delivered.' : 'Depends on the target tool.',
+        sessionId,
+        createdBy: 'judge_fail_approval',
+      });
+
+    const hasTypedEdge = listEvents(sessionId, {
+      types: ['autonomy_note'],
+      sinceSeq: sourceUserSeq,
+    }).some((event) => (
+      event.data.kind === 'pending_action_queued'
+      && event.data.pendingActionId === record.id
+      && event.data.sourceUserSeq === sourceUserSeq
+    ));
+    if (!hasTypedEdge) {
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'autonomy_note',
+        data: {
+          kind: 'pending_action_queued',
+          pendingActionId: record.id,
+          actionKind: record.kind,
+          approvalRequired: true,
+          payloadHash: record.payloadHash,
+          sourceUserSeq,
+          approvalIntent: 'request_now',
+          autoMaterialize: true,
+          callId: `judge-fail:${input.judge}:${record.id}`,
+        },
+      });
+    }
+
+    const transitions = queuedApprovalTransitionsForRequest(
+      sessionId,
+      sourceUserSeq,
+    ).filter((transition) => transition.record.id === record.id);
+    materializeQueuedApprovals(sessionId, 0, sourceUserSeq, transitions);
+
+    // Never claim "a card is waiting" from the queue record alone. The return
+    // value is evidence that a canonical, session-scoped registry row exists.
+    const linked = getPendingAction(record.id);
+    if (!linked?.approvalId) return null;
+    const approval = listPendingApprovals({
+      sessionId,
+      status: 'pending',
+    }).find((row) => (
+      row.approvalId === linked.approvalId
+      && row.tool === 'request_approval'
+      && pendingActionIdFromArgs(row.args) === linked.id
+    ));
+    return approval ? linked.id : null;
   } catch {
     return null; // never let the mint failure change the refusal path
   }
@@ -1576,6 +1663,34 @@ function recordExternalWriteSettlement(
   return type;
 }
 
+/**
+ * One recovery for a validated irreversible inner send. call_tool invokes this
+ * only after its own reachability + argument checks have passed; raw carrier
+ * JSON must never reach this conversion point.
+ */
+export function pendingActionApprovalRequiredError(
+  toolName: string,
+  payload: unknown,
+): ExternalWritePreDispatchError {
+  const payloadLabel = (() => {
+    try {
+      const encoded = JSON.stringify(payload);
+      return encoded && encoded.length <= 400
+        ? ` The blocked payload was ${encoded}.`
+        : '';
+    } catch {
+      return '';
+    }
+  })();
+  return new ExternalWritePreDispatchError(
+    `PENDING_ACTION_APPROVAL_REQUIRED: "${toolName}" is an irreversible external send reached through a nested dispatcher, which cannot open its own approval card. `
+    + 'Do not call execution_create and do not retry the send. Call pending_action_queue ONCE with '
+    + `kind "external_send", toolName "${toolName}", payloadJson set to the exact blocked payload, and approvalIntent "request_now"; then stop for the one formal card. `
+    + 'After the user approves it, pending_action_execute dispatches that byte-pinned payload exactly once.'
+    + payloadLabel,
+  );
+}
+
 function assertNoDuplicateExternalWrite(input: {
   sessionId: string;
   toolName: string;
@@ -1806,6 +1921,33 @@ export function wrapToolForHarness<T extends WrappableTool>(
       ctx.sessionId,
       ctx.sourceUserSeq ? { sourceUserSeq: ctx.sourceUserSeq } : undefined,
     );
+    // call_tool is a pure transport carrier. Its raw model-authored name and
+    // args_json have not passed the dispatcher's reachability/schema checks yet,
+    // so the outer wrapper must not claim artifacts, reserve writes, or mint
+    // approval guidance from them. The validated INNER tool re-enters this same
+    // bracket battery and owns all effect decisions.
+    //
+    // The SDK rejects a malformed OUTER carrier before call-tool.execute runs,
+    // however, so there is no inner/refusal path to charge it. Account for only
+    // those structurally invalid envelopes here to retain a deterministic loop
+    // ceiling without applying any outer effect/write gate. A valid envelope is
+    // charged exactly once by either its validated inner call or execute.refuse.
+    if (tool.name === 'call_tool') {
+      const carrier = parsedInput && typeof parsedInput === 'object' && !Array.isArray(parsedInput)
+        ? parsedInput as Record<string, unknown>
+        : null;
+      const structurallyValid = Boolean(
+        carrier
+        && typeof carrier.name === 'string'
+        && carrier.name.length > 0
+        && typeof carrier.args_json === 'string',
+      );
+      if (!structurallyValid) {
+        if (ctx.counter.willExceed()) throw new ToolCallsLimitExceeded(ctx.counter.limit);
+        ctx.counter.increment();
+      }
+      return undefined;
+    }
     // (fold 2026-07-17: the fail-closed turn-preflight gate that ran here was
     // demoted — alignment is a conversational directive; consent enforcement
     // stays with plan-scope/approvals. See turn-control.ts.)
@@ -2236,6 +2378,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   judge: 'goal-fidelity',
                   judgeFailureReason: verdict.reason,
                   targetSummary: verdict.targets.slice(0, 5).join(', '),
+                  sourceUserSeq: ctx.sourceUserSeq,
                 })
               : null;
             try {
@@ -3001,6 +3144,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // refusal acquired nothing and leaves the authoritative row untouched.
         releaseUndispatchedArtifact(artifact.dispatch);
         if (err instanceof ArtifactReuseDenied) return err.reuseMessage;
+        if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
         // A recoverable gate throw lands as a SOFT tool error — the model sees
         // it as the tool's output and self-corrects. Throwing here would abort
         // the run because our wrap is OUTSIDE the SDK's _invoke catch. The exact
@@ -3078,6 +3222,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           invokeCallId,
           true,
         );
+        if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
         const soft = softToolError(err);
         if (soft !== null) return soft;
         throw err;
@@ -3186,6 +3331,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     } catch (err) {
       releaseUndispatchedArtifact(artifact.dispatch);
       if (err instanceof ArtifactReuseDenied) return err.reuseMessage;
+      if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
       // SAME disposition as wrappedInvoke above: a recoverable gate throw becomes
       // a soft tool error here too (this path had NO try/catch, so a typed gate
       // throw aborted the run purely because the tool used `execute` not `invoke`).
@@ -3222,6 +3368,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         executeCallId,
         true,
       );
+      if (ctx?.certifiedBatch && err instanceof ExternalWritePreDispatchError) throw err;
       // Same general self-correction as the invoke path: a long-job timeout on an
       // external-API / MCP tool returns the async/verify corrective as the result
       // (run continues) instead of propagating ToolTimeout to the ask-user pause.

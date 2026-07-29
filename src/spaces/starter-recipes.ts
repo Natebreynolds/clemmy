@@ -37,9 +37,9 @@ export const WORKSPACE_STARTER_RECIPES: WorkspaceStarterRecipe[] = [
   {
     id: 'deal-board',
     title: 'Deal Board',
-    pitch: 'A live board of your open deals — stage, age, next step — refreshed on a schedule, with stale ones flagged.',
+    pitch: 'A live board of your open deals — including what materially changed since the prior successful refresh.',
     connects: ['salesforce', 'hubspot', 'pipedrive', 'attio'],
-    buildPrompt: 'Build me a Deal Board workspace: pull my open deals/opportunities from my connected CRM into a live board grouped by stage, showing amount, age, and last activity. Flag anything stale (no activity in 14+ days). Refresh it every morning and re-engage me if a deal goes stale.',
+    buildPrompt: 'Build me a Deal Board workspace: pull my open deals/opportunities from my connected CRM into a live board grouped by stage, showing amount, age, and last activity. Flag anything stale (no activity in 14+ days). Refresh it every morning. After the first successful baseline, use the Workspace observation history to show only verified stage/amount/activity changes since the prior successful refresh, and re-engage me when a deal newly becomes stale. If no comparable observation exists yet, label it baseline-only instead of inventing movement.',
   },
   {
     id: 'inbox-triage',
@@ -51,23 +51,23 @@ export const WORKSPACE_STARTER_RECIPES: WorkspaceStarterRecipe[] = [
   {
     id: 'daily-brief',
     title: 'Daily Brief',
-    pitch: "Today's meetings, waiting-on-you items, and anything that changed overnight — one page, ready before you sit down.",
+    pitch: "Today's meetings, waiting-on-you items, open tasks, and a verified “since yesterday” change brief.",
     connects: ['calendar', 'outlook', 'gmail', 'googlecalendar'],
-    buildPrompt: "Build me a Daily Brief workspace: today's calendar, emails waiting on my reply, and my open tasks — one clean page, refreshed early each morning so it's ready when I sit down.",
+    buildPrompt: "Build me a Daily Brief workspace: today's calendar, emails waiting on my reply, and my open tasks — one clean page, refreshed early each morning so it's ready when I sit down. Once a prior successful observation exists, include a concise verified “what changed since the prior brief” section from Workspace history. On the first run, say it established the baseline.",
   },
   {
     id: 'seo-rank-tracker',
     title: 'SEO Rank Tracker',
-    pitch: 'Your target keywords with live positions and movement arrows — re-engages you when a ranking moves.',
+    pitch: 'Your target keywords with current positions and verified movement since the prior successful check.',
     connects: ['dataforseo', 'semrush', 'ahrefs', 'serp'],
-    buildPrompt: 'Build me an SEO Rank Tracker workspace: ask me for my domain and 5-10 target keywords, then track their positions with movement since last check, refreshed daily. Re-engage me when anything moves more than 3 spots.',
+    buildPrompt: 'Build me an SEO Rank Tracker workspace: ask me for my domain, 5-10 target keywords, and the position threshold I care about. Show their current positions, refresh daily, and—after the first successful baseline—use Workspace history to show verified movement since the prior successful refresh. Re-engage me when any keyword newly falls outside that threshold. Never infer movement when history reports insufficient observations.',
   },
   {
     id: 'client-health',
     title: 'Client Health Board',
-    pitch: 'Every client with a freshness score — last touch, open items, sentiment — so nobody quietly goes cold.',
+    pitch: 'Every client with a freshness score, plus verified changes since the prior successful refresh.',
     connects: ['salesforce', 'hubspot', 'airtable', 'notion'],
-    buildPrompt: 'Build me a Client Health workspace: list my clients/accounts from my connected system with last-touch date, open items, and a simple health color (green/yellow/red by recency). Refresh daily and re-engage me when anyone goes red.',
+    buildPrompt: 'Build me a Client Health workspace: list my clients/accounts from my connected system with last-touch date, open items, and a simple health color (green/yellow/red by recency). Refresh daily. After the first successful baseline, use Workspace history to show verified health/last-touch/open-item changes since the prior successful refresh and re-engage me when anyone newly goes red. If comparison history is insufficient, report the current state as a baseline.',
   },
   {
     id: 'task-cockpit',

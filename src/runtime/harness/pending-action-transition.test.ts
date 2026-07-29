@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-pending-transition-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {

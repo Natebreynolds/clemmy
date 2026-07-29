@@ -22,6 +22,9 @@
  * Continuation turns (the canned self-continuation nudge) are classified by the
  * caller, which knows it's a continuation and treats it as full-assembly.
  */
+import { classifyMessageIntent } from '../../assistant/message-intent.js';
+import { classifyExternalEffectRequest } from '../../assistant/external-effect-taxonomy.js';
+
 export type TurnIntent = 'qa' | 'action';
 
 // Irreversible/high-stakes action verbs in free-text user input. Deliberately
@@ -30,11 +33,17 @@ export type TurnIntent = 'qa' | 'action';
 // layer's old STAKES_ACTION_RE (no old match is dropped), lifted here as the
 // shared truth. UPCOMING tense only (base/-s/-ing) — NOT past tense: "I sent
 // the email" describes a COMPLETED action and should not read as action-intent.
-const ACTION_VERB_RE = /\b(send|sends|sending|publish|publishes|publishing|deploy|deploys|deploying|launch|launches|launching|delete|deletes|deleting|migrate|migrates|migrating|wire|wires|wiring|charge|charges|charging|refund|refunds|refunding|production|irreversible)\b/i;
+const ACTION_VERB_RE = /\b(send|sends|sending|publish|publishes|publishing|deploy|deploys|deploying|launch|launches|launching|delete|deletes|deleting|migrate|migrates|migrating|update|updates|updating|wire|wires|wiring|charge|charges|charging|refund|refunds|refunding|production|irreversible)\b/i;
 
 /** Classify a turn's text as a consequential 'action' or a light 'qa'.
  *  Pure + cheap. Empty/whitespace → 'qa'. */
 export function classifyTurnIntent(text: string | undefined | null): TurnIntent {
   const s = typeof text === 'string' ? text : '';
-  return ACTION_VERB_RE.test(s) ? 'action' : 'qa';
+  const messageIntent = classifyMessageIntent(s).intent;
+  if (messageIntent === 'lookup' || messageIntent === 'meta_clarify' || messageIntent === 'casual') {
+    return 'qa';
+  }
+  return classifyExternalEffectRequest(s).requested || ACTION_VERB_RE.test(s)
+    ? 'action'
+    : 'qa';
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { isLoopbackWebhookHost, normalizeWebhookHost } from '../config.js';
 import {
+  isSecretLikeKey,
   isSensitivePath,
   isStrongLocalSecret,
   redactSensitiveText,
@@ -37,6 +38,35 @@ test('redactSensitiveText covers API keys, bearer tokens, url tokens, and env as
   assert.match(redacted, /\[REDACTED\]/);
 });
 
+test('secret-key classification and assignment redaction cover camelCase credentials', () => {
+  for (const key of [
+    'authToken',
+    'idToken',
+    'session_token',
+    'credentialValue',
+    'client-secret',
+    'privateKey',
+    'access.key',
+    'jwt',
+  ]) {
+    assert.equal(isSecretLikeKey(key), true, `${key} must be treated as secret-bearing`);
+  }
+  for (const key of ['id', 'key', 'monkey']) {
+    assert.equal(isSecretLikeKey(key), false, `${key} is ordinary data`);
+  }
+  // A field containing a whole secret word stays sensitive even when its
+  // suffix sounds like metadata; callers should use an explicitly safe name.
+  assert.equal(isSecretLikeKey('tokenCount'), true);
+  assert.equal(isSecretLikeKey('credentialStatus'), true);
+
+  const redacted = redactSensitiveText(
+    'authToken=ordinaryCanary123 idToken: anotherCanary456 '
+    + '"credentialValue":"thirdCanary789" safeValue=visible',
+  );
+  assert.doesNotMatch(redacted, /ordinaryCanary|anotherCanary|thirdCanary/);
+  assert.match(redacted, /safeValue=visible/);
+});
+
 test('redactSensitiveValue does not treat ordinary MCP telemetry as a secret', () => {
   const value = redactSensitiveValue({
     mcp: true,
@@ -50,11 +80,29 @@ test('redactSensitiveValue does not treat ordinary MCP telemetry as a secret', (
   });
 });
 
+test('redactSensitiveValue redacts secret-bearing camelCase keys regardless of value format', () => {
+  assert.deepEqual(redactSensitiveValue({
+    authToken: 'plain words are still a credential',
+    idToken: 'short',
+    credentialValue: 12345,
+    nested: { privateKey: 'not-key-shaped' },
+    safeValue: 'visible',
+  }), {
+    authToken: '[REDACTED]',
+    idToken: '[REDACTED]',
+    credentialValue: '[REDACTED]',
+    nested: { privateKey: '[REDACTED]' },
+    safeValue: 'visible',
+  });
+});
+
 test('sensitive path and shell classifiers flag secret-bearing surfaces', () => {
   assert.equal(isSensitivePath('/Users/me/.clementine-next/state/secrets-vault.json'), true);
+  assert.equal(isSensitivePath('/Users/me/.clementine-next/state/composio-cli-default-accounts.json'), true);
   assert.equal(isSensitivePath('/Users/me/.clementine-next/mcp/servers.json'), true);
   assert.equal(isSensitivePath('/Users/me/project/src/index.ts'), false);
   assert.equal(shellCommandTouchesSensitiveData('cat ~/.clementine-next/state/secrets-vault.json'), true);
+  assert.equal(shellCommandTouchesSensitiveData('printf forged > ~/.clementine-next/state/composio-cli-default-accounts.json'), true);
   assert.equal(shellCommandTouchesSensitiveData('security dump-keychain'), true);
   assert.equal(shellCommandTouchesSensitiveData('ls -la'), false);
 });

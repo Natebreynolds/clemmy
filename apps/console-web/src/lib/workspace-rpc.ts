@@ -8,18 +8,24 @@
  */
 
 export const WORKSPACE_RPC_CHANNEL = 'clementine.workspace.rpc.v1';
+export const WORKSPACE_GESTURE_CHANNEL = 'clementine.workspace.gesture.v1';
 export const WORKSPACE_IFRAME_SANDBOX = 'allow-scripts';
 
 export type WorkspaceRpcOp =
   | 'data'
+  | 'history'
+  | 'diff'
   | 'refresh'
   | 'note'
   | 'compose'
-  | 'action'
-  /** Internal bridge-only operations. They are never exposed on window.clem;
-   * the injected capture handler emits them only for a real user click. */
-  | 'open_external'
-  | 'download';
+  | 'action';
+
+/**
+ * Privileged browser effects never share the script-callable RPC port. The
+ * injected bridge receives a second capability port and uses it only from its
+ * capture-phase `isTrusted` click handler.
+ */
+export type WorkspaceGestureOp = 'open_external' | 'download';
 
 interface WorkspaceRpcBase {
   channel: typeof WORKSPACE_RPC_CHANNEL;
@@ -31,6 +37,17 @@ interface WorkspaceRpcBase {
 export interface WorkspaceRpcRequest extends WorkspaceRpcBase {
   kind: 'request';
   op: WorkspaceRpcOp;
+  payload: Record<string, unknown>;
+}
+
+export interface WorkspaceGestureRequest {
+  channel: typeof WORKSPACE_GESTURE_CHANNEL;
+  version: 1;
+  kind: 'gesture';
+  workspaceId: string;
+  documentId: string;
+  id: string;
+  op: WorkspaceGestureOp;
   payload: Record<string, unknown>;
 }
 
@@ -78,19 +95,27 @@ export type WorkspaceRpcBootstrapParseResult =
   | { ok: true; bootstrap: WorkspaceRpcBootstrap }
   | { ok: false; reason: string };
 
+export type WorkspaceGestureParseResult =
+  | { ok: true; gesture: WorkspaceGestureRequest }
+  | { ok: false; reason: string };
+
 const OPS = new Set<WorkspaceRpcOp>([
   'data',
+  'history',
+  'diff',
   'refresh',
   'note',
   'compose',
   'action',
-  'open_external',
-  'download',
 ]);
+const GESTURE_OPS = new Set<WorkspaceGestureOp>(['open_external', 'download']);
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
 const MAX_PAYLOAD_BYTES = 100_000;
 const SAFE_DOWNLOAD_NAME_RE = /^(?!\.{1,2}$)[^/\\\0]{1,180}$/;
 const SAFE_DOWNLOAD_DATA_RE = /^data:(?:image\/(?:svg\+xml|png|jpeg|webp)|text\/(?:plain|csv|markdown)|application\/json)(?:;charset=[^,;]{1,80})?(?:;base64)?,/i;
+const OBSERVATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SOURCE_KEY_RE = /^[^\u0000-\u001f\u007f]{1,200}$/;
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -137,9 +162,42 @@ function payloadIsBounded(payload: Record<string, unknown>): boolean {
   }
 }
 
+function optionalSourceKey(value: unknown): boolean {
+  return value === undefined
+    || (typeof value === 'string' && value.trim() === value && SOURCE_KEY_RE.test(value));
+}
+
+function optionalObservationId(value: unknown): boolean {
+  return value === undefined
+    || (typeof value === 'string' && OBSERVATION_ID_RE.test(value));
+}
+
+function optionalIsoTimestamp(value: unknown): boolean {
+  return value === undefined
+    || (typeof value === 'string'
+      && value.length <= 32
+      && ISO_TIMESTAMP_RE.test(value)
+      && Number.isFinite(Date.parse(value)));
+}
+
 function payloadMatchesOperation(op: WorkspaceRpcOp, payload: Record<string, unknown>): boolean {
   if (!payloadIsBounded(payload)) return false;
   if (op === 'data') return Object.keys(payload).length === 0;
+  if (op === 'history') {
+    return hasOnlyKeys(payload, ['sourceKey', 'limit', 'cursor', 'before'])
+      && optionalSourceKey(payload.sourceKey)
+      && (payload.limit === undefined
+        || (Number.isInteger(payload.limit) && Number(payload.limit) >= 1 && Number(payload.limit) <= 100))
+      && optionalObservationId(payload.cursor)
+      && !(payload.cursor !== undefined && payload.before !== undefined)
+      && optionalIsoTimestamp(payload.before);
+  }
+  if (op === 'diff') {
+    return hasOnlyKeys(payload, ['sourceKey', 'from', 'to'])
+      && optionalSourceKey(payload.sourceKey)
+      && optionalObservationId(payload.from)
+      && optionalObservationId(payload.to);
+  }
   if (op === 'refresh') {
     return hasOnlyKeys(payload, ['sourceId'])
       && (payload.sourceId === undefined || boundedString(payload.sourceId, 200));
@@ -156,6 +214,16 @@ function payloadMatchesOperation(op: WorkspaceRpcOp, payload: Record<string, unk
       && (payload.maxChars === undefined
         || (Number.isInteger(payload.maxChars) && Number(payload.maxChars) >= 1 && Number(payload.maxChars) <= 20_000));
   }
+  return hasOnlyKeys(payload, ['actionId', 'args'])
+    && boundedString(payload.actionId, 200)
+    && isRecord(payload.args);
+}
+
+function payloadMatchesGesture(
+  op: WorkspaceGestureOp,
+  payload: Record<string, unknown>,
+): boolean {
+  if (!payloadIsBounded(payload)) return false;
   if (op === 'open_external') {
     if (!hasOnlyKeys(payload, ['url']) || !boundedString(payload.url, 4_096)) return false;
     try {
@@ -187,9 +255,7 @@ function payloadMatchesOperation(op: WorkspaceRpcOp, payload: Record<string, unk
       && boundedString(payload.dataUrl, MAX_PAYLOAD_BYTES)
       && SAFE_DOWNLOAD_DATA_RE.test(payload.dataUrl);
   }
-  return hasOnlyKeys(payload, ['actionId', 'args'])
-    && boundedString(payload.actionId, 200)
-    && isRecord(payload.args);
+  return false;
 }
 
 /** Parse a request received on the document-pinned MessagePort. Source/origin
@@ -225,6 +291,72 @@ export function parseWorkspaceRpcRequest(
       version: 1,
       kind: 'request',
       workspaceId: expectedWorkspaceId,
+      id: message.id,
+      op,
+      payload: message.payload,
+    },
+  };
+}
+
+/**
+ * Parse an intent received only on the private gesture capability port.
+ * Calling this parser on the general RPC port would erase the authority
+ * separation; the parent host keeps distinct MessageChannel listeners.
+ */
+export function parseWorkspaceGestureRequest(
+  data: unknown,
+  expectedWorkspaceId: string,
+  expectedDocumentId: string,
+): WorkspaceGestureParseResult {
+  if (!isRecord(data)) return { ok: false, reason: 'invalid_envelope' };
+  const message = data;
+  if (
+    message.channel !== WORKSPACE_GESTURE_CHANNEL
+    || message.version !== 1
+    || message.kind !== 'gesture'
+  ) {
+    return { ok: false, reason: 'invalid_envelope' };
+  }
+  if (message.workspaceId !== expectedWorkspaceId) {
+    return { ok: false, reason: 'wrong_workspace' };
+  }
+  if (message.documentId !== expectedDocumentId) {
+    return { ok: false, reason: 'wrong_document' };
+  }
+  if (!boundedString(message.id, 96) || !REQUEST_ID_RE.test(message.id)) {
+    return { ok: false, reason: 'invalid_id' };
+  }
+  if (
+    typeof message.op !== 'string'
+    || !GESTURE_OPS.has(message.op as WorkspaceGestureOp)
+  ) {
+    return { ok: false, reason: 'invalid_operation' };
+  }
+  if (!isRecord(message.payload)) return { ok: false, reason: 'invalid_payload' };
+  const op = message.op as WorkspaceGestureOp;
+  if (!payloadMatchesGesture(op, message.payload)) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+  if (!hasOnlyKeys(message, [
+    'channel',
+    'version',
+    'kind',
+    'workspaceId',
+    'documentId',
+    'id',
+    'op',
+    'payload',
+  ])) {
+    return { ok: false, reason: 'invalid_envelope' };
+  }
+  return {
+    ok: true,
+    gesture: {
+      channel: WORKSPACE_GESTURE_CHANNEL,
+      version: 1,
+      kind: 'gesture',
+      workspaceId: expectedWorkspaceId,
+      documentId: expectedDocumentId,
       id: message.id,
       op,
       payload: message.payload,
@@ -302,7 +434,11 @@ export function parseWorkspaceRpcEvent(
 }
 
 export function workspaceRpcOpAllowed(op: WorkspaceRpcOp, readOnly: boolean): boolean {
-  return !readOnly || op === 'data';
+  return !readOnly || op === 'data' || op === 'history' || op === 'diff';
+}
+
+export function workspaceGestureAllowed(readOnly: boolean): boolean {
+  return !readOnly;
 }
 
 export function workspaceRpcSuccess(request: WorkspaceRpcRequest, result: unknown): WorkspaceRpcSuccess {

@@ -17,6 +17,7 @@ test('classifyTurnIntent: irreversible-action verbs are action', () => {
   assert.equal(classifyTurnIntent('delete those records'), 'action');
   assert.equal(classifyTurnIntent('charge the customer'), 'action');
   assert.equal(classifyTurnIntent('migrate the database'), 'action');
+  assert.equal(classifyTurnIntent('cool update Airtable'), 'action');
 });
 
 test('classifyTurnIntent: NARROW — reversible chatter stays qa (no over-fire)', () => {
@@ -24,7 +25,11 @@ test('classifyTurnIntent: NARROW — reversible chatter stays qa (no over-fire)'
   // action, and the workflow hint is kept in the packet regardless of intent.
   assert.equal(classifyTurnIntent('run my email flow'), 'qa');
   assert.equal(classifyTurnIntent('look at the spreadsheet'), 'qa');
-  assert.equal(classifyTurnIntent('what should I send?'), 'action'); // contains "send" — conservative, fine
+  assert.equal(classifyTurnIntent('what should I send?'), 'qa');
+  assert.equal(classifyTurnIntent('should I publish this?'), 'qa');
+  assert.equal(classifyTurnIntent('explain how to deploy to Netlify'), 'qa');
+  assert.equal(classifyTurnIntent('research whether to refund the charge'), 'qa');
+  assert.equal(classifyTurnIntent('send the proposal now'), 'action');
 });
 
 test('classifyTurnIntent: word-boundary — substrings do not false-match', () => {

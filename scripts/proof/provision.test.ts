@@ -51,7 +51,12 @@ writeFileSync(path.join(tmpHome, '.env'), [
   '',
 ].join('\n'));
 
-const { planBrain, proofProcessIsolationEnv, proofRuntimeOverrides } = await import('./provision.js');
+const {
+  planBrain,
+  proofProcessIsolationEnv,
+  proofRuntimeOverrides,
+  PROOF_COMPOSIO_ACCOUNT_AUTHORITY,
+} = await import('./provision.js');
 
 test.after(() => {
   rmSync(tmpHome, { recursive: true, force: true });
@@ -108,4 +113,22 @@ test('live proof gives spawned CLIs only the disposable home and dotfiles', () =
     HOME: '/tmp/proof-home',
     ZDOTDIR: '/tmp/proof-home',
   });
+  assert.deepEqual(proofProcessIsolationEnv('C:\\proof-home', 'win32'), {
+    HOME: 'C:\\proof-home',
+    ZDOTDIR: 'C:\\proof-home',
+    USERPROFILE: 'C:\\proof-home',
+    HOMEDRIVE: 'C:',
+    HOMEPATH: '\\proof-home',
+  });
+});
+
+test('selectable proof toolkits have explicit disposable CLI account authority', () => {
+  const authority = new Map(
+    PROOF_COMPOSIO_ACCOUNT_AUTHORITY
+      .split(',')
+      .map((entry) => entry.split('=', 2) as [string, string]),
+  );
+  assert.equal(authority.get('gmail'), 'isolated-proof');
+  assert.equal(authority.get('instagram'), 'isolated-proof');
+  assert.equal(authority.get('googlesheets'), 'isolated-proof');
 });

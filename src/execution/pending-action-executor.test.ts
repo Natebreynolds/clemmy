@@ -13,6 +13,7 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-pae-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
@@ -25,6 +26,10 @@ const { executeApprovedPendingActionCall } = await import('./pending-action-exec
 const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const {
+  grantComposioCliDefaultAccountAuthority,
+  revokeComposioCliDefaultAccountAuthority,
+} = await import('../integrations/composio/cli-default-account-authority.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
 createSession({ id: 'sess-pae', kind: 'chat' });
@@ -85,6 +90,165 @@ test('approved single-call executes the EXACT stored payload via the dispatcher'
   assert.equal(getPendingAction(record.id)?.status, 'executed', 'the card is marked executed');
   assert.match(res.resultSummary, /Authoritative tool result:\s*OK sent/, 'the caller can verify without a redundant pending_action_get');
   assert.match(res.resultSummary, /Outcome is already recorded.*Do not call pending_action_get or pending_action_record_result/);
+});
+
+test('operator-authorized CLI-default publish executes once, while authority rotation invalidates an older approved card', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  const firstAuthority = await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'instagram',
+    label: 'Brand Instagram A',
+    grantedBy: 'test',
+  });
+  const payload = {
+    tool_slug: 'INSTAGRAM_CREATE_POST',
+    arguments: JSON.stringify({
+      caption: 'Launch day',
+      image_url: 'https://assets.example/launch.png',
+    }),
+    connected_account_id: null,
+  };
+  try {
+    const executable = queuePendingAction({
+      title: 'CLI-default Instagram publish',
+      summary: 'Publish the exact launch post to the operator-verified CLI default.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload,
+      executionAuthority: firstAuthority,
+      sessionId: 'sess-pae',
+    });
+    markPendingActionApprovalResolved(
+      executable.id,
+      'approved',
+      realApprovedCardId(executable, 'approve CLI-default Instagram publish'),
+    );
+    let dispatches = 0;
+    const executed = await executeApprovedPendingActionCall(executable.id, {
+      sessionId: 'sess-pae',
+      dispatch: async () => {
+        dispatches += 1;
+        return { successful: true, data: { id: 'post-1' } };
+      },
+    });
+    assert.equal(executed.status, 'executed');
+    assert.equal(dispatches, 1);
+
+    const stale = queuePendingAction({
+      title: 'Stale CLI-default Instagram publish',
+      summary: 'This card must not survive an operator account-authority change.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        ...payload,
+        arguments: JSON.stringify({
+          caption: 'Second post',
+          image_url: 'https://assets.example/second.png',
+        }),
+      },
+      executionAuthority: firstAuthority,
+      sessionId: 'sess-pae',
+    });
+    markPendingActionApprovalResolved(
+      stale.id,
+      'approved',
+      realApprovedCardId(stale, 'approve stale CLI-default Instagram publish'),
+    );
+    const changedAuthority = await grantComposioCliDefaultAccountAuthority({
+      toolkit: 'instagram',
+      label: 'Brand Instagram B',
+      grantedBy: 'test',
+    });
+    let staleDispatches = 0;
+    const blocked = await executeApprovedPendingActionCall(stale.id, {
+      sessionId: 'sess-pae',
+      dispatch: async () => {
+        staleDispatches += 1;
+        return { successful: true };
+      },
+    });
+    assert.equal(blocked.status, 'failed');
+    assert.equal(staleDispatches, 0);
+    assert.match(blocked.resultSummary, /execution-authority|operator changed|approval-authority/i);
+    assert.equal(getPendingAction(stale.id)?.status, 'failed');
+
+    const revoked = queuePendingAction({
+      title: 'Revoked CLI-default Instagram publish',
+      summary: 'This card must not survive explicit authority revocation.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        ...payload,
+        arguments: JSON.stringify({
+          caption: 'Third post',
+          image_url: 'https://assets.example/third.png',
+        }),
+      },
+      executionAuthority: changedAuthority,
+      sessionId: 'sess-pae',
+    });
+    markPendingActionApprovalResolved(
+      revoked.id,
+      'approved',
+      realApprovedCardId(revoked, 'approve soon-to-be-revoked CLI-default publish'),
+    );
+    await revokeComposioCliDefaultAccountAuthority('instagram');
+    let revokedDispatches = 0;
+    const revokedResult = await executeApprovedPendingActionCall(revoked.id, {
+      sessionId: 'sess-pae',
+      dispatch: async () => {
+        revokedDispatches += 1;
+        return { successful: true };
+      },
+    });
+    assert.equal(revokedResult.status, 'failed');
+    assert.equal(revokedDispatches, 0);
+    assert.match(revokedResult.resultSummary, /execution-authority|revoked|approval-authority/i);
+    assert.equal(getPendingAction(revoked.id)?.status, 'failed');
+  } finally {
+    await revokeComposioCliDefaultAccountAuthority('instagram');
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('an approved account-scoped publish without SDK account or CLI authority is terminally refused before dispatch', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  try {
+    const record = queuePendingAction({
+      title: 'Unbound judge-outage publish',
+      summary: 'A bypassed queue producer must not mint executable default-account authority.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'INSTAGRAM_CREATE_POST',
+        arguments: JSON.stringify({
+          caption: 'Must remain inert',
+          image_url: 'https://assets.example/inert.png',
+        }),
+        connected_account_id: null,
+      },
+      sessionId: 'sess-pae',
+    });
+    markPendingActionApprovalResolved(
+      record.id,
+      'approved',
+      realApprovedCardId(record, 'unbound judge-outage publish'),
+    );
+    let dispatches = 0;
+    const result = await executeApprovedPendingActionCall(record.id, {
+      sessionId: 'sess-pae',
+      dispatch: async () => {
+        dispatches += 1;
+        return { successful: true };
+      },
+    });
+    assert.equal(result.status, 'failed');
+    assert.equal(dispatches, 0);
+    assert.match(result.resultSummary, /no immutable account destination|execution-authority/i);
+  } finally {
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
 });
 
 test('a payload changed after approval is terminally refused before dispatch', async () => {
@@ -336,6 +500,64 @@ test('only a nominal local pre-dispatch error can prove an approved call never r
   assert.match(res.resultSummary, /refused locally before the provider call started/i);
   assert.match(res.resultSummary, /No provider commit occurred/i);
   assert.equal(getPendingAction(record.id)?.status, 'failed');
+});
+
+test('a trusted harness ExternalWritePreDispatchError maps to the pending-action no-dispatch outcome without prose parsing', async () => {
+  const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
+  const record = queueSingleCall();
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId(record, 'trusted harness pre-dispatch refusal'));
+
+  const res = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-pae',
+    dispatch: async () => {
+      throw new ExternalWritePreDispatchError(
+        'opaque local capability condition; deliberately contains no refusal marker',
+      );
+    },
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 'failed');
+  assert.match(res.resultSummary, /refused locally before the provider call started/i);
+  assert.match(res.resultSummary, /No provider commit occurred/i);
+  assert.doesNotMatch(res.resultSummary, /uncertain|no automatic retry is safe/i);
+  assert.equal(getPendingAction(record.id)?.status, 'failed');
+});
+
+test('a legacy approved call_tool carrier is refused before dispatch because its turn-scoped authority cannot be replayed', async () => {
+  const record = queuePendingAction({
+    title: 'Legacy deferred send',
+    summary: 'This old record stored a turn-scoped transport carrier.',
+    kind: 'external_send',
+    toolName: 'call_tool',
+    payload: {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({
+          to: 'legacy-authority@example.com',
+          subject: 'Legacy authority',
+          body: 'Must remain pre-dispatch.',
+        }),
+      }),
+    },
+    sessionId: 'sess-pae',
+  });
+  markPendingActionApprovalResolved(record.id, 'approved', realApprovedCardId(record, 'legacy call_tool authority'));
+  let dispatches = 0;
+  const result = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-pae',
+    dispatch: async () => {
+      dispatches += 1;
+      return 'must not run';
+    },
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(dispatches, 0);
+  assert.match(result.resultSummary, /refused locally before the provider call started/i);
+  assert.match(result.resultSummary, /original turn scope|validated inner tool/i);
+  assert.match(result.resultSummary, /No provider commit occurred/i);
 });
 
 test('a structured provider failure is recorded FAILED, never executed', async () => {

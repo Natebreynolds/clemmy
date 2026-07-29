@@ -410,6 +410,7 @@ import {
   buildAnalyzerPrompt,
   buildMeetingChatPrompt,
   createRecallSdkUpload,
+  deriveRecallMeetingPresentation,
   finalizeRecallMeeting,
   findRecallMeetingRecord,
   listMeetingNotes,
@@ -433,6 +434,7 @@ import {
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import {
   recoverPendingRecallSdkUploads,
+  requestRecallMeetingTranscriptRetry,
   startRecallSdkUploadReconciliation,
 } from '../integrations/recall/sdk-upload-reconcile.js';
 import {
@@ -8246,6 +8248,50 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Explicit recovery for a terminal Recall upload/canonical-transcript
+   * failure. The worker remains bounded and one-at-a-time; terminal records
+   * are never automatically churned in the background.
+   */
+  app.post('/api/console/meetings/recall/:meetingId/retry-transcript', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = requestRecallMeetingTranscriptRetry(req.params.meetingId);
+      if (result.status === 'not_found') {
+        res.status(404).json({ error: result.reason ?? 'meeting not found' });
+        return;
+      }
+      if (result.status === 'not_retryable') {
+        res.status(409).json({
+          error: result.reason ?? 'This meeting transcript cannot be retried.',
+          presentation: result.record
+            ? deriveRecallMeetingPresentation(result.record)
+            : undefined,
+        });
+        return;
+      }
+      if (result.status === 'start_failed') {
+        res.status(500).json({
+          error: result.reason ?? 'Transcript recovery could not start.',
+          presentation: result.record
+            ? deriveRecallMeetingPresentation(result.record)
+            : undefined,
+        });
+        return;
+      }
+      res.status(202).json({
+        status: result.status,
+        mode: result.mode,
+        reason: result.reason,
+        presentation: result.record
+          ? deriveRecallMeetingPresentation(result.record)
+          : undefined,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Single meeting + analysis. Returns the full record (with
    * transcript segments) plus the structured analysis JSON when
    * available. Used by the meeting drawer's "view" mode and the
@@ -8258,7 +8304,13 @@ export function registerConsoleRoutes(
       const record = loadRecallMeetingById(meetingId);
       if (!record) { res.status(404).json({ error: 'meeting not found' }); return; }
       const analysis = loadRecallMeetingAnalysis(meetingId);
-      res.json({ record, analysis });
+      res.json({
+        record,
+        analysis,
+        presentation: record.provider === 'local'
+          ? undefined
+          : deriveRecallMeetingPresentation(record),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

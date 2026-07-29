@@ -23,7 +23,17 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
-import { readData, writeData, appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
+import { appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
+import {
+  bootstrapWorkspaceObservationHistory,
+  commitWorkspaceObservationBatch,
+  getWorkspaceDatasetObservationByRefreshId,
+  healWorkspaceDataProjection,
+  indexWorkspaceRecord,
+  type CommitWorkspaceObservationBatchResult,
+  type WorkspaceObservationCommitItem,
+} from './workspace-db.js';
+import { finalizeWorkspaceObservationCommit } from './workspace-observation-finalize.js';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
@@ -481,6 +491,8 @@ export interface RefreshResult {
   error?: string;
   pendingApprovalId?: string;
   write?: WriteDataResult | WriteDataError;
+  observationId?: string;
+  changed?: boolean | null;
 }
 
 const refreshQueues = new Map<string, Promise<void>>();
@@ -509,6 +521,14 @@ export interface RefreshSpaceOptions {
   /** Paused-build auto-retry: probe the sources of a PAUSED workspace (the
    *  status gate otherwise makes a retry impossible). Archived stays blocked. */
   allowPaused?: boolean;
+  /** Why this refresh ran. Kept deliberately small and descriptive; it is
+   * provenance, not control flow. */
+  cause?: 'manual' | 'scheduled' | 'creation_smoke' | 'retry';
+  /** Stable caller-owned idempotency key. Scheduled/retry callers use this to
+   * converge after a daemon restart; manual calls may omit it. */
+  refreshId?: string;
+  /** Optional durable batch identity for diagnostics. */
+  batchId?: string;
 }
 
 export async function refreshSpaceData(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
@@ -535,50 +555,189 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     return [{ ok: false, sourceId: sourceId ?? '(none)', error: 'no matching data source' }];
   }
 
-  const current = (() => {
-    const d = readData(slug);
-    return (d && typeof d === 'object') ? { ...(d as Record<string, unknown>) } : {};
-  })();
-  const meta = (current._meta && typeof current._meta === 'object') ? { ...(current._meta as Record<string, unknown>) } : {};
+  // Existing file-backed Workspaces may predate the temporal index. Preserve
+  // their current data as the comparison baseline before the first 3.0 pull.
+  indexWorkspaceRecord(rec, {
+    emitOperational: false,
+    appendStateEvent: false,
+  });
+  const baseline = bootstrapWorkspaceObservationHistory(slug);
+  if (!baseline.ok) {
+    return sources.map((source) => ({
+      ok: false,
+      sourceId: source.id,
+      error: `workspace history baseline could not be preserved; refresh was not run: ${baseline.error}`,
+      write: { ok: false, error: baseline.error, bytes: 0 },
+    }));
+  }
+
   const results: RefreshResult[] = [];
+  const observations: WorkspaceObservationCommitItem[] = [];
+  const cause = opts.cause ?? 'manual';
+  const batchId = opts.batchId ?? randomUUID();
 
   // Phase A observability: the workspace data-refresh lifecycle on the operator view.
   recordOperationalEvent({ source: 'workspace', type: 'workspace_data_refresh_started', workspaceId: slug, actor: 'space-runner', payload: { sourceCount: sources.length, sourceId } });
   for (const source of sources) {
     const run = await runSpaceDataSource(slug, source);
+    const observedAt = new Date().toISOString();
+    const refreshId = opts.refreshId ?? randomUUID();
+    const provenance: Record<string, unknown> = source.composioSlug
+      ? {
+        provider: 'composio',
+        adapter: 'composio',
+        toolSlug: source.composioSlug,
+        argsHash: createHash('sha256')
+          .update(JSON.stringify(source.composioArgs ?? {}))
+          .digest('hex'),
+        ...(source.schedule ? { schedule: source.schedule } : {}),
+      }
+      : {
+        adapter: 'legacy_runner',
+        ...(source.runner ? { runner: source.runner } : {}),
+        ...(source.schedule ? { schedule: source.schedule } : {}),
+      };
     if (run.ok) {
-      current[source.id] = run.data;
-      meta[source.id] = { refreshedAt: new Date().toISOString(), ok: true };
       results.push({ ok: true, sourceId: source.id });
+      observations.push({
+        sourceKey: source.id,
+        refreshId,
+        cause,
+        status: 'ok',
+        data: run.data,
+        observedAt,
+        provenance,
+      });
     } else {
-      meta[source.id] = run.pendingApprovalId
-        ? {
-          refreshedAt: new Date().toISOString(),
-          ok: null,
-          status: 'awaiting_approval',
-          approvalId: run.pendingApprovalId,
-        }
-        : { refreshedAt: new Date().toISOString(), ok: false, error: run.error };
       results.push({
         ok: false,
         sourceId: source.id,
         error: run.error,
         ...(run.pendingApprovalId ? { pendingApprovalId: run.pendingApprovalId } : {}),
       });
+      observations.push({
+        sourceKey: source.id,
+        refreshId,
+        cause,
+        status: run.pendingApprovalId ? 'awaiting_approval' : 'error',
+        error: run.error,
+        observedAt,
+        provenance: run.pendingApprovalId
+          ? { ...provenance, approvalId: run.pendingApprovalId }
+          : provenance,
+      });
+    }
+  }
+
+  // Persist each source independently. One malformed/oversized provider result
+  // must not roll back valid observations from the same refresh fan-out.
+  // batchId still correlates the independent commits for diagnostics.
+  for (const [index, observation] of observations.entries()) {
+    const result = results[index]!;
+    let committed: CommitWorkspaceObservationBatchResult | null = null;
+    let persistenceError = '';
+    try {
+      committed = commitWorkspaceObservationBatch({
+        workspaceId: slug,
+        batchId,
+        observations: [observation],
+      });
+    } catch (error) {
+      persistenceError = error instanceof Error ? error.message : String(error);
+      const durable = getWorkspaceDatasetObservationByRefreshId(
+        slug,
+        observation.sourceKey,
+        observation.refreshId,
+      );
+      if (durable) {
+        // SQLite commits before data.json. A crash or idempotent retry can
+        // therefore find the exact durable receipt even when projection failed
+        // (or the provider returned different bytes on a retry). The receipt
+        // wins: heal from it and never relabel/reinsert this refresh identity.
+        try {
+          committed = {
+            batchId: durable.batchId,
+            observations: [{ ...durable, deduped: true }],
+            projection: healWorkspaceDataProjection(slug),
+          };
+        } catch (healError) {
+          persistenceError = healError instanceof Error
+            ? healError.message
+            : String(healError);
+        }
+      } else {
+        // The successful payload itself was rejected before commit (for
+        // example, a size bound). Preserve a small, truthful error observation
+        // under the same refresh id so history explains the gap while prior
+        // current data remains intact.
+        const error = `source result was not persisted: ${persistenceError}`.slice(0, 2_000);
+        const { data: _discardedData, ...failureObservation } = observation;
+        try {
+          committed = commitWorkspaceObservationBatch({
+            workspaceId: slug,
+            batchId,
+            observations: [{
+              ...failureObservation,
+              status: 'error',
+              error,
+            }],
+          });
+        } catch (fallbackError) {
+          persistenceError = fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError);
+        }
+      }
+    }
+
+    if (!committed) {
+      const write: WriteDataError = {
+        ok: false,
+        error: `workspace observation was not persisted: ${persistenceError}`.slice(0, 2_000),
+        bytes: 0,
+      };
+      result.ok = false;
+      result.error = result.error ? `${result.error}; ${write.error}` : write.error;
+      result.write = write;
+      appendAudit(slug, {
+        method: 'REFRESH',
+        path: `/refresh/${result.sourceId}`,
+        outcome: 'error',
+        note: result.error,
+      });
+      continue;
+    }
+
+    const saved = committed.observations[0]!;
+    const write: WriteDataResult = { ok: true, bytes: committed.projection.bytes };
+    result.write = write;
+    result.observationId = saved.id;
+    result.changed = saved.changed;
+    delete result.pendingApprovalId;
+    if (saved.status === 'ok') {
+      result.ok = true;
+      delete result.error;
+    } else {
+      result.ok = false;
+      result.error = saved.error ?? 'workspace source did not produce a successful observation';
+      if (
+        saved.status === 'awaiting_approval'
+        && typeof saved.provenance.approvalId === 'string'
+      ) {
+        result.pendingApprovalId = saved.provenance.approvalId;
+      }
     }
     appendAudit(slug, {
       method: 'REFRESH',
-      path: `/refresh/${source.id}`,
-      outcome: run.ok ? 'ok' : run.pendingApprovalId ? 'rejected' : 'error',
-      note: run.ok ? undefined : run.error,
+      path: `/refresh/${result.sourceId}`,
+      outcome: result.ok ? 'ok' : result.pendingApprovalId ? 'rejected' : 'error',
+      note: result.ok ? undefined : result.error,
     });
+    await finalizeWorkspaceObservationCommit(slug, committed);
   }
 
-  current._meta = meta;
-  const write = writeData(slug, current);
   const okCount = results.filter((r) => r.ok).length;
-  if (write.ok && okCount > 0) spaceStore.update(slug, { lastRefreshedAt: new Date().toISOString() });
-  for (const r of results) r.write = write;
+  if (okCount > 0) spaceStore.update(slug, { lastRefreshedAt: new Date().toISOString() });
   const pendingCount = results.filter((result) => !result.ok && result.pendingApprovalId).length;
   const failedCount = results.length - okCount - pendingCount;
   recordOperationalEvent({
@@ -591,7 +750,13 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     severity: failedCount > 0 ? 'error' : pendingCount > 0 ? 'warn' : 'info',
     workspaceId: slug,
     actor: 'space-runner',
-    payload: { okCount, pendingCount, failedCount, total: results.length, writeOk: write.ok },
+    payload: {
+      okCount,
+      pendingCount,
+      failedCount,
+      total: results.length,
+      writeOk: results.every((result) => result.write?.ok === true),
+    },
   });
   return results;
 }

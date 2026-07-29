@@ -4,6 +4,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-pending-action-recipient-integrity';
 process.env.CLEMENTINE_HOME = TEST_HOME;
+process.env.COMPOSIO_BACKEND = 'sdk';
 
 const {
   canonicalizePendingActionCall,
@@ -24,6 +25,10 @@ const {
   queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } = await import('../runtime/harness/pending-action-transition.js');
+const {
+  grantComposioCliDefaultAccountAuthority,
+  revokeComposioCliDefaultAccountAuthority,
+} = await import('../integrations/composio/cli-default-account-authority.js');
 
 function handlerFor(name: string): (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>>();
@@ -226,12 +231,20 @@ test('pending-action canonicalization never rewrites local or custom tool identi
   }
 
   assert.deepEqual(
-    canonicalizePendingActionCall('GMAIL_SEND_EMAIL', { to: 'proof@example.com' }),
+    canonicalizePendingActionCall('GMAIL_SEND_EMAIL', {
+      to: 'proof@example.com',
+      subject: 'Proof',
+      body: 'Meaningful payload.',
+    }),
     {
       toolName: 'composio_execute_tool',
       payload: {
         tool_slug: 'GMAIL_SEND_EMAIL',
-        arguments: JSON.stringify({ to: 'proof@example.com' }),
+        arguments: JSON.stringify({
+          to: 'proof@example.com',
+          subject: 'Proof',
+          body: 'Meaningful payload.',
+        }),
         connected_account_id: null,
       },
     },
@@ -243,6 +256,250 @@ test('pending-action canonicalization never rewrites local or custom tool identi
     }),
     /concrete Composio action slug/,
   );
+});
+
+test('pending_action_queue refuses a targetless directed send but accepts an account-scoped social publish', async () => {
+  assert.throws(
+    () => canonicalizePendingActionCall('GMAIL_SEND_EMAIL', {
+      ownerEmail: 'sender@example.com',
+      accountId: 'ca_sender',
+      subject: 'Targetless proof',
+      body: 'This must never mint a card.',
+    }),
+    /recipient|target/i,
+  );
+  assert.throws(
+    () => canonicalizePendingActionCall('composio_execute_tool', {
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: JSON.stringify({
+        profileEmail: 'sender@example.com',
+        subject: 'Targetless proof',
+        body: 'This must never mint a card.',
+      }),
+    }),
+    /recipient|target/i,
+  );
+
+  const social = canonicalizePendingActionCall('composio_execute_tool', {
+    tool_slug: 'INSTAGRAM_CREATE_POST',
+    arguments: {
+      caption: 'Account-scoped launch post',
+      image_url: 'https://assets.example/launch.png',
+    },
+    connected_account_id: 'ca_instagram_brand',
+  });
+  assert.equal(social.toolName, 'composio_execute_tool');
+  assert.deepEqual(social.payload, {
+    tool_slug: 'INSTAGRAM_CREATE_POST',
+    arguments: JSON.stringify({
+      caption: 'Account-scoped launch post',
+      image_url: 'https://assets.example/launch.png',
+    }),
+    connected_account_id: 'ca_instagram_brand',
+  });
+
+  const session = createSession({ kind: 'chat' });
+  const response = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Targetless email',
+      summary: 'A directed send without a recipient must stay pre-approval.',
+      kind: 'external_send',
+      toolName: 'GMAIL_SEND_EMAIL',
+      payloadJson: JSON.stringify({
+        authenticatedUserEmail: 'sender@example.com',
+        subject: 'Targetless proof',
+        body: 'No recipient.',
+      }),
+      approvalIntent: 'request_now',
+    }));
+  assert.match(response.content[0].text, /recipient|target/i);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 0);
+
+  const unboundRequestNow = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Publish launch post now',
+      summary: 'Open approval for the exact account-scoped launch post.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payloadJson: JSON.stringify({
+        tool_slug: 'INSTAGRAM_CREATE_POST',
+        arguments: {
+          caption: 'Account-scoped launch post',
+          image_url: 'https://assets.example/launch.png',
+        },
+      }),
+      approvalIntent: 'request_now',
+    }));
+  assert.match(unboundRequestNow.content[0].text, /connected_account_id.*immutable SDK snapshot/i);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 0, 'an unbound card never exists');
+
+  const unboundLegacyIntent = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Legacy launch post',
+      summary: 'An omitted intent must not leave the legacy prose bridge able to open an unbound card.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payloadJson: JSON.stringify({
+        tool_slug: 'INSTAGRAM_CREATE_POST',
+        arguments: {
+          caption: 'Account-scoped launch post',
+          image_url: 'https://assets.example/launch.png',
+        },
+      }),
+    }));
+  assert.match(unboundLegacyIntent.content[0].text, /formal approval path.*connected_account_id/i);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 0, 'the legacy bridge cannot mint an unbound card');
+
+  const stagedUnbound = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Stage launch post',
+      summary: 'Keep the account-scoped launch post preparatory until its account is selected.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payloadJson: JSON.stringify({
+        tool_slug: 'INSTAGRAM_CREATE_POST',
+        arguments: {
+          caption: 'Account-scoped launch post',
+          image_url: 'https://assets.example/launch.png',
+        },
+      }),
+      approvalIntent: 'queue_only',
+    }));
+  assert.match(stagedUnbound.content[0].text, /QUEUE-ONLY EDGE RECORDED/);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 1, 'preparatory staging remains available');
+
+  const pinnedSession = createSession({ kind: 'chat' });
+  const pinnedRequestNow = await withToolOutputContext({ sessionId: pinnedSession.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Publish pinned launch post',
+      summary: 'Open approval for the immutable account-scoped launch post.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payloadJson: JSON.stringify({
+        tool_slug: 'INSTAGRAM_CREATE_POST',
+        arguments: {
+          caption: 'Account-scoped launch post',
+          image_url: 'https://assets.example/launch.png',
+        },
+        connected_account_id: 'ca_instagram_brand',
+      }),
+      approvalIntent: 'request_now',
+    }));
+  assert.match(pinnedRequestNow.content[0].text, /GRAPH EDGE RECORDED/);
+  const [pinnedRecord] = listPendingActions({ sessionId: pinnedSession.id });
+  assert.equal(
+    (pinnedRecord.payload as { connected_account_id?: string }).connected_account_id,
+    'ca_instagram_brand',
+    'the approval snapshot freezes the exact social account',
+  );
+});
+
+test('CLI-default publish queue snapshots operator authority and refuses account-targeted selectors', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  const authority = await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'instagram',
+    label: 'Brand Instagram selected in the Composio CLI',
+    grantedBy: 'test',
+  });
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Publish this approved launch post to the CLI default Instagram account.' },
+  });
+  const invoke = (payload: Record<string, unknown>) => withToolOutputContext(
+    { sessionId: session.id, runScopeId: 'cli-default-publish', callId: 'queue-cli-default' },
+    () => withHarnessRunContext(
+      {
+        sessionId: session.id,
+        sourceUserSeq: source.seq,
+        behaviorScopeId: 'cli-default-publish',
+        counter: new ToolCallsCounter(10),
+      },
+      () => handlerFor('pending_action_queue')({
+        title: 'Publish CLI-default launch post',
+        summary: 'Publish the exact reviewed post to the operator-verified CLI default.',
+        kind: 'external_send',
+        toolName: 'composio_execute_tool',
+        payloadJson: JSON.stringify(payload),
+        approvalIntent: 'request_now',
+      }),
+    ),
+  );
+
+  try {
+    const queued = await invoke({
+      tool_slug: 'INSTAGRAM_CREATE_POST',
+      arguments: {
+        caption: 'Launch day',
+        image_url: 'https://assets.example/launch.png',
+      },
+    });
+    assert.match(queued.content[0].text, /GRAPH EDGE RECORDED/);
+    const [record] = listPendingActions({ sessionId: session.id });
+    assert.deepEqual(record.executionAuthority, authority);
+    assert.equal(
+      (record.payload as { connected_account_id?: unknown }).connected_account_id,
+      null,
+      'the approval is explicitly CLI-default and never pretends to carry an SDK account id',
+    );
+
+    const targeted = await invoke({
+      tool_slug: 'INSTAGRAM_CREATE_POST',
+      arguments: {
+        caption: 'Wrong route',
+        image_url: 'https://assets.example/wrong.png',
+      },
+      connected_account_id: 'ca_brand',
+    });
+    assert.match(targeted.content[0].text, /CLI cannot honor account-targeted selectors/i);
+    assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
+  } finally {
+    await revokeComposioCliDefaultAccountAuthority('instagram');
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('pending_action_queue refuses the turn-scoped call_tool carrier instead of persisting raw deferred authority', async () => {
+  assert.throws(
+    () => canonicalizePendingActionCall('call_tool', {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({ to: 'authority@example.com' }),
+      }),
+    }),
+    /call_tool cannot be stored.*validated inner toolName/i,
+  );
+  assert.throws(
+    () => canonicalizePendingActionCall('mcp__clementine-local__call_tool', {
+      name: 'composio_execute_tool',
+      args_json: '{}',
+    }),
+    /call_tool cannot be stored/i,
+  );
+
+  const session = createSession({ kind: 'chat' });
+  const response = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Raw deferred send',
+      summary: 'A transport carrier must not become durable approval authority.',
+      kind: 'external_send',
+      toolName: 'call_tool',
+      payloadJson: JSON.stringify({
+        name: 'composio_execute_tool',
+        args_json: JSON.stringify({
+          tool_slug: 'GMAIL_SEND_EMAIL',
+          arguments: JSON.stringify({ to: 'authority@example.com' }),
+        }),
+      }),
+      approvalIntent: 'request_now',
+    }));
+  assert.match(response.content[0].text, /call_tool cannot be stored/i);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 0);
 });
 
 test('pending_action_queue rejects malformed Composio transport before creating an action', async () => {

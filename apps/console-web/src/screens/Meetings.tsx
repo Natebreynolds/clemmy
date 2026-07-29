@@ -18,6 +18,9 @@ import {
   patchRecallSettings,
   patchLocalMeetingSettings,
   retryLocalMeetingTranscription,
+  retryRecallMeetingTranscript,
+  recallMeetingDetailPollInterval,
+  recallMeetingTone,
   listMeetings,
   getMeeting,
   getMeetingChatPrompt,
@@ -93,6 +96,7 @@ export function Meetings() {
   const [localTitle, setLocalTitle] = useState('');
   const [localBusy, setLocalBusy] = useState(false);
   const [retryingMeetingId, setRetryingMeetingId] = useState<string | null>(null);
+  const [meetingRetryError, setMeetingRetryError] = useState<string | null>(null);
   const [localNotice, setLocalNotice] = useState<{ tone: 'info' | 'warn' | 'error'; text: string } | null>(null);
   // The capture is a module-level SINGLETON shared with AppShell's recording
   // pill (2026-07-14 review): recording used to be per-mount state, so any SPA
@@ -118,7 +122,14 @@ export function Meetings() {
     };
   }, []);
 
-  const detail = useQuery({ queryKey: ['meeting', selected], queryFn: () => getMeeting(selected!), enabled: !!selected });
+  const detail = useQuery({
+    queryKey: ['meeting', selected],
+    queryFn: () => getMeeting(selected!),
+    enabled: !!selected,
+    refetchInterval: (query) => recallMeetingDetailPollInterval(query.state.data),
+  });
+
+  useEffect(() => setMeetingRetryError(null), [selected]);
 
   const settings = status.data?.settings ?? {};
   const credConnected = (status.data?.credential?.status ?? '').toLowerCase() === 'connected';
@@ -284,6 +295,22 @@ export function Meetings() {
       ]);
     } catch (e) {
       setLocalNotice({ tone: 'error', text: `Could not retry transcription: ${(e as Error).message}` });
+    } finally {
+      setRetryingMeetingId(null);
+    }
+  };
+
+  const retryRecallTranscript = async (meetingId: string) => {
+    setRetryingMeetingId(meetingId);
+    setMeetingRetryError(null);
+    try {
+      await retryRecallMeetingTranscript(meetingId);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['meeting', meetingId] }),
+        qc.invalidateQueries({ queryKey: ['meetings'] }),
+      ]);
+    } catch (e) {
+      setMeetingRetryError(`Could not retry the Recall transcript: ${(e as Error).message}`);
     } finally {
       setRetryingMeetingId(null);
     }
@@ -569,7 +596,12 @@ export function Meetings() {
               <MeetingDetailView
                 data={detail.data}
                 retrying={retryingMeetingId === selected}
-                onRetry={() => { if (selected) void retryTranscription(selected); }}
+                retryError={meetingRetryError}
+                onRetry={() => {
+                  if (!selected) return;
+                  if (detail.data?.record?.provider === 'local') void retryTranscription(selected);
+                  else void retryRecallTranscript(selected);
+                }}
               />
             </>
           )}
@@ -713,7 +745,7 @@ function ScratchpadPanel({ windowId, startedAtMs, readOnly, compact }: {
 }
 
 function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: boolean; onSelect: () => void }) {
-  const tone = m.provider === 'local' ? localTranscriptionTone(m) : statusTone(m.status);
+  const tone = m.provider === 'local' ? localTranscriptionTone(m) : recallMeetingTone(m);
   return (
     <button type="button" onClick={onSelect}
       className={cn('flex w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
@@ -766,10 +798,12 @@ function toList(v: unknown): unknown[] { return Array.isArray(v) ? v : v == null
 function MeetingDetailView({
   data,
   retrying = false,
+  retryError,
   onRetry,
 }: {
   data?: import('@/lib/meetings').MeetingDetail;
   retrying?: boolean;
+  retryError?: string | null;
   onRetry?: () => void;
 }) {
   const a = (data?.analysis ?? {}) as Record<string, unknown>;
@@ -783,6 +817,12 @@ function MeetingDetailView({
   const localProvider = asText(r.provider) === 'local';
   const transcriptionStatus = asText(r.transcriptionStatus);
   const transcriptionError = asText(r.transcriptionError);
+  const recallPresentation = data?.presentation;
+  const recallProcessing = !localProvider
+    && (recallPresentation?.status === 'processing' || recallPresentation?.status === 'recording');
+  const recallProblem = !localProvider
+    && recallPresentation
+    && ['failed', 'timed_out', 'unavailable'].includes(recallPresentation.status);
   return (
     <div>
       <div className="mb-2 flex items-center gap-2 text-caption text-faint">
@@ -801,6 +841,24 @@ function MeetingDetailView({
           {onRetry && <Button variant="secondary" size="sm" onClick={onRetry} disabled={retrying}>{retrying ? 'Retrying…' : 'Retry transcription'}</Button>}
         </div>
       )}
+      {recallProcessing && (
+        <p className="mb-4 rounded-md border border-info/30 bg-info-tint px-3 py-2 text-small text-info" role="status">
+          {recallPresentation?.label ?? 'Processing transcript'}
+        </p>
+      )}
+      {recallProblem && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-danger/30 bg-danger-tint px-3 py-2" role="alert">
+          <p className="min-w-0 flex-1 text-small text-danger">
+            {recallPresentation.label}{recallPresentation.error ? `: ${recallPresentation.error}` : '.'}
+          </p>
+          {recallPresentation.retryable && onRetry && (
+            <Button variant="secondary" size="sm" onClick={onRetry} disabled={retrying}>
+              {retrying ? 'Retrying…' : 'Retry transcript'}
+            </Button>
+          )}
+        </div>
+      )}
+      {retryError && <p className="mb-4 rounded-md border border-danger/30 bg-danger-tint px-3 py-2 text-small text-danger" role="alert">{retryError}</p>}
       {summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{linkify(summary)}</p>}
 
       {actionItems.length > 0 && (

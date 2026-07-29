@@ -20,12 +20,14 @@ import { usePoll } from '@/lib/poll';
 import { CodexReauth } from './settings/CodexLoginForm';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio,
+  getComposioCliDefaultAccounts, authorizeComposioCliDefaultAccount, revokeComposioCliDefaultAccount,
   setAccountLabel, setComposioApiKey, setupComposioCredentials,
   getCredentials, setCredential, setDiscordOwner,
   normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
   connectedToolkits, reconnectConnectionId, searchToolkits, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit, type ComposioConnection,
   type ComposioAuthorization, type ComposioConnectResult, type ComposioSetupMeta,
+  type ComposioCliDefaultAccountAuthority,
 } from '@/lib/connect';
 
 function prettyName(name: string): string {
@@ -63,6 +65,7 @@ export function Connect() {
   const qc = useQueryClient();
   const composio = usePoll(['composio-status'], getComposioStatus, 20000);
   const toolkits = usePoll(['composio-toolkits'], getComposioToolkits, 30000);
+  const cliDefaults = usePoll(['composio-cli-default-accounts'], getComposioCliDefaultAccounts, 30000);
   const creds = usePoll(['credentials'], getCredentials, 20000);
 
   const [appQuery, setAppQuery] = useState('');
@@ -70,6 +73,9 @@ export function Connect() {
   const connected = connectedToolkits(snap);
   const results = searchToolkits(snap, appQuery);
   const appsUnavailable = composio.isError || toolkits.isError;
+  const cliOnlyComposio = composio.data?.executionBackend === 'cli'
+    || (composio.data?.executionBackend === 'auto' && !composio.data?.apiKeyPresent);
+  const cliAuthenticated = composio.data?.cli?.authenticated === true;
   // Internal plumbing never renders as a user row: the Codex refresh token is
   // half of the SAME sign-in as the access token (one "Codex sign-in" row
   // represents the pair; storage keeps both), and the webhook secret is the
@@ -171,8 +177,12 @@ export function Connect() {
               aria-label="Refresh apps" title="Refresh connection status">
               {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Refresh
             </button>
-            <StatusPill tone={composio.data.apiKeyPresent ? 'success' : 'neutral'}>
-              {composio.data.apiKeyPresent ? 'Composio connected' : 'Not set up'}
+            <StatusPill tone={composio.data.apiKeyPresent || cliAuthenticated ? 'success' : 'neutral'}>
+              {composio.data.apiKeyPresent
+                ? 'Composio connected'
+                : cliAuthenticated
+                  ? 'Composio CLI connected'
+                  : 'Not set up'}
             </StatusPill>
           </div>
         )}
@@ -200,6 +210,21 @@ export function Connect() {
           <ComposioApiKeyCard
             present={Boolean(composio.data.apiKeyPresent)}
             onSaved={() => { void refreshApps(); }}
+          />
+        )}
+        {!appsUnavailable && cliOnlyComposio && cliAuthenticated && (
+          <CliDefaultAccountsCard
+            authorities={cliDefaults.data?.authorities ?? []}
+            loading={cliDefaults.isLoading}
+            unavailable={cliDefaults.isError}
+            onAuthorize={async (toolkit, label) => {
+              await authorizeComposioCliDefaultAccount(toolkit, label);
+              await qc.invalidateQueries({ queryKey: ['composio-cli-default-accounts'] });
+            }}
+            onRevoke={async (toolkit) => {
+              await revokeComposioCliDefaultAccount(toolkit);
+              await qc.invalidateQueries({ queryKey: ['composio-cli-default-accounts'] });
+            }}
           />
         )}
         {/* Search to find + connect a new app from the full catalog. */}
@@ -544,6 +569,148 @@ function AccountRow({ slug, conn, onDisconnect, onSaveLabel }: {
         </Button>
       ))}
     </div>
+  );
+}
+
+function CliDefaultAccountsCard({
+  authorities,
+  loading,
+  unavailable,
+  onAuthorize,
+  onRevoke,
+}: {
+  authorities: ComposioCliDefaultAccountAuthority[];
+  loading: boolean;
+  unavailable: boolean;
+  onAuthorize: (toolkit: string, label: string) => Promise<void>;
+  onRevoke: (toolkit: string) => Promise<void>;
+}) {
+  const [toolkit, setToolkit] = useState('');
+  const [label, setLabel] = useState('');
+  const [confirmed, setConfirmed] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [message, setMessage] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+
+  const authorize = async () => {
+    const slug = toolkit.trim().toLowerCase().replace(/[-\s]+/g, '_');
+    const accountLabel = label.trim();
+    if (!slug || !accountLabel || !confirmed || busy) return;
+    setBusy(slug);
+    setMessage(null);
+    try {
+      await onAuthorize(slug, accountLabel);
+      setToolkit('');
+      setLabel('');
+      setConfirmed(false);
+      setMessage({
+        tone: 'info',
+        text: `${slug} writes can now use the named CLI default after the normal exact approval card.`,
+      });
+    } catch (error) {
+      setMessage({ tone: 'error', text: error instanceof Error ? error.message : 'Could not authorize this CLI default.' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const revoke = async (slug: string) => {
+    if (busy) return;
+    setBusy(slug);
+    setMessage(null);
+    try {
+      await onRevoke(slug);
+      setMessage({
+        tone: 'info',
+        text: `${slug} CLI-default authority revoked. Older queued writes are now invalid.`,
+      });
+    } catch (error) {
+      setMessage({ tone: 'error', text: error instanceof Error ? error.message : 'Could not revoke this CLI default.' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  return (
+    <Card className="mb-4 border-primary/20 p-4">
+      <div className="mb-1 flex items-center gap-2">
+        <Check className="h-4 w-4 text-primary" aria-hidden />
+        <span className="text-body font-medium text-fg">CLI default accounts for writes</span>
+      </div>
+      <p className="mb-3 text-small text-muted">
+        CLI reads use the signed-in default automatically. For posts, sends, or updates, name the exact
+        toolkit default you verified. Clementine still opens the normal byte-exact approval card before writing.
+      </p>
+
+      {unavailable ? (
+        <p className="text-small text-danger">CLI-default authorities are unavailable. No new write authority was granted.</p>
+      ) : loading ? (
+        <Skeleton className="h-10 w-full" />
+      ) : (
+        <>
+          {authorities.length > 0 && (
+            <div className="mb-3 space-y-1.5">
+              {authorities.map((authority) => (
+                <div key={authority.toolkit} className="flex items-center gap-2 rounded-md border border-border bg-subtle px-3 py-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-small font-medium text-fg">{prettyName(authority.toolkit)}</div>
+                    <div className="truncate text-caption text-muted">{authority.label}</div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void revoke(authority.toolkit)}
+                    disabled={Boolean(busy)}
+                  >
+                    {busy === authority.toolkit ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : 'Revoke'}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Input
+              value={toolkit}
+              onChange={(event) => setToolkit(event.target.value)}
+              placeholder="Toolkit slug (e.g. instagram)"
+              aria-label="Composio toolkit slug"
+            />
+            <Input
+              value={label}
+              onChange={(event) => setLabel(event.target.value)}
+              placeholder="Account label (e.g. Brand Instagram)"
+              aria-label="Verified CLI default account label"
+            />
+          </div>
+          <label className="mt-2 flex cursor-pointer items-start gap-2 text-caption text-muted">
+            <input
+              type="checkbox"
+              checked={confirmed}
+              onChange={(event) => setConfirmed(event.target.checked)}
+              className="mt-0.5"
+            />
+            I verified this is the provider-side account the Composio CLI currently uses for this toolkit.
+          </label>
+          <div className="mt-3 flex justify-end">
+            <Button
+              size="sm"
+              onClick={() => void authorize()}
+              disabled={Boolean(busy) || !toolkit.trim() || !label.trim() || !confirmed}
+            >
+              {busy && !authorities.some((authority) => authority.toolkit === busy)
+                ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                : <Check className="h-3.5 w-3.5" aria-hidden />}
+              Authorize named default
+            </Button>
+          </div>
+        </>
+      )}
+      {message && (
+        <p className={cn('mt-2 text-caption', message.tone === 'error' ? 'text-danger' : 'text-muted')}>
+          {message.text}
+        </p>
+      )}
+    </Card>
   );
 }
 

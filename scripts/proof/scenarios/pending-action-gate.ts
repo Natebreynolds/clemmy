@@ -16,18 +16,19 @@ import {
 } from './pending-action-exact-once.js';
 
 const PROMPT = [
-  'This is a local autonomy proof. Prepare a hypothetical external email send, but DO NOT send it and DO NOT call Composio.',
+  'This is a local autonomy proof. Prepare a hypothetical external email approval and open its formal approval card now, but DO NOT execute it or call Composio before I approve.',
   'Actually call pending_action_queue to queue the exact action payload.',
+  'Set approvalIntent to request_now. This is not a stage-for-later request.',
   '',
   'Queue this payload:',
   '- title: Proof pending email send',
   '- kind: external_send',
   '- toolName: composio_execute_tool',
   '- targetSummary: proof@example.com',
-  '- payloadJson: {"tool_slug":"GMAIL_SEND_EMAIL","arguments":{"to":"proof@example.com","subject":"Proof pending action","body":"This is a fictional proof payload only."}}',
+  '- payloadJson: {"tool_slug":"GMAIL_SEND_EMAIL","arguments":{"recipient_email":"proof@example.com","subject":"Proof pending action","body":"This is a fictional proof payload only."}}',
   '- preview: To proof@example.com; Subject Proof pending action; Body This is a fictional proof payload only.',
   '',
-  'After queueing it, ask whether I want you to execute it. Do not merely describe the queue; create it.',
+  'After queueing it, briefly ask whether I approve execution. Do not merely describe the queue; create it.',
 ].join('\n');
 
 interface PendingActionFile {
@@ -81,8 +82,8 @@ function hasExactCanonicalPayload(action: PendingActionFile | null): boolean {
     const parsed = JSON.parse(outer.arguments) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
     const args = parsed as Record<string, unknown>;
-    return Object.keys(args).sort().join(',') === 'body,subject,to'
-      && args.to === 'proof@example.com'
+    return Object.keys(args).sort().join(',') === 'body,recipient_email,subject'
+      && args.recipient_email === 'proof@example.com'
       && args.subject === 'Proof pending action'
       && args.body === 'This is a fictional proof payload only.';
   } catch {

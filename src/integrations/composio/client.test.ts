@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   COMPOSIO_AUTH_CONFIGS_URL,
   ComposioNeedsAuthConfigError,
@@ -18,11 +21,63 @@ import {
   loneToolkitConnection,
   composioAutoFallbackAllowed,
   composioCliErrorProvesNoDispatch,
+  executeComposioTool,
   prepareInAppToolkitConnection,
+  resetComposioClient,
   selectToolkitCredentialValues,
   toComposioDashboardConnection,
   type ConnectedToolkit,
 } from './client.js';
+
+test('AUTO with an SDK key never touches an authenticated CLI shim for an unpinned write', async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-auto-sdk-'));
+  const shim = path.join(tmp, 'composio-authenticated.mjs');
+  const log = path.join(tmp, 'cli-invocations.jsonl');
+  writeFileSync(shim, [
+    `import { appendFileSync } from 'node:fs';`,
+    `const argv = process.argv.slice(2);`,
+    `appendFileSync(${JSON.stringify(log)}, JSON.stringify(argv) + '\\n');`,
+    `if (argv[0] === '--version') console.log('composio-proof 1.0.0');`,
+    `else if (argv[0] === 'whoami') console.log('authenticated-proof-user');`,
+    `else if (argv[0] === 'execute') console.log(JSON.stringify({ successful: true, lane: 'cli' }));`,
+    `else process.exitCode = 2;`,
+    '',
+  ].join('\n'));
+  chmodSync(shim, 0o755);
+
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousApiKey = process.env.COMPOSIO_API_KEY;
+  const previousCliPath = process.env.COMPOSIO_CLI_PATH;
+  process.env.COMPOSIO_BACKEND = 'auto';
+  process.env.COMPOSIO_API_KEY = 'isolated-sdk-proof-key';
+  process.env.COMPOSIO_CLI_PATH = shim;
+  __test__.setConnectedAccountsLoader(async () => []);
+  let sdkDispatches = 0;
+  __test__.setComposioClient({
+    tools: {
+      execute: async (slug: string, body: Record<string, unknown>) => {
+        sdkDispatches += 1;
+        return { successful: true, lane: 'sdk', slug, body };
+      },
+    },
+  });
+  try {
+    const out = await executeComposioTool('PROOF_CREATE_RECORD', { fields: { Name: 'SDK lane proof' } });
+    assert.equal((out as { lane?: unknown }).lane, 'sdk');
+    assert.equal(sdkDispatches, 1, 'AUTO+key dispatches exactly once through the SDK');
+    assert.equal(existsSync(log), false, 'CLI status and execute were both untouched');
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
+    resetComposioClient();
+    if (previousCliPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = previousCliPath;
+    if (previousApiKey === undefined) delete process.env.COMPOSIO_API_KEY;
+    else process.env.COMPOSIO_API_KEY = previousApiKey;
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
 
 test('AUTO fallback never replays an ambiguous CLI mutation through the SDK', () => {
   const timeout = new Error('socket timeout after request dispatch');

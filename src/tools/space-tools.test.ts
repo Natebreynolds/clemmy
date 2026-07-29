@@ -34,10 +34,12 @@ function text(result: unknown): string {
 
 const tools = captureTools();
 
-test('registerSpaceTools exposes the three tools', () => {
+test('registerSpaceTools exposes Workspace authoring and deferred temporal reads', () => {
   assert.ok(tools.space_save);
   assert.ok(tools.space_list);
   assert.ok(tools.space_get);
+  assert.ok(tools.space_history);
+  assert.ok(tools.space_diff);
 });
 
 test('space_save creates a workspace, installs the view, returns the URL', async () => {
@@ -428,6 +430,7 @@ test('space_list + space_get read back', async () => {
   assert.match(got, /Objective: Keep the sales team focused/);
   assert.match(got, /Success criteria:.*Every risky deal/);
   assert.match(got, /Invariants:.*Never update the CRM/);
+  assert.match(got, /Dataset history: no retained observations yet/i);
 });
 
 test('space_edit_view applies a targeted change + bumps version + snapshots', async () => {
@@ -620,6 +623,102 @@ test('space_set_data commits inline JSON, counts rows, and stamps _meta.provenan
   assert.equal((data.deals as unknown[]).length, 2);
   const meta = data._meta as Record<string, { provenance?: string }>;
   assert.equal(meta.deals.provenance, 'manual');
+
+  const history = text(await tools.space_history({
+    slug: 'setdata',
+    source_id: 'deals',
+    status: null,
+    limit: null,
+  }));
+  assert.match(history, /"status":"ok"/);
+  assert.match(history, /"cause":"manual"/);
+  assert.doesNotMatch(history, /"firm": "Acme"/, 'history metadata must not copy retained rows');
+
+  const baseline = text(await tools.space_diff({
+    slug: 'setdata',
+    source_id: 'deals',
+    from_observation_id: null,
+    to_observation_id: null,
+    max_changes: null,
+  }));
+  assert.match(baseline, /"status":"insufficient_history"/);
+
+  await tools.space_set_data({
+    slug: 'setdata',
+    source_id: 'deals',
+    data_json: JSON.stringify([{ firm: 'Acme', stage: 'renewal' }, { firm: 'Globex', stage: 'lost' }]),
+  });
+  const diff = text(await tools.space_diff({
+    slug: 'setdata',
+    source_id: 'deals',
+    from_observation_id: null,
+    to_observation_id: null,
+    max_changes: null,
+  }));
+  assert.match(diff, /"status":"changed"/);
+  assert.match(diff, /stage/);
+  assert.match(text(await tools.space_get({ slug: 'setdata' })), /space_diff is confirmed for: deals/);
+});
+
+test('space_get imports a pre-3.0 data.json once as an honest baseline', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-legacy-history.html');
+  writeFileSync(draft, '<html>legacy history</html>', 'utf-8');
+  await tools.space_save({ slug: 'legacy-history', title: 'Legacy History', view_path: draft });
+  const dataMod = await import('../spaces/data-store.js');
+  const written = dataMod.writeData('legacy-history', {
+    metrics: { spend: 100, conversions: 4 },
+    _meta: { metrics: { provenance: 'legacy' } },
+  });
+  assert.equal(written.ok, true);
+
+  const firstGet = text(await tools.space_get({ slug: 'legacy-history' }));
+  assert.match(firstGet, /1 retained observation/);
+  assert.match(firstGet, /Baseline only/);
+  const firstHistory = text(await tools.space_history({
+    slug: 'legacy-history',
+    source_id: 'metrics',
+    status: null,
+    limit: null,
+  }));
+  assert.match(firstHistory, /"cause":"legacy_import"/);
+
+  await tools.space_get({ slug: 'legacy-history' });
+  const secondHistory = text(await tools.space_history({
+    slug: 'legacy-history',
+    source_id: 'metrics',
+    status: null,
+    limit: null,
+  }));
+  assert.match(secondHistory, /"returned":1/, 'repeated reads must not duplicate the baseline');
+});
+
+test('space_set_data refuses to overwrite malformed pre-3.0 data before it has a baseline', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-malformed-legacy-history.html');
+  writeFileSync(draft, '<html>malformed legacy history</html>', 'utf-8');
+  await tools.space_save({
+    slug: 'malformed-legacy-history',
+    title: 'Malformed Legacy History',
+    view_path: draft,
+  });
+  const dataFile = store.resolveInSpace('malformed-legacy-history', 'data.json');
+  const original = '{"metrics":{"spend":100},"unfinished":';
+  writeFileSync(dataFile, original, 'utf-8');
+
+  const result = text(await tools.space_set_data({
+    slug: 'malformed-legacy-history',
+    source_id: 'metrics',
+    data_json: JSON.stringify({ spend: 999 }),
+  }));
+  assert.match(result, /Could not save data/i);
+  assert.match(result, /legacy comparison baseline could not be imported/i);
+  assert.equal(readFileSync(dataFile, 'utf-8'), original, 'the malformed legacy bytes remain untouched');
+
+  const workspaceDb = await import('../spaces/workspace-db.js');
+  assert.equal(
+    workspaceDb.listWorkspaceDatasetObservations('malformed-legacy-history', { limit: 10 }).length,
+    0,
+    'no observation may commit when the prior file could not be preserved',
+  );
 });
 
 test('space_set_data rejects invalid JSON (no write)', async () => {

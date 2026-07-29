@@ -29,6 +29,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-runner-te
 const runner = await import('./runner.js');
 const store = await import('./store.js');
 const dataStore = await import('./data-store.js');
+const workspaceDb = await import('./workspace-db.js');
+const observationDiff = await import('./observation-diff.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 
@@ -572,6 +574,148 @@ test('refreshSpaceData serializes same-space read-only Composio refreshes so con
     assert.deepEqual(data.beta, { rows: [{ id: 'beta' }] });
     assert.equal((data._meta as Record<string, { ok?: boolean }>).alpha.ok, true);
     assert.equal((data._meta as Record<string, { ok?: boolean }>).beta.ok, true);
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+    runner._resetSpaceRefreshQueuesForTest();
+  }
+});
+
+test('refreshSpaceData commits valid sources when a sibling result is oversized, and retries without duplicates', async () => {
+  const slug = 'refresh-partial-batch';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Refresh Partial Batch',
+    dataSources: [
+      { id: 'small', composioSlug: 'SALESFORCE_GET_SMALL' },
+      { id: 'oversized', composioSlug: 'SALESFORCE_GET_OVERSIZED' },
+    ],
+  });
+  runner._setSpaceComposioDispatchForTests(async (toolSlug) => ({
+    ok: true as const,
+    result: toolSlug.endsWith('OVERSIZED')
+      ? { payload: 'x'.repeat(6 * 1024 * 1024) }
+      : { rows: [{ id: 'kept', value: 42 }] },
+    connectionId: 'ca-proof',
+    identity: 'proof@example.test',
+  }));
+  try {
+    for (const batchId of ['partial-batch-first', 'partial-batch-retry']) {
+      const results = await runner.refreshSpaceData(slug, undefined, {
+        cause: 'scheduled',
+        refreshId: 'stable-refresh',
+        batchId,
+      });
+      assert.equal(results.length, 2);
+      assert.equal(results[0]?.sourceId, 'small');
+      assert.equal(results[0]?.ok, true, results[0]?.error ?? '');
+      assert.equal(results[1]?.sourceId, 'oversized');
+      assert.equal(results[1]?.ok, false);
+      assert.match(results[1]?.error ?? '', /not persisted|byte cap|exceeds/i);
+      assert.equal(
+        results.every((result) => result.write?.ok === true),
+        true,
+        JSON.stringify(results),
+      );
+    }
+
+    const data = dataStore.readData(slug) as Record<string, unknown>;
+    assert.deepEqual(data.small, { rows: [{ id: 'kept', value: 42 }] });
+    assert.equal(Object.hasOwn(data, 'oversized'), false);
+    assert.equal(
+      (data._meta as Record<string, { ok?: boolean | null }>).small.ok,
+      true,
+    );
+    assert.equal(
+      (data._meta as Record<string, { ok?: boolean | null }>).oversized.ok,
+      false,
+    );
+    assert.equal(
+      workspaceDb.listWorkspaceDatasetObservations(slug, {
+        sourceKey: 'small',
+        limit: 10,
+      }).length,
+      1,
+      'valid source retry reuses its durable observation',
+    );
+    const oversized = workspaceDb.listWorkspaceDatasetObservations(slug, {
+      sourceKey: 'oversized',
+      limit: 10,
+    });
+    assert.equal(oversized.length, 1, 'oversized source retry reuses its error observation');
+    assert.equal(oversized[0]?.status, 'error');
+  } finally {
+    runner._setSpaceComposioDispatchForTests(null);
+    runner._resetSpaceRefreshQueuesForTest();
+  }
+});
+
+test('refreshSpaceData preserves a 2.7.5 snapshot as baseline and appends restart-deduped observations', async () => {
+  const slug = 'refresh-temporal-baseline';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Refresh Temporal Baseline',
+    dataSources: [{ id: 'campaigns', composioSlug: 'GOOGLEADS_SEARCH_CAMPAIGNS' }],
+  });
+  const legacy = {
+    campaigns: { rows: [{ id: 'campaign-1', spend: 10, status: 'active' }] },
+    _meta: { campaigns: { refreshedAt: '2026-06-01T00:00:00.000Z', ok: true } },
+  };
+  assert.equal(dataStore.writeData(slug, legacy).ok, true);
+
+  runner._setSpaceComposioDispatchForTests(async () => ({
+    ok: true as const,
+    result: { rows: [{ id: 'campaign-1', spend: 15, status: 'paused' }] },
+    connectionId: 'ca-proof',
+    identity: 'proof@example.test',
+  }));
+  try {
+    const first = await runner.refreshSpaceData(slug, 'campaigns', {
+      cause: 'manual',
+      refreshId: 'manual-refresh-1',
+      batchId: 'manual-batch-1',
+    });
+    assert.equal(first[0]?.ok, true, first[0]?.error ?? '');
+    assert.equal(first[0]?.changed, true);
+    assert.match(first[0]?.observationId ?? '', /^[a-f0-9-]{36}$/i);
+
+    const afterFirst = workspaceDb.listWorkspaceDatasetObservations(slug, {
+      sourceKey: 'campaigns',
+      limit: 10,
+    });
+    assert.equal(afterFirst.length, 2);
+    assert.equal(afterFirst[0]?.cause, 'manual');
+    assert.equal(afterFirst[1]?.cause, 'legacy_import');
+    assert.equal(afterFirst[0]?.previousObservationId, afterFirst[1]?.id);
+    const beforeDoc = workspaceDb.getWorkspaceObservationDocument(slug, afterFirst[1]!.id);
+    const afterDoc = workspaceDb.getWorkspaceObservationDocument(slug, afterFirst[0]!.id);
+    const delta = observationDiff.diffWorkspaceObservationDocuments(beforeDoc, afterDoc);
+    assert.deepEqual(delta.changes.map((entry) => entry.path), [
+      '/rows/@id=campaign-1/spend',
+      '/rows/@id=campaign-1/status',
+    ]);
+
+    const same = await runner.refreshSpaceData(slug, 'campaigns', {
+      cause: 'manual',
+      refreshId: 'manual-refresh-2',
+      batchId: 'manual-batch-2',
+    });
+    assert.equal(same[0]?.ok, true);
+    assert.equal(same[0]?.changed, false);
+    const replay = await runner.refreshSpaceData(slug, 'campaigns', {
+      cause: 'manual',
+      refreshId: 'manual-refresh-2',
+      batchId: 'manual-batch-replayed',
+    });
+    assert.equal(replay[0]?.ok, true);
+    assert.equal(replay[0]?.observationId, same[0]?.observationId);
+    assert.equal(
+      workspaceDb.listWorkspaceDatasetObservations(slug, {
+        sourceKey: 'campaigns',
+        limit: 10,
+      }).length,
+      3,
+      'same refresh identity reuses its observation after restart/retry',
+    );
   } finally {
     runner._setSpaceComposioDispatchForTests(null);
     runner._resetSpaceRefreshQueuesForTest();

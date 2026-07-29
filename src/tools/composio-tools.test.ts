@@ -7,6 +7,10 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-tools-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+// These unit tests exercise SDK/gateway semantics with injected account
+// inventory. Do not let a developer machine's authenticated CLI silently turn
+// them into CLI-default-account tests.
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';

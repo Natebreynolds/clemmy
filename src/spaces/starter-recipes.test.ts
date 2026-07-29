@@ -27,6 +27,17 @@ test('availableStarterRecipes: runtime connections drive the connected flag; con
   assert.ok(WORKSPACE_STARTER_RECIPES.length >= 5, 'a real starter library, not a stub');
 });
 
+test('manager-style starter recipes use verified history with an honest first-run baseline', () => {
+  for (const id of ['deal-board', 'daily-brief', 'seo-rank-tracker', 'client-health']) {
+    const recipe = WORKSPACE_STARTER_RECIPES.find((candidate) => candidate.id === id);
+    assert.ok(recipe, `missing ${id}`);
+    assert.match(recipe.buildPrompt, /Workspace (?:observation )?history/i);
+    assert.match(recipe.buildPrompt, /baseline/i);
+    assert.match(recipe.buildPrompt, /prior successful/i);
+    assert.doesNotMatch(recipe.buildPrompt, /\bassume\b|\binfer movement\b(?! when history)/i);
+  }
+});
+
 test('maybeOfferStarterWorkspace: offers ONCE when zero workspaces + a connection; never again after', async () => {
   const notifications: Array<{ id: string; title: string; body: string }> = [];
   const deps = {

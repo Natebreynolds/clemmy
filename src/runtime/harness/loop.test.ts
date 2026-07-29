@@ -24,6 +24,7 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-loop-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 mkdirSync(path.join(TMP_HOME, 'vault', '02-Projects'), { recursive: true });
 writeFileSync(
@@ -87,7 +88,9 @@ const { getPlanScope } = await import('../../agents/plan-scope.js');
 const { rememberFact } = await import('../../memory/facts.js');
 const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
 const artifactLedger = await import('./artifact-ledger.js');
-const { getPendingAction, queuePendingAction } = await import('./pending-actions.js');
+const { getPendingAction, pendingActionPayloadHash, queuePendingAction } = await import('./pending-actions.js');
+const { pendingActionApprovalView } = await import('./pending-action-view.js');
+const { executeApprovedPendingActionCall } = await import('../../execution/pending-action-executor.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
 
@@ -1431,6 +1434,197 @@ test('interruption emits approval_requested per interrupted tool call with parse
   assert.equal(approvals[0].data.tool, 'request_approval');
   assert.equal(approvals[0].data.subject, 'deploy to prod');
   assert.deepEqual(approvals[0].data.args, { subject: 'deploy to prod', destructive: true });
+});
+
+test('queue-only action → request_approval interruption pins the immutable action; approval executes once and tampering stays inert', async () => {
+  resetEventLog();
+  const requestCard = async (
+    sessionId: string,
+    recipient: string,
+  ) => {
+    const sess = HarnessSession.create({ id: sessionId, kind: 'chat' });
+    const record = queuePendingAction({
+      title: `Send reviewed note to ${recipient}`,
+      summary: 'The exact send was prepared queue-only and is now being presented for approval.',
+      kind: 'external_send',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({
+          to: recipient,
+          subject: 'Reviewed note',
+          body: 'Exact approved body.',
+        }),
+        connected_account_id: 'ca_gmail_owner',
+      },
+      targetSummary: recipient,
+      sessionId,
+    });
+    const interruptionArgs = {
+      subject: record.title,
+      reason: record.summary,
+      pendingActionId: record.id,
+    };
+    await runTurn({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Present the staged action for approval now.',
+      makeRunner: makeRunnerStub,
+      runRunner: async () => ({
+        history: [],
+        lastResponseId: undefined,
+        finalOutput: undefined,
+        hasInterruptions: true,
+        serializedState: '{"$schema":1,"items":[]}',
+        interruptions: [{
+          toolName: 'request_approval',
+          rawArgs: JSON.stringify(interruptionArgs),
+          args: interruptionArgs,
+        }],
+      }),
+    });
+    const [row] = approvalRegistry.listPending({ sessionId, status: 'pending' });
+    assert.ok(row);
+    assert.deepEqual(row.args?.pendingAction, pendingActionApprovalView(record));
+    const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'test');
+    assert.equal(resolved.ok, true);
+    assert.equal(getPendingAction(record.id)?.status, 'approved');
+    return record;
+  };
+
+  const executable = await requestCard('sess-loop-exact-card-execute', 'proof@example.com');
+  let dispatches = 0;
+  const executed = await executeApprovedPendingActionCall(executable.id, {
+    sessionId: executable.sessionId!,
+    dispatch: async () => {
+      dispatches += 1;
+      return 'OK sent exact staged payload';
+    },
+  });
+  assert.equal(executed.status, 'executed');
+  assert.equal(dispatches, 1);
+
+  const tampered = await requestCard('sess-loop-exact-card-tamper', 'original@example.com');
+  const recordFile = path.join(TMP_HOME, 'pending-actions', `${tampered.id}.json`);
+  const changed = JSON.parse(readFileSync(recordFile, 'utf8')) as {
+    toolName: string;
+    payload: Record<string, unknown>;
+    payloadHash: string;
+  };
+  changed.payload = {
+    ...changed.payload,
+    arguments: JSON.stringify({
+      to: 'attacker@example.com',
+      subject: 'Changed after approval',
+      body: 'This must never dispatch.',
+    }),
+  };
+  // Re-hashing the mutable queue record cannot outrun the independent card
+  // snapshot stored by registerAndEmitApprovals.
+  changed.payloadHash = pendingActionPayloadHash(changed.toolName, changed.payload);
+  writeFileSync(recordFile, JSON.stringify(changed), 'utf8');
+
+  let tamperedDispatches = 0;
+  const refused = await executeApprovedPendingActionCall(tampered.id, {
+    sessionId: tampered.sessionId!,
+    dispatch: async () => {
+      tamperedDispatches += 1;
+      return 'must never run';
+    },
+  });
+  assert.equal(refused.status, 'failed');
+  assert.equal(tamperedDispatches, 0);
+  assert.match(refused.resultSummary, /approval-authority|approval card|snapshot|does not pin/i);
+});
+
+test('an identical pending-action interruption reuses its linked card, but a re-hashed changed payload cannot', async () => {
+  resetEventLog();
+  const sessionId = 'sess-loop-linked-card-replay';
+  const sess = HarnessSession.create({ id: sessionId, kind: 'chat' });
+  const record = queuePendingAction({
+    title: 'Send the exact reviewed replay proof',
+    summary: 'The immutable queued payload should own one approval card.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: {
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: JSON.stringify({
+        to: 'proof@example.com',
+        subject: 'Replay proof',
+        body: 'Original exact body.',
+      }),
+      connected_account_id: 'ca_gmail_owner',
+    },
+    targetSummary: 'proof@example.com',
+    sessionId,
+  });
+  const interruptionArgs = {
+    subject: record.title,
+    reason: record.summary,
+    pendingActionId: record.id,
+  };
+  const surfaceInterruption = async (input: string) => runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input,
+    makeRunner: makeRunnerStub,
+    runRunner: async () => ({
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: undefined,
+      hasInterruptions: true,
+      serializedState: '{"$schema":1,"items":[]}',
+      interruptions: [{
+        toolName: 'request_approval',
+        rawArgs: JSON.stringify(interruptionArgs),
+        args: interruptionArgs,
+      }],
+    }),
+  });
+
+  await surfaceInterruption('Present the exact staged action for approval.');
+  const [firstCard] = approvalRegistry.listPending({ sessionId, status: 'pending' });
+  assert.ok(firstCard);
+  const firstArgs = JSON.parse(JSON.stringify(firstCard.args)) as Record<string, unknown>;
+  const firstSnapshot = firstArgs.pendingAction as { payloadHash: string };
+
+  await surfaceInterruption('The same unresolved interruption surfaced again.');
+  let pendingCards = approvalRegistry.listPending({ sessionId, status: 'pending' });
+  assert.equal(pendingCards.length, 1, 'link-time display fields cannot create a duplicate card');
+  assert.equal(pendingCards[0].approvalId, firstCard.approvalId);
+  assert.deepEqual(pendingCards[0].args, firstArgs, 'replay reuses the card-owned immutable snapshot');
+
+  const recordFile = path.join(TMP_HOME, 'pending-actions', `${record.id}.json`);
+  const changed = JSON.parse(readFileSync(recordFile, 'utf8')) as {
+    toolName: string;
+    payload: Record<string, unknown>;
+    payloadHash: string;
+  };
+  changed.payload = {
+    ...changed.payload,
+    arguments: JSON.stringify({
+      to: 'different@example.com',
+      subject: 'Changed after first card',
+      body: 'This is a different authority and needs a different card.',
+    }),
+  };
+  changed.payloadHash = pendingActionPayloadHash(changed.toolName, changed.payload);
+  writeFileSync(recordFile, JSON.stringify(changed), 'utf8');
+
+  await surfaceInterruption('The same id now points at a changed, re-hashed payload.');
+  pendingCards = approvalRegistry.listPending({ sessionId, status: 'pending' });
+  assert.equal(pendingCards.length, 2, 'a changed payload must never inherit the old card');
+  const pinnedHashes = pendingCards.map((row) =>
+    (row.args?.pendingAction as { payloadHash?: unknown } | undefined)?.payloadHash);
+  assert.deepEqual(
+    new Set(pinnedHashes),
+    new Set([firstSnapshot.payloadHash, changed.payloadHash]),
+  );
+  assert.deepEqual(
+    approvalRegistry.get(firstCard.approvalId)?.args,
+    firstArgs,
+    'minting the changed authority cannot mutate the original card snapshot',
+  );
 });
 
 test('interruption registers Discord channel id for approval routing', async () => {
@@ -3122,6 +3316,78 @@ test('request-bound write evidence: exhausted verification never false-greens a 
     assert.equal(terminal.data.delivered, false);
     assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
     assert.doesNotMatch(String(terminal.data.reply), /^PASS\b/);
+    const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
+    assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
+  }
+});
+
+test('request-bound write evidence: a direct communication command requires a current receipt', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runner = scriptedRunner([{
+      finalOutput: {
+        summary: 'email sent',
+        reply: 'Done — I emailed the prospect.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    }]);
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'Email the prospect.',
+      judgeCompletion: true,
+      judgeFn: async () => ({ done: true, reason: 'accepted unsupported claim' }),
+      makeRunner: makeRunnerStub,
+      runRunner: runner,
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.delivered, false);
+    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
+    const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
+    assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prev;
+  }
+});
+
+test('request-bound write evidence: a direct invitation response cannot false-complete without a receipt', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runner = scriptedRunner([{
+      finalOutput: {
+        summary: 'invitation accepted',
+        reply: 'Done — I RSVP’d yes to the invitation.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    }]);
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'RSVP yes to the invitation.',
+      judgeCompletion: true,
+      judgeFn: async () => ({ done: true, reason: 'accepted unsupported claim' }),
+      makeRunner: makeRunnerStub,
+      runRunner: runner,
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(terminal.data.delivered, false);
+    assert.match(String(terminal.data.summary), /no write receipt exists after your current request/i);
     const trips = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
     assert.ok(trips.some((event) => event.data.kind === 'request_bound_external_write_missing'));
   } finally {

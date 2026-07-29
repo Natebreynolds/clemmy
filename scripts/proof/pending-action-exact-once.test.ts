@@ -157,6 +157,30 @@ test('semantic email shape accepts the provider recipient alias while canonical 
     'transport failure must not erase the request-owned semantic action',
   );
 
+  const singletonRecipientArray = pendingEmailAction('composio_execute_tool', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify({
+      to: [expected.to],
+      subject: expected.subject,
+      body: expected.body,
+    }),
+  });
+  assert.equal(
+    exactEmailShape(singletonRecipientArray, expected),
+    true,
+    'a provider-valid one-recipient array retains the same exact semantic target',
+  );
+
+  const multipleRecipients = pendingEmailAction('composio_execute_tool', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify({
+      to: [expected.to, 'extra@example.com'],
+      subject: expected.subject,
+      body: expected.body,
+    }),
+  });
+  assert.equal(exactEmailShape(multipleRecipients, expected), false, 'additional recipients fail exact shape');
+
   const extraField = pendingEmailAction('composio_execute_tool', {
     tool_slug: 'GMAIL_SEND_EMAIL',
     arguments: JSON.stringify({
@@ -187,6 +211,8 @@ test('proof prompt keeps a neutral fixture body exact', () => {
     body: 'Neutral fixture body.',
   });
   assert.match(prompt, /Body: Neutral fixture body\./);
+  assert.match(prompt, /recipient_email, subject, and body/);
+  assert.match(prompt, /open its formal approval card now/);
   assert.doesNotMatch(prompt, /must (?:never )?reach|provider shim/i);
 });
 
@@ -199,17 +225,15 @@ test('final execute-gate prose does not need to predict the materialized approva
   assert.equal(replyOffersFinalExecuteGate('The send is blocked. Which account should I use?'), false);
 });
 
-test('proof-local Composio shim records the raw provider argument and keeps the legacy slug log', {
-  skip: process.platform === 'win32' ? 'POSIX proof shim execution test' : false,
-}, () => {
+test('proof-local Composio shim records the raw provider argument and keeps the legacy slug log', () => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'clemmy-proof-composio-shim-'));
   try {
-    createProofComposioShim(home);
+    const shim = createProofComposioShim(home);
     writeFileSync(path.join(home, 'proof-composio-connected'), 'connected\n', 'utf8');
     const payload = '{"to":"proof+shim@example.com","subject":"Exact \\"shim\\" bytes","body":"line one\\nline two"}';
     execFileSync(
-      path.join(home, 'proof-bin', 'composio'),
-      ['execute', 'GMAIL_SEND_EMAIL', '-d', payload],
+      process.execPath,
+      [shim, 'execute', 'GMAIL_SEND_EMAIL', '-d', payload],
       {
         env: { ...process.env, HOME: home },
         encoding: 'utf8',

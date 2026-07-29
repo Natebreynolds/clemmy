@@ -192,7 +192,9 @@ test('deferred validation accepts omitted optional keys as well as strict-mode n
   const recall = schemas.get('memory_recall_all');
   const getRunner = schemas.get('space_get_runner');
   const refreshSpace = schemas.get('space_refresh');
-  assert.ok(facts && working && recall && getRunner && refreshSpace);
+  const spaceHistory = schemas.get('space_history');
+  const spaceDiff = schemas.get('space_diff');
+  assert.ok(facts && working && recall && getRunner && refreshSpace && spaceHistory && spaceDiff);
   assert.equal(facts!.safeParse({ query: 'Northstar live-proof team', limit: 50 }).success, true);
   assert.equal(facts!.safeParse({ kind: null, query: 'Northstar live-proof team', limit: 50, includeInactive: false }).success, true);
   assert.equal(working!.safeParse({ action: 'read' }).success, true);
@@ -200,6 +202,8 @@ test('deferred validation accepts omitted optional keys as well as strict-mode n
   assert.equal(recall!.safeParse({}).success, false, 'genuinely required keys remain required');
   assert.equal(getRunner!.safeParse({ slug: 'proof-cockpit', runner_path: 'tasks.mjs' }).success, true);
   assert.equal(refreshSpace!.safeParse({ slug: 'proof-cockpit' }).success, true);
+  assert.equal(spaceHistory!.safeParse({ slug: 'proof-cockpit' }).success, true);
+  assert.equal(spaceDiff!.safeParse({ slug: 'proof-cockpit', source_id: 'tasks' }).success, true);
 });
 
 test('deferred workflow schemas accept lean nested steps and materialize strict nulls only at dispatch', async () => {
@@ -305,7 +309,11 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
       sess.id, 'composio_execute_tool',
       JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: 'p@site.example' }) }),
     ));
-    assert.match(sendOut, /SEND_REQUIRES_APPROVAL|run_batch/i, 'a send via call_tool is refused, directed to run_batch/first-class');
+    assert.match(
+      sendOut,
+      /PENDING_ACTION_APPROVAL_REQUIRED|pending_action_queue/i,
+      'a send via call_tool is refused with the one typed pending-action recovery',
+    );
     assert.equal(listEvents(sess.id, { types: ['external_write'] }).length, 0, 'no send dispatched');
 
     // A REVERSIBLE WRITE still routes through the gated boundary keyed on the
@@ -323,6 +331,261 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
     process.env.HARNESS_TOOL_BRACKETS = prev.brackets;
     process.env.CLEMMY_CONFIRM_FIRST = prev.confirm;
     process.env.CLEMMY_EXECUTION_GATE = prev.execGate;
+  }
+});
+
+test('a wrapped nested irreversible send gives one pending-action recovery, never execution-wrap then send-floor advice', async () => {
+  const prev = {
+    brackets: process.env.HARNESS_TOOL_BRACKETS,
+    execution: process.env.CLEMMY_EXECUTION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  let dispatched = 0;
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', {
+      name: 'composio_execute_tool',
+      invoke: async () => {
+        dispatched += 1;
+        return 'must not send';
+      },
+    }]]),
+  );
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as ToolLike;
+  const counter = new ToolCallsCounter(10);
+  try {
+    const output = String(await withHarnessRunContext(
+      { sessionId: sess.id, counter },
+      () => wrapped.invoke!(
+        { context: { sessionId: sess.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: 'GMAIL_SEND_EMAIL',
+            arguments: JSON.stringify({
+              to: 'approval-route@example.com',
+              subject: 'Approval route',
+              body: 'Exact body',
+            }),
+          }),
+        }),
+        { toolCall: { callId: 'nested-send-one-recovery' } },
+      ) as Promise<unknown>,
+    ));
+    assert.match(output, /PENDING_ACTION_APPROVAL_REQUIRED/);
+    assert.match(output, /pending_action_queue/);
+    assert.match(output, /approvalIntent[^a-z]+request_now/i);
+    assert.doesNotMatch(output, /EXECUTION_WRAP_REQUIRED/);
+    assert.doesNotMatch(output, /SEND_REQUIRES_APPROVAL/);
+    assert.equal(dispatched, 0, 'the provider is untouched while the exact call waits for approval');
+    assert.equal(counter.calls, 1, 'the pre-dispatch send floor still charges the refused attempt');
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (prev.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev.brackets;
+    if (prev.execution === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = prev.execution;
+  }
+});
+
+test('carrier target policy allows account-scoped social posts but blocks targetless directed sends', async () => {
+  const prev = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const session = createSession({ kind: 'chat' });
+  const counter = new ToolCallsCounter(10);
+  let dispatched = 0;
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', {
+      name: 'composio_execute_tool',
+      invoke: async () => {
+        dispatched += 1;
+        return 'must not publish or send before approval';
+      },
+    }]]),
+  );
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
+  ) as unknown as ToolLike;
+  const invoke = (toolSlug: string, args: Record<string, unknown>, callId: string) =>
+    withHarnessRunContext(
+      { sessionId: session.id, counter },
+      () => wrapped.invoke!(
+        { context: { sessionId: session.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: toolSlug,
+            arguments: JSON.stringify(args),
+          }),
+        }),
+        { toolCall: { callId } },
+      ) as Promise<unknown>,
+    );
+  try {
+    const broadcast = String(await invoke(
+      'INSTAGRAM_CREATE_POST',
+      { caption: 'Launch day', image_url: 'https://assets.example.test/launch.png' },
+      'account-scoped-instagram-post',
+    ));
+    assert.match(broadcast, /PENDING_ACTION_APPROVAL_REQUIRED|pending_action_queue/);
+    assert.doesNotMatch(broadcast, /target_missing|resolvable recipient/i);
+
+    const mediaPublish = String(await invoke(
+      'INSTAGRAM_POST_IG_USER_MEDIA_PUBLISH',
+      { creation_id: 'ig-container-123' },
+      'account-scoped-instagram-media-publish',
+    ));
+    assert.match(mediaPublish, /PENDING_ACTION_APPROVAL_REQUIRED|pending_action_queue/);
+    assert.doesNotMatch(mediaPublish, /arguments_missing|target_missing/i);
+
+    const emptyBroadcast = JSON.parse(String(await invoke(
+      'INSTAGRAM_CREATE_POST',
+      {},
+      'empty-account-scoped-instagram-post',
+    ))) as { error?: string; reason?: string; detail?: string };
+    assert.equal(emptyBroadcast.error, 'arg_validation');
+    assert.equal(emptyBroadcast.reason, 'arguments_missing');
+    assert.match(emptyBroadcast.detail ?? '', /non-empty/i);
+
+    const blankBroadcast = JSON.parse(String(await invoke(
+      'INSTAGRAM_CREATE_POST',
+      { caption: '   ', image_url: '' },
+      'blank-account-scoped-instagram-post',
+    ))) as { error?: string; reason?: string; detail?: string };
+    assert.equal(blankBroadcast.error, 'arg_validation');
+    assert.equal(blankBroadcast.reason, 'arguments_missing');
+
+    for (const candidate of [
+      { slug: 'INSTAGRAM_SEND_DM', args: { message: 'Hello' } },
+      { slug: 'SLACK_CHAT_POST_MESSAGE', args: { text: 'Hello channel' } },
+      { slug: 'GMAIL_SEND_EMAIL', args: { subject: 'Hello', body: 'No recipient' } },
+    ]) {
+      const targetless = JSON.parse(String(await invoke(
+        candidate.slug,
+        candidate.args,
+        `targetless-directed-${candidate.slug.toLowerCase()}`,
+      ))) as { error?: string; reason?: string; detail?: string };
+      assert.equal(targetless.error, 'arg_validation', candidate.slug);
+      assert.equal(targetless.reason, 'target_missing', candidate.slug);
+      assert.match(targetless.detail ?? '', /recipient|target/i, candidate.slug);
+    }
+    assert.equal(dispatched, 0);
+    assert.equal(counter.calls, 7, 'two approval conversions plus five validation refusals charge once each');
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+test('unknown, denied, and malformed nested sends validate before any pending-action conversion', async () => {
+  const prev = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  let dispatched = 0;
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', {
+      name: 'composio_execute_tool',
+      invoke: async () => {
+        dispatched += 1;
+        return 'must not send';
+      },
+    }]]),
+  );
+  const invokeWrapped = (
+    toolOptions: Parameters<typeof buildCallTool>[0],
+    name: string,
+    args: string,
+    callId: string,
+  ) => {
+    const wrapped = wrapToolForHarness(buildCallTool(toolOptions) as never) as unknown as ToolLike;
+    return withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(20) },
+      () => wrapped.invoke!(
+        { context: { sessionId: sess.id } },
+        JSON.stringify({ name, args_json: args }),
+        { toolCall: { callId } },
+      ) as Promise<unknown>,
+    );
+  };
+  try {
+    const unknown = String(await invokeWrapped(
+      { reachableBuiltinNames: new Set(['composio_execute_tool']) },
+      'TOTALLY_UNKNOWN_SEND_EMAIL',
+      JSON.stringify({ to: 'unknown@example.com' }),
+      'unknown-nested-send',
+    ));
+    assert.match(unknown, /not_reachable/);
+    assert.doesNotMatch(unknown, /PENDING_ACTION_APPROVAL_REQUIRED|pending_action_queue/);
+
+    const denied = String(await invokeWrapped(
+      {
+        reachableBuiltinNames: new Set(['composio_execute_tool']),
+        deniedNames: new Set(['composio_execute_tool']),
+      },
+      'composio_execute_tool',
+      JSON.stringify({
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({ to: 'denied@example.com' }),
+      }),
+      'denied-nested-send',
+    ));
+    assert.match(denied, /not_reachable|excluded from this turn/i);
+    assert.doesNotMatch(denied, /PENDING_ACTION_APPROVAL_REQUIRED|pending_action_queue/);
+
+    const malformed = String(await invokeWrapped(
+      { reachableBuiltinNames: new Set(['composio_execute_tool']) },
+      'composio_execute_tool',
+      JSON.stringify({
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: '{not-json',
+      }),
+      'malformed-nested-send',
+    ));
+    assert.match(malformed, /arg_validation/);
+    assert.match(malformed, /arguments is not valid JSON/i);
+    assert.doesNotMatch(malformed, /PENDING_ACTION_APPROVAL_REQUIRED|pending_action_queue/);
+
+    const targetlessArguments: Array<{ label: string; argumentsValue?: string | null }> = [
+      { label: 'omitted' },
+      { label: 'null', argumentsValue: null },
+      { label: 'blank', argumentsValue: '' },
+      { label: 'empty-object', argumentsValue: '{}' },
+      {
+        label: 'content-without-target',
+        argumentsValue: JSON.stringify({ subject: 'No destination', body: 'Must not be approved.' }),
+      },
+    ];
+    for (const candidate of targetlessArguments) {
+      const carrier: Record<string, unknown> = { tool_slug: 'GMAIL_SEND_EMAIL' };
+      if ('argumentsValue' in candidate) carrier.arguments = candidate.argumentsValue;
+      const targetless = JSON.parse(String(await invokeWrapped(
+        { reachableBuiltinNames: new Set(['composio_execute_tool']) },
+        'composio_execute_tool',
+        JSON.stringify(carrier),
+        `targetless-nested-send-${candidate.label}`,
+      ))) as { error?: string; reason?: string; detail?: string };
+      assert.equal(targetless.error, 'arg_validation', candidate.label);
+      assert.equal(targetless.reason, 'target_missing', candidate.label);
+      assert.match(targetless.detail ?? '', /recipient|target/i, candidate.label);
+    }
+
+    assert.equal(dispatched, 0);
+    assert.equal(
+      listEvents(sess.id, { types: ['guardrail_tripped'] })
+        .filter((event) => event.data.kind === 'pending_action_approval_required').length,
+      0,
+      'unvalidated carrier JSON never reaches an approval-routing gate',
+    );
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev;
   }
 });
 
@@ -539,6 +802,40 @@ test('an external MCP name (<server>__<tool>) passes authority and reaches MCP r
   // authority refusal.
   const out = String(await invokeCallTool('sess-mcp', 'fakeserver__fake_tool', '{"q":1}'));
   assert.ok(!out.includes('not_reachable'), 'MCP names must not be refused by the built-in authority check');
+});
+
+test('malformed outer call_tool envelopes consume budget and hit the loop ceiling before SDK validation', async () => {
+  const session = createSession({ kind: 'chat' });
+  const counter = new ToolCallsCounter(3);
+  const wrapped = wrapToolForHarness(
+    buildCallTool({ reachableBuiltinNames: new Set() }) as never,
+  ) as unknown as ToolLike;
+  const malformedInputs = [
+    '{',
+    JSON.stringify({ name: 'composio_execute_tool' }),
+    JSON.stringify({ args_json: '{}' }),
+  ];
+  await withHarnessRunContext(
+    { sessionId: session.id, counter },
+    async () => {
+      for (let index = 0; index < malformedInputs.length; index += 1) {
+        const output = String(await wrapped.invoke!(
+          { context: { sessionId: session.id } },
+          malformedInputs[index],
+          { toolCall: { callId: `malformed-outer-${index}` } },
+        ));
+        assert.match(output, /invalid|error/i);
+        assert.equal(counter.calls, index + 1, 'each SDK-rejected envelope consumes one attempt');
+      }
+      const bounded = String(await wrapped.invoke!(
+        { context: { sessionId: session.id } },
+        '{',
+        { toolCall: { callId: 'malformed-outer-over-limit' } },
+      ));
+      assert.match(bounded, /tool call refused by harness|tool.call limit|exceeded/i);
+      assert.equal(counter.calls, 3, 'the ceiling refuses without spending past its cap');
+    },
+  );
 });
 
 test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per deferred action', async () => {

@@ -48,6 +48,8 @@ import { schemaOnDemand } from './scenarios/schema-on-demand.js';
 import { cleanTurnIsolation } from './scenarios/clean-turn-isolation.js';
 import { socialStudioLifecycle } from './scenarios/social-studio-lifecycle.js';
 import { pendingActionExactOnce } from './scenarios/pending-action-exact-once.js';
+import { bookkeepingReceiptExactOnce } from './scenarios/bookkeeping-receipt-exact-once.js';
+import { workspaceTemporalHistory } from './scenarios/workspace-temporal-history.js';
 import type { BrainKind, FusionProofMode, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
 const DEFAULT_SCENARIOS: ScenarioDef[] = [
@@ -76,6 +78,8 @@ const SCENARIO_CATALOG: ScenarioDef[] = [
   fusionBoundedVerifier,
   socialStudioLifecycle,
   pendingActionExactOnce,
+  bookkeepingReceiptExactOnce,
+  workspaceTemporalHistory,
 ];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 

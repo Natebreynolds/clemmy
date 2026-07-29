@@ -37,6 +37,10 @@ import { resolveCallToolAlias } from './call-tool-alias.js';
 import { textResult } from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
+import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import {
+  validateIrreversibleSendPayload,
+} from '../runtime/harness/grounding-gate.js';
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
@@ -244,6 +248,64 @@ function jsonResult(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
 }
 
+interface CarrierValidationError {
+  detail: string;
+  reason?: 'arguments_missing' | 'target_missing';
+}
+
+function composioCarrierValidationError(target: string, args: unknown): CarrierValidationError | null {
+  if (target !== 'composio_execute_tool') return null;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    return { detail: 'composio_execute_tool requires a JSON object with tool_slug and arguments.' };
+  }
+  const record = args as Record<string, unknown>;
+  if (typeof record.tool_slug !== 'string' || !record.tool_slug.trim()) {
+    return { detail: 'composio_execute_tool requires a non-empty tool_slug.' };
+  }
+  const toolSlug = record.tool_slug.trim();
+  const rawArguments = record.arguments;
+  let parsedArguments: Record<string, unknown> | null = null;
+  if (rawArguments !== undefined && rawArguments !== null) {
+    if (typeof rawArguments !== 'string') {
+      return { detail: 'composio_execute_tool arguments must be a JSON-object string or null.' };
+    }
+    if (rawArguments.trim()) {
+      try {
+        const parsed = JSON.parse(rawArguments) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return { detail: 'composio_execute_tool arguments must decode to a JSON object.' };
+        }
+        parsedArguments = parsed as Record<string, unknown>;
+      } catch {
+        return { detail: 'composio_execute_tool arguments is not valid JSON.' };
+      }
+    }
+  }
+  // Approval is authority for one executable action, not permission to invent
+  // its destination later. A target-less send used to mint a card that the
+  // pending queue either rejected (missing/null/blank arguments) or accepted as
+  // an impossible `{}` payload. Validate the effect before approval conversion
+  // using the same generic target predicate as the provider gateway.
+  if (isIrreversibleSendSlug(toolSlug)) {
+    const validation = validateIrreversibleSendPayload(toolSlug, parsedArguments);
+    if (!validation.ok) {
+      return {
+        reason: validation.reason,
+        detail: validation.detail ?? `${toolSlug} has an invalid irreversible-send payload.`,
+      };
+    }
+  }
+  const connectionId = record.connected_account_id;
+  if (
+    connectionId !== undefined
+    && connectionId !== null
+    && (typeof connectionId !== 'string' || !connectionId.trim())
+  ) {
+    return { detail: 'composio_execute_tool connected_account_id must be a non-empty string or null.' };
+  }
+  return null;
+}
+
 export interface BuildCallToolOptions {
   /** Exact built-in names advertised as deferred on this turn. Omit for the
    * legacy full orchestrator surface (tests and non-scoped callers). */
@@ -367,6 +429,14 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       }
 
       // 3. Zod-validate BEFORE dispatch — zero side effects on failure.
+      const carrierValidationError = composioCarrierValidationError(target, resolvedArgs);
+      if (carrierValidationError) {
+        return refuse({
+          error: 'arg_validation',
+          ...(carrierValidationError.reason ? { reason: carrierValidationError.reason } : {}),
+          detail: carrierValidationError.detail,
+        });
+      }
       const local = await localSchemas();
       const schema = local.schemas.get(target);
       let dispatchArgs = resolvedArgs;
@@ -421,13 +491,18 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // prevents call_tool from resetting the safety budget on every wrapper
       // invocation; the fallback only serves direct/unit invocations without a
       // harness run context.
-      const counter = harnessRunContextStorage.getStore()?.counter ?? new ToolCallsCounter(1000);
+      const activeRunContext = harnessRunContextStorage.getStore();
+      const counter = activeRunContext?.counter ?? new ToolCallsCounter(1000);
       const outerCallId = details?.toolCall?.callId ?? details?.toolCall?.id;
       const out = await dispatchBatchItemTool(
         target,
         dispatchArgs,
         sessionId,
         counter,
+        // call_tool authority is turn-scoped and may not carry a batch/pending
+        // grant into another target. Approved durable calls store the validated
+        // INNER tool directly; a legacy/synthetic carrier must pass the inner
+        // send floor instead of widening outer authority.
         undefined,
         { accounting: 'transport_mirror', canonicalCallId: outerCallId },
         activeMcpScope,

@@ -31,11 +31,73 @@ import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
+import {
+  admitPendingActionCall,
+  verifyPendingComposioExecutionAuthority,
+} from './pending-action-admission.js';
+import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import type { ComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 
 const textResult = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 
 type BatchPlanRunner = typeof runBatchPlan;
 let batchPlanRunner: BatchPlanRunner = runBatchPlan;
+
+function admitComposioBatchPlan(
+  plan: BatchPlan,
+): ComposioCliDefaultAccountAuthority | null {
+  if (plan.tool !== 'composio_execute_tool') return null;
+  const slug = plan.composioSlug?.trim() ?? '';
+  if (plan.sideEffect === 'read' && classifyComposioSlugEffect(slug) !== 'read') {
+    throw new Error(
+      `${slug || 'This Composio action'} is write-shaped but the batch declares sideEffect:"read". `
+      + 'Correct the side effect before proposing it; no dispatch or approval was created.',
+    );
+  }
+  let authority: ComposioCliDefaultAccountAuthority | null = null;
+  for (const item of plan.items) {
+    const admitted = admitPendingActionCall(
+      'composio_execute_tool',
+      {
+        tool_slug: slug,
+        arguments: item.args,
+        connected_account_id: item.connectedAccountId ?? null,
+      },
+      { approvalIntent: 'request_now' },
+    );
+    if (!admitted.executionAuthority) continue;
+    if (authority && authority.grantId !== admitted.executionAuthority.grantId) {
+      throw new Error(
+        `The operator changed the ${admitted.executionAuthority.toolkit} CLI-default authority while this batch was being admitted. `
+        + 'Re-propose once so every item is pinned to one authority generation.',
+      );
+    }
+    authority = admitted.executionAuthority;
+  }
+  return authority;
+}
+
+function verifyBatchExecutionAuthority(
+  record: NonNullable<ReturnType<typeof getPendingAction>>,
+): string | null {
+  const authority = record.executionAuthority ?? null;
+  const plan = record.payload as Partial<BatchPlan> | null;
+  if (!plan || typeof plan !== 'object' || plan.tool !== 'composio_execute_tool') {
+    return authority
+      ? 'A Composio CLI-default capability was attached to a non-Composio batch.'
+      : null;
+  }
+  const slug = typeof plan.composioSlug === 'string' ? plan.composioSlug.trim() : '';
+  if (plan.sideEffect === 'read' && classifyComposioSlugEffect(slug) !== 'read') {
+    return `${slug || 'This Composio action'} is write-shaped but the stored batch declares sideEffect:"read".`;
+  }
+  const items = Array.isArray(plan.items) ? plan.items : [];
+  return verifyPendingComposioExecutionAuthority({
+    toolSlug: slug,
+    connectedAccountIds: items.map((item) => item?.connectedAccountId),
+    executionAuthority: authority,
+  });
+}
 
 function currentBatchRequestAttribution(): {
   sourceUserSeq?: number;
@@ -174,8 +236,10 @@ export function registerBatchTools(server: McpServer): void {
             sideEffect: rawPlan.sideEffect,
             objective: rawPlan.objective,
             items: parsedItems,
-            concurrency: rawPlan.concurrency ?? undefined,
-            haltAfterConsecutiveFailures: rawPlan.haltAfterConsecutiveFailures ?? undefined,
+            ...(rawPlan.concurrency == null ? {} : { concurrency: rawPlan.concurrency }),
+            ...(rawPlan.haltAfterConsecutiveFailures == null
+              ? {}
+              : { haltAfterConsecutiveFailures: rawPlan.haltAfterConsecutiveFailures }),
           };
           const prepared = prepareBatchPlanForExecution(plan);
           if (prepared.errors.length > 0) {
@@ -192,6 +256,14 @@ export function registerBatchTools(server: McpServer): void {
           const planForExecution = prepared.plan;
           const errors = validateBatchPlan(planForExecution);
           if (errors.length > 0) return textResult(`Plan invalid — DO NOT re-propose the identical plan; change what the errors name first:\n${errors.map((e) => `- ${e}`).join('\n')}`);
+          let executionAuthority: ComposioCliDefaultAccountAuthority | null;
+          try {
+            executionAuthority = admitComposioBatchPlan(planForExecution);
+          } catch (error) {
+            return textResult(
+              `Plan refused before certification: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
           const repairNote = prepared.repairs.length > 0
             ? ` Harness normalized ${prepared.repairs.length} batch item shape(s) before certification.`
             : '';
@@ -236,7 +308,11 @@ export function registerBatchTools(server: McpServer): void {
               + 'No approval or executable batch was created; retry once from the live task so the exact batch can own one approval card.',
             );
           }
-          const payloadHash = pendingActionPayloadHash('run_batch', planForExecution);
+          const payloadHash = pendingActionPayloadHash(
+            'run_batch',
+            planForExecution,
+            executionAuthority,
+          );
           let record = requestOwnedBatchRetry({
             sessionId,
             sourceUserSeq: attribution.sourceUserSeq,
@@ -253,7 +329,8 @@ export function registerBatchTools(server: McpServer): void {
               kind,
               toolName: 'run_batch',
               payload: planForExecution,
-              targetSummary: `${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,
+              executionAuthority,
+              targetSummary: `${executionAuthority ? `${executionAuthority.toolkit} CLI default — ${executionAuthority.label}; ` : ''}${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,
               preview: JSON.stringify(planForExecution.items[0]?.args ?? {}).slice(0, 400),
               risk: `Executes ${planForExecution.items.length} ${planForExecution.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`
                 + (unverified ? ' NOTE: automated certification was unavailable — this batch was not machine-verified, so review the payloads before approving.' : ''),
@@ -338,6 +415,7 @@ export function registerBatchTools(server: McpServer): void {
           const claim = claimPendingActionExecution(record.id, 'run_batch', {
             expectedSessionId: sessionId,
             requireResolvedHumanCard: pendingActionRequiresHumanApproval(record),
+            verifyExecutionAuthority: verifyBatchExecutionAuthority,
           });
           if (!claim.claimed || !claim.record || !claim.claimToken) {
             if (

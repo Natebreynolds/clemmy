@@ -15,6 +15,7 @@ import { BASE_DIR } from '../../config.js';
 // Deliberate ESM cycle (approval-registry imports this module): bindings are
 // only touched inside verifyApprovedCard at call time, never at module eval.
 import * as approvalRegistryForVerify from './approval-registry.js';
+import type { ComposioCliDefaultAccountAuthority } from '../../integrations/composio/cli-default-account-authority.js';
 
 export const PENDING_ACTIONS_DIR = path.join(BASE_DIR, 'pending-actions');
 
@@ -70,6 +71,9 @@ export interface PendingActionRecord {
   kind: PendingActionKind;
   toolName: string;
   payload: unknown;
+  /** Immutable non-payload execution capability selected by trusted queue
+   * admission. Models cannot author this field. */
+  executionAuthority?: ComposioCliDefaultAccountAuthority | null;
   payloadHash: string;
   idempotencyKey: string;
   targetSummary: string;
@@ -100,6 +104,7 @@ export interface QueuePendingActionInput {
   kind: PendingActionKind;
   toolName: string;
   payload: unknown;
+  executionAuthority?: ComposioCliDefaultAccountAuthority | null;
   targetSummary?: string | null;
   preview?: string | null;
   risk?: string | null;
@@ -262,6 +267,7 @@ function safeReadRecord(file: string): PendingActionRecord | null {
         parsed.approvalEvidence = parsed.approvalEvidence ?? null;
       }
     }
+    parsed.executionAuthority = parsed.executionAuthority ?? null;
     return parsed;
   } catch {
     return null;
@@ -270,7 +276,8 @@ function safeReadRecord(file: string): PendingActionRecord | null {
 
 export function queuePendingAction(input: QueuePendingActionInput): PendingActionRecord {
   const now = new Date().toISOString();
-  const payloadHash = shortHash({ toolName: input.toolName, payload: input.payload });
+  const executionAuthority = input.executionAuthority ?? null;
+  const payloadHash = pendingActionPayloadHash(input.toolName, input.payload, executionAuthority);
   const idempotencyKey = shortHash({
     kind: input.kind,
     toolName: input.toolName,
@@ -284,6 +291,7 @@ export function queuePendingAction(input: QueuePendingActionInput): PendingActio
     kind: input.kind,
     toolName: cleanLine(input.toolName, 'unknown_tool', 160),
     payload: input.payload,
+    executionAuthority,
     payloadHash,
     idempotencyKey,
     targetSummary: cleanLine(input.targetSummary, 'target not specified', 1000),
@@ -360,17 +368,39 @@ const PENDING_ACTION_TRANSITIONS: Readonly<Record<PendingActionStatus, ReadonlyS
 
 /** Compute the payloadHash the way queuePendingAction does (stable over key
  *  order) so callers can dedup BEFORE minting. */
-export function pendingActionPayloadHash(toolName: string, payload: unknown): string {
-  return shortHash({ toolName, payload });
+export function pendingActionPayloadHash(
+  toolName: string,
+  payload: unknown,
+  executionAuthority: ComposioCliDefaultAccountAuthority | null = null,
+): string {
+  return executionAuthority
+    ? shortHash({ toolName, payload, executionAuthority })
+    : shortHash({ toolName, payload });
 }
 
 /** An OPEN pending action for the exact same tool + payload, if one already
  *  exists — so a repeated judge-failure on the same call (a batch loop) reuses
  *  the one card instead of minting a stack of duplicates. */
-export function findOpenPendingActionByPayload(toolName: string, payload: unknown): PendingActionRecord | null {
-  const hash = pendingActionPayloadHash(toolName, payload);
+export function findOpenPendingActionByPayload(
+  toolName: string,
+  payload: unknown,
+  options: {
+    sessionId?: string | null;
+    executionAuthority?: ComposioCliDefaultAccountAuthority | null;
+  } = {},
+): PendingActionRecord | null {
+  const hash = pendingActionPayloadHash(
+    toolName,
+    payload,
+    options.executionAuthority ?? null,
+  );
+  const sessionId = options.sessionId?.trim() || null;
   return listPendingActions({ status: 'all', limit: 100 })
-    .find((record) => record.payloadHash === hash && OPEN_PENDING_STATUSES.has(record.status)) ?? null;
+    .find((record) => (
+      record.payloadHash === hash
+      && OPEN_PENDING_STATUSES.has(record.status)
+      && (!sessionId || record.sessionId === sessionId)
+    )) ?? null;
 }
 
 function updatePendingAction(
@@ -467,6 +497,10 @@ export interface PendingActionExecutionClaimOptions {
   /** Irreversible/unknown external writes must be backed by one exact resolved
    * card whose immutable snapshot matches this record. */
   requireResolvedHumanCard?: boolean;
+  /** Trusted subsystem-specific capability check, evaluated under the same
+   * lock as the approved→executing claim. A non-empty reason terminally fails
+   * the action before any provider boundary. */
+  verifyExecutionAuthority?: (record: PendingActionRecord) => string | null;
 }
 
 function failPendingActionClaimIntegrity(
@@ -538,12 +572,18 @@ function verifyResolvedHumanCardAuthority(record: PendingActionRecord): string |
   ) {
     return 'The resolved approval card does not pin this pending action id, tool, and payload hash.';
   }
-  const pinnedHash = pendingActionPayloadHash(String(pinned.toolName), pinned.payload);
+  const pinnedExecutionAuthority = pinned.executionAuthority ?? null;
+  const recordExecutionAuthority = record.executionAuthority ?? null;
   if (
-    pinnedHash !== pinned.payloadHash
+    pendingActionPayloadHash(
+      String(pinned.toolName),
+      pinned.payload,
+      pinnedExecutionAuthority as ComposioCliDefaultAccountAuthority | null,
+    ) !== pinned.payloadHash
     || stableStringify(pinned.payload) !== stableStringify(record.payload)
+    || stableStringify(pinnedExecutionAuthority) !== stableStringify(recordExecutionAuthority)
   ) {
-    return 'The resolved approval card payload snapshot does not match the stored action payload.';
+    return 'The resolved approval card payload or execution-authority snapshot does not match the stored action.';
   }
   return null;
 }
@@ -578,7 +618,11 @@ export function claimPendingActionExecution(
         record,
       } satisfies PendingActionExecutionClaim;
     }
-    const recomputedPayloadHash = pendingActionPayloadHash(record.toolName, record.payload);
+    const recomputedPayloadHash = pendingActionPayloadHash(
+      record.toolName,
+      record.payload,
+      record.executionAuthority ?? null,
+    );
     if (recomputedPayloadHash !== record.payloadHash) {
       return failPendingActionClaimIntegrity(
         record,
@@ -597,6 +641,15 @@ export function claimPendingActionExecution(
           `Pending action ${record.id} failed its pre-dispatch approval-authority check: ${authorityError}`,
         );
       }
+    }
+    const executionAuthorityError = options.verifyExecutionAuthority?.(record) ?? null;
+    if (executionAuthorityError) {
+      return failPendingActionClaimIntegrity(
+        record,
+        actor,
+        'approval_authority_invalid',
+        `Pending action ${record.id} failed its pre-dispatch execution-authority check: ${executionAuthorityError}`,
+      );
     }
     const now = new Date().toISOString();
     const claimedBy = cleanLine(actor, 'pending-action-executor', 120);
@@ -769,6 +822,11 @@ export function formatPendingAction(record: PendingActionRecord, opts: { verbose
     `Idempotency key: ${record.idempotencyKey}`,
   ];
   if (record.approvalId) lines.push(`Approval: ${record.approvalId}`);
+  if (record.executionAuthority) {
+    lines.push(
+      `CLI default authority: ${record.executionAuthority.toolkit} — ${record.executionAuthority.label}`,
+    );
+  }
   if (opts.verbose) {
     lines.push(
       `Summary: ${record.summary}`,

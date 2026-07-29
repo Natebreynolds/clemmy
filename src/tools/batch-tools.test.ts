@@ -13,6 +13,7 @@ import os from 'node:os';
 // Isolation FIRST (test-hygiene rule): this suite writes pending-action records.
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-batch-tools-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test, after } from 'node:test';
@@ -28,6 +29,10 @@ const {
   listPendingActions,
   queuePendingAction,
 } = await import('../runtime/harness/pending-actions.js');
+const {
+  grantComposioCliDefaultAccountAuthority,
+  revokeComposioCliDefaultAccountAuthority,
+} = await import('../integrations/composio/cli-default-account-authority.js');
 const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
@@ -200,6 +205,194 @@ test('run_batch propose: a reversible Sheets write still emits an automatic form
   assert.ok(edge);
   assert.equal(edge.data.approvalRequired, true);
   assert.equal(edge.data.autoMaterialize, true);
+});
+
+test('run_batch Composio admission refuses an unbound SDK social publish and a CLI account selector before minting a card', async () => {
+  _setCertifyJudgeForTests(async () => ({
+    allow: true,
+    reason: 'payloads are exact',
+    concerns: [],
+    judged: true,
+  }));
+  const handler = batchHandler();
+  const propose = async (
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResult> => {
+    createSession({ id: sessionId, kind: 'chat' });
+    const source = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Publish this reviewed social post.' },
+    });
+    return withToolOutputContext(
+      { sessionId },
+      () => withHarnessRunContext(
+        {
+          sessionId,
+          sourceUserSeq: source.seq,
+          counter: new ToolCallsCounter(100),
+        },
+        () => handler({
+          action: 'propose',
+          plan: {
+            tool: 'composio_execute_tool',
+            composioSlug: 'INSTAGRAM_CREATE_POST',
+            sideEffect: 'send',
+            objective: 'publish the reviewed launch post to Instagram',
+            items: [{ id: 'launch-post', args: JSON.stringify(args) }],
+          },
+        }),
+      ),
+    ) as Promise<ToolResult>;
+  };
+
+  const sdkUnbound = await propose('sess-batch-sdk-unbound-social', {
+    caption: 'Launch day',
+    image_url: 'https://assets.example/launch.png',
+  });
+  assert.match(sdkUnbound.content[0].text, /connected_account_id|immutable account destination|exact destination/i);
+  assert.equal(listPendingActions({ sessionId: 'sess-batch-sdk-unbound-social', status: 'all' }).length, 0);
+
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  try {
+    const cliTargeted = await propose('sess-batch-cli-targeted-social', {
+      tool_slug: 'INSTAGRAM_CREATE_POST',
+      arguments: JSON.stringify({
+        caption: 'Launch day',
+        image_url: 'https://assets.example/launch.png',
+      }),
+      connected_account_id: 'ca_instagram_brand',
+    });
+    assert.match(cliTargeted.content[0].text, /CLI cannot honor account-targeted selectors|connected_account_id/i);
+    assert.equal(listPendingActions({ sessionId: 'sess-batch-cli-targeted-social', status: 'all' }).length, 0);
+  } finally {
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
+});
+
+test('run_batch snapshots one named CLI-default authority; rotation and revocation invalidate approved batches before dispatch', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  _setCertifyJudgeForTests(async () => ({
+    allow: true,
+    reason: 'payloads are exact',
+    concerns: [],
+    judged: true,
+  }));
+  const handler = batchHandler();
+  const firstAuthority = await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'instagram',
+    label: 'Brand Instagram A',
+    grantedBy: 'test',
+  });
+
+  const propose = async (sessionId: string, caption: string) => {
+    createSession({ id: sessionId, kind: 'chat' });
+    const source = appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: `Publish the reviewed post: ${caption}` },
+    });
+    const result = await withToolOutputContext(
+      { sessionId },
+      () => withHarnessRunContext(
+        {
+          sessionId,
+          sourceUserSeq: source.seq,
+          counter: new ToolCallsCounter(100),
+        },
+        () => handler({
+          action: 'propose',
+          plan: {
+            tool: 'composio_execute_tool',
+            composioSlug: 'INSTAGRAM_CREATE_POST',
+            sideEffect: 'send',
+            objective: 'publish the reviewed launch post to Instagram',
+            items: [{
+              id: caption,
+              args: JSON.stringify({
+                caption,
+                image_url: `https://assets.example/${caption}.png`,
+              }),
+            }],
+          },
+        }),
+      ),
+    ) as ToolResult;
+    const [record] = listPendingActions({ sessionId, status: 'all' });
+    assert.ok(record, result.content[0].text);
+    return record;
+  };
+
+  let runCount = 0;
+  _setBatchPlanRunnerForTests(async (plan, sessionId) => {
+    runCount += 1;
+    return {
+      batchId: `batch-cli-default-${runCount}`,
+      sessionId,
+      tool: plan.tool,
+      composioSlug: plan.composioSlug,
+      sideEffect: plan.sideEffect,
+      objective: plan.objective,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      total: plan.items.length,
+      succeeded: plan.items.length,
+      failed: 0,
+      halted: false,
+      outcomes: plan.items.map((item) => ({ id: item.id, ok: true, attempts: 1, ms: 1 })),
+    };
+  });
+
+  try {
+    const executable = await propose('sess-batch-cli-authorized', 'launch-a');
+    assert.deepEqual(executable.executionAuthority, firstAuthority);
+    assert.match(executable.targetSummary, /Brand Instagram A/);
+    approveExactPendingAction(executable, 'approve named CLI-default batch');
+    const executed = await withToolOutputContext(
+      { sessionId: executable.sessionId! },
+      () => handler({ action: 'execute', pending_action_id: executable.id }),
+    ) as ToolResult;
+    assert.match(executed.content[0].text, /batch-cli-default-1/);
+    assert.equal(runCount, 1);
+
+    const staleByRotation = await propose('sess-batch-cli-rotated', 'launch-b');
+    approveExactPendingAction(staleByRotation, 'approve batch before account-authority change');
+    const changedAuthority = await grantComposioCliDefaultAccountAuthority({
+      toolkit: 'instagram',
+      label: 'Brand Instagram B',
+      grantedBy: 'test',
+    });
+    const rotated = await withToolOutputContext(
+      { sessionId: staleByRotation.sessionId! },
+      () => handler({ action: 'execute', pending_action_id: staleByRotation.id }),
+    ) as ToolResult;
+    assert.match(rotated.content[0].text, /operator changed|execution-authority|approval-authority/i);
+    assert.equal(runCount, 1, 'authority rotation blocks before the batch runner');
+    assert.equal(getPendingAction(staleByRotation.id)?.status, 'failed');
+
+    const staleByRevocation = await propose('sess-batch-cli-revoked', 'launch-c');
+    assert.deepEqual(staleByRevocation.executionAuthority, changedAuthority);
+    approveExactPendingAction(staleByRevocation, 'approve batch before authority revocation');
+    await revokeComposioCliDefaultAccountAuthority('instagram');
+    const revoked = await withToolOutputContext(
+      { sessionId: staleByRevocation.sessionId! },
+      () => handler({ action: 'execute', pending_action_id: staleByRevocation.id }),
+    ) as ToolResult;
+    assert.match(revoked.content[0].text, /revoked|execution-authority|approval-authority/i);
+    assert.equal(runCount, 1, 'authority revocation blocks before the batch runner');
+    assert.equal(getPendingAction(staleByRevocation.id)?.status, 'failed');
+  } finally {
+    await revokeComposioCliDefaultAccountAuthority('instagram');
+    _setBatchPlanRunnerForTests(null);
+    process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
+  }
 });
 
 test('run_batch execute atomically consumes approval: concurrent calls start one batch and retries stay inert', async () => {

@@ -58,7 +58,32 @@ export function isGroundingGateEnabled(): boolean {
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 /** Arg keys whose values identify the write's TARGET. Generic on purpose —
  *  covers composio email/CRM shapes and most custom tools. */
-const TARGET_KEY_RE = /(^|_)(to|to_email|to_name|recipient|recipients|email|contact_id|record_id|lead_id|account_id|channel|phone|to_number)$/i;
+const TARGET_KEY_RE = /(^|_)(to|to_email|to_name|recipient|recipients|recipient_id|attendee|attendees|invitee|invitees|participant|participants|participant_id|email|contact_id|record_id|lead_id|account_id|channel|channel_id|conversation_id|chat_id|room_id|thread_id|destination|destination_id|target|target_id|target_user_id|recipient_user_id|to_user_id|peer_id|phone|phone_number|to_number)$/i;
+/**
+ * Provider/sender context often ends in a recipient-looking suffix
+ * (`ownerEmail`, `pageAccountId`). Those fields identify the authenticated
+ * actor or source resource, not who receives the write. Keep this list
+ * semantic and prefix-anchored so a real `targetUserId` remains admissible.
+ */
+const SEND_TARGET_CONTEXT_KEY_RE =
+  /^(?:connected_account_id|connection_id|connector_id|user_id|account_id|owner(?:_|$)|account(?:_|$)|profile(?:_|$)|authenticated(?:_user)?(?:_|$)|current(?:_user)?(?:_|$)|source(?:_|$)|mailbox(?:_|$)|login(?:_|$)|actor(?:_|$)|user(?:_|$)|provider(?:_|$)|business_account(?:_|$)|social_account(?:_|$)|ad_account(?:_|$)|organization_account(?:_|$)|tenant_account(?:_|$)|page_account_id|workspace_account_id|sender(?:_|$)|from(?:_|$)|reply_to(?:_|$)|return_path(?:_|$)|on_behalf_of(?:_|$))/i;
+
+export function isMeaningfulPayloadValue(value: unknown, depth = 0): boolean {
+  if (value === null || value === undefined || depth > 3) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (typeof value === 'number') return Number.isFinite(value) && value !== 0;
+  if (typeof value === 'bigint') return value !== 0n;
+  if (Array.isArray(value)) {
+    return value.some((entry) => isMeaningfulPayloadValue(entry, depth + 1));
+  }
+  if (typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>)
+      .some((entry) => isMeaningfulPayloadValue(entry, depth + 1));
+  }
+  // Booleans, symbols, and functions cannot identify a provider target or
+  // constitute broadcast content.
+  return false;
+}
 
 /**
  * Does this call carry a resolvable recipient/TARGET FIELD? Generic on purpose —
@@ -72,9 +97,13 @@ const TARGET_KEY_RE = /(^|_)(to|to_email|to_name|recipient|recipients|email|cont
 export function argsHaveSendTarget(rawArgs: unknown): boolean {
   const hasTargetField = (obj: Record<string, unknown>): boolean => {
     for (const [key, value] of Object.entries(obj)) {
-      if (value === null || value === undefined || value === '') continue;
-      if (Array.isArray(value) && value.length === 0) continue;
-      if (TARGET_KEY_RE.test(key)) return true;
+      const normalizedKey = normalizedArgKey(key);
+      if (
+        !SENDER_EMAIL_KEY_RE.test(normalizedKey)
+        && !SEND_TARGET_CONTEXT_KEY_RE.test(normalizedKey)
+        && TARGET_KEY_RE.test(normalizedKey)
+        && isMeaningfulPayloadValue(value)
+      ) return true;
     }
     return false;
   };
@@ -89,6 +118,85 @@ export function argsHaveSendTarget(rawArgs: unknown): boolean {
     } catch { /* not JSON — no nested target */ }
   }
   return false;
+}
+
+/**
+ * Whether an irreversible communication must name a recipient/channel in its
+ * payload. Account-scoped social publishing is addressed by the authenticated
+ * owner selected at the gateway, so caption/media args are complete without a
+ * separate recipient. Directed social actions (DM, reply, comment, etc.) keep
+ * the same explicit-target floor as email/chat/SMS.
+ *
+ * This classifier is deliberately pure and conservative: unknown providers and
+ * unfamiliar shapes require a target. Callers should first establish that the
+ * slug is an irreversible send, then use this to decide whether
+ * argsHaveSendTarget is required.
+ */
+export function irreversibleSendRequiresExplicitTarget(toolSlug: string): boolean {
+  const normalized = toolSlug
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[-\s/]+/g, '_')
+    .toUpperCase();
+  if (
+    !/^(?:INSTAGRAM|LINKEDIN|TWITTER|X|FACEBOOK|TIKTOK|THREADS|PINTEREST|REDDIT|BLUESKY|MASTODON|YOUTUBE)_/.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  const tokens = normalized.split(/[_.]+/).filter(Boolean);
+  const directed = new Set([
+    'DM', 'MESSAGE', 'MESSAGES', 'EMAIL', 'SMS', 'CHAT', 'CALL', 'DIAL',
+    'REPLY', 'FORWARD', 'COMMENT', 'COMMENTS', 'MENTION',
+    'INVITE', 'INVITES', 'INVITATION',
+  ]);
+  if (tokens.some((token) => directed.has(token))) return true;
+  const accountScopedBroadcast = tokens.some((token) =>
+    [
+      'BROADCAST', 'PUBLISH', 'POST', 'POSTS', 'REEL', 'REELS', 'STORY', 'STORIES',
+      'TWEET', 'MEDIA', 'VIDEO', 'VIDEOS', 'SHORT', 'SHORTS', 'PIN', 'PINS',
+      'ARTICLE', 'ARTICLES',
+    ].includes(token));
+  return !accountScopedBroadcast;
+}
+
+export interface IrreversibleSendPayloadValidation {
+  ok: boolean;
+  reason?: 'arguments_missing' | 'target_missing';
+  detail?: string;
+}
+
+/**
+ * One provider-agnostic admission contract shared by deferred carriers, the
+ * pending-action queue, and the Composio gateway. Directed sends must have a
+ * resolvable recipient; account-scoped broadcasts instead need a meaningful
+ * provider payload because their positively selected account is the target.
+ *
+ * This function is pure and never executes a provider. Callers invoke it only
+ * after classifying the slug as an irreversible send.
+ */
+export function validateIrreversibleSendPayload(
+  toolSlug: string,
+  args: unknown,
+): IrreversibleSendPayloadValidation {
+  const requiresTarget = irreversibleSendRequiresExplicitTarget(toolSlug);
+  if (requiresTarget && !argsHaveSendTarget(args)) {
+    return {
+      ok: false,
+      reason: 'target_missing',
+      detail:
+        `${toolSlug} requires non-empty arguments with a resolvable recipient/target `
+        + 'before approval or dispatch.',
+    };
+  }
+  if (!requiresTarget && !isMeaningfulPayloadValue(args)) {
+    return {
+      ok: false,
+      reason: 'arguments_missing',
+      detail: `${toolSlug} requires a non-empty meaningful arguments object before approval or dispatch.`,
+    };
+  }
+  return { ok: true };
 }
 
 /**

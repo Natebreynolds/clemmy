@@ -16,7 +16,14 @@ import { tool } from '@openai/agents';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
-import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import {
+  wrapToolForHarness,
+  withHarnessRunContext,
+  ToolCallsCounter,
+  ToolCallsLimitExceeded,
+  harnessRunContextStorage,
+  pendingActionApprovalRequiredError,
+} from '../runtime/harness/brackets.js';
 import { maybeBounceMassExecution } from '../agents/fanout-alignment-gate.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
@@ -586,18 +593,21 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
   // SEND FLOOR (2026-07-09 bypass hunt, Hole 1): call_tool / code-mode dispatch
   // by calling wrapped.invoke() DIRECTLY — bypassing the SDK's per-tool
   // needsApproval hook. So an irreversible SEND reached this way never parks
-  // for a card. Refuse it here unless it rides an approved certified batch:
-  // irreversible sends must go through run_batch (the deterministic, approved
-  // primitive) or a first-class call (which hits the SDK approval hook). Reads
-  // and reversible writes are unaffected.
+  // for a card. Refuse it here unless it rides an approved certified payload,
+  // and point the model at the typed pending-action graph so one exact card can
+  // authorize one exact call. Reads and reversible writes are unaffected.
   if (!certifiedBatch) {
     const { classifyExternalWrite } = await import('../runtime/harness/confirm-first-gate.js');
     const shape = classifyExternalWrite(method, args);
     if (shape.mutating && shape.irreversible) {
-      throw new Error(
-        `SEND_REQUIRES_APPROVAL: "${method}" is an irreversible external send and cannot be dispatched through call_tool/code-mode (which bypass the approval card). `
-        + 'Use run_batch to send (propose → the user approves the card → it executes), or call the tool first-class so it gets its approval prompt.',
-      );
+      // This floor runs before wrapToolForHarness, so it must account for the
+      // refused attempt itself. Otherwise repeated nested sends can request the
+      // same recovery forever while consuming zero of the ambient turn budget.
+      if (counter) {
+        if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
+        counter.increment();
+      }
+      throw pendingActionApprovalRequiredError(method, args);
     }
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;

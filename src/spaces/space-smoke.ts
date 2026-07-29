@@ -67,7 +67,7 @@ export async function runSpaceCreationSmoke(slug: string): Promise<SpaceSmokeRes
   for (const source of rec.dataSources) {
     let results;
     try {
-      results = await refreshSpaceData(slug, source.id);
+      results = await refreshSpaceData(slug, source.id, { cause: 'creation_smoke' });
     } catch (err) {
       failed.push({ id: source.id, error: err instanceof Error ? err.message : String(err) });
       continue;

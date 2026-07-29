@@ -13,7 +13,7 @@
  *   - CLI/SDK selection: a pinned owner can never dispatch via the CLI
  *     (the CLI cannot target a specific connected account)
  */
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -25,21 +25,33 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'gateway-test-machine\
 // "COMPOSIO_API_KEY is not configured" — so a clean typed block RETURNING
 // (not throwing) is itself proof of zero dispatch.
 delete process.env.COMPOSIO_API_KEY;
+// Resolver tests exercise SDK account-routing semantics unless a test
+// explicitly switches to the CLI-only lane.
+process.env.COMPOSIO_BACKEND = 'sdk';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { __test__ } = await import('../integrations/composio/client.js');
+const {
+  __test__,
+  bustComposioDashboardCaches,
+  resetComposioClient,
+} = await import('../integrations/composio/client.js');
 const {
   resolveComposioDispatch,
   dispatchComposioTool,
   composioDispatchLaneAvailable,
+  composioCliCanResolveUnlistedConnectedAccount,
   __gatewayTest__,
 } = await import('./composio-tools.js');
-const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
+const { deleteToolChoice, rememberToolChoice } = await import('../memory/tool-choice-store.js');
 const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { rememberAccountAlias, resolveAccountAlias } = await import('../memory/account-alias-store.js');
 const { recordIdentityProbe } = await import('../integrations/composio/identity-cache.js');
+const {
+  grantComposioCliDefaultAccountAuthority,
+  revokeComposioCliDefaultAccountAuthority,
+} = await import('../integrations/composio/cli-default-account-authority.js');
 
 type LoaderItem = Record<string, unknown>;
 function account(id: string, toolkit: string, email?: string, status = 'ACTIVE'): LoaderItem {
@@ -158,13 +170,51 @@ test('breaker is NARROW: fires only when the snapshot confirms zero usable conne
   __gatewayTest__.clearReconnectBreaker(sid, 'NOTION_SEARCH_PAGES');
 });
 
-test('a managed toolkit with zero usable connections blocks before its first dispatch', async () => {
-  setAccounts([]);
-  const out = await resolveComposioDispatch('GOOGLESHEETS_BATCH_UPDATE', {}, undefined, {});
+test('multiword toolkit semantics keep OneDrive distinct in breaker, ask, and guardrail evidence', async () => {
+  const sid = createSession({ kind: 'chat' }).id;
+  __gatewayTest__.recordReconnectBreaker(sid, 'ONE_DRIVE_LIST_FILES');
+  assert.equal(__gatewayTest__.reconnectBreakerTripped(sid, 'ONE_DRIVE_UPLOAD_FILE'), true);
+  assert.equal(
+    __gatewayTest__.reconnectBreakerTripped(sid, 'ONE_NOTE_LIST_PAGES'),
+    false,
+    'one_drive and one_note cannot collide under a generic "one" key',
+  );
+  __gatewayTest__.clearReconnectBreaker(sid, 'ONE_DRIVE_LIST_FILES');
+
+  setAccounts([
+    account('ca_one_drive_work', 'one_drive', 'work@drive.example'),
+    account('ca_one_drive_home', 'one_drive', 'home@drive.example'),
+  ]);
+  const out = await resolveComposioDispatch(
+    'ONE_DRIVE_LIST_FILES',
+    {},
+    undefined,
+    { sessionId: sid },
+  );
   assert.equal(out.ok, false);
   if (!out.ok) {
-    assert.equal(out.reason, 'not-connected');
-    assert.match(out.message, /No provider dispatch was started/);
+    assert.equal(out.reason, 'ambiguous-account');
+    assert.equal(out.toolkit, 'one_drive');
+    assert.match(out.message, /NEEDS-YOUR-CHOICE \(one_drive\)/);
+  }
+  const [event] = listEvents(sid, { types: ['guardrail_tripped'] });
+  assert.equal(event?.data.toolkit, 'one_drive');
+});
+
+test('an SDK-managed toolkit with zero usable connections blocks before its first dispatch', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'sdk';
+  setAccounts([]);
+  try {
+    const out = await resolveComposioDispatch('GOOGLESHEETS_BATCH_UPDATE', {}, undefined, {});
+    assert.equal(out.ok, false);
+    if (!out.ok) {
+      assert.equal(out.reason, 'not-connected');
+      assert.match(out.message, /No provider dispatch was started/);
+    }
+  } finally {
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
   }
 });
 
@@ -177,6 +227,357 @@ test('dispatch-lane availability distinguishes SDK, CLI, and AUTO auth without g
   assert.equal(composioDispatchLaneAvailable({ executionBackend: 'cli', apiKeyPresent: false, cli: liveCli }), true);
   assert.equal(composioDispatchLaneAvailable({ executionBackend: 'auto', apiKeyPresent: false, cli: deadCli }), false);
   assert.equal(composioDispatchLaneAvailable({ executionBackend: 'auto', apiKeyPresent: true, cli: deadCli }), true);
+});
+
+test('an empty SDK snapshot makes provider-default resolution eligible only on a positively authenticated CLI lane', () => {
+  const deadCli = { installed: true, authenticated: false, authStatus: 'error' as const };
+  const unknownCli = { installed: true, authenticated: false, authStatus: 'unknown' as const };
+  const liveCli = { installed: true, authenticated: true, authStatus: 'ok' as const };
+
+  assert.equal(
+    composioCliCanResolveUnlistedConnectedAccount({
+      executionBackend: 'auto',
+      apiKeyPresent: false,
+      cli: liveCli,
+    }),
+    true,
+    'AUTO without an SDK key is eligible for CLI provider-default resolution',
+  );
+  assert.equal(
+    composioCliCanResolveUnlistedConnectedAccount({
+      executionBackend: 'cli',
+      apiKeyPresent: true,
+      cli: liveCli,
+    }),
+    true,
+    'an explicit CLI backend remains provider-default eligible even when an unused SDK key exists',
+  );
+  assert.equal(
+    composioCliCanResolveUnlistedConnectedAccount({
+      executionBackend: 'auto',
+      apiKeyPresent: true,
+      cli: liveCli,
+    }),
+    false,
+    'AUTO with an SDK key treats the SDK account snapshot as authoritative',
+  );
+  assert.equal(
+    composioCliCanResolveUnlistedConnectedAccount({
+      executionBackend: 'sdk',
+      apiKeyPresent: false,
+      cli: liveCli,
+    }),
+    false,
+  );
+  assert.equal(
+    composioCliCanResolveUnlistedConnectedAccount({
+      executionBackend: 'cli',
+      apiKeyPresent: false,
+      cli: deadCli,
+    }),
+    false,
+  );
+  assert.equal(
+    composioCliCanResolveUnlistedConnectedAccount({
+      executionBackend: 'cli',
+      apiKeyPresent: false,
+      cli: unknownCli,
+    }),
+    false,
+    'unknown auth may probe no-auth tools but cannot authorize account-bearing writes',
+  );
+});
+
+test('CLI-only reads remain lightweight, writes require durable default-account authority, and account selectors fail closed', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  setAccounts([]);
+  __gatewayTest__.setRuntimeStatusLoader(async () => ({
+    enabled: true,
+    apiKeyPresent: false,
+    userId: 'cli-only-test-user',
+    executionBackend: 'cli',
+    cli: {
+      installed: true,
+      path: '/test/composio',
+      version: 'test',
+      authenticated: true,
+      authStatus: 'ok',
+      authMessage: 'cli-only-test-user',
+    },
+  }));
+  try {
+    const knownRead = await resolveComposioDispatch('AIRTABLE_LIST_RECORDS', {}, undefined, {});
+    const unknownRead = await resolveComposioDispatch('NEWCRM_LIST_RECORDS', {}, undefined, {});
+    const unknownWrite = await resolveComposioDispatch(
+      'NEWCRM_CREATE_RECORD',
+      { fields: { Name: 'Proof' } },
+      undefined,
+      {},
+    );
+    for (const out of [knownRead, unknownRead]) {
+      assert.equal(out.ok, true, 'an authenticated CLI default remains a usable lightweight read lane');
+      if (out.ok) {
+        assert.equal(out.connectionId, undefined);
+        assert.ok(out.notes.some((note) => /read through the authenticated Composio CLI/i.test(note)));
+      }
+    }
+    assert.equal(unknownWrite.ok, false, 'CLI whoami alone cannot establish write authority');
+    if (!unknownWrite.ok) {
+      assert.equal(unknownWrite.reason, 'ambiguous-account');
+      assert.match(unknownWrite.message, /authorize.*CLI default in Connect/i);
+      assert.match(unknownWrite.message, /Reads remain available/i);
+      assert.match(unknownWrite.message, /No provider dispatch was started/i);
+    }
+
+    const explicitlyPinnedWrite = await resolveComposioDispatch(
+      'NOTION_CREATE_PAGE',
+      { parent_id: 'page-proof', title: 'Proof' },
+      'ca_cli_explicit',
+      {},
+    );
+    assert.equal(explicitlyPinnedWrite.ok, false, 'CLI execute cannot honor an explicit connected account pin');
+    if (!explicitlyPinnedWrite.ok) {
+      assert.match(explicitlyPinnedWrite.message, /cannot honor connected_account_id/i);
+      assert.match(explicitlyPinnedWrite.message, /COMPOSIO_BACKEND=sdk/i);
+      assert.match(explicitlyPinnedWrite.message, /No provider dispatch was started/i);
+    }
+
+    // Even a lone row in an SDK inventory does not make it routable by the CLI.
+    // Without deliberate default-account authority, it remains a typed block.
+    setAccounts([account('ca_cli_single', 'airtable', 'only@example.test')]);
+    const singleAccountWrite = await resolveComposioDispatch(
+      'AIRTABLE_CREATE_RECORD',
+      { base_id: 'app-proof', table_id: 'tbl-proof', fields: { Name: 'Proof' } },
+      undefined,
+      {},
+    );
+    assert.equal(singleAccountWrite.ok, false, 'a single SDK inventory owner is not CLI routing authority');
+    if (!singleAccountWrite.ok) {
+      assert.match(singleAccountWrite.message, /authorize.*CLI default in Connect/i);
+      assert.match(singleAccountWrite.message, /No provider dispatch was started/i);
+    }
+  } finally {
+    __gatewayTest__.setRuntimeStatusLoader(null);
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
+});
+
+test('CLI account-specific blocks name preferred/remembered identity and a concrete recovery', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  setAccounts([]);
+  __gatewayTest__.setRuntimeStatusLoader(async () => ({
+    enabled: true,
+    apiKeyPresent: false,
+    userId: 'cli-account-copy-user',
+    executionBackend: 'cli',
+    cli: {
+      installed: true,
+      path: '/test/composio',
+      version: 'test',
+      authenticated: true,
+      authStatus: 'ok',
+      authMessage: 'cli-account-copy-user',
+    },
+  }));
+  try {
+    const preferred = await resolveComposioDispatch(
+      'ONE_DRIVE_LIST_FILES',
+      {},
+      undefined,
+      { preferredIdentity: 'finance@drive.example' },
+    );
+    assert.equal(preferred.ok, false);
+    if (!preferred.ok) {
+      assert.match(preferred.message, /finance@drive\.example/);
+      assert.match(preferred.message, /preferred/i);
+      assert.match(preferred.message, /clear|retry without/i);
+      assert.match(preferred.message, /COMPOSIO_BACKEND=sdk/i);
+    }
+
+    const rememberedIntent = 'list files from remembered one drive';
+    rememberToolChoice({
+      intent: rememberedIntent,
+      choice: {
+        kind: 'composio',
+        identifier: 'ONE_DRIVE_LIST_FILES',
+        accountIdentity: 'archive@drive.example',
+      },
+    });
+    const remembered = await resolveComposioDispatch(
+      'ONE_DRIVE_LIST_FILES',
+      {},
+      undefined,
+      {},
+    );
+    assert.equal(remembered.ok, false);
+    if (!remembered.ok) {
+      assert.match(remembered.message, /archive@drive\.example/);
+      assert.match(remembered.message, /remembered/i);
+      assert.match(remembered.message, /tool_choice_forget|Tool Memory/i);
+    }
+  } finally {
+    deleteToolChoice('list files from remembered one drive');
+    __gatewayTest__.setRuntimeStatusLoader(null);
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
+});
+
+test('CLI default-account authority uses the longest known toolkit prefix and preserves generic discovery', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'one_drive',
+    label: 'isolated-one-drive',
+    grantedBy: 'test',
+  });
+  await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'newcrm',
+    label: 'isolated-generic',
+    grantedBy: 'test',
+  });
+  setAccounts([]);
+  __gatewayTest__.setRuntimeStatusLoader(async () => ({
+    enabled: true,
+    apiKeyPresent: false,
+    userId: 'cli-prefix-test-user',
+    executionBackend: 'cli',
+    cli: {
+      installed: true,
+      path: '/test/composio',
+      version: 'test',
+      authenticated: true,
+      authStatus: 'ok',
+      authMessage: 'cli-prefix-test-user',
+    },
+  }));
+  try {
+    const oneDrive = await resolveComposioDispatch(
+      'ONE_DRIVE_CREATE_FOLDER',
+      { name: 'Proof folder' },
+      undefined,
+      {},
+    );
+    assert.equal(oneDrive.ok, true, 'ONE_DRIVE_* resolves authority as one_drive, not one');
+    if (oneDrive.ok) {
+      assert.ok(oneDrive.notes.some((note) => /scoped specifically to one_drive/i.test(note)));
+    }
+
+    const generic = await resolveComposioDispatch(
+      'NEWCRM_CREATE_RECORD',
+      { fields: { Name: 'Proof' } },
+      undefined,
+      {},
+    );
+    assert.equal(generic.ok, true, 'unknown single-token toolkit discovery keeps its generic fallback');
+    if (generic.ok) {
+      assert.ok(generic.notes.some((note) => /scoped specifically to newcrm/i.test(note)));
+    }
+  } finally {
+    __gatewayTest__.setRuntimeStatusLoader(null);
+    await revokeComposioCliDefaultAccountAuthority('one_drive');
+    await revokeComposioCliDefaultAccountAuthority('newcrm');
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
+});
+
+test('operator-authorized CLI default dispatches end-to-end with no false connected-account pin', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousCliPath = process.env.COMPOSIO_CLI_PATH;
+  const shimPath = path.join(TMP_HOME, 'composio-gateway-cli-proof.mjs');
+  const shimLog = path.join(TMP_HOME, 'composio-gateway-cli-proof.jsonl');
+  writeFileSync(shimPath, [
+    `import { appendFileSync } from 'node:fs';`,
+    `const argv = process.argv.slice(2);`,
+    `appendFileSync(process.env.CLEMMY_COMPOSIO_SHIM_LOG, JSON.stringify(argv) + '\\n');`,
+    `if (argv[0] === '--version') console.log('composio-proof 1.0.0');`,
+    `else if (argv[0] === 'whoami') console.log('isolated-proof-operator');`,
+    `else if (argv[0] === 'execute') console.log(JSON.stringify({ successful: true, data: { slug: argv[1], arguments: JSON.parse(argv[3] ?? '{}') } }));`,
+    `else { console.error('unsupported command'); process.exitCode = 2; }`,
+    '',
+  ].join('\n'));
+  chmodSync(shimPath, 0o755);
+  process.env.COMPOSIO_BACKEND = 'cli';
+  await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'proof',
+    label: 'isolated-proof',
+    grantedBy: 'test',
+  });
+  process.env.COMPOSIO_CLI_PATH = shimPath;
+  process.env.CLEMMY_COMPOSIO_SHIM_LOG = shimLog;
+  delete process.env.COMPOSIO_API_KEY;
+  setAccounts([]);
+  __gatewayTest__.setRuntimeStatusLoader(null);
+  resetComposioClient();
+  bustComposioDashboardCaches();
+  try {
+    const out = await dispatchComposioTool(
+      'PROOF_CREATE_RECORD',
+      { fields: { Name: 'End-to-end CLI proof' } },
+      {},
+    );
+    assert.equal(out.ok, true, 'the gateway must reach the real CLI client path, not stop at resolver-only ok:true');
+    if (out.ok) {
+      assert.equal(out.connectionId, undefined, 'CLI execute has no account selector; never claim a routed SDK owner');
+      assert.deepEqual(out.result, {
+        successful: true,
+        data: {
+          slug: 'PROOF_CREATE_RECORD',
+          arguments: { fields: { Name: 'End-to-end CLI proof' } },
+        },
+      });
+    }
+    const invocations = readFileSync(shimLog, 'utf-8')
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line) as string[]);
+    const executes = invocations.filter((argv) => argv[0] === 'execute');
+    assert.equal(executes.length, 1, 'exactly one provider dispatch');
+    assert.deepEqual(executes[0]?.slice(0, 3), [
+      'execute',
+      'PROOF_CREATE_RECORD',
+      '-d',
+    ]);
+    assert.ok(!JSON.stringify(executes[0]).includes('connected_account_id'));
+    assert.ok(!JSON.stringify(executes[0]).includes('ca_'));
+  } finally {
+    __gatewayTest__.setRuntimeStatusLoader(null);
+    delete process.env.CLEMMY_COMPOSIO_SHIM_LOG;
+    if (previousCliPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
+    else process.env.COMPOSIO_CLI_PATH = previousCliPath;
+    await revokeComposioCliDefaultAccountAuthority('proof');
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+    resetComposioClient();
+    bustComposioDashboardCaches();
+  }
+});
+
+test('AUTO with an SDK key keeps normal account-addressable routing unchanged', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  const previousApiKey = process.env.COMPOSIO_API_KEY;
+  process.env.COMPOSIO_BACKEND = 'auto';
+  process.env.COMPOSIO_API_KEY = 'proof-sdk-key';
+  setAccounts([account('ca_sdk_airtable', 'airtable', 'sdk-owner@example.test')]);
+  try {
+    const out = await resolveComposioDispatch(
+      'AIRTABLE_CREATE_RECORD',
+      { base_id: 'app-proof', table_id: 'tbl-proof', fields: { Name: 'SDK proof' } },
+      undefined,
+      {},
+    );
+    assert.equal(out.ok, true);
+    if (out.ok) assert.equal(out.connectionId, 'ca_sdk_airtable');
+  } finally {
+    if (previousApiKey === undefined) delete process.env.COMPOSIO_API_KEY;
+    else process.env.COMPOSIO_API_KEY = previousApiKey;
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
 });
 
 test('named accounts: "remember this as acme" binds pin→name; alias alone then resolves with no ask', async () => {
@@ -313,6 +714,145 @@ test('validate-the-write does NOT block a legitimate send that HAS a target (no 
   setAccounts([account('ca_slack', 'slack', 'me@work.example')]);
   const out = await resolveComposioDispatch('SLACK_SEND_MESSAGE', { channel: 'C0123', text: 'hi team' }, undefined, {});
   assert.equal(out.ok, true, 'a send WITH a target dispatches — the rule is target-presence, not a taxonomy wall');
+});
+
+test('account-scoped social publishes use the positively resolved owner without synthetic destination fields', async () => {
+  const cases: Array<{
+    slug: string;
+    toolkit: string;
+    args: Record<string, unknown>;
+  }> = [
+    {
+      slug: 'INSTAGRAM_CREATE_POST',
+      toolkit: 'instagram',
+      args: { caption: 'Launch day', image_url: 'https://assets.example/launch.png' },
+    },
+    {
+      slug: 'LINKEDIN_CREATE_POST',
+      toolkit: 'linkedin',
+      args: { commentary: 'Launch day', visibility: 'PUBLIC' },
+    },
+    {
+      slug: 'LINKEDIN_POST_UPDATE',
+      toolkit: 'linkedin',
+      args: { commentary: 'Launch update' },
+    },
+    {
+      slug: 'TWITTER_CREATE_TWEET',
+      toolkit: 'twitter',
+      args: { text: 'Launch day' },
+    },
+    {
+      slug: 'TWITTER_POST',
+      toolkit: 'twitter',
+      args: { text: 'Launch update' },
+    },
+  ];
+  for (const entry of cases) {
+    const connectionId = `ca_${entry.toolkit}_publisher`;
+    setAccounts([account(connectionId, entry.toolkit, `publisher@${entry.toolkit}.example`)]);
+    const out = await resolveComposioDispatch(entry.slug, entry.args, undefined, {});
+    assert.equal(out.ok, true, `${entry.slug} should address the resolved social account itself`);
+    if (out.ok) {
+      assert.equal(out.connectionId, connectionId);
+      for (const invented of ['target', 'destination', 'channel', 'channel_id', 'recipient']) {
+        assert.ok(!(invented in out.args), `${entry.slug} must not invent provider field ${invented}`);
+      }
+    }
+  }
+});
+
+test('social account destination is fail-closed on ambiguity, while directed email/chat/DM still require targets', async () => {
+  setAccounts([
+    account('ca_instagram_brand', 'instagram', 'brand@instagram.example'),
+    account('ca_instagram_personal', 'instagram', 'personal@instagram.example'),
+  ]);
+  const ambiguousBroadcast = await resolveComposioDispatch(
+    'INSTAGRAM_CREATE_POST',
+    { caption: 'Launch day', image_url: 'https://assets.example/launch.png' },
+    undefined,
+    {},
+  );
+  assert.equal(ambiguousBroadcast.ok, false, 'a social publish cannot guess between multiple account destinations');
+  if (!ambiguousBroadcast.ok) assert.equal(ambiguousBroadcast.reason, 'ambiguous-account');
+
+  const directed: Array<{ slug: string; toolkit: string; args: Record<string, unknown> }> = [
+    { slug: 'OUTLOOK_SEND_EMAIL', toolkit: 'outlook', args: { subject: 'Hello', body: 'No recipient' } },
+    { slug: 'SLACK_SEND_MESSAGE', toolkit: 'slack', args: { text: 'No channel' } },
+    { slug: 'TWITTER_SEND_DM', toolkit: 'twitter', args: { text: 'No DM recipient' } },
+  ];
+  for (const entry of directed) {
+    setAccounts([account(`ca_${entry.toolkit}_directed`, entry.toolkit, `owner@${entry.toolkit}.example`)]);
+    const out = await resolveComposioDispatch(entry.slug, entry.args, undefined, {});
+    assert.equal(out.ok, false, `${entry.slug} remains directed and must carry a recipient/channel`);
+    if (!out.ok) {
+      assert.equal(out.reason, 'invalid-args');
+      assert.match(out.message, /recipient|target/i);
+    }
+  }
+});
+
+test('operator-authorized CLI default is a valid account destination for a social broadcast', async () => {
+  const previousBackend = process.env.COMPOSIO_BACKEND;
+  process.env.COMPOSIO_BACKEND = 'cli';
+  await grantComposioCliDefaultAccountAuthority({
+    toolkit: 'instagram',
+    label: 'isolated-proof',
+    grantedBy: 'test',
+  });
+  setAccounts([]);
+  __gatewayTest__.setRuntimeStatusLoader(async () => ({
+    enabled: true,
+    apiKeyPresent: false,
+    userId: 'cli-social-test-user',
+    executionBackend: 'cli',
+    cli: {
+      installed: true,
+      path: '/test/composio',
+      version: 'test',
+      authenticated: true,
+      authStatus: 'ok',
+      authMessage: 'cli-social-test-user',
+    },
+  }));
+  try {
+    const out = await resolveComposioDispatch(
+      'INSTAGRAM_CREATE_POST',
+      { caption: 'Launch day', image_url: 'https://assets.example/launch.png' },
+      undefined,
+      {},
+    );
+    assert.equal(out.ok, true);
+    if (out.ok) {
+      assert.equal(out.connectionId, undefined, 'CLI default is deliberate but not falsely represented as a targetable connection');
+      assert.ok(out.notes.some((note) => /operator authority scoped specifically to instagram/i.test(note)));
+    }
+
+    const otherRead = await resolveComposioDispatch('GMAIL_LIST_MESSAGES', {}, undefined, {});
+    assert.equal(otherRead.ok, true, 'another toolkit read remains usable without inheriting write authority');
+    if (otherRead.ok) {
+      assert.ok(otherRead.notes.some((note) => /read through the authenticated Composio CLI/i.test(note)));
+      assert.ok(otherRead.notes.every((note) => !/operator authority/i.test(note)));
+    }
+
+    const otherWrite = await resolveComposioDispatch(
+      'NOTION_CREATE_PAGE',
+      { parent_id: 'page-proof', title: 'Proof' },
+      undefined,
+      {},
+    );
+    assert.equal(otherWrite.ok, false, 'another toolkit write must not inherit Instagram authority');
+    if (!otherWrite.ok) {
+      assert.equal(otherWrite.reason, 'ambiguous-account');
+      assert.match(otherWrite.message, /authorize.*CLI default in Connect/i);
+      assert.match(otherWrite.message, /No provider dispatch was started/i);
+    }
+  } finally {
+    __gatewayTest__.setRuntimeStatusLoader(null);
+    await revokeComposioCliDefaultAccountAuthority('instagram');
+    if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
+    else process.env.COMPOSIO_BACKEND = previousBackend;
+  }
 });
 
 test('identity enrichment does NOT permanently blind a mailbox on a transient probe failure (finding 13)', async () => {

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findComposioCli, parseComposioCliJson } from './cli.js';
+import { composioCliSpawnSpec, findComposioCli, parseComposioCliJson } from './cli.js';
 
 test('parseComposioCliJson parses clean JSON output', () => {
   assert.deepEqual(parseComposioCliJson('{"ok":true}'), { ok: true });
@@ -40,6 +40,125 @@ test('findComposioCli honors COMPOSIO_CLI_PATH', () => {
     if (oldPath === undefined) delete process.env.COMPOSIO_CLI_PATH;
     else process.env.COMPOSIO_CLI_PATH = oldPath;
   }
+});
+
+test('findComposioCli probes safe Windows PATHEXT candidates, including cmd shims', () => {
+  const checked: string[] = [];
+  const selected = findComposioCli({
+    platform: 'win32',
+    homeDir: 'C:\\Users\\Clem',
+    env: {
+      PATH: 'C:\\Tools;D:\\Bin',
+      PATHEXT: '.EXE;.PS1;.CMD;.PY;.VBS;..\\escape;.BAT',
+    },
+    isExecutable: (candidate: string) => {
+      checked.push(candidate);
+      return candidate === 'D:\\Bin\\composio.CMD';
+    },
+  });
+
+  assert.equal(selected, 'D:\\Bin\\composio.CMD');
+  assert.ok(checked.includes('C:\\Tools\\composio.EXE'));
+  assert.ok(checked.includes('C:\\Tools\\composio.CMD'));
+  assert.ok(checked.includes('D:\\Bin\\composio.CMD'));
+  assert.ok(
+    checked.every((candidate) => !candidate.includes('escape')),
+    'invalid PATHEXT entries never become filesystem probes',
+  );
+  assert.ok(
+    checked.every((candidate) => !/\.(?:ps1|py|vbs)$/i.test(candidate)),
+    'PATHEXT entries the spawn adapter cannot launch are never discovered',
+  );
+});
+
+test('findComposioCli rejects unsupported explicit Windows script extensions before probing', () => {
+  for (const extension of ['ps1', 'vbs']) {
+    const checked: string[] = [];
+    const selected = findComposioCli({
+      platform: 'win32',
+      homeDir: 'C:\\Users\\Clem',
+      env: {
+        COMPOSIO_CLI_PATH: `C:\\Custom\\composio.${extension}`,
+        PATH: '',
+        PATHEXT: '.EXE;.CMD',
+      },
+      isExecutable: (candidate: string) => {
+        checked.push(candidate);
+        return candidate.toLowerCase().endsWith(`.${extension}`);
+      },
+    });
+    assert.equal(selected, null);
+    assert.ok(
+      checked.every((candidate) => !candidate.toLowerCase().endsWith(`.${extension}`)),
+      `explicit .${extension} path never reaches the executable probe`,
+    );
+  }
+
+  assert.equal(
+    findComposioCli({
+      platform: 'win32',
+      homeDir: 'C:\\Users\\Clem',
+      env: {
+        COMPOSIO_CLI_PATH: 'C:\\Custom\\composio.cjs',
+        PATH: '',
+      },
+      isExecutable: (candidate: string) => candidate === 'C:\\Custom\\composio.cjs',
+    }),
+    'C:\\Custom\\composio.cjs',
+    'an explicitly supported Node adapter remains discoverable',
+  );
+});
+
+test('Composio JS adapters run through Node without a command shell on every platform', () => {
+  assert.deepEqual(
+    composioCliSpawnSpec('C:\\proof\\composio-proof.cjs', ['execute', 'TOOL', '-d', '{"value":"a&b"}']),
+    {
+      command: process.execPath,
+      args: ['C:\\proof\\composio-proof.cjs', 'execute', 'TOOL', '-d', '{"value":"a&b"}'],
+    },
+  );
+  assert.deepEqual(
+    composioCliSpawnSpec('/usr/local/bin/composio', ['whoami']),
+    { command: '/usr/local/bin/composio', args: ['whoami'] },
+  );
+});
+
+test('Windows cmd/bat shims use explicit cmd.exe with metacharacter-safe verbatim arguments', () => {
+  const payload =
+    '{"value":"a&b|c>out<in%PATH%!bang^caret","quote":"\\"hello\\""}';
+  for (const extension of ['cmd', 'bat']) {
+    const spec = composioCliSpawnSpec(
+      `C:\\Program Files\\Composio\\composio.${extension}`,
+      ['execute', 'TOOL', '-d', payload],
+      {
+        platform: 'win32',
+        env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+      },
+    );
+
+    assert.equal(spec.command, 'C:\\Windows\\System32\\cmd.exe');
+    assert.deepEqual(spec.args.slice(0, 4), ['/d', '/s', '/v:off', '/c']);
+    assert.equal(spec.windowsVerbatimArguments, true);
+    const commandLine = spec.args[4] ?? '';
+    assert.match(commandLine, /^"C:\\Program\^ Files\\Composio\\composio\.(?:cmd|bat) /i);
+    assert.match(commandLine, /\^&/);
+    assert.match(commandLine, /\^\|/);
+    assert.match(commandLine, /\^>/);
+    assert.match(commandLine, /\^</);
+    assert.match(commandLine, /\^%PATH\^%/);
+    assert.match(commandLine, /\^!/);
+    assert.match(commandLine, /\^\^caret/);
+    assert.doesNotMatch(commandLine, /(?<!\^)(?:%PATH%|&b|\|c|>out|<in)/);
+    assert.equal(commandLine.at(-1), '"');
+  }
+  assert.throws(
+    () => composioCliSpawnSpec(
+      'C:\\Composio\\composio.cmd',
+      ['execute', 'TOOL', '-d', '{"value":"safe"}\r\nwhoami'],
+      { platform: 'win32', env: {} },
+    ),
+    /line breaks|NUL/i,
+  );
 });
 
 test('getComposioCliStatus memoizes within the TTL and re-probes after invalidation', async () => {

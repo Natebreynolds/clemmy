@@ -11,6 +11,7 @@
  * registerWorkflowScheduleTools.
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -26,14 +27,102 @@ import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData } from '../spaces/runner.js';
-import { readData, writeData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
+import { readData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
+import {
+  bootstrapWorkspaceObservationHistory,
+  commitWorkspaceObservationBatch,
+  indexWorkspaceRecord,
+  openWorkspaceDb,
+} from '../spaces/workspace-db.js';
+import {
+  diffWorkspaceObservations,
+  getWorkspaceHistoryAvailability,
+  listWorkspaceObservationHistory,
+} from '../spaces/workspace-observation-query.js';
+import { redactSensitiveText } from '../runtime/security.js';
 
 // Re-exported for back-compat (space-tools.test.ts imports it from here); the
 // canonical definition now lives in the shared leaf so workflow_get can reuse it.
 export { deriveRunnerProvenance };
+
+const observationBootstrapChecks = new WeakMap<object, Set<string>>();
+
+function safeWorkspaceObservationError(value: unknown): string {
+  return redactSensitiveText(value).replace(/\s+/g, ' ').trim().slice(0, 500)
+    || 'workspace observation store unavailable';
+}
+
+function safeWorkspaceObservationLabel(value: string): string {
+  return redactSensitiveText(value).replace(/\s+/g, ' ').trim().slice(0, 160)
+    || '[redacted source]';
+}
+
+function prepareWorkspaceObservationStore(
+  rec: SpaceRecord,
+): { ok: true; db: ReturnType<typeof openWorkspaceDb> } | { ok: false; error: string } {
+  try {
+    const db = openWorkspaceDb();
+    const indexed = db.prepare('SELECT 1 FROM workspaces WHERE id = ? LIMIT 1').get(rec.id);
+    if (!indexed) {
+      indexWorkspaceRecord(rec, {
+        db,
+        actor: 'workspace-history-bootstrap',
+        emitOperational: false,
+        appendStateEvent: false,
+        payload: { legacyIndex: true },
+      });
+      const nowIndexed = db.prepare('SELECT 1 FROM workspaces WHERE id = ? LIMIT 1').get(rec.id);
+      if (!nowIndexed) return { ok: false, error: 'workspace index could not be prepared' };
+    }
+    let checked = observationBootstrapChecks.get(db);
+    if (!checked) {
+      checked = new Set<string>();
+      observationBootstrapChecks.set(db, checked);
+    }
+    if (!checked.has(rec.id)) {
+      const bootstrap = bootstrapWorkspaceObservationHistory(rec.id, { db });
+      if (!bootstrap.ok) return {
+        ok: false,
+        error: `legacy comparison baseline could not be imported: ${bootstrap.error}`,
+      };
+      checked.add(rec.id);
+    }
+    return { ok: true, db };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+function renderWorkspaceHistoryAvailability(
+  availability: ReturnType<typeof getWorkspaceHistoryAvailability>,
+): string {
+  if (availability.observations === 0) {
+    return 'Dataset history: no retained observations yet. A successful refresh or manual data commit will create the first comparison baseline.';
+  }
+  const count = availability.observationsAreLowerBound
+    ? `at least ${availability.observations}`
+    : String(availability.observations);
+  const sourceCount = availability.observationsAreLowerBound
+    ? `at least ${availability.sourcesObserved}`
+    : String(availability.sourcesObserved);
+  const successfulCount = availability.observationsAreLowerBound
+    ? `at least ${availability.successfulObservations}`
+    : String(availability.successfulObservations);
+  const base = `Dataset history: ${count} retained observation${availability.observations === 1 ? '' : 's'} across ${sourceCount} source${availability.sourcesObserved === 1 ? '' : 's'} (${successfulCount} successful).`;
+  if (availability.comparableSources.length > 0) {
+    return `${base} space_diff is confirmed for: ${availability.comparableSources.join(', ')}; use space_history for exact observation metadata.`;
+  }
+  if (availability.observationsAreLowerBound) {
+    return `${base} This summary is bounded; call space_diff for a source to prove whether a prior successful observation exists.`;
+  }
+  if (availability.successfulObservations > 0) {
+    return `${base} Baseline only: another successful observation is required before space_diff can report change.`;
+  }
+  return `${base} Failed or awaiting attempts do not create a comparable dataset; inspect them with space_history.`;
+}
 
 function expandHome(p: string): string {
   if (p === '~') return os.homedir();
@@ -714,6 +803,7 @@ export function registerSpaceTools(server: McpServer): void {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
+      const observationStore = prepareWorkspaceObservationStore(rec);
       const notes = listNotes(slug, 10);
       const audit = listAudit(slug, 5);
       let dataPreview = '';
@@ -746,11 +836,106 @@ export function registerSpaceTools(server: McpServer): void {
         (rec.dataSources.some((d) => d.runner) || rec.actions.some((a) => a.runner))
           ? 'To see HOW a runner pulls its data (which connector/query) — and to edit it — use space_get_runner / space_edit_runner.'
           : '',
+        observationStore.ok
+          ? renderWorkspaceHistoryAvailability(getWorkspaceHistoryAvailability(rec.id, observationStore.db))
+          : `Dataset history is temporarily unavailable: ${safeWorkspaceObservationError(observationStore.error)}. Do not infer a delta from the current snapshot.`,
         `Dataset (truncated): ${dataPreview}`,
         notes.length > 0 ? `Recent notes:\n${notes.map((n) => `  - [${n.kind ?? 'note'}] ${n.text}`).join('\n')}` : 'No notes yet.',
         audit.length > 0 ? `Recent activity: ${audit.length} data-plane call(s).` : '',
       ].filter(Boolean);
       return textResult(parts.join('\n'));
+    },
+  );
+
+  server.tool(
+    'space_history',
+    [
+      'Read retained observation METADATA for a Workspace: source, status, changed/unchanged, cause, timestamp, and a scrubbed provenance summary.',
+      'This is intentionally schema-on-demand and never returns raw retained datasets. Filter by source/status or lower the limit when you only need a narrow window. Use space_diff to inspect bounded value changes between two successful observations.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      source_id: z.string().max(120).nullable().describe('Optional source id filter. Omit to list observations across this Workspace.'),
+      status: z.enum(['ok', 'error', 'awaiting_approval']).nullable().describe('Optional observation status filter.'),
+      limit: z.number().int().min(1).max(25).nullable().describe('Maximum metadata rows to return (default 12, hard cap 25).'),
+    },
+    async ({ slug, source_id, status, limit }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const sourceKey = source_id?.trim() || undefined;
+      if (source_id != null && !sourceKey) return textResult('Error: source_id cannot be blank.');
+      const observationStore = prepareWorkspaceObservationStore(rec);
+      if (!observationStore.ok) {
+        return textResult(JSON.stringify({
+          status: 'history_unavailable',
+          workspace: slug,
+          reason: safeWorkspaceObservationError(observationStore.error),
+        }));
+      }
+      try {
+        const result = listWorkspaceObservationHistory(rec.id, {
+          db: observationStore.db,
+          ...(sourceKey ? { sourceKey } : {}),
+          ...(status ? { status } : {}),
+          limit,
+        });
+        return textResult(JSON.stringify(result), { maxChars: 36_000 });
+      } catch (err) {
+        return textResult(JSON.stringify({
+          status: 'history_unavailable',
+          workspace: slug,
+          reason: safeWorkspaceObservationError(err),
+        }));
+      }
+    },
+  );
+
+  server.tool(
+    'space_diff',
+    [
+      'Compare retained successful observations for ONE Workspace data source. With no observation ids, compares the current successful observation with its prior successful observation.',
+      'The result is a deterministic, bounded structural diff—not model judgment—and explicitly reports insufficient_history or unchanged. Optional ids are accepted only when they belong to this same Workspace and source; failed/awaiting observations are not comparable.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      source_id: z.string().min(1).max(120).describe('The exact data source id to compare.'),
+      from_observation_id: z.string().max(200).nullable().describe('Optional older successful observation id. Omit to use the successful observation immediately before `to`.'),
+      to_observation_id: z.string().max(200).nullable().describe('Optional newer successful observation id. Omit to use the current successful observation.'),
+      max_changes: z.number().int().min(1).max(25).nullable().describe('Maximum bounded change entries (default 15, hard cap 25).'),
+    },
+    async ({ slug, source_id, from_observation_id, to_observation_id, max_changes }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const sourceKey = source_id.trim();
+      if (!sourceKey) return textResult('Error: source_id cannot be blank.');
+      const modelFacingSource = safeWorkspaceObservationLabel(sourceKey);
+      const observationStore = prepareWorkspaceObservationStore(rec);
+      if (!observationStore.ok) {
+        return textResult(JSON.stringify({
+          status: 'history_unavailable',
+          workspace: slug,
+          source: modelFacingSource,
+          reason: safeWorkspaceObservationError(observationStore.error),
+        }));
+      }
+      try {
+        const result = diffWorkspaceObservations(rec.id, sourceKey, {
+          db: observationStore.db,
+          fromObservationId: from_observation_id,
+          toObservationId: to_observation_id,
+          maxChanges: max_changes,
+        });
+        return textResult(JSON.stringify(result), { maxChars: 36_000 });
+      } catch (err) {
+        return textResult(JSON.stringify({
+          status: 'history_unavailable',
+          workspace: slug,
+          source: modelFacingSource,
+          reason: safeWorkspaceObservationError(err),
+        }));
+      }
     },
   );
 
@@ -1045,19 +1230,40 @@ export function registerSpaceTools(server: McpServer): void {
       let parsed: unknown;
       try { parsed = JSON.parse(data_json); }
       catch (err) { return textResult(`Error: data_json is not valid JSON: ${(err as Error).message}`); }
-      const current = (() => {
-        const d = readData(slug);
-        return (d && typeof d === 'object') ? { ...(d as Record<string, unknown>) } : {};
-      })();
-      current[sid] = parsed;
-      const meta = (current._meta && typeof current._meta === 'object') ? { ...(current._meta as Record<string, unknown>) } : {};
-      meta[sid] = { refreshedAt: new Date().toISOString(), ok: true, provenance: 'manual' };
-      current._meta = meta;
-      const write = writeData(slug, current);
-      if (!write.ok) return textResult(`Could not save data for "${slug}": ${write.error}`);
-      appendAudit(slug, { method: 'SET_DATA', path: `/set_data/${sid}`, outcome: 'ok', bytes: write.bytes });
+      const observationStore = prepareWorkspaceObservationStore(rec);
+      if (!observationStore.ok) {
+        return textResult(`Could not save data for "${slug}": ${safeWorkspaceObservationError(observationStore.error)}`);
+      }
+      let bytes: number;
+      try {
+        const committed = commitWorkspaceObservationBatch({
+          db: observationStore.db,
+          workspaceId: rec.id,
+          observations: [{
+            sourceKey: sid,
+            refreshId: randomUUID(),
+            cause: 'manual',
+            status: 'ok',
+            data: parsed,
+            provenance: { adapter: 'manual', initiatedBy: 'model' },
+          }],
+        });
+        bytes = committed.projection.bytes;
+        try {
+          const { finalizeWorkspaceObservationCommit } = await import(
+            '../spaces/workspace-observation-finalize.js'
+          );
+          await finalizeWorkspaceObservationCommit(rec.id, committed);
+        } catch {
+          // The observation + data.json projection are already durable.
+          // Memory/retention finalization is deliberately best-effort.
+        }
+      } catch (err) {
+        return textResult(`Could not save data for "${slug}": ${safeWorkspaceObservationError(err)}`);
+      }
+      appendAudit(slug, { method: 'SET_DATA', path: `/set_data/${sid}`, outcome: 'ok', bytes });
       const n = countRows(parsed);
-      return textResult(`Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${sid}" (${write.bytes} bytes, marked manual). The open Workspace auto-refreshes.`);
+      return textResult(`Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${sid}" (${bytes} bytes, marked manual). The open Workspace auto-refreshes.`);
     },
   );
 

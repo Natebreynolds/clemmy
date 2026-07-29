@@ -10,12 +10,13 @@
  *     notes.jsonl            # user notes/actions (append-only)  — never served
  *     audit.jsonl            # data-plane API audit (guardrail)  — never served
  *     data/<runner>          # Clem-authored fetch scripts        — never served
- *     space.json             # manifest (source of truth for this Space)
+ *     space.json             # manifest/configuration source of truth
  *
  * Design choices:
- *  - The per-Space `space.json` IS the source of truth. The index is built by
- *    scanning each `spaces/<slug>/space.json` (self-healing by construction — no
- *    separate index file to drift). Cardinality is low (tens), scan-per-list is fine.
+ *  - The per-Space `space.json` is the manifest/configuration source of truth.
+ *    Durable dataset history lives in workspaces.db; data.json is its current
+ *    compatibility projection. Listing still scans manifests so file-authored
+ *    Workspaces remain discoverable and self-healing.
  *  - Writes are atomic (temp + rename) so a crash mid-write can't corrupt a
  *    manifest. Mirrors the workflow-store idiom.
  *  - The view lives in a `view/` subtree so the serving route can expose ONLY
@@ -29,15 +30,79 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { purgeWorkspaceObservationMemory } from '../memory/workspace-observation-bridge.js';
 import { deleteWorkspaceIndex, indexWorkspaceRecord, reindexWorkspaceRecords } from './workspace-db.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
+/** Hidden, invalid-as-a-slug directory used as the durable hard-delete marker. */
+export const WORKSPACE_DELETE_QUARANTINE_DIR = path.join(
+  SPACES_DIR,
+  '.delete-quarantine',
+);
 
 /** Slug rules: lowercase kebab, 2–63 chars, no traversal. Path-safe by design. */
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
+const DELETE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function isValidSpaceSlug(slug: string): boolean {
   return typeof slug === 'string' && SLUG_RE.test(slug);
+}
+
+export function workspaceDeletionQuarantinePath(
+  slug: string,
+  deletionId: string,
+): string {
+  if (!isValidSpaceSlug(slug)) throw new Error(`invalid workspace slug: ${slug}`);
+  if (!DELETE_ID_RE.test(deletionId)) throw new Error('invalid workspace deletion id');
+  return path.join(WORKSPACE_DELETE_QUARANTINE_DIR, `${slug}--${deletionId}`);
+}
+
+function quarantinedWorkspaceSlug(entry: string): string | null {
+  const match = /^(.*)--([0-9a-f-]{36})$/i.exec(entry);
+  if (!match || !isValidSpaceSlug(match[1]) || !DELETE_ID_RE.test(match[2])) return null;
+  return match[1];
+}
+
+/**
+ * Complete interrupted hard deletes. The hidden directory is the durable
+ * intent marker: DB history is removed before its files, and any failure leaves
+ * the marker in place so save/recreate remains fail-closed.
+ */
+export function recoverWorkspaceDeletionQuarantine(slug?: string): number {
+  if (slug !== undefined && !isValidSpaceSlug(slug)) {
+    throw new Error(`invalid workspace slug: ${slug}`);
+  }
+  if (!existsSync(WORKSPACE_DELETE_QUARANTINE_DIR)) return 0;
+  let entries: string[];
+  try {
+    entries = readdirSync(WORKSPACE_DELETE_QUARANTINE_DIR);
+  } catch (err) {
+    throw new Error(`could not inspect Workspace deletion quarantine: ${(err as Error).message}`);
+  }
+  let recovered = 0;
+  for (const entry of entries.sort()) {
+    const quarantinedSlug = quarantinedWorkspaceSlug(entry);
+    if (!quarantinedSlug || (slug !== undefined && quarantinedSlug !== slug)) continue;
+    const quarantinedDir = path.join(WORKSPACE_DELETE_QUARANTINE_DIR, entry);
+    let isDirectory: boolean;
+    try {
+      isDirectory = statSync(quarantinedDir).isDirectory();
+    } catch (err) {
+      throw new Error(
+        `could not inspect quarantined Workspace "${quarantinedSlug}": ${(err as Error).message}`,
+      );
+    }
+    if (!isDirectory) {
+      throw new Error(`invalid deletion quarantine marker for Workspace "${quarantinedSlug}"`);
+    }
+    deleteWorkspaceIndex(quarantinedSlug, {
+      actor: 'space-store-delete-recovery',
+    });
+    purgeWorkspaceObservationMemory(quarantinedSlug);
+    rmSync(quarantinedDir, { recursive: true, force: true });
+    recovered += 1;
+  }
+  return recovered;
 }
 
 /**
@@ -95,6 +160,80 @@ export interface SpaceAction {
   argsTemplate?: Record<string, unknown>;
   /** Hint to the view that it should confirm before firing (advisory). */
   confirm?: boolean;
+}
+
+/** Shared product/UI bound for stable source and action identities. */
+export const WORKSPACE_IDENTITY_MAX_CHARS = 120;
+const WORKSPACE_IDENTITY_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+
+function workspaceIdentityDisplay(value: string, fallback: string): string {
+  const printable = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, '�');
+  if (!printable) return fallback;
+  return `${printable.slice(0, 80)}${printable.length > 80 ? '…' : ''}`;
+}
+
+/**
+ * Validate the stable keys used to address Workspace data sources and actions.
+ *
+ * Keep this structural and deterministic: identities must already be canonical
+ * at the authoring boundary so refreshes, projections, approvals, and actions
+ * all address the same item. Map deliberately permits otherwise-safe keys such
+ * as "__proto__", "constructor", and "prototype".
+ */
+export function workspaceIdentityErrors(
+  dataSources: ReadonlyArray<{ id?: unknown }> | undefined,
+  actions: ReadonlyArray<{ id?: unknown }> | undefined,
+): string[] {
+  const errors: string[] = [];
+
+  const validate = (
+    items: ReadonlyArray<{ id?: unknown }>,
+    kind: 'Data source' | 'Action',
+    duplicateKind: 'data source' | 'action',
+  ): void => {
+    const firstIndexById = new Map<string, number>();
+    for (const [index, item] of items.entries()) {
+      const raw = typeof item?.id === 'string' ? item.id : '';
+      const canonical = raw.trim();
+      const fallback = `#${index + 1}`;
+      const label = workspaceIdentityDisplay(raw, fallback);
+      const canonicalLabel = workspaceIdentityDisplay(canonical, fallback);
+
+      if (!canonical) {
+        errors.push(`${kind} "${label}" id must contain a non-whitespace value.`);
+        continue;
+      }
+      if (raw !== canonical) {
+        errors.push(
+          `${kind} "${label}" id must not have leading or trailing whitespace (use "${canonicalLabel}").`,
+        );
+      }
+      if (canonical.length > WORKSPACE_IDENTITY_MAX_CHARS) {
+        errors.push(
+          `${kind} "${label}" id exceeds the ${WORKSPACE_IDENTITY_MAX_CHARS} character limit.`,
+        );
+      }
+      if (WORKSPACE_IDENTITY_CONTROL_RE.test(canonical)) {
+        errors.push(`${kind} "${label}" id cannot contain control characters.`);
+      }
+      if (kind === 'Data source' && canonical === '_meta') {
+        errors.push(`${kind} "${label}" uses reserved id "_meta".`);
+      }
+
+      const firstIndex = firstIndexById.get(canonical);
+      if (firstIndex !== undefined) {
+        errors.push(
+          `Duplicate ${duplicateKind} id "${canonicalLabel}" (entries ${firstIndex + 1} and ${index + 1}).`,
+        );
+      } else {
+        firstIndexById.set(canonical, index);
+      }
+    }
+  };
+
+  validate(dataSources ?? [], 'Data source', 'data source');
+  validate(actions ?? [], 'Action', 'action');
+  return errors;
 }
 
 export interface SpaceRevision {
@@ -411,6 +550,7 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
     lastRefreshedAt: asStr(m.lastRefreshedAt),
     recipe: asStr(m.recipe),
   };
+  manifestErrors.push(...workspaceIdentityErrors(rec.dataSources, rec.actions));
   if (manifestErrors.length > 0) rec.manifestErrors = manifestErrors;
   return rec;
 }
@@ -452,6 +592,16 @@ function assertValidDeclaredRunners(
   const errors = declaredRunnerErrors(dataSources, actions);
   if (errors.length > 0) {
     throw new Error(`invalid workspace runner declarations:\n- ${errors.join('\n- ')}`);
+  }
+}
+
+function assertValidWorkspaceIdentities(
+  dataSources: SpaceDataSource[] | undefined,
+  actions: SpaceAction[] | undefined,
+): void {
+  const errors = workspaceIdentityErrors(dataSources, actions);
+  if (errors.length > 0) {
+    throw new Error(`invalid workspace identities:\n- ${errors.join('\n- ')}`);
   }
 }
 
@@ -632,6 +782,12 @@ export interface SaveSpaceInput {
 export class SpaceStore {
   /** List every Space by scanning each spaces/<slug>/space.json (newest first). */
   list(includeArchived = false): SpaceRecord[] {
+    try {
+      recoverWorkspaceDeletionQuarantine();
+    } catch {
+      // A failed recovery marker remains hidden and durable. Recreate is still
+      // blocked by save(), while unrelated Workspaces remain listable.
+    }
     if (!existsSync(SPACES_DIR)) return [];
     const out: SpaceRecord[] = [];
     let entries: string[] = [];
@@ -663,8 +819,10 @@ export class SpaceStore {
     if (!isValidSpaceSlug(input.id)) {
       throw new Error(`invalid space slug "${input.id}" — use lowercase kebab-case (2-63 chars).`);
     }
+    // A prior process may have stopped after moving this slug into quarantine.
+    // Complete its DB cascade before a new generation can claim the same slug.
+    recoverWorkspaceDeletionQuarantine(input.id);
     const dir = resolveSpaceDir(input.id);
-    ensureDir(dir);
     const now = new Date().toISOString();
     const existing = readManifest(input.id);
     const missingFixes = missingManifestFixes(
@@ -675,6 +833,9 @@ export class SpaceStore {
     if (missingFixes.length > 0) {
       throw new Error(`existing space manifest has invalid fields; pass corrected ${missingFixes.join(' and ')} before saving`);
     }
+    const dataSources = input.dataSources ?? existing?.dataSources ?? [];
+    const actions = input.actions ?? existing?.actions ?? [];
+    assertValidWorkspaceIdentities(dataSources, actions);
     assertValidDeclaredRunners(input.dataSources, input.actions);
     const record: SpaceRecord = {
       id: input.id,
@@ -682,8 +843,8 @@ export class SpaceStore {
       status: input.status ?? existing?.status ?? 'active',
       contract: input.contract ?? existing?.contract,
       viewEntry: input.viewEntry ?? existing?.viewEntry ?? 'view/index.html',
-      dataSources: input.dataSources ?? existing?.dataSources ?? [],
-      actions: input.actions ?? existing?.actions ?? [],
+      dataSources,
+      actions,
       reengage: input.reengage ?? existing?.reengage,
       originSessionId: input.originSessionId ?? existing?.originSessionId,
       focusId: input.focusId ?? existing?.focusId ?? null,
@@ -695,6 +856,7 @@ export class SpaceStore {
       lastRefreshedAt: existing?.lastRefreshedAt,
       recipe: input.recipe ?? existing?.recipe,
     };
+    ensureDir(dir);
     atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));
     indexWorkspaceRecord(record, {
       eventType: existing ? 'workspace_file_changed' : 'workspace_created',
@@ -714,6 +876,10 @@ export class SpaceStore {
       'actions' in patch,
     );
     if (missingFixes.length > 0) return existing;
+    assertValidWorkspaceIdentities(
+      patch.dataSources ?? existing.dataSources,
+      patch.actions ?? existing.actions,
+    );
     assertValidDeclaredRunners(patch.dataSources, patch.actions);
     const record: SpaceRecord = {
       ...existing,
@@ -809,14 +975,52 @@ export class SpaceStore {
     return this.update(slug, { status: 'archived' });
   }
 
-  /** Hard-delete the entire Space directory. Irreversible. */
+  /**
+   * Hard-delete a Workspace without allowing temporal history to reattach.
+   *
+   * Files first move atomically to a hidden quarantine. The directory is
+   * removed only after both SQLite stores confirm their cascading deletes.
+   * A Workspace DB failure restores the original directory where possible.
+   * Once that first DB commits, a memory purge failure leaves the quarantine
+   * marker in place so restart recovery finishes before slug reuse.
+   */
   remove(slug: string): boolean {
     if (!isValidSpaceSlug(slug)) return false;
     const dir = resolveSpaceDir(slug);
-    if (!existsSync(dir)) return false;
-    rmSync(dir, { recursive: true, force: true });
-    deleteWorkspaceIndex(slug, { actor: 'space-store' });
-    return true;
+    let recovered = 0;
+    try {
+      recovered = recoverWorkspaceDeletionQuarantine(slug);
+    } catch {
+      return false;
+    }
+    if (!existsSync(dir)) return recovered > 0;
+    const deletionId = randomUUID();
+    const quarantinedDir = workspaceDeletionQuarantinePath(slug, deletionId);
+    try {
+      ensureDir(WORKSPACE_DELETE_QUARANTINE_DIR);
+      renameSync(dir, quarantinedDir);
+    } catch {
+      return false;
+    }
+
+    let durableDeleteCommitted = false;
+    try {
+      deleteWorkspaceIndex(slug, { actor: 'space-store' });
+      durableDeleteCommitted = true;
+      purgeWorkspaceObservationMemory(slug);
+      rmSync(quarantinedDir, { recursive: true, force: true });
+      return true;
+    } catch {
+      if (!durableDeleteCommitted && existsSync(quarantinedDir) && !existsSync(dir)) {
+        try {
+          renameSync(quarantinedDir, dir);
+        } catch {
+          // Leave the marker in quarantine. save(slug) must finish the durable
+          // delete before the slug can ever be reused.
+        }
+      }
+      return false;
+    }
   }
 
   /** Rebuild the queryable DB index from manifest files. Manifests remain source of truth. */

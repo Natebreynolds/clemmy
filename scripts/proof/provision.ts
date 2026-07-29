@@ -306,10 +306,21 @@ export function proofRuntimeOverrides(fusionMode: FusionProofMode = 'off'): Reco
 /** Process-level isolation shared by the daemon and every shell it spawns.
  * ZDOTDIR prevents a login shell from sourcing the real user's dotfiles and
  * replacing the proof PATH or re-exposing authenticated CLI configuration. */
-export function proofProcessIsolationEnv(home: string): Record<string, string> {
-  return {
+export function proofProcessIsolationEnv(
+  home: string,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const base = {
     HOME: home,
     ZDOTDIR: home,
+  };
+  if (platform !== 'win32') return base;
+  const parsed = path.win32.parse(home);
+  return {
+    ...base,
+    USERPROFILE: home,
+    HOMEDRIVE: parsed.root.replace(/[\\/]$/, ''),
+    HOMEPATH: home.slice(Math.max(0, parsed.root.length - 1)),
   };
 }
 
@@ -325,68 +336,107 @@ function createProofRailwayShim(home: string): string {
   return bin;
 }
 
+/** Explicit identities available inside the disposable proof CLI. Keep this
+ * exported so self-tests catch a selectable scenario whose toolkit was added
+ * to the shim but not to runtime owner resolution. */
+export const PROOF_COMPOSIO_ACCOUNT_AUTHORITY =
+  'proof=isolated-proof,instagram=isolated-proof,gmail=isolated-proof,googlesheets=isolated-proof';
+
 /** A local-only Composio lane for capability recovery proofs. It begins
  * unauthenticated. Creating $HOME/proof-composio-connected makes `whoami` and
  * `execute` succeed. Every execute keeps the legacy slug-only log and also
- * appends `<slug> TAB <raw -d argument>` to a proof-local payload log. The
+ * appends `{slug,payload}` JSONL to a proof-local payload log. The
  * latter is deliberately written by the provider shim, not inferred from
  * harness telemetry, so an exact-once proof can compare the bytes that actually
  * crossed the last local dispatch boundary without reaching a real account. */
-export function createProofComposioShim(home: string): void {
+export function createProofComposioShim(home: string): string {
   const bin = path.join(home, 'proof-bin');
   mkdirSync(bin, { recursive: true });
-  const shim = path.join(bin, process.platform === 'win32' ? 'composio.cmd' : 'composio');
-  const body = process.platform === 'win32'
-    ? [
-        '@echo off',
-        'if "%1"=="--version" (echo composio-proof 1.0& exit /b 0)',
-        'if "%1"=="whoami" (',
-        '  if exist "%HOME%\\proof-composio-connected" (echo proof-user& exit /b 0)',
-        '  echo Not authenticated. 1>&2',
-        '  exit /b 1',
-        ')',
-        'if "%1"=="execute" (',
-        '  if not exist "%HOME%\\proof-composio-connected" (echo 401 Unauthorized. 1>&2& exit /b 1)',
-        '  echo %2>>"%HOME%\\proof-composio-dispatches.log"',
-        '  echo %2	%4>>"%HOME%\\proof-composio-payloads.log"',
-        '  if "%2"=="PROOF_SOCIAL_CONTENT_PLAN" (echo {"successful":true,"data":[{"sourceMarker":"SOCIAL_SOURCE:PROOF_ONLY","brand":"Juniper Vale Coffee","handle":"@junipervale","campaign":"Rainy Day Roast","offer":"Complimentary oat-milk upgrade on August 14","hashtag":"#RainyDayRoast"}]}& exit /b 0)',
-        '  echo {"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}',
-        '  exit /b 0',
-        ')',
-        'echo unsupported proof composio command 1>&2',
-        'exit /b 1',
-        '',
-      ].join('\r\n')
-    : [
-        '#!/bin/sh',
-        'state="${HOME}/proof-composio-connected"',
-        'dispatch_log="${HOME}/proof-composio-dispatches.log"',
-        'payload_log="${HOME}/proof-composio-payloads.log"',
-        'case "$1" in',
-        '  --version) printf "%s\\n" "composio-proof 1.0"; exit 0 ;;',
-        '  whoami)',
-        '    if [ -f "$state" ]; then printf "%s\\n" "proof-user"; exit 0; fi',
-        '    printf "%s\\n" "Not authenticated." >&2',
-        '    exit 1',
-        '    ;;',
-        '  execute)',
-        '    if [ ! -f "$state" ]; then printf "%s\\n" "401 Unauthorized." >&2; exit 1; fi',
-        '    printf "%s\\n" "$2" >> "$dispatch_log"',
-        '    printf "%s\\t%s\\n" "$2" "$4" >> "$payload_log"',
-        '    if [ "$2" = "PROOF_SOCIAL_CONTENT_PLAN" ]; then',
-        '      printf "%s\\n" \'{"successful":true,"data":[{"sourceMarker":"SOCIAL_SOURCE:PROOF_ONLY","brand":"Juniper Vale Coffee","handle":"@junipervale","campaign":"Rainy Day Roast","offer":"Complimentary oat-milk upgrade on August 14","hashtag":"#RainyDayRoast"}]}\'',
-        '      exit 0',
-        '    fi',
-        '    printf "%s\\n" \'{"successful":true,"data":{"proof":true,"receipt":"proof-cli-1"}}\'',
-        '    exit 0',
-        '    ;;',
-        'esac',
-        'printf "%s\\n" "unsupported proof composio command" >&2',
-        'exit 1',
-        '',
-      ].join('\n');
+  const shim = path.join(bin, 'composio-proof.cjs');
+  const body = [
+    '#!/usr/bin/env node',
+    "'use strict';",
+    "const crypto = require('node:crypto');",
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const home = process.env.HOME || process.env.USERPROFILE;",
+    "if (!home) { console.error('proof home missing'); process.exit(1); }",
+    "const [command, slug, flag, payload = ''] = process.argv.slice(2);",
+    "const state = path.join(home, 'proof-composio-connected');",
+    "const sheetsStatePath = path.join(home, 'proof-googlesheets-state.json');",
+    "const sheetsReceiptLog = path.join(home, 'proof-googlesheets-receipts.log');",
+    "const sheetsOperationLog = path.join(home, 'proof-googlesheets-operations.log');",
+    "const sheetHeaders = ['fingerprint','source_receipt_id','purchased_on','merchant','amount','currency','tax','category','category_scope','source_uri','captured_at','evidence_note'];",
+    "const appendKeys = ['includeValuesInResponse','insertDataOption','majorDimension','range','spreadsheetId','valueInputOption','values'];",
+    "const readKeys = ['range','spreadsheet_id'];",
+    "const plainObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));",
+    "const exactKeys = (value, expected) => plainObject(value) && Object.keys(value).sort().join('\\n') === [...expected].sort().join('\\n');",
+    "const readJson = (file, fallback) => { try { const parsed = JSON.parse(fs.readFileSync(file, 'utf8')); return plainObject(parsed) ? parsed : fallback; } catch { return fallback; } };",
+    "const writeJsonAtomic = (file, value) => { const temp = file + '.tmp-' + process.pid; fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\\n', 'utf8'); fs.renameSync(temp, file); };",
+    "const parsePayload = () => { try { const parsed = JSON.parse(payload); if (!plainObject(parsed)) throw new Error('payload must be an object'); return parsed; } catch (error) { console.error('invalid JSON payload: ' + (error && error.message ? error.message : String(error))); process.exit(2); } };",
+    "const sheetKey = (spreadsheetId, range) => spreadsheetId + '\\n' + range;",
+    "const appendSheetOperation = (record) => fs.appendFileSync(sheetsOperationLog, JSON.stringify(record) + '\\n', 'utf8');",
+    "if (command === '--version') { console.log('composio-proof 1.0'); process.exit(0); }",
+    "if (command === 'whoami') {",
+    "  if (fs.existsSync(state)) { console.log('proof-user'); process.exit(0); }",
+    "  console.error('Not authenticated.'); process.exit(1);",
+    "}",
+    "if (command === 'execute') {",
+    "  if (!fs.existsSync(state)) { console.error('401 Unauthorized.'); process.exit(1); }",
+    "  if (!slug || flag !== '-d') { console.error('invalid proof execute arguments'); process.exit(1); }",
+    "  fs.appendFileSync(path.join(home, 'proof-composio-dispatches.log'), slug + '\\n', 'utf8');",
+    "  fs.appendFileSync(path.join(home, 'proof-composio-payloads.log'), JSON.stringify({ slug, payload }) + '\\n', 'utf8');",
+    "  if (slug === 'PROOF_SOCIAL_GET_CONTENT_PLAN') {",
+    "    console.log(JSON.stringify({ successful: true, data: [{ sourceMarker: 'SOCIAL_SOURCE:PROOF_ONLY', brand: 'Juniper Vale Coffee', handle: '@junipervale', campaign: 'Rainy Day Roast', offer: 'Complimentary oat-milk upgrade on August 14', hashtag: '#RainyDayRoast' }] }));",
+    "    process.exit(0);",
+    "  }",
+    "  if (slug === 'GOOGLESHEETS_SPREADSHEETS_VALUES_APPEND') {",
+    "    const args = parsePayload();",
+    "    const validRows = Array.isArray(args.values) && args.values.length === 1 && Array.isArray(args.values[0]) && args.values[0].length === sheetHeaders.length;",
+    "    if (!exactKeys(args, appendKeys) || typeof args.spreadsheetId !== 'string' || !args.spreadsheetId || typeof args.range !== 'string' || !args.range || args.valueInputOption !== 'RAW' || args.majorDimension !== 'ROWS' || args.insertDataOption !== 'INSERT_ROWS' || args.includeValuesInResponse !== true || !validRows) {",
+    "      console.error('invalid Sheets append payload: use the exact camelCase keys spreadsheetId, range, valueInputOption, majorDimension, insertDataOption, includeValuesInResponse, values; values must contain exactly one 12-cell row');",
+    "      process.exit(2);",
+    "    }",
+    "    const sheetsState = readJson(sheetsStatePath, { version: 1, sheets: {} });",
+    "    if (!plainObject(sheetsState.sheets)) sheetsState.sheets = {};",
+    "    const key = sheetKey(args.spreadsheetId, args.range);",
+    "    const prior = plainObject(sheetsState.sheets[key]) && Array.isArray(sheetsState.sheets[key].rows) ? sheetsState.sheets[key] : { spreadsheetId: args.spreadsheetId, range: args.range, rows: [sheetHeaders] };",
+    "    const row = args.values[0].map((cell) => cell == null ? '' : String(cell));",
+    "    prior.rows.push(row);",
+    "    sheetsState.sheets[key] = prior;",
+    "    writeJsonAtomic(sheetsStatePath, sheetsState);",
+    "    const ordinal = prior.rows.length - 1;",
+    "    const receiptId = 'proof-sheets-' + crypto.createHash('sha256').update(JSON.stringify({ spreadsheetId: args.spreadsheetId, range: args.range, row, ordinal })).digest('hex').slice(0, 20);",
+    "    const receipt = { id: receiptId, slug, spreadsheetId: args.spreadsheetId, range: args.range, rowCount: 1, fingerprint: row[0] || null, ordinal };",
+    "    fs.appendFileSync(sheetsReceiptLog, JSON.stringify(receipt) + '\\n', 'utf8');",
+    "    appendSheetOperation({ operation: 'append', ...receipt });",
+    "    console.log(JSON.stringify({ successful: true, data: { spreadsheetId: args.spreadsheetId, tableRange: args.range, proofReceipt: receipt, updates: { spreadsheetId: args.spreadsheetId, updatedRange: args.range, updatedRows: 1, updatedColumns: row.length, updatedCells: row.length, updatedData: { range: args.range, majorDimension: 'ROWS', values: [row] } } } }));",
+    "    process.exit(0);",
+    "  }",
+    "  if (slug === 'GOOGLESHEETS_VALUES_GET') {",
+    "    const args = parsePayload();",
+    "    if (!exactKeys(args, readKeys) || typeof args.spreadsheet_id !== 'string' || !args.spreadsheet_id || typeof args.range !== 'string' || !args.range) {",
+    "      console.error('invalid Sheets read payload: use exactly spreadsheet_id and range');",
+    "      process.exit(2);",
+    "    }",
+    "    const sheetsState = readJson(sheetsStatePath, { version: 1, sheets: {} });",
+    "    const key = sheetKey(args.spreadsheet_id, args.range);",
+    "    const stored = plainObject(sheetsState.sheets) && plainObject(sheetsState.sheets[key]) && Array.isArray(sheetsState.sheets[key].rows) ? sheetsState.sheets[key].rows : [sheetHeaders];",
+    "    const rows = stored.map((row) => Array.isArray(row) ? row.map((cell) => cell == null ? '' : String(cell)) : []);",
+    "    appendSheetOperation({ operation: 'read', slug, spreadsheetId: args.spreadsheet_id, range: args.range, rowCount: rows.length });",
+    "    console.log(JSON.stringify({ successful: true, data: { spreadsheetId: args.spreadsheet_id, range: args.range, majorDimension: 'ROWS', values: rows } }));",
+    "    process.exit(0);",
+    "  }",
+    "  console.log(JSON.stringify({ successful: true, data: { proof: true, receipt: 'proof-cli-1' } }));",
+    "  process.exit(0);",
+    "}",
+    "console.error('unsupported proof composio command');",
+    'process.exit(1);',
+    '',
+  ].join('\n');
   writeFileSync(shim, body, { encoding: 'utf-8', mode: 0o700 });
   try { chmodSync(shim, 0o700); } catch { /* best-effort on Windows */ }
+  return shim;
 }
 
 /** Keep event/task state for a failed proof without retaining copied model
@@ -435,7 +485,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     throw new Error('no currently-valid Claude subscription access token is available for the isolated proof');
   }
   const proofBin = createProofRailwayShim(home);
-  createProofComposioShim(home);
+  const proofComposioShim = createProofComposioShim(home);
 
   const logChunks: string[] = [];
   const daemonEnv: NodeJS.ProcessEnv = {
@@ -443,6 +493,11 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     TERM: process.env.TERM ?? 'xterm-256color',
     ...proofProcessIsolationEnv(home),
+    COMPOSIO_CLI_PATH: proofComposioShim,
+    // The disposable CLI has exactly one in-process proof account. Production
+    // CLI-only users must make this same default-account authority explicit;
+    // normal SDK/Connect users route by connected-account inventory instead.
+    COMPOSIO_CLI_DEFAULT_ACCOUNT_AUTHORITY: PROOF_COMPOSIO_ACCOUNT_AUTHORITY,
     CLEMENTINE_HOME: home,
     WEBHOOK_PORT: String(port),
     WEBHOOK_SECRET: secret,

@@ -609,6 +609,18 @@ export function getComposioExecutionBackend(): ComposioExecutionBackend {
   return (BACKEND_VALUES as readonly string[]).includes(raw) ? raw as ComposioExecutionBackend : 'auto';
 }
 
+/** Single backend-lane decision shared by gateway resolution and execution.
+ * AUTO with a configured SDK key is SDK-owned; AUTO falls to the CLI default
+ * only when no SDK key exists. Keeping this pure prevents the resolver from
+ * proving an SDK account route that execute later sends through the CLI. */
+export function composioExecutionUsesCliOnlyLane(status: {
+  executionBackend: ComposioExecutionBackend;
+  apiKeyPresent: boolean;
+}): boolean {
+  return status.executionBackend === 'cli'
+    || (status.executionBackend === 'auto' && !status.apiKeyPresent);
+}
+
 export function saveComposioExecutionBackend(backend: string): ComposioExecutionBackend {
   const normalized = (BACKEND_VALUES as readonly string[]).includes(backend) ? backend as ComposioExecutionBackend : 'auto';
   const env = readEnvFile(ENV_FILE);
@@ -1795,6 +1807,10 @@ export async function executeComposioTool(
   preferredIdentity?: string,
 ): Promise<unknown> {
   const backend = getComposioExecutionBackend();
+  const cliOnlyLane = composioExecutionUsesCliOnlyLane({
+    executionBackend: backend,
+    apiKeyPresent: Boolean(readComposioEnv('COMPOSIO_API_KEY')),
+  });
   // The Composio ENTITY (user_id) is only the fallback when no specific
   // connection resolves; the MAILBOX is chosen by the identity-resolved
   // connectedAccountId below. Pure/local, no network (getPreferredUserId).
@@ -1813,7 +1829,7 @@ export async function executeComposioTool(
       ? connectedAccountId
       : undefined;
 
-  if (backend !== 'sdk' && !pinnedAccountId) {
+  if (cliOnlyLane && !pinnedAccountId) {
     const cliOptions = { ...composioCliOptions(), userId };
     const cliStatus = await getComposioCliStatus(cliOptions);
     if (cliStatus.installed && (backend === 'cli' || cliStatus.authenticated)) {
@@ -2252,6 +2268,9 @@ export const __test__ = {
   authConfigToolkitSlug,
   selectAuthConfigIdForToolkit,
   derivedComposioUserId,
+  setComposioClient(client: unknown): void {
+    singleton = client as Composio;
+  },
   setConnectedAccountsLoader(
     loader: (() => Promise<Array<Record<string, unknown>>>) | null,
   ): void {

@@ -62,6 +62,9 @@ test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a s
   // must trigger acquisition, never the old generic "capability missing; stop".
   assert.match(primer!, /tool_search then call_tool/);
   assert.doesNotMatch(primer!, /tool you need is unavailable.*stop/i);
+  assert.match(primer!, /space_history\('deal-risk'\)/);
+  assert.match(primer!, /space_diff\('deal-risk', '<source id>'\)/);
+  assert.match(primer!, /Never infer a delta.*insufficient history/i);
   // Keep the always-injected guide small enough to let the model drive.
   assert.ok(primer!.length < 2_400, `workspace primer grew to ${primer!.length} chars`);
 });
@@ -74,7 +77,7 @@ test('WORKSPACE_DOCK_TOOLS lists the tools a dock turn needs to edit', () => {
   assert.deepEqual([...WORKSPACE_DOCK_TOOLS], [
     'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
     'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
-    'space_publish',
+    'space_history', 'space_diff', 'space_publish',
   ]);
 });
 
@@ -86,7 +89,7 @@ test('WORKSPACE_DOCK_HOT_TOOLS is a strict common-operation subset', () => {
 
 test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () => {
   const full = sdk.defaultClaudeAgentSdkAllowedLocalTools('full');
-  for (const t of ['space_get', 'space_get_view', 'space_get_runner', 'space_list', 'space_edit_view', 'space_edit_runner', 'space_revert_runner', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data', 'space_publish']) {
+  for (const t of ['space_get', 'space_get_view', 'space_get_runner', 'space_list', 'space_history', 'space_diff', 'space_edit_view', 'space_edit_runner', 'space_revert_runner', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data', 'space_publish']) {
     assert.ok(full.includes(t), `full profile missing ${t}`);
   }
   const authoring = sdk.defaultClaudeAgentSdkAllowedLocalTools('local_authoring');
@@ -96,6 +99,7 @@ test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () =>
   // the writes/executors (space_save/edit/try_runner/set_data).
   const ro = sdk.defaultClaudeAgentSdkAllowedLocalTools('read_only');
   assert.ok(ro.includes('space_get') && ro.includes('space_get_view') && ro.includes('space_list'));
+  assert.ok(ro.includes('space_history') && ro.includes('space_diff'));
   assert.ok(!ro.includes('space_save') && !ro.includes('space_edit_view'));
   assert.ok(!ro.includes('space_try_runner') && !ro.includes('space_set_data'));
 });

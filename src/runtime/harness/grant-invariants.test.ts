@@ -19,6 +19,7 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-grant-inv-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { queuePendingAction, markPendingActionApprovalResolved, getPendingAction } = await import('./pending-actions.js');

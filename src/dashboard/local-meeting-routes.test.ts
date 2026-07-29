@@ -14,6 +14,7 @@ process.env.NODE_ENV = 'test';
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const local = await import('../integrations/local-meetings/meeting-capture.js');
+const recall = await import('../integrations/recall/meeting-capture.js');
 
 test.after(() => {
   local._setLocalMeetingTranscriberForTests(null);
@@ -50,9 +51,29 @@ test('local meeting routes require auth and complete the start → ingest → hi
     assert.equal((await fetch(`${harness.url}/api/console/meetings/local/status`)).status, 401);
     assert.equal((await fetch(`${harness.url}/api/console/meetings/local/start`, json('POST', { sessionId: 'route-test-123' }))).status, 401);
     assert.equal((await fetch(`${harness.url}/api/console/meetings/local/retry`, json('POST', { meetingId: 'anything' }))).status, 401);
+    assert.equal((await fetch(`${harness.url}/api/console/meetings/recall/anything/retry-transcript`, json('POST'))).status, 401);
 
     authorized.value = true;
     assert.equal((await fetch(`${harness.url}/api/console/meetings/local/retry`, json('POST', {}))).status, 400);
+    assert.equal((await fetch(`${harness.url}/api/console/meetings/recall/missing/retry-transcript`, json('POST'))).status, 404);
+    recall.appendRecallTranscriptSegment({
+      windowId: 'route-recall-ready',
+      event: 'transcript.data',
+      text: 'This live transcript is already usable.',
+      isFinal: true,
+    });
+    const readyRecall = recall.finalizeRecallMeeting({
+      windowId: 'route-recall-ready',
+      retentionMode: 'zero',
+      canonicalBackfill: false,
+    });
+    const healthyRetry = await fetch(
+      `${harness.url}/api/console/meetings/recall/${encodeURIComponent(readyRecall.record.id)}/retry-transcript`,
+      json('POST'),
+    );
+    assert.equal(healthyRetry.status, 409, 'a healthy transcript cannot start duplicate recovery work');
+    const healthyRetryBody = await healthyRetry.json() as Record<string, unknown>;
+    assert.equal('record' in healthyRetryBody, false, 'retry responses never echo a potentially large transcript record');
     assert.equal((await fetch(`${harness.url}/api/console/meetings/recall/upload-token`, json('POST', {
       region: 'invalid-region',
     }))).status, 400);

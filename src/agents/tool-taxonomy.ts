@@ -194,6 +194,11 @@ const ALWAYS_READ = new Set<string>([
   'workspace_roots',
   'workspace_list',
   'workspace_info',
+  // Retained Workspace observation queries are local, bounded reads. `diff`
+  // and `history` are nouns in these tool names, so neither is covered by the
+  // verb matcher below.
+  'space_history',
+  'space_diff',
   'git_status',
   'session_history',
   'skill_list',

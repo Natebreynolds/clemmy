@@ -47,29 +47,193 @@ function isExecutable(filePath: string): boolean {
   }
 }
 
-export function findComposioCli(): string | null {
-  const explicit = process.env.COMPOSIO_CLI_PATH?.trim();
-  if (explicit && isExecutable(explicit)) return explicit;
+export interface ComposioCliDiscoveryOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  /** Test seam for probing candidate paths without changing the host platform. */
+  isExecutable?: (filePath: string) => boolean;
+}
 
-  const home = os.homedir();
-  const candidates = [
-    path.join(home, '.composio', 'composio'),
-    path.join(home, '.composio', 'bin', 'composio'),
-    path.join(home, '.local', 'bin', 'composio'),
-    '/opt/homebrew/bin/composio',
-    '/usr/local/bin/composio',
-  ];
-  for (const candidate of candidates) {
-    if (isExecutable(candidate)) return candidate;
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  if (env[name] !== undefined) return env[name];
+  const match = Object.keys(env).find((key) => key.toLowerCase() === name.toLowerCase());
+  return match ? env[match] : undefined;
+}
+
+const WINDOWS_SPAWN_SUPPORTED_EXTENSIONS =
+  new Set(['.COM', '.EXE', '.CMD', '.BAT', '.JS', '.CJS', '.MJS']);
+
+function safeWindowsExecutableExtensions(raw: string | undefined): string[] {
+  const fallback = ['.COM', '.EXE', '.CMD', '.BAT'];
+  const parsed = (raw ?? fallback.join(';'))
+    .split(';')
+    .map((entry) => entry.trim())
+    // PATHEXT is metadata, never a path: reject separators, traversal, globs,
+    // and shell syntax before turning any entry into a filesystem probe. Also
+    // admit only formats composioCliSpawnSpec can launch without guessing an
+    // interpreter from the host's file association.
+    .filter((entry) =>
+      /^\.[A-Za-z0-9]{1,10}$/.test(entry)
+      && WINDOWS_SPAWN_SUPPORTED_EXTENSIONS.has(entry.toUpperCase()));
+  const source = parsed.length > 0 ? parsed : fallback;
+  const seen = new Set<string>();
+  return source.filter((entry) => {
+    const key = entry.toUpperCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function stripMatchingQuotes(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')
+    ? trimmed.slice(1, -1)
+    : trimmed;
+}
+
+export function findComposioCli(options: ComposioCliDiscoveryOptions = {}): string | null {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const home = options.homeDir ?? os.homedir();
+  const check = options.isExecutable ?? isExecutable;
+  const pathFlavor = platform === 'win32' ? path.win32 : path;
+  const pathDelimiter = platform === 'win32' ? ';' : path.delimiter;
+  const executableExtensions = platform === 'win32'
+    ? safeWindowsExecutableExtensions(envValue(env, 'PATHEXT'))
+    : [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (basePath: string): void => {
+    const base = stripMatchingQuotes(basePath);
+    if (!base) return;
+    const extension = pathFlavor.extname(base);
+    // COMPOSIO_CLI_PATH is user-controlled and bypasses PATHEXT expansion.
+    // Refuse Windows script/file types the spawn adapter cannot launch
+    // deterministically instead of delegating to mutable file associations.
+    if (
+      platform === 'win32'
+      && extension
+      && !WINDOWS_SPAWN_SUPPORTED_EXTENSIONS.has(extension.toUpperCase())
+    ) return;
+    const variants =
+      platform === 'win32' && !extension
+        ? [base, ...executableExtensions.map((extension) => `${base}${extension}`)]
+        : [base];
+    for (const candidate of variants) {
+      const key = platform === 'win32' ? candidate.toLowerCase() : candidate;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  };
+
+  const explicit = envValue(env, 'COMPOSIO_CLI_PATH');
+  if (explicit?.trim()) addCandidate(explicit);
+
+  addCandidate(pathFlavor.join(home, '.composio', 'composio'));
+  addCandidate(pathFlavor.join(home, '.composio', 'bin', 'composio'));
+  addCandidate(pathFlavor.join(home, '.local', 'bin', 'composio'));
+  if (platform !== 'win32') {
+    addCandidate('/opt/homebrew/bin/composio');
+    addCandidate('/usr/local/bin/composio');
   }
 
-  const pathDirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
-  for (const dir of pathDirs) {
-    const candidate = path.join(dir, 'composio');
-    if (isExecutable(candidate)) return candidate;
-  }
+  const pathDirs = (envValue(env, 'PATH') ?? '')
+    .split(pathDelimiter)
+    .map(stripMatchingQuotes)
+    .filter(Boolean);
+  for (const dir of pathDirs) addCandidate(pathFlavor.join(dir, 'composio'));
 
-  return null;
+  return candidates.find((candidate) => check(candidate)) ?? null;
+}
+
+export interface ComposioCliSpawnOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ComposioCliSpawnSpec {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+}
+
+const WINDOWS_CMD_META_RE = /([()\][%!^"`<>&|;, *?])/g;
+
+function assertWindowsCmdToken(value: string): void {
+  if (/[\0\r\n]/.test(value)) {
+    throw new Error('Windows cmd/bat arguments cannot contain NUL bytes or line breaks.');
+  }
+}
+
+function escapeWindowsCmdCommand(value: string): string {
+  assertWindowsCmdToken(value);
+  return value.replace(WINDOWS_CMD_META_RE, '^$1');
+}
+
+function escapeWindowsCmdArgument(value: string, doubleEscapeMetaChars: boolean): string {
+  assertWindowsCmdToken(value);
+
+  // Quote using the Windows C-runtime rules first: backslashes before a quote
+  // are doubled and the quote is escaped; trailing backslashes are doubled so
+  // they cannot consume the closing quote.
+  let quoted = '"';
+  let backslashes = 0;
+  for (const char of value) {
+    if (char === '\\') {
+      backslashes += 1;
+      continue;
+    }
+    if (char === '"') {
+      quoted += `${'\\'.repeat(backslashes * 2 + 1)}"`;
+      backslashes = 0;
+      continue;
+    }
+    quoted += `${'\\'.repeat(backslashes)}${char}`;
+    backslashes = 0;
+  }
+  quoted += `${'\\'.repeat(backslashes * 2)}"`;
+
+  // Then neutralize cmd.exe metacharacters. A node_modules/.bin cmd-shim
+  // performs a second parse while forwarding %*, so those shims need the same
+  // escaping twice. This is the same boundary used by mature Windows spawn
+  // adapters, but kept local so Composio does not rely on a transitive package.
+  let escaped = quoted.replace(WINDOWS_CMD_META_RE, '^$1');
+  if (doubleEscapeMetaChars) escaped = escaped.replace(WINDOWS_CMD_META_RE, '^$1');
+  return escaped;
+}
+
+export function composioCliSpawnSpec(
+  binary: string,
+  args: readonly string[],
+  options: ComposioCliSpawnOptions = {},
+): ComposioCliSpawnSpec {
+  // Node adapters are a byte-preserving cross-platform CLI boundary. Windows
+  // batch files require shell parsing, which can reinterpret JSON payload
+  // characters; an explicit JS adapter runs through this exact Node binary.
+  if (/\.(?:cjs|mjs|js)$/i.test(binary)) {
+    return { command: process.execPath, args: [binary, ...args] };
+  }
+  const platform = options.platform ?? process.platform;
+  if (platform === 'win32' && /\.(?:cmd|bat)$/i.test(binary)) {
+    const env = options.env ?? process.env;
+    const command = path.win32.normalize(binary);
+    const doubleEscape = /node_modules[\\/]\.bin[\\/][^\\/]+\.(?:cmd|bat)$/i.test(command);
+    const shellCommand = [
+      escapeWindowsCmdCommand(command),
+      ...args.map((arg) => escapeWindowsCmdArgument(String(arg), doubleEscape)),
+    ].join(' ');
+    const comspec = stripMatchingQuotes(envValue(env, 'ComSpec') ?? 'cmd.exe');
+    return {
+      command: comspec || 'cmd.exe',
+      args: ['/d', '/s', '/v:off', '/c', `"${shellCommand}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return { command: binary, args: [...args] };
 }
 
 function cliEnv(options: ComposioCliEnvOptions = {}): NodeJS.ProcessEnv {
@@ -118,11 +282,25 @@ export function runComposioCli(
     });
   }
 
+  let spec: ComposioCliSpawnSpec;
+  try {
+    spec = composioCliSpawnSpec(binary, args);
+  } catch (error) {
+    return Promise.resolve({
+      ok: false,
+      stdout: '',
+      stderr: error instanceof Error ? error.message : String(error),
+      exitCode: null,
+      timedOut: false,
+    });
+  }
+
   return new Promise((resolve) => {
     let settled = false;
-    const child = spawn(binary, args, {
+    const child = spawn(spec.command, spec.args, {
       env: cliEnv(options),
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsVerbatimArguments: spec.windowsVerbatimArguments,
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];

@@ -21,6 +21,7 @@
  * There is deliberately no release-time bypass: alternate callers and stale
  * debug configuration must not turn an approval-required action into a write.
  */
+import { createHash } from 'node:crypto';
 import {
   listPending, onApprovalResolved, registerResumable, type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
@@ -44,6 +45,10 @@ import {
   parseActionApprovalSnapshot,
   spaceActionApprovalResumeKey,
 } from './space-action-authority.js';
+import {
+  createWorkspaceObservationMemoryBridge,
+  type WorkspaceMemorySignal,
+} from '../memory/workspace-observation-bridge.js';
 
 /** Synthetic tool name stamped on the approval row so the resolve listener can
  *  recognise a Space-action approval (and tell it apart from agent tool calls). */
@@ -51,6 +56,44 @@ export const SPACE_ACTION_TOOL = SPACE_ACTION_APPROVAL_TOOL;
 export { SPACE_ACTION_MUTATION_WORKFLOW_SLUG };
 const SPACE_ACTION_EXECUTION_VERSION = 1;
 const RUNNER_ACTION_SCOPE_REASON = 'This approval covers a pinned entrypoint: only the runner entrypoint bytes are frozen. Helpers, packages, CLIs, local files, auth state, and network services remain live and outside the digest; arbitrary runner code is not a read-only sandbox.';
+const workspaceMemoryBridge = createWorkspaceObservationMemoryBridge();
+type WorkspaceMemoryCapture = (
+  signal: WorkspaceMemorySignal,
+) => ReturnType<typeof workspaceMemoryBridge.capture>;
+let workspaceMemoryCapture: WorkspaceMemoryCapture = (signal) =>
+  workspaceMemoryBridge.capture(signal);
+
+/** Focused test seam. Memory is a best-effort projection after the durable
+ * approval receipt/note; it must never become action authority. */
+export function _setWorkspaceActionMemoryCaptureForTests(
+  capture: WorkspaceMemoryCapture | null,
+): void {
+  workspaceMemoryCapture = capture ?? ((signal) => workspaceMemoryBridge.capture(signal));
+}
+
+function rememberResolvedEffect(
+  slug: string,
+  actionId: string,
+  approvalId: string,
+  decision: 'approved' | 'rejected',
+): Promise<void> {
+  const contentHash = createHash('sha256')
+    .update(`${slug}\u001f${actionId}\u001f${approvalId}\u001f${decision}`)
+    .digest('hex');
+  return workspaceMemoryCapture({
+    kind: 'effect_outcome',
+    workspaceId: slug,
+    sourceId: actionId,
+    observationId: approvalId,
+    contentHash,
+    occurredAt: new Date().toISOString(),
+    provenanceSummary: 'Authoritative Workspace action approval outcome.',
+    decision,
+    summary: decision === 'approved'
+      ? 'An approved Workspace effect completed with a durable receipt.'
+      : 'The user rejected a proposed Workspace effect; it was not run.',
+  }).then(() => undefined);
+}
 
 /**
  * Does this action mutate an external system (→ needs one approval)?
@@ -161,6 +204,8 @@ function recordApprovedActionSuccess(
     text: `Approved and ran “${actionLabel}”.`,
     auditNote: approvalId,
   });
+  void rememberResolvedEffect(slug, actionId, approvalId, 'approved')
+    .catch(() => undefined);
 }
 
 function resultIsUncertain(error: string): boolean {
@@ -342,7 +387,7 @@ export function executeApprovedSpaceAction(row: PendingApprovalRow): Promise<voi
 }
 
 /** Record a rejected/expired/cancelled Space action so the surface reflects it. */
-function recordUnapproved(row: PendingApprovalRow): void {
+async function recordUnapproved(row: PendingApprovalRow): Promise<void> {
   const args = row.args ?? {};
   const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
   const actionId = typeof args.actionId === 'string' ? args.actionId : '';
@@ -363,6 +408,11 @@ function recordUnapproved(row: PendingApprovalRow): void {
       kind: 'action',
       meta: { actionId, approvalId: row.approvalId, status },
     });
+  }
+  // Expiry/cancellation are lifecycle outcomes, not an explicit human
+  // rejection. Only a resolved rejection becomes a lasting preference signal.
+  if (row.resolution === 'rejected') {
+    await rememberResolvedEffect(slug, actionId, row.approvalId, 'rejected');
   }
 }
 
@@ -388,12 +438,19 @@ export async function recoverApprovedSpaceActions(): Promise<void> {
   const rows = listPending({ status: 'resolved' })
     .filter((row) => (
       row.tool === SPACE_ACTION_TOOL
-      && row.resolution === 'approved'
+      && (row.resolution === 'approved' || row.resolution === 'rejected')
       && row.args?.spaceActionExecutionVersion === SPACE_ACTION_EXECUTION_VERSION
     ))
     .sort((left, right) => left.requestedAt.localeCompare(right.requestedAt));
   for (const row of rows) {
-    await executeApprovedSpaceAction(row);
+    if (row.resolution === 'approved') {
+      await executeApprovedSpaceAction(row);
+    } else {
+      // Rejections are authoritative effects too. Re-project them on boot so
+      // a crash after registry resolution cannot silently lose the preference
+      // episode. recordUnapproved and the memory bridge are deterministic.
+      await recordUnapproved(row);
+    }
   }
 }
 
@@ -412,7 +469,9 @@ export function initSpaceActionApprovals(): void {
         recordApprovalExecutionCrash(row, err);
       });
     } else {
-      recordUnapproved(row);
+      void recordUnapproved(row).catch(() => {
+        // Approval state is already durable; boot recovery retries projection.
+      });
     }
   });
   setImmediate(() => {

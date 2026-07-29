@@ -14,14 +14,30 @@
  */
 import type { Express, Request, Response } from 'express';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import {
   spaceStore, resolveInSpace, resolveSpaceDir, isValidSpaceSlug, buildSpaceHealthSnapshot,
   mergeSpaceContract,
+  type SpaceRecord,
 } from '../spaces/store.js';
 import {
-  readData, writeData, appendNote, listNotes, appendAudit, listAudit,
+  readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit,
 } from '../spaces/data-store.js';
+import {
+  bootstrapWorkspaceObservationHistory,
+  commitWorkspaceObservationBatch,
+  getCurrentWorkspaceDatasetObservation,
+  getWorkspaceDatasetObservation,
+  getWorkspaceObservationDocument,
+  indexWorkspaceRecord,
+  listIndexedWorkspaces,
+  listWorkspaceDatasetObservations,
+  type WorkspaceDatasetObservation,
+} from '../spaces/workspace-db.js';
+import { diffWorkspaceObservationDocuments } from '../spaces/observation-diff.js';
+import { finalizeWorkspaceObservationCommit } from '../spaces/workspace-observation-finalize.js';
+import { redactSensitiveText } from '../runtime/security.js';
 import { refreshSpaceData, runSpaceAction } from '../spaces/runner.js';
 import { composeForSpace } from '../spaces/compose.js';
 import {
@@ -34,6 +50,121 @@ import { availableStarterRecipes } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 
 type IsAuthorized = (req: Request) => boolean;
+
+const OBSERVATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SOURCE_KEY_RE = /^[^\u0000-\u001f\u007f]{1,200}$/;
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const DEFAULT_HISTORY_LIMIT = 50;
+const MAX_HISTORY_LIMIT = 100;
+
+interface SafeWorkspaceObservation {
+  id: string;
+  sourceKey: string;
+  status: WorkspaceDatasetObservation['status'];
+  changed: boolean | null;
+  cause: string;
+  observedAt: string;
+  previousObservationId: string | null;
+  isCurrent: boolean;
+}
+
+function singleQueryString(value: unknown): string | undefined | null {
+  if (value === undefined) return undefined;
+  return typeof value === 'string' ? value : null;
+}
+
+function parseSourceKey(value: unknown): { ok: true; value?: string } | { ok: false } {
+  const raw = singleQueryString(value);
+  if (raw === undefined) return { ok: true };
+  if (raw === null || raw.trim() !== raw || !SOURCE_KEY_RE.test(raw)) return { ok: false };
+  return { ok: true, value: raw };
+}
+
+function parseObservationId(value: unknown): { ok: true; value?: string } | { ok: false } {
+  const raw = singleQueryString(value);
+  if (raw === undefined) return { ok: true };
+  if (raw === null || !OBSERVATION_ID_RE.test(raw)) return { ok: false };
+  return { ok: true, value: raw };
+}
+
+function parseBefore(value: unknown): { ok: true; value?: string } | { ok: false } {
+  const raw = singleQueryString(value);
+  if (raw === undefined) return { ok: true };
+  if (
+    raw === null
+    || raw.length > 32
+    || !ISO_TIMESTAMP_RE.test(raw)
+    || !Number.isFinite(Date.parse(raw))
+  ) return { ok: false };
+  return { ok: true, value: new Date(raw).toISOString() };
+}
+
+function parseHistoryLimit(value: unknown): { ok: true; value: number } | { ok: false } {
+  const raw = singleQueryString(value);
+  if (raw === undefined) return { ok: true, value: DEFAULT_HISTORY_LIMIT };
+  if (raw === null || !/^[1-9]\d{0,2}$/.test(raw)) return { ok: false };
+  const parsed = Number(raw);
+  return parsed <= MAX_HISTORY_LIMIT ? { ok: true, value: parsed } : { ok: false };
+}
+
+function safeObservation(observation: WorkspaceDatasetObservation): SafeWorkspaceObservation {
+  return {
+    id: OBSERVATION_ID_RE.test(observation.id) ? observation.id : 'invalid-observation-id',
+    sourceKey: SOURCE_KEY_RE.test(observation.sourceKey)
+      ? observation.sourceKey
+      : 'unknown-source',
+    status: observation.status,
+    changed: typeof observation.changed === 'boolean' ? observation.changed : null,
+    cause: String(observation.cause ?? 'unknown')
+      .replace(/[\u0000-\u001f\u007f]/g, ' ')
+      .trim()
+      .slice(0, 80) || 'unknown',
+    observedAt: Number.isFinite(Date.parse(observation.observedAt))
+      ? new Date(observation.observedAt).toISOString()
+      : new Date(0).toISOString(),
+    previousObservationId:
+      observation.previousObservationId && OBSERVATION_ID_RE.test(observation.previousObservationId)
+        ? observation.previousObservationId
+        : null,
+    isCurrent: observation.isCurrent === true,
+  };
+}
+
+function safeObservationDiff(
+  diff: ReturnType<typeof diffWorkspaceObservationDocuments>,
+): ReturnType<typeof diffWorkspaceObservationDocuments> {
+  return {
+    ...diff,
+    summary: redactSensitiveText(diff.summary).slice(0, 500),
+    changes: diff.changes.map((change) => ({
+      ...change,
+      path: redactSensitiveText(change.path).slice(0, 1_000),
+      ...(change.entityKey
+        ? { entityKey: redactSensitiveText(change.entityKey).slice(0, 300) }
+        : {}),
+      ...(change.before !== undefined
+        ? { before: redactSensitiveText(change.before).slice(0, 2_000) }
+        : {}),
+      ...(change.after !== undefined
+        ? { after: redactSensitiveText(change.after).slice(0, 2_000) }
+        : {}),
+    })),
+  };
+}
+
+function ensureWorkspaceIndexed(record: SpaceRecord): void {
+  if (listIndexedWorkspaces().some((entry) => entry.id === record.id)) return;
+  indexWorkspaceRecord(record, {
+    emitOperational: false,
+    appendStateEvent: false,
+  });
+}
+
+function bootstrapLegacyWorkspaceHistoryIfNeeded(workspaceId: string): void {
+  if (listWorkspaceDatasetObservations(workspaceId, { limit: 1 }).length > 0) return;
+  const bootstrapped = bootstrapWorkspaceObservationHistory(workspaceId);
+  if (!bootstrapped.ok) throw new Error(bootstrapped.error);
+}
 
 const CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -108,6 +239,8 @@ function workspaceViewCsp(req: Request, slug: string): string | null {
  *  workspace-scoped operation set. Authored HTML therefore never sees a cookie,
  *  token, API URL, or general-purpose authenticated fetch primitive:
  *    await clem.data()                       → the dataset (keyed by sourceId)
+ *    await clem.history(opts?)               → bounded observation summaries
+ *    await clem.diff(opts?)                  → bounded, redacted structural diff
  *    await clem.refresh(sourceId?)           → re-pull server-side, returns data
  *    await clem.compose(instructions, ctx)   → a grounded draft (throws on error)
  *    await clem.action(actionId, args)       → fire a declared action
@@ -118,30 +251,41 @@ function workspaceViewCsp(req: Request, slug: string): string | null {
 const CLEM_VIEW_BRIDGE = (slug: string): string => {
   const S = JSON.stringify(slug);
   return `<script>(function(){'use strict';
-var C='clementine.workspace.rpc.v1',S=${S},N=0,P=new Map(),Q=[],PORT=null;
-var ADD=EventTarget.prototype.addEventListener,REMOVE=EventTarget.prototype.removeEventListener;
-var STOP=Event.prototype.stopImmediatePropagation,PREVENT=Event.prototype.preventDefault;
-var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response;
+var C='clementine.workspace.rpc.v1',GC='clementine.workspace.gesture.v1',S=${S},N=0,P=new Map(),Q=[],GQ=[],PORT=null,GPORT=null;
+var U=function(fn){return Function.prototype.call.bind(fn);};
+var ADD=U(EventTarget.prototype.addEventListener),REMOVE=U(EventTarget.prototype.removeEventListener);
+var STOP=U(Event.prototype.stopImmediatePropagation),PREVENT=U(Event.prototype.preventDefault);
+var PORT_POST=U(MessagePort.prototype.postMessage),PORT_START=U(MessagePort.prototype.start);
+var OWN_DESC=Object.getOwnPropertyDescriptor,PORTS_DESC=OWN_DESC(MessageEvent.prototype,'ports'),DATA_DESC=OWN_DESC(MessageEvent.prototype,'data'),SOURCE_DESC=OWN_DESC(MessageEvent.prototype,'source');
+var TARGET_DESC=OWN_DESC(Event.prototype,'target'),TRUSTED_DESC=OWN_DESC(Event.prototype,'isTrusted'),PATH=U(Event.prototype.composedPath);
+var GET_PORTS=PORTS_DESC&&PORTS_DESC.get?U(PORTS_DESC.get):null,GET_DATA=DATA_DESC&&DATA_DESC.get?U(DATA_DESC.get):null,GET_SOURCE=SOURCE_DESC&&SOURCE_DESC.get?U(SOURCE_DESC.get):null;
+var GET_TARGET=TARGET_DESC&&TARGET_DESC.get?U(TARGET_DESC.get):null,GET_TRUSTED=TRUSTED_DESC&&TRUSTED_DESC.get?U(TRUSTED_DESC.get):function(e){return e.isTrusted;};
+var CLOSEST=U(Element.prototype.closest),HAS_ATTR=U(Element.prototype.hasAttribute),GET_ATTR=U(Element.prototype.getAttribute);
+var ARRAY_PUSH=U(Array.prototype.push),ARRAY_INDEX=U(Array.prototype.indexOf);
+var URL_PROTOCOL_DESC=OWN_DESC(URL.prototype,'protocol'),URL_HREF_DESC=OWN_DESC(URL.prototype,'href');
+var GET_URL_PROTOCOL=URL_PROTOCOL_DESC&&URL_PROTOCOL_DESC.get?U(URL_PROTOCOL_DESC.get):null,GET_URL_HREF=URL_HREF_DESC&&URL_HREF_DESC.get?U(URL_HREF_DESC.get):null;
+var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response,BASE_URL=location.href;
 function id(){try{if(crypto&&crypto.randomUUID)return crypto.randomUUID();}catch(_){}return Date.now().toString(36)+'-'+(++N).toString(36);}
-var D='doc_'+id(),nav=window.navigation,SAFE_NAV=!!(nav&&typeof nav.addEventListener==='function');
+var D='doc_'+id(),nav=window.navigation,SAFE_NAV=!!(nav&&typeof nav.addEventListener==='function'&&GET_PORTS&&GET_DATA&&GET_SOURCE&&GET_TARGET&&GET_TRUSTED&&GET_URL_PROTOCOL&&GET_URL_HREF);
 function lock(name,value){try{Object.defineProperty(window,name,{value:value,writable:false,configurable:false});}catch(_){}}
-if(SAFE_NAV){ADD.call(nav,'navigate',function(e){if(e.hashChange)return;if(e.cancelable)PREVENT.call(e);},true);}
+if(SAFE_NAV){ADD(nav,'navigate',function(e){if(e.hashChange)return;if(e.cancelable)PREVENT(e);},true);}
 function finish(m){var p;if(!m||m.channel!==C||m.version!==1||m.kind!=='response'||m.workspaceId!==S||typeof m.id!=='string')return;p=P.get(m.id);if(!p)return;P.delete(m.id);clearTimeout(p.timer);if(m.ok)p.resolve(m.result);else p.reject(new Error(typeof m.error==='string'?m.error:'Workspace request failed'));}
-function send(m){if(PORT)PORT.postMessage(m);else Q.push(m);}
+function send(m){if(PORT)PORT_POST(PORT,m);else ARRAY_PUSH(Q,m);}
+function gesture(op,payload){var m;if(!SAFE_NAV)return;m={channel:GC,version:1,kind:'gesture',workspaceId:S,documentId:D,id:id(),op:op,payload:payload||{}};if(GPORT)PORT_POST(GPORT,m);else if(GQ.length<8)ARRAY_PUSH(GQ,m);}
 function rpc(op,payload){return new Promise(function(resolve,reject){if(!SAFE_NAV){reject(new Error('This browser cannot safely isolate Workspace navigation'));return;}if(parent===window){reject(new Error('Workspace bridge requires the Clementine shell'));return;}if(P.size>=64){reject(new Error('Too many Workspace requests'));return;}var rid=id(),timer=setTimeout(function(){P.delete(rid);reject(new Error('Workspace request timed out'));},30000);P.set(rid,{resolve:resolve,reject:reject,timer:timer});send({channel:C,version:1,kind:'request',workspaceId:S,id:rid,op:op,payload:payload||{}});});}
-function onAck(e){var m=e.data,p;if(e.source!==parent||!m||m.channel!==C||m.version!==1||m.kind!=='bootstrap_ack'||m.workspaceId!==S||m.documentId!==D||!e.ports||!e.ports[0])return;STOP.call(e);PORT=e.ports[0];PORT.onmessage=function(pe){finish(pe.data);};PORT.start();while((p=Q.shift()))PORT.postMessage(p);if(BOOT)clearInterval(BOOT);REMOVE.call(window,'message',onAck,true);}
-ADD.call(window,'message',onAck,true);
+function onAck(e){var m,p,g,i,ports;if(GET_TRUSTED(e)!==true||GET_SOURCE(e)!==parent)return;m=GET_DATA(e);ports=GET_PORTS(e);if(!m||m.channel!==C||m.version!==1||m.kind!=='bootstrap_ack'||m.workspaceId!==S||m.documentId!==D||!ports||!ports[0]||!ports[1])return;STOP(e);PORT=ports[0];GPORT=ports[1];ADD(PORT,'message',function(pe){finish(GET_DATA(pe));});PORT_START(PORT);for(i=0;i<Q.length;i++){p=Q[i];PORT_POST(PORT,p);}Q.length=0;for(i=0;i<GQ.length;i++){g=GQ[i];PORT_POST(GPORT,g);}GQ.length=0;if(BOOT)clearInterval(BOOT);REMOVE(window,'message',onAck,true);}
+ADD(window,'message',onAck,true);
 function bootstrap(){parent.postMessage({channel:C,version:1,kind:'bootstrap',workspaceId:S,documentId:D},'*');}
-var BOOT=null;if(SAFE_NAV&&parent!==window){bootstrap();BOOT=setInterval(bootstrap,250);setTimeout(function(){if(BOOT){clearInterval(BOOT);BOOT=null;}},5000);}
+var BOOT=null;if(parent!==window){bootstrap();BOOT=setInterval(bootstrap,250);setTimeout(function(){if(BOOT){clearInterval(BOOT);BOOT=null;}},5000);}
 function response(body,status){return new RESPONSE_CTOR(JSON_STRINGIFY(body),{status:status||200,headers:{'content-type':'application/json'}});}
 function parsedBody(init){if(!init||init.body===undefined||init.body===null||init.body==='')return {};if(typeof init.body!=='string')throw new TypeError('Workspace compatibility fetch accepts a JSON string body only');var value=JSON_PARSE(init.body);if(!value||typeof value!=='object'||Array.isArray(value))throw new TypeError('Workspace request body must be a JSON object');return value;}
 function legacyFetch(input,init){return Promise.resolve().then(function(){var raw=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:String(input));var u=new URL_CTOR(raw,location.href),here=new URL_CTOR(location.href),prefix='/api/console/spaces/'+encodeURIComponent(S)+'/',method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase(),body=parsedBody(init),tail;if(u.origin!==here.origin||u.search||u.hash||u.pathname.indexOf(prefix)!==0)throw new TypeError('Workspace fetch is limited to this Workspace RPC surface');tail=u.pathname.slice(prefix.length);if(tail==='data'&&method==='GET')return rpc('data',{}).then(function(r){return response({data:r},200);});if(tail==='refresh'&&method==='POST')return rpc('refresh',typeof body.sourceId==='string'?{sourceId:body.sourceId}:{}).then(function(r){return response(r,200);});if(tail==='notes'&&method==='POST')return rpc('note',{text:body.text,kind:body.kind,meta:body.meta}).then(function(r){return response(r,201);});if(tail==='compose'&&method==='POST')return rpc('compose',{instructions:body.instructions,context:body.context,maxChars:body.maxChars}).then(function(r){return response({text:r},200);});if(tail==='action'&&method==='POST')return rpc('action',{actionId:body.actionId,args:body.args||{}}).then(function(r){return response(r,r&&r.pending?202:200);});throw new TypeError('Workspace fetch operation is not allowed');}).catch(function(error){return response({error:error&&error.message?String(error.message):'Workspace request failed'},500);});}
 lock('fetch',legacyFetch);
 ['XMLHttpRequest','WebSocket','EventSource','WebTransport','RTCPeerConnection','webkitRTCPeerConnection'].forEach(function(name){lock(name,undefined);});
 try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;},writable:false,configurable:false});}catch(_){}
-function anchor(target){while(target&&target!==document){if(target.tagName==='A')return target;target=target.parentElement;}return null;}
-ADD.call(document,'click',function(e){var a,url,protocol;if(!e.isTrusted||(a=anchor(e.target))===null)return;if(a.hasAttribute('download')){PREVENT.call(e);STOP.call(e);rpc('download',{filename:a.getAttribute('download')||'download',dataUrl:a.getAttribute('href')||''}).catch(function(){});return;}try{url=a.href;protocol=new URL_CTOR(url).protocol;}catch(_){return;}if(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'].indexOf(protocol)<0)return;PREVENT.call(e);STOP.call(e);rpc('open_external',{url:url}).catch(function(){});},true);
-window.clem=Object.freeze({slug:S,data:function(){return rpc('data',{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
+function anchor(e){var path=PATH(e),i,a;for(i=0;i<path.length;i++){try{a=CLOSEST(path[i],'a');if(a)return a;}catch(_){}}return null;}
+ADD(document,'click',function(e){var a,raw,parsed,url,protocol;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(a=anchor(e))===null)return;if(HAS_ATTR(a,'download')){PREVENT(e);STOP(e);gesture('download',{filename:GET_ATTR(a,'download')||'download',dataUrl:GET_ATTR(a,'href')||''});return;}raw=GET_ATTR(a,'href');if(typeof raw!=='string'||!raw)return;try{parsed=new URL_CTOR(raw,BASE_URL);url=GET_URL_HREF(parsed);protocol=GET_URL_PROTOCOL(parsed);}catch(_){return;}if(ARRAY_INDEX(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'],protocol)<0)return;PREVENT(e);STOP(e);gesture('open_external',{url:url});},true);
+window.clem=Object.freeze({slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
 })();</script>`;
 };
 
@@ -333,16 +477,243 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     res.json({ data: readData(slug) });
   });
 
-  app.put('/api/console/spaces/:id/data', (req, res) => {
+  app.put('/api/console/spaces/:id/data', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
     const rec = spaceStore.get(slug);
     if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
     if (rec.status !== 'active') { res.status(423).json({ error: `workspace is ${rec.status}` }); return; }
-    const result = writeData(slug, req.body?.data ?? req.body);
-    appendAudit(slug, { method: 'PUT', path: '/data', outcome: result.ok ? 'ok' : 'rejected', bytes: result.bytes, note: result.ok ? undefined : result.error });
-    if (!result.ok) { res.status(413).json({ error: result.error }); return; }
-    res.json({ ok: true, bytes: result.bytes });
+    const body = req.body as unknown;
+    const document = (
+      body !== null
+      && typeof body === 'object'
+      && !Array.isArray(body)
+      && Object.hasOwn(body, 'data')
+    )
+      ? (body as Record<string, unknown>).data
+      : body;
+    let serialized: string;
+    try {
+      const encoded = JSON.stringify(document === undefined ? {} : document);
+      if (encoded === undefined) {
+        throw new Error('top-level value is not representable in JSON');
+      }
+      serialized = encoded;
+    } catch (err) {
+      const error = `data is not JSON-serializable: ${(err as Error).message}`;
+      appendAudit(slug, { method: 'PUT', path: '/data', outcome: 'rejected', bytes: 0, note: error });
+      res.status(413).json({ error });
+      return;
+    }
+    const bytes = Buffer.byteLength(serialized, 'utf-8');
+    if (bytes > MAX_DATA_BYTES) {
+      const error = `data exceeds ${MAX_DATA_BYTES} byte cap (${bytes} bytes)`;
+      appendAudit(slug, { method: 'PUT', path: '/data', outcome: 'rejected', bytes, note: error });
+      res.status(413).json({ error });
+      return;
+    }
+    try {
+      // A legacy file-backed Workspace may not have reached the rebuildable DB
+      // index yet. Index it before the append-only temporal commit.
+      ensureWorkspaceIndexed(rec);
+      bootstrapLegacyWorkspaceHistoryIfNeeded(slug);
+      const committed = commitWorkspaceObservationBatch({
+        workspaceId: slug,
+        observations: [{
+          sourceKey: '$document',
+          refreshId: randomUUID(),
+          cause: 'direct_put',
+          projectionMode: 'document',
+          status: 'ok',
+          data: document,
+        }],
+      });
+      try {
+        await finalizeWorkspaceObservationCommit(slug, committed);
+      } catch {
+        // The temporal commit + data.json projection are already durable.
+        // Memory/retention maintenance is best-effort and must never turn a
+        // successful external write into a false failure.
+      }
+      appendAudit(slug, {
+        method: 'PUT',
+        path: '/data',
+        outcome: 'ok',
+        bytes: committed.projection.bytes,
+      });
+      res.json({ ok: true, bytes: committed.projection.bytes });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      appendAudit(slug, {
+        method: 'PUT',
+        path: '/data',
+        outcome: 'error',
+        bytes,
+        note: redactSensitiveText(error).slice(0, 1_000),
+      });
+      res.status(500).json({ error: 'workspace data could not be persisted' });
+    }
+  });
+
+  app.get('/api/console/spaces/:id/history', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    const slug = String(req.params.id ?? '');
+    const rec = spaceStore.get(slug);
+    if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
+    const sourceKey = parseSourceKey(req.query.sourceKey);
+    const limit = parseHistoryLimit(req.query.limit);
+    const before = parseBefore(req.query.before);
+    const cursor = parseObservationId(req.query.cursor);
+    if (
+      !sourceKey.ok
+      || !limit.ok
+      || !before.ok
+      || !cursor.ok
+      || (before.value !== undefined && cursor.value !== undefined)
+    ) {
+      res.status(400).json({ error: 'invalid history query' });
+      return;
+    }
+    try {
+      ensureWorkspaceIndexed(rec);
+      bootstrapLegacyWorkspaceHistoryIfNeeded(slug);
+      const observations = listWorkspaceDatasetObservations(slug, {
+        ...(sourceKey.value ? { sourceKey: sourceKey.value } : {}),
+        ...(before.value ? { before: before.value } : {}),
+        ...(cursor.value ? { cursor: cursor.value } : {}),
+        // Fetch one extra row so pagination never guesses from a full page.
+        limit: limit.value + 1,
+      });
+      const hasMore = observations.length > limit.value;
+      const page = observations.slice(0, limit.value).map(safeObservation);
+      const nextCursor = hasMore ? page.at(-1)?.id : undefined;
+      const nextBefore = hasMore ? page.at(-1)?.observedAt : undefined;
+      res.json({
+        observations: page,
+        hasMore,
+        ...(nextCursor ? { nextCursor } : {}),
+        // Kept for older console clients. Cursor is the lossless 3.0 contract.
+        ...(nextBefore ? { nextBefore } : {}),
+        ...(sourceKey.value ? { sourceKey: sourceKey.value } : {}),
+      });
+    } catch (error) {
+      if (
+        error instanceof Error
+        && error.message === 'Workspace observation cursor was not found for this workspace'
+      ) {
+        res.status(400).json({ error: 'invalid history cursor' });
+        return;
+      }
+      // The DB is a rebuildable index. A broken/unavailable index must not
+      // break the live Workspace or accidentally fall back to unsafely reading
+      // arbitrary files.
+      res.status(503).json({ error: 'workspace history is temporarily unavailable' });
+    }
+  });
+
+  app.get('/api/console/spaces/:id/diff', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    const slug = String(req.params.id ?? '');
+    const rec = spaceStore.get(slug);
+    if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
+    const sourceKey = parseSourceKey(req.query.sourceKey);
+    const fromId = parseObservationId(req.query.from);
+    const toId = parseObservationId(req.query.to);
+    if (!sourceKey.ok || !fromId.ok || !toId.ok) {
+      res.status(400).json({ error: 'invalid diff query' });
+      return;
+    }
+    try {
+      ensureWorkspaceIndexed(rec);
+      bootstrapLegacyWorkspaceHistoryIfNeeded(slug);
+      const recent = listWorkspaceDatasetObservations(slug, {
+        ...(sourceKey.value ? { sourceKey: sourceKey.value } : {}),
+        limit: 500,
+      });
+
+      let to = toId.value
+        ? getWorkspaceDatasetObservation(slug, toId.value) ?? undefined
+        : undefined;
+      let from = fromId.value
+        ? getWorkspaceDatasetObservation(slug, fromId.value) ?? undefined
+        : undefined;
+      if ((toId.value && !to) || (fromId.value && !from)) {
+        res.status(404).json({ error: 'observation not found in this workspace' });
+        return;
+      }
+
+      if (!to) {
+        if (sourceKey.value) {
+          to = getCurrentWorkspaceDatasetObservation(slug, sourceKey.value) ?? undefined;
+        } else if (from) {
+          to = getCurrentWorkspaceDatasetObservation(slug, from.sourceKey) ?? undefined;
+        } else {
+          const current = recent.filter((entry) =>
+            entry.isCurrent && entry.status === 'ok' && entry.datasetId);
+          if (current.length > 1) {
+            res.status(400).json({
+              error: 'sourceKey is required when a workspace has multiple current data sources',
+            });
+            return;
+          }
+          to = current[0];
+        }
+      }
+      if (to && !from) {
+        from = to.previousObservationId
+          ? getWorkspaceDatasetObservation(slug, to.previousObservationId) ?? undefined
+          : undefined;
+      }
+
+      const selectedSource = sourceKey.value ?? to?.sourceKey ?? from?.sourceKey;
+      const successfulCount = recent.filter((entry) =>
+        entry.status === 'ok'
+        && entry.datasetId
+        && (!selectedSource || entry.sourceKey === selectedSource)).length;
+      if (!to || !from) {
+        res.json({
+          status: 'insufficient_history',
+          ...(selectedSource ? { sourceKey: selectedSource } : {}),
+          observations: successfulCount,
+        });
+        return;
+      }
+      if (
+        to.status !== 'ok'
+        || from.status !== 'ok'
+        || !to.datasetId
+        || !from.datasetId
+        || to.sourceKey !== from.sourceKey
+        || (sourceKey.value && (to.sourceKey !== sourceKey.value || from.sourceKey !== sourceKey.value))
+      ) {
+        res.status(400).json({ error: 'diff observations must be successful observations from one source' });
+        return;
+      }
+
+      const beforeDocument = getWorkspaceObservationDocument(slug, from.id);
+      const afterDocument = getWorkspaceObservationDocument(slug, to.id);
+      if (beforeDocument === undefined || afterDocument === undefined) {
+        res.status(410).json({ error: 'observation data is no longer retained' });
+        return;
+      }
+      const diff = safeObservationDiff(diffWorkspaceObservationDocuments(beforeDocument, afterDocument, {
+        maxChanges: 80,
+        maxDepth: 8,
+        maxPreviewChars: 240,
+        maxCollectionEntries: 500,
+      }));
+      res.json({
+        status: 'ok',
+        sourceKey: to.sourceKey,
+        from: safeObservation(from),
+        to: safeObservation(to),
+        diff,
+      });
+    } catch {
+      res.status(503).json({ error: 'workspace history is temporarily unavailable' });
+    }
   });
 
   app.get('/api/console/spaces/:id/notes', (req, res) => {
@@ -360,8 +731,16 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (rec.status === 'archived') { res.status(423).json({ error: 'workspace is archived' }); return; }
     const textVal = typeof req.body?.text === 'string' ? req.body.text : '';
     if (!textVal.trim()) { res.status(400).json({ error: 'text required' }); return; }
-    const note = appendNote(slug, { text: textVal, kind: typeof req.body?.kind === 'string' ? req.body.kind : undefined, meta: req.body?.meta });
+    const explicitKind = typeof req.body?.kind === 'string' ? req.body.kind : undefined;
+    const storedKind = explicitKind === 'correction' || explicitKind === 'user_correction'
+      ? 'correction_candidate'
+      : explicitKind;
+    const note = appendNote(slug, { text: textVal, kind: storedKind, meta: req.body?.meta });
     appendAudit(slug, { method: 'POST', path: '/notes', outcome: 'ok' });
+    // Authored Workspace code can call clem.note() programmatically, so a
+    // caller-provided `kind` is not proof of a human correction. Such labels
+    // are downgraded to a local candidate; genuine user corrections made in
+    // chat follow the normal trusted conversation-memory path.
     res.status(201).json({ note });
   });
 

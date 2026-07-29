@@ -65,6 +65,12 @@ export interface PendingActionFile {
   payloadHash: string;
   payload: unknown;
   resultSummary?: string | null;
+  history?: Array<{
+    status?: string;
+    at?: string;
+    actor?: string;
+    note?: string;
+  }>;
 }
 
 export interface ExpectedEmail {
@@ -138,7 +144,7 @@ export function parseProofComposioPayloadLog(raw: string): ProofComposioPayloadO
         continue;
       }
     } catch {
-      // The real shim uses TSV; fall through without normalizing payload bytes.
+      // Legacy shims used TSV; fall through without normalizing payload bytes.
     }
     const tab = line.indexOf('\t');
     if (tab <= 0) continue;
@@ -338,9 +344,16 @@ export function exactEmailShape(action: PendingActionFile | null, expected: Expe
   const recipientKeys = EMAIL_RECIPIENT_KEYS.filter((key) => Object.hasOwn(inner.parsed!, key));
   if (recipientKeys.length !== 1) return false;
   const recipientKey = recipientKeys[0];
+  const recipientValue = inner.parsed[recipientKey];
+  const exactRecipient = recipientValue === expected.to
+    || (
+      Array.isArray(recipientValue)
+      && recipientValue.length === 1
+      && recipientValue[0] === expected.to
+    );
   return Object.keys(inner.parsed).sort().join(',')
       === ['body', 'subject', recipientKey].sort().join(',')
-    && inner.parsed[recipientKey] === expected.to
+    && exactRecipient
     && inner.parsed.subject === expected.subject
     && inner.parsed.body === expected.body;
 }
@@ -362,8 +375,10 @@ export function canonicalComposioEmailTransport(action: PendingActionFile | null
 
 export function naturalSendPrompt(expected: ExpectedEmail): string {
   return [
-    'Please send this exact email through my connected Gmail account now.',
+    'Please prepare this exact email through my connected Gmail account and open its formal approval card now.',
+    'Do not call Gmail or pending_action_execute before I approve the card.',
     `The connected integration already selected the ${TOOL_SLUG} action, so use that action rather than searching for a different one.`,
+    'The selected action schema uses exactly three arguments: recipient_email, subject, and body. Keep the recipient as one string or a one-item string array.',
     '',
     `To: ${expected.to}`,
     `Subject: ${expected.subject}`,
@@ -450,6 +465,52 @@ async function waitForActionTerminal(
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return last;
+}
+
+function actionHistoryCount(action: PendingActionFile | null, status: string): number {
+  return action?.history?.filter((entry) => entry.status === status).length ?? 0;
+}
+
+function sessionEventCount(home: string, sessionId: string, type: string): number {
+  const db = openHarnessDb(home);
+  try {
+    const row = db.prepare(
+      'SELECT COUNT(*) AS count FROM events WHERE session_id = ? AND type = ?',
+    ).get(sessionId, type) as { count?: number } | undefined;
+    return Number(row?.count ?? 0);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Approval endpoints return as soon as the exact action is terminal, while the
+ * model-backed resume turn may still be writing its route/completion events.
+ * Wait for that turn to settle before scoring or stopping the daemon; otherwise
+ * a healthy Claude resume is misreported as never having used Claude.
+ */
+async function waitForModelTurnsSettled(
+  home: string,
+  sessionId: string,
+  expectedTurns: number,
+  timeoutMs: number,
+): Promise<{ routes: number; conversationSteps: number }> {
+  const deadline = Date.now() + timeoutMs;
+  let routes = 0;
+  let conversationSteps = 0;
+  while (Date.now() < deadline) {
+    try {
+      routes = sessionEventCount(home, sessionId, 'turn_model_routed');
+      conversationSteps = sessionEventCount(home, sessionId, 'conversation_step');
+      if (routes >= expectedTurns && conversationSteps >= expectedTurns) {
+        return { routes, conversationSteps };
+      }
+    } catch {
+      // The daemon may be between SQLite commits; retry within the bound.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return { routes, conversationSteps };
 }
 
 function actionDetail(action: PendingActionFile | null): string {
@@ -571,21 +632,24 @@ export const pendingActionExactOnce: ScenarioDef = {
       name: 'human rejection terminated the queued action',
       pass: rejectStatus < 300
         && rejectedFinal?.status === 'rejected'
-        && rejectedFinal.approvedBy == null,
+        && rejectedFinal.approvedBy == null
+        && actionHistoryCount(rejectedFinal, 'executing') === 0
+        && actionHistoryCount(rejectedFinal, 'executed') === 0,
       detail: `HTTP ${rejectStatus}; ${actionDetail(rejectedFinal)}`,
     });
     checks.push({
-      name: 'reject path produced zero dispatch',
+      name: 'reject path produced zero provider dispatch or execution claim',
       pass: observationsAfterReject.length === 0
         && slugsAfterReject.length === 0
         && rejectMetrics != null
-        && rejectMetrics.externalWrites === 0
-        && (rejectMetrics.logicalToolCalls.pending_action_execute ?? 0) === 0
-        && (rejectMetrics.logicalToolCalls.composio_execute_tool ?? 0) === 0,
+        && actionHistoryCount(rejectedFinal, 'executing') === 0
+        && actionHistoryCount(rejectedFinal, 'executed') === 0,
       detail: JSON.stringify({
         providerObservations: observationsAfterReject,
         providerSlugs: slugsAfterReject,
-        externalWrites: rejectMetrics?.externalWrites ?? null,
+        executionClaims: actionHistoryCount(rejectedFinal, 'executing'),
+        executedTransitions: actionHistoryCount(rejectedFinal, 'executed'),
+        preDispatchReservations: rejectMetrics?.externalWrites ?? null,
         logicalTools: rejectMetrics?.logicalToolCalls ?? null,
       }),
     });
@@ -664,6 +728,12 @@ export const pendingActionExactOnce: ScenarioDef = {
       ? await waitForActionTerminal(daemon.home, approvedQueued.id, 300_000)
       : null;
     const approvalResumeWallMs = Date.now() - approvalStartedAt;
+    const settledResume = await waitForModelTurnsSettled(
+      daemon.home,
+      sessionId,
+      3,
+      90_000,
+    );
     let finalMetrics = null;
     try {
       const db = openHarnessDb(daemon.home);
@@ -677,12 +747,25 @@ export const pendingActionExactOnce: ScenarioDef = {
     const exactProvider = exactProviderPayloadObservation(approvedArgs, finalObservations);
 
     checks.push({
-      name: 'approval auto-resumed pending_action_execute',
+      name: 'approval auto-resumed the exact action with one execution claim',
       pass: approveStatus < 300
         && approvedFinal?.status === 'executed'
         && approvedFinal.approvedBy === 'human'
-        && (finalMetrics?.logicalToolCalls.pending_action_execute ?? 0) === 1,
-      detail: `HTTP ${approveStatus}; pending_action_execute × ${finalMetrics?.logicalToolCalls.pending_action_execute ?? 0}; ${actionDetail(approvedFinal)}`,
+        && actionHistoryCount(approvedFinal, 'executing') === 1
+        && actionHistoryCount(approvedFinal, 'executed') === 1
+        && (finalMetrics?.logicalToolCalls.pending_action_execute ?? 0) >= 1,
+      detail: [
+        `HTTP ${approveStatus}`,
+        `pending_action_execute attempts × ${finalMetrics?.logicalToolCalls.pending_action_execute ?? 0}`,
+        `execution claims × ${actionHistoryCount(approvedFinal, 'executing')}`,
+        `executed transitions × ${actionHistoryCount(approvedFinal, 'executed')}`,
+        actionDetail(approvedFinal),
+      ].join('; '),
+    });
+    checks.push({
+      name: 'approval-resume model turn settled before scoring',
+      pass: settledResume.routes >= 3 && settledResume.conversationSteps >= 3,
+      detail: JSON.stringify(settledResume),
     });
     checks.push({
       name: 'provider observed one byte-identical queued payload',
@@ -732,14 +815,21 @@ export const pendingActionExactOnce: ScenarioDef = {
         && replayBody?.status === 'skipped'
         && observationsAfterReplay.length === 1
         && slugsAfterReplay.length === 1
-        && recordAfterReplay?.status === 'executed',
+        && recordAfterReplay?.status === 'executed'
+        && actionHistoryCount(recordAfterReplay, 'executing') === 1
+        && actionHistoryCount(recordAfterReplay, 'executed') === 1,
       detail: JSON.stringify({
         duplicateApprovalStatus,
         replayStatus: replay.status,
         replayBody,
         observations: observationsAfterReplay,
         slugs: slugsAfterReplay,
-        record: recordAfterReplay ? { id: recordAfterReplay.id, status: recordAfterReplay.status } : null,
+        record: recordAfterReplay ? {
+          id: recordAfterReplay.id,
+          status: recordAfterReplay.status,
+          executionClaims: actionHistoryCount(recordAfterReplay, 'executing'),
+          executedTransitions: actionHistoryCount(recordAfterReplay, 'executed'),
+        } : null,
       }),
     });
 
@@ -756,9 +846,10 @@ export const pendingActionExactOnce: ScenarioDef = {
     const metricLatencies = finalMetrics?.latency ?? [];
     return {
       checks,
-      // Three provider turns share one conversational session: reject request,
-      // fresh approve request, and the approval-resume directive. The exact
-      // route scorer therefore requires at least three explicit route markers.
+      // Three model turns share one conversational session: reject request,
+      // fresh approve request, and the model-backed approval-resume directive.
+      // waitForModelTurnsSettled above prevents the runner from stopping the
+      // daemon before the third turn records its route/completion events.
       latency: [
         { wallMs: rejectTurn.wallMs, ttftMs: metricLatencies[0]?.ttftMs ?? finalMetrics?.firstByteMs ?? null },
         { wallMs: approveTurn.wallMs, ttftMs: metricLatencies[1]?.ttftMs ?? null },

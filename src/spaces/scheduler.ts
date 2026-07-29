@@ -127,7 +127,14 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
         if (lastRun[key] === mk) continue; // already fired this minute
         lastRun[key] = mk;
         try {
-          const results = await refreshSpaceData(space.id, ds.id);
+          const results = await refreshSpaceData(space.id, ds.id, {
+            cause: 'scheduled',
+            // The scheduler's existing authority is one source per UTC minute.
+            // Reuse that same identity in the temporal store so a daemon
+            // restart cannot append a second observation for the occurrence.
+            refreshId: `scheduled:${mk}`,
+            batchId: `scheduled:${space.id}:${ds.id}:${mk}`,
+          });
           if (results.some((r) => !r.ok)) {
             if (results.some((r) => !r.ok && !r.pendingApprovalId)) errors += 1;
             else awaitingApproval += 1;
@@ -206,7 +213,12 @@ export async function retryPausedSpaces(now: Date = new Date()): Promise<PausedR
 
     let allOk = false;
     try {
-      const results = await refreshSpaceData(space.id, undefined, { allowPaused: true });
+      const results = await refreshSpaceData(space.id, undefined, {
+        allowPaused: true,
+        cause: 'retry',
+        refreshId: `retry:${space.updatedAt}:${budget.attempts}`,
+        batchId: `retry:${space.id}:${space.updatedAt}:${budget.attempts}`,
+      });
       allOk = results.length > 0 && results.every((r) => r.ok);
     } catch { allOk = false; }
 

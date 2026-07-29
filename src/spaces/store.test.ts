@@ -10,7 +10,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -18,6 +26,9 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-spaces-te
 
 const store = await import('./store.js');
 const data = await import('./data-store.js');
+const workspaceDb = await import('./workspace-db.js');
+const memoryDb = await import('../memory/db.js');
+const temporalMemory = await import('../memory/temporal-memory.js');
 
 test('isValidSpaceSlug accepts kebab, rejects traversal/space/caps', () => {
   assert.equal(store.isValidSpaceSlug('sf-daily-report'), true);
@@ -235,6 +246,47 @@ test('buildSpaceHealthSnapshot surfaces pending pinned-entrypoint approval witho
   assert.equal(health.issues.some((issue) => /last refresh failed/.test(issue)), false);
 });
 
+test('temporal awaiting-approval projection and restart heal remain pending, never failed', () => {
+  const slug = 'temporal-awaiting-health';
+  const rec = store.spaceStore.save({
+    id: slug,
+    title: 'Awaiting Health',
+    dataSources: [{ id: 'pull', composioSlug: 'GOOGLEADS_SEARCH' }],
+  });
+  workspaceDb.commitWorkspaceObservationBatch({
+    workspaceId: slug,
+    rootDir: store.resolveSpaceDir(slug),
+    observations: [{
+      sourceKey: 'pull',
+      refreshId: 'awaiting-health-1',
+      cause: 'manual',
+      status: 'awaiting_approval',
+      error: 'Pinned entrypoint approval required',
+      provenance: { approvalId: 'apr-temporal-health' },
+    }],
+  });
+
+  const assertPendingHealth = (): void => {
+    const projected = data.readData(slug) as {
+      _meta: Record<string, Record<string, unknown>>;
+    };
+    assert.equal(projected._meta.pull.ok, null);
+    assert.equal(projected._meta.pull.status, 'awaiting_approval');
+    assert.equal(projected._meta.pull.approvalId, 'apr-temporal-health');
+    const health = store.buildSpaceHealthSnapshot(rec);
+    assert.ok(health.issues.some((issue) =>
+      /data source "pull" is awaiting pinned-entrypoint approval.*apr-temporal-health/.test(issue)));
+    assert.equal(health.issues.some((issue) => /last refresh failed/.test(issue)), false);
+  };
+  assertPendingHealth();
+
+  writeFileSync(store.resolveInSpace(slug, 'data.json'), '{}', 'utf-8');
+  workspaceDb.healWorkspaceDataProjection(slug, {
+    rootDir: store.resolveSpaceDir(slug),
+  });
+  assertPendingHealth();
+});
+
 test('archive hides from default list; includeArchived shows it; remove deletes dir', () => {
   store.spaceStore.save({ id: 'gone', title: 'Gone' });
   store.spaceStore.archive('gone');
@@ -242,6 +294,243 @@ test('archive hides from default list; includeArchived shows it; remove deletes 
   assert.equal(store.spaceStore.list(true).some((s) => s.id === 'gone'), true);
   assert.equal(store.spaceStore.remove('gone'), true);
   assert.equal(store.spaceStore.get('gone'), undefined);
+});
+
+test('hard delete restores the Workspace and history when the durable DB cascade fails', () => {
+  const slug = 'delete-fail-closed';
+  store.spaceStore.save({ id: slug, title: 'Keep Until Durable' });
+  workspaceDb.commitWorkspaceObservationBatch({
+    workspaceId: slug,
+    rootDir: store.resolveSpaceDir(slug),
+    observations: [{
+      sourceKey: 'metrics',
+      refreshId: 'before-delete',
+      cause: 'manual',
+      status: 'ok',
+      data: { value: 'must-not-reattach' },
+    }],
+  });
+  const db = workspaceDb.openWorkspaceDb();
+  db.exec(`
+    CREATE TRIGGER fail_workspace_delete
+    BEFORE DELETE ON workspaces
+    WHEN OLD.id = 'delete-fail-closed'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected durable delete failure');
+    END;
+  `);
+  try {
+    assert.equal(store.spaceStore.remove(slug), false);
+    assert.ok(existsSync(store.resolveSpaceDir(slug)));
+    assert.equal(store.spaceStore.get(slug)?.title, 'Keep Until Durable');
+    assert.equal(
+      workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'metrics')?.refreshId,
+      'before-delete',
+    );
+    assert.equal(
+      existsSync(store.WORKSPACE_DELETE_QUARANTINE_DIR)
+        ? store.spaceStore.list(true).some((entry) => entry.id.startsWith('.delete'))
+        : false,
+      false,
+      'hidden quarantine markers never enter normal list/reindex',
+    );
+  } finally {
+    db.exec('DROP TRIGGER fail_workspace_delete');
+  }
+
+  assert.equal(store.spaceStore.remove(slug), true);
+  assert.equal(store.spaceStore.get(slug), undefined);
+  assert.equal(
+    workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'metrics'),
+    null,
+  );
+  const recreated = store.spaceStore.save({ id: slug, title: 'Clean Generation' });
+  assert.equal(recreated.title, 'Clean Generation');
+  assert.equal(
+    workspaceDb.listWorkspaceDatasetObservations(slug, { limit: 100 }).length,
+    0,
+    'a reused slug cannot inherit temporal observations from the deleted generation',
+  );
+});
+
+test('restart/recreate completes quarantined deletes before and after the DB cascade', () => {
+  const beforeSlug = 'delete-crash-before-db';
+  store.spaceStore.save({ id: beforeSlug, title: 'Old Before DB' });
+  workspaceDb.commitWorkspaceObservationBatch({
+    workspaceId: beforeSlug,
+    rootDir: store.resolveSpaceDir(beforeSlug),
+    observations: [{
+      sourceKey: 'metrics',
+      refreshId: 'old-before-db',
+      cause: 'manual',
+      status: 'ok',
+      data: { generation: 'old' },
+    }],
+  });
+  const beforeQuarantine = store.workspaceDeletionQuarantinePath(
+    beforeSlug,
+    '00000000-0000-4000-8000-000000000001',
+  );
+  mkdirSync(store.WORKSPACE_DELETE_QUARANTINE_DIR, { recursive: true });
+  renameSync(store.resolveSpaceDir(beforeSlug), beforeQuarantine);
+  workspaceDb.closeWorkspaceDb();
+
+  const blockedDb = workspaceDb.openWorkspaceDb();
+  blockedDb.exec(`
+    CREATE TRIGGER fail_recovery_delete
+    BEFORE DELETE ON workspaces
+    WHEN OLD.id = 'delete-crash-before-db'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected recovery delete failure');
+    END;
+  `);
+  assert.throws(
+    () => store.spaceStore.save({ id: beforeSlug, title: 'Must Stay Blocked' }),
+    /injected recovery delete failure/,
+  );
+  assert.equal(existsSync(store.resolveSpaceDir(beforeSlug)), false);
+  assert.equal(existsSync(beforeQuarantine), true);
+  assert.equal(
+    workspaceDb.getCurrentWorkspaceDatasetObservation(beforeSlug, 'metrics')?.refreshId,
+    'old-before-db',
+  );
+  blockedDb.exec('DROP TRIGGER fail_recovery_delete');
+
+  const cleanBefore = store.spaceStore.save({
+    id: beforeSlug,
+    title: 'New After Recovery',
+  });
+  assert.equal(cleanBefore.title, 'New After Recovery');
+  assert.equal(existsSync(beforeQuarantine), false);
+  assert.equal(
+    workspaceDb.listWorkspaceDatasetObservations(beforeSlug, { limit: 100 }).length,
+    0,
+  );
+
+  const afterSlug = 'delete-crash-after-db';
+  store.spaceStore.save({ id: afterSlug, title: 'Old After DB' });
+  workspaceDb.commitWorkspaceObservationBatch({
+    workspaceId: afterSlug,
+    rootDir: store.resolveSpaceDir(afterSlug),
+    observations: [{
+      sourceKey: 'metrics',
+      refreshId: 'old-after-db',
+      cause: 'manual',
+      status: 'ok',
+      data: { generation: 'old' },
+    }],
+  });
+  const afterQuarantine = store.workspaceDeletionQuarantinePath(
+    afterSlug,
+    '00000000-0000-4000-8000-000000000002',
+  );
+  mkdirSync(store.WORKSPACE_DELETE_QUARANTINE_DIR, { recursive: true });
+  renameSync(store.resolveSpaceDir(afterSlug), afterQuarantine);
+  assert.equal(workspaceDb.deleteWorkspaceIndex(afterSlug, {
+    actor: 'delete-crash-test',
+    emitOperational: false,
+  }), true);
+  workspaceDb.closeWorkspaceDb();
+
+  const cleanAfter = store.spaceStore.save({
+    id: afterSlug,
+    title: 'New After Cleanup',
+  });
+  assert.equal(cleanAfter.title, 'New After Cleanup');
+  assert.equal(existsSync(afterQuarantine), false);
+  assert.equal(
+    workspaceDb.listWorkspaceDatasetObservations(afterSlug, { limit: 100 }).length,
+    0,
+  );
+});
+
+test('memory purge failure keeps hard delete quarantined and blocks same-slug recall inheritance', () => {
+  const slug = 'delete-memory-fail';
+  store.spaceStore.save({ id: slug, title: 'Old Memory Generation' });
+  workspaceDb.commitWorkspaceObservationBatch({
+    workspaceId: slug,
+    rootDir: store.resolveSpaceDir(slug),
+    observations: [{
+      sourceKey: 'metrics',
+      refreshId: 'old-memory-generation',
+      cause: 'manual',
+      status: 'ok',
+      data: { generation: 'old' },
+    }],
+  });
+  temporalMemory.recordMemoryEpisode({
+    kind: 'tool_result',
+    sourceApp: 'workspace',
+    sessionId: `workspace:${slug}`,
+    callId: 'old-observation',
+    sourceUri: `workspace://${slug}/sources/metrics`,
+    occurredAt: '2026-07-28T12:00:00.000Z',
+    content: 'Old generation evidence must never reach a recreated slug.',
+  });
+  const db = memoryDb.openMemoryDb();
+  db.exec(`
+    CREATE TRIGGER fail_workspace_memory_purge
+    BEFORE DELETE ON memory_episodes
+    WHEN OLD.source_app = 'workspace'
+      AND OLD.session_id = 'workspace:delete-memory-fail'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected Workspace memory purge failure');
+    END;
+  `);
+
+  assert.equal(store.spaceStore.remove(slug), false);
+  assert.equal(existsSync(store.resolveSpaceDir(slug)), false);
+  assert.equal(
+    workspaceDb.listWorkspaceDatasetObservations(slug, { limit: 100 }).length,
+    0,
+    'the first durable cascade committed before the memory seam failed',
+  );
+  assert.ok(
+    readdirSync(store.WORKSPACE_DELETE_QUARANTINE_DIR)
+      .some((entry) => entry.startsWith(`${slug}--`)),
+    'the marker remains durable after the second-store failure',
+  );
+  assert.equal(
+    (db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM memory_episodes
+      WHERE source_app = 'workspace' AND session_id = ?
+    `).get(`workspace:${slug}`) as { count: number }).count,
+    1,
+  );
+
+  workspaceDb.closeWorkspaceDb();
+  memoryDb.closeMemoryDb();
+  assert.throws(
+    () => store.spaceStore.save({ id: slug, title: 'Must Stay Blocked' }),
+    /injected Workspace memory purge failure/i,
+  );
+  assert.equal(existsSync(store.resolveSpaceDir(slug)), false);
+
+  memoryDb.openMemoryDb().exec('DROP TRIGGER fail_workspace_memory_purge');
+  const recreated = store.spaceStore.save({
+    id: slug,
+    title: 'Clean Memory Generation',
+  });
+  assert.equal(recreated.title, 'Clean Memory Generation');
+  assert.equal(
+    (memoryDb.openMemoryDb().prepare(`
+      SELECT COUNT(*) AS count
+      FROM memory_episodes
+      WHERE source_app = 'workspace' AND session_id = ?
+    `).get(`workspace:${slug}`) as { count: number }).count,
+    0,
+    'recreate cannot inherit episodic recall from the deleted generation',
+  );
+  assert.equal(
+    workspaceDb.listWorkspaceDatasetObservations(slug, { limit: 100 }).length,
+    0,
+  );
+  assert.equal(
+    readdirSync(store.WORKSPACE_DELETE_QUARANTINE_DIR)
+      .some((entry) => entry.startsWith(`${slug}--`)),
+    false,
+  );
 });
 
 test('list ignores non-slug dirs and dirs without a manifest', () => {
@@ -283,6 +572,134 @@ test('hand-written manifest keeps invalid JSON diagnostics instead of silently d
   const fixed = store.spaceStore.get(slug);
   assert.equal(fixed?.manifestErrors, undefined);
   assert.deepEqual(fixed?.dataSources[0].composioArgs, { max: 10 });
+});
+
+test('hand-written manifest reports non-canonical and duplicate identities while preserving safe prototype-shaped ids', () => {
+  const slug = 'identity-handwritten';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Identity Handwritten',
+    dataSources: [
+      { id: '   ', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: ' pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: '_meta', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'x'.repeat(121), composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'control\u0001source', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: '__proto__', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'constructor', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'prototype', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+    ],
+    actions: [
+      { id: '', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'send ', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'y'.repeat(121), composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'control\u0001action', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+    ],
+  }), 'utf-8');
+
+  const record = store.spaceStore.get(slug)!;
+  const errors = record.manifestErrors?.join('\n') ?? '';
+  assert.match(errors, /Data source .*non-whitespace/i);
+  assert.match(errors, /Data source .*leading or trailing whitespace/i);
+  assert.match(errors, /Duplicate data source id "pull"/i);
+  assert.match(errors, /reserved id "_meta"/i);
+  assert.match(errors, /Data source .*120 character/i);
+  assert.match(errors, /Data source .*control character/i);
+  assert.match(errors, /Action .*non-whitespace/i);
+  assert.match(errors, /Action .*leading or trailing whitespace/i);
+  assert.match(errors, /Duplicate action id "send"/i);
+  assert.match(errors, /Action .*120 character/i);
+  assert.match(errors, /Action .*control character/i);
+  assert.doesNotMatch(errors, /__proto__|constructor|prototype/);
+});
+
+test('identity diagnostics stay bounded and printable for hostile handwritten ids', () => {
+  const canonical = `control\u0001${'x'.repeat(100_000)}`;
+  const errors = store.workspaceIdentityErrors([
+    { id: ` ${canonical} ` },
+    { id: canonical },
+  ], []);
+  const rendered = errors.join('\n');
+
+  assert.match(rendered, /leading or trailing whitespace/i);
+  assert.match(rendered, /120 character/i);
+  assert.match(rendered, /control character/i);
+  assert.match(rendered, /Duplicate data source id/i);
+  assert.ok(
+    Buffer.byteLength(rendered, 'utf-8') < 1_000,
+    `diagnostics unexpectedly expanded to ${Buffer.byteLength(rendered, 'utf-8')} bytes`,
+  );
+  assert.ok(
+    errors.every((error) => !/[\u0000-\u001f\u007f-\u009f]/.test(error)),
+    'individual diagnostics must not retain control characters',
+  );
+  assert.doesNotMatch(rendered, /x{100}/);
+});
+
+test('save and update reject invalid identities before persisting, but allow prototype-shaped ids', () => {
+  const invalidSlug = 'identity-save-invalid';
+  assert.throws(
+    () => store.spaceStore.save({
+      id: invalidSlug,
+      title: 'Invalid',
+      dataSources: [
+        { id: 'same', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+        { id: 'same', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      ],
+    }),
+    /Duplicate data source id "same"/i,
+  );
+  assert.equal(store.spaceStore.get(invalidSlug), undefined);
+  assert.equal(existsSync(store.resolveSpaceDir(invalidSlug)), false);
+
+  const updateSlug = 'identity-update-invalid';
+  store.spaceStore.save({
+    id: updateSlug,
+    title: 'Original',
+    actions: [{ id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' }],
+  });
+  const before = readFileSync(
+    path.join(store.resolveSpaceDir(updateSlug), 'space.json'),
+    'utf-8',
+  );
+  assert.throws(
+    () => store.spaceStore.update(updateSlug, {
+      actions: [
+        { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+        { id: ' send ', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      ],
+    }),
+    /leading or trailing whitespace|Duplicate action id/i,
+  );
+  assert.equal(
+    readFileSync(path.join(store.resolveSpaceDir(updateSlug), 'space.json'), 'utf-8'),
+    before,
+  );
+
+  const valid = store.spaceStore.save({
+    id: 'identity-prototype-valid',
+    title: 'Valid Prototype Identities',
+    dataSources: [
+      { id: '__proto__', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'constructor', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'prototype', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+    ],
+    actions: [
+      { id: '__proto__', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'constructor', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'prototype', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+    ],
+  });
+  assert.deepEqual(
+    valid.dataSources.map((source) => source.id),
+    ['__proto__', 'constructor', 'prototype'],
+  );
 });
 
 test('hand-written manifest flags runner paths as invalid manifest diagnostics', () => {

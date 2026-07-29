@@ -624,6 +624,11 @@ test('runner-controlled no-dispatch wording cannot make an ambiguous action repl
 
 test('resolving a gated approval as approved triggers execution via the listener', async () => {
   gate.initSpaceActionApprovals();
+  const captured: Array<Record<string, unknown>> = [];
+  gate._setWorkspaceActionMemoryCaptureForTests(async (signal) => {
+    captured.push(signal as unknown as Record<string, unknown>);
+    return { status: 'recorded', reason: null, episodeId: 'episode-proof', wake: true };
+  });
   const slug = 'gate-resolve';
   const rec = store.spaceStore.save({
     id: slug, title: 'Resolve',
@@ -633,21 +638,95 @@ test('resolving a gated approval as approved triggers execution via the listener
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, 'act.mjs'), 'process.stdout.write(JSON.stringify({ok:1}))', 'utf-8');
 
-  const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'x@y' });
-  registry.resolve(approvalId, 'approved', 'test');
-  // Execution is fire-and-forget on resolve and spawns a runner subprocess —
-  // POLL for the note rather than sleeping a fixed delay (a fixed wait flaked
-  // under full-suite load when the subprocess was delayed by other test files).
-  let ran = false;
-  let lastNotes = dataStore.listNotes(slug);
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline && !ran) {
-    await new Promise((r) => setTimeout(r, 50));
-    lastNotes = dataStore.listNotes(slug);
-    ran = lastNotes.some((n) => /Approved and ran/.test(n.text));
+  try {
+    const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'x@y' });
+    registry.resolve(approvalId, 'approved', 'test');
+    // Execution is fire-and-forget on resolve and spawns a runner subprocess —
+    // POLL for the note rather than sleeping a fixed delay (a fixed wait flaked
+    // under full-suite load when the subprocess was delayed by other test files).
+    let ran = false;
+    let lastNotes = dataStore.listNotes(slug);
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && !ran) {
+      await new Promise((r) => setTimeout(r, 50));
+      lastNotes = dataStore.listNotes(slug);
+      ran = lastNotes.some((n) => /Approved and ran/.test(n.text));
+    }
+    assert.ok(
+      ran,
+      `expected the approved action to run and record an "Approved and ran" note; notes=${JSON.stringify(lastNotes)}`,
+    );
+    const matching = captured.filter((signal) => signal.observationId === approvalId);
+    assert.equal(matching.length, 1);
+    assert.equal(matching[0]?.kind, 'effect_outcome');
+    assert.equal(matching[0]?.decision, 'approved');
+  } finally {
+    gate._setWorkspaceActionMemoryCaptureForTests(null);
   }
-  assert.ok(
-    ran,
-    `expected the approved action to run and record an "Approved and ran" note; notes=${JSON.stringify(lastNotes)}`,
-  );
+});
+
+test('an explicit Workspace action rejection becomes a memory outcome without dispatch', async () => {
+  gate.initSpaceActionApprovals();
+  const captured: Array<Record<string, unknown>> = [];
+  gate._setWorkspaceActionMemoryCaptureForTests(async (signal) => {
+    captured.push(signal as unknown as Record<string, unknown>);
+    return { status: 'recorded', reason: null, episodeId: 'episode-rejected', wake: true };
+  });
+  const slug = 'gate-rejected-memory';
+  const rec = store.spaceStore.save({
+    id: slug,
+    title: 'Rejected Memory',
+    actions: [{ id: 'send', label: 'Send email', runner: 'act.mjs' }],
+  });
+  writeCountingRunner(slug);
+  try {
+    const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'x@y' });
+    registry.resolve(approvalId, 'rejected', 'test');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(dispatchCount(slug), 0);
+    const matching = captured.filter((signal) => signal.observationId === approvalId);
+    assert.equal(matching.length, 1);
+    assert.equal(matching[0]?.kind, 'effect_outcome');
+    assert.equal(matching[0]?.decision, 'rejected');
+  } finally {
+    gate._setWorkspaceActionMemoryCaptureForTests(null);
+  }
+});
+
+test('boot recovery re-projects an authoritative rejection when the first memory write was interrupted', async () => {
+  gate.initSpaceActionApprovals();
+  const slug = 'gate-rejected-memory-recovery';
+  const rec = store.spaceStore.save({
+    id: slug,
+    title: 'Rejected Memory Recovery',
+    actions: [{ id: 'send', label: 'Send email', runner: 'act.mjs' }],
+  });
+  writeCountingRunner(slug);
+
+  gate._setWorkspaceActionMemoryCaptureForTests(async () => {
+    throw new Error('simulated crash before memory projection');
+  });
+  const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'x@y' });
+  registry.resolve(approvalId, 'rejected', 'test');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const recovered: Array<Record<string, unknown>> = [];
+  gate._setWorkspaceActionMemoryCaptureForTests(async (signal) => {
+    recovered.push(signal as unknown as Record<string, unknown>);
+    return { status: 'recorded', reason: null, episodeId: 'episode-recovered', wake: true };
+  });
+  try {
+    await gate.recoverApprovedSpaceActions();
+    assert.equal(dispatchCount(slug), 0);
+    const matching = recovered.filter((signal) => signal.observationId === approvalId);
+    assert.equal(matching.length, 1);
+    assert.equal(matching[0]?.decision, 'rejected');
+    assert.equal(
+      dataStore.listNotes(slug).filter((note) => note.meta?.approvalId === approvalId).length,
+      2,
+      'one pending note and one terminal note remain; recovery adds no duplicate',
+    );
+  } finally {
+    gate._setWorkspaceActionMemoryCaptureForTests(null);
+  }
 });

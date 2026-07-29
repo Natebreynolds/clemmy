@@ -39,6 +39,7 @@ import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
+import { initializeWorkspaceTemporalStorage } from '../spaces/workspace-temporal-init.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
@@ -1214,6 +1215,27 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // on schedule and fail — surface it once so it's fixed before the next
   // occurrence, not discovered as a silent miss.
   reportBrokenWorkflowsOnBoot();
+  // 3.0 Workspace history: index file-backed manifests, preserve pre-upgrade
+  // data as comparison baselines, heal a DB-commit/file-projection crash, and
+  // enforce bounded local retention before any scheduled refresh can run.
+  try {
+    const temporal = await initializeWorkspaceTemporalStorage();
+    if (temporal.errors.length > 0 || temporal.memoryFailures > 0) {
+      logger.warn(temporal, 'Some Workspace temporal histories could not initialize');
+    } else if (
+      temporal.baselinesImported > 0
+      || temporal.projectionsHealed > 0
+      || temporal.memoryRecorded > 0
+      || temporal.observationsPruned > 0
+    ) {
+      logger.info(temporal, 'Initialized Workspace temporal history');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Workspace temporal-history initialization failed',
+    );
+  }
   // Migration-safe identity finalization: the schema upgrade preserves every
   // historical row, then this backup-first step redirects only people sharing
   // an exact non-generic personal email. This makes identity readiness true on

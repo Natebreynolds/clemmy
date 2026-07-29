@@ -19,7 +19,14 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { validateCronExpression } from '../shared/cron.js';
-import { resolveInSpace, runnerFilenameError, type SpaceDataSource, type SpaceAction, type SpaceStatus } from './store.js';
+import {
+  resolveInSpace,
+  runnerFilenameError,
+  workspaceIdentityErrors,
+  type SpaceDataSource,
+  type SpaceAction,
+  type SpaceStatus,
+} from './store.js';
 import {
   workspaceActionRequiresApproval,
   workspaceDataSourceSafetyError,
@@ -205,5 +212,14 @@ export function prepareSpaceForWrite(input: {
     input.availableRunnerFiles,
     legacyRunnerDeclarations,
   );
-  return { dataSources, actions, ok: check.ok, errors: check.errors, warnings: check.warnings, repairs };
+  const identityErrors = workspaceIdentityErrors(dataSources, actions);
+  const errors = [...identityErrors, ...check.errors];
+  return {
+    dataSources,
+    actions,
+    ok: errors.length === 0,
+    errors,
+    warnings: check.warnings,
+    repairs,
+  };
 }

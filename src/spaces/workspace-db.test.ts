@@ -57,6 +57,55 @@ test('indexWorkspaceRecord indexes manifest-backed workspace rows', () => {
     const event = db.prepare('SELECT seq, event_type FROM workspace_state_events WHERE workspace_id = ?').get('release-room') as { seq: number; event_type: string };
     assert.deepEqual(event, { seq: 1, event_type: 'workspace_created' });
 
+    indexWorkspaceRecord(record, {
+      db,
+      rootDir: tmp,
+      actor: 'refresh-bootstrap',
+      appendStateEvent: false,
+      now: new Date('2026-06-30T03:00:00.000Z'),
+    });
+    indexWorkspaceRecord(record, {
+      db,
+      rootDir: tmp,
+      actor: 'restart-bootstrap',
+      appendStateEvent: false,
+      now: new Date('2026-06-30T04:00:00.000Z'),
+    });
+    assert.equal(
+      (db.prepare(`
+        SELECT COUNT(*) AS n
+        FROM workspace_state_events
+        WHERE workspace_id = ?
+      `).get('release-room') as { n: number }).n,
+      1,
+      'refresh/restart indexing current state must not invent state transitions',
+    );
+
+    indexWorkspaceRecord({
+      ...record,
+      title: 'Release Room Updated',
+      updatedAt: '2026-06-30T05:00:00.000Z',
+    }, {
+      db,
+      rootDir: tmp,
+      eventType: 'workspace_file_changed',
+      actor: 'test-mutation',
+      now: new Date('2026-06-30T05:00:00.000Z'),
+    });
+    assert.deepEqual(
+      db.prepare(`
+        SELECT seq, event_type
+        FROM workspace_state_events
+        WHERE workspace_id = ?
+        ORDER BY seq
+      `).all('release-room'),
+      [
+        { seq: 1, event_type: 'workspace_created' },
+        { seq: 2, event_type: 'workspace_file_changed' },
+      ],
+      'real manifest mutations still append ordered state events',
+    );
+
     deleteWorkspaceIndex('release-room', { db });
     assert.equal((db.prepare('SELECT COUNT(*) AS n FROM workspaces').get() as { n: number }).n, 0);
   } finally {

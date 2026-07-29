@@ -5,18 +5,23 @@ import {
   composeSpace,
   executeSpaceAction,
   getSpaceData,
+  getSpaceDiff,
+  getSpaceHistory,
   refreshSpace,
   spaceViewUrl,
 } from '@/lib/spaces';
 import {
+  parseWorkspaceGestureRequest,
   parseWorkspaceRpcBootstrapEvent,
   parseWorkspaceRpcRequest,
+  workspaceGestureAllowed,
   workspaceRpcCorrelation,
   workspaceRpcFailure,
   workspaceRpcOpAllowed,
   workspaceRpcSuccess,
   WORKSPACE_IFRAME_SANDBOX,
   WORKSPACE_RPC_CHANNEL,
+  type WorkspaceGestureRequest,
   type WorkspaceRpcFailure,
   type WorkspaceRpcRequest,
 } from '@/lib/workspace-rpc';
@@ -73,6 +78,19 @@ async function runWorkspaceOperation(id: string, request: WorkspaceRpcRequest): 
   switch (request.op) {
     case 'data':
       return getSpaceData(id);
+    case 'history':
+      return getSpaceHistory(id, {
+        ...(typeof payload.sourceKey === 'string' ? { sourceKey: payload.sourceKey } : {}),
+        ...(typeof payload.limit === 'number' ? { limit: payload.limit } : {}),
+        ...(typeof payload.cursor === 'string' ? { cursor: payload.cursor } : {}),
+        ...(typeof payload.before === 'string' ? { before: payload.before } : {}),
+      });
+    case 'diff':
+      return getSpaceDiff(id, {
+        ...(typeof payload.sourceKey === 'string' ? { sourceKey: payload.sourceKey } : {}),
+        ...(typeof payload.from === 'string' ? { from: payload.from } : {}),
+        ...(typeof payload.to === 'string' ? { to: payload.to } : {}),
+      });
     case 'refresh':
       return refreshSpace(id, typeof payload.sourceId === 'string' ? payload.sourceId : undefined);
     case 'note': {
@@ -96,6 +114,12 @@ async function runWorkspaceOperation(id: string, request: WorkspaceRpcRequest): 
         actionId: payload.actionId as string,
         args: payload.args as Record<string, unknown>,
       });
+  }
+}
+
+async function runWorkspaceGesture(request: WorkspaceGestureRequest): Promise<unknown> {
+  const payload = request.payload;
+  switch (request.op) {
     case 'open_external':
       return openWorkspaceExternal(payload.url as string);
     case 'download':
@@ -127,9 +151,13 @@ export function WorkspaceFrame({
     if (!frame) return;
     const seen = new Set<string>();
     const seenOrder: string[] = [];
+    const seenGestures = new Set<string>();
+    const seenGestureOrder: string[] = [];
     let inFlight = 0;
     let pinnedDocumentId: string | null = null;
     let port: MessagePort | null = null;
+    let gesturePort: MessagePort | null = null;
+    let gestureInFlight = false;
     let loadCount = 0;
     let revoked = false;
 
@@ -140,6 +168,17 @@ export function WorkspaceFrame({
       if (seenOrder.length > MAX_REMEMBERED_REQUESTS) {
         const oldest = seenOrder.shift();
         if (oldest) seen.delete(oldest);
+      }
+      return true;
+    };
+
+    const rememberGesture = (gestureId: string): boolean => {
+      if (seenGestures.has(gestureId)) return false;
+      seenGestures.add(gestureId);
+      seenGestureOrder.push(gestureId);
+      if (seenGestureOrder.length > MAX_REMEMBERED_REQUESTS) {
+        const oldest = seenGestureOrder.shift();
+        if (oldest) seenGestures.delete(oldest);
       }
       return true;
     };
@@ -196,6 +235,25 @@ export function WorkspaceFrame({
         .finally(() => { inFlight -= 1; });
     };
 
+    const receiveGesture = (event: MessageEvent<unknown>) => {
+      if (
+        revoked
+        || !gesturePort
+        || !pinnedDocumentId
+        || !workspaceGestureAllowed(readOnly)
+      ) return;
+      const parsed = parseWorkspaceGestureRequest(event.data, id, pinnedDocumentId);
+      if (!parsed.ok) return;
+      if (!rememberGesture(parsed.gesture.id) || gestureInFlight) return;
+      gestureInFlight = true;
+      void runWorkspaceGesture(parsed.gesture)
+        .catch(() => {
+          // The iframe has no privileged response channel. Browser/Electron
+          // failures remain local and cannot turn this capability into RPC.
+        })
+        .finally(() => { gestureInFlight = false; });
+    };
+
     const receiveBootstrap = (event: MessageEvent<unknown>) => {
       const source = frame.contentWindow;
       if (!source || revoked) return;
@@ -209,13 +267,17 @@ export function WorkspaceFrame({
       port = channel.port1;
       port.addEventListener('message', receivePort);
       port.start();
+      const gestureChannel = new MessageChannel();
+      gesturePort = gestureChannel.port1;
+      gesturePort.addEventListener('message', receiveGesture);
+      gesturePort.start();
       source.postMessage({
         channel: WORKSPACE_RPC_CHANNEL,
         version: 1,
         kind: 'bootstrap_ack',
         workspaceId: id,
         documentId: pinnedDocumentId,
-      }, '*', [channel.port2]);
+      }, '*', [channel.port2, gestureChannel.port2]);
     };
 
     const onLoad = () => {
@@ -227,6 +289,8 @@ export function WorkspaceFrame({
       revoked = true;
       port?.close();
       port = null;
+      gesturePort?.close();
+      gesturePort = null;
     };
 
     frame.addEventListener('load', onLoad);
@@ -238,6 +302,10 @@ export function WorkspaceFrame({
       if (port) {
         port.removeEventListener('message', receivePort);
         port.close();
+      }
+      if (gesturePort) {
+        gesturePort.removeEventListener('message', receiveGesture);
+        gesturePort.close();
       }
     };
   }, [id, readOnly]);

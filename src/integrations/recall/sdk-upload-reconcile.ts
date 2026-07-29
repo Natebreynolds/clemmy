@@ -18,6 +18,7 @@ import {
 } from './backfill.js';
 import {
   buildAnalyzerPrompt,
+  deriveRecallMeetingPresentation,
   findRecallMeetingRecord,
   listAllRecallMeetingRecords,
   loadRecallMeetingAnalysis,
@@ -52,6 +53,22 @@ export interface SdkUploadReconcileResult {
   recordingId?: string;
   backfillStatus?: BackfillResult['status'];
   reason?: string;
+}
+
+export interface RecallTranscriptRetryResult {
+  status: 'started' | 'already_running' | 'not_found' | 'not_retryable' | 'start_failed';
+  mode?: 'sdk_upload' | 'canonical';
+  reason?: string;
+  record?: RecallMeetingRecord;
+}
+
+export interface RecallTranscriptRetryOptions {
+  /** Test seam; production uses the normal one-at-a-time reconciler. */
+  startSdk?: (input: { meetingId: string }) => void;
+  isSdkActive?: (meetingId: string) => boolean;
+  /** Test seam for legacy records that already have a recording id. */
+  startCanonical?: (record: RecallMeetingRecord) => void;
+  isCanonicalActive?: (meetingId: string) => boolean;
 }
 
 function normalizedCode(upload: RecallSdkUpload): string {
@@ -257,6 +274,7 @@ export async function reconcileRecallSdkUpload(
 }
 
 const activeReconciliations = new Map<string, Promise<SdkUploadReconcileResult>>();
+const activeExplicitCanonicalRetries = new Map<string, Promise<BackfillResult>>();
 
 /** Fire-and-forget entry used by HTTP completion and startup recovery. */
 export function startRecallSdkUploadReconciliation(input: { meetingId?: string; sdkUploadId?: string }): void {
@@ -273,24 +291,158 @@ export function startRecallSdkUploadReconciliation(input: { meetingId?: string; 
   activeReconciliations.set(record.id, running);
 }
 
+function startExplicitCanonicalRetry(record: RecallMeetingRecord): void {
+  if (!record.recordingId || activeExplicitCanonicalRetries.has(record.id)) return;
+  const running = backfillCanonicalTranscript({
+    windowId: record.windowId,
+    recordingId: record.recordingId,
+    region: record.sdkUploadRegion,
+  })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error({ meetingId: record.id, err: message }, 'explicit canonical transcript retry crashed');
+      return { status: 'failed', reason: message } as BackfillResult;
+    })
+    .finally(() => activeExplicitCanonicalRetries.delete(record.id));
+  activeExplicitCanonicalRetries.set(record.id, running);
+}
+
+/**
+ * User-triggered retry for terminal Recall transcript failures. Each request
+ * delegates to the existing bounded poller (15 minutes / 180 SDK attempts or
+ * 10 minutes for canonical backfill). Nothing automatically requeues a
+ * terminal failure, and the active maps prevent duplicate concurrent work.
+ */
+export function requestRecallMeetingTranscriptRetry(
+  meetingId: string,
+  options: RecallTranscriptRetryOptions = {},
+): RecallTranscriptRetryResult {
+  const record = loadRecallMeetingById(meetingId);
+  if (!record) return { status: 'not_found', reason: 'meeting not found' };
+  if (record.provider === 'local') {
+    return { status: 'not_retryable', reason: 'local meetings use the local transcription retry', record };
+  }
+
+  const retrySdkHandoff = Boolean(record.sdkUploadId)
+    && (
+      !record.recordingId
+      || record.sdkUploadStatus === 'failed'
+      || record.sdkUploadStatus === 'timed_out'
+    );
+  const mode: RecallTranscriptRetryResult['mode'] = retrySdkHandoff ? 'sdk_upload' : 'canonical';
+  const useSdkReconciler = retrySdkHandoff
+    || (Boolean(record.sdkUploadId) && record.sdkUploadStatus === 'complete');
+  const sdkActive = options.isSdkActive ?? ((id: string) => activeReconciliations.has(id));
+  const canonicalActive = options.isCanonicalActive
+    ?? ((id: string) => activeExplicitCanonicalRetries.has(id));
+
+  if (
+    (useSdkReconciler && sdkActive(record.id))
+    || (!useSdkReconciler && canonicalActive(record.id))
+  ) {
+    return {
+      status: 'already_running',
+      mode,
+      reason: 'Transcript recovery is already running for this meeting.',
+      record,
+    };
+  }
+
+  const presentation = deriveRecallMeetingPresentation(record);
+  if (!presentation.retryable) {
+    return {
+      status: 'not_retryable',
+      reason: presentation.error ?? `${presentation.label} is not retryable`,
+      record,
+    };
+  }
+
+  const updatedAt = new Date().toISOString();
+  const reset = retrySdkHandoff
+    ? patchMeetingRecord(record.id, {
+      sdkUploadStatus: 'pending',
+      sdkUploadUpdatedAt: updatedAt,
+      sdkUploadAttempts: 0,
+      sdkUploadNextAttemptAt: undefined,
+      sdkUploadDeadlineAt: undefined,
+      sdkUploadError: undefined,
+      canonicalStatus: 'pending',
+      canonicalUpdatedAt: updatedAt,
+      canonicalError: undefined,
+    })
+    : patchMeetingRecord(record.id, {
+      canonicalStatus: 'pending',
+      canonicalUpdatedAt: updatedAt,
+      canonicalError: undefined,
+    });
+  if (!reset) return { status: 'not_found', reason: 'meeting disappeared before retry could start' };
+
+  try {
+    if (useSdkReconciler) {
+      (options.startSdk ?? ((input) => startRecallSdkUploadReconciliation(input)))({ meetingId: reset.id });
+    } else {
+      (options.startCanonical ?? startExplicitCanonicalRetry)(reset);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const reason = `Transcript recovery could not start: ${message}`;
+    const failedAt = new Date().toISOString();
+    const failed = retrySdkHandoff
+      ? patchMeetingRecord(reset.id, {
+        sdkUploadStatus: 'failed',
+        sdkUploadUpdatedAt: failedAt,
+        sdkUploadError: reason,
+        canonicalStatus: 'failed',
+        canonicalUpdatedAt: failedAt,
+        canonicalError: reason,
+      })
+      : patchMeetingRecord(reset.id, {
+        canonicalStatus: 'failed',
+        canonicalUpdatedAt: failedAt,
+        canonicalError: reason,
+      });
+    return { status: 'start_failed', mode, reason, record: failed ?? reset };
+  }
+
+  return { status: 'started', mode, record: reset };
+}
+
 /** Resume pending upload handoffs and post-upload backfills on daemon start. */
 export function recoverPendingRecallSdkUploads(options: {
   start?: (input: { meetingId: string }) => void;
+  startCanonical?: (record: RecallMeetingRecord) => void;
 } = {}): string[] {
-  const start = options.start ?? startRecallSdkUploadReconciliation;
+  const startSdk = options.start ?? startRecallSdkUploadReconciliation;
+  const startCanonical = options.startCanonical ?? startExplicitCanonicalRetry;
   const recovered: string[] = [];
   for (const record of listAllRecallMeetingRecords()) {
-    if (record.provider === 'local' || record.status !== 'completed' || !record.sdkUploadId) continue;
-    const needsUpload = !record.recordingId
+    if (record.provider === 'local' || record.status !== 'completed') continue;
+    const needsUpload = Boolean(record.sdkUploadId)
+      && record.sdkUploadStatus !== 'complete'
       && record.sdkUploadStatus !== 'failed'
-      && record.sdkUploadStatus !== 'timed_out';
+      && record.sdkUploadStatus !== 'timed_out'
+      && (record.sdkUploadStatus === 'pending' || !record.recordingId);
     const needsPostUpload = Boolean(record.recordingId)
+      && Boolean(record.sdkUploadId)
       && record.sdkUploadStatus === 'complete'
       && retentionModeFor(record) === 'timed'
       && (record.canonicalStatus === 'pending' || (record.canonicalStatus === 'ready' && !record.analysisTaskId));
-    if (!needsUpload && !needsPostUpload) continue;
-    recovered.push(record.id);
-    start({ meetingId: record.id });
+    if (needsUpload || needsPostUpload) {
+      recovered.push(record.id);
+      startSdk({ meetingId: record.id });
+      continue;
+    }
+
+    // Legacy/direct captures can have a canonical recording id without an
+    // SDK-upload owner. Explicit retry persists pending before dispatch, so a
+    // daemon restart must reclaim it rather than leave the UI processing.
+    const needsDirectCanonical = Boolean(record.recordingId)
+      && record.canonicalStatus === 'pending'
+      && (!record.sdkUploadId || !record.sdkUploadStatus);
+    if (needsDirectCanonical) {
+      recovered.push(record.id);
+      startCanonical(record);
+    }
   }
   return recovered;
 }

@@ -17,6 +17,8 @@ import { dispatchBatchItemTool } from '../tools/code-mode-tool.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
+import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
+import { verifyPendingComposioExecutionAuthority } from '../tools/pending-action-admission.js';
 
 export interface ExecuteApprovedResult {
   ok: boolean;
@@ -92,6 +94,36 @@ function skippedClaimResult(id: string, claim: PendingActionExecutionClaim): Exe
   };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Revalidate route authority inside the pending-action claim lock. This closes
+ * every queue producer, including legacy/judge-outage paths: a CLI-default
+ * write needs the exact current grant generation, and an SDK social publish
+ * still needs a concrete connected account.
+ */
+function verifyPendingActionExecutionAuthority(record: PendingActionRecord): string | null {
+  const authority = record.executionAuthority ?? null;
+  if (record.toolName !== 'composio_execute_tool' || !isPlainRecord(record.payload)) {
+    return authority
+      ? 'A Composio CLI-default capability was attached to a non-Composio action.'
+      : null;
+  }
+  const slug = typeof record.payload.tool_slug === 'string'
+    ? record.payload.tool_slug.trim()
+    : '';
+  const connectedAccountId = typeof record.payload.connected_account_id === 'string'
+    ? record.payload.connected_account_id.trim()
+    : '';
+  return verifyPendingComposioExecutionAuthority({
+    toolSlug: slug,
+    connectedAccountIds: [connectedAccountId || null],
+    executionAuthority: authority,
+  });
+}
+
 export async function executeApprovedPendingActionCall(
   id: string,
   opts: { sessionId?: string; dispatch?: ApprovedCallDispatch } = {},
@@ -130,6 +162,7 @@ export async function executeApprovedPendingActionCall(
     claim = claimPendingActionExecution(id, 'pending-action-executor', {
       expectedSessionId: opts.sessionId,
       requireResolvedHumanCard: pendingActionRequiresHumanApproval(record),
+      verifyExecutionAuthority: verifyPendingActionExecutionAuthority,
     });
   } catch {
     // If durable claim storage itself is unavailable, the only safe choice is
@@ -147,6 +180,15 @@ export async function executeApprovedPendingActionCall(
   const sessionId = opts.sessionId ?? claimedRecord.sessionId ?? '';
   const dispatch = opts.dispatch ?? defaultDispatch;
   try {
+    // Legacy records may predate pending_action_queue's carrier rejection.
+    // call_tool authority is turn-scoped (reachable/denied sets), so replaying
+    // its raw name + args_json later cannot reproduce the approval-time scope.
+    // Fail proven-pre-dispatch and require a fresh validated inner-tool record.
+    if ((claimedRecord.toolName.split('__').at(-1) ?? claimedRecord.toolName) === 'call_tool') {
+      throw new PendingActionPreDispatchError(
+        'Stored call_tool carriers cannot be replayed outside their original turn scope. Queue the validated inner tool and exact payload in a new pending action.',
+      );
+    }
     const out = await dispatch(claimedRecord.toolName, claimedRecord.payload, sessionId, {
       batchId: claimedRecord.id,
       payloadHash: claimedRecord.payloadHash,
@@ -216,8 +258,17 @@ export async function executeApprovedPendingActionCall(
       record: updated ?? getPendingAction(id),
     };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (err instanceof PendingActionPreDispatchError) {
+    // A certified nested dispatcher preserves this nominal in-process type.
+    // Map it into the executor's local control-flow error by identity — never
+    // by matching provider-visible prose, which could follow a real commit.
+    const preDispatchError = err instanceof PendingActionPreDispatchError
+      ? err
+      : err instanceof ExternalWritePreDispatchError
+        ? new PendingActionPreDispatchError(err.message, err)
+        : null;
+    const msg = preDispatchError?.message
+      ?? (err instanceof Error ? err.message : String(err));
+    if (preDispatchError) {
       const updated = recordPendingActionResult(
         claimedRecord.id,
         'failed',

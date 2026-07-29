@@ -94,10 +94,16 @@ import {
   selectToolkitCredentialValues,
   validateComposioApiKey,
   saveComposioExecutionBackend,
+  composioExecutionUsesCliOnlyLane,
   setupCredentialToolkit,
   setupOAuthToolkit,
   getToolkitSetupMeta,
 } from '../integrations/composio/client.js';
+import {
+  grantComposioCliDefaultAccountAuthority,
+  listComposioCliDefaultAccountAuthorities,
+  revokeComposioCliDefaultAccountAuthority,
+} from '../integrations/composio/cli-default-account-authority.js';
 import { computeAvailability, KNOWN_SERVICES, loadToolPreferences, saveToolPreferences, type ToolSource } from '../integrations/tool-preferences.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
@@ -1429,6 +1435,51 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     try {
       const saved = saveComposioExecutionBackend(backend);
       res.json({ ok: true, backend: saved });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get('/api/composio/cli-default-accounts', requireAuth, (_req, res) => {
+    res.json({ authorities: listComposioCliDefaultAccountAuthorities() });
+  });
+
+  app.post('/api/composio/cli-default-accounts/:slug', requireAuth, async (req, res) => {
+    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+    const label = typeof req.body?.label === 'string' ? req.body.label : '';
+    if (req.body?.confirmed !== true) {
+      res.status(400).json({
+        error: 'Confirm that you verified the provider-side account currently selected by the Composio CLI.',
+      });
+      return;
+    }
+    try {
+      const runtime = await getComposioRuntimeStatus();
+      if (
+        !composioExecutionUsesCliOnlyLane(runtime)
+        || !runtime.cli.authenticated
+      ) {
+        res.status(409).json({
+          error: 'An authenticated CLI-only Composio lane is required. Sign in with `composio login` and select CLI/AUTO without an SDK key first.',
+        });
+        return;
+      }
+      const authority = await grantComposioCliDefaultAccountAuthority({
+        toolkit: slug,
+        label,
+        grantedBy: 'console',
+      });
+      res.json({ ok: true, authority });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/composio/cli-default-accounts/:slug/revoke', requireAuth, async (req, res) => {
+    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+    try {
+      const revoked = await revokeComposioCliDefaultAccountAuthority(slug);
+      res.json({ ok: true, revoked });
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
     }

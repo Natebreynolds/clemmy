@@ -34,6 +34,67 @@ test('clean thin space passes untouched (no repairs, no errors)', () => {
   assert.equal(prep.errors.length, 0);
 });
 
+test('prepare rejects ambiguous identities before a caller can smoke, refresh, or dispatch', () => {
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'identity-gate',
+    dataSources: [
+      { id: '   ', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: ' pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: '_meta', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'x'.repeat(121), composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'control\u0001source', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+    ],
+    actions: [
+      { id: '', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'send ', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'y'.repeat(121), composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'control\u0001action', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+    ],
+  });
+  assert.equal(prep.ok, false);
+  const errors = prep.errors.join('\n');
+  assert.match(errors, /Data source .*non-whitespace/i);
+  assert.match(errors, /Data source .*leading or trailing whitespace/i);
+  assert.match(errors, /Duplicate data source id "pull"/i);
+  assert.match(errors, /reserved id "_meta"/i);
+  assert.match(errors, /Data source .*120 character/i);
+  assert.match(errors, /Data source .*control character/i);
+  assert.match(errors, /Action .*non-whitespace/i);
+  assert.match(errors, /Action .*leading or trailing whitespace/i);
+  assert.match(errors, /Duplicate action id "send"/i);
+  assert.match(errors, /Action .*120 character/i);
+  assert.match(errors, /Action .*control character/i);
+});
+
+test('prepare preserves valid prototype-shaped source and action identities', () => {
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'identity-prototype',
+    dataSources: [
+      { id: '__proto__', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'constructor', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: 'prototype', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+    ],
+    actions: [
+      { id: '__proto__', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'constructor', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: 'prototype', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+    ],
+  });
+  assert.equal(prep.ok, true, prep.errors.join('\n'));
+  assert.deepEqual(
+    prep.dataSources.map((source) => source.id),
+    ['__proto__', 'constructor', 'prototype'],
+  );
+  assert.deepEqual(
+    prep.actions.map((action) => action.id),
+    ['__proto__', 'constructor', 'prototype'],
+  );
+});
+
 test('auto-repair coerces confirm:true on a send-like action', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'sendy',
