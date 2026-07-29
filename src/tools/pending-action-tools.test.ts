@@ -101,6 +101,24 @@ test('pending_action_queue accepts the exact source-backed recipient set', async
   assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
 });
 
+test('pending_action_queue keeps a reversible local action on the lighter conversational path', async () => {
+  const session = createSession({ kind: 'chat' });
+  const response = await handlerFor('pending_action_queue')({
+    title: 'Save local draft',
+    summary: 'Save a reversible local draft in the current workspace.',
+    kind: 'local_file_write',
+    toolName: 'write_file',
+    payloadJson: JSON.stringify({
+      path: 'draft.md',
+      content: 'Local draft only.',
+    }),
+    sessionId: session.id,
+  });
+
+  assert.match(response.content[0].text, /Next step: ask the user whether to execute/);
+  assert.doesNotMatch(response.content[0].text, /REQUIRED NEXT TOOL/);
+});
+
 test('model-callable pending_action_record_result cannot forge completion of an executing action', async () => {
   const record = queuePendingAction({
     title: 'Owner-bound completion',

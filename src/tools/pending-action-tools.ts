@@ -52,7 +52,7 @@ export function registerPendingActionTools(server: McpServer): void {
     [
       'Queue a fully prepared action payload before an irreversible external write/send/deploy or other approval-bound execution.',
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
-      'Then ask once at the write boundary, usually with request_approval({pendingActionId:<id>, ...}).',
+      'For an approval-bound action, call request_approval({pendingActionId:<id>, ...}) once immediately after queueing; do not add a separate prose confirmation first.',
       'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
     ].join(' '),
     {
@@ -120,14 +120,15 @@ export function registerPendingActionTools(server: McpServer): void {
         payloadHash: record.payloadHash,
         targetSummary: record.targetSummary,
       });
-      const nextStep = shape.mutating && shape.irreversible
-        ? 'Next step: call request_approval ONCE now with pendingActionId set to this id and include a concise preview. Do not stop at a separate prose confirmation; the approval card is the single user confirmation. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
+      const needsFormalApproval = input.kind === 'external_send' || (shape.mutating && shape.irreversible);
+      const nextStep = needsFormalApproval
+        ? 'REQUIRED NEXT TOOL: call request_approval ONCE now with pendingActionId set to this id and include a concise preview. Do not stop at a separate prose confirmation; the approval card is the single user confirmation. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.'
         : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
       return textResult([
         `Pending action queued: ${record.id}`,
-        formatPendingAction(record, { verbose: true }),
-        '',
         nextStep,
+        '',
+        formatPendingAction(record, { verbose: true }),
       ].join('\n'));
     },
   );

@@ -22,7 +22,7 @@ const PROMPT = [
   '- payloadJson: {"tool_slug":"GMAIL_SEND_EMAIL","arguments":{"to":"proof@example.com","subject":"Proof pending action","body":"This is a fictional proof payload only."}}',
   '- preview: To proof@example.com; Subject Proof pending action; Body This is a fictional proof payload only.',
   '',
-  'After queueing it, follow Clementine’s normal single-approval flow for that exact pending action. Do not stop at a prose-only question and do not merely describe the queue; create the one actionable approval card.',
+  'After queueing it, ask whether I want you to execute it. Do not merely describe the queue; create it.',
 ].join('\n');
 
 interface PendingActionFile {
@@ -31,6 +31,7 @@ interface PendingActionFile {
   status?: string;
   kind?: string;
   toolName?: string;
+  sessionId?: string | null;
   targetSummary?: string;
   payloadHash?: string;
   approvalId?: string | null;
@@ -41,11 +42,13 @@ interface ApprovalAuditRow {
   approval_id: string;
   session_id: string;
   status: string;
+  tool: string | null;
   args_json: string | null;
 }
 
 interface ApprovalEventData {
   approvalId?: string;
+  tool?: string;
   pendingAction?: { id?: string; approvalId?: string | null };
 }
 
@@ -72,8 +75,9 @@ export const pendingActionGate: ScenarioDef = {
     const sessionId = `proof-pending-action-${Date.now().toString(36)}`;
     const turn = await daemon.chat(PROMPT, sessionId, 420_000);
     const actions = readPendingActions(daemon.home);
-    const action = actions.find((item) => item.targetSummary === 'proof@example.com')
-      ?? actions.find((item) => item.toolName === 'composio_execute_tool');
+    const sessionActions = actions.filter((item) => item.sessionId === turn.sessionId);
+    const action = sessionActions.find((item) => item.targetSummary === 'proof@example.com')
+      ?? sessionActions.find((item) => item.toolName === 'composio_execute_tool');
 
     let metrics = null;
     let approval: ApprovalAuditRow | null = null;
@@ -86,7 +90,7 @@ export const pendingActionGate: ScenarioDef = {
       try {
         metrics = sessionMetrics(db, turn.sessionId);
         const approvals = db.prepare(
-          `SELECT approval_id, session_id, status, args_json
+          `SELECT approval_id, session_id, status, tool, args_json
              FROM pending_approvals
             WHERE session_id = ?
             ORDER BY requested_at DESC`,
@@ -122,15 +126,19 @@ export const pendingActionGate: ScenarioDef = {
       name: 'pending action opened one formal approval gate',
       pass: Boolean(
         action?.id
+        && sessionActions.length === 1
+        && action.sessionId === turn.sessionId
         && action.status === 'approval_requested'
         && action.approvalId
         && approvalCount === 1
         && approval?.approval_id === action.approvalId
         && approval.session_id === turn.sessionId
         && approval.status === 'pending'
+        && approval.tool === 'request_approval'
         && approvalArgs?.pendingActionId === action.id
         && approvalEventCount === 1
         && approvalEvent?.approvalId === action.approvalId
+        && approvalEvent.tool === 'request_approval'
         && approvalEvent.pendingAction?.id === action.id
         && approvalEvent.pendingAction.approvalId === action.approvalId
         && turn.pendingApprovalId === action.approvalId
@@ -141,6 +149,7 @@ export const pendingActionGate: ScenarioDef = {
           count: approvalCount,
           id: approval.approval_id,
           status: approval.status,
+          tool: approval.tool,
           pendingActionId: approvalArgs?.pendingActionId,
         } : null,
         event: approvalEvent ? { count: approvalEventCount, ...approvalEvent } : null,
@@ -150,9 +159,12 @@ export const pendingActionGate: ScenarioDef = {
     checks.push({
       name: 'exact external payload retained',
       pass: action?.toolName === 'composio_execute_tool'
+        && action.kind === 'external_send'
+        && action.targetSummary === 'proof@example.com'
         && action.payload?.tool_slug === 'GMAIL_SEND_EMAIL'
         && action.payload?.arguments?.to === 'proof@example.com'
-        && action.payload?.arguments?.subject === 'Proof pending action',
+        && action.payload?.arguments?.subject === 'Proof pending action'
+        && action.payload?.arguments?.body === 'This is a fictional proof payload only.',
       detail: JSON.stringify(action?.payload ?? null),
     });
     checks.push({
@@ -166,8 +178,8 @@ export const pendingActionGate: ScenarioDef = {
     });
     checks.push({
       name: 'brain used pending-action queue',
-      pass: Boolean(action?.id) || (toolCalls.pending_action_queue ?? 0) >= 1,
-      detail: `pending_action_queue × ${toolCalls.pending_action_queue ?? 0}; actions=${actions.length}`,
+      pass: Boolean(action?.id) && (toolCalls.pending_action_queue ?? 0) === 1,
+      detail: `pending_action_queue × ${toolCalls.pending_action_queue ?? 0}; session actions=${sessionActions.length}; all actions=${actions.length}`,
     });
     checks.push({
       name: 'reply offers final execute gate',
