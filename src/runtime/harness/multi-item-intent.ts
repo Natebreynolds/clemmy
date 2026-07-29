@@ -67,6 +67,32 @@ const STRUCTURAL_PER_ITEM_WORK_RE =
   /\b(?:for\s+each|each\s+(?:one|of\s+(?:them|these|those))|every\s+one\s+of|one\s+per|per[- ]item)\b/i;
 const PRIOR_BATCH_PROPOSAL_RE =
   /\b(?:want me to|should i|shall i|would you like me to|do you want me to|ready for me to|may i|can i)\b/i;
+const DURABLE_BACKGROUND_ENVELOPE_RE =
+  /^(?:You are running a durable Clementine background task\.|Continue background task\b|The user answered your question:)/i;
+const ORIGINAL_REQUEST_MARKER_RE = /(?:^|\n)[ \t]*Original request:[ \t]*\r?\n/gi;
+
+/**
+ * Background workers receive a model-visible machine envelope containing
+ * bounded origin history and, at the end, one authoritative Original request
+ * block. The origin history can contain the same numbered user list, so
+ * structural detection over the whole envelope doubles one five-item universe
+ * into ten. Keep the rich envelope for the model, but classify fan-out against
+ * its canonical task objective exactly once.
+ *
+ * The prefix check is intentionally narrow: ordinary user prompts with two
+ * genuinely distinct numbered lists retain both universes.
+ */
+function canonicalMultiItemObjective(input: string): string {
+  if (!DURABLE_BACKGROUND_ENVELOPE_RE.test(input)) return input;
+  const markers = [...input.matchAll(new RegExp(
+    ORIGINAL_REQUEST_MARKER_RE.source,
+    ORIGINAL_REQUEST_MARKER_RE.flags,
+  ))];
+  const marker = markers.at(-1);
+  if (marker?.index === undefined) return input;
+  const objective = input.slice(marker.index + marker[0].length).trim();
+  return objective || input;
+}
 
 /** Boundaries such as "do not write memory" are not positive work signals. */
 export function positiveActionSignalText(text: string): string {
@@ -129,7 +155,8 @@ function referencesCountedKind(text: string, kind: string | null): boolean {
 
 export function detectMultiItemIntent(input: string): MultiItemIntent {
   try {
-    const text = (typeof input === 'string' ? input : '').trim();
+    const rawText = (typeof input === 'string' ? input : '').trim();
+    const text = canonicalMultiItemObjective(rawText);
     if (text.length < 4) return NO_MULTI_ITEM;
     const actionText = positiveActionSignalText(text);
 

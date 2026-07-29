@@ -7,7 +7,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -55,7 +56,9 @@ const {
   planBrain,
   proofProcessIsolationEnv,
   proofRuntimeOverrides,
-  PROOF_COMPOSIO_ACCOUNT_AUTHORITY,
+  createProofComposioShim,
+  PROOF_COMPOSIO_DEFAULT_ACCOUNT_TOOLKITS,
+  seedProofComposioDefaultAccountAuthorities,
 } = await import('./provision.js');
 
 test.after(() => {
@@ -122,13 +125,51 @@ test('live proof gives spawned CLIs only the disposable home and dotfiles', () =
   });
 });
 
-test('selectable proof toolkits have explicit disposable CLI account authority', () => {
-  const authority = new Map(
-    PROOF_COMPOSIO_ACCOUNT_AUTHORITY
-      .split(',')
-      .map((entry) => entry.split('=', 2) as [string, string]),
-  );
-  assert.equal(authority.get('gmail'), 'isolated-proof');
-  assert.equal(authority.get('instagram'), 'isolated-proof');
-  assert.equal(authority.get('googlesheets'), 'isolated-proof');
+test('selectable proof toolkits load as real durable CLI-default authorities', async () => {
+  const file = seedProofComposioDefaultAccountAuthorities(tmpHome);
+  const stored = JSON.parse(readFileSync(file, 'utf8')) as {
+    version?: number;
+    grants?: Record<string, { kind?: string; toolkit?: string; label?: string; grantId?: string }>;
+  };
+  assert.equal(stored.version, 1);
+  assert.deepEqual(Object.keys(stored.grants ?? {}).sort(), [...PROOF_COMPOSIO_DEFAULT_ACCOUNT_TOOLKITS].sort());
+
+  const {
+    listComposioCliDefaultAccountAuthorities,
+    verifyComposioCliDefaultAccountAuthority,
+  } = await import('../../src/integrations/composio/cli-default-account-authority.js');
+  const loaded = listComposioCliDefaultAccountAuthorities();
+  assert.deepEqual(loaded.map((row) => row.toolkit).sort(), [...PROOF_COMPOSIO_DEFAULT_ACCOUNT_TOOLKITS].sort());
+  for (const row of loaded) {
+    assert.equal(row.kind, 'composio_cli_default_account');
+    assert.match(row.label, /^isolated-proof /);
+    assert.equal(verifyComposioCliDefaultAccountAuthority(row).ok, true);
+  }
+});
+
+test('proof-local task feed is a dynamic read result with no real provider', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clemmy-proof-task-feed-'));
+  try {
+    const shim = createProofComposioShim(home);
+    writeFileSync(path.join(home, 'proof-composio-connected'), 'connected\n', 'utf8');
+    const raw = execFileSync(
+      process.execPath,
+      [shim, 'execute', 'PROOF_TASKS_LIST', '-d', '{"scope":"isolated-proof"}'],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, USERPROFILE: home },
+      },
+    );
+    const result = JSON.parse(raw) as {
+      successful?: boolean;
+      data?: { tasks?: Array<{ id?: string; status?: string }>; count?: number };
+    };
+    assert.equal(result.successful, true);
+    assert.equal(result.data?.count, 1);
+    assert.deepEqual(result.data?.tasks?.map((task) => [task.id, task.status]), [
+      ['proof-task-1', 'open'],
+    ]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

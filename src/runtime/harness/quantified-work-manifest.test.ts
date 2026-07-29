@@ -11,6 +11,7 @@ const eventlog = await import('./eventlog.js');
 const {
   evaluateQuantifiedWorkManifestGate: evaluateGate,
 } = await import('./quantified-work-manifest.js');
+const { detectMultiItemIntent } = await import('./multi-item-intent.js');
 const { prepareWorkerManifest } = await import('./work-manifest.js');
 const sourceSeqBySession = new Map<string, number>();
 
@@ -113,6 +114,70 @@ test('background quantifiable work refuses an unbound or successful-subset worke
   assert.equal(complete.ok, true);
   assert.equal(complete.required, true);
   assert.equal(complete.expectedCount, 10);
+});
+
+test('a durable background envelope measures its canonical request once', () => {
+  const originalRequest = [
+    'For EACH of these 5 fictional firms, produce one same-shape SEO snapshot.',
+    'Firms:',
+    '1. Auric & Vale Law',
+    '2. Meridian Injury Group',
+    '3. Copperline Defense',
+    '4. Harborlight Estate Law',
+    '5. Bluegrass Family Legal',
+  ].join('\n');
+  const workerEnvelope = [
+    'You are running a durable Clementine background task.',
+    '## Durable Task Contract',
+    'Active contract version: 1.',
+    'Version 1 is the original request below.',
+    '## Origin Session Lineage',
+    'The bounded origin history is authoritative.',
+    originalRequest,
+    'Original request:',
+    originalRequest,
+  ].join('\n');
+
+  const detected = detectMultiItemIntent(workerEnvelope);
+  assert.equal(detected.isMultiItem, true);
+  assert.equal(detected.itemCount, 5, 'the model-visible lineage copy must not double the canonical universe');
+
+  const sessionId = openTurn(
+    'quantified-background-canonical-objective',
+    'execution',
+    workerEnvelope,
+  );
+  const decision = gate({
+    sessionId,
+    items: [
+      'Auric & Vale Law',
+      'Meridian Injury Group',
+      'Copperline Defense',
+      'Harborlight Estate Law',
+      'Bluegrass Family Legal',
+    ],
+    workManifest: descriptor('proof-fanout-multi-item'),
+  });
+  assert.equal(decision.ok, true, decision.error);
+  assert.equal(decision.required, true);
+  assert.equal(decision.expectedCount, 5);
+
+  const distinctUserUniverses = detectMultiItemIntent([
+    'Research every listed firm in both genuinely distinct regions.',
+    'West:',
+    '1. Alder Law',
+    '2. Birch Law',
+    '3. Cedar Law',
+    '4. Dogwood Law',
+    '5. Elm Law',
+    'East:',
+    '1. Finch Law',
+    '2. Grove Law',
+    '3. Harbor Law',
+    '4. Iris Law',
+    '5. Juniper Law',
+  ].join('\n'));
+  assert.equal(distinctUserUniverses.itemCount, 10, 'ordinary distinct user lists remain one ten-item universe');
 });
 
 test('a declared full universe permits later phase slices but rejects universe drift', () => {

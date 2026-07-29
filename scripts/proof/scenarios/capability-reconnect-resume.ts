@@ -101,6 +101,8 @@ export const capabilityReconnectResume: ScenarioDef = {
   routeExpectation: 'exact-workflow-step',
   async run(daemon: DaemonHandle) {
     const startedAt = Date.now();
+    const dispatchBaseline = dispatches(daemon).length;
+    const scenarioDispatches = (): string[] => dispatches(daemon).slice(dispatchBaseline);
     const checks: Check[] = [];
     const create = await daemon.request('POST', '/api/console/workflows', {
       name: WORKFLOW_NAME,
@@ -165,8 +167,8 @@ export const capabilityReconnectResume: ScenarioDef = {
     });
     checks.push({
       name: 'zero fake provider dispatches occurred before reconnect',
-      pass: dispatches(daemon).length === 0,
-      detail: JSON.stringify(dispatches(daemon)),
+      pass: scenarioDispatches().length === 0,
+      detail: JSON.stringify(scenarioDispatches()),
     });
 
     // Simulate the user completing Composio login, then invalidate the same
@@ -195,7 +197,7 @@ export const capabilityReconnectResume: ScenarioDef = {
     const prepareAfter = afterEvents.filter((event) => event.kind === 'step_completed' && event.stepId === PREPARE_STEP).length;
     const paused = afterEvents.filter((event) => event.kind === 'run_paused' && event.meta?.reason === 'capability_blocked');
     const resumed = afterEvents.filter((event) => event.kind === 'run_resumed' && event.meta?.reason === 'capability_retry');
-    const fakeDispatches = dispatches(daemon);
+    const fakeDispatches = scenarioDispatches();
 
     checks.push({
       name: 'same workflow run completed after reconnect',

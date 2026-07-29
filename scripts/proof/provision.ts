@@ -336,11 +336,42 @@ function createProofRailwayShim(home: string): string {
   return bin;
 }
 
-/** Explicit identities available inside the disposable proof CLI. Keep this
- * exported so self-tests catch a selectable scenario whose toolkit was added
- * to the shim but not to runtime owner resolution. */
-export const PROOF_COMPOSIO_ACCOUNT_AUTHORITY =
-  'proof=isolated-proof,instagram=isolated-proof,gmail=isolated-proof,googlesheets=isolated-proof';
+/** Toolkits whose proof-only CLI defaults are explicitly operator-authorized
+ * inside the disposable home. This is deliberately the same durable store
+ * production Connect writes — never an environment-variable bypass. */
+export const PROOF_COMPOSIO_DEFAULT_ACCOUNT_TOOLKITS = [
+  'proof',
+  'proofapp',
+  'gmail',
+  'instagram',
+  'googlesheets',
+] as const;
+
+export function seedProofComposioDefaultAccountAuthorities(home: string): string {
+  const stateDir = path.join(home, 'state');
+  const file = path.join(stateDir, 'composio-cli-default-accounts.json');
+  const grantedAt = new Date().toISOString();
+  const grants = Object.fromEntries(
+    PROOF_COMPOSIO_DEFAULT_ACCOUNT_TOOLKITS.map((toolkit) => [
+      toolkit,
+      {
+        kind: 'composio_cli_default_account',
+        toolkit,
+        label: `isolated-proof ${toolkit} default`,
+        grantId: `proof-cli-default-${toolkit}`,
+        grantedAt,
+        grantedBy: 'proof-harness',
+      },
+    ]),
+  );
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(file, `${JSON.stringify({ version: 1, grants }, null, 2)}\n`, {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
+  try { chmodSync(file, 0o600); } catch { /* best-effort on Windows */ }
+  return file;
+}
 
 /** A local-only Composio lane for capability recovery proofs. It begins
  * unauthenticated. Creating $HOME/proof-composio-connected makes `whoami` and
@@ -386,6 +417,15 @@ export function createProofComposioShim(home: string): string {
     "  if (!slug || flag !== '-d') { console.error('invalid proof execute arguments'); process.exit(1); }",
     "  fs.appendFileSync(path.join(home, 'proof-composio-dispatches.log'), slug + '\\n', 'utf8');",
     "  fs.appendFileSync(path.join(home, 'proof-composio-payloads.log'), JSON.stringify({ slug, payload }) + '\\n', 'utf8');",
+    "  if (slug === 'PROOF_TASKS_LIST') {",
+    "    const args = parsePayload();",
+    "    if (!exactKeys(args, ['scope']) || args.scope !== 'isolated-proof') {",
+    "      console.error('invalid proof task-list payload: use exactly {\"scope\":\"isolated-proof\"}');",
+    "      process.exit(2);",
+    "    }",
+    "    console.log(JSON.stringify({ successful: true, data: { tasks: [{ id: 'proof-task-1', title: 'Review the Clementine release proof', status: 'open' }], count: 1, generated_at: '2026-07-29T00:00:00.000Z' } }));",
+    "    process.exit(0);",
+    "  }",
     "  if (slug === 'PROOF_SOCIAL_GET_CONTENT_PLAN') {",
     "    console.log(JSON.stringify({ successful: true, data: [{ sourceMarker: 'SOCIAL_SOURCE:PROOF_ONLY', brand: 'Juniper Vale Coffee', handle: '@junipervale', campaign: 'Rainy Day Roast', offer: 'Complimentary oat-milk upgrade on August 14', hashtag: '#RainyDayRoast' }] }));",
     "    process.exit(0);",
@@ -469,6 +509,7 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
   // physically unable to reach external services. Databases, memory and every
   // other state file start EMPTY: that's the isolation contract.
   mkdirSync(path.join(home, 'state'), { recursive: true });
+  seedProofComposioDefaultAccountAuthorities(home);
   const codexAuth = path.join(REAL_CLEM_HOME, 'state', 'auth.json');
   if (existsSync(codexAuth)) copyFileSync(codexAuth, path.join(home, 'state', 'auth.json'));
   // Never copy a rotating Claude refresh token into a disposable home. A
@@ -494,10 +535,6 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     TERM: process.env.TERM ?? 'xterm-256color',
     ...proofProcessIsolationEnv(home),
     COMPOSIO_CLI_PATH: proofComposioShim,
-    // The disposable CLI has exactly one in-process proof account. Production
-    // CLI-only users must make this same default-account authority explicit;
-    // normal SDK/Connect users route by connected-account inventory instead.
-    COMPOSIO_CLI_DEFAULT_ACCOUNT_AUTHORITY: PROOF_COMPOSIO_ACCOUNT_AUTHORITY,
     CLEMENTINE_HOME: home,
     WEBHOOK_PORT: String(port),
     WEBHOOK_SECRET: secret,
