@@ -64,6 +64,14 @@ function safeWorkspaceObservationLabel(value: string): string {
     || '[redacted source]';
 }
 
+function optionalWorkspaceObservationId(value: string | null | undefined): string | null {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+  return ['null', 'undefined', 'none'].includes(normalized.toLowerCase())
+    ? null
+    : normalized;
+}
+
 function prepareWorkspaceObservationStore(
   rec: SpaceRecord,
 ): { ok: true; db: ReturnType<typeof openWorkspaceDb> } | { ok: false; error: string } {
@@ -1005,8 +1013,8 @@ export function registerSpaceTools(server: McpServer): void {
       try {
         const result = diffWorkspaceObservations(rec.id, sourceKey, {
           db: observationStore.db,
-          fromObservationId: from_observation_id,
-          toObservationId: to_observation_id,
+          fromObservationId: optionalWorkspaceObservationId(from_observation_id),
+          toObservationId: optionalWorkspaceObservationId(to_observation_id),
           maxChanges: max_changes,
         });
         return textResult(JSON.stringify(result), { maxChars: 36_000 });

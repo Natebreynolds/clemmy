@@ -657,6 +657,33 @@ test('space_set_data commits inline JSON, counts rows, and stamps _meta.provenan
   }));
   assert.match(diff, /"status":"changed"/);
   assert.match(diff, /stage/);
+
+  const stringNullDiff = text(await tools.space_diff({
+    slug: 'setdata',
+    source_id: 'deals',
+    from_observation_id: 'null',
+    to_observation_id: 'null',
+    max_changes: 25,
+  }));
+  assert.match(
+    stringNullDiff,
+    /"status":"changed"/,
+    'BYO models that serialize optional null ids as the string "null" still get the default current-versus-prior diff',
+  );
+  assert.match(stringNullDiff, /stage/);
+
+  const bogusIdDiff = text(await tools.space_diff({
+    slug: 'setdata',
+    source_id: 'deals',
+    from_observation_id: 'not-a-real-observation-id',
+    to_observation_id: null,
+    max_changes: 25,
+  }));
+  assert.match(
+    bogusIdDiff,
+    /"status":"observation_not_found"/,
+    'only known null sentinels are normalized; a real bogus id must still fail closed',
+  );
   assert.match(text(await tools.space_get({ slug: 'setdata' })), /space_diff is confirmed for: deals/);
 });
 
