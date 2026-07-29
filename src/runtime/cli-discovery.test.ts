@@ -50,10 +50,21 @@ test('isDeveloperToolchainInstalled returns a boolean (file-stat only — never 
   assert.equal(typeof result, 'boolean');
 });
 
-test('resolveSafeCliProbe with no CLT skips any /usr/bin path, even unknowns', (t) => {
+test('resolveSafeCliProbe with no CLT skips any /usr/bin path, even unknowns (darwin only)', (t) => {
+  if (process.platform !== 'darwin') {
+    // The CLT-shim installer trap is a macOS phenomenon. On Linux/Windows
+    // /usr/bin binaries are real — the guard must NOT fire. This is the
+    // v3.0.0 release-run regression: Linux CI skipped /usr/bin/echo with a
+    // macOS install prompt.
+    const result = resolveSafeCliProbe('definitely-not-a-real-cli-zzz', '/usr/bin/definitely-not-a-real-cli-zzz');
+    if (result.skipped) {
+      assert.doesNotMatch(result.reason, /Command Line Tools/i, 'the macOS CLT guard must never fire off-darwin');
+    }
+    return;
+  }
   if (isDeveloperToolchainInstalled()) {
     // We can't simulate "no CLT" on a dev machine that has it. Skip
-    // rather than flake — CI machines without Xcode/CLT exercise this.
+    // rather than flake — macOS CI machines without Xcode/CLT exercise this.
     t.skip('CLT installed on this machine; structural skip path not exercised here');
     return;
   }

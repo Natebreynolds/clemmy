@@ -414,7 +414,11 @@ export function resolveSafeCliProbe(command: string, resolved: string): SafeCliP
   //
   // Binaries outside /usr/bin (Homebrew, asdf, npm globals, /usr/local)
   // are real and fine to probe regardless of CLT state.
-  if (resolved.startsWith('/usr/bin/') && !isDeveloperToolchainInstalled()) {
+  // Darwin-only by definition: the CLT-shim installer trap does not exist on
+  // Linux/Windows, where /usr/bin binaries are real. Without this gate, Linux
+  // CI skipped /usr/bin/echo with a macOS install prompt — caught by the v3.0.0
+  // release run when new strict-null coverage first dispatched a real binary.
+  if (process.platform === 'darwin' && resolved.startsWith('/usr/bin/') && !isDeveloperToolchainInstalled()) {
     return {
       skipped: true,
       command,
