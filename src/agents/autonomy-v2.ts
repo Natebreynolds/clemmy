@@ -1116,10 +1116,15 @@ async function runAgentCycleViaRuntime(
       // decision from there before declaring the cycle unusable.
       try {
         const [completed] = listEvents(`agent:${record.slug}`, { types: ['conversation_completed'], desc: true, limit: 1 });
-        const eventSummary = (completed?.data as { summary?: unknown } | undefined)?.summary;
-        if (typeof eventSummary === 'string' && eventSummary.trim()) {
-          parsed = parseDecisionJson(eventSummary) as Record<string, unknown> | null;
-          decision = sanitizeAgentDecisionOutput(eventSummary);
+        const data = completed?.data as { reply?: unknown; summary?: unknown } | undefined;
+        // `reply` is the FULL final text; `summary` is a 400-char preview that
+        // truncated the actions array mid-word on the first live attempt.
+        const eventText = typeof data?.reply === 'string' && data.reply.trim()
+          ? data.reply
+          : typeof data?.summary === 'string' ? data.summary : '';
+        if (eventText.trim()) {
+          parsed = parseDecisionJson(eventText) as Record<string, unknown> | null;
+          decision = sanitizeAgentDecisionOutput(eventText);
         }
       } catch { /* fall through to the explicit failure below */ }
     }
