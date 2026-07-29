@@ -465,3 +465,57 @@ test('PROVENANCE: a completed delegation says its result is model prose', async 
   const record = read('rt-prov', 'pv1');
   assert.equal(record.resultEvidence, 'model_prose', 'the record never implies independent verification');
 });
+
+test('WAKE: open delegated work wakes the agent, paced by backoff', async () => {
+  const mod = await import('./autonomy-v2.js');
+  seedTeamAgent('rt-wake');
+  seed('rt-wake', 'w9');
+
+  // Cadence NOT due (fresh lastRunAt) — only the delegation can wake it.
+  const stateDir = path.join(process.env.CLEMENTINE_HOME!, 'agents-state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, 'rt-wake.json'), JSON.stringify({
+    slug: 'rt-wake', engine: 'v2', lastRunAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  const decision = JSON.stringify({
+    summary: 'Completed delegated work on delegation wake.',
+    commitments: [],
+    actions: [{ type: 'complete_delegation', delegationId: 'w9', result: 'Done: a, b, c.' }],
+  });
+  const prompts: string[] = [];
+  const assistant = {
+    async respond(request: { message: string; sessionId?: string }) {
+      prompts.push(request.message);
+      return { text: decision, sessionId: request.sessionId ?? 'x' };
+    },
+    getRuntime() { return { async run() { throw new Error('unused'); } }; },
+  };
+
+  const prevAgents = process.env.AUTONOMY_V2_AGENTS;
+  process.env.AUTONOMY_V2_AGENTS = 'rt-wake';
+  try {
+    const summary = await mod.processAgentAutonomyV2(assistant as never);
+    assert.equal(summary.succeeded, 1, 'the delegation itself must wake the agent');
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+  }
+  assert.equal(read('rt-wake', 'w9').status, 'completed');
+
+  // And with a future nextWakeAt (failure backoff), the same state SKIPS.
+  seed('rt-wake', 'w10');
+  writeFileSync(path.join(stateDir, 'rt-wake.json'), JSON.stringify({
+    slug: 'rt-wake', engine: 'v2', lastRunAt: new Date().toISOString(),
+    nextWakeAt: new Date(Date.now() + 60_000).toISOString(),
+  }), 'utf-8');
+  process.env.AUTONOMY_V2_AGENTS = 'rt-wake';
+  try {
+    const summary2 = await mod.processAgentAutonomyV2(assistant as never);
+    assert.equal(summary2.skipped, 1, 'backoff paces the delegation wake');
+  } finally {
+    if (prevAgents === undefined) delete process.env.AUTONOMY_V2_AGENTS;
+    else process.env.AUTONOMY_V2_AGENTS = prevAgents;
+  }
+  assert.equal(read('rt-wake', 'w10').status, 'pending');
+});

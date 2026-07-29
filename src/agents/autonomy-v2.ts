@@ -22,6 +22,7 @@ import {
   resetCommsCycle,
 } from './agent-comms.js';
 import { buildAgentDelegationTools, claimDelegationFor, completeDelegationFor, renderOpenDelegations } from './agent-delegations.js';
+import { DELEGATIONS_DIR as DELEGATIONS_DIR_FOR_WAKE } from '../tools/shared.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { addNotification } from '../runtime/notifications.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -295,6 +296,29 @@ function loadActiveGoals(): GoalRecord[] {
       return (pri[a.priority] ?? 1) - (pri[b.priority] ?? 1);
     });
 }
+
+/** Open delegated work is itself a wake reason — the 'delegation' entry every
+ *  agent record has always listed in wakeTriggers, consumed at last. Paced by
+ *  state.nextWakeAt so a failing cycle retries on a bounded backoff instead of
+ *  hammering every tick or burning the full cadence. */
+function isDelegationWakeDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean {
+  if (agent.wakeTriggers && !agent.wakeTriggers.includes('delegation')) return false;
+  if (state.nextWakeAt && new Date(state.nextWakeAt).getTime() > Date.now()) return false;
+  try {
+    return readdirSync(path.join(DELEGATIONS_DIR_FOR_WAKE, agent.slug))
+      .filter((file) => file.endsWith('.json'))
+      .some((file) => {
+        try {
+          const record = JSON.parse(readFileSync(path.join(DELEGATIONS_DIR_FOR_WAKE, agent.slug, file), 'utf-8')) as { status?: string };
+          return record.status !== 'completed';
+        } catch { return false; }
+      });
+  } catch { return false; }
+}
+
+/** Backoff after a failed cycle: long enough not to hammer a degraded
+ *  provider, short enough that transient weather never costs a full cadence. */
+const CYCLE_FAILURE_RETRY_MS = 90_000;
 
 function isCadenceDue(agent: TeamAgentRecord, state: AgentStateRecord): boolean {
   if (!agent.proactive) return false;
@@ -854,6 +878,7 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
   const wakeReasons = [
     ...(inboxItems.length > 0 ? ['inbox'] : []),
     ...(isCadenceDue(record, state) ? ['cadence'] : []),
+    ...(isDelegationWakeDue(record, state) ? ['delegation'] : []),
   ];
   if (wakeReasons.length === 0) {
     return { runId: '', success: true, outcomes: [] };
@@ -1076,6 +1101,7 @@ async function runAgentCycleViaRuntime(
   const wakeReasons = [
     ...(inboxItems.length > 0 ? ['inbox'] : []),
     ...(isCadenceDue(record, state) ? ['cadence'] : []),
+    ...(isDelegationWakeDue(record, state) ? ['delegation'] : []),
   ];
   if (wakeReasons.length === 0) return { runId: '', success: true, outcomes: [] };
 
@@ -1192,7 +1218,15 @@ async function runAgentCycleViaRuntime(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, agent: record.slug }, 'autonomy runtime cycle failed');
-    saveAgentState({ ...state, slug: record.slug, engine: 'v2', lastRunAt: new Date().toISOString(), lastError: message });
+    saveAgentState({
+      ...state,
+      slug: record.slug,
+      engine: 'v2',
+      lastRunAt: new Date().toISOString(),
+      lastError: message,
+      // Bounded retry: transient provider weather must not cost a full cadence.
+      nextWakeAt: new Date(Date.now() + CYCLE_FAILURE_RETRY_MS).toISOString(),
+    });
     finishAutonomyRun(runId, [], message);
     return { runId, success: false, outcomes: [], error: message };
   }

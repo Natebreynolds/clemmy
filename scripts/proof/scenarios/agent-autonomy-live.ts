@@ -21,7 +21,10 @@ import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 
 const SLUG = 'proof-autonomist';
 const DELEGATION_ID = 'auto1';
-const WAIT_MS = 150_000; // 10 daemon ticks — one cycle plus generous model time
+// Long enough for one cycle PLUS one bounded failure-retry (90s backoff): a
+// transient provider blip mid-cycle must not red the gate when the retry
+// succeeds honestly. Severe sustained weather still reds it — that is correct.
+const WAIT_MS = 300_000;
 const POLL_MS = 5_000;
 
 function seedAgent(home: string): void {
