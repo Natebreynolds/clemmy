@@ -25,6 +25,7 @@ import { buildAgentDelegationTools, claimDelegationFor, completeDelegationFor, r
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { addNotification } from '../runtime/notifications.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -1105,6 +1106,22 @@ async function runAgentCycleViaRuntime(
       }, (req) => assistant.respond(req));
       parsed = parseDecisionJson(run.text) as Record<string, unknown> | null;
       decision = sanitizeAgentDecisionOutput(run.text);
+    }
+    if (!decision) {
+      // The Claude SDK brain lane records the model's final structured output
+      // in the durable conversation_completed event but can ship EMPTY
+      // user-visible text for a JSON-only reply (proven live: two attempts,
+      // both with the full decision JSON in the event summary and empty
+      // response text). The eventlog is the canonical record — read the
+      // decision from there before declaring the cycle unusable.
+      try {
+        const [completed] = listEvents(`agent:${record.slug}`, { types: ['conversation_completed'], desc: true, limit: 1 });
+        const eventSummary = (completed?.data as { summary?: unknown } | undefined)?.summary;
+        if (typeof eventSummary === 'string' && eventSummary.trim()) {
+          parsed = parseDecisionJson(eventSummary) as Record<string, unknown> | null;
+          decision = sanitizeAgentDecisionOutput(eventSummary);
+        }
+      } catch { /* fall through to the explicit failure below */ }
     }
     if (!decision) throw new Error('Agent cycle completed but produced no usable decision output.');
     await assertAutonomyDecisionGuardrails(decision);
