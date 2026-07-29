@@ -80,7 +80,7 @@ const {
   finishRunAttempt,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage } = await import('./brackets.js');
@@ -5911,6 +5911,171 @@ test('runConversation: structured zero-tool completion claim is retried', async 
   assert.equal((stuckEvents[0].data as { kind: string }).kind, 'structured_zero_tool_claim');
   const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
   assert.equal(retryEvents.length, 1);
+});
+
+test('runConversation: an explicit decision-only JSON contract completes without a tool-stall retry', async () => {
+  // Autonomy cycles deliberately expose zero tools: the model's job is to
+  // return a closed JSON action plan, then slug-bound code owns the mutations.
+  // The generic "claimed completion with zero tools" detector must not replace
+  // a valid JSON payload with "you MUST call a tool" when the caller opted into
+  // this exact contract. The outer autonomy layer still validates every field,
+  // delegation id, and result before executing anything.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'execution' });
+  const decisionJson = JSON.stringify({
+    summary: 'Completed the assigned checklist.',
+    commitments: [],
+    actions: [
+      { type: 'claim_delegation', delegationId: 'day-ops-1' },
+      {
+        type: 'complete_delegation',
+        delegationId: 'day-ops-1',
+        result: '1. Unlock doors\\n2. Start brewers\\n3. Count tills\\n4. Check pastry case',
+      },
+    ],
+  });
+  let modelTurns = 0;
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    modelTurns += 1;
+    return {
+      history: items,
+      lastResponseId: undefined,
+      // This is the actual provider shape the autonomy caller requests: raw
+      // JSON text, not a harness decision envelope.
+      finalOutput: decisionJson,
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Return the strict JSON autonomy decision.',
+    acceptStructuredNoToolResult: true,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(modelTurns, 1, 'the valid zero-tool decision is not overwritten by a stall retry');
+  assert.equal(result.lastDecision?.reply, decisionJson, 'the caller receives the exact JSON it must validate');
+  assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('decision-only JSON recognition is exact and autonomy-shaped, never repaired or inferred', () => {
+  const valid = JSON.stringify({
+    summary: 'Completed owned work.',
+    commitments: [],
+    actions: [{ type: 'complete_delegation', delegationId: 'owned-1', result: 'actual result' }],
+  });
+  assert.equal(_testOnly_strictStructuredNoToolResultText(valid), valid);
+  assert.equal(
+    _testOnly_strictStructuredNoToolResultText({
+      summary: 'Harness wrapper.',
+      reply: valid,
+      done: true,
+      nextAction: 'completed',
+    }),
+    valid,
+    'provider wrappers may carry the exact autonomy JSON in reply',
+  );
+
+  const rejected: unknown[] = [
+    '{"summary":"broken","commitments":[],"actions":[',
+    `\`\`\`json\n${valid}\n\`\`\``,
+    '{"ok":true}',
+    JSON.stringify({
+      summary: 'Sent the email.',
+      reply: 'Sent the email.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    }),
+    {
+      summary: 'Sent the email.',
+      reply: 'Sent the email.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  for (const candidate of rejected) {
+    assert.equal(
+      _testOnly_strictStructuredNoToolResultText(candidate),
+      null,
+      `must reject ${typeof candidate === 'string' ? candidate.slice(0, 60) : JSON.stringify(candidate)}`,
+    );
+  }
+});
+
+test('runConversation: structured-result recognition is disabled after any tool call', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'execution' });
+  const decisionJson = JSON.stringify({
+    summary: 'Returned a decision after unexpected tool work.',
+    commitments: [],
+    actions: [],
+  });
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'memory_status' };
+    const details = {
+      toolCall: { callId: 'unexpected-tool', arguments: '{}' },
+    };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'ok', details);
+    return { history: items, lastResponseId: undefined, finalOutput: decisionJson };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Return the strict JSON autonomy decision.',
+    acceptStructuredNoToolResult: true,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.notEqual(
+    result.lastDecision?.reason,
+    'structured_no_tool_result',
+    'the exemption is recognized only when the turn made exactly zero tool calls',
+  );
+});
+
+test('runConversation: decision-only opt-in never exempts a prose completion claim', async () => {
+  // Positive control: the capability is not a broad "zero tools are fine"
+  // switch. Only strict JSON is eligible; ordinary action narration keeps the
+  // same fail-closed stall behavior.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'execution' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'Claimed an external action without evidence.',
+        reply: 'Sent the email to the whole team.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+  ]);
+
+  await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Return the strict JSON autonomy decision.',
+    acceptStructuredNoToolResult: true,
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+
+  const claims = listEventsForConv(sess.id, { types: ['stuck_detected'] })
+    .filter((event) => (event.data as { kind?: string }).kind === 'structured_zero_tool_claim');
+  assert.ok(claims.length >= 1, 'non-JSON action narration still trips the zero-tool guard');
 });
 
 test('runConversation: plain self-reported no-tool-access completion is retried', async () => {

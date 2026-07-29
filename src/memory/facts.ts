@@ -534,22 +534,51 @@ export function updateFact(
  *  a fail-open ADD, so supersedeFact (which mints a new row) would create a
  *  third copy. Same active=0 + valid_to + superseded_by chain as supersedeFact,
  *  so recall's active=1 gate hides the loser identically. Refuses self-links,
- *  missing rows, and pinned targets (pinned = standing instruction; only the
- *  full resolver path with user authority may rewrite those). */
-export function markFactSupersededBy(id: number, byFactId: number): boolean {
+ *  missing rows, and pinned targets by default. The causal correction path may
+ *  opt into pinned retirement only after proving direct user authority. */
+export function markFactSupersededBy(
+  id: number,
+  byFactId: number,
+  options: {
+    /** Semantic close boundary. Causal correction paths pass the newer source
+     * event's occurredAt instead of wall-clock ingestion time. */
+    validTo?: string;
+    /** Only an already-proven explicit user correction may retire a pinned
+     * row through this low-level helper. Ordinary conflict retry stays false. */
+    allowPinned?: boolean;
+    /** Carry standing visibility to the correction when the retired row was
+     * pinned. This does not change the winner's kind or dispatch authority. */
+    transferPin?: boolean;
+  } = {},
+): boolean {
   if (!Number.isInteger(id) || !Number.isInteger(byFactId) || id === byFactId) return false;
   const db = openMemoryDb();
   const target = db.prepare('SELECT id, pinned, active FROM consolidated_facts WHERE id = ?')
     .get(id) as { id: number; pinned: number; active: number } | undefined;
   const winner = db.prepare('SELECT id, active FROM consolidated_facts WHERE id = ?')
     .get(byFactId) as { id: number; active: number } | undefined;
-  if (!target || !winner || !target.active || !winner.active || target.pinned) return false;
+  if (!target || !winner || !target.active || !winner.active || (target.pinned && !options.allowPinned)) return false;
   const now = new Date().toISOString();
-  db.prepare(`
-    UPDATE consolidated_facts
-    SET active = 0, valid_to = ?, superseded_by_fact_id = ?, updated_at = ?
-    WHERE id = ? AND active = 1
-  `).run(now, byFactId, now, id);
+  const parsedBoundary = options.validTo ? Date.parse(options.validTo) : Number.NaN;
+  const boundary = Number.isFinite(parsedBoundary)
+    ? new Date(parsedBoundary).toISOString()
+    : now;
+  const tx = db.transaction(() => {
+    const changed = db.prepare(`
+      UPDATE consolidated_facts
+      SET active = 0, valid_to = ?, superseded_by_fact_id = ?, updated_at = ?
+      WHERE id = ? AND active = 1
+    `).run(boundary, byFactId, now, id);
+    if (Number(changed.changes ?? 0) !== 1) return false;
+    if (target.pinned && options.transferPin) {
+      db.prepare('UPDATE consolidated_facts SET pinned = 1, updated_at = ? WHERE id = ?')
+        .run(now, byFactId);
+    }
+    return true;
+  });
+  const changed = tx();
+  if (!changed) return false;
+  syncMemoryPolicyForFact(id);
   syncMemoryPolicyForFact(byFactId);
   return true;
 }

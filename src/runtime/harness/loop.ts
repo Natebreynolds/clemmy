@@ -1314,6 +1314,13 @@ export interface RunConversationOptions {
   /** Exact external MCP authority, forwarded to every continuation turn. */
   mcpToolScope?: McpToolScope | null;
   /**
+   * Opt-in for closed decision lanes whose requested deliverable is a strict
+   * JSON object, not a tool effect. A matching result bypasses only the generic
+   * zero-tool stall recovery; its caller must validate the payload and execute
+   * any allowed transitions itself.
+   */
+  acceptStructuredNoToolResult?: boolean;
+  /**
    * Opt-in: gate the orchestrator's self-declared completion with an
    * INDEPENDENT objective-completion judge (Hermes-style). Only interactive
    * chat callers set this; workflow-step executions (which also use
@@ -1383,6 +1390,62 @@ export interface RunConversationResult {
    *  drain parks instead of misclassifying the run (Stage 4). */
   limitKind?: 'wall_clock' | 'max_steps' | 'token_budget';
 }
+
+/**
+ * Recover the exact JSON object emitted by a closed decision lane.
+ *
+ * Most providers wrap the requested JSON in the ordinary orchestrator
+ * `reply`; a structured-output provider may hand back the decision object
+ * directly. Do not repair, extract fenced snippets, accept arrays, or treat an
+ * orchestrator envelope containing ordinary prose as this contract. That
+ * keeps the capability narrower than the generic zero-tool detector it
+ * bypasses; the outer caller still owns the domain schema validation.
+ */
+function strictStructuredNoToolResultText(value: unknown): string | null {
+  const hasClosedDecisionShape = (candidate: unknown): candidate is Record<string, unknown> =>
+    Boolean(
+      candidate
+      && typeof candidate === 'object'
+      && !Array.isArray(candidate)
+      && typeof (candidate as Record<string, unknown>).summary === 'string'
+      && Array.isArray((candidate as Record<string, unknown>).commitments)
+      && Array.isArray((candidate as Record<string, unknown>).actions),
+    );
+
+  const parseExactDecisionObject = (candidate: unknown): string | null => {
+    if (typeof candidate !== 'string') return null;
+    const trimmed = candidate.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      return hasClosedDecisionShape(parsed) ? trimmed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = parseExactDecisionObject(value);
+  if (direct) return direct;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+
+  const obj = value as Record<string, unknown>;
+  const reply = parseExactDecisionObject(obj.reply);
+  if (reply) return reply;
+  const summary = parseExactDecisionObject(obj.summary);
+  if (summary) return summary;
+
+  // A structured-output provider can return the requested decision object
+  // rather than a JSON string. Require the summary + commitments + actions
+  // container fields that distinguish this closed action contract from the
+  // harness's own ordinary `{summary, done, nextAction}` envelope. Field-level
+  // validity remains the outer autonomy layer's responsibility.
+  if (hasClosedDecisionShape(obj)) {
+    try { return JSON.stringify(obj); } catch { return null; }
+  }
+  return null;
+}
+
+export const _testOnly_strictStructuredNoToolResultText = strictStructuredNoToolResultText;
 
 function positiveIntEnv(key: string, fallback: number): number {
   const parsed = Number.parseInt(getRuntimeEnv(key, String(fallback)), 10);
@@ -2767,7 +2830,19 @@ async function runConversationCore(
     // A completed turn MUST hand back an OrchestratorDecision-shaped
     // finalOutput. If it doesn't, treat the conversation as complete
     // (the Orchestrator chose to end without our structured shape).
-    let decision = toOrchestratorDecision(turnResult.finalOutput);
+    const structuredNoToolResult = options.acceptStructuredNoToolResult
+      && (turnResult.toolCalls ?? 0) === 0
+      ? strictStructuredNoToolResultText(turnResult.finalOutput)
+      : null;
+    let decision = structuredNoToolResult
+      ? {
+          summary: 'Structured decision returned for caller validation.',
+          reply: structuredNoToolResult,
+          done: true,
+          nextAction: 'completed' as const,
+          reason: 'structured_no_tool_result',
+        }
+      : toOrchestratorDecision(turnResult.finalOutput);
     // A terse completion acknowledgement after verified work is a valid
     // terminal reply, not an unparseable decision. `parseDecisionText` keeps
     // bare acknowledgements null so a true ZERO-work "Noted." / "Done." cannot
@@ -2877,7 +2952,7 @@ async function runConversationCore(
       },
     });
 
-    const structuredStallInfo = decision
+    const structuredStallInfo = decision && !structuredNoToolResult
       ? evaluateStructuredDecisionStall({
           decision,
           toolCalls: turnResult.toolCalls ?? 0,

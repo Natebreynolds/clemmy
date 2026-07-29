@@ -26,6 +26,34 @@ import { PROOF_CLIENT_COMPLETION_TIMEOUT_MS } from '../timeouts.js';
 const STALE = 'Zubrowka-7741';
 const CORRECTED = 'Marzipan-9214';
 
+/**
+ * A correction-aware proof must distinguish quoting the retired value from
+ * asserting it. Require a retirement marker beside every stale-token mention;
+ * an unrelated word such as "old" elsewhere in the reply grants no credit.
+ */
+export function staleValueAssertedAsCurrent(text: string, staleValue: string): boolean {
+  const haystack = text.toLowerCase();
+  const needle = staleValue.toLowerCase();
+  if (!needle) return false;
+
+  let cursor = 0;
+  while (cursor < haystack.length) {
+    const index = haystack.indexOf(needle, cursor);
+    if (index < 0) return false;
+
+    const before = text.slice(Math.max(0, index - 72), index);
+    const after = text.slice(index + staleValue.length, index + staleValue.length + 112);
+    const retiredBefore =
+      /(?:stale|old|outdated|superseded|retired|deprecated|former|previous)(?:\s+(?:project\s+)?(?:access\s+)?(?:code|value|credential))?[\s:="'`—–-]*$/i.test(before);
+    const retiredAfter =
+      /^[\s()[\]{}:="'`—–,;-]*(?:(?:is|was|has been|=)[\s:="'`—–-]*)?(?:stale|old|outdated|superseded|retired|deprecated|no longer\s+(?:current|valid|correct)|not\s+(?:current|valid|correct)|should not be used|do not use|don't use)\b/i.test(after);
+    const reversal = /\b(?:but|however|yet)\b.{0,96}\b(?:(?:is|was|became|remains)\s+(?:now\s+)?(?:current|valid|correct)(?:\s+again)?|no longer\s+(?:stale|old|outdated|superseded|retired|deprecated)|should\s+(?:now\s+)?be\s+used|(?:do\s+)?use\s+(?:it|this|the\s+(?:code|value|credential)))\b/i.test(after);
+    if (reversal || (!retiredBefore && !retiredAfter)) return true;
+    cursor = index + needle.length;
+  }
+  return false;
+}
+
 export const correctionSticks: ScenarioDef = {
   name: 'correction-sticks',
   summary: 'state a fact → correct it → new session recalls only the correction',
@@ -91,13 +119,10 @@ export const correctionSticks: ScenarioDef = {
       pass: said.includes(CORRECTED),
       detail: said.slice(0, 240),
     });
-    // Quoting is not asserting (third occurrence of this measurement class):
-    // "Marzipan-9214. (Zubrowka-7741 is stale — you corrected that earlier.)"
-    // is EXEMPLARY recall — correct answer plus the correction's history — and
-    // a bare substring check failed it. Fail only when the stale value appears
-    // WITHOUT any retirement marker crediting the correction.
-    const staleAsserted = said.includes(STALE)
-      && !/stale|corrected|old|superseded|no longer|not.{0,12}(current|valid)|previous/i.test(said);
+    // Quoting is not asserting: "Zubrowka-7741 is stale" is safe correction
+    // history. The marker must be local to every mention so unrelated words
+    // cannot excuse an actual stale assertion elsewhere in the reply.
+    const staleAsserted = staleValueAssertedAsCurrent(said, STALE);
     checks.push({
       name: 'the superseded value is never asserted as current',
       pass: !staleAsserted,

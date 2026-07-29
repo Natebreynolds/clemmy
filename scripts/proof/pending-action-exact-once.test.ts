@@ -220,6 +220,24 @@ test('final execute-gate prose does not need to predict the materialized approva
   const reply = 'The exact email action is queued but not sent. Do you want me to execute it?';
   assert.equal(reply.includes('apr-'), false);
   assert.equal(replyOffersFinalExecuteGate(reply), true);
+  assert.equal(
+    replyOffersFinalExecuteGate(
+      'Do you approve executing the queued email to proof@example.com?\n\n'
+      + 'The exact payload is queued; it has not been sent and Composio was not called.',
+    ),
+    true,
+    'a post-question no-effect reassurance does not erase the explicit approval ask',
+  );
+  assert.equal(
+    replyOffersFinalExecuteGate('Do you approve executing it? Never mind; the request is cancelled.'),
+    false,
+    'a later retraction cannot borrow credit from an earlier approval question',
+  );
+  assert.equal(
+    replyOffersFinalExecuteGate('Do you approve executing it? Actually, which account should I use?'),
+    false,
+    'a later scope question is not a final execute gate',
+  );
   assert.equal(replyOffersFinalExecuteGate('The exact email action is queued for later.'), false);
   assert.equal(replyOffersFinalExecuteGate('I could not send it. What should I do next?'), false);
   assert.equal(replyOffersFinalExecuteGate('The send is blocked. Which account should I use?'), false);

@@ -244,6 +244,13 @@ export interface AssistantRequest {
   /** Exact local harness tool authority for this call. An explicitly empty
    * list means decision-only: no local or external tools may be exposed. */
   allowedToolNames?: string[];
+  /**
+   * Narrow decision-lane contract: a strict JSON object is the deliverable, so
+   * zero tool calls are expected and must not trigger the generic action-stall
+   * retry. The caller remains responsible for validating that JSON and owning
+   * every resulting transition. This never exempts prose or malformed JSON.
+   */
+  acceptStructuredNoToolResult?: boolean;
 }
 
 export interface AssistantResponse {

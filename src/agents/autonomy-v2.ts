@@ -1078,6 +1078,10 @@ async function runAgentCycleViaRuntime(
       // An explicit empty allowlist prevents the generic cron harness from
       // granting unrelated local or external tool authority mid-turn.
       allowedToolNames: [],
+      // The model's strict JSON decision is the intended zero-tool deliverable.
+      // The autonomy layer below still validates its schema, exact queue-owned
+      // ids, and result text before code executes any transition.
+      acceptStructuredNoToolResult: true,
       // The harness surface exposes the registry team tools, which attribute
       // the actor from the PROCESS-GLOBAL agent slug — in the shared daemon a
       // cycle using them records the work as 'clementine' (proven live: the

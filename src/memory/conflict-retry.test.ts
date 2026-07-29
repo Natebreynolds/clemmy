@@ -12,7 +12,7 @@ const TEST_HOME = '/tmp/clemmy-test-conflict-retry';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const { resetMemoryDb } = await import('./db.js');
-const { getFact, rememberFact, markFactSupersededBy } = await import('./facts.js');
+const { getFact, rememberFact, markFactSupersededBy, setFactPinned } = await import('./facts.js');
 const { recordUnresolvedConflict, retryPendingMemoryConflicts, _resetPendingConflictsForTest } = await import('./conflict-retry.js');
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
@@ -82,6 +82,39 @@ test('a conflict resolved elsewhere (fact already retired) drops from the queue'
   assert.equal(result.resolved, 0);
 });
 
+test('a refused pinned retirement stays pending instead of reporting a false resolution', async () => {
+  const { staleId, correctionId } = seedConflict();
+  setFactPinned(staleId, true);
+  const result = await retryPendingMemoryConflicts({
+    resolver: async () => ({ decision: 'DELETE', target_id: staleId }),
+  });
+  assert.deepEqual(
+    { resolved: result.resolved, stillPending: result.stillPending },
+    { resolved: 0, stillPending: 1 },
+  );
+  assert.equal(getFact(staleId)?.active, true, 'the pinned fact remains active');
+  assert.equal(getFact(correctionId)?.active, true, 'the correction remains available for later review');
+  const again = await retryPendingMemoryConflicts({
+    resolver: async () => ({ decision: 'ADD', unresolved: true }),
+  });
+  assert.equal(again.scanned, 1, 'the refused transition remains durably queued');
+});
+
+test('a retry resolver cannot retire a fact outside the exact queued candidate set', async () => {
+  const { staleId, correctionId } = seedConflict();
+  const unrelated = rememberFact({ kind: 'user', content: 'Unrelated office door code is 8831.' });
+  const result = await retryPendingMemoryConflicts({
+    resolver: async () => ({ decision: 'DELETE', target_id: unrelated.id }),
+  });
+  assert.deepEqual(
+    { resolved: result.resolved, stillPending: result.stillPending },
+    { resolved: 0, stillPending: 1 },
+  );
+  assert.equal(getFact(unrelated.id)?.active, true);
+  assert.equal(getFact(staleId)?.active, true);
+  assert.equal(getFact(correctionId)?.active, true);
+});
+
 // ─── Confident-ADD over a near-duplicate also queues (live, 2026-07-29) ───
 // The queue previously recorded ONLY resolver-failure ADDs. Live on both
 // brains: a correction the resolver confidently judged "new fact" left the
@@ -126,4 +159,54 @@ test('confident ADD over an UNRELATED fact does not churn the queue', async () =
 
   const result = await retryPendingMemoryConflicts({ resolver: async () => ({ decision: 'NOOP' }) });
   assert.equal(result.scanned, 0, 'novel facts never enter the re-review queue');
+});
+
+test('an ambiguous explicit cross-kind correction queues only its strongly related facts', async () => {
+  const { consolidateFact } = await import('./reflection.js');
+  const projectCopy = rememberFact({
+    kind: 'project',
+    content: 'My project access code is Zubrowka-7741.',
+    occurredAt: '2026-07-15T19:00:00.000Z',
+  });
+  const referenceCopy = rememberFact({
+    kind: 'reference',
+    content: 'Reference copy: my project access code is Zubrowka-7741.',
+    occurredAt: '2026-07-15T19:00:00.000Z',
+  });
+  const unrelated = rememberFact({
+    kind: 'project',
+    content: 'Project Beacon launch owner is Theo.',
+    occurredAt: '2026-07-15T19:00:00.000Z',
+  });
+
+  const correction = await consolidateFact(
+    {
+      kind: 'user',
+      text: 'Correction: my project access code is Marzipan-9214. Zubrowka-7741 is stale and must not be used.',
+      trustLevel: 1,
+      authority: 'user',
+      sourceApp: 'Conversation',
+      occurredAt: '2026-07-15T19:01:00.000Z',
+    },
+    { sessionId: 'cross-kind-ambiguous' },
+    { resolver: async () => ({ decision: 'ADD' }) },
+  );
+  assert.equal(correction.action, 'add', 'two possible stale rows are not guessed away');
+  assert.equal(getFact(projectCopy.id)?.active, true);
+  assert.equal(getFact(referenceCopy.id)?.active, true);
+  assert.equal(getFact(unrelated.id)?.active, true);
+
+  let comparedIds: number[] = [];
+  const retry = await retryPendingMemoryConflicts({
+    resolver: async (_candidate, similar) => {
+      comparedIds = similar.map((fact) => fact.id).sort((a, b) => a - b);
+      return { decision: 'ADD', unresolved: true };
+    },
+  });
+  assert.equal(retry.scanned, 1);
+  assert.deepEqual(
+    comparedIds,
+    [projectCopy.id, referenceCopy.id].sort((a, b) => a - b),
+    'the durable conflict contains the exact related pair, not unrelated cross-kind rows',
+  );
 });

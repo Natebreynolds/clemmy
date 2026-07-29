@@ -7,12 +7,14 @@ import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type
 import {
   rememberFact,
   supersedeFact,
+  markFactSupersededBy,
   deleteFact,
   demoteRolledUpSource,
   getFact,
   updateFact,
   setFactPinned,
   findSimilarFactsScored,
+  searchFactsByText,
   type RememberInput,
   type ConsolidatedFact,
 } from './facts.js';
@@ -1257,6 +1259,224 @@ export interface ConsolidateOptions {
   resolver?: typeof resolveConflict;
 }
 
+// A cross-kind correction is allowed to widen conflict retrieval only when the
+// user's wording makes the revision explicit. `kind` is a classification hint,
+// not a causal boundary: the live failure classified "remember my project
+// code" as project and "Correction — that code is stale" as user.
+const EXPLICIT_CORRECTION_RE =
+  /\bcorrection\b|\b(?:wrong|incorrect|stale|outdated)\b.{0,120}\b(?:actually|instead|correct|use|valid)\b|\b(?:actually|instead|no longer)\b.{0,120}\b(?:wrong|incorrect|stale|outdated|valid|current|correct)\b/i;
+
+const CORRECTION_RELATION_STOPWORDS = new Set([
+  'the', 'and', 'but', 'not', 'for', 'from', 'this', 'that', 'with', 'your',
+  'you', 'our', 'my', 'was', 'were', 'are', 'is', 'actually', 'correction',
+  'wrong', 'incorrect', 'stale', 'outdated', 'later', 'again', 'gave', 'told',
+  'one', 'use', 'used', 'using', 'valid', 'current', 'correct', 'instead',
+  'project', 'access', 'code', 'value', 'prior', 'fact', 'remember',
+  'launch', 'owner',
+]);
+
+function correctionRelationTokens(text: string): Set<string> {
+  return new Set(
+    (text.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+      .filter((token) => token.length >= 3 && !CORRECTION_RELATION_STOPWORDS.has(token)),
+  );
+}
+
+/**
+ * Extract only explicit claim-owner anchors. These are intentionally narrow:
+ * they do not try to perform entity resolution, they only prevent an old
+ * identifier quoted for Alice/Project Atlas from retiring Bob/Project Beacon.
+ * An absent anchor remains "unknown" and falls through to the existing
+ * resolver; two present, conflicting anchors are never guessed across.
+ */
+function explicitCorrectionSubjectKeys(text: string): Map<string, Set<string>> {
+  const subjects = new Map<string, Set<string>>();
+  const add = (family: string, value: string): void => {
+    const values = subjects.get(family) ?? new Set<string>();
+    values.add(value);
+    subjects.set(family, values);
+  };
+  if (/\b(?:i|me|my|mine)\b/i.test(text)) add('person', 'self');
+  if (/\b(?:we|us|our|ours)\b/i.test(text)) add('person', 'collective-self');
+
+  for (const match of text.matchAll(/\b([a-z][a-z0-9_-]{1,40})(?:'s|’s)\b/gi)) {
+    const subject = match[1]?.toLowerCase();
+    if (subject && !['it', 'that', 'this', 'there', 'what', 'who'].includes(subject)) {
+      add('person', subject);
+    }
+  }
+
+  const genericEntityNames = new Set([
+    'access', 'code', 'launch', 'owner', 'account', 'project', 'workspace',
+    'campaign', 'company', 'team', 'customer', 'client', 'contact', 'person',
+  ]);
+  for (const match of text.matchAll(
+    /\b(project|account|client|customer|workspace|campaign|company|team|contact|person)\s+([a-z0-9][a-z0-9_-]{1,40})\b/gi,
+  )) {
+    const family = match[1]?.toLowerCase();
+    const name = match[2]?.toLowerCase();
+    if (family && name && !genericEntityNames.has(name)) {
+      add(family, name);
+    }
+  }
+  return subjects;
+}
+
+function hasConflictingExplicitCorrectionSubjects(a: string, b: string): boolean {
+  const aSubjects = explicitCorrectionSubjectKeys(a);
+  const bSubjects = explicitCorrectionSubjectKeys(b);
+  for (const [family, aValues] of aSubjects) {
+    const bValues = bSubjects.get(family);
+    if (!bValues) continue;
+    if (![...aValues].some((value) => bValues.has(value))) return true;
+  }
+  return false;
+}
+
+function hasCompatibleExplicitCorrectionSubject(a: string, b: string): boolean {
+  const aSubjects = explicitCorrectionSubjectKeys(a);
+  const bSubjects = explicitCorrectionSubjectKeys(b);
+  for (const [family, aValues] of aSubjects) {
+    const bValues = bSubjects.get(family);
+    if (bValues && [...aValues].some((value) => bValues.has(value))) return true;
+  }
+  return false;
+}
+
+/** Components of code-like values are not subject context. In particular,
+ * `Zubrowka-7741` tokenizes to two apparently meaningful matches; those two
+ * pieces alone cannot prove which person/project the correction belongs to. */
+function correctionIdentifierComponents(text: string): Set<string> {
+  const components = new Set<string>();
+  const lower = text.toLowerCase();
+  for (const match of lower.matchAll(/\b[a-z0-9]+(?:[-_:][a-z0-9]+)+\b/g)) {
+    for (const component of match[0].split(/[-_:]+/)) {
+      if (component.length >= 3) components.add(component);
+    }
+  }
+  const tokens = lower.match(/[a-z0-9]+/g) ?? [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (!/\d/.test(tokens[index]!)) continue;
+    components.add(tokens[index]!);
+    const previous = tokens[index - 1];
+    const next = tokens[index + 1];
+    if (previous && previous.length >= 3) components.add(previous);
+    if (next && next.length >= 3) components.add(next);
+  }
+  return components;
+}
+
+/**
+ * High-precision local relation for deterministic correction handling.
+ *
+ * The correction must quote at least two meaningful pieces of the retired
+ * claim, including a distinctive identifier/token, OR share a dense
+ * three-token subject phrase. Generic "project/access/code" vocabulary is
+ * deliberately removed, so unrelated cross-kind facts never collapse merely
+ * because they belong to the same broad product area.
+ */
+function isStrongExplicitCorrectionRelation(a: string, b: string): boolean {
+  if (hasConflictingExplicitCorrectionSubjects(a, b)) return false;
+  const aTokens = correctionRelationTokens(a);
+  const bTokens = correctionRelationTokens(b);
+  if (aTokens.size === 0 || bTokens.size === 0) return false;
+  const shared = [...aTokens].filter((token) => bTokens.has(token));
+  const distinctive = shared.some((token) => /\d/.test(token) || token.length >= 8);
+  const density = shared.length / Math.max(1, Math.min(aTokens.size, bTokens.size));
+  const identifierComponents = new Set([
+    ...correctionIdentifierComponents(a),
+    ...correctionIdentifierComponents(b),
+  ]);
+  const hasSharedContext = shared.some((token) => !identifierComponents.has(token));
+  const contextualized = !distinctive
+    || hasCompatibleExplicitCorrectionSubject(a, b)
+    || hasSharedContext;
+  return contextualized
+    && ((shared.length >= 2 && distinctive) || (shared.length >= 3 && density >= 0.6));
+}
+
+function isExplicitUserCorrectionCandidate(candidate: ConsolidateCandidate): boolean {
+  return candidate.authority === 'user'
+    && (candidate.trustLevel ?? 1) >= 0.99
+    && EXPLICIT_CORRECTION_RE.test(candidate.text);
+}
+
+function factTimeMs(fact: ConsolidatedFact): number | null {
+  const parsed = Date.parse(fact.validFrom ?? fact.createdAt);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function candidateTimeMs(candidate: ConsolidateCandidate): number | null {
+  if (!candidate.occurredAt) return null;
+  const parsed = Date.parse(candidate.occurredAt);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isStoredExplicitUserCorrection(fact: ConsolidatedFact): boolean {
+  const directConversationEvidence =
+    fact.sourceApp === 'Conversation'
+    || fact.source.path?.startsWith('conversation://') === true;
+  return fact.active
+    && directConversationEvidence
+    && (fact.trustLevel ?? fact.confidence ?? 0) >= 0.99
+    && EXPLICIT_CORRECTION_RE.test(fact.content);
+}
+
+/** Fresh, synchronous lexical lookup complements the embedding pool here.
+ * A correction written milliseconds ago may not have a vector yet — exactly
+ * the live race — so semantic-only retrieval cannot be the causal guard. */
+function relatedFactsForExplicitCorrection(candidate: ConsolidateCandidate): ConsolidatedFact[] {
+  if (!isExplicitUserCorrectionCandidate(candidate)) return [];
+  const occurredAt = candidateTimeMs(candidate);
+  const hits = searchFactsByText(candidate.text, 20);
+  return hits.filter((fact) => {
+    const factAt = factTimeMs(fact);
+    return fact.active
+      && (occurredAt === null || factAt === null || factAt <= occurredAt)
+      && isStrongExplicitCorrectionRelation(candidate.text, fact.content);
+  });
+}
+
+function newerExplicitCorrectionFor(candidate: ConsolidateCandidate): ConsolidatedFact | null {
+  const occurredAt = candidateTimeMs(candidate);
+  if (occurredAt === null) return null;
+  return searchFactsByText(candidate.text, 20)
+    .filter((fact) => {
+      const factAt = factTimeMs(fact);
+      return factAt !== null
+        && factAt > occurredAt
+        && isStoredExplicitUserCorrection(fact)
+        && isStrongExplicitCorrectionRelation(candidate.text, fact.content);
+    })
+    // Latest source event is authoritative when several corrections exist.
+    .sort((a, b) => (factTimeMs(b) ?? 0) - (factTimeMs(a) ?? 0))[0] ?? null;
+}
+
+async function retireLateFactBehindNewerCorrection(
+  candidate: ConsolidateCandidate,
+  fact: ConsolidatedFact,
+): Promise<ConsolidatedFact | null> {
+  const winner = newerExplicitCorrectionFor(candidate);
+  if (!winner || winner.id === fact.id) return null;
+  const retired = markFactSupersededBy(fact.id, winner.id, {
+    validTo: winner.validFrom ?? winner.createdAt,
+    // The winner is not an inferred string: isStoredExplicitUserCorrection
+    // requires direct conversation provenance, trust=1, and explicit wording.
+    allowPinned: true,
+    transferPin: true,
+  });
+  if (!retired) {
+    // Build on the existing confident-ADD ledger rather than inventing a
+    // second repair subsystem. Candidate means "the correction that wins";
+    // similar contains the exact older row maintenance must revisit.
+    try {
+      const { recordUnresolvedConflict } = await import('./conflict-retry.js');
+      recordUnresolvedConflict({ candidateFactId: winner.id, similarFactIds: [fact.id] });
+    } catch { /* the source fact remains durable even if bookkeeping fails */ }
+  }
+  return winner;
+}
+
 /**
  * Consolidate a single candidate fact into memory via the Mem0 update
  * phase (Chhikara et al §2.1): retrieve similar existing facts, let the
@@ -1363,22 +1583,51 @@ async function consolidateFactInner(
     try { setFactPinned(id, true); } catch { /* best-effort */ }
   };
 
-  const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
-  const similar = scored.map((s) => s.fact);
-  const topSim = scored.length > 0 ? scored[0].sim : null;
-
-  // Exact restatements reinforce the canonical row and attach any new episode
-  // evidence without invoking a semantic conflict judge.
-  const normalizedCandidate = candidate.text.replace(/\s+/g, ' ').trim().toLowerCase();
-  const exact = similar.find((fact) => fact.content.replace(/\s+/g, ' ').trim().toLowerCase() === normalizedCandidate);
-  if (exact) {
-    const reinforced = rememberFact({
-      kind: candidate.kind,
+  const rememberInput: RememberInput = {
+    kind: candidate.kind,
+    content: candidate.text,
+    sessionId: ctx.sessionId,
+    derivedFrom: ctx.derivedFrom,
+    importance: candidate.importance,
+    trustLevel: candidate.trustLevel,
+    sourceApp: candidate.sourceApp,
+    sourceUri: candidate.sourceUri,
+    occurredAt: candidate.occurredAt,
+    derivationDepth: candidate.derivationDepth,
+    derivedFromFactIds: candidate.derivedFromFactIds,
+    evidence: candidate.evidence,
+  };
+  const rememberCandidate = async (): Promise<{
+    fact: ConsolidatedFact;
+    supersededByNewerCorrection: ConsolidatedFact | null;
+  }> => {
+    const fact = rememberFact(rememberInput);
+    const supersededByNewerCorrection = await retireLateFactBehindNewerCorrection(candidate, fact);
+    // A late stale pin must not be re-applied after the causal guard retired it.
+    // When necessary markFactSupersededBy transfers an existing standing pin to
+    // the direct user correction.
+    if (supersededByNewerCorrection && candidate.pin) {
+      try { setFactPinned(supersededByNewerCorrection.id, true); } catch { /* best-effort */ }
+    } else if (!supersededByNewerCorrection) {
+      maybePin(fact.id);
+    }
+    return { fact, supersededByNewerCorrection };
+  };
+  const tryDeterministicCorrection = (related: ConsolidatedFact[]): boolean => {
+    const target =
+      isExplicitUserCorrectionCandidate(candidate)
+      && candidate.sourceApp === 'Conversation'
+      && Boolean(candidate.evidence?.episodeId && candidate.evidence.excerpt.trim())
+      && related.length === 1
+        ? related[0]
+        : null;
+    if (!target) return false;
+    const corrected = supersedeFact(target.id, {
       content: candidate.text,
+      trustLevel: candidate.trustLevel,
+      importance: candidate.importance,
       sessionId: ctx.sessionId,
       derivedFrom: ctx.derivedFrom,
-      importance: candidate.importance,
-      trustLevel: candidate.trustLevel,
       sourceApp: candidate.sourceApp,
       sourceUri: candidate.sourceUri,
       occurredAt: candidate.occurredAt,
@@ -1386,10 +1635,59 @@ async function consolidateFactInner(
       derivedFromFactIds: candidate.derivedFromFactIds,
       evidence: candidate.evidence,
     });
-    maybePin(reinforced.id);
+    if (!corrected) return false;
+    out.action = 'supersede';
+    out.factId = corrected.id;
+    out.supersededFactId = target.id;
+    out.updated = 1;
+    maybePin(corrected.id);
+    out.importanceAdded += candidate.importance ?? 0;
+    return true;
+  };
+
+  const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
+  let explicitCorrectionRelated = relatedFactsForExplicitCorrection(candidate);
+  const scoredIds = new Set(scored.map((item) => item.fact.id));
+  // Explicit correction is the sole bounded exception to same-kind conflict
+  // lookup. Fresh lexical hits are required to pass the high-precision local
+  // relation above; unrelated cross-kind facts never enter this set.
+  for (const fact of explicitCorrectionRelated) {
+    if (scoredIds.has(fact.id)) continue;
+    scored.push({ fact, sim: null });
+    scoredIds.add(fact.id);
+  }
+  const similar = scored.map((s) => s.fact);
+  const topSim = scored.find((item) => item.sim !== null)?.sim ?? null;
+
+  // Exact restatements reinforce the canonical row and attach any new episode
+  // evidence without invoking a semantic conflict judge.
+  const normalizedCandidate = candidate.text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const exact = similar.find((fact) => fact.content.replace(/\s+/g, ' ').trim().toLowerCase() === normalizedCandidate);
+  if (exact) {
+    const { fact: reinforced } = await rememberCandidate();
     out.action = 'reinforce';
     out.factId = reinforced.id;
     out.noop = 1; // legacy compatibility: no new canonical row was created
+    out.importanceAdded += candidate.importance ?? 0;
+    return out;
+  }
+
+  // Direct, evidence-backed correction of exactly one quoted claim is a local
+  // deterministic transition, not a model judgment. This fixes normal-order
+  // cross-kind corrections while retaining the old row and exact validity
+  // chain. Multiple/ambiguous pairs deliberately fall through to the existing
+  // resolver + pending-conflict ledger.
+  if (tryDeterministicCorrection(explicitCorrectionRelated)) return out;
+
+  // Fast paths below can mutate before the resolver. Recheck causality first:
+  // if a newer explicit correction already exists, preserve this older source
+  // as history and close it behind the correction instead of letting ingestion
+  // order rewrite current truth.
+  if (newerExplicitCorrectionFor(candidate)) {
+    const { fact } = await rememberCandidate();
+    out.action = 'add';
+    out.factId = fact.id;
+    out.written = 1;
     out.importanceAdded += candidate.importance ?? 0;
     return out;
   }
@@ -1457,21 +1755,7 @@ async function consolidateFactInner(
     topSim !== null &&
     topSim < opts.noveltyFastPathSim
   ) {
-    const added = rememberFact({
-      kind: candidate.kind,
-      content: candidate.text,
-      sessionId: ctx.sessionId,
-      derivedFrom: ctx.derivedFrom,
-      importance: candidate.importance,
-      trustLevel: candidate.trustLevel,
-      sourceApp: candidate.sourceApp,
-      sourceUri: candidate.sourceUri,
-      occurredAt: candidate.occurredAt,
-      derivationDepth: candidate.derivationDepth,
-      derivedFromFactIds: candidate.derivedFromFactIds,
-      evidence: candidate.evidence,
-    });
-    maybePin(added.id);
+    const { fact: added } = await rememberCandidate();
     out.action = 'add';
     out.factId = added.id;
     out.written = 1;
@@ -1479,7 +1763,7 @@ async function consolidateFactInner(
     return out;
   }
 
-  const decision = await (opts.resolver ?? resolveConflict)(
+  let decision: Awaited<ReturnType<typeof resolveConflict>> = await (opts.resolver ?? resolveConflict)(
     {
       kind: candidate.kind,
       text: candidate.text,
@@ -1488,6 +1772,49 @@ async function consolidateFactInner(
     },
     similar,
   );
+
+  // The resolver is asynchronous. A later user turn can commit a correction
+  // while this older call is awaiting a model, so the causal check immediately
+  // before applying its decision is the essential race boundary.
+  if (newerExplicitCorrectionFor(candidate)) {
+    const { fact } = await rememberCandidate();
+    out.action = 'add';
+    out.factId = fact.id;
+    out.written = 1;
+    out.importanceAdded += candidate.importance ?? 0;
+    return out;
+  }
+
+  // The correction may have taken its first retrieval snapshot before an
+  // older source finished consolidating. Re-read at the final synchronous
+  // commit boundary: one exact related target is superseded immediately;
+  // multiple late targets stay active and enter the existing pending-conflict
+  // ledger rather than letting a stale resolver snapshot guess.
+  const finalExplicitCorrectionRelated = relatedFactsForExplicitCorrection(candidate);
+  const existingSimilarIds = new Set(similar.map((fact) => fact.id));
+  const lateRelated = finalExplicitCorrectionRelated.filter((fact) => !existingSimilarIds.has(fact.id));
+  if (lateRelated.length > 0) {
+    similar.push(...lateRelated);
+    explicitCorrectionRelated = finalExplicitCorrectionRelated;
+  }
+  if (tryDeterministicCorrection(finalExplicitCorrectionRelated)) return out;
+  if (lateRelated.length > 0) {
+    decision = { decision: 'ADD', unresolved: true };
+  }
+
+  // A model-selected mutation target is authority, not advice: it must be one
+  // of the exact active facts supplied to this resolver call. Missing or
+  // foreign ids fail open to a durable ADD/conflict instead of mutating an
+  // unrelated memory row or silently discarding the candidate as a NOOP.
+  if (
+    decision.decision !== 'ADD'
+    && (
+      typeof decision.target_id !== 'number'
+      || !similar.some((fact) => fact.id === decision.target_id)
+    )
+  ) {
+    decision = { decision: 'ADD', unresolved: true };
+  }
 
   if (decision.decision === 'NOOP') {
     out.action = 'ignore';
@@ -1606,28 +1933,15 @@ async function consolidateFactInner(
     // Target row gone — fall through to ADD.
   }
 
-  const rememberInput: RememberInput = {
-    kind: candidate.kind,
-    content: candidate.text,
-    sessionId: ctx.sessionId,
-    derivedFrom: ctx.derivedFrom,
-    importance: candidate.importance,
-    // Leave undefined for tool-derived (rememberFact derives 0.6 from
-    // derivedFrom); user path passes 1.0 explicitly.
-    trustLevel: candidate.trustLevel,
-    sourceApp: candidate.sourceApp,
-    sourceUri: candidate.sourceUri,
-    occurredAt: candidate.occurredAt,
-    derivationDepth: candidate.derivationDepth,
-    derivedFromFactIds: candidate.derivedFromFactIds,
-    evidence: candidate.evidence,
-  };
-  const added = rememberFact(rememberInput);
-  maybePin(added.id);
+  const {
+    fact: added,
+    supersededByNewerCorrection,
+  } = await rememberCandidate();
   out.action = 'add';
   out.factId = added.id;
   out.written = 1;
   out.importanceAdded += candidate.importance ?? 0;
+  if (supersededByNewerCorrection) return out;
   // M1 (2026-07-20): a fail-open ADD leaves the conflict LIVE (both
   // contradictory facts active + recallable). Record it durably so the
   // nightly retry re-resolves once a resolver is available. Best-effort.
@@ -1650,11 +1964,21 @@ async function consolidateFactInner(
       // This is the LIVE condition for a fresh session's correction, and it
       // is precisely the ambiguity the nightly re-review exists to settle.
       || topSim === null
+      // An explicit correction can legitimately cross a classifier kind.
+      // The high-precision lexical relation is stronger evidence than an
+      // absent/cold embedding and must remain tracked if multiple targets made
+      // deterministic supersession ambiguous.
+      || explicitCorrectionRelated.length > 0
     );
   if (decision.decision === 'ADD' && similar.length > 0 && (decision.unresolved || confidentAddOverNearDuplicate)) {
     try {
       const { recordUnresolvedConflict } = await import('./conflict-retry.js');
-      recordUnresolvedConflict({ candidateFactId: added.id, similarFactIds: similar.map((f) => f.id) });
+      recordUnresolvedConflict({
+        candidateFactId: added.id,
+        similarFactIds: explicitCorrectionRelated.length > 0
+          ? explicitCorrectionRelated.map((fact) => fact.id)
+          : similar.map((fact) => fact.id),
+      });
     } catch { /* the queue is a safety net; the ADD itself already stands */ }
   }
   return out;

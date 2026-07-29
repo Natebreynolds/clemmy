@@ -156,6 +156,63 @@ test('non-honorModel surface ignores request.model (cron/gateway byte-identical)
   assert.equal(capturedModel, undefined, 'cron does NOT forward model — harness keeps its configured model');
 });
 
+test('structured no-tool completion opt-in requires explicit empty tool authority', async () => {
+  const forwarded: boolean[] = [];
+  const recordingRun = (async (opts: {
+    sessionId: string;
+    acceptStructuredNoToolResult?: boolean;
+  }) => {
+    forwarded.push(opts.acceptStructuredNoToolResult === true);
+    return {
+      sessionId: opts.sessionId,
+      status: 'completed',
+      steps: 1,
+      lastTurn: 1,
+      lastDecision: {
+        summary: 'ok',
+        reply: 'ok',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    };
+  }) as never;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: recordingRun,
+  });
+
+  await respondViaHarness('cron', {
+    message: 'closed decision',
+    sessionId: 'structured-empty-authority',
+    allowedToolNames: [],
+    acceptStructuredNoToolResult: true,
+  });
+  await respondViaHarness('cron', {
+    message: 'undefined authority',
+    sessionId: 'structured-undefined-authority',
+    acceptStructuredNoToolResult: true,
+  });
+  await respondViaHarness('cron', {
+    message: 'nonempty authority',
+    sessionId: 'structured-nonempty-authority',
+    allowedToolNames: ['memory_status'],
+    acceptStructuredNoToolResult: true,
+  });
+  await respondViaHarness('cron', {
+    message: 'flag absent',
+    sessionId: 'structured-flag-absent',
+    allowedToolNames: [],
+  });
+
+  assert.deepEqual(
+    forwarded,
+    [true, false, false, false],
+    'only flag=true plus an explicitly empty allowlist can suppress zero-tool stall recovery',
+  );
+});
+
 test('respondPreferHarness: kill-switch blocks by default, legacy fallback requires explicit break-glass', async () => {
   process.env.CLEMMY_HARNESS_CRON = 'off';
   let legacyCalled = 0;

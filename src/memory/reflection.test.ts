@@ -1645,6 +1645,21 @@ test('consolidateFact: resolver UPDATE on a pinned fact is blocked — content u
   assert.equal(out.written, 1, 'candidate falls through to the conservative ADD');
 });
 
+test('consolidateFact: a resolver cannot mutate a fact outside the exact similar set it received', async () => {
+  resetMemoryDb();
+  const related = rememberFact({ kind: 'project', content: 'Quarterly Atlas revenue target is 1M.' });
+  const unrelated = rememberFact({ kind: 'project', content: 'Project Beacon launch owner is Marina.' });
+  const out = await consolidateFact(
+    { kind: 'project', text: 'Quarterly Atlas revenue target is now 2M.' },
+    {},
+    { resolver: async () => ({ decision: 'UPDATE', target_id: unrelated.id }) },
+  );
+  assert.equal(getFact(related.id)?.active, true, 'the actual similar fact is not guessed away');
+  assert.equal(getFact(unrelated.id)?.active, true, 'a foreign resolver id has no mutation authority');
+  assert.equal(out.written, 1, 'the candidate is preserved for durable re-review');
+  assert.equal(out.updated, 0);
+});
+
 test('consolidateFact: an explicit user correction supersedes pinned policy and preserves history', async () => {
   resetMemoryDb();
   const original = rememberFact({

@@ -121,19 +121,47 @@ export async function retryPendingMemoryConflicts(
       continue;
     }
     if ((decision.decision === 'DELETE' || decision.decision === 'UPDATE') && typeof decision.target_id === 'number') {
+      if (!similar.some((fact) => fact.id === decision.target_id)) {
+        keep.push({ ...entry, attempts: entry.attempts + 1 });
+        result.stillPending += 1;
+        logger.warn({ target: decision.target_id, candidate: candidate.id },
+          'retried memory conflict returned a target outside its exact candidate set');
+        continue;
+      }
       // The candidate (already-added correction) wins; the old fact retires.
       const ok = markFactSupersededBy(decision.target_id, candidate.id);
-      logger.info({ loser: decision.target_id, winner: candidate.id, ok, decision: decision.decision },
-        'retried memory conflict resolved — stale fact superseded by the existing correction');
-      result.resolved += 1;
+      if (ok) {
+        logger.info({ loser: decision.target_id, winner: candidate.id, decision: decision.decision },
+          'retried memory conflict resolved — stale fact superseded by the existing correction');
+        result.resolved += 1;
+      } else {
+        logger.warn({ loser: decision.target_id, winner: candidate.id, decision: decision.decision },
+          'retried memory conflict transition was refused and remains pending');
+        keep.push({ ...entry, attempts: entry.attempts + 1 });
+        result.stillPending += 1;
+      }
       continue;
     }
     if (decision.decision === 'NOOP' && typeof decision.target_id === 'number') {
+      if (!similar.some((fact) => fact.id === decision.target_id)) {
+        keep.push({ ...entry, attempts: entry.attempts + 1 });
+        result.stillPending += 1;
+        logger.warn({ target: decision.target_id, candidate: candidate.id },
+          'retried memory conflict returned a target outside its exact candidate set');
+        continue;
+      }
       // The EXISTING fact is canonical; the fail-open ADD was the duplicate.
       const ok = markFactSupersededBy(candidate.id, decision.target_id);
-      logger.info({ loser: candidate.id, winner: decision.target_id, ok },
-        'retried memory conflict resolved — duplicate fail-open ADD folded into the canonical fact');
-      result.resolved += 1;
+      if (ok) {
+        logger.info({ loser: candidate.id, winner: decision.target_id },
+          'retried memory conflict resolved — duplicate fail-open ADD folded into the canonical fact');
+        result.resolved += 1;
+      } else {
+        logger.warn({ loser: candidate.id, winner: decision.target_id },
+          'retried memory conflict transition was refused and remains pending');
+        keep.push({ ...entry, attempts: entry.attempts + 1 });
+        result.stillPending += 1;
+      }
       continue;
     }
     // Considered ADD (facts genuinely coexist) — the conflict was benign.

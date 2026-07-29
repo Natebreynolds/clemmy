@@ -526,6 +526,13 @@ export async function respondViaHarness(
       maxRunTokens: request.maxRunTokens,
       runTokenBaseline: request.runTokenBaseline,
       judgeCompletion: config.judgeCompletion,
+      // A structured zero-tool result is meaningful only on an explicitly
+      // decision-only surface. Never let a caller combine this opt-in with
+      // undefined or non-empty tool authority and suppress effect evidence.
+      acceptStructuredNoToolResult:
+        request.acceptStructuredNoToolResult === true
+        && Array.isArray(request.allowedToolNames)
+        && request.allowedToolNames.length === 0,
       onChunk: request.onChunk,
       reuseRecordedUserInput: true,
       falloverModelIds: fallover.falloverModelIds,

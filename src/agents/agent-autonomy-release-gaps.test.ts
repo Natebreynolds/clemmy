@@ -123,12 +123,17 @@ test('delegation wake fires even when cadence proactivity is disabled', async ()
   process.env.AUTONOMY_V2_AGENTS = slug;
 
   let assistantCalls = 0;
+  let structuredNoToolOptIn: boolean | undefined;
   process.env.CLEMMY_HARNESS_CRON = 'on';
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
-    runConversation: (async (options: { sessionId: string }) => {
+    runConversation: (async (options: {
+      sessionId: string;
+      acceptStructuredNoToolResult?: boolean;
+    }) => {
       assistantCalls += 1;
+      structuredNoToolOptIn = options.acceptStructuredNoToolResult;
       return {
         sessionId: options.sessionId,
         status: 'completed',
@@ -150,11 +155,34 @@ test('delegation wake fires even when cadence proactivity is disabled', async ()
 
   assert.equal(summary.skipped, 0, 'a configured delegation trigger must wake the assigned agent');
   assert.equal(summary.succeeded, 1);
-  assert.equal(assistantCalls, 1, 'the delegated work must reach a model cycle');
+  assert.equal(assistantCalls, 1, 'the valid structured result must not be replaced by a retry turn');
+  assert.equal(
+    structuredNoToolOptIn,
+    true,
+    'only the closed autonomy decision lane opts into zero-tool structured completion',
+  );
   assert.equal(
     existsSync(path.join(TEST_HOME, 'agents-state', `${slug}.json`)),
     true,
     'a real wake records agent state',
+  );
+  const delegation = JSON.parse(
+    await import('node:fs').then(({ readFileSync }) =>
+      readFileSync(path.join(TEST_HOME, 'delegations', slug, `${delegationId}.json`), 'utf-8')
+    ),
+  ) as { status: string; result?: string; completedBy?: string };
+  assert.deepEqual(
+    {
+      status: delegation.status,
+      result: delegation.result,
+      completedBy: delegation.completedBy,
+    },
+    {
+      status: 'completed',
+      result: '42',
+      completedBy: slug,
+    },
+    'the exact queue-owned action result reaches the existing slug-bound transition path',
   );
 });
 

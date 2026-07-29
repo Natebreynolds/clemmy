@@ -16,6 +16,7 @@ const {
 const { getFactEvidence } = await import('./temporal-memory.js');
 const { readReflectionCandidateHealth } = await import('./reflection-candidates.js');
 const { buildMemoryNeighborhood } = await import('../dashboard/memory-graph.js');
+const { getFact, getFactAt } = await import('./facts.js');
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
 beforeEach(() => { resetMemoryDb(); });
@@ -172,4 +173,319 @@ test('a failed immediate resolver remains visible and succeeds on bounded replay
   assert.equal(row.attempt_count, 2);
   assert.equal(row.last_error, null);
   assert.equal(row.next_attempt_at, null);
+});
+
+test('an older overlapping capture cannot resurrect after a newer explicit cross-kind correction', async () => {
+  const sessionId = 'chat-causal-correction';
+  const stale = enqueueAutoCaptureCandidates({
+    message: 'For later: my project access code is Zubrowka-7741.',
+    sessionId,
+    sourceEventId: 'turn:old',
+    occurredAt: '2026-07-15T19:10:00.000Z',
+    candidates: [{
+      kind: 'project',
+      content: 'For later: my project access code is Zubrowka-7741.',
+      reason: 'explicit remember request',
+      pin: true,
+    }],
+  });
+  const correction = enqueueAutoCaptureCandidates({
+    message: 'Correction — I gave you the wrong one. My project access code is actually Marzipan-9214. Zubrowka-7741 is stale, do not use it again.',
+    sessionId,
+    sourceEventId: 'turn:new',
+    occurredAt: '2026-07-15T19:10:09.000Z',
+    candidates: [{
+      // The live classifier legitimately chose a different kind for the
+      // correction. Causality cannot depend on that heuristic label matching.
+      kind: 'user',
+      content: 'Correction — I gave you the wrong one. My project access code is actually Marzipan-9214. Zubrowka-7741 is stale, do not use it again.',
+      reason: 'durable first-person declarative',
+    }],
+  });
+
+  let releaseOlder!: () => void;
+  const holdOlder = new Promise<void>((resolve) => { releaseOlder = resolve; });
+  let olderResolverStarted!: () => void;
+  const olderStarted = new Promise<void>((resolve) => { olderResolverStarted = resolve; });
+  const olderDrain = drainDurableConsolidationCandidates({
+    ids: stale.candidateIds,
+    resolver: async () => {
+      olderResolverStarted();
+      await holdOlder;
+      return { decision: 'ADD' as const };
+    },
+  });
+
+  await olderStarted;
+  const newerDrain = await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  });
+  assert.equal(newerDrain.promoted, 1, 'the newer source event commits while the older resolver is still in flight');
+  releaseOlder();
+  assert.equal((await olderDrain).promoted, 1, 'the older source evidence is preserved, not dropped');
+
+  const rows = openMemoryDb().prepare(`
+    SELECT id, content, active, pinned, valid_to, superseded_by_fact_id
+    FROM consolidated_facts ORDER BY id ASC
+  `).all() as Array<{
+    id: number; content: string; active: number; pinned: number;
+    valid_to: string | null; superseded_by_fact_id: number | null;
+  }>;
+  const staleFact = rows.find((row) => row.content.includes('Zubrowka-7741') && !row.content.includes('Marzipan-9214'));
+  const correctedFact = rows.find((row) => row.content.includes('Marzipan-9214'));
+  assert.ok(staleFact);
+  assert.ok(correctedFact);
+  assert.equal(staleFact.active, 0, 'finish order cannot make the causally older value current');
+  assert.equal(staleFact.superseded_by_fact_id, correctedFact.id);
+  assert.equal(staleFact.valid_to, '2026-07-15T19:10:09.000Z', 'the validity boundary is the correction source time');
+  assert.equal(correctedFact.pinned, 1, 'a late stale pin transfers to the proven correction instead of disappearing');
+  assert.equal(getFact(correctedFact.id)?.active, true);
+  assert.ok(getFactAt(staleFact.id, '2026-07-15T19:10:05.000Z'), 'the older fact remains historically queryable');
+  assert.equal(getFactAt(staleFact.id, '2026-07-15T19:10:10.000Z'), null, 'the stale fact is not valid after the correction');
+});
+
+test('a normal-order explicit cross-kind correction deterministically retires the quoted stale value', async () => {
+  const sessionId = 'chat-cross-kind-correction';
+  const stale = enqueueAutoCaptureCandidates({
+    message: 'For later: my project access code is Zubrowka-7741.',
+    sessionId,
+    sourceEventId: 'turn:old',
+    occurredAt: '2026-07-15T19:20:00.000Z',
+    candidates: [{
+      kind: 'project',
+      content: 'For later: my project access code is Zubrowka-7741.',
+      reason: 'explicit remember request',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: stale.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const correction = enqueueAutoCaptureCandidates({
+    message: 'Correction — I gave you the wrong one. My project access code is actually Marzipan-9214. Zubrowka-7741 is stale, do not use it again.',
+    sessionId,
+    sourceEventId: 'turn:new',
+    occurredAt: '2026-07-15T19:20:09.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Correction — I gave you the wrong one. My project access code is actually Marzipan-9214. Zubrowka-7741 is stale, do not use it again.',
+      reason: 'durable first-person declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    // A same-kind-only implementation would never surface the project row to
+    // this resolver and would therefore leave both values active.
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const rows = openMemoryDb().prepare(`
+    SELECT id, kind, content, active, valid_to, superseded_by_fact_id
+    FROM consolidated_facts ORDER BY id
+  `).all() as Array<{
+    id: number; kind: string; content: string; active: number;
+    valid_to: string | null; superseded_by_fact_id: number | null;
+  }>;
+  const staleFact = rows.find((row) => row.content.includes('Zubrowka-7741') && !row.content.includes('Marzipan-9214'));
+  const correctedFact = rows.find((row) => row.content.includes('Marzipan-9214'));
+  assert.ok(staleFact);
+  assert.ok(correctedFact);
+  assert.equal(staleFact.active, 0);
+  assert.equal(staleFact.valid_to, '2026-07-15T19:20:09.000Z');
+  assert.equal(staleFact.superseded_by_fact_id, correctedFact.id);
+  assert.equal(correctedFact.active, 1);
+  assert.equal(correctedFact.kind, 'project', 'the correction inherits the claim family it corrected');
+});
+
+test('a quoted retired identifier cannot cross conflicting claim subjects', async () => {
+  const stale = enqueueAutoCaptureCandidates({
+    message: "Bob's Project Atlas access code is Zubrowka-7741.",
+    sessionId: 'chat-cross-kind-subject-scope',
+    sourceEventId: 'turn:bob',
+    occurredAt: '2026-07-15T19:30:00.000Z',
+    candidates: [{
+      kind: 'project',
+      content: "Bob's Project Atlas access code is Zubrowka-7741.",
+      reason: 'durable first-person declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: stale.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const correction = enqueueAutoCaptureCandidates({
+    message: "Correction: Alice's Project Atlas access code is Marzipan-9214. Zubrowka-7741 is stale.",
+    sessionId: 'chat-cross-kind-subject-scope',
+    sourceEventId: 'turn:alice',
+    occurredAt: '2026-07-15T19:31:00.000Z',
+    candidates: [{
+      kind: 'user',
+      content: "Correction: Alice's Project Atlas access code is Marzipan-9214. Zubrowka-7741 is stale.",
+      reason: 'durable first-person declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const active = openMemoryDb().prepare(`
+    SELECT kind, content FROM consolidated_facts WHERE active = 1 ORDER BY id
+  `).all() as Array<{ kind: string; content: string }>;
+  assert.equal(active.length, 2, 'a shared old identifier does not merge different people');
+  assert.ok(active.some((row) => row.content.includes("Bob's Project Atlas access code")));
+  assert.ok(active.some((row) => row.kind === 'user' && row.content.includes("Alice's Project Atlas access code")));
+});
+
+test('a split identifier alone is not enough to prove an otherwise unanchored correction relation', async () => {
+  const stale = enqueueAutoCaptureCandidates({
+    message: 'The Foxtrot server access code is Zubrowka-7741.',
+    sessionId: 'chat-cross-kind-identifier-scope',
+    sourceEventId: 'turn:foxtrot',
+    occurredAt: '2026-07-15T19:35:00.000Z',
+    candidates: [{
+      kind: 'project',
+      content: 'The Foxtrot server access code is Zubrowka-7741.',
+      reason: 'durable declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: stale.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const correction = enqueueAutoCaptureCandidates({
+    message: 'Correction: the Echo database access code is Marzipan-9214. Zubrowka-7741 is stale.',
+    sessionId: 'chat-cross-kind-identifier-scope',
+    sourceEventId: 'turn:echo',
+    occurredAt: '2026-07-15T19:36:00.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Correction: the Echo database access code is Marzipan-9214. Zubrowka-7741 is stale.',
+      reason: 'durable declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const active = openMemoryDb().prepare(`
+    SELECT kind, content FROM consolidated_facts WHERE active = 1 ORDER BY id
+  `).all() as Array<{ kind: string; content: string }>;
+  assert.equal(active.length, 2, 'identifier-only overlap falls through instead of guessing');
+  assert.ok(active.some((row) => row.content.includes('Foxtrot server')));
+  assert.ok(active.some((row) => row.kind === 'user' && row.content.includes('Echo database')));
+});
+
+test('a correction rechecks older targets after its resolver wait before committing', async () => {
+  const sessionId = 'chat-causal-correction-opposite';
+  const correction = enqueueAutoCaptureCandidates({
+    message: 'Correction — I gave you the wrong one. My project access code is actually Marzipan-9214. Zubrowka-7741 is stale, do not use it again.',
+    sessionId,
+    sourceEventId: 'turn:new',
+    occurredAt: '2026-07-15T19:40:09.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Correction — I gave you the wrong one. My project access code is actually Marzipan-9214. Zubrowka-7741 is stale, do not use it again.',
+      reason: 'durable first-person declarative',
+    }],
+  });
+  const stale = enqueueAutoCaptureCandidates({
+    message: 'For later: my project access code is Zubrowka-7741.',
+    sessionId,
+    sourceEventId: 'turn:old',
+    occurredAt: '2026-07-15T19:40:00.000Z',
+    candidates: [{
+      kind: 'project',
+      content: 'For later: my project access code is Zubrowka-7741.',
+      reason: 'explicit remember request',
+      pin: true,
+    }],
+  });
+
+  let releaseCorrection!: () => void;
+  const holdCorrection = new Promise<void>((resolve) => { releaseCorrection = resolve; });
+  let correctionResolverStarted!: () => void;
+  const correctionStarted = new Promise<void>((resolve) => { correctionResolverStarted = resolve; });
+  const correctionDrain = drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => {
+      correctionResolverStarted();
+      await holdCorrection;
+      return { decision: 'ADD' as const };
+    },
+  });
+
+  await correctionStarted;
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: stale.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1, 'the older source commits while the newer resolver is waiting');
+  releaseCorrection();
+  assert.equal((await correctionDrain).promoted, 1);
+
+  const rows = openMemoryDb().prepare(`
+    SELECT id, kind, content, active, pinned, valid_to, superseded_by_fact_id
+    FROM consolidated_facts ORDER BY id ASC
+  `).all() as Array<{
+    id: number; kind: string; content: string; active: number; pinned: number;
+    valid_to: string | null; superseded_by_fact_id: number | null;
+  }>;
+  const staleFact = rows.find((row) => row.content.includes('Zubrowka-7741') && !row.content.includes('Marzipan-9214'));
+  const correctedFact = rows.find((row) => row.content.includes('Marzipan-9214'));
+  assert.ok(staleFact);
+  assert.ok(correctedFact);
+  assert.equal(staleFact.active, 0, 'the resolver interleaving cannot leave the older value current');
+  assert.equal(staleFact.valid_to, '2026-07-15T19:40:09.000Z');
+  assert.equal(staleFact.superseded_by_fact_id, correctedFact.id);
+  assert.equal(correctedFact.active, 1);
+  assert.equal(correctedFact.kind, 'project', 'the correction still inherits the corrected claim family');
+  assert.equal(correctedFact.pinned, 1, 'the standing pin transfers at the final commit boundary');
+  assert.ok(getFactAt(staleFact.id, '2026-07-15T19:40:05.000Z'));
+  assert.equal(getFactAt(staleFact.id, '2026-07-15T19:40:10.000Z'), null);
+});
+
+test('an explicit correction does not collapse an unrelated cross-kind fact', async () => {
+  const unrelated = enqueueAutoCaptureCandidates({
+    message: 'Project Atlas launch owner is Marina.',
+    sessionId: 'chat-cross-kind-scope',
+    sourceEventId: 'turn:atlas',
+    occurredAt: '2026-07-15T20:00:00.000Z',
+    candidates: [{
+      kind: 'project',
+      content: 'Project Atlas launch owner is Marina.',
+      reason: 'durable first-person declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: unrelated.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const correction = enqueueAutoCaptureCandidates({
+    message: 'Correction: Project Beacon launch owner is Theo; the prior value was wrong.',
+    sessionId: 'chat-cross-kind-scope',
+    sourceEventId: 'turn:beacon',
+    occurredAt: '2026-07-15T20:01:00.000Z',
+    candidates: [{
+      kind: 'user',
+      content: 'Correction: Project Beacon launch owner is Theo; the prior value was wrong.',
+      reason: 'durable first-person declarative',
+    }],
+  });
+  assert.equal((await drainDurableConsolidationCandidates({
+    ids: correction.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+  })).promoted, 1);
+
+  const active = openMemoryDb().prepare(`
+    SELECT content FROM consolidated_facts WHERE active = 1 ORDER BY id
+  `).all() as Array<{ content: string }>;
+  assert.equal(active.length, 2);
+  assert.ok(active.some((row) => row.content.includes('Project Atlas')));
+  assert.ok(active.some((row) => row.content.includes('Project Beacon')));
 });
