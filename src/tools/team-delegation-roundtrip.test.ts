@@ -219,6 +219,15 @@ test('assignee completion records the assignee as the actor', async () => {
   assert.equal(record?.onBehalfOf, undefined, 'no on-behalf-of marker when the assignee did the work');
 });
 
+test('check_delegation reports the result AND its author', async () => {
+  // Clementine reads this back in later turns. If it showed a result without
+  // an author she could report a teammate as having done her own work.
+  const out = await call('check_delegation', { id: delegationId });
+  assert.match(out, /Status: completed/i);
+  assert.match(out, /Freeze writes/, 'the result itself is shown');
+  assert.match(out, /Completed by: test-builder/, 'and who produced it');
+});
+
 test('a delegation that cannot be found is reported, not silently dropped', async () => {
   const out = await asAgent('test-builder', () => call('complete_delegation', {
     delegation_id: 'deadbeef',
