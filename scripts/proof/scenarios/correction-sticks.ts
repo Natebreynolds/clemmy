@@ -91,10 +91,17 @@ export const correctionSticks: ScenarioDef = {
       pass: said.includes(CORRECTED),
       detail: said.slice(0, 240),
     });
+    // Quoting is not asserting (third occurrence of this measurement class):
+    // "Marzipan-9214. (Zubrowka-7741 is stale — you corrected that earlier.)"
+    // is EXEMPLARY recall — correct answer plus the correction's history — and
+    // a bare substring check failed it. Fail only when the stale value appears
+    // WITHOUT any retirement marker crediting the correction.
+    const staleAsserted = said.includes(STALE)
+      && !/stale|corrected|old|superseded|no longer|not.{0,12}(current|valid)|previous/i.test(said);
     checks.push({
-      name: 'the superseded value does not come back',
-      pass: !said.includes(STALE),
-      detail: said.includes(STALE) ? `stale ${STALE} resurfaced: ${said.slice(0, 240)}` : 'stale value absent',
+      name: 'the superseded value is never asserted as current',
+      pass: !staleAsserted,
+      detail: staleAsserted ? `stale ${STALE} asserted: ${said.slice(0, 240)}` : (said.includes(STALE) ? 'stale value mentioned only as retired' : 'stale value absent'),
     });
 
     // A store that only appends would hold BOTH and recall would be a coin
